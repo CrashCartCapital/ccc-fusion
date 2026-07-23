@@ -124,21 +124,28 @@ describe("ccc-fusion secret and scope boundaries", () => {
     expect(captured).toEqual([{ SAFE_SERVER_VALUE: "safe-value" }]);
   });
 
-  it("redacts fake secret, token, and protected-path canaries from tool args, results, and errors before persistence", async () => {
+  it("redacts JSON-shaped secrets, escaped values, and protected-path canaries before persistence", async () => {
     const entries: Array<{ text: string; detail?: string }> = [];
     const logger = new AgentLogger({
       persistAgentToolOutput: true,
       appendLog: async (entry) => { entries.push(entry); },
     });
+    const jsonToken = "sk_live_example_9Q2";
+    const jsonApiKey = "api key value with spaces";
+    const escapedSecret = "value with \"quoted text\" and spaces";
     logger.onToolStart("Bash", {
       command: "export API_KEY=fake-secret-canary && cat /fake/_secrets/canary.txt",
-      token: "fake-token-canary",
+      token: jsonToken,
+      api_key: jsonApiKey,
     });
-    logger.onToolEnd("Bash", false, { token: "fake-token-canary", path: "/fake/_KELSEY/canary.txt" });
+    logger.onToolEnd("Bash", false, { secret: escapedSecret, path: "/fake/_KELSEY/canary.txt" });
     logger.onToolEnd("Bash", true, new Error("token=fake-token-canary path=/fake/_secrets/canary.txt"));
     await logger.flush();
 
     const persisted = JSON.stringify(entries);
+    expect(persisted).not.toContain(jsonToken);
+    expect(persisted).not.toContain(jsonApiKey);
+    expect(persisted).not.toContain("quoted text");
     expect(persisted).not.toContain("fake-secret-canary");
     expect(persisted).not.toContain("fake-token-canary");
     expect(persisted).not.toContain("/fake/_secrets/canary.txt");

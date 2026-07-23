@@ -69,7 +69,6 @@ export function persistCccFusionPosture(
     ? settings.model
     : undefined;
   return {
-    ...(posture ?? {}),
     [CCC_FUSION_POSTURE_PROFILE_KEY]: CCC_FUSION_PROFILE,
     ...(model ? { [CCC_FUSION_POSTURE_MODEL_KEY]: model } : {}),
   };
@@ -93,6 +92,7 @@ export function restoreCccFusionSettings(
 export function redactCccSensitiveText(value: string): string {
   return value
     .replace(/(?:^|[\\/])(?:_KELSEY|_secrets)(?:[\\/][^\s"'`]+)*/gi, "[REDACTED_PROTECTED_PATH]")
-    .replace(/((?:api[_-]?key|auth[_-]?token|oauth[_-]?token|token|secret|password)\s*[=:]\s*["']?)[^\s,"'}\]]+/gi, "$1[REDACTED]")
+    .replace(/("(?:api[_-]?key|auth[_-]?token|oauth[_-]?token|token|secret|password)"\s*:\s*)"(?:\\.|[^"\\])*"/gi, '$1"[REDACTED]"')
+    .replace(/((?:api[_-]?key|auth[_-]?token|oauth[_-]?token|token|secret|password)\s*[=:]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,"'}\]]+)/gi, "$1[REDACTED]")
     .replace(/\bfake[-_](?:secret|token)[-_][a-z0-9_-]+\b/gi, "[REDACTED]");
 }

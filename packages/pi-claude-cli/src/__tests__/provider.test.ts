@@ -311,36 +311,17 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
   it.each([
     ["missing", undefined],
     ["false", false],
-  ])("blocks %s ccc-fusion subscription readiness through streamViaCli before the actual child spawn", async (_label, subscriptionReady) => {
+    ["non-boolean", "true"],
+  ])("rejects %s ccc-fusion readiness synchronously at the public streamViaCli boundary", (_label, subscriptionReady) => {
     const model = mockModels[0] as any;
     const context = {
       messages: [{ role: "user", content: "Hello" }],
     };
 
-    streamViaCli(model, context, { profile: "ccc-fusion", subscriptionReady } as any);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(spawnClaude).toHaveBeenCalledWith(
-      model.id,
-      undefined,
-      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady }),
-    );
+    expect(() => streamViaCli(model, context, { profile: "ccc-fusion", subscriptionReady } as any))
+      .toThrow("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    expect(spawnClaude).not.toHaveBeenCalled();
     expect(spawn).not.toHaveBeenCalled();
-  });
-
-  it("denies a ccc-fusion public streamViaCli call before the actual child_process.spawn boundary when readiness is missing", async () => {
-    const model = mockModels[0] as any;
-    const context = { messages: [{ role: "user", content: "Hello" }] };
-
-    streamViaCli(model, context, { profile: "ccc-fusion" } as any);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(spawn).not.toHaveBeenCalled();
-    expect(spawnClaude).toHaveBeenCalledWith(
-      model.id,
-      undefined,
-      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: undefined }),
-    );
   });
 
   it("forwards exact ccc-fusion readiness from public streamViaCli into the captured process boundary", async () => {

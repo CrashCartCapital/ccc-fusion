@@ -229,6 +229,7 @@ interface CachedAcpConn {
   child: ChildProcess;
   acpSessionId: string;
   cwd: string;
+  profile: string | undefined;
   inUse: boolean;
   router: AcpRouter;
   idleTimer?: ReturnType<typeof setTimeout>;
@@ -482,6 +483,13 @@ export function streamViaAcp(
       // holds the prior turns server-side (sending full history would duplicate
       // it). Gated by `reuseKey`, which is undefined unless reuse is enabled.
       let warm = reuseKey ? acpSessionCache.get(reuseKey) : undefined;
+      // A cached ordinary child may carry opt-in auth forwarded at spawn time.
+      // Never cross a profile boundary through reuse: evict the old process so
+      // ccc-fusion always cold-starts with its explicit safe environment.
+      if (warm && warm.profile !== options.profile && reuseKey) {
+        evictCachedAcpConn(reuseKey, warm);
+        warm = undefined;
+      }
       // Never reuse a busy connection or one bound to a different cwd.
       if (warm && (warm.inUse || warm.cwd !== cwd)) warm = undefined;
       // A reuse turn sends only the delta; if there's nothing new to send, an
@@ -568,7 +576,16 @@ export function streamViaAcp(
       // it. Only when reuse is enabled (reuseKey set) and the child is live.
       if (reuseKey) {
         myTurn = ++acpTurnCounter;
-        cacheEntry = { conn, child, acpSessionId: opened.sessionId, cwd, inUse: true, router, activeTurn: myTurn };
+        cacheEntry = {
+          conn,
+          child,
+          acpSessionId: opened.sessionId,
+          cwd,
+          profile: options.profile,
+          inUse: true,
+          router,
+          activeTurn: myTurn,
+        };
         acpSessionCache.set(reuseKey, cacheEntry);
       }
 

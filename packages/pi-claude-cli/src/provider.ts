@@ -39,6 +39,7 @@ import {
   registerProcess,
   cleanupSystemPromptFile,
   buildClaudeSpawnArgs,
+  assertCccFusionSubscriptionReady,
 } from "./process-manager.js";
 import { parseLine } from "./stream-parser.js";
 import { createEventBridge } from "./event-bridge.js";
@@ -100,6 +101,7 @@ export function streamViaCli(
   context: PiContext,
   options?: StreamViaCLiOptions,
 ): AssistantMessageEventStream {
+  assertCccFusionSubscriptionReady(options?.profile, options?.subscriptionReady);
   // @ts-expect-error — tsc can't verify AssistantMessageEventStream is a value
   // through pi-ai's `export *` re-export chain. The class constructor exists at runtime.
   const stream = new AssistantMessageEventStream();

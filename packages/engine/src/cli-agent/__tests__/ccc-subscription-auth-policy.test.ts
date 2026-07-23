@@ -169,6 +169,11 @@ describe("ccc-fusion subscription child environment policy", () => {
         projectId: "project-ccc",
         purpose: "execute",
         settings: { profile: CCC_PROFILE, model: "gpt-5.6-sol", subscriptionReady: true },
+        posture: {
+          autoApprove: true,
+          cccFusionSubscriptionReady: true,
+          unexpected: "must-not-persist",
+        },
       });
       const recorded = store.getSession(session.id);
       expect(recorded.autonomyPosture).toMatchObject({
@@ -176,6 +181,7 @@ describe("ccc-fusion subscription child environment policy", () => {
         cccFusionModel: "gpt-5.6-sol",
       });
       expect(Object.keys(recorded.autonomyPosture ?? {}).sort()).toEqual(["cccFusionModel", "cccFusionProfile"]);
+      expect(first.captures[0].args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
       recorded.nativeSessionId = "codex-native-session";
     } finally {
       first.manager.dispose();
