@@ -133,19 +133,22 @@ describe("ccc-fusion secret and scope boundaries", () => {
     const jsonToken = "sk_live_example_9Q2";
     const jsonApiKey = "api key value with spaces";
     const escapedSecret = "value with \"quoted text\" and spaces";
+    const plainSecret = "plain value with spaces";
     logger.onToolStart("Bash", {
       command: "export API_KEY=fake-secret-canary && cat /fake/_secrets/canary.txt",
-      token: jsonToken,
-      api_key: jsonApiKey,
     });
+    logger.onToolStart("CustomTokenTool", { token: jsonToken });
+    logger.onToolStart("CustomApiTool", { api_key: jsonApiKey });
     logger.onToolEnd("Bash", false, { secret: escapedSecret, path: "/fake/_KELSEY/canary.txt" });
     logger.onToolEnd("Bash", true, new Error("token=fake-token-canary path=/fake/_secrets/canary.txt"));
+    logger.onToolEnd("CustomErrorTool", true, new Error(`api_key=${plainSecret} path=/synthetic/safe.txt`));
     await logger.flush();
 
     const persisted = JSON.stringify(entries);
     expect(persisted).not.toContain(jsonToken);
     expect(persisted).not.toContain(jsonApiKey);
     expect(persisted).not.toContain("quoted text");
+    expect(persisted).not.toContain(plainSecret);
     expect(persisted).not.toContain("fake-secret-canary");
     expect(persisted).not.toContain("fake-token-canary");
     expect(persisted).not.toContain("/fake/_secrets/canary.txt");

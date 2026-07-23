@@ -2,7 +2,10 @@ import { createHash } from "node:crypto";
 import type { TaskStore, AgentLogEntry, AgentRole } from "@fusion/core";
 import { categorizeToolName } from "@fusion/core";
 import { createLogger } from "./logger.js";
-import { redactCccSensitiveText } from "./cli-agent/ccc-subscription-policy.js";
+import {
+  isCccForbiddenEnvKey,
+  redactCccSensitiveText,
+} from "./cli-agent/ccc-subscription-policy.js";
 
 /**
  * Session-context fields that let the logger emit normalized `usage_events`
@@ -143,9 +146,17 @@ export function summarizeToolArgs(name: string, args?: Record<string, unknown>):
     if (typeof p === "string") return p;
   }
 
-  // Fallback: return first string-valued arg
-  for (const val of Object.values(args)) {
-    if (typeof val === "string") return val;
+  /*
+   * FNXC:CCCLogRedaction 2026-07-23-15:10:
+   * Generic tool summaries historically discarded the argument key. A secret
+   * value then reached the final text redactor without the label needed to
+   * classify it. Redact forbidden keyed values here while preserving the
+   * existing bare-value summary contract for ordinary arguments.
+   */
+  for (const [key, val] of Object.entries(args)) {
+    if (typeof val !== "string") continue;
+    if (isCccForbiddenEnvKey(key)) return `${key}=[REDACTED]`;
+    return val;
   }
 
   // Structured-arg fallback: distinct non-string payloads stay distinguishable.
