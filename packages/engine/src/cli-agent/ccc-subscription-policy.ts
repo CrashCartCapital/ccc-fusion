@@ -39,8 +39,9 @@ export function isCccFusionProfile(settings: Record<string, unknown> | undefined
 FNXC:CCCSubscriptionReadiness 2026-07-23-14:38:
 The ccc-fusion child boundary accepts only subscriptionReady === true, a
 structural caller-supplied outcome. It deliberately performs no auth,
-credential, or provider probe; recovery persists only profile and model, so
-each relaunch must supply current readiness rather than inherit prior success.
+credential, or provider probe. Recovery persists profile/model plus the separate
+sanitized native-MCP posture, never readiness; the eligible recovery coordinator
+supplies a fresh in-memory marker to this same gate for its one relaunch.
 */
 export function assertCccFusionSubscriptionReady(settings: { profile?: unknown; subscriptionReady?: unknown } | undefined | null): void {
   if (settings?.profile === CCC_FUSION_PROFILE && settings.subscriptionReady !== true) {

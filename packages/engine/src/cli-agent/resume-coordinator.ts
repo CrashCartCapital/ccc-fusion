@@ -41,6 +41,10 @@ import type { CliSession, CliSessionStore, CliTerminationReason } from "@fusion/
 import type { CliSessionManager } from "./session-manager.js";
 import { CliConcurrencyLimitError, CliResumeUnsupportedError } from "./session-manager.js";
 import type { CliAdapterRegistry } from "./adapter.js";
+import {
+  CCC_FUSION_POSTURE_PROFILE_KEY,
+  CCC_FUSION_PROFILE,
+} from "./ccc-subscription-policy.js";
 import { isResumeEligible } from "./state-machine.js";
 
 const execFileAsync = promisify(execFile);
@@ -275,6 +279,17 @@ export class CliResumeCoordinator {
     // Relaunch via the manager's resume path (adapter buildResume + native id),
     // reusing the existing record so no duplicate session row is created.
     try {
+      /*
+       * A persisted ccc posture proves that the original launch passed the
+       * structural readiness boundary. Recovery supplies a fresh in-memory
+       * marker to the same spawn gate without persisting readiness or reading
+       * credentials. The manager independently restores and revalidates the
+       * exact sanitized MCP posture before adapter argv or PTY creation.
+       */
+      const cccRecoverySettings =
+        session.autonomyPosture?.[CCC_FUSION_POSTURE_PROFILE_KEY] === CCC_FUSION_PROFILE
+          ? { subscriptionReady: true }
+          : undefined;
       await this.manager.spawn({
         adapterId: session.adapterId,
         projectId: session.projectId,
@@ -283,6 +298,7 @@ export class CliResumeCoordinator {
         chatSessionId: session.chatSessionId,
         worktreePath,
         posture: session.autonomyPosture,
+        ...(cccRecoverySettings ? { settings: cccRecoverySettings } : {}),
         resume: { sessionId: session.id, nativeSessionId: session.nativeSessionId },
       });
     } catch (err) {

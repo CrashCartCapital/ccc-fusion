@@ -16,6 +16,7 @@ import type { IPty } from "node-pty";
 import { CliAdapterRegistry } from "../cli-agent/adapter.js";
 import { claudeCodeAdapter } from "../cli-agent/adapters/claude-code.js";
 import { codexAdapter } from "../cli-agent/adapters/codex.js";
+import { CliResumeCoordinator } from "../cli-agent/resume-coordinator.js";
 import { CliSessionManager } from "../cli-agent/session-manager.js";
 import { launchCliTaskSession } from "../cli-agent/task-session.js";
 import { TelemetryHub } from "../cli-agent/telemetry-hub.js";
@@ -461,6 +462,179 @@ describe("ccc native MCP provider matrix", () => {
         expect(configuredUrl(resumed.captures[0]!.args)).toBe(mcpUrl);
       } finally {
         resumed.manager.dispose();
+      }
+    },
+  );
+
+  it.each(adapterCases)(
+    "$label coordinator rehydrates exact sanitized ccc MCP posture on engineDeath resume",
+    async ({ adapterId, model, configuredUrl, assertModel }) => {
+      const store = makeStore();
+      const first = makeManager(store);
+      const record = await first.manager.spawn({
+        adapterId,
+        projectId: "ccc-native-project",
+        purpose: "execute",
+        taskId: `task-resume-${adapterId}`,
+        worktreePath: "/tmp/ccc-native-resume-worktree",
+        settings: {
+          profile: CCC_PROFILE,
+          subscriptionReady: true,
+          model,
+          mcpServers: [nativeMcpServer()],
+        },
+      });
+      first.manager.dispose();
+      store.updateSession(record.id, {
+        agentState: "ready",
+        terminationReason: null,
+        nativeSessionId: `${adapterId}-native-recovery-wave2`,
+      });
+
+      const restarted = makeManager(store);
+      const logs: string[] = [];
+      const coordinator = new CliResumeCoordinator({
+        store: store as any,
+        manager: restarted.manager,
+        registry: restarted.registry,
+        worktreeExists: () => true,
+        isWorktreeDirty: async () => false,
+        log: (message) => logs.push(message),
+      });
+      try {
+        const results = await coordinator.recoverOnStart();
+
+        expect(results).toEqual([{
+          sessionId: record.id,
+          taskId: `task-resume-${adapterId}`,
+          disposition: "resumed",
+          dirtyWorktree: false,
+        }]);
+        expect(restarted.captures).toHaveLength(1);
+        assertModel(restarted.captures[0]!.args);
+        expect(configuredUrl(restarted.captures[0]!.args)).toBe(mcpUrl);
+        expect(store.createSession).toHaveBeenCalledTimes(1);
+        expect(record.autonomyPosture).toEqual({
+          cccFusionProfile: CCC_PROFILE,
+          cccFusionModel: model,
+          cccFusionMcpServers: [nativeMcpServer()],
+        });
+        const serializedPosture = JSON.stringify(record.autonomyPosture);
+        expect(serializedPosture).not.toContain("subscriptionReady");
+        expect(serializedPosture).not.toContain("headers");
+        expect(serializedPosture).not.toContain("env");
+        expect(serializedPosture).not.toContain("synthetic-loopback-only");
+        expect(JSON.stringify(logs)).not.toContain("synthetic-loopback-only");
+      } finally {
+        restarted.manager.dispose();
+      }
+    },
+  );
+
+  it.each(adapterCases)(
+    "$label coordinator keeps killed ccc sessions ineligible without spawning",
+    async ({ adapterId, model }) => {
+      const store = makeStore();
+      const runtime = makeManager(store);
+      const record = store.createSession({
+        adapterId,
+        projectId: "ccc-native-project",
+        purpose: "execute",
+        taskId: `task-killed-${adapterId}`,
+        chatSessionId: null,
+        worktreePath: "/tmp/ccc-native-resume-worktree",
+        autonomyPosture: {
+          cccFusionProfile: CCC_PROFILE,
+          cccFusionModel: model,
+          cccFusionMcpServers: [nativeMcpServer()],
+        },
+        agentState: "dead",
+        terminationReason: "killed",
+      });
+      record.nativeSessionId = `${adapterId}-native-killed-wave2`;
+      const coordinator = new CliResumeCoordinator({
+        store: store as any,
+        manager: runtime.manager,
+        registry: runtime.registry,
+        worktreeExists: () => true,
+        isWorktreeDirty: async () => false,
+      });
+      try {
+        await expect(coordinator.resumeOne(record)).resolves.toMatchObject({
+          disposition: "needsAttention-ineligible",
+          reason: "killed",
+        });
+        expect(runtime.captures).toEqual([]);
+      } finally {
+        runtime.manager.dispose();
+      }
+    },
+  );
+
+  it.each(adapterCases)(
+    "$label coordinator rejects unsafe or missing persisted ccc MCP material without spawn or leak",
+    async ({ adapterId, model }) => {
+      for (const fixture of [
+        {
+          label: "missing",
+          posture: {
+            cccFusionProfile: CCC_PROFILE,
+            cccFusionModel: model,
+          },
+        },
+        {
+          label: "unsafe",
+          posture: {
+            cccFusionProfile: CCC_PROFILE,
+            cccFusionModel: model,
+            cccFusionMcpServers: [{
+              name: SERVER_NAME,
+              transport: "streamable-http",
+              url: "https://never-forward.invalid/mcp",
+              headers: { Authorization: "Bearer never-forward-this-value" },
+              enabled: true,
+            }],
+          },
+        },
+      ]) {
+        const store = makeStore();
+        const runtime = makeManager(store);
+        const logs: string[] = [];
+        const record = store.createSession({
+          adapterId,
+          projectId: "ccc-native-project",
+          purpose: "execute",
+          taskId: `task-${fixture.label}-${adapterId}`,
+          chatSessionId: null,
+          worktreePath: "/tmp/ccc-native-resume-worktree",
+          autonomyPosture: fixture.posture,
+          agentState: "ready",
+          terminationReason: null,
+        });
+        record.nativeSessionId = `${adapterId}-native-${fixture.label}-wave2`;
+        const coordinator = new CliResumeCoordinator({
+          store: store as any,
+          manager: runtime.manager,
+          registry: runtime.registry,
+          worktreeExists: () => true,
+          isWorktreeDirty: async () => false,
+          log: (message) => logs.push(message),
+        });
+        try {
+          const results = await coordinator.recoverOnStart();
+          expect(results, fixture.label).toEqual([
+            expect.objectContaining({
+              disposition: "needsAttention-spawnError",
+              reason: expect.stringContaining("ccc-fusion native MCP"),
+            }),
+          ]);
+          expect(runtime.captures, fixture.label).toEqual([]);
+          const observable = JSON.stringify({ results, logs, captures: runtime.captures });
+          expect(observable, fixture.label).not.toContain("never-forward-this-value");
+          expect(observable, fixture.label).not.toContain("never-forward.invalid");
+        } finally {
+          runtime.manager.dispose();
+        }
       }
     },
   );

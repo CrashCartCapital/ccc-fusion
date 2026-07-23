@@ -27,6 +27,7 @@ const harness = vi.hoisted(() => ({
   customProviders: [] as CustomProvider[],
   modelRegistry: undefined as TestModelRegistry | undefined,
   createAgentSession: vi.fn(),
+  actualCreateAgentSession: undefined as typeof import("@earendil-works/pi-coding-agent").createAgentSession | undefined,
 }));
 
 vi.mock("@fusion/core", async (importOriginal) => {
@@ -62,6 +63,7 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
   // The spy delegates to the real in-memory pi agent loop by default. Individual
   // identity-error tests may still install a one-shot synthetic session.
+  harness.actualCreateAgentSession = actual.createAgentSession;
   harness.createAgentSession.mockImplementation(actual.createAgentSession);
   const inertTool = (name: string) => ({
     name,
@@ -193,6 +195,18 @@ function deferred<T = void>(): Deferred<T> {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function noDispatchSession() {
+  return {
+    model: undefined,
+    messages: [],
+    state: {},
+    prompt: vi.fn(async () => {}),
+    subscribe: vi.fn(() => vi.fn()),
+    dispose: vi.fn(),
+    setThinkingLevel: vi.fn(),
+  };
 }
 
 function assertLoopbackTarget(raw: string): URL {
@@ -391,7 +405,8 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     await registerCustomProviders(registry, providers, vi.fn());
     harness.customProviders = providers;
     harness.modelRegistry = registry;
-    harness.createAgentSession.mockClear();
+    harness.createAgentSession.mockReset();
+    harness.createAgentSession.mockImplementation(harness.actualCreateAgentSession!);
   });
 
   function registeredModel(provider: CustomProvider): Model {
@@ -601,6 +616,11 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     }).promptWithFallback;
     await prompt("CCC_TOOL_LOOP");
 
+    const completedAssistant = [...result.session.messages].reverse().find(
+      (message) => message.role === "assistant",
+    ) as AssistantMessage | undefined;
+    expect(completedAssistant?.model).toBe(model.id);
+    expect(completedAssistant?.responseModel).toBe(model.id);
     expect(execute).toHaveBeenCalledTimes(1);
     expect(actualToolResult).toEqual({
       content: [{ type: "text", text: JSON.stringify(structuredResult) }],
@@ -700,6 +720,55 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     ]);
   });
 
+  it.each([
+    { label: "missing", reportedModel: undefined },
+    { label: "empty", reportedModel: "" },
+  ])("refuses a ccc successful turn with a $label reported response model", async ({ reportedModel }) => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const sessionMessages: AssistantMessage[] = [];
+    const session = {
+      model,
+      messages: sessionMessages,
+      state: {},
+      prompt: vi.fn(async () => {
+        sessionMessages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "unproven response identity" }],
+          provider: model.provider,
+          model: model.id,
+          ...(reportedModel === undefined ? {} : { responseModel: reportedModel }),
+          stopReason: "stop",
+          timestamp: Date.now(),
+        } as unknown as AssistantMessage);
+      }),
+      subscribe: vi.fn(() => vi.fn()),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+    };
+    harness.createAgentSession.mockResolvedValueOnce({ session });
+
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const result = await createFnAgent({
+      cwd: "/tmp/ccc-wave2-readonly",
+      systemPrompt: "synthetic loopback only",
+      tools: "readonly",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+    const prompt = (result.session as unknown as {
+      promptWithFallback: (value: string) => Promise<void>;
+    }).promptWithFallback;
+
+    await expect(prompt("CCC_RESPONSE_MODEL_UNPROVEN")).rejects.toThrow(
+      `ccc-fusion response model identity missing: configured ${registryKey}/${model.id}`,
+    );
+    expect(capturedRequests).toHaveLength(0);
+  });
+
   it("returns an aborted stream result and closes the held loopback request", async () => {
     const model = registeredModel(providers[1]!);
     const controller = new AbortController();
@@ -743,6 +812,89 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       `Configured model ${registryKey}/alpha-7b-alias (primary selection) was not found in the pi model registry`,
     );
     expect(harness.createAgentSession).not.toHaveBeenCalled();
+    expect(capturedRequests).toHaveLength(0);
+  });
+
+  it.each([
+    { label: "https", baseUrl: "https://127.0.0.1:7443/v1" },
+    { label: "hostname alias", baseUrl: "http://localhost:7443/v1" },
+    { label: "IPv6", baseUrl: "http://[::1]:7443/v1" },
+    { label: "userinfo", baseUrl: "http://synthetic-user:synthetic-password@127.0.0.1:7443/v1" },
+    { label: "query", baseUrl: "http://127.0.0.1:7443/v1?route=unsafe" },
+    { label: "hash", baseUrl: "http://127.0.0.1:7443/v1#unsafe" },
+    { label: "zero port", baseUrl: "http://127.0.0.1:0/v1" },
+    { label: "missing port", baseUrl: "http://127.0.0.1/v1" },
+    { label: "missing path", baseUrl: "http://127.0.0.1:7443/" },
+  ])("createFnAgent refuses a ccc custom-provider $label base URL before registration, session, or request", async ({ baseUrl: unsafeBaseUrl }) => {
+    const unsafeProvider: CustomProvider = {
+      id: "ccc-provider-unsafe-egress",
+      name: "CCC Unsafe Egress",
+      apiType: "openai-compatible",
+      baseUrl: unsafeBaseUrl,
+      apiKey: "synthetic-never-read",
+      models: [{ id: "unsafe-model-exact", name: "Unsafe Exact" }],
+    };
+    const unsafeRegistry = new TestModelRegistry();
+    harness.customProviders = [unsafeProvider];
+    harness.modelRegistry = unsafeRegistry;
+    harness.createAgentSession.mockResolvedValue({ session: noDispatchSession() });
+    const registryKey = customProviderRegistryKey(unsafeProvider, [unsafeProvider]);
+    const { createFnAgent } = await import("../pi.js");
+
+    let failure: unknown;
+    try {
+      await createFnAgent({
+        cwd: "/tmp/ccc-wave2-readonly",
+        systemPrompt: "must fail before any provider or session effect",
+        tools: "readonly",
+        defaultProvider: registryKey,
+        defaultModelId: "unsafe-model-exact",
+        profile: "ccc-fusion",
+        subscriptionReady: true,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: "CCC_CUSTOM_PROVIDER_EGRESS_POLICY_VIOLATION",
+    });
+
+    const observableFailure = failure instanceof Error ? failure.message : JSON.stringify(failure);
+    expect(observableFailure).not.toContain(unsafeBaseUrl);
+    expect(observableFailure).not.toContain("synthetic-password");
+    expect(observableFailure).not.toContain("synthetic-never-read");
+    expect(unsafeRegistry.configs.size).toBe(0);
+    expect(harness.createAgentSession).not.toHaveBeenCalled();
+    expect(capturedRequests).toHaveLength(0);
+  });
+
+  it("preserves ordinary custom-provider base URL behavior without dispatching a request", async () => {
+    const ordinaryProvider: CustomProvider = {
+      id: "ordinary-provider-remote-shape",
+      name: "Ordinary Remote Shape",
+      apiType: "openai-compatible",
+      baseUrl: "https://ordinary.example.invalid/v1",
+      apiKey: "synthetic-never-read",
+      models: [{ id: "ordinary-model-exact", name: "Ordinary Exact" }],
+    };
+    const ordinaryRegistry = new TestModelRegistry();
+    harness.customProviders = [ordinaryProvider];
+    harness.modelRegistry = ordinaryRegistry;
+    harness.createAgentSession.mockResolvedValue({ session: noDispatchSession() });
+    const registryKey = customProviderRegistryKey(ordinaryProvider, [ordinaryProvider]);
+    const { createFnAgent } = await import("../pi.js");
+
+    const result = await createFnAgent({
+      cwd: "/tmp/ccc-wave2-readonly",
+      systemPrompt: "ordinary profile registration only",
+      tools: "readonly",
+      defaultProvider: registryKey,
+      defaultModelId: "ordinary-model-exact",
+    });
+    await result.session.dispose();
+
+    expect(ordinaryRegistry.configs.get(registryKey)?.baseUrl).toBe(ordinaryProvider.baseUrl);
+    expect(harness.createAgentSession).toHaveBeenCalledTimes(1);
     expect(capturedRequests).toHaveLength(0);
   });
 });

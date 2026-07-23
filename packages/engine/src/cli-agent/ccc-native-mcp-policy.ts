@@ -1,5 +1,10 @@
-import type { ResolvedMcpServerDefinition } from "@fusion/core";
-import { isCccFusionProfile } from "./ccc-subscription-policy.js";
+import type { CliAutonomyPosture, ResolvedMcpServerDefinition } from "@fusion/core";
+import { validateCccLoopbackHttpUrl } from "../ccc-loopback-policy.js";
+import {
+  CCC_FUSION_POSTURE_PROFILE_KEY,
+  CCC_FUSION_PROFILE,
+  isCccFusionProfile,
+} from "./ccc-subscription-policy.js";
 
 const CCC_NATIVE_MCP_ALLOWED_KEYS = new Set([
   "name",
@@ -7,6 +12,8 @@ const CCC_NATIVE_MCP_ALLOWED_KEYS = new Set([
   "url",
   "enabled",
 ]);
+
+export const CCC_FUSION_POSTURE_MCP_KEY = "cccFusionMcpServers";
 
 export type CccNativeMcpServerDefinition = ResolvedMcpServerDefinition & {
   transport: "streamable-http";
@@ -28,37 +35,8 @@ function reject(index: number, reason: string): never {
 }
 
 function validateLoopbackUrl(raw: unknown, index: number): string {
-  if (typeof raw !== "string") {
-    return reject(index, "URL must be a string");
-  }
-  const match = /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})(\/[^/?#][^?#]*)$/.exec(raw);
-  if (!match) {
-    return reject(
-      index,
-      "URL must use literal http://127.0.0.1 with an explicit positive port and path",
-    );
-  }
-  const port = Number(match[1]);
-  if (!Number.isInteger(port) || port > 65_535) {
-    return reject(index, "port must be between 1 and 65535");
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(raw);
-  } catch {
-    return reject(index, "URL is invalid");
-  }
-  if (
-    parsed.protocol !== "http:"
-    || parsed.hostname !== "127.0.0.1"
-    || parsed.username !== ""
-    || parsed.password !== ""
-    || parsed.search !== ""
-    || parsed.hash !== ""
-  ) {
-    return reject(index, "URL is outside the ccc-fusion loopback boundary");
-  }
-  return raw;
+  const validation = validateCccLoopbackHttpUrl(raw);
+  return validation.ok ? validation.url : reject(index, validation.reason);
 }
 
 /**
@@ -137,4 +115,70 @@ export function applyCccNativeMcpPolicy(
   return servers.length > 0
     ? { ...withoutMcp, mcpServers: servers }
     : withoutMcp;
+}
+
+/**
+ * Persist only the already-validated, credential-free ccc MCP set. An explicit
+ * empty array distinguishes a Wave 2 session with no enabled servers from a
+ * stale/malformed posture that lacks recovery material.
+ */
+export function persistCccNativeMcpPosture(
+  posture: CliAutonomyPosture | null,
+  settings: Record<string, unknown> | undefined | null,
+): CliAutonomyPosture | null {
+  if (!isCccFusionProfile(settings)) return posture;
+  const servers = resolveCccNativeMcpServers(settings);
+  return {
+    ...(posture ?? {}),
+    [CCC_FUSION_POSTURE_MCP_KEY]: servers.map((server) => ({ ...server })),
+  };
+}
+
+function hasExactPersistedShape(
+  candidate: unknown,
+  expected: CccNativeMcpServerDefinition,
+): boolean {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+  const record = candidate as Record<string, unknown>;
+  return Object.keys(record).length === 4
+    && record.name === expected.name
+    && record.transport === expected.transport
+    && record.url === expected.url
+    && record.enabled === true;
+}
+
+/**
+ * Restore only sanitized ccc MCP material from the durable posture. Caller
+ * settings are never used as a recovery source, so restart cannot re-resolve
+ * secret-bearing definitions or smuggle arbitrary settings into adapter argv.
+ */
+export function restoreCccNativeMcpSettings(
+  settings: Record<string, unknown> | undefined | null,
+  posture: CliAutonomyPosture | null,
+): Record<string, unknown> {
+  const restored = { ...(settings ?? {}) };
+  if (posture?.[CCC_FUSION_POSTURE_PROFILE_KEY] !== CCC_FUSION_PROFILE) {
+    return restored;
+  }
+  if (!Object.prototype.hasOwnProperty.call(posture, CCC_FUSION_POSTURE_MCP_KEY)) {
+    return reject(-1, "persisted configuration is missing");
+  }
+  const raw = posture[CCC_FUSION_POSTURE_MCP_KEY];
+  if (!Array.isArray(raw)) {
+    return reject(-1, "persisted configuration must be an array");
+  }
+  const servers = resolveCccNativeMcpServers({
+    profile: CCC_FUSION_PROFILE,
+    mcpServers: raw,
+  });
+  if (
+    raw.length !== servers.length
+    || raw.some((candidate, index) => !hasExactPersistedShape(candidate, servers[index]!))
+  ) {
+    return reject(-1, "persisted configuration is not the exact sanitized shape");
+  }
+  return {
+    ...restored,
+    mcpServers: servers,
+  };
 }

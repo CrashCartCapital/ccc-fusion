@@ -158,7 +158,7 @@ describe("ccc-fusion subscription child environment policy", () => {
     }
   });
 
-  it("persists only ccc profile and exact Codex model, then requires a current ready marker for a fresh manager resume", async () => {
+  it("persists only ccc profile, exact Codex model, and sanitized MCP set, then requires a current ready marker for a fresh manager resume", async () => {
     installFakeChildEnv();
     const store = makeStore();
     const first = makeManager(store);
@@ -179,8 +179,13 @@ describe("ccc-fusion subscription child environment policy", () => {
       expect(recorded.autonomyPosture).toMatchObject({
         cccFusionProfile: CCC_PROFILE,
         cccFusionModel: "gpt-5.6-sol",
+        cccFusionMcpServers: [],
       });
-      expect(Object.keys(recorded.autonomyPosture ?? {}).sort()).toEqual(["cccFusionModel", "cccFusionProfile"]);
+      expect(Object.keys(recorded.autonomyPosture ?? {}).sort()).toEqual([
+        "cccFusionMcpServers",
+        "cccFusionModel",
+        "cccFusionProfile",
+      ]);
       expect(first.captures[0].args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
       recorded.nativeSessionId = "codex-native-session";
     } finally {

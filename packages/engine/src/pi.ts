@@ -83,6 +83,7 @@ import { isModelAuthTierIncompatibilityError, isProviderModelNotFoundError, isUn
 import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp-runtime-support.js";
 import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp-session-tools.js";
 import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
+import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
 export { isModelAuthTierIncompatibilityError } from "./transient-error-detector.js";
 
 const RTK_ACCEPTED_REWRITE_EXIT_CODES = new Set([0, 3]);
@@ -330,22 +331,82 @@ type CccResponseIdentitySession = AgentSession & {
   };
 };
 
+class CccCustomProviderEgressPolicyViolationError extends Error {
+  readonly code = "CCC_CUSTOM_PROVIDER_EGRESS_POLICY_VIOLATION";
+
+  constructor(public readonly selection: "primary" | "fallback") {
+    super(`ccc-fusion ${selection} custom-provider base URL rejected by loopback policy`);
+    this.name = "CccCustomProviderEgressPolicyViolationError";
+  }
+}
+
+function assertCccCustomProviderEgress(
+  options: AgentOptions,
+  providers: ReturnType<typeof readCustomProviders>,
+): void {
+  if (options.profile !== CCC_FUSION_PROFILE) return;
+  const selections = [
+    ["primary", options.defaultProvider],
+    ["fallback", options.fallbackProvider],
+  ] as const;
+  for (const [selection, providerKey] of selections) {
+    if (!providerKey) continue;
+    const provider = providers.find(
+      (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
+    );
+    if (!provider) continue;
+    if (!validateCccLoopbackHttpUrl(provider.baseUrl).ok) {
+      throw new CccCustomProviderEgressPolicyViolationError(selection);
+    }
+  }
+}
+
 function assertCccResponseModelIdentity(session: AgentSession): void {
   const expected = (session as CccResponseIdentitySession)[CCC_EXPECTED_RESPONSE_MODEL];
   if (!expected) return;
   const messages = (session as { messages?: unknown }).messages;
-  if (!Array.isArray(messages)) return;
-  const assistant = [...messages].reverse().find(
+  const assistant = Array.isArray(messages) ? [...messages].reverse().find(
     (message): message is Record<string, unknown> =>
       Boolean(message) && typeof message === "object" && (message as Record<string, unknown>).role === "assistant",
-  );
+  ) : undefined;
   const responseModel = assistant?.responseModel;
-  if (typeof responseModel !== "string" || responseModel.length === 0 || responseModel === expected.modelId) {
+  if (typeof responseModel !== "string" || responseModel.trim().length === 0) {
+    throw new Error(
+      `ccc-fusion response model identity missing: configured ${expected.provider}/${expected.modelId}`,
+    );
+  }
+  if (responseModel === expected.modelId) {
     return;
   }
   throw new Error(
     `ccc-fusion response model mismatch: configured ${expected.provider}/${expected.modelId}, provider reported ${responseModel}`,
   );
+}
+
+function restoreCccStreamRequestModel<TStream extends AsyncIterable<any> & {
+  result: () => Promise<any>;
+}>(source: TStream, expectedModelId: string): TStream {
+  const restore = (message: unknown): void => {
+    if (message && typeof message === "object") {
+      (message as { model?: string }).model = expectedModelId;
+    }
+  };
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const event of source) {
+        if (event && typeof event === "object") {
+          restore((event as { partial?: unknown }).partial);
+          restore((event as { message?: unknown }).message);
+        }
+        yield event;
+      }
+    },
+    async result() {
+      const result = await source.result();
+      restore(result);
+      return result;
+    },
+  } as unknown as TStream;
 }
 
 function isThinkingReasoningConflictError(message: string): boolean {
@@ -2222,6 +2283,8 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
    * neither probes auth nor reads credentials.
    */
   assertCccFusionSubscriptionReady(options);
+  const customProviders = readCustomProviders();
+  assertCccCustomProviderEgress(options, customProviders);
   piLog.log(`createFnAgent called (tools=${options.tools}, provider=${options.defaultProvider}, model=${options.defaultModelId})`);
   // FNXC:McpConfig 2026-06-25-22:02:
   // The pi session is the final shared forwarding seam for direct createFnAgent lanes. Forward the resolved MCP set only to MCP-capable provider/runtime combinations and keep unsupported lanes content-free by logging just provider/runtime/count metadata.
@@ -2245,15 +2308,52 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
      * when the caller omits readiness. This never reads auth state or forwards
      * credentials.
      */
-    const withCccFusionSubscriptionOptions = <TOptions extends object | undefined>(requestOptions: TOptions): TOptions => ({
-      ...(requestOptions ?? {}),
-      profile: CCC_FUSION_PROFILE,
-      subscriptionReady: true,
-    }) as TOptions;
+    const dispatchCccFusionStream = (
+      dispatch: (...args: any[]) => any,
+      model: any,
+      context: any,
+      requestOptions: any,
+    ) => {
+      const expectedModelId = model.id as string;
+      const optionsWithBoundary = {
+        ...(requestOptions ?? {}),
+        profile: CCC_FUSION_PROFILE,
+        subscriptionReady: true,
+      };
+      const priorOnPayload = optionsWithBoundary.onPayload as
+        | ((payload: unknown, model: unknown) => unknown | Promise<unknown>)
+        | undefined;
+      optionsWithBoundary.onPayload = async (payload: unknown) => {
+        const prior = priorOnPayload ? await priorOnPayload(payload, model) : undefined;
+        const resolved = prior === undefined ? payload : prior;
+        if (!resolved || typeof resolved !== "object" || Array.isArray(resolved)) {
+          throw new Error("ccc-fusion provider payload did not expose a structured model identity");
+        }
+        return {
+          ...(resolved as Record<string, unknown>),
+          model: expectedModelId,
+        };
+      };
+      /*
+       * pi-ai records responseModel only when the provider-reported model differs
+       * from model.id. Use a private in-process probe id while forcing the exact
+       * configured id onto the outbound payload, then restore the public request
+       * model on every event/result. A missing provider model stays missing, an
+       * alias stays visible, and an exact echo becomes independently observable.
+       */
+      const source = dispatch(
+        { ...model, id: `__fusion_ccc_response_probe__${expectedModelId}` },
+        context,
+        optionsWithBoundary,
+      );
+      return restoreCccStreamRequestModel(source, expectedModelId);
+    };
     const stream = modelRuntime.stream.bind(modelRuntime);
-    modelRuntime.stream = ((model, context, streamOptions) => stream(model, context, withCccFusionSubscriptionOptions(streamOptions))) as typeof modelRuntime.stream;
+    modelRuntime.stream = ((model, context, streamOptions) =>
+      dispatchCccFusionStream(stream, model, context, streamOptions)) as typeof modelRuntime.stream;
     const streamSimple = modelRuntime.streamSimple.bind(modelRuntime);
-    modelRuntime.streamSimple = ((model, context, streamOptions) => streamSimple(model, context, withCccFusionSubscriptionOptions(streamOptions))) as typeof modelRuntime.streamSimple;
+    modelRuntime.streamSimple = ((model, context, streamOptions) =>
+      dispatchCccFusionStream(streamSimple, model, context, streamOptions)) as typeof modelRuntime.streamSimple;
   }
 
   // Resolve the project root early so extension providers, skill discovery,
@@ -2262,7 +2362,6 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const resolvedProjectRoot = getProjectRootFromWorktree(options.cwd) ?? resolvePiExtensionProjectRoot(options.cwd);
   await registerExtensionProviders(resolvedProjectRoot, modelRegistry);
 
-  const customProviders = readCustomProviders();
   for (const provider of customProviders) {
     try {
       const registryKey = customProviderRegistryKey(provider, customProviders);

@@ -39,7 +39,11 @@ import { loadPtyModule } from "../pty-native.js";
 import type { IPty } from "node-pty";
 import type { CliAdapterRegistry, CliAgentAdapter, CliLaunchSpec, CliReadinessDetector } from "./adapter.js";
 import { assertCccFusionSubscriptionReady, persistCccFusionPosture, restoreCccFusionSettings } from "./ccc-subscription-policy.js";
-import { applyCccNativeMcpPolicy } from "./ccc-native-mcp-policy.js";
+import {
+  applyCccNativeMcpPolicy,
+  persistCccNativeMcpPosture,
+  restoreCccNativeMcpSettings,
+} from "./ccc-native-mcp-policy.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -452,15 +456,16 @@ export class CliSessionManager {
       if (!existing) throw new UnknownCliSessionError(options.resume.sessionId);
       /*
       FNXC:CCCSubscriptionPolicy 2026-07-23-14:14:
-      Crash recovery reapplies only the persisted ccc profile and exact model.
-      Subscription readiness is a current caller-supplied structural outcome,
-      never a durable success marker; the posture carries no child-env or
-      credential values, so a new manager cannot reintroduce a billing route
-      or bypass the structural launch guard.
+      Crash recovery reapplies the persisted ccc profile, exact model, and exact
+      credential-free MCP set. Subscription readiness remains a current
+      caller-supplied structural outcome, never a durable success marker; the
+      posture carries no child-env or credential values, so a new manager cannot
+      reintroduce a billing route or bypass the structural launch guard.
       */
-      launchSettings = applyCccNativeMcpPolicy(
+      launchSettings = applyCccNativeMcpPolicy(restoreCccNativeMcpSettings(
         restoreCccFusionSettings(requestedSettings, existing.autonomyPosture),
-      );
+        existing.autonomyPosture,
+      ));
       assertCccFusionSubscriptionReady(launchSettings);
       launch = adapter.buildResume({ settings: launchSettings, posture: existing.autonomyPosture, nativeSessionId: options.resume.nativeSessionId });
       // Move the reused record back to "starting" for the relaunch.
@@ -471,7 +476,10 @@ export class CliSessionManager {
     } else {
       launchSettings = applyCccNativeMcpPolicy(requestedSettings);
       assertCccFusionSubscriptionReady(launchSettings);
-      const posture = persistCccFusionPosture(options.posture ?? null, launchSettings);
+      const posture = persistCccNativeMcpPosture(
+        persistCccFusionPosture(options.posture ?? null, launchSettings),
+        launchSettings,
+      );
       launch = adapter.buildLaunch({ settings: launchSettings, posture });
       // Persist the session record BEFORE spawning so a crash mid-spawn still has
       // a durable record to reason about.
