@@ -44,6 +44,7 @@
  */
 
 import { writeFileSync } from "node:fs";
+import type { ResolvedMcpServerDefinition } from "@fusion/core";
 import type {
   CliAdapterCapabilities,
   CliAdapterLaunchContext,
@@ -101,6 +102,8 @@ export interface ClaudeCodeLaunchSettings {
   model?: string;
   /** Session-scoped hook script paths (from U17). */
   hookScripts?: HookScriptRefs;
+  /** Resolved MCP servers forwarded through Claude Code's native MCP config. */
+  mcpServers?: readonly ResolvedMcpServerDefinition[];
   /**
    * Absolute path the adapter should WRITE the session-scoped settings JSON to.
    * MUST live under the session's scratch dir — never the user's global
@@ -187,6 +190,55 @@ function appendSettingsFlag(
   } else {
     args.push("--settings", json);
   }
+}
+
+type ClaudeNativeMcpServer =
+  | {
+      type: "stdio";
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+    }
+  | {
+      type: "sse" | "http";
+      url: string;
+      headers?: Record<string, string>;
+    };
+
+/**
+ * Append resolved MCP servers through Claude Code's native configuration seam.
+ *
+ * FNXC:CCCNativeMcp 2026-07-23-15:45:
+ * Native MCP configuration preserves tool schemas, calls, and structured
+ * results as protocol data. It must never be flattened into the provider prompt
+ * or routed through the generic CLI adapter.
+ */
+function appendNativeMcpConfig(
+  args: string[],
+  servers: readonly ResolvedMcpServerDefinition[] | undefined,
+): void {
+  const enabledServers = servers?.filter((server) => server.enabled !== false) ?? [];
+  if (enabledServers.length === 0) return;
+
+  const mcpServers: Record<string, ClaudeNativeMcpServer> = {};
+  for (const server of enabledServers) {
+    if (server.transport === "stdio") {
+      mcpServers[server.name] = {
+        type: "stdio",
+        command: server.command,
+        ...(server.args ? { args: [...server.args] } : {}),
+        ...(server.env ? { env: { ...server.env } } : {}),
+      };
+      continue;
+    }
+    mcpServers[server.name] = {
+      type: server.transport === "sse" ? "sse" : "http",
+      url: server.url,
+      ...(server.headers ? { headers: { ...server.headers } } : {}),
+    };
+  }
+
+  args.push("--mcp-config", JSON.stringify({ mcpServers }), "--strict-mcp-config");
 }
 
 /** Append the autonomy posture's privileged flags, only when permitted. */
@@ -561,6 +613,7 @@ export const claudeCodeAdapter: CliAgentAdapter = {
     const settings = readSettings(ctx);
     const { command, args } = buildBaseArgs(ctx);
     appendSettingsFlag(args, settings);
+    appendNativeMcpConfig(args, settings.mcpServers);
     appendPostureFlags(args, ctx);
     if (settings.extraArgs) args.push(...settings.extraArgs);
     return { command, args };
@@ -618,6 +671,7 @@ export const claudeCodeAdapter: CliAgentAdapter = {
     const { command, args } = buildBaseArgs(ctx);
     args.push("--resume", ctx.nativeSessionId);
     appendSettingsFlag(args, settings);
+    appendNativeMcpConfig(args, settings.mcpServers);
     appendPostureFlags(args, ctx);
     if (settings.extraArgs) args.push(...settings.extraArgs);
     return { command, args };

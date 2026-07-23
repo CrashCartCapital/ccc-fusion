@@ -1151,6 +1151,7 @@ function resolveConfiguredModel(
   kind: "primary" | "fallback",
   provider?: string,
   modelId?: string,
+  profile?: string,
 ) {
   if (!provider || !modelId) {
     return undefined;
@@ -1161,12 +1162,16 @@ function resolveConfiguredModel(
     return model;
   }
 
-  // Fall back to constructing a model on-the-fly if the provider is known.
-  // This mirrors the pi CLI's buildFallbackModel behaviour, which accepts any
-  // model ID for a configured provider (e.g. any OpenRouter model string) even
-  // when it isn't in the built-in or custom model list.
+  /*
+  FNXC:CCCTransport 2026-07-23-15:45:
+  The ccc-fusion profile is a frozen custom-provider route: its configured
+  provider/model pair is the wire identity. Never synthesize an alias from the
+  provider's first model, because that silently changes the requested route
+  while retaining an unrelated base model. Other profiles keep the pi CLI's
+  permissive unknown-model behavior for providers such as OpenRouter.
+  */
   const providerModels = modelRegistry.getAll().filter((m) => m.provider === provider);
-  if (providerModels.length > 0) {
+  if (profile !== CCC_FUSION_PROFILE && providerModels.length > 0) {
     const baseModel = providerModels[0]!;
     piLog.warn(`${kind} model ${provider}/${modelId} not in registry; using provider base model as template`);
     return { ...baseModel, id: modelId, name: modelId };
@@ -2338,6 +2343,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       "primary",
       options.defaultProvider,
       options.defaultModelId,
+      options.profile,
     );
   } catch (primaryResolutionError) {
     if (!options.fallbackProvider || !options.fallbackModelId) {
@@ -2348,6 +2354,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       "fallback",
       options.fallbackProvider,
       options.fallbackModelId,
+      options.profile,
     );
     selectedModel = fallbackModel;
   }
@@ -2358,6 +2365,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       "fallback",
       options.fallbackProvider,
       options.fallbackModelId,
+      options.profile,
     );
   }
 
