@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { TaskStore, AgentLogEntry, AgentRole } from "@fusion/core";
 import { categorizeToolName } from "@fusion/core";
 import { createLogger } from "./logger.js";
+import { redactCccSensitiveText } from "./cli-agent/ccc-subscription-policy.js";
 
 /**
  * Session-context fields that let the logger emit normalized `usage_events`
@@ -483,12 +484,18 @@ export class AgentLogger {
     const isToolEntry = type === "tool" || type === "tool_result" || type === "tool_error";
     // FNXC:AgentLogging 2026-07-15-16:00: Failed tool detail is diagnostic signal, unlike verbose arguments/success output, and must survive default-off tool-output persistence for FN-7995 Activity diagnosis.
     const includeDetail = !isToolEntry || type === "tool_error" || this.persistAgentToolOutput;
+    /*
+    FNXC:CCCLogRedaction 2026-07-23-13:15:
+    Apply the Wave 1 secret/protected-path redaction at the final persistence
+    boundary for every profile. This is safe general hardening and covers tool
+    args, successful results, and error summaries even when a prior formatter changes.
+    */
     const entry: AgentLogEntry = {
       timestamp: new Date().toISOString(),
       taskId: this.taskId,
-      text,
+      text: redactCccSensitiveText(text),
       type,
-      ...(detail !== undefined && includeDetail && { detail }),
+      ...(detail !== undefined && includeDetail && { detail: redactCccSensitiveText(detail) }),
       ...(this.agent !== undefined && { agent: this.agent }),
       ...(timing?.durationMs !== undefined && { durationMs: timing.durationMs }),
       ...(timing?.timeToFirstTokenMs !== undefined && { timeToFirstTokenMs: timing.timeToFirstTokenMs }),

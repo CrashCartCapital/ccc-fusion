@@ -65,6 +65,7 @@ import type {
   CliReadinessDetector,
 } from "../adapter.js";
 import { stripAnsiControl, type TelemetryEvent } from "../telemetry-hub.js";
+import { cccFusionEnvAllowlist } from "../ccc-subscription-policy.js";
 
 // ── Capabilities ────────────────────────────────────────────────────────────
 
@@ -643,7 +644,7 @@ export const codexAdapter: CliAgentAdapter = {
       "OPENAI_BASE_URL",
     ];
     // When a layered CODEX_HOME scratch dir is configured the env carries it.
-    return settings.codexHome ? [...new Set([...base, "CODEX_HOME"])] : base;
+    return cccFusionEnvAllowlist(settings.codexHome ? [...new Set([...base, "CODEX_HOME"])] : base, ctx.settings);
   },
 
   createReadinessDetector(): CliReadinessDetector {

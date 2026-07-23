@@ -82,6 +82,7 @@ import { createStreamingDeltaNormalizer } from "./streaming-delta.js";
 import { isModelAuthTierIncompatibilityError, isProviderModelNotFoundError, isUnsupportedMessageRoleError } from "./transient-error-detector.js";
 import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp-runtime-support.js";
 import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp-session-tools.js";
+import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
 export { isModelAuthTierIncompatibilityError } from "./transient-error-detector.js";
 
 const RTK_ACCEPTED_REWRITE_EXIT_CODES = new Set([0, 3]);
@@ -1102,6 +1103,10 @@ export interface AgentOptions {
   mcpClientFactory?: McpClientFactory;
   /** Test seam for MCP retry timing. */
   mcpBootstrapRetryDelayMs?: number;
+  /** Explicit ccc-fusion child profile; all other profiles preserve existing MCP behavior. */
+  profile?: string;
+  /** Caller-supplied structural readiness outcome for ccc-fusion child boundaries. */
+  subscriptionReady?: true;
   /** Optional task-scoped env injected into this session's subprocess tools only. */
   taskEnv?: NodeJS.ProcessEnv;
   /** Last-chance abort hook fired immediately before `createAgentSession`.
@@ -2176,6 +2181,14 @@ function withMcpPromptOptions(promptOptions: unknown, mcpServers: ResolvedMcpSer
 }
 
 export async function createFnAgent(options: AgentOptions): Promise<AgentResult> {
+  /*
+   * FNXC:CCCSubscriptionPolicy 2026-07-23-14:19:
+   * createFnAgent is the public engine entrypoint before either pi provider
+   * dispatch or stdio MCP connection. Fail closed here for ccc-fusion unless
+   * the caller supplies subscriptionReady === true; this structural check
+   * neither probes auth nor reads credentials.
+   */
+  assertCccFusionSubscriptionReady(options);
   piLog.log(`createFnAgent called (tools=${options.tools}, provider=${options.defaultProvider}, model=${options.defaultModelId})`);
   // FNXC:McpConfig 2026-06-25-22:02:
   // The pi session is the final shared forwarding seam for direct createFnAgent lanes. Forward the resolved MCP set only to MCP-capable provider/runtime combinations and keep unsupported lanes content-free by logging just provider/runtime/count metadata.
@@ -2187,6 +2200,28 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const authStorage = createFusionAuthStorage();
   const modelRegistry = await createFusionModelRegistry(authStorage);
   const modelRuntime = modelRegistry.modelRuntime;
+
+  if (options.profile === CCC_FUSION_PROFILE) {
+    /*
+     * FNXC:CCCSubscriptionPolicy 2026-07-23-14:38:
+     * createAgentSession dispatches provider traffic through this per-session
+     * ModelRuntime rather than an engine-level provider option. Carry only the
+     * explicit ccc-fusion marker and positive structural readiness result to
+     * direct stream seams; ModelRuntime completion methods delegate through
+     * those streams. The provider then fails closed before its child spawn
+     * when the caller omits readiness. This never reads auth state or forwards
+     * credentials.
+     */
+    const withCccFusionSubscriptionOptions = <TOptions extends object | undefined>(requestOptions: TOptions): TOptions => ({
+      ...(requestOptions ?? {}),
+      profile: CCC_FUSION_PROFILE,
+      subscriptionReady: true,
+    }) as TOptions;
+    const stream = modelRuntime.stream.bind(modelRuntime);
+    modelRuntime.stream = ((model, context, streamOptions) => stream(model, context, withCccFusionSubscriptionOptions(streamOptions))) as typeof modelRuntime.stream;
+    const streamSimple = modelRuntime.streamSimple.bind(modelRuntime);
+    modelRuntime.streamSimple = ((model, context, streamOptions) => streamSimple(model, context, withCccFusionSubscriptionOptions(streamOptions))) as typeof modelRuntime.streamSimple;
+  }
 
   // Resolve the project root early so extension providers, skill discovery,
   // and resource loading all use the correct root when cwd is a worktree,
@@ -2445,6 +2480,19 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         clientFactory: options.mcpClientFactory,
         logger: piLog,
         retryDelayMs: options.mcpBootstrapRetryDelayMs,
+        /*
+         * FNXC:CCCSubscriptionPolicy 2026-07-23-13:58:
+         * This is the real engine-to-stdio-MCP child seam. Forward only the
+         * exact positive ccc-fusion profile and its structural readiness bit,
+         * so absent or false readiness still reaches the fail-closed MCP guard
+         * without exposing credentials, auth state, or other profile values.
+         */
+        ...(options.profile === CCC_FUSION_PROFILE
+          ? {
+              profile: CCC_FUSION_PROFILE,
+              ...(options.subscriptionReady === true ? { subscriptionReady: true } : {}),
+            }
+          : {}),
       });
       /*
        * FNXC:McpConfig 2026-07-18-19:41:

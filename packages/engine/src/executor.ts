@@ -15093,7 +15093,8 @@ export class TaskExecutor {
     settings: Settings,
     audit?: RunAuditor,
   ): Promise<{ blocked: false } | { blocked: true; message: string }> {
-    if (task.scopeOverride === true) {
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    if (task.scopeOverride === true && !cccFusionTask) {
       executorLog.log(`${task.id}: scope-leak guard bypassed (scopeOverride=true)`);
       await this.store.logEntry(task.id, "[scope-leak] scope guard bypassed via task.scopeOverride", undefined, this.getRunContextFor(task.id));
       return { blocked: false };
@@ -15101,12 +15102,20 @@ export class TaskExecutor {
 
     const declaredScope = await this.store.parseFileScopeFromPrompt(task.id).catch(() => [] as string[]);
     if (declaredScope.length === 0) {
+      if (cccFusionTask) {
+        const message = "CCC Fusion scope verification requires a declared File Scope before fn_task_done.";
+        executorLog.warn(`${task.id}: [scope-leak] ${message}`);
+        await this.store.logEntry(task.id, `[scope-leak] ${message}`, undefined, this.getRunContextFor(task.id));
+        return { blocked: true, message };
+      }
       return { blocked: false };
     }
 
     const reviewLevel = parseReviewLevelFromPrompt(promptContent);
     const configuredMode = settings.planOnlyScopeLeakEnforcement ?? "warn";
-    const enforcementMode: "off" | "warn" | "block" = reviewLevel === 1
+    const enforcementMode: "off" | "warn" | "block" = cccFusionTask
+      ? "block"
+      : reviewLevel === 1
       ? configuredMode
       : "warn";
 
@@ -15586,8 +15595,20 @@ export class TaskExecutor {
         // workflow values. Behavior-inert by default.
         const settings = await mergeEffectiveSettings(store, task, await store.getSettings());
         const scopeLeakCheck = await this.evaluateTaskDoneScopeLeak(task, worktreePath, promptContent, settings, audit)
-          .catch((error: unknown) => {
+          .catch(async (error: unknown) => {
             const errorMessage = error instanceof Error ? error.message : String(error);
+            if (task.customFields?.cccFusionProfile === "ccc-fusion") {
+              /*
+              FNXC:CCCScopeVerification 2026-07-23-13:15:
+              Wave 1 makes only the explicit ccc-fusion task profile fail closed
+              when scope verification throws. Existing Fusion tasks keep their
+              compatibility fail-open behavior until their own policy changes.
+              */
+              const message = "CCC Fusion scope verification unavailable — fn_task_done blocked to preserve ccc-fusion scope safety.";
+              executorLog.warn(`${taskId}: [scope-leak] ${message}`);
+              await store.logEntry(taskId, `[scope-leak] ${message}`, undefined, this.getRunContextFor(task.id));
+              return { blocked: true, message } as const;
+            }
             executorLog.warn(`${taskId}: scope-leak guard failed open: ${errorMessage}`);
             return { blocked: false } as const;
           });

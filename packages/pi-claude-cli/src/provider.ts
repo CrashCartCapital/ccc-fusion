@@ -74,6 +74,8 @@ function debugLog(message: string): void {
 type StreamViaCLiOptions = SimpleStreamOptions & {
   cwd?: string;
   mcpConfigPath?: string;
+  profile?: string;
+  subscriptionReady?: true;
 };
 
 /**
@@ -140,6 +142,8 @@ export function streamViaCli(
         mcpConfigPath: options?.mcpConfigPath,
         resumeSessionId,
         newSessionId: !resumeSessionId ? options?.sessionId : undefined,
+        profile: options?.profile,
+        subscriptionReady: options?.subscriptionReady,
       };
 
       // Spawn subprocess

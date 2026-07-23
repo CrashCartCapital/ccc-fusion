@@ -8,6 +8,7 @@ import type { ResolvedMcpServerDefinition } from "@fusion/core";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { cancellableSleep, computeBackoff } from "./retry-with-backoff.js";
+import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE, isCccForbiddenEnvKey } from "./cli-agent/ccc-subscription-policy.js";
 
 export interface McpSessionToolset {
   tools: ToolDefinition[];
@@ -38,7 +39,7 @@ export interface McpToolCallResult {
 }
 
 export type McpClientFactory = (server: ResolvedMcpServerDefinition) => McpSessionClient;
-export type McpTransportFactory = (server: ResolvedMcpServerDefinition, opts: { cwd?: string }) => Transport;
+export type McpTransportFactory = (server: ResolvedMcpServerDefinition, opts: { cwd?: string; env?: NodeJS.ProcessEnv; profile?: string }) => Transport;
 
 export interface McpSessionToolsOptions {
   cwd?: string;
@@ -53,6 +54,10 @@ export interface McpSessionToolsOptions {
   retryDelayMs?: number;
   /** Per-attempt deadline for the MCP initialize and tool-list requests. */
   requestTimeoutMs?: number;
+  /** The ccc-fusion profile strips ambient and configured credential-route env keys for stdio children. */
+  profile?: string;
+  /** Caller-supplied, non-secret structural readiness outcome for ccc-fusion children. */
+  subscriptionReady?: true;
 }
 
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
@@ -74,6 +79,10 @@ export async function connectMcpSessionTools(
   servers: ResolvedMcpServerDefinition[],
   opts: McpSessionToolsOptions = {},
 ): Promise<McpSessionToolset> {
+  assertCccFusionSubscriptionReady({
+    profile: opts.profile,
+    subscriptionReady: opts.subscriptionReady,
+  });
   const tools: ToolDefinition[] = [];
   const connected: string[] = [];
   const skipped: Array<{ name: string; reason: string }> = [];
@@ -117,7 +126,10 @@ export async function connectMcpSessionTools(
         // already be closed or hold partial protocol state and is not reusable.
         clients.push(client);
         try {
-          const transport = (opts.transportFactory ?? defaultTransportFactory)(server, { cwd: opts.cwd });
+          const transportEnv = server.transport === "stdio"
+            ? buildMcpStdioEnv(server.env, opts.profile)
+            : undefined;
+          const transport = (opts.transportFactory ?? defaultTransportFactory)(server, { cwd: opts.cwd, env: transportEnv, profile: opts.profile });
           await client.connect(transport, { timeout: requestTimeoutMs });
           if (opts.signal?.aborted || disposed) {
             throw new DOMException("MCP bootstrap aborted", "AbortError");
@@ -186,12 +198,24 @@ function defaultClientFactory(): McpSessionClient {
   return new Client({ name: "fusion-pi-mcp-session", version: "0.1.0" }, { capabilities: {} }) as unknown as McpSessionClient;
 }
 
-function defaultTransportFactory(server: ResolvedMcpServerDefinition, opts: { cwd?: string }): Transport {
+/*
+FNXC:CCCMcpEnvironment 2026-07-23-13:15:
+Wave 1 ccc stdio MCP children receive no ambient environment. Explicit server
+configuration is retained only when it is not a credential or base-route name.
+*/
+export function buildMcpStdioEnv(serverEnv: Record<string, string> | undefined, profile?: string): Record<string, string> {
+  if (profile === CCC_FUSION_PROFILE) {
+    return Object.fromEntries(Object.entries(serverEnv ?? {}).filter(([key]) => !isCccForbiddenEnvKey(key)));
+  }
+  return { ...process.env, ...(serverEnv ?? {}) } as Record<string, string>;
+}
+
+function defaultTransportFactory(server: ResolvedMcpServerDefinition, opts: { cwd?: string; env?: NodeJS.ProcessEnv }): Transport {
   if (server.transport === "stdio") {
     return new StdioClientTransport({
       command: server.command,
       args: server.args,
-      env: { ...process.env, ...(server.env ?? {}) } as Record<string, string>,
+      env: (opts.env ?? buildMcpStdioEnv(server.env)) as Record<string, string>,
       cwd: opts.cwd,
       stderr: "pipe",
     });

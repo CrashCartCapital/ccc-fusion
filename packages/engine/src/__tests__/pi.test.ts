@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { describeModel, formatModelMarkerDetails, compactSessionContext, COMPACTION_FALLBACK_INSTRUCTIONS, createFnAgent, getProjectRootFromWorktree, isModelAuthTierIncompatibilityError, isRetryableModelSelectionError, promptWithFallback, type AgentOptions } from "../pi.js";
 import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { piLog } from "../logger.js";
+import { connectMcpSessionTools } from "../mcp-session-tools.js";
 
 // Mock skill resolver functions - define inside factory to avoid hoisting issues
 vi.mock("../skill-resolver.js", () => {
@@ -907,6 +908,252 @@ describe("session failure diagnostics", () => {
 
     expect(createAgentSessionMock.mock.calls[0]?.[0]).not.toHaveProperty("mcpServers");
     expect(session.prompt).toHaveBeenCalledWith("Use docs", expect.objectContaining({ mcpServers }));
+  });
+
+  it("forwards ccc-fusion profile and subscription readiness through createFnAgent to the actual MCP connection seam", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const session = {
+      model: { provider: "anthropic", id: "primary-model" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const mcpServers = [
+      { name: "docs", transport: "stdio" as const, command: "fake-mcp", args: [], env: { SAFE_SERVER_VALUE: "safe-value" } },
+    ];
+
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce({
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: vi.fn(() => ({})),
+      complete: vi.fn(async () => ({ role: "assistant", content: [] })),
+      streamSimple: vi.fn(() => ({})),
+    } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc MCP forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      mcpServers,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    } as AgentOptions & { profile: "ccc-fusion"; subscriptionReady: true });
+
+    expect(connectMcpSessionTools).toHaveBeenCalledWith(
+      mcpServers,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["false", false],
+    ["non-boolean", "ready"],
+  ])("blocks %s ccc-fusion readiness with no MCP servers before model or session setup", async (_label, subscriptionReady) => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+
+    createAgentSessionMock.mockReset();
+    vi.mocked(ModelRuntime.create).mockClear();
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await expect(createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc readiness boundary",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      profile: "ccc-fusion",
+      ...(subscriptionReady === undefined ? {} : { subscriptionReady }),
+    } as any)).rejects.toMatchObject({ code: "CCC_SUBSCRIPTION_PREFLIGHT_REQUIRED" });
+
+    expect(ModelRuntime.create).not.toHaveBeenCalled();
+    expect(connectMcpSessionTools).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("forwards ccc-fusion profile and readiness through ModelRuntime stream paths without MCP servers", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const providerStream = vi.fn(() => ({}));
+    const providerStreamSimple = vi.fn(() => ({}));
+    const modelRuntime = {
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: providerStream,
+      streamSimple: providerStreamSimple,
+      complete(model: any, context: any, options: any) {
+        return this.stream(model, context, options);
+      },
+      completeSimple(model: any, context: any, options: any) {
+        return this.streamSimple(model, context, options);
+      },
+    };
+    const session = {
+      model: { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce(modelRuntime as any);
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc no-MCP runtime forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+
+    const createdOptions = createAgentSessionMock.mock.calls[0]?.[0] as { modelRuntime: typeof modelRuntime };
+    const model = { provider: "pi-claude-cli", id: "claude-sonnet-4-6" } as any;
+    const context = { messages: [] } as any;
+    createdOptions.modelRuntime.stream(model, context, { headers: { "x-test": "stream" } } as any);
+    createdOptions.modelRuntime.streamSimple(model, context, { headers: { "x-test": "simple" } } as any);
+    await createdOptions.modelRuntime.complete(model, context, { headers: { "x-test": "complete" } } as any);
+    await createdOptions.modelRuntime.completeSimple(model, context, { headers: { "x-test": "complete-simple" } } as any);
+
+    expect(providerStream).toHaveBeenCalledTimes(2);
+    expect(providerStream).toHaveBeenNthCalledWith(
+      1,
+      model,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStream).toHaveBeenNthCalledWith(
+      2,
+      model,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStreamSimple).toHaveBeenCalledTimes(2);
+    expect(providerStreamSimple).toHaveBeenNthCalledWith(
+      1,
+      model,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStreamSimple).toHaveBeenNthCalledWith(
+      2,
+      model,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(connectMcpSessionTools).not.toHaveBeenCalled();
+  });
+
+  it("leaves non-ccc ModelRuntime stream and complete options unchanged", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const providerStream = vi.fn(() => ({}));
+    const providerComplete = vi.fn(async () => ({ role: "assistant", content: [] }));
+    const modelRuntime = {
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: providerStream,
+      complete: providerComplete,
+      streamSimple: vi.fn(() => ({})),
+      completeSimple: vi.fn(async () => ({ role: "assistant", content: [] })),
+    };
+    const session = {
+      model: { provider: "anthropic", id: "primary-model" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const streamOptions = { headers: { "x-test": "stream" } };
+    const completeOptions = { headers: { "x-test": "complete" } };
+
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce(modelRuntime as any);
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ordinary runtime forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+    });
+
+    const createdOptions = createAgentSessionMock.mock.calls[0]?.[0] as { modelRuntime: typeof modelRuntime };
+    const model = { provider: "anthropic", id: "primary-model" } as any;
+    const context = { messages: [] } as any;
+    createdOptions.modelRuntime.stream(model, context, streamOptions as any);
+    await createdOptions.modelRuntime.complete(model, context, completeOptions as any);
+
+    expect(providerStream).toHaveBeenCalledWith(model, context, streamOptions);
+    expect(providerComplete).toHaveBeenCalledWith(model, context, completeOptions);
+    expect(connectMcpSessionTools).not.toHaveBeenCalled();
+  });
+
+  it("forwards ccc-fusion profile and readiness through createFnAgent to both pi provider and MCP connection options", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const providerStream = vi.fn(() => ({}));
+    const providerStreamSimple = vi.fn(() => ({}));
+    const modelRuntime = {
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: providerStream,
+      complete: vi.fn(async () => ({ role: "assistant", content: [] })),
+      streamSimple: providerStreamSimple,
+    };
+    const session = {
+      model: { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const mcpServers = [
+      { name: "docs", transport: "stdio" as const, command: "fake-mcp", args: [], env: { SAFE_SERVER_VALUE: "safe-value" } },
+    ];
+
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce(modelRuntime as any);
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc dual forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      mcpServers,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+
+    const createdOptions = createAgentSessionMock.mock.calls[0]?.[0] as { modelRuntime: typeof modelRuntime };
+    await createdOptions.modelRuntime.stream(
+      { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      { messages: [] },
+      { reasoning: "low" },
+    );
+    await createdOptions.modelRuntime.streamSimple(
+      { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      { messages: [] },
+      { reasoning: "low" },
+    );
+
+    expect(providerStream).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStreamSimple).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(connectMcpSessionTools).toHaveBeenCalledWith(
+      mcpServers,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
   });
 
   it("skips MCP forwarding for unsupported mock provider and emits a content-free skip log", async () => {

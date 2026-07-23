@@ -108,6 +108,43 @@ describe("spawnClaude", () => {
     expect(args).not.toContain("stdio");
   });
 
+  it("blocks ccc-fusion before the real child_process.spawn boundary without subscription readiness", () => {
+    expect(() => spawnClaude("claude-sonnet-4-6", undefined, { profile: "ccc-fusion" } as any))
+      .toThrow("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("blocks ccc-fusion before the real child_process.spawn boundary when subscription readiness is false", () => {
+    expect(() => spawnClaude("claude-sonnet-4-6", undefined, { profile: "ccc-fusion", subscriptionReady: false } as any))
+      .toThrow("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("uses an explicit safe child env for the ccc-fusion profile", () => {
+    vi.stubEnv("HOME", "/fake/home");
+    vi.stubEnv("PATH", "/fake/bin");
+    vi.stubEnv("TERM", "xterm-fake");
+    vi.stubEnv("ANTHROPIC_API_KEY", "fake-api-key");
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "fake-auth-token");
+    vi.stubEnv("ANTHROPIC_BASE_URL", "https://fake-base.invalid");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "fake-oauth-token");
+    vi.stubEnv("FUSION_CLAUDE_ACP_FORWARD_AUTH", "1");
+    try {
+      spawnClaude("claude-sonnet-4-6", undefined, { profile: "ccc-fusion", subscriptionReady: true } as any);
+      const [, , options] = (spawn as any).mock.calls[0];
+      expect(options.env).toMatchObject({ HOME: "/fake/home", PATH: "/fake/bin", TERM: "xterm-fake" });
+      for (const key of [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "FUSION_CLAUDE_ACP_FORWARD_AUTH",
+      ]) expect(options.env[key]).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("passes stream-json for both input-format and output-format", () => {
     spawnClaude("claude-sonnet-4-5-20250929");
     const args = (spawn as any).mock.calls[0][1] as string[];

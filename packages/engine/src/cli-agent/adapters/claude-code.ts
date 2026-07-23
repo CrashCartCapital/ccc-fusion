@@ -54,6 +54,7 @@ import type {
   CliReadinessDetector,
 } from "../adapter.js";
 import type { TelemetryEvent } from "../telemetry-hub.js";
+import { cccFusionEnvAllowlist } from "../ccc-subscription-policy.js";
 
 // ── Capabilities ────────────────────────────────────────────────────────────
 
@@ -565,12 +566,12 @@ export const claudeCodeAdapter: CliAgentAdapter = {
     return { command, args };
   },
 
-  buildEnvAllowlist(): string[] {
+  buildEnvAllowlist(ctx: CliAdapterLaunchContext): string[] {
     // Only what Claude Code needs to authenticate, find its config, and render a
     // terminal. NEVER an inherit-everything posture — FUSION_* service creds and
     // unrelated secrets stay out of the child (the session manager copies ONLY
     // these keys).
-    return [
+    return cccFusionEnvAllowlist([
       "HOME",
       "PATH",
       "SHELL",
@@ -592,7 +593,7 @@ export const claudeCodeAdapter: CliAgentAdapter = {
       "ANTHROPIC_BASE_URL",
       "CLAUDE_CODE_USE_BEDROCK",
       "CLAUDE_CODE_USE_VERTEX",
-    ];
+    ], ctx.settings);
   },
 
   createReadinessDetector(): CliReadinessDetector {

@@ -420,4 +420,33 @@ describe("buildBridgeEnv — R17 auth opt-in (item 3)", () => {
     const env = buildBridgeEnv({ HOME: "/h", PATH: "/b", ANTHROPIC_API_KEY: "attacker" } as NodeJS.ProcessEnv);
     expect(env.ANTHROPIC_API_KEY).toBe("real-from-env");
   });
+
+  it("denies auth forwarding for the ccc-fusion profile even when the old opt-in is set", async () => {
+    vi.mocked(spawn).mockClear();
+    process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH = "1";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "fake-oauth-token";
+    process.env.ANTHROPIC_AUTH_TOKEN = "fake-auth-token";
+    const stream = streamViaAcp(MODEL, CTX, { ...OPTS, profile: "ccc-fusion", subscriptionReady: true } as any);
+    await flush();
+    expect(stream).toBeDefined();
+    const [, , options] = vi.mocked(spawn).mock.calls.at(-1) as any;
+    expect(options.env).toMatchObject({ HOME: "/h", PATH: "/b" });
+    expect(options.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(options.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(options.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("blocks ccc-fusion before the actual ACP bridge spawn without a ready preflight", () => {
+    vi.mocked(spawn).mockClear();
+    expect(() => streamViaAcp(MODEL, CTX, { ...OPTS, profile: "ccc-fusion" } as any))
+      .toThrow("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("blocks ccc-fusion before the actual ACP bridge spawn when subscription readiness is false", () => {
+    vi.mocked(spawn).mockClear();
+    expect(() => streamViaAcp(MODEL, CTX, { ...OPTS, profile: "ccc-fusion", subscriptionReady: false } as any))
+      .toThrow("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    expect(spawn).not.toHaveBeenCalled();
+  });
 });

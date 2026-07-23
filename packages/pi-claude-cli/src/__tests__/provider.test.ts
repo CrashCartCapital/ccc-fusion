@@ -69,8 +69,14 @@ vi.mock("@earendil-works/pi-ai/providers/all", () => ({
   getBuiltinModels: vi.fn(() => mockModels),
 }));
 
+vi.mock("../process-manager.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../process-manager.js")>();
+  return { ...actual, spawnClaude: vi.fn(actual.spawnClaude) };
+});
+
 import { spawn } from "node:child_process";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import { spawnClaude } from "../process-manager.js";
 import { streamViaCli } from "../provider";
 
 describe("provider registration (default export)", () => {
@@ -284,6 +290,72 @@ describe("streamViaCli", { timeout: 90_000 }, () => {
     const parsed = JSON.parse(written.trim());
     expect(parsed.type).toBe("user");
     expect(parsed.message.role).toBe("user");
+  });
+
+  it("propagates ccc-fusion profile and subscription readiness to spawnClaude", async () => {
+    const model = mockModels[0] as any;
+    const context = {
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    streamViaCli(model, context, { profile: "ccc-fusion", subscriptionReady: true } as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(spawnClaude).toHaveBeenCalledWith(
+      model.id,
+      undefined,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["false", false],
+  ])("blocks %s ccc-fusion subscription readiness through streamViaCli before the actual child spawn", async (_label, subscriptionReady) => {
+    const model = mockModels[0] as any;
+    const context = {
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    streamViaCli(model, context, { profile: "ccc-fusion", subscriptionReady } as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(spawnClaude).toHaveBeenCalledWith(
+      model.id,
+      undefined,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady }),
+    );
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("denies a ccc-fusion public streamViaCli call before the actual child_process.spawn boundary when readiness is missing", async () => {
+    const model = mockModels[0] as any;
+    const context = { messages: [{ role: "user", content: "Hello" }] };
+
+    streamViaCli(model, context, { profile: "ccc-fusion" } as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(spawn).not.toHaveBeenCalled();
+    expect(spawnClaude).toHaveBeenCalledWith(
+      model.id,
+      undefined,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: undefined }),
+    );
+  });
+
+  it("forwards exact ccc-fusion readiness from public streamViaCli into the captured process boundary", async () => {
+    const model = mockModels[0] as any;
+    const context = { messages: [{ role: "user", content: "Hello" }] };
+
+    streamViaCli(model, context, { profile: "ccc-fusion", subscriptionReady: true } as any);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(spawnClaude).toHaveBeenCalledWith(
+      model.id,
+      undefined,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(spawn).toHaveBeenCalledTimes(1);
   });
 
   describe("stdin close behavior", () => {
