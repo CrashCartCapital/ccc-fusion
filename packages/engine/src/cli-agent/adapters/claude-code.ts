@@ -56,6 +56,7 @@ import type {
 } from "../adapter.js";
 import type { TelemetryEvent } from "../telemetry-hub.js";
 import { cccFusionEnvAllowlist } from "../ccc-subscription-policy.js";
+import { resolveCccNativeMcpServers } from "../ccc-native-mcp-policy.js";
 
 // ── Capabilities ────────────────────────────────────────────────────────────
 
@@ -192,18 +193,10 @@ function appendSettingsFlag(
   }
 }
 
-type ClaudeNativeMcpServer =
-  | {
-      type: "stdio";
-      command: string;
-      args?: string[];
-      env?: Record<string, string>;
-    }
-  | {
-      type: "sse" | "http";
-      url: string;
-      headers?: Record<string, string>;
-    };
+interface ClaudeNativeMcpServer {
+  type: "http";
+  url: string;
+}
 
 /**
  * Append resolved MCP servers through Claude Code's native configuration seam.
@@ -215,26 +208,18 @@ type ClaudeNativeMcpServer =
  */
 function appendNativeMcpConfig(
   args: string[],
-  servers: readonly ResolvedMcpServerDefinition[] | undefined,
+  settings: ClaudeCodeLaunchSettings,
 ): void {
-  const enabledServers = servers?.filter((server) => server.enabled !== false) ?? [];
-  if (enabledServers.length === 0) return;
+  const servers = resolveCccNativeMcpServers(
+    settings as unknown as Record<string, unknown>,
+  );
+  if (servers.length === 0) return;
 
   const mcpServers: Record<string, ClaudeNativeMcpServer> = {};
-  for (const server of enabledServers) {
-    if (server.transport === "stdio") {
-      mcpServers[server.name] = {
-        type: "stdio",
-        command: server.command,
-        ...(server.args ? { args: [...server.args] } : {}),
-        ...(server.env ? { env: { ...server.env } } : {}),
-      };
-      continue;
-    }
+  for (const server of servers) {
     mcpServers[server.name] = {
-      type: server.transport === "sse" ? "sse" : "http",
+      type: "http",
       url: server.url,
-      ...(server.headers ? { headers: { ...server.headers } } : {}),
     };
   }
 
@@ -613,7 +598,7 @@ export const claudeCodeAdapter: CliAgentAdapter = {
     const settings = readSettings(ctx);
     const { command, args } = buildBaseArgs(ctx);
     appendSettingsFlag(args, settings);
-    appendNativeMcpConfig(args, settings.mcpServers);
+    appendNativeMcpConfig(args, settings);
     appendPostureFlags(args, ctx);
     if (settings.extraArgs) args.push(...settings.extraArgs);
     return { command, args };
@@ -671,7 +656,7 @@ export const claudeCodeAdapter: CliAgentAdapter = {
     const { command, args } = buildBaseArgs(ctx);
     args.push("--resume", ctx.nativeSessionId);
     appendSettingsFlag(args, settings);
-    appendNativeMcpConfig(args, settings.mcpServers);
+    appendNativeMcpConfig(args, settings);
     appendPostureFlags(args, ctx);
     if (settings.extraArgs) args.push(...settings.extraArgs);
     return { command, args };

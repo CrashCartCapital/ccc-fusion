@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
   AssistantMessage,
   AssistantMessageEvent,
@@ -25,14 +26,7 @@ tool participates.
 const harness = vi.hoisted(() => ({
   customProviders: [] as CustomProvider[],
   modelRegistry: undefined as TestModelRegistry | undefined,
-  createAgentSession: vi.fn(async () => ({
-    session: {
-      prompt: vi.fn(),
-      subscribe: vi.fn(() => vi.fn()),
-      dispose: vi.fn(),
-      setThinkingLevel: vi.fn(),
-    },
-  })),
+  createAgentSession: vi.fn(),
 }));
 
 vi.mock("@fusion/core", async (importOriginal) => {
@@ -64,39 +58,67 @@ vi.mock("../custom-providers.js", () => ({
   readCustomProviders: () => harness.customProviders,
 }));
 
-vi.mock("@earendil-works/pi-coding-agent", () => ({
-  createAgentSession: harness.createAgentSession,
-  createBashTool: () => ({ name: "bash", execute: vi.fn() }),
-  createCodingTools: () => [],
-  createEditTool: () => ({ name: "edit", execute: vi.fn() }),
-  createExtensionRuntime: vi.fn(),
-  createFindTool: () => ({ name: "find", execute: vi.fn() }),
-  createGrepTool: () => ({ name: "grep", execute: vi.fn() }),
-  createLsTool: () => ({ name: "ls", execute: vi.fn() }),
-  createReadOnlyTools: () => [],
-  createReadTool: () => ({ name: "read", execute: vi.fn() }),
-  createWriteTool: () => ({ name: "write", execute: vi.fn() }),
-  DefaultResourceLoader: class {
-    async reload() {}
-  },
-  DefaultPackageManager: class {
-    async resolve() {
-      return { extensions: [] };
-    }
-  },
-  discoverAndLoadExtensions: async () => ({
-    errors: [],
-    runtime: { pendingProviderRegistrations: [] },
-  }),
-  ModelRegistry: class {},
-  ModelRuntime: class {},
-  SessionManager: {
-    inMemory: () => ({}),
-  },
-  SettingsManager: {
-    inMemory: () => ({}),
-  },
-}));
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
+  // The spy delegates to the real in-memory pi agent loop by default. Individual
+  // identity-error tests may still install a one-shot synthetic session.
+  harness.createAgentSession.mockImplementation(actual.createAgentSession);
+  const inertTool = (name: string) => ({
+    name,
+    label: name,
+    description: `Inert ${name} fixture`,
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    execute: vi.fn(async () => ({
+      content: [{ type: "text", text: "inert fixture" }],
+      details: {},
+    })),
+  });
+
+  return {
+    ...actual,
+    createAgentSession: harness.createAgentSession,
+    createBashTool: () => inertTool("bash"),
+    createCodingTools: () => [],
+    createEditTool: () => inertTool("edit"),
+    createFindTool: () => inertTool("find"),
+    createGrepTool: () => inertTool("grep"),
+    createLsTool: () => inertTool("ls"),
+    createReadOnlyTools: () => [],
+    createReadTool: () => inertTool("read"),
+    createWriteTool: () => inertTool("write"),
+    DefaultResourceLoader: class {
+      private readonly extensions = {
+        extensions: [],
+        errors: [],
+        runtime: actual.createExtensionRuntime(),
+      };
+
+      async reload() {}
+      getExtensions() { return this.extensions; }
+      getSkills() { return { skills: [], diagnostics: [] }; }
+      getPrompts() { return { prompts: [], diagnostics: [] }; }
+      getThemes() { return { themes: [], diagnostics: [] }; }
+      getAgentsFiles() { return { agentsFiles: [] }; }
+      getSystemPrompt() { return undefined; }
+      getAppendSystemPrompt() { return []; }
+      extendResources() {}
+    },
+    DefaultPackageManager: class {
+      async resolve() {
+        return { extensions: [] };
+      }
+    },
+    discoverAndLoadExtensions: async () => ({
+      extensions: [],
+      errors: [],
+      runtime: actual.createExtensionRuntime(),
+    }),
+  };
+});
 
 type ProviderConfig = {
   baseUrl: string;
@@ -118,9 +140,18 @@ class TestModelRegistry {
   readonly configs = new Map<string, ProviderConfig>();
   readonly modelRuntime = {
     getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+    hasConfiguredAuth: vi.fn(() => true),
     refresh: vi.fn(async () => undefined),
     stream: vi.fn(),
-    streamSimple: vi.fn(),
+    streamSimple: vi.fn((
+      model: Model,
+      context: Context,
+      options: Record<string, unknown> = {},
+    ) => streamSimple(model, context, {
+      ...options,
+      apiKey: "synthetic-loopback-only",
+      maxRetries: 0,
+    })),
   };
 
   registerProvider(name: string, config: ProviderConfig): void {
@@ -145,6 +176,8 @@ class TestModelRegistry {
 }
 
 interface CapturedRequest {
+  method: string;
+  path: string;
   body: Record<string, unknown>;
   responseModel: string;
 }
@@ -223,12 +256,23 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
   let incrementalRelease: Deferred;
   let incrementalFirstChunk: Deferred;
   let abortClosed: Deferred;
+  const sockets = new Set<Socket>();
 
   beforeAll(async () => {
     server = createServer(async (request, response) => {
+      if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "unexpected Wave 2 fixture endpoint" }));
+        return;
+      }
       const body = await readJsonBody(request);
       const model = String(body.model);
-      capturedRequests.push({ body, responseModel: model });
+      capturedRequests.push({
+        method: request.method,
+        path: request.url,
+        body,
+        responseModel: model,
+      });
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
@@ -298,6 +342,10 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       writeSse(response, startChunk(model, {}, "stop"));
       finishSse(response);
     });
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
@@ -308,6 +356,9 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
   });
 
   afterAll(async () => {
+    incrementalRelease?.resolve();
+    server.closeAllConnections?.();
+    for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
     });
@@ -475,6 +526,108 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       content: JSON.stringify(structuredResult),
     }));
     expect(wireMessages.filter((message) => message.role === "user")).toHaveLength(1);
+  });
+
+  it("createFnAgent executes one registered read-only custom tool and continues with its structured result", async () => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const structuredResult = {
+      session: { id: "session-wave2" },
+      effect: { id: "effect-777" },
+      record: {
+        selector: { kind: "summary" },
+        status: "observed",
+        revision: 3,
+      },
+    };
+    let actualToolResult: unknown;
+    const execute = vi.fn(async (
+      _toolCallId: string,
+      args: {
+        sessionId: string;
+        effectId: string;
+        query: { kind: "summary" };
+      },
+    ) => {
+      expect(args).toEqual({
+        sessionId: "session-wave2",
+        effectId: "effect-777",
+        query: { kind: "summary" },
+      });
+      actualToolResult = {
+        content: [{ type: "text" as const, text: JSON.stringify(structuredResult) }],
+        details: { structuredContent: structuredResult },
+      };
+      return actualToolResult;
+    });
+    const customTool = {
+      name: "read_session_effect",
+      label: "Read session effect",
+      description: "Read one synthetic in-memory session/effect record",
+      parameters: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          effectId: { type: "string" },
+          query: {
+            type: "object",
+            properties: {
+              kind: { type: "string", enum: ["summary"] },
+            },
+            required: ["kind"],
+            additionalProperties: false,
+          },
+        },
+        required: ["sessionId", "effectId", "query"],
+        additionalProperties: false,
+      },
+      execute,
+    } as unknown as ToolDefinition;
+
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const result = await createFnAgent({
+      cwd: "/tmp/ccc-wave2-readonly",
+      systemPrompt: "synthetic loopback and in-memory read-only tool only",
+      tools: "coding",
+      customTools: [customTool],
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+    const prompt = (result.session as unknown as {
+      promptWithFallback: (value: string) => Promise<void>;
+    }).promptWithFallback;
+    await prompt("CCC_TOOL_LOOP");
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(actualToolResult).toEqual({
+      content: [{ type: "text", text: JSON.stringify(structuredResult) }],
+      details: { structuredContent: structuredResult },
+    });
+    expect(capturedRequests).toHaveLength(2);
+    expect(capturedRequests.map(({ method, path }) => ({ method, path }))).toEqual([
+      { method: "POST", path: "/v1/chat/completions" },
+      { method: "POST", path: "/v1/chat/completions" },
+    ]);
+
+    const continuationBody = capturedRequests[1]!.body;
+    const wireMessages = continuationBody.messages as Array<Record<string, unknown>>;
+    expect(wireMessages).toContainEqual(expect.objectContaining({
+      role: "tool",
+      tool_call_id: "call-wave2-read",
+      content: JSON.stringify(structuredResult),
+    }));
+    expect(wireMessages.filter((message) => message.role === "user")).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: [{ type: "text", text: "CCC_TOOL_LOOP" }],
+      }),
+    ]);
+    expect(JSON.stringify(
+      wireMessages.filter((message) => message.role !== "tool"),
+    )).not.toContain(JSON.stringify(structuredResult));
   });
 
   it("keeps both dissimilar configured model IDs exact on request and response wires", async () => {

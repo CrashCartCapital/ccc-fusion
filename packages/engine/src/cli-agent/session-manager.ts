@@ -39,6 +39,7 @@ import { loadPtyModule } from "../pty-native.js";
 import type { IPty } from "node-pty";
 import type { CliAdapterRegistry, CliAgentAdapter, CliLaunchSpec, CliReadinessDetector } from "./adapter.js";
 import { assertCccFusionSubscriptionReady, persistCccFusionPosture, restoreCccFusionSettings } from "./ccc-subscription-policy.js";
+import { applyCccNativeMcpPolicy } from "./ccc-native-mcp-policy.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -436,13 +437,12 @@ export class CliSessionManager {
 
     const adapter = this.registry.get(options.adapterId);
     const requestedSettings = (options.settings ?? {}) as Record<string, unknown>;
-    if (!options.resume) assertCccFusionSubscriptionReady(requestedSettings);
-    const posture = persistCccFusionPosture(options.posture ?? null, requestedSettings);
 
     // Resume vs fresh launch. A resume relaunches the recorded native session id
     // via the adapter's `buildResume` and REUSES the existing record (no
     // duplicate row); a fresh launch uses `buildLaunch` and mints a new record.
     let launch: CliLaunchSpec;
+    let launchSettings: Record<string, unknown>;
     let record: CliSession;
     if (options.resume) {
       if (!adapter.capabilities.supportsResume || typeof adapter.buildResume !== "function") {
@@ -458,16 +458,21 @@ export class CliSessionManager {
       credential values, so a new manager cannot reintroduce a billing route
       or bypass the structural launch guard.
       */
-      const resumeSettings = restoreCccFusionSettings(requestedSettings, existing.autonomyPosture);
-      assertCccFusionSubscriptionReady(resumeSettings);
-      launch = adapter.buildResume({ settings: resumeSettings, posture: existing.autonomyPosture, nativeSessionId: options.resume.nativeSessionId });
+      launchSettings = applyCccNativeMcpPolicy(
+        restoreCccFusionSettings(requestedSettings, existing.autonomyPosture),
+      );
+      assertCccFusionSubscriptionReady(launchSettings);
+      launch = adapter.buildResume({ settings: launchSettings, posture: existing.autonomyPosture, nativeSessionId: options.resume.nativeSessionId });
       // Move the reused record back to "starting" for the relaunch.
       record = this.store.updateSession(options.resume.sessionId, {
         agentState: "starting",
         worktreePath: options.worktreePath ?? existing.worktreePath ?? null,
       }) ?? existing;
     } else {
-      launch = adapter.buildLaunch({ settings: requestedSettings, posture });
+      launchSettings = applyCccNativeMcpPolicy(requestedSettings);
+      assertCccFusionSubscriptionReady(launchSettings);
+      const posture = persistCccFusionPosture(options.posture ?? null, launchSettings);
+      launch = adapter.buildLaunch({ settings: launchSettings, posture });
       // Persist the session record BEFORE spawning so a crash mid-spawn still has
       // a durable record to reason about.
       record = this.store.createSession({
@@ -488,7 +493,7 @@ export class CliSessionManager {
     await this.store.flush();
 
     const allowlist = adapter.buildEnvAllowlist({
-      settings: options.resume ? restoreCccFusionSettings(requestedSettings, record.autonomyPosture) : requestedSettings,
+      settings: launchSettings,
       posture: record.autonomyPosture,
     });
     const env = this.buildEnv(allowlist);

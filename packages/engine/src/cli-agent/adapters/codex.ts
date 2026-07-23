@@ -67,6 +67,7 @@ import type {
 } from "../adapter.js";
 import { stripAnsiControl, type TelemetryEvent } from "../telemetry-hub.js";
 import { cccFusionEnvAllowlist } from "../ccc-subscription-policy.js";
+import { resolveCccNativeMcpServers } from "../ccc-native-mcp-policy.js";
 
 // ── Capabilities ────────────────────────────────────────────────────────────
 
@@ -135,12 +136,6 @@ export function buildNotifyOverrideArg(notifyProgram: string | undefined): strin
   return ["-c", `notify=${value}`];
 }
 
-function tomlInlineStringMap(values: Record<string, string>): string {
-  return `{ ${Object.entries(values)
-    .map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`)
-    .join(", ")} }`;
-}
-
 /**
  * Build session-scoped Codex config overrides for resolved MCP servers.
  *
@@ -150,26 +145,15 @@ function tomlInlineStringMap(values: Record<string, string>): string {
  * is never converted to prompt text or sent through the generic adapter.
  */
 function buildNativeMcpOverrideArgs(
-  servers: readonly ResolvedMcpServerDefinition[] | undefined,
+  settings: CodexLaunchSettings,
 ): string[] {
   const args: string[] = [];
-  for (const server of servers ?? []) {
-    if (server.enabled === false) continue;
+  const servers = resolveCccNativeMcpServers(
+    settings as unknown as Record<string, unknown>,
+  );
+  for (const server of servers) {
     const prefix = `mcp_servers.${JSON.stringify(server.name)}`;
-    if (server.transport === "stdio") {
-      args.push("-c", `${prefix}.command=${JSON.stringify(server.command)}`);
-      if (server.args) {
-        args.push("-c", `${prefix}.args=${JSON.stringify(server.args)}`);
-      }
-      if (server.env) {
-        args.push("-c", `${prefix}.env=${tomlInlineStringMap(server.env)}`);
-      }
-    } else {
-      args.push("-c", `${prefix}.url=${JSON.stringify(server.url)}`);
-      if (server.headers) {
-        args.push("-c", `${prefix}.http_headers=${tomlInlineStringMap(server.headers)}`);
-      }
-    }
+    args.push("-c", `${prefix}.url=${JSON.stringify(server.url)}`);
     args.push("-c", `${prefix}.enabled=true`);
   }
   return args;
@@ -204,7 +188,7 @@ function buildBaseArgs(ctx: CliAdapterLaunchContext): { command: string; args: s
     args.push("-c", `model=${JSON.stringify(settings.model)}`);
   }
   args.push(...buildNotifyOverrideArg(settings.notifyProgram));
-  args.push(...buildNativeMcpOverrideArgs(settings.mcpServers));
+  args.push(...buildNativeMcpOverrideArgs(settings));
   return { command, args };
 }
 
@@ -713,7 +697,7 @@ export const codexAdapter: CliAgentAdapter = {
       args.push("-c", `model=${JSON.stringify(settings.model)}`);
     }
     args.push(...buildNotifyOverrideArg(settings.notifyProgram));
-    args.push(...buildNativeMcpOverrideArgs(settings.mcpServers));
+    args.push(...buildNativeMcpOverrideArgs(settings));
     appendPostureFlags(args, ctx);
     if (settings.extraArgs) args.push(...settings.extraArgs);
     return { command, args };

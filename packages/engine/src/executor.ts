@@ -110,6 +110,7 @@ import {
 } from "./agent-session-helpers.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { resolveMcpServersForStore } from "./mcp-resolution.js";
+import { CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
 import { proseSignalsClearApproval, extractJsonObjectCandidates, type ReviewVerdict, type ReviewResult } from "./reviewer.js";
 import { buildUserCommentsPromptSection, selectUserCommentsForAgentContext } from "./agent-user-comments.js";
 import { resolveSandboxBackend } from "./sandbox/index.js";
@@ -8538,7 +8539,12 @@ export class TaskExecutor {
     // executeWorkflowStep / model machinery. It is write-capable (the agent edits
     // the worktree), so it requires a task worktree like any coding node.
     if (executorKind === "cli-agent") {
-      return this.runCliAgentNode(node, await this.store.getTask(live.id), cfg);
+      return this.runCliAgentNode(
+        node,
+        await this.store.getTask(live.id),
+        cfg,
+        columnBinding,
+      );
     }
 
     // Fast mode bypasses pre-merge automated review/validation gates. Custom
@@ -8946,6 +8952,7 @@ export class TaskExecutor {
     node: WorkflowIrNode,
     live: TaskDetail,
     cfg: Record<string, unknown>,
+    columnBinding?: WorkflowColumnAgent,
   ): Promise<WorkflowNodeResult> {
     const runtime = this.options.cliAgentRuntime;
     if (!runtime) {
@@ -8978,6 +8985,39 @@ export class TaskExecutor {
     }
 
     const prompt = typeof cfg.prompt === "string" ? cfg.prompt : (live.prompt ?? "");
+    /*
+    FNXC:CCCNativeMcp 2026-07-23-16:10:
+    Native CLI MCP resolution uses the same effective-agent precedence as model
+    nodes. Resolve only for the ccc profile, immediately before task-session
+    construction, so ordinary profiles neither materialize nor forward MCP data.
+    */
+    const ownAgentId = typeof cfg.agentId === "string" && cfg.agentId.trim()
+      ? cfg.agentId.trim()
+      : typeof live.assignedAgentId === "string" && live.assignedAgentId.trim()
+        ? live.assignedAgentId.trim()
+        : undefined;
+    const cfgModelComplete = Boolean(
+      typeof cfg.modelProvider === "string"
+      && cfg.modelProvider.trim()
+      && typeof cfg.modelId === "string"
+      && cfg.modelId.trim(),
+    );
+    const effectiveIdentity = resolveEffectiveAgent({
+      binding: columnBinding,
+      ownAgentId,
+      ownModelProvider: cfgModelComplete
+        ? (cfg.modelProvider as string).trim()
+        : live.modelProvider ?? undefined,
+      ownModelId: cfgModelComplete
+        ? (cfg.modelId as string).trim()
+        : live.modelId ?? undefined,
+    });
+    const effectiveAgentId = effectiveIdentity.source === "column-agent"
+      ? effectiveIdentity.agentId
+      : ownAgentId;
+    const mcpServers = config.settings?.profile === CCC_FUSION_PROFILE
+      ? await this.resolveMcpServers(effectiveAgentId)
+      : undefined;
 
     // Re-entry: kill any prior LIVE session for this task (RETHINK/replan context
     // reset) before launching fresh.
@@ -8991,6 +9031,7 @@ export class TaskExecutor {
         worktreePath: live.worktree,
         prompt,
         config,
+        ...(mcpServers ? { mcpServers } : {}),
         manager: runtime.manager,
         hub: runtime.hub,
         registry: runtime.registry,

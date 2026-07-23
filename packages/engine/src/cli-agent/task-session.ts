@@ -46,6 +46,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
   CliAutonomyPosture,
+  ResolvedMcpServerDefinition,
   CliSession,
   CliTerminationReason,
 } from "@fusion/core";
@@ -64,6 +65,7 @@ import {
   type CliAgentResolveSettings,
   type EffectivePosture,
 } from "./autonomy.js";
+import { applyCccNativeMcpPolicy } from "./ccc-native-mcp-policy.js";
 
 // ── Outcome ──────────────────────────────────────────────────────────────────
 
@@ -135,6 +137,8 @@ export interface LaunchCliTaskSessionOptions {
   prompt: string;
   /** Resolved (snapshotted) executor config. */
   config: ResolvedCliExecutorConfig;
+  /** Production-resolved MCP definitions for the effective ccc agent identity. */
+  mcpServers?: readonly ResolvedMcpServerDefinition[];
   /** Engine-owned PTY session manager (U2). */
   manager: CliSessionManager;
   /** In-process telemetry hub (U3) — mints the hook token + owns the state machine. */
@@ -224,20 +228,46 @@ export class CliTaskSession {
     const log = opts.log ?? (() => {});
     const adapter = opts.registry.get(opts.config.cliAdapterId);
 
-    // 0. Autonomy approval gate (U15). Resolve the EFFECTIVE posture from the
-    // fully resolved argv + env (NOT the autonomy field alone) and enforce the
-    // per-project approval for any elevation. A missing lookup fails closed.
-    // Runs BEFORE any side effects (scratch dir / spawn) so an unapproved
-    // elevation never reserves a concurrency slot or leaves a scratch dir.
+    // 0. Assemble and validate the complete launch settings before posture
+    // evaluation or any scratch/session/PTY side effect. The production-resolved
+    // MCP set is authoritative when supplied by the executor. Non-ccc profiles
+    // retain their pre-Wave behavior and do not receive native MCP settings.
+    const cliAgentSettings = opts.config.cliAgentSettings ?? null;
+    const operatorEnvAdditions = (cliAgentSettings?.envAdditions ?? []).filter(
+      (key) => !/^FUSION_/i.test(key),
+    );
+    const priorAllowlist = Array.isArray(
+      (opts.config.settings as Record<string, unknown> | undefined)?.envAllowlist,
+    )
+      ? ((opts.config.settings as Record<string, unknown>).envAllowlist as string[])
+      : [];
+    const expandedSettings = applyCccNativeMcpPolicy({
+      ...(opts.config.settings ?? {}),
+      ...(opts.mcpServers !== undefined
+        ? { mcpServers: [...opts.mcpServers] }
+        : {}),
+      ...(cliAgentSettings?.commandOverride
+        ? { command: cliAgentSettings.commandOverride }
+        : {}),
+      ...(cliAgentSettings?.extraArgs && cliAgentSettings.extraArgs.length > 0
+        ? { extraArgs: [...cliAgentSettings.extraArgs] }
+        : {}),
+      envAllowlist: [...new Set([...priorAllowlist, ...operatorEnvAdditions])],
+    });
+
+    // 1. Autonomy approval gate (U15). Resolve the EFFECTIVE posture from the
+    // exact validated launch settings + env additions and enforce the per-project
+    // approval for any elevation. A missing lookup fails closed.
     const effectivePosture: EffectivePosture = await assertAutonomyApproved({
       adapter,
       settings: opts.config.cliAgentSettings ?? null,
+      launchSettings: expandedSettings,
       nodeConfig: { cliAutonomy: opts.config.cliAutonomy ?? null },
       projectId: opts.projectId,
       isApproved: opts.isAutonomyApproved ?? (() => false),
     });
 
-    // 1. Scratch dir for the session-scoped hook scripts + settings.
+    // 2. Scratch dir for the session-scoped hook scripts + settings.
     const root = opts.hookDirRoot ?? tmpdir();
     const hookDir = await mkdtemp(join(root, "fusion-cli-hooks-"));
 
@@ -251,33 +281,11 @@ export class CliTaskSession {
     const hookScriptPath = join(hookDir, HOOK_SCRIPT_NAMES.hook);
     const settingsPath = join(hookDir, "settings.json");
 
-    // Fold the per-adapter operator settings (U15) into the launch settings bag
-    // so they actually reach the child: command override → `command`, extra args
-    // → `extraArgs`, env additions → `envAllowlist`. Service credentials are
-    // ALWAYS excluded from the env allowlist regardless of what the operator
-    // added (a user must never widen the allowlist to leak FUSION_* creds).
-    const cliAgentSettings = opts.config.cliAgentSettings ?? null;
-    const operatorEnvAdditions = (cliAgentSettings?.envAdditions ?? []).filter(
-      (k) => !/^FUSION_/i.test(k),
-    );
-    const priorAllowlist = Array.isArray(
-      (opts.config.settings as Record<string, unknown> | undefined)?.envAllowlist,
-    )
-      ? ((opts.config.settings as Record<string, unknown>).envAllowlist as string[])
-      : [];
-
     // Build adapter launch settings carrying the hook-script refs. Claude's
     // settings flow reads `hookScripts` + `settingsPath` off ctx.settings; other
     // adapters ignore unknown keys.
     const settings: Record<string, unknown> = {
-      ...(opts.config.settings ?? {}),
-      ...(cliAgentSettings?.commandOverride
-        ? { command: cliAgentSettings.commandOverride }
-        : {}),
-      ...(cliAgentSettings?.extraArgs && cliAgentSettings.extraArgs.length > 0
-        ? { extraArgs: [...cliAgentSettings.extraArgs] }
-        : {}),
-      envAllowlist: [...new Set([...priorAllowlist, ...operatorEnvAdditions])],
+      ...expandedSettings,
       hookScripts: {
         stopScript: hookScriptPath,
         notificationScript: hookScriptPath,
@@ -288,7 +296,7 @@ export class CliTaskSession {
       settingsPath,
     };
 
-    // 2. Spawn (reserves the concurrency slot; throws CliConcurrencyLimitError at
+    // 3. Spawn (reserves the concurrency slot; throws CliConcurrencyLimitError at
     // the ceiling). The record is created with state "starting".
     let record: CliSession;
     try {
@@ -324,7 +332,7 @@ export class CliTaskSession {
       throw err;
     }
 
-    // 3. Mint the per-session hook token + write the hook scripts.
+    // 4. Mint the per-session hook token + write the hook scripts.
     const token = opts.hub.issueToken(record.id);
     await writeSessionHookScripts({
       sessionId: record.id,
@@ -345,11 +353,11 @@ export class CliTaskSession {
       log,
     });
 
-    // 4. Subscribe to the authoritative state machine BEFORE injecting so a fast
+    // 5. Subscribe to the authoritative state machine BEFORE injecting so a fast
     // done is never missed.
     session.subscribe();
 
-    // 5. Inject the prompt after readiness (fire-and-forget; readiness gates it).
+    // 6. Inject the prompt after readiness (fire-and-forget; readiness gates it).
     void session.injectAfterReady(opts.prompt, adapter.capabilities.nativeDone);
 
     log(`cli-task-session ${record.id}: launched for task ${opts.taskId} (adapter ${opts.config.cliAdapterId})`);
