@@ -321,6 +321,33 @@ function clearSessionStateError(session: AgentSession): void {
   }
 }
 
+const CCC_EXPECTED_RESPONSE_MODEL = "__fusionCccExpectedResponseModel";
+
+type CccResponseIdentitySession = AgentSession & {
+  [CCC_EXPECTED_RESPONSE_MODEL]?: {
+    provider: string;
+    modelId: string;
+  };
+};
+
+function assertCccResponseModelIdentity(session: AgentSession): void {
+  const expected = (session as CccResponseIdentitySession)[CCC_EXPECTED_RESPONSE_MODEL];
+  if (!expected) return;
+  const messages = (session as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return;
+  const assistant = [...messages].reverse().find(
+    (message): message is Record<string, unknown> =>
+      Boolean(message) && typeof message === "object" && (message as Record<string, unknown>).role === "assistant",
+  );
+  const responseModel = assistant?.responseModel;
+  if (typeof responseModel !== "string" || responseModel.length === 0 || responseModel === expected.modelId) {
+    return;
+  }
+  throw new Error(
+    `ccc-fusion response model mismatch: configured ${expected.provider}/${expected.modelId}, provider reported ${responseModel}`,
+  );
+}
+
 function isThinkingReasoningConflictError(message: string): boolean {
   return /cannot specify both\s+['"]?thinking['"]?\s+and\s+['"]?reasoning_effort['"]?/i.test(message);
 }
@@ -431,6 +458,7 @@ export async function promptSessionAndCheck(session: AgentSession, prompt: strin
     }
     throw new Error(stateError);
   }
+  assertCccResponseModelIdentity(session);
 }
 
 // Re-entry guard for the top-level dispatcher below. When `session.promptWithFallback`
@@ -2653,6 +2681,19 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
        */
       if (modelOverride && !(result.session as AgentSession & { model?: unknown }).model) {
         (result.session as AgentSession & { model?: typeof modelOverride }).model = modelOverride;
+      }
+      /*
+      FNXC:CCCTransport 2026-07-23-15:45:
+      pi-ai records an OpenAI-compatible response model that differs from the
+      request as `responseModel`. Pin the exact ccc provider/model identity on
+      every primary, fallback, or recovery session so the shared prompt seam can
+      refuse a provider-side alias before the turn is accepted.
+      */
+      if (options.profile === CCC_FUSION_PROFILE && modelOverride) {
+        (result.session as CccResponseIdentitySession)[CCC_EXPECTED_RESPONSE_MODEL] = {
+          provider: modelOverride.provider,
+          modelId: modelOverride.id,
+        };
       }
       return result;
     } catch (error) {

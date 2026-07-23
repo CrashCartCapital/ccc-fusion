@@ -250,6 +250,18 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
         return;
       }
 
+      if (userText(body).includes("CCC_RESPONSE_MODEL_MISMATCH")) {
+        const responseModel = "wire-alias-not-configured";
+        capturedRequests.at(-1)!.responseModel = responseModel;
+        writeSse(response, startChunk(responseModel, {
+          role: "assistant",
+          content: "mismatched-response-model",
+        }));
+        writeSse(response, startChunk(responseModel, {}, "stop"));
+        finishSse(response);
+        return;
+      }
+
       if (hasToolResult(body)) {
         writeSse(response, startChunk(model, { role: "assistant", content: "continued-after-tool" }));
         writeSse(response, startChunk(model, {}, "stop"));
@@ -482,6 +494,56 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     expect(capturedRequests.map(({ body }) => body.model)).toEqual([
       "route/alpha-7b-exact",
       "vendor.beta:model-Z9",
+    ]);
+  });
+
+  it("refuses a ccc response model that differs from the configured request model", async () => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const sessionMessages: AssistantMessage[] = [];
+    const session = {
+      model,
+      messages: sessionMessages,
+      state: {},
+      prompt: vi.fn(async () => {
+        const response = await collect(model, {
+          messages: [{
+            role: "user",
+            content: "CCC_RESPONSE_MODEL_MISMATCH",
+            timestamp: Date.now(),
+          }],
+        });
+        sessionMessages.push(response.result);
+      }),
+      subscribe: vi.fn(() => vi.fn()),
+      dispose: vi.fn(),
+      setThinkingLevel: vi.fn(),
+    };
+    harness.createAgentSession.mockResolvedValueOnce({ session });
+
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const result = await createFnAgent({
+      cwd: "/tmp/ccc-wave2-readonly",
+      systemPrompt: "synthetic loopback only",
+      tools: "readonly",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+    const prompt = (result.session as unknown as {
+      promptWithFallback: (value: string) => Promise<void>;
+    }).promptWithFallback;
+
+    await expect(prompt("CCC_RESPONSE_MODEL_MISMATCH")).rejects.toThrow(
+      `ccc-fusion response model mismatch: configured ${registryKey}/${model.id}, provider reported wire-alias-not-configured`,
+    );
+    expect(capturedRequests).toEqual([
+      expect.objectContaining({
+        body: expect.objectContaining({ model: model.id }),
+        responseModel: "wire-alias-not-configured",
+      }),
     ]);
   });
 
