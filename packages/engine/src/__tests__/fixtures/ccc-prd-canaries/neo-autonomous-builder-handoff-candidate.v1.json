@@ -1,0 +1,39 @@
+{
+  "schema_id": "autonomous_builder_handoff_candidate.v1",
+  "schema_version": 1,
+  "candidate_id": "CCC-AUTOCODE-NEO-v0.5.0-HANDOFF",
+  "bindings": [
+    {"artifact_id": "FINAL-PRD-v0.5.0", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/260712-ccc-autocode-neo-PRODPRD-v0.5.0.md", "sha256": "af47129a46b9c7bae115010bb2a56990ed9f0d145600ecf3969fb21ea0a059d1", "schema_id": null, "schema_version": null, "purpose": "FINAL_PRD"},
+    {"artifact_id": "B3-TERMINAL-RECEIPT-R2B", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.4.0/iterations/260712-b-loop-r2b/b3-r002/R2B-B3-APPLICATION-RECEIPT-r002-FINAL.v1.json", "sha256": "50fed09021838cdc88933da7aef2e21ce59df37efa5d3f22321733469bbe5f69", "schema_id": "application_receipt.v1", "schema_version": 1, "purpose": "B3_RECEIPT"},
+    {"artifact_id": "AUTOCODE-LITE-PROOF-KERNEL-BINDING", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.3.0/iterations/260712-b-loop-r2a/R2A-REPAIR-BUILDER-BINDING-AUTOCODE-LITE-r001.json", "sha256": "00607f983b56f78e2f670a3da3d92dd62e10e5a12041f97b8d6143edf2880f67", "schema_id": "builder_external_binding.v1", "schema_version": 1, "purpose": "EXTERNAL_BINDING"},
+    {"artifact_id": "TARGET-SCAFFOLD-IDENTITY-v0.5.0", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/handoff/target-scaffold-identity.v1.json", "sha256": "c88d722ff8fc9e5eed18dcae348f0927e27301f19628c29d33c3823c52acb513", "schema_id": "target_scaffold_identity.v1", "schema_version": 1, "purpose": "TARGET_SCAFFOLD"},
+    {"artifact_id": "R2C-ITERATION-MANIFEST", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/iterations/260712-b-loop-r2c/R2C-ITERATION-MANIFEST.json", "sha256": "4ca7b42560e9a33f3c12793a80c4b1346a7ade620b849c30edc615e46f33d451", "schema_id": null, "schema_version": null, "purpose": "CLEAN_ROUND"},
+    {"artifact_id": "R2C-FINDING-REGISTRY", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/iterations/260712-b-loop-r2c/R2C-FINDING-REGISTRY.json", "sha256": "df0bf3e62b07997ea456d8e870cd2fd1e05f7efa60ba8094495facbef9b875ac", "schema_id": null, "schema_version": null, "purpose": "CLEAN_ROUND"},
+    {"artifact_id": "R2C-B1-SUMMARY", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/iterations/260712-b-loop-r2c/R2C-B1-SUMMARY.json", "sha256": "d1af1a77dad14d74d21acb1f1ec2bf3d45d04435d758f1269abd7d778aba5507", "schema_id": null, "schema_version": null, "purpose": "CLEAN_ROUND"},
+    {"artifact_id": "R2D-ITERATION-MANIFEST", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/iterations/260712-b-loop-r2d/R2D-ITERATION-MANIFEST.json", "sha256": "42e8f13b9307b6f8dae4cb0adc8b3d88578614b84ab1d90414732ca6b8842259", "schema_id": null, "schema_version": null, "purpose": "CLEAN_ROUND"},
+    {"artifact_id": "R2D-FINDING-REGISTRY", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/iterations/260712-b-loop-r2d/R2D-FINDING-REGISTRY.json", "sha256": "b10e0ea0f53a7cf6dc64b1ef5a6d02992665631b507f21d1c1d38e1080b80c8f", "schema_id": null, "schema_version": null, "purpose": "CLEAN_ROUND"},
+    {"artifact_id": "R2D-B1-SUMMARY", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/iterations/260712-b-loop-r2d/R2D-B1-SUMMARY.json", "sha256": "596f999e081672bf64f569126ccf2a6ef4f7d3377937ab48289fc71f10f270b5", "schema_id": null, "schema_version": null, "purpose": "CLEAN_ROUND"},
+    {"artifact_id": "FINAL-AGY-ADJUDICATION", "path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/handoff/final-agy-adjudication.v1.json", "sha256": "727b1264e63a27680cc191b51ec191a1bd440a668d35a809a729f92e051c39db", "schema_id": "final_agy_adjudication.v1", "schema_version": 1, "purpose": "AGY_EVIDENCE"}
+  ],
+  "clean_rounds": [
+    {"iteration_id": "R2c-v0.5.0", "manifest_artifact_id": "R2C-ITERATION-MANIFEST", "registry_artifact_id": "R2C-FINDING-REGISTRY", "summary_artifact_id": "R2C-B1-SUMMARY", "convergence_key": "d04ef7e2087e6356e27e6dce907e0dd547b4484508a7293bfed47415d0fac85e"},
+    {"iteration_id": "R2d-v0.5.0", "manifest_artifact_id": "R2D-ITERATION-MANIFEST", "registry_artifact_id": "R2D-FINDING-REGISTRY", "summary_artifact_id": "R2D-B1-SUMMARY", "convergence_key": "d04ef7e2087e6356e27e6dce907e0dd547b4484508a7293bfed47415d0fac85e"}
+  ],
+  "builder_input_allowlist": ["AUTOCODE-LITE-PROOF-KERNEL-BINDING", "FINAL-PRD-v0.5.0", "TARGET-SCAFFOLD-IDENTITY-v0.5.0"],
+  "task_requirement_ids": ["NEO-M0-001", "NEO-M0-002", "NEO-M0-003", "NEO-M0-004", "NEO-M0-005", "NEO-M1-000", "NEO-M1-001", "NEO-M1-002", "NEO-M1-003", "NEO-M1-004", "NEO-M1-005", "NEO-M2-000", "NEO-M2-001", "NEO-M2-002", "NEO-M2-003", "NEO-M2-004", "NEO-M2-005", "NEO-M2-006", "NEO-M2-007", "NEO-M2-008", "NEO-M2-009", "NEO-M2-010", "NEO-M3-001"],
+  "global_requirement_ids": ["GLOBAL-ACCEPTANCE-01", "GLOBAL-ACCEPTANCE-02", "GLOBAL-ACCEPTANCE-03", "GLOBAL-ACCEPTANCE-04", "GLOBAL-ACCEPTANCE-05", "GLOBAL-ACCEPTANCE-06", "GLOBAL-ACCEPTANCE-07", "GLOBAL-ACCEPTANCE-08"],
+  "coverage_ratio": 1.0,
+  "protected_paths": ["/Users/ryanpappal/01_VAULT/KnR-Vault/.obsidian", "/Users/ryanpappal/01_VAULT/KnR-Vault/_KELSEY", "/Users/ryanpappal/01_VAULT/KnR-Vault/**/_secrets/**"],
+  "must_not_touch": ["/Users/ryanpappal/01_VAULT/KnR-Vault", "/Users/ryanpappal/03_CODE/autocode-lite", "/Users/ryanpappal/03_CODE/ccc-autocode-neo/.git"],
+  "implementation_write_root": "/Users/ryanpappal/03_CODE/ccc-autocode-neo",
+  "verifier": {
+    "python_executable_path": "/Users/ryanpappal/.pyenv/shims/python3",
+    "python_executable_sha256": "4641e651fe112a3b56e7a25f70596dde0efc4d02506fe0e1e6ce236d6c0c1924",
+    "script_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-autocode-neo/prd-v0.5.0/handoff/verify_autonomous_builder_handoff.py",
+    "script_sha256": "a6dd0ca40d8f2080510424ddc9a2a406f6700e965419a0aa42ad0279ef75af47",
+    "argv_shape": ["PYTHON_EXE", "VERIFY_HANDOFF_SCRIPT", "--candidate", "CANDIDATE_ABS_PATH", "--receipt", "RECEIPT_ABS_PATH", "--json"]
+  },
+  "producer": "PARENT_CONTROLLER",
+  "created_at": "2026-07-12T20:47:34.000Z",
+  "status": "READY_FOR_COLD_REVIEW"
+}

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -20,5 +20,5 @@ describe("ccc-prd pure compiler", () => {
     const absent = packet({ "root.md": markdown() }); const absentManifest = JSON.parse(String(require("node:fs").readFileSync(absent.manifestPath))); absentManifest.entries[0].relative_path = "undeclared.md"; writeFileSync(absent.manifestPath, JSON.stringify(absentManifest)); expect(ccc.compileCccPrdPacket({ rootDir: absent.root, manifestPath: absent.manifestPath }).diagnostics?.[0]?.code).toBe("CCC_PRD_UNDECLARED_COMPANION");
     const input = packet({ "root.md": markdown() }); symlinkSync(join(input.root, "root.md"), join(input.root, "link.md")); const manifest = JSON.parse(String(require("node:fs").readFileSync(input.manifestPath))); manifest.entries[0].relative_path = "link.md"; writeFileSync(input.manifestPath, JSON.stringify(manifest)); expect(ccc.compileCccPrdPacket({ rootDir: input.root, manifestPath: input.manifestPath }).diagnostics?.[0]?.code).toBe("CCC_PRD_PATH_ESCAPE");
   });
-  it("validates Neo cold review but always refuses dispatch", () => expect(ccc.validateNeoCandidate({ schema_id: "autonomous_builder_handoff_candidate.v1", status: "READY_FOR_COLD_REVIEW" })).toMatchObject({ valid: true, dispatch: { kind: "refusal", diagnostics: [{ code: "CCC_PRD_DISPATCH_REFUSED" }] } }));
+  it("validates the admitted Neo cold-review candidate but always refuses dispatch", () => { const candidate = JSON.parse(readFileSync(new URL("./fixtures/ccc-prd-canaries/neo-autonomous-builder-handoff-candidate.v1.json", import.meta.url), "utf8")); expect(ccc.validateNeoCandidate(candidate)).toMatchObject({ valid: true, dispatch: { kind: "refusal", diagnostics: [{ code: "CCC_PRD_DISPATCH_REFUSED" }] } }); });
 });
