@@ -499,10 +499,12 @@ describe("embedded-lifecycle: macOS dylib compatibility links", () => {
       // requests the ABI-specific uc name rather than the unversioned link.
       writeFileSync(join(libDir, "libicui18n.68.2.dylib"), "");
       writeFileSync(join(libDir, "libicuuc.68.2.dylib"), "");
+      writeFileSync(join(libDir, "libicudata.68.2.dylib"), "");
 
       const created = normalizeMacosEmbeddedPostgresDylibSymlinks(nativeRoot);
 
       expect(created.map((link) => link.expected).sort()).toEqual([
+        "libicudata.68.dylib",
         "libicui18n.dylib",
         "libicuuc.68.dylib",
         "liblz4.1.dylib",

@@ -819,11 +819,11 @@ export interface EmbeddedDylibNormalization {
 }
 
 /*
-FNXC:PostgresEmbedded 2026-07-22-14:34:
-The bundled libicui18n.68.2.dylib records libicuuc.68.dylib as its loader
-name. macOS dyld must find that ABI-specific compatibility name before initdb
-runs, so normalize it only from the packaged libicuuc.68.<patch>.dylib payload
-rather than adding a broad unversioned ICU link or relying on system libraries.
+FNXC:PostgresEmbedded 2026-07-24-11:31:
+The bundled ICU libraries record libicuuc.68.dylib and libicudata.68.dylib as
+loader names. macOS dyld must find those ABI-specific compatibility names before
+initdb runs, so normalize each only from its packaged ICU 68 patch payload rather
+than adding broad unversioned links or relying on system libraries.
 */
 const MACOS_EMBEDDED_DYLIB_SYMLINKS: readonly EmbeddedDylibSymlinkSpec[] = [
   { expected: "libpq.5.dylib", candidate: /^libpq\.5\..+\.dylib$/ },
@@ -832,6 +832,7 @@ const MACOS_EMBEDDED_DYLIB_SYMLINKS: readonly EmbeddedDylibSymlinkSpec[] = [
   { expected: "libz.1.dylib", candidate: /^libz\.1\..+\.dylib$/ },
   { expected: "libicui18n.dylib", candidate: /^libicui18n\..+\.dylib$/ },
   { expected: "libicuuc.68.dylib", candidate: /^libicuuc\.68\..+\.dylib$/ },
+  { expected: "libicudata.68.dylib", candidate: /^libicudata\.68\..+\.dylib$/ },
 ];
 
 function sortDylibCandidates(files: readonly string[], candidate: RegExp): string[] {
@@ -845,8 +846,8 @@ function sortDylibCandidates(files: readonly string[], candidate: RegExp): strin
  *
  * The @embedded-postgres/darwin-* packages can contain fully-versioned dylibs
  * (for example libpq.5.15.dylib, libzstd.1.5.7.dylib, and
- * libicuuc.68.2.dylib) while the bundled binaries link against ABI compatibility
- * names such as libpq.5.dylib, libzstd.1.dylib, and libicuuc.68.dylib via
+ * libicuuc.68.2.dylib, and libicudata.68.2.dylib) while the bundled binaries link against ABI compatibility
+ * names such as libpq.5.dylib, libzstd.1.dylib, libicuuc.68.dylib, and libicudata.68.dylib via
  * @loader_path/../lib/.... When the package postinstall symlink hydration is
  * skipped or incomplete, dyld fails before initdb can run.
  *
