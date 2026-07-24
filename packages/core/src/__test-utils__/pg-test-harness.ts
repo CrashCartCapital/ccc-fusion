@@ -682,6 +682,8 @@ export async function createTaskStoreForTest(options?: {
   readonly poolMax?: number;
   readonly prefix?: string;
   readonly copyFromGolden?: boolean;
+  /** Test-only deterministic teardown fault used to prove retained diagnostics. */
+  readonly teardownFault?: "remove-root-dir";
 }): Promise<PgTestHarness> {
   const poolMax = options?.poolMax ?? 5;
   const prefix = options?.prefix ?? "fusion_test";
@@ -775,36 +777,65 @@ export async function createTaskStoreForTest(options?: {
   const teardown = async (): Promise<void> => {
     if (tornDown) return;
     tornDown = true;
+    let teardownFailure: { stage: string; error: unknown } | undefined;
+    const recordFailure = (stage: string, error: unknown): void => {
+      teardownFailure ??= { stage, error };
+    };
     try {
       store.stopWatching();
-    } catch {
-      // best-effort
+    } catch (error) {
+      recordFailure("stop-watching", error);
     }
     try {
       await store.close();
-    } catch {
-      // best-effort
+    } catch (error) {
+      recordFailure("store-close", error);
     }
     try {
       await layer.close();
-    } catch {
-      // best-effort
+    } catch (error) {
+      recordFailure("layer-close", error);
     }
     try {
       await adminSql.end({ timeout: 5 });
-    } catch {
-      // best-effort
+    } catch (error) {
+      recordFailure("admin-close", error);
     }
     try {
       // FNXC:PgTestHarness 2026-07-18-17:27: FORCE so open pool sockets cannot block drop after close races.
       await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
-    } catch {
-      // best-effort
+    } catch (error) {
+      recordFailure("drop-database", error);
     }
     try {
+      if (options?.teardownFault === "remove-root-dir") {
+        throw new Error("injected test teardown failure before root-dir removal");
+      }
       await rm(rootDir, { recursive: true, force: true });
-    } catch {
-      // best-effort
+    } catch (error) {
+      recordFailure("remove-root-dir", error);
+    }
+    if (teardownFailure) {
+      /*
+      FNXC:PgTestHarness 2026-07-24-12:05:
+      A failed disposable-PG teardown is diagnostic evidence, not routine
+      cleanup noise. Preserve a redacted packet under the isolated root and
+      surface failure to the test so CI retains the exact stage without ever
+      serializing a connection URL or password.
+      */
+      const errorText = teardownFailure.error instanceof Error
+        ? teardownFailure.error.message
+        : String(teardownFailure.error);
+      const packet = {
+        kind: "fusion-pg-test-teardown-diagnostic",
+        dbName,
+        stage: teardownFailure.stage,
+        error: errorText
+          .replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "[redacted-postgresql-url]")
+          .replace(/password=[^\s&]+/gi, "password=[redacted]"),
+      };
+      await writeFile(join(rootDir, "pg-teardown-diagnostic.json"), `${JSON.stringify(packet, null, 2)}\n`);
+      throw new Error(`PostgreSQL test harness teardown failed at ${teardownFailure.stage}; retained redacted diagnostic packet`);
     }
   };
 
@@ -1064,4 +1095,3 @@ export function createSharedPgTaskStoreTestHarness(options?: {
     },
   };
 }
-

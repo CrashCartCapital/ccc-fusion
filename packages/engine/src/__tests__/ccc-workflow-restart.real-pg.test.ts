@@ -1,5 +1,6 @@
 import { once } from "node:events";
 import { spawn } from "node:child_process";
+import { access, readFile } from "node:fs/promises";
 import { expect, it, vi } from "vitest";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
 import { createTaskStoreForTest, pgDescribe } from "../../../core/src/__test-utils__/pg-test-harness.js";
@@ -55,13 +56,19 @@ function controllerProgram(repoRoot: string): string {
     const { createConnectionSetFromUrl } = await import(${JSON.stringify(`${repoRoot}/packages/core/src/postgres/connection.ts`)});
     const { createAsyncDataLayer } = await import(${JSON.stringify(`${repoRoot}/packages/core/src/postgres/data-layer.ts`)});
     const { WorkflowGraphExecutor } = await import(${JSON.stringify(`${repoRoot}/packages/engine/src/workflow-graph-executor.ts`)});
-    const [url, rootDir, taskId, runId] = process.argv.slice(1);
+    const [url, rootDir, taskId, runId, mode] = process.argv.slice(1);
     const connections = await createConnectionSetFromUrl({ mode: "external", runtimeUrl: url, migrationUrl: url, migrationUrlOverridden: false }, { poolMax: 2, connectTimeoutSeconds: 5 });
     const layer = createAsyncDataLayer(connections);
     const store = new TaskStore(rootDir, undefined, { asyncLayer: layer });
     await store.init();
     const persisted = {
-      saveBranchState: (state) => store.saveWorkflowRunBranch(state),
+      saveBranchState: async (state) => {
+        await store.saveWorkflowRunBranch(state);
+        if (mode === "hold-after-frontier" && state.branchId === "__ccc_frontier__:A") {
+          emit("frontier-committed", "A");
+          await new Promise(() => {});
+        }
+      },
       loadBranchStates: (id, stableRunId) => store.loadWorkflowRunBranches(id, stableRunId),
       clearStaleBranchStates: (id, stableRunId) => store.clearWorkflowRunBranches(id, stableRunId),
     };
@@ -285,5 +292,87 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
       }
       await harness.teardown();
     }
+  });
+
+  it("Wave 4 preservation: PostgreSQL restart after durable A resumes at the split without replaying A", async () => {
+    const harness = await createTaskStoreForTest({ prefix: "fusion_ccc_wave4_frontier", copyFromGolden: true });
+    const runId = "wave4-frontier-run";
+    const events: Array<{ event: string; node: string }> = [];
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      const created = await harness.store.createTask({ description: "CCC frontier controller death" });
+      let resolveFrontier!: () => void;
+      const frontier = new Promise<void>((resolve) => { resolveFrontier = resolve; });
+      child = spawn(process.execPath, [
+        "--import", "tsx", "--input-type=module", "-e", controllerProgram(process.cwd().replace(/\/packages\/engine$/, "")),
+        harness.testUrl,
+        harness.rootDir,
+        created.id,
+        runId,
+        "hold-after-frontier",
+      ], { stdio: ["ignore", "pipe", "inherit"] });
+      child.stdout.setEncoding("utf8");
+      let stdout = "";
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+        const lines = stdout.split("\n");
+        stdout = lines.pop() ?? "";
+        for (const line of lines) {
+          const event = JSON.parse(line) as { event: string; node: string };
+          events.push(event);
+          if (event.event === "frontier-committed" && event.node === "A") resolveFrontier();
+        }
+      });
+      await frontier;
+      await vi.waitFor(async () => {
+        expect(await harness.store.loadWorkflowRunBranches(created.id, runId)).toEqual(expect.arrayContaining([
+          expect.objectContaining({ branchId: "__ccc_frontier__:A", currentNodeId: "A", status: "completed" }),
+        ]));
+      });
+      expect(events).toContainEqual({ event: "effect", node: "A" });
+      expect(child.kill("SIGKILL")).toBe(true);
+      await once(child, "exit");
+      child = undefined;
+
+      const calls: string[] = [];
+      const resumed = new WorkflowGraphExecutor({
+        runId,
+        branchPersistence: pgBranchPersistence(harness.store),
+        handlers: { prompt: async (node) => { calls.push(node.id); return { outcome: "success" as const }; } },
+      });
+      const result = await resumed.run(asCccTask(created as TaskDetail), {}, wave4Ir);
+
+      expect(result.outcome).toBe("success");
+      expect(calls).not.toContain("A");
+      expect(calls.filter((node) => node === "B")).toHaveLength(1);
+      expect(calls.filter((node) => node === "C")).toHaveLength(1);
+      expect(calls.filter((node) => node === "D")).toHaveLength(1);
+    } finally {
+      if (child && child.exitCode === null) {
+        child.kill("SIGKILL");
+        await once(child, "exit");
+      }
+      await harness.teardown();
+    }
+  });
+
+  it("Wave 4 RED: failed PostgreSQL fixture teardown preserves a redacted diagnostic packet", async () => {
+    const harness = await createTaskStoreForTest({
+      prefix: "fusion_ccc_wave4_teardown_failure",
+      copyFromGolden: true,
+      // Deliberately exercise the harness's test-only teardown-failure seam.
+      teardownFault: "remove-root-dir",
+    } as Parameters<typeof createTaskStoreForTest>[0]);
+
+    await expect(harness.teardown()).rejects.toThrow(/teardown/i);
+    const packet = await readFile(`${harness.rootDir}/pg-teardown-diagnostic.json`, "utf8");
+    expect(JSON.parse(packet)).toMatchObject({ dbName: harness.dbName, stage: "remove-root-dir" });
+    expect(packet).not.toContain(harness.testUrl);
+    await expect(access(harness.rootDir)).resolves.toBeUndefined();
+
+    const cleanHarness = await createTaskStoreForTest({ prefix: "fusion_ccc_wave4_teardown_success", copyFromGolden: true });
+    const cleanRoot = cleanHarness.rootDir;
+    await cleanHarness.teardown();
+    await expect(access(cleanRoot)).rejects.toThrow();
   });
 });

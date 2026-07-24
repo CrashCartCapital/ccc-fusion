@@ -116,6 +116,37 @@ describe("fast mode workflow/runtime invariants", () => {
     }
   });
 
+  it("Wave 4 RED: terminal CCC branch persistence failure parks the native work item for manual action", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-terminal", taskId: liveTask.id, kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([workItem]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "ccc-branch-persistence-terminal-failed",
+      context: { "node:split:branchPersistenceFailure": "ccc-branch-persistence-terminal-failed" },
+      visitedNodeIds: ["start", "A", "split", "B"],
+    });
+    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "manual-required", expect.objectContaining({
+        blockedReason: "ccc-branch-persistence-terminal-failed",
+        lastError: "ccc-branch-persistence-terminal-failed",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      }));
+      expect(graphFailure).toHaveBeenCalledWith(liveTask, expect.objectContaining({ outcome: "failure" }));
+    } finally {
+      run.mockRestore();
+      graphFailure.mockRestore();
+    }
+  });
+
   it("graph executor with a custom workflow skips custom pre-merge prompt/gate nodes in fast mode", async () => {
     const { store, executor } = makeExecutorForTask(task({ executionMode: "fast", worktree: "/tmp/wt" }));
     const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true });

@@ -47,10 +47,18 @@ pgDescribe("CCC Wave 4 PostgreSQL retry classification", () => {
 
       const result = await runtime.runWorkItem(item, {});
       const durable = await harness.store.getWorkflowWorkItem(item.id);
+      const audit = await harness.store.getRunAuditEventsAsync({ runId: "wave4-retry-run" });
 
       expect(result.disposition).toBe("completed");
       expect(calls).toBe(3);
       expect(durable).toEqual(expect.objectContaining({ state: "succeeded", attempt: 3 }));
+      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").reverse().map((event) => ({ mutationType: event.mutationType, state: event.metadata?.state, attempt: event.metadata?.attempt }))).toEqual([
+        { mutationType: "workflow:work-item-transition", state: "retrying", attempt: 1 },
+        { mutationType: "workflow:work-item-transition", state: "running", attempt: 2 },
+        { mutationType: "workflow:work-item-transition", state: "retrying", attempt: 2 },
+        { mutationType: "workflow:work-item-transition", state: "running", attempt: 3 },
+        { mutationType: "workflow:work-item-transition", state: "succeeded", attempt: 3 },
+      ]);
     } finally {
       await harness.teardown();
     }
@@ -76,6 +84,7 @@ pgDescribe("CCC Wave 4 PostgreSQL retry classification", () => {
 
       const result = await runtime.runWorkItem(item, {});
       const durable = await harness.store.getWorkflowWorkItem(item.id);
+      const audit = await harness.store.getRunAuditEventsAsync({ runId: "wave4-permanent-run" });
 
       expect(result.disposition).toBe("manual-required");
       expect(calls).toBe(1);
@@ -84,6 +93,7 @@ pgDescribe("CCC Wave 4 PostgreSQL retry classification", () => {
         attempt: 1,
         blockedReason: "ccc-permanent:CCC_PERMANENT",
       }));
+      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").map((event) => event.metadata?.state)).toEqual(["manual-required"]);
     } finally {
       await harness.teardown();
     }

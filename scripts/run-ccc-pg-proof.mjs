@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -14,53 +14,195 @@ if (process.env.FUSION_PG_TEST_SKIP === "1") {
 const repoRoot = process.cwd();
 const proofRoot = await mkdtemp(join(tmpdir(), "ccc-wave-4-proof-"));
 const dataRoot = join(proofRoot, "postgres-data");
+const resultRoot = join(dataRoot, "machine-results");
 const reportPath = join(proofRoot, "report.json");
 const manifestPath = join(proofRoot, "manifest.json");
+
+const expectedRestartNames = [
+  "CCC Wave 4 PostgreSQL branch persistence > Wave 4 control: PostgreSQL persists uninterrupted A → {B,C} → D",
+  "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: ccc branch admission failure stops before the first branch effect",
+  "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: ccc terminal branch checkpoint failure blocks the join successor",
+  "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: PostgreSQL death during B and C resumes only unfinished branch work",
+  "CCC Wave 4 PostgreSQL branch persistence > Wave 4 preservation: PostgreSQL restart after durable A resumes at the split without replaying A",
+  "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: failed PostgreSQL fixture teardown preserves a redacted diagnostic packet",
+];
+const expectedRetryNames = [
+  "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: transient failure consumes exactly the configured total attempt count",
+  "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: permanent failure is attempted once and parks manual-required",
+];
+
+function assertionName(assertion) {
+  return [...(assertion.ancestorTitles ?? []), assertion.title].join(" > ");
+}
+
+function assertClosedNamedResults(expectedNames, assertions, label) {
+  const expected = new Set(expectedNames);
+  if (expected.size !== expectedNames.length) throw new Error(`${label}: expected-name list contains duplicates`);
+  const seen = new Map();
+  for (const assertion of assertions) {
+    const name = assertionName(assertion);
+    if (!expected.has(name)) throw new Error(`${label}: unexpected named test: ${name}`);
+    seen.set(name, (seen.get(name) ?? 0) + 1);
+    if (assertion.status !== "passed") throw new Error(`${label}: ${name} is ${assertion.status}`);
+  }
+  for (const name of expectedNames) {
+    const count = seen.get(name) ?? 0;
+    if (count === 0) throw new Error(`${label}: missing named test: ${name}`);
+    if (count !== 1) throw new Error(`${label}: duplicate named test: ${name}`);
+  }
+}
+
+/*
+FNXC:CccWave4Proof 2026-07-24-12:12:
+The proof runner's policy is itself a correctness boundary. Exercise the
+closed-list checker against synthetic machine results so missing, extra,
+duplicate, skipped, pending, and failed outcomes are rejected without parsing
+human vitest output.
+*/
+function selfTestClosedNamePolicy() {
+  const expected = ["suite > required"];
+  const good = [{ ancestorTitles: ["suite"], title: "required", status: "passed" }];
+  assertClosedNamedResults(expected, good, "policy-self-test");
+  for (const [label, assertions] of [
+    ["missing", []],
+    ["extra", [...good, { ancestorTitles: ["suite"], title: "extra", status: "passed" }]],
+    ["duplicate", [...good, ...good]],
+    ["skipped", [{ ...good[0], status: "skipped" }]],
+    ["pending", [{ ...good[0], status: "pending" }]],
+    ["failed", [{ ...good[0], status: "failed" }]],
+  ]) {
+    let rejected = false;
+    try {
+      assertClosedNamedResults(expected, assertions, `policy-self-test:${label}`);
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw new Error(`policy-self-test:${label} was accepted`);
+  }
+}
+selfTestClosedNamePolicy();
+
 const commands = [
-  ["pnpm", ["--filter", "@fusion/core", "test:pg-gate"]],
-  ["pnpm", ["--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/restart.integration.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"]],
-  ["pnpm", ["--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-workflow-restart.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"]],
-  ["pnpm", ["--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-retry-classification.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"]],
+  {
+    id: "core-pg-gate",
+    command: ["pnpm", "--filter", "@fusion/core", "test:pg-gate"],
+    expectedNames: null,
+    machineResults: false,
+  },
+  {
+    id: "engine-restart-integration",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/restart.integration.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: null,
+    machineResults: true,
+  },
+  {
+    id: "ccc-workflow-restart-real-pg",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-workflow-restart.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedRestartNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-retry-classification-real-pg",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-retry-classification.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedRetryNames,
+    machineResults: true,
+  },
 ];
 
 const supervisor = `
   import { EmbeddedPostgresLifecycle } from ${JSON.stringify(join(repoRoot, "packages/core/src/postgres/embedded-lifecycle.ts"))};
   import { spawn } from "node:child_process";
+  import { mkdir } from "node:fs/promises";
+  import { join } from "node:path";
   const lifecycle = new EmbeddedPostgresLifecycle({ dataDir: process.env.CCC_W4_DATA_ROOT, database: "ccc_wave4_proof" });
   const commands = JSON.parse(process.env.CCC_W4_COMMANDS);
   const results = [];
   const run = (cmd, args, env) => new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: process.env.CCC_W4_REPO_ROOT, env, stdio: "ignore" });
+    const child = spawn(cmd, args, { cwd: process.env.CCC_W4_REPO_ROOT, env, stdio: ["ignore", "ignore", "ignore"] });
     child.once("error", reject); child.once("exit", (code) => resolve(Number(code ?? 1)));
   });
   try {
     await lifecycle.start();
     const url = new URL(lifecycle.getConnectionUrl()); url.pathname = "/";
-    for (const [cmd, args] of commands) {
-      const code = await run(cmd, args, { ...process.env, FUSION_PG_TEST_URL_BASE: url.href.slice(0, -1) });
-      results.push({ command: [cmd, ...args], code });
+    await mkdir(process.env.CCC_W4_RESULT_ROOT, { recursive: true });
+    for (const entry of commands) {
+      const outputFile = entry.machineResults ? join(process.env.CCC_W4_RESULT_ROOT, entry.id + ".json") : null;
+      const args = entry.machineResults
+        ? [...entry.command.slice(1), ...entry.vitestArgs, "--outputFile", outputFile]
+        : entry.command.slice(1);
+      const code = await run(entry.command[0], args, { ...process.env, FUSION_PG_TEST_URL_BASE: url.href.slice(0, -1) });
+      results.push({ id: entry.id, command: entry.command, code, outputFile });
       if (code !== 0) break;
     }
   } finally { await lifecycle.stop().catch(() => {}); }
-  process.stdout.write(JSON.stringify(results));
+  process.stdout.write("CCC_W4_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: "ccc_wave4_proof" }) + "\\n");
   if (results.some((result) => result.code !== 0) || results.length !== commands.length) process.exitCode = 1;
 `;
 
+function redact(text) {
+  return String(text)
+    .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[redacted-postgresql-url]")
+    .replace(/password=[^\s&]+/gi, "password=[redacted]");
+}
+
 const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", supervisor], {
   cwd: repoRoot,
-  env: { ...process.env, CCC_W4_DATA_ROOT: dataRoot, CCC_W4_REPO_ROOT: repoRoot, CCC_W4_COMMANDS: JSON.stringify(commands) },
-  stdio: ["ignore", "pipe", "inherit"],
+  env: {
+    ...process.env,
+    CCC_W4_DATA_ROOT: dataRoot,
+    CCC_W4_RESULT_ROOT: resultRoot,
+    CCC_W4_REPO_ROOT: repoRoot,
+    CCC_W4_COMMANDS: JSON.stringify(commands),
+  },
+  stdio: ["ignore", "pipe", "pipe"],
 });
-let output = "";
-child.stdout.on("data", (chunk) => { output += String(chunk); });
-const code = await new Promise((resolve, reject) => { child.once("error", reject); child.once("exit", resolve); });
-const results = JSON.parse(output || "[]");
-await writeFile(reportPath, JSON.stringify({ wave: 4, results }, null, 2));
-await writeFile(manifestPath, JSON.stringify({ wave: 4, reportPath, passed: code === 0 }, null, 2));
-if (code === 0) {
+let stdout = "";
+let stderr = "";
+child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+const exitCode = await new Promise((resolve, reject) => {
+  child.once("error", reject);
+  child.once("exit", resolve);
+});
+const supervisorLine = stdout.split("\n").find((line) => line.startsWith("CCC_W4_SUPERVISOR_RESULT="));
+let supervisorResult = { results: [], database: "ccc_wave4_proof" };
+let policyError;
+try {
+  if (!supervisorLine) throw new Error("supervisor did not emit machine result");
+  supervisorResult = JSON.parse(supervisorLine.slice("CCC_W4_SUPERVISOR_RESULT=".length));
+  for (const command of commands) {
+    const result = supervisorResult.results.find((entry) => entry.id === command.id);
+    if (!result) throw new Error(`missing command result: ${command.id}`);
+    if (result.code !== 0) throw new Error(`${command.id} exited ${result.code}`);
+    if (!command.machineResults) continue;
+    const json = JSON.parse(await readFile(result.outputFile, "utf8"));
+    const assertions = json.testResults.flatMap((testResult) => testResult.assertionResults ?? []);
+    if (json.numFailedTests !== 0 || json.numPendingTests !== 0 || json.numTodoTests !== 0 || json.numPassedTests === 0) {
+      throw new Error(`${command.id}: failed, skipped, pending, todo, or empty machine result`);
+    }
+    if (command.expectedNames) assertClosedNamedResults(command.expectedNames, assertions, command.id);
+  }
+} catch (error) {
+  policyError = error instanceof Error ? error.message : String(error);
+}
+
+const passed = exitCode === 0 && policyError === undefined;
+const report = {
+  wave: 4,
+  passed,
+  commands: supervisorResult.results.map(({ outputFile, ...result }) => result),
+  policyError: policyError ?? null,
+};
+await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+await writeFile(manifestPath, `${JSON.stringify({ wave: 4, passed, reportPath, database: supervisorResult.database }, null, 2)}\n`);
+if (passed) {
   await rm(dataRoot, { recursive: true, force: true });
   console.log(`Wave 4 PostgreSQL proof passed; redacted report: ${reportPath}`);
 } else {
+  await writeFile(join(proofRoot, "supervisor.log"), redact(`${stdout}\n${stderr}`));
   console.error(`Wave 4 PostgreSQL proof failed; preserved diagnosis: ${proofRoot}`);
   process.exitCode = 1;
 }

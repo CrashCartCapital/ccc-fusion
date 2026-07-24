@@ -1,4 +1,4 @@
-import type { Settings, TaskDetail, WorkflowIr, WorkflowIrArtifact, WorkflowIrNode, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
+import type { RunAuditEventInput, Settings, TaskDetail, WorkflowIr, WorkflowIrArtifact, WorkflowIrNode, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
 import {
   getBuiltinWorkflow,
   isBuiltinWorkflowId,
@@ -45,6 +45,7 @@ export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps,
       state: WorkflowWorkItemState,
       patch?: { now?: string; attempt?: number; lastError?: string | null; blockedReason?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
     ) => WorkflowWorkItem | Promise<WorkflowWorkItem>;
+    recordRunAuditEvent?: (input: RunAuditEventInput) => Promise<unknown> | unknown;
   };
   primitives: WorkflowRuntimePrimitives;
   runCustomNode: WorkflowCustomNodeRunner;
@@ -247,6 +248,7 @@ export class WorkflowTaskRuntime {
             lastError: reason,
             blockedReason: reason,
           });
+          await this.recordWorkItemTransition(workItem, "manual-required", attempt, reason);
           this.emit("terminal", workItem.taskId, "work-item:manual-required");
           return { disposition: "manual-required", outcome: "failure", visitedNodeIds: invoked, context, reason };
         }
@@ -255,11 +257,13 @@ export class WorkflowTaskRuntime {
             attempt,
             lastError: `ccc-transient:${err.code}`,
           });
+          await this.recordWorkItemTransition(workItem, "retrying", attempt, `ccc-transient:${err.code}`);
           attempt += 1;
           await this.deps.store.transitionWorkflowWorkItem(workItem.id, "running", {
             attempt,
             lastError: null,
           });
+          await this.recordWorkItemTransition(workItem, "running", attempt);
           continue;
         }
         outcome = "failure";
@@ -286,6 +290,7 @@ export class WorkflowTaskRuntime {
       leaseExpiresAt: null,
       lastError: reason ?? null,
     });
+    await this.recordWorkItemTransition(workItem, terminalState, attempt, reason);
     this.emit("terminal", workItem.taskId, `work-item:${disposition}`);
     return {
       disposition,
@@ -310,6 +315,23 @@ export class WorkflowTaskRuntime {
       context: {},
       reason,
     };
+  }
+
+  private async recordWorkItemTransition(
+    workItem: WorkflowWorkItem,
+    state: WorkflowWorkItemState,
+    attempt: number,
+    reason?: string,
+  ): Promise<void> {
+    await this.deps.store.recordRunAuditEvent?.({
+      taskId: workItem.taskId,
+      agentId: "workflow-task-runtime",
+      runId: workItem.runId,
+      domain: "database",
+      mutationType: "workflow:work-item-transition",
+      target: workItem.id,
+      metadata: { state, attempt, ...(reason ? { reason } : {}) },
+    });
   }
 
   /**

@@ -256,6 +256,7 @@ vi.mock("@earendil-works/pi-ai", () => ({
     Object: (props: Record<string, unknown>) => ({ type: "object", properties: props }),
     String: (opts?: unknown) => ({ type: "string", ...((opts as object) ?? {}) }),
     Number: (opts?: unknown) => ({ type: "number", ...((opts as object) ?? {}) }),
+    Integer: (opts?: unknown) => ({ type: "integer", ...((opts as object) ?? {}) }),
     Boolean: (opts?: unknown) => ({ type: "boolean", ...((opts as object) ?? {}) }),
     Optional: (schema: unknown) => schema,
     Array: (schema: unknown, opts?: unknown) => ({ type: "array", items: schema, ...((opts as object) ?? {}) }),
@@ -384,6 +385,11 @@ function createMockStore(overrides: Record<string, any> = {}) {
       return { ...(patches.get(id) ?? {}), id };
     }),
     moveTask: makeWriteThroughMoveTask(),
+    moveTaskIf: vi.fn(async (id: string, column: string, predicate: (task: any) => boolean, options?: any) => {
+      const live = await store.getTask(id);
+      if (!predicate(live)) return { moved: false, task: live };
+      return { moved: true, task: await store.moveTask(id, column, options) };
+    }),
     recordActivity: vi.fn().mockResolvedValue({}),
     mergeTask: vi.fn().mockResolvedValue({}),
     getWorkflowStep: vi.fn().mockResolvedValue(undefined),
@@ -407,7 +413,12 @@ function createMockStore(overrides: Record<string, any> = {}) {
     addTaskComment: vi.fn().mockResolvedValue(undefined),
     appendAgentLog: vi.fn().mockResolvedValue(undefined),
     parseStepsFromPrompt: vi.fn().mockResolvedValue([]),
+    parseDependenciesFromPrompt: vi.fn().mockResolvedValue([]),
     parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
+    getMissionStore: vi.fn().mockReturnValue({
+      listMissions: vi.fn().mockResolvedValue([]),
+      listGoalIdsForMission: vi.fn().mockResolvedValue([]),
+    }),
     getSettings: vi.fn().mockResolvedValue({
       ...DEFAULT_SETTINGS,
       mergeIntegrationWorktree: "cwd-main" as const,

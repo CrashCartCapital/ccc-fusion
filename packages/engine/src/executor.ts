@@ -6336,10 +6336,24 @@ export class TaskExecutor {
       }
       if (result.disposition === "failed") {
         if (continuation) {
-          await this.store.transitionWorkflowWorkItem(continuation.id, "failed", {
+          const branchPersistenceFailure = result.context?.["node:split:branchPersistenceFailure"];
+          const terminalCccBranchPersistenceFailure = typeof branchPersistenceFailure === "string"
+            && branchPersistenceFailure.startsWith("ccc-branch-persistence-");
+          /*
+          FNXC:CccBranchPersistence 2026-07-24-12:07:
+          A CCC branch whose terminal checkpoint was not durably recorded must
+          not look like an ordinary retryable graph failure. The existing native
+          work item is the operator-facing recovery contract, so park it
+          manual-required with the stable persistence reason before graph
+          teardown can schedule anything else.
+          */
+          await this.store.transitionWorkflowWorkItem(continuation.id, terminalCccBranchPersistenceFailure ? "manual-required" : "failed", {
             leaseOwner: null,
             leaseExpiresAt: null,
-            lastError: "workflow-continuation-failed",
+            lastError: terminalCccBranchPersistenceFailure
+              ? branchPersistenceFailure
+              : "workflow-continuation-failed",
+            ...(terminalCccBranchPersistenceFailure ? { blockedReason: branchPersistenceFailure } : {}),
           });
         }
         await this.handleGraphFailure(task, result);
