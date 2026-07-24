@@ -6410,6 +6410,14 @@ export class TaskExecutor {
               metadata: { state: "exhausted", attempt: continuation.attempt, classification: "ccc-transient-exhausted" },
             });
           }
+          if (terminalCccFailure) {
+            /*
+            FNXC:CccWave4TerminalPark 2026-07-24-16:00: once the native work
+            item is durably parked, never enter generic graph-failure routing;
+            that router may rehome executable review work for ordinary retries.
+            */
+            return;
+          }
         }
         await this.handleGraphFailure(task, result);
       } else if (result.disposition === "completed") {

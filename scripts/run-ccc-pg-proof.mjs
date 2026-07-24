@@ -265,14 +265,22 @@ const supervisor = `
   process.once("SIGINT", onSigInt);
   process.once("SIGTERM", onSigTerm);
   const stopWithinBudget = async () => await new Promise((resolve, reject) => {
-    const timer = setTimeout(async () => {
+    let timeoutLatched = false;
+    let settled = false;
+    const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); };
+    const timer = setTimeout(() => {
+      timeoutLatched = true;
       const timeout = new Error("embedded PostgreSQL stop timed out");
-      try { await lifecycle.terminateOwnedPostmaster(); } catch { /* preserve the original stop timeout */ }
-      reject(timeout);
+      // FNXC:CccWave4Proof 2026-07-24-16:05: timeout is terminal at expiry;
+      // a late stop resolution cannot overwrite the forced-cleanup verdict.
+      void lifecycle.terminateOwnedPostmaster().then(
+        () => finish(reject, timeout),
+        (forcedError) => finish(reject, new AggregateError([timeout, forcedError], "embedded PostgreSQL stop and forced cleanup failed")),
+      );
     }, stopTimeoutMs);
     lifecycle.stop().then(
-      () => { clearTimeout(timer); resolve(); },
-      (error) => { clearTimeout(timer); reject(error); },
+      () => { if (!timeoutLatched) finish(resolve); },
+      (error) => { if (!timeoutLatched) finish(reject, error); },
     );
   });
   let stopError = null;

@@ -2017,7 +2017,10 @@ export class EmbeddedPostgresLifecycle {
     const waitForExit = async (budgetMs: number): Promise<boolean> => {
       const deadline = Date.now() + budgetMs;
       for (;;) {
-        try { process.kill(pid, 0); } catch { return true; }
+        try { process.kill(pid, 0); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+          throw error;
+        }
         if (Date.now() >= deadline) return false;
         await new Promise<void>((resolve) => setTimeout(resolve, 25));
       }
