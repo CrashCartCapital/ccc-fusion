@@ -1142,7 +1142,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     const running = { value: false };
     const stop = vi.fn(async () => {
       running.value = false;
-      if (stop.mock.calls.length === 2) resolveLateStop();
+      resolveLateStop();
     });
 
     class DelayedEmbeddedPostgres {
@@ -1150,6 +1150,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
       async start() {
         await delayedStart;
         running.value = true;
+        writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n0\n55439\n`);
       }
       stop = stop;
       createDatabase = vi.fn(async () => {});
@@ -1169,7 +1170,6 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
       port: 55439,
       startTimeoutMs: 25,
     });
-    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
 
     const start = lifecycle.start();
     const timeoutRejection = expect(start).rejects.toBeInstanceOf(EmbeddedStartTimeoutError);
@@ -1180,7 +1180,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     releaseStart();
     await lateStop;
 
-    expect(stop).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveBeenCalledTimes(1);
     expect(running.value).toBe(false);
     expect(lifecycle.isRunning()).toBe(false);
     expect(process.listenerCount("beforeExit")).toBe(beforeExitListeners);
