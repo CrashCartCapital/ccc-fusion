@@ -292,6 +292,50 @@ describe("ccc-fusion Wave 3 cancellation and resume provider matrix", () => {
     }
   });
 
+  it("excludes TaskExecutor-owned PI receipt ledgers from generic CLI restart recovery", async () => {
+    const store = makeStore();
+    const registry = new CliAdapterRegistry();
+    registry.register(makeAdapter("pi"));
+    const spawn = vi.fn(async () => undefined);
+    const coordinator = new CliResumeCoordinator({
+      store: store as any,
+      manager: {
+        isLive: () => false,
+        availableSlots: () => 1,
+        spawn,
+      } as any,
+      registry,
+      worktreeExists: () => true,
+      isWorktreeDirty: async () => false,
+    });
+    const receipt = store.createSession({
+      projectId: "ccc",
+      taskId: "FN-CCC-PI-RECEIPT",
+      adapterId: "pi",
+      purpose: "execute",
+      agentState: "busy",
+      worktreePath: "/tmp/ccc-pi-receipt",
+      autonomyPosture: {
+        cccFusionProfile: "ccc-fusion",
+        cccEffectReceiptContract: "ccc-tool-receipts/v2",
+        cccControllerGeneration: "receipt-controller-generation",
+        cccControllerFenced: false,
+        cccExecutionAuthority: {
+          actorId: "executor-FN-CCC-PI-RECEIPT",
+          permissionPolicy: { presetId: "unrestricted" },
+          effectTurnMode: "keep-open",
+          toolScope: [{ authority: "fn_task_done", parametersSha256: "receipt-scope-sha256" }],
+        },
+      },
+    });
+    store.updateSession(receipt.id, { nativeSessionId: "pi-native-receipt" });
+    const before = structuredClone(store.getSession(receipt.id));
+
+    await expect(coordinator.recoverOnStart()).resolves.toEqual([]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(store.getSession(receipt.id)).toEqual(before);
+  });
+
   it("keeps CCC ownership and returns a typed failure when the registered PTY never closes", async () => {
     const store = makeStore();
     let onExit: ((result: { exitCode: number; signal: number }) => void) | undefined;

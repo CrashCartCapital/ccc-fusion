@@ -57,6 +57,13 @@ const ORPHANED_LIVE_STATES = new Set<CliSession["agentState"]>([
   "waitingOnInput",
 ]);
 
+/** TaskExecutor owns PI receipt recovery when it persisted this exact authority marker. */
+function isTaskExecutorOwnedPiReceiptLedger(session: CliSession): boolean {
+  return session.adapterId === "pi"
+    && session.purpose === "execute"
+    && session.autonomyPosture?.cccExecutionAuthority != null;
+}
+
 /** Default resume attempt cap (KTD = 2). */
 export const DEFAULT_MAX_RESUME_ATTEMPTS = 2;
 /** Default base backoff (ms) between resume attempts; doubled per attempt. */
@@ -163,6 +170,7 @@ export class CliResumeCoordinator {
 
   /** Whether a recorded session is currently resume-eligible (for sweep skipping). */
   isRecordResumeEligible(session: CliSession): boolean {
+    if (isTaskExecutorOwnedPiReceiptLedger(session)) return false;
     if (session.resumeAttempts >= this.maxResumeAttempts) return false;
     // Found-live-on-restart → engineDeath (eligible).
     if (ORPHANED_LIVE_STATES.has(session.agentState)) return true;
@@ -188,6 +196,7 @@ export class CliResumeCoordinator {
     const candidates = this.store
       .listSessions()
       .filter((s) => ORPHANED_LIVE_STATES.has(s.agentState))
+      .filter((s) => !isTaskExecutorOwnedPiReceiptLedger(s))
       // Never reclaim a session the manager already owns (idempotent re-run).
       .filter((s) => !this.manager.isLive(s.id));
 
