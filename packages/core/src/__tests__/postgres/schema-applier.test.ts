@@ -76,6 +76,8 @@ import {
   SQLITE_MIGRATION_RUNTIME_READ_VERSION,
   WORKFLOW_TASK_CONTINUATIONS_VERSION,
   LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+  TASK_WEDGE_NOTIFICATION_VERSION,
+  CCC_EFFECT_RECEIPTS_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -640,7 +642,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 93 project tables, 18 central tables, 1 archive table", async () => {
+  it("creates all 96 project tables, 18 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -659,9 +661,10 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 1 import_translation_cache (FNXC:GitHubImportTranslate 2026-07-15-09:30)
     // + 1 configuration_revisions (FNXC:ConfigVersioning 2026-07-18-14:00)
     // + 2 ideation_sessions/ideation_candidates (FNXC:Ideation 2026-07-18-13:25 / FN-8295)
-    // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305).
+    // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
+    // + 1 durable ccc_effect_receipts table (FNXC:CCCEffectReceipts).
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(95);
+    expect(bySchema.project).toBe(96);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -1492,6 +1495,16 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       );
       /* FNXC:GitHubImportTranslate 2026-07-16-23:30: Later durable-task migrations run after this historical 0000 fixture, so retain their required task table surface. */
       CREATE TABLE project.tasks (id text PRIMARY KEY);
+      /* FNXC:WorkflowTaskContinuations: 0031 alters and indexes this pre-existing durable work-item surface. */
+      CREATE TABLE project.workflow_work_items (
+        id text PRIMARY KEY,
+        task_id text NOT NULL,
+        kind text NOT NULL,
+        state text NOT NULL,
+        lease_owner text,
+        lease_expires_at text,
+        updated_at text NOT NULL
+      );
       /*
       FNXC:Ideation 2026-07-18-13:25:
       FN-8295 migration 0022 FKs ideation rows to missions/mission_features on (project_id, id).
@@ -1594,6 +1607,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1652,6 +1667,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION,
     ]);
   });
 
@@ -1843,6 +1860,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION,
     ]);
   });
 
@@ -1915,6 +1934,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION,
     ]);
   });
 
@@ -1987,6 +2008,8 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION,
     ]);
   });
 });
