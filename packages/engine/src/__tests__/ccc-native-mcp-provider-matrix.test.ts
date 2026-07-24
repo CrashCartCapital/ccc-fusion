@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -363,6 +363,67 @@ async function callDurableEffect(url: string): Promise<unknown> {
     expect(result).toMatchObject({ content: [{ type: "text", text: "durable native effect committed" }], structuredContent: DURABLE_EFFECT_RESULT, isError: false });
     return result.structuredContent;
   } finally { await client.close(); }
+}
+
+async function postNativeJsonRpc(url: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  const response = await fetch(assertLoopbackTarget(url), {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  expect(response.status).toBe(200);
+  return await response.json() as Record<string, unknown>;
+}
+
+function holdNativeJsonRpcRequest(url: string, body: Record<string, unknown>): Promise<void> {
+  const target = assertLoopbackTarget(url);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(target, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2025-06-18" },
+    }, (response) => {
+      response.resume();
+      response.once("end", resolve);
+    });
+    request.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNRESET" || error.code === "EPIPE") resolve();
+      else reject(error);
+    });
+    request.end(JSON.stringify(body));
+  });
+}
+
+async function startSharedToolFixture(options: {
+  name: string;
+  readOnly: boolean;
+  structuredResult: Record<string, unknown>;
+}): Promise<{ readonly url: string; readonly upstreamExecutions: () => number; close(): Promise<void> }> {
+  let upstreamExecutions = 0;
+  const sockets = new Set<Socket>();
+  const server = createServer(async (request, response) => {
+    const protocolServer = new Server({ name: options.name, version: "1.0.0" }, { capabilities: { tools: {} } });
+    protocolServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [{
+      name: "shared", title: "Shared fixture tool", description: "Read-only/effectful route isolation fixture",
+      inputSchema: { type: "object", properties: { slot: { type: "string" } }, required: ["slot"], additionalProperties: false },
+      annotations: { readOnlyHint: options.readOnly, destructiveHint: false, idempotentHint: options.readOnly, openWorldHint: false },
+    }] }));
+    protocolServer.setRequestHandler(CallToolRequestSchema, async () => {
+      upstreamExecutions += 1;
+      return { content: [{ type: "text", text: `${options.name}:shared` }], structuredContent: options.structuredResult, isError: false };
+    });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    await protocolServer.connect(transport);
+    try { await transport.handleRequest(request, response, await readJsonBody(request)); } finally { await protocolServer.close(); }
+  });
+  server.on("connection", (socket) => { sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
+  assertLoopbackTarget(url);
+  return { url, upstreamExecutions: () => upstreamExecutions, async close() {
+    server.closeAllConnections?.(); for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  } };
 }
 
 describe("ccc native MCP provider matrix", () => {
@@ -1100,6 +1161,126 @@ describe("ccc native MCP provider matrix", () => {
 });
 
 pgDescribe("ccc native MCP durable receipt proxy", () => {
+  it("does not publish native cancellation before its registered loopback proxy request closes", async () => {
+    let upstreamRequestClosed = false;
+    let observeUpstreamRequest: (() => void) | undefined;
+    const upstreamRequestObserved = new Promise<void>((resolve) => { observeUpstreamRequest = resolve; });
+    const upstream = createServer((request, response) => {
+      request.once("close", () => { upstreamRequestClosed = true; });
+      observeUpstreamRequest?.();
+      // The real proxy owns this in-flight loopback request. It must abort and
+      // observe this request closing before it can write dead/CANCELLED.
+      response.writeHead(200, { "content-type": "application/json" });
+    });
+    await new Promise<void>((resolve, reject) => { upstream.once("error", reject); upstream.listen(0, "127.0.0.1", resolve); });
+    const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/mcp`;
+    const store = makeStore();
+    const lifecycle: string[] = [];
+    const originalUpdate = store.updateSession.getMockImplementation()!;
+    store.updateSession.mockImplementation((id: string, patch: Record<string, unknown>) => {
+      if (patch.agentState === "dead") lifecycle.push("persist-terminal");
+      return originalUpdate(id, patch);
+    });
+    const originalFlush = store.flush.getMockImplementation()!;
+    store.flush.mockImplementation(async () => { lifecycle.push("flush"); await originalFlush(); });
+    const runtime = makeManager(store);
+    try {
+      const record = await runtime.manager.spawn({
+        adapterId: "claude-code", projectId: "ccc-native-cancel-order", purpose: "execute", taskId: "task-native-cancel-order", worktreePath: tmpdir(),
+        settings: { profile: CCC_PROFILE, subscriptionReady: true, model: "claude-native-cancel-order", mcpServers: [{ name: "held-native-request", transport: "streamable-http", url: upstreamUrl, enabled: true }] },
+      });
+      const proxyUrl = claudeConfiguredUrl(runtime.captures[0]!.args, "held-native-request");
+      const request = holdNativeJsonRpcRequest(proxyUrl, { jsonrpc: "2.0", id: "held-list", method: "tools/list", params: {} });
+      await upstreamRequestObserved;
+      const cancellation = runtime.manager.kill(record.id, "killed");
+      await vi.waitFor(() => expect(lifecycle).toContain("persist-terminal"));
+      expect(upstreamRequestClosed).toBe(true);
+      await cancellation;
+      await request;
+    } finally {
+      upstream.closeAllConnections?.();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+      await runtime.manager.dispose().catch(() => undefined);
+    }
+  });
+
+  it("replays a committed native effect through the current JSON-RPC request id after manager restart", async () => {
+    const fixture = await startDurableEffectFixture();
+    const harness = await createTaskStoreForTest({ prefix: "fusion_wave3_native_rpc_id" });
+    const projectId = "ccc-native-rpc-id";
+    const store = await CliSessionStore.create(harness.layer, projectId);
+    const first = makeManager(store as never);
+    try {
+      const record = await first.manager.spawn({
+        adapterId: "claude-code", projectId, purpose: "execute", taskId: "task-native-rpc-id", worktreePath: tmpdir(),
+        settings: { profile: CCC_PROFILE, subscriptionReady: true, model: "claude-native-rpc-id", mcpServers: [{ name: DURABLE_EFFECT_SERVER_NAME, transport: "streamable-http", url: fixture.url, enabled: true }] },
+      });
+      const firstProxyUrl = claudeConfiguredUrl(first.captures[0]!.args, DURABLE_EFFECT_SERVER_NAME);
+      await postNativeJsonRpc(firstProxyUrl, { jsonrpc: "2.0", id: "catalog-first", method: "tools/list", params: {} });
+      const firstResponse = await postNativeJsonRpc(firstProxyUrl, { jsonrpc: "2.0", id: "request-first", method: "tools/call", params: { name: DURABLE_EFFECT_TOOL_NAME, arguments: { slot: "native-restart-slot" } } });
+      expect(firstResponse).toMatchObject({ jsonrpc: "2.0", id: "request-first", result: { structuredContent: DURABLE_EFFECT_RESULT } });
+      captureNativeSessionId(store as never, record.id, "native-rpc-id");
+      await store.flush();
+      await disposeManager(first.manager);
+
+      const restartedStore = await CliSessionStore.create(harness.layer, projectId);
+      const resumed = makeManager(restartedStore as never);
+      try {
+        await resumed.manager.spawn({
+          adapterId: "claude-code", projectId, purpose: "execute", taskId: "task-native-rpc-id", worktreePath: tmpdir(), settings: { subscriptionReady: true },
+          resume: { sessionId: record.id, nativeSessionId: "native-rpc-id" },
+        });
+        const replayResponse = await postNativeJsonRpc(claudeConfiguredUrl(resumed.captures[0]!.args, DURABLE_EFFECT_SERVER_NAME), {
+          jsonrpc: "2.0", id: "request-current", method: "tools/call", params: { name: DURABLE_EFFECT_TOOL_NAME, arguments: { slot: "native-restart-slot" } },
+        });
+        expect(replayResponse).toEqual({ ...firstResponse, id: "request-current" });
+        expect(fixture.upstreamExecutions()).toBe(1);
+      } finally { await disposeManager(resumed.manager); }
+    } finally { await harness.teardown(); await fixture.close(); }
+  });
+
+  it("keeps same-named native MCP tools classified by their canonical server route", async () => {
+    const readonlyFixture = await startSharedToolFixture({ name: "ccc-native-readonly-shared", readOnly: true, structuredResult: { route: "readonly" } });
+    const effectfulFixture = await startSharedToolFixture({ name: "ccc-native-effectful-shared", readOnly: false, structuredResult: { route: "effectful", status: "committed" } });
+    const harness = await createTaskStoreForTest({ prefix: "fusion_wave3_native_route_scope" });
+    const projectId = "ccc-native-route-scope";
+    const store = await CliSessionStore.create(harness.layer, projectId);
+    const first = makeManager(store as never);
+    const readonlyName = "readonly-shared";
+    const effectfulName = "effectful-shared";
+    try {
+      const record = await first.manager.spawn({
+        adapterId: "codex", projectId, purpose: "execute", taskId: "task-native-route-scope", worktreePath: tmpdir(),
+        settings: { profile: CCC_PROFILE, subscriptionReady: true, model: "codex-native-route-scope", mcpServers: [
+          { name: readonlyName, transport: "streamable-http", url: readonlyFixture.url, enabled: true },
+          { name: effectfulName, transport: "streamable-http", url: effectfulFixture.url, enabled: true },
+        ] },
+      });
+      const readonlyUrl = codexConfiguredUrl(first.captures[0]!.args, readonlyName);
+      const effectfulUrl = codexConfiguredUrl(first.captures[0]!.args, effectfulName);
+      await postNativeJsonRpc(effectfulUrl, { jsonrpc: "2.0", id: "effectful-list", method: "tools/list", params: {} });
+      await postNativeJsonRpc(readonlyUrl, { jsonrpc: "2.0", id: "readonly-list", method: "tools/list", params: {} });
+      const firstResponse = await postNativeJsonRpc(effectfulUrl, { jsonrpc: "2.0", id: "effectful-first", method: "tools/call", params: { name: "shared", arguments: { slot: "route-scope" } } });
+      expect(firstResponse).toMatchObject({ id: "effectful-first", result: { structuredContent: { route: "effectful", status: "committed" } } });
+      expect(effectfulFixture.upstreamExecutions()).toBe(1);
+      captureNativeSessionId(store as never, record.id, "native-route-scope");
+      await store.flush();
+      await disposeManager(first.manager);
+
+      const restartedStore = await CliSessionStore.create(harness.layer, projectId);
+      const resumed = makeManager(restartedStore as never);
+      try {
+        await resumed.manager.spawn({
+          adapterId: "codex", projectId, purpose: "execute", taskId: "task-native-route-scope", worktreePath: tmpdir(), settings: { subscriptionReady: true },
+          resume: { sessionId: record.id, nativeSessionId: "native-route-scope" },
+        });
+        const replay = await postNativeJsonRpc(codexConfiguredUrl(resumed.captures[0]!.args, effectfulName), { jsonrpc: "2.0", id: "effectful-replay", method: "tools/call", params: { name: "shared", arguments: { slot: "route-scope" } } });
+        expect(replay).toEqual({ ...firstResponse, id: "effectful-replay" });
+        expect(effectfulFixture.upstreamExecutions()).toBe(1);
+      } finally { await disposeManager(resumed.manager); }
+    } finally { await harness.teardown(); await readonlyFixture.close(); await effectfulFixture.close(); }
+  });
+
   it("native Claude and Codex effectful MCP calls survive manager/store restart through one durable Fusion receipt", async () => {
     const fixture = await startDurableEffectFixture();
     const harness = await createTaskStoreForTest({ prefix: "fusion_wave3_native_mcp" });

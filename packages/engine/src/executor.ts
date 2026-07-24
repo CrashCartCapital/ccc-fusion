@@ -1699,6 +1699,16 @@ function selectCccExecutorReceiptLedger(
 ): CliSession | undefined {
   const matching = store.listByTask(taskId)
     .filter((session) => matchesCccExecutorReceiptLedger(session, taskId, provider, modelId, worktreePath))
+    .filter((session) => {
+      // A hard-cancelled ledger is historical evidence, never a relaunch
+      // identity. Crash recovery is different: it may reuse the durable
+      // receipt scope only after the previous generation is both terminal and
+      // explicitly fenced, so an old finalizer cannot own the replacement.
+      if (session.terminationReason === "killed") return false;
+      if (session.agentState !== "dead") return true;
+      return session.terminationReason === "engineDeath"
+        && session.autonomyPosture?.cccControllerFenced === true;
+    })
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   return matching.find((session) => Array.isArray(session.autonomyPosture?.cccEffectReceipts)
     && session.autonomyPosture.cccEffectReceipts.length > 0) ?? matching[0];
@@ -12980,9 +12990,10 @@ export class TaskExecutor {
             executorModelId,
             worktreePath,
           );
-          cccEffectReceiptControllerToken = typeof existingLedger?.autonomyPosture?.cccControllerGeneration === "string"
-            ? existingLedger.autonomyPosture.cccControllerGeneration
-            : randomUUID();
+          // Every admitted recovery owns a fresh generation. The prior token is
+          // only fence evidence; reusing it lets old finalizers terminalize or
+          // release the replacement controller.
+          cccEffectReceiptControllerToken = randomUUID();
           cccDurableSession = existingLedger
             ? cccRuntime.store.updateSession(existingLedger.id, {
                 agentState: "starting",
