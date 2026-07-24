@@ -207,31 +207,6 @@ function deferred<T = void>(): Deferred<T> {
   return { promise, resolve };
 }
 
-function makeEffectReceiptStore() {
-  const sessions = new Map<string, { autonomyPosture: Record<string, unknown> | null }>();
-  return {
-    sessions,
-    getSession: (id: string) => sessions.get(id),
-    updateSession: vi.fn((id: string, updates: { autonomyPosture?: Record<string, unknown> }) => {
-      const session = sessions.get(id);
-      if (!session) return undefined;
-      Object.assign(session, updates);
-      return session;
-    }),
-    flush: vi.fn(async () => undefined),
-  };
-}
-
-function effectTool(name: string, execute: (...args: any[]) => Promise<any>): ToolDefinition {
-  return {
-    name,
-    label: name,
-    description: `Wave 3 durable receipt fixture for ${name}`,
-    parameters: { type: "object", properties: {} },
-    execute,
-  } as ToolDefinition;
-}
-
 function makeCccExecutorStore(
   task: Record<string, any>,
   provider: string,
@@ -346,90 +321,13 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
   let providers: CustomProvider[];
   let registry: TestModelRegistry;
   let capturedRequests: CapturedRequest[];
+  let durableEffectCallSequence: number;
   let incrementalRelease: Deferred;
   let incrementalFirstChunk: Deferred;
   let abortClosed: Deferred;
   const sockets = new Set<Socket>();
   const durableRestartPg: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_ccc_executor_restart",
-  });
-
-  it("shares an in-flight duplicate durable effect across independently created CCC wrappers", async () => {
-    const receiptStore = makeEffectReceiptStore();
-    receiptStore.sessions.set("ccc-concurrent-receipt", { autonomyPosture: {} });
-    const release = deferred<{ content: Array<{ type: "text"; text: string }> }>();
-    const execute = vi.fn(() => release.promise);
-    const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
-    const [first] = wrapCccToolsWithDurableEffectReceipts(
-      [effectTool("commit_synthetic_effect", execute)],
-      receiptStore,
-      "ccc-concurrent-receipt",
-    );
-    const [second] = wrapCccToolsWithDurableEffectReceipts(
-      [effectTool("commit_synthetic_effect", execute)],
-      receiptStore,
-      "ccc-concurrent-receipt",
-    );
-    const duplicateArgs = ["provider-call-duplicate", { target: "loopback", revision: 1 }] as const;
-    const both = Promise.all([
-      first!.execute!(...duplicateArgs),
-      second!.execute!(...duplicateArgs),
-    ]);
-
-    try {
-      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
-    } finally {
-      release.resolve({ content: [{ type: "text", text: "effect committed once" }] });
-      await both;
-    }
-
-    // One flush durably reserves the effect before it runs; the second commits
-    // the result after it returns, while followers share that one execution.
-    expect(receiptStore.flush).toHaveBeenCalledTimes(2);
-  });
-
-  it("keeps different durable effect identities independent", async () => {
-    const receiptStore = makeEffectReceiptStore();
-    receiptStore.sessions.set("ccc-independent-receipts", { autonomyPosture: {} });
-    const release = deferred<{ content: Array<{ type: "text"; text: string }> }>();
-    const execute = vi.fn(() => release.promise);
-    const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
-    const [tool] = wrapCccToolsWithDurableEffectReceipts(
-      [effectTool("commit_synthetic_effect", execute)],
-      receiptStore,
-      "ccc-independent-receipts",
-    );
-    const both = Promise.all([
-      tool!.execute!("provider-call-one", { target: "loopback", revision: 1 }),
-      tool!.execute!("provider-call-two", { target: "loopback", revision: 1 }),
-    ]);
-
-    try {
-      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
-    } finally {
-      release.resolve({ content: [{ type: "text", text: "independent effects committed" }] });
-      await both;
-    }
-  });
-
-  it("clears a failed durable effect claim so an honest retry can execute", async () => {
-    const receiptStore = makeEffectReceiptStore();
-    receiptStore.sessions.set("ccc-failed-receipt", { autonomyPosture: {} });
-    const execute = vi.fn()
-      .mockRejectedValueOnce(new Error("loopback effect failed before commit"))
-      .mockResolvedValueOnce({ content: [{ type: "text", text: "retry committed" }] });
-    const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
-    const [tool] = wrapCccToolsWithDurableEffectReceipts(
-      [effectTool("commit_synthetic_effect", execute)],
-      receiptStore,
-      "ccc-failed-receipt",
-    );
-
-    await expect(tool!.execute!("provider-call-retry", { target: "loopback", revision: 1 }))
-      .rejects.toThrow("loopback effect failed before commit");
-    await expect(tool!.execute!("provider-call-retry", { target: "loopback", revision: 1 }))
-      .resolves.toEqual({ content: [{ type: "text", text: "retry committed" }] });
-    expect(execute).toHaveBeenCalledTimes(2);
   });
 
   beforeAll(async () => {
@@ -487,6 +385,30 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
         return;
       }
 
+      if (userText(body).includes("CCC_DURABLE_EFFECT")) {
+        durableEffectCallSequence += 1;
+        writeSse(response, startChunk(model, {
+          role: "assistant",
+          tool_calls: [{
+            index: 0,
+            id: `call-durable-effect-${durableEffectCallSequence}`,
+            type: "function",
+            function: {
+              name: "write_durable_effect",
+              arguments: '{"value":"loopback","__fusion_effect":{"key":"durable-',
+            },
+          }],
+        }));
+        writeSse(response, startChunk(model, {
+          tool_calls: [{
+            index: 0,
+            function: { arguments: 'loopback-effect"}}' },
+          }],
+        }, "tool_calls"));
+        finishSse(response);
+        return;
+      }
+
       if (userText(body).includes("CCC_EXECUTOR_RECEIPT")) {
         writeSse(response, startChunk(model, {
           role: "assistant",
@@ -496,7 +418,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
             type: "function",
             function: {
               name: "fn_workflow_list",
-              arguments: "{}",
+              arguments: '{"__fusion_effect":{"key":"executor-receipt-list"}}',
             },
           }],
         }, "tool_calls"));
@@ -557,6 +479,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
 
   beforeEach(async () => {
     capturedRequests = [];
+    durableEffectCallSequence = 0;
     incrementalRelease = deferred();
     incrementalFirstChunk = deferred();
     abortClosed = deferred();
@@ -591,6 +514,107 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     beforeEach(durableRestartPg.beforeEach);
     afterEach(durableRestartPg.afterEach);
     afterAll(durableRestartPg.afterAll);
+
+    it("executes a committed PI ToolDefinition once across a real controller restart and provider call-id drift", async () => {
+      const projectId = "ccc-pi-effect-boundary-project";
+      const taskId = "FN-CCC-PI-EFFECT-BOUNDARY";
+      const firstStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+      const receiptSession = firstStore.createSession({
+        projectId,
+        adapterId: "pi",
+        purpose: "execute",
+        taskId,
+        worktreePath: "/tmp/ccc-pi-effect-boundary",
+        autonomyPosture: { cccFusionProfile: "ccc-fusion", cccEffectReceiptContract: "ccc-tool-receipts/v2" },
+        agentState: "busy",
+      });
+      const effectScope = receiptSession.id;
+      await firstStore.flush();
+
+      const observedStates: string[] = [];
+      const observedProviderCallIds: string[] = [];
+      const effect = vi.fn(async (toolCallId: string, args: Record<string, unknown>) => {
+        observedProviderCallIds.push(toolCallId);
+        const receipt = await firstStore.getCccEffectReceipt(effectScope, "durable-loopback-effect");
+        observedStates.push(receipt?.state ?? "missing");
+        expect(args).toEqual({ value: "loopback" });
+        return { content: [{ type: "text" as const, text: "committed loopback effect" }] };
+      });
+      const customTool = {
+        name: "write_durable_effect",
+        label: "Write durable effect",
+        description: "Effectful loopback fixture for the production PI tool boundary",
+        parameters: {
+          type: "object",
+          properties: {
+            value: { type: "string" },
+            __fusion_effect: {
+              type: "object",
+              properties: { key: { type: "string" } },
+              required: ["key"],
+              additionalProperties: false,
+            },
+          },
+          required: ["value", "__fusion_effect"],
+          additionalProperties: false,
+        },
+        execute: effect,
+      } as unknown as ToolDefinition;
+      const provider = providers[0]!;
+      const model = registeredModel(provider);
+      const registryKey = customProviderRegistryKey(provider, providers);
+      const { createFnAgent } = await import("../pi.js");
+      const createController = (store: CliSessionStore) => createFnAgent({
+        cwd: "/tmp/ccc-pi-effect-boundary",
+        systemPrompt: "real loopback durable PI tool effect",
+        tools: "coding",
+        customTools: [customTool],
+        defaultProvider: registryKey,
+        defaultModelId: model.id,
+        profile: "ccc-fusion",
+        subscriptionReady: true,
+        cccEffectReceiptStore: store,
+        cccEffectReceiptSessionId: effectScope,
+      });
+
+      const first = await createController(firstStore);
+      try {
+        await (first.session as unknown as { promptWithFallback(value: string): Promise<void> })
+          .promptWithFallback("CCC_TOOL_LOOP CCC_DURABLE_EFFECT");
+        expect(capturedRequests).toHaveLength(2);
+        expect(capturedRequests[1]!.body.messages).toContainEqual(expect.objectContaining({
+          role: "tool",
+          tool_call_id: "call-durable-effect-1",
+          content: "committed loopback effect",
+        }));
+        await expect(firstStore.getCccEffectReceipt(effectScope, "durable-loopback-effect"))
+          .resolves.toMatchObject({ state: "committed" });
+      } finally {
+        await first.session.dispose();
+      }
+
+      const restartedStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+      registry = new TestModelRegistry();
+      await registerCustomProviders(registry, providers, vi.fn());
+      harness.modelRegistry = registry;
+      const restarted = await createController(restartedStore);
+      try {
+        await (restarted.session as unknown as { promptWithFallback(value: string): Promise<void> })
+          .promptWithFallback("CCC_TOOL_LOOP CCC_DURABLE_EFFECT");
+      } finally {
+        await restarted.session.dispose();
+      }
+
+      expect(effect).toHaveBeenCalledTimes(1);
+      expect(observedProviderCallIds).toEqual(["call-durable-effect-1"]);
+      expect(observedStates).toEqual(["dispatched_unknown"]);
+      await expect(restartedStore.getCccEffectReceipt(effectScope, "durable-loopback-effect"))
+        .resolves.toMatchObject({ state: "committed" });
+      // Each controller makes one initial prompt request and one tool-result
+      // continuation. The second tool call has a new provider call ID but is
+      // served from the committed receipt without invoking the handler again.
+      expect(capturedRequests.filter(({ body }) => userText(body).includes("CCC_DURABLE_EFFECT"))).toHaveLength(4);
+    });
 
     it("reuses the exact durable receipt ledger after a production executor restart", async () => {
       const provider = providers[0]!;
@@ -666,7 +690,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
             cccFusionProfile: "ccc-fusion",
             cccFusionProvider: providerKey,
             cccFusionModel: model.id,
-            cccEffectReceipts: [expect.any(String)],
+            cccEffectReceiptContract: "ccc-tool-receipts/v2",
           },
         });
 
@@ -714,7 +738,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
               cccFusionProfile: "ccc-fusion",
               cccFusionProvider: customProviderRegistryKey(mismatchedProvider, providers),
               cccFusionModel: mismatchedModel.id,
-              cccEffectReceipts: [expect.any(String)],
+              cccEffectReceiptContract: "ccc-tool-receipts/v2",
             },
           });
           ledgerIdsBeforeProfileMismatch = ledgersAfterMismatch.map((ledger) => ledger.id).sort();
@@ -745,59 +769,6 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       }
     });
 
-    it("does not reissue an external effect after its receipt commit crashes and the durable store reopens", async () => {
-      const projectId = "ccc-effect-crash-reopen-project";
-      const taskId = "FN-CCC-EFFECT-CRASH-REOPEN";
-      const firstStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
-      const receiptSession = firstStore.createSession({
-        projectId,
-        adapterId: "pi",
-        purpose: "execute",
-        taskId,
-        worktreePath: "/tmp/ccc-effect-crash-reopen",
-        autonomyPosture: {
-          cccFusionProfile: "ccc-fusion",
-          cccEffectReceiptContract: "ccc-tool-receipts/v1",
-        },
-        agentState: "busy",
-      });
-      await firstStore.flush();
-
-      const effect = vi.fn(async () => ({
-        content: [{ type: "text" as const, text: "loopback external effect committed" }],
-      }));
-      const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
-      const [first] = wrapCccToolsWithDurableEffectReceipts(
-        [effectTool("commit_loopback_effect", effect)],
-        firstStore,
-        receiptSession.id,
-      );
-      const realUpdateSession = firstStore.updateSession.bind(firstStore);
-      vi.spyOn(firstStore, "updateSession").mockImplementation((id, patch) => {
-        // Model a process/store failure at the real receipt-write boundary after
-        // the external effect resolves. A future pre-effect durable claim will
-        // delegate before this branch; the post-effect acknowledgement cannot.
-        if (effect.mock.calls.length > 0) throw new Error("simulated receipt write crash");
-        return realUpdateSession(id, patch);
-      });
-      const envelope = ["loopback-effect-call-1", { resource: "loopback", revision: 1 }] as const;
-
-      await expect(first!.execute!(...envelope)).rejects.toThrow("simulated receipt write crash");
-      expect(effect).toHaveBeenCalledTimes(1);
-
-      const restartedStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
-      const reopened = restartedStore.getSession(receiptSession.id);
-      expect(reopened?.autonomyPosture).toMatchObject({
-        cccEffectReceiptPending: [expect.any(String)],
-      });
-      const [restarted] = wrapCccToolsWithDurableEffectReceipts(
-        [effectTool("commit_loopback_effect", effect)],
-        restartedStore,
-        receiptSession.id,
-      );
-      await restarted!.execute!(...envelope).catch(() => undefined);
-      expect(effect).toHaveBeenCalledTimes(1);
-    });
   });
 
   function registeredModel(provider: CustomProvider): Model {
@@ -1039,73 +1010,6 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     expect(JSON.stringify(
       wireMessages.filter((message) => message.role !== "tool"),
     )).not.toContain(JSON.stringify(structuredResult));
-  });
-
-  it("does not reissue a committed loopback custom-tool effect after a fresh controller", async () => {
-    const provider = providers[0]!;
-    const model = registeredModel(provider);
-    const receiptStore = makeEffectReceiptStore();
-    receiptStore.sessions.set("ccc-effect-session", { autonomyPosture: {} });
-    const effect = vi.fn(async () => ({
-      content: [{ type: "text" as const, text: "effect committed" }],
-      details: { structuredContent: { committed: true } },
-    }));
-    const customTool = {
-      name: "read_session_effect",
-      label: "Commit one synthetic effect",
-      description: "Synthetic local effect boundary for receipt replay proof",
-      parameters: {
-        type: "object",
-        properties: {
-          sessionId: { type: "string" },
-          effectId: { type: "string" },
-          query: { type: "object", additionalProperties: true },
-        },
-        required: ["sessionId", "effectId", "query"],
-        additionalProperties: false,
-      },
-      execute: effect,
-    } as unknown as ToolDefinition;
-    const registryKey = customProviderRegistryKey(provider, providers);
-    const { createFnAgent } = await import("../pi.js");
-    const createController = () => createFnAgent({
-      cwd: "/tmp/ccc-wave2-effect-receipt",
-      systemPrompt: "synthetic loopback effect receipt only",
-      tools: "coding",
-      customTools: [customTool],
-      defaultProvider: registryKey,
-      defaultModelId: model.id,
-      profile: "ccc-fusion",
-      subscriptionReady: true,
-      // This is an existing production createFnAgent seam exercised with a
-      // real AgentSession; current bytes ignore it, so the behavioral RED is
-      // duplicate execution rather than a missing import or type failure.
-      cccEffectReceiptStore: receiptStore,
-      cccEffectReceiptSessionId: "ccc-effect-session",
-    } as any);
-
-    let first: Awaited<ReturnType<typeof createController>> | undefined;
-    let restarted: Awaited<ReturnType<typeof createController>> | undefined;
-    try {
-      first = await createController();
-      await (first.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
-      // Recreate the actual controller/model runtime, not merely the session, so
-      // the second call reads only the durable receipt surface.
-      registry = new TestModelRegistry();
-      await registerCustomProviders(registry, providers, vi.fn());
-      harness.modelRegistry = registry;
-      restarted = await createController();
-      await (restarted.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
-
-      expect(effect).toHaveBeenCalledTimes(1);
-      expect(receiptStore.flush).toHaveBeenCalledTimes(2);
-      expect(receiptStore.sessions.get("ccc-effect-session")?.autonomyPosture).toMatchObject({
-        cccEffectReceipts: [expect.any(String)],
-      });
-    } finally {
-      await first?.session.dispose();
-      await restarted?.session.dispose();
-    }
   });
 
   /*

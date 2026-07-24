@@ -113,6 +113,76 @@ describe("TaskExecutor user cancel handling", () => {
     expect(internals.activeSessions.has("FN-CUSTOM-PROVIDER-CLOSE")).toBe(false);
   });
 
+  it("awaits asynchronous custom-provider disposal before releasing registry and worktree ownership", async () => {
+    resetExecutorMocks();
+    const taskId = "FN-CUSTOM-PROVIDER-AWAIT-DISPOSE";
+    const worktreePath = "/tmp/fn-custom-provider-await-dispose";
+    const store = createMockStore();
+    const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test");
+    const internals = cancellationTestInternals(executor);
+    let resolveDispose: (() => void) | undefined;
+    const disposePending = new Promise<void>((resolve) => {
+      resolveDispose = resolve;
+    });
+    const session = {
+      prompt: vi.fn(),
+      abort: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(() => disposePending),
+    };
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+    }, worktreePath);
+
+    const cleanup = executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true });
+    try {
+      await vi.waitFor(() => expect(session.dispose).toHaveBeenCalledOnce());
+      expect(internals.activeSessions.get(taskId)?.session).toBe(session);
+      expect(activeSessionRegistry.lookupByPath(worktreePath)).toMatchObject({ taskId, kind: "executor" });
+    } finally {
+      resolveDispose?.();
+      await cleanup;
+      activeSessionRegistry.unregisterPath(worktreePath);
+      internals.activeSessions.delete(taskId);
+      internals.activeWorktrees.delete(taskId);
+    }
+    expect(internals.activeSessions.has(taskId)).toBe(false);
+    expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
+  });
+
+  it("returns a typed failure and retains custom-provider ownership when asynchronous disposal rejects", async () => {
+    resetExecutorMocks();
+    const taskId = "FN-CUSTOM-PROVIDER-DISPOSE-REJECTS";
+    const worktreePath = "/tmp/fn-custom-provider-dispose-rejects";
+    const store = createMockStore();
+    const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test");
+    const internals = cancellationTestInternals(executor);
+    const session = {
+      prompt: vi.fn(),
+      abort: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn().mockRejectedValue(new Error("loopback disposal rejected")),
+    };
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+    }, worktreePath);
+
+    try {
+      await expect(executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true }))
+        .rejects.toMatchObject({ code: "TASK_CANCELLATION_DISPOSE_FAILED" });
+      expect(internals.activeSessions.get(taskId)?.session).toBe(session);
+      expect(activeSessionRegistry.lookupByPath(worktreePath)).toMatchObject({ taskId, kind: "executor" });
+    } finally {
+      activeSessionRegistry.unregisterPath(worktreePath);
+      internals.activeSessions.delete(taskId);
+      internals.activeWorktrees.delete(taskId);
+    }
+  });
+
   it("keeps the custom-provider worktree lease until its stream abort settles", async () => {
     resetExecutorMocks();
     const taskId = "FN-CUSTOM-PROVIDER-LEASE";
@@ -239,10 +309,14 @@ describe("TaskExecutor user cancel handling", () => {
     const abortPending = new Promise<void>((resolve) => {
       resolveAbort = resolve;
     });
+    let resolveDispose: (() => void) | undefined;
+    const disposePending = new Promise<void>((resolve) => {
+      resolveDispose = resolve;
+    });
     const session = {
       prompt: vi.fn(),
       abort: vi.fn(() => abortPending),
-      dispose: vi.fn(),
+      dispose: vi.fn(() => disposePending),
     };
     const store = createMockStore();
     const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test", { cancellationTimeoutMs: 15 });
@@ -275,11 +349,18 @@ describe("TaskExecutor user cancel handling", () => {
         autonomyPosture: { cccCancellationState: "CANCELLED" },
       });
       expect(durableStore.flush).toHaveBeenCalledTimes(2);
-      expect(session.dispose).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect(session.dispose).toHaveBeenCalledOnce());
+      expect(internals.activeSessions.get(taskId)?.session).toBe(session);
+      expect(activeSessionRegistry.lookupByPath(worktreePath)).toMatchObject({ taskId, kind: "executor" });
+
+      resolveDispose?.();
+      await Promise.resolve();
+      await Promise.resolve();
       expect(internals.activeSessions.has(taskId)).toBe(false);
       expect(internals.activeWorktrees.has(taskId)).toBe(false);
       expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
     } finally {
+      resolveDispose?.();
       activeSessionRegistry.unregisterPath(worktreePath);
       internals.activeSessions.delete(taskId);
       internals.activeWorktrees.delete(taskId);

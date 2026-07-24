@@ -11,6 +11,7 @@ import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 
 const execAsync = promisify(exec);
 import {
@@ -36,10 +37,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
-  abandonCccEffectReceipt,
   customProviderRegistryKey,
-  commitCccEffectReceipt,
-  CccEffectReceiptPendingError,
   getEnabledPiExtensionPaths,
   getFusionAgentDir,
   getLegacyPiAgentDir,
@@ -54,7 +52,6 @@ import {
   registerBuiltInZaiProvider,
   resolvePiExtensionProjectRoot,
   cccEffectReceiptIdentity,
-  hasCccEffectReceipt,
   reserveCccEffectReceipt,
 } from "@fusion/core";
 import type {
@@ -301,6 +298,7 @@ function wrapSessionDisposeWithShutdown(session: AgentSession): void {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       piLog.warn(`Session dispose failed after session_shutdown emit: ${message}`);
+      throw error;
     }
   };
 
@@ -2013,9 +2011,9 @@ export function wrapToolsWithBoundary(
 /*
 FNXC:CCCEffectReceipts 2026-07-23-20:38:
 This is the committed effect boundary: the ToolDefinition execute closure passed
-to createAgentSession. CCC effects derive identity from the real tool-call id,
-name, and canonical arguments; a durable pending claim flushes before the
-external effect, then the committed receipt flushes before its result returns.
+to createAgentSession. Fusion owns the logical envelope; provider call IDs are
+only fencing evidence. The database state reaches dispatched_unknown before the
+handler and committed before its result returns upstream.
 */
 export function wrapCccToolsWithDurableEffectReceipts(
   tools: ToolDefinition[],
@@ -2028,8 +2026,10 @@ export function wrapCccToolsWithDurableEffectReceipts(
   can both observe an absent receipt. Scope a transient claim to the durable
   store (not an individual wrapper/controller), keyed by the canonical receipt
   identity. The leader's committed result is shared with followers; a failure
-  removes the claim so a later honest retry is not fabricated as committed.
+  clears only the local claim while the durable unknown receipt remains a
+  replay barrier until reconciliation.
   */
+  const controllerToken = randomUUID();
   return tools.map((tool) => {
     const originalExecute = tool.execute as (...args: any[]) => Promise<any>;
     return {
@@ -2040,13 +2040,8 @@ export function wrapCccToolsWithDurableEffectReceipts(
           toolCallId: String(args[0] ?? ""),
           toolName: tool.name,
           arguments: args[1] ?? {},
+          controllerToken,
         };
-        if (hasCccEffectReceipt(store, input)) {
-          return {
-            content: [{ type: "text" as const, text: "CCC effect already committed; replay suppressed." }],
-            details: { cccEffectReceipt: "already-committed" },
-          };
-        }
         const storeScope = store as object;
         let claims = cccEffectReceiptInFlightClaims.get(storeScope);
         if (!claims) {
@@ -2059,24 +2054,17 @@ export function wrapCccToolsWithDurableEffectReceipts(
 
         const claimed = (async () => {
           const reservation = await reserveCccEffectReceipt(store, input);
-          if (reservation.alreadyCommitted) {
+          if (reservation.state === "committed") {
             return {
               content: [{ type: "text" as const, text: "CCC effect already committed; replay suppressed." }],
               details: { cccEffectReceipt: "already-committed" },
             };
           }
-          if (reservation.pending) throw new CccEffectReceiptPendingError(reservation.identity);
-          let result: any;
-          try {
-            result = await originalExecute(...args);
-          } catch (cause) {
-            // The external effect itself rejected, so it is safe to remove the
-            // pre-effect claim and permit a later honest retry. A commit failure
-            // below deliberately keeps the pending durable claim for reconciliation.
-            await abandonCccEffectReceipt(store, input);
-            throw cause;
-          }
-          await commitCccEffectReceipt(store, input);
+          await store.markCccEffectReceiptDispatched(reservation);
+          // Do not clear a dispatched_unknown receipt when the handler throws:
+          // the downstream effect may have occurred and replay must reconcile.
+          const result = await originalExecute(args[0], reservation.forwardedArguments, ...args.slice(2));
+          await store.commitCccEffectReceipt(reservation);
           return result;
         })();
         claims.set(identity, claimed);

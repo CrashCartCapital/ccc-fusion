@@ -1706,6 +1706,8 @@ function selectCccExecutorReceiptLedger(
 interface ActiveExecutorSessionState {
   session: AgentSession;
   seenSteeringIds: Set<string>;
+  /** One owned async disposal per execution generation. */
+  disposeCompletion?: Promise<void>;
   /** Durable CCC record retained until abort, stream closure, and flush all confirm. */
   cccDurableSession?: { store: CliSessionStore; sessionId: string };
   lastResolvedModelProvider?: string;
@@ -2968,14 +2970,27 @@ export class TaskExecutor {
     }
 
     try {
-      session.dispose();
+      await this.disposeAgentSessionOnce(state);
     } catch (cause) {
+      await this.persistCccCancellationAttention(state).catch(() => undefined);
       throw new TaskCancellationAbortError(taskId, "agent-session", "TASK_CANCELLATION_DISPOSE_FAILED", { cause });
     }
 
     if (this.activeSessions.get(taskId)?.session === session) {
       this.deleteActiveSession(taskId);
     }
+  }
+
+  /**
+   * AgentSession declares a synchronous disposer, but PI custom-provider
+   * sessions own async transports. Memoize that close per generation so every
+   * cancellation/retry path observes one result before it releases ownership.
+   */
+  private disposeAgentSessionOnce(state: ActiveExecutorSessionState): Promise<void> {
+    if (!state.disposeCompletion) {
+      state.disposeCompletion = Promise.resolve().then(() => state.session.dispose());
+    }
+    return state.disposeCompletion;
   }
 
   private async awaitAgentSessionClosure(
@@ -3046,12 +3061,13 @@ export class TaskExecutor {
     try {
       await this.persistCccCancellationConfirmed(state);
       if (this.activeSessions.get(taskId)?.session !== session) return;
-      session.dispose();
+      await this.disposeAgentSessionOnce(state);
       if (this.activeSessions.get(taskId)?.session === session) {
         this.deleteActiveSession(taskId);
         if (releaseWorktreeAfterConfirmedClose) this.activeWorktrees.delete(taskId);
       }
     } catch {
+      await this.persistCccCancellationAttention(state).catch(() => undefined);
       // The original caller already received the typed failure. Keep ownership
       // visible when a late durable finalization cannot be proven.
     }
