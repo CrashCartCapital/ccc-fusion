@@ -1231,7 +1231,9 @@ export class EmbeddedPostgresLifecycle {
   // True when THIS lifecycle instance owns (started) the postmaster process.
   // When we detect an already-running instance and connect to it, ownsProcess
   // is false and stop() is a no-op (the owning instance handles shutdown).
-  private ownsProcess = true;
+  private ownsProcess = false;
+  /** Exact postmaster identity captured only after this lifecycle starts it. */
+  private ownedPostmasterPid: number | null = null;
   private shutdownHookInstalled = false;
   /**
    * FNXC:WindowsDesktopPackaging 2026-07-17-22:30:
@@ -1598,6 +1600,13 @@ export class EmbeddedPostgresLifecycle {
       await this.settleCancelledStart(pg);
       throw new EmbeddedStartCancelledError(this.options.dataDir);
     }
+    const firstLine = readFileSync(join(this.options.dataDir, "postmaster.pid"), "utf8").split("\n")[0]?.trim();
+    const ownedPid = Number(firstLine);
+    if (!Number.isInteger(ownedPid) || ownedPid <= 0) {
+      await this.settleCancelledStart(pg);
+      throw new Error("embedded postgres: owned postmaster identity was unavailable after launch");
+    }
+    this.ownedPostmasterPid = ownedPid;
     this.running = true;
     this.ownsProcess = true;
 
@@ -1998,15 +2007,8 @@ export class EmbeddedPostgresLifecycle {
    */
   async terminateOwnedPostmaster(): Promise<void> {
     if (!this.ownsProcess) return;
-    let pid: number | undefined;
-    try {
-      const firstLine = readFileSync(join(this.options.dataDir, "postmaster.pid"), "utf8").split("\n")[0]?.trim();
-      const parsed = Number(firstLine);
-      if (Number.isInteger(parsed) && parsed > 0) pid = parsed;
-    } catch {
-      return;
-    }
-    if (pid === undefined) return;
+    const pid = this.ownedPostmasterPid;
+    if (pid === null) return;
     /*
     FNXC:CccWave4Proof 2026-07-24-15:25: a proof-only bounded shutdown may
     need to terminate its exact owned postmaster when pg_ctl stop hangs; do
@@ -2020,10 +2022,18 @@ export class EmbeddedPostgresLifecycle {
         await new Promise<void>((resolve) => setTimeout(resolve, 25));
       }
     };
-    try { process.kill(pid, "SIGTERM"); } catch { return; }
+    try { process.kill(pid, "SIGTERM"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
     if (await waitForExit(1_000)) return;
-    try { process.kill(pid, "SIGKILL"); } catch { return; }
-    await waitForExit(1_000);
+    try { process.kill(pid, "SIGKILL"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    if (!await waitForExit(1_000)) {
+      throw new Error(`embedded postgres: owned postmaster ${pid} did not exit after SIGKILL`);
+    }
   }
 
   /**

@@ -1579,7 +1579,12 @@ export class WorkflowGraphExecutor {
      * — the deterministic `ensureWorkflowCompletionSummary` fallback still fills
      * `task.summary` — so the graph always advances past it.
      */
-    if (isCompletionSummaryNode(node)) {
+    const cccClassification = cccFusionTask && lastError instanceof PermanentError
+      ? `ccc-permanent:${lastError.code}`
+      : cccFusionTask && lastError instanceof TransientError
+        ? `ccc-transient-retry-exhausted:${lastError.code}`
+        : undefined;
+    if (isCompletionSummaryNode(node) && !cccClassification) {
       const degraded: WorkflowNodeResult = {
         outcome: "success",
         value: "summary-unavailable",
@@ -1592,11 +1597,6 @@ export class WorkflowGraphExecutor {
       }
       return degraded;
     }
-    const cccClassification = cccFusionTask && lastError instanceof PermanentError
-      ? `ccc-permanent:${lastError.code}`
-      : cccFusionTask && lastError instanceof TransientError
-        ? `ccc-transient-retry-exhausted:${lastError.code}`
-        : undefined;
     const failureResult: WorkflowNodeResult = {
       outcome: "failure",
       value: cccClassification ?? "exception",

@@ -208,6 +208,17 @@ const commands = [
   },
 ];
 
+function positiveBudget(name, fallback) {
+  const value = process.env[name] === undefined ? fallback : Number(process.env[name]);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive finite millisecond budget`);
+  return Math.floor(value);
+}
+
+const childTimeoutMs = positiveBudget("CCC_W4_CHILD_TIMEOUT_MS", 120_000);
+const childTerminateGraceMs = positiveBudget("CCC_W4_CHILD_TERMINATE_GRACE_MS", 2_000);
+const postgresStopBudgetMs = positiveBudget("CCC_W4_PG_STOP_TIMEOUT_MS", 10_000);
+const parentShutdownMarginMs = positiveBudget("CCC_W4_PARENT_SHUTDOWN_MARGIN_MS", 3_000);
+
 const supervisor = `
   import { EmbeddedPostgresLifecycle } from ${JSON.stringify(join(repoRoot, "packages/core/src/postgres/embedded-lifecycle.ts"))};
   import { spawn } from "node:child_process";
@@ -302,6 +313,9 @@ const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module",
     CCC_W4_RESULT_ROOT: resultRoot,
     CCC_W4_REPO_ROOT: repoRoot,
     CCC_W4_COMMANDS: JSON.stringify(commands),
+    CCC_W4_CHILD_TIMEOUT_MS: String(childTimeoutMs),
+    CCC_W4_CHILD_TERMINATE_GRACE_MS: String(childTerminateGraceMs),
+    CCC_W4_PG_STOP_TIMEOUT_MS: String(postgresStopBudgetMs),
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -311,10 +325,6 @@ child.stdout.on("data", (chunk) => { stdout += String(chunk); });
 child.stderr.on("data", (chunk) => { stderr += String(chunk); });
 let forwardedSignal = null;
 let parentForceKillTimer = null;
-const childTimeoutMs = 120_000;
-const childTerminateGraceMs = 2_000;
-const postgresStopBudgetMs = 10_000;
-const parentShutdownMarginMs = 3_000;
 const parentSignalBoundMs = childTerminateGraceMs + postgresStopBudgetMs + parentShutdownMarginMs;
 const parentNormalBoundMs = commands.length * childTimeoutMs + childTerminateGraceMs + postgresStopBudgetMs + parentShutdownMarginMs;
 let parentNormalTimeout = null;
