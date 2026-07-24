@@ -3,20 +3,129 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import assert from "node:assert/strict";
 
-if (process.argv.length !== 4 || process.argv[2] !== "--wave" || process.argv[3] !== "4") {
+const stopPolicySelfTest = process.argv.length === 3 && process.argv[2] === "--self-test-stop-settlement";
+const runnerPolicySelfTest = process.argv.length === 3 && process.argv[2] === "--self-test-policies";
+if (!stopPolicySelfTest && !runnerPolicySelfTest && (process.argv.length !== 4 || process.argv[2] !== "--wave" || process.argv[3] !== "4")) {
   throw new Error("usage: node scripts/run-ccc-pg-proof.mjs --wave 4");
 }
-if (process.env.FUSION_PG_TEST_SKIP === "1") {
+if (!stopPolicySelfTest && !runnerPolicySelfTest && process.env.FUSION_PG_TEST_SKIP === "1") {
   throw new Error("FUSION_PG_TEST_SKIP=1 disables the required Wave 4 PostgreSQL proof before test execution");
 }
 
-const repoRoot = process.cwd();
-const proofRoot = await mkdtemp(join(tmpdir(), "ccc-wave-4-proof-"));
-const dataRoot = join(proofRoot, "postgres-data");
-const resultRoot = join(dataRoot, "machine-results");
-const reportPath = join(proofRoot, "report.json");
-const manifestPath = join(proofRoot, "manifest.json");
+function stopWithinBudgetPolicy(lifecycle, stopTimeoutMs) {
+  return new Promise((resolve, reject) => {
+    let timeoutLatched = false;
+    let settled = false;
+    const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); };
+    const stopPromise = Promise.resolve().then(() => lifecycle.stop());
+    const timer = setTimeout(() => {
+      timeoutLatched = true;
+      const timeout = new Error("embedded PostgreSQL stop timed out");
+      // FNXC:CccWave4Proof 2026-07-24-18:05: timeout is terminal at expiry.
+      // Settle both owned shutdown paths before reporting so neither late
+      // failure can be lost or become an unhandled rejection.
+      const forcedCleanupPromise = Promise.resolve().then(() => lifecycle.terminateOwnedPostmaster());
+      void Promise.allSettled([stopPromise, forcedCleanupPromise]).then(([stopResult, forcedResult]) => {
+        const errors = [
+          timeout,
+          ...(stopResult.status === "rejected" ? [stopResult.reason] : []),
+          ...(forcedResult.status === "rejected" ? [forcedResult.reason] : []),
+        ];
+        finish(reject, new AggregateError(errors, "embedded PostgreSQL stop timed out and shutdown settlement failed"));
+      });
+    }, stopTimeoutMs);
+    stopPromise.then(
+      () => { if (!timeoutLatched) finish(resolve); },
+      (error) => { if (!timeoutLatched) finish(reject, error); },
+    );
+  });
+}
+
+function stopFailureText(error) {
+  const errors = error instanceof AggregateError ? error.errors : [error];
+  return errors.map((entry) => String(entry instanceof Error ? entry.message : entry)
+    .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[redacted-postgresql-url]")
+    .replace(/password=[^\s&]+/gi, "password=[redacted]")).join(" | ");
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  return { promise: new Promise((onResolve, onReject) => { resolve = onResolve; reject = onReject; }), resolve, reject };
+}
+
+async function nextTurn() {
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function selfTestStopSettlementPolicy() {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+  const stop = deferred();
+  const forced = deferred();
+  let forcedCalls = 0;
+  const outcome = stopWithinBudgetPolicy({
+    stop: () => stop.promise,
+    terminateOwnedPostmaster: () => { forcedCalls += 1; return forced.promise; },
+  }, 1).then(
+    () => ({ status: "resolved" }),
+    (error) => ({ status: "rejected", error }),
+  );
+  while (forcedCalls === 0) await nextTurn();
+  forced.reject(new Error(`forced cleanup password=${"unsafe"}`));
+  await nextTurn();
+  const lateStopError = new Error(`late stop postgresql:${"//"}unsafe:unsafe@loopback/proof`);
+  stop.reject(lateStopError);
+  const terminal = await outcome;
+  assert.equal(terminal.status, "rejected");
+  assert.ok(terminal.error instanceof AggregateError);
+  assert.equal(terminal.error.errors.length, 3, "timeout must preserve both stop and forced-cleanup failures");
+  const diagnostic = stopFailureText(terminal.error);
+  assert.match(diagnostic, /embedded PostgreSQL stop timed out/);
+  assert.match(diagnostic, /late stop \[redacted-postgresql-url\]/);
+  assert.match(diagnostic, /forced cleanup password=\[redacted\]/);
+  assert.doesNotMatch(diagnostic, /unsafe/);
+
+  const lateSuccessStop = deferred();
+  const lateSuccessForced = deferred();
+  let lateSuccessForcedCalls = 0;
+  let settledBeforeStop = false;
+  const lateSuccessOutcome = stopWithinBudgetPolicy({
+    stop: () => lateSuccessStop.promise,
+    terminateOwnedPostmaster: () => { lateSuccessForcedCalls += 1; return lateSuccessForced.promise; },
+  }, 1).then(
+    () => ({ status: "resolved" }),
+    (error) => ({ status: "rejected", error }),
+  ).then((result) => { settledBeforeStop = true; return result; });
+  while (lateSuccessForcedCalls === 0) await nextTurn();
+  lateSuccessForced.resolve();
+  await nextTurn();
+  assert.equal(settledBeforeStop, false, "timeout must await the original stop even when forced cleanup succeeds");
+  lateSuccessStop.resolve();
+  assert.equal((await lateSuccessOutcome).status, "rejected", "a late successful stop cannot turn timeout into success");
+
+  let preTimeoutForcedCalls = 0;
+  await stopWithinBudgetPolicy({
+    stop: async () => undefined,
+    terminateOwnedPostmaster: async () => { preTimeoutForcedCalls += 1; },
+  }, 10);
+  assert.equal(preTimeoutForcedCalls, 0, "a successful pre-timeout stop must not force cleanup");
+  await nextTurn();
+  assert.deepEqual(unhandled, [], "shutdown settlement must not emit unhandled rejections");
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+}
+
+if (stopPolicySelfTest) {
+  await selfTestStopSettlementPolicy();
+  console.log("Wave 4 stop-settlement policy self-test passed");
+  process.exit(0);
+}
 
 const expectedCoreGateNames = [
   "VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL) > creates a task and reads it back",
@@ -177,6 +286,19 @@ function selfTestSupervisorFailurePolicy() {
 }
 selfTestSupervisorFailurePolicy();
 
+if (runnerPolicySelfTest) {
+  await selfTestStopSettlementPolicy();
+  console.log("Wave 4 runner policy self-tests passed");
+  process.exit(0);
+}
+
+const repoRoot = process.cwd();
+const proofRoot = await mkdtemp(join(tmpdir(), "ccc-wave-4-proof-"));
+const dataRoot = join(proofRoot, "postgres-data");
+const resultRoot = join(dataRoot, "machine-results");
+const reportPath = join(proofRoot, "report.json");
+const manifestPath = join(proofRoot, "manifest.json");
+
 const commands = [
   {
     id: "core-pg-gate",
@@ -264,25 +386,9 @@ const supervisor = `
   const onSigTerm = () => onSignal("SIGTERM");
   process.once("SIGINT", onSigInt);
   process.once("SIGTERM", onSigTerm);
-  const stopWithinBudget = async () => await new Promise((resolve, reject) => {
-    let timeoutLatched = false;
-    let settled = false;
-    const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); };
-    const timer = setTimeout(() => {
-      timeoutLatched = true;
-      const timeout = new Error("embedded PostgreSQL stop timed out");
-      // FNXC:CccWave4Proof 2026-07-24-16:05: timeout is terminal at expiry;
-      // a late stop resolution cannot overwrite the forced-cleanup verdict.
-      void lifecycle.terminateOwnedPostmaster().then(
-        () => finish(reject, timeout),
-        (forcedError) => finish(reject, new AggregateError([timeout, forcedError], "embedded PostgreSQL stop and forced cleanup failed")),
-      );
-    }, stopTimeoutMs);
-    lifecycle.stop().then(
-      () => { if (!timeoutLatched) finish(resolve); },
-      (error) => { if (!timeoutLatched) finish(reject, error); },
-    );
-  });
+  ${stopWithinBudgetPolicy.toString()}
+  ${stopFailureText.toString()}
+  const stopWithinBudget = () => stopWithinBudgetPolicy(lifecycle, stopTimeoutMs);
   let stopError = null;
   try {
     await lifecycle.start();
@@ -301,7 +407,7 @@ const supervisor = `
   } finally {
     process.removeListener("SIGINT", onSigInt);
     process.removeListener("SIGTERM", onSigTerm);
-    try { await stopWithinBudget(); } catch (error) { stopError = error instanceof Error ? error.message : String(error); }
+    try { await stopWithinBudget(); } catch (error) { stopError = stopFailureText(error); }
   }
   process.stdout.write("CCC_W4_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: "ccc_wave4_proof", stopError, lifecycleErrors, interrupted }) + "\\n");
   if (stopError || interrupted || results.some((result) => result.code !== 0) || results.length !== commands.length) process.exitCode = 1;
