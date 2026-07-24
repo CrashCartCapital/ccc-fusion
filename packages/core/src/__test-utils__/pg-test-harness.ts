@@ -74,6 +74,12 @@ import {
 export const PG_TEST_URL_BASE =
   process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
 
+function redactPgDiagnostic(value: unknown): string {
+  return String(value)
+    .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[redacted-postgresql-url]")
+    .replace(/password=[^\s&]+/gi, "password=[redacted]");
+}
+
 /**
  * FNXC:FixPgTestsAndCi 2026-06-26-09:00:
  * Parse the host/port out of PG_TEST_URL_BASE so a synchronous TCP probe can
@@ -837,9 +843,7 @@ export async function createTaskStoreForTest(options?: {
         kind: "fusion-pg-test-teardown-diagnostic",
         dbName,
         stage: teardownFailure.stage,
-        error: errorText
-          .replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "[redacted-postgresql-url]")
-          .replace(/password=[^\s&]+/gi, "password=[redacted]"),
+        error: redactPgDiagnostic(errorText),
       };
       let diagnosticWriteError: unknown;
       try {
@@ -853,9 +857,9 @@ export async function createTaskStoreForTest(options?: {
         const diagnosticMessage = diagnosticWriteError instanceof Error
           ? diagnosticWriteError.message
           : String(diagnosticWriteError);
-        throw new Error(`${originalMessage}; diagnostic packet write also failed: ${diagnosticMessage}`, { cause: teardownFailure.error });
+        throw new Error(`${originalMessage}; diagnostic packet write also failed: ${redactPgDiagnostic(diagnosticMessage)}`, { cause: new Error(redactPgDiagnostic(errorText)) });
       }
-      throw new Error(originalMessage, { cause: teardownFailure.error });
+      throw new Error(originalMessage, { cause: new Error(redactPgDiagnostic(errorText)) });
     }
   };
 

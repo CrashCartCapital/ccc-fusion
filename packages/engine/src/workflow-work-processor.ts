@@ -21,7 +21,7 @@ type WorkflowWorkProcessorStore = WorkflowWorkSchedulerStore & {
     id: string,
     state: WorkflowWorkItemState,
     patch?: { now?: string; lastError?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
-  ) => WorkflowWorkItem;
+  ) => WorkflowWorkItem | Promise<WorkflowWorkItem>;
 };
 
 export async function processDueWorkflowWorkItem(
@@ -62,7 +62,7 @@ export async function processDueWorkflowWorkItem(
   } catch (err) {
     const reason = `workflow-work-item-runtime-error:${err instanceof Error ? err.message : String(err)}`;
     try {
-      store.transitionWorkflowWorkItem?.(dispatch.workItem.id, "failed", {
+      await store.transitionWorkflowWorkItem?.(dispatch.workItem.id, "failed", {
         now: opts.now,
         leaseOwner: null,
         leaseExpiresAt: null,

@@ -46,6 +46,7 @@ import {
 import {
   MERGE_REGION_KINDS,
   CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY,
+  CCC_RETRY_CLASSIFICATION_CONTEXT_KEY,
   PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE,
   WORKFLOW_DRIFT_PARK_CONTEXT_KEY,
   WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND,
@@ -6336,10 +6337,35 @@ export class TaskExecutor {
         return;
       }
       if (result.disposition === "failed") {
+        const branchPersistenceFailure = result.context?.[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY];
+        const retryClassification = result.context?.[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY];
+        const terminalCccBranchPersistenceFailure = task.customFields?.cccFusionProfile === "ccc-fusion"
+          && typeof branchPersistenceFailure === "string"
+          && branchPersistenceFailure.startsWith("ccc-branch-persistence-");
+        const terminalCccPermanentFailure = task.customFields?.cccFusionProfile === "ccc-fusion"
+          && typeof retryClassification === "string"
+          && retryClassification.startsWith("ccc-permanent:");
+        const terminalCccTransientExhaustion = task.customFields?.cccFusionProfile === "ccc-fusion"
+          && typeof retryClassification === "string"
+          && retryClassification.startsWith("ccc-transient-retry-exhausted:");
+        const terminalCccFailure = terminalCccBranchPersistenceFailure || terminalCccPermanentFailure || terminalCccTransientExhaustion;
+        if (terminalCccFailure && !continuation) {
+          /*
+          FNXC:CccBranchPersistence 2026-07-24-13:35:
+          A first-run checkpoint failure has no continuation to park yet. Create
+          the existing native task work item under the resolved stable run id so
+          the operator sees the same durable manual-required contract as resume.
+          */
+          continuation = await this.store.upsertWorkflowWorkItem({
+            runId: resolvedRunId ?? `${task.id}:${selection.workflowId}`,
+            taskId: task.id,
+            nodeId: terminalCccBranchPersistenceFailure ? "ccc-branch-persistence" : "ccc-retry-classification",
+            kind: "task",
+            state: "running",
+            attempt: terminalCccTransientExhaustion ? 3 : 1,
+          });
+        }
         if (continuation) {
-          const branchPersistenceFailure = result.context?.[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY];
-          const terminalCccBranchPersistenceFailure = typeof branchPersistenceFailure === "string"
-            && branchPersistenceFailure.startsWith("ccc-branch-persistence-");
           /*
           FNXC:CccBranchPersistence 2026-07-24-12:07:
           A CCC branch whose terminal checkpoint was not durably recorded must
@@ -6348,14 +6374,42 @@ export class TaskExecutor {
           manual-required with the stable persistence reason before graph
           teardown can schedule anything else.
           */
-          await this.store.transitionWorkflowWorkItem(continuation.id, terminalCccBranchPersistenceFailure ? "manual-required" : "failed", {
+          const terminalReason = terminalCccBranchPersistenceFailure
+            ? branchPersistenceFailure as string
+            : terminalCccFailure
+              ? retryClassification as string
+              : undefined;
+          const terminalState = terminalCccTransientExhaustion ? "exhausted" : terminalCccFailure ? "manual-required" : "failed";
+          await this.store.transitionWorkflowWorkItem(continuation.id, terminalState, {
             leaseOwner: null,
             leaseExpiresAt: null,
-            lastError: terminalCccBranchPersistenceFailure
-              ? branchPersistenceFailure
+            lastError: terminalCccFailure
+              ? terminalReason
               : "workflow-continuation-failed",
-            ...(terminalCccBranchPersistenceFailure ? { blockedReason: branchPersistenceFailure } : {}),
+            ...(terminalCccFailure ? { blockedReason: terminalReason } : {}),
           });
+          if (terminalCccPermanentFailure) {
+            await this.store.recordRunAuditEvent({
+              taskId: task.id,
+              agentId: "task-executor",
+              runId: continuation.runId,
+              domain: "database",
+              mutationType: "workflow:work-item-transition",
+              target: continuation.id,
+              metadata: { state: "manual-required", attempt: continuation.attempt, classification: "ccc-permanent" },
+            });
+          }
+          if (terminalCccTransientExhaustion) {
+            await this.store.recordRunAuditEvent({
+              taskId: task.id,
+              agentId: "task-executor",
+              runId: continuation.runId,
+              domain: "database",
+              mutationType: "workflow:work-item-transition",
+              target: continuation.id,
+              metadata: { state: "exhausted", attempt: continuation.attempt, classification: "ccc-transient-exhausted" },
+            });
+          }
         }
         await this.handleGraphFailure(task, result);
       } else if (result.disposition === "completed") {

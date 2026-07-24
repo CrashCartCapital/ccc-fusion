@@ -56,7 +56,9 @@ function controllerProgram(repoRoot: string): string {
     const { createConnectionSetFromUrl } = await import(${JSON.stringify(`${repoRoot}/packages/core/src/postgres/connection.ts`)});
     const { createAsyncDataLayer } = await import(${JSON.stringify(`${repoRoot}/packages/core/src/postgres/data-layer.ts`)});
     const { WorkflowGraphExecutor } = await import(${JSON.stringify(`${repoRoot}/packages/engine/src/workflow-graph-executor.ts`)});
-    const [url, rootDir, taskId, runId, mode] = process.argv.slice(1);
+    const [rootDir, taskId, runId, mode] = process.argv.slice(1);
+    const url = process.env.CCC_W4_CHILD_PG_URL;
+    if (!url) throw new Error("missing scoped PostgreSQL child URL");
     const connections = await createConnectionSetFromUrl({ mode: "external", runtimeUrl: url, migrationUrl: url, migrationUrlOverridden: false }, { poolMax: 2, connectTimeoutSeconds: 5 });
     const layer = createAsyncDataLayer(connections);
     const store = new TaskStore(rootDir, undefined, { asyncLayer: layer });
@@ -91,7 +93,8 @@ function controllerProgram(repoRoot: string): string {
     });
     await executor.run(task, {}, ${JSON.stringify(wave4Ir)});
     } catch (error) {
-      process.stderr.write(error instanceof Error ? error.stack + "\\n" : String(error) + "\\n");
+      const raw = error instanceof Error ? error.stack ?? error.message : String(error);
+      process.stderr.write(raw.replace(/postgres(?:ql)?:\\/\\/[^\\s"']+/gi, "[redacted-postgresql-url]") + "\\n");
       process.exitCode = 1;
     }
   `;
@@ -225,11 +228,10 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
       });
       child = spawn(process.execPath, [
         "--import", "tsx", "--input-type=module", "-e", controllerProgram(process.cwd().replace(/\/packages\/engine$/, "")),
-        harness.testUrl,
         harness.rootDir,
         created.id,
         runId,
-      ], { stdio: ["ignore", "pipe", "inherit"] });
+      ], { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, CCC_W4_CHILD_PG_URL: harness.testUrl } });
       child.stdout.setEncoding("utf8");
       let stdout = "";
       child.stdout.on("data", (chunk: string) => {
@@ -305,12 +307,11 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
       const frontier = new Promise<void>((resolve) => { resolveFrontier = resolve; });
       child = spawn(process.execPath, [
         "--import", "tsx", "--input-type=module", "-e", controllerProgram(process.cwd().replace(/\/packages\/engine$/, "")),
-        harness.testUrl,
         harness.rootDir,
         created.id,
         runId,
         "hold-after-frontier",
-      ], { stdio: ["ignore", "pipe", "inherit"] });
+      ], { stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, CCC_W4_CHILD_PG_URL: harness.testUrl } });
       child.stdout.setEncoding("utf8");
       let stdout = "";
       child.stdout.on("data", (chunk: string) => {
@@ -374,5 +375,27 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
     const cleanRoot = cleanHarness.rootDir;
     await cleanHarness.teardown();
     await expect(access(cleanRoot)).rejects.toThrow();
+  });
+
+  it("Wave 4 RED: early teardown and packet-write failures preserve the original redacted cause", async () => {
+    const early = await createTaskStoreForTest({
+      prefix: "fusion_ccc_wave4_teardown_early",
+      copyFromGolden: true,
+      teardownFault: "store-close",
+    });
+    await expect(early.teardown()).rejects.toThrow(/store-close/);
+    const packet = await readFile(`${early.rootDir}/pg-teardown-diagnostic.json`, "utf8");
+    expect(JSON.parse(packet)).toMatchObject({ dbName: early.dbName, stage: "store-close" });
+    expect(packet).not.toContain(early.testUrl);
+    await expect(access(early.rootDir)).resolves.toBeUndefined();
+
+    const packetWriteFailure = await createTaskStoreForTest({
+      prefix: "fusion_ccc_wave4_teardown_packet",
+      copyFromGolden: true,
+      teardownFault: "store-close",
+      diagnosticWriteFault: true,
+    });
+    await expect(packetWriteFailure.teardown()).rejects.toThrow(/store-close/);
+    await expect(access(packetWriteFailure.rootDir)).resolves.toBeUndefined();
   });
 });

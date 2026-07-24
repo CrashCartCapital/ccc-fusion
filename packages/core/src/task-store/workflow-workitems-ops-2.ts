@@ -172,7 +172,7 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
         target: updated.id,
         metadata: { id: updated.id, leaseOwner: updated.leaseOwner, leaseExpiresAt: updated.leaseExpiresAt },
       });
-      return updated;
+      return { ...updated, id };
     }
 
     return store.db.transactionImmediate(() => {

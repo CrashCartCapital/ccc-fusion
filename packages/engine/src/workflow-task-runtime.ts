@@ -194,6 +194,21 @@ export class WorkflowTaskRuntime {
       ? Math.min(10, Math.floor(configuredRetries))
       : 1;
     const currentAttempt = Math.max(1, workItem.attempt);
+    const claimedCccTransient = cccFusionTask
+      && workItem.state === "running"
+      && workItem.lastError?.startsWith("ccc-transient:") === true;
+    if (claimedCccTransient && currentAttempt >= maxAttempts) {
+      const reason = "ccc-transient-retry-exhausted";
+      await this.deps.store.transitionWorkflowWorkItem(workItem.id, "exhausted", {
+        attempt: currentAttempt,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: reason,
+      });
+      await this.recordWorkItemTransition(workItem, "exhausted", currentAttempt, "ccc-transient-exhausted");
+      this.emit("terminal", workItem.taskId, "work-item:failed");
+      return { disposition: "failed", outcome: "failure", visitedNodeIds: [], context: {}, reason };
+    }
     if (workItem.state !== "running") {
       if (cccFusionTask && workItem.state === "retrying" && currentAttempt >= maxAttempts) {
         const reason = "ccc-transient-retry-exhausted";
@@ -242,6 +257,11 @@ export class WorkflowTaskRuntime {
     PermanentError is classified once and durably parked for operator action.
     */
     let attempt = currentAttempt;
+    if (claimedCccTransient) {
+      attempt += 1;
+      await this.deps.store.transitionWorkflowWorkItem(workItem.id, "running", { attempt, lastError: null });
+      await this.recordWorkItemTransition(workItem, "running", attempt, "ccc-transient-resume");
+    }
     for (;;) {
       try {
         const result = handler

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { TaskDetail, WorkflowIr, WorkflowIrNode } from "@fusion/core";
 
 import { WorkflowGraphExecutor, type WorkflowNodeHandler } from "../workflow-graph-executor.js";
+import { PermanentError, TransientError } from "../engine-errors.js";
 import type {
   WorkflowBranchPersistence,
   WorkflowBranchProgress,
@@ -51,6 +52,68 @@ function twoBranchIr(joinConfig: Record<string, unknown>): WorkflowIr {
 }
 
 describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
+  it("Wave 4 RED: CCC frontier checkpoint failure does not traverse an authored failure effect", async () => {
+    const calls: string[] = [];
+    const executor = new WorkflowGraphExecutor({
+      branchPersistence: { saveBranchState: async () => { throw new Error("checkpoint unavailable"); } },
+      handlers: { prompt: async (node) => { calls.push(node.id); return { outcome: "success" as const }; } },
+    });
+    const ir: WorkflowIr = {
+      version: "v2", name: "ccc-frontier-fail-closed", columns: [],
+      nodes: [
+        { id: "start", kind: "start" }, { id: "A", kind: "prompt", config: {} },
+        { id: "failure-effect", kind: "prompt", config: {} }, { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "A" }, { from: "A", to: "end", condition: "success" },
+        { from: "A", to: "failure-effect", condition: "failure" }, { from: "failure-effect", to: "end" },
+      ],
+    };
+
+    const result = await executor.run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir,
+    );
+
+    expect(result.outcome).toBe("failure");
+    expect(result.context["ccc:branch-persistence-failure"]).toBe("ccc-branch-persistence-progress-failed");
+    expect(calls).not.toContain("failure-effect");
+  });
+
+  it("Wave 4 RED: CCC permanent node failure is classified once without authored failure traversal", async () => {
+    let calls = 0;
+    const executor = new WorkflowGraphExecutor({
+      handlers: { prompt: async () => { calls += 1; throw new PermanentError("operator action", "CCC_PERMANENT"); } },
+    });
+    const ir: WorkflowIr = {
+      version: "v2", name: "ccc-permanent", columns: [],
+      nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: { maxRetries: 3 } }, { id: "failure-effect", kind: "prompt" }, { id: "end", kind: "end" }],
+      edges: [{ from: "start", to: "A" }, { from: "A", to: "failure-effect", condition: "failure" }, { from: "A", to: "end", condition: "success" }, { from: "failure-effect", to: "end" }],
+    };
+
+    const result = await executor.run({ ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir);
+
+    expect(calls).toBe(1);
+    expect(result.outcome).toBe("failure");
+    expect(result.context["ccc:retry-classification"]).toBe("ccc-permanent:CCC_PERMANENT");
+    expect(result.visitedNodeIds).not.toContain("failure-effect");
+  });
+
+  it("Wave 4 RED: CCC transient node failure consumes the configured total attempt cap", async () => {
+    let calls = 0;
+    const executor = new WorkflowGraphExecutor({
+      handlers: { prompt: async () => { calls += 1; throw new TransientError("retry", "CCC_TRANSIENT"); } },
+    });
+    const ir: WorkflowIr = {
+      version: "v2", name: "ccc-transient", columns: [],
+      nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: { maxRetries: 3 } }, { id: "end", kind: "end" }],
+      edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }],
+    };
+    const result = await executor.run({ ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir);
+    expect(calls).toBe(3);
+    expect(result.outcome).toBe("failure");
+    expect(result.context["ccc:retry-classification"]).toBe("ccc-transient-retry-exhausted:CCC_TRANSIENT");
+  });
+
   it("mode:all — both branches complete in any order, join fires once, advances to tail", async () => {
     const a = deferred<void>();
     const b = deferred<void>();

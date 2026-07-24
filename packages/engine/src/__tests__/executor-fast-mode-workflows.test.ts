@@ -147,6 +147,97 @@ describe("fast mode workflow/runtime invariants", () => {
     }
   });
 
+  it("Wave 4 RED: fresh CCC branch persistence failure creates and parks a native work item", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-fresh", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-branch-persistence", kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "ccc-branch-persistence-terminal-failed",
+      context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+      visitedNodeIds: ["start", "A", "fanout", "B"],
+    });
+    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
+
+    try {
+      await executor.execute(liveTask);
+
+      expect(store.upsertWorkflowWorkItem).toHaveBeenCalledWith(expect.objectContaining({
+        runId: `${liveTask.id}:builtin:coding`, taskId: liveTask.id, nodeId: "ccc-branch-persistence", kind: "task", state: "running",
+      }));
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "manual-required", expect.objectContaining({
+        blockedReason: "ccc-branch-persistence-terminal-failed",
+        lastError: "ccc-branch-persistence-terminal-failed",
+      }));
+      expect(graphFailure).toHaveBeenCalledWith(liveTask, expect.objectContaining({ outcome: "failure" }));
+    } finally {
+      run.mockRestore();
+      graphFailure.mockRestore();
+    }
+  });
+
+  it("Wave 4 RED: public TaskExecutor parks a classified CCC permanent graph failure once", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-permanent", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-retry-classification", kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    const selected = { workflowId: "wave4-actual-permanent", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 actual permanent",
+      ir: { version: "v2", name: "Wave 4 actual permanent", columns: [], nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: {} }, { id: "end", kind: "end" }], edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }] },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockRejectedValue(new (await import("../engine-errors.js")).PermanentError("operator action", "CCC_PERMANENT"));
+    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
+    try {
+      await executor.execute(liveTask);
+      expect(store.upsertWorkflowWorkItem).toHaveBeenCalledWith(expect.objectContaining({ nodeId: "ccc-retry-classification", state: "running" }));
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "manual-required", expect.objectContaining({
+        blockedReason: "ccc-permanent:CCC_PERMANENT", lastError: "ccc-permanent:CCC_PERMANENT",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition", metadata: expect.objectContaining({ classification: "ccc-permanent" }),
+      }));
+    } finally { customNode.mockRestore(); graphFailure.mockRestore(); }
+  });
+
+  it("Wave 4 RED: public TaskExecutor exhausts a classified CCC transient graph failure", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-transient", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-retry-classification", kind: "task", state: "running", attempt: 3 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    const selected = { workflowId: "wave4-actual-transient", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 actual transient",
+      ir: { version: "v2", name: "Wave 4 actual transient", columns: [], nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: { maxRetries: 3 } }, { id: "end", kind: "end" }], edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }] },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockRejectedValue(new (await import("../engine-errors.js")).TransientError("retry", "CCC_TRANSIENT"));
+    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
+    try {
+      await executor.execute(liveTask);
+      expect(customNode).toHaveBeenCalledTimes(3);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "exhausted", expect.objectContaining({
+        lastError: "ccc-transient-retry-exhausted:CCC_TRANSIENT",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition", metadata: expect.objectContaining({ classification: "ccc-transient-exhausted" }),
+      }));
+    } finally { customNode.mockRestore(); graphFailure.mockRestore(); }
+  });
+
   it("graph executor with a custom workflow skips custom pre-merge prompt/gate nodes in fast mode", async () => {
     const { store, executor } = makeExecutorForTask(task({ executionMode: "fast", worktree: "/tmp/wt" }));
     const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true });

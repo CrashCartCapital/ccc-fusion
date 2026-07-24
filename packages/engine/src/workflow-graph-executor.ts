@@ -12,6 +12,7 @@ import type {
 import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
 import { isNonPlanDefectPlanReviewFailure } from "./transient-error-detector.js";
 import { isRequiredArtifactReadFailedValue, parseRequiredArtifactMissingValue } from "./required-workflow-artifacts.js";
+import { PermanentError, TransientError } from "./engine-errors.js";
 
 import {
   createDefaultNodeHandlers,
@@ -56,6 +57,7 @@ type WorkflowNodeSettings = Pick<Settings, "experimentalFeatures"> & {
 export const PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE = "plan-review-provider-failure-hold";
 /** Node-ID-independent CCC terminal checkpoint classification for the outer executor. */
 export const CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY = "ccc:branch-persistence-failure";
+export const CCC_RETRY_CLASSIFICATION_CONTEXT_KEY = "ccc:retry-classification";
 
 /*
 FNXC:PlanReviewLease 2026-07-18-23:45:
@@ -641,6 +643,7 @@ export class WorkflowGraphExecutor {
           context[`node:${splitResult.joinNodeId}:branchOutcomes`] = splitResult.branchOutcomes;
           if (splitResult.failureReason) {
             context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = splitResult.failureReason;
+            return { outcome: "failure", value: splitResult.failureReason };
           }
           if (!inStack.has(splitResult.joinNodeId)) visitedNodeIds.push(splitResult.joinNodeId);
           return await traverseChildren(
@@ -1073,11 +1076,16 @@ export class WorkflowGraphExecutor {
         context[`node:${node.id}:outcome`] = result.outcome;
         if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
 
+        const cccClassification = context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY];
+        if (typeof cccClassification === "string" && cccClassification.startsWith("ccc-")) {
+          return { outcome: "failure", value: cccClassification };
+        }
+
         if (result.outcome === "success") {
           const checkpointFailure = await checkpointCccFrontier(node);
           if (checkpointFailure) {
             context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = checkpointFailure;
-            return await traverseChildren(node, { outcome: "failure", value: checkpointFailure });
+            return { outcome: "failure", value: checkpointFailure };
           }
         }
 
@@ -1500,6 +1508,7 @@ export class WorkflowGraphExecutor {
       : this.maxRetriesPerNode;
 
     let lastError: unknown;
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // Fail-fast cancellation: a branch or top-level graph abort mid-retry stops re-trying.
       if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
@@ -1534,6 +1543,7 @@ export class WorkflowGraphExecutor {
       } catch (error) {
         if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
         lastError = error;
+        if (cccFusionTask && error instanceof PermanentError) break;
       }
     }
 
@@ -1565,10 +1575,16 @@ export class WorkflowGraphExecutor {
       }
       return degraded;
     }
+    const cccClassification = cccFusionTask && lastError instanceof PermanentError
+      ? `ccc-permanent:${lastError.code}`
+      : cccFusionTask && lastError instanceof TransientError
+        ? `ccc-transient-retry-exhausted:${lastError.code}`
+        : undefined;
     const failureResult: WorkflowNodeResult = {
       outcome: "failure",
-      value: "exception",
+      value: cccClassification ?? "exception",
       contextPatch: {
+        ...(cccClassification ? { [CCC_RETRY_CLASSIFICATION_CONTEXT_KEY]: cccClassification } : {}),
         [`node:${node.id}:error`]: lastError instanceof Error ? lastError.message : String(lastError),
       },
     };

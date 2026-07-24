@@ -18,6 +18,68 @@ const resultRoot = join(dataRoot, "machine-results");
 const reportPath = join(proofRoot, "report.json");
 const manifestPath = join(proofRoot, "manifest.json");
 
+const expectedCoreGateNames = [
+  "VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL) > creates a task and reads it back",
+  "VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL) > moves a task through all columns",
+  "VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL) > archives and lists tasks",
+  "VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL) > updates task fields and they persist",
+  "VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL) > searches tasks by description",
+  "VAL-CROSS-001: End-to-end task lifecycle (PostgreSQL) > deletes a task (soft-delete)",
+  "handoff-to-review transactional invariant (PostgreSQL) > atomically moves column + enqueues merge queue + creates workflow work item",
+  "handoff-to-review transactional invariant (PostgreSQL) > is idempotent and records the retry status in the handoff audit",
+  "handoff-to-review transactional invariant (PostgreSQL) > rejects handoff of a soft-deleted task without partial writes",
+  "handoff-to-review transactional invariant (PostgreSQL) > rollback of the outer handoff tx must not leave orphaned workflow work items (#12)",
+];
+const expectedRestartIntegrationNames = [
+  "In-progress task resume after restart > resumeOrphaned() calls execute() for each in-progress task not already executing",
+  "In-progress task resume after restart > resumed task reuses existing worktree — no git worktree add called",
+  "In-progress task resume after restart > resumed task with step progress includes RESUMING section in agent prompt",
+  "In-progress task resume after restart > resumed task does NOT re-run worktreeInitCommand",
+  "In-progress task resume after restart > recovers a step whose code review approved before the engine stopped (no review replay)",
+  "In-progress task resume after restart > does NOT recover a step that was reset to pending after its code review approved",
+  "In-progress task resume after restart > does NOT recover a step whose code review only revised (no APPROVE)",
+  "In-progress task resume after restart > recovers multiple in-progress steps that each have approved code reviews",
+  "In-progress task resume after restart > resumeOrphaned() logs 'Resumed after engine restart' for each orphaned task",
+  "In-progress task resume after restart > resumeOrphaned() fast-paths already-complete tasks to in-review",
+  "In-progress task resume after restart > resumeOrphaned() does not block startup on completed-task recovery",
+  "In-progress task resume after restart > resumeOrphaned() leaves no-progress no-fn_task_done failures for self-healing",
+  "In-progress task resume after restart > recoverCompletedTask() re-enters the workflow graph (records results + owns the transition)",
+  "In-progress task resume after restart > recoverCompletedTask() skips graph re-entry when enabled pre-merge gates already passed",
+  "In-progress task resume after restart > recoverCompletedTask() legally re-homes a completed triage zombie before review handoff",
+  "In-progress task resume after restart > recoverCompletedTask() treats passed default review rows as satisfied when enabled steps are absent",
+  "In-progress task resume after restart > recoverCompletedTask() fails closed (KTD-5) when the store lacks getTaskWorkflowSelection and the task has enabled workflow steps",
+  "In-progress task resume after restart > recoverCompletedTask() refuses graph re-entry when the live task has incomplete steps",
+  "In-progress task resume after restart > recoverCompletedTask() yields to a scheduled workflow remediation bounce",
+  "In-review merge handling after restart > aiMergeTask validates task is in 'in-review' before merging",
+  "In-review merge handling after restart > aiMergeTask sets status to 'merging' during execution and clears on success",
+  "In-review merge handling after restart > sequential aiMergeTask calls for multiple in-review tasks all succeed",
+  "In-review merge handling after restart > aiMergeTask throws on agent failure during session.prompt and calls git reset --merge",
+  "In-review merge handling after restart > aiMergeTask blocks done transition when branch is missing and ownership evidence is unproven",
+  "Triage re-pick after restart > TriageProcessor.start() after restart picks up triage tasks (processing set is fresh)",
+  "Triage re-pick after restart > specifyTask() skips task already in processing set (no double-specification)",
+  "Scheduler after restart > schedule() moves todo tasks to in-progress when deps are satisfied",
+  "Scheduler after restart > schedule() respects dependency ordering — blocked tasks stay in todo",
+  "Scheduler after restart > full column coverage: restart with tasks in every column",
+  "Crash scenario edge cases > agent dies mid-step — onError is called, semaphore slot released, task eligible for resume",
+  "Crash scenario edge cases > engine killed during merge — git reset --merge cleanup, task stays in-review",
+  "Crash scenario edge cases > concurrent resumeOrphaned() calls don't double-execute the same task",
+  "Crash scenario edge cases > semaphore integrity after crash — activeCount returns to pre-execution value",
+  "Worktree pool restart with recycleWorktrees=true > pool is rehydrated with idle worktrees from disk",
+  "Worktree pool restart with recycleWorktrees=true > executor acquires from rehydrated pool instead of creating new worktrees",
+  "Worktree pool restart with recycleWorktrees=true > worktrees assigned to in-progress tasks are preserved (not in pool)",
+  "Worktree pool restart with recycleWorktrees=true > worktrees assigned to in-review tasks are preserved (not in pool)",
+  "Worktree cleanup on restart with recycleWorktrees=false > orphaned worktrees are cleaned up via git worktree remove",
+  "Worktree cleanup on restart with recycleWorktrees=false > worktrees assigned to in-progress tasks are preserved during cleanup",
+  "Worktree cleanup on restart with recycleWorktrees=false > worktrees assigned to in-review tasks are preserved during cleanup",
+  "Edge case: worktree deleted between scan and acquire > acquire returns null when rehydrated worktree was deleted from disk",
+  "Engine pause/unpause cycle > executor: agents continue running on enginePaused (soft pause), complete normally",
+  "Engine pause/unpause cycle > triage: agents NOT terminated on enginePaused (soft pause), session continues",
+  "Engine pause/unpause cycle > scheduler resumes on unpause: schedule() runs when enginePaused goes true→false",
+  "Engine pause/unpause cycle > concurrency slots freed after agent completes during enginePaused (soft pause)",
+  "getTaskMergeBlocker import regression > getTaskMergeBlocker is importable from @fusion/core at runtime",
+  "getTaskMergeBlocker import regression > getTaskMergeBlocker rejects non-in-review tasks",
+  "getTaskMergeBlocker import regression > aiMergeTask can be loaded from merger module (getTaskMergeBlocker reachable)",
+];
 const expectedRestartNames = [
   "CCC Wave 4 PostgreSQL branch persistence > Wave 4 control: PostgreSQL persists uninterrupted A → {B,C} → D",
   "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: ccc branch admission failure stops before the first branch effect",
@@ -25,12 +87,14 @@ const expectedRestartNames = [
   "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: PostgreSQL death during B and C resumes only unfinished branch work",
   "CCC Wave 4 PostgreSQL branch persistence > Wave 4 preservation: PostgreSQL restart after durable A resumes at the split without replaying A",
   "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: failed PostgreSQL fixture teardown preserves a redacted diagnostic packet",
+  "CCC Wave 4 PostgreSQL branch persistence > Wave 4 RED: early teardown and packet-write failures preserve the original redacted cause",
 ];
 const expectedRetryNames = [
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: transient failure consumes exactly the configured total attempt count",
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: permanent failure is attempted once and parks manual-required",
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: transient exhaustion consumes three calls and parks exhausted",
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: consumed retrying cap fails closed without another handler call",
+  "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: claimed retrying cap exhausts without dispatch through the native processor",
 ];
 
 function assertionName(assertion) {
@@ -117,14 +181,15 @@ const commands = [
   {
     id: "core-pg-gate",
     command: ["pnpm", "--filter", "@fusion/core", "test:pg-gate"],
-    expectedNames: null,
-    machineResults: false,
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedCoreGateNames,
+    machineResults: true,
   },
   {
     id: "engine-restart-integration",
     command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/restart.integration.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
     vitestArgs: ["--reporter=json"],
-    expectedNames: null,
+    expectedNames: expectedRestartIntegrationNames,
     machineResults: true,
   },
   {
@@ -225,21 +290,31 @@ let stderr = "";
 child.stdout.on("data", (chunk) => { stdout += String(chunk); });
 child.stderr.on("data", (chunk) => { stderr += String(chunk); });
 let forwardedSignal = null;
-const forwardSignal = (signal) => { forwardedSignal ??= signal; child.kill(signal); };
+let parentForceKillTimer = null;
+const forwardSignal = (signal) => {
+  forwardedSignal ??= signal;
+  child.kill(signal);
+  parentForceKillTimer ??= setTimeout(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }, 2_000);
+};
 const forwardSigInt = () => forwardSignal("SIGINT");
 const forwardSigTerm = () => forwardSignal("SIGTERM");
 process.once("SIGINT", forwardSigInt);
 process.once("SIGTERM", forwardSigTerm);
-const exitCode = await new Promise((resolve, reject) => {
-  child.once("error", reject);
+let supervisorSpawnError = null;
+const exitCode = await new Promise((resolve) => {
+  child.once("error", (error) => { supervisorSpawnError = redact(error instanceof Error ? error.message : String(error)); resolve(1); });
   child.once("exit", resolve);
 });
 process.removeListener("SIGINT", forwardSigInt);
 process.removeListener("SIGTERM", forwardSigTerm);
+if (parentForceKillTimer) clearTimeout(parentForceKillTimer);
 const supervisorLine = stdout.split("\n").find((line) => line.startsWith("CCC_W4_SUPERVISOR_RESULT="));
 let supervisorResult = { results: [], database: "ccc_wave4_proof" };
 let policyError;
 try {
+  if (supervisorSpawnError) throw new Error(`supervisor spawn rejected: ${supervisorSpawnError}`);
   if (!supervisorLine) throw new Error("supervisor did not emit machine result");
   supervisorResult = JSON.parse(supervisorLine.slice("CCC_W4_SUPERVISOR_RESULT=".length));
   if (forwardedSignal) throw new Error(`proof runner interrupted by ${forwardedSignal}`);
@@ -255,14 +330,16 @@ try {
     if (command.expectedNames) assertClosedNamedResults(command.expectedNames, assertions, command.id);
   }
 } catch (error) {
-  policyError = error instanceof Error ? error.message : String(error);
+  policyError = redact(error instanceof Error ? error.message : String(error));
 }
 
 const passed = exitCode === 0 && policyError === undefined;
 const report = {
   wave: 4,
   passed,
-  commands: supervisorResult.results.map(({ outputFile, ...result }) => result),
+  commands: supervisorResult.results.map(({ outputFile, ...result }) => Object.fromEntries(
+    Object.entries(result).map(([key, value]) => [key, typeof value === "string" ? redact(value) : value]),
+  )),
   policyError: policyError ?? null,
 };
 await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
