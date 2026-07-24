@@ -54,12 +54,12 @@ pgDescribe("CCC Wave 4 PostgreSQL retry classification", () => {
       expect(result.disposition).toBe("completed");
       expect(calls).toBe(3);
       expect(durable).toEqual(expect.objectContaining({ state: "succeeded", attempt: 3 }));
-      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").reverse().map((event) => ({ mutationType: event.mutationType, state: event.metadata?.state, attempt: event.metadata?.attempt }))).toEqual([
-        { mutationType: "workflow:work-item-transition", state: "retrying", attempt: 1 },
-        { mutationType: "workflow:work-item-transition", state: "running", attempt: 2 },
-        { mutationType: "workflow:work-item-transition", state: "retrying", attempt: 2 },
-        { mutationType: "workflow:work-item-transition", state: "running", attempt: 3 },
-        { mutationType: "workflow:work-item-transition", state: "succeeded", attempt: 3 },
+      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").reverse().map((event) => ({ mutationType: event.mutationType, state: event.metadata?.state, attempt: event.metadata?.attempt, classification: event.metadata?.classification }))).toEqual([
+        { mutationType: "workflow:work-item-transition", state: "retrying", attempt: 1, classification: "ccc-transient-retry" },
+        { mutationType: "workflow:work-item-transition", state: "running", attempt: 2, classification: "ccc-transient-resume" },
+        { mutationType: "workflow:work-item-transition", state: "retrying", attempt: 2, classification: "ccc-transient-retry" },
+        { mutationType: "workflow:work-item-transition", state: "running", attempt: 3, classification: "ccc-transient-resume" },
+        { mutationType: "workflow:work-item-transition", state: "succeeded", attempt: 3, classification: "ccc-transient-succeeded" },
       ]);
     } finally {
       await harness.teardown();
@@ -95,7 +95,7 @@ pgDescribe("CCC Wave 4 PostgreSQL retry classification", () => {
         attempt: 1,
         blockedReason: "ccc-permanent:CCC_PERMANENT",
       }));
-      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").map((event) => event.metadata?.state)).toEqual(["manual-required"]);
+      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").map((event) => ({ state: event.metadata?.state, classification: event.metadata?.classification }))).toEqual([{ state: "manual-required", classification: "ccc-permanent" }]);
     } finally {
       await harness.teardown();
     }
@@ -112,6 +112,32 @@ pgDescribe("CCC Wave 4 PostgreSQL retry classification", () => {
       expect(calls).toBe(3);
       expect(result.disposition).toBe("failed");
       expect(durable).toEqual(expect.objectContaining({ state: "exhausted", attempt: 3 }));
+      const audit = await harness.store.getRunAuditEventsAsync({ runId: "wave4-exhausted-run" });
+      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").reverse().map((event) => ({ state: event.metadata?.state, attempt: event.metadata?.attempt, classification: event.metadata?.classification }))).toEqual([
+        { state: "retrying", attempt: 1, classification: "ccc-transient-retry" },
+        { state: "running", attempt: 2, classification: "ccc-transient-resume" },
+        { state: "retrying", attempt: 2, classification: "ccc-transient-retry" },
+        { state: "running", attempt: 3, classification: "ccc-transient-resume" },
+        { state: "exhausted", attempt: 3, classification: "ccc-transient-exhausted" },
+      ]);
+    } finally { await harness.teardown(); }
+  });
+
+  it("Wave 4 RED: consumed retrying cap fails closed without another handler call", async () => {
+    const harness = await createTaskStoreForTest({ prefix: "fusion_ccc_wave4_consumed", copyFromGolden: true });
+    try {
+      const task = await harness.store.createTask({ description: "CCC consumed retry cap" });
+      const item = await harness.store.upsertWorkflowWorkItem({ runId: "wave4-consumed-run", taskId: task.id, nodeId: "retry", kind: "task", state: "retrying", attempt: 3 });
+      let calls = 0;
+      const result = await runtimeFor(harness.store, async () => { calls += 1; return { outcome: "success" }; }).runWorkItem(item, {});
+      const durable = await harness.store.getWorkflowWorkItem(item.id);
+      expect(result.disposition).toBe("failed");
+      expect(calls).toBe(0);
+      expect(durable).toEqual(expect.objectContaining({ state: "exhausted", attempt: 3, lastError: "ccc-transient-retry-exhausted" }));
+      const audit = await harness.store.getRunAuditEventsAsync({ runId: "wave4-consumed-run" });
+      expect(audit.filter((event) => event.mutationType === "workflow:work-item-transition").map((event) => event.metadata)).toEqual([
+        { state: "exhausted", attempt: 3, classification: "ccc-transient-exhausted" },
+      ]);
     } finally { await harness.teardown(); }
   });
 });

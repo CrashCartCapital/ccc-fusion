@@ -169,10 +169,6 @@ export class WorkflowTaskRuntime {
         reason,
       };
     }
-    if (workItem.state !== "running") {
-      return await this.failWorkItem(workItem, `workflow-work-item-not-running:${workItem.state}`);
-    }
-
     let task: TaskDetail;
     try {
       task = await this.deps.store.getTask(workItem.taskId);
@@ -190,6 +186,28 @@ export class WorkflowTaskRuntime {
     const node = target.ir.nodes.find((candidate) => candidate.id === workItem.nodeId);
     if (!node) {
       return await this.failWorkItem(workItem, `workflow-work-item-node-missing:${workItem.nodeId}`);
+    }
+
+    const configuredRetries = Number(node.config?.maxRetries);
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const maxAttempts = Number.isFinite(configuredRetries) && configuredRetries >= 1
+      ? Math.min(10, Math.floor(configuredRetries))
+      : 1;
+    const currentAttempt = Math.max(1, workItem.attempt);
+    if (workItem.state !== "running") {
+      if (cccFusionTask && workItem.state === "retrying" && currentAttempt >= maxAttempts) {
+        const reason = "ccc-transient-retry-exhausted";
+        await this.deps.store.transitionWorkflowWorkItem(workItem.id, "exhausted", {
+          attempt: currentAttempt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastError: reason,
+        });
+        await this.recordWorkItemTransition(workItem, "exhausted", currentAttempt, "ccc-transient-exhausted");
+        this.emit("terminal", workItem.taskId, "work-item:failed");
+        return { disposition: "failed", outcome: "failure", visitedNodeIds: [], context: {}, reason };
+      }
+      return await this.failWorkItem(workItem, `workflow-work-item-not-running:${workItem.state}`);
     }
 
     if (workItem.kind === "merge" || workItem.kind === "manual-hold") {
@@ -223,12 +241,7 @@ export class WorkflowTaskRuntime {
     native TransientError failures consume another bounded attempt; a
     PermanentError is classified once and durably parked for operator action.
     */
-    const configuredRetries = Number(node.config?.maxRetries);
-    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
-    const maxAttempts = Number.isFinite(configuredRetries) && configuredRetries >= 1
-      ? Math.min(10, Math.floor(configuredRetries))
-      : 1;
-    let attempt = Math.max(1, workItem.attempt);
+    let attempt = currentAttempt;
     for (;;) {
       try {
         const result = handler
@@ -249,7 +262,7 @@ export class WorkflowTaskRuntime {
             lastError: reason,
             blockedReason: reason,
           });
-          await this.recordWorkItemTransition(workItem, "manual-required", attempt, reason);
+          await this.recordWorkItemTransition(workItem, "manual-required", attempt, "ccc-permanent");
           this.emit("terminal", workItem.taskId, "work-item:manual-required");
           return { disposition: "manual-required", outcome: "failure", visitedNodeIds: invoked, context, reason };
         }
@@ -258,13 +271,13 @@ export class WorkflowTaskRuntime {
             attempt,
             lastError: `ccc-transient:${err.code}`,
           });
-          await this.recordWorkItemTransition(workItem, "retrying", attempt, `ccc-transient:${err.code}`);
+          await this.recordWorkItemTransition(workItem, "retrying", attempt, "ccc-transient-retry");
           attempt += 1;
           await this.deps.store.transitionWorkflowWorkItem(workItem.id, "running", {
             attempt,
             lastError: null,
           });
-          await this.recordWorkItemTransition(workItem, "running", attempt);
+          await this.recordWorkItemTransition(workItem, "running", attempt, "ccc-transient-resume");
           continue;
         }
         outcome = "failure";
@@ -293,7 +306,14 @@ export class WorkflowTaskRuntime {
       leaseExpiresAt: null,
       lastError: reason ?? null,
     });
-    if (cccFusionTask) await this.recordWorkItemTransition(workItem, terminalState, attempt, reason);
+    if (cccFusionTask) {
+      const classification = terminalState === "exhausted"
+        ? "ccc-transient-exhausted"
+        : terminalState === "succeeded"
+          ? "ccc-transient-succeeded"
+          : "ccc-work-item-failed";
+      await this.recordWorkItemTransition(workItem, terminalState, attempt, classification);
+    }
     this.emit("terminal", workItem.taskId, `work-item:${disposition}`);
     return {
       disposition,
@@ -324,7 +344,7 @@ export class WorkflowTaskRuntime {
     workItem: WorkflowWorkItem,
     state: WorkflowWorkItemState,
     attempt: number,
-    reason?: string,
+    classification: string,
   ): Promise<void> {
     await this.deps.store.recordRunAuditEvent?.({
       taskId: workItem.taskId,
@@ -333,7 +353,7 @@ export class WorkflowTaskRuntime {
       domain: "database",
       mutationType: "workflow:work-item-transition",
       target: workItem.id,
-      metadata: { state, attempt, ...(reason ? { reason } : {}) },
+      metadata: { state, attempt, classification },
     });
   }
 

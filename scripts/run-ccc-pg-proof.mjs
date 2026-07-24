@@ -30,6 +30,7 @@ const expectedRetryNames = [
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: transient failure consumes exactly the configured total attempt count",
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: permanent failure is attempted once and parks manual-required",
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: transient exhaustion consumes three calls and parks exhausted",
+  "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: consumed retrying cap fails closed without another handler call",
 ];
 
 function assertionName(assertion) {
