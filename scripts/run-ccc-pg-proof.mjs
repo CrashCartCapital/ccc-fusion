@@ -29,6 +29,7 @@ const expectedRestartNames = [
 const expectedRetryNames = [
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: transient failure consumes exactly the configured total attempt count",
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: permanent failure is attempted once and parks manual-required",
+  "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: transient exhaustion consumes three calls and parks exhausted",
 ];
 
 function assertionName(assertion) {
@@ -120,10 +121,15 @@ const supervisor = `
   const lifecycle = new EmbeddedPostgresLifecycle({ dataDir: process.env.CCC_W4_DATA_ROOT, database: "ccc_wave4_proof" });
   const commands = JSON.parse(process.env.CCC_W4_COMMANDS);
   const results = [];
+  const timeoutMs = Number(process.env.CCC_W4_CHILD_TIMEOUT_MS ?? 120000);
   const run = (cmd, args, env) => new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd: process.env.CCC_W4_REPO_ROOT, env, stdio: ["ignore", "ignore", "ignore"] });
-    child.once("error", reject); child.once("exit", (code) => resolve(Number(code ?? 1)));
+    let settled = false;
+    const finish = (result) => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
+    const timer = setTimeout(() => { child.kill("SIGTERM"); child.once("exit", () => finish({ code: 1, timedOut: true })); }, timeoutMs);
+    child.once("error", reject); child.once("exit", (code, signal) => finish({ code: Number(code ?? 1), signal: signal ?? null, timedOut: false }));
   });
+  let stopError = null;
   try {
     await lifecycle.start();
     const url = new URL(lifecycle.getConnectionUrl()); url.pathname = "/";
@@ -133,13 +139,13 @@ const supervisor = `
       const args = entry.machineResults
         ? [...entry.command.slice(1), ...entry.vitestArgs, "--outputFile", outputFile]
         : entry.command.slice(1);
-      const code = await run(entry.command[0], args, { ...process.env, FUSION_PG_TEST_URL_BASE: url.href.slice(0, -1) });
-      results.push({ id: entry.id, command: entry.command, code, outputFile });
-      if (code !== 0) break;
+      const outcome = await run(entry.command[0], args, { ...process.env, FUSION_PG_TEST_URL_BASE: url.href.slice(0, -1) });
+      results.push({ id: entry.id, command: entry.command, ...outcome, outputFile });
+      if (outcome.code !== 0) break;
     }
-  } finally { await lifecycle.stop().catch(() => {}); }
-  process.stdout.write("CCC_W4_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: "ccc_wave4_proof" }) + "\\n");
-  if (results.some((result) => result.code !== 0) || results.length !== commands.length) process.exitCode = 1;
+  } finally { try { await lifecycle.stop(); } catch (error) { stopError = error instanceof Error ? error.message : String(error); } }
+  process.stdout.write("CCC_W4_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: "ccc_wave4_proof", stopError }) + "\\n");
+  if (stopError || results.some((result) => result.code !== 0) || results.length !== commands.length) process.exitCode = 1;
 `;
 
 function redact(text) {
@@ -173,6 +179,7 @@ let policyError;
 try {
   if (!supervisorLine) throw new Error("supervisor did not emit machine result");
   supervisorResult = JSON.parse(supervisorLine.slice("CCC_W4_SUPERVISOR_RESULT=".length));
+  if (supervisorResult.stopError) throw new Error(`embedded PostgreSQL stop failed: ${supervisorResult.stopError}`);
   for (const command of commands) {
     const result = supervisorResult.results.find((entry) => entry.id === command.id);
     if (!result) throw new Error(`missing command result: ${command.id}`);

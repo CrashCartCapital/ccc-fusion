@@ -209,6 +209,24 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(branchOutcomes.some((b) => b.outcome === "success")).toBe(true);
   });
 
+  it("Wave 4 RED: CCC persistence failure aborts a collect join before its next sibling effect", async () => {
+    const calls: string[] = [];
+    const executor = new WorkflowGraphExecutor({
+      branchPersistence: {
+        saveBranchState: async (state) => {
+          if (state.branchId === "branchA" && state.status === "completed") {
+            throw new Error("durable terminal checkpoint failed");
+          }
+        },
+      },
+      handlers: { prompt: async (node) => { calls.push(node.id); return { outcome: "success" as const }; } },
+    });
+    const result = await executor.run({ ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), twoBranchIr({ mode: "all", onBranchFailure: "collect" }));
+
+    expect(result.outcome).toBe("failure");
+    expect(calls).not.toContain("branchB");
+  });
+
   it("crash mid-branch resume — completed branches' nodes are NOT re-run", async () => {
     const calls: string[] = [];
     const store: WorkflowBranchRunState[] = [];

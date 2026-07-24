@@ -170,26 +170,26 @@ export class WorkflowTaskRuntime {
       };
     }
     if (workItem.state !== "running") {
-      return this.failWorkItem(workItem, `workflow-work-item-not-running:${workItem.state}`);
+      return await this.failWorkItem(workItem, `workflow-work-item-not-running:${workItem.state}`);
     }
 
     let task: TaskDetail;
     try {
       task = await this.deps.store.getTask(workItem.taskId);
     } catch (err) {
-      return this.failWorkItem(workItem, `workflow-work-item-task-missing:${err instanceof Error ? err.message : String(err)}`);
+      return await this.failWorkItem(workItem, `workflow-work-item-task-missing:${err instanceof Error ? err.message : String(err)}`);
     }
 
     let target: WorkflowRuntimeTarget;
     try {
       target = await this.resolveRuntimeTarget(workItem.taskId);
     } catch (err) {
-      return this.failWorkItem(workItem, `workflow-resolution-error: ${err instanceof Error ? err.message : String(err)}`);
+      return await this.failWorkItem(workItem, `workflow-resolution-error: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     const node = target.ir.nodes.find((candidate) => candidate.id === workItem.nodeId);
     if (!node) {
-      return this.failWorkItem(workItem, `workflow-work-item-node-missing:${workItem.nodeId}`);
+      return await this.failWorkItem(workItem, `workflow-work-item-node-missing:${workItem.nodeId}`);
     }
 
     if (workItem.kind === "merge" || workItem.kind === "manual-hold") {
@@ -203,7 +203,7 @@ export class WorkflowTaskRuntime {
     const invoked: string[] = [];
     const handler = this.recordingHandlers(invoked)[node.kind];
     if (!handler && node.kind !== "start" && node.kind !== "end") {
-      return this.failWorkItem(workItem, `workflow-work-item-node-unhandled:${node.kind}`);
+      return await this.failWorkItem(workItem, `workflow-work-item-node-unhandled:${node.kind}`);
     }
 
     const runtimeSettings = buildWorkflowRuntimeSettings(settings);
@@ -224,6 +224,7 @@ export class WorkflowTaskRuntime {
     PermanentError is classified once and durably parked for operator action.
     */
     const configuredRetries = Number(node.config?.maxRetries);
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
     const maxAttempts = Number.isFinite(configuredRetries) && configuredRetries >= 1
       ? Math.min(10, Math.floor(configuredRetries))
       : 1;
@@ -239,7 +240,7 @@ export class WorkflowTaskRuntime {
         reason = result.outcome === "failure" ? result.value ?? "workflow-work-item-node-failed" : undefined;
         break;
       } catch (err) {
-        if (err instanceof PermanentError) {
+        if (cccFusionTask && err instanceof PermanentError) {
           const reason = `ccc-permanent:${err.code}`;
           await this.deps.store.transitionWorkflowWorkItem(workItem.id, "manual-required", {
             attempt,
@@ -252,7 +253,7 @@ export class WorkflowTaskRuntime {
           this.emit("terminal", workItem.taskId, "work-item:manual-required");
           return { disposition: "manual-required", outcome: "failure", visitedNodeIds: invoked, context, reason };
         }
-        if (err instanceof TransientError && attempt < maxAttempts) {
+        if (cccFusionTask && err instanceof TransientError && attempt < maxAttempts) {
           await this.deps.store.transitionWorkflowWorkItem(workItem.id, "retrying", {
             attempt,
             lastError: `ccc-transient:${err.code}`,
@@ -267,7 +268,7 @@ export class WorkflowTaskRuntime {
           continue;
         }
         outcome = "failure";
-        reason = err instanceof TransientError
+        reason = cccFusionTask && err instanceof TransientError
           ? `ccc-transient-retry-exhausted:${err.code}`
           : `workflow-work-item-node-error:${err instanceof Error ? err.message : String(err)}`;
         break;
@@ -279,7 +280,9 @@ export class WorkflowTaskRuntime {
       : reason === "manual-required"
         ? "manual-required"
         : "failed";
-    const terminalState: WorkflowWorkItemState = disposition === "completed"
+    const terminalState: WorkflowWorkItemState = cccFusionTask && reason?.startsWith("ccc-transient-retry-exhausted:")
+      ? "exhausted"
+      : disposition === "completed"
       ? "succeeded"
       : disposition === "manual-required"
         ? "manual-required"
@@ -290,7 +293,7 @@ export class WorkflowTaskRuntime {
       leaseExpiresAt: null,
       lastError: reason ?? null,
     });
-    await this.recordWorkItemTransition(workItem, terminalState, attempt, reason);
+    if (cccFusionTask) await this.recordWorkItemTransition(workItem, terminalState, attempt, reason);
     this.emit("terminal", workItem.taskId, `work-item:${disposition}`);
     return {
       disposition,
@@ -301,8 +304,8 @@ export class WorkflowTaskRuntime {
     };
   }
 
-  private failWorkItem(workItem: WorkflowWorkItem, reason: string): WorkflowTaskRuntimeResult {
-    this.deps.store.transitionWorkflowWorkItem!(workItem.id, "failed", {
+  private async failWorkItem(workItem: WorkflowWorkItem, reason: string): Promise<WorkflowTaskRuntimeResult> {
+    await this.deps.store.transitionWorkflowWorkItem!(workItem.id, "failed", {
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: reason,

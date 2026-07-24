@@ -163,7 +163,7 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
 
       expect(result.outcome).toBe("failure");
       expect(calls).toEqual(["A"]);
-      expect(result.context["node:split:branchPersistenceFailure"]).toBe("ccc-branch-persistence-admission-failed");
+      expect(result.context["ccc:branch-persistence-failure"]).toBe("ccc-branch-persistence-admission-failed");
     } finally {
       await harness.teardown();
     }
@@ -200,7 +200,7 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
       expect(result.outcome).toBe("failure");
       expect(calls).toContain("B");
       expect(calls).not.toContain("D");
-      expect(result.context["node:split:branchPersistenceFailure"]).toBe("ccc-branch-persistence-terminal-failed");
+      expect(result.context["ccc:branch-persistence-failure"]).toBe("ccc-branch-persistence-terminal-failed");
     } finally {
       await harness.teardown();
     }

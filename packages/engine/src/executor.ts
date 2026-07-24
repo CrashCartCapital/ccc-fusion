@@ -45,6 +45,7 @@ import {
 } from "./workflow-node-handlers.js";
 import {
   MERGE_REGION_KINDS,
+  CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY,
   PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE,
   WORKFLOW_DRIFT_PARK_CONTEXT_KEY,
   WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND,
@@ -6336,7 +6337,7 @@ export class TaskExecutor {
       }
       if (result.disposition === "failed") {
         if (continuation) {
-          const branchPersistenceFailure = result.context?.["node:split:branchPersistenceFailure"];
+          const branchPersistenceFailure = result.context?.[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY];
           const terminalCccBranchPersistenceFailure = typeof branchPersistenceFailure === "string"
             && branchPersistenceFailure.startsWith("ccc-branch-persistence-");
           /*

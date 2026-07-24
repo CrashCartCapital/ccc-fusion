@@ -126,7 +126,7 @@ describe("fast mode workflow/runtime invariants", () => {
       disposition: "failed",
       outcome: "failure",
       reason: "ccc-branch-persistence-terminal-failed",
-      context: { "node:split:branchPersistenceFailure": "ccc-branch-persistence-terminal-failed" },
+      context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
       visitedNodeIds: ["start", "A", "split", "B"],
     });
     const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);

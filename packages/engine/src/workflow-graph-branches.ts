@@ -122,6 +122,8 @@ export interface BranchEnvironment {
   onBranchProgress?: (progress: WorkflowBranchProgress) => void;
   /** Node IDs already completed in a prior (crashed) run — skipped on resume. */
   completedNodeIds?: Set<string>;
+  /** Branch IDs with a durable terminal row — never re-admit or re-walk them. */
+  completedBranchIds?: Set<string>;
 }
 
 export interface SplitJoinResult {
@@ -191,6 +193,7 @@ export async function runSplitJoin(
   if (failClosed) {
     try {
       for (const edge of branchEdges) {
+        if (env.completedBranchIds?.has(edge.to)) continue;
         await persistBranchState(env.persistence, {
           taskId: env.task.id,
           runId: env.runId,
@@ -229,9 +232,9 @@ export async function runSplitJoin(
 
   // Re-evaluate the join after each branch settles. `lastWasFailure` only
   // affects fail-fast (one failure cancels siblings immediately).
-  const evaluateJoin = (lastWasFailure: boolean): void => {
+  const evaluateJoin = (lastWasFailure: boolean, persistenceFailure = false): void => {
     if (settled) return;
-    if (joinConfig.onBranchFailure === "fail-fast" && lastWasFailure) {
+    if ((joinConfig.onBranchFailure === "fail-fast" && lastWasFailure) || persistenceFailure) {
       controller.abort();
       settle("failure");
       return;
@@ -248,8 +251,14 @@ export async function runSplitJoin(
     }
   };
 
-  const branchPromises = branchEdges.map((edge) => {
+  const runBranch = (edge: WorkflowIrEdge) => {
     const branchId = edge.to;
+    if (env.completedBranchIds?.has(branchId)) {
+      branchOutcomes.push({ branchId, outcome: "success", nodeId: branchId });
+      succeeded += 1;
+      evaluateJoin(false);
+      return Promise.resolve();
+    }
     return walkBranch(branchId, join, env, controller.signal, visitedNodeIds)
       .then((result) => {
         branchOutcomes.push({ branchId, outcome: result.outcome, nodeId: result.lastNodeId });
@@ -264,12 +273,24 @@ export async function runSplitJoin(
           return;
         }
         failed += 1;
-        if (err instanceof CccBranchPersistenceError) failureReason ??= err.reason;
+        const persistenceFailure = err instanceof CccBranchPersistenceError;
+        if (persistenceFailure) failureReason ??= err.reason;
         branchOutcomes.push({ branchId, outcome: "failure", nodeId: branchId });
-        evaluateJoin(true);
+        evaluateJoin(true, persistenceFailure);
         void err;
       });
-  });
+  };
+  // CCC's durable boundary is stronger than ordinary collect semantics: do not
+  // start a later sibling after a checkpoint failure is observed.
+  const branchPromises: Promise<void>[] = [];
+  if (failClosed) {
+    for (const edge of branchEdges) {
+      await runBranch(edge);
+      if (failureReason) break;
+    }
+  } else {
+    branchPromises.push(...branchEdges.map(runBranch));
+  }
 
   // Wait for the join to resolve, then let in-flight branches settle so collect
   // semantics (and persistence writes) complete before we return.

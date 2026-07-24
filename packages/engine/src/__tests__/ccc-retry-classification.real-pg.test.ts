@@ -13,8 +13,10 @@ const retryIr: WorkflowIr = {
 };
 
 function runtimeFor(store: any, handler: () => Promise<{ outcome: "success" }>): WorkflowTaskRuntime {
+  const getTask = store.getTask.bind(store);
   return new WorkflowTaskRuntime({
     store: Object.assign(store, {
+      getTask: async (taskId: string) => ({ ...await getTask(taskId), customFields: { cccFusionProfile: "ccc-fusion" } }),
       getTaskWorkflowSelection: () => ({ workflowId: "ccc-wave-4-retry" }),
       getTaskWorkflowSelectionAsync: async () => ({ workflowId: "ccc-wave-4-retry" }),
       getWorkflowDefinition: async () => ({ id: "ccc-wave-4-retry", ir: retryIr }),
@@ -97,5 +99,19 @@ pgDescribe("CCC Wave 4 PostgreSQL retry classification", () => {
     } finally {
       await harness.teardown();
     }
+  });
+
+  it("Wave 4 RED: transient exhaustion consumes three calls and parks exhausted", async () => {
+    const harness = await createTaskStoreForTest({ prefix: "fusion_ccc_wave4_exhausted", copyFromGolden: true });
+    try {
+      const task = await harness.store.createTask({ description: "CCC transient exhaustion" });
+      const item = await harness.store.upsertWorkflowWorkItem({ runId: "wave4-exhausted-run", taskId: task.id, nodeId: "retry", kind: "task", state: "running", attempt: 1 });
+      let calls = 0;
+      const result = await runtimeFor(harness.store, async () => { calls += 1; throw new TransientError("always transient", "CCC_TRANSIENT"); }).runWorkItem(item, {});
+      const durable = await harness.store.getWorkflowWorkItem(item.id);
+      expect(calls).toBe(3);
+      expect(result.disposition).toBe("failed");
+      expect(durable).toEqual(expect.objectContaining({ state: "exhausted", attempt: 3 }));
+    } finally { await harness.teardown(); }
   });
 });

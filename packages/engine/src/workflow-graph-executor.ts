@@ -54,6 +54,8 @@ type WorkflowNodeSettings = Pick<Settings, "experimentalFeatures"> & {
 
 /** A classified Plan Review provider outage terminates the graph without replan traversal. */
 export const PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE = "plan-review-provider-failure-hold";
+/** Node-ID-independent CCC terminal checkpoint classification for the outer executor. */
+export const CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY = "ccc:branch-persistence-failure";
 
 /*
 FNXC:PlanReviewLease 2026-07-18-23:45:
@@ -516,12 +518,18 @@ export class WorkflowGraphExecutor {
     // On resume, completed branch nodes (from a prior crashed run) are skipped
     // so their handlers do not re-fire (idempotency).
     let completedNodeIds: Set<string> | undefined;
+    let completedBranchIds: Set<string> | undefined;
     const persisted = await this.deps.branchPersistence?.loadBranchStates?.(task.id, runId);
     if (persisted && persisted.length > 0) {
       completedNodeIds = new Set(
         persisted
           .filter((s: WorkflowBranchRunState) => s.status === "completed")
           .map((s) => s.currentNodeId),
+      );
+      completedBranchIds = new Set(
+        persisted
+          .filter((s: WorkflowBranchRunState) => s.status === "completed")
+          .map((s) => s.branchId),
       );
     }
     /*
@@ -576,6 +584,7 @@ export class WorkflowGraphExecutor {
       semaphore: this.deps.branchSemaphore,
       onBranchProgress: this.deps.onBranchProgress,
       completedNodeIds,
+      completedBranchIds,
     });
 
     // Execute one node and traverse its outgoing edges. May return a ReworkSignal
@@ -631,7 +640,7 @@ export class WorkflowGraphExecutor {
           context[`node:${splitResult.joinNodeId}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:branchOutcomes`] = splitResult.branchOutcomes;
           if (splitResult.failureReason) {
-            context[`node:${node.id}:branchPersistenceFailure`] = splitResult.failureReason;
+            context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = splitResult.failureReason;
           }
           if (!inStack.has(splitResult.joinNodeId)) visitedNodeIds.push(splitResult.joinNodeId);
           return await traverseChildren(
@@ -1067,7 +1076,7 @@ export class WorkflowGraphExecutor {
         if (result.outcome === "success") {
           const checkpointFailure = await checkpointCccFrontier(node);
           if (checkpointFailure) {
-            context[`node:${node.id}:branchPersistenceFailure`] = checkpointFailure;
+            context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = checkpointFailure;
             return await traverseChildren(node, { outcome: "failure", value: checkpointFailure });
           }
         }

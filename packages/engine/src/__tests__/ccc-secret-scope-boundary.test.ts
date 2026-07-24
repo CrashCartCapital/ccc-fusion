@@ -30,6 +30,15 @@ function baseTask(overrides: Record<string, unknown> = {}) {
 
 async function setupScopeTask(overrides: Record<string, unknown> = {}, scope = ["docs/allowed.md"], enforcement: "off" | "warn" | "block" = "warn") {
   const store = createMockStore();
+  const branchRows: any[] = [];
+  store.saveWorkflowRunBranch = vi.fn(async (state: any) => {
+    const index = branchRows.findIndex((row) => row.taskId === state.taskId && row.runId === state.runId && row.branchId === state.branchId);
+    if (index >= 0) branchRows[index] = { ...state }; else branchRows.push({ ...state });
+  });
+  store.loadWorkflowRunBranches = vi.fn(async (taskId: string, runId: string) => branchRows.filter((row) => row.taskId === taskId && row.runId === runId));
+  store.clearWorkflowRunBranches = vi.fn(async (taskId: string, keepRunId: string) => {
+    for (let index = branchRows.length - 1; index >= 0; index -= 1) if (branchRows[index].taskId === taskId && branchRows[index].runId !== keepRunId) branchRows.splice(index, 1);
+  });
   const task = baseTask(overrides);
   let tool: any;
   store.getTask.mockResolvedValue(task);
