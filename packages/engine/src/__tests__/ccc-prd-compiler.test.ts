@@ -1,0 +1,23 @@
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import * as engine from "@fusion/engine";
+
+type Result = { kind: "bundle" | "refusal"; bundleHash?: string; sources?: Array<{ path: string }>; requirements?: Array<{ id: string }>; diagnostics?: Array<{ code: string; span?: { path: string } }> };
+const ccc = engine as typeof engine & { compileCccPrdPacket(input: { rootDir: string; manifestPath: string }): Result; validateNeoCandidate(candidate: unknown): { valid: boolean; dispatch: Result } };
+const roots: string[] = [];
+afterEach(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
+const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+function packet(files: Record<string, string>, extra: Record<string, unknown> = {}) { const root = mkdtempSync(join(tmpdir(), "ccc-prd-")); roots.push(root); const entries = Object.entries(files).map(([relative_path, content]) => { const file = join(root, relative_path); mkdirSync(join(file, ".."), { recursive: true }); writeFileSync(file, content); return { relative_path, role: "root", authoritative: true, sha256: digest(content) }; }); const manifest = { schema: "ccc-prd.packet.v1", source_version: "test", entries, ...extra }; const manifestPath = join(root, "manifest.json"); writeFileSync(manifestPath, JSON.stringify(manifest)); return { root, manifestPath }; }
+const markdown = (id = "FR-1", proof = "prove it") => `| ${id} | requirement | ${proof} |\n`;
+
+describe("ccc-prd pure compiler", () => {
+  it("is deterministic and reports a one-byte admitted mutation against its source", () => { const input = packet({ "root.md": markdown() }); const first = ccc.compileCccPrdPacket({ rootDir: input.root, manifestPath: input.manifestPath }); const second = ccc.compileCccPrdPacket({ rootDir: input.root, manifestPath: input.manifestPath }); expect(second).toEqual(first); writeFileSync(join(input.root, "root.md"), `${markdown()} `); const changed = ccc.compileCccPrdPacket({ rootDir: input.root, manifestPath: input.manifestPath }); expect(changed.diagnostics?.[0]).toMatchObject({ code: "CCC_PRD_SOURCE_HASH_MISMATCH", span: { path: "root.md" } }); });
+  it("rejects undeclared escapes, symlinks, protected paths, unknown schema, conflicts, missing proof, deferred state, and unbounded loops", () => {
+    for (const [label, files, extra, expected] of [["escape", { "../extra.md": markdown() }, {}, "CCC_PRD_PATH_ESCAPE"], ["protected", { "_secrets/nope.md": markdown() }, {}, "CCC_PRD_PROTECTED_PATH"], ["schema", { "root.md": markdown() }, { schema: "unknown.v9" }, "CCC_PRD_UNKNOWN_SCHEMA"], ["conflict", { "a.md": markdown(), "b.md": markdown() }, {}, "CCC_PRD_AUTHORITY_CONFLICT"], ["proof", { "root.md": markdown("FR-1", "") }, {}, "CCC_PRD_MISSING_PROOF"], ["deferred", { "root.md": `${markdown()}\nstatus: DEFERRED` }, {}, "CCC_PRD_UNRESOLVED_DEFERRED"], ["loop", { "root.md": `${markdown()}\nwhile true` }, {}, "CCC_PRD_UNBOUNDED_LOOP"]] as const) { const input = packet(files, extra); expect(ccc.compileCccPrdPacket({ rootDir: input.root, manifestPath: input.manifestPath }).diagnostics?.[0]?.code, label).toBe(expected); }
+    const input = packet({ "root.md": markdown() }); symlinkSync(join(input.root, "root.md"), join(input.root, "link.md")); const manifest = JSON.parse(String(require("node:fs").readFileSync(input.manifestPath))); manifest.entries[0].relative_path = "link.md"; writeFileSync(input.manifestPath, JSON.stringify(manifest)); expect(ccc.compileCccPrdPacket({ rootDir: input.root, manifestPath: input.manifestPath }).diagnostics?.[0]?.code).toBe("CCC_PRD_PATH_ESCAPE");
+  });
+  it("validates Neo cold review but always refuses dispatch", () => expect(ccc.validateNeoCandidate({ schema_id: "autonomous_builder_handoff_candidate.v1", status: "READY_FOR_COLD_REVIEW" })).toMatchObject({ valid: true, dispatch: { kind: "refusal", diagnostics: [{ code: "CCC_PRD_DISPATCH_REFUSED" }] } }));
+});

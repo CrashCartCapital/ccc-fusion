@@ -153,6 +153,7 @@ async function loadCommandHandlers() {
   const { runSkillsSearch, runSkillsInstall } = await import("./commands/skills.js");
   const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = await import("./commands/research.js");
   const { runExperimentFinalize } = await import("./commands/experiment-finalize.js");
+  const { runPrdCommand } = await import("./commands/prd.js");
   const { dispatchUpdateCliArgs } = await import("./commands/update.js");
 
   return {
@@ -289,6 +290,7 @@ async function loadCommandHandlers() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    runPrdCommand,
     dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
@@ -816,6 +818,7 @@ async function main() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    runPrdCommand,
     dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
@@ -823,6 +826,10 @@ async function main() {
 
   try {
     switch (command) {
+      case "prd": {
+        process.exitCode = runPrdCommand(args.slice(1));
+        break;
+      }
       case "init": {
         // Parse init options
         const nameIdx = args.indexOf("--name");
