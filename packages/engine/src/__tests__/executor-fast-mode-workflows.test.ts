@@ -116,8 +116,8 @@ describe("fast mode workflow/runtime invariants", () => {
     }
   });
 
-  it("Wave 4 RED: terminal CCC branch persistence failure parks the native work item for manual action", async () => {
-    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+  it("Wave 4 verification: public TaskExecutor terminal CCC park bypasses generic in-review routing", async () => {
+    const liveTask = task({ status: "in-review", customFields: { cccFusionProfile: "ccc-fusion" } });
     const { store, executor } = makeExecutorForTask(liveTask);
     const workItem = { id: "WI-wave4-terminal", taskId: liveTask.id, kind: "task", state: "running", attempt: 1 };
     store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([workItem]);
@@ -129,7 +129,6 @@ describe("fast mode workflow/runtime invariants", () => {
       context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
       visitedNodeIds: ["start", "A", "split", "B"],
     });
-    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
 
     try {
       await (executor as any).executeWorkflowGraph(liveTask);
@@ -140,10 +139,12 @@ describe("fast mode workflow/runtime invariants", () => {
         leaseOwner: null,
         leaseExpiresAt: null,
       }));
-      expect(graphFailure).toHaveBeenCalledWith(liveTask, expect.objectContaining({ outcome: "failure" }));
+      expect(store.updateTask).toHaveBeenCalledTimes(1);
+      expect(store.updateTask).toHaveBeenLastCalledWith(liveTask.id, {
+        toolFailureDetectorLogCursor: 0,
+      }, undefined);
     } finally {
       run.mockRestore();
-      graphFailure.mockRestore();
     }
   });
 
@@ -161,7 +162,6 @@ describe("fast mode workflow/runtime invariants", () => {
       context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
       visitedNodeIds: ["start", "A", "fanout", "B"],
     });
-    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
 
     try {
       await executor.execute(liveTask);
@@ -173,10 +173,8 @@ describe("fast mode workflow/runtime invariants", () => {
         blockedReason: "ccc-branch-persistence-terminal-failed",
         lastError: "ccc-branch-persistence-terminal-failed",
       }));
-      expect(graphFailure).toHaveBeenCalledWith(liveTask, expect.objectContaining({ outcome: "failure" }));
     } finally {
       run.mockRestore();
-      graphFailure.mockRestore();
     }
   });
 

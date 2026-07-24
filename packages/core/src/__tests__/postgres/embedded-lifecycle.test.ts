@@ -1695,6 +1695,29 @@ describe("embedded-lifecycle: signal re-raise (P1 #23)", () => {
 });
 
 describe("embedded-lifecycle: proof-supervisor shutdown ownership", () => {
+  it("Wave 4 verification: owned postmaster liveness rejects EPERM instead of treating it as exit", async () => {
+    const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions("/tmp/wave4-owned-eperm") });
+    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
+    (lifecycle as unknown as { ownedPostmasterPid: number | null }).ownedPostmasterPid = 424242;
+    const realKill = process.kill;
+    const kill = vi.fn((pid: number, signal?: string | number) => {
+      expect(pid).toBe(424242);
+      if (signal === 0) {
+        const error = Object.assign(new Error("permission denied"), { code: "EPERM" });
+        throw error;
+      }
+    });
+    try {
+      (process as unknown as { kill: typeof process.kill }).kill = kill as typeof process.kill;
+      await expect(lifecycle.terminateOwnedPostmaster()).rejects.toMatchObject({ code: "EPERM" });
+      expect(kill).toHaveBeenCalledWith(424242, "SIGTERM");
+      expect(kill).toHaveBeenCalledWith(424242, 0);
+      expect(kill).not.toHaveBeenCalledWith(424242, "SIGKILL");
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+    }
+  });
+
   it("Wave 4 RED: proof opt-in exposes a reported stop failure without installing lifecycle signal hooks", async () => {
     const onError = vi.fn();
     const lifecycle = new EmbeddedPostgresLifecycle({
