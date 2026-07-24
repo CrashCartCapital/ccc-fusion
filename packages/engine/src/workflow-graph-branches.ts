@@ -30,7 +30,7 @@ export interface WorkflowBranchRunState {
 
 /**
  * Persistence callback surface. Kept as an injected interface so the executor
- * stays DI-pure and fake-friendly; the SQLite-backed implementation is wired
+ * stays DI-pure and fake-friendly; the PostgreSQL-backed implementation is wired
  * separately (see workflow_run_branches table). All methods are optional so a
  * fully in-memory run (tests, flag-off) needs no persistence at all.
  */
@@ -49,17 +49,42 @@ export interface WorkflowBranchPersistence {
 
 /**
  * Await a `saveBranchState` call inside a guard so a Promise-returning impl
- * cannot escape as an unhandled rejection, and so a persistence failure never
- * kills branch execution (log-and-continue). For a synchronous impl this
- * preserves the prior behavior (the write completes before the caller proceeds).
+ * cannot escape as an unhandled rejection. Normal workflows retain the historic
+ * log-and-continue behavior; the explicit ccc-fusion profile is fail-closed.
  */
+/*
+FNXC:CCCBranchPersistence 2026-07-24-11:40:
+CCC branch admission, progress, and terminal checkpoints are safety boundaries:
+when any cannot be recorded durably, no later branch effect or join successor
+may be released. Other workflow profiles retain their established best-effort
+branch telemetry behavior.
+*/
+class CccBranchPersistenceError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = "CccBranchPersistenceError";
+  }
+}
+
+function isCccFusionTask(task: TaskDetail): boolean {
+  return task.customFields?.cccFusionProfile === "ccc-fusion";
+}
+
 async function persistBranchState(
   persistence: WorkflowBranchPersistence | undefined,
   state: WorkflowBranchRunState,
+  stage: "admission" | "progress" | "terminal",
+  failClosed: boolean,
 ): Promise<void> {
+  if (failClosed && typeof persistence?.saveBranchState !== "function") {
+    throw new CccBranchPersistenceError(`ccc-branch-persistence-${stage}-failed`);
+  }
   try {
     await persistence?.saveBranchState?.(state);
   } catch (err) {
+    if (failClosed) {
+      throw new CccBranchPersistenceError(`ccc-branch-persistence-${stage}-failed`);
+    }
     const message = err instanceof Error ? err.message : String(err);
     schedulerLog.warn(
       `saveBranchState failed for task ${state.taskId} run ${state.runId} branch ${state.branchId}: ${message}`,
@@ -108,6 +133,8 @@ export interface SplitJoinResult {
   branchOutcomes: { branchId: string; outcome: WorkflowNodeOutcome; nodeId: string }[];
   /** Node IDs visited across all branches (for the executor's visited list). */
   visitedNodeIds: string[];
+  /** Stable fail-closed classification for an explicit ccc-fusion branch write failure. */
+  failureReason?: string;
 }
 
 interface ResolvedJoinConfig {
@@ -159,7 +186,26 @@ export async function runSplitJoin(
   const join = findMatchingJoin(branchEdges[0].to, env);
   if (!join) throw new WorkflowIrError(`split '${split.id}' has no reachable matching join`);
   const joinConfig = resolveJoinConfig(env.nodeMap.get(join)!);
+  const failClosed = isCccFusionTask(env.task);
 
+  if (failClosed) {
+    try {
+      for (const edge of branchEdges) {
+        await persistBranchState(env.persistence, {
+          taskId: env.task.id,
+          runId: env.runId,
+          branchId: edge.to,
+          currentNodeId: edge.to,
+          status: "running",
+        }, "admission", true);
+      }
+    } catch (error) {
+      const reason = error instanceof CccBranchPersistenceError
+        ? error.reason
+        : "ccc-branch-persistence-admission-failed";
+      return { joinNodeId: join, outcome: "failure", branchOutcomes: [], visitedNodeIds: [], failureReason: reason };
+    }
+  }
   const controller = new AbortController();
   const branchCount = branchEdges.length;
   const required = requiredCompletions(joinConfig.mode, branchCount);
@@ -168,6 +214,7 @@ export async function runSplitJoin(
   const branchOutcomes: SplitJoinResult["branchOutcomes"] = [];
   let succeeded = 0;
   let failed = 0;
+  let failureReason: string | undefined;
   let settled = false;
   let resolveJoin!: (outcome: WorkflowNodeOutcome) => void;
   const joinReached = new Promise<WorkflowNodeOutcome>((res) => {
@@ -217,6 +264,7 @@ export async function runSplitJoin(
           return;
         }
         failed += 1;
+        if (err instanceof CccBranchPersistenceError) failureReason ??= err.reason;
         branchOutcomes.push({ branchId, outcome: "failure", nodeId: branchId });
         evaluateJoin(true);
         void err;
@@ -228,7 +276,7 @@ export async function runSplitJoin(
   const outcome = await joinReached;
   await Promise.allSettled(branchPromises);
 
-  return { joinNodeId: join, outcome, branchOutcomes, visitedNodeIds };
+  return { joinNodeId: join, outcome, branchOutcomes, visitedNodeIds, failureReason };
 }
 
 interface BranchWalkResult {
@@ -284,7 +332,7 @@ async function walkBranch(
         branchId: startNodeId,
         currentNodeId: currentId,
         status: lastResult.outcome === "success" ? "running" : "failed",
-      });
+      }, "progress", isCccFusionTask(env.task));
       env.onBranchProgress?.({
         branchId: startNodeId,
         nodeId: currentId,
@@ -299,7 +347,7 @@ async function walkBranch(
         branchId: startNodeId,
         currentNodeId: currentId,
         status: "failed",
-      });
+      }, "progress", isCccFusionTask(env.task));
       return { outcome: "failure", lastNodeId: currentId };
     }
 
@@ -315,7 +363,7 @@ async function walkBranch(
         branchId: startNodeId,
         currentNodeId: currentId,
         status: "completed",
-      });
+      }, "terminal", isCccFusionTask(env.task));
       env.onBranchProgress?.({ branchId: startNodeId, nodeId: currentId, status: "completed" });
       return { outcome: lastResult.outcome, lastNodeId: currentId };
     }

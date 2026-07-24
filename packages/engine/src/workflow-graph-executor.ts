@@ -524,6 +524,34 @@ export class WorkflowGraphExecutor {
           .map((s) => s.currentNodeId),
       );
     }
+    /*
+    FNXC:CCCBranchPersistence 2026-07-24-11:48:
+    CCC’s stable run uses the existing branch rows as a durable frontier, not a
+    second continuation store. A completed sequential node is admitted only
+    after its checkpoint commits; recovery therefore never replays A before a
+    split, and a failed checkpoint routes failure before any successor effect.
+    */
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const checkpointCccFrontier = async (node: WorkflowIrNode): Promise<string | undefined> => {
+      if (!cccFusionTask || node.kind === "start" || node.kind === "end") return undefined;
+      if (typeof this.deps.branchPersistence?.saveBranchState !== "function") {
+        return "ccc-branch-persistence-progress-failed";
+      }
+      try {
+        await this.deps.branchPersistence.saveBranchState({
+          taskId: task.id,
+          runId,
+          branchId: `__ccc_frontier__:${node.id}`,
+          currentNodeId: node.id,
+          status: "completed",
+        });
+        completedNodeIds ??= new Set<string>();
+        completedNodeIds.add(node.id);
+        return undefined;
+      } catch {
+        return "ccc-branch-persistence-progress-failed";
+      }
+    };
 
     // Prune prior-run branch rows on run start (#1412). Done after the resume
     // load so this run's own (taskId, runId) rows survive while every stale run
@@ -566,6 +594,10 @@ export class WorkflowGraphExecutor {
           return { outcome: "success" };
         }
 
+        if (cccFusionTask && completedNodeIds?.has(node.id)) {
+          return await traverseChildren(node, { outcome: "success" });
+        }
+
         // U1: cross the lifecycle column boundary on node entry (KTD-1/2/3). A
         // columnless node, a same-column node, or a hold→wip boundary produces no
         // move; the controller owns that decision. Runs BEFORE the node executes,
@@ -598,6 +630,9 @@ export class WorkflowGraphExecutor {
           context[`node:${node.id}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:branchOutcomes`] = splitResult.branchOutcomes;
+          if (splitResult.failureReason) {
+            context[`node:${node.id}:branchPersistenceFailure`] = splitResult.failureReason;
+          }
           if (!inStack.has(splitResult.joinNodeId)) visitedNodeIds.push(splitResult.joinNodeId);
           return await traverseChildren(
             nodeMap.get(splitResult.joinNodeId)!,
@@ -1028,6 +1063,14 @@ export class WorkflowGraphExecutor {
         if (result.contextPatch) Object.assign(context, result.contextPatch);
         context[`node:${node.id}:outcome`] = result.outcome;
         if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
+
+        if (result.outcome === "success") {
+          const checkpointFailure = await checkpointCccFrontier(node);
+          if (checkpointFailure) {
+            context[`node:${node.id}:branchPersistenceFailure`] = checkpointFailure;
+            return await traverseChildren(node, { outcome: "failure", value: checkpointFailure });
+          }
+        }
 
         return await traverseChildren(node, result);
     };

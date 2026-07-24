@@ -22,6 +22,7 @@ import {
 import type { WorkflowRuntimePrimitives } from "./runtime-primitives.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { requiresNonEmptyWorkflowArtifact } from "./required-workflow-artifacts.js";
+import { PermanentError, TransientError } from "./engine-errors.js";
 
 export type WorkflowTaskRuntimeDisposition = "completed" | "failed" | "manual-required";
 
@@ -42,8 +43,8 @@ export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps,
     transitionWorkflowWorkItem?: (
       id: string,
       state: WorkflowWorkItemState,
-      patch?: { now?: string; lastError?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
-    ) => WorkflowWorkItem;
+      patch?: { now?: string; attempt?: number; lastError?: string | null; blockedReason?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
+    ) => WorkflowWorkItem | Promise<WorkflowWorkItem>;
   };
   primitives: WorkflowRuntimePrimitives;
   runCustomNode: WorkflowCustomNodeRunner;
@@ -215,17 +216,58 @@ export class WorkflowTaskRuntime {
       "workflow:work-item-attempt": workItem.attempt,
     };
 
-    try {
-      const result = handler
-        ? await handler(node, { task, settings: runtimeSettings, context })
-        : { outcome: "success" as const };
-      outcome = result.outcome;
-      if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
-      context = { ...context, ...(result.contextPatch ?? {}) };
-      reason = result.outcome === "failure" ? result.value ?? "workflow-work-item-node-failed" : undefined;
-    } catch (err) {
-      outcome = "failure";
-      reason = `workflow-work-item-node-error:${err instanceof Error ? err.message : String(err)}`;
+    /*
+    FNXC:CCCWorkItemRetry 2026-07-24-11:52:
+    `maxRetries` is the total invocation cap, including the first attempt. Only
+    native TransientError failures consume another bounded attempt; a
+    PermanentError is classified once and durably parked for operator action.
+    */
+    const configuredRetries = Number(node.config?.maxRetries);
+    const maxAttempts = Number.isFinite(configuredRetries) && configuredRetries >= 1
+      ? Math.min(10, Math.floor(configuredRetries))
+      : 1;
+    let attempt = Math.max(1, workItem.attempt);
+    for (;;) {
+      try {
+        const result = handler
+          ? await handler(node, { task, settings: runtimeSettings, context })
+          : { outcome: "success" as const };
+        outcome = result.outcome;
+        if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
+        context = { ...context, ...(result.contextPatch ?? {}) };
+        reason = result.outcome === "failure" ? result.value ?? "workflow-work-item-node-failed" : undefined;
+        break;
+      } catch (err) {
+        if (err instanceof PermanentError) {
+          const reason = `ccc-permanent:${err.code}`;
+          await this.deps.store.transitionWorkflowWorkItem(workItem.id, "manual-required", {
+            attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastError: reason,
+            blockedReason: reason,
+          });
+          this.emit("terminal", workItem.taskId, "work-item:manual-required");
+          return { disposition: "manual-required", outcome: "failure", visitedNodeIds: invoked, context, reason };
+        }
+        if (err instanceof TransientError && attempt < maxAttempts) {
+          await this.deps.store.transitionWorkflowWorkItem(workItem.id, "retrying", {
+            attempt,
+            lastError: `ccc-transient:${err.code}`,
+          });
+          attempt += 1;
+          await this.deps.store.transitionWorkflowWorkItem(workItem.id, "running", {
+            attempt,
+            lastError: null,
+          });
+          continue;
+        }
+        outcome = "failure";
+        reason = err instanceof TransientError
+          ? `ccc-transient-retry-exhausted:${err.code}`
+          : `workflow-work-item-node-error:${err instanceof Error ? err.message : String(err)}`;
+        break;
+      }
     }
 
     const disposition: WorkflowTaskRuntimeDisposition = outcome === "success"
@@ -238,7 +280,8 @@ export class WorkflowTaskRuntime {
       : disposition === "manual-required"
         ? "manual-required"
         : "failed";
-    this.deps.store.transitionWorkflowWorkItem(workItem.id, terminalState, {
+    await this.deps.store.transitionWorkflowWorkItem(workItem.id, terminalState, {
+      attempt,
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: reason ?? null,
