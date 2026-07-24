@@ -1,0 +1,13 @@
+export const CCC_PRD_SCHEMA_VERSION = "ccc-prd.packet.v1" as const;
+export type CccPrdSourceSpan = { path: string; line: number; column: number; endLine?: number; endColumn?: number };
+export type CccPrdDiagnostic = { code: string; message: string; span?: CccPrdSourceSpan };
+export type CccPrdProof = { id: string; command: string; span: CccPrdSourceSpan };
+export type CccPrdRequirement = { id: string; text: string; acceptance: string; span: CccPrdSourceSpan; proofs: CccPrdProof[] };
+export type CccPrdManifestEntry = { relativePath: string; role: string; sha256: string; authoritative: boolean };
+export type CccPrdManifestPacket = { schema: string; sourceVersion: string; entries: CccPrdManifestEntry[] };
+export type CccPrdProtectedActionKind = "promotion" | "live_execution" | "deletion" | "merge" | "publication" | "credential" | "billing" | "upstream_write";
+export type CccPrdOperatorDecision = "approve_promotion" | "approve_live_execution" | "approve_deletion" | "approve_merge" | "approve_publication" | "approve_credential_use" | "approve_billing" | "approve_upstream_write";
+export type CccPrdProtectedActionIntent = { kind: CccPrdProtectedActionKind; target: string; operatorDecision: CccPrdOperatorDecision; requiresOperatorDecision: true };
+export type CccPrdSource = { path: string; sha256: string; span: CccPrdSourceSpan };
+export type CccPrdSemanticBundle = { kind: "bundle"; schema: typeof CCC_PRD_SCHEMA_VERSION; sourceHash: string; bundleHash: string; sources: CccPrdSource[]; requirements: CccPrdRequirement[]; protectedActions: CccPrdProtectedActionIntent[] };
+export type CccPrdRefusalBundle = { kind: "refusal"; diagnostics: CccPrdDiagnostic[] };
