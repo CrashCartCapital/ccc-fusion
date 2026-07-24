@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,7 +15,7 @@ import type {
   Model,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { CliSessionStore, customProviderRegistryKey, drizzleSql as sql, type CustomProvider } from "@fusion/core";
+import { CliSessionStore, customProviderRegistryKey, drizzleSql as sql, resolveEffectiveAgentPermissionPolicy, type CustomProvider } from "@fusion/core";
 import { registerCustomProviders } from "../custom-provider-registry.js";
 import { activeSessionRegistry } from "../active-session-registry.js";
 import { TaskExecutor } from "../executor.js";
@@ -263,6 +265,40 @@ function noDispatchSession() {
     dispose: vi.fn(),
     setThinkingLevel: vi.fn(),
   };
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJson(nested)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function offeredToolScope(body: Record<string, unknown>): Array<{ authority: string; parametersSha256: string }> {
+  return (Array.isArray(body.tools) ? body.tools : [])
+    .filter((tool): tool is Record<string, unknown> => Boolean(tool) && typeof tool === "object")
+    .map((tool) => tool.function as Record<string, unknown>)
+    .filter((fn): fn is Record<string, unknown> => Boolean(fn) && typeof fn.name === "string")
+    .map((fn) => ({
+      authority: String(fn.name),
+      parametersSha256: createHash("sha256").update(canonicalJson(fn.parameters)).digest("hex"),
+    }))
+    .sort((left, right) => left.authority.localeCompare(right.authority));
+}
+
+async function createDisposableGitTaskFixture(prefix: string, branch: string): Promise<{ rootDir: string; worktreePath: string }> {
+  const rootDir = await mkdtemp(join(tmpdir(), prefix));
+  execFileSync("git", ["init", "-b", "main"], { cwd: rootDir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "CCC RED"], { cwd: rootDir });
+  execFileSync("git", ["config", "user.email", "ccc-red@example.invalid"], { cwd: rootDir });
+  await writeFile(join(rootDir, "README.md"), "ccc durable receipt fixture\n", "utf8");
+  execFileSync("git", ["add", "README.md"], { cwd: rootDir });
+  execFileSync("git", ["commit", "-m", "fixture"], { cwd: rootDir, stdio: "ignore" });
+  const worktreePath = join(rootDir, ".worktrees", "task");
+  execFileSync("git", ["worktree", "add", "-b", branch, worktreePath], { cwd: rootDir, stdio: "ignore" });
+  return { rootDir, worktreePath };
 }
 
 function assertLoopbackTarget(raw: string): URL {
@@ -846,6 +882,487 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
         await rm(worktreePath, { recursive: true, force: true });
       }
     });
+
+    it("admits only an eligible exact CCC execution authority and preserves terminal ledgers", async () => {
+      const provider = providers[0]!;
+      const model = registeredModel(provider);
+      const providerKey = customProviderRegistryKey(provider, providers);
+      const projectDefaultPolicy = { rules: { git_write: "allow", file_scope: "allow" } };
+      const actorPolicy = { presetId: "custom", rules: { git_write: "allow", file_scope: "allow" } };
+      const reorderedActorPolicy = { presetId: "custom", rules: { file_scope: "allow", git_write: "allow" } };
+      const normalizedActorPolicy = resolveEffectiveAgentPermissionPolicy(actorPolicy, projectDefaultPolicy);
+      const normalizedPermissionMismatch = resolveEffectiveAgentPermissionPolicy(
+        { presetId: "custom", rules: { file_scope: "allow", git_write: "block" } },
+        projectDefaultPolicy,
+      );
+      const fixtures: Array<{ rootDir: string; worktreePath: string }> = [];
+      type DurableRow = {
+        id: string;
+        agent_state: string;
+        termination_reason: string | null;
+        worktree_path: string | null;
+        autonomy_posture: string;
+        updated_at: string;
+      };
+      const rowsFor = async (projectId: string, taskId: string): Promise<DurableRow[]> => (
+        await durableRestartPg.layer().db.execute(sql`
+          SELECT id, agent_state, termination_reason, worktree_path, autonomy_posture, updated_at
+          FROM project.cli_sessions
+          WHERE owner_project_id = ${projectId} AND task_id = ${taskId}
+          ORDER BY id
+        `)
+      ) as DurableRow[];
+      const createCase = async (label: string) => {
+        const projectId = `ccc-wave3-exact-authority-${label}`;
+        const taskId = `FN-CCC-WAVE3-EXACT-AUTHORITY-${label.toUpperCase()}`;
+        const branch = `fusion/ccc-wave3-exact-authority-${label}`;
+        const fixture = await createDisposableGitTaskFixture(`ccc-wave3-exact-authority-${label}-`, branch);
+        fixtures.push(fixture);
+        const task: Record<string, any> = {
+          id: taskId,
+          title: `exact authority ${label}`,
+          description: `CCC_EXACT_AUTHORITY_${label}`,
+          prompt: `CCC_EXACT_AUTHORITY_${label}`,
+          column: "in-progress",
+          status: "in-progress",
+          dependencies: [],
+          steps: [],
+          currentStep: 0,
+          log: [],
+          worktree: fixture.worktreePath,
+          branch,
+          assignedAgentId: "actor-a",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        const durable = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+        const runPublic = async (actorId: string, policy: Record<string, unknown> = actorPolicy) => {
+          task.assignedAgentId = actorId;
+          task.column = "in-progress";
+          task.status = "in-progress";
+          task.worktree = fixture.worktreePath;
+          task.branch = branch;
+          const store = makeCccExecutorStore(task, providerKey, model.id, durableRestartPg.layer()) as Record<string, any>;
+          const baseSettings = store.getSettings;
+          store.getSettings = async () => ({ ...(await baseSettings()), defaultAgentPermissionPolicy: projectDefaultPolicy });
+          store.getTaskWorkflowSelection = () => ({ workflowId: "ccc-red", stepIds: [] });
+          store.getTaskWorkflowSelectionAsync = async () => ({ workflowId: "ccc-red", stepIds: [] });
+          store.getWorkflowDefinition = async () => ({ ir: { version: "v2", name: "ccc-red", columns: [{ id: "in-progress", name: "In progress", traits: [{ trait: "wip" }] }], nodes: [{ id: "start", kind: "start", column: "in-progress" }, { id: "execute", kind: "prompt", column: "in-progress", config: { seam: "execute" } }, { id: "end", kind: "end", column: "in-progress" }], edges: [{ from: "start", to: "execute" }, { from: "execute", to: "end", condition: "success" }] } });
+          store.updateTaskAtomic = async (_id: string, update: (live: Record<string, unknown>) => Record<string, unknown>) => Object.assign(task, await update(task));
+          const executor = new TaskExecutor(store as any, fixture.rootDir, { agentStore: { getAgent: async () => ({ id: actorId, permissionPolicy: policy }), listAgents: async () => [] } as any, cliAgentRuntime: { store: durable, projectId, manager: {} as any, hub: {} as any, registry: {} as any, hookEndpointUrl: "http://127.0.0.1:1/unused" } });
+          await executor.execute(task as any).catch(() => undefined);
+          await durable.flush();
+        };
+        return { projectId, taskId, fixture, durable, runPublic };
+      };
+      try {
+        const exact = await createCase("exact");
+        await exact.runPublic("actor-a");
+        await exact.runPublic("actor-a", reorderedActorPolicy);
+        const firstRequest = capturedRequests.find(({ body }) => userText(body).includes("CCC_EXACT_AUTHORITY_exact"));
+        expect.soft(firstRequest, "exact authority public dispatch reached the loopback provider").toBeDefined();
+        const expectedScope = offeredToolScope(firstRequest!.body);
+        const exactRows = await rowsFor(exact.projectId, exact.taskId);
+        expect.soft(exactRows, "exact eligible authority reuses one durable ledger").toHaveLength(1);
+        expect.soft(JSON.parse(exactRows[0]!.autonomy_posture), "exact authority is durably normalized and redacted").toMatchObject({ cccExecutionAuthority: { actorId: "actor-a", permissionPolicy: normalizedActorPolicy, effectTurnMode: "keep-open", toolScope: expectedScope } });
+
+        const makeSeed = (authority: Record<string, unknown>, terminal = false) => ({
+          adapterId: "pi",
+          purpose: "execute" as const,
+          agentState: terminal ? "dead" as const : "busy" as const,
+          ...(terminal ? { terminationReason: "killed" as const } : {}),
+          autonomyPosture: {
+            cccFusionProfile: "ccc-fusion",
+            cccFusionProvider: providerKey,
+            cccFusionModel: model.id,
+            cccEffectReceiptContract: "ccc-tool-receipts/v2",
+            cccExecutionAuthority: authority,
+            ...(terminal ? { cccControllerFenced: true, cccCancellationState: "CANCELLED" } : {}),
+          },
+        });
+        const assertIsolatedMismatch = async (
+          label: string,
+          authority: Record<string, unknown>,
+          actorId: string,
+          policy: Record<string, unknown>,
+          terminal = false,
+        ) => {
+          const isolated = await createCase(label);
+          const seed = isolated.durable.createSession({
+            projectId: isolated.projectId,
+            taskId: isolated.taskId,
+            ...makeSeed(authority, terminal),
+            worktreePath: isolated.fixture.worktreePath,
+          });
+          await isolated.durable.flush();
+          const before = await rowsFor(isolated.projectId, isolated.taskId);
+          expect.soft(before, `${label} has exactly one seeded candidate before public dispatch`).toHaveLength(1);
+          await isolated.runPublic(actorId, policy);
+          const after = await rowsFor(isolated.projectId, isolated.taskId);
+          expect.soft(after.filter((row) => row.id === seed.id), `${label} preserves the sole seeded ledger byte-for-byte`).toEqual(before);
+          expect.soft(after, `${label} rejects its sole seed and admits one distinct fresh ledger`).toHaveLength(2);
+          expect.soft(after.some((row) => row.id !== seed.id), `${label} durable result includes a distinct fresh ledger`).toBe(true);
+        };
+        const exactAuthority = {
+          actorId: "actor-a",
+          permissionPolicy: normalizedActorPolicy,
+          effectTurnMode: "keep-open",
+          toolScope: expectedScope,
+        };
+        await assertIsolatedMismatch("actor", exactAuthority, "actor-b", actorPolicy);
+        await assertIsolatedMismatch("permission", exactAuthority, "actor-a", { presetId: "custom", rules: { file_scope: "allow", git_write: "block" } });
+        await assertIsolatedMismatch("tool-scope", {
+          ...exactAuthority,
+          toolScope: expectedScope.map((tool, index) => index === 0
+            ? { ...tool, parametersSha256: "0".repeat(64) }
+            : tool),
+        }, "actor-a", actorPolicy);
+        await assertIsolatedMismatch("terminal", exactAuthority, "actor-a", actorPolicy, true);
+        expect.soft(normalizedPermissionMismatch, "permission mismatch is derived through the production effective-policy resolver").not.toEqual(normalizedActorPolicy);
+      } finally {
+        for (const fixture of fixtures) {
+          execFileSync("git", ["worktree", "remove", "--force", fixture.worktreePath], { cwd: fixture.rootDir, stdio: "ignore" });
+          await rm(fixture.rootDir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it("fences engine-death recovery to a fresh controller generation and ignores an old late finalizer", async () => {
+      const provider = providers[0]!;
+      const model = registeredModel(provider);
+      const providerKey = customProviderRegistryKey(provider, providers);
+      const fixtures: Array<{ rootDir: string; worktreePath: string }> = [];
+      const observations: Record<string, unknown> = {};
+      const failures: string[] = [];
+      type DurableRow = {
+        id: string;
+        agent_state: string;
+        termination_reason: string | null;
+        worktree_path: string | null;
+        autonomy_posture: string;
+      };
+      type DurableTurn = {
+        effect_scope_id: string;
+        turn_key: string;
+        state: "open" | "closed";
+        controller_token: string;
+      };
+      const graph = {
+        ir: {
+          version: "v2",
+          name: "ccc-engine-death-red",
+          columns: [{ id: "in-progress", name: "In progress", traits: [{ trait: "wip" }] }],
+          nodes: [
+            { id: "start", kind: "start", column: "in-progress" },
+            { id: "execute", kind: "prompt", column: "in-progress", config: { seam: "execute" } },
+            { id: "end", kind: "end", column: "in-progress" },
+          ],
+          edges: [
+            { from: "start", to: "execute" },
+            { from: "execute", to: "end", condition: "success" },
+          ],
+        },
+      };
+      const rowsFor = async (projectId: string, taskId: string): Promise<DurableRow[]> => (
+        await durableRestartPg.layer().db.execute(sql`
+          SELECT id, agent_state, termination_reason, worktree_path, autonomy_posture
+          FROM project.cli_sessions
+          WHERE owner_project_id = ${projectId} AND task_id = ${taskId}
+          ORDER BY id
+        `)
+      ) as DurableRow[];
+      const turnsFor = async (projectId: string, sessionId: string): Promise<DurableTurn[]> => (
+        await durableRestartPg.layer().db.execute(sql`
+          SELECT effect_scope_id, turn_key, state, controller_token
+          FROM project.ccc_effect_turns
+          WHERE owner_project_id = ${projectId} AND effect_scope_id = ${sessionId}
+          ORDER BY turn_key
+        `)
+      ) as DurableTurn[];
+      const posture = (row: DurableRow | undefined): Record<string, unknown> | undefined => (
+        row ? JSON.parse(row.autonomy_posture) as Record<string, unknown> : undefined
+      );
+      const settle = async (promise: Promise<unknown>): Promise<{ status: "fulfilled" | "rejected"; detail?: string }> => {
+        const result = await Promise.allSettled([promise]);
+        const settled = result[0]!;
+        return settled.status === "fulfilled"
+          ? { status: "fulfilled" }
+          : { status: "rejected", detail: settled.reason instanceof Error ? settled.reason.message : String(settled.reason) };
+      };
+      const within = async <T>(promise: Promise<T>, timeoutMs = 3_000): Promise<{ completed: boolean; value?: T }> => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([
+            promise.then((value) => ({ completed: true, value })),
+            new Promise<{ completed: false }>((resolve) => {
+              timer = setTimeout(() => resolve({ completed: false }), timeoutMs);
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+      const observe = async (label: string, predicate: () => boolean): Promise<boolean> => {
+        try {
+          await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 3_000 });
+          return true;
+        } catch (error) {
+          observations[`${label}ObservationError`] = error instanceof Error ? error.message : String(error);
+          return false;
+        }
+      };
+      const requestCount = (marker: string) => capturedRequests.filter(({ body }) => userText(body).includes(marker)).length;
+      const publicCase = async (label: string) => {
+        const projectId = `ccc-wave3-engine-death-${label}`;
+        const taskId = `FN-CCC-WAVE3-ENGINE-DEATH-${label.toUpperCase()}`;
+        const branch = `fusion/ccc-wave3-engine-death-${label}`;
+        const fixture = await createDisposableGitTaskFixture(`ccc-wave3-engine-death-${label}-`, branch);
+        fixtures.push(fixture);
+        const task: Record<string, any> = {
+          id: taskId,
+          title: `CCC engine-death ${label}`,
+          description: `CCC_ABORT ${label}`,
+          prompt: `CCC_ABORT ${label}`,
+          column: "in-progress",
+          status: "in-progress",
+          dependencies: [],
+          steps: [],
+          currentStep: 0,
+          log: [],
+          worktree: fixture.worktreePath,
+          branch,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        const durable = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+        const makeExecutor = (options: Record<string, unknown> = {}) => {
+          const taskStore = makeCccExecutorStore(task, providerKey, model.id, durableRestartPg.layer()) as Record<string, any>;
+          taskStore.getTaskWorkflowSelection = () => ({ workflowId: "ccc-engine-death-red", stepIds: [] });
+          taskStore.getTaskWorkflowSelectionAsync = async () => ({ workflowId: "ccc-engine-death-red", stepIds: [] });
+          taskStore.getWorkflowDefinition = async () => graph;
+          taskStore.updateTaskAtomic = async (_id: string, update: (live: Record<string, unknown>) => Record<string, unknown>) => (
+            Object.assign(task, await update(task))
+          );
+          return new TaskExecutor(taskStore as any, fixture.rootDir, {
+            cancellationTimeoutMs: 40,
+            cliAgentRuntime: {
+              store: durable,
+              projectId,
+              manager: {} as any,
+              hub: {} as any,
+              registry: {} as any,
+              hookEndpointUrl: "http://127.0.0.1:1/unused",
+            },
+            ...options,
+          });
+        };
+        return { projectId, taskId, task, durable, makeExecutor };
+      };
+      const cleanupLiveExecutor = async (executor: TaskExecutor, taskId: string, label: string) => {
+        observations[`${label}Cleanup`] = await settle(
+          executor.awaitAbortInFlightTaskWork(taskId, `${label}-cleanup`, { userCanceled: true }),
+        );
+      };
+      const seedEngineDeath = async (
+        current: Awaited<ReturnType<typeof publicCase>>,
+        controllerToken: string,
+        fenced: boolean,
+        openTurn: boolean,
+      ) => {
+        const seedScope = offeredToolScope(capturedRequests.find(({ body }) => userText(body).includes("CCC_ABORT confirmed-cancellation"))?.body ?? {});
+        const seed = current.durable.createSession({
+          projectId: current.projectId,
+          taskId: current.taskId,
+          adapterId: "pi",
+          purpose: "execute",
+          worktreePath: current.task.worktree,
+          agentState: "dead",
+          terminationReason: "engineDeath",
+          autonomyPosture: {
+            cccFusionProfile: "ccc-fusion",
+            cccFusionProvider: providerKey,
+            cccFusionModel: model.id,
+            cccEffectReceiptContract: "ccc-tool-receipts/v2",
+            cccExecutionAuthority: {
+              actorId: `executor-${current.taskId}`,
+              permissionPolicy: resolveEffectiveAgentPermissionPolicy(undefined, undefined),
+              effectTurnMode: "keep-open",
+              toolScope: seedScope,
+            },
+            cccControllerGeneration: controllerToken,
+            cccControllerFenced: fenced,
+          },
+        });
+        await current.durable.flush();
+        if (openTurn) {
+          await current.durable.openCccEffectTurn(seed.id, controllerToken);
+          await current.durable.flush();
+        }
+        return seed;
+      };
+
+      try {
+        // A: real executor admission followed by the public cancellation surface.
+        const cancellation = await publicCase("confirmed-cancellation");
+        const cancellationExecutor = cancellation.makeExecutor();
+        const cancellationExecution = cancellationExecutor.execute(cancellation.task as any);
+        const cancellationDispatched = await observe("A dispatch", () => requestCount("CCC_ABORT confirmed-cancellation") > 0);
+        const cancellationResult = await settle(
+          cancellationExecutor.awaitAbortInFlightTaskWork(cancellation.taskId, "confirmed-cancellation", { userCanceled: true }),
+        );
+        const cancellationClosed = cancellationDispatched && (await within(abortClosed.promise)).completed;
+        await settle(cancellationExecution);
+        await cancellation.durable.flush();
+        const cancellationRows = await rowsFor(cancellation.projectId, cancellation.taskId);
+        const cancellationRow = cancellationRows[0];
+        const cancellationPosture = posture(cancellationRow);
+        observations.A = { cancellationDispatched, cancellationClosed, cancellationResult, cancellationRows };
+        if (!cancellationDispatched) failures.push("A public TaskExecutor/createFnAgent dispatch did not reach loopback");
+        if (cancellationResult.status !== "fulfilled") failures.push(`A public cancellation did not confirm closure: ${cancellationResult.detail}`);
+        if (cancellationRow?.agent_state !== "dead" || cancellationRow.termination_reason !== "killed") failures.push("A confirmed cancellation did not persist dead/killed");
+        if (cancellationPosture?.cccCancellationState !== "CANCELLED") failures.push("A confirmed cancellation did not persist CANCELLED");
+        if (cancellationPosture?.cccControllerFenced !== true) failures.push("A confirmed cancellation did not persist cccControllerFenced:true");
+
+        // B: the sole unfenced engine-death candidate must remain untouched and unselected.
+        const unfenced = await publicCase("unfenced-engine-death");
+        const unfencedSeed = await seedEngineDeath(unfenced, "unfenced-old-generation", false, false);
+        const unfencedBefore = await rowsFor(unfenced.projectId, unfenced.taskId);
+        const unfencedExecutor = unfenced.makeExecutor();
+        await unfencedExecutor.resumeOrphaned();
+        const unfencedDispatched = await observe("B dispatch", () => requestCount("CCC_ABORT unfenced-engine-death") > 0);
+        await unfenced.durable.flush();
+        const unfencedAfterAdmission = await rowsFor(unfenced.projectId, unfenced.taskId);
+        observations.B = { unfencedSeed: unfencedSeed.id, unfencedBefore, unfencedDispatched, unfencedAfterAdmission };
+        if (unfencedDispatched) await cleanupLiveExecutor(unfencedExecutor, unfenced.taskId, "B");
+        if (unfencedDispatched) await settle(new Promise<void>((resolve) => setTimeout(resolve, 20)));
+        if (JSON.stringify(unfencedAfterAdmission) !== JSON.stringify(unfencedBefore)) failures.push("B unfenced engineDeath candidate was relabelled or reused");
+        if (unfencedDispatched) failures.push("B unfenced engineDeath candidate reached public replacement admission");
+
+        // C: the durable-turn takeover is exercised through resumeOrphaned(), not direct replacement mutation.
+        const fenced = await publicCase("fenced-engine-death");
+        const fencedSeed = await seedEngineDeath(fenced, "fenced-old-generation", true, true);
+        const fencedBefore = await rowsFor(fenced.projectId, fenced.taskId);
+        const fencedTurnsBefore = await turnsFor(fenced.projectId, fencedSeed.id);
+        const fencedExecutor = fenced.makeExecutor();
+        await fencedExecutor.resumeOrphaned();
+        const fencedDispatched = await observe("C dispatch", () => requestCount("CCC_ABORT fenced-engine-death") > 0);
+        await fenced.durable.flush();
+        const fencedAfterAdmission = await rowsFor(fenced.projectId, fenced.taskId);
+        const fencedTurnsAfterAdmission = await turnsFor(fenced.projectId, fencedSeed.id);
+        const fencedReplacement = fencedAfterAdmission.find((row) => row.id === fencedSeed.id);
+        const fencedReplacementPosture = posture(fencedReplacement);
+        const fencedOpenTurn = fencedTurnsAfterAdmission.find((turn) => turn.state === "open");
+        observations.C = {
+          fencedBefore,
+          fencedTurnsBefore,
+          fencedDispatched,
+          fencedAfterAdmission,
+          fencedTurnsAfterAdmission,
+        };
+        if (!fencedDispatched) failures.push("C fenced engineDeath recovery did not reach public TaskExecutor/createFnAgent admission");
+        if (!fencedReplacement || !["starting", "busy", "idle", "needsAttention"].includes(fencedReplacement.agent_state)) failures.push("C replacement is not durably nonterminal");
+        if (fencedReplacementPosture?.cccControllerGeneration === "fenced-old-generation") failures.push("C fenced engineDeath recovery reused the old controller generation");
+        if (fencedOpenTurn?.controller_token !== fencedReplacementPosture?.cccControllerGeneration) failures.push("C open durable turn is not owned by the replacement controller generation");
+        if (fencedDispatched) await cleanupLiveExecutor(fencedExecutor, fenced.taskId, "C");
+        if (fencedDispatched) await settle(new Promise<void>((resolve) => setTimeout(resolve, 20)));
+
+        // D: delay only the real PI session's owned-transport-close barrier. The old raw abort itself remains real.
+        const late = await publicCase("late-finalizer");
+        const releaseOldClosure = deferred();
+        const oldClosureEntered = deferred();
+        const oldClosureReleased = deferred();
+        harness.createAgentSession.mockImplementationOnce(async (...args: any[]) => {
+          const created = await harness.actualCreateAgentSession!(...args);
+          const rawSession = created.session as typeof created.session & { abort?: () => Promise<void> };
+          const rawAbort = rawSession.abort?.bind(rawSession);
+          if (!rawAbort) throw new Error("real third-party PI AgentSession did not expose abort()");
+          rawSession.abort = async () => {
+            await rawAbort();
+            oldClosureEntered.resolve();
+            await releaseOldClosure.promise;
+            oldClosureReleased.resolve();
+          };
+          return created;
+        });
+        const oldExecutor = late.makeExecutor();
+        const oldExecution = oldExecutor.execute(late.task as any);
+        const oldDispatched = await observe("D old dispatch", () => requestCount("CCC_ABORT late-finalizer") === 1);
+        const oldCancellation = await settle(
+          oldExecutor.awaitAbortInFlightTaskWork(late.taskId, "late-finalizer", { userCanceled: true }),
+        );
+        const oldClosureReached = await within(oldClosureEntered.promise);
+        await settle(oldExecution);
+        await late.durable.flush();
+        const beforeReplacement = await rowsFor(late.projectId, late.taskId);
+        const oldRow = beforeReplacement[0];
+        const seededEngineDeath = oldRow && late.durable.updateSession(oldRow.id, {
+          agentState: "dead",
+          terminationReason: "engineDeath",
+          autonomyPosture: {
+            ...(posture(oldRow) ?? {}),
+            cccControllerFenced: true,
+          },
+        });
+        await late.durable.flush();
+        const engineDeathSeedBeforeReplacement = await rowsFor(late.projectId, late.taskId);
+        const oldGeneration = posture(engineDeathSeedBeforeReplacement[0])?.cccControllerGeneration;
+        const engineDeathSeedTurns = seededEngineDeath
+          ? await turnsFor(late.projectId, seededEngineDeath.id)
+          : [];
+        const replacementExecutor = late.makeExecutor();
+        await replacementExecutor.resumeOrphaned();
+        const replacementDispatched = await observe("D replacement dispatch", () => requestCount("CCC_ABORT late-finalizer") >= 2);
+        await late.durable.flush();
+        const replacementBeforeRelease = await rowsFor(late.projectId, late.taskId);
+        const replacementRow = replacementBeforeRelease[0];
+        const replacementGeneration = posture(replacementRow)?.cccControllerGeneration;
+        const replacementTurnsBeforeRelease = replacementRow ? await turnsFor(late.projectId, replacementRow.id) : [];
+        releaseOldClosure.resolve();
+        const oldClosureFinished = await within(oldClosureReleased.promise);
+        await settle(new Promise<void>((resolve) => setTimeout(resolve, 20)));
+        await late.durable.flush();
+        const replacementAfterRelease = await rowsFor(late.projectId, late.taskId);
+        const replacementAfterReleaseRow = replacementAfterRelease[0];
+        const replacementTurnsAfterRelease = replacementAfterReleaseRow
+          ? await turnsFor(late.projectId, replacementAfterReleaseRow.id)
+          : [];
+        observations.D = {
+          oldDispatched,
+          oldCancellation,
+          oldClosureReached,
+          beforeReplacement,
+          engineDeathSeedBeforeReplacement,
+          engineDeathSeedTurns,
+          replacementDispatched,
+          replacementBeforeRelease,
+          replacementTurnsBeforeRelease,
+          oldClosureFinished,
+          replacementAfterRelease,
+          replacementTurnsAfterRelease,
+        };
+        if (!oldDispatched) failures.push("D old controller did not reach the real loopback PI session");
+        if (oldCancellation.status !== "rejected") failures.push("D delayed owned transport closure did not exercise the public cancellation timeout race");
+        if (!oldClosureReached.completed || !oldClosureFinished.completed) failures.push("D bounded old owned-transport closure seam did not complete");
+        if (!seededEngineDeath || engineDeathSeedBeforeReplacement[0]?.agent_state !== "dead" || posture(engineDeathSeedBeforeReplacement[0])?.cccControllerFenced !== true) failures.push("D allowed engineDeath/fenced restart precondition was not durably seeded");
+        if (!replacementDispatched) failures.push("D public resumeOrphaned did not admit a replacement after old execution unwound");
+        if (replacementGeneration === oldGeneration) failures.push("D replacement reused the old controller generation");
+        if (!replacementAfterReleaseRow || !["starting", "busy", "idle", "needsAttention"].includes(replacementAfterReleaseRow.agent_state)) failures.push("D old late finalizer terminalized or deleted the replacement");
+        const replacementOpenTurn = replacementTurnsAfterRelease.find((turn) => turn.state === "open");
+        if (replacementOpenTurn?.controller_token !== replacementGeneration) failures.push("D old late finalizer released replacement durable-turn ownership");
+        if (replacementDispatched) await cleanupLiveExecutor(replacementExecutor, late.taskId, "D");
+        if (replacementDispatched) await settle(new Promise<void>((resolve) => setTimeout(resolve, 20)));
+
+        expect.soft(
+          failures,
+          `CCC engine-death RED durable observations: ${JSON.stringify(observations)}`,
+        ).toEqual([]);
+      } finally {
+        for (const fixture of fixtures) {
+          execFileSync("git", ["worktree", "remove", "--force", fixture.worktreePath], { cwd: fixture.rootDir, stdio: "ignore" });
+          await rm(fixture.rootDir, { recursive: true, force: true });
+        }
+      }
+    }, 30_000);
 
   });
 

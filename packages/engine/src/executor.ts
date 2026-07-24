@@ -1678,6 +1678,18 @@ function matchesCccExecutorReceiptLedger(
   provider: string | undefined,
   modelId: string | undefined,
   worktreePath: string,
+  authority: unknown,
+): boolean {
+  return matchesCccExecutorReceiptLedgerPosture(session, taskId, provider, modelId, worktreePath)
+    && canonicalCccExecutionAuthorityJson(session.autonomyPosture?.cccExecutionAuthority ?? null) === canonicalCccExecutionAuthorityJson(authority);
+}
+
+function matchesCccExecutorReceiptLedgerPosture(
+  session: CliSession,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
 ): boolean {
   const posture = session.autonomyPosture;
   return session.taskId === taskId
@@ -1690,18 +1702,56 @@ function matchesCccExecutorReceiptLedger(
     && posture?.cccEffectReceiptContract === CCC_EFFECT_RECEIPT_CONTRACT;
 }
 
+function canonicalCccExecutionAuthorityJson(value: unknown, seen = new Set<object>()): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("CCC execution authority must be JSON-serializable");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalCccExecutionAuthorityJson(entry, seen)).join(",")}]`;
+  if (typeof value === "object") {
+    if (seen.has(value)) throw new Error("CCC execution authority must not be circular");
+    seen.add(value);
+    const serialized = `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalCccExecutionAuthorityJson(entry, seen)}`)
+      .join(",")}}`;
+    seen.delete(value);
+    return serialized;
+  }
+  throw new Error("CCC execution authority must be JSON-serializable");
+}
+
 function selectCccExecutorReceiptLedger(
   store: Pick<CliSessionStore, "listByTask">,
   taskId: string,
   provider: string | undefined,
   modelId: string | undefined,
   worktreePath: string,
+  authority: unknown,
 ): CliSession | undefined {
   const matching = store.listByTask(taskId)
-    .filter((session) => matchesCccExecutorReceiptLedger(session, taskId, provider, modelId, worktreePath))
+    .filter((session) => matchesCccExecutorReceiptLedger(session, taskId, provider, modelId, worktreePath, authority))
+    .filter((session) => session.terminationReason === null && session.agentState !== "dead" && session.agentState !== "done")
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-  return matching.find((session) => Array.isArray(session.autonomyPosture?.cccEffectReceipts)
-    && session.autonomyPosture.cccEffectReceipts.length > 0) ?? matching[0];
+  return matching[0];
+}
+
+function selectCccFencedEngineDeathLedger(
+  store: Pick<CliSessionStore, "listByTask">,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
+  authority: unknown,
+): CliSession | undefined {
+  return store.listByTask(taskId)
+    .filter((session) => matchesCccExecutorReceiptLedger(session, taskId, provider, modelId, worktreePath, authority))
+    .filter((session) => session.agentState === "dead" && session.terminationReason === "engineDeath")
+    .filter((session) => session.autonomyPosture?.cccControllerFenced === true)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
 }
 
 interface ActiveExecutorSessionState {
@@ -1710,7 +1760,7 @@ interface ActiveExecutorSessionState {
   /** One owned async disposal per execution generation. */
   disposeCompletion?: Promise<void>;
   /** Durable CCC record retained until abort, stream closure, and flush all confirm. */
-  cccDurableSession?: { store: CliSessionStore; sessionId: string };
+  cccDurableSession?: { store: CliSessionStore; sessionId: string; controllerToken: string };
   lastResolvedModelProvider?: string;
   lastResolvedModelId?: string;
   lastTaskModelProvider?: string | null;
@@ -1800,6 +1850,8 @@ export class TaskExecutor {
   private executing = new Set<string>();
   /** Tasks currently being prepared for unpause resume, before execute() has registered them. */
   private resumingUnpaused = new Set<string>();
+  /** Startup-only dispatch marker; enables fenced engine-death receipt recovery. */
+  private resumingOrphaned = new Set<string>();
   /** Tasks whose active session was intentionally suspended by an action gate. */
   private approvalSuspended = new Set<string>();
   /** Approval decisions received while the old execute() lifecycle is still unwinding. */
@@ -3082,36 +3134,62 @@ export class TaskExecutor {
   private async persistCccCancellationConfirmed(state: ActiveExecutorSessionState): Promise<void> {
     const durable = state.cccDurableSession;
     if (!durable) return;
-    const current = durable.store.getSession(durable.sessionId);
-    if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
-    const updated = durable.store.updateSession(durable.sessionId, {
-      agentState: "dead",
-      terminationReason: "killed",
-      autonomyPosture: {
-        ...(current.autonomyPosture ?? {}),
-        cccCancellationState: "CANCELLED",
-      },
-    });
-    if (!updated) throw new Error(`CCC durable session disappeared: ${durable.sessionId}`);
-    await durable.store.flush();
+    const guardedStore = durable.store as CliSessionStore & {
+      updateCccSessionForController?: CliSessionStore["updateCccSessionForController"];
+    };
+    const updated = typeof guardedStore.updateCccSessionForController === "function"
+      ? await guardedStore.updateCccSessionForController(durable.sessionId, durable.controllerToken, {
+          agentState: "dead",
+          terminationReason: "killed",
+          controllerFenced: true,
+          cancellationState: "CANCELLED",
+        })
+      : (() => {
+          const current = durable.store.getSession(durable.sessionId);
+          if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
+          return durable.store.updateSession(durable.sessionId, {
+            agentState: "dead",
+            terminationReason: "killed",
+            autonomyPosture: {
+              ...(current.autonomyPosture ?? {}),
+              cccControllerFenced: true,
+              cccCancellationState: "CANCELLED",
+            },
+          });
+        })();
+    // A replacement controller owns this durable row now. Late finalizers may
+    // still dispose their own transport, but must not mutate that replacement.
+    if (updated) await durable.store.flush();
   }
 
   /** Keep a truthfully non-terminal record when abort or persistence is unconfirmed. */
   private async persistCccCancellationAttention(state: ActiveExecutorSessionState): Promise<void> {
     const durable = state.cccDurableSession;
     if (!durable) return;
-    const current = durable.store.getSession(durable.sessionId);
-    if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
-    const updated = durable.store.updateSession(durable.sessionId, {
-      agentState: "needsAttention",
-      terminationReason: null,
-      autonomyPosture: {
-        ...(current.autonomyPosture ?? {}),
-        cccCancellationState: "CANCELLATION_UNCONFIRMED",
-      },
-    });
-    if (!updated) throw new Error(`CCC durable session disappeared: ${durable.sessionId}`);
-    await durable.store.flush();
+    const guardedStore = durable.store as CliSessionStore & {
+      updateCccSessionForController?: CliSessionStore["updateCccSessionForController"];
+    };
+    const updated = typeof guardedStore.updateCccSessionForController === "function"
+      ? await guardedStore.updateCccSessionForController(durable.sessionId, durable.controllerToken, {
+          agentState: "needsAttention",
+          terminationReason: null,
+          controllerFenced: false,
+          cancellationState: "CANCELLATION_UNCONFIRMED",
+        })
+      : (() => {
+          const current = durable.store.getSession(durable.sessionId);
+          if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
+          return durable.store.updateSession(durable.sessionId, {
+            agentState: "needsAttention",
+            terminationReason: null,
+            autonomyPosture: {
+              ...(current.autonomyPosture ?? {}),
+              cccControllerFenced: false,
+              cccCancellationState: "CANCELLATION_UNCONFIRMED",
+            },
+          });
+        })();
+    if (updated) await durable.store.flush();
   }
 
   private startCliSessionCancellation(taskId: string, session: CliTaskSession): Promise<void> {
@@ -5711,9 +5789,10 @@ export class TaskExecutor {
         executorLog.error(`Failed to write resume log for ${task.id}:`, err);
       }
       scheduleResume(() => {
-        this.execute(task).catch((err) =>
-          executorLog.error(`Failed to resume ${task.id}:`, err),
-        );
+        this.resumingOrphaned.add(task.id);
+        this.execute(task)
+          .catch((err) => executorLog.error(`Failed to resume ${task.id}:`, err))
+          .finally(() => this.resumingOrphaned.delete(task.id));
       });
     }
   }
@@ -12972,47 +13051,122 @@ export class TaskExecutor {
         */
         let cccDurableSession: CliSession | undefined;
         let cccEffectReceiptControllerToken: string | undefined;
-        if (cccFusionExecutor && cccRuntime) {
-          const existingLedger = selectCccExecutorReceiptLedger(
-            cccRuntime.store,
-            task.id,
-            executorProvider,
-            executorModelId,
-            worktreePath,
-          );
-          cccEffectReceiptControllerToken = typeof existingLedger?.autonomyPosture?.cccControllerGeneration === "string"
-            ? existingLedger.autonomyPosture.cccControllerGeneration
-            : randomUUID();
-          cccDurableSession = existingLedger
-            ? cccRuntime.store.updateSession(existingLedger.id, {
-                agentState: "starting",
-                terminationReason: null,
-                worktreePath,
-                autonomyPosture: {
-                  ...(existingLedger.autonomyPosture ?? {}),
-                  cccControllerGeneration: cccEffectReceiptControllerToken,
-                  cccControllerFenced: false,
-                },
-              })
-            : cccRuntime.store.createSession({
-                projectId: cccRuntime.projectId,
-                adapterId: "pi",
-                purpose: "execute",
-                taskId: task.id,
-                worktreePath,
-                autonomyPosture: {
-                  cccFusionProfile: CCC_FUSION_PROFILE,
-                  cccFusionProvider: executorProvider,
-                  cccFusionModel: executorModelId,
-                  cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
-                  cccControllerGeneration: cccEffectReceiptControllerToken,
-                  cccControllerFenced: false,
-                },
-                agentState: "starting",
-              });
-          if (!cccDurableSession) throw new Error("CCC durable receipt ledger disappeared while restarting executor");
-        }
-        if (cccDurableSession) await cccRuntime!.store.flush();
+        let cccReceiptBindingPromise: Promise<{
+          store: CliSessionStore;
+          sessionId: string;
+          controllerToken: string;
+          keepTurnOpen: boolean;
+        }> | undefined;
+        const cccEffectReceiptBinder = cccFusionExecutor && cccRuntime
+          ? async (toolScope: readonly { authority: string; parametersSha256: string }[]) => {
+              if (!cccReceiptBindingPromise) {
+                cccReceiptBindingPromise = (async () => {
+                  const cccExecutionAuthority = {
+                    actorId: identityAgent?.id ?? `executor-${task.id}`,
+                    permissionPolicy: resolveEffectiveAgentPermissionPolicy(
+                      identityAgent?.permissionPolicy,
+                      settings.defaultAgentPermissionPolicy,
+                    ),
+                    effectTurnMode: "keep-open" as const,
+                    toolScope,
+                  };
+                  const unfencedEngineDeath = this.resumingOrphaned.has(task.id)
+                    && cccRuntime.store.listByTask(task.id).some((session) => (
+                      matchesCccExecutorReceiptLedgerPosture(
+                        session,
+                        task.id,
+                        executorProvider,
+                        executorModelId,
+                        worktreePath,
+                      )
+                      && session.agentState === "dead"
+                      && session.terminationReason === "engineDeath"
+                      && session.autonomyPosture?.cccControllerFenced !== true
+                    ));
+                  if (unfencedEngineDeath) {
+                    throw new Error("CCC engine-death receipt recovery requires a durable controller fence");
+                  }
+                  const existingLedger = selectCccExecutorReceiptLedger(
+                    cccRuntime.store,
+                    task.id,
+                    executorProvider,
+                    executorModelId,
+                    worktreePath,
+                    cccExecutionAuthority,
+                  );
+                  if (existingLedger) {
+                    const token = existingLedger.autonomyPosture?.cccControllerGeneration;
+                    if (typeof token !== "string") throw new Error("CCC reusable receipt ledger is missing its controller generation");
+                    cccDurableSession = await cccRuntime.store.updateCccSessionForController(existingLedger.id, token, {
+                      agentState: "starting",
+                      terminationReason: null,
+                      controllerFenced: false,
+                    });
+                    if (!cccDurableSession) throw new Error("CCC durable receipt ledger changed before exact-authority reuse");
+                    cccEffectReceiptControllerToken = token;
+                  } else {
+                    const recoveryLedger = this.resumingOrphaned.has(task.id)
+                      ? selectCccFencedEngineDeathLedger(
+                          cccRuntime.store,
+                          task.id,
+                          executorProvider,
+                          executorModelId,
+                          worktreePath,
+                          cccExecutionAuthority,
+                        )
+                      : undefined;
+                    if (recoveryLedger) {
+                      const oldToken = recoveryLedger.autonomyPosture?.cccControllerGeneration;
+                      if (typeof oldToken !== "string") throw new Error("CCC fenced engine-death ledger is missing its controller generation");
+                      const freshToken = randomUUID();
+                      // The durable turn takeover validates the old dead/fenced owner before this
+                      // controller can make the session row live under a new generation.
+                      await cccRuntime.store.openCccEffectTurn(recoveryLedger.id, freshToken);
+                      cccDurableSession = await cccRuntime.store.updateCccSessionForController(recoveryLedger.id, oldToken, {
+                        agentState: "starting",
+                        terminationReason: null,
+                        controllerToken: freshToken,
+                        controllerFenced: false,
+                        cancellationState: null,
+                      });
+                      if (!cccDurableSession) throw new Error("CCC fenced engine-death ledger changed before recovery admission");
+                      cccEffectReceiptControllerToken = freshToken;
+                    } else {
+                      cccEffectReceiptControllerToken = randomUUID();
+                      cccDurableSession = cccRuntime.store.createSession({
+                        projectId: cccRuntime.projectId,
+                        adapterId: "pi",
+                        purpose: "execute",
+                        taskId: task.id,
+                        worktreePath,
+                        autonomyPosture: {
+                          cccFusionProfile: CCC_FUSION_PROFILE,
+                          cccFusionProvider: executorProvider,
+                          cccFusionModel: executorModelId,
+                          cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
+                          cccExecutionAuthority,
+                          cccControllerGeneration: cccEffectReceiptControllerToken,
+                          cccControllerFenced: false,
+                        },
+                        agentState: "starting",
+                      });
+                      await cccRuntime.store.flush();
+                    }
+                  }
+                  if (!cccDurableSession || !cccEffectReceiptControllerToken) {
+                    throw new Error("CCC durable receipt admission did not produce a session generation");
+                  }
+                  return {
+                    store: cccRuntime.store,
+                    sessionId: cccDurableSession.id,
+                    controllerToken: cccEffectReceiptControllerToken,
+                    keepTurnOpen: true,
+                  };
+                })();
+              }
+              return cccReceiptBindingPromise;
+            }
+          : undefined;
         try {
           const createdSession = await createResolvedAgentSession({
             sessionPurpose: "executor",
@@ -13051,13 +13205,10 @@ export class TaskExecutor {
             permanentAgentGating: this.buildPermanentAgentGatingContext(task.id, identityAgent, settings.defaultAgentPermissionPolicy),
             taskId: task.id,
             taskTitle: detail.title,
-            ...(cccDurableSession ? {
+            ...(cccEffectReceiptBinder ? {
               profile: CCC_FUSION_PROFILE,
               subscriptionReady: true as const,
-              cccEffectReceiptStore: cccRuntime!.store,
-              cccEffectReceiptSessionId: cccDurableSession.id,
-              cccEffectReceiptControllerToken,
-              cccEffectReceiptKeepTurnOpen: true,
+              cccEffectReceiptBinder,
             } : {}),
             onFallbackModelUsed: createFallbackModelObserver({
               agent: "executor",
@@ -13069,9 +13220,10 @@ export class TaskExecutor {
           });
           session = createdSession.session;
           sessionFile = createdSession.sessionFile;
-          if (cccDurableSession) {
-            const updated = cccRuntime!.store.updateSession(cccDurableSession.id, {
+          if (cccDurableSession && cccEffectReceiptControllerToken) {
+            const updated = await cccRuntime!.store.updateCccSessionForController(cccDurableSession.id, cccEffectReceiptControllerToken, {
               agentState: "busy",
+              terminationReason: null,
               ...(sessionFile ? { nativeSessionId: sessionFile } : {}),
             });
             if (!updated) throw new Error(`CCC durable session disappeared: ${cccDurableSession.id}`);
@@ -13118,7 +13270,13 @@ export class TaskExecutor {
           lastResolvedModelId: executorModelId,
           lastTaskModelProvider: detail.modelProvider,
           lastTaskModelId: detail.modelId,
-          ...(cccDurableSession ? { cccDurableSession: { store: cccRuntime!.store, sessionId: cccDurableSession.id } } : {}),
+          ...(cccDurableSession && cccEffectReceiptControllerToken ? {
+            cccDurableSession: {
+              store: cccRuntime!.store,
+              sessionId: cccDurableSession.id,
+              controllerToken: cccEffectReceiptControllerToken,
+            },
+          } : {}),
           lastAssignedAgentId: detail.assignedAgentId ?? null,
           // U5 (R7): the effective column-agent governing this session (null when no
           // binding governs — legacy path). The watcher re-resolves this for graph-
@@ -13498,13 +13656,10 @@ export class TaskExecutor {
                   // X-Session-Id/X-Session-Affinity as the primary session, keeping the
                   // task's LLM requests grouped under one stable routing/observability id.
                   taskId: task.id,
-                  ...(cccDurableSession ? {
+                  ...(cccEffectReceiptBinder ? {
                     profile: CCC_FUSION_PROFILE,
                     subscriptionReady: true as const,
-                    cccEffectReceiptStore: cccRuntime!.store,
-                    cccEffectReceiptSessionId: cccDurableSession.id,
-                    cccEffectReceiptControllerToken,
-                    cccEffectReceiptKeepTurnOpen: true,
+                    cccEffectReceiptBinder,
                   } : {}),
                 });
                 retrySession = createdRetrySession.session;
@@ -13526,7 +13681,13 @@ export class TaskExecutor {
                   lastResolvedModelId: executorModelId,
                   lastTaskModelProvider: detail.modelProvider,
                   lastTaskModelId: detail.modelId,
-                  ...(cccDurableSession ? { cccDurableSession: { store: cccRuntime!.store, sessionId: cccDurableSession.id } } : {}),
+                  ...(cccDurableSession && cccEffectReceiptControllerToken ? {
+                    cccDurableSession: {
+                      store: cccRuntime!.store,
+                      sessionId: cccDurableSession.id,
+                      controllerToken: cccEffectReceiptControllerToken,
+                    },
+                  } : {}),
                   lastAssignedAgentId: detail.assignedAgentId ?? null,
                   // U5 (R7): preserve the effective column-agent across the retry.
                   lastEffectiveColumnAgentId: columnAgentSeam?.agent.id ?? null,

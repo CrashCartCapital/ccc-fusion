@@ -11,7 +11,7 @@ import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const execAsync = promisify(exec);
 import {
@@ -81,6 +81,11 @@ import {
 } from "./agent-action-gate.js";
 import { resolvePermanentAgentToolDecision } from "./permanent-agent-gating.js";
 import type { SystemPromptLayers } from "./prompt-layers.js";
+import type {
+  CccEffectReceiptBinder,
+  CccEffectReceiptBinding,
+  CccExecutionToolAuthority,
+} from "./agent-runtime.js";
 import { READONLY_ALLOWLIST, filterCustomToolsForReadonly, isReadonlyAllowed } from "./workflow-step-tool-policy.js";
 import { createStreamingDeltaNormalizer } from "./streaming-delta.js";
 import { isModelAuthTierIncompatibilityError, isProviderModelNotFoundError, isUnsupportedMessageRoleError } from "./transient-error-detector.js";
@@ -97,6 +102,28 @@ import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
  */
 const cccEffectReceiptInFlightClaims = new WeakMap<object, Map<string, Promise<unknown>>>();
 export { isModelAuthTierIncompatibilityError } from "./transient-error-detector.js";
+
+function canonicalCccToolSchemaJson(value: unknown, seen = new Set<object>()): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("CCC tool schema must be JSON-serializable");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalCccToolSchemaJson(entry, seen)).join(",")}]`;
+  if (typeof value === "object") {
+    if (seen.has(value)) throw new Error("CCC tool schema must not be circular");
+    seen.add(value);
+    const serialized = `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalCccToolSchemaJson(entry, seen)}`)
+      .join(",")}}`;
+    seen.delete(value);
+    return serialized;
+  }
+  throw new Error("CCC tool schema must be JSON-serializable");
+}
 
 const RTK_ACCEPTED_REWRITE_EXIT_CODES = new Set([0, 3]);
 const RTK_EXPECTED_PASSTHROUGH_EXIT_CODES = new Set([1, 2]);
@@ -1234,6 +1261,8 @@ export interface AgentOptions {
   cccEffectReceiptSessionId?: string;
   /** Durable controller-generation fence supplied by the owning runtime. */
   cccEffectReceiptControllerToken?: string;
+  /** Late-bound durable ownership selected from PI's final offered-tool boundary. */
+  cccEffectReceiptBinder?: CccEffectReceiptBinder;
   /** Task retries share one incomplete durable turn until their owner settles it. */
   cccEffectReceiptKeepTurnOpen?: boolean;
   /** Optional task-scoped env injected into this session's subprocess tools only. */
@@ -2722,21 +2751,59 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     attachSessionRoutingHeaders(modelRuntime, sessionRoutingId);
   }
 
-  const cccControllerToken = options.cccEffectReceiptControllerToken ?? randomUUID();
+  let cccReceiptBinding: CccEffectReceiptBinding | undefined;
+  let cccReceiptBindingPromise: Promise<CccEffectReceiptBinding> | undefined;
+  let cccControllerToken = options.cccEffectReceiptControllerToken ?? randomUUID();
+  const resolveCccReceiptBinding = async (boundaryTools: readonly ToolDefinition[]): Promise<CccEffectReceiptBinding | undefined> => {
+    if (options.profile !== CCC_FUSION_PROFILE) return undefined;
+    if (!options.cccEffectReceiptBinder) {
+      if (!options.cccEffectReceiptStore || !options.cccEffectReceiptSessionId) return undefined;
+      return {
+        store: options.cccEffectReceiptStore,
+        sessionId: options.cccEffectReceiptSessionId,
+        controllerToken: cccControllerToken,
+        keepTurnOpen: options.cccEffectReceiptKeepTurnOpen === true,
+      };
+    }
+    if (!cccReceiptBindingPromise) {
+      const authorities: CccExecutionToolAuthority[] = boundaryTools
+        .map((tool) => ({
+          authority: tool.name,
+          parametersSha256: createHash("sha256")
+            .update(canonicalCccToolSchemaJson(tool.parameters))
+            .digest("hex"),
+        }))
+        .sort((left, right) => left.authority.localeCompare(right.authority)
+          || left.parametersSha256.localeCompare(right.parametersSha256));
+      cccReceiptBindingPromise = options.cccEffectReceiptBinder(authorities).then((binding) => {
+        cccReceiptBinding = binding;
+        cccControllerToken = binding.controllerToken;
+        return binding;
+      });
+    }
+    return cccReceiptBindingPromise;
+  };
+  const cccReceiptStore = (): CccEffectReceiptStore | undefined => cccReceiptBinding?.store ?? options.cccEffectReceiptStore;
+  const cccReceiptSessionId = (): string | undefined => cccReceiptBinding?.sessionId ?? options.cccEffectReceiptSessionId;
+  const cccKeepTurnOpen = (): boolean => cccReceiptBinding?.keepTurnOpen ?? options.cccEffectReceiptKeepTurnOpen === true;
   let cccOpenTurn: { turnKey: string; nextSlot: number } | undefined;
   const openCccTurnForPrompt = async (): Promise<void> => {
-    if (options.profile !== CCC_FUSION_PROFILE || !options.cccEffectReceiptStore || !options.cccEffectReceiptSessionId) return;
-    const turn = await options.cccEffectReceiptStore.openCccEffectTurn(
-      options.cccEffectReceiptSessionId,
+    const store = cccReceiptStore();
+    const sessionId = cccReceiptSessionId();
+    if (options.profile !== CCC_FUSION_PROFILE || !store || !sessionId) return;
+    const turn = await store.openCccEffectTurn(
+      sessionId,
       cccControllerToken,
     );
     cccOpenTurn = { turnKey: turn.turnKey, nextSlot: 0 };
   };
   const closeCccTurnAfterPrompt = async (): Promise<void> => {
-    if (options.cccEffectReceiptKeepTurnOpen) return;
-    if (!cccOpenTurn || !options.cccEffectReceiptStore || !options.cccEffectReceiptSessionId) return;
-    await options.cccEffectReceiptStore.closeCccEffectTurn(
-      options.cccEffectReceiptSessionId,
+    const store = cccReceiptStore();
+    const sessionId = cccReceiptSessionId();
+    if (cccKeepTurnOpen()) return;
+    if (!cccOpenTurn || !store || !sessionId) return;
+    await store.closeCccEffectTurn(
+      sessionId,
       cccOpenTurn.turnKey,
       cccControllerToken,
     );
@@ -2840,13 +2907,13 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       boundaryContext.worktreeProjectRoot,
       normalizedAdditionalSkillPaths,
     );
+    const cccBinding = await resolveCccReceiptBinding(boundaryTools);
     const customToolList: ToolDefinition[] = options.profile === CCC_FUSION_PROFILE
-      && options.cccEffectReceiptStore
-      && options.cccEffectReceiptSessionId
+      && cccBinding
       ? wrapCccToolsWithDurableEffectReceipts(
           boundaryTools,
-          options.cccEffectReceiptStore,
-          options.cccEffectReceiptSessionId,
+          cccBinding.store,
+          cccBinding.sessionId,
           {
             controllerToken: cccControllerToken,
             current: () => {

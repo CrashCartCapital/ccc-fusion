@@ -66,6 +66,57 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     expect((await CliSessionStore.create(h.layer(), "project-a")).getSession(created.id)).toBeUndefined();
   });
 
+  it("rejects a stale CCC controller lifecycle finalizer after durable generation takeover", async () => {
+    const bootstrap = await CliSessionStore.create(h.layer(), "project-a");
+    const session = bootstrap.createSession({
+      id: "cli-pg-controller-cas",
+      projectId: "project-a",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: "FN-CCC-CAS",
+      agentState: "dead",
+      terminationReason: "engineDeath",
+      autonomyPosture: {
+        cccControllerGeneration: "controller-old",
+        cccControllerFenced: true,
+      },
+    });
+    await bootstrap.flush();
+
+    const oldController = await CliSessionStore.create(h.layer(), "project-a");
+    const replacementController = await CliSessionStore.create(h.layer(), "project-a");
+    const replacement = await replacementController.updateCccSessionForController(session.id, "controller-old", {
+      agentState: "busy",
+      terminationReason: null,
+      controllerToken: "controller-fresh",
+      controllerFenced: false,
+      cancellationState: null,
+    });
+    expect(replacement).toMatchObject({
+      agentState: "busy",
+      terminationReason: null,
+      autonomyPosture: {
+        cccControllerGeneration: "controller-fresh",
+        cccControllerFenced: false,
+      },
+    });
+
+    await expect(oldController.updateCccSessionForController(session.id, "controller-old", {
+      agentState: "dead",
+      terminationReason: "killed",
+      controllerFenced: true,
+      cancellationState: "CANCELLED",
+    })).resolves.toBeUndefined();
+    expect((await CliSessionStore.create(h.layer(), "project-a")).getSession(session.id)).toMatchObject({
+      agentState: "busy",
+      terminationReason: null,
+      autonomyPosture: {
+        cccControllerGeneration: "controller-fresh",
+        cccControllerFenced: false,
+      },
+    });
+  });
+
   it("does not reissue a committed CCC effect after PostgreSQL store rehydration", async () => {
     const first = await CliSessionStore.create(h.layer(), "project-a");
     first.createSession({

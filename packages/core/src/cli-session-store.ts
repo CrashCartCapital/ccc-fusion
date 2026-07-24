@@ -251,6 +251,74 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
     return updated;
   }
 
+  /**
+   * Atomically transition the CCC lifecycle row only when this controller still
+   * owns the durable generation. This deliberately bypasses the hydrated cache:
+   * independently restarted engines must not let a stale late finalizer write
+   * over a replacement controller's state.
+   */
+  async updateCccSessionForController(
+    id: string,
+    expectedControllerToken: string,
+    input: {
+      agentState: CliAgentState;
+      terminationReason: CliTerminationReason | null;
+      nativeSessionId?: string | null;
+      controllerToken?: string;
+      controllerFenced?: boolean;
+      cancellationState?: string | null;
+    },
+  ): Promise<CliSession | undefined> {
+    this.assertAgentState(input.agentState);
+    this.assertTerminationReason(input.terminationReason);
+    await this.flush();
+    const updated = await this.layer.transaction(async (tx) => {
+      const rows = (await tx.execute(sql`
+        SELECT id, task_id AS "taskId", chat_session_id AS "chatSessionId", purpose,
+          owner_project_id AS "ownerProjectId", adapter_id AS "adapterId", agent_state AS "agentState",
+          termination_reason AS "terminationReason", native_session_id AS "nativeSessionId",
+          resume_attempts AS "resumeAttempts", autonomy_posture AS "autonomyPosture",
+          worktree_path AS "worktreePath", created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM project.cli_sessions
+        WHERE owner_project_id = ${this.projectId} AND id = ${id}
+        FOR UPDATE
+      `)) as unknown as CliSessionRow[];
+      const row = rows[0];
+      if (!row) return undefined;
+      const current = rowToSession(row);
+      const posture = current.autonomyPosture ?? {};
+      if (posture.cccControllerGeneration !== expectedControllerToken) return undefined;
+      const nextPosture: CliAutonomyPosture = {
+        ...posture,
+        ...(input.controllerToken !== undefined ? { cccControllerGeneration: input.controllerToken } : {}),
+        ...(input.controllerFenced !== undefined ? { cccControllerFenced: input.controllerFenced } : {}),
+      };
+      if (input.cancellationState === null) delete nextPosture.cccCancellationState;
+      else if (input.cancellationState !== undefined) nextPosture.cccCancellationState = input.cancellationState;
+      const next: CliSession = {
+        ...current,
+        agentState: input.agentState,
+        terminationReason: input.terminationReason,
+        ...(input.nativeSessionId !== undefined ? { nativeSessionId: input.nativeSessionId } : {}),
+        autonomyPosture: nextPosture,
+        updatedAt: new Date().toISOString(),
+      };
+      await tx.execute(sql`
+        UPDATE project.cli_sessions
+        SET agent_state = ${next.agentState}, termination_reason = ${next.terminationReason},
+          native_session_id = ${next.nativeSessionId},
+          autonomy_posture = ${JSON.stringify(nextPosture)}, updated_at = ${next.updatedAt}
+        WHERE owner_project_id = ${this.projectId} AND id = ${id}
+          AND autonomy_posture::jsonb->>'cccControllerGeneration' = ${expectedControllerToken}
+      `);
+      return next;
+    });
+    if (!updated) return undefined;
+    this.sessions.set(id, updated);
+    this.emit("cli-session:updated", updated);
+    return updated;
+  }
+
   deleteSession(id: string): boolean {
     if (!this.sessions.delete(id)) return false;
     this.enqueue(() => this.layer.db

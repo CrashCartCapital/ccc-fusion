@@ -46,6 +46,28 @@ export interface AgentMcpServerConfig {
 
 export type AgentRuntimeMcpServerConfig = ResolvedMcpServerDefinition | AgentMcpServerConfig;
 
+/** The final, safe projection of the tools actually offered to a CCC PI session. */
+export interface CccExecutionToolAuthority {
+  authority: string;
+  parametersSha256: string;
+}
+
+/** Durable receipt ownership selected only after PI has materialized its final tool boundary. */
+export interface CccEffectReceiptBinding {
+  store: CccEffectReceiptStore;
+  sessionId: string;
+  controllerToken: string;
+  keepTurnOpen: boolean;
+}
+
+/**
+ * PI invokes this once per session construction after every tool filter and
+ * wrapper has completed. The executor receives no raw schemas or tool args.
+ */
+export type CccEffectReceiptBinder = (
+  authorities: readonly CccExecutionToolAuthority[],
+) => Promise<CccEffectReceiptBinding>;
+
 export function normalizeAgentRuntimeMcpServers(
   servers: AgentRuntimeMcpServerConfig[] | undefined,
 ): ResolvedMcpServerDefinition[] | undefined {
@@ -171,6 +193,8 @@ export interface AgentRuntimeOptions {
   cccEffectReceiptSessionId?: string;
   /** Durable controller-generation fence for a ccc receipt turn. */
   cccEffectReceiptControllerToken?: string;
+  /** Late-bound durable CCC receipt ownership for the final PI tool boundary. */
+  cccEffectReceiptBinder?: CccEffectReceiptBinder;
   actionGateContext?: AgentActionGateContext;
   /** Permanent-agent action gating context for v1 category classification enforcement. */
   permanentAgentGating?: PermanentAgentGatingContext;
