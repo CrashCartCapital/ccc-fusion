@@ -421,11 +421,6 @@ export class CliTaskSession {
         // best-effort transition
       }
     }
-    // A live native follow-up is a new logical user prompt, not a transport
-    // reconnect. Advance the receipt turn before injecting so the same ordinary
-    // effect may run once in this new turn while interrupted-turn recovery still
-    // replays its committed receipt.
-    await this.manager.rotateCccEffectTurn(this.sessionId);
     await this.manager.inject(this.sessionId, prompt);
     this.log(`cli-task-session ${this.sessionId}: follow-up injected (live resume)`);
     return true;

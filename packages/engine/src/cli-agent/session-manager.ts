@@ -626,12 +626,6 @@ export class CliSessionManager {
     return this.sessions.has(sessionId);
   }
 
-  /** Rotate the native durable effect turn only at the task-owned follow-up seam. */
-  async rotateCccEffectTurn(sessionId: string): Promise<void> {
-    const live = this.require(sessionId);
-    await live.nativeMcpProxy?.rotateEffectTurn();
-  }
-
   // ── Spawn ──────────────────────────────────────────────────────────────
 
   /**
@@ -1273,15 +1267,6 @@ export class CliSessionManager {
   private async persistConfirmedCancellation(live: LiveSession, reason: CliTerminationReason): Promise<void> {
     if (this.sessions.get(live.id) !== live) return;
     try {
-      // The provider process tree is already observed closed at this point. The
-      // native proxy is another registered, owned resource: its loopback
-      // request/stream must be closed before durable terminal state can fence a
-      // replacement controller or release this manager's ownership.
-      await live.nativeMcpProxy?.dispose();
-    } catch (cause) {
-      await this.failCancellationWithoutClosure(live, "CANCELLATION_UNCONFIRMED", cause);
-    }
-    try {
       const current = this.store.getSession(live.id);
       this.store.updateSession(live.id, {
         agentState: "dead",
@@ -1312,6 +1297,7 @@ export class CliSessionManager {
     }
     live.queue = [];
 
+    await live.nativeMcpProxy?.dispose();
     if (this.sessions.get(live.id) === live) this.sessions.delete(live.id);
   }
 
