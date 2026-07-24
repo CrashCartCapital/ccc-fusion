@@ -280,17 +280,10 @@ export async function runSplitJoin(
         void err;
       });
   };
-  // CCC's durable boundary is stronger than ordinary collect semantics: do not
-  // start a later sibling after a checkpoint failure is observed.
-  const branchPromises: Promise<void>[] = [];
-  if (failClosed) {
-    for (const edge of branchEdges) {
-      await runBranch(edge);
-      if (failureReason) break;
-    }
-  } else {
-    branchPromises.push(...branchEdges.map(runBranch));
-  }
+  // Admission has committed before dispatch, so all branches retain ordinary
+  // fan-out concurrency. A later CCC checkpoint failure aborts the shared
+  // signal; walkBranch checks it before every successor node/effect.
+  const branchPromises = branchEdges.map(runBranch);
 
   // Wait for the join to resolve, then let in-flight branches settle so collect
   // semantics (and persistence writes) complete before we return.

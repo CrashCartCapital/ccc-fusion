@@ -209,22 +209,92 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(branchOutcomes.some((b) => b.outcome === "success")).toBe(true);
   });
 
-  it("Wave 4 RED: CCC persistence failure aborts a collect join before its next sibling effect", async () => {
+  it("Wave 4 RED: CCC persistence failure aborts a collect join before the next sibling effect", async () => {
     const calls: string[] = [];
+    const branchBEntered = deferred<void>();
+    const ir: WorkflowIr = {
+      ...twoBranchIr({ mode: "all", onBranchFailure: "collect" }),
+      nodes: [
+        { id: "start", kind: "start" }, { id: "split", kind: "split", column: "work" },
+        { id: "branchA", kind: "prompt", column: "work", config: {} },
+        { id: "branchATerminal", kind: "prompt", column: "work", config: {} },
+        { id: "branchB", kind: "prompt", column: "work", config: {} },
+        { id: "branchBAfter", kind: "prompt", column: "work", config: {} },
+        { id: "join", kind: "join", column: "work", config: { mode: "all", onBranchFailure: "collect" } },
+        { id: "tail", kind: "prompt", column: "work", config: {} }, { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "split" }, { from: "split", to: "branchA" }, { from: "split", to: "branchB" },
+        { from: "branchA", to: "branchATerminal" }, { from: "branchATerminal", to: "join", condition: "success" },
+        { from: "branchB", to: "branchBAfter" }, { from: "branchBAfter", to: "join", condition: "success" },
+        { from: "join", to: "tail", condition: "success" }, { from: "join", to: "end", condition: "failure" },
+        { from: "tail", to: "end", condition: "success" },
+      ],
+    };
     const executor = new WorkflowGraphExecutor({
       branchPersistence: {
         saveBranchState: async (state) => {
-          if (state.branchId === "branchA" && state.status === "completed") {
+          if (state.branchId === "branchA" && state.currentNodeId === "branchATerminal" && state.status === "completed") {
             throw new Error("durable terminal checkpoint failed");
           }
         },
       },
-      handlers: { prompt: async (node) => { calls.push(node.id); return { outcome: "success" as const }; } },
+      handlers: {
+        prompt: async (node, ctx) => {
+          calls.push(node.id);
+          if (node.id === "branchB") {
+            branchBEntered.resolve();
+            await new Promise<void>((resolve) => ctx.signal?.addEventListener("abort", () => resolve(), { once: true }));
+          }
+          if (node.id === "branchATerminal") {
+            await branchBEntered.promise;
+          }
+          return { outcome: "success" as const };
+        },
+      },
     });
-    const result = await executor.run({ ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), twoBranchIr({ mode: "all", onBranchFailure: "collect" }));
+    const result = await executor.run({ ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir);
 
     expect(result.outcome).toBe("failure");
-    expect(calls).not.toContain("branchB");
+    expect(calls).toContain("branchB");
+    expect(calls).not.toContain("branchBAfter");
+    expect(calls).not.toContain("tail");
+  });
+
+  it("Wave 4 RED: CCC branches enter the split concurrently", async () => {
+    const entered = new Set<string>();
+    const bothEntered = deferred<void>();
+    let overlapBarrierOpened = false;
+    const prompt: WorkflowNodeHandler = async (node) => {
+      if (node.id === "branchA" || node.id === "branchB") {
+        entered.add(node.id);
+        if (entered.size === 2) {
+          overlapBarrierOpened = true;
+          bothEntered.resolve();
+        }
+        if (node.id === "branchA") {
+          // Let the fan-out dispatcher invoke the sibling before A crosses its
+          // barrier; a serialized dispatcher leaves this false.
+          await Promise.resolve();
+          expect(overlapBarrierOpened).toBe(true);
+          await bothEntered.promise;
+        }
+      }
+      return { outcome: "success" as const };
+    };
+    const executor = new WorkflowGraphExecutor({
+      branchPersistence: { saveBranchState: async () => {} },
+      handlers: { prompt },
+    });
+
+    const result = await executor.run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } },
+      settingsOn(),
+      twoBranchIr({ mode: "all", onBranchFailure: "collect" }),
+    );
+
+    expect(result.outcome).toBe("success");
+    expect(entered).toEqual(new Set(["branchA", "branchB"]));
   });
 
   it("crash mid-branch resume — completed branches' nodes are NOT re-run", async () => {

@@ -683,7 +683,9 @@ export async function createTaskStoreForTest(options?: {
   readonly prefix?: string;
   readonly copyFromGolden?: boolean;
   /** Test-only deterministic teardown fault used to prove retained diagnostics. */
-  readonly teardownFault?: "remove-root-dir";
+  readonly teardownFault?: "store-close" | "remove-root-dir";
+  /** Test-only diagnostic write fault; the original teardown error must survive it. */
+  readonly diagnosticWriteFault?: boolean;
 }): Promise<PgTestHarness> {
   const poolMax = options?.poolMax ?? 5;
   const prefix = options?.prefix ?? "fusion_test";
@@ -787,6 +789,9 @@ export async function createTaskStoreForTest(options?: {
       recordFailure("stop-watching", error);
     }
     try {
+      if (options?.teardownFault === "store-close") {
+        throw new Error("injected test teardown failure before store close");
+      }
       await store.close();
     } catch (error) {
       recordFailure("store-close", error);
@@ -807,13 +812,15 @@ export async function createTaskStoreForTest(options?: {
     } catch (error) {
       recordFailure("drop-database", error);
     }
-    try {
-      if (options?.teardownFault === "remove-root-dir") {
-        throw new Error("injected test teardown failure before root-dir removal");
+    if (!teardownFailure) {
+      try {
+        if (options?.teardownFault === "remove-root-dir") {
+          throw new Error("injected test teardown failure before root-dir removal");
+        }
+        await rm(rootDir, { recursive: true, force: true });
+      } catch (error) {
+        recordFailure("remove-root-dir", error);
       }
-      await rm(rootDir, { recursive: true, force: true });
-    } catch (error) {
-      recordFailure("remove-root-dir", error);
     }
     if (teardownFailure) {
       /*
@@ -834,8 +841,21 @@ export async function createTaskStoreForTest(options?: {
           .replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "[redacted-postgresql-url]")
           .replace(/password=[^\s&]+/gi, "password=[redacted]"),
       };
-      await writeFile(join(rootDir, "pg-teardown-diagnostic.json"), `${JSON.stringify(packet, null, 2)}\n`);
-      throw new Error(`PostgreSQL test harness teardown failed at ${teardownFailure.stage}; retained redacted diagnostic packet`);
+      let diagnosticWriteError: unknown;
+      try {
+        if (options?.diagnosticWriteFault) throw new Error("injected test diagnostic packet write failure");
+        await writeFile(join(rootDir, "pg-teardown-diagnostic.json"), `${JSON.stringify(packet, null, 2)}\n`);
+      } catch (error) {
+        diagnosticWriteError = error;
+      }
+      const originalMessage = `PostgreSQL test harness teardown failed at ${teardownFailure.stage}; retained redacted diagnostic packet`;
+      if (diagnosticWriteError) {
+        const diagnosticMessage = diagnosticWriteError instanceof Error
+          ? diagnosticWriteError.message
+          : String(diagnosticWriteError);
+        throw new Error(`${originalMessage}; diagnostic packet write also failed: ${diagnosticMessage}`, { cause: teardownFailure.error });
+      }
+      throw new Error(originalMessage, { cause: teardownFailure.error });
     }
   };
 

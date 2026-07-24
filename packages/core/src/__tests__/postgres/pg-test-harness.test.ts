@@ -6,6 +6,8 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
+import { access, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
   createTaskStoreForTest,
   PG_AVAILABLE,
@@ -68,5 +70,24 @@ testDescribe("createTaskStoreForTest (PG fixture helper)", () => {
   it("supports a custom prefix for database naming", async () => {
     harness = await createTaskStoreForTest({ prefix: "custom_prefix" });
     expect(harness.dbName.startsWith("custom_prefix")).toBe(true);
+  });
+
+  it("Wave 4 RED: preserves an earlier teardown failure packet before root cleanup", async () => {
+    const h = await createTaskStoreForTest({ teardownFault: "store-close" });
+    harness = null;
+
+    await expect(h.teardown()).rejects.toThrow("teardown failed at store-close");
+    await expect(access(h.rootDir)).resolves.toBeUndefined();
+    const packet = JSON.parse(await readFile(join(h.rootDir, "pg-teardown-diagnostic.json"), "utf8"));
+    expect(packet).toEqual(expect.objectContaining({ stage: "store-close" }));
+    expect(JSON.stringify(packet)).not.toContain(h.testUrl);
+  });
+
+  it("Wave 4 RED: packet-write failure preserves the original teardown stage", async () => {
+    const h = await createTaskStoreForTest({ teardownFault: "store-close", diagnosticWriteFault: true });
+    harness = null;
+
+    await expect(h.teardown()).rejects.toThrow("teardown failed at store-close");
+    await expect(access(h.rootDir)).resolves.toBeUndefined();
   });
 });
