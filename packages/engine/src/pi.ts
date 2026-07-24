@@ -37,6 +37,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   customProviderRegistryKey,
+  commitCccEffectReceipt,
   getEnabledPiExtensionPaths,
   getFusionAgentDir,
   getLegacyPiAgentDir,
@@ -50,12 +51,14 @@ import {
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
   resolvePiExtensionProjectRoot,
+  hasCccEffectReceipt,
 } from "@fusion/core";
 import type {
   AgentPermissionPolicyActionCategory,
   PermanentAgentActionCategory,
   PermanentAgentGatingContext,
   ResolvedMcpServerDefinition,
+  CccEffectReceiptStore,
 } from "@fusion/core";
 import {
   resolveSessionSkills,
@@ -323,6 +326,25 @@ function clearSessionStateError(session: AgentSession): void {
 }
 
 const CCC_EXPECTED_RESPONSE_MODEL = "__fusionCccExpectedResponseModel";
+
+/**
+ * An owned CCC transport is not considered closed when AbortController merely
+ * fires. The provider stream must first reach its terminal result and one full
+ * close-callback turn must run before executor ownership can be released.
+ */
+export const CCC_AWAIT_OWNED_TRANSPORT_CLOSURE = Symbol("cccAwaitOwnedTransportClosure");
+
+type CccTransportClosureSession = AgentSession & {
+  [CCC_AWAIT_OWNED_TRANSPORT_CLOSURE]?: () => Promise<void>;
+};
+
+function awaitNodeTransportCloseCallbacks(): Promise<void> {
+  return new Promise((resolve) => {
+    // Node runs socket close callbacks after check. Two turns make the
+    // completion observable to the owner without a timing delay or polling.
+    setImmediate(() => setImmediate(resolve));
+  });
+}
 
 type CccResponseIdentitySession = AgentSession & {
   [CCC_EXPECTED_RESPONSE_MODEL]?: {
@@ -1196,6 +1218,10 @@ export interface AgentOptions {
   profile?: string;
   /** Caller-supplied structural readiness outcome for ccc-fusion child boundaries. */
   subscriptionReady?: true;
+  /** Durable receipt store for actual ccc custom-tool effects. */
+  cccEffectReceiptStore?: CccEffectReceiptStore;
+  /** Stable durable session identity used by the effect receipt contract. */
+  cccEffectReceiptSessionId?: string;
   /** Optional task-scoped env injected into this session's subprocess tools only. */
   taskEnv?: NodeJS.ProcessEnv;
   /** Last-chance abort hook fired immediately before `createAgentSession`.
@@ -1972,6 +1998,43 @@ export function wrapToolsWithBoundary(
   });
 }
 
+/*
+FNXC:CCCEffectReceipts 2026-07-23-18:48:
+This is the committed effect boundary: the ToolDefinition execute closure passed
+to createAgentSession. CCC effects derive identity from the real tool-call id,
+name, and canonical arguments; a durable receipt is checked before execution
+and flushed after execution before its result acknowledges the effect.
+*/
+export function wrapCccToolsWithDurableEffectReceipts(
+  tools: ToolDefinition[],
+  store: CccEffectReceiptStore,
+  sessionId: string,
+): ToolDefinition[] {
+  return tools.map((tool) => {
+    const originalExecute = tool.execute as (...args: any[]) => Promise<any>;
+    return {
+      ...tool,
+      execute: async (...args: any[]) => {
+        const input = {
+          sessionId,
+          toolCallId: String(args[0] ?? ""),
+          toolName: tool.name,
+          arguments: args[1] ?? {},
+        };
+        if (hasCccEffectReceipt(store, input)) {
+          return {
+            content: [{ type: "text" as const, text: "CCC effect already committed; replay suppressed." }],
+            details: { cccEffectReceipt: "already-committed" },
+          };
+        }
+        const result = await originalExecute(...args);
+        await commitCccEffectReceipt(store, input);
+        return result;
+      },
+    };
+  });
+}
+
 export function wrapToolsWithRtkRewrite(
   tools: ToolDefinition[],
   options: RtkRewriteOptions = resolveRtkRewriteOptions(),
@@ -2296,6 +2359,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const authStorage = createFusionAuthStorage();
   const modelRegistry = await createFusionModelRegistry(authStorage);
   const modelRuntime = modelRegistry.modelRuntime;
+  const cccTransportClosures = new Set<Promise<void>>();
 
   if (options.profile === CCC_FUSION_PROFILE) {
     /*
@@ -2346,6 +2410,11 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         context,
         optionsWithBoundary,
       );
+      const closed = Promise.resolve(source.result())
+        .catch(() => undefined)
+        .then(() => awaitNodeTransportCloseCallbacks());
+      cccTransportClosures.add(closed);
+      void closed.then(() => cccTransportClosures.delete(closed));
       return restoreCccStreamRequestModel(source, expectedModelId);
     };
     const stream = modelRuntime.stream.bind(modelRuntime);
@@ -2685,12 +2754,21 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       toolsWithPermanentGating,
       options.actionGateContext,
     );
-    const customToolList: ToolDefinition[] = wrapToolsWithBoundary(
+    const boundaryTools: ToolDefinition[] = wrapToolsWithBoundary(
       toolsWithActionGate,
       boundaryContext.worktreePath,
       boundaryContext.worktreeProjectRoot,
       normalizedAdditionalSkillPaths,
     );
+    const customToolList: ToolDefinition[] = options.profile === CCC_FUSION_PROFILE
+      && options.cccEffectReceiptStore
+      && options.cccEffectReceiptSessionId
+      ? wrapCccToolsWithDurableEffectReceipts(
+          boundaryTools,
+          options.cccEffectReceiptStore,
+          options.cccEffectReceiptSessionId,
+        )
+      : boundaryTools;
     // Sort tools alphabetically by name for deterministic ordering.
     // Prompt caching requires the tool list to be byte-identical across
     // sessions — reordering breaks cache prefix matching.
@@ -2899,6 +2977,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   installMessageContentGuard(activeSession as AgentToolHookSession, sessionManager as unknown as SessionManagerLike);
   (activeSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
   const promptableSession = activeSession as PromptableSession;
+
+  if (options.profile === CCC_FUSION_PROFILE) {
+    (promptableSession as CccTransportClosureSession)[CCC_AWAIT_OWNED_TRANSPORT_CLOSURE] = async () => {
+      await Promise.all([...cccTransportClosures]);
+    };
+  }
 
   let thinkingCompatibilityDisabled = false;
   const applyThinkingLevelIfSupported = (targetSession: AgentSession, sourceModel: string): void => {

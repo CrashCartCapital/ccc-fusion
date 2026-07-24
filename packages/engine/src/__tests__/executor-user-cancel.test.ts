@@ -149,6 +149,72 @@ describe("TaskExecutor user cancel handling", () => {
     expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
   });
 
+  it("returns a typed failure and retains custom-provider ownership when abort rejects", async () => {
+    resetExecutorMocks();
+    const taskId = "FN-CUSTOM-PROVIDER-ABORT-REJECTS";
+    const worktreePath = "/tmp/fn-custom-provider-abort-rejects";
+    const store = createMockStore();
+    const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test");
+    const internals = cancellationTestInternals(executor);
+    const session = {
+      prompt: vi.fn(),
+      abort: vi.fn().mockRejectedValue(new Error("loopback stream close rejected")),
+      dispose: vi.fn(),
+    };
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+    }, worktreePath);
+
+    try {
+      await expect(executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true }))
+        .rejects.toMatchObject({ code: "TASK_CANCELLATION_ABORT_FAILED" });
+
+      expect(session.dispose).not.toHaveBeenCalled();
+      expect(internals.activeSessions.get(taskId)?.session).toBe(session);
+      expect(activeSessionRegistry.lookupByPath(worktreePath)).toMatchObject({ taskId, kind: "executor" });
+    } finally {
+      activeSessionRegistry.unregisterPath(worktreePath);
+      internals.activeSessions.delete(taskId);
+      internals.activeWorktrees.delete(taskId);
+    }
+  });
+
+  it("bounds an unclosed custom-provider abort without releasing its worktree lease", async () => {
+    resetExecutorMocks();
+    const taskId = "FN-CUSTOM-PROVIDER-ABORT-NO-CLOSE";
+    const worktreePath = "/tmp/fn-custom-provider-abort-no-close";
+    const store = createMockStore();
+    const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test", { cancellationTimeoutMs: 15 });
+    const internals = cancellationTestInternals(executor);
+    const session = {
+      prompt: vi.fn(),
+      abort: vi.fn(() => new Promise<void>(() => undefined)),
+      dispose: vi.fn(),
+    };
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+    }, worktreePath);
+
+    try {
+      await expect(executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true }))
+        .rejects.toMatchObject({ code: "TASK_CANCELLATION_TIMEOUT" });
+
+      expect(session.dispose).not.toHaveBeenCalled();
+      expect(internals.activeSessions.get(taskId)?.session).toBe(session);
+      expect(activeSessionRegistry.lookupByPath(worktreePath)).toMatchObject({ taskId, kind: "executor" });
+    } finally {
+      activeSessionRegistry.unregisterPath(worktreePath);
+      internals.activeSessions.delete(taskId);
+      internals.activeWorktrees.delete(taskId);
+    }
+  });
+
   it("does not let late cancellation cleanup touch a replacement execution", async () => {
     resetExecutorMocks();
     let resolveChildStateUpdate: (() => void) | undefined;

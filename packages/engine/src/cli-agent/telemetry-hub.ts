@@ -314,25 +314,6 @@ export class TelemetryHub {
     }
 
     const sanitized = this.sanitize(entry, event);
-    if (sanitized.kind === "toolActivity" && sanitized.effectIdentity) {
-      const current = this.store.getSession(sessionId);
-      const receipts = Array.isArray(current?.autonomyPosture?.cccEffectReceipts)
-        ? current.autonomyPosture.cccEffectReceipts.filter((receipt): receipt is string => typeof receipt === "string")
-        : [];
-      // A receipt is committed before forwarding the activity to consumers; a
-      // restarted controller therefore reconciles the same provider/tool effect
-      // instead of replaying it. The session manager flushes this queue before
-      // any cancellation acknowledgement releases ownership.
-      if (receipts.includes(sanitized.effectIdentity)) return undefined;
-      if (current) {
-        this.store.updateSession(sessionId, {
-          autonomyPosture: {
-            ...(current.autonomyPosture ?? {}),
-            cccEffectReceipts: [...receipts, sanitized.effectIdentity],
-          },
-        });
-      }
-    }
     this.route(entry, sanitized);
     // Narrow tap: feed the sanitized event to a downstream observer (e.g. the
     // chat transcript runner). Best-effort — a throwing listener must not break

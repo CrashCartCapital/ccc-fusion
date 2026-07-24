@@ -101,16 +101,33 @@ function makeStore() {
 }
 
 function makePty(): IPty {
+  let onExit: ((event: { exitCode: number; signal: number }) => void) | undefined;
   return {
     pid: 7331,
     onData: vi.fn(() => () => {}),
-    onExit: vi.fn(() => () => {}),
+    onExit: vi.fn((listener: (event: { exitCode: number; signal: number }) => void) => {
+      onExit = listener;
+      return () => {
+        if (onExit === listener) onExit = undefined;
+      };
+    }),
     write: vi.fn(),
     resize: vi.fn(),
-    kill: vi.fn(),
+    // CCC cancellation signals the owned bridge with SIGTERM; terminal proof
+    // arrives through the same callback a real PTY emits for either signal.
+    kill: vi.fn(() => queueMicrotask(() => onExit?.({ exitCode: -1, signal: 15 }))),
     pause: vi.fn(),
     resume: vi.fn(),
   } as unknown as IPty;
+}
+
+/** Decode the manager-owned CCC PTY bridge without weakening adapter assertions. */
+function providerLaunchArgs(args: string[]): string[] {
+  if (args[0] !== "-e" || typeof args[2] !== "string") return args;
+  const decoded = JSON.parse(Buffer.from(args[2], "base64").toString("utf8")) as { args?: unknown };
+  return Array.isArray(decoded.args) && decoded.args.every((arg) => typeof arg === "string")
+    ? decoded.args
+    : args;
 }
 
 function makeManager(store: ReturnType<typeof makeStore>) {
@@ -141,6 +158,11 @@ function makeManager(store: ReturnType<typeof makeStore>) {
     })) as any,
   });
   return { manager, registry, captures };
+}
+
+async function disposeManager(manager: CliSessionManager): Promise<void> {
+  await manager.dispose();
+  expect(manager.activeCount()).toBe(0);
 }
 
 function captureNativeSessionId(
@@ -213,6 +235,7 @@ function makeProtocolServer(calls: FixtureCall[]): Server {
 }
 
 function claudeConfiguredUrl(args: string[], serverName = SERVER_NAME): string {
+  args = providerLaunchArgs(args);
   const index = args.indexOf("--mcp-config");
   expect(index).toBeGreaterThanOrEqual(0);
   const raw = args[index + 1];
@@ -227,6 +250,7 @@ function claudeConfiguredUrl(args: string[], serverName = SERVER_NAME): string {
 }
 
 function codexConfiguredUrl(args: string[], serverName = SERVER_NAME): string {
+  args = providerLaunchArgs(args);
   const assignments = args
     .map((arg, index) => args[index - 1] === "-c" ? arg : undefined)
     .filter((arg): arg is string => typeof arg === "string");
@@ -409,6 +433,7 @@ describe("ccc native MCP provider matrix", () => {
       model: "claude-production-wave2-exact",
       configuredUrl: claudeConfiguredUrl,
       assertModel(args: string[]) {
+        args = providerLaunchArgs(args);
         expect(args.slice(0, 2)).toEqual(["--model", "claude-production-wave2-exact"]);
       },
     },
@@ -418,6 +443,7 @@ describe("ccc native MCP provider matrix", () => {
       model: "gpt-production-wave2-exact",
       configuredUrl: codexConfiguredUrl,
       assertModel(args: string[]) {
+        args = providerLaunchArgs(args);
         expect(args).toEqual(expect.arrayContaining([
           "-c",
           'model="gpt-production-wave2-exact"',
@@ -449,7 +475,7 @@ describe("ccc native MCP provider matrix", () => {
         expect(configuredUrl(first.captures[0]!.args)).toBe(mcpUrl);
         captureNativeSessionId(store, record.id, `${adapterId}-native-wave2`);
       } finally {
-        first.manager.dispose();
+        await disposeManager(first.manager);
       }
 
       const resumed = makeManager(store);
@@ -471,7 +497,7 @@ describe("ccc native MCP provider matrix", () => {
         assertModel(resumed.captures[0]!.args);
         expect(configuredUrl(resumed.captures[0]!.args)).toBe(mcpUrl);
       } finally {
-        resumed.manager.dispose();
+        await disposeManager(resumed.manager);
       }
     },
   );
@@ -494,7 +520,7 @@ describe("ccc native MCP provider matrix", () => {
           mcpServers: [nativeMcpServer()],
         },
       });
-      first.manager.dispose();
+      await disposeManager(first.manager);
       store.updateSession(record.id, {
         agentState: "ready",
         terminationReason: null,
@@ -533,7 +559,7 @@ describe("ccc native MCP provider matrix", () => {
             nativeSessionId: `${adapterId}-native-recovery-wave2`,
             requestedModel: model,
             permissionAutonomy: null,
-            effectIdentity: null,
+            effectReceiptContract: "ccc-tool-receipts/v1",
           },
         });
         const serializedPosture = JSON.stringify(record.autonomyPosture);
@@ -543,7 +569,7 @@ describe("ccc native MCP provider matrix", () => {
         expect(serializedPosture).not.toContain("synthetic-loopback-only");
         expect(JSON.stringify(logs)).not.toContain("synthetic-loopback-only");
       } finally {
-        restarted.manager.dispose();
+        await disposeManager(restarted.manager);
       }
     },
   );
@@ -583,7 +609,7 @@ describe("ccc native MCP provider matrix", () => {
         });
         expect(runtime.captures).toEqual([]);
       } finally {
-        runtime.manager.dispose();
+        await disposeManager(runtime.manager);
       }
     },
   );
@@ -650,7 +676,7 @@ describe("ccc native MCP provider matrix", () => {
           expect(observable, fixture.label).not.toContain("never-forward-this-value");
           expect(observable, fixture.label).not.toContain("never-forward.invalid");
         } finally {
-          runtime.manager.dispose();
+          await disposeManager(runtime.manager);
         }
       }
     },
@@ -691,7 +717,7 @@ describe("ccc native MCP provider matrix", () => {
         expect(configuredUrl(runtime.captures[0]!.args)).toBe(mcpUrl);
       } finally {
         if (session) await session.kill();
-        runtime.manager.dispose();
+        await disposeManager(runtime.manager);
       }
     },
   );
@@ -826,7 +852,7 @@ describe("ccc native MCP provider matrix", () => {
           failure = error;
           logs.push(error instanceof Error ? error.message : String(error));
         } finally {
-          runtime.manager.dispose();
+          await disposeManager(runtime.manager);
         }
 
         expect(failure, label).toMatchObject({
@@ -885,7 +911,7 @@ describe("ccc native MCP provider matrix", () => {
         expect(store.createSession).not.toHaveBeenCalled();
         expect(runtime.captures).toEqual([]);
       } finally {
-        runtime.manager.dispose();
+        await disposeManager(runtime.manager);
       }
     },
   );
@@ -940,14 +966,18 @@ describe("ccc native MCP provider matrix", () => {
 
         expect(runtime.captures).toHaveLength(3);
         for (const capture of runtime.captures) {
-          const serialized = JSON.stringify(capture);
+          const serialized = JSON.stringify({
+            command: capture.command,
+            args: providerLaunchArgs(capture.args),
+            env: capture.options.env,
+          });
           expect(serialized).not.toContain("--mcp-config");
           expect(serialized).not.toContain("mcp_servers.");
           expect(serialized).not.toContain("never-forward-this-value");
           expect(serialized).not.toContain("synthetic-secret-command");
         }
       } finally {
-        runtime.manager.dispose();
+        await disposeManager(runtime.manager);
       }
     },
   );
@@ -972,7 +1002,7 @@ describe("ccc native MCP provider matrix", () => {
         });
         expect(configuredUrl(runtime.captures[0]!.args, hostileName)).toBe(mcpUrl);
       } finally {
-        runtime.manager.dispose();
+        await disposeManager(runtime.manager);
       }
     },
   );

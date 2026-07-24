@@ -5,6 +5,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { CliSessionStore } from "../../cli-session-store.js";
+import { commitCccEffectReceipt, hasCccEffectReceipt } from "../../ccc-effect-receipts.js";
 import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
@@ -55,6 +56,41 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     expect(rehydrated.deleteSession(created.id)).toBe(true);
     await rehydrated.flush();
     expect((await CliSessionStore.create(h.layer(), "project-a")).getSession(created.id)).toBeUndefined();
+  });
+
+  it("does not reissue a committed CCC effect after PostgreSQL store rehydration", async () => {
+    const first = await CliSessionStore.create(h.layer(), "project-a");
+    first.createSession({
+      id: "cli-pg-effect-receipt",
+      projectId: "project-a",
+      adapterId: "custom-provider-pi",
+      purpose: "execute",
+      taskId: "FN-CCC-EFFECT",
+      autonomyPosture: { cccFusionProfile: "ccc-fusion" },
+    });
+    await first.flush();
+    const effectInput = {
+      sessionId: "cli-pg-effect-receipt",
+      toolCallId: "provider-call-001",
+      toolName: "commit_synthetic_effect",
+      arguments: { target: "loopback", revision: 1 },
+    };
+    let executions = 0;
+    const executeIfUncommitted = async (store: CliSessionStore) => {
+      if (hasCccEffectReceipt(store, effectInput)) return "replayed" as const;
+      executions += 1;
+      await commitCccEffectReceipt(store, effectInput);
+      return "executed" as const;
+    };
+
+    expect(await executeIfUncommitted(first)).toBe("executed");
+    const restarted = await CliSessionStore.create(h.layer(), "project-a");
+    expect(await executeIfUncommitted(restarted)).toBe("replayed");
+    expect(executions).toBe(1);
+    expect(restarted.getSession("cli-pg-effect-receipt")?.autonomyPosture).toMatchObject({
+      cccEffectReceiptContract: "ccc-tool-receipts/v1",
+      cccEffectReceipts: [expect.any(String)],
+    });
   });
 
   it("surfaces a queued PostgreSQL write failure at every durability boundary", async () => {

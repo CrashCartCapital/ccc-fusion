@@ -15,7 +15,7 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
+import type { CccEffectReceiptStore, PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { FallbackModelUsedPayload } from "./pi.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
@@ -161,6 +161,14 @@ export interface AgentRuntimeOptions {
   /** Optional task context for fallback notifications. */
   taskId?: string;
   taskTitle?: string;
+  /** Explicit ccc-fusion boundary; omitted profiles retain predecessor behavior. */
+  profile?: string;
+  /** Structural ccc subscription preflight propagated to the PI runtime. */
+  subscriptionReady?: true;
+  /** Durable receipt surface for real ccc custom-tool effects. */
+  cccEffectReceiptStore?: CccEffectReceiptStore;
+  /** Durable ccc session identity for tool-effect replay protection. */
+  cccEffectReceiptSessionId?: string;
   actionGateContext?: AgentActionGateContext;
   /** Permanent-agent action gating context for v1 category classification enforcement. */
   permanentAgentGating?: PermanentAgentGatingContext;

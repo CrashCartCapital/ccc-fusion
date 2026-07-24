@@ -1,11 +1,12 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { EventEmitter, once } from "node:events";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CliAdapterRegistry, type CliAgentAdapter } from "../cli-agent/adapter.js";
+import { claudeCodeAdapter } from "../cli-agent/adapters/claude-code.js";
+import { codexAdapter } from "../cli-agent/adapters/codex.js";
 import { CliResumeCoordinator } from "../cli-agent/resume-coordinator.js";
 import { CliSessionManager } from "../cli-agent/session-manager.js";
-import { TelemetryHub } from "../cli-agent/telemetry-hub.js";
 
 type Session = Record<string, any>;
 
@@ -61,7 +62,12 @@ function makeAdapter(id: string): CliAgentAdapter {
   };
 }
 
-function makeManager(store: ReturnType<typeof makeStore>, adapterIds: string[], spawnPty: () => any) {
+function makeManager(
+  store: ReturnType<typeof makeStore>,
+  adapterIds: string[],
+  spawnPty: () => any,
+  options: { cancellationTimeoutMs?: number } = {},
+) {
   const registry = new CliAdapterRegistry();
   for (const id of adapterIds) registry.register(makeAdapter(id));
   return {
@@ -70,8 +76,88 @@ function makeManager(store: ReturnType<typeof makeStore>, adapterIds: string[], 
       registry,
       store: store as any,
       loadPty: vi.fn(async () => ({ spawn: () => spawnPty() })) as any,
+      ...options,
     }),
   };
+}
+
+const LOCAL_PROVIDER_TREE = [
+  "const { spawn } = require('node:child_process');",
+  "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 500)'], { stdio: 'ignore' });",
+  "setTimeout(() => process.stdout.write(String(child.pid) + '\\n'), 10);",
+  "setInterval(() => {}, 1_000);",
+].join("\n");
+
+function productionAdapterWithDisposableProvider(adapter: CliAgentAdapter): CliAgentAdapter {
+  return {
+    ...adapter,
+    buildLaunch: () => ({ command: process.execPath, args: ["-e", LOCAL_PROVIDER_TREE] }),
+    buildResume: () => ({ command: process.execPath, args: ["-e", LOCAL_PROVIDER_TREE] }),
+    // The production session-manager seam is under test; no child environment
+    // values or vendor command are needed for the disposable local provider.
+    buildEnvAllowlist: () => [],
+  };
+}
+
+function rootOnlyProcessPty() {
+  return {
+    spawn: (command: string, args: string[], options: { cwd: string; env: Record<string, string> }) => {
+      const root = spawn(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (!root.pid || !root.stdout) throw new Error("failed to start disposable PTY root");
+      const dataListeners = new Set<(data: string) => void>();
+      const exitListeners = new Set<(event: { exitCode: number; signal: number }) => void>();
+      root.stdout.on("data", (chunk: Buffer) => {
+        for (const listener of dataListeners) listener(chunk.toString("utf8"));
+      });
+      root.once("exit", (exitCode, signal) => {
+        for (const listener of exitListeners) listener({ exitCode: exitCode ?? -1, signal: signal ? 9 : 0 });
+      });
+      return {
+        pid: root.pid,
+        onData: (listener: (data: string) => void) => {
+          dataListeners.add(listener);
+          return () => dataListeners.delete(listener);
+        },
+        onExit: (listener: (event: { exitCode: number; signal: number }) => void) => {
+          exitListeners.add(listener);
+          return () => exitListeners.delete(listener);
+        },
+        write: () => {}, resize: () => {}, pause: () => {}, resume: () => {},
+        // This bridge deliberately signals only the PTY root. The behavior under
+        // test must come from the production-owned supervisor, never the fake.
+        kill: (signal: NodeJS.Signals) => process.kill(root.pid!, signal),
+      };
+    },
+  };
+}
+
+function makeProductionManager(store: ReturnType<typeof makeStore>, adapter: CliAgentAdapter) {
+  const registry = new CliAdapterRegistry();
+  registry.register(productionAdapterWithDisposableProvider(adapter));
+  return new CliSessionManager({
+    registry,
+    store: store as any,
+    loadPty: vi.fn(async () => rootOnlyProcessPty()) as any,
+  });
+}
+
+async function readProviderDescendantPid(manager: CliSessionManager, sessionId: string): Promise<number> {
+  const attachment = manager.attach(sessionId);
+  const decoder = new TextDecoder();
+  let output = decoder.decode(attachment.scrollback);
+  for await (const chunk of attachment.stream) {
+    output += decoder.decode(chunk, { stream: true });
+    const line = output.split(/\r?\n/).find((candidate) => /^\d+$/.test(candidate));
+    if (line) {
+      attachment.detach();
+      return Number(line);
+    }
+  }
+  throw new Error("disposable provider did not report its descendant pid");
 }
 
 function isAlive(pid: number): boolean {
@@ -81,77 +167,6 @@ function isAlive(pid: number): boolean {
   } catch (error: unknown) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
-}
-
-const spawnedPids = new Set<number>();
-
-function stopIfAlive(pid: number | undefined): void {
-  if (pid === undefined || !isAlive(pid)) return;
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // The process exited between the liveness probe and cleanup.
-  }
-}
-
-async function waitForDead(pid: number): Promise<void> {
-  await vi.waitFor(() => expect(isAlive(pid)).toBe(false));
-}
-
-function spawnRegisteredNativeTree(order: string[]) {
-  const root: ChildProcess = spawn(process.execPath, ["-e", [
-    "const { spawn } = require('node:child_process');",
-    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { stdio: 'ignore' });",
-    "process.stdout.write(String(child.pid) + '\\n');",
-    "setInterval(() => {}, 1_000);",
-  ].join("\n")], { stdio: ["ignore", "pipe", "ignore"] });
-  if (!root.pid || !root.stdout) throw new Error("failed to create disposable registered provider root");
-  spawnedPids.add(root.pid);
-
-  const childPid = new Promise<number>((resolve, reject) => {
-    let output = "";
-    root.stdout!.on("data", (chunk: Buffer) => {
-      output += chunk.toString("utf8");
-      const firstLine = output.split("\n")[0];
-      if (/^\d+$/.test(firstLine)) {
-        const pid = Number(firstLine);
-        spawnedPids.add(pid);
-        resolve(pid);
-      }
-    });
-    root.once("error", reject);
-  });
-  const rootExited = once(root, "exit");
-  root.once("exit", () => order.push("registered-root-exited"));
-
-  const onExitCallbacks: Array<(result: { exitCode: number; signal: number }) => void> = [];
-  root.once("exit", (code, signal) => {
-    for (const callback of onExitCallbacks) callback({ exitCode: code ?? -1, signal: signal ? 9 : 0 });
-  });
-
-  return {
-    rootPid: root.pid,
-    childPid,
-    rootExited,
-    pty: {
-      pid: root.pid,
-      onData: () => () => {},
-      onExit: (callback: (result: { exitCode: number; signal: number }) => void) => {
-        onExitCallbacks.push(callback);
-        return () => {};
-      },
-      write: () => {},
-      resize: () => {},
-      pause: () => {},
-      resume: () => {},
-      kill: () => {
-        // The injected PTY supervisor knows only this registered root and its
-        // registered child. It never enumerates or signals sibling processes.
-        void childPid.then((pid) => stopIfAlive(pid));
-        stopIfAlive(root.pid!);
-      },
-    },
-  };
 }
 
 async function startLoopbackStream(): Promise<{
@@ -198,28 +213,26 @@ async function startLoopbackStream(): Promise<{
   return { server, pty, requestClosed: () => closed };
 }
 
-afterEach(async () => {
-  for (const pid of spawnedPids) stopIfAlive(pid);
-  spawnedPids.clear();
-});
-
 describe("ccc-fusion Wave 3 cancellation and resume provider matrix", () => {
-  it.each(["claude-code", "codex"])("%s waits for its registered local root and descendant before flushing and releasing", async (adapterId) => {
+  it.each([claudeCodeAdapter, codexAdapter])("$name owns its provider descendant through the production PTY bridge", async (adapter) => {
     const store = makeStore();
-    const tree = spawnRegisteredNativeTree(store.order);
-    const sibling = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000)"], { stdio: "ignore" });
+    const manager = makeProductionManager(store, adapter);
+    const sibling = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 500)"], { stdio: "ignore" });
     if (!sibling.pid) throw new Error("failed to create unregistered sibling");
-    spawnedPids.add(sibling.pid);
-    const { manager } = makeManager(store, [adapterId], () => tree.pty);
 
     try {
-      const session = await manager.spawn({ adapterId, projectId: "ccc", purpose: "execute", taskId: "FN-W3" });
-      const registeredChildPid = await tree.childPid;
+      const session = await manager.spawn({
+        adapterId: adapter.id,
+        projectId: "ccc",
+        purpose: "execute",
+        taskId: "FN-W3",
+        settings: { profile: "ccc-fusion", subscriptionReady: true },
+      });
+      const registeredChildPid = await readProviderDescendantPid(manager, session.id);
 
       await manager.kill(session.id, "killed");
 
-      await tree.rootExited;
-      await waitForDead(registeredChildPid);
+      expect(isAlive(registeredChildPid)).toBe(false);
       expect(isAlive(sibling.pid)).toBe(true);
       expect(store.getSession(session.id)).toMatchObject({
         agentState: "dead",
@@ -227,7 +240,6 @@ describe("ccc-fusion Wave 3 cancellation and resume provider matrix", () => {
         autonomyPosture: { cccCancellationState: "CANCELLED" },
       });
       expect(store.flush).toHaveBeenCalledTimes(2);
-      expect(store.order.indexOf("registered-root-exited")).toBeLessThan(store.order.indexOf("persist:dead:killed"));
       expect(store.order.indexOf("persist:dead:killed")).toBeGreaterThanOrEqual(0);
       expect(store.order.lastIndexOf("flush")).toBeGreaterThan(store.order.indexOf("persist:dead:killed"));
       expect(manager.activeCount()).toBe(0);
@@ -235,8 +247,95 @@ describe("ccc-fusion Wave 3 cancellation and resume provider matrix", () => {
       await manager.kill(session.id, "killed");
       expect(store.flush).toHaveBeenCalledTimes(2);
     } finally {
-      stopIfAlive(sibling.pid);
       await manager.dispose();
+    }
+  });
+
+  it("keeps CCC ownership and returns a typed failure when the registered PTY never closes", async () => {
+    const store = makeStore();
+    let onExit: ((result: { exitCode: number; signal: number }) => void) | undefined;
+    const pty = {
+      pid: 9200,
+      onData: () => () => {},
+      onExit: (callback: (result: { exitCode: number; signal: number }) => void) => {
+        onExit = callback;
+        return () => {};
+      },
+      write: () => {}, resize: () => {}, pause: () => {}, resume: () => {},
+      // Deliberately accepts the signal but never proves registered-resource
+      // closure. This is the production manager's bounded failure seam.
+      kill: vi.fn(),
+    };
+    const { manager } = makeManager(store, ["claude-code"], () => pty, { cancellationTimeoutMs: 15 });
+    let result: { status: "fulfilled" } | { status: "rejected"; code?: string } | { status: "deadline-breached" };
+
+    try {
+      result = await Promise.race([
+        manager.kill((await manager.spawn({
+          adapterId: "claude-code",
+          projectId: "ccc",
+          purpose: "execute",
+          settings: { profile: "ccc-fusion", subscriptionReady: true },
+        })).id, "killed").then(
+          () => ({ status: "fulfilled" as const }),
+          (error: unknown) => ({ status: "rejected" as const, code: (error as { code?: string }).code }),
+        ),
+        new Promise<{ status: "deadline-breached" }>((resolve) => setTimeout(() => resolve({ status: "deadline-breached" }), 80)),
+      ]);
+
+      expect(result).toEqual({ status: "rejected", code: "CLI_CANCELLATION_TIMEOUT" });
+      expect(pty.kill).toHaveBeenCalledTimes(1);
+      expect(manager.activeCount()).toBe(1);
+      expect([...store.sessions.values()][0]).toMatchObject({
+        agentState: "needsAttention",
+        terminationReason: null,
+        autonomyPosture: { cccCancellationState: "CANCELLATION_UNCONFIRMED" },
+      });
+      expect(store.order).not.toContain("persist:dead:killed");
+    } finally {
+      // This closes only the synthetic registered resource after the assertions;
+      // it never targets an OS process and lets the manager remove its exit hook.
+      onExit?.({ exitCode: -1, signal: 9 });
+      await manager.dispose().catch(() => undefined);
+    }
+  });
+
+  it("keeps CCC ownership and a non-terminal record when the cancellation flush rejects", async () => {
+    const store = makeStore();
+    let onExit: ((result: { exitCode: number; signal: number }) => void) | undefined;
+    const pty = {
+      pid: 9201,
+      onData: () => () => {},
+      onExit: (callback: (result: { exitCode: number; signal: number }) => void) => {
+        onExit = callback;
+        return () => {};
+      },
+      write: () => {}, resize: () => {}, pause: () => {}, resume: () => {},
+      kill: vi.fn(() => onExit?.({ exitCode: -1, signal: 9 })),
+    };
+    const { manager } = makeManager(store, ["claude-code"], () => pty);
+    try {
+      const session = await manager.spawn({
+        adapterId: "claude-code",
+        projectId: "ccc",
+        purpose: "execute",
+        settings: { profile: "ccc-fusion", subscriptionReady: true },
+      });
+      store.flush.mockRejectedValueOnce(new Error("durable cancellation flush rejected"));
+
+      await expect(manager.kill(session.id, "killed"))
+        .rejects.toMatchObject({ code: "CLI_CANCELLATION_PERSISTENCE_FAILED" });
+
+      expect(store.getSession(session.id)).toMatchObject({
+        agentState: "needsAttention",
+        terminationReason: null,
+        autonomyPosture: { cccCancellationState: "CANCELLATION_UNCONFIRMED" },
+      });
+      expect(manager.activeCount()).toBe(1);
+      expect(store.order.at(-2)).toBe("persist:needsAttention:none");
+      expect(store.order.at(-1)).toBe("flush");
+    } finally {
+      await manager.dispose().catch(() => undefined);
     }
   });
 
@@ -263,42 +362,10 @@ describe("ccc-fusion Wave 3 cancellation and resume provider matrix", () => {
     }
   });
 
-  it.each(["claude-code", "codex", "custom-provider-pi"])("%s enforces exact resume identity", async (adapterId) => {
+  it.each(["claude-code", "codex"])("%s enforces exact ccc resume identity", async (adapterId) => {
     await runResumeIdentityMatrix(adapterId);
   });
 
-  it.each(["claude-code", "codex", "custom-provider-pi"])("%s records a committed tool effect and suppresses the identical effect after a controller restart", (adapterId) => {
-    const store = makeStore();
-    store.sessions.set("effect-session", {
-      id: "effect-session",
-      projectId: "ccc",
-      adapterId,
-      purpose: "execute",
-      taskId: "FN-W3",
-      chatSessionId: null,
-      agentState: "busy",
-      terminationReason: null,
-      nativeSessionId: "provider-native",
-      resumeAttempts: 0,
-      autonomyPosture: null,
-      worktreePath: "/tmp/wave3",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-    const observed = vi.fn();
-    const first = new TelemetryHub({ store: store as any, onEvent: observed });
-    first.issueToken("effect-session");
-    first.ingest("effect-session", { kind: "toolActivity", payload: { effectIdentity: "tool:commit-1" } });
-
-    const restarted = new TelemetryHub({ store: store as any, onEvent: observed });
-    restarted.issueToken("effect-session");
-    restarted.ingest("effect-session", { kind: "toolActivity", payload: { effectIdentity: "tool:commit-1" } });
-
-    expect(store.getSession("effect-session").autonomyPosture).toMatchObject({
-      cccEffectReceipts: ["tool:commit-1"],
-    });
-    expect(observed).toHaveBeenCalledTimes(1);
-  });
 });
 
 async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
@@ -306,7 +373,6 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
     ["native session", { nativeSessionId: "native-other" }],
     ["requested model", { model: "model-other" }],
     ["permission/autonomy", { permissionAutonomy: "unrestricted" }],
-    ["effect/tool identity", { effectIdentity: "tool:other" }],
   ] as const) {
     const store = makeStore();
     let onExit: ((result: { exitCode: number; signal: number }) => void) | undefined;
@@ -322,18 +388,25 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
     };
     const { manager, registry } = makeManager(store, [adapterId], () => pty);
     try {
-      const session = await manager.spawn({ adapterId, projectId: "ccc", purpose: "execute" });
+      const session = await manager.spawn({
+        adapterId,
+        projectId: "ccc",
+        purpose: "execute",
+        settings: { profile: "ccc-fusion", subscriptionReady: true },
+      });
       store.updateSession(session.id, {
         agentState: "dead",
         terminationReason: "crashed",
         nativeSessionId: "native-exact",
         autonomyPosture: {
+          cccFusionProfile: "ccc-fusion",
+          cccFusionMcpServers: [],
           cccResumeContract: {
             adapterId,
             nativeSessionId: "native-exact",
             requestedModel: "model-exact",
             permissionAutonomy: "guarded",
-            effectIdentity: "tool:exact",
+            effectReceiptContract: "ccc-tool-receipts/v1",
           },
         },
       });
@@ -342,17 +415,20 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
         adapterId,
         projectId: "ccc",
         purpose: "execute",
-        settings: { model: "model-exact", permissionAutonomy: "guarded", effectIdentity: "tool:exact" },
+        settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact", permissionAutonomy: "guarded" },
         resume: { sessionId: session.id, nativeSessionId: "native-exact" },
       })).resolves.toMatchObject({ id: session.id });
 
       const requested = {
+        profile: "ccc-fusion",
+        subscriptionReady: true,
         model: "model-exact",
         permissionAutonomy: "guarded",
-        effectIdentity: "tool:exact",
         ...mismatch,
-      } as Record<string, string>;
-      const nativeSessionId = requested.nativeSessionId ?? "native-exact";
+      } as Record<string, string | boolean>;
+      const nativeSessionId = typeof requested.nativeSessionId === "string"
+        ? requested.nativeSessionId
+        : "native-exact";
       delete requested.nativeSessionId;
       await expect(manager.spawn({
         adapterId,
@@ -360,6 +436,24 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
         purpose: "execute",
         settings: requested,
         resume: { sessionId: session.id, nativeSessionId },
+      })).rejects.toThrow(/resume contract/i);
+
+      const record = store.getSession(session.id);
+      store.updateSession(session.id, {
+        autonomyPosture: {
+          ...(record.autonomyPosture ?? {}),
+          cccResumeContract: {
+            ...(record.autonomyPosture?.cccResumeContract ?? {}),
+            effectReceiptContract: "ccc-tool-receipts/v0",
+          },
+        },
+      });
+      await expect(manager.spawn({
+        adapterId,
+        projectId: "ccc",
+        purpose: "execute",
+        settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact", permissionAutonomy: "guarded" },
+        resume: { sessionId: session.id, nativeSessionId: "native-exact" },
       })).rejects.toThrow(/resume contract/i);
 
       const coordinator = new CliResumeCoordinator({

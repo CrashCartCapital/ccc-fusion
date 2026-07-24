@@ -35,6 +35,11 @@ export function isCccFusionProfile(settings: Record<string, unknown> | undefined
   return settings?.profile === CCC_FUSION_PROFILE;
 }
 
+/** Whether a durable session posture belongs to the strict CCC recovery lane. */
+export function isCccFusionPosture(posture: CliAutonomyPosture | undefined | null): boolean {
+  return posture?.[CCC_FUSION_POSTURE_PROFILE_KEY] === CCC_FUSION_PROFILE;
+}
+
 /*
 FNXC:CCCSubscriptionReadiness 2026-07-23-14:38:
 The ccc-fusion child boundary accepts only subscriptionReady === true, a
@@ -69,7 +74,16 @@ export function persistCccFusionPosture(
   const model = typeof settings?.model === "string" && settings.model.length > 0
     ? settings.model
     : undefined;
+  /*
+  FNXC:CCCResumeContract 2026-07-23-18:29:
+  CCC recovery may sanitize profile and child-environment material, but it must
+  retain the resolved autonomy facts computed by CliTaskSession. Dropping these
+  fields made a resumed CCC launch unable to compare the real permission posture
+  and also silently removed the effective launch posture from the durable row.
+  */
   return {
+    ...(typeof posture?.maxResumeAttempts === "number" ? { maxResumeAttempts: posture.maxResumeAttempts } : {}),
+    ...(posture?.effectivePosture !== undefined ? { effectivePosture: posture.effectivePosture } : {}),
     [CCC_FUSION_POSTURE_PROFILE_KEY]: CCC_FUSION_PROFILE,
     ...(model ? { [CCC_FUSION_POSTURE_MODEL_KEY]: model } : {}),
   };

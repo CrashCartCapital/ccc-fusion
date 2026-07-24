@@ -38,7 +38,13 @@ import {
 import { loadPtyModule } from "../pty-native.js";
 import type { IPty } from "node-pty";
 import type { CliAdapterRegistry, CliAgentAdapter, CliLaunchSpec, CliReadinessDetector } from "./adapter.js";
-import { assertCccFusionSubscriptionReady, persistCccFusionPosture, restoreCccFusionSettings } from "./ccc-subscription-policy.js";
+import {
+  assertCccFusionSubscriptionReady,
+  isCccFusionProfile,
+  isCccFusionPosture,
+  persistCccFusionPosture,
+  restoreCccFusionSettings,
+} from "./ccc-subscription-policy.js";
 import {
   applyCccNativeMcpPolicy,
   persistCccNativeMcpPosture,
@@ -105,15 +111,95 @@ export class CliResumeContractError extends Error {
   }
 }
 
+/** A registered CLI resource accepted cancellation but never proved closure. */
+export class CliCancellationTimeoutError extends Error {
+  readonly code = "CLI_CANCELLATION_TIMEOUT";
+
+  constructor(public readonly sessionId: string, public readonly timeoutMs: number) {
+    super(`CLI cancellation timed out waiting for registered resource closure after ${timeoutMs}ms: ${sessionId}`);
+    this.name = "CliCancellationTimeoutError";
+  }
+}
+
+/** The manager could not durably record an honest cancellation-attention state. */
+export class CliCancellationPersistenceError extends Error {
+  readonly code = "CLI_CANCELLATION_PERSISTENCE_FAILED";
+
+  constructor(public readonly sessionId: string, options?: { cause?: unknown }) {
+    super(`CLI cancellation could not durably persist attention state: ${sessionId}`, options);
+    this.name = "CliCancellationPersistenceError";
+  }
+}
+
+/** Signalling the only registered PTY resource itself failed before closure. */
+export class CliCancellationSignalError extends Error {
+  readonly code = "CLI_CANCELLATION_SIGNAL_FAILED";
+
+  constructor(public readonly sessionId: string, options?: { cause?: unknown }) {
+    super(`CLI cancellation could not signal registered resource: ${sessionId}`, options);
+    this.name = "CliCancellationSignalError";
+  }
+}
+
 interface CccResumeContract {
   adapterId: string;
   nativeSessionId: string | null;
   requestedModel: string | null;
   permissionAutonomy: string | null;
-  effectIdentity: string | null;
+  effectReceiptContract: string;
 }
 
 const CCC_RESUME_CONTRACT_KEY = "cccResumeContract";
+const CCC_EFFECT_RECEIPT_CONTRACT = "ccc-tool-receipts/v1";
+/** Matches the core process supervisor's bounded post-SIGKILL observation window. */
+export const DEFAULT_CLI_CANCELLATION_TIMEOUT_MS = 1_000;
+
+const CCC_SUPERVISED_ADAPTER_IDS = new Set(["claude-code", "codex"]);
+
+/*
+FNXC:CCCProcessSupervisor 2026-07-23-18:31:
+CCC Claude/Codex launches run below a Fusion-owned PTY supervisor. The
+supervisor starts the provider in its own process group, so a manager SIGTERM
+reaches only the supervisor; it then SIGKILLs that owned group and waits until
+the group is gone. This never enumerates system PIDs or touches a sibling that
+was not started in the group's custody.
+*/
+const CCC_PTY_SUPERVISOR_SOURCE = [
+  "const { spawn } = require('node:child_process');",
+  "const encoded = process.argv[1];",
+  "const launch = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));",
+  "const child = spawn(launch.command, launch.args, { cwd: process.cwd(), env: process.env, stdio: 'inherit', detached: process.platform !== 'win32' });",
+  "let stopping = false;",
+  "let childExited = false;",
+  "const groupAlive = () => {",
+  "  if (!child.pid || process.platform === 'win32') return !childExited;",
+  "  try { process.kill(-child.pid, 0); return true; } catch (error) { return error && error.code !== 'ESRCH'; }",
+  "};",
+  "const exitWhenOwnedGroupCloses = () => {",
+  "  if (!groupAlive()) process.exit(0);",
+  "  else setTimeout(exitWhenOwnedGroupCloses, 10);",
+  "};",
+  "child.once('error', () => process.exit(1));",
+  "child.once('exit', () => { childExited = true; exitWhenOwnedGroupCloses(); });",
+  "process.once('SIGTERM', () => {",
+  "  if (stopping) return;",
+  "  stopping = true;",
+  "  try {",
+  "    if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');",
+  "    else child.kill('SIGKILL');",
+  "  } catch {}",
+  "  exitWhenOwnedGroupCloses();",
+  "});",
+].join("\n");
+
+function useCccProcessSupervisor(adapterId: string, settings: Record<string, unknown>): boolean {
+  return CCC_SUPERVISED_ADAPTER_IDS.has(adapterId) && isCccFusionProfile(settings);
+}
+
+function buildCccSupervisedLaunch(launch: CliLaunchSpec): CliLaunchSpec {
+  const encoded = Buffer.from(JSON.stringify({ command: launch.command, args: launch.args }), "utf8").toString("base64");
+  return { command: process.execPath, args: ["-e", CCC_PTY_SUPERVISOR_SOURCE, encoded] };
+}
 
 function identityValue(value: unknown): string | null {
   if (value === undefined || value === null) return null;
@@ -136,7 +222,12 @@ function readResumeContract(posture: CliAutonomyPosture | null | undefined): Ccc
     nativeSessionId: typeof value.nativeSessionId === "string" ? value.nativeSessionId : null,
     requestedModel: typeof value.requestedModel === "string" ? value.requestedModel : null,
     permissionAutonomy: typeof value.permissionAutonomy === "string" ? value.permissionAutonomy : null,
-    effectIdentity: typeof value.effectIdentity === "string" ? value.effectIdentity : null,
+    // Wave 3's first attempt persisted an optional caller-supplied effectIdentity.
+    // Existing CCC rows upgrade in memory to the real receipt protocol rather
+    // than treating that arbitrary setting as a replay contract.
+    effectReceiptContract: typeof value.effectReceiptContract === "string"
+      ? value.effectReceiptContract
+      : CCC_EFFECT_RECEIPT_CONTRACT,
   };
 }
 
@@ -151,7 +242,7 @@ function buildResumeContract(
     nativeSessionId,
     requestedModel: identityValue(settings.model),
     permissionAutonomy: permissionAutonomyIdentity(settings, posture),
-    effectIdentity: identityValue(settings.effectIdentity),
+    effectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
   };
 }
 
@@ -160,7 +251,7 @@ function withResumeContract(posture: CliAutonomyPosture | null, contract: CccRes
 }
 
 function assertExactResumeContract(expected: CccResumeContract, actual: CccResumeContract): void {
-  for (const field of ["adapterId", "nativeSessionId", "requestedModel", "permissionAutonomy", "effectIdentity"] as const) {
+  for (const field of ["adapterId", "nativeSessionId", "requestedModel", "permissionAutonomy", "effectReceiptContract"] as const) {
     if (expected[field] !== actual[field]) throw new CliResumeContractError(field);
   }
 }
@@ -425,6 +516,10 @@ interface LiveSession {
   cancellation: Promise<void> | null;
   /** The deliberate terminal reason while we wait for the registered resource. */
   cancellationReason: CliTerminationReason | null;
+  /** True when this session's PTY root is the Fusion-owned CCC group supervisor. */
+  usesOwnedCccProcessSupervisor: boolean;
+  /** The cancellation has already reported an attention failure to its caller. */
+  cancellationFailed: boolean;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -448,6 +543,8 @@ export interface CliSessionManagerOptions {
    * loader. Lets tests mock node-pty at the loadPtyModule seam.
    */
   loadPty?: typeof loadPtyModule;
+  /** Bound for proving registered PTY closure after cancellation (injectable for tests). */
+  cancellationTimeoutMs?: number;
 }
 
 // ── CliSessionManager ────────────────────────────────────────────────────────
@@ -460,6 +557,7 @@ export class CliSessionManager {
   private readonly highWatermark: number;
   private readonly injectionQuietWindowMs: number;
   private readonly loadPty: typeof loadPtyModule;
+  private readonly cancellationTimeoutMs: number;
 
   /** Process registry: session id → live session. Self-cleaning on exit. */
   private readonly sessions = new Map<string, LiveSession>();
@@ -476,6 +574,7 @@ export class CliSessionManager {
     this.highWatermark = options.highWatermark ?? DEFAULT_HIGH_WATERMARK;
     this.injectionQuietWindowMs = options.injectionQuietWindowMs ?? 0;
     this.loadPty = options.loadPty ?? loadPtyModule;
+    this.cancellationTimeoutMs = options.cancellationTimeoutMs ?? DEFAULT_CLI_CANCELLATION_TIMEOUT_MS;
     this.installExitHook();
   }
 
@@ -521,22 +620,22 @@ export class CliSessionManager {
     let launch: CliLaunchSpec;
     let launchSettings: Record<string, unknown>;
     let record: CliSession;
+    let usesOwnedCccProcessSupervisor = false;
     if (options.resume) {
       if (!adapter.capabilities.supportsResume || typeof adapter.buildResume !== "function") {
         throw new CliResumeUnsupportedError(options.adapterId);
       }
       const existing = this.store.getSession(options.resume.sessionId);
       if (!existing) throw new UnknownCliSessionError(options.resume.sessionId);
-      const storedContract = readResumeContract(existing.autonomyPosture);
+      const storedContract = isCccFusionPosture(existing.autonomyPosture)
+        ? readResumeContract(existing.autonomyPosture)
+        : undefined;
       if (storedContract) {
         if (requestedSettings.model === undefined && storedContract.requestedModel !== null) {
           requestedSettings.model = storedContract.requestedModel;
         }
         if (requestedSettings.permissionAutonomy === undefined && storedContract.permissionAutonomy !== null) {
           requestedSettings.permissionAutonomy = storedContract.permissionAutonomy;
-        }
-        if (requestedSettings.effectIdentity === undefined && storedContract.effectIdentity !== null) {
-          requestedSettings.effectIdentity = storedContract.effectIdentity;
         }
         assertExactResumeContract(storedContract, buildResumeContract(
           options.adapterId,
@@ -571,10 +670,18 @@ export class CliSessionManager {
         persistCccFusionPosture(options.posture ?? null, launchSettings),
         launchSettings,
       );
-      const posture = withResumeContract(
-        persistedPosture,
-        buildResumeContract(options.adapterId, null, launchSettings, persistedPosture),
-      );
+      /*
+      FNXC:CCCResumeContract 2026-07-23-18:29:
+      Strict resume identity is an exact ccc-fusion recovery rule, never a
+      global CliSessionManager policy. Non-CCC and predecessor rows retain
+      their historical permissive model/autonomy resume semantics byte-for-byte.
+      */
+      const posture = isCccFusionPosture(persistedPosture)
+        ? withResumeContract(
+            persistedPosture,
+            buildResumeContract(options.adapterId, null, launchSettings, persistedPosture),
+          )
+        : persistedPosture;
       launch = adapter.buildLaunch({ settings: launchSettings, posture });
       // Persist the session record BEFORE spawning so a crash mid-spawn still has
       // a durable record to reason about.
@@ -588,6 +695,11 @@ export class CliSessionManager {
         autonomyPosture: posture,
         agentState: "starting",
       });
+    }
+
+    if (useCccProcessSupervisor(options.adapterId, launchSettings)) {
+      launch = buildCccSupervisedLaunch(launch);
+      usesOwnedCccProcessSupervisor = true;
     }
 
     // FNXC:CliAgentPostgres 2026-07-14-12:00:
@@ -649,6 +761,8 @@ export class CliSessionManager {
       exitWaiters: [],
       cancellation: null,
       cancellationReason: null,
+      usesOwnedCccProcessSupervisor,
+      cancellationFailed: false,
     };
     this.sessions.set(record.id, live);
 
@@ -742,7 +856,13 @@ export class CliSessionManager {
 
     // The cancellation owner observes this registered resource first, then
     // writes + flushes its terminal state before releasing the registry slot.
-    if (live.cancellationReason !== null) return;
+    if (live.cancellationReason !== null) {
+      // A caller already received a bounded attention failure, but the registered
+      // resource later proved closed. Finish durable cleanup without turning that
+      // earlier failure acknowledgement into a false cancellation success.
+      if (live.cancellationFailed) void this.finalizeLateCancellation(live);
+      return;
+    }
 
     live.terminated = true;
     this.sessions.delete(live.id);
@@ -983,19 +1103,81 @@ export class CliSessionManager {
     if (live.terminated) return;
     live.cancellationReason = reason;
 
-    // Scoped SIGKILL — ONLY this registered provider resource (never port 4040,
-    // dashboard, or an unregistered sibling). The PTY bridge owns any registered
-    // descendants and reports the root/resource closure through onExit.
+    // Scoped signal — ONLY this registered provider resource (never port 4040,
+    // dashboard, or an unregistered sibling). The CCC bridge owns its explicitly
+    // registered descendants and reports resource closure through onExit.
     try {
-      live.pty.kill("SIGKILL");
-    } catch {
-      // A synchronous PTY kill failure means the resource was already gone.
-      this.settleExit(live, -1, 9);
+      live.pty.kill(live.usesOwnedCccProcessSupervisor ? "SIGTERM" : "SIGKILL");
+    } catch (cause) {
+      await this.failCancellationWithoutClosure(live, "CANCELLATION_SIGNAL_FAILED", new CliCancellationSignalError(live.id, { cause }));
     }
 
-    if (!live.exitResult) {
-      await new Promise<void>((resolve) => live.exitWaiters.push(() => resolve()));
+    try {
+      await this.waitForRegisteredExit(live);
+    } catch (error) {
+      await this.failCancellationWithoutClosure(live, "CANCELLATION_UNCONFIRMED", error);
     }
+
+    await this.persistConfirmedCancellation(live, reason);
+  }
+
+  private async waitForRegisteredExit(live: LiveSession): Promise<void> {
+    if (live.exitResult) return;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const settle = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const index = live.exitWaiters.indexOf(onExit);
+        if (index >= 0) live.exitWaiters.splice(index, 1);
+        callback();
+      };
+      const onExit = () => settle(resolve);
+      const timer = setTimeout(() => settle(() => reject(new CliCancellationTimeoutError(live.id, this.cancellationTimeoutMs))), this.cancellationTimeoutMs);
+      timer.unref?.();
+      live.exitWaiters.push(onExit);
+    });
+  }
+
+  private async failCancellationWithoutClosure(live: LiveSession, state: "CANCELLATION_SIGNAL_FAILED" | "CANCELLATION_UNCONFIRMED", failure: unknown): Promise<never> {
+    live.cancellationFailed = true;
+    try {
+      const current = this.store.getSession(live.id);
+      this.store.updateSession(live.id, {
+        agentState: "needsAttention",
+        terminationReason: null,
+        autonomyPosture: { ...(current?.autonomyPosture ?? {}), cccCancellationState: state },
+      });
+      await this.store.flush();
+    } catch (cause) {
+      throw new CliCancellationPersistenceError(live.id, { cause });
+    }
+    throw failure;
+  }
+
+  /*
+  FNXC:CCCFusionCancellation 2026-07-23-18:36:
+  A cancellation acknowledgement exists only after every registered resource is
+  observed closed and the dead/CANCELLED record flushes. A timeout, signal, or
+  flush failure keeps the in-memory owner and its concurrency slot intact; the
+  durable floor is needsAttention, never a fabricated killed/dead success.
+  */
+  private async persistConfirmedCancellation(live: LiveSession, reason: CliTerminationReason): Promise<void> {
+    try {
+      const current = this.store.getSession(live.id);
+      this.store.updateSession(live.id, {
+        agentState: "dead",
+        terminationReason: reason,
+        ...(reason === "killed"
+          ? { autonomyPosture: { ...(current?.autonomyPosture ?? {}), cccCancellationState: "CANCELLED" } }
+          : {}),
+      });
+      await this.store.flush();
+    } catch (cause) {
+      await this.failCancellationWithoutClosure(live, "CANCELLATION_UNCONFIRMED", new CliCancellationPersistenceError(live.id, { cause }));
+    }
+
     live.terminated = true;
 
     for (const stream of live.streams) stream.close();
@@ -1005,16 +1187,17 @@ export class CliSessionManager {
     }
     live.queue = [];
 
-    const current = this.store.getSession(live.id);
-    this.store.updateSession(live.id, {
-      agentState: "dead",
-      terminationReason: reason,
-      ...(reason === "killed"
-        ? { autonomyPosture: { ...(current?.autonomyPosture ?? {}), cccCancellationState: "CANCELLED" } }
-        : {}),
-    });
-    await this.store.flush();
     this.sessions.delete(live.id);
+  }
+
+  private async finalizeLateCancellation(live: LiveSession): Promise<void> {
+    if (live.terminated) return;
+    try {
+      await this.persistConfirmedCancellation(live, live.cancellationReason ?? "crashed");
+    } catch {
+      // The original caller already received the typed failure and ownership
+      // remains held; later exit observation cannot manufacture success.
+    }
   }
 
   /**

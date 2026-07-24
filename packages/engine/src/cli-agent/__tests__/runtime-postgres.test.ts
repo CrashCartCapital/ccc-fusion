@@ -106,7 +106,7 @@ describe("createCliAgentRuntime PostgreSQL wiring", () => {
         terminationReason: "crashed",
       });
     } finally {
-      manager.dispose();
+      await manager.dispose();
     }
   });
 });

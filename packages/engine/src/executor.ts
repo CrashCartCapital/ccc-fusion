@@ -14,6 +14,7 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
 import { getUnmetSchedulingDependencies } from "./scheduler.js";
+import { CCC_EFFECT_RECEIPT_CONTRACT } from "@fusion/core";
 import { RetryStormError, serializeRetryStormError, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, resolveWorkflowIrForTask, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveReboundTarget, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AgentStore, resolveExecutorFallbackModel } from "@fusion/core";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
@@ -94,7 +95,13 @@ import {
 import { canonicalFusionBranchName, canonicalStepInstanceBranchName, generateWorktreeName, resolveTaskWorkingBranch } from "./worktree-names.js";
 import { resolveTaskWorktreePath, resolveWorktreesDir } from "./worktree-paths.js";
 import { Type, type Static } from "@earendil-works/pi-ai";
-import { describeModel, formatModelMarkerDetails, promptWithFallback, compactSessionContext } from "./pi.js";
+import {
+  CCC_AWAIT_OWNED_TRANSPORT_CLOSURE,
+  describeModel,
+  formatModelMarkerDetails,
+  promptWithFallback,
+  compactSessionContext,
+} from "./pi.js";
 import { buildAgentGatedActionSummary } from "./permanent-agent-gating.js";
 import { accumulateSessionTokenUsage, captureSessionTokenBaseline, mergeTokenUsagePerModel, resetSessionTokenBaseline } from "./session-token-usage.js";
 import { finalizePlanningSegment, startPlanningSegment } from "@fusion/core";
@@ -147,7 +154,7 @@ import {
   type ResolvedCliExecutorConfig,
 } from "./cli-agent/task-session.js";
 import type { CliSessionManager } from "./cli-agent/session-manager.js";
-import { CliConcurrencyLimitError } from "./cli-agent/session-manager.js";
+import { CliConcurrencyLimitError, DEFAULT_CLI_CANCELLATION_TIMEOUT_MS } from "./cli-agent/session-manager.js";
 import type { TelemetryHub } from "./cli-agent/telemetry-hub.js";
 import type { CliAdapterRegistry } from "./cli-agent/adapter.js";
 import type { CliSessionStore } from "@fusion/core";
@@ -1633,6 +1640,8 @@ export interface TaskExecutorOptions {
    * PTY manager + telemetry hub + adapter registry + hook endpoint together.
    */
   cliAgentRuntime?: CliAgentRuntime;
+  /** Bound for a real AgentSession abort plus its owned CCC transport closure. */
+  cancellationTimeoutMs?: number;
 }
 
 /** Bundled CLI Agent Executor runtime dependencies (U7). */
@@ -1659,6 +1668,8 @@ export interface CliAgentRuntime {
 interface ActiveExecutorSessionState {
   session: AgentSession;
   seenSteeringIds: Set<string>;
+  /** Durable CCC record retained until abort, stream closure, and flush all confirm. */
+  cccDurableSession?: { store: CliSessionStore; sessionId: string };
   lastResolvedModelProvider?: string;
   lastResolvedModelId?: string;
   lastTaskModelProvider?: string | null;
@@ -1708,6 +1719,19 @@ graph-owned, at which point this type disappears in favor of a returned outcome.
 docs/plans/2026-07-19-002-u5e-remaining-deletions-handoff.md.
 */
 export type GraphCompletionCallback = (info: { modifiedFiles: string[] }) => void;
+
+/** A cancellation did not confirm that the task-owned execution surface closed. */
+export class TaskCancellationAbortError extends Error {
+  constructor(
+    public readonly taskId: string,
+    public readonly surface: "agent-session" | "cli-agent-session",
+    public readonly code: "TASK_CANCELLATION_ABORT_FAILED" | "TASK_CANCELLATION_DISPOSE_FAILED" | "TASK_CANCELLATION_PERSISTENCE_FAILED" | "TASK_CANCELLATION_TIMEOUT",
+    options?: { cause?: unknown },
+  ) {
+    super(`Task cancellation could not close ${surface}: ${taskId}`, options);
+    this.name = "TaskCancellationAbortError";
+  }
+}
 
 export class TaskExecutor {
   /*
@@ -1779,6 +1803,8 @@ export class TaskExecutor {
   instead of double-aborting or admitting a replacement session too early.
   */
   private activeSessionAbortCompletions = new Map<string, Promise<void>>();
+  /** CLI sessions share the same ownership rule but use their task-session kill seam. */
+  private activeCliSessionAbortCompletions = new Map<string, Promise<void>>();
   /** Active step-session executors per task (mutually exclusive with activeSessions). */
   private activeStepExecutors = new Map<string, StepSessionExecutor>();
   /** Steering comments already observed for active step-session executor runs. */
@@ -2734,9 +2760,7 @@ export class TaskExecutor {
     // abort. Without this, two concurrent disposal calls for the same task
     // (e.g., task:moved-away followed immediately by task:deleted) both pass
     // the `has(taskId)` guards and double-call abort/dispose.
-    let claimedSession: ActiveExecutorSessionState | undefined;
     let waitForClaimedSessionAbort: Promise<void> | undefined;
-    let resolveClaimedSessionAbort: (() => void) | undefined;
     const activeSession = this.activeSessions.get(taskId);
     if (activeSession) {
       hadActiveSurface = true;
@@ -2744,11 +2768,7 @@ export class TaskExecutor {
       if (existingAbort) {
         waitForClaimedSessionAbort = existingAbort;
       } else {
-        claimedSession = activeSession;
-        const completion = new Promise<void>((resolve) => {
-          resolveClaimedSessionAbort = resolve;
-        });
-        this.activeSessionAbortCompletions.set(taskId, completion);
+        waitForClaimedSessionAbort = this.startAgentSessionCancellation(taskId, activeSession);
         abortedSurfaces.push("agent-session");
       }
     }
@@ -2791,37 +2811,14 @@ export class TaskExecutor {
     // `killed` (never resume-eligible) — the same dispose/abort contract API
     // sessions honor. moveTask(in-progress→todo) routes here (AGENTS.md hard
     // cancel), so this is what guarantees the PTY tree is reaped on column exit.
+    let waitForClaimedCliSessionAbort: Promise<void> | undefined;
     const claimedCliSession = this.activeCliTaskSessions.get(taskId);
     if (claimedCliSession) {
       hadActiveSurface = true;
       abortedSurfaces.push("cli-agent-session");
-      this.activeCliTaskSessions.delete(taskId);
+      waitForClaimedCliSessionAbort = this.startCliSessionCancellation(taskId, claimedCliSession);
     }
 
-    if (claimedSession) {
-      const { session } = claimedSession;
-      try {
-        const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
-        if (typeof sessionWithAbort.abort === "function") {
-          await sessionWithAbort.abort().catch((err) => {
-            executorLog.warn(`Failed to abort agent session for ${taskId}: ${err}`);
-          });
-        }
-        try {
-          session.dispose();
-        } catch (err) {
-          executorLog.warn(`Failed to dispose agent session for ${taskId}: ${err}`);
-        }
-      } finally {
-        if (this.activeSessions.get(taskId)?.session === session) {
-          this.deleteActiveSession(taskId);
-        }
-        resolveClaimedSessionAbort?.();
-        if (this.activeSessionAbortCompletions.get(taskId)) {
-          this.activeSessionAbortCompletions.delete(taskId);
-        }
-      }
-    }
     if (waitForClaimedSessionAbort) await waitForClaimedSessionAbort;
 
     if (claimedStepExecutor) {
@@ -2852,10 +2849,17 @@ export class TaskExecutor {
       }
     }
 
-    if (claimedCliSession) {
-      await claimedCliSession.kill("killed").catch((err) => {
-        executorLog.warn(`Failed to kill CLI agent session for ${taskId}: ${err}`);
-      });
+    if (waitForClaimedCliSessionAbort) await waitForClaimedCliSessionAbort;
+
+    /*
+    FNXC:CCCFusionCancellation 2026-07-23-19:34:
+    A user cancellation acknowledges only after its task-owned resources have
+    closed and any CCC durable cancellation record has flushed. Release the
+    task worktree lease at that same proven boundary; an abort/flush failure
+    throws above and intentionally leaves the lease owned for attention.
+    */
+    if (options.userCanceled) {
+      this.activeWorktrees.delete(taskId);
     }
 
     this.loopRecoveryState.delete(taskId);
@@ -2868,6 +2872,165 @@ export class TaskExecutor {
         `Pause abort cleanup completed: reason=${reason}; surfaces=${abortedSurfaces.join(", ") || "none"}`,
       );
     }
+  }
+
+  private startAgentSessionCancellation(taskId: string, state: ActiveExecutorSessionState): Promise<void> {
+    const completion = this.abortAndReleaseAgentSession(taskId, state);
+    this.activeSessionAbortCompletions.set(taskId, completion);
+    void completion.then(() => {
+      if (this.activeSessionAbortCompletions.get(taskId) === completion) {
+        this.activeSessionAbortCompletions.delete(taskId);
+      }
+    }, () => {
+      // Keep a rejected completion as the single-flight result. Repeated cancel
+      // calls must return the same typed failure without releasing ownership.
+    });
+    return completion;
+  }
+
+  private async abortAndReleaseAgentSession(taskId: string, state: ActiveExecutorSessionState): Promise<void> {
+    const { session } = state;
+    const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
+    try {
+      await this.awaitAgentSessionClosure(taskId, state, sessionWithAbort);
+    } catch (cause) {
+      await this.persistCccCancellationAttention(state).catch((persistenceCause) => {
+        throw new TaskCancellationAbortError(
+          taskId,
+          "agent-session",
+          "TASK_CANCELLATION_PERSISTENCE_FAILED",
+          { cause: persistenceCause },
+        );
+      });
+      if (cause instanceof TaskCancellationAbortError) throw cause;
+      throw new TaskCancellationAbortError(taskId, "agent-session", "TASK_CANCELLATION_ABORT_FAILED", { cause });
+    }
+
+    try {
+      await this.persistCccCancellationConfirmed(state);
+    } catch (cause) {
+      await this.persistCccCancellationAttention(state).catch(() => undefined);
+      throw new TaskCancellationAbortError(
+        taskId,
+        "agent-session",
+        "TASK_CANCELLATION_PERSISTENCE_FAILED",
+        { cause },
+      );
+    }
+
+    try {
+      session.dispose();
+    } catch (cause) {
+      throw new TaskCancellationAbortError(taskId, "agent-session", "TASK_CANCELLATION_DISPOSE_FAILED", { cause });
+    }
+
+    if (this.activeSessions.get(taskId)?.session === session) {
+      this.deleteActiveSession(taskId);
+    }
+  }
+
+  private async awaitAgentSessionClosure(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    sessionWithAbort: AgentSession & { abort?: () => Promise<void> },
+  ): Promise<void> {
+    const close = async () => {
+      if (typeof sessionWithAbort.abort !== "function") {
+        // Pre-CCC mock/legacy sessions did not expose an abort acknowledgement;
+        // preserve their predecessor dispose path while enforcing closure proof on
+        // the real custom-provider transport.
+        if (state.lastResolvedModelProvider === "custom-provider-pi") {
+          throw new Error("custom-provider session has no abort acknowledgement");
+        }
+        return;
+      }
+      await sessionWithAbort.abort();
+      const awaitTransport = (state.session as AgentSession & {
+        [CCC_AWAIT_OWNED_TRANSPORT_CLOSURE]?: () => Promise<void>;
+      })[CCC_AWAIT_OWNED_TRANSPORT_CLOSURE];
+      if (awaitTransport) await awaitTransport();
+    };
+    const timeoutMs = this.options.cancellationTimeoutMs ?? DEFAULT_CLI_CANCELLATION_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        close(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new TaskCancellationAbortError(
+            taskId,
+            "agent-session",
+            "TASK_CANCELLATION_TIMEOUT",
+          )), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The AgentSession abort acknowledgement plus the owned custom-provider
+   * stream-close barrier must resolve before a CCC receipt session becomes
+   * terminal; a failed close remains visible and owns its worktree.
+   */
+  private async persistCccCancellationConfirmed(state: ActiveExecutorSessionState): Promise<void> {
+    const durable = state.cccDurableSession;
+    if (!durable) return;
+    const current = durable.store.getSession(durable.sessionId);
+    if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
+    const updated = durable.store.updateSession(durable.sessionId, {
+      agentState: "dead",
+      terminationReason: "killed",
+      autonomyPosture: {
+        ...(current.autonomyPosture ?? {}),
+        cccCancellationState: "CANCELLED",
+      },
+    });
+    if (!updated) throw new Error(`CCC durable session disappeared: ${durable.sessionId}`);
+    await durable.store.flush();
+  }
+
+  /** Keep a truthfully non-terminal record when abort or persistence is unconfirmed. */
+  private async persistCccCancellationAttention(state: ActiveExecutorSessionState): Promise<void> {
+    const durable = state.cccDurableSession;
+    if (!durable) return;
+    const current = durable.store.getSession(durable.sessionId);
+    if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
+    const updated = durable.store.updateSession(durable.sessionId, {
+      agentState: "needsAttention",
+      terminationReason: null,
+      autonomyPosture: {
+        ...(current.autonomyPosture ?? {}),
+        cccCancellationState: "CANCELLATION_UNCONFIRMED",
+      },
+    });
+    if (!updated) throw new Error(`CCC durable session disappeared: ${durable.sessionId}`);
+    await durable.store.flush();
+  }
+
+  private startCliSessionCancellation(taskId: string, session: CliTaskSession): Promise<void> {
+    const existing = this.activeCliSessionAbortCompletions.get(taskId);
+    if (existing) return existing;
+    const completion = (async () => {
+      try {
+        await session.kill("killed");
+      } catch (cause) {
+        throw new TaskCancellationAbortError(taskId, "cli-agent-session", "TASK_CANCELLATION_ABORT_FAILED", { cause });
+      }
+      if (this.activeCliTaskSessions.get(taskId) === session) {
+        this.activeCliTaskSessions.delete(taskId);
+      }
+    })();
+    this.activeCliSessionAbortCompletions.set(taskId, completion);
+    void completion.then(() => {
+      if (this.activeCliSessionAbortCompletions.get(taskId) === completion) {
+        this.activeCliSessionAbortCompletions.delete(taskId);
+      }
+    }, () => {
+      // Retain the failed single-flight cancellation and the live CLI owner.
+    });
+    return completion;
   }
 
   async abortAllInFlight(reason: string): Promise<void> {
@@ -12690,6 +12853,35 @@ export class TaskExecutor {
         // sessionFile must be let because it's assigned before downstream retry-session reassignment.
         let session: AgentSession;
         let sessionFile: string | null | undefined;
+        const cccFusionExecutor = settings.profile === CCC_FUSION_PROFILE;
+        const cccRuntime = this.options.cliAgentRuntime;
+        if (cccFusionExecutor && !cccRuntime) {
+          throw new Error("CCC Fusion executor requires the CLI session runtime for durable effect receipts");
+        }
+        /*
+        FNXC:CCCDurableEffects 2026-07-23-19:20:
+        The generic PI/custom-provider executor owns the actual synthetic tool
+        boundary. Give that live AgentSession a durable CliSessionStore record
+        before it can execute any tool so a process restart can suppress a
+        receipt that was committed before its acknowledgement returned.
+        */
+        const cccDurableSession = cccFusionExecutor && cccRuntime
+          ? cccRuntime.store.createSession({
+              projectId: cccRuntime.projectId,
+              adapterId: "pi",
+              purpose: "execute",
+              taskId: task.id,
+              worktreePath,
+              autonomyPosture: {
+                cccFusionProfile: CCC_FUSION_PROFILE,
+                cccFusionProvider: executorProvider,
+                cccFusionModel: executorModelId,
+                cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
+              },
+              agentState: "starting",
+            })
+          : undefined;
+        if (cccDurableSession) await cccRuntime!.store.flush();
         try {
           const createdSession = await createResolvedAgentSession({
             sessionPurpose: "executor",
@@ -12728,6 +12920,12 @@ export class TaskExecutor {
             permanentAgentGating: this.buildPermanentAgentGatingContext(task.id, identityAgent, settings.defaultAgentPermissionPolicy),
             taskId: task.id,
             taskTitle: detail.title,
+            ...(cccDurableSession ? {
+              profile: CCC_FUSION_PROFILE,
+              subscriptionReady: true as const,
+              cccEffectReceiptStore: cccRuntime!.store,
+              cccEffectReceiptSessionId: cccDurableSession.id,
+            } : {}),
             onFallbackModelUsed: createFallbackModelObserver({
               agent: "executor",
               label: "executor",
@@ -12738,6 +12936,14 @@ export class TaskExecutor {
           });
           session = createdSession.session;
           sessionFile = createdSession.sessionFile;
+          if (cccDurableSession) {
+            const updated = cccRuntime!.store.updateSession(cccDurableSession.id, {
+              agentState: "busy",
+              ...(sessionFile ? { nativeSessionId: sessionFile } : {}),
+            });
+            if (!updated) throw new Error(`CCC durable session disappeared: ${cccDurableSession.id}`);
+            await cccRuntime!.store.flush();
+          }
         } catch (sessionStartError) {
           if (await this.recoverMissingWorktreeSessionStartFailure(task, worktreePath, sessionStartError, audit)) {
             return;

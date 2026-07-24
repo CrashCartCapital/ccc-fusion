@@ -12,6 +12,8 @@ import type {
 } from "@earendil-works/pi-ai";
 import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
 import { registerCustomProviders } from "../custom-provider-registry.js";
+import { activeSessionRegistry } from "../active-session-registry.js";
+import { TaskExecutor } from "../executor.js";
 
 /*
 FNXC:CCCTransport 2026-07-23-15:45:
@@ -195,6 +197,21 @@ function deferred<T = void>(): Deferred<T> {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function makeEffectReceiptStore() {
+  const sessions = new Map<string, { autonomyPosture: Record<string, unknown> | null }>();
+  return {
+    sessions,
+    getSession: (id: string) => sessions.get(id),
+    updateSession: vi.fn((id: string, updates: { autonomyPosture?: Record<string, unknown> }) => {
+      const session = sessions.get(id);
+      if (!session) return undefined;
+      Object.assign(session, updates);
+      return session;
+    }),
+    flush: vi.fn(async () => undefined),
+  };
 }
 
 function noDispatchSession() {
@@ -648,6 +665,159 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     expect(JSON.stringify(
       wireMessages.filter((message) => message.role !== "tool"),
     )).not.toContain(JSON.stringify(structuredResult));
+  });
+
+  it("does not reissue a committed loopback custom-tool effect after a fresh controller", async () => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const receiptStore = makeEffectReceiptStore();
+    receiptStore.sessions.set("ccc-effect-session", { autonomyPosture: {} });
+    const effect = vi.fn(async () => ({
+      content: [{ type: "text" as const, text: "effect committed" }],
+      details: { structuredContent: { committed: true } },
+    }));
+    const customTool = {
+      name: "read_session_effect",
+      label: "Commit one synthetic effect",
+      description: "Synthetic local effect boundary for receipt replay proof",
+      parameters: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          effectId: { type: "string" },
+          query: { type: "object", additionalProperties: true },
+        },
+        required: ["sessionId", "effectId", "query"],
+        additionalProperties: false,
+      },
+      execute: effect,
+    } as unknown as ToolDefinition;
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const createController = () => createFnAgent({
+      cwd: "/tmp/ccc-wave2-effect-receipt",
+      systemPrompt: "synthetic loopback effect receipt only",
+      tools: "coding",
+      customTools: [customTool],
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+      // This is an existing production createFnAgent seam exercised with a
+      // real AgentSession; current bytes ignore it, so the behavioral RED is
+      // duplicate execution rather than a missing import or type failure.
+      cccEffectReceiptStore: receiptStore,
+      cccEffectReceiptSessionId: "ccc-effect-session",
+    } as any);
+
+    const first = await createController();
+    await (first.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
+    // Recreate the actual controller/model runtime, not merely the session, so
+    // the second call reads only the durable receipt surface.
+    registry = new TestModelRegistry();
+    await registerCustomProviders(registry, providers, vi.fn());
+    harness.modelRegistry = registry;
+    const restarted = await createController();
+    await (restarted.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
+
+    expect(effect).toHaveBeenCalledTimes(1);
+    expect(receiptStore.flush).toHaveBeenCalledTimes(1);
+    expect(receiptStore.sessions.get("ccc-effect-session")?.autonomyPosture).toMatchObject({
+      cccEffectReceipts: [expect.any(String)],
+    });
+  });
+
+  /*
+  FNXC:CCCFusionCancellation 2026-07-23-19:28:
+  This drives the real TaskExecutor cancellation seam and the real PI
+  AgentSession against the fixture's intentionally open SSE response. The
+  fixture only observes its own socket; it does not abort or close the stream.
+  */
+  it("orders TaskExecutor custom-provider cancellation after loopback stream closure and durable flush", async () => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const lifecycle: string[] = [];
+    const sessionId = "ccc-executor-cancel-session";
+    const durableSessions = new Map<string, any>([[sessionId, {
+      id: sessionId,
+      agentState: "busy",
+      terminationReason: null,
+      autonomyPosture: { cccFusionProfile: "ccc-fusion" },
+    }]]);
+    const durableStore = {
+      getSession: (id: string) => durableSessions.get(id),
+      updateSession: vi.fn((id: string, updates: Record<string, unknown>) => {
+        lifecycle.push("persist");
+        const current = durableSessions.get(id);
+        if (!current) return undefined;
+        Object.assign(current, updates);
+        return current;
+      }),
+      flush: vi.fn(async () => {
+        lifecycle.push("flush");
+      }),
+    };
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const created = await createFnAgent({
+      cwd: "/tmp/ccc-wave2-executor-cancel",
+      systemPrompt: "synthetic loopback cancellation only",
+      tools: "coding",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+    const session = created.session as unknown as {
+      abort: () => Promise<void>;
+      dispose: () => void;
+      promptWithFallback: (value: string) => Promise<void>;
+    };
+    const actualAbort = session.abort.bind(session);
+    session.abort = vi.fn(async () => {
+      lifecycle.push("agent-abort");
+      await actualAbort();
+    });
+    const prompt = session.promptWithFallback("CCC_ABORT").catch(() => undefined);
+    await vi.waitFor(() => expect(capturedRequests).toHaveLength(1));
+    const observedClose = abortClosed.promise.then(() => lifecycle.push("loopback-closed"));
+
+    const taskId = "FN-CCC-LOOPBACK-CANCEL";
+    const worktreePath = "/tmp/ccc-wave2-executor-cancel";
+    const executor = new TaskExecutor({ on: vi.fn() } as any, "/tmp/ccc-wave2-root");
+    const internals = executor as unknown as {
+      activeWorktrees: Map<string, Set<string>>;
+      setActiveSession(task: string, state: unknown, path: string): void;
+    };
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+      cccDurableSession: { store: durableStore, sessionId },
+    }, worktreePath);
+
+    lifecycle.push("task-cancel");
+    await executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true });
+    await observedClose;
+    lifecycle.push("acknowledged");
+    await prompt;
+
+    expect(lifecycle).toEqual([
+      "task-cancel",
+      "agent-abort",
+      "loopback-closed",
+      "persist",
+      "flush",
+      "acknowledged",
+    ]);
+    expect(durableSessions.get(sessionId)).toMatchObject({
+      agentState: "dead",
+      terminationReason: "killed",
+      autonomyPosture: { cccCancellationState: "CANCELLED" },
+    });
+    expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
+    expect(internals.activeWorktrees.has(taskId)).toBe(false);
   });
 
   it("keeps both dissimilar configured model IDs exact on request and response wires", async () => {

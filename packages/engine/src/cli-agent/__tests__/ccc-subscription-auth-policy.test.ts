@@ -49,13 +49,21 @@ function makeStore() {
 
 function makePty(): IPty {
   const emitter = new EventEmitter();
+  let onExit: ((event: { exitCode: number; signal: number }) => void) | undefined;
   return Object.assign(emitter, {
     pid: 4242,
     onData: vi.fn(() => () => {}),
-    onExit: vi.fn(() => () => {}),
+    onExit: vi.fn((listener: (event: { exitCode: number; signal: number }) => void) => {
+      onExit = listener;
+      return () => {
+        if (onExit === listener) onExit = undefined;
+      };
+    }),
     write: vi.fn(),
     resize: vi.fn(),
-    kill: vi.fn(),
+    kill: vi.fn(() => {
+      queueMicrotask(() => onExit?.({ exitCode: -1, signal: 9 }));
+    }),
     pause: vi.fn(),
     resume: vi.fn(),
   }) as unknown as IPty;
@@ -77,6 +85,15 @@ function makeManager(store: ReturnType<typeof makeStore>) {
     })) as any,
   });
   return { manager, captures };
+}
+
+/** Inspect the real provider argv carried inside the manager-owned CCC bridge. */
+function providerLaunchArgs(args: string[]): string[] {
+  if (args[0] !== "-e" || typeof args[2] !== "string") return args;
+  const decoded = JSON.parse(Buffer.from(args[2], "base64").toString("utf8")) as { args?: unknown };
+  return Array.isArray(decoded.args) && decoded.args.every((arg) => typeof arg === "string")
+    ? decoded.args
+    : args;
 }
 
 function installFakeChildEnv(): void {
@@ -120,7 +137,7 @@ describe("ccc-fusion subscription child environment policy", () => {
       expect(captures).toEqual([]);
       expect(store.createSession).not.toHaveBeenCalled();
     } finally {
-      manager.dispose();
+      await manager.dispose();
     }
   });
 
@@ -138,7 +155,7 @@ describe("ccc-fusion subscription child environment policy", () => {
       expect(captures).toEqual([]);
       expect(store.createSession).not.toHaveBeenCalled();
     } finally {
-      manager.dispose();
+      await manager.dispose();
     }
   });
 
@@ -166,7 +183,7 @@ describe("ccc-fusion subscription child environment policy", () => {
       });
       expect(captures[1].options.env.ANTHROPIC_API_KEY).toBe("fake-anthropic-key");
     } finally {
-      manager.dispose();
+      await manager.dispose();
     }
   });
 
@@ -185,6 +202,11 @@ describe("ccc-fusion subscription child environment policy", () => {
           autoApprove: true,
           cccFusionSubscriptionReady: true,
           unexpected: "must-not-persist",
+          effectivePosture: {
+            mode: "elevated",
+            elevated: true,
+            flags: ["--sandbox", "danger-full-access"],
+          },
         },
       });
       const recorded = store.getSession(session.id);
@@ -192,12 +214,17 @@ describe("ccc-fusion subscription child environment policy", () => {
         cccFusionProfile: CCC_PROFILE,
         cccFusionModel: "gpt-5.6-sol",
         cccFusionMcpServers: [],
+        effectivePosture: {
+          mode: "elevated",
+          elevated: true,
+          flags: ["--sandbox", "danger-full-access"],
+        },
         cccResumeContract: {
           adapterId: "codex",
           nativeSessionId: null,
           requestedModel: "gpt-5.6-sol",
-          permissionAutonomy: null,
-          effectIdentity: null,
+          permissionAutonomy: '{"mode":"elevated","elevated":true,"flags":["--sandbox","danger-full-access"]}',
+          effectReceiptContract: "ccc-tool-receipts/v1",
         },
       });
       expect(Object.keys(recorded.autonomyPosture ?? {}).sort()).toEqual([
@@ -205,11 +232,12 @@ describe("ccc-fusion subscription child environment policy", () => {
         "cccFusionModel",
         "cccFusionProfile",
         "cccResumeContract",
+        "effectivePosture",
       ]);
       expect(first.captures[0].args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
       captureNativeSessionId(store, session.id, "codex-native-session");
     } finally {
-      first.manager.dispose();
+      await first.manager.dispose();
     }
 
     const restarted = makeManager(store);
@@ -230,9 +258,10 @@ describe("ccc-fusion subscription child environment policy", () => {
         expect(freshEnv[key]).toBeUndefined();
         expect(resumed.options.env[key]).toBeUndefined();
       }
-      expect(resumed.args).toEqual(expect.arrayContaining(["resume", "codex-native-session", "-c", 'model="gpt-5.6-sol"']));
+      expect(resumed.command).toBe(process.execPath);
+      expect(providerLaunchArgs(resumed.args)).toEqual(expect.arrayContaining(["resume", "codex-native-session", "-c", 'model="gpt-5.6-sol"']));
     } finally {
-      restarted.manager.dispose();
+      await restarted.manager.dispose();
     }
   });
 
@@ -250,7 +279,7 @@ describe("ccc-fusion subscription child environment policy", () => {
       });
       captureNativeSessionId(store, session.id, "codex-native-session");
     } finally {
-      first.manager.dispose();
+      await first.manager.dispose();
     }
 
     const restarted = makeManager(store);
@@ -264,7 +293,45 @@ describe("ccc-fusion subscription child environment policy", () => {
 
       expect(restarted.captures).toEqual([]);
     } finally {
-      restarted.manager.dispose();
+      await restarted.manager.dispose();
+    }
+  });
+
+  it("keeps pre-Wave non-ccc resume model and autonomy choices permissive", async () => {
+    installFakeChildEnv();
+    const store = makeStore();
+    const first = makeManager(store);
+    let session: any;
+    try {
+      session = await first.manager.spawn({
+        adapterId: "codex",
+        projectId: "project-fusion",
+        purpose: "execute",
+        settings: { model: "predecessor-model", permissionAutonomy: "guarded" },
+      });
+      store.updateSession(session.id, { nativeSessionId: "predecessor-native-session" });
+    } finally {
+      await first.manager.dispose();
+    }
+
+    const restarted = makeManager(store);
+    try {
+      await expect(restarted.manager.spawn({
+        adapterId: "codex",
+        projectId: "project-fusion",
+        purpose: "execute",
+        resume: { sessionId: session.id, nativeSessionId: "predecessor-native-session" },
+        settings: { model: "changed-model-is-allowed", permissionAutonomy: "unrestricted" },
+      })).resolves.toMatchObject({ id: session.id });
+
+      expect(restarted.captures[0]!.args).toEqual(expect.arrayContaining([
+        "resume",
+        "predecessor-native-session",
+        "-c",
+        'model="changed-model-is-allowed"',
+      ]));
+    } finally {
+      await restarted.manager.dispose();
     }
   });
 });
