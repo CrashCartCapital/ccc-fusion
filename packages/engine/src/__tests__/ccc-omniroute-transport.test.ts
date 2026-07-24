@@ -1,6 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
@@ -10,10 +13,15 @@ import type {
   Model,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
+import { CliSessionStore, customProviderRegistryKey, type CustomProvider } from "@fusion/core";
 import { registerCustomProviders } from "../custom-provider-registry.js";
 import { activeSessionRegistry } from "../active-session-registry.js";
 import { TaskExecutor } from "../executor.js";
+import {
+  createSharedPgTaskStoreTestHarness,
+  pgDescribe,
+  type SharedPgTaskStoreHarness,
+} from "../../../core/src/__test-utils__/pg-test-harness.js";
 
 /*
 FNXC:CCCTransport 2026-07-23-15:45:
@@ -214,6 +222,60 @@ function makeEffectReceiptStore() {
   };
 }
 
+function effectTool(name: string, execute: (...args: any[]) => Promise<any>): ToolDefinition {
+  return {
+    name,
+    label: name,
+    description: `Wave 3 durable receipt fixture for ${name}`,
+    parameters: { type: "object", properties: {} },
+    execute,
+  } as ToolDefinition;
+}
+
+function makeCccExecutorStore(
+  task: Record<string, any>,
+  provider: string,
+  modelId: string,
+  asyncLayer: unknown,
+  profile = "ccc-fusion",
+) {
+  return {
+    on: vi.fn(),
+    getAsyncLayer: () => asyncLayer,
+    setPluginWorkflowStepTemplates: vi.fn(),
+    getFusionDir: () => task.worktree,
+    getSettings: vi.fn(async () => ({
+      profile,
+      subscriptionReady: true,
+      executionProvider: provider,
+      executionModelId: modelId,
+      defaultProvider: provider,
+      defaultModelId: modelId,
+      groupOverlappingFiles: false,
+      autoMerge: false,
+      experimentalFeatures: {},
+    })),
+    getTask: vi.fn(async () => task),
+    listTasks: vi.fn(async () => [task]),
+    parseStepsFromPrompt: vi.fn(async () => []),
+    updateTask: vi.fn(async (_id: string, patch: Record<string, unknown>) => Object.assign(task, patch)),
+    moveTask: vi.fn(async (_id: string, column: string) => Object.assign(task, { column })),
+    logEntry: vi.fn(async () => undefined),
+    appendAgentLog: vi.fn(async () => undefined),
+    recordActivity: vi.fn(async () => undefined),
+    recordRunAuditEvent: vi.fn(async () => undefined),
+    emitUsageEvent: vi.fn(async () => undefined),
+    getTaskVerificationRequestAsync: vi.fn(async () => null),
+    listWorkflowDefinitions: vi.fn(async () => []),
+    getWorkflowDefinition: vi.fn(async () => undefined),
+    getWorkflowSelection: vi.fn(async () => undefined),
+    getTaskWorkflowSelection: vi.fn(async () => undefined),
+    listTraits: vi.fn(async () => []),
+    listGoals: vi.fn(async () => []),
+    listMessages: vi.fn(async () => []),
+  };
+}
+
 function noDispatchSession() {
   return {
     model: undefined,
@@ -288,6 +350,85 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
   let incrementalFirstChunk: Deferred;
   let abortClosed: Deferred;
   const sockets = new Set<Socket>();
+  const durableRestartPg: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
+    prefix: "fusion_ccc_executor_restart",
+  });
+
+  it("shares an in-flight duplicate durable effect across independently created CCC wrappers", async () => {
+    const receiptStore = makeEffectReceiptStore();
+    receiptStore.sessions.set("ccc-concurrent-receipt", { autonomyPosture: {} });
+    const release = deferred<{ content: Array<{ type: "text"; text: string }> }>();
+    const execute = vi.fn(() => release.promise);
+    const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
+    const [first] = wrapCccToolsWithDurableEffectReceipts(
+      [effectTool("commit_synthetic_effect", execute)],
+      receiptStore,
+      "ccc-concurrent-receipt",
+    );
+    const [second] = wrapCccToolsWithDurableEffectReceipts(
+      [effectTool("commit_synthetic_effect", execute)],
+      receiptStore,
+      "ccc-concurrent-receipt",
+    );
+    const duplicateArgs = ["provider-call-duplicate", { target: "loopback", revision: 1 }] as const;
+    const both = Promise.all([
+      first!.execute!(...duplicateArgs),
+      second!.execute!(...duplicateArgs),
+    ]);
+
+    try {
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
+    } finally {
+      release.resolve({ content: [{ type: "text", text: "effect committed once" }] });
+      await both;
+    }
+
+    expect(receiptStore.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps different durable effect identities independent", async () => {
+    const receiptStore = makeEffectReceiptStore();
+    receiptStore.sessions.set("ccc-independent-receipts", { autonomyPosture: {} });
+    const release = deferred<{ content: Array<{ type: "text"; text: string }> }>();
+    const execute = vi.fn(() => release.promise);
+    const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
+    const [tool] = wrapCccToolsWithDurableEffectReceipts(
+      [effectTool("commit_synthetic_effect", execute)],
+      receiptStore,
+      "ccc-independent-receipts",
+    );
+    const both = Promise.all([
+      tool!.execute!("provider-call-one", { target: "loopback", revision: 1 }),
+      tool!.execute!("provider-call-two", { target: "loopback", revision: 1 }),
+    ]);
+
+    try {
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    } finally {
+      release.resolve({ content: [{ type: "text", text: "independent effects committed" }] });
+      await both;
+    }
+  });
+
+  it("clears a failed durable effect claim so an honest retry can execute", async () => {
+    const receiptStore = makeEffectReceiptStore();
+    receiptStore.sessions.set("ccc-failed-receipt", { autonomyPosture: {} });
+    const execute = vi.fn()
+      .mockRejectedValueOnce(new Error("loopback effect failed before commit"))
+      .mockResolvedValueOnce({ content: [{ type: "text", text: "retry committed" }] });
+    const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
+    const [tool] = wrapCccToolsWithDurableEffectReceipts(
+      [effectTool("commit_synthetic_effect", execute)],
+      receiptStore,
+      "ccc-failed-receipt",
+    );
+
+    await expect(tool!.execute!("provider-call-retry", { target: "loopback", revision: 1 }))
+      .rejects.toThrow("loopback effect failed before commit");
+    await expect(tool!.execute!("provider-call-retry", { target: "loopback", revision: 1 }))
+      .resolves.toEqual({ content: [{ type: "text", text: "retry committed" }] });
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
 
   beforeAll(async () => {
     server = createServer(async (request, response) => {
@@ -340,6 +481,23 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       if (hasToolResult(body)) {
         writeSse(response, startChunk(model, { role: "assistant", content: "continued-after-tool" }));
         writeSse(response, startChunk(model, {}, "stop"));
+        finishSse(response);
+        return;
+      }
+
+      if (userText(body).includes("CCC_EXECUTOR_RECEIPT")) {
+        writeSse(response, startChunk(model, {
+          role: "assistant",
+          tool_calls: [{
+            index: 0,
+            id: "call-ccc-executor-receipt",
+            type: "function",
+            function: {
+              name: "fn_workflow_list",
+              arguments: "{}",
+            },
+          }],
+        }, "tool_calls"));
         finishSse(response);
         return;
       }
@@ -424,6 +582,166 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     harness.modelRegistry = registry;
     harness.createAgentSession.mockReset();
     harness.createAgentSession.mockImplementation(harness.actualCreateAgentSession!);
+  });
+
+  pgDescribe("CCC durable executor receipt restart", () => {
+    beforeAll(durableRestartPg.beforeAll);
+    beforeEach(durableRestartPg.beforeEach);
+    afterEach(durableRestartPg.afterEach);
+    afterAll(durableRestartPg.afterAll);
+
+    it("reuses the exact durable receipt ledger after a production executor restart", async () => {
+      const provider = providers[0]!;
+      const model = registeredModel(provider);
+      const providerKey = customProviderRegistryKey(provider, providers);
+      const worktreePath = await mkdtemp(join(tmpdir(), "ccc-executor-restart-"));
+      const taskId = "FN-CCC-RESTART-RECEIPT";
+      const task = {
+        id: taskId,
+        title: "CCC executor durable receipt restart",
+        description: "CCC_EXECUTOR_RECEIPT",
+        prompt: "CCC_EXECUTOR_RECEIPT",
+        column: "in-progress",
+        status: "in-progress",
+        dependencies: [],
+        steps: [],
+        currentStep: 0,
+        log: [],
+        worktree: worktreePath,
+        branch: "fusion/ccc-executor-restart",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      let originalEffects = 0;
+      const firstRuntimeStore = await CliSessionStore.create(durableRestartPg.layer(), "ccc-executor-restart-project");
+      const run = async (
+        durableStore: CliSessionStore,
+        runProvider = provider,
+        runModel = model,
+        runWorktreePath = worktreePath,
+        profile = "ccc-fusion",
+      ) => {
+        const runProviderKey = customProviderRegistryKey(runProvider, providers);
+        const taskStore = makeCccExecutorStore(
+          task,
+          runProviderKey,
+          runModel.id,
+          durableRestartPg.layer(),
+          profile,
+        );
+        const originalUpdateTask = taskStore.updateTask;
+        const originalListWorkflowDefinitions = taskStore.listWorkflowDefinitions;
+        taskStore.updateTask = vi.fn(async (id: string, patch: Record<string, unknown>) => {
+          return originalUpdateTask(id, patch);
+        });
+        taskStore.listWorkflowDefinitions = vi.fn(async () => {
+          originalEffects += 1;
+          return originalListWorkflowDefinitions();
+        });
+        const executor = new TaskExecutor(taskStore as any, runWorktreePath, {
+          cliAgentRuntime: {
+            store: durableStore,
+            projectId: "ccc-executor-restart-project",
+            manager: {} as any,
+            hub: {} as any,
+            registry: {} as any,
+            hookEndpointUrl: "http://127.0.0.1:1/unused",
+          },
+        });
+        (executor as any).workspaceConfig = { repos: ["fixture"] };
+        await (executor as any).runImplementation(task, () => undefined);
+      };
+
+      try {
+        await run(firstRuntimeStore);
+        await firstRuntimeStore.flush();
+        const firstLedger = firstRuntimeStore.listByTask(taskId);
+        expect(firstLedger).toHaveLength(1);
+        expect(firstLedger[0]).toMatchObject({
+          adapterId: "pi",
+          worktreePath,
+          autonomyPosture: {
+            cccFusionProfile: "ccc-fusion",
+            cccFusionProvider: providerKey,
+            cccFusionModel: model.id,
+            cccEffectReceipts: [expect.any(String)],
+          },
+        });
+
+        const restartedRuntimeStore = await CliSessionStore.create(durableRestartPg.layer(), "ccc-executor-restart-project");
+        registry = new TestModelRegistry();
+        await registerCustomProviders(registry, providers, vi.fn());
+        harness.modelRegistry = registry;
+        Object.assign(task, {
+          column: "in-progress",
+          status: "in-progress",
+          worktree: worktreePath,
+          branch: "fusion/ccc-executor-restart",
+        });
+        await run(restartedRuntimeStore);
+        await restartedRuntimeStore.flush();
+
+        expect(originalEffects).toBe(1);
+        expect(restartedRuntimeStore.listByTask(taskId)).toHaveLength(1);
+
+        const mismatchedProvider = providers[1]!;
+        const mismatchedModel = registeredModel(mismatchedProvider);
+        const mismatchedWorktreePath = await mkdtemp(join(tmpdir(), "ccc-executor-restart-mismatch-"));
+        let ledgerIdsBeforeProfileMismatch: string[];
+        try {
+          Object.assign(task, {
+            column: "in-progress",
+            status: "in-progress",
+            worktree: mismatchedWorktreePath,
+            branch: "fusion/ccc-executor-restart-mismatch",
+          });
+          const mismatchedRuntimeStore = await CliSessionStore.create(
+            durableRestartPg.layer(),
+            "ccc-executor-restart-project",
+          );
+          await run(mismatchedRuntimeStore, mismatchedProvider, mismatchedModel, mismatchedWorktreePath);
+          await mismatchedRuntimeStore.flush();
+
+          const ledgersAfterMismatch = mismatchedRuntimeStore.listByTask(taskId);
+          expect(originalEffects).toBe(2);
+          expect(ledgersAfterMismatch).toHaveLength(2);
+          expect(ledgersAfterMismatch.find((ledger) => ledger.worktreePath === mismatchedWorktreePath)).toMatchObject({
+            adapterId: "pi",
+            worktreePath: mismatchedWorktreePath,
+            autonomyPosture: {
+              cccFusionProfile: "ccc-fusion",
+              cccFusionProvider: customProviderRegistryKey(mismatchedProvider, providers),
+              cccFusionModel: mismatchedModel.id,
+              cccEffectReceipts: [expect.any(String)],
+            },
+          });
+          ledgerIdsBeforeProfileMismatch = ledgersAfterMismatch.map((ledger) => ledger.id).sort();
+        } finally {
+          await rm(mismatchedWorktreePath, { recursive: true, force: true });
+        }
+
+        Object.assign(task, {
+          column: "in-progress",
+          status: "in-progress",
+          worktree: worktreePath,
+          branch: "fusion/ccc-executor-restart-profile-mismatch",
+          description: "CCC_PROFILE_MISMATCH_NO_TOOL",
+          prompt: "CCC_PROFILE_MISMATCH_NO_TOOL",
+        });
+        const nonCccRuntimeStore = await CliSessionStore.create(
+          durableRestartPg.layer(),
+          "ccc-executor-restart-project",
+        );
+        await run(nonCccRuntimeStore, provider, model, worktreePath, "predecessor-compatible-profile");
+        await nonCccRuntimeStore.flush();
+
+        expect(originalEffects).toBe(2);
+        expect(nonCccRuntimeStore.listByTask(taskId).map((ledger) => ledger.id).sort())
+          .toEqual(ledgerIdsBeforeProfileMismatch);
+      } finally {
+        await rm(worktreePath, { recursive: true, force: true });
+      }
+    });
   });
 
   function registeredModel(provider: CustomProvider): Model {

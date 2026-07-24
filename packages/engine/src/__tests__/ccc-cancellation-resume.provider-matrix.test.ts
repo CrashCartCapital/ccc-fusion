@@ -99,6 +99,15 @@ function productionAdapterWithDisposableProvider(adapter: CliAgentAdapter): CliA
   };
 }
 
+function productionAdapterWithNaturalExit(adapter: CliAgentAdapter, exitCode: number): CliAgentAdapter {
+  return {
+    ...adapter,
+    buildLaunch: () => ({ command: process.execPath, args: ["-e", `process.exit(${exitCode})`] }),
+    buildResume: () => ({ command: process.execPath, args: ["-e", `process.exit(${exitCode})`] }),
+    buildEnvAllowlist: () => [],
+  };
+}
+
 function rootOnlyProcessPty() {
   return {
     spawn: (command: string, args: string[], options: { cwd: string; env: Record<string, string> }) => {
@@ -138,6 +147,16 @@ function rootOnlyProcessPty() {
 function makeProductionManager(store: ReturnType<typeof makeStore>, adapter: CliAgentAdapter) {
   const registry = new CliAdapterRegistry();
   registry.register(productionAdapterWithDisposableProvider(adapter));
+  return new CliSessionManager({
+    registry,
+    store: store as any,
+    loadPty: vi.fn(async () => rootOnlyProcessPty()) as any,
+  });
+}
+
+function makeProductionNaturalExitManager(store: ReturnType<typeof makeStore>, adapter: CliAgentAdapter, exitCode: number) {
+  const registry = new CliAdapterRegistry();
+  registry.register(productionAdapterWithNaturalExit(adapter, exitCode));
   return new CliSessionManager({
     registry,
     store: store as any,
@@ -246,6 +265,28 @@ describe("ccc-fusion Wave 3 cancellation and resume provider matrix", () => {
 
       await manager.kill(session.id, "killed");
       expect(store.flush).toHaveBeenCalledTimes(2);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it.each([claudeCodeAdapter, codexAdapter])("$name preserves a natural nonzero provider exit through the production supervisor", async (adapter) => {
+    const store = makeStore();
+    const manager = makeProductionNaturalExitManager(store, adapter, 47);
+    try {
+      const session = await manager.spawn({
+        adapterId: adapter.id,
+        projectId: "ccc",
+        purpose: "execute",
+        settings: { profile: "ccc-fusion", subscriptionReady: true },
+      });
+
+      await expect(manager.waitForExit(session.id)).resolves.toEqual({ exitCode: 47, signal: 0 });
+      await vi.waitFor(() => expect(manager.activeCount()).toBe(0));
+      expect(store.getSession(session.id)).toMatchObject({
+        agentState: "dead",
+        terminationReason: "crashed",
+      });
     } finally {
       await manager.dispose();
     }

@@ -51,6 +51,7 @@ import {
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
   resolvePiExtensionProjectRoot,
+  cccEffectReceiptIdentity,
   hasCccEffectReceipt,
 } from "@fusion/core";
 import type {
@@ -87,6 +88,14 @@ import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp-runtime-suppo
 import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp-session-tools.js";
 import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
 import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
+
+/**
+ * A receipt is durable after its flush, but two concurrently-created agent
+ * sessions can reach the pre-commit read together. Claims are deliberately
+ * scoped to the shared durable store so they span wrappers/controllers while
+ * remaining local to that runtime's receipt ledger.
+ */
+const cccEffectReceiptInFlightClaims = new WeakMap<object, Map<string, Promise<unknown>>>();
 export { isModelAuthTierIncompatibilityError } from "./transient-error-detector.js";
 
 const RTK_ACCEPTED_REWRITE_EXIT_CODES = new Set([0, 3]);
@@ -2010,6 +2019,14 @@ export function wrapCccToolsWithDurableEffectReceipts(
   store: CccEffectReceiptStore,
   sessionId: string,
 ): ToolDefinition[] {
+  /*
+  FNXC:CCCEffectReceiptSingleFlight 2026-07-23-20:06:
+  A durable receipt is visible only after its flush, so concurrent controllers
+  can both observe an absent receipt. Scope a transient claim to the durable
+  store (not an individual wrapper/controller), keyed by the canonical receipt
+  identity. The leader's committed result is shared with followers; a failure
+  removes the claim so a later honest retry is not fabricated as committed.
+  */
   return tools.map((tool) => {
     const originalExecute = tool.execute as (...args: any[]) => Promise<any>;
     return {
@@ -2027,9 +2044,31 @@ export function wrapCccToolsWithDurableEffectReceipts(
             details: { cccEffectReceipt: "already-committed" },
           };
         }
-        const result = await originalExecute(...args);
-        await commitCccEffectReceipt(store, input);
-        return result;
+        const storeScope = store as object;
+        let claims = cccEffectReceiptInFlightClaims.get(storeScope);
+        if (!claims) {
+          claims = new Map<string, Promise<any>>();
+          cccEffectReceiptInFlightClaims.set(storeScope, claims);
+        }
+        const identity = cccEffectReceiptIdentity(input);
+        const existing = claims.get(identity);
+        if (existing) return existing;
+
+        const claimed = (async () => {
+          const result = await originalExecute(...args);
+          await commitCccEffectReceipt(store, input);
+          return result;
+        })();
+        claims.set(identity, claimed);
+        void claimed.then(
+          () => {
+            if (claims!.get(identity) === claimed) claims!.delete(identity);
+          },
+          () => {
+            if (claims!.get(identity) === claimed) claims!.delete(identity);
+          },
+        );
+        return claimed;
       },
     };
   });

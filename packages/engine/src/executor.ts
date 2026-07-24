@@ -157,7 +157,7 @@ import type { CliSessionManager } from "./cli-agent/session-manager.js";
 import { CliConcurrencyLimitError, DEFAULT_CLI_CANCELLATION_TIMEOUT_MS } from "./cli-agent/session-manager.js";
 import type { TelemetryHub } from "./cli-agent/telemetry-hub.js";
 import type { CliAdapterRegistry } from "./cli-agent/adapter.js";
-import type { CliSessionStore } from "@fusion/core";
+import type { CliSession, CliSessionStore } from "@fusion/core";
 import {
   StaleWorktreeIndexLockError,
   classifyStaleLock,
@@ -1663,6 +1663,44 @@ export interface CliAgentRuntime {
   hookEndpointUrl: string;
   /** Optional override for the hook scratch-dir root (tests). */
   hookDirRoot?: string;
+}
+
+/**
+ * A CCC executor receipt ledger is reusable only for the exact task execution
+ * contract. Keeping this check at the production controller seam prevents a
+ * restarted controller from borrowing a different model, provider, worktree,
+ * or profile's effects merely because that task once had a CLI row.
+ */
+function matchesCccExecutorReceiptLedger(
+  session: CliSession,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
+): boolean {
+  const posture = session.autonomyPosture;
+  return session.taskId === taskId
+    && session.adapterId === "pi"
+    && session.purpose === "execute"
+    && session.worktreePath === worktreePath
+    && posture?.cccFusionProfile === CCC_FUSION_PROFILE
+    && posture?.cccFusionProvider === provider
+    && posture?.cccFusionModel === modelId
+    && posture?.cccEffectReceiptContract === CCC_EFFECT_RECEIPT_CONTRACT;
+}
+
+function selectCccExecutorReceiptLedger(
+  store: Pick<CliSessionStore, "listByTask">,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
+): CliSession | undefined {
+  const matching = store.listByTask(taskId)
+    .filter((session) => matchesCccExecutorReceiptLedger(session, taskId, provider, modelId, worktreePath))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return matching.find((session) => Array.isArray(session.autonomyPosture?.cccEffectReceipts)
+    && session.autonomyPosture.cccEffectReceipts.length > 0) ?? matching[0];
 }
 
 interface ActiveExecutorSessionState {
@@ -12865,22 +12903,37 @@ export class TaskExecutor {
         before it can execute any tool so a process restart can suppress a
         receipt that was committed before its acknowledgement returned.
         */
-        const cccDurableSession = cccFusionExecutor && cccRuntime
-          ? cccRuntime.store.createSession({
-              projectId: cccRuntime.projectId,
-              adapterId: "pi",
-              purpose: "execute",
-              taskId: task.id,
-              worktreePath,
-              autonomyPosture: {
-                cccFusionProfile: CCC_FUSION_PROFILE,
-                cccFusionProvider: executorProvider,
-                cccFusionModel: executorModelId,
-                cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
-              },
-              agentState: "starting",
-            })
-          : undefined;
+        let cccDurableSession: CliSession | undefined;
+        if (cccFusionExecutor && cccRuntime) {
+          const existingLedger = selectCccExecutorReceiptLedger(
+            cccRuntime.store,
+            task.id,
+            executorProvider,
+            executorModelId,
+            worktreePath,
+          );
+          cccDurableSession = existingLedger
+            ? cccRuntime.store.updateSession(existingLedger.id, {
+                agentState: "starting",
+                terminationReason: null,
+                worktreePath,
+              })
+            : cccRuntime.store.createSession({
+                projectId: cccRuntime.projectId,
+                adapterId: "pi",
+                purpose: "execute",
+                taskId: task.id,
+                worktreePath,
+                autonomyPosture: {
+                  cccFusionProfile: CCC_FUSION_PROFILE,
+                  cccFusionProvider: executorProvider,
+                  cccFusionModel: executorModelId,
+                  cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
+                },
+                agentState: "starting",
+              });
+          if (!cccDurableSession) throw new Error("CCC durable receipt ledger disappeared while restarting executor");
+        }
         if (cccDurableSession) await cccRuntime!.store.flush();
         try {
           const createdSession = await createResolvedAgentSession({
@@ -12985,6 +13038,7 @@ export class TaskExecutor {
           lastResolvedModelId: executorModelId,
           lastTaskModelProvider: detail.modelProvider,
           lastTaskModelId: detail.modelId,
+          ...(cccDurableSession ? { cccDurableSession: { store: cccRuntime!.store, sessionId: cccDurableSession.id } } : {}),
           lastAssignedAgentId: detail.assignedAgentId ?? null,
           // U5 (R7): the effective column-agent governing this session (null when no
           // binding governs — legacy path). The watcher re-resolves this for graph-
@@ -13364,6 +13418,12 @@ export class TaskExecutor {
                   // X-Session-Id/X-Session-Affinity as the primary session, keeping the
                   // task's LLM requests grouped under one stable routing/observability id.
                   taskId: task.id,
+                  ...(cccDurableSession ? {
+                    profile: CCC_FUSION_PROFILE,
+                    subscriptionReady: true as const,
+                    cccEffectReceiptStore: cccRuntime!.store,
+                    cccEffectReceiptSessionId: cccDurableSession.id,
+                  } : {}),
                 });
                 retrySession = createdRetrySession.session;
                 await this.captureExecutorTokenUsageBaseline(task.id, retrySession);
@@ -13384,6 +13444,7 @@ export class TaskExecutor {
                   lastResolvedModelId: executorModelId,
                   lastTaskModelProvider: detail.modelProvider,
                   lastTaskModelId: detail.modelId,
+                  ...(cccDurableSession ? { cccDurableSession: { store: cccRuntime!.store, sessionId: cccDurableSession.id } } : {}),
                   lastAssignedAgentId: detail.assignedAgentId ?? null,
                   // U5 (R7): preserve the effective column-agent across the retry.
                   lastEffectiveColumnAgentId: columnAgentSeam?.agent.id ?? null,
