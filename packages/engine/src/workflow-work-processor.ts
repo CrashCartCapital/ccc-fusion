@@ -30,6 +30,14 @@ export async function processDueWorkflowWorkItem(
   settings: (Pick<Settings, "experimentalFeatures"> & Partial<Settings>) | undefined,
   opts: WorkflowWorkProcessorOptions,
 ): Promise<WorkflowWorkProcessorResult> {
+  if (typeof store.transitionWorkflowWorkItem !== "function") {
+    /*
+    FNXC:CCCWorkProcessor 2026-07-24-15:12: never consume a recoverable work
+    lease unless the native terminal transition exists to durably record a
+    runtime rejection.
+    */
+    throw new Error("workflow work processor requires transitionWorkflowWorkItem");
+  }
   /* FNXC:MissionSymbolAdmission 2026-07-31-12:00: await the async symbol-lock admission before runtime may consume the workflow work lease. */
   const dispatch = await claimDueWorkflowWorkItem(store, {
     now: opts.now,
@@ -62,7 +70,7 @@ export async function processDueWorkflowWorkItem(
   } catch (err) {
     const reason = `workflow-work-item-runtime-error:${err instanceof Error ? err.message : String(err)}`;
     try {
-      await store.transitionWorkflowWorkItem?.(dispatch.workItem.id, "failed", {
+      await store.transitionWorkflowWorkItem(dispatch.workItem.id, "failed", {
         now: opts.now,
         leaseOwner: null,
         leaseExpiresAt: null,

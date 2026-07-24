@@ -254,7 +254,11 @@ const supervisor = `
   process.once("SIGINT", onSigInt);
   process.once("SIGTERM", onSigTerm);
   const stopWithinBudget = async () => await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("embedded PostgreSQL stop timed out")), stopTimeoutMs);
+    const timer = setTimeout(async () => {
+      const timeout = new Error("embedded PostgreSQL stop timed out");
+      try { await lifecycle.terminateOwnedPostmaster(); } catch { /* preserve the original stop timeout */ }
+      reject(timeout);
+    }, stopTimeoutMs);
     lifecycle.stop().then(
       () => { clearTimeout(timer); resolve(); },
       (error) => { clearTimeout(timer); reject(error); },
@@ -307,18 +311,25 @@ child.stdout.on("data", (chunk) => { stdout += String(chunk); });
 child.stderr.on("data", (chunk) => { stderr += String(chunk); });
 let forwardedSignal = null;
 let parentForceKillTimer = null;
-const parentShutdownBoundMs = 15_000;
+const childTimeoutMs = 120_000;
+const childTerminateGraceMs = 2_000;
+const postgresStopBudgetMs = 10_000;
+const parentShutdownMarginMs = 3_000;
+const parentSignalBoundMs = childTerminateGraceMs + postgresStopBudgetMs + parentShutdownMarginMs;
+const parentNormalBoundMs = commands.length * childTimeoutMs + childTerminateGraceMs + postgresStopBudgetMs + parentShutdownMarginMs;
+let parentNormalTimeout = null;
 const forwardSignal = (signal) => {
   forwardedSignal ??= signal;
   child.kill(signal);
   parentForceKillTimer ??= setTimeout(() => {
     if (child.exitCode === null) child.kill("SIGKILL");
-  }, parentShutdownBoundMs);
+  }, parentSignalBoundMs);
 };
 const forwardSigInt = () => forwardSignal("SIGINT");
 const forwardSigTerm = () => forwardSignal("SIGTERM");
 process.once("SIGINT", forwardSigInt);
 process.once("SIGTERM", forwardSigTerm);
+parentNormalTimeout = setTimeout(() => forwardSignal("SIGTERM"), parentNormalBoundMs);
 let supervisorSpawnError = null;
 const exitCode = await new Promise((resolve) => {
   child.once("error", (error) => { supervisorSpawnError = redact(error instanceof Error ? error.message : String(error)); resolve(1); });
@@ -327,6 +338,7 @@ const exitCode = await new Promise((resolve) => {
 process.removeListener("SIGINT", forwardSigInt);
 process.removeListener("SIGTERM", forwardSigTerm);
 if (parentForceKillTimer) clearTimeout(parentForceKillTimer);
+if (parentNormalTimeout) clearTimeout(parentNormalTimeout);
 const supervisorLine = stdout.split("\n").find((line) => line.startsWith("CCC_W4_SUPERVISOR_RESULT="));
 let supervisorResult = { results: [], database: "ccc_wave4_proof" };
 let policyError;

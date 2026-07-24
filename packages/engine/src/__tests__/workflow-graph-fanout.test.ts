@@ -616,6 +616,57 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(result.visitedNodeIds).not.toContain("tail");
   });
 
+  it("Wave 4 RED: a late CCC terminal checkpoint survives an ordinary fail-fast abort", async () => {
+    const releaseLateBranch = deferred<void>();
+    const ordinaryFailureObserved = deferred<void>();
+    const calls: string[] = [];
+    const ir: WorkflowIr = {
+      version: "v2", name: "late-terminal-checkpoint", columns: [],
+      nodes: [
+        { id: "start", kind: "start" }, { id: "split", kind: "split" },
+        { id: "ordinary", kind: "prompt", config: {} }, { id: "late", kind: "prompt", config: {} },
+        { id: "join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+        { id: "failureEffect", kind: "prompt", config: {} }, { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "split" }, { from: "split", to: "ordinary" }, { from: "split", to: "late" },
+        { from: "ordinary", to: "join", condition: "success" }, { from: "late", to: "join", condition: "success" },
+        { from: "join", to: "end", condition: "success" }, { from: "join", to: "failureEffect", condition: "failure" },
+        { from: "failureEffect", to: "end" },
+      ],
+    };
+    const executor = new WorkflowGraphExecutor({
+      branchPersistence: {
+        saveBranchState: async (state) => {
+          if (state.branchId === "late" && state.currentNodeId === "late" && state.status === "completed") {
+            throw new Error("late checkpoint failed");
+          }
+        },
+      },
+      handlers: {
+        prompt: async (node) => {
+          calls.push(node.id);
+          if (node.id === "ordinary") {
+            ordinaryFailureObserved.resolve();
+            return { outcome: "failure" as const };
+          }
+          if (node.id === "late") {
+            await releaseLateBranch.promise;
+            return { outcome: "success" as const };
+          }
+          return { outcome: "success" as const };
+        },
+      },
+    });
+    const running = executor.run({ ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir);
+    await ordinaryFailureObserved.promise;
+    releaseLateBranch.resolve();
+    const result = await running;
+
+    expect(result.context["ccc:branch-persistence-failure"]).toBe("ccc-branch-persistence-terminal-failed");
+    expect(calls).not.toContain("failureEffect");
+  });
+
   it("reports live per-branch progress for the dashboard", async () => {
     const progress: WorkflowBranchProgress[] = [];
     const executor = new WorkflowGraphExecutor({

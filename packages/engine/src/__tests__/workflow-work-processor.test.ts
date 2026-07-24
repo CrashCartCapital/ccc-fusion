@@ -14,6 +14,7 @@ describe("processDueWorkflowWorkItem symbol lock renewal", () => {
     const store = {
       listDueWorkflowWorkItems: () => [item],
       acquireWorkflowWorkItemLease: () => item,
+      transitionWorkflowWorkItem: async () => item,
       getTask: async () => ({ id: "FN-renew", missionId: "M-1", sliceId: "SL-1", declaredSymbols: ["pkg/a.ts#A"] }),
       getMissionStore: () => ({
         getFeatureByTaskId: async () => ({ id: "F-1", sliceId: "SL-1", status: "triaged" }),
@@ -60,5 +61,20 @@ describe("processDueWorkflowWorkItem symbol lock renewal", () => {
     expect(observed).toBeInstanceOf(AggregateError);
     expect((observed as AggregateError).errors).toEqual([runtimeFailure, fallbackFailure]);
     expect(transitionWorkflowWorkItem).toHaveBeenCalledOnce();
+  });
+
+  it("Wave 4 RED: rejects before claiming when native fallback terminal persistence is unavailable", async () => {
+    const acquireWorkflowWorkItemLease = vi.fn(async () => item);
+    const runWorkItem = vi.fn(async () => { throw new Error("runtime failure"); });
+    const store = {
+      listDueWorkflowWorkItems: async () => [item],
+      acquireWorkflowWorkItemLease,
+    };
+
+    await expect(processDueWorkflowWorkItem(store as any, { runWorkItem } as any, undefined, {
+      leaseOwner: "worker", leaseDurationMs: 1_000,
+    })).rejects.toThrow("workflow work processor requires transitionWorkflowWorkItem");
+    expect(acquireWorkflowWorkItemLease).not.toHaveBeenCalled();
+    expect(runWorkItem).not.toHaveBeenCalled();
   });
 });

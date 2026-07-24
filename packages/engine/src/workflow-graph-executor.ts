@@ -1545,13 +1545,26 @@ export class WorkflowGraphExecutor {
         }
         return projected;
       } catch (error) {
-        if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
         lastError = error;
+        const cccTerminalFailure = cccFusionTask && (
+          error instanceof PermanentError
+          || (error instanceof TransientError && attempt + 1 >= maxAttempts)
+        );
+        /*
+        FNXC:CccWave4Retry 2026-07-24-15:32: preserve a permanent or
+        exhausted transient CCC handler classification even when a competing
+        branch aborted the shared signal while that handler was settling.
+        */
+        if (cccTerminalFailure) break;
+        if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
         if (cccFusionTask && error instanceof PermanentError) break;
       }
     }
 
-    if (signal?.aborted) {
+    const cccTerminalAfterAbort = cccFusionTask && (
+      lastError instanceof PermanentError || lastError instanceof TransientError
+    );
+    if (signal?.aborted && !cccTerminalAfterAbort) {
       return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
     }
 

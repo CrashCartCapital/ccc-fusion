@@ -1992,6 +1992,41 @@ export class EmbeddedPostgresLifecycle {
   }
 
   /**
+   * Terminate only this lifecycle's postmaster after a caller-bounded stop
+   * operation has failed to settle. The PID comes from this owned cluster's
+   * postmaster.pid, never a port scan or a caller-supplied process id.
+   */
+  async terminateOwnedPostmaster(): Promise<void> {
+    if (!this.ownsProcess) return;
+    let pid: number | undefined;
+    try {
+      const firstLine = readFileSync(join(this.options.dataDir, "postmaster.pid"), "utf8").split("\n")[0]?.trim();
+      const parsed = Number(firstLine);
+      if (Number.isInteger(parsed) && parsed > 0) pid = parsed;
+    } catch {
+      return;
+    }
+    if (pid === undefined) return;
+    /*
+    FNXC:CccWave4Proof 2026-07-24-15:25: a proof-only bounded shutdown may
+    need to terminate its exact owned postmaster when pg_ctl stop hangs; do
+    not target ports, process groups, or any caller-supplied PID.
+    */
+    const waitForExit = async (budgetMs: number): Promise<boolean> => {
+      const deadline = Date.now() + budgetMs;
+      for (;;) {
+        try { process.kill(pid, 0); } catch { return true; }
+        if (Date.now() >= deadline) return false;
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+    };
+    try { process.kill(pid, "SIGTERM"); } catch { return; }
+    if (await waitForExit(1_000)) return;
+    try { process.kill(pid, "SIGKILL"); } catch { return; }
+    await waitForExit(1_000);
+  }
+
+  /**
    * Install process-level shutdown handlers so SIGTERM/SIGINT cleanly stop the
    * embedded postgres process (VAL-CONN-007 — no orphaned process remains).
    *

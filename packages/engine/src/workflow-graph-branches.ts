@@ -277,14 +277,18 @@ export async function runSplitJoin(
         evaluateJoin(result.outcome === "failure", result.failureReason !== undefined);
       })
       .catch((err) => {
-        // An aborted branch settles silently; any other throw fails the join.
-        if (controller.signal.aborted) {
+        const persistenceFailure = err instanceof CccBranchPersistenceError;
+        // FNXC:CCCBranchPersistence 2026-07-24-15:05: a terminal durable
+        // checkpoint can reject after a competing ordinary fail-fast abort;
+        // classify it before treating the shared signal as an ordinary abort.
+        if (persistenceFailure) failClosedCccTerminal(err.reason);
+        // An aborted branch settles silently only when it has no stronger CCC
+        // terminal classification to preserve.
+        if (controller.signal.aborted && !persistenceFailure) {
           branchOutcomes.push({ branchId, outcome: "failure", nodeId: branchId });
           return;
         }
         failed += 1;
-        const persistenceFailure = err instanceof CccBranchPersistenceError;
-        if (persistenceFailure) failClosedCccTerminal(err.reason);
         branchOutcomes.push({ branchId, outcome: "failure", nodeId: branchId });
         evaluateJoin(true, persistenceFailure);
         void err;
