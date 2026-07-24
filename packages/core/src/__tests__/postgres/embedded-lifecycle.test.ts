@@ -1169,6 +1169,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
       port: 55439,
       startTimeoutMs: 25,
     });
+    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
 
     const start = lifecycle.start();
     const timeoutRejection = expect(start).rejects.toBeInstanceOf(EmbeddedStartTimeoutError);
@@ -1191,6 +1192,7 @@ describe("embedded-lifecycle: Windows fatal recovery", () => {
   it("restarts an owned cluster on its resolved port when no port was configured", async () => {
     const dataDir = makeDataDir();
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n0\n55491\n`);
     const records: Record<string, unknown>[] = [];
     const logs: string[] = [];
     class RecordingEmbeddedPostgres {
@@ -1658,6 +1660,7 @@ describe("embedded-lifecycle: signal re-raise (P1 #23)", () => {
     // started a real cluster). The boundShutdown handler checks this.running.
     // We set it true to exercise the stop path, then stub stop to flip it.
     (lifecycle as unknown as { running: boolean }).running = true;
+    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
     const killCalls: string[] = [];
     const realKill = process.kill;
     const realExit = process.exit;
@@ -1705,6 +1708,7 @@ describe("embedded-lifecycle: proof-supervisor shutdown ownership", () => {
       stop: async () => { throw failure; },
     };
     (lifecycle as unknown as { running: boolean }).running = true;
+    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
 
     await expect(lifecycle.stop()).rejects.toBe(failure);
     expect(onError).toHaveBeenCalledWith(expect.stringContaining("synthetic stop failure"));
