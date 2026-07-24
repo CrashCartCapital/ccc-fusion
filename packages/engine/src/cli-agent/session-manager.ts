@@ -96,6 +96,75 @@ export class CliResumeUnsupportedError extends Error {
   }
 }
 
+/** A resume may only reattach the exact durable provider/session contract. */
+export class CliResumeContractError extends Error {
+  readonly code = "CLI_RESUME_CONTRACT_MISMATCH";
+  constructor(public readonly field: string) {
+    super(`CLI resume contract mismatch: ${field}`);
+    this.name = "CliResumeContractError";
+  }
+}
+
+interface CccResumeContract {
+  adapterId: string;
+  nativeSessionId: string | null;
+  requestedModel: string | null;
+  permissionAutonomy: string | null;
+  effectIdentity: string | null;
+}
+
+const CCC_RESUME_CONTRACT_KEY = "cccResumeContract";
+
+function identityValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+function permissionAutonomyIdentity(settings: Record<string, unknown>, posture: CliAutonomyPosture | null): string | null {
+  if (settings.permissionAutonomy !== undefined) return identityValue(settings.permissionAutonomy);
+  return identityValue(posture?.effectivePosture ?? posture?.autoApprove ?? null);
+}
+
+function readResumeContract(posture: CliAutonomyPosture | null | undefined): CccResumeContract | undefined {
+  const candidate = posture?.[CCC_RESUME_CONTRACT_KEY];
+  if (!candidate || typeof candidate !== "object") return undefined;
+  const value = candidate as Partial<CccResumeContract>;
+  if (typeof value.adapterId !== "string") return undefined;
+  return {
+    adapterId: value.adapterId,
+    nativeSessionId: typeof value.nativeSessionId === "string" ? value.nativeSessionId : null,
+    requestedModel: typeof value.requestedModel === "string" ? value.requestedModel : null,
+    permissionAutonomy: typeof value.permissionAutonomy === "string" ? value.permissionAutonomy : null,
+    effectIdentity: typeof value.effectIdentity === "string" ? value.effectIdentity : null,
+  };
+}
+
+function buildResumeContract(
+  adapterId: string,
+  nativeSessionId: string | null,
+  settings: Record<string, unknown>,
+  posture: CliAutonomyPosture | null,
+): CccResumeContract {
+  return {
+    adapterId,
+    nativeSessionId,
+    requestedModel: identityValue(settings.model),
+    permissionAutonomy: permissionAutonomyIdentity(settings, posture),
+    effectIdentity: identityValue(settings.effectIdentity),
+  };
+}
+
+function withResumeContract(posture: CliAutonomyPosture | null, contract: CccResumeContract): CliAutonomyPosture {
+  return { ...(posture ?? {}), [CCC_RESUME_CONTRACT_KEY]: contract };
+}
+
+function assertExactResumeContract(expected: CccResumeContract, actual: CccResumeContract): void {
+  for (const field of ["adapterId", "nativeSessionId", "requestedModel", "permissionAutonomy", "effectIdentity"] as const) {
+    if (expected[field] !== actual[field]) throw new CliResumeContractError(field);
+  }
+}
+
 // ── Injection neutralization (security-critical) ───────────────────────────
 
 /**
@@ -352,6 +421,10 @@ interface LiveSession {
   exitResult: { exitCode: number; signal: number | undefined } | null;
   /** Resolvers waiting on process exit (one-shot sessions). */
   exitWaiters: ((result: { exitCode: number; signal: number | undefined }) => void)[];
+  /** In-flight ordered cancellation; reused by repeated cancellation calls. */
+  cancellation: Promise<void> | null;
+  /** The deliberate terminal reason while we wait for the registered resource. */
+  cancellationReason: CliTerminationReason | null;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -392,7 +465,7 @@ export class CliSessionManager {
   private readonly sessions = new Map<string, LiveSession>();
 
   /** Bound exit handler so it can be removed on dispose. */
-  private readonly onProcessExit = () => this.killAll();
+  private readonly onProcessExit = () => { void this.killAll(); };
   private exitHookInstalled = false;
 
   constructor(options: CliSessionManagerOptions) {
@@ -440,7 +513,7 @@ export class CliSessionManager {
     }
 
     const adapter = this.registry.get(options.adapterId);
-    const requestedSettings = (options.settings ?? {}) as Record<string, unknown>;
+    const requestedSettings = { ...((options.settings ?? {}) as Record<string, unknown>) };
 
     // Resume vs fresh launch. A resume relaunches the recorded native session id
     // via the adapter's `buildResume` and REUSES the existing record (no
@@ -454,6 +527,24 @@ export class CliSessionManager {
       }
       const existing = this.store.getSession(options.resume.sessionId);
       if (!existing) throw new UnknownCliSessionError(options.resume.sessionId);
+      const storedContract = readResumeContract(existing.autonomyPosture);
+      if (storedContract) {
+        if (requestedSettings.model === undefined && storedContract.requestedModel !== null) {
+          requestedSettings.model = storedContract.requestedModel;
+        }
+        if (requestedSettings.permissionAutonomy === undefined && storedContract.permissionAutonomy !== null) {
+          requestedSettings.permissionAutonomy = storedContract.permissionAutonomy;
+        }
+        if (requestedSettings.effectIdentity === undefined && storedContract.effectIdentity !== null) {
+          requestedSettings.effectIdentity = storedContract.effectIdentity;
+        }
+        assertExactResumeContract(storedContract, buildResumeContract(
+          options.adapterId,
+          options.resume.nativeSessionId,
+          requestedSettings,
+          existing.autonomyPosture,
+        ));
+      }
       /*
       FNXC:CCCSubscriptionPolicy 2026-07-23-14:14:
       Crash recovery reapplies the persisted ccc profile, exact model, and exact
@@ -476,9 +567,13 @@ export class CliSessionManager {
     } else {
       launchSettings = applyCccNativeMcpPolicy(requestedSettings);
       assertCccFusionSubscriptionReady(launchSettings);
-      const posture = persistCccNativeMcpPosture(
+      const persistedPosture = persistCccNativeMcpPosture(
         persistCccFusionPosture(options.posture ?? null, launchSettings),
         launchSettings,
+      );
+      const posture = withResumeContract(
+        persistedPosture,
+        buildResumeContract(options.adapterId, null, launchSettings, persistedPosture),
       );
       launch = adapter.buildLaunch({ settings: launchSettings, posture });
       // Persist the session record BEFORE spawning so a crash mid-spawn still has
@@ -552,6 +647,8 @@ export class CliSessionManager {
       inflightBytes: 0,
       exitResult: null,
       exitWaiters: [],
+      cancellation: null,
+      cancellationReason: null,
     };
     this.sessions.set(record.id, live);
 
@@ -641,9 +738,14 @@ export class CliSessionManager {
 
   private handleExit(live: LiveSession, exitCode: number, signal?: number): void {
     if (live.terminated) return;
+    this.settleExit(live, exitCode, signal);
+
+    // The cancellation owner observes this registered resource first, then
+    // writes + flushes its terminal state before releasing the registry slot.
+    if (live.cancellationReason !== null) return;
+
     live.terminated = true;
     this.sessions.delete(live.id);
-    this.settleExit(live, exitCode, signal);
 
     for (const stream of live.streams) stream.close();
     live.streams.clear();
@@ -868,21 +970,33 @@ export class CliSessionManager {
    * the record, release the concurrency slot. NEVER touches anything but this
    * session's own registered pid.
    */
-  kill(sessionId: string, reason: CliTerminationReason = "killed"): void {
+  async kill(sessionId: string, reason: CliTerminationReason = "killed"): Promise<void> {
     const live = this.sessions.get(sessionId);
     if (!live) return;
-    this.killLive(live, reason);
+    if (live.cancellation) return live.cancellation;
+    const cancellation = this.killLive(live, reason);
+    live.cancellation = cancellation;
+    return cancellation;
   }
 
-  private killLive(live: LiveSession, reason: CliTerminationReason): void {
-    if (live.terminated) {
-      this.sessions.delete(live.id);
-      return;
+  private async killLive(live: LiveSession, reason: CliTerminationReason): Promise<void> {
+    if (live.terminated) return;
+    live.cancellationReason = reason;
+
+    // Scoped SIGKILL — ONLY this registered provider resource (never port 4040,
+    // dashboard, or an unregistered sibling). The PTY bridge owns any registered
+    // descendants and reports the root/resource closure through onExit.
+    try {
+      live.pty.kill("SIGKILL");
+    } catch {
+      // A synchronous PTY kill failure means the resource was already gone.
+      this.settleExit(live, -1, 9);
+    }
+
+    if (!live.exitResult) {
+      await new Promise<void>((resolve) => live.exitWaiters.push(() => resolve()));
     }
     live.terminated = true;
-    this.sessions.delete(live.id);
-    // A killed PTY exited via signal — surface a nonzero result to one-shot waiters.
-    this.settleExit(live, -1, 9);
 
     for (const stream of live.streams) stream.close();
     live.streams.clear();
@@ -891,42 +1005,33 @@ export class CliSessionManager {
     }
     live.queue = [];
 
-    // Scoped SIGKILL — ONLY this session's registered pid (never port 4040 /
-    // dashboard / unrelated processes).
-    try {
-      live.pty.kill("SIGKILL");
-    } catch {
-      // already gone
-    }
-
-    try {
-      this.store.updateSession(live.id, {
-        agentState: "dead",
-        terminationReason: reason,
-      });
-    } catch {
-      // store may be closed during shutdown
-    }
+    const current = this.store.getSession(live.id);
+    this.store.updateSession(live.id, {
+      agentState: "dead",
+      terminationReason: reason,
+      ...(reason === "killed"
+        ? { autonomyPosture: { ...(current?.autonomyPosture ?? {}), cccCancellationState: "CANCELLED" } }
+        : {}),
+    });
+    await this.store.flush();
+    this.sessions.delete(live.id);
   }
 
   /**
    * Kill every registered session. Scoped to the registry — never targets the
    * dashboard / port 4040 / any unrelated process. Invoked on `process.exit`.
    */
-  killAll(): void {
-    for (const live of [...this.sessions.values()]) {
-      this.killLive(live, "engineDeath");
-    }
-    this.sessions.clear();
+  async killAll(): Promise<void> {
+    await Promise.all([...this.sessions.values()].map((live) => this.kill(live.id, "engineDeath")));
   }
 
   /** Remove the process-exit hook and tear down all sessions. */
-  dispose(): void {
-    this.killAll();
+  async dispose(): Promise<void> {
     if (this.exitHookInstalled) {
       process.off("exit", this.onProcessExit);
       this.exitHookInstalled = false;
     }
+    await this.killAll();
   }
 
   private installExitHook(): void {

@@ -433,7 +433,7 @@ export class CliTaskSession {
    * done). Cleans up the hook dir + invalidates the token.
    */
   async reap(): Promise<void> {
-    this.manager.kill(this.sessionId, "completed");
+    await this.manager.kill(this.sessionId, "completed");
     await this.teardown();
     this.log(`cli-task-session ${this.sessionId}: reaped at handoff`);
   }
@@ -444,7 +444,7 @@ export class CliTaskSession {
    * `killed`.
    */
   async kill(reason: CliTerminationReason = "killed"): Promise<void> {
-    this.manager.kill(this.sessionId, reason);
+    await this.manager.kill(this.sessionId, reason);
     await this.teardown();
     if (!this.settled) {
       this.finish({ kind: "killed", sessionId: this.sessionId, terminationReason: reason });
@@ -580,15 +580,15 @@ export function launchCliTaskSession(
  * eligible). Best-effort: a dead/missing session is a no-op. Returns the count
  * of sessions killed.
  */
-export function killLiveTaskSessions(
+export async function killLiveTaskSessions(
   taskId: string,
   manager: CliSessionManager,
   store: { listByTask(taskId: string): CliSession[] },
-): number {
+): Promise<number> {
   let killed = 0;
   for (const record of store.listByTask(taskId)) {
     if (manager.isLive(record.id)) {
-      manager.kill(record.id, "killed");
+      await manager.kill(record.id, "killed");
       killed += 1;
     }
   }

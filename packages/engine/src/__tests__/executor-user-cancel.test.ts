@@ -1,8 +1,31 @@
 import { describe, it, expect, vi } from "vitest";
 import "./executor-test-helpers.js";
-import { getTaskMoveDisposer } from "@fusion/core";
+import { getTaskMoveDisposer, type TaskStore } from "@fusion/core";
+import { activeSessionRegistry } from "../active-session-registry.js";
 import { TaskExecutor } from "../executor.js";
 import { createMockStore, resetExecutorMocks } from "./executor-test-helpers.js";
+
+interface CancellationTestSession {
+  prompt: () => void;
+  abort: () => Promise<void>;
+  dispose: () => void;
+}
+
+interface CancellationTestSessionState {
+  session: CancellationTestSession;
+  seenSteeringIds: Set<string>;
+  lastResolvedModelProvider: string;
+}
+
+interface CancellationTestExecutorInternals {
+  activeSessions: Map<string, CancellationTestSessionState>;
+  activeWorktrees: Map<string, Set<string>>;
+  setActiveSession(taskId: string, state: CancellationTestSessionState, worktreePath: string): void;
+}
+
+function cancellationTestInternals(executor: TaskExecutor): CancellationTestExecutorInternals {
+  return executor as unknown as CancellationTestExecutorInternals;
+}
 
 describe("TaskExecutor user cancel handling", () => {
   /*
@@ -45,6 +68,85 @@ describe("TaskExecutor user cancel handling", () => {
     await disposal;
     expect(session.dispose).toHaveBeenCalledOnce();
     expect((executor as any).userCanceledTaskIds.has("FN-AWAITED")).toBe(true);
+  });
+
+  /*
+  FNXC:CCCFusionCancellation 2026-07-23-17:32:
+  A custom-provider stream remains the executor's active owner until its async
+  abort has closed the stream. Releasing the registry earlier lets a replacement
+  run acquire the same task while the original provider still has live effects.
+  */
+  it("keeps custom-provider ownership registered until its stream abort settles", async () => {
+    resetExecutorMocks();
+    const store = createMockStore();
+    const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test");
+    const internals = cancellationTestInternals(executor);
+    let resolveAbort: (() => void) | undefined;
+    const abortPending = new Promise<void>((resolve) => {
+      resolveAbort = resolve;
+    });
+    const session = {
+      prompt: vi.fn(),
+      abort: vi.fn(() => abortPending),
+      dispose: vi.fn(),
+    };
+    internals.activeSessions.set("FN-CUSTOM-PROVIDER-CLOSE", {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+    });
+
+    const cleanup = executor.awaitAbortInFlightTaskWork(
+      "FN-CUSTOM-PROVIDER-CLOSE",
+      "user cancellation",
+      { userCanceled: true },
+    );
+
+    await Promise.resolve();
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(internals.activeSessions.get("FN-CUSTOM-PROVIDER-CLOSE")?.session).toBe(session);
+    expect(session.dispose).not.toHaveBeenCalled();
+
+    resolveAbort?.();
+    await cleanup;
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(internals.activeSessions.has("FN-CUSTOM-PROVIDER-CLOSE")).toBe(false);
+  });
+
+  it("keeps the custom-provider worktree lease until its stream abort settles", async () => {
+    resetExecutorMocks();
+    const taskId = "FN-CUSTOM-PROVIDER-LEASE";
+    const worktreePath = "/tmp/fn-custom-provider-stream";
+    const store = createMockStore();
+    const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test");
+    const internals = cancellationTestInternals(executor);
+    let resolveAbort: (() => void) | undefined;
+    const abortPending = new Promise<void>((resolve) => {
+      resolveAbort = resolve;
+    });
+    const session = {
+      prompt: vi.fn(),
+      abort: vi.fn(() => abortPending),
+      dispose: vi.fn(),
+    };
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+    }, worktreePath);
+
+    const cleanup = executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true });
+
+    await Promise.resolve();
+    try {
+      expect(activeSessionRegistry.lookupByPath(worktreePath)).toMatchObject({ taskId, kind: "executor" });
+    } finally {
+      resolveAbort?.();
+      await cleanup;
+      activeSessionRegistry.unregisterPath(worktreePath);
+    }
+    expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
   });
 
   it("does not let late cancellation cleanup touch a replacement execution", async () => {

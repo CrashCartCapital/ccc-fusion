@@ -70,8 +70,10 @@ export interface TelemetryEvent {
   payload?: Record<string, unknown> & {
     /** Raw text chunk (output / transcript) — stripped + redacted on ingest. */
     text?: string;
-    /** Native session id reported by the CLI (e.g. Claude `session_id`). */
-    nativeSessionId?: string;
+  /** Native session id reported by the CLI (e.g. Claude `session_id`). */
+  nativeSessionId?: string;
+  /** Stable identity of a provider effect/tool commit; never replay it. */
+  effectIdentity?: string;
     /** Notification context for a waitingOnInput event (permission/question). */
     notification?: Record<string, unknown>;
   };
@@ -83,6 +85,7 @@ export interface SanitizedTelemetryEvent {
   /** Sanitized text (ANSI/control stripped, secret-redacted, size-capped). */
   text?: string;
   nativeSessionId?: string;
+  effectIdentity?: string;
   notification?: Record<string, unknown>;
   /** True when the event text was truncated by the size cap. */
   truncated?: boolean;
@@ -311,6 +314,25 @@ export class TelemetryHub {
     }
 
     const sanitized = this.sanitize(entry, event);
+    if (sanitized.kind === "toolActivity" && sanitized.effectIdentity) {
+      const current = this.store.getSession(sessionId);
+      const receipts = Array.isArray(current?.autonomyPosture?.cccEffectReceipts)
+        ? current.autonomyPosture.cccEffectReceipts.filter((receipt): receipt is string => typeof receipt === "string")
+        : [];
+      // A receipt is committed before forwarding the activity to consumers; a
+      // restarted controller therefore reconciles the same provider/tool effect
+      // instead of replaying it. The session manager flushes this queue before
+      // any cancellation acknowledgement releases ownership.
+      if (receipts.includes(sanitized.effectIdentity)) return undefined;
+      if (current) {
+        this.store.updateSession(sessionId, {
+          autonomyPosture: {
+            ...(current.autonomyPosture ?? {}),
+            cccEffectReceipts: [...receipts, sanitized.effectIdentity],
+          },
+        });
+      }
+    }
     this.route(entry, sanitized);
     // Narrow tap: feed the sanitized event to a downstream observer (e.g. the
     // chat transcript runner). Best-effort — a throwing listener must not break
@@ -333,6 +355,9 @@ export class TelemetryHub {
 
     if (typeof payload.nativeSessionId === "string") {
       out.nativeSessionId = payload.nativeSessionId.slice(0, 256);
+    }
+    if (typeof payload.effectIdentity === "string") {
+      out.effectIdentity = payload.effectIdentity.slice(0, 256);
     }
     if (payload.notification && typeof payload.notification === "object") {
       out.notification = payload.notification as Record<string, unknown>;
@@ -374,8 +399,18 @@ export class TelemetryHub {
     if (event.nativeSessionId) {
       const current = this.store.getSession(entry.machine.sessionId);
       if (current && current.nativeSessionId !== event.nativeSessionId) {
+        const contract = current.autonomyPosture?.cccResumeContract;
         this.store.updateSession(entry.machine.sessionId, {
           nativeSessionId: event.nativeSessionId,
+          autonomyPosture: contract && typeof contract === "object"
+            ? {
+              ...(current.autonomyPosture ?? {}),
+              cccResumeContract: {
+                ...(contract as Record<string, unknown>),
+                nativeSessionId: event.nativeSessionId,
+              },
+            }
+            : current.autonomyPosture,
         });
       }
     }

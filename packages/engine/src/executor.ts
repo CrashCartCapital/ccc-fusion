@@ -1771,6 +1771,14 @@ export class TaskExecutor {
   private unregisterArchiveWorkspaceWorktreeDisposer: (() => void) | undefined;
   /** Active agent sessions per task, used to terminate on pause and inject steering. */
   private activeSessions = new Map<string, ActiveExecutorSessionState>();
+  /*
+  FNXC:CCCFusionCancellation 2026-07-23-17:34:
+  A custom-provider stream retains its active-session and worktree ownership until
+  abort and dispose have settled. This promise map claims the cancellation without
+  clearing the visible owner, so concurrent hard-cancel callers await one teardown
+  instead of double-aborting or admitting a replacement session too early.
+  */
+  private activeSessionAbortCompletions = new Map<string, Promise<void>>();
   /** Active step-session executors per task (mutually exclusive with activeSessions). */
   private activeStepExecutors = new Map<string, StepSessionExecutor>();
   /** Steering comments already observed for active step-session executor runs. */
@@ -2726,11 +2734,23 @@ export class TaskExecutor {
     // abort. Without this, two concurrent disposal calls for the same task
     // (e.g., task:moved-away followed immediately by task:deleted) both pass
     // the `has(taskId)` guards and double-call abort/dispose.
-    const claimedSession = this.activeSessions.get(taskId);
-    if (claimedSession) {
+    let claimedSession: ActiveExecutorSessionState | undefined;
+    let waitForClaimedSessionAbort: Promise<void> | undefined;
+    let resolveClaimedSessionAbort: (() => void) | undefined;
+    const activeSession = this.activeSessions.get(taskId);
+    if (activeSession) {
       hadActiveSurface = true;
-      abortedSurfaces.push("agent-session");
-      this.deleteActiveSession(taskId);
+      const existingAbort = this.activeSessionAbortCompletions.get(taskId);
+      if (existingAbort) {
+        waitForClaimedSessionAbort = existingAbort;
+      } else {
+        claimedSession = activeSession;
+        const completion = new Promise<void>((resolve) => {
+          resolveClaimedSessionAbort = resolve;
+        });
+        this.activeSessionAbortCompletions.set(taskId, completion);
+        abortedSurfaces.push("agent-session");
+      }
     }
     const claimedStepExecutor = this.activeStepExecutors.get(taskId);
     if (claimedStepExecutor) {
@@ -2780,18 +2800,29 @@ export class TaskExecutor {
 
     if (claimedSession) {
       const { session } = claimedSession;
-      const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
-      if (typeof sessionWithAbort.abort === "function") {
-        await sessionWithAbort.abort().catch((err) => {
-          executorLog.warn(`Failed to abort agent session for ${taskId}: ${err}`);
-        });
-      }
       try {
-        session.dispose();
-      } catch (err) {
-        executorLog.warn(`Failed to dispose agent session for ${taskId}: ${err}`);
+        const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
+        if (typeof sessionWithAbort.abort === "function") {
+          await sessionWithAbort.abort().catch((err) => {
+            executorLog.warn(`Failed to abort agent session for ${taskId}: ${err}`);
+          });
+        }
+        try {
+          session.dispose();
+        } catch (err) {
+          executorLog.warn(`Failed to dispose agent session for ${taskId}: ${err}`);
+        }
+      } finally {
+        if (this.activeSessions.get(taskId)?.session === session) {
+          this.deleteActiveSession(taskId);
+        }
+        resolveClaimedSessionAbort?.();
+        if (this.activeSessionAbortCompletions.get(taskId)) {
+          this.activeSessionAbortCompletions.delete(taskId);
+        }
       }
     }
+    if (waitForClaimedSessionAbort) await waitForClaimedSessionAbort;
 
     if (claimedStepExecutor) {
       const stepExecutorWithAbort = claimedStepExecutor as StepSessionExecutor & { abortAllSessionBash?: () => void };
@@ -9021,7 +9052,7 @@ export class TaskExecutor {
 
     // Re-entry: kill any prior LIVE session for this task (RETHINK/replan context
     // reset) before launching fresh.
-    killLiveTaskSessions(live.id, runtime.manager, runtime.store);
+    await killLiveTaskSessions(live.id, runtime.manager, runtime.store);
 
     let session: CliTaskSession;
     try {

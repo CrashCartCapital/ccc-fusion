@@ -166,7 +166,7 @@ export async function createCliAgentRuntime(
       }
     },
     dispose: async () => {
-      manager.dispose();
+      await manager.dispose();
       await store.flush();
     },
   };

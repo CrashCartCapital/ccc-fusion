@@ -5,6 +5,7 @@ import { CliAdapterRegistry } from "../adapter.js";
 import { claudeCodeAdapter } from "../adapters/claude-code.js";
 import { codexAdapter } from "../adapters/codex.js";
 import { CliSessionManager } from "../session-manager.js";
+import { TelemetryHub } from "../telemetry-hub.js";
 
 const CCC_PROFILE = "ccc-fusion";
 const CLAUDE_FORBIDDEN = [
@@ -41,6 +42,7 @@ function makeStore() {
       return record;
     }),
     getSession: vi.fn((id: string) => sessions.get(id)),
+    listSessions: vi.fn(() => [...sessions.values()]),
     flush: vi.fn(async () => {}),
   });
 }
@@ -89,6 +91,16 @@ function installFakeChildEnv(): void {
   vi.stubEnv("CLAUDE_CODE_USE_VERTEX", "1");
   vi.stubEnv("OPENAI_API_KEY", "fake-openai-key");
   vi.stubEnv("OPENAI_BASE_URL", "https://fake-openai.invalid");
+}
+
+function captureNativeSessionId(
+  store: ReturnType<typeof makeStore>,
+  sessionId: string,
+  nativeSessionId: string,
+): void {
+  const telemetry = new TelemetryHub({ store: store as any });
+  telemetry.issueToken(sessionId);
+  telemetry.ingest(sessionId, { kind: "sessionStart", payload: { nativeSessionId } });
 }
 
 afterEach(() => vi.unstubAllEnvs());
@@ -158,7 +170,7 @@ describe("ccc-fusion subscription child environment policy", () => {
     }
   });
 
-  it("persists only ccc profile, exact Codex model, and sanitized MCP set, then requires a current ready marker for a fresh manager resume", async () => {
+  it("persists the ccc resume contract with the exact Codex model and sanitized MCP set, then requires a current ready marker for a fresh manager resume", async () => {
     installFakeChildEnv();
     const store = makeStore();
     const first = makeManager(store);
@@ -180,14 +192,22 @@ describe("ccc-fusion subscription child environment policy", () => {
         cccFusionProfile: CCC_PROFILE,
         cccFusionModel: "gpt-5.6-sol",
         cccFusionMcpServers: [],
+        cccResumeContract: {
+          adapterId: "codex",
+          nativeSessionId: null,
+          requestedModel: "gpt-5.6-sol",
+          permissionAutonomy: null,
+          effectIdentity: null,
+        },
       });
       expect(Object.keys(recorded.autonomyPosture ?? {}).sort()).toEqual([
         "cccFusionMcpServers",
         "cccFusionModel",
         "cccFusionProfile",
+        "cccResumeContract",
       ]);
       expect(first.captures[0].args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
-      recorded.nativeSessionId = "codex-native-session";
+      captureNativeSessionId(store, session.id, "codex-native-session");
     } finally {
       first.manager.dispose();
     }
@@ -228,7 +248,7 @@ describe("ccc-fusion subscription child environment policy", () => {
         purpose: "execute",
         settings: { profile: CCC_PROFILE, model: "gpt-5.6-sol", subscriptionReady: true },
       });
-      store.getSession(session.id).nativeSessionId = "codex-native-session";
+      captureNativeSessionId(store, session.id, "codex-native-session");
     } finally {
       first.manager.dispose();
     }

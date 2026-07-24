@@ -143,6 +143,16 @@ function makeManager(store: ReturnType<typeof makeStore>) {
   return { manager, registry, captures };
 }
 
+function captureNativeSessionId(
+  store: ReturnType<typeof makeStore>,
+  sessionId: string,
+  nativeSessionId: string,
+): void {
+  const telemetry = new TelemetryHub({ store: store as any });
+  telemetry.issueToken(sessionId);
+  telemetry.ingest(sessionId, { kind: "sessionStart", payload: { nativeSessionId } });
+}
+
 function assertLoopbackTarget(raw: string): URL {
   const url = new URL(raw);
   if (
@@ -437,7 +447,7 @@ describe("ccc native MCP provider matrix", () => {
         expect(first.captures).toHaveLength(1);
         assertModel(first.captures[0]!.args);
         expect(configuredUrl(first.captures[0]!.args)).toBe(mcpUrl);
-        record.nativeSessionId = `${adapterId}-native-wave2`;
+        captureNativeSessionId(store, record.id, `${adapterId}-native-wave2`);
       } finally {
         first.manager.dispose();
       }
@@ -488,8 +498,8 @@ describe("ccc native MCP provider matrix", () => {
       store.updateSession(record.id, {
         agentState: "ready",
         terminationReason: null,
-        nativeSessionId: `${adapterId}-native-recovery-wave2`,
       });
+      captureNativeSessionId(store, record.id, `${adapterId}-native-recovery-wave2`);
 
       const restarted = makeManager(store);
       const logs: string[] = [];
@@ -518,6 +528,13 @@ describe("ccc native MCP provider matrix", () => {
           cccFusionProfile: CCC_PROFILE,
           cccFusionModel: model,
           cccFusionMcpServers: [nativeMcpServer()],
+          cccResumeContract: {
+            adapterId,
+            nativeSessionId: `${adapterId}-native-recovery-wave2`,
+            requestedModel: model,
+            permissionAutonomy: null,
+            effectIdentity: null,
+          },
         });
         const serializedPosture = JSON.stringify(record.autonomyPosture);
         expect(serializedPosture).not.toContain("subscriptionReady");
