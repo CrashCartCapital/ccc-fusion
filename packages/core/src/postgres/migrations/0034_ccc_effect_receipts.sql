@@ -3,7 +3,7 @@
 -- posture is a cache-local whole-row write, so it cannot be the authority for a
 -- reserve/dispatch/commit state machine.
 CREATE TABLE IF NOT EXISTS project.ccc_effect_receipts (
-  project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
   owner_project_id text,
   effect_scope_id text NOT NULL,
   logical_key text NOT NULL,

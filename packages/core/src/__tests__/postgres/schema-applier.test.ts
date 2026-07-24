@@ -2426,6 +2426,158 @@ pgDescribe("schema-applier: VAL-SCHEMA-007 plugin-owned tables materialize via s
   });
 });
 
+/*
+FNXC:CCCEffectReceipts 2026-07-23-22:20:
+Fresh-baseline coverage cannot prove that an already-deployed 0033 database
+receives the new receipt table. Materialize that exact bookkeeping/table shape,
+then use the real applier to prove the forward migration restores both the
+database boundary and fresh-baseline parity.
+*/
+pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
+  let ctx: TestContext | null = null;
+  let freshCtx: TestContext | null = null;
+
+  afterEach(async () => {
+    await teardownDb(ctx);
+    await teardownDb(freshCtx);
+    ctx = null;
+    freshCtx = null;
+  });
+
+  it("upgrades a 0033 receipt-less database with constrained forced-RLS receipt parity", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    // Construct the durable state of the last released schema: all bookkeeping
+    // through 0033, but no v2 receipt table or 0034 marker.
+    await ctx.db.execute(sql.raw(`
+      DROP TABLE IF EXISTS project.ccc_effect_receipts;
+      DELETE FROM public.fusion_schema_migrations WHERE version = '0034';
+    `));
+    expect(await getAppliedMigrations(ctx.db)).toContain("0033");
+    expect(await getAppliedMigrations(ctx.db)).not.toContain("0034");
+    const before = (await ctx.db.execute(sql`
+      SELECT to_regclass('project.ccc_effect_receipts') AS receipt_table
+    `)) as unknown as Array<{ receipt_table: string | null }>;
+    expect(before).toEqual([{ receipt_table: null }]);
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    expect(await getAppliedMigrations(ctx.db)).toContain("0034");
+
+    const catalog = (await ctx.db.execute(sql`
+      SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,
+        EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'project.ccc_effect_receipts'::regclass
+            AND conname = 'ccc_effect_receipts_state_check'
+        ) AS state_check,
+        EXISTS (
+          SELECT 1 FROM pg_policies
+          WHERE schemaname = 'project' AND tablename = 'ccc_effect_receipts'
+            AND policyname = 'fusion_project_isolation'
+        ) AS policy,
+        EXISTS (
+          SELECT 1 FROM pg_indexes
+          WHERE schemaname = 'project' AND tablename = 'ccc_effect_receipts'
+            AND indexname = 'idx_ccc_effect_receipts_scope_authority_digest'
+        ) AS lookup_index
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'project' AND c.relname = 'ccc_effect_receipts'
+    `)) as unknown as Array<{
+      rls: boolean;
+      forced: boolean;
+      state_check: boolean;
+      policy: boolean;
+      lookup_index: boolean;
+    }>;
+    expect(catalog).toEqual([{
+      rls: true,
+      forced: true,
+      state_check: true,
+      policy: true,
+      lookup_index: true,
+    }]);
+
+    await expectPgError(ctx.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT set_config('fusion.project_id', 'project-a', true)`);
+      await tx.execute(sql`SELECT set_config('fusion.project_bypass', 'on', true)`);
+      await tx.execute(sql`
+        INSERT INTO project.ccc_effect_receipts(
+          effect_scope_id, logical_key, tool_authority, arguments_digest,
+          state, controller_token, created_at, updated_at
+        ) VALUES (
+          'scope-invalid', 'invalid-state', 'tool.write', 'digest-invalid',
+          'impossible', 'controller-a', '2026-07-23T22:20:00.000Z', '2026-07-23T22:20:00.000Z'
+        )
+      `);
+    }), /ccc_effect_receipts_state_check|check constraint/i);
+
+    const role = `fusion_receipt_isolation_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+    await ctx.db.execute(sql.raw(`
+      CREATE ROLE ${role} NOLOGIN;
+      GRANT USAGE ON SCHEMA project TO ${role};
+      GRANT SELECT, INSERT, UPDATE, DELETE ON project.ccc_effect_receipts TO ${role};
+    `));
+    try {
+      await ctx.db.transaction(async (tx) => {
+        await tx.execute(sql.raw(`SET LOCAL ROLE ${role}`));
+        await tx.execute(sql`SELECT set_config('fusion.project_id', 'project-a', true)`);
+        await tx.execute(sql`
+          INSERT INTO project.ccc_effect_receipts(
+            effect_scope_id, logical_key, tool_authority, arguments_digest,
+            state, controller_token, created_at, updated_at
+          ) VALUES (
+            'scope-a', 'effect-a', 'tool.write', 'digest-a',
+            'reserved', 'controller-a', '2026-07-23T22:20:00.000Z', '2026-07-23T22:20:00.000Z'
+          )
+        `);
+      });
+      await ctx.db.transaction(async (tx) => {
+        await tx.execute(sql.raw(`SET LOCAL ROLE ${role}`));
+        await tx.execute(sql`SELECT set_config('fusion.project_id', 'project-b', true)`);
+        const visible = (await tx.execute(sql`
+          SELECT logical_key FROM project.ccc_effect_receipts
+          WHERE effect_scope_id = 'scope-a'
+        `)) as unknown as Array<{ logical_key: string }>;
+        expect(visible).toEqual([]);
+        const mutated = (await tx.execute(sql`
+          UPDATE project.ccc_effect_receipts
+          SET state = 'proved_failed'
+          WHERE effect_scope_id = 'scope-a' AND logical_key = 'effect-a'
+          RETURNING logical_key
+        `)) as unknown as Array<{ logical_key: string }>;
+        expect(mutated).toEqual([]);
+      });
+    } finally {
+      await ctx.db.execute(sql.raw(`DROP OWNED BY ${role}; DROP ROLE ${role};`));
+    }
+
+    const receiptShape = async (target: TestContext) => ({
+      columns: await target.db.execute(sql`
+        SELECT column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = 'project' AND table_name = 'ccc_effect_receipts'
+        ORDER BY ordinal_position
+      `),
+      constraints: await target.db.execute(sql`
+        SELECT conname, contype, pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint
+        WHERE conrelid = 'project.ccc_effect_receipts'::regclass
+        ORDER BY conname
+      `),
+      indexes: await target.db.execute(sql`
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'project' AND tablename = 'ccc_effect_receipts'
+        ORDER BY indexname
+      `),
+    });
+    freshCtx = await setupFreshDb();
+    await applySchemaBaseline(freshCtx.db, { pluginHooks: [] });
+    expect(await receiptShape(ctx)).toEqual(await receiptShape(freshCtx));
+  });
+});
+
 /**
  * Assert that an async query rejects with a PostgreSQL error whose message or
  * cause mentions the given constraint detail. Drizzle wraps postgres errors in
