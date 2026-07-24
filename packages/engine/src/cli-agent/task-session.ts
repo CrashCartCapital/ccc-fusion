@@ -401,6 +401,10 @@ export class CliTaskSession {
     const adapter = this.registry.get(this.config.cliAdapterId);
     if (!adapter.capabilities.supportsResume) return false;
     if (!this.manager.isLive(this.sessionId)) return false;
+    // The native-MCP proxy owns durable effect turns. Advance it before changing
+    // task state or injecting so a failed close/open cannot leak a follow-up
+    // prompt onto the prior turn.
+    await this.manager.beginFollowUpTurn(this.sessionId);
     // Live + resumable: a follow-up is just another injection on the live PTY.
     // Re-arm the result promise so the next done resolves it again.
     if (this.settled) this.rearm();

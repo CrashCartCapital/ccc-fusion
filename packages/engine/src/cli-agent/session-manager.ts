@@ -952,6 +952,13 @@ export class CliSessionManager {
     const reason: CliTerminationReason =
       signal && signal !== 0 ? "crashed" : exitCode === 0 ? "completed" : "crashed";
     try {
+      await this.disposeNativeMcpProxy(live);
+    } catch {
+      await this.persistProxyDisposalAttention(live, "NATIVE_MCP_PROXY_DISPOSAL_FAILED");
+      return;
+    }
+    if (this.sessions.get(live.id) !== live) return;
+    try {
       this.store.updateSession(live.id, {
         agentState: "dead",
         terminationReason: reason,
@@ -970,12 +977,6 @@ export class CliSessionManager {
       // Keep ownership when natural-exit durability is unavailable. The record
       // remains recoverable/attention-worthy instead of releasing a false clean
       // completion to a replacement generation.
-      return;
-    }
-    if (this.sessions.get(live.id) !== live) return;
-    try {
-      await live.nativeMcpProxy?.dispose();
-    } catch {
       return;
     }
     if (this.sessions.get(live.id) !== live) return;
@@ -1040,6 +1041,17 @@ export class CliSessionManager {
       live.queue.push({ kind: "injection", text, resolve });
       void this.drain(live);
     });
+  }
+
+  /**
+   * Advance the native-MCP durable effect turn at the sole semantic follow-up
+   * boundary. Ordinary prompt injection, steering, catalog requests, reconnects,
+   * and manager restart deliberately do not call this method.
+   */
+  async beginFollowUpTurn(sessionId: string): Promise<void> {
+    const live = this.require(sessionId);
+    if (live.terminated) throw new UnknownCliSessionError(sessionId);
+    await live.nativeMcpProxy?.beginFollowUpTurn();
   }
 
   /**
@@ -1241,14 +1253,15 @@ export class CliSessionManager {
     });
   }
 
-  private async failCancellationWithoutClosure(live: LiveSession, state: "CANCELLATION_SIGNAL_FAILED" | "CANCELLATION_UNCONFIRMED", failure: unknown): Promise<never> {
+  private async failCancellationWithoutClosure(live: LiveSession, state: "CANCELLATION_SIGNAL_FAILED" | "CANCELLATION_UNCONFIRMED" | "NATIVE_MCP_PROXY_DISPOSAL_FAILED", failure: unknown): Promise<never> {
     live.cancellationFailed = true;
+    if (this.sessions.get(live.id) !== live) throw failure;
     try {
       const current = this.store.getSession(live.id);
       this.store.updateSession(live.id, {
         agentState: "needsAttention",
         terminationReason: null,
-        autonomyPosture: { ...(current?.autonomyPosture ?? {}), cccCancellationState: state },
+        autonomyPosture: { ...(current?.autonomyPosture ?? {}), cccControllerFenced: false, cccCancellationState: state },
       });
       await this.store.flush();
     } catch (cause) {
@@ -1265,6 +1278,12 @@ export class CliSessionManager {
   durable floor is needsAttention, never a fabricated killed/dead success.
   */
   private async persistConfirmedCancellation(live: LiveSession, reason: CliTerminationReason): Promise<void> {
+    if (this.sessions.get(live.id) !== live) return;
+    try {
+      await this.disposeNativeMcpProxy(live);
+    } catch (cause) {
+      await this.failCancellationWithoutClosure(live, "NATIVE_MCP_PROXY_DISPOSAL_FAILED", cause);
+    }
     if (this.sessions.get(live.id) !== live) return;
     try {
       const current = this.store.getSession(live.id);
@@ -1296,8 +1315,6 @@ export class CliSessionManager {
       if (job.kind === "injection") job.resolve();
     }
     live.queue = [];
-
-    await live.nativeMcpProxy?.dispose();
     if (this.sessions.get(live.id) === live) this.sessions.delete(live.id);
   }
 
@@ -1308,6 +1325,33 @@ export class CliSessionManager {
     } catch {
       // The original caller already received the typed failure and ownership
       // remains held; later exit observation cannot manufacture success.
+    }
+  }
+
+  /** Wait for the owned proxy's in-flight HTTP handlers before terminal durability. */
+  private async disposeNativeMcpProxy(live: LiveSession): Promise<void> {
+    if (this.sessions.get(live.id) !== live) return;
+    await live.nativeMcpProxy?.dispose();
+    if (this.sessions.get(live.id) !== live) return;
+  }
+
+  /** A failed proxy close is attention-worthy, nonterminal, and retains ownership. */
+  private async persistProxyDisposalAttention(live: LiveSession, state: string): Promise<void> {
+    if (this.sessions.get(live.id) !== live) return;
+    try {
+      const current = this.store.getSession(live.id);
+      this.store.updateSession(live.id, {
+        agentState: "needsAttention",
+        terminationReason: null,
+        autonomyPosture: {
+          ...(current?.autonomyPosture ?? {}),
+          cccControllerFenced: false,
+          cccCancellationState: state,
+        },
+      });
+      await this.store.flush();
+    } catch {
+      // Ownership stays held even when the attention floor cannot be flushed.
     }
   }
 
