@@ -976,8 +976,8 @@ describe("session failure diagnostics", () => {
 
   it("forwards ccc-fusion profile and readiness through ModelRuntime stream paths without MCP servers", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
-    const providerStream = vi.fn(() => ({}));
-    const providerStreamSimple = vi.fn(() => ({}));
+    const providerStream = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
+    const providerStreamSimple = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
     const modelRuntime = {
       getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
       stream: providerStream,
@@ -1019,32 +1019,40 @@ describe("session failure diagnostics", () => {
     await createdOptions.modelRuntime.complete(model, context, { headers: { "x-test": "complete" } } as any);
     await createdOptions.modelRuntime.completeSimple(model, context, { headers: { "x-test": "complete-simple" } } as any);
 
+    const expectedProbe = expect.objectContaining({
+      provider: "pi-claude-cli",
+      id: "__fusion_ccc_response_probe__claude-sonnet-4-6",
+    });
     expect(providerStream).toHaveBeenCalledTimes(2);
     expect(providerStream).toHaveBeenNthCalledWith(
       1,
-      model,
+      expectedProbe,
       context,
       expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
     );
     expect(providerStream).toHaveBeenNthCalledWith(
       2,
-      model,
+      expectedProbe,
       context,
       expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
     );
     expect(providerStreamSimple).toHaveBeenCalledTimes(2);
     expect(providerStreamSimple).toHaveBeenNthCalledWith(
       1,
-      model,
+      expectedProbe,
       context,
       expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
     );
     expect(providerStreamSimple).toHaveBeenNthCalledWith(
       2,
-      model,
+      expectedProbe,
       context,
       expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
     );
+    const firstStreamOptions = providerStream.mock.calls[0]?.[2] as { onPayload: (payload: unknown) => Promise<unknown> };
+    await expect(firstStreamOptions.onPayload({ messages: [] })).resolves.toMatchObject({
+      model: "claude-sonnet-4-6",
+    });
     expect(connectMcpSessionTools).not.toHaveBeenCalled();
   });
 
@@ -1094,8 +1102,8 @@ describe("session failure diagnostics", () => {
 
   it("forwards ccc-fusion profile and readiness through createFnAgent to both pi provider and MCP connection options", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
-    const providerStream = vi.fn(() => ({}));
-    const providerStreamSimple = vi.fn(() => ({}));
+    const providerStream = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
+    const providerStreamSimple = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
     const modelRuntime = {
       getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
       stream: providerStream,
