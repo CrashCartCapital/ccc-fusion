@@ -383,7 +383,9 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       await both;
     }
 
-    expect(receiptStore.flush).toHaveBeenCalledTimes(1);
+    // One flush durably reserves the effect before it runs; the second commits
+    // the result after it returns, while followers share that one execution.
+    expect(receiptStore.flush).toHaveBeenCalledTimes(2);
   });
 
   it("keeps different durable effect identities independent", async () => {
@@ -742,6 +744,60 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
         await rm(worktreePath, { recursive: true, force: true });
       }
     });
+
+    it("does not reissue an external effect after its receipt commit crashes and the durable store reopens", async () => {
+      const projectId = "ccc-effect-crash-reopen-project";
+      const taskId = "FN-CCC-EFFECT-CRASH-REOPEN";
+      const firstStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+      const receiptSession = firstStore.createSession({
+        projectId,
+        adapterId: "pi",
+        purpose: "execute",
+        taskId,
+        worktreePath: "/tmp/ccc-effect-crash-reopen",
+        autonomyPosture: {
+          cccFusionProfile: "ccc-fusion",
+          cccEffectReceiptContract: "ccc-tool-receipts/v1",
+        },
+        agentState: "busy",
+      });
+      await firstStore.flush();
+
+      const effect = vi.fn(async () => ({
+        content: [{ type: "text" as const, text: "loopback external effect committed" }],
+      }));
+      const { wrapCccToolsWithDurableEffectReceipts } = await import("../pi.js");
+      const [first] = wrapCccToolsWithDurableEffectReceipts(
+        [effectTool("commit_loopback_effect", effect)],
+        firstStore,
+        receiptSession.id,
+      );
+      const realUpdateSession = firstStore.updateSession.bind(firstStore);
+      vi.spyOn(firstStore, "updateSession").mockImplementation((id, patch) => {
+        // Model a process/store failure at the real receipt-write boundary after
+        // the external effect resolves. A future pre-effect durable claim will
+        // delegate before this branch; the post-effect acknowledgement cannot.
+        if (effect.mock.calls.length > 0) throw new Error("simulated receipt write crash");
+        return realUpdateSession(id, patch);
+      });
+      const envelope = ["loopback-effect-call-1", { resource: "loopback", revision: 1 }] as const;
+
+      await expect(first!.execute!(...envelope)).rejects.toThrow("simulated receipt write crash");
+      expect(effect).toHaveBeenCalledTimes(1);
+
+      const restartedStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+      const reopened = restartedStore.getSession(receiptSession.id);
+      expect(reopened?.autonomyPosture).toMatchObject({
+        cccEffectReceiptPending: [expect.any(String)],
+      });
+      const [restarted] = wrapCccToolsWithDurableEffectReceipts(
+        [effectTool("commit_loopback_effect", effect)],
+        restartedStore,
+        receiptSession.id,
+      );
+      await restarted!.execute!(...envelope).catch(() => undefined);
+      expect(effect).toHaveBeenCalledTimes(1);
+    });
   });
 
   function registeredModel(provider: CustomProvider): Model {
@@ -1028,21 +1084,28 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       cccEffectReceiptSessionId: "ccc-effect-session",
     } as any);
 
-    const first = await createController();
-    await (first.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
-    // Recreate the actual controller/model runtime, not merely the session, so
-    // the second call reads only the durable receipt surface.
-    registry = new TestModelRegistry();
-    await registerCustomProviders(registry, providers, vi.fn());
-    harness.modelRegistry = registry;
-    const restarted = await createController();
-    await (restarted.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
+    let first: Awaited<ReturnType<typeof createController>> | undefined;
+    let restarted: Awaited<ReturnType<typeof createController>> | undefined;
+    try {
+      first = await createController();
+      await (first.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
+      // Recreate the actual controller/model runtime, not merely the session, so
+      // the second call reads only the durable receipt surface.
+      registry = new TestModelRegistry();
+      await registerCustomProviders(registry, providers, vi.fn());
+      harness.modelRegistry = registry;
+      restarted = await createController();
+      await (restarted.session as unknown as { promptWithFallback: (value: string) => Promise<void> }).promptWithFallback("CCC_TOOL_LOOP");
 
-    expect(effect).toHaveBeenCalledTimes(1);
-    expect(receiptStore.flush).toHaveBeenCalledTimes(1);
-    expect(receiptStore.sessions.get("ccc-effect-session")?.autonomyPosture).toMatchObject({
-      cccEffectReceipts: [expect.any(String)],
-    });
+      expect(effect).toHaveBeenCalledTimes(1);
+      expect(receiptStore.flush).toHaveBeenCalledTimes(2);
+      expect(receiptStore.sessions.get("ccc-effect-session")?.autonomyPosture).toMatchObject({
+        cccEffectReceipts: [expect.any(String)],
+      });
+    } finally {
+      await first?.session.dispose();
+      await restarted?.session.dispose();
+    }
   });
 
   /*
@@ -1136,6 +1199,89 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     });
     expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
     expect(internals.activeWorktrees.has(taskId)).toBe(false);
+  });
+
+  it("finalizes a timed-out TaskExecutor cancellation only after the real loopback transport closes", async () => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const sessionId = "ccc-executor-late-close-session";
+    const durableSessions = new Map<string, any>([[sessionId, {
+      id: sessionId,
+      agentState: "busy",
+      terminationReason: null,
+      autonomyPosture: { cccFusionProfile: "ccc-fusion" },
+    }]]);
+    const durableStore = {
+      getSession: (id: string) => durableSessions.get(id),
+      updateSession: vi.fn((id: string, updates: Record<string, unknown>) => {
+        const current = durableSessions.get(id);
+        if (!current) return undefined;
+        Object.assign(current, updates);
+        return current;
+      }),
+      flush: vi.fn(async () => undefined),
+    };
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const created = await createFnAgent({
+      cwd: "/tmp/ccc-wave2-executor-late-close",
+      systemPrompt: "synthetic loopback late cancellation only",
+      tools: "coding",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+    const session = created.session as unknown as {
+      abort: () => Promise<void>;
+      dispose: () => void;
+      promptWithFallback: (value: string) => Promise<void>;
+    };
+    const actualAbort = session.abort.bind(session);
+    const releaseAbort = deferred();
+    session.abort = vi.fn(async () => {
+      await releaseAbort.promise;
+      await actualAbort();
+    });
+    const prompt = session.promptWithFallback("CCC_ABORT").catch(() => undefined);
+    await vi.waitFor(() => expect(capturedRequests).toHaveLength(1));
+
+    const taskId = "FN-CCC-LOOPBACK-LATE-CLOSE";
+    const worktreePath = "/tmp/ccc-wave2-executor-late-close";
+    const executor = new TaskExecutor({ on: vi.fn() } as any, "/tmp/ccc-wave2-root", { cancellationTimeoutMs: 15 });
+    const internals = executor as unknown as {
+      activeWorktrees: Map<string, Set<string>>;
+      activeSessions: Map<string, { session: unknown }>;
+      setActiveSession(task: string, state: unknown, path: string): void;
+    };
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+      cccDurableSession: { store: durableStore, sessionId },
+    }, worktreePath);
+
+    await expect(executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true }))
+      .rejects.toMatchObject({ code: "TASK_CANCELLATION_TIMEOUT" });
+    await expect(executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true }))
+      .rejects.toMatchObject({ code: "TASK_CANCELLATION_TIMEOUT" });
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(internals.activeSessions.get(taskId)?.session).toBe(session);
+
+    releaseAbort.resolve();
+    await abortClosed.promise;
+    await vi.waitFor(() => expect(durableSessions.get(sessionId)).toMatchObject({
+      agentState: "dead",
+      terminationReason: "killed",
+      autonomyPosture: { cccCancellationState: "CANCELLED" },
+    }));
+    await prompt;
+
+    expect(durableStore.flush).toHaveBeenCalledTimes(2);
+    expect(internals.activeSessions.has(taskId)).toBe(false);
+    expect(internals.activeWorktrees.has(taskId)).toBe(false);
+    expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
   });
 
   it("keeps both dissimilar configured model IDs exact on request and response wires", async () => {

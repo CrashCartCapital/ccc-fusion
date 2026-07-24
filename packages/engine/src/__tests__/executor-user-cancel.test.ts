@@ -215,6 +215,77 @@ describe("TaskExecutor user cancel handling", () => {
     }
   });
 
+  it("finalizes a late custom-provider close after the caller received the bounded typed failure", async () => {
+    resetExecutorMocks();
+    const taskId = "FN-CUSTOM-PROVIDER-LATE-CLOSE";
+    const worktreePath = "/tmp/fn-custom-provider-late-close";
+    const durableSessions = new Map<string, any>([["ccc-late-close", {
+      id: "ccc-late-close",
+      agentState: "busy",
+      terminationReason: null,
+      autonomyPosture: {},
+    }]]);
+    const durableStore = {
+      getSession: (id: string) => durableSessions.get(id),
+      updateSession: vi.fn((id: string, patch: Record<string, unknown>) => {
+        const current = durableSessions.get(id);
+        if (!current) return undefined;
+        Object.assign(current, patch);
+        return current;
+      }),
+      flush: vi.fn(async () => undefined),
+    };
+    let resolveAbort: (() => void) | undefined;
+    const abortPending = new Promise<void>((resolve) => {
+      resolveAbort = resolve;
+    });
+    const session = {
+      prompt: vi.fn(),
+      abort: vi.fn(() => abortPending),
+      dispose: vi.fn(),
+    };
+    const store = createMockStore();
+    const executor = new TaskExecutor(store as unknown as TaskStore, "/tmp/test", { cancellationTimeoutMs: 15 });
+    const internals = cancellationTestInternals(executor);
+    internals.activeWorktrees.set(taskId, new Set([worktreePath]));
+    internals.setActiveSession(taskId, {
+      session,
+      seenSteeringIds: new Set<string>(),
+      lastResolvedModelProvider: "custom-provider-pi",
+      cccDurableSession: { store: durableStore, sessionId: "ccc-late-close" },
+    } as any, worktreePath);
+
+    try {
+      await expect(executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true }))
+        .rejects.toMatchObject({ code: "TASK_CANCELLATION_TIMEOUT" });
+      await expect(executor.awaitAbortInFlightTaskWork(taskId, "user cancellation", { userCanceled: true }))
+        .rejects.toMatchObject({ code: "TASK_CANCELLATION_TIMEOUT" });
+      expect(session.abort).toHaveBeenCalledOnce();
+      expect(internals.activeSessions.get(taskId)?.session).toBe(session);
+
+      resolveAbort?.();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(durableSessions.get("ccc-late-close")).toMatchObject({
+        agentState: "dead",
+        terminationReason: "killed",
+        autonomyPosture: { cccCancellationState: "CANCELLED" },
+      });
+      expect(durableStore.flush).toHaveBeenCalledTimes(2);
+      expect(session.dispose).toHaveBeenCalledOnce();
+      expect(internals.activeSessions.has(taskId)).toBe(false);
+      expect(internals.activeWorktrees.has(taskId)).toBe(false);
+      expect(activeSessionRegistry.lookupByPath(worktreePath)).toBeNull();
+    } finally {
+      activeSessionRegistry.unregisterPath(worktreePath);
+      internals.activeSessions.delete(taskId);
+      internals.activeWorktrees.delete(taskId);
+    }
+  });
+
   it("does not let late cancellation cleanup touch a replacement execution", async () => {
     resetExecutorMocks();
     let resolveChildStateUpdate: (() => void) | undefined;

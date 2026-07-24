@@ -413,7 +413,6 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
   for (const [_label, mismatch] of [
     ["native session", { nativeSessionId: "native-other" }],
     ["requested model", { model: "model-other" }],
-    ["permission/autonomy", { permissionAutonomy: "unrestricted" }],
   ] as const) {
     const store = makeStore();
     let onExit: ((result: { exitCode: number; signal: number }) => void) | undefined;
@@ -442,11 +441,12 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
         autonomyPosture: {
           cccFusionProfile: "ccc-fusion",
           cccFusionMcpServers: [],
+          effectivePosture: { mode: "guarded", elevated: false, flags: [] },
           cccResumeContract: {
             adapterId,
             nativeSessionId: "native-exact",
             requestedModel: "model-exact",
-            permissionAutonomy: "guarded",
+            permissionAutonomy: '{"mode":"guarded","elevated":false,"flags":[]}',
             effectReceiptContract: "ccc-tool-receipts/v1",
           },
         },
@@ -456,7 +456,7 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
         adapterId,
         projectId: "ccc",
         purpose: "execute",
-        settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact", permissionAutonomy: "guarded" },
+        settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact" },
         resume: { sessionId: session.id, nativeSessionId: "native-exact" },
       })).resolves.toMatchObject({ id: session.id });
 
@@ -464,7 +464,6 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
         profile: "ccc-fusion",
         subscriptionReady: true,
         model: "model-exact",
-        permissionAutonomy: "guarded",
         ...mismatch,
       } as Record<string, string | boolean>;
       const nativeSessionId = typeof requested.nativeSessionId === "string"
@@ -483,6 +482,20 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
       store.updateSession(session.id, {
         autonomyPosture: {
           ...(record.autonomyPosture ?? {}),
+          effectivePosture: { mode: "unrestricted", elevated: true, flags: ["synthetic"] },
+        },
+      });
+      await expect(manager.spawn({
+        adapterId,
+        projectId: "ccc",
+        purpose: "execute",
+        settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact" },
+        resume: { sessionId: session.id, nativeSessionId: "native-exact" },
+      })).rejects.toThrow(/resume contract/i);
+
+      store.updateSession(session.id, {
+        autonomyPosture: {
+          ...(record.autonomyPosture ?? {}),
           cccResumeContract: {
             ...(record.autonomyPosture?.cccResumeContract ?? {}),
             effectReceiptContract: "ccc-tool-receipts/v0",
@@ -493,7 +506,7 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
         adapterId,
         projectId: "ccc",
         purpose: "execute",
-        settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact", permissionAutonomy: "guarded" },
+        settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact" },
         resume: { sessionId: session.id, nativeSessionId: "native-exact" },
       })).rejects.toThrow(/resume contract/i);
 

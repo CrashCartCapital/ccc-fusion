@@ -218,8 +218,9 @@ function identityValue(value: unknown): string | null {
   return JSON.stringify(value);
 }
 
-function permissionAutonomyIdentity(settings: Record<string, unknown>, posture: CliAutonomyPosture | null): string | null {
-  if (settings.permissionAutonomy !== undefined) return identityValue(settings.permissionAutonomy);
+function permissionAutonomyIdentity(posture: CliAutonomyPosture | null): string | null {
+  // Resume identity must describe the normalized posture that the adapter
+  // actually receives, never a free-form caller setting the adapter ignores.
   return identityValue(posture?.effectivePosture ?? posture?.autoApprove ?? null);
 }
 
@@ -252,7 +253,7 @@ function buildResumeContract(
     adapterId,
     nativeSessionId,
     requestedModel: identityValue(settings.model),
-    permissionAutonomy: permissionAutonomyIdentity(settings, posture),
+    permissionAutonomy: permissionAutonomyIdentity(posture),
     effectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
   };
 }

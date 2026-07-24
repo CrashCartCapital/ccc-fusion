@@ -2054,6 +2054,9 @@ export class TaskExecutor {
   }
 
   private setActiveSession(taskId: string, sessionState: ActiveExecutorSessionState, worktreePath: string): void {
+    // A new registered session is a new execution generation. A prior timed-out
+    // cancellation stays idempotently failed only for its original generation.
+    this.activeSessionAbortCompletions.delete(taskId);
     this.activeSessions.set(taskId, sessionState);
     activeSessionRegistry.registerPath(this.sessionRegistryPath(taskId, worktreePath), { taskId, kind: "executor", ownerKey: taskId });
   }
@@ -2806,7 +2809,7 @@ export class TaskExecutor {
       if (existingAbort) {
         waitForClaimedSessionAbort = existingAbort;
       } else {
-        waitForClaimedSessionAbort = this.startAgentSessionCancellation(taskId, activeSession);
+        waitForClaimedSessionAbort = this.startAgentSessionCancellation(taskId, activeSession, options.userCanceled === true);
         abortedSurfaces.push("agent-session");
       }
     }
@@ -2912,8 +2915,12 @@ export class TaskExecutor {
     }
   }
 
-  private startAgentSessionCancellation(taskId: string, state: ActiveExecutorSessionState): Promise<void> {
-    const completion = this.abortAndReleaseAgentSession(taskId, state);
+  private startAgentSessionCancellation(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    releaseWorktreeAfterConfirmedClose: boolean,
+  ): Promise<void> {
+    const completion = this.abortAndReleaseAgentSession(taskId, state, releaseWorktreeAfterConfirmedClose);
     this.activeSessionAbortCompletions.set(taskId, completion);
     void completion.then(() => {
       if (this.activeSessionAbortCompletions.get(taskId) === completion) {
@@ -2926,11 +2933,15 @@ export class TaskExecutor {
     return completion;
   }
 
-  private async abortAndReleaseAgentSession(taskId: string, state: ActiveExecutorSessionState): Promise<void> {
+  private async abortAndReleaseAgentSession(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    releaseWorktreeAfterConfirmedClose: boolean,
+  ): Promise<void> {
     const { session } = state;
     const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
     try {
-      await this.awaitAgentSessionClosure(taskId, state, sessionWithAbort);
+      await this.awaitAgentSessionClosure(taskId, state, sessionWithAbort, releaseWorktreeAfterConfirmedClose);
     } catch (cause) {
       await this.persistCccCancellationAttention(state).catch((persistenceCause) => {
         throw new TaskCancellationAbortError(
@@ -2971,6 +2982,7 @@ export class TaskExecutor {
     taskId: string,
     state: ActiveExecutorSessionState,
     sessionWithAbort: AgentSession & { abort?: () => Promise<void> },
+    releaseWorktreeAfterConfirmedClose: boolean,
   ): Promise<void> {
     const close = async () => {
       if (typeof sessionWithAbort.abort !== "function") {
@@ -2990,9 +3002,10 @@ export class TaskExecutor {
     };
     const timeoutMs = this.options.cancellationTimeoutMs ?? DEFAULT_CLI_CANCELLATION_TIMEOUT_MS;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const closePromise = close();
     try {
       await Promise.race([
-        close(),
+        closePromise,
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => reject(new TaskCancellationAbortError(
             taskId,
@@ -3002,8 +3015,45 @@ export class TaskExecutor {
           timer.unref?.();
         }),
       ]);
+    } catch (cause) {
+      if (cause instanceof TaskCancellationAbortError && cause.code === "TASK_CANCELLATION_TIMEOUT") {
+        /*
+        FNXC:CCCFusionCancellation 2026-07-23-20:36:
+        A timeout is an honest failure acknowledgement, not proof that the
+        custom-provider transport will never close. Observe that original
+        close promise without calling abort twice; if it later proves closed,
+        finalize only the same execution generation after a durable flush.
+        */
+        void closePromise.then(
+          () => this.finalizeLateAgentSessionCancellation(taskId, state, releaseWorktreeAfterConfirmedClose),
+          () => undefined,
+        );
+      }
+      throw cause;
     } finally {
       if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Complete a late proven close without allowing it to touch a replacement session generation. */
+  private async finalizeLateAgentSessionCancellation(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    releaseWorktreeAfterConfirmedClose: boolean,
+  ): Promise<void> {
+    const { session } = state;
+    if (this.activeSessions.get(taskId)?.session !== session) return;
+    try {
+      await this.persistCccCancellationConfirmed(state);
+      if (this.activeSessions.get(taskId)?.session !== session) return;
+      session.dispose();
+      if (this.activeSessions.get(taskId)?.session === session) {
+        this.deleteActiveSession(taskId);
+        if (releaseWorktreeAfterConfirmedClose) this.activeWorktrees.delete(taskId);
+      }
+    } catch {
+      // The original caller already received the typed failure. Keep ownership
+      // visible when a late durable finalization cannot be proven.
     }
   }
 

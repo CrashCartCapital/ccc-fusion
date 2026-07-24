@@ -2367,10 +2367,13 @@ export { CliSessionStore } from "./cli-session-store.js";
 export type { CliSessionStoreEvents } from "./cli-session-store.js";
 export {
   CCC_EFFECT_RECEIPT_CONTRACT,
+  abandonCccEffectReceipt,
+  CccEffectReceiptPendingError,
   CccEffectReceiptSessionMissingError,
   cccEffectReceiptIdentity,
   commitCccEffectReceipt,
   hasCccEffectReceipt,
+  reserveCccEffectReceipt,
 } from "./ccc-effect-receipts.js";
 export type { CccEffectReceiptInput, CccEffectReceiptStore } from "./ccc-effect-receipts.js";
 export {

@@ -297,6 +297,39 @@ describe("ccc-fusion subscription child environment policy", () => {
     }
   });
 
+  it("derives the CCC permission identity from the normalized adapter posture, not caller settings", async () => {
+    installFakeChildEnv();
+    const store = makeStore();
+    const { manager, captures } = makeManager(store);
+    try {
+      const session = await manager.spawn({
+        adapterId: "codex",
+        projectId: "project-ccc",
+        purpose: "execute",
+        settings: {
+          profile: CCC_PROFILE,
+          model: "gpt-5.6-sol",
+          subscriptionReady: true,
+          permissionAutonomy: "caller-controlled-skew",
+        },
+        posture: {
+          effectivePosture: {
+            mode: "default",
+            elevated: false,
+            flags: [],
+          },
+        },
+      });
+      const recorded = store.getSession(session.id);
+      expect(providerLaunchArgs(captures[0]!.args)).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+      expect((recorded.autonomyPosture as Record<string, any>).cccResumeContract).toMatchObject({
+        permissionAutonomy: '{"mode":"default","elevated":false,"flags":[]}',
+      });
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it("keeps pre-Wave non-ccc resume model and autonomy choices permissive", async () => {
     installFakeChildEnv();
     const store = makeStore();

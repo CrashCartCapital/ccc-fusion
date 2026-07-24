@@ -36,8 +36,10 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+  abandonCccEffectReceipt,
   customProviderRegistryKey,
   commitCccEffectReceipt,
+  CccEffectReceiptPendingError,
   getEnabledPiExtensionPaths,
   getFusionAgentDir,
   getLegacyPiAgentDir,
@@ -53,6 +55,7 @@ import {
   resolvePiExtensionProjectRoot,
   cccEffectReceiptIdentity,
   hasCccEffectReceipt,
+  reserveCccEffectReceipt,
 } from "@fusion/core";
 import type {
   AgentPermissionPolicyActionCategory,
@@ -2008,11 +2011,11 @@ export function wrapToolsWithBoundary(
 }
 
 /*
-FNXC:CCCEffectReceipts 2026-07-23-18:48:
+FNXC:CCCEffectReceipts 2026-07-23-20:38:
 This is the committed effect boundary: the ToolDefinition execute closure passed
 to createAgentSession. CCC effects derive identity from the real tool-call id,
-name, and canonical arguments; a durable receipt is checked before execution
-and flushed after execution before its result acknowledges the effect.
+name, and canonical arguments; a durable pending claim flushes before the
+external effect, then the committed receipt flushes before its result returns.
 */
 export function wrapCccToolsWithDurableEffectReceipts(
   tools: ToolDefinition[],
@@ -2055,7 +2058,24 @@ export function wrapCccToolsWithDurableEffectReceipts(
         if (existing) return existing;
 
         const claimed = (async () => {
-          const result = await originalExecute(...args);
+          const reservation = await reserveCccEffectReceipt(store, input);
+          if (reservation.alreadyCommitted) {
+            return {
+              content: [{ type: "text" as const, text: "CCC effect already committed; replay suppressed." }],
+              details: { cccEffectReceipt: "already-committed" },
+            };
+          }
+          if (reservation.pending) throw new CccEffectReceiptPendingError(reservation.identity);
+          let result: any;
+          try {
+            result = await originalExecute(...args);
+          } catch (cause) {
+            // The external effect itself rejected, so it is safe to remove the
+            // pre-effect claim and permit a later honest retry. A commit failure
+            // below deliberately keeps the pending durable claim for reconciliation.
+            await abandonCccEffectReceipt(store, input);
+            throw cause;
+          }
           await commitCccEffectReceipt(store, input);
           return result;
         })();
