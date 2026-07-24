@@ -11,7 +11,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { ResolvedMcpServerDefinition } from "@fusion/core";
+import { CliSessionStore, type ResolvedMcpServerDefinition } from "@fusion/core";
 import type { IPty } from "node-pty";
 import { CliAdapterRegistry } from "../cli-agent/adapter.js";
 import { claudeCodeAdapter } from "../cli-agent/adapters/claude-code.js";
@@ -20,6 +20,7 @@ import { CliResumeCoordinator } from "../cli-agent/resume-coordinator.js";
 import { CliSessionManager } from "../cli-agent/session-manager.js";
 import { launchCliTaskSession } from "../cli-agent/task-session.js";
 import { TelemetryHub } from "../cli-agent/telemetry-hub.js";
+import { createTaskStoreForTest, pgDescribe } from "../../../core/src/__test-utils__/pg-test-harness.js";
 
 /*
 FNXC:CCCNativeMcp 2026-07-23-15:45:
@@ -311,6 +312,57 @@ async function exerciseNativeMcpConfig(url: string, calls: FixtureCall[]) {
   } finally {
     await client.close();
   }
+}
+
+const DURABLE_EFFECT_TOOL_NAME = "commit_durable_native_effect";
+const DURABLE_EFFECT_SERVER_NAME = "ccc-durable-native-fixture";
+const DURABLE_EFFECT_RESULT = { effect: { slot: "native-restart-slot", revision: 1 }, status: "committed" } as const;
+
+async function startDurableEffectFixture(): Promise<{ readonly url: string; readonly upstreamExecutions: () => number; close(): Promise<void> }> {
+  let upstreamExecutions = 0;
+  const sockets = new Set<Socket>();
+  const server = createServer(async (request, response) => {
+    if (request.url !== "/mcp" || request.method !== "POST") {
+      response.writeHead(405, { "content-type": "application/json" });
+      response.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null }));
+      return;
+    }
+    const protocolServer = new Server({ name: "ccc-wave3-durable-native-fixture", version: "1.0.0" }, { capabilities: { tools: {} } });
+    protocolServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [{
+      name: DURABLE_EFFECT_TOOL_NAME, title: "Commit durable native effect", description: "Effectful loopback fixture for native durable receipt recovery",
+      inputSchema: { type: "object", properties: { slot: { type: "string", const: "native-restart-slot" } }, required: ["slot"], additionalProperties: false },
+      annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    }] }));
+    protocolServer.setRequestHandler(CallToolRequestSchema, async (call) => {
+      expect(call.params.name).toBe(DURABLE_EFFECT_TOOL_NAME);
+      expect(call.params.arguments).toEqual({ slot: "native-restart-slot" });
+      upstreamExecutions += 1;
+      return { content: [{ type: "text", text: "durable native effect committed" }], structuredContent: DURABLE_EFFECT_RESULT, isError: false };
+    });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    await protocolServer.connect(transport);
+    try { await transport.handleRequest(request, response, await readJsonBody(request)); } finally { await protocolServer.close(); }
+  });
+  server.on("connection", (socket) => { sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
+  assertLoopbackTarget(url);
+  return { url, upstreamExecutions: () => upstreamExecutions, async close() {
+    server.closeAllConnections?.(); for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  } };
+}
+
+async function callDurableEffect(url: string): Promise<unknown> {
+  const client = new Client({ name: "ccc-wave3-durable-native-mcp-test", version: "1.0.0" }, { capabilities: {} });
+  await client.connect(new StreamableHTTPClientTransport(assertLoopbackTarget(url)));
+  try {
+    const catalog = await client.listTools();
+    expect(catalog.tools).toEqual([expect.objectContaining({ name: DURABLE_EFFECT_TOOL_NAME, annotations: expect.not.objectContaining({ readOnlyHint: true }) })]);
+    const result = await client.callTool({ name: DURABLE_EFFECT_TOOL_NAME, arguments: { slot: "native-restart-slot" } });
+    expect(result).toMatchObject({ content: [{ type: "text", text: "durable native effect committed" }], structuredContent: DURABLE_EFFECT_RESULT, isError: false });
+    return result.structuredContent;
+  } finally { await client.close(); }
 }
 
 describe("ccc native MCP provider matrix", () => {
@@ -1044,5 +1096,48 @@ describe("ccc native MCP provider matrix", () => {
       "Wave 2 MCP egress guard rejected non-loopback target",
     );
     expect(calls).toEqual([]);
+  });
+});
+
+pgDescribe("ccc native MCP durable receipt proxy", () => {
+  it("native Claude and Codex effectful MCP calls survive manager/store restart through one durable Fusion receipt", async () => {
+    const fixture = await startDurableEffectFixture();
+    const harness = await createTaskStoreForTest({ prefix: "fusion_wave3_native_mcp" });
+    const upstreamExecutions: number[] = [];
+    try {
+      for (const { adapterId, model, configuredUrl } of [
+        { adapterId: "claude-code", model: "claude-wave3-native", configuredUrl: claudeConfiguredUrl },
+        { adapterId: "codex", model: "gpt-wave3-native", configuredUrl: codexConfiguredUrl },
+      ] as const) {
+        const executionsBefore = fixture.upstreamExecutions();
+        const projectId = `ccc-native-receipt-${adapterId}`;
+        const firstStore = await CliSessionStore.create(harness.layer, projectId);
+        const first = makeManager(firstStore as never);
+        const record = await first.manager.spawn({
+          adapterId, projectId, purpose: "execute", taskId: `task-${adapterId}-native-receipt`, worktreePath: tmpdir(),
+          settings: { profile: CCC_PROFILE, subscriptionReady: true, model, mcpServers: [{ name: DURABLE_EFFECT_SERVER_NAME, transport: "streamable-http", url: fixture.url, enabled: true }] },
+        });
+        const firstResult = await callDurableEffect(configuredUrl(first.captures[0]!.args, DURABLE_EFFECT_SERVER_NAME));
+        const nativeSessionId = `${adapterId}-native-receipt-session`;
+        captureNativeSessionId(firstStore as never, record.id, nativeSessionId);
+        await firstStore.flush();
+        await disposeManager(first.manager);
+        await firstStore.flush();
+
+        const restartedStore = await CliSessionStore.create(harness.layer, projectId);
+        const durableRecord = restartedStore.getSession(record.id);
+        expect(durableRecord).toMatchObject({ agentState: "dead", terminationReason: "engineDeath", nativeSessionId });
+        const resumed = makeManager(restartedStore as never);
+        try {
+          await resumed.manager.spawn({
+            adapterId, projectId, purpose: "execute", taskId: durableRecord!.taskId, worktreePath: tmpdir(), settings: { subscriptionReady: true },
+            resume: { sessionId: record.id, nativeSessionId },
+          });
+          expect(await callDurableEffect(configuredUrl(resumed.captures[0]!.args, DURABLE_EFFECT_SERVER_NAME))).toEqual(firstResult);
+        } finally { await disposeManager(resumed.manager); }
+        upstreamExecutions.push(fixture.upstreamExecutions() - executionsBefore);
+      }
+      expect(upstreamExecutions).toEqual([1, 1]);
+    } finally { await harness.teardown(); await fixture.close(); }
   });
 });

@@ -194,6 +194,8 @@ interface CapturedRequest {
   responseModel: string;
 }
 
+const wave3OrdinaryProviderArgumentChunks = ["{\"value\":\"loop", "back\"}"] as const;
+
 interface Deferred<T = void> {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -338,12 +340,15 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
         return;
       }
       const body = await readJsonBody(request);
-      const model = String(body.model);
+      const reportedModel = String(body.model);
+      const model = reportedModel.startsWith("__fusion_ccc_response_probe__")
+        ? reportedModel.slice("__fusion_ccc_response_probe__".length)
+        : reportedModel;
       capturedRequests.push({
         method: request.method,
         path: request.url,
         body,
-        responseModel: model,
+        responseModel: reportedModel,
       });
       response.writeHead(200, {
         "content-type": "text/event-stream",
@@ -408,6 +413,17 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
             function: { arguments: 'back"}' },
           }],
         }, "tool_calls"));
+        finishSse(response);
+        return;
+      }
+
+      if (userText(body).includes("CCC_WAVE3_ORDINARY_RESTART")) {
+        durableEffectCallSequence += 1;
+        writeSse(response, startChunk(model, { role: "assistant", tool_calls: [{
+          index: 0, id: `call-wave3-ordinary-${durableEffectCallSequence}`, type: "function",
+          function: { name: "write_ordinary_effect", arguments: wave3OrdinaryProviderArgumentChunks[0] },
+        }] }));
+        writeSse(response, startChunk(model, { tool_calls: [{ index: 0, function: { arguments: wave3OrdinaryProviderArgumentChunks[1] } }] }, "tool_calls"));
         finishSse(response);
         return;
       }
@@ -627,6 +643,55 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       // served from the committed receipt without invoking the handler again.
       expect(capturedRequests.filter(({ body }) => userText(body).includes("CCC_DURABLE_EFFECT"))).toHaveLength(4);
 
+    });
+
+    it("replays an ordinary ToolDefinition result across a controller restart without suppressing the same action in a new durable turn", async () => {
+      const projectId = "ccc-wave3-ordinary-tooldefinition-project";
+      const taskId = "FN-CCC-WAVE3-ORDINARY-TOOLDEFINITION";
+      const firstStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+      const firstTurn = firstStore.createSession({ projectId, adapterId: "pi", purpose: "execute", taskId, worktreePath: "/tmp/ccc-wave3-ordinary-tooldefinition", autonomyPosture: { cccFusionProfile: "ccc-fusion", cccEffectReceiptContract: "ccc-tool-receipts/v2" }, agentState: "busy" });
+      await firstStore.flush();
+      const publicParameters = { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false };
+      const structuredResult = { effect: { status: "committed", value: "loopback" } };
+      const structuredResultText = JSON.stringify(structuredResult);
+      const effect = vi.fn(async (_toolCallId: string, args: Record<string, unknown>) => {
+        expect(args).toEqual({ value: "loopback" });
+        return { content: [{ type: "text" as const, text: structuredResultText }], details: structuredResult };
+      });
+      const customTool = { name: "write_ordinary_effect", label: "Write ordinary effect", description: "Ordinary public-schema loopback effect for the production PI tool boundary", parameters: publicParameters, execute: effect } as unknown as ToolDefinition;
+      const provider = providers[0]!;
+      const model = registeredModel(provider);
+      const registryKey = customProviderRegistryKey(provider, providers);
+      const { createFnAgent } = await import("../pi.js");
+      const createController = (store: CliSessionStore, turnId: string, controllerToken: string, keepTurnOpen: boolean) => createFnAgent({
+        cwd: "/tmp/ccc-wave3-ordinary-tooldefinition", systemPrompt: "real loopback ordinary PI tool effect", tools: "coding", customTools: [customTool],
+        defaultProvider: registryKey, defaultModelId: model.id, profile: "ccc-fusion", subscriptionReady: true,
+        cccEffectReceiptStore: store, cccEffectReceiptSessionId: turnId, cccEffectReceiptControllerToken: controllerToken, cccEffectReceiptKeepTurnOpen: keepTurnOpen,
+      });
+      const first = await createController(firstStore, firstTurn.id, "controller-one", true);
+      try { await (first.session as unknown as { promptWithFallback(value: string): Promise<void> }).promptWithFallback("CCC_WAVE3_ORDINARY_RESTART"); }
+      finally { await first.session.dispose(); }
+      expect(publicParameters).toEqual({ type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false });
+      expect(JSON.parse(wave3OrdinaryProviderArgumentChunks.join(""))).toEqual({ value: "loopback" });
+      expect(capturedRequests[0]!.body.tools).toContainEqual(expect.objectContaining({ type: "function", function: expect.objectContaining({ name: "write_ordinary_effect", parameters: publicParameters }) }));
+      expect(effect).toHaveBeenCalledTimes(1);
+      expect(capturedRequests.at(-1)!.body.messages).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "call-wave3-ordinary-1", content: structuredResultText }));
+      firstStore.updateSession(firstTurn.id, { agentState: "dead", terminationReason: "engineDeath", autonomyPosture: { cccFusionProfile: "ccc-fusion", cccControllerGeneration: "controller-one", cccControllerFenced: true } });
+      await firstStore.flush();
+      const restartedStore = await CliSessionStore.create(durableRestartPg.layer(), projectId);
+      registry = new TestModelRegistry(); await registerCustomProviders(registry, providers, vi.fn()); harness.modelRegistry = registry;
+      const restarted = await createController(restartedStore, firstTurn.id, "controller-two", false);
+      try { await (restarted.session as unknown as { promptWithFallback(value: string): Promise<void> }).promptWithFallback("CCC_WAVE3_ORDINARY_RESTART"); }
+      finally { await restarted.session.dispose(); }
+      expect(effect).toHaveBeenCalledTimes(1);
+      expect(capturedRequests.at(-1)!.body.messages).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "call-wave3-ordinary-2", content: structuredResultText }));
+      const newTurn = restartedStore.createSession({ projectId, adapterId: "pi", purpose: "execute", taskId, worktreePath: "/tmp/ccc-wave3-ordinary-tooldefinition", autonomyPosture: { cccFusionProfile: "ccc-fusion", cccEffectReceiptContract: "ccc-tool-receipts/v2" }, agentState: "busy" });
+      await restartedStore.flush();
+      const next = await createController(restartedStore, newTurn.id, "controller-three", false);
+      try { await (next.session as unknown as { promptWithFallback(value: string): Promise<void> }).promptWithFallback("CCC_WAVE3_ORDINARY_RESTART"); }
+      finally { await next.session.dispose(); }
+      expect(effect).toHaveBeenCalledTimes(2);
+      expect(capturedRequests.at(-1)!.body.messages).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "call-wave3-ordinary-3", content: structuredResultText }));
     });
 
     it("reuses the exact durable receipt ledger after a production executor restart", async () => {
