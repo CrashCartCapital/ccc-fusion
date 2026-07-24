@@ -642,7 +642,11 @@ export class WorkflowGraphExecutor {
           context[`node:${splitResult.joinNodeId}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:branchOutcomes`] = splitResult.branchOutcomes;
           if (splitResult.failureReason) {
-            context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = splitResult.failureReason;
+            if (splitResult.failureReason.startsWith("ccc-branch-persistence-")) {
+              context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = splitResult.failureReason;
+            } else {
+              context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY] = splitResult.failureReason;
+            }
             return { outcome: "failure", value: splitResult.failureReason };
           }
           if (!inStack.has(splitResult.joinNodeId)) visitedNodeIds.push(splitResult.joinNodeId);

@@ -124,6 +124,8 @@ export interface BranchEnvironment {
   completedNodeIds?: Set<string>;
   /** Branch IDs with a durable terminal row — never re-admit or re-walk them. */
   completedBranchIds?: Set<string>;
+  /** Parent split notification used only to abort nested CCC terminal failures immediately. */
+  onCccTerminalFailure?: (reason: string) => void;
 }
 
 export interface SplitJoinResult {
@@ -135,7 +137,7 @@ export interface SplitJoinResult {
   branchOutcomes: { branchId: string; outcome: WorkflowNodeOutcome; nodeId: string }[];
   /** Node IDs visited across all branches (for the executor's visited list). */
   visitedNodeIds: string[];
-  /** Stable fail-closed classification for an explicit ccc-fusion branch write failure. */
+  /** Stable fail-closed classification for a CCC terminal branch failure. */
   failureReason?: string;
 }
 
@@ -230,11 +232,18 @@ export async function runSplitJoin(
     resolveJoin(outcome);
   };
 
+  const failClosedCccTerminal = (reason: string): void => {
+    failureReason ??= reason;
+    env.onCccTerminalFailure?.(reason);
+    controller.abort();
+    settle("failure");
+  };
+
   // Re-evaluate the join after each branch settles. `lastWasFailure` only
   // affects fail-fast (one failure cancels siblings immediately).
-  const evaluateJoin = (lastWasFailure: boolean, persistenceFailure = false): void => {
+  const evaluateJoin = (lastWasFailure: boolean, terminalCccFailure = false): void => {
     if (settled) return;
-    if ((joinConfig.onBranchFailure === "fail-fast" && lastWasFailure) || persistenceFailure) {
+    if ((joinConfig.onBranchFailure === "fail-fast" && lastWasFailure) || terminalCccFailure) {
       controller.abort();
       settle("failure");
       return;
@@ -259,12 +268,13 @@ export async function runSplitJoin(
       evaluateJoin(false);
       return Promise.resolve();
     }
-    return walkBranch(branchId, join, env, controller.signal, visitedNodeIds)
+    return walkBranch(branchId, join, env, controller.signal, visitedNodeIds, failClosedCccTerminal)
       .then((result) => {
         branchOutcomes.push({ branchId, outcome: result.outcome, nodeId: result.lastNodeId });
         if (result.outcome === "success") succeeded += 1;
         else failed += 1;
-        evaluateJoin(result.outcome === "failure");
+        if (result.failureReason) failClosedCccTerminal(result.failureReason);
+        evaluateJoin(result.outcome === "failure", result.failureReason !== undefined);
       })
       .catch((err) => {
         // An aborted branch settles silently; any other throw fails the join.
@@ -274,7 +284,7 @@ export async function runSplitJoin(
         }
         failed += 1;
         const persistenceFailure = err instanceof CccBranchPersistenceError;
-        if (persistenceFailure) failureReason ??= err.reason;
+        if (persistenceFailure) failClosedCccTerminal(err.reason);
         branchOutcomes.push({ branchId, outcome: "failure", nodeId: branchId });
         evaluateJoin(true, persistenceFailure);
         void err;
@@ -296,6 +306,17 @@ export async function runSplitJoin(
 interface BranchWalkResult {
   outcome: WorkflowNodeOutcome;
   lastNodeId: string;
+  /** CCC-only terminal classification which must bypass authored branch edges. */
+  failureReason?: string;
+}
+
+function cccTerminalBranchReason(task: TaskDetail, result: WorkflowNodeResult): string | undefined {
+  if (!isCccFusionTask(task) || result.outcome !== "failure") return undefined;
+  const value = result.contextPatch?.["ccc:retry-classification"];
+  if (typeof value !== "string") return undefined;
+  return value.startsWith("ccc-permanent:") || value.startsWith("ccc-transient-retry-exhausted:")
+    ? value
+    : undefined;
 }
 
 /**
@@ -310,6 +331,7 @@ async function walkBranch(
   env: BranchEnvironment,
   signal: AbortSignal,
   visitedNodeIds: string[],
+  onCccTerminalFailure?: (reason: string) => void,
 ): Promise<BranchWalkResult> {
   let currentId = startNodeId;
   let lastResult: WorkflowNodeResult = { outcome: "success" };
@@ -323,8 +345,17 @@ async function walkBranch(
 
     if (node.kind === "split") {
       // Nested split: resolve its inner window, then continue from the inner join.
-      const inner = await runSplitJoin(node, env);
+      const inner = await runSplitJoin(node, {
+        ...env,
+        onCccTerminalFailure: onCccTerminalFailure ?? env.onCccTerminalFailure,
+      });
       visitedNodeIds.push(...inner.visitedNodeIds);
+      if (inner.failureReason) {
+        // FNXC:CCCBranchPersistence 2026-07-24-14:25: a nested CCC terminal
+        // failure is not an authored branch outcome; bubble it to the owning
+        // split so collect joins abort before any inner or outer failure edge.
+        return { outcome: "failure", lastNodeId: inner.joinNodeId, failureReason: inner.failureReason };
+      }
       lastResult = { outcome: inner.outcome };
       const next = nextEdge(inner.joinNodeId, env, lastResult);
       if (!next) return { outcome: inner.outcome, lastNodeId: inner.joinNodeId };
@@ -362,7 +393,13 @@ async function walkBranch(
         currentNodeId: currentId,
         status: "failed",
       }, "progress", isCccFusionTask(env.task));
-      return { outcome: "failure", lastNodeId: currentId };
+      const failureReason = cccTerminalBranchReason(env.task, lastResult);
+      if (failureReason) onCccTerminalFailure?.(failureReason);
+      return {
+        outcome: "failure",
+        lastNodeId: currentId,
+        failureReason,
+      };
     }
 
     const next = nextEdge(currentId, env, lastResult);

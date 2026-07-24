@@ -68,8 +68,17 @@ export async function processDueWorkflowWorkItem(
         leaseExpiresAt: null,
         lastError: reason,
       });
-    } catch {
-      // Best-effort cleanup; callers still need the claimed work identity on double-failure.
+    } catch (terminalPersistenceError) {
+      /*
+      FNXC:CCCWorkProcessor 2026-07-24-14:35:
+      A runtime rejection plus a rejected native terminal transition is not an
+      acknowledged claim: retaining both causes lets the owning caller surface
+      the durable-state uncertainty instead of falsely reporting completion.
+      */
+      throw new AggregateError(
+        [err, terminalPersistenceError],
+        "workflow work runtime and terminal persistence both failed",
+      );
     }
     runtimeResult = {
       disposition: "failed",

@@ -773,6 +773,10 @@ export interface EmbeddedLifecycleOptions {
   readonly onLog?: (message: string) => void;
   /** Error handler for postgres/initdb stderr. */
   readonly onError?: (messageOrError: string | Error | unknown) => void;
+  /** Keep process-level shutdown ownership with the lifecycle. Defaults to true. */
+  readonly installShutdownHooks?: boolean;
+  /** Re-throw a stop failure after reporting it. Defaults to legacy report-only behavior. */
+  readonly throwOnStopError?: boolean;
   /**
    * FNXC:PostgresEmbedded 2026-06-26-16:15 (fix migration-review P1 #24):
    * Hard timeout (ms) on the FULL `start()` sequence (initdb + pg_ctl start +
@@ -1207,13 +1211,15 @@ export class EmbeddedPostgresLifecycle {
   private readonly options: Required<
     Omit<
       EmbeddedLifecycleOptions,
-      "port" | "onLog" | "onError" | "initdbFlags" | "postgresFlags" | "startTimeoutMs"
+      "port" | "onLog" | "onError" | "initdbFlags" | "postgresFlags" | "startTimeoutMs" | "installShutdownHooks" | "throwOnStopError"
     >
   > & {
     port?: number;
     initdbFlags: readonly string[];
     postgresFlags: readonly string[];
     startTimeoutMs: number;
+    installShutdownHooks: boolean;
+    throwOnStopError: boolean;
     onLog: (message: string) => void;
     onError: (messageOrError: string | Error | unknown) => void;
   };
@@ -1256,6 +1262,8 @@ export class EmbeddedPostgresLifecycle {
       initdbFlags: [...DEFAULT_EMBEDDED_INITDB_FLAGS, ...(opts.initdbFlags ?? [])],
       postgresFlags: [...DEFAULT_EMBEDDED_POSTGRES_FLAGS, ...(opts.postgresFlags ?? [])],
       startTimeoutMs: opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS,
+      installShutdownHooks: opts.installShutdownHooks ?? true,
+      throwOnStopError: opts.throwOnStopError ?? false,
       onLog: opts.onLog ?? ((msg: string) => log.log(msg)),
       onError:
         opts.onError ?? ((err: string | Error | unknown) => log.error(String(err))),
@@ -1626,7 +1634,7 @@ export class EmbeddedPostgresLifecycle {
       throw new EmbeddedStartCancelledError(this.options.dataDir);
     }
 
-    this.installShutdownHook();
+    if (this.options.installShutdownHooks) this.installShutdownHook();
 
     const runtimeUrl = this.buildUrl(port, this.options.database);
     this.options.onLog(
@@ -1947,9 +1955,11 @@ export class EmbeddedPostgresLifecycle {
     // non-admin user; stop it via the handle instead of embedded-postgres
     // (which never called .start() and has no process handle).
     if (this.nonAdminHandle) {
+      let stopError: unknown;
       try {
         await this.nonAdminHandle.stop();
       } catch (err) {
+        stopError = err;
         this.options.onError(`embedded postgres: error during non-admin stop: ${String(err)}`);
       } finally {
         this.nonAdminHandle = null;
@@ -1957,6 +1967,7 @@ export class EmbeddedPostgresLifecycle {
         this.running = false;
         runningInstances.delete(this.options.dataDir);
       }
+      if (stopError && this.options.throwOnStopError) throw stopError;
       return;
     }
 
@@ -1966,15 +1977,18 @@ export class EmbeddedPostgresLifecycle {
       runningInstances.delete(this.options.dataDir);
       return;
     }
+    let stopError: unknown;
     try {
       await this.pg.stop();
     } catch (err) {
+      stopError = err;
       this.options.onError(`embedded postgres: error during stop: ${String(err)}`);
     } finally {
       this.pg = null;
       this.running = false;
       runningInstances.delete(this.options.dataDir);
     }
+    if (stopError && this.options.throwOnStopError) throw stopError;
   }
 
   /**

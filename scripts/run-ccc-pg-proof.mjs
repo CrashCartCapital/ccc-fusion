@@ -213,11 +213,20 @@ const supervisor = `
   import { spawn } from "node:child_process";
   import { mkdir } from "node:fs/promises";
   import { join } from "node:path";
-  const lifecycle = new EmbeddedPostgresLifecycle({ dataDir: process.env.CCC_W4_DATA_ROOT, database: "ccc_wave4_proof" });
+  const lifecycleErrors = [];
+  const lifecycle = new EmbeddedPostgresLifecycle({
+    dataDir: process.env.CCC_W4_DATA_ROOT,
+    database: "ccc_wave4_proof",
+    // The supervisor owns SIGINT/SIGTERM for this disposable proof process.
+    installShutdownHooks: false,
+    throwOnStopError: true,
+    onError: (error) => lifecycleErrors.push(String(error)),
+  });
   const commands = JSON.parse(process.env.CCC_W4_COMMANDS);
   const results = [];
   const timeoutMs = Number(process.env.CCC_W4_CHILD_TIMEOUT_MS ?? 120000);
   const terminateGraceMs = Number(process.env.CCC_W4_CHILD_TERMINATE_GRACE_MS ?? 2000);
+  const stopTimeoutMs = Number(process.env.CCC_W4_PG_STOP_TIMEOUT_MS ?? 10000);
   let activeTerminate = null;
   let interrupted = null;
   const run = (cmd, args, env) => new Promise((resolve, reject) => {
@@ -244,6 +253,13 @@ const supervisor = `
   const onSigTerm = () => onSignal("SIGTERM");
   process.once("SIGINT", onSigInt);
   process.once("SIGTERM", onSigTerm);
+  const stopWithinBudget = async () => await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("embedded PostgreSQL stop timed out")), stopTimeoutMs);
+    lifecycle.stop().then(
+      () => { clearTimeout(timer); resolve(); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
   let stopError = null;
   try {
     await lifecycle.start();
@@ -262,9 +278,9 @@ const supervisor = `
   } finally {
     process.removeListener("SIGINT", onSigInt);
     process.removeListener("SIGTERM", onSigTerm);
-    try { await lifecycle.stop(); } catch (error) { stopError = error instanceof Error ? error.message : String(error); }
+    try { await stopWithinBudget(); } catch (error) { stopError = error instanceof Error ? error.message : String(error); }
   }
-  process.stdout.write("CCC_W4_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: "ccc_wave4_proof", stopError, interrupted }) + "\\n");
+  process.stdout.write("CCC_W4_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: "ccc_wave4_proof", stopError, lifecycleErrors, interrupted }) + "\\n");
   if (stopError || interrupted || results.some((result) => result.code !== 0) || results.length !== commands.length) process.exitCode = 1;
 `;
 
@@ -291,12 +307,13 @@ child.stdout.on("data", (chunk) => { stdout += String(chunk); });
 child.stderr.on("data", (chunk) => { stderr += String(chunk); });
 let forwardedSignal = null;
 let parentForceKillTimer = null;
+const parentShutdownBoundMs = 15_000;
 const forwardSignal = (signal) => {
   forwardedSignal ??= signal;
   child.kill(signal);
   parentForceKillTimer ??= setTimeout(() => {
     if (child.exitCode === null) child.kill("SIGKILL");
-  }, 2_000);
+  }, parentShutdownBoundMs);
 };
 const forwardSigInt = () => forwardSignal("SIGINT");
 const forwardSigTerm = () => forwardSignal("SIGTERM");

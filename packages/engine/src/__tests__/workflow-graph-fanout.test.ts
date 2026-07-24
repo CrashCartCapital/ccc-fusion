@@ -486,6 +486,7 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     };
     const calls: string[] = [];
     const executor = new WorkflowGraphExecutor({
+      branchPersistence: { saveBranchState: async () => {} },
       handlers: {
         prompt: async (node) => {
           calls.push(node.id);
@@ -496,6 +497,123 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     const result = await executor.run(task, settingsOn(), ir);
     expect(result.outcome).toBe("success");
     expect(calls).toEqual(expect.arrayContaining(["branchX", "i1", "i2"]));
+  });
+
+  it("Wave 4 RED: nested CCC checkpoint failure bypasses inner and outer failure edges", async () => {
+    const calls: string[] = [];
+    const checkpointFailed = deferred<void>();
+    const releaseOuterSibling = deferred<void>();
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "nested-ccc-checkpoint-failure",
+      columns: [],
+      nodes: [
+        { id: "start", kind: "start" }, { id: "outer", kind: "split" },
+        { id: "inner", kind: "split" }, { id: "outerSibling", kind: "prompt", config: {} },
+        { id: "outerSiblingAfter", kind: "prompt", config: {} },
+        { id: "i1", kind: "prompt", config: {} }, { id: "i2", kind: "prompt", config: {} },
+        { id: "innerJoin", kind: "join", config: { mode: "all", onBranchFailure: "collect" } },
+        { id: "innerFailureEffect", kind: "prompt", config: {} },
+        { id: "outerJoin", kind: "join", config: { mode: "all", onBranchFailure: "collect" } },
+        { id: "outerFailureEffect", kind: "prompt", config: {} }, { id: "tail", kind: "prompt", config: {} },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "outer" }, { from: "outer", to: "inner" }, { from: "outer", to: "outerSibling" },
+        { from: "inner", to: "i1" }, { from: "inner", to: "i2" },
+        { from: "i1", to: "innerJoin", condition: "success" }, { from: "i2", to: "innerJoin", condition: "success" },
+        { from: "innerJoin", to: "outerJoin", condition: "success" }, { from: "innerJoin", to: "innerFailureEffect", condition: "failure" },
+        { from: "outerSibling", to: "outerSiblingAfter" }, { from: "outerSiblingAfter", to: "outerJoin", condition: "success" },
+        { from: "outerJoin", to: "tail", condition: "success" }, { from: "outerJoin", to: "outerFailureEffect", condition: "failure" },
+        { from: "innerFailureEffect", to: "end" }, { from: "outerFailureEffect", to: "end" }, { from: "tail", to: "end" },
+      ],
+    };
+    const executor = new WorkflowGraphExecutor({
+      branchPersistence: {
+        saveBranchState: async (state) => {
+          if (state.branchId === "i1" && state.currentNodeId === "i1" && state.status === "completed") {
+            checkpointFailed.resolve();
+            throw new Error("terminal checkpoint unavailable");
+          }
+        },
+      },
+      handlers: {
+        prompt: async (node) => {
+          calls.push(node.id);
+          if (node.id === "outerSibling") await releaseOuterSibling.promise;
+          return { outcome: "success" as const };
+        },
+      },
+    });
+
+    const running = executor.run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir,
+    );
+    await checkpointFailed.promise;
+    releaseOuterSibling.resolve();
+    const result = await running;
+
+    expect(result.outcome).toBe("failure");
+    expect(result.context["ccc:branch-persistence-failure"]).toBe("ccc-branch-persistence-terminal-failed");
+    expect(calls).not.toContain("innerFailureEffect");
+    expect(calls).not.toContain("outerFailureEffect");
+    expect(calls).not.toContain("outerSiblingAfter");
+    expect(calls).not.toContain("tail");
+  });
+
+  it("Wave 4 RED: CCC permanent branch failure cannot be masked by a collect join", async () => {
+    let permanentCalls = 0;
+    const executor = new WorkflowGraphExecutor({
+      branchPersistence: { saveBranchState: async () => {} },
+      handlers: {
+        prompt: async (node) => {
+          if (node.id === "branchA") {
+            permanentCalls += 1;
+            throw new PermanentError("operator action", "BRANCH_PERMANENT");
+          }
+          return { outcome: "success" as const };
+        },
+      },
+    });
+    const result = await executor.run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } },
+      settingsOn(),
+      twoBranchIr({ mode: "any", onBranchFailure: "collect", maxRetries: 3 }),
+    );
+
+    expect(permanentCalls).toBe(1);
+    expect(result.outcome).toBe("failure");
+    expect(result.context["ccc:retry-classification"]).toBe("ccc-permanent:BRANCH_PERMANENT");
+    expect(result.visitedNodeIds).not.toContain("tail");
+  });
+
+  it("Wave 4 RED: exhausted CCC transient branch failure cannot be masked by a collect join", async () => {
+    let transientCalls = 0;
+    const executor = new WorkflowGraphExecutor({
+      branchPersistence: { saveBranchState: async () => {} },
+      handlers: {
+        prompt: async (node) => {
+          if (node.id === "branchA") {
+            transientCalls += 1;
+            throw new TransientError("retry", "BRANCH_TRANSIENT");
+          }
+          return { outcome: "success" as const };
+        },
+      },
+    });
+    const ir = twoBranchIr({ mode: "any", onBranchFailure: "collect" });
+    ir.nodes = ir.nodes.map((node) => node.id === "branchA"
+      ? { ...node, config: { maxRetries: 3 } }
+      : node,
+    );
+    const result = await executor.run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir,
+    );
+
+    expect(transientCalls).toBe(3);
+    expect(result.outcome).toBe("failure");
+    expect(result.context["ccc:retry-classification"]).toBe("ccc-transient-retry-exhausted:BRANCH_TRANSIENT");
+    expect(result.visitedNodeIds).not.toContain("tail");
   });
 
   it("reports live per-branch progress for the dashboard", async () => {

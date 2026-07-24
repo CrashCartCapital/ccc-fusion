@@ -1690,3 +1690,24 @@ describe("embedded-lifecycle: signal re-raise (P1 #23)", () => {
     }
   });
 });
+
+describe("embedded-lifecycle: proof-supervisor shutdown ownership", () => {
+  it("Wave 4 RED: proof opt-in exposes a reported stop failure without installing lifecycle signal hooks", async () => {
+    const onError = vi.fn();
+    const lifecycle = new EmbeddedPostgresLifecycle({
+      ...baseOptions("/tmp/wave4-stop-failure"),
+      installShutdownHooks: false,
+      throwOnStopError: true,
+      onError,
+    });
+    const failure = new Error("synthetic stop failure");
+    (lifecycle as unknown as { pg: { stop: () => Promise<void> }; running: boolean }).pg = {
+      stop: async () => { throw failure; },
+    };
+    (lifecycle as unknown as { running: boolean }).running = true;
+
+    await expect(lifecycle.stop()).rejects.toBe(failure);
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("synthetic stop failure"));
+    expect((lifecycle as unknown as { shutdownHookInstalled: boolean }).shutdownHookInstalled).toBe(false);
+  });
+});

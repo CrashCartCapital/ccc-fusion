@@ -36,4 +36,29 @@ describe("processDueWorkflowWorkItem symbol lock renewal", () => {
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(renewSymbolLocks).toHaveBeenCalledOnce();
   });
+
+  it("Wave 4 RED: rejects the public processor call when runtime and fallback terminal persistence both fail", async () => {
+    const runtimeFailure = new Error("runtime terminal failure");
+    const fallbackFailure = new Error("fallback terminal persistence failure");
+    const transitionWorkflowWorkItem = vi.fn(async () => { throw fallbackFailure; });
+    const store = {
+      listDueWorkflowWorkItems: async () => [item],
+      acquireWorkflowWorkItemLease: async () => item,
+      transitionWorkflowWorkItem,
+    };
+    const runtime = { runWorkItem: vi.fn(async () => { throw runtimeFailure; }) };
+
+    let observed: unknown;
+    try {
+      await processDueWorkflowWorkItem(store as any, runtime as any, undefined, {
+        leaseOwner: "worker", leaseDurationMs: 1_000,
+      });
+    } catch (error) {
+      observed = error;
+    }
+
+    expect(observed).toBeInstanceOf(AggregateError);
+    expect((observed as AggregateError).errors).toEqual([runtimeFailure, fallbackFailure]);
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledOnce();
+  });
 });
