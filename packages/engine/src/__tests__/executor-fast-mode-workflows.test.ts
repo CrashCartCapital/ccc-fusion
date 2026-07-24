@@ -238,6 +238,35 @@ describe("fast mode workflow/runtime invariants", () => {
     } finally { customNode.mockRestore(); graphFailure.mockRestore(); }
   });
 
+  it("Wave 4 verification: public TaskExecutor replaces a stale continuation attempt with the consumed cap", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const stale = { id: "WI-wave4-stale", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "A", kind: "task", state: "running", attempt: 9 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([stale]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue({ ...stale, state: "exhausted", attempt: 2 });
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    const selected = { workflowId: "wave4-two-attempt-transient", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 two attempts",
+      ir: { version: "v2", name: "Wave 4 two attempts", columns: [], nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: { maxRetries: 2 } }, { id: "end", kind: "end" }], edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }] },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockRejectedValue(new (await import("../engine-errors.js")).TransientError("retry", "CCC_TWO"));
+    try {
+      await executor.execute(liveTask);
+      expect(customNode).toHaveBeenCalledTimes(2);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(stale.id, "exhausted", expect.objectContaining({
+        attempt: 2,
+        lastError: "ccc-transient-retry-exhausted:CCC_TWO",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition",
+        metadata: expect.objectContaining({ classification: "ccc-transient-exhausted", attempt: 2 }),
+      }));
+    } finally { customNode.mockRestore(); }
+  });
+
   it("graph executor with a custom workflow skips custom pre-merge prompt/gate nodes in fast mode", async () => {
     const { store, executor } = makeExecutorForTask(task({ executionMode: "fast", worktree: "/tmp/wt" }));
     const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true });
