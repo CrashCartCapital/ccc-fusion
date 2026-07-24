@@ -3091,7 +3091,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     }
     wrapSessionDisposeWithShutdown(activeSession);
     try {
-      activeSession.dispose();
+      await Promise.resolve(activeSession.dispose());
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       piLog.warn(`Failed to dispose session during swap: ${msg}`);
