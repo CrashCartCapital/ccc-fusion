@@ -58,6 +58,8 @@ export const PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE = "plan-review-provider-fai
 /** Node-ID-independent CCC terminal checkpoint classification for the outer executor. */
 export const CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY = "ccc:branch-persistence-failure";
 export const CCC_RETRY_CLASSIFICATION_CONTEXT_KEY = "ccc:retry-classification";
+/** Actual total handler calls consumed by a terminal CCC retry classification. */
+export const CCC_RETRY_ATTEMPT_CONTEXT_KEY = "ccc:retry-attempt";
 
 /*
 FNXC:PlanReviewLease 2026-07-18-23:45:
@@ -1602,6 +1604,7 @@ export class WorkflowGraphExecutor {
       value: cccClassification ?? "exception",
       contextPatch: {
         ...(cccClassification ? { [CCC_RETRY_CLASSIFICATION_CONTEXT_KEY]: cccClassification } : {}),
+        ...(cccClassification ? { [CCC_RETRY_ATTEMPT_CONTEXT_KEY]: maxAttempts } : {}),
         [`node:${node.id}:error`]: lastError instanceof Error ? lastError.message : String(lastError),
       },
     };

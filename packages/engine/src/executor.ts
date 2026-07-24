@@ -46,6 +46,7 @@ import {
 import {
   MERGE_REGION_KINDS,
   CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY,
+  CCC_RETRY_ATTEMPT_CONTEXT_KEY,
   CCC_RETRY_CLASSIFICATION_CONTEXT_KEY,
   PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE,
   WORKFLOW_DRIFT_PARK_CONTEXT_KEY,
@@ -6339,6 +6340,9 @@ export class TaskExecutor {
       if (result.disposition === "failed") {
         const branchPersistenceFailure = result.context?.[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY];
         const retryClassification = result.context?.[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY];
+        const terminalAttempt = typeof result.context?.[CCC_RETRY_ATTEMPT_CONTEXT_KEY] === "number"
+          ? result.context[CCC_RETRY_ATTEMPT_CONTEXT_KEY] as number
+          : undefined;
         const terminalCccBranchPersistenceFailure = task.customFields?.cccFusionProfile === "ccc-fusion"
           && typeof branchPersistenceFailure === "string"
           && branchPersistenceFailure.startsWith("ccc-branch-persistence-");
@@ -6362,7 +6366,7 @@ export class TaskExecutor {
             nodeId: terminalCccBranchPersistenceFailure ? "ccc-branch-persistence" : "ccc-retry-classification",
             kind: "task",
             state: "running",
-            attempt: terminalCccTransientExhaustion ? 3 : 1,
+            attempt: terminalCccTransientExhaustion ? (terminalAttempt ?? 1) : 1,
           });
         }
         if (continuation) {
@@ -6381,6 +6385,7 @@ export class TaskExecutor {
               : undefined;
           const terminalState = terminalCccTransientExhaustion ? "exhausted" : terminalCccFailure ? "manual-required" : "failed";
           await this.store.transitionWorkflowWorkItem(continuation.id, terminalState, {
+            ...(terminalCccTransientExhaustion && terminalAttempt !== undefined ? { attempt: terminalAttempt } : {}),
             leaseOwner: null,
             leaseExpiresAt: null,
             lastError: terminalCccFailure
@@ -6407,7 +6412,7 @@ export class TaskExecutor {
               domain: "database",
               mutationType: "workflow:work-item-transition",
               target: continuation.id,
-              metadata: { state: "exhausted", attempt: continuation.attempt, classification: "ccc-transient-exhausted" },
+              metadata: { state: "exhausted", attempt: terminalAttempt ?? continuation.attempt, classification: "ccc-transient-exhausted" },
             });
           }
           if (terminalCccFailure) {

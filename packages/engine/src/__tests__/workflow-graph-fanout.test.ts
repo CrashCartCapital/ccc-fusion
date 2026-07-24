@@ -112,6 +112,23 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(calls).toBe(3);
     expect(result.outcome).toBe("failure");
     expect(result.context["ccc:retry-classification"]).toBe("ccc-transient-retry-exhausted:CCC_TRANSIENT");
+    expect(result.context["ccc:retry-attempt"]).toBe(3);
+  });
+
+  it("Wave 4 RED: CCC transient terminal context carries a non-three consumed cap", async () => {
+    let calls = 0;
+    const executor = new WorkflowGraphExecutor({
+      handlers: { prompt: async () => { calls += 1; throw new TransientError("retry", "CCC_TWO"); } },
+    });
+    const ir: WorkflowIr = {
+      version: "v2", name: "ccc-two-attempts", columns: [],
+      nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: { maxRetries: 2 } }, { id: "end", kind: "end" }],
+      edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }],
+    };
+    const result = await executor.run({ ...task, customFields: { cccFusionProfile: "ccc-fusion" } }, settingsOn(), ir);
+    expect(calls).toBe(2);
+    expect(result.context["ccc:retry-classification"]).toBe("ccc-transient-retry-exhausted:CCC_TWO");
+    expect(result.context["ccc:retry-attempt"]).toBe(2);
   });
 
   it("mode:all — both branches complete in any order, join fires once, advances to tail", async () => {
