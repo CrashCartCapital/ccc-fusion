@@ -1,5 +1,6 @@
 // port-4040-allowlist: this file embeds the "never kill port 4040" rule in the executor prompt.
 import { exec, execFile, execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { setImmediate as setImmediateCb } from "node:timers";
 
@@ -12970,6 +12971,7 @@ export class TaskExecutor {
         receipt that was committed before its acknowledgement returned.
         */
         let cccDurableSession: CliSession | undefined;
+        let cccEffectReceiptControllerToken: string | undefined;
         if (cccFusionExecutor && cccRuntime) {
           const existingLedger = selectCccExecutorReceiptLedger(
             cccRuntime.store,
@@ -12978,11 +12980,19 @@ export class TaskExecutor {
             executorModelId,
             worktreePath,
           );
+          cccEffectReceiptControllerToken = typeof existingLedger?.autonomyPosture?.cccControllerGeneration === "string"
+            ? existingLedger.autonomyPosture.cccControllerGeneration
+            : randomUUID();
           cccDurableSession = existingLedger
             ? cccRuntime.store.updateSession(existingLedger.id, {
                 agentState: "starting",
                 terminationReason: null,
                 worktreePath,
+                autonomyPosture: {
+                  ...(existingLedger.autonomyPosture ?? {}),
+                  cccControllerGeneration: cccEffectReceiptControllerToken,
+                  cccControllerFenced: false,
+                },
               })
             : cccRuntime.store.createSession({
                 projectId: cccRuntime.projectId,
@@ -12995,6 +13005,8 @@ export class TaskExecutor {
                   cccFusionProvider: executorProvider,
                   cccFusionModel: executorModelId,
                   cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
+                  cccControllerGeneration: cccEffectReceiptControllerToken,
+                  cccControllerFenced: false,
                 },
                 agentState: "starting",
               });
@@ -13044,6 +13056,8 @@ export class TaskExecutor {
               subscriptionReady: true as const,
               cccEffectReceiptStore: cccRuntime!.store,
               cccEffectReceiptSessionId: cccDurableSession.id,
+              cccEffectReceiptControllerToken,
+              cccEffectReceiptKeepTurnOpen: true,
             } : {}),
             onFallbackModelUsed: createFallbackModelObserver({
               agent: "executor",
@@ -13489,6 +13503,8 @@ export class TaskExecutor {
                     subscriptionReady: true as const,
                     cccEffectReceiptStore: cccRuntime!.store,
                     cccEffectReceiptSessionId: cccDurableSession.id,
+                    cccEffectReceiptControllerToken,
+                    cccEffectReceiptKeepTurnOpen: true,
                   } : {}),
                 });
                 retrySession = createdRetrySession.session;

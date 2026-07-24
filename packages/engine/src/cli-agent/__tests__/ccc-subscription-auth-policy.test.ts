@@ -224,10 +224,16 @@ describe("ccc-fusion subscription child environment policy", () => {
           nativeSessionId: null,
           requestedModel: "gpt-5.6-sol",
           permissionAutonomy: '{"mode":"elevated","elevated":true,"flags":["--sandbox","danger-full-access"]}',
-          effectReceiptContract: "ccc-tool-receipts/v1",
+          effectReceiptContract: "ccc-tool-receipts/v2",
         },
       });
+      expect(recorded.autonomyPosture).toMatchObject({
+        cccControllerGeneration: expect.any(String),
+        cccControllerFenced: false,
+      });
       expect(Object.keys(recorded.autonomyPosture ?? {}).sort()).toEqual([
+        "cccControllerFenced",
+        "cccControllerGeneration",
         "cccFusionMcpServers",
         "cccFusionModel",
         "cccFusionProfile",

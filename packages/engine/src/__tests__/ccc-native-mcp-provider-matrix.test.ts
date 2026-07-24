@@ -472,7 +472,10 @@ describe("ccc native MCP provider matrix", () => {
         });
         expect(first.captures).toHaveLength(1);
         assertModel(first.captures[0]!.args);
-        expect(configuredUrl(first.captures[0]!.args)).toBe(mcpUrl);
+        // The process-facing native configuration must point at Fusion's
+        // session-owned interception proxy, never directly at the admitted
+        // upstream loopback MCP server.
+        expect(configuredUrl(first.captures[0]!.args)).not.toBe(mcpUrl);
         captureNativeSessionId(store, record.id, `${adapterId}-native-wave2`);
       } finally {
         await disposeManager(first.manager);
@@ -495,9 +498,36 @@ describe("ccc native MCP provider matrix", () => {
         });
         expect(resumed.captures).toHaveLength(1);
         assertModel(resumed.captures[0]!.args);
-        expect(configuredUrl(resumed.captures[0]!.args)).toBe(mcpUrl);
+        expect(configuredUrl(resumed.captures[0]!.args)).not.toBe(mcpUrl);
       } finally {
         await disposeManager(resumed.manager);
+      }
+    },
+  );
+
+  it.each(adapterCases)(
+    "$label production manager routes protocol traffic through its session-owned proxy",
+    async ({ adapterId, model, configuredUrl }) => {
+      const store = makeStore();
+      const runtime = makeManager(store);
+      try {
+        await runtime.manager.spawn({
+          adapterId,
+          projectId: "ccc-native-project",
+          purpose: "execute",
+          settings: {
+            profile: CCC_PROFILE,
+            subscriptionReady: true,
+            model,
+            mcpServers: [nativeMcpServer()],
+          },
+        });
+        const proxyUrl = configuredUrl(runtime.captures[0]!.args);
+        expect(proxyUrl).not.toBe(mcpUrl);
+        await exerciseNativeMcpConfig(proxyUrl, calls);
+        expect(calls).toHaveLength(1);
+      } finally {
+        await disposeManager(runtime.manager);
       }
     },
   );
@@ -548,9 +578,9 @@ describe("ccc native MCP provider matrix", () => {
         }]);
         expect(restarted.captures).toHaveLength(1);
         assertModel(restarted.captures[0]!.args);
-        expect(configuredUrl(restarted.captures[0]!.args)).toBe(mcpUrl);
+        expect(configuredUrl(restarted.captures[0]!.args)).not.toBe(mcpUrl);
         expect(store.createSession).toHaveBeenCalledTimes(1);
-        expect(record.autonomyPosture).toEqual({
+        expect(record.autonomyPosture).toEqual(expect.objectContaining({
           cccFusionProfile: CCC_PROFILE,
           cccFusionModel: model,
           cccFusionMcpServers: [nativeMcpServer()],
@@ -559,9 +589,11 @@ describe("ccc native MCP provider matrix", () => {
             nativeSessionId: `${adapterId}-native-recovery-wave2`,
             requestedModel: model,
             permissionAutonomy: null,
-            effectReceiptContract: "ccc-tool-receipts/v1",
+            effectReceiptContract: "ccc-tool-receipts/v2",
           },
-        });
+        }));
+        expect(record.autonomyPosture.cccControllerGeneration).toEqual(expect.any(String));
+        expect(record.autonomyPosture.cccControllerFenced).toBe(false);
         const serializedPosture = JSON.stringify(record.autonomyPosture);
         expect(serializedPosture).not.toContain("subscriptionReady");
         expect(serializedPosture).not.toContain("headers");
@@ -714,7 +746,7 @@ describe("ccc native MCP provider matrix", () => {
         });
 
         expect(runtime.captures).toHaveLength(1);
-        expect(configuredUrl(runtime.captures[0]!.args)).toBe(mcpUrl);
+        expect(configuredUrl(runtime.captures[0]!.args)).not.toBe(mcpUrl);
       } finally {
         if (session) await session.kill();
         await disposeManager(runtime.manager);
@@ -1000,7 +1032,7 @@ describe("ccc native MCP provider matrix", () => {
             mcpServers: [nativeMcpServer(hostileName)],
           },
         });
-        expect(configuredUrl(runtime.captures[0]!.args, hostileName)).toBe(mcpUrl);
+        expect(configuredUrl(runtime.captures[0]!.args, hostileName)).not.toBe(mcpUrl);
       } finally {
         await disposeManager(runtime.manager);
       }

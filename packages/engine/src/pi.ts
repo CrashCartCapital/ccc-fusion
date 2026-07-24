@@ -51,7 +51,7 @@ import {
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
   resolvePiExtensionProjectRoot,
-  cccEffectReceiptIdentity,
+  prepareCccEffectReceipt,
   reserveCccEffectReceipt,
 } from "@fusion/core";
 import type {
@@ -1232,6 +1232,10 @@ export interface AgentOptions {
   cccEffectReceiptStore?: CccEffectReceiptStore;
   /** Stable durable session identity used by the effect receipt contract. */
   cccEffectReceiptSessionId?: string;
+  /** Durable controller-generation fence supplied by the owning runtime. */
+  cccEffectReceiptControllerToken?: string;
+  /** Task retries share one incomplete durable turn until their owner settles it. */
+  cccEffectReceiptKeepTurnOpen?: boolean;
   /** Optional task-scoped env injected into this session's subprocess tools only. */
   taskEnv?: NodeJS.ProcessEnv;
   /** Last-chance abort hook fired immediately before `createAgentSession`.
@@ -2019,6 +2023,7 @@ export function wrapCccToolsWithDurableEffectReceipts(
   tools: ToolDefinition[],
   store: CccEffectReceiptStore,
   sessionId: string,
+  turnContext: { controllerToken: string; current: () => { turnKey: string; nextSlot: number } },
 ): ToolDefinition[] {
   /*
   FNXC:CCCEffectReceiptSingleFlight 2026-07-23-20:06:
@@ -2029,18 +2034,22 @@ export function wrapCccToolsWithDurableEffectReceipts(
   clears only the local claim while the durable unknown receipt remains a
   replay barrier until reconciliation.
   */
-  const controllerToken = randomUUID();
+  const turnTails = new Map<string, Promise<void>>();
   return tools.map((tool) => {
     const originalExecute = tool.execute as (...args: any[]) => Promise<any>;
     return {
       ...tool,
       execute: async (...args: any[]) => {
+        const turn = turnContext.current();
+        const slotOrdinal = turn.nextSlot++;
         const input = {
           sessionId,
           toolCallId: String(args[0] ?? ""),
           toolName: tool.name,
           arguments: args[1] ?? {},
-          controllerToken,
+          controllerToken: turnContext.controllerToken,
+          turnKey: turn.turnKey,
+          slotOrdinal,
         };
         const storeScope = store as object;
         let claims = cccEffectReceiptInFlightClaims.get(storeScope);
@@ -2048,25 +2057,28 @@ export function wrapCccToolsWithDurableEffectReceipts(
           claims = new Map<string, Promise<any>>();
           cccEffectReceiptInFlightClaims.set(storeScope, claims);
         }
-        const identity = cccEffectReceiptIdentity(input);
+        const prepared = prepareCccEffectReceipt(input);
+        const identity = `${prepared.effectScopeId}\0${prepared.turnKey}\0${prepared.slotOrdinal}`;
         const existing = claims.get(identity);
         if (existing) return existing;
 
-        const claimed = (async () => {
+        const prior = turnTails.get(turn.turnKey) ?? Promise.resolve();
+        const claimed = prior.then(async () => {
           const reservation = await reserveCccEffectReceipt(store, input);
           if (reservation.state === "committed") {
-            return {
-              content: [{ type: "text" as const, text: "CCC effect already committed; replay suppressed." }],
-              details: { cccEffectReceipt: "already-committed" },
-            };
+            if (reservation.result === undefined) {
+              throw new Error("CCC committed effect replay lacks a durable structured result");
+            }
+            return reservation.result;
           }
           await store.markCccEffectReceiptDispatched(reservation);
           // Do not clear a dispatched_unknown receipt when the handler throws:
           // the downstream effect may have occurred and replay must reconcile.
           const result = await originalExecute(args[0], reservation.forwardedArguments, ...args.slice(2));
-          await store.commitCccEffectReceipt(reservation);
+          await store.commitCccEffectReceipt(reservation, result);
           return result;
-        })();
+        });
+        turnTails.set(turn.turnKey, claimed.then(() => undefined, () => undefined));
         claims.set(identity, claimed);
         void claimed.then(
           () => {
@@ -2710,6 +2722,27 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     attachSessionRoutingHeaders(modelRuntime, sessionRoutingId);
   }
 
+  const cccControllerToken = options.cccEffectReceiptControllerToken ?? randomUUID();
+  let cccOpenTurn: { turnKey: string; nextSlot: number } | undefined;
+  const openCccTurnForPrompt = async (): Promise<void> => {
+    if (options.profile !== CCC_FUSION_PROFILE || !options.cccEffectReceiptStore || !options.cccEffectReceiptSessionId) return;
+    const turn = await options.cccEffectReceiptStore.openCccEffectTurn(
+      options.cccEffectReceiptSessionId,
+      cccControllerToken,
+    );
+    cccOpenTurn = { turnKey: turn.turnKey, nextSlot: 0 };
+  };
+  const closeCccTurnAfterPrompt = async (): Promise<void> => {
+    if (options.cccEffectReceiptKeepTurnOpen) return;
+    if (!cccOpenTurn || !options.cccEffectReceiptStore || !options.cccEffectReceiptSessionId) return;
+    await options.cccEffectReceiptStore.closeCccEffectTurn(
+      options.cccEffectReceiptSessionId,
+      cccOpenTurn.turnKey,
+      cccControllerToken,
+    );
+    cccOpenTurn = undefined;
+  };
+
   const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
     // Tool instances. We need boundary-wrapped versions of the built-ins, so we
@@ -2814,6 +2847,13 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           boundaryTools,
           options.cccEffectReceiptStore,
           options.cccEffectReceiptSessionId,
+          {
+            controllerToken: cccControllerToken,
+            current: () => {
+              if (!cccOpenTurn) throw new Error("CCC effectful tool call occurred without an open Fusion turn");
+              return cccOpenTurn;
+            },
+          },
         )
       : boundaryTools;
     // Sort tools alphabetically by name for deterministic ordering.
@@ -3109,8 +3149,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
 
   promptableSession.promptWithFallback = async (prompt: string, promptOptions?: unknown) => {
     const effectivePromptOptions = withMcpPromptOptions(promptOptions, forwardedMcpServers);
+    await openCccTurnForPrompt();
     try {
       await promptSessionAndCheck(activeSession, prompt, effectivePromptOptions);
+      await closeCccTurnAfterPrompt();
       return;
     } catch (err: any) {
       const errorMessage = err?.message || "";
@@ -3118,6 +3160,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         // Context limit error — attempt auto-compaction and retry once
         const promptMemoryRetry = await retryWithCompactedPromptMemory(activeSession, prompt, effectivePromptOptions);
         if (promptMemoryRetry.recovered) {
+          await closeCccTurnAfterPrompt();
           return;
         }
         if (promptMemoryRetry.error) {
@@ -3129,6 +3172,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
 
         const promptSectionRetry = await retryWithCompactedPromptSections(activeSession, prompt, effectivePromptOptions);
         if (promptSectionRetry.recovered) {
+          await closeCccTurnAfterPrompt();
           return;
         }
         if (promptSectionRetry.error) {
@@ -3145,6 +3189,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           piLog.log(`promptWithFallback: compaction succeeded (${compactResult.tokensBefore} tokens) — retrying prompt`);
           try {
             await promptSessionAndCheck(activeSession, prompt, effectivePromptOptions);
+            await closeCccTurnAfterPrompt();
             return;
           } catch (retryErr: any) {
             const retryErrorMessage = retryErr?.message || "";
@@ -3163,6 +3208,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         piLog.warn(`Prompt failed with thinking/reasoning conflict; retrying without explicit thinking level: ${errorMessage}`);
         const recoveredSession = await swapPromptSession(selectedModel);
         await promptSessionAndCheck(recoveredSession, prompt, effectivePromptOptions);
+        await closeCccTurnAfterPrompt();
         return;
       }
 
@@ -3180,6 +3226,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       // Retry with fallback model, also with auto-compaction support
       try {
         await promptSessionAndCheck(fallbackSession, prompt, effectivePromptOptions);
+        await closeCccTurnAfterPrompt();
         return;
       } catch (_fallbackErr: unknown) {
         /*
@@ -3192,6 +3239,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         try {
           const primaryRetrySession = await swapPromptSession(selectedModel);
           await promptSessionAndCheck(primaryRetrySession, prompt, effectivePromptOptions);
+          await closeCccTurnAfterPrompt();
           return;
         } catch (primaryRetryErr: unknown) {
           throw makeFallbackExhaustedError("prompt-time", 3, primaryRetryErr);

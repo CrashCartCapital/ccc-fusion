@@ -29,6 +29,8 @@ import {
 import {
   CccEffectReceiptPendingError,
   CccEffectReceiptProtocolError,
+  canonicalCccEffectJson,
+  type CccEffectTurn,
   type CccEffectReceiptRecord,
   type CccPreparedEffectReceipt,
 } from "./ccc-effect-receipts.js";
@@ -44,11 +46,14 @@ type CliSessionRow = typeof schema.project.cliSessions.$inferSelect;
 type CccEffectReceiptRow = {
   effect_scope_id: string;
   logical_key: string;
+  turn_key: string;
+  slot_ordinal: number;
   tool_authority: string;
   arguments_digest: string;
   repeat_of: string | null;
   state: CccEffectReceiptRecord["state"];
   controller_token: string;
+  result_json: string | null;
 };
 
 function receiptFromRow(row: CccEffectReceiptRow): CccEffectReceiptRecord {
@@ -59,8 +64,11 @@ function receiptFromRow(row: CccEffectReceiptRow): CccEffectReceiptRecord {
     toolAuthority: row.tool_authority,
     argumentsDigest: row.arguments_digest,
     controllerToken: row.controller_token,
+    turnKey: row.turn_key,
+    slotOrdinal: row.slot_ordinal,
     forwardedArguments: undefined,
     state: row.state,
+    result: row.result_json === null ? undefined : JSON.parse(row.result_json),
   };
 }
 
@@ -274,11 +282,80 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
   private async lockedCccEffectRows(tx: DbTransaction, effectScopeId: string): Promise<CccEffectReceiptRow[]> {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`fusion:ccc-effect:${this.projectId}:${effectScopeId}`}))`);
     return (await tx.execute(sql`
-      SELECT effect_scope_id, logical_key, tool_authority, arguments_digest, repeat_of, state, controller_token
+      SELECT effect_scope_id, logical_key, turn_key, slot_ordinal, tool_authority, arguments_digest, repeat_of,
+        state, controller_token, result_json
       FROM project.ccc_effect_receipts
       WHERE owner_project_id = ${this.projectId} AND effect_scope_id = ${effectScopeId}
       FOR UPDATE
     `)) as unknown as CccEffectReceiptRow[];
+  }
+
+  private async priorControllerIsDurablyFenced(
+    tx: DbTransaction,
+    effectScopeId: string,
+    controllerToken: string,
+  ): Promise<boolean> {
+    const rows = (await tx.execute(sql`
+      SELECT agent_state, autonomy_posture
+      FROM project.cli_sessions
+      WHERE owner_project_id = ${this.projectId} AND id = ${effectScopeId}
+      FOR UPDATE
+    `)) as unknown as Array<{ agent_state: string; autonomy_posture: string | null }>;
+    const row = rows[0];
+    if (!row || row.agent_state !== "dead") return false;
+    const posture = parsePosture(row.autonomy_posture);
+    return posture?.cccControllerGeneration === controllerToken
+      && posture?.cccControllerFenced === true;
+  }
+
+  async openCccEffectTurn(effectScopeId: string, controllerToken: string): Promise<CccEffectTurn> {
+    this.assertNoLegacyCccReceiptEvidence(effectScopeId);
+    return this.layer.transaction(async (tx) => {
+      await this.lockedCccEffectRows(tx, effectScopeId);
+      const rows = (await tx.execute(sql`
+        SELECT effect_scope_id, turn_key, state, controller_token
+        FROM project.ccc_effect_turns
+        WHERE owner_project_id = ${this.projectId} AND effect_scope_id = ${effectScopeId} AND state = 'open'
+        FOR UPDATE
+      `)) as unknown as Array<{ effect_scope_id: string; turn_key: string; state: "open" | "closed"; controller_token: string }>;
+      const current = rows[0];
+      if (current) {
+        if (current.controller_token === controllerToken) {
+          return { effectScopeId, turnKey: current.turn_key, state: current.state, controllerToken };
+        }
+        if (!await this.priorControllerIsDurablyFenced(tx, effectScopeId, current.controller_token)) {
+          throw new CccEffectReceiptPendingError(current.turn_key);
+        }
+        const now = new Date().toISOString();
+        await tx.execute(sql`
+          UPDATE project.ccc_effect_turns
+          SET controller_token = ${controllerToken}, updated_at = ${now}
+          WHERE owner_project_id = ${this.projectId} AND effect_scope_id = ${effectScopeId}
+            AND turn_key = ${current.turn_key} AND state = 'open' AND controller_token = ${current.controller_token}
+        `);
+        return { effectScopeId, turnKey: current.turn_key, state: "open", controllerToken };
+      }
+      const turnKey = randomUUID();
+      const now = new Date().toISOString();
+      await tx.execute(sql`
+        INSERT INTO project.ccc_effect_turns (
+          owner_project_id, effect_scope_id, turn_key, state, controller_token, created_at, updated_at
+        ) VALUES (${this.projectId}, ${effectScopeId}, ${turnKey}, 'open', ${controllerToken}, ${now}, ${now})
+      `);
+      return { effectScopeId, turnKey, state: "open", controllerToken };
+    });
+  }
+
+  async closeCccEffectTurn(effectScopeId: string, turnKey: string, controllerToken: string): Promise<void> {
+    await this.layer.transaction(async (tx) => {
+      await this.lockedCccEffectRows(tx, effectScopeId);
+      const now = new Date().toISOString();
+      await tx.execute(sql`
+        UPDATE project.ccc_effect_turns SET state = 'closed', updated_at = ${now}
+        WHERE owner_project_id = ${this.projectId} AND effect_scope_id = ${effectScopeId}
+          AND turn_key = ${turnKey} AND state = 'open' AND controller_token = ${controllerToken}
+      `);
+    });
   }
 
   private assertReceiptCompatibility(input: CccPreparedEffectReceipt, existing: CccEffectReceiptRow): void {
@@ -308,7 +385,10 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
         // proved_failed is the durable, explicit fence for a controller that
         // never crossed dispatch. It is the only takeover path; elapsed time
         // is deliberately absent from this state machine.
-        if (sameKey.state === "proved_failed") {
+        if (sameKey.state === "proved_failed" || (
+          sameKey.state === "reserved"
+          && await this.priorControllerIsDurablyFenced(tx, input.effectScopeId, sameKey.controller_token)
+        )) {
           const now = new Date().toISOString();
           await tx.execute(sql`
             UPDATE project.ccc_effect_receipts
@@ -316,13 +396,21 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
             WHERE owner_project_id = ${this.projectId}
               AND effect_scope_id = ${input.effectScopeId}
               AND logical_key = ${input.logicalKey}
-              AND state = 'proved_failed'
+              AND state IN ('proved_failed', 'reserved')
           `);
-          return { ...input, state: "reserved" };
+          return { ...input, state: "reserved", result: undefined };
         }
         throw new CccEffectReceiptPendingError(input.logicalKey);
       }
+      // A new durable turn is an explicit Fusion-owned repeat boundary. The
+      // ambiguity guard applies only within the same recovered turn, never
+      // across a separately opened prompt/turn.
       const priorSameIntent = rows.find((row) => row.state === "committed"
+        // Legacy envelope callers have no recoverable turn boundary. Keep
+        // their conservative scope-wide ambiguity rule while production
+        // Fusion-owned turn/slot callers can intentionally repeat in a new
+        // durable turn.
+        && (input.turnKey.startsWith("legacy:") || row.turn_key === input.turnKey)
         && row.tool_authority === input.toolAuthority
         && row.arguments_digest === input.argumentsDigest);
       if (priorSameIntent && input.repeatOf !== priorSameIntent.logical_key) {
@@ -343,14 +431,14 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
       const now = new Date().toISOString();
       await tx.execute(sql`
         INSERT INTO project.ccc_effect_receipts (
-          owner_project_id, effect_scope_id, logical_key, tool_authority,
+          owner_project_id, effect_scope_id, logical_key, turn_key, slot_ordinal, tool_authority,
           arguments_digest, repeat_of, state, controller_token, created_at, updated_at
         ) VALUES (
-          ${this.projectId}, ${input.effectScopeId}, ${input.logicalKey}, ${input.toolAuthority},
+          ${this.projectId}, ${input.effectScopeId}, ${input.logicalKey}, ${input.turnKey}, ${input.slotOrdinal}, ${input.toolAuthority},
           ${input.argumentsDigest}, ${input.repeatOf}, 'reserved', ${input.controllerToken}, ${now}, ${now}
         )
       `);
-      return { ...input, state: "reserved" };
+      return { ...input, state: "reserved", result: undefined };
     });
   }
 
@@ -358,8 +446,8 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
     return this.transitionCccEffectReceipt(input, "reserved", "dispatched_unknown");
   }
 
-  async commitCccEffectReceipt(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord> {
-    return this.transitionCccEffectReceipt(input, "dispatched_unknown", "committed");
+  async commitCccEffectReceipt(input: CccPreparedEffectReceipt, result?: unknown): Promise<CccEffectReceiptRecord> {
+    return this.transitionCccEffectReceipt(input, "dispatched_unknown", "committed", result);
   }
 
   async proveCccEffectReceiptFailed(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord> {
@@ -370,6 +458,7 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
     input: CccPreparedEffectReceipt,
     expected: CccEffectReceiptRecord["state"],
     next: CccEffectReceiptRecord["state"],
+    result?: unknown,
   ): Promise<CccEffectReceiptRecord> {
     this.assertNoLegacyCccReceiptEvidence(input.effectScopeId);
     return this.layer.transaction(async (tx) => {
@@ -381,23 +470,32 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
       if (existing.state !== expected || existing.controller_token !== input.controllerToken) {
         throw new CccEffectReceiptPendingError(input.logicalKey);
       }
+      // Compatibility callers that only need a durable execution marker did not
+      // historically provide a result. Persist JSON null, never an undefined or
+      // fabricated success payload; production effect boundaries always provide
+      // their actual structured result before replying.
+      const resultJson = next === "committed" ? canonicalCccEffectJson(result ?? null) : null;
+      if (resultJson !== null && Buffer.byteLength(resultJson, "utf8") > 65_536) {
+        throw new CccEffectReceiptProtocolError("CCC_EFFECT_RECONCILIATION_REQUIRED", "CCC effect result exceeds the durable replay bound");
+      }
       const now = new Date().toISOString();
       await tx.execute(sql`
         UPDATE project.ccc_effect_receipts
-        SET state = ${next}, updated_at = ${now}
+        SET state = ${next}, result_json = ${resultJson}, updated_at = ${now}
         WHERE owner_project_id = ${this.projectId}
           AND effect_scope_id = ${input.effectScopeId}
           AND logical_key = ${input.logicalKey}
           AND controller_token = ${input.controllerToken}
           AND state = ${expected}
       `);
-      return { ...input, state: next };
+      return { ...input, state: next, result };
     });
   }
 
   async getCccEffectReceipt(effectScopeId: string, logicalKey: string): Promise<CccEffectReceiptRecord | undefined> {
     const rows = (await this.layer.db.execute(sql`
-      SELECT effect_scope_id, logical_key, tool_authority, arguments_digest, repeat_of, state, controller_token
+      SELECT effect_scope_id, logical_key, turn_key, slot_ordinal, tool_authority, arguments_digest, repeat_of,
+        state, controller_token, result_json
       FROM project.ccc_effect_receipts
       WHERE owner_project_id = ${this.projectId}
         AND effect_scope_id = ${effectScopeId}

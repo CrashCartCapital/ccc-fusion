@@ -209,6 +209,45 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     })).resolves.toMatchObject({ state: "reserved", controllerToken: "generation-two" });
   });
 
+  it("takes over a pre-dispatch reservation only after durable session ownership proves the prior controller dead", async () => {
+    const initial = await CliSessionStore.create(h.layer(), "project-a");
+    initial.createSession({
+      id: "cli-pg-dead-controller-fence",
+      projectId: "project-a",
+      adapterId: "pi",
+      purpose: "execute",
+      autonomyPosture: { cccFusionProfile: "ccc-fusion", cccControllerGeneration: "generation-one" },
+    });
+    await initial.flush();
+    const first = {
+      sessionId: "cli-pg-dead-controller-fence",
+      controllerToken: "generation-one",
+      toolName: "commit_synthetic_effect",
+      arguments: { target: "loopback", __fusion_effect: { key: "fenced-after-death" } },
+    };
+    await reserveCccEffectReceipt(initial, first);
+
+    // This is the durable crash/fence proof available after the first controller
+    // is gone. It deliberately does not invoke its unavailable in-memory helper
+    // or use elapsed time as an authority signal.
+    initial.updateSession(first.sessionId, {
+      agentState: "dead",
+      terminationReason: "engineDeath",
+      autonomyPosture: {
+        cccFusionProfile: "ccc-fusion",
+        cccControllerGeneration: "generation-one",
+        cccControllerFenced: true,
+      },
+    });
+    await initial.flush();
+
+    const restarted = await CliSessionStore.create(h.layer(), "project-a");
+    await expect(reserveCccEffectReceipt(restarted, {
+      ...first,
+      controllerToken: "generation-two",
+    })).resolves.toMatchObject({ state: "reserved", controllerToken: "generation-two" });
+  });
+
   it("blocks an entire effectful scope after dispatched_unknown until reconciliation", async () => {
     const store = await CliSessionStore.create(h.layer(), "project-a");
     store.createSession({ id: "cli-pg-scope-barrier", projectId: "project-a", adapterId: "pi", purpose: "execute" });
@@ -254,6 +293,34 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     await reserveCccEffectReceipt(store, repeat);
     await markCccEffectReceiptDispatched(store, repeat);
     await expect(commitCccEffectReceipt(store, repeat)).resolves.toMatchObject({ state: "committed", logicalKey: "intentional-repeat" });
+  });
+
+  it("admits an identical effect in a distinct Fusion-owned durable turn", async () => {
+    const store = await CliSessionStore.create(h.layer(), "project-a");
+    store.createSession({ id: "cli-pg-distinct-turn-repeat", projectId: "project-a", adapterId: "pi", purpose: "execute" });
+    await store.flush();
+    const first = {
+      sessionId: "cli-pg-distinct-turn-repeat",
+      controllerToken: "turn-controller-one",
+      turnKey: "turn-one",
+      slotOrdinal: 0,
+      toolName: "commit_synthetic_effect",
+      arguments: { target: "loopback" },
+    };
+    await reserveCccEffectReceipt(store, first);
+    await markCccEffectReceiptDispatched(store, first);
+    await commitCccEffectReceipt(store, first, { content: [{ type: "text", text: "first" }] });
+
+    const repeatInNewTurn = {
+      ...first,
+      controllerToken: "turn-controller-two",
+      turnKey: "turn-two",
+    };
+    await expect(reserveCccEffectReceipt(store, repeatInNewTurn)).resolves.toMatchObject({
+      state: "reserved",
+      turnKey: "turn-two",
+      slotOrdinal: 0,
+    });
   });
 
   it("reopens committed effect and suppresses replay despite changed provider request id", async () => {

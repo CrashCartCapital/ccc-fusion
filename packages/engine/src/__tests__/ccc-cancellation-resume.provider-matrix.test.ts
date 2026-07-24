@@ -403,6 +403,62 @@ describe("ccc-fusion Wave 3 cancellation and resume provider matrix", () => {
     }
   });
 
+  it("rejects a direct resume of a durably killed session before any replacement PTY can spawn", async () => {
+    const store = makeStore();
+    let exits: Array<(event: { exitCode: number; signal: number }) => void> = [];
+    const pty = {
+      pid: 9301,
+      onData: () => () => {},
+      onExit: (callback: (event: { exitCode: number; signal: number }) => void) => {
+        exits.push(callback);
+        return () => { exits = exits.filter((candidate) => candidate !== callback); };
+      },
+      write: () => {}, resize: () => {}, pause: () => {}, resume: () => {},
+      kill: () => exits.forEach((callback) => callback({ exitCode: -1, signal: 9 })),
+    };
+    const { manager } = makeManager(store, ["claude-code"], () => pty);
+    try {
+      const session = await manager.spawn({ adapterId: "claude-code", projectId: "ccc", purpose: "execute" });
+      store.updateSession(session.id, { nativeSessionId: "native-killed" });
+      await manager.kill(session.id, "killed");
+
+      await expect(manager.spawn({
+        adapterId: "claude-code",
+        projectId: "ccc",
+        purpose: "execute",
+        resume: { sessionId: session.id, nativeSessionId: "native-killed" },
+      })).rejects.toThrow(/killed|ineligible|resume/i);
+      expect(manager.activeCount()).toBe(0);
+    } finally {
+      await manager.dispose().catch(() => undefined);
+    }
+  });
+
+  it("rejects a direct resume when the same durable id is already owned live", async () => {
+    const store = makeStore();
+    const pty = {
+      pid: 9302,
+      onData: () => () => {},
+      onExit: () => () => {},
+      write: () => {}, resize: () => {}, pause: () => {}, resume: () => {}, kill: () => {},
+    };
+    const { manager } = makeManager(store, ["codex"], () => pty);
+    try {
+      const session = await manager.spawn({ adapterId: "codex", projectId: "ccc", purpose: "execute" });
+      store.updateSession(session.id, { nativeSessionId: "native-live", agentState: "ready" });
+
+      await expect(manager.spawn({
+        adapterId: "codex",
+        projectId: "ccc",
+        purpose: "execute",
+        resume: { sessionId: session.id, nativeSessionId: "native-live" },
+      })).rejects.toThrow(/already live|owned|resume/i);
+      expect(manager.activeCount()).toBe(1);
+    } finally {
+      await manager.dispose().catch(() => undefined);
+    }
+  });
+
   it.each(["claude-code", "codex"])("%s enforces exact ccc resume identity", async (adapterId) => {
     await runResumeIdentityMatrix(adapterId);
   });
@@ -447,10 +503,14 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
             nativeSessionId: "native-exact",
             requestedModel: "model-exact",
             permissionAutonomy: '{"mode":"guarded","elevated":false,"flags":[]}',
-            effectReceiptContract: "ccc-tool-receipts/v1",
+            effectReceiptContract: "ccc-tool-receipts/v2",
           },
         },
       });
+      // This matrix is a manager-restart/resume case: release the original
+      // in-memory owner before asserting durable resume admission.
+      onExit?.({ exitCode: 1, signal: 0 });
+      await vi.waitFor(() => expect(manager.activeCount()).toBe(0));
 
       await expect(manager.spawn({
         adapterId,
@@ -459,6 +519,11 @@ async function runResumeIdentityMatrix(adapterId: string): Promise<void> {
         settings: { profile: "ccc-fusion", subscriptionReady: true, model: "model-exact" },
         resume: { sessionId: session.id, nativeSessionId: "native-exact" },
       })).resolves.toMatchObject({ id: session.id });
+      // Subsequent assertions exercise resume-contract admission, not the
+      // separate live-owner guard. Model the resumed provider's real terminal
+      // callback before asking the manager to consider another resume.
+      onExit?.({ exitCode: 1, signal: 0 });
+      await vi.waitFor(() => expect(manager.activeCount()).toBe(0));
 
       const requested = {
         profile: "ccc-fusion",

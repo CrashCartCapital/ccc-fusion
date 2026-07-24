@@ -1918,22 +1918,41 @@ export const cliSessions = projectSchema.table("cli_sessions", {
 ]);
 
 export const cccEffectReceipts = projectSchema.table("ccc_effect_receipts", {
-  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  projectId: text("project_id").notNull().default(sql`COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__')`),
   ownerProjectId: text("owner_project_id"),
   effectScopeId: text("effect_scope_id").notNull(),
   logicalKey: text("logical_key").notNull(),
+  turnKey: text("turn_key").notNull(),
+  slotOrdinal: integer("slot_ordinal").notNull(),
   toolAuthority: text("tool_authority").notNull(),
   argumentsDigest: text("arguments_digest").notNull(),
   repeatOf: text("repeat_of"),
   state: text("state").notNull(),
   controllerToken: text("controller_token").notNull(),
   evidenceDigest: text("evidence_digest"),
+  resultJson: text("result_json"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (t) => [
   primaryKey({ columns: [t.projectId, t.effectScopeId, t.logicalKey] }),
   index("idx_ccc_effect_receipts_scope_authority_digest")
     .on(t.projectId, t.effectScopeId, t.toolAuthority, t.argumentsDigest),
+  index("idx_ccc_effect_receipts_turn_slot")
+    .on(t.projectId, t.effectScopeId, t.turnKey, t.slotOrdinal),
+]);
+
+export const cccEffectTurns = projectSchema.table("ccc_effect_turns", {
+  projectId: text("project_id").notNull().default(sql`COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__')`),
+  ownerProjectId: text("owner_project_id"),
+  effectScopeId: text("effect_scope_id").notNull(),
+  turnKey: text("turn_key").notNull(),
+  state: text("state").notNull(),
+  controllerToken: text("controller_token").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.effectScopeId, t.turnKey] }),
+  index("idx_ccc_effect_turns_open").on(t.projectId, t.effectScopeId, t.state),
 ]);
 
 export const chatMessages = projectSchema.table("chat_messages", {
@@ -2237,7 +2256,7 @@ export const projectTableNames = [
   "routines", "project_insights", "project_insight_runs", "project_insight_run_events",
   "todo_lists", "todo_items", "usage_events", "plugin_activations",
   "knowledge_pages", "deployments", "incidents", "ai_sessions", "messages",
-  "agent_ratings", "chat_sessions", "cli_sessions", "ccc_effect_receipts", "chat_messages",
+  "agent_ratings", "chat_sessions", "cli_sessions", "ccc_effect_receipts", "ccc_effect_turns", "chat_messages",
   "run_audit_events", "mission_contract_assertions", "mission_feature_assertions",
   "mission_validator_runs", "mission_validator_failures",
   "mission_fix_feature_lineage", "verification_cache", "import_translation_cache",

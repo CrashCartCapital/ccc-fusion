@@ -169,6 +169,8 @@ export interface AgentRuntimeOptions {
   cccEffectReceiptStore?: CccEffectReceiptStore;
   /** Durable ccc session identity for tool-effect replay protection. */
   cccEffectReceiptSessionId?: string;
+  /** Durable controller-generation fence for a ccc receipt turn. */
+  cccEffectReceiptControllerToken?: string;
   actionGateContext?: AgentActionGateContext;
   /** Permanent-agent action gating context for v1 category classification enforcement. */
   permanentAgentGating?: PermanentAgentGatingContext;

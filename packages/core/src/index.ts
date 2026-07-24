@@ -2371,6 +2371,7 @@ export {
   CccEffectReceiptPendingError,
   CccEffectReceiptSessionMissingError,
   cccEffectReceiptIdentity,
+  prepareCccEffectReceipt,
   commitCccEffectReceipt,
   hasCccEffectReceipt,
   reserveCccEffectReceipt,

@@ -14,6 +14,10 @@ export interface CccEffectReceiptInput {
   retryNumber?: number;
   /** Must identify the controller generation that owns this dispatch. */
   controllerToken?: string;
+  /** Fusion-owned durable prompt/turn identity. Never supplied by a provider. */
+  turnKey?: string;
+  /** Fusion-owned deterministic zero-based effect position within turnKey. */
+  slotOrdinal?: number;
   toolName: string;
   /** Untrusted tool arguments containing the required __fusion_effect envelope. */
   arguments: unknown;
@@ -26,18 +30,31 @@ export interface CccPreparedEffectReceipt {
   toolAuthority: string;
   argumentsDigest: string;
   controllerToken: string;
+  turnKey: string;
+  slotOrdinal: number;
   /** Safe arguments forwarded downstream after stripping Fusion-only envelope. */
   forwardedArguments: unknown;
 }
 
 export interface CccEffectReceiptRecord extends CccPreparedEffectReceipt {
   state: CccEffectReceiptState;
+  /** Bounded structured result returned when a committed effect is replayed. */
+  result: unknown;
+}
+
+export interface CccEffectTurn {
+  effectScopeId: string;
+  turnKey: string;
+  controllerToken: string;
+  state: "open" | "closed";
 }
 
 export interface CccEffectReceiptStore {
+  openCccEffectTurn(effectScopeId: string, controllerToken: string): Promise<CccEffectTurn>;
+  closeCccEffectTurn(effectScopeId: string, turnKey: string, controllerToken: string): Promise<void>;
   reserveCccEffectReceipt(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
   markCccEffectReceiptDispatched(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
-  commitCccEffectReceipt(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
+  commitCccEffectReceipt(input: CccPreparedEffectReceipt, result?: unknown): Promise<CccEffectReceiptRecord>;
   proveCccEffectReceiptFailed(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
   getCccEffectReceipt(effectScopeId: string, logicalKey: string): Promise<CccEffectReceiptRecord | undefined>;
 }
@@ -103,6 +120,11 @@ function canonicalJson(value: unknown, seen = new Set<object>()): string {
   throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect arguments must be JSON values");
 }
 
+/** Strict JSON validation shared by receipt arguments and replayable results. */
+export function canonicalCccEffectJson(value: unknown): string {
+  return canonicalJson(value);
+}
+
 function envelope(argumentsValue: unknown): { key: string; repeatOf: string | null; forwardedArguments: unknown } {
   if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
     throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect requires an object argument envelope");
@@ -129,6 +151,27 @@ export function prepareCccEffectReceipt(input: CccEffectReceiptInput): CccPrepar
   if (!input.sessionId || !input.toolName || !input.controllerToken) {
     throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect scope, authority, and controller token are required");
   }
+  const fusionOwnedTurn = input.turnKey !== undefined || input.slotOrdinal !== undefined;
+  if (fusionOwnedTurn) {
+    if (typeof input.turnKey !== "string" || input.turnKey.length === 0 || input.turnKey.length > 256
+      || !Number.isInteger(input.slotOrdinal) || input.slotOrdinal! < 0) {
+      throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect requires a Fusion-owned turn key and slot ordinal");
+    }
+    const canonicalArguments = canonicalJson(input.arguments);
+    return {
+      effectScopeId: input.sessionId,
+      logicalKey: `${input.turnKey}:${input.slotOrdinal}`,
+      repeatOf: null,
+      toolAuthority: input.toolName,
+      argumentsDigest: createHash("sha256").update(canonicalArguments).digest("hex"),
+      controllerToken: input.controllerToken,
+      turnKey: input.turnKey,
+      slotOrdinal: input.slotOrdinal!,
+      forwardedArguments: input.arguments,
+    };
+  }
+  // Compatibility only for already-written v2 callers. Production boundaries
+  // must use Fusion-owned turn/slot identity above, never model arguments.
   const extracted = envelope(input.arguments);
   const canonicalArguments = canonicalJson(extracted.forwardedArguments);
   return {
@@ -138,6 +181,8 @@ export function prepareCccEffectReceipt(input: CccEffectReceiptInput): CccPrepar
     toolAuthority: input.toolName,
     argumentsDigest: createHash("sha256").update(canonicalArguments).digest("hex"),
     controllerToken: input.controllerToken,
+    turnKey: `legacy:${extracted.key}`,
+    slotOrdinal: 0,
     forwardedArguments: extracted.forwardedArguments,
   };
 }
@@ -168,8 +213,8 @@ export async function markCccEffectReceiptDispatched(store: CccEffectReceiptStor
   return store.markCccEffectReceiptDispatched(prepareCccEffectReceipt(input));
 }
 
-export async function commitCccEffectReceipt(store: CccEffectReceiptStore, input: CccEffectReceiptInput): Promise<CccEffectReceiptRecord> {
-  return store.commitCccEffectReceipt(prepareCccEffectReceipt(input));
+export async function commitCccEffectReceipt(store: CccEffectReceiptStore, input: CccEffectReceiptInput, result?: unknown): Promise<CccEffectReceiptRecord> {
+  return store.commitCccEffectReceipt(prepareCccEffectReceipt(input), result);
 }
 
 /** Only a proved pre-dispatch failure is allowed to clear a reservation. */

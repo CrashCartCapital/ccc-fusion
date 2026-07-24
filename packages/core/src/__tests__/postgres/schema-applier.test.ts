@@ -662,9 +662,10 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 1 configuration_revisions (FNXC:ConfigVersioning 2026-07-18-14:00)
     // + 2 ideation_sessions/ideation_candidates (FNXC:Ideation 2026-07-18-13:25 / FN-8295)
     // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
-    // + 1 durable ccc_effect_receipts table (FNXC:CCCEffectReceipts).
+    // + 1 durable ccc_effect_receipts table and its ccc_effect_turns authority
+    // table (FNXC:CCCEffectReceipts).
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(96);
+    expect(bySchema.project).toBe(97);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -2526,10 +2527,10 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
       await tx.execute(sql`SELECT set_config('fusion.project_bypass', 'on', true)`);
       await tx.execute(sql`
         INSERT INTO project.ccc_effect_receipts(
-          effect_scope_id, logical_key, tool_authority, arguments_digest,
+          effect_scope_id, logical_key, turn_key, slot_ordinal, tool_authority, arguments_digest,
           state, controller_token, created_at, updated_at
         ) VALUES (
-          'scope-invalid', 'invalid-state', 'tool.write', 'digest-invalid',
+          'scope-invalid', 'invalid-state', 'turn-invalid', 0, 'tool.write', 'digest-invalid',
           'impossible', 'controller-a', '2026-07-23T22:20:00.000Z', '2026-07-23T22:20:00.000Z'
         )
       `);
@@ -2547,10 +2548,10 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
         await tx.execute(sql`SELECT set_config('fusion.project_id', 'project-a', true)`);
         await tx.execute(sql`
           INSERT INTO project.ccc_effect_receipts(
-            effect_scope_id, logical_key, tool_authority, arguments_digest,
+            effect_scope_id, logical_key, turn_key, slot_ordinal, tool_authority, arguments_digest,
             state, controller_token, created_at, updated_at
           ) VALUES (
-            'scope-a', 'effect-a', 'tool.write', 'digest-a',
+            'scope-a', 'effect-a', 'turn-a', 0, 'tool.write', 'digest-a',
             'reserved', 'controller-a', '2026-07-23T22:20:00.000Z', '2026-07-23T22:20:00.000Z'
           )
         `);

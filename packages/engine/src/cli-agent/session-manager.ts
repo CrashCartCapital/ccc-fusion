@@ -29,12 +29,14 @@
  */
 
 import {
+  CCC_EFFECT_RECEIPT_CONTRACT,
   CliSessionStore,
   type CliAutonomyPosture,
   type CliSession,
   type CliSessionPurpose,
   type CliTerminationReason,
 } from "@fusion/core";
+import { randomUUID } from "node:crypto";
 import { loadPtyModule } from "../pty-native.js";
 import type { IPty } from "node-pty";
 import type { CliAdapterRegistry, CliAgentAdapter, CliLaunchSpec, CliReadinessDetector } from "./adapter.js";
@@ -49,7 +51,10 @@ import {
   applyCccNativeMcpPolicy,
   persistCccNativeMcpPosture,
   restoreCccNativeMcpSettings,
+  resolveCccNativeMcpServers,
 } from "./ccc-native-mcp-policy.js";
+import { isResumeEligible } from "./state-machine.js";
+import { startCccNativeMcpProxy, type CccNativeMcpProxy } from "./ccc-native-mcp-proxy.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -111,6 +116,15 @@ export class CliResumeContractError extends Error {
   }
 }
 
+/** Resume admission is checked by the manager against current durable/live state. */
+export class CliResumeAdmissionError extends Error {
+  readonly code = "CLI_RESUME_ADMISSION_REJECTED";
+  constructor(public readonly sessionId: string, public readonly reason: string) {
+    super(`CLI resume admission rejected for ${sessionId}: ${reason}`);
+    this.name = "CliResumeAdmissionError";
+  }
+}
+
 /** A registered CLI resource accepted cancellation but never proved closure. */
 export class CliCancellationTimeoutError extends Error {
   readonly code = "CLI_CANCELLATION_TIMEOUT";
@@ -150,7 +164,6 @@ interface CccResumeContract {
 }
 
 const CCC_RESUME_CONTRACT_KEY = "cccResumeContract";
-const CCC_EFFECT_RECEIPT_CONTRACT = "ccc-tool-receipts/v1";
 /** Matches the core process supervisor's bounded post-SIGKILL observation window. */
 export const DEFAULT_CLI_CANCELLATION_TIMEOUT_MS = 1_000;
 
@@ -532,6 +545,9 @@ interface LiveSession {
   usesOwnedCccProcessSupervisor: boolean;
   /** The cancellation has already reported an attention failure to its caller. */
   cancellationFailed: boolean;
+  /** Durable controller fence for this exact manager-owned generation. */
+  controllerGeneration?: string;
+  nativeMcpProxy?: CccNativeMcpProxy;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -632,13 +648,27 @@ export class CliSessionManager {
     let launch: CliLaunchSpec;
     let launchSettings: Record<string, unknown>;
     let record: CliSession;
+    let nativeMcpProxy: CccNativeMcpProxy | undefined;
+    let controllerGeneration: string | undefined;
     let usesOwnedCccProcessSupervisor = false;
     if (options.resume) {
       if (!adapter.capabilities.supportsResume || typeof adapter.buildResume !== "function") {
         throw new CliResumeUnsupportedError(options.adapterId);
       }
+      // Admission is centralized here, immediately before any durable mutation
+      // or PTY allocation. A coordinator snapshot is advisory only: it may be
+      // stale relative to a terminal write or a concurrent owner.
+      if (this.sessions.has(options.resume.sessionId)) {
+        throw new CliResumeAdmissionError(options.resume.sessionId, "session is already live");
+      }
       const existing = this.store.getSession(options.resume.sessionId);
       if (!existing) throw new UnknownCliSessionError(options.resume.sessionId);
+      if (existing.agentState === "dead" && (!existing.terminationReason || !isResumeEligible(existing.terminationReason))) {
+        throw new CliResumeAdmissionError(options.resume.sessionId, `terminal reason is ineligible: ${existing.terminationReason ?? "none"}`);
+      }
+      if (existing.agentState === "needsAttention") {
+        throw new CliResumeAdmissionError(options.resume.sessionId, "session requires attention");
+      }
       const storedContract = isCccFusionPosture(existing.autonomyPosture)
         ? readResumeContract(existing.autonomyPosture)
         : undefined;
@@ -670,11 +700,11 @@ export class CliSessionManager {
       ));
       assertCccFusionSubscriptionReady(launchSettings);
       launch = adapter.buildResume({ settings: launchSettings, posture: existing.autonomyPosture, nativeSessionId: options.resume.nativeSessionId });
-      // Move the reused record back to "starting" for the relaunch.
-      record = this.store.updateSession(options.resume.sessionId, {
-        agentState: "starting",
-        worktreePath: options.worktreePath ?? existing.worktreePath ?? null,
-      }) ?? existing;
+      // Keep the terminal, fenced record intact until the receipt-turn store
+      // has admitted this replacement generation. That admission reads the
+      // old durable owner; overwriting it with `starting` first would erase the
+      // very evidence required for a safe reserved-slot takeover.
+      record = existing;
     } else {
       launchSettings = applyCccNativeMcpPolicy(requestedSettings);
       assertCccFusionSubscriptionReady(launchSettings);
@@ -709,6 +739,44 @@ export class CliSessionManager {
       });
     }
 
+    // A CCC native proxy has an independently recoverable effect turn. Its
+    // durable admission below must see a resumed record's *prior* dead/fenced
+    // generation before this new token replaces it.
+    if (isCccFusionProfile(launchSettings)) {
+      controllerGeneration = randomUUID();
+    }
+
+    // Native adapters receive only this session-owned proxy URL. The persisted
+    // posture above remains the sanitized upstream definition so recovery never
+    // stores an ephemeral listener address.
+    const nativeServers = resolveCccNativeMcpServers(launchSettings);
+    if (nativeServers.length > 0) {
+      nativeMcpProxy = await startCccNativeMcpProxy({
+        servers: nativeServers,
+        ...(typeof (this.store as unknown as { openCccEffectTurn?: unknown }).openCccEffectTurn === "function"
+          ? { receiptStore: this.store, effectScopeId: record.id, controllerToken: controllerGeneration ?? randomUUID() }
+          : {}),
+      });
+      launchSettings = { ...launchSettings, mcpServers: nativeMcpProxy.servers };
+      launch = options.resume
+        ? adapter.buildResume!({ settings: launchSettings, posture: record.autonomyPosture, nativeSessionId: options.resume.nativeSessionId })
+        : adapter.buildLaunch({ settings: launchSettings, posture: record.autonomyPosture });
+    }
+
+    if (controllerGeneration) {
+      const currentPosture = record.autonomyPosture ?? {};
+      record = this.store.updateSession(record.id, {
+        ...(options.resume
+          ? { agentState: "starting", worktreePath: options.worktreePath ?? record.worktreePath ?? null }
+          : {}),
+        autonomyPosture: {
+          ...currentPosture,
+          cccControllerGeneration: controllerGeneration,
+          cccControllerFenced: false,
+        },
+      }) ?? record;
+    }
+
     if (useCccProcessSupervisor(options.adapterId, launchSettings)) {
       launch = buildCccSupervisedLaunch(launch);
       usesOwnedCccProcessSupervisor = true;
@@ -736,6 +804,7 @@ export class CliSessionManager {
         env: env as { [key: string]: string },
       });
     } catch (err) {
+      await nativeMcpProxy?.dispose().catch(() => undefined);
       /*
       FNXC:CliAgentPostgres 2026-07-14-21:33:
       A failed PTY spawn is the actionable launch error. Persisting its dead session state is best-effort so an update or flush failure cannot replace the original spawn exception reported to callers.
@@ -775,6 +844,8 @@ export class CliSessionManager {
       cancellationReason: null,
       usesOwnedCccProcessSupervisor,
       cancellationFailed: false,
+      controllerGeneration,
+      nativeMcpProxy,
     };
     this.sessions.set(record.id, live);
 
@@ -796,7 +867,7 @@ export class CliSessionManager {
           // best-effort
         }
       }
-      this.handleExit(live, exitCode, signal);
+      void this.handleExit(live, exitCode, signal);
     });
 
     return record;
@@ -862,8 +933,10 @@ export class CliSessionManager {
     for (const w of waiters) w(live.exitResult);
   }
 
-  private handleExit(live: LiveSession, exitCode: number, signal?: number): void {
-    if (live.terminated) return;
+  private async handleExit(live: LiveSession, exitCode: number, signal?: number): Promise<void> {
+    // A replacement may have been admitted while an old timeout finalizer was
+    // still observing closure. Never let that old generation touch the new one.
+    if (live.terminated || this.sessions.get(live.id) !== live) return;
     this.settleExit(live, exitCode, signal);
 
     // The cancellation owner observes this registered resource first, then
@@ -876,28 +949,44 @@ export class CliSessionManager {
       return;
     }
 
-    live.terminated = true;
-    this.sessions.delete(live.id);
-
-    for (const stream of live.streams) stream.close();
-    live.streams.clear();
-
-    // Reject any pending injection waiters.
-    for (const job of live.queue) {
-      if (job.kind === "injection") job.resolve();
-    }
-    live.queue = [];
-
     const reason: CliTerminationReason =
       signal && signal !== 0 ? "crashed" : exitCode === 0 ? "completed" : "crashed";
     try {
       this.store.updateSession(live.id, {
         agentState: "dead",
         terminationReason: reason,
+        ...(live.controllerGeneration
+          ? {
+              autonomyPosture: {
+                ...(this.store.getSession(live.id)?.autonomyPosture ?? {}),
+                cccControllerGeneration: live.controllerGeneration,
+                cccControllerFenced: true,
+              },
+            }
+          : {}),
       });
+      await this.store.flush();
     } catch {
-      // Store may be closed during shutdown; teardown must not throw.
+      // Keep ownership when natural-exit durability is unavailable. The record
+      // remains recoverable/attention-worthy instead of releasing a false clean
+      // completion to a replacement generation.
+      return;
     }
+    if (this.sessions.get(live.id) !== live) return;
+    try {
+      await live.nativeMcpProxy?.dispose();
+    } catch {
+      return;
+    }
+    if (this.sessions.get(live.id) !== live) return;
+    live.terminated = true;
+    for (const stream of live.streams) stream.close();
+    live.streams.clear();
+    for (const job of live.queue) {
+      if (job.kind === "injection") job.resolve();
+    }
+    live.queue = [];
+    if (this.sessions.get(live.id) === live) this.sessions.delete(live.id);
   }
 
   private maybeUpdateState(live: LiveSession, state: CliSession["agentState"]): void {
@@ -1176,13 +1265,22 @@ export class CliSessionManager {
   durable floor is needsAttention, never a fabricated killed/dead success.
   */
   private async persistConfirmedCancellation(live: LiveSession, reason: CliTerminationReason): Promise<void> {
+    if (this.sessions.get(live.id) !== live) return;
     try {
       const current = this.store.getSession(live.id);
       this.store.updateSession(live.id, {
         agentState: "dead",
         terminationReason: reason,
-        ...(reason === "killed"
-          ? { autonomyPosture: { ...(current?.autonomyPosture ?? {}), cccCancellationState: "CANCELLED" } }
+        ...(live.controllerGeneration || reason === "killed"
+          ? {
+              autonomyPosture: {
+                ...(current?.autonomyPosture ?? {}),
+                ...(live.controllerGeneration
+                  ? { cccControllerGeneration: live.controllerGeneration, cccControllerFenced: true }
+                  : {}),
+                ...(reason === "killed" ? { cccCancellationState: "CANCELLED" } : {}),
+              },
+            }
           : {}),
       });
       await this.store.flush();
@@ -1199,7 +1297,8 @@ export class CliSessionManager {
     }
     live.queue = [];
 
-    this.sessions.delete(live.id);
+    await live.nativeMcpProxy?.dispose();
+    if (this.sessions.get(live.id) === live) this.sessions.delete(live.id);
   }
 
   private async finalizeLateCancellation(live: LiveSession): Promise<void> {
