@@ -1917,6 +1917,25 @@ export const cliSessions = projectSchema.table("cli_sessions", {
   index("idx_cli_sessions_project_state").on(t.projectId, t.agentState),
 ]);
 
+export const cccEffectReceipts = projectSchema.table("ccc_effect_receipts", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  ownerProjectId: text("owner_project_id"),
+  effectScopeId: text("effect_scope_id").notNull(),
+  logicalKey: text("logical_key").notNull(),
+  toolAuthority: text("tool_authority").notNull(),
+  argumentsDigest: text("arguments_digest").notNull(),
+  repeatOf: text("repeat_of"),
+  state: text("state").notNull(),
+  controllerToken: text("controller_token").notNull(),
+  evidenceDigest: text("evidence_digest"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.effectScopeId, t.logicalKey] }),
+  index("idx_ccc_effect_receipts_scope_authority_digest")
+    .on(t.projectId, t.effectScopeId, t.toolAuthority, t.argumentsDigest),
+]);
+
 export const chatMessages = projectSchema.table("chat_messages", {
   id: text("id").primaryKey(),
   sessionId: text("session_id").notNull(),
@@ -2218,7 +2237,7 @@ export const projectTableNames = [
   "routines", "project_insights", "project_insight_runs", "project_insight_run_events",
   "todo_lists", "todo_items", "usage_events", "plugin_activations",
   "knowledge_pages", "deployments", "incidents", "ai_sessions", "messages",
-  "agent_ratings", "chat_sessions", "cli_sessions", "chat_messages",
+  "agent_ratings", "chat_sessions", "cli_sessions", "ccc_effect_receipts", "chat_messages",
   "run_audit_events", "mission_contract_assertions", "mission_feature_assertions",
   "mission_validator_runs", "mission_validator_failures",
   "mission_fix_feature_lineage", "verification_cache", "import_translation_cache",

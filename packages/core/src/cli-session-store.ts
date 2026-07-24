@@ -10,9 +10,9 @@
  */
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
-import type { AsyncDataLayer } from "./postgres/data-layer.js";
+import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
 import { fromJson } from "./db-helpers.js";
 import {
   isCliAgentState,
@@ -26,6 +26,12 @@ import {
   type CliSessionUpdateInput,
   type CliTerminationReason,
 } from "./cli-session-types.js";
+import {
+  CccEffectReceiptPendingError,
+  CccEffectReceiptProtocolError,
+  type CccEffectReceiptRecord,
+  type CccPreparedEffectReceipt,
+} from "./ccc-effect-receipts.js";
 
 export interface CliSessionStoreEvents {
   "cli-session:created": [session: CliSession];
@@ -34,6 +40,29 @@ export interface CliSessionStoreEvents {
 }
 
 type CliSessionRow = typeof schema.project.cliSessions.$inferSelect;
+
+type CccEffectReceiptRow = {
+  effect_scope_id: string;
+  logical_key: string;
+  tool_authority: string;
+  arguments_digest: string;
+  repeat_of: string | null;
+  state: CccEffectReceiptRecord["state"];
+  controller_token: string;
+};
+
+function receiptFromRow(row: CccEffectReceiptRow): CccEffectReceiptRecord {
+  return {
+    effectScopeId: row.effect_scope_id,
+    logicalKey: row.logical_key,
+    repeatOf: row.repeat_of,
+    toolAuthority: row.tool_authority,
+    argumentsDigest: row.arguments_digest,
+    controllerToken: row.controller_token,
+    forwardedArguments: undefined,
+    state: row.state,
+  };
+}
 
 function parsePosture(value: string | null): CliAutonomyPosture | null {
   return fromJson<CliAutonomyPosture>(value) ?? null;
@@ -224,5 +253,156 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
       )));
     this.emit("cli-session:deleted", id);
     return true;
+  }
+
+  /*
+  FNXC:CCCEffectReceipts 2026-07-23-21:42:
+  Receipt transitions use their own PostgreSQL row and a transaction-scoped
+  advisory lock. The session posture cache remains lifecycle metadata only: two
+  independently hydrated stores must never coordinate dispatch through it.
+  */
+  private assertNoLegacyCccReceiptEvidence(effectScopeId: string): void {
+    const posture = this.sessions.get(effectScopeId)?.autonomyPosture;
+    if (Array.isArray(posture?.cccEffectReceipts) || Array.isArray(posture?.cccEffectReceiptPending)) {
+      throw new CccEffectReceiptProtocolError(
+        "CCC_EFFECT_LEGACY_RECONCILIATION_REQUIRED",
+        `CCC v1 receipt evidence requires reconciliation: ${effectScopeId}`,
+      );
+    }
+  }
+
+  private async lockedCccEffectRows(tx: DbTransaction, effectScopeId: string): Promise<CccEffectReceiptRow[]> {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`fusion:ccc-effect:${this.projectId}:${effectScopeId}`}))`);
+    return (await tx.execute(sql`
+      SELECT effect_scope_id, logical_key, tool_authority, arguments_digest, repeat_of, state, controller_token
+      FROM project.ccc_effect_receipts
+      WHERE owner_project_id = ${this.projectId} AND effect_scope_id = ${effectScopeId}
+      FOR UPDATE
+    `)) as unknown as CccEffectReceiptRow[];
+  }
+
+  private assertReceiptCompatibility(input: CccPreparedEffectReceipt, existing: CccEffectReceiptRow): void {
+    if (existing.tool_authority !== input.toolAuthority
+      || existing.arguments_digest !== input.argumentsDigest
+      || existing.repeat_of !== input.repeatOf) {
+      throw new CccEffectReceiptProtocolError(
+        "CCC_EFFECT_KEY_COLLISION",
+        `CCC effect key collision: ${input.logicalKey}`,
+      );
+    }
+  }
+
+  async reserveCccEffectReceipt(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord> {
+    this.assertNoLegacyCccReceiptEvidence(input.effectScopeId);
+    return this.layer.transaction(async (tx) => {
+      const rows = await this.lockedCccEffectRows(tx, input.effectScopeId);
+      const unresolvedDispatch = rows.find((row) => row.state === "dispatched_unknown");
+      if (unresolvedDispatch) {
+        throw new CccEffectReceiptPendingError(unresolvedDispatch.logical_key);
+      }
+      const sameKey = rows.find((row) => row.logical_key === input.logicalKey);
+      if (sameKey) {
+        this.assertReceiptCompatibility(input, sameKey);
+        if (sameKey.state === "committed") return receiptFromRow(sameKey);
+        if (sameKey.state === "reserved" && sameKey.controller_token === input.controllerToken) return receiptFromRow(sameKey);
+        // proved_failed is the durable, explicit fence for a controller that
+        // never crossed dispatch. It is the only takeover path; elapsed time
+        // is deliberately absent from this state machine.
+        if (sameKey.state === "proved_failed") {
+          const now = new Date().toISOString();
+          await tx.execute(sql`
+            UPDATE project.ccc_effect_receipts
+            SET state = 'reserved', controller_token = ${input.controllerToken}, updated_at = ${now}
+            WHERE owner_project_id = ${this.projectId}
+              AND effect_scope_id = ${input.effectScopeId}
+              AND logical_key = ${input.logicalKey}
+              AND state = 'proved_failed'
+          `);
+          return { ...input, state: "reserved" };
+        }
+        throw new CccEffectReceiptPendingError(input.logicalKey);
+      }
+      const priorSameIntent = rows.find((row) => row.state === "committed"
+        && row.tool_authority === input.toolAuthority
+        && row.arguments_digest === input.argumentsDigest);
+      if (priorSameIntent && input.repeatOf !== priorSameIntent.logical_key) {
+        throw new CccEffectReceiptProtocolError(
+          "CCC_EFFECT_AMBIGUOUS_DUPLICATE",
+          `CCC effect repeats committed intent without repeatOf: ${input.logicalKey}`,
+        );
+      }
+      if (input.repeatOf) {
+        const repeated = rows.find((row) => row.logical_key === input.repeatOf);
+        if (!repeated || repeated.state !== "committed") {
+          throw new CccEffectReceiptProtocolError(
+            "CCC_EFFECT_AMBIGUOUS_DUPLICATE",
+            `CCC effect repeatOf must name a committed effect: ${input.repeatOf}`,
+          );
+        }
+      }
+      const now = new Date().toISOString();
+      await tx.execute(sql`
+        INSERT INTO project.ccc_effect_receipts (
+          owner_project_id, effect_scope_id, logical_key, tool_authority,
+          arguments_digest, repeat_of, state, controller_token, created_at, updated_at
+        ) VALUES (
+          ${this.projectId}, ${input.effectScopeId}, ${input.logicalKey}, ${input.toolAuthority},
+          ${input.argumentsDigest}, ${input.repeatOf}, 'reserved', ${input.controllerToken}, ${now}, ${now}
+        )
+      `);
+      return { ...input, state: "reserved" };
+    });
+  }
+
+  async markCccEffectReceiptDispatched(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord> {
+    return this.transitionCccEffectReceipt(input, "reserved", "dispatched_unknown");
+  }
+
+  async commitCccEffectReceipt(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord> {
+    return this.transitionCccEffectReceipt(input, "dispatched_unknown", "committed");
+  }
+
+  async proveCccEffectReceiptFailed(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord> {
+    return this.transitionCccEffectReceipt(input, "reserved", "proved_failed");
+  }
+
+  private async transitionCccEffectReceipt(
+    input: CccPreparedEffectReceipt,
+    expected: CccEffectReceiptRecord["state"],
+    next: CccEffectReceiptRecord["state"],
+  ): Promise<CccEffectReceiptRecord> {
+    this.assertNoLegacyCccReceiptEvidence(input.effectScopeId);
+    return this.layer.transaction(async (tx) => {
+      const rows = await this.lockedCccEffectRows(tx, input.effectScopeId);
+      const existing = rows.find((row) => row.logical_key === input.logicalKey);
+      if (!existing) throw new CccEffectReceiptProtocolError("CCC_EFFECT_RECONCILIATION_REQUIRED", `CCC effect receipt is missing: ${input.logicalKey}`);
+      this.assertReceiptCompatibility(input, existing);
+      if (existing.state === next) return receiptFromRow(existing);
+      if (existing.state !== expected || existing.controller_token !== input.controllerToken) {
+        throw new CccEffectReceiptPendingError(input.logicalKey);
+      }
+      const now = new Date().toISOString();
+      await tx.execute(sql`
+        UPDATE project.ccc_effect_receipts
+        SET state = ${next}, updated_at = ${now}
+        WHERE owner_project_id = ${this.projectId}
+          AND effect_scope_id = ${input.effectScopeId}
+          AND logical_key = ${input.logicalKey}
+          AND controller_token = ${input.controllerToken}
+          AND state = ${expected}
+      `);
+      return { ...input, state: next };
+    });
+  }
+
+  async getCccEffectReceipt(effectScopeId: string, logicalKey: string): Promise<CccEffectReceiptRecord | undefined> {
+    const rows = (await this.layer.db.execute(sql`
+      SELECT effect_scope_id, logical_key, tool_authority, arguments_digest, repeat_of, state, controller_token
+      FROM project.ccc_effect_receipts
+      WHERE owner_project_id = ${this.projectId}
+        AND effect_scope_id = ${effectScopeId}
+        AND logical_key = ${logicalKey}
+    `)) as unknown as CccEffectReceiptRow[];
+    return rows[0] ? receiptFromRow(rows[0]) : undefined;
   }
 }

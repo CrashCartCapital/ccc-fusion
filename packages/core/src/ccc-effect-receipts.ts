@@ -1,165 +1,184 @@
 import { createHash } from "node:crypto";
-import type { CliAutonomyPosture, CliSession } from "./cli-session-types.js";
 
-/** Versioned durable protocol, not a caller-supplied effect label. */
-export const CCC_EFFECT_RECEIPT_CONTRACT = "ccc-tool-receipts/v1";
+/** Versioned, PostgreSQL-authoritative CCC effect protocol. */
+export const CCC_EFFECT_RECEIPT_CONTRACT = "ccc-tool-receipts/v2";
 
-export interface CccEffectReceiptStore {
-  getSession(id: string): CliSession | undefined;
-  updateSession(id: string, updates: { autonomyPosture?: CliAutonomyPosture }): CliSession | undefined;
-  flush(): Promise<void>;
-}
+export type CccEffectReceiptState = "reserved" | "dispatched_unknown" | "committed" | "proved_failed";
 
 export interface CccEffectReceiptInput {
+  /** Stable CliSession.id reused through the exact CCC resume/retry chain. */
   sessionId: string;
-  toolCallId: string;
+  /** Provider request/call identity is fencing evidence only. */
+  toolCallId?: string;
+  nativeRequestId?: string;
+  retryNumber?: number;
+  /** Must identify the controller generation that owns this dispatch. */
+  controllerToken?: string;
   toolName: string;
+  /** Untrusted tool arguments containing the required __fusion_effect envelope. */
   arguments: unknown;
 }
 
-export class CccEffectReceiptSessionMissingError extends Error {
-  readonly code = "CCC_EFFECT_RECEIPT_SESSION_MISSING";
+export interface CccPreparedEffectReceipt {
+  effectScopeId: string;
+  logicalKey: string;
+  repeatOf: string | null;
+  toolAuthority: string;
+  argumentsDigest: string;
+  controllerToken: string;
+  /** Safe arguments forwarded downstream after stripping Fusion-only envelope. */
+  forwardedArguments: unknown;
+}
 
+export interface CccEffectReceiptRecord extends CccPreparedEffectReceipt {
+  state: CccEffectReceiptState;
+}
+
+export interface CccEffectReceiptStore {
+  reserveCccEffectReceipt(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
+  markCccEffectReceiptDispatched(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
+  commitCccEffectReceipt(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
+  proveCccEffectReceiptFailed(input: CccPreparedEffectReceipt): Promise<CccEffectReceiptRecord>;
+  getCccEffectReceipt(effectScopeId: string, logicalKey: string): Promise<CccEffectReceiptRecord | undefined>;
+}
+
+export class CccEffectReceiptProtocolError extends Error {
+  constructor(
+    public readonly code:
+      | "CCC_EFFECT_IDENTITY_INVALID"
+      | "CCC_EFFECT_KEY_COLLISION"
+      | "CCC_EFFECT_AMBIGUOUS_DUPLICATE"
+      | "CCC_EFFECT_RECONCILIATION_REQUIRED"
+      | "CCC_EFFECT_LEGACY_RECONCILIATION_REQUIRED",
+    message: string,
+  ) {
+    super(message);
+    this.name = "CccEffectReceiptProtocolError";
+  }
+}
+
+/** Retained export for callers that distinguish a missing durable effect scope. */
+export class CccEffectReceiptSessionMissingError extends CccEffectReceiptProtocolError {
   constructor(public readonly sessionId: string) {
-    super(`CCC effect receipt session is missing: ${sessionId}`);
+    super("CCC_EFFECT_RECONCILIATION_REQUIRED", `CCC effect scope is missing: ${sessionId}`);
     this.name = "CccEffectReceiptSessionMissingError";
   }
 }
 
-/** An effect may have crossed its external boundary; replay requires reconciliation, never a guess. */
-export class CccEffectReceiptPendingError extends Error {
-  readonly code = "CCC_EFFECT_RECEIPT_RECONCILIATION_REQUIRED";
-
+export class CccEffectReceiptPendingError extends CccEffectReceiptProtocolError {
   constructor(public readonly identity: string) {
-    super(`CCC effect receipt is pending reconciliation: ${identity}`);
+    super("CCC_EFFECT_RECONCILIATION_REQUIRED", `CCC effect receipt requires reconciliation: ${identity}`);
     this.name = "CccEffectReceiptPendingError";
   }
 }
 
-function canonicalJson(value: unknown): string {
+function canonicalJson(value: unknown, seen = new Set<object>()): string {
   if (value === null) return "null";
   if (typeof value === "string") return JSON.stringify(value);
-  if (typeof value === "boolean" || typeof value === "number") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect arguments must be finite JSON numbers");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect arguments must not contain cycles");
+    seen.add(value);
+    const result = `[${value.map((entry) => canonicalJson(entry, seen)).join(",")}]`;
+    seen.delete(value);
+    return result;
+  }
   if (typeof value === "object") {
+    if (seen.has(value as object)) throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect arguments must not contain cycles");
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect arguments must be plain JSON objects");
+    }
+    seen.add(value as object);
     const entries = Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`);
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry, seen)}`);
+    seen.delete(value as object);
     return `{${entries.join(",")}}`;
   }
-  return JSON.stringify(String(value));
+  throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect arguments must be JSON values");
 }
 
-/** Stable identity from the real provider tool-call envelope and arguments. */
+function envelope(argumentsValue: unknown): { key: string; repeatOf: string | null; forwardedArguments: unknown } {
+  if (!argumentsValue || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
+    throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect requires an object argument envelope");
+  }
+  const raw = argumentsValue as Record<string, unknown>;
+  const marker = raw.__fusion_effect;
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) {
+    throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect requires __fusion_effect identity");
+  }
+  const key = (marker as Record<string, unknown>).key;
+  const repeatOf = (marker as Record<string, unknown>).repeatOf;
+  if (typeof key !== "string" || key.length === 0 || key.length > 256) {
+    throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect key must be a bounded string");
+  }
+  if (repeatOf !== undefined && (typeof repeatOf !== "string" || repeatOf.length === 0 || repeatOf.length > 256)) {
+    throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect repeatOf must be a bounded string when supplied");
+  }
+  const { __fusion_effect: _marker, ...forwardedArguments } = raw;
+  return { key, repeatOf: typeof repeatOf === "string" ? repeatOf : null, forwardedArguments };
+}
+
+/** Validate the reserved envelope and produce immutable authority/digest assertions. */
+export function prepareCccEffectReceipt(input: CccEffectReceiptInput): CccPreparedEffectReceipt {
+  if (!input.sessionId || !input.toolName || !input.controllerToken) {
+    throw new CccEffectReceiptProtocolError("CCC_EFFECT_IDENTITY_INVALID", "CCC effect scope, authority, and controller token are required");
+  }
+  const extracted = envelope(input.arguments);
+  const canonicalArguments = canonicalJson(extracted.forwardedArguments);
+  return {
+    effectScopeId: input.sessionId,
+    logicalKey: extracted.key,
+    repeatOf: extracted.repeatOf,
+    toolAuthority: input.toolName,
+    argumentsDigest: createHash("sha256").update(canonicalArguments).digest("hex"),
+    controllerToken: input.controllerToken,
+    forwardedArguments: extracted.forwardedArguments,
+  };
+}
+
+/** Logical v2 identity intentionally excludes provider call/request IDs. */
 export function cccEffectReceiptIdentity(input: CccEffectReceiptInput): string {
+  const prepared = prepareCccEffectReceipt(input);
   return createHash("sha256")
     .update(CCC_EFFECT_RECEIPT_CONTRACT)
     .update("\0")
-    .update(input.sessionId)
+    .update(prepared.effectScopeId)
     .update("\0")
-    .update(input.toolCallId)
+    .update(prepared.logicalKey)
     .update("\0")
-    .update(input.toolName)
+    .update(prepared.toolAuthority)
     .update("\0")
-    .update(canonicalJson(input.arguments))
+    .update(prepared.argumentsDigest)
+    .update("\0")
+    .update(prepared.repeatOf ?? "")
     .digest("hex");
 }
 
-function receipts(posture: CliAutonomyPosture | null | undefined): string[] {
-  return Array.isArray(posture?.cccEffectReceipts)
-    ? posture.cccEffectReceipts.filter((receipt): receipt is string => typeof receipt === "string")
-    : [];
+export async function reserveCccEffectReceipt(store: CccEffectReceiptStore, input: CccEffectReceiptInput): Promise<CccEffectReceiptRecord> {
+  return store.reserveCccEffectReceipt(prepareCccEffectReceipt(input));
 }
 
-function pendingReceipts(posture: CliAutonomyPosture | null | undefined): string[] {
-  return Array.isArray(posture?.cccEffectReceiptPending)
-    ? posture.cccEffectReceiptPending.filter((receipt): receipt is string => typeof receipt === "string")
-    : [];
+export async function markCccEffectReceiptDispatched(store: CccEffectReceiptStore, input: CccEffectReceiptInput): Promise<CccEffectReceiptRecord> {
+  return store.markCccEffectReceiptDispatched(prepareCccEffectReceipt(input));
 }
 
-function updateReceiptPosture(
-  store: CccEffectReceiptStore,
-  sessionId: string,
-  update: (current: CliAutonomyPosture | null | undefined) => CliAutonomyPosture,
-): CliSession {
-  const session = store.getSession(sessionId);
-  if (!session) throw new CccEffectReceiptSessionMissingError(sessionId);
-  const updated = store.updateSession(sessionId, { autonomyPosture: update(session.autonomyPosture) });
-  if (!updated) throw new CccEffectReceiptSessionMissingError(sessionId);
-  return updated;
+export async function commitCccEffectReceipt(store: CccEffectReceiptStore, input: CccEffectReceiptInput): Promise<CccEffectReceiptRecord> {
+  return store.commitCccEffectReceipt(prepareCccEffectReceipt(input));
 }
 
-/*
-FNXC:CCCEffectReceipts 2026-07-23-20:38:
-An external custom-tool effect can succeed immediately before its post-effect
-receipt write crashes. Persist a pending claim first; a restarted controller
-must require reconciliation instead of guessing that it may repeat the effect.
-Only a proved tool rejection clears this claim for an honest retry.
-*/
-/** Durable pre-effect claim. A reopen seeing this state must not replay blindly. */
-export async function reserveCccEffectReceipt(
-  store: CccEffectReceiptStore,
-  input: CccEffectReceiptInput,
-): Promise<{ identity: string; alreadyCommitted: boolean; pending: boolean }> {
-  const identity = cccEffectReceiptIdentity(input);
-  const session = store.getSession(input.sessionId);
-  if (!session) throw new CccEffectReceiptSessionMissingError(input.sessionId);
-  if (receipts(session.autonomyPosture).includes(identity)) {
-    return { identity, alreadyCommitted: true, pending: false };
-  }
-  if (pendingReceipts(session.autonomyPosture).includes(identity)) {
-    return { identity, alreadyCommitted: false, pending: true };
-  }
-  updateReceiptPosture(store, input.sessionId, (posture) => ({
-    ...(posture ?? {}),
-    cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
-    cccEffectReceiptPending: [...pendingReceipts(posture), identity],
-  }));
-  await store.flush();
-  return { identity, alreadyCommitted: false, pending: false };
+/** Only a proved pre-dispatch failure is allowed to clear a reservation. */
+export async function abandonCccEffectReceipt(store: CccEffectReceiptStore, input: CccEffectReceiptInput): Promise<CccEffectReceiptRecord> {
+  return store.proveCccEffectReceiptFailed(prepareCccEffectReceipt(input));
 }
 
-/** Clear a proved pre-effect failure so a genuine retry may execute. */
-export async function abandonCccEffectReceipt(
-  store: CccEffectReceiptStore,
-  input: CccEffectReceiptInput,
-): Promise<void> {
-  const identity = cccEffectReceiptIdentity(input);
-  const session = store.getSession(input.sessionId);
-  if (!session) throw new CccEffectReceiptSessionMissingError(input.sessionId);
-  if (!pendingReceipts(session.autonomyPosture).includes(identity)) return;
-  updateReceiptPosture(store, input.sessionId, (posture) => ({
-    ...(posture ?? {}),
-    cccEffectReceiptPending: pendingReceipts(posture).filter((entry) => entry !== identity),
-  }));
-  await store.flush();
-}
-
-/** Read before execution, then write and flush before returning an effect ack. */
-export async function commitCccEffectReceipt(
-  store: CccEffectReceiptStore,
-  input: CccEffectReceiptInput,
-): Promise<{ identity: string; alreadyCommitted: boolean }> {
-  const identity = cccEffectReceiptIdentity(input);
-  const session = store.getSession(input.sessionId);
-  if (!session) throw new CccEffectReceiptSessionMissingError(input.sessionId);
-  if (receipts(session.autonomyPosture).includes(identity)) {
-    return { identity, alreadyCommitted: true };
-  }
-  updateReceiptPosture(store, input.sessionId, (posture) => ({
-    ...(posture ?? {}),
-    cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
-    cccEffectReceipts: [...receipts(posture), identity],
-    cccEffectReceiptPending: pendingReceipts(posture).filter((entry) => entry !== identity),
-  }));
-  await store.flush();
-  return { identity, alreadyCommitted: false };
-}
-
-export function hasCccEffectReceipt(
-  store: Pick<CccEffectReceiptStore, "getSession">,
-  input: CccEffectReceiptInput,
-): boolean {
-  const session = store.getSession(input.sessionId);
-  return Boolean(session && receipts(session.autonomyPosture).includes(cccEffectReceiptIdentity(input)));
+export async function hasCccEffectReceipt(store: CccEffectReceiptStore, input: CccEffectReceiptInput): Promise<boolean> {
+  const prepared = prepareCccEffectReceipt(input);
+  const receipt = await store.getCccEffectReceipt(prepared.effectScopeId, prepared.logicalKey);
+  return receipt?.state === "committed";
 }

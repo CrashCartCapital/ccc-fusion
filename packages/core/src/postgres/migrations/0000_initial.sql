@@ -1388,6 +1388,25 @@ CREATE TABLE IF NOT EXISTS project.cli_sessions (
   updated_at text NOT NULL
 );
 
+-- FNXC:CCCEffectReceipts 2026-07-23-21:42: fresh baselines need the same v2 receipt authority as upgrades.
+CREATE TABLE IF NOT EXISTS project.ccc_effect_receipts (
+  project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+  owner_project_id text,
+  effect_scope_id text NOT NULL,
+  logical_key text NOT NULL,
+  tool_authority text NOT NULL,
+  arguments_digest text NOT NULL,
+  repeat_of text,
+  state text NOT NULL,
+  controller_token text NOT NULL,
+  evidence_digest text,
+  created_at text NOT NULL,
+  updated_at text NOT NULL,
+  PRIMARY KEY (project_id, effect_scope_id, logical_key),
+  CONSTRAINT ccc_effect_receipts_state_check
+    CHECK (state IN ('reserved', 'dispatched_unknown', 'committed', 'proved_failed'))
+);
+
 CREATE TABLE IF NOT EXISTS project.chat_messages (
   id text PRIMARY KEY,
   session_id text NOT NULL,
@@ -1646,6 +1665,8 @@ CREATE INDEX IF NOT EXISTS "idxChatTokenUsageCreatedAt" ON project.chat_token_us
 CREATE INDEX IF NOT EXISTS "idx_cli_sessions_taskId" ON project.cli_sessions(task_id);
 CREATE INDEX IF NOT EXISTS "idx_cli_sessions_chatSessionId" ON project.cli_sessions(chat_session_id);
 CREATE INDEX IF NOT EXISTS "idx_cli_sessions_project_state" ON project.cli_sessions(project_id, agent_state);
+CREATE INDEX IF NOT EXISTS "idx_ccc_effect_receipts_scope_authority_digest"
+  ON project.ccc_effect_receipts(project_id, effect_scope_id, tool_authority, arguments_digest);
 
 -- run_audit_events
 CREATE INDEX IF NOT EXISTS "idxRunAuditEventsRunIdTimestamp" ON project.run_audit_events(run_id, timestamp);
