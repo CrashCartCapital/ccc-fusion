@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import type { TaskDetail, WorkflowIr, WorkflowIrNode } from "@fusion/core";
+import {
+  __resetWorkflowExtensionRegistryForTests,
+  getWorkflowExtensionRegistry,
+  WORKFLOW_EXTENSION_SCHEMA_VERSION,
+  workflowExtensionRegistryId,
+  type TaskDetail,
+  type WorkflowIr,
+  type WorkflowIrNode,
+} from "@fusion/core";
 
 import { WorkflowGraphExecutor, type WorkflowNodeHandler } from "../workflow-graph-executor.js";
 import { PermanentError, TransientError } from "../engine-errors.js";
@@ -130,6 +138,90 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(result.context["ccc:retry-classification"]).toBe("ccc-transient-retry-exhausted:CCC_TWO");
     expect(result.context["ccc:retry-attempt"]).toBe(2);
   });
+
+  it.each(["normal handler", "plugin handler"] as const)(
+    "Wave 4 RED: an aborted sibling cannot publish a task projection from the %s path",
+    async (resultPath) => {
+      const siblingEntered = deferred<void>();
+      const projectionSink = vi.fn();
+      const extensionKey = workflowExtensionRegistryId("wave4-projection", "late-result");
+      const workflow: WorkflowIr = {
+        version: "v2",
+        name: "abort-before-projection",
+        columns: [],
+        nodes: [
+          { id: "start", kind: "start" },
+          { id: "split", kind: "split" },
+          { id: "terminal", kind: "prompt", config: { maxRetries: 1 } },
+          {
+            id: "late-projection",
+            kind: "prompt",
+            ...(resultPath === "plugin handler" ? { extensions: { [extensionKey]: {} } } : {}),
+          },
+          { id: "join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+          { id: "end", kind: "end" },
+        ],
+        edges: [
+          { from: "start", to: "split" },
+          { from: "split", to: "terminal" },
+          { from: "split", to: "late-projection" },
+          { from: "terminal", to: "join", condition: "success" },
+          { from: "late-projection", to: "join", condition: "success" },
+          { from: "join", to: "end", condition: "success" },
+        ],
+      };
+      const awaitAbort = (signal: AbortSignal | undefined) => signal?.aborted
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+      const lateResult = async (signal: AbortSignal | undefined) => {
+        siblingEntered.resolve();
+        await awaitAbort(signal);
+        return { outcome: "success" as const, contextPatch: { modifiedFiles: ["src/late.ts"] } };
+      };
+
+      if (resultPath === "plugin handler") {
+        getWorkflowExtensionRegistry().register("wave4-projection", {
+          extensionId: "late-result",
+          name: "Late result",
+          kind: "node-handler",
+          nodeKind: "prompt",
+          schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
+          fallback: "failClosed",
+          handle: async ({ signal }) => lateResult(signal),
+        });
+      }
+
+      const executor = new WorkflowGraphExecutor({
+        branchPersistence: { saveBranchState: async () => {} },
+        handlers: {
+          prompt: async (node, context) => {
+            if (node.id === "terminal") {
+              await siblingEntered.promise;
+              throw new PermanentError("terminal", "CCC_ABORT");
+            }
+            if (node.id === "late-projection" && resultPath === "normal handler") {
+              return lateResult(context.signal);
+            }
+            return { outcome: "success" as const };
+          },
+        },
+        publishTaskProjection: projectionSink,
+      });
+
+      try {
+        const result = await executor.run(
+          { ...task, customFields: { cccFusionProfile: "ccc-fusion" } },
+          settingsOn(),
+          workflow,
+        );
+
+        expect(result.outcome).toBe("failure");
+        expect(projectionSink).not.toHaveBeenCalled();
+      } finally {
+        __resetWorkflowExtensionRegistryForTests();
+      }
+    },
+  );
 
   it("mode:all — both branches complete in any order, join fires once, advances to tail", async () => {
     const a = deferred<void>();

@@ -1528,8 +1528,17 @@ export class WorkflowGraphExecutor {
           : null;
         const pluginResult = await this.executePluginNodeHandler(node, task, workflow, context, signal);
         if (pluginResult) {
+          /*
+          FNXC:CccWave4Projection 2026-07-24-18:25:
+          A fail-closed branch abort is authoritative once a delayed handler
+          settles. Check it before projecting either plugin or normal handler
+          metadata so a losing sibling cannot publish stale task state.
+          */
+          if (signal?.aborted || this.isAbortNodeResult(pluginResult)) {
+            return this.withEnginePauseAbortContext(node, pluginResult);
+          }
           const projected = await this.publishTaskProjectionFromResult(task.id, node, pluginResult);
-          if (signal?.aborted || this.isAbortNodeResult(projected)) {
+          if (this.isAbortNodeResult(projected)) {
             return this.withEnginePauseAbortContext(node, projected);
           }
           if (progressRecord) {
@@ -1541,8 +1550,11 @@ export class WorkflowGraphExecutor {
           throw new WorkflowIrError(`No handler registered for node kind: ${node.kind}`);
         }
         const result = await handler(node, { task, settings, context, signal });
+        if (signal?.aborted || this.isAbortNodeResult(result)) {
+          return this.withEnginePauseAbortContext(node, result);
+        }
         const projected = await this.publishTaskProjectionFromResult(task.id, node, result);
-        if (signal?.aborted || this.isAbortNodeResult(projected)) {
+        if (this.isAbortNodeResult(projected)) {
           return this.withEnginePauseAbortContext(node, projected);
         }
         if (progressRecord) {
