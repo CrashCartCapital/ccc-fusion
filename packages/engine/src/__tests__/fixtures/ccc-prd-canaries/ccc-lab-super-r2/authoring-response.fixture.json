@@ -1,0 +1,433 @@
+{
+  "schema": "ccc-prd.authoring-proposal.v1",
+  "authorityRoles": [
+    {
+      "id": "AUTHORITY-ROOT",
+      "role": "root",
+      "sourcePaths": [
+        "260708-DuckLake-Quant-Stack-PRD-v7.2.3.md"
+      ],
+      "accountableProducer": "ccc-lab-super product owner"
+    },
+    {
+      "id": "AUTHORITY-KERNEL",
+      "role": "production_module",
+      "sourcePaths": [
+        "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md"
+      ],
+      "accountableProducer": "publish-control kernel owner"
+    },
+    {
+      "id": "AUTHORITY-OPS",
+      "role": "production_module",
+      "sourcePaths": [
+        "PRJ-AI-CCC-DuckLake-v7.2.3-Ops-Recovery-Maintenance-Security.md",
+        "PRJ-AI-CCC-DuckLake-v7.2.3-Executive-Contract-And-Authority.md"
+      ],
+      "accountableProducer": "operations and authority owner"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-KERNEL-TXN",
+      "statement": "Define the minimal kernel DDL, legal transition matrix, idempotency, locks, crash-recovery points, and backup/publish ordering.",
+      "acceptance": "The kernel transaction proof passes every declared transition, idempotency, crash, and ordering negative control.",
+      "accountableProducer": "publish-control kernel owner",
+      "dependencies": [
+        "REQ-WRITE-01"
+      ],
+      "proofIds": [
+        "PROOF-KERNEL-TXN"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-KERNEL-TXN`: The kernel must define minimal Phase 0 DDL, a legal transition matrix with explicit preconditions, idempotency-key uniqueness, lock ownership/scopes, named crash-recovery points between every boundary, and backup/publish ordering before any publish path is green (D09; pairs with `REQ-WRITE-SERIAL`)."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "REQ-LAKE-01",
+      "statement": "Use DuckLake tables over Parquet with PostgreSQL as the metadata catalog.",
+      "acceptance": "The catalog bootstrap proof observes DuckLake tables over Parquet and the admitted PostgreSQL catalog binding.",
+      "accountableProducer": "catalog bootstrap owner",
+      "dependencies": [],
+      "proofIds": [
+        "PROOF-LAKE-01"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-LAKE-01`: The canonical table format MUST be DuckLake tables over Parquet; the DuckLake metadata catalog MUST be PostgreSQL on the always-on control node."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "REQ-WRITE-01",
+      "statement": "Allow canonical lake mutation only through the controlled DuckLake/DuckDB publication path.",
+      "acceptance": "The canonical-write proof accepts the controlled publication path and rejects a direct writer.",
+      "accountableProducer": "canonical write-boundary owner",
+      "dependencies": [
+        "REQ-LAKE-01"
+      ],
+      "proofIds": [
+        "PROOF-WRITE-01"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-WRITE-01`: Only the controlled DuckLake/DuckDB publication path may create or mutate canonical lake tables."
+        }
+      ],
+      "confidence": "high"
+    }
+  ],
+  "proofs": [
+    {
+      "id": "PROOF-KERNEL-TXN",
+      "requirementIds": [
+        "REQ-KERNEL-TXN"
+      ],
+      "command": "task verify:phase0 -- kernel-transaction",
+      "positiveOracle": "Every declared legal transition and crash boundary passes with one recoverable authoritative state.",
+      "negativeControls": [
+        "illegal transition is refused before mutation",
+        "duplicate idempotency key cannot create a second publish",
+        "crash between boundaries cannot expose a half-published batch"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-KERNEL-TXN`: The kernel must define minimal Phase 0 DDL, a legal transition matrix with explicit preconditions, idempotency-key uniqueness, lock ownership/scopes, named crash-recovery points between every boundary, and backup/publish ordering before any publish path is green (D09; pairs with `REQ-WRITE-SERIAL`)."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "PROOF-LAKE-01",
+      "requirementIds": [
+        "REQ-LAKE-01"
+      ],
+      "command": "task verify:phase0 -- catalog-bootstrap",
+      "positiveOracle": "The admitted scratch catalog reports DuckLake-over-Parquet tables and PostgreSQL metadata.",
+      "negativeControls": [
+        "a shared mutable native DuckDB file is not accepted as canonical storage"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-LAKE-01`: The canonical table format MUST be DuckLake tables over Parquet; the DuckLake metadata catalog MUST be PostgreSQL on the always-on control node."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "PROOF-WRITE-01",
+      "requirementIds": [
+        "REQ-WRITE-01"
+      ],
+      "command": "task verify:phase0 -- canonical-write-boundary",
+      "positiveOracle": "The controlled publication path mutates the scratch catalog exactly once.",
+      "negativeControls": [
+        "a direct Polars, PyArrow, or unmanaged DuckDB canonical write is refused"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-WRITE-01`: Only the controlled DuckLake/DuckDB publication path may create or mutate canonical lake tables."
+        }
+      ],
+      "confidence": "high"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-CATALOG-BOOTSTRAP",
+      "title": "Bootstrap the admitted DuckLake catalog",
+      "description": "Create the catalog bootstrap slice required by REQ-LAKE-01.",
+      "accountableProducer": "catalog bootstrap owner",
+      "requirementIds": [
+        "REQ-LAKE-01"
+      ],
+      "dependencyTaskIds": [],
+      "proofIds": [
+        "PROOF-LAKE-01"
+      ],
+      "workflowId": "WORKFLOW-PHASE0-KERNEL",
+      "documentIds": [
+        "DOCUMENT-PHASE0-PLAN"
+      ],
+      "artifactIds": [],
+      "protectedActionIds": [],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-LAKE-01`: The canonical table format MUST be DuckLake tables over Parquet; the DuckLake metadata catalog MUST be PostgreSQL on the always-on control node."
+        }
+      ]
+    },
+    {
+      "id": "TASK-CANONICAL-WRITE-BOUNDARY",
+      "title": "Implement the canonical write boundary",
+      "description": "Route canonical mutation only through the controlled publication path.",
+      "accountableProducer": "canonical write-boundary owner",
+      "requirementIds": [
+        "REQ-WRITE-01"
+      ],
+      "dependencyTaskIds": [
+        "TASK-CATALOG-BOOTSTRAP"
+      ],
+      "proofIds": [
+        "PROOF-WRITE-01"
+      ],
+      "workflowId": "WORKFLOW-PHASE0-KERNEL",
+      "documentIds": [],
+      "artifactIds": [],
+      "protectedActionIds": [],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-WRITE-01`: Only the controlled DuckLake/DuckDB publication path may create or mutate canonical lake tables."
+        }
+      ]
+    },
+    {
+      "id": "TASK-KERNEL-TRANSACTION",
+      "title": "Implement the kernel transaction and recovery contract",
+      "description": "Implement legal transitions, idempotency, locking, and named crash recovery.",
+      "accountableProducer": "publish-control kernel owner",
+      "requirementIds": [
+        "REQ-KERNEL-TXN"
+      ],
+      "dependencyTaskIds": [
+        "TASK-CANONICAL-WRITE-BOUNDARY"
+      ],
+      "proofIds": [
+        "PROOF-KERNEL-TXN"
+      ],
+      "workflowId": "WORKFLOW-PHASE0-KERNEL",
+      "documentIds": [],
+      "artifactIds": [
+        "ARTIFACT-PHASE0-PROOF"
+      ],
+      "protectedActionIds": [
+        "ACTION-LIVE-EXECUTION",
+        "ACTION-PHYSICAL-DELETION"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-KERNEL-TXN`: The kernel must define minimal Phase 0 DDL, a legal transition matrix with explicit preconditions, idempotency-key uniqueness, lock ownership/scopes, named crash-recovery points between every boundary, and backup/publish ordering before any publish path is green (D09; pairs with `REQ-WRITE-SERIAL`)."
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "EDGE-WRITE-AFTER-CATALOG",
+      "fromTaskId": "TASK-CANONICAL-WRITE-BOUNDARY",
+      "toTaskId": "TASK-CATALOG-BOOTSTRAP",
+      "kind": "depends_on"
+    },
+    {
+      "id": "EDGE-KERNEL-AFTER-WRITE",
+      "fromTaskId": "TASK-KERNEL-TRANSACTION",
+      "toTaskId": "TASK-CANONICAL-WRITE-BOUNDARY",
+      "kind": "depends_on"
+    }
+  ],
+  "workflows": [
+    {
+      "id": "WORKFLOW-PHASE0-KERNEL",
+      "title": "Phase 0 catalog and publish-control kernel",
+      "taskIds": [
+        "TASK-CATALOG-BOOTSTRAP",
+        "TASK-CANONICAL-WRITE-BOUNDARY",
+        "TASK-KERNEL-TRANSACTION"
+      ],
+      "entryTaskIds": [
+        "TASK-CATALOG-BOOTSTRAP"
+      ],
+      "terminalTaskIds": [
+        "TASK-KERNEL-TRANSACTION"
+      ],
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-KERNEL-TXN`: The kernel must define minimal Phase 0 DDL, a legal transition matrix with explicit preconditions, idempotency-key uniqueness, lock ownership/scopes, named crash-recovery points between every boundary, and backup/publish ordering before any publish path is green (D09; pairs with `REQ-WRITE-SERIAL`)."
+        }
+      ]
+    }
+  ],
+  "documents": [
+    {
+      "id": "DOCUMENT-PHASE0-PLAN",
+      "taskId": "TASK-CATALOG-BOOTSTRAP",
+      "key": "plan",
+      "title": "Phase 0 catalog and kernel plan",
+      "content": "Implement the admitted catalog, canonical write boundary, and transaction kernel in dependency order.",
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-LAKE-01`: The canonical table format MUST be DuckLake tables over Parquet; the DuckLake metadata catalog MUST be PostgreSQL on the always-on control node."
+        }
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "ARTIFACT-PHASE0-PROOF",
+      "taskId": "TASK-KERNEL-TRANSACTION",
+      "type": "proof",
+      "title": "Phase 0 kernel proof inventory",
+      "mimeType": "application/json",
+      "content": "{\"proof_ids\":[\"PROOF-LAKE-01\",\"PROOF-WRITE-01\",\"PROOF-KERNEL-TXN\"]}",
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Publish-Control-Kernel.md",
+          "exactQuote": "- `REQ-KERNEL-TXN`: The kernel must define minimal Phase 0 DDL, a legal transition matrix with explicit preconditions, idempotency-key uniqueness, lock ownership/scopes, named crash-recovery points between every boundary, and backup/publish ordering before any publish path is green (D09; pairs with `REQ-WRITE-SERIAL`)."
+        }
+      ]
+    }
+  ],
+  "importIntents": [
+    {
+      "id": "IMPORT-CAMPAIGN",
+      "entityType": "campaign",
+      "entityId": "CAMPAIGN-CCC-LAB-SUPER-R2",
+      "operation": "create",
+      "target": "project.missions"
+    },
+    {
+      "id": "IMPORT-TASK-CATALOG",
+      "entityType": "task",
+      "entityId": "TASK-CATALOG-BOOTSTRAP",
+      "operation": "create",
+      "target": "project.tasks"
+    },
+    {
+      "id": "IMPORT-TASK-WRITE",
+      "entityType": "task",
+      "entityId": "TASK-CANONICAL-WRITE-BOUNDARY",
+      "operation": "create",
+      "target": "project.tasks"
+    },
+    {
+      "id": "IMPORT-TASK-KERNEL",
+      "entityType": "task",
+      "entityId": "TASK-KERNEL-TRANSACTION",
+      "operation": "create",
+      "target": "project.tasks"
+    },
+    {
+      "id": "IMPORT-EDGE-CATALOG",
+      "entityType": "dependency_edge",
+      "entityId": "EDGE-WRITE-AFTER-CATALOG",
+      "operation": "create",
+      "target": "project.tasks.dependencies"
+    },
+    {
+      "id": "IMPORT-EDGE-KERNEL",
+      "entityType": "dependency_edge",
+      "entityId": "EDGE-KERNEL-AFTER-WRITE",
+      "operation": "create",
+      "target": "project.tasks.dependencies"
+    },
+    {
+      "id": "IMPORT-WORKFLOW",
+      "entityType": "workflow",
+      "entityId": "WORKFLOW-PHASE0-KERNEL",
+      "operation": "create",
+      "target": "project.workflow_work_items"
+    },
+    {
+      "id": "IMPORT-DOCUMENT",
+      "entityType": "document",
+      "entityId": "DOCUMENT-PHASE0-PLAN",
+      "operation": "create",
+      "target": "project.task_documents"
+    },
+    {
+      "id": "IMPORT-ARTIFACT",
+      "entityType": "artifact",
+      "entityId": "ARTIFACT-PHASE0-PROOF",
+      "operation": "create",
+      "target": "project.artifacts"
+    },
+    {
+      "id": "IMPORT-SOURCES",
+      "entityType": "source",
+      "entityId": "SOURCE-CUSTODY-CCC-LAB-SUPER-R2",
+      "operation": "create",
+      "target": "project.ccc_prd_import_sources"
+    },
+    {
+      "id": "IMPORT-WORK-ITEMS",
+      "entityType": "work_item",
+      "entityId": "WORKFLOW-PHASE0-KERNEL",
+      "operation": "create",
+      "target": "project.workflow_work_items"
+    },
+    {
+      "id": "IMPORT-AUDIT",
+      "entityType": "run_audit",
+      "entityId": "CAMPAIGN-CCC-LAB-SUPER-R2",
+      "operation": "create",
+      "target": "project.run_audit_events"
+    }
+  ],
+  "protectedActions": [
+    {
+      "id": "ACTION-LIVE-EXECUTION",
+      "kind": "live_execution",
+      "target": "ccc-lab-super:pre-live-provider-gate",
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Executive-Contract-And-Authority.md",
+          "exactQuote": "Fixture-complete green proves the machinery, not data trustworthiness; a green fixture gate implies no live-research or trading trust until per-source `REQ-SRC-VERIFY` and pre-live gates pass."
+        }
+      ]
+    },
+    {
+      "id": "ACTION-PHYSICAL-DELETION",
+      "kind": "deletion",
+      "target": "ccc-lab-super:cleanup_eligibility.physical_delete",
+      "sourceRefs": [
+        {
+          "path": "PRJ-AI-CCC-DuckLake-v7.2.3-Ops-Recovery-Maintenance-Security.md",
+          "exactQuote": "- `REQ-MAINT-02`: Snapshot expiry MUST have a named retention policy and be dry-run capable; cleanup/orphan deletion MUST default to dry-run, and any actual deletion MUST require a safety record containing the cleanup command, pinned DuckDB/DuckLake versions, dry-run file set, manifest cross-check, backup-reference guard, current-snapshot guard, cleanup-protection-window guard, an approval hash, and a post-cleanup validation query. The `approval_hash` preimage is the RFC 8785 canonical JSON of the dry-run candidate delete set with its guard results (FBL2-24); `qdbctl cleanup --approve <hash>` recomputes the candidate set at delete time and refuses on any drift from the approved hash, closing the dry-run-to-delete TOCTOU window."
+        }
+      ]
+    }
+  ],
+  "bounds": {
+    "maxRequests": 8,
+    "maxDurationMs": 120000,
+    "maxConcurrency": 3
+  },
+  "admittedWriteRoots": [
+    {
+      "path": "/Users/ryanpappal/03_CODE/ccc-lab-super/.fusion/tasks",
+      "purpose": "task and prompt projection"
+    },
+    {
+      "path": "/Users/ryanpappal/03_CODE/ccc-lab-super/.fusion/artifacts",
+      "purpose": "text artifact projection"
+    }
+  ],
+  "targetRepository": {
+    "path": "/Users/ryanpappal/03_CODE/ccc-lab-super",
+    "baseCommit": "87f9013f51fee0a438e8edce4d255c57d83da63f"
+  },
+  "nonGoals": [
+    "No live provider or vendor call.",
+    "No credential, billing, publication, merge, push, release, or physical deletion.",
+    "This frozen local oracle covers a representative executable slice; the unchanged packet remains the full authority."
+  ],
+  "unresolvedDecisions": [],
+  "ambiguities": [],
+  "exceptions": [],
+  "confidence": "high"
+}

@@ -302,6 +302,12 @@ fn — AI-orchestrated task board
 
 Usage:
   fn                                  Launch the dashboard (same as fn dashboard)
+  fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
+                                      Generate a traceable candidate sidecar through the local deterministic authoring adapter
+  fn prd validate <root-dir> <manifest-path> <sidecar-path>
+                                      Validate custody and semantics; emit diagnostics only
+  fn prd compile <root-dir> <manifest-path> <sidecar-path>
+                                      Compile a validated sidecar into the complete deterministic semantic bundle
   fn init [opts]                      Initialize a new fn project (--name, --path, --git)
   fn onboard [--force] [--skip-onboarding]
                                       Run onboarding on demand; auto-launch runs before interactive commands when central DB is missing,
@@ -827,7 +833,7 @@ async function main() {
   try {
     switch (command) {
       case "prd": {
-        process.exitCode = runPrdCommand(args.slice(1));
+        process.exitCode = await runPrdCommand(args.slice(1));
         break;
       }
       case "init": {
