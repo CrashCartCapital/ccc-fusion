@@ -13,7 +13,7 @@ import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { beforeAll, beforeEach, afterAll, afterEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
-import { canonicalCccPrdJson, type CccPrdSemanticBundle } from "../../ccc-prd/index.js";
+import type { CccPrdSemanticBundle } from "../../ccc-prd/index.js";
 import {
   importCccPrdBundle,
   inspectCccPrdImport,
@@ -26,11 +26,13 @@ import {
 } from "../../__test-utils__/pg-test-harness.js";
 import type { AsyncDataLayer, DbTransaction } from "../../postgres/data-layer.js";
 import type { CccPrdImportEntityType } from "../../ccc-prd/types.js";
+import {
+  CCC_PRD_TEST_BASE as BASE,
+  createCccPrdImportTestBundle as bundle,
+  rehashCccPrdImportTestBundle as rehashBundle,
+} from "../../__test-utils__/ccc-prd-import-fixture.js";
 
 const pgTest = pgDescribe;
-
-const HASH = "a".repeat(64);
-const BASE = "b".repeat(40);
 
 // Keep the API contract RED even on a machine whose loopback PostgreSQL user
 // is not configured. The PostgreSQL suite below remains the behavioral proof.
@@ -45,86 +47,6 @@ describe("CCC PRD import public surface", () => {
     expect(bundle("/tmp/phase-c", "one").bundleHash).not.toBe(bundle("/tmp/phase-c", "two").bundleHash);
   });
 });
-
-function span(path = "packet.md") {
-  return {
-    path,
-    byteStart: 0,
-    byteEnd: 1,
-    line: 1,
-    column: 1,
-    endLine: 1,
-    endColumn: 2,
-    sha256: HASH,
-    excerptSha256: HASH,
-  };
-}
-
-function bundle(targetRoot: string, suffix = "base"): CccPrdSemanticBundle {
-  const requirementId = `REQ-${suffix}`;
-  const taskId = `TASK-${suffix}`;
-  const terminalTaskId = `TASK-terminal-${suffix}`;
-  const proofId = `PROOF-${suffix}`;
-  const workflowId = `WF-${suffix}`;
-  const documentId = `DOC-${suffix}`;
-  const artifactId = `ART-${suffix}`;
-  const sourceId = `SOURCE-${suffix}`;
-  const edgeId = `EDGE-${suffix}`;
-  const campaignId = `CAMPAIGN-${suffix}`;
-  const auditId = `AUDIT-${suffix}`;
-  const workItemId = `WORK-${suffix}`;
-  const bundleWithoutHash: Omit<CccPrdSemanticBundle, "bundleHash"> = {
-    kind: "bundle",
-    schema: "ccc-prd.bundle.v1",
-    sourceVersion: "phase-c-test",
-    sourceHash: HASH,
-    sidecarHash: "c".repeat(64),
-    orderedSources: [{ path: "packet.md", role: "root", authoritative: true, sha256: HASH, byteLength: 1 }],
-    provenance: { authoringAdapterId: "phase-c-test", proposalHash: "e".repeat(64), packetHash: HASH },
-    authorityRoles: [{ id: "AUTH-root", role: "root", sourcePaths: ["packet.md"], accountableProducer: "phase-c-test" }],
-    requirements: [{ id: requirementId, statement: "Import atomically.", acceptance: "No runnable partial state.", accountableProducer: "phase-c-test", dependencies: [], proofIds: [proofId], spans: [span()], confidence: "high" }],
-    proofs: [{ id: proofId, requirementIds: [requirementId], command: "pnpm test", positiveOracle: "import active", negativeControls: ["rollback"], spans: [span()], confidence: "high" }],
-    tasks: [
-      { id: taskId, title: "Import-owned task", description: "A task projected only after commit.", accountableProducer: "phase-c-test", requirementIds: [requirementId], dependencyTaskIds: [], proofIds: [proofId], workflowId, documentIds: [documentId], artifactIds: [artifactId], protectedActionIds: [], spans: [span()] },
-      { id: terminalTaskId, title: "Terminal import-owned task", description: "Dependent terminal task.", accountableProducer: "phase-c-test", requirementIds: [requirementId], dependencyTaskIds: [taskId], proofIds: [proofId], workflowId, documentIds: [], artifactIds: [], protectedActionIds: [], spans: [span()] },
-    ],
-    edges: [{ id: edgeId, fromTaskId: terminalTaskId, toTaskId: taskId, kind: "depends_on" }],
-    workflows: [{ id: workflowId, title: "Import workflow", taskIds: [taskId, terminalTaskId], entryTaskIds: [taskId], terminalTaskIds: [terminalTaskId], spans: [span()] }],
-    documents: [{ id: documentId, taskId, key: "PROMPT.md", title: "Prompt", content: "import-owned prompt", spans: [span()] }],
-    artifacts: [{ id: artifactId, taskId, type: "text", title: "Import evidence", mimeType: "text/plain", content: "artifact bytes", spans: [span()] }],
-    importIntents: [
-      { id: campaignId, entityType: "campaign", entityId: campaignId, operation: "create", target: targetRoot },
-      { id: taskId, entityType: "task", entityId: taskId, operation: "create", target: targetRoot },
-      { id: terminalTaskId, entityType: "task", entityId: terminalTaskId, operation: "create", target: targetRoot },
-      { id: edgeId, entityType: "dependency_edge", entityId: edgeId, operation: "create", target: targetRoot },
-      { id: workflowId, entityType: "workflow", entityId: workflowId, operation: "create", target: targetRoot },
-      { id: documentId, entityType: "document", entityId: documentId, operation: "create", target: targetRoot },
-      { id: artifactId, entityType: "artifact", entityId: artifactId, operation: "create", target: targetRoot },
-      { id: sourceId, entityType: "source", entityId: sourceId, operation: "create", target: targetRoot },
-      { id: workItemId, entityType: "work_item", entityId: workItemId, operation: "create", target: targetRoot },
-      { id: auditId, entityType: "run_audit", entityId: auditId, operation: "create", target: targetRoot },
-    ],
-    protectedActions: [],
-    bounds: { maxRequests: 1, maxDurationMs: 1_000, maxConcurrency: 1 },
-    admittedWriteRoots: [{ path: targetRoot, purpose: "disposable test target" }],
-    targetRepository: { path: targetRoot, baseCommit: BASE },
-    nonGoals: ["No live providers."],
-    confidence: "high",
-  };
-  return withBundleHash(bundleWithoutHash);
-}
-
-function withBundleHash(bundleWithoutHash: Omit<CccPrdSemanticBundle, "bundleHash">): CccPrdSemanticBundle {
-  return {
-    ...bundleWithoutHash,
-    bundleHash: createHash("sha256").update(canonicalCccPrdJson(bundleWithoutHash), "utf8").digest("hex"),
-  };
-}
-
-function rehashBundle(bundleWithOldHash: CccPrdSemanticBundle): CccPrdSemanticBundle {
-  const { bundleHash: _oldBundleHash, ...bundleWithoutHash } = bundleWithOldHash;
-  return withBundleHash(bundleWithoutHash);
-}
 
 function withSharedGlobalIds(
   source: CccPrdSemanticBundle,
@@ -268,14 +190,13 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       return;
     }
 
-    // After projection/move, an interrupted attempt may have a canonical task
-    // mirror. Before DB activation it may already carry active bytes, but the
-    // database remains the runnable authority and is still prepared/held.
+    // The canonical filesystem mirror must never independently advertise
+    // runnable work. PostgreSQL is the sole activation authority.
     if (await fileExists(projection.taskJson)) {
-      const expectedFileState = checkpoint === "before_activation"
-        ? { state: "active", runnable: true }
-        : { state: "prepared", runnable: false };
-      expect(JSON.parse(await readFile(projection.taskJson, "utf8"))).toMatchObject(expectedFileState);
+      expect(JSON.parse(await readFile(projection.taskJson, "utf8"))).toMatchObject({
+        state: "prepared",
+        runnable: false,
+      });
     }
   }
 
@@ -356,8 +277,8 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(committed).toMatchObject({ state: "active", runnable: true });
     const projection = canonicalProjectionPaths(suffix, committed?.importId);
     expect(JSON.parse(await readFile(projection.taskJson, "utf8"))).toMatchObject({
-      state: "active",
-      runnable: true,
+      state: "prepared",
+      runnable: false,
     });
     expect(await fileExists(resolve(h.rootDir(), committed!.stagingRelativePath))).toBe(true);
 
@@ -499,6 +420,11 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(await h.store().getWorkflowWorkItem("WORK-success")).toMatchObject({
       state: "runnable",
       blockedReason: null,
+    });
+    const projection = canonicalProjectionPaths("success", imported.importId);
+    expect(JSON.parse(await readFile(projection.taskJson, "utf8"))).toMatchObject({
+      state: "prepared",
+      runnable: false,
     });
     expect((await h.store().getAllDocuments()).map((document) => document.content)).toContain("import-owned prompt");
     expect((await h.store().listArtifacts()).map((artifact) => artifact.id)).toContain(nativeArtifactId);

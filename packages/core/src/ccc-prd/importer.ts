@@ -170,7 +170,6 @@ type PreparedProjection = {
   taskFiles: Array<{
     id: string;
     taskJson: string;
-    activeTaskJson: string;
     prompt: string;
   }>;
   artifactFiles: Array<{
@@ -429,25 +428,6 @@ function preparedTask(
   };
 }
 
-function activeTask(task: Task & { state: "prepared"; runnable: false }, now: string): Task & {
-  state: "active";
-  runnable: true;
-} {
-  const { pausedReason: _preparedReason, ...withoutPreparedReason } = task;
-  return {
-    ...withoutPreparedReason,
-    column: "todo",
-    status: "queued",
-    paused: false,
-    userPaused: false,
-    updatedAt: now,
-    columnMovedAt: now,
-    log: [...task.log, { timestamp: now, action: "CCC PRD import activated" }],
-    state: "active",
-    runnable: true,
-  };
-}
-
 async function writeCampaign(
   tx: DbTransaction,
   recorder: ImportTransactionWitnessRecorder,
@@ -634,6 +614,10 @@ async function writeWorkflows(
   );
 }
 
+function nativeWorkflowTaskNodeId(taskId: string): string {
+  return `ccc-task-${sha256(taskId).slice(0, 24)}`;
+}
+
 function nativeWorkflowIr(
   bundle: CccPrdSemanticBundle,
   workflow: CccPrdWorkflow,
@@ -643,7 +627,6 @@ function nativeWorkflowIr(
   nodes: Array<Record<string, unknown>>;
   edges: Array<{ from: string; to: string; condition?: "success" }>;
 } {
-  const nodeId = (taskId: string) => `ccc-task-${sha256(taskId).slice(0, 24)}`;
   const taskById = new Map(bundle.tasks.map((task) => [task.id, task]));
   const taskNodes = workflow.taskIds.map((taskId) => {
     const task = taskById.get(taskId);
@@ -654,7 +637,7 @@ function nativeWorkflowIr(
       );
     }
     return {
-      id: nodeId(taskId),
+      id: nativeWorkflowTaskNodeId(taskId),
       kind: "prompt",
       config: {
         name: task.title,
@@ -668,8 +651,8 @@ function nativeWorkflowIr(
       workflow.taskIds.includes(edge.fromTaskId)
       && workflow.taskIds.includes(edge.toTaskId))
     .map((edge) => ({
-      from: nodeId(edge.toTaskId),
-      to: nodeId(edge.fromTaskId),
+      from: nativeWorkflowTaskNodeId(edge.toTaskId),
+      to: nativeWorkflowTaskNodeId(edge.fromTaskId),
       condition: "success" as const,
     }));
   return {
@@ -683,12 +666,12 @@ function nativeWorkflowIr(
     edges: [
       ...workflow.entryTaskIds.map((taskId) => ({
         from: "start",
-        to: nodeId(taskId),
+        to: nativeWorkflowTaskNodeId(taskId),
         condition: "success" as const,
       })),
       ...dependencyEdges,
       ...workflow.terminalTaskIds.map((taskId) => ({
-        from: nodeId(taskId),
+        from: nativeWorkflowTaskNodeId(taskId),
         to: "end",
         condition: "success" as const,
       })),
@@ -860,7 +843,7 @@ async function writeWorkItems(
       id: intent.id,
       runId: `ccc-prd:${importId}`,
       taskId,
-      nodeId: nativeScopedId(importId, workflow.id),
+      nodeId: nativeWorkflowTaskNodeId(taskId),
       kind: "task",
       state: "held",
       attempt: 0,
@@ -1093,11 +1076,9 @@ function buildProjection(
   const missionId = oneIntent(bundle, "campaign").entityId;
   const taskFiles = bundle.tasks.map((source) => {
     const prepared = preparedTask(source, missionId, identityHash, now);
-    const active = activeTask(prepared, now);
     return {
       id: source.id,
       taskJson: `${canonicalCccPrdJson(prepared)}\n`,
-      activeTaskJson: `${canonicalCccPrdJson(active)}\n`,
       prompt: promptForTask(bundle, source),
     };
   });
@@ -1224,21 +1205,6 @@ async function ensureExactFile(path: string, bytes: string): Promise<void> {
   }
 }
 
-async function replaceOwnedFile(path: string, before: string, after: string): Promise<void> {
-  await assertOwnedRegularFile(path);
-  const existing = await readFile(path, "utf8");
-  if (existing === after) return;
-  if (existing !== before) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_PROJECTION_CONFLICT",
-      `CCC PRD import does not own current bytes at ${path}`,
-    );
-  }
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, after, { encoding: "utf8", flag: "wx" });
-  await rename(temporary, path);
-}
-
 async function assertOwnedFusionRoot(rootDir: string): Promise<string> {
   const root = await realpath(rootDir);
   await ensureOwnedDirectory(root, join(root, ".fusion"), ".fusion");
@@ -1321,7 +1287,7 @@ async function verifyProjectedTask(
   for (const [file, bytes] of expected) {
     await assertOwnedRegularFile(file);
     const existing = await readFile(file, "utf8").catch(() => null);
-    if (existing !== bytes && !(file.endsWith("task.json") && existing === task.activeTaskJson)) {
+    if (existing !== bytes) {
       throw new CccPrdImportError(
         "CCC_PRD_IMPORT_PROJECTION_CONFLICT",
         `CCC PRD canonical task projection differs at ${file}`,
@@ -1576,19 +1542,6 @@ async function activateImport(
   });
 }
 
-async function writeActiveProjection(
-  rootDir: string,
-  projection: PreparedProjection,
-): Promise<void> {
-  const root = await assertOwnedFusionRoot(rootDir);
-  const tasksRoot = await ensureOwnedDirectory(root, join(root, ".fusion", "tasks"), "canonical tasks");
-  for (const task of projection.taskFiles) {
-    const taskRoot = await ensureOwnedDirectory(root, join(tasksRoot, task.id), `canonical task ${task.id}`);
-    const path = join(taskRoot, "task.json");
-    await replaceOwnedFile(path, task.taskJson, task.activeTaskJson);
-  }
-}
-
 async function cleanupStagingProjection(
   rootDir: string,
   row: ImportRow,
@@ -1753,7 +1706,11 @@ async function reconcileOwned(
       row.createdAt,
     );
     if (row.state === "active") {
-      await writeActiveProjection(input.rootDir, projection);
+      await moveCanonicalProjection(
+        input.rootDir,
+        resolve(input.rootDir, row.stagingRelativePath),
+        projection,
+      );
       await cleanupStagingProjection(input.rootDir, row);
       const active = await inspectCccPrdImport(input);
       if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
@@ -1773,7 +1730,6 @@ async function reconcileOwned(
       const stagingPath = await ensureStagedFiles(input.rootDir, row, projection, failureInjection);
       await moveCanonicalProjection(input.rootDir, stagingPath, projection);
       inject(failureInjection, "canonical_projection_move");
-      await writeActiveProjection(input.rootDir, projection);
       inject(failureInjection, "before_activation");
       await activateImport({ layer: input.layer, row, token });
       inject(failureInjection, "after_activation");
