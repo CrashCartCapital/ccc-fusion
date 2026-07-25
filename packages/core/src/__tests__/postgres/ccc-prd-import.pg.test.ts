@@ -814,7 +814,9 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       ...request(suffix, key),
       bundle: boundedBundle,
       failureInjection: {
-        projectionLeaseMs: 40,
+        // Lease expiry is covered separately; this case isolates the shorter
+        // admitted waiter deadline even under loaded parallel proof lanes.
+        projectionLeaseMs: 1_000,
         pause: {
           checkpoint: "artifact_bytes",
           entered: announceEntered,
