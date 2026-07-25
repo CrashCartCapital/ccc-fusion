@@ -59,6 +59,7 @@ export type CccPrdImportFailureCheckpoint =
   | "artifact_bytes"
   | "canonical_projection_move"
   | "before_activation"
+  | "activation_handoff"
   | "after_activation"
   | "lost_response_after_commit";
 
@@ -116,6 +117,7 @@ export type ImportCccPrdBundleInput = {
   failureInjection?: {
     checkpoint?: CccPrdImportFailureCheckpoint;
     projectionLeaseMs?: number;
+    reconciliationOverheadMs?: number;
     pause?: {
       checkpoint: CccPrdImportFailureCheckpoint;
       entered?: () => void;
@@ -1312,50 +1314,57 @@ async function moveCanonicalProjection(
   rootDir: string,
   stagingPath: string,
   projection: PreparedProjection,
+  assertClaim?: () => Promise<void>,
 ): Promise<void> {
+  await assertClaim?.();
   const root = await assertOwnedFusionRoot(rootDir);
   const tasksRoot = await ensureOwnedDirectory(root, join(root, ".fusion", "tasks"), "canonical tasks");
   const artifactsRoot = await ensureOwnedDirectory(root, join(root, ".fusion", "artifacts"), "canonical artifacts");
   for (const task of projection.taskFiles) {
     const staged = join(stagingPath, "tasks", task.id);
     const canonical = join(tasksRoot, task.id);
-    const canonicalKind = await existingPathKind(canonical);
-    if (canonicalKind !== "missing") {
-      const canonicalTaskRoot = await ensureOwnedDirectory(
-        root,
-        canonical,
-        `canonical task ${task.id}`,
-      );
-      await verifyProjectedTask(canonicalTaskRoot, task);
-      if (await pathExists(staged)) {
-        await rm(staged, { recursive: true });
+    await assertClaim?.();
+    if (await existingPathKind(canonical) === "missing") {
+      try {
+        await rename(staged, canonical);
+      } catch (error) {
+        if (await existingPathKind(canonical) === "missing") throw error;
       }
-      continue;
     }
-    await rename(staged, canonical);
     const canonicalTaskRoot = await ensureOwnedDirectory(
       root,
       canonical,
       `canonical task ${task.id}`,
     );
     await verifyProjectedTask(canonicalTaskRoot, task);
+    if (await pathExists(staged)) {
+      await assertClaim?.();
+      await rm(staged, { recursive: true });
+    }
   }
   for (const artifact of projection.artifactFiles) {
     const staged = join(stagingPath, "artifacts", artifact.id);
     const canonical = join(artifactsRoot, artifact.id);
-    if (await pathExists(canonical)) {
-      await assertOwnedRegularFile(canonical);
-      const existing = await readFile(canonical, "utf8");
-      if (existing !== artifact.content) {
-        throw new CccPrdImportError(
-          "CCC_PRD_IMPORT_PROJECTION_CONFLICT",
-          `CCC PRD canonical artifact projection differs at ${canonical}`,
-        );
+    await assertClaim?.();
+    if (await existingPathKind(canonical) === "missing") {
+      try {
+        await rename(staged, canonical);
+      } catch (error) {
+        if (await existingPathKind(canonical) === "missing") throw error;
       }
-      if (await pathExists(staged)) await rm(staged);
-      continue;
     }
-    await rename(staged, canonical);
+    await assertOwnedRegularFile(canonical);
+    const existing = await readFile(canonical, "utf8");
+    if (existing !== artifact.content) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_PROJECTION_CONFLICT",
+        `CCC PRD canonical artifact projection differs at ${canonical}`,
+      );
+    }
+    if (await pathExists(staged)) {
+      await assertClaim?.();
+      await rm(staged);
+    }
   }
 }
 
@@ -1367,7 +1376,7 @@ async function releaseProjection(
 ): Promise<void> {
   const now = new Date().toISOString();
   const message = error instanceof Error ? error.message : String(error);
-  await layer.transactionImmediate(async (tx) => {
+  await serializable(layer, () => layer.transactionImmediate(async (tx) => {
     await tx
       .update(schema.project.cccPrdImports)
       .set({
@@ -1383,7 +1392,7 @@ async function releaseProjection(
         eq(schema.project.cccPrdImports.idempotencyKey, row.idempotencyKey),
         eq(schema.project.cccPrdImports.projectionOwner, token),
       ));
-  });
+  }));
 }
 
 async function claimProjection(
@@ -1393,7 +1402,7 @@ async function claimProjection(
   token: string,
   leaseDurationMs: number,
 ): Promise<{ row: ImportRow; claimed: boolean }> {
-  return layer.transactionImmediate(async (tx) => {
+  return serializable(layer, () => layer.transactionImmediate(async (tx) => {
     const rows = await tx
       .select()
       .from(schema.project.cccPrdImports)
@@ -1449,7 +1458,7 @@ async function claimProjection(
       },
       claimed: true,
     };
-  });
+  }));
 }
 
 async function renewProjectionLease(
@@ -1457,8 +1466,9 @@ async function renewProjectionLease(
   row: ImportRow,
   token: string,
   leaseDurationMs: number,
+  allowActive: boolean,
 ): Promise<void> {
-  await layer.transactionImmediate(async (tx) => {
+  await serializable(layer, () => layer.transactionImmediate(async (tx) => {
     const lockedRows = await tx
       .select()
       .from(schema.project.cccPrdImports)
@@ -1469,6 +1479,7 @@ async function renewProjectionLease(
       .limit(1)
       .for("update");
     const current = lockedRows[0] as ImportRow | undefined;
+    if (current?.state === "active" && allowActive) return;
     if (
       !current
       || current.state !== "projecting"
@@ -1491,7 +1502,7 @@ async function renewProjectionLease(
         eq(schema.project.cccPrdImports.idempotencyKey, row.idempotencyKey),
         eq(schema.project.cccPrdImports.projectionOwner, token),
       ));
-  });
+  }));
 }
 
 function startProjectionLeaseHeartbeat(
@@ -1501,9 +1512,11 @@ function startProjectionLeaseHeartbeat(
   leaseDurationMs: number,
 ): {
   assertHealthy(): Promise<void>;
+  beginActivation(): void;
   stop(): Promise<void>;
 } {
   let stopped = false;
+  let activationStarted = false;
   let failure: unknown;
   let renewal = Promise.resolve();
   const intervalMs = Math.max(10, Math.floor(leaseDurationMs / 3));
@@ -1511,7 +1524,7 @@ function startProjectionLeaseHeartbeat(
     renewal = renewal.then(async () => {
       if (stopped || failure) return;
       try {
-        await renewProjectionLease(layer, row, token, leaseDurationMs);
+        await renewProjectionLease(layer, row, token, leaseDurationMs, activationStarted);
       } catch (error) {
         failure = error;
       }
@@ -1525,6 +1538,9 @@ function startProjectionLeaseHeartbeat(
     async assertHealthy() {
       await queueRenewal();
       if (failure) throw failure;
+    },
+    beginActivation() {
+      activationStarted = true;
     },
     async stop() {
       if (!stopped) {
@@ -1546,7 +1562,7 @@ async function activateImport(
 ): Promise<void> {
   const { layer, row, token } = input;
   const now = new Date().toISOString();
-  await layer.transactionImmediate(async (tx) => {
+  await serializable(layer, () => layer.transactionImmediate(async (tx) => {
     const lockedRows = await tx
       .select()
       .from(schema.project.cccPrdImports)
@@ -1649,7 +1665,7 @@ async function activateImport(
         eq(schema.project.cccPrdImports.projectId, row.projectId),
         eq(schema.project.cccPrdImports.idempotencyKey, row.idempotencyKey),
       ));
-  });
+  }));
 }
 
 async function cleanupStagingProjection(
@@ -1799,12 +1815,19 @@ async function reconcileOwned(
 ): Promise<CccPrdImportInspection> {
   const projectId = projectIdFor(input.layer);
   const token = randomUUID();
-  const deadline = Date.now() + 10_000;
+  const waitStartedAt = Date.now();
   const leaseDurationMs = failureInjection?.projectionLeaseMs ?? 5_000;
+  const reconciliationOverheadMs = failureInjection?.reconciliationOverheadMs ?? 5_000;
   if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_INVALID_FAILURE_INJECTION",
       "CCC PRD projection lease test override must be positive and finite",
+    );
+  }
+  if (!Number.isFinite(reconciliationOverheadMs) || reconciliationOverheadMs < 0) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_FAILURE_INJECTION",
+      "CCC PRD reconciliation overhead test override must be finite and non-negative",
     );
   }
   while (true) {
@@ -1829,9 +1852,10 @@ async function reconcileOwned(
       row.createdAt,
     );
     if (row.state === "active") {
+      const stagingPath = await ensureStagedFiles(input.rootDir, row, projection);
       await moveCanonicalProjection(
         input.rootDir,
-        resolve(input.rootDir, row.stagingRelativePath),
+        stagingPath,
         projection,
       );
       await cleanupStagingProjection(input.rootDir, row);
@@ -1840,10 +1864,11 @@ async function reconcileOwned(
       return active;
     }
     if (!claim.claimed) {
-      if (Date.now() >= deadline) {
+      const waitBudgetMs = row.canonicalBundle.bounds.maxDurationMs + reconciliationOverheadMs;
+      if (Date.now() - waitStartedAt >= waitBudgetMs) {
         throw new CccPrdImportError(
           "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
-          `Timed out waiting for CCC PRD import ${row.importId} projection owner`,
+          `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${row.importId} projection owner`,
         );
       }
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
@@ -1857,12 +1882,21 @@ async function reconcileOwned(
     );
     try {
       const stagingPath = await ensureStagedFiles(input.rootDir, row, projection, failureInjection);
-      await moveCanonicalProjection(input.rootDir, stagingPath, projection);
+      await heartbeat.assertHealthy();
+      await moveCanonicalProjection(
+        input.rootDir,
+        stagingPath,
+        projection,
+        () => heartbeat.assertHealthy(),
+      );
       await inject(failureInjection, "canonical_projection_move");
       await inject(failureInjection, "before_activation");
       await heartbeat.assertHealthy();
-      await heartbeat.stop();
+      await inject(failureInjection, "activation_handoff");
+      await heartbeat.assertHealthy();
+      heartbeat.beginActivation();
       await activateImport({ layer: input.layer, row, token });
+      await heartbeat.stop();
       await inject(failureInjection, "after_activation");
       await cleanupStagingProjection(input.rootDir, row);
       const active = await inspectCccPrdImport(input);

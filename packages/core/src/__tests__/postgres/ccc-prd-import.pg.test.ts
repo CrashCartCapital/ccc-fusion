@@ -108,6 +108,7 @@ type FailureCheckpoint =
   | "canonical_projection_move"
   | "after_prepared_db_commit"
   | "before_activation"
+  | "activation_handoff"
   | "after_activation"
   | "lost_response_after_commit";
 
@@ -438,6 +439,37 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect((await inspectCccPrdImport({ idempotencyKey: key, layer: h.layer(), rootDir: h.rootDir() }))?.state).toBe("active");
   });
 
+  it("rebuilds missing canonical prepared files for an active import after restart", async () => {
+    const suffix = "active-repair";
+    const key = "idem-active-repair";
+    const imported = await importCccPrdBundle(request(suffix, key));
+    const projection = canonicalProjectionPaths(suffix, imported.importId);
+    expect(await fileExists(resolve(h.rootDir(), imported.stagingRelativePath))).toBe(false);
+    await rm(projection.taskDir, { recursive: true });
+    await rm(projection.artifact);
+    expect(await fileExists(projection.taskDir)).toBe(false);
+    expect(await fileExists(projection.artifact)).toBe(false);
+
+    const { TaskStore } = await import("../../store.js");
+    const restarted = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+    await expect(reconcileCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      store: restarted,
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      state: "active",
+      runnable: true,
+      replayed: true,
+    });
+    expect(JSON.parse(await readFile(projection.taskJson, "utf8"))).toMatchObject({
+      state: "prepared",
+      runnable: false,
+    });
+    expect(await readFile(projection.artifact, "utf8")).toBe("artifact bytes");
+    expect(await fileExists(resolve(h.rootDir(), imported.stagingRelativePath))).toBe(false);
+  });
+
   it("is sequentially and concurrently idempotent, including a lost response after commit", async () => {
     const key = "idem-replay";
     const replayObserver = emissionObserver();
@@ -521,6 +553,170 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       .toEqual([false, true]);
   });
 
+  it("keeps renewing through the activation handoff while an identical import waits", async () => {
+    const suffix = "activation-handoff";
+    const key = "idem-activation-handoff";
+    let announceEntered!: () => void;
+    let releaseActivation!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdActivation = new Promise<void>((resolveActivation) => {
+      releaseActivation = resolveActivation;
+    });
+    const first = importCccPrdBundle({
+      ...request(suffix, key),
+      failureInjection: {
+        projectionLeaseMs: 80,
+        pause: {
+          checkpoint: "activation_handoff",
+          entered: announceEntered,
+          until: holdActivation,
+        },
+      },
+    });
+    await entered;
+    const readClaim = async () => {
+      const rows = (await h.layer().db.execute(sql`
+        SELECT state, projection_owner
+        FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+      `)) as unknown as Array<{ state: string; projection_owner: string | null }>;
+      return rows[0];
+    };
+    const beforeExpiry = await readClaim();
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+    let secondSettled = false;
+    const second = importCccPrdBundle(request(suffix, key))
+      .finally(() => {
+        secondSettled = true;
+      });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+
+    let assertionError: unknown;
+    try {
+      expect(await readClaim()).toEqual(beforeExpiry);
+      expect(secondSettled).toBe(false);
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      releaseActivation();
+    }
+    const results = await Promise.allSettled([first, second]);
+    if (assertionError) throw assertionError;
+    expect(results.every(({ status }) => status === "fulfilled")).toBe(true);
+    expect(results.map((result) => result.status === "fulfilled" && result.value.replayed))
+      .toEqual([false, true]);
+  });
+
+  it("bounds an identical wait by the admitted bundle duration plus reconciliation overhead", async () => {
+    const suffix = "bounded-wait";
+    const key = "idem-bounded-wait";
+    const boundedBundle = rehashBundle({
+      ...bundle(h.rootDir(), suffix),
+      bounds: { maxRequests: 1, maxDurationMs: 40, maxConcurrency: 1 },
+    });
+    let announceEntered!: () => void;
+    let releaseProjection!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdProjection = new Promise<void>((resolveProjection) => {
+      releaseProjection = resolveProjection;
+    });
+    const first = importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+      failureInjection: {
+        projectionLeaseMs: 40,
+        pause: {
+          checkpoint: "artifact_bytes",
+          entered: announceEntered,
+          until: holdProjection,
+        },
+      },
+    });
+    await entered;
+    const secondOutcome = importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+      failureInjection: { reconciliationOverheadMs: 40 },
+    }).then(
+      (result) => ({ status: "fulfilled" as const, result }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    const observed = await Promise.race([
+      secondOutcome,
+      new Promise<{ status: "still-waiting" }>((resolveDelay) => {
+        setTimeout(() => resolveDelay({ status: "still-waiting" }), 250);
+      }),
+    ]);
+    let assertionError: unknown;
+    try {
+      expect(observed).toMatchObject({
+        status: "rejected",
+        error: { code: "CCC_PRD_IMPORT_RECONCILE_TIMEOUT" },
+      });
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      releaseProjection();
+    }
+    await first;
+    await secondOutcome;
+    if (assertionError) throw assertionError;
+  });
+
+  it("retries one transient PostgreSQL lease-renewal failure without losing ownership", async () => {
+    const suffix = "lease-retry";
+    const key = "idem-lease-retry";
+    const baseLayer = h.layer();
+    let failNextTransaction = false;
+    let injectedFailures = 0;
+    const retryingLayer: AsyncDataLayer = {
+      ...baseLayer,
+      transactionImmediate: async (fn, options) => {
+        if (failNextTransaction) {
+          failNextTransaction = false;
+          injectedFailures += 1;
+          throw Object.assign(new Error("synthetic serialization failure"), { code: "40001" });
+        }
+        return baseLayer.transactionImmediate(fn, options);
+      },
+    };
+    let announceEntered!: () => void;
+    let releaseProjection!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdProjection = new Promise<void>((resolveProjection) => {
+      releaseProjection = resolveProjection;
+    });
+    const importing = importCccPrdBundle({
+      ...request(suffix, key),
+      layer: retryingLayer,
+      failureInjection: {
+        projectionLeaseMs: 60,
+        pause: {
+          checkpoint: "artifact_bytes",
+          entered: announceEntered,
+          until: holdProjection,
+        },
+      },
+    });
+    await entered;
+    failNextTransaction = true;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 80));
+    releaseProjection();
+
+    await expect(importing).resolves.toMatchObject({
+      state: "active",
+      runnable: true,
+      replayed: false,
+    });
+    expect(injectedFailures).toBe(1);
+  });
+
   it("surfaces projection lease ownership loss as a deterministic reconciliation conflict", async () => {
     const suffix = "lease-ownership-loss";
     const key = "idem-lease-ownership-loss";
@@ -573,6 +769,9 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       state: "held",
       blockedReason: "ccc-prd-import-prepared",
     });
+    const projection = canonicalProjectionPaths(suffix);
+    expect(await fileExists(projection.taskDir)).toBe(false);
+    expect(await fileExists(projection.artifact)).toBe(false);
   });
 
   it("namespaces global workflow and artifact IDs so independent imports cannot collide", async () => {
@@ -665,6 +864,38 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       }
     },
   );
+
+  it("refuses a dangling symlink at an existing canonical artifact path", async () => {
+    const suffix = "symlink-artifact-file";
+    const key = "idem-symlink-artifact-file";
+    await expect(importCccPrdBundle(
+      request(suffix, key, "artifact_bytes"),
+    )).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_INJECTED_FAILURE" });
+    const inspection = await inspectCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const projection = canonicalProjectionPaths(suffix, inspection?.importId);
+    const outsideRoot = await mkdtemp(join(dirname(h.rootDir()), "fusion-ccc-prd-outside-artifact-"));
+    const outsideFile = join(outsideRoot, "missing-artifact");
+    await mkdir(dirname(projection.artifact), { recursive: true });
+    await symlink(outsideFile, projection.artifact);
+    try {
+      await expect(importCccPrdBundle(request(suffix, key))).rejects.toMatchObject({
+        code: "CCC_PRD_IMPORT_WRITE_ROOT_REFUSED",
+      });
+      await expect(inspectCccPrdImport({
+        idempotencyKey: key,
+        layer: h.layer(),
+        rootDir: h.rootDir(),
+      })).resolves.toMatchObject({ state: "prepared", runnable: false });
+      expect(await fileExists(outsideFile)).toBe(false);
+    } finally {
+      await rm(projection.artifact, { force: true });
+      await rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
 
   it("refuses a byte-identical symlink at an existing canonical task directory", async () => {
     const suffix = "symlink-task-directory";
