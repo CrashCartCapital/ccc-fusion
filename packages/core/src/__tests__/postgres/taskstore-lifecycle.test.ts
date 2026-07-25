@@ -48,6 +48,7 @@ import {
 } from "../../task-store/async-merge-coordination.js";
 import { recordRunAuditEventWithinTransaction } from "../../postgres/data-layer.js";
 import type { MergeQueueRow } from "../../task-store/row-types.js";
+import { TaskStore } from "../../store.js";
 
 const PG_TEST_URL_BASE =
   process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
@@ -167,6 +168,33 @@ pgDescribe("U13 taskstore-lifecycle (PostgreSQL)", () => {
   afterEach(async () => {
     await teardownCtx(ctx);
     ctx = null;
+  });
+
+  it("Wave 4: concurrent workflow work-item claims admit one worker and never steal a live lease", async () => {
+    ctx = await setupCtx();
+    const now = "2026-07-24T18:30:00.000Z";
+    const store = new TaskStore(process.cwd(), undefined, { asyncLayer: ctx.layer });
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-WORK-LEASE"), { lineageId: null });
+    const item = await store.upsertWorkflowWorkItem({
+      runId: "run-work-lease",
+      taskId: "KB-WORK-LEASE",
+      nodeId: "lease-node",
+      kind: "execute",
+      state: "runnable",
+      now,
+    });
+
+    const claims = await Promise.all([
+      store.acquireWorkflowWorkItemLease(item.id, "worker-a", { leaseDurationMs: 60_000, now }),
+      store.acquireWorkflowWorkItemLease(item.id, "worker-b", { leaseDurationMs: 60_000, now }),
+    ]);
+    const winners = claims.filter((claim): claim is NonNullable<typeof claim> => claim !== null);
+
+    expect(winners).toHaveLength(1);
+    expect(["worker-a", "worker-b"]).toContain(winners[0]?.leaseOwner);
+    await expect(
+      store.acquireWorkflowWorkItemLease(item.id, "worker-c", { leaseDurationMs: 60_000, now }),
+    ).resolves.toBeNull();
   });
 
   // ── VAL-DATA-010: Lineage-integrity gate blocks parent delete with live children ──

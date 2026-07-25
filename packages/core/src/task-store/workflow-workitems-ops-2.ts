@@ -9,11 +9,11 @@
 import {TaskStore} from "../store.js";
 import * as schema from "../postgres/schema/index.js";
 import {randomUUID} from "node:crypto";
-import {and, eq, inArray} from "drizzle-orm";
+import {and, eq, inArray, isNull, lte, or} from "drizzle-orm";
 import type {WorkflowWorkItem, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput} from "../types.js";
 import "../builtin-traits.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {replaceActiveTaskWorkflowContinuation as replaceActiveTaskWorkflowContinuationAsync, upsertWorkflowWorkItem as upsertWorkflowWorkItemAsync, transitionWorkflowWorkItem as transitionWorkflowWorkItemAsync, getWorkflowWorkItem as getWorkflowWorkItemAsync} from "../task-store/async-workflow-workitems.js";
+import {replaceActiveTaskWorkflowContinuation as replaceActiveTaskWorkflowContinuationAsync, upsertWorkflowWorkItem as upsertWorkflowWorkItemAsync, transitionWorkflowWorkItem as transitionWorkflowWorkItemAsync} from "../task-store/async-workflow-workitems.js";
 import type {WorkflowWorkItemRow} from "../task-store/row-types.js";
 import type {DbTransaction} from "../postgres/data-layer.js";
 
@@ -137,14 +137,17 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
       throw new Error(`workflow work item leaseDurationMs must be > 0 (received ${opts.leaseDurationMs})`);
     }
 
-    // No dedicated async helper; use a raw Drizzle UPDATE in backend mode.
     if (store.backendMode) {
       const layer = store.asyncLayer!;
       const now = opts.now ?? new Date().toISOString();
       const leaseExpiresAt = new Date(new Date(now).getTime() + opts.leaseDurationMs).toISOString();
-      // The sync path uses a guarded UPDATE (state IN runnable/retrying/running
-      // + retryAfter/leaseExpiresAt passed). Use sql`` for the state-list guard.
-      const result = await layer.db
+      /*
+      FNXC:CccWave4Lease 2026-07-24-18:35:
+      PostgreSQL claim eligibility and the returned lease must come from one
+      guarded UPDATE. A follow-up SELECT can observe a competing owner after
+      this claimant's write and makes two workers believe they acquired it.
+      */
+      const claimedRows = await layer.db
         .update(schema.project.workflowWorkItems)
         .set({
           state: "running",
@@ -156,12 +159,20 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
           and(
             eq(schema.project.workflowWorkItems.id, id),
             inArray(schema.project.workflowWorkItems.state, ["runnable", "retrying", "running"]),
+            or(
+              isNull(schema.project.workflowWorkItems.retryAfter),
+              lte(schema.project.workflowWorkItems.retryAfter, now),
+            ),
+            or(
+              isNull(schema.project.workflowWorkItems.leaseExpiresAt),
+              lte(schema.project.workflowWorkItems.leaseExpiresAt, now),
+            ),
           ),
-        );
-      // Check if any row was updated (postgres.js returns a result with count).
-      const updated = await getWorkflowWorkItemAsync(layer.db, id);
-      if (!updated || updated.leaseOwner !== leaseOwner) return null;
-      void result;
+        )
+        .returning();
+      const claimedRow = claimedRows[0] as WorkflowWorkItemRow | undefined;
+      if (!claimedRow) return null;
+      const updated = store.rowToWorkflowWorkItem(claimedRow);
       // Record the audit event (fire-and-forget).
       void store.recordRunAuditEvent({
         taskId: updated.taskId,
@@ -172,7 +183,7 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
         target: updated.id,
         metadata: { id: updated.id, leaseOwner: updated.leaseOwner, leaseExpiresAt: updated.leaseExpiresAt },
       });
-      return { ...updated, id };
+      return updated;
     }
 
     return store.db.transactionImmediate(() => {
