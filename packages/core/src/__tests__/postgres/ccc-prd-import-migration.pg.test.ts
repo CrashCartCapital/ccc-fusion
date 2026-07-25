@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { importCccPrdBundle, reconcileCccPrdImport } from "../../index.js";
+import { TaskStore } from "../../store.js";
 import {
   createTaskStoreForTest,
   pgDescribe,
   type PgTestHarness,
 } from "../../__test-utils__/pg-test-harness.js";
+import {
+  createCccPrdImportTestBundle,
+  createCccPrdImportTestExecutionPolicy,
+} from "../../__test-utils__/ccc-prd-import-fixture.js";
 import {
   applySchemaBaseline,
   getAppliedMigrations,
@@ -218,5 +224,118 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       copyFromGolden: true,
     });
     expect(await importShape(upgraded)).toEqual(await importShape(fresh));
+  });
+});
+
+pgDescribe("CCC PRD import migration 0035 to 0036", () => {
+  let populated: PgTestHarness | null = null;
+
+  afterEach(async () => {
+    await populated?.teardown();
+    populated = null;
+  });
+
+  it("marks a populated runnable 0035 import unadmitted and refuses restart reconciliation", async () => {
+    populated = await createTaskStoreForTest({
+      prefix: "fusion_ccc_prd_populated_0035",
+      copyFromGolden: true,
+    });
+    const harness = populated;
+    const suffix = "populated-0035";
+    const taskId = `TASK-${suffix}`;
+    const idempotencyKey = "test-test-test-0035";
+    const bundle = createCccPrdImportTestBundle(harness.rootDir, suffix);
+    const emissions: unknown[] = [];
+    const observer = {
+      emissions,
+      emit: (value: unknown) => emissions.push(value),
+    };
+    await expect(importCccPrdBundle({
+      bundle,
+      executionPolicy: createCccPrdImportTestExecutionPolicy(bundle),
+      idempotencyKey,
+      store: harness.store,
+      layer: harness.layer,
+      rootDir: harness.rootDir,
+      effects: observer,
+      events: observer,
+    })).resolves.toMatchObject({
+      state: "active",
+      runnable: true,
+    });
+    await expect(harness.store.getCccCampaignContextForTask(taskId))
+      .resolves.toMatchObject({ taskId, idempotencyKey });
+    expect(emissions).toEqual([]);
+
+    await harness.adminDb.execute(sql.raw(`
+      ALTER TABLE project.ccc_prd_imports
+        DROP COLUMN execution_policy,
+        DROP COLUMN campaign_manifest,
+        DROP COLUMN campaign_manifest_hash,
+        DROP COLUMN campaign_started_at,
+        DROP COLUMN campaign_deadline_at,
+        DROP COLUMN request_count,
+        DROP COLUMN active_action_leases;
+      DELETE FROM public.fusion_schema_migrations WHERE version = '0036';
+    `));
+    expect(await getAppliedMigrations(harness.adminDb)).toContain("0035");
+    expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0036");
+
+    expect(await applySchemaBaseline(harness.adminDb, { pluginHooks: [] }))
+      .toMatchObject({ applied: true });
+    const readCampaignState = () => harness.adminDb.execute(sql`
+      SELECT
+        state,
+        runnable,
+        execution_policy,
+        campaign_manifest,
+        projection_owner,
+        projection_lease_until,
+        activated_at,
+        request_count,
+        active_action_leases
+      FROM project.ccc_prd_imports
+      WHERE idempotency_key = ${idempotencyKey}
+    `);
+    const migratedRows = await readCampaignState();
+    expect(migratedRows).toEqual([{
+      state: "active",
+      runnable: 1,
+      execution_policy: {
+        schema: "ccc-campaign.execution-policy.unadmitted.v0",
+        routes: [],
+      },
+      campaign_manifest: expect.objectContaining({
+        schema: "ccc-campaign.manifest.unadmitted.v0",
+      }),
+      projection_owner: null,
+      projection_lease_until: null,
+      activated_at: expect.any(String),
+      request_count: 0,
+      active_action_leases: {},
+    }]);
+
+    const restarted = new TaskStore(
+      harness.rootDir,
+      undefined,
+      { asyncLayer: harness.layer },
+    );
+    await expect(restarted.getTask(taskId)).resolves.toMatchObject({ id: taskId });
+    await expect(restarted.getCccCampaignContextForTask(taskId))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_CONTEXT_REFUSED" });
+    await expect(reconcileCccPrdImport({
+      idempotencyKey,
+      store: restarted,
+      layer: harness.layer,
+      rootDir: harness.rootDir,
+      effects: observer,
+      events: observer,
+    })).rejects.toMatchObject({
+      code: "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+    });
+
+    const refusedRows = await readCampaignState();
+    expect(refusedRows).toEqual(migratedRows);
+    expect(emissions).toEqual([]);
   });
 });

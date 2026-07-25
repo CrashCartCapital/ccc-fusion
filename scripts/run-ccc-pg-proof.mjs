@@ -275,6 +275,7 @@ const expectedWave5CoreImportNames = [
 const expectedWave5CoreMigrationNames = [
   "CCC PRD import migration registry > keeps migration 0035 immutable and registers every custody table",
   "CCC PRD import migration 0034 to 0035 > upgrades once with fresh-shape parity, forced RLS, triggers, FKs, checks, and indexes",
+  "CCC PRD import migration 0035 to 0036 > marks a populated runnable 0035 import unadmitted and refuses restart reconciliation",
 ];
 const expectedWave5EngineContractNames = [
   "ccc-prd structural compiler boundary > refuses direct Markdown compilation without the generated structural sidecar",
