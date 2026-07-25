@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { setImmediate } from "node:timers";
 import assert from "node:assert/strict";
 
 const stopPolicySelfTest = process.argv.length === 3 && process.argv[2] === "--self-test-stop-settlement";
