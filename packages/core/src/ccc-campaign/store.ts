@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { realpath } from "node:fs/promises";
 import { and, eq } from "drizzle-orm";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
@@ -102,9 +102,17 @@ export async function loadCccCampaignContextForTask(
     );
   }
   const { bundle, executionPolicy, manifest, manifestHash } = custody;
+  let physicalRoot: string;
+  try {
+    physicalRoot = await realpath(rootDir);
+  } catch {
+    throw new CccCampaignContextError(
+      `Task ${taskId} campaign target is unavailable`,
+    );
+  }
   if (
-    resolve(row.targetRepository) !== resolve(rootDir)
-    || resolve(row.targetRepository) !== resolve(manifest.targetRepository.path)
+    row.targetRepository !== physicalRoot
+    || manifest.targetRepository.path !== physicalRoot
   ) {
     throw new CccCampaignContextError(
       `Task ${taskId} campaign target does not match its TaskStore root`,
@@ -160,8 +168,8 @@ export async function loadCccCampaignContextForTask(
     protectedActions: manifest.protectedActions,
     executionPolicy: manifest.executionPolicy,
     route: { ...route },
-    campaignStartedAt: row.campaignStartedAt,
-    campaignDeadlineAt: row.campaignDeadlineAt,
+    campaignStartedAt: manifest.campaignStartedAt,
+    campaignDeadlineAt: manifest.campaignDeadlineAt,
     requestCount: row.requestCount,
     activeActionLeases: { ...row.activeActionLeases },
   };

@@ -8,6 +8,8 @@
 
 import { beforeAll, beforeEach, afterAll, afterEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { mkdir, realpath, symlink, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { importCccPrdBundle, reconcileCccPrdImport } from "../../index.js";
 import { TaskStore } from "../../store.js";
 import {
@@ -239,7 +241,10 @@ pgTest("CCC campaign native persistence", () => {
       bundleHash: source.bundleHash,
       manifestHash: expect.stringMatching(/^[0-9a-f]{64}$/),
       sourceVersion: source.sourceVersion,
-      targetRepository: source.targetRepository,
+      targetRepository: {
+        ...source.targetRepository,
+        path: await realpath(source.targetRepository.path),
+      },
       bounds: source.bounds,
       admittedWriteRoots: source.admittedWriteRoots,
       proofs: source.proofs,
@@ -305,6 +310,70 @@ pgTest("CCC campaign native persistence", () => {
     ) as unknown as CampaignContextStore;
     await expect(
       restarted.getCccCampaignContextForTask("TASK-malformed-custody"),
+    ).rejects.toMatchObject({
+      name: "CccCampaignContextError",
+      code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
+    });
+  });
+
+  it("refuses restart custody after an admitted symlink target is retargeted", async () => {
+    const linkPath = join(h.rootDir(), "campaign-target-link");
+    const retargetPath = join(h.rootDir(), "retargeted-campaign-root");
+    await symlink(h.rootDir(), linkPath, "dir");
+    try {
+      const source = bundle(linkPath, "symlink-retarget");
+      await importCccPrdBundle({
+        ...request(source, "idem-symlink-retarget", policyFor(source)),
+        rootDir: linkPath,
+      });
+      const restarted = new TaskStore(
+        linkPath,
+        undefined,
+        { asyncLayer: h.layer() },
+      ) as unknown as CampaignContextStore;
+      await mkdir(retargetPath);
+      await unlink(linkPath);
+      await symlink(retargetPath, linkPath, "dir");
+
+      await expect(
+        restarted.getCccCampaignContextForTask("TASK-symlink-retarget"),
+      ).rejects.toMatchObject({
+        name: "CccCampaignContextError",
+        code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
+      });
+    } finally {
+      await unlink(linkPath).catch(() => {});
+    }
+  });
+
+  it("refuses a shifted persisted campaign window even when its duration is preserved", async () => {
+    const source = bundle(h.rootDir(), "shifted-window");
+    await importCccPrdBundle(
+      request(source, "idem-shifted-window", policyFor(source)),
+    );
+    const admitted = await (h.store() as unknown as CampaignContextStore)
+      .getCccCampaignContextForTask("TASK-shifted-window");
+    const shiftedStart = new Date(
+      Date.parse(admitted!.campaignStartedAt) + 1_000,
+    ).toISOString();
+    const shiftedDeadline = new Date(
+      Date.parse(admitted!.campaignDeadlineAt) + 1_000,
+    ).toISOString();
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET
+        campaign_started_at = ${shiftedStart},
+        campaign_deadline_at = ${shiftedDeadline}
+      WHERE idempotency_key = ${"idem-shifted-window"}
+    `);
+
+    const restarted = new TaskStore(
+      h.rootDir(),
+      undefined,
+      { asyncLayer: h.layer() },
+    ) as unknown as CampaignContextStore;
+    await expect(
+      restarted.getCccCampaignContextForTask("TASK-shifted-window"),
     ).rejects.toMatchObject({
       name: "CccCampaignContextError",
       code: "CCC_CAMPAIGN_CONTEXT_REFUSED",

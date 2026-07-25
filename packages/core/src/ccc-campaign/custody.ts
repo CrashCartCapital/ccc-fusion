@@ -1,4 +1,3 @@
-import { resolve } from "node:path";
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
 import {
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
@@ -30,6 +29,8 @@ export type CccCampaignCustodyRecord = {
   executionPolicy: unknown;
   campaignManifest: unknown;
   campaignManifestHash: string;
+  campaignStartedAt: string;
+  campaignDeadlineAt: string;
 };
 
 export type ReconstructedCccCampaignCustody = {
@@ -59,6 +60,8 @@ function storedManifest(value: unknown): CccCampaignManifest {
     || !isRecord(value.targetRepository)
     || typeof value.targetRepository.path !== "string"
     || typeof value.targetRepository.baseCommit !== "string"
+    || typeof value.campaignStartedAt !== "string"
+    || typeof value.campaignDeadlineAt !== "string"
   ) {
     throw new CccCampaignCustodyError("missing admitted campaign manifest");
   }
@@ -99,6 +102,8 @@ export function reconstructCccCampaignCustody(
       campaignId: persistedManifest.campaignId,
       bundle,
       executionPolicy,
+      targetRepositoryPath: row.targetRepository,
+      campaignStartedAt: persistedManifest.campaignStartedAt,
     });
     const manifestHash = hashCccCampaignManifest(manifest);
     if (
@@ -109,8 +114,10 @@ export function reconstructCccCampaignCustody(
       || row.packetHash !== bundle.sourceHash
       || row.sidecarHash !== bundle.sidecarHash
       || row.sourceVersion !== bundle.sourceVersion
-      || resolve(row.targetRepository) !== resolve(bundle.targetRepository.path)
+      || row.targetRepository !== manifest.targetRepository.path
       || row.targetBase !== bundle.targetRepository.baseCommit
+      || row.campaignStartedAt !== manifest.campaignStartedAt
+      || row.campaignDeadlineAt !== manifest.campaignDeadlineAt
     ) {
       throw new CccCampaignCustodyError("campaign manifest drift");
     }

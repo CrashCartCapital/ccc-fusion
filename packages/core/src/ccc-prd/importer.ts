@@ -21,23 +21,17 @@ import { createCccCampaignManifest, hashCccCampaignManifest, parseCccCampaignExe
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
 import type { CccCampaignExecutionPolicy, CccCampaignManifest } from "../ccc-campaign/types.js";
 import { canonicalCccPrdJson } from "./contract.js";
+import {
+  assertCccPrdImportBundle,
+  CCC_PRD_IMPORT_WRITER_CLASSES,
+  physicalCccPrdImportRoot,
+} from "./import-admission.js";
+import { CccPrdImportError } from "./import-error.js";
 import { buildCccPrdProjection, CCC_PRD_IMPORT_PREPARED_STATUS, nativeCccPrdScopedId, preparedCccPrdTask, type PreparedCccPrdProjection } from "./projection.js";
 import type { CccPrdImportEntityType, CccPrdImportIntent, CccPrdSemanticBundle, CccPrdWorkflow } from "./types.js";
 
 const STAGING_PREFIX = join(".fusion", "ccc-prd-import-staging");
-const WRITER_CLASSES = [
-  "campaign",
-  "task",
-  "dependency_edge",
-  "workflow",
-  "document",
-  "artifact",
-  "source",
-  "work_item",
-  "run_audit",
-] as const satisfies readonly CccPrdImportEntityType[];
 const RETRYABLE_SQLSTATES = new Set(["40001", "40P01"]);
-const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/;
 
 export type CccPrdImportFailureCheckpoint =
   | CccPrdImportEntityType
@@ -180,15 +174,7 @@ type ImportTransactionWitnessRecorder = {
   readonly probe?: CccPrdImportTransactionProbe;
 };
 
-export class CccPrdImportError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
-    this.name = "CccPrdImportError";
-  }
-}
+export { CccPrdImportError } from "./import-error.js";
 
 function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
@@ -198,106 +184,9 @@ function projectIdFor(layer: AsyncDataLayer): string {
   return layer.projectId?.trim() || "__legacy_unscoped__";
 }
 
-function bundleIdentity(bundle: CccPrdSemanticBundle): string {
-  const { bundleHash: _declared, ...withoutHash } = bundle;
-  return sha256(canonicalCccPrdJson(withoutHash));
-}
-
-function normalizeRoot(path: string): string {
-  return resolve(path);
-}
-
 function isContainedPath(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
-}
-
-function assertSafeEntityId(id: string, label: string): void {
-  if (!ENTITY_ID_PATTERN.test(id)) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_INVALID_BUNDLE",
-      `${label} has an unsafe identifier: ${JSON.stringify(id)}`,
-    );
-  }
-}
-
-function assertBundleContract(
-  bundle: CccPrdSemanticBundle,
-  rootDir: string,
-  idempotencyKey: string,
-): string {
-  if (!idempotencyKey.trim() || idempotencyKey.length > 256) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_USAGE",
-      "CCC PRD import idempotencyKey must contain 1-256 characters",
-    );
-  }
-  if (bundle.kind !== "bundle" || bundle.schema !== "ccc-prd.bundle.v1") {
-    throw new CccPrdImportError("CCC_PRD_IMPORT_INVALID_BUNDLE", "CCC PRD import requires a v1 semantic bundle");
-  }
-  const identityHash = bundleIdentity(bundle);
-  if (identityHash !== bundle.bundleHash) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_INVALID_BUNDLE",
-      `CCC PRD bundle hash mismatch: declared ${bundle.bundleHash}, calculated ${identityHash}`,
-    );
-  }
-  if (bundle.provenance.packetHash !== bundle.sourceHash) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_INVALID_BUNDLE",
-      "CCC PRD packet provenance does not match sourceHash",
-    );
-  }
-  if (normalizeRoot(rootDir) !== normalizeRoot(bundle.targetRepository.path)) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_ROOT_MISMATCH",
-      "CCC PRD import rootDir must exactly match bundle.targetRepository.path",
-    );
-  }
-  if (
-    !Number.isSafeInteger(bundle.bounds.maxRequests)
-    || !Number.isSafeInteger(bundle.bounds.maxDurationMs)
-    || !Number.isSafeInteger(bundle.bounds.maxConcurrency)
-    || bundle.bounds.maxRequests < 1
-    || bundle.bounds.maxDurationMs < 1
-    || bundle.bounds.maxConcurrency < 1
-    || bundle.bounds.maxRequests > 10_000
-    || bundle.bounds.maxDurationMs > 86_400_000
-    || bundle.bounds.maxConcurrency > 256
-  ) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_INVALID_BUNDLE",
-      "CCC PRD import bounds must be finite positive integers within local admission ceilings",
-    );
-  }
-  const root = normalizeRoot(rootDir);
-  const admitted = bundle.admittedWriteRoots.map(({ path }) => normalizeRoot(path));
-  for (const output of [join(root, ".fusion", "tasks"), join(root, ".fusion", "artifacts")]) {
-    if (!admitted.some((candidate) => isContainedPath(candidate, output))) {
-      throw new CccPrdImportError(
-        "CCC_PRD_IMPORT_WRITE_ROOT_REFUSED",
-        `CCC PRD output is outside admitted write roots: ${output}`,
-      );
-    }
-  }
-  const allIds = [
-    ...bundle.tasks.map(({ id }) => ["task", id] as const),
-    ...bundle.edges.map(({ id }) => ["dependency edge", id] as const),
-    ...bundle.workflows.map(({ id }) => ["workflow", id] as const),
-    ...bundle.documents.map(({ id }) => ["document", id] as const),
-    ...bundle.artifacts.map(({ id }) => ["artifact", id] as const),
-    ...bundle.importIntents.map(({ id }) => ["import intent", id] as const),
-  ];
-  for (const [label, id] of allIds) assertSafeEntityId(id, label);
-  for (const type of WRITER_CLASSES) {
-    if (!bundle.importIntents.some((intent) => intent.entityType === type)) {
-      throw new CccPrdImportError(
-        "CCC_PRD_IMPORT_INVALID_BUNDLE",
-        `CCC PRD bundle has no ${type} import intent`,
-      );
-    }
-  }
-  return identityHash;
 }
 
 async function inject(
@@ -408,7 +297,6 @@ async function writeCampaign(
 ): Promise<string> {
   observeWriter(recorder, "campaign", tx);
   const intent = oneIntent(bundle, "campaign");
-  assertSafeEntityId(intent.entityId, "campaign");
   await tx.insert(schema.project.missions).values({
     projectId,
     id: intent.entityId,
@@ -946,22 +834,37 @@ function persistedCampaignIdentity(row: ImportRow): CccCampaignImportIdentity {
 
 async function prepareDatabaseImport(
   input: ImportCccPrdBundleInput,
-  campaignIdentity: CccCampaignImportIdentity,
+  executionPolicy: CccCampaignExecutionPolicy,
+  canonicalRootDir: string,
   waitBudgetMs: number,
 ): Promise<{ row: ImportRow; created: boolean }> {
   const { bundle, layer, idempotencyKey, store, failureInjection } = input;
-  const { executionPolicy, manifest, manifestHash: identityHash } = campaignIdentity;
-  const projectId = manifest.projectId;
+  const projectId = projectIdFor(layer);
+  const importId = importIdFor(projectId, idempotencyKey);
+  const campaignId = oneIntent(bundle, "campaign").entityId;
   return withImportIdentityLock(layer, projectId, idempotencyKey, waitBudgetMs, async (tx) => {
       const existing = await selectImportRow(tx, projectId, idempotencyKey);
       if (existing) {
+        const persisted = persistedCampaignIdentity(existing);
+        const manifest = createCccCampaignManifest({
+          projectId,
+          importId,
+          idempotencyKey,
+          campaignId,
+          bundle,
+          executionPolicy,
+          targetRepositoryPath: canonicalRootDir,
+          campaignStartedAt: persisted.manifest.campaignStartedAt,
+        });
+        const identityHash = hashCccCampaignManifest(manifest);
         if (
           existing.bundleHash !== bundle.bundleHash
           || existing.identityHash !== identityHash
           || existing.campaignManifestHash !== identityHash
           || canonicalCccPrdJson(existing.executionPolicy) !== canonicalCccPrdJson(executionPolicy)
           || canonicalCccPrdJson(existing.campaignManifest) !== canonicalCccPrdJson(manifest)
-          || normalizeRoot(existing.targetRepository) !== normalizeRoot(bundle.targetRepository.path)
+          || existing.targetRepository !== canonicalRootDir
+          || existing.rootDir !== canonicalRootDir
           || existing.targetBase !== bundle.targetRepository.baseCommit
         ) {
           throw new CccPrdImportError(
@@ -981,7 +884,17 @@ async function prepareDatabaseImport(
       input.transactionProbe?.onPrepareTransaction(tx);
       try {
         const now = new Date().toISOString();
-        const importId = manifest.importId;
+        const manifest = createCccCampaignManifest({
+          projectId,
+          importId,
+          idempotencyKey,
+          campaignId,
+          bundle,
+          executionPolicy,
+          targetRepositoryPath: canonicalRootDir,
+          campaignStartedAt: now,
+        });
+        const identityHash = hashCccCampaignManifest(manifest);
         const stagingRelativePath = join(STAGING_PREFIX, importId);
         const transactionWitness: CccPrdImportTransactionWitness = {
           transactionId: recorder.transactionId,
@@ -992,13 +905,10 @@ async function prepareDatabaseImport(
           executionPolicy,
           importId,
           identityHash,
-          campaignId: manifest.campaignId,
+          campaignId,
           now,
         });
         const projectionDigest = contentDigest(projection);
-        const campaignDeadlineAt = new Date(
-          Date.parse(now) + bundle.bounds.maxDurationMs,
-        ).toISOString();
         await tx.insert(schema.project.cccPrdImports).values({
           projectId,
           idempotencyKey,
@@ -1008,9 +918,9 @@ async function prepareDatabaseImport(
           packetHash: bundle.sourceHash,
           sidecarHash: bundle.sidecarHash,
           sourceVersion: bundle.sourceVersion,
-          targetRepository: normalizeRoot(bundle.targetRepository.path),
+          targetRepository: canonicalRootDir,
           targetBase: bundle.targetRepository.baseCommit,
-          rootDir: normalizeRoot(input.rootDir),
+          rootDir: canonicalRootDir,
           stagingRelativePath,
           state: "prepared",
           runnable: 0,
@@ -1020,8 +930,8 @@ async function prepareDatabaseImport(
           executionPolicy,
           campaignManifest: manifest,
           campaignManifestHash: identityHash,
-          campaignStartedAt: now,
-          campaignDeadlineAt,
+          campaignStartedAt: manifest.campaignStartedAt,
+          campaignDeadlineAt: manifest.campaignDeadlineAt,
           requestCount: 0,
           activeActionLeases: {},
           createdAt: now,
@@ -1058,7 +968,7 @@ async function prepareDatabaseImport(
         await writeRunAudit(tx, recorder, bundle, projectId, importId, now);
         await inject(failureInjection, "run_audit");
 
-        if (canonicalCccPrdJson(recorder.observedWriterClasses) !== canonicalCccPrdJson(WRITER_CLASSES)) {
+        if (canonicalCccPrdJson(recorder.observedWriterClasses) !== canonicalCccPrdJson(CCC_PRD_IMPORT_WRITER_CLASSES)) {
           throw new CccPrdImportError(
             "CCC_PRD_IMPORT_TRANSACTION_VIOLATION",
             `CCC PRD import writer transaction coverage is incomplete: ${recorder.observedWriterClasses.join(", ")}`,
@@ -1797,10 +1707,10 @@ function invalidateImportReadCaches(store: TaskStore): void {
 export async function inspectCccPrdImport(
   input: InspectCccPrdImportInput,
 ): Promise<CccPrdImportInspection | null> {
-  const rootDir = normalizeRoot(input.rootDir);
+  const rootDir = await physicalCccPrdImportRoot(input.rootDir);
   const row = await selectImportRow(input.layer.db, projectIdFor(input.layer), input.idempotencyKey);
   if (!row) return null;
-  if (normalizeRoot(row.rootDir) !== rootDir) {
+  if (row.rootDir !== rootDir) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_ROOT_MISMATCH",
       `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${rootDir}`,
@@ -1825,6 +1735,13 @@ async function reconcileOwned(
       `CCC PRD import not found for ${JSON.stringify(input.idempotencyKey)}`,
     );
   }
+  const preflightRoot = await physicalCccPrdImportRoot(input.rootDir);
+  if (preflightRow.rootDir !== preflightRoot) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_ROOT_MISMATCH",
+      `CCC PRD import ${preflightRow.importId} belongs to ${preflightRow.rootDir}, not ${preflightRoot}`,
+    );
+  }
   persistedCampaignIdentity(preflightRow);
   const token = randomUUID();
   const waitStartedAt = Date.now();
@@ -1845,10 +1762,11 @@ async function reconcileOwned(
       leaseDurationMs,
     );
     const row = claim.row;
-    if (normalizeRoot(row.rootDir) !== normalizeRoot(input.rootDir)) {
+    const currentRoot = await physicalCccPrdImportRoot(input.rootDir);
+    if (row.rootDir !== currentRoot) {
       throw new CccPrdImportError(
         "CCC_PRD_IMPORT_ROOT_MISMATCH",
-        `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${normalizeRoot(input.rootDir)}`,
+        `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${currentRoot}`,
       );
     }
     const campaignIdentity = persistedCampaignIdentity(row);
@@ -1870,9 +1788,9 @@ async function reconcileOwned(
             `CCC PRD import ${row.importId} left active state during projection repair`,
           );
         }
-        const stagingPath = await ensureStagedFiles(input.rootDir, row, projection, failureInjection);
-        await moveCanonicalProjection(input.rootDir, stagingPath, projection);
-        await cleanupStagingProjection(input.rootDir, row);
+        const stagingPath = await ensureStagedFiles(row.rootDir, row, projection, failureInjection);
+        await moveCanonicalProjection(row.rootDir, stagingPath, projection);
+        await cleanupStagingProjection(row.rootDir, row);
       });
       const active = await inspectCccPrdImport(input);
       if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
@@ -1895,10 +1813,10 @@ async function reconcileOwned(
       leaseDurationMs,
     );
     try {
-      const stagingPath = await ensureStagedFiles(input.rootDir, row, projection, failureInjection);
+      const stagingPath = await ensureStagedFiles(row.rootDir, row, projection, failureInjection);
       await heartbeat.assertHealthy();
       await moveCanonicalProjection(
-        input.rootDir,
+        row.rootDir,
         stagingPath,
         projection,
         () => heartbeat.assertHealthy(),
@@ -1917,7 +1835,7 @@ async function reconcileOwned(
         row.projectId,
         row.idempotencyKey,
         waitBudgetMs,
-        async () => cleanupStagingProjection(input.rootDir, row),
+        async () => cleanupStagingProjection(row.rootDir, row),
       );
       const active = await inspectCccPrdImport(input);
       if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
@@ -1954,29 +1872,39 @@ export async function reconcileCccPrdImport(
 export async function importCccPrdBundle(
   input: ImportCccPrdBundleInput,
 ): Promise<CccPrdImportResult> {
-  assertBundleContract(input.bundle, input.rootDir, input.idempotencyKey);
+  assertCccPrdImportBundle(input.bundle, input.rootDir, input.idempotencyKey);
+  const existing = await selectImportRow(
+    input.layer.db,
+    projectIdFor(input.layer),
+    input.idempotencyKey,
+  );
+  if (existing && existing.bundleHash !== input.bundle.bundleHash) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_IDEMPOTENCY_COLLISION",
+      `CCC PRD idempotency key ${JSON.stringify(input.idempotencyKey)} is already bound to a different bundle, target, or base`,
+    );
+  }
+  const canonicalRootDir = await physicalCccPrdImportRoot(input.rootDir);
+  const canonicalTargetRepository = await physicalCccPrdImportRoot(
+    input.bundle.targetRepository.path,
+  );
+  if (canonicalRootDir !== canonicalTargetRepository) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_ROOT_MISMATCH",
+      "CCC PRD import rootDir and target repository resolve to different physical roots",
+    );
+  }
   const executionPolicy = parseCccCampaignExecutionPolicy(
     input.executionPolicy,
     input.bundle,
   );
-  const projectId = projectIdFor(input.layer);
-  const importId = importIdFor(projectId, input.idempotencyKey);
-  const campaignId = oneIntent(input.bundle, "campaign").entityId;
-  const manifest = createCccCampaignManifest({
-    projectId,
-    importId,
-    idempotencyKey: input.idempotencyKey,
-    campaignId,
-    bundle: input.bundle,
-    executionPolicy,
-  });
-  const campaignIdentity: CccCampaignImportIdentity = {
-    executionPolicy,
-    manifest,
-    manifestHash: hashCccCampaignManifest(manifest),
-  };
   const waitBudgetMs = input.bundle.bounds.maxDurationMs + reconciliationAllowance(input.failureInjection);
-  const prepared = await prepareDatabaseImport(input, campaignIdentity, waitBudgetMs);
+  const prepared = await prepareDatabaseImport(
+    input,
+    executionPolicy,
+    canonicalRootDir,
+    waitBudgetMs,
+  );
   invalidateImportReadCaches(input.store);
   if (prepared.created) {
     await inject(input.failureInjection, "after_prepared_db_commit");

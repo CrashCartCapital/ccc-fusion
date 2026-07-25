@@ -39,6 +39,8 @@ export type CccCampaignManifest = {
   sourceVersion: string;
   targetRepository: CccPrdTargetRepository;
   bounds: CccPrdExecutionBounds;
+  campaignStartedAt: string;
+  campaignDeadlineAt: string;
   admittedWriteRoots: CccPrdAdmittedWriteRoot[];
   proofs: CccPrdProof[];
   protectedActions: CccPrdProtectedActionIntent[];
@@ -50,8 +52,6 @@ export type CccCampaignContext = Omit<CccCampaignManifest, "schema"> & {
   taskId: string;
   route: CccCampaignExecutionRoute;
   manifestHash: string;
-  campaignStartedAt: string;
-  campaignDeadlineAt: string;
   requestCount: number;
   activeActionLeases: Record<string, unknown>;
 };

@@ -5,12 +5,7 @@ import { and, eq, isNull, ne, sql } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
 import { type FSWatcher } from "node:fs";
 import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, ColumnId, CheckoutClaimPrecondition, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, ArchivedTaskDocumentAdditionInput, ArchivedTaskDocumentAdditionResult, TaskDocumentWithTask, Artifact, ArtifactCreateInput, ArtifactType, ArtifactWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, WorkflowStepTemplate, Agent, AutostashOrphanRecord, TaskCommitAssociation, CommitAssociationDiffBackfillReport, GithubIssueAction, MergeQueueEntry, MergeQueueEnqueueOptions, MergeQueueAcquireOptions, MergeQueueReleaseOutcome, HandoffToReviewOptions, GoalCitation, GoalCitationFilter, GoalCitationInput, GoalCitationSurface, BranchGroup, BranchGroupCreateInput, BranchGroupUpdate, TaskBranchAssignmentMode, MergeRequestRecord, MergeRequestState, MergeRequestWorkflowProjectionOptions, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemDueFilter, WorkflowWorkItemKind, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput, PrEntity, PrEntityCreateInput, PrEntityUpdate, PrThreadState, PrThreadOutcome, PluginActivation, PluginActivationInput } from "./types.js";
-import {
-  loadCccCampaignContextForTask,
-  type CccCampaignContext,
-} from "./ccc-campaign/index.js";
-
-
+import { loadCccCampaignContextForTask, type CccCampaignContext } from "./ccc-campaign/index.js";
 export type OverlapBlockerRepairReason =
   | "task-not-found"
   | "no-overlap-blocker"
@@ -960,12 +955,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async getTask(id: string, options?: { activityLogLimit?: number; includeDeleted?: boolean }): Promise<TaskDetail> {
     return getTaskImpl(this, id, options);
   }
-  async getCccCampaignContextForTask(taskId: string): Promise<CccCampaignContext | null> {
-    if (!this.asyncLayer) {
-      throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore");
-    }
-    return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId);
-  }
+  async getCccCampaignContextForTask(taskId: string): Promise<CccCampaignContext | null> { if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore"); return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId); }
 
   /**
    * FNXC:RuntimeWorkflowAsync 2026-06-24-16:20:

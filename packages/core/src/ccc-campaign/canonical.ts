@@ -131,7 +131,18 @@ export function createCccCampaignManifest(input: {
   campaignId: string;
   bundle: CccPrdSemanticBundle;
   executionPolicy: CccCampaignExecutionPolicy;
+  targetRepositoryPath: string;
+  campaignStartedAt: string;
 }): CccCampaignManifest {
+  const startedAt = Date.parse(input.campaignStartedAt);
+  if (
+    !Number.isFinite(startedAt)
+    || new Date(startedAt).toISOString() !== input.campaignStartedAt
+  ) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC campaign start must be a canonical ISO timestamp",
+    );
+  }
   return {
     schema: CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
     projectId: input.projectId,
@@ -143,10 +154,14 @@ export function createCccCampaignManifest(input: {
     bundleHash: input.bundle.bundleHash,
     sourceVersion: input.bundle.sourceVersion,
     targetRepository: {
-      path: resolve(input.bundle.targetRepository.path),
+      path: resolve(input.targetRepositoryPath),
       baseCommit: input.bundle.targetRepository.baseCommit,
     },
     bounds: { ...input.bundle.bounds },
+    campaignStartedAt: input.campaignStartedAt,
+    campaignDeadlineAt: new Date(
+      startedAt + input.bundle.bounds.maxDurationMs,
+    ).toISOString(),
     admittedWriteRoots: input.bundle.admittedWriteRoots.map((root) => ({ ...root })),
     proofs: input.bundle.proofs.map((proof) => ({
       ...proof,

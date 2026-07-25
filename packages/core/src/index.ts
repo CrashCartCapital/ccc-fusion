@@ -2622,7 +2622,6 @@ export {
 // FNXC:SqliteRemoval 2026-07-14: Export async audit reader so engine tests can
 // query run-audit events in backend mode (sync getRunAuditEvents returns [] in PG mode).
 export { queryRunAuditEvents } from "./task-store/async-audit.js";
-
 /*
 FNXC:GitHubImportTranslate 2026-07-15-09:30:
 Language detection is shared by the dashboard translate banner and the server-side auto-translate skip decision; exporting it from core keeps both surfaces on one heuristic.
