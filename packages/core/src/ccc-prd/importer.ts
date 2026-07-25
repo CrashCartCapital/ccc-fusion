@@ -113,7 +113,15 @@ export type ImportCccPrdBundleInput = {
   store: TaskStore;
   layer: AsyncDataLayer;
   rootDir: string;
-  failureInjection?: { checkpoint: CccPrdImportFailureCheckpoint };
+  failureInjection?: {
+    checkpoint?: CccPrdImportFailureCheckpoint;
+    projectionLeaseMs?: number;
+    pause?: {
+      checkpoint: CccPrdImportFailureCheckpoint;
+      entered?: () => void;
+      until: Promise<void>;
+    };
+  };
   transactionProbe?: CccPrdImportTransactionProbe;
   effects?: EmissionSink;
   events?: EmissionSink;
@@ -306,10 +314,14 @@ function assertBundleContract(
   return identityHash;
 }
 
-function inject(
+async function inject(
   failureInjection: ImportCccPrdBundleInput["failureInjection"] | undefined,
   checkpoint: CccPrdImportFailureCheckpoint,
-): void {
+): Promise<void> {
+  if (failureInjection?.pause?.checkpoint === checkpoint) {
+    failureInjection.pause.entered?.();
+    await failureInjection.pause.until;
+  }
   if (failureInjection?.checkpoint !== checkpoint) return;
   if (checkpoint === "lost_response_after_commit") {
     throw new CccPrdImportError(
@@ -1010,23 +1022,23 @@ async function prepareDatabaseImport(
         });
 
         const missionId = await writeCampaign(tx, recorder, bundle, projectId, importId, now);
-        inject(failureInjection, "campaign");
+        await inject(failureInjection, "campaign");
         await writeTasks(tx, recorder, bundle, projectId, importId, missionId, identityHash, store, now);
-        inject(failureInjection, "task");
+        await inject(failureInjection, "task");
         await writeDependencyEdges(tx, recorder, bundle, projectId, importId);
-        inject(failureInjection, "dependency_edge");
+        await inject(failureInjection, "dependency_edge");
         await writeWorkflows(tx, recorder, bundle, projectId, importId, now);
-        inject(failureInjection, "workflow");
+        await inject(failureInjection, "workflow");
         await writeDocuments(tx, recorder, bundle, projectId, importId, now);
-        inject(failureInjection, "document");
+        await inject(failureInjection, "document");
         await writeArtifacts(tx, recorder, bundle, projectId, importId, now);
-        inject(failureInjection, "artifact");
+        await inject(failureInjection, "artifact");
         await writeSources(tx, recorder, bundle, projectId, importId);
-        inject(failureInjection, "source");
+        await inject(failureInjection, "source");
         await writeWorkItems(tx, recorder, bundle, projectId, importId, now);
-        inject(failureInjection, "work_item");
+        await inject(failureInjection, "work_item");
         await writeRunAudit(tx, recorder, bundle, projectId, importId, now);
-        inject(failureInjection, "run_audit");
+        await inject(failureInjection, "run_audit");
 
         if (canonicalCccPrdJson(recorder.observedWriterClasses) !== canonicalCccPrdJson(WRITER_CLASSES)) {
           throw new CccPrdImportError(
@@ -1260,19 +1272,19 @@ async function ensureStagedFiles(
   for (const task of projection.taskFiles) {
     await ensureOwnedDirectory(canonicalRoot, join(stagedTasksRoot, task.id), `staged task ${task.id}`);
   }
-  inject(failureInjection, "task_directory");
+  await inject(failureInjection, "task_directory");
   for (const task of projection.taskFiles) {
     await ensureExactFile(join(stagingPath, "tasks", task.id, "task.json"), task.taskJson);
   }
-  inject(failureInjection, "task_json");
+  await inject(failureInjection, "task_json");
   for (const task of projection.taskFiles) {
     await ensureExactFile(join(stagingPath, "tasks", task.id, "PROMPT.md"), task.prompt);
   }
-  inject(failureInjection, "prompt");
+  await inject(failureInjection, "prompt");
   for (const artifact of projection.artifactFiles) {
     await ensureExactFile(join(stagingPath, "artifacts", artifact.id), artifact.content);
   }
-  inject(failureInjection, "artifact_bytes");
+  await inject(failureInjection, "artifact_bytes");
   return stagingPath;
 }
 
@@ -1307,14 +1319,26 @@ async function moveCanonicalProjection(
   for (const task of projection.taskFiles) {
     const staged = join(stagingPath, "tasks", task.id);
     const canonical = join(tasksRoot, task.id);
-    if (await pathExists(canonical)) {
-      await verifyProjectedTask(canonical, task);
+    const canonicalKind = await existingPathKind(canonical);
+    if (canonicalKind !== "missing") {
+      const canonicalTaskRoot = await ensureOwnedDirectory(
+        root,
+        canonical,
+        `canonical task ${task.id}`,
+      );
+      await verifyProjectedTask(canonicalTaskRoot, task);
       if (await pathExists(staged)) {
         await rm(staged, { recursive: true });
       }
       continue;
     }
     await rename(staged, canonical);
+    const canonicalTaskRoot = await ensureOwnedDirectory(
+      root,
+      canonical,
+      `canonical task ${task.id}`,
+    );
+    await verifyProjectedTask(canonicalTaskRoot, task);
   }
   for (const artifact of projection.artifactFiles) {
     const staged = join(stagingPath, "artifacts", artifact.id);
@@ -1367,6 +1391,7 @@ async function claimProjection(
   projectId: string,
   idempotencyKey: string,
   token: string,
+  leaseDurationMs: number,
 ): Promise<{ row: ImportRow; claimed: boolean }> {
   return layer.transactionImmediate(async (tx) => {
     const rows = await tx
@@ -1398,7 +1423,7 @@ async function claimProjection(
       return { row, claimed: false };
     }
     const now = new Date(nowMs).toISOString();
-    const leaseUntil = new Date(nowMs + 5_000).toISOString();
+    const leaseUntil = new Date(nowMs + leaseDurationMs).toISOString();
     await tx
       .update(schema.project.cccPrdImports)
       .set({
@@ -1425,6 +1450,91 @@ async function claimProjection(
       claimed: true,
     };
   });
+}
+
+async function renewProjectionLease(
+  layer: AsyncDataLayer,
+  row: ImportRow,
+  token: string,
+  leaseDurationMs: number,
+): Promise<void> {
+  await layer.transactionImmediate(async (tx) => {
+    const lockedRows = await tx
+      .select()
+      .from(schema.project.cccPrdImports)
+      .where(and(
+        eq(schema.project.cccPrdImports.projectId, row.projectId),
+        eq(schema.project.cccPrdImports.idempotencyKey, row.idempotencyKey),
+      ))
+      .limit(1)
+      .for("update");
+    const current = lockedRows[0] as ImportRow | undefined;
+    if (
+      !current
+      || current.state !== "projecting"
+      || current.projectionOwner !== token
+    ) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_RECONCILE_CONFLICT",
+        `CCC PRD import ${row.importId} lost its projection claim during renewal`,
+      );
+    }
+    const nowMs = Date.now();
+    await tx
+      .update(schema.project.cccPrdImports)
+      .set({
+        projectionLeaseUntil: new Date(nowMs + leaseDurationMs).toISOString(),
+        updatedAt: new Date(nowMs).toISOString(),
+      })
+      .where(and(
+        eq(schema.project.cccPrdImports.projectId, row.projectId),
+        eq(schema.project.cccPrdImports.idempotencyKey, row.idempotencyKey),
+        eq(schema.project.cccPrdImports.projectionOwner, token),
+      ));
+  });
+}
+
+function startProjectionLeaseHeartbeat(
+  layer: AsyncDataLayer,
+  row: ImportRow,
+  token: string,
+  leaseDurationMs: number,
+): {
+  assertHealthy(): Promise<void>;
+  stop(): Promise<void>;
+} {
+  let stopped = false;
+  let failure: unknown;
+  let renewal = Promise.resolve();
+  const intervalMs = Math.max(10, Math.floor(leaseDurationMs / 3));
+  const queueRenewal = (): Promise<void> => {
+    renewal = renewal.then(async () => {
+      if (stopped || failure) return;
+      try {
+        await renewProjectionLease(layer, row, token, leaseDurationMs);
+      } catch (error) {
+        failure = error;
+      }
+    });
+    return renewal;
+  };
+  const timer = setInterval(() => {
+    void queueRenewal();
+  }, intervalMs);
+  return {
+    async assertHealthy() {
+      await queueRenewal();
+      if (failure) throw failure;
+    },
+    async stop() {
+      if (!stopped) {
+        stopped = true;
+        clearInterval(timer);
+      }
+      await renewal;
+      if (failure) throw failure;
+    },
+  };
 }
 
 async function activateImport(
@@ -1690,8 +1800,21 @@ async function reconcileOwned(
   const projectId = projectIdFor(input.layer);
   const token = randomUUID();
   const deadline = Date.now() + 10_000;
+  const leaseDurationMs = failureInjection?.projectionLeaseMs ?? 5_000;
+  if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_FAILURE_INJECTION",
+      "CCC PRD projection lease test override must be positive and finite",
+    );
+  }
   while (true) {
-    const claim = await claimProjection(input.layer, projectId, input.idempotencyKey, token);
+    const claim = await claimProjection(
+      input.layer,
+      projectId,
+      input.idempotencyKey,
+      token,
+      leaseDurationMs,
+    );
     const row = claim.row;
     if (normalizeRoot(row.rootDir) !== normalizeRoot(input.rootDir)) {
       throw new CccPrdImportError(
@@ -1726,19 +1849,34 @@ async function reconcileOwned(
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
       continue;
     }
+    const heartbeat = startProjectionLeaseHeartbeat(
+      input.layer,
+      row,
+      token,
+      leaseDurationMs,
+    );
     try {
       const stagingPath = await ensureStagedFiles(input.rootDir, row, projection, failureInjection);
       await moveCanonicalProjection(input.rootDir, stagingPath, projection);
-      inject(failureInjection, "canonical_projection_move");
-      inject(failureInjection, "before_activation");
+      await inject(failureInjection, "canonical_projection_move");
+      await inject(failureInjection, "before_activation");
+      await heartbeat.assertHealthy();
+      await heartbeat.stop();
       await activateImport({ layer: input.layer, row, token });
-      inject(failureInjection, "after_activation");
+      await inject(failureInjection, "after_activation");
       await cleanupStagingProjection(input.rootDir, row);
       const active = await inspectCccPrdImport(input);
       if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
       return active;
     } catch (error) {
+      const heartbeatError = await heartbeat.stop().then(
+        () => null,
+        (stopError: unknown) => stopError,
+      );
       await releaseProjection(input.layer, row, token, error).catch(() => {});
+      if (heartbeatError) {
+        throw heartbeatError;
+      }
       throw error;
     }
   }
@@ -1772,7 +1910,7 @@ export async function importCccPrdBundle(
     prepared.row.createdAt,
   );
   await ensureStagingManifest(input.rootDir, prepared.row, projection);
-  inject(input.failureInjection, "after_prepared_db_commit");
+  await inject(input.failureInjection, "after_prepared_db_commit");
   const reconciled = await reconcileOwned({
     idempotencyKey: input.idempotencyKey,
     layer: input.layer,
@@ -1781,6 +1919,6 @@ export async function importCccPrdBundle(
     effects: input.effects,
     events: input.events,
   }, input.failureInjection);
-  inject(input.failureInjection, "lost_response_after_commit");
+  await inject(input.failureInjection, "lost_response_after_commit");
   return { ...reconciled, replayed: !prepared.created };
 }

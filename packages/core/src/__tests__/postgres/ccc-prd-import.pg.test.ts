@@ -9,7 +9,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { beforeAll, beforeEach, afterAll, afterEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
@@ -461,6 +461,120 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(lostObserver.emissions).toEqual([]);
   });
 
+  it("keeps a live projection claim beyond lease expiry while an identical import waits", async () => {
+    const suffix = "lease-renewal";
+    const key = "idem-lease-renewal";
+    let announceEntered!: () => void;
+    let releaseProjection!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdProjection = new Promise<void>((resolveProjection) => {
+      releaseProjection = resolveProjection;
+    });
+    const first = importCccPrdBundle({
+      ...request(suffix, key),
+      failureInjection: {
+        projectionLeaseMs: 80,
+        pause: {
+          checkpoint: "artifact_bytes",
+          entered: announceEntered,
+          until: holdProjection,
+        },
+      },
+    });
+    await entered;
+    const readClaim = async () => {
+      const rows = (await h.layer().db.execute(sql`
+        SELECT state, projection_owner
+        FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+      `)) as unknown as Array<{ state: string; projection_owner: string | null }>;
+      return rows[0];
+    };
+    const beforeExpiry = await readClaim();
+    expect(beforeExpiry).toMatchObject({
+      state: "projecting",
+      projection_owner: expect.any(String),
+    });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+    let secondSettled = false;
+    const second = importCccPrdBundle(request(suffix, key))
+      .finally(() => {
+        secondSettled = true;
+      });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+
+    let assertionError: unknown;
+    try {
+      expect(await readClaim()).toEqual(beforeExpiry);
+      expect(secondSettled).toBe(false);
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      releaseProjection();
+    }
+    const results = await Promise.allSettled([first, second]);
+    if (assertionError) throw assertionError;
+    expect(results.every(({ status }) => status === "fulfilled")).toBe(true);
+    expect(results.map((result) => result.status === "fulfilled" && result.value.replayed))
+      .toEqual([false, true]);
+  });
+
+  it("surfaces projection lease ownership loss as a deterministic reconciliation conflict", async () => {
+    const suffix = "lease-ownership-loss";
+    const key = "idem-lease-ownership-loss";
+    let announceEntered!: () => void;
+    let releaseProjection!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdProjection = new Promise<void>((resolveProjection) => {
+      releaseProjection = resolveProjection;
+    });
+    const importing = importCccPrdBundle({
+      ...request(suffix, key),
+      failureInjection: {
+        projectionLeaseMs: 80,
+        pause: {
+          checkpoint: "artifact_bytes",
+          entered: announceEntered,
+          until: holdProjection,
+        },
+      },
+    });
+    await entered;
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET projection_owner = 'foreign-test-owner'
+      WHERE idempotency_key = ${key}
+    `);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 60));
+    releaseProjection();
+
+    await expect(importing).rejects.toMatchObject({
+      code: "CCC_PRD_IMPORT_RECONCILE_CONFLICT",
+    });
+    await expect(inspectCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      state: "projecting",
+      runnable: false,
+    });
+    expect(await h.store().getTask(`TASK-${suffix}`)).toMatchObject({
+      column: "triage",
+      status: "ccc-prd-import-prepared",
+      paused: true,
+      userPaused: true,
+    });
+    expect(await h.store().getWorkflowWorkItem(`WORK-${suffix}`)).toMatchObject({
+      state: "held",
+      blockedReason: "ccc-prd-import-prepared",
+    });
+  });
+
   it("namespaces global workflow and artifact IDs so independent imports cannot collide", async () => {
     const sharedWorkflowId = "WF-shared-global";
     const sharedArtifactId = "ART-shared-global";
@@ -551,4 +665,40 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       }
     },
   );
+
+  it("refuses a byte-identical symlink at an existing canonical task directory", async () => {
+    const suffix = "symlink-task-directory";
+    const key = "idem-symlink-task-directory";
+    await expect(importCccPrdBundle(
+      request(suffix, key, "canonical_projection_move"),
+    )).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_INJECTED_FAILURE" });
+    const inspection = await inspectCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const projection = canonicalProjectionPaths(suffix, inspection?.importId);
+    const outsideRoot = await mkdtemp(join(dirname(h.rootDir()), "fusion-ccc-prd-outside-task-"));
+    const outsideTask = join(outsideRoot, "task");
+    await rename(projection.taskDir, outsideTask);
+    const taskBytes = await readFile(join(outsideTask, "task.json"), "utf8");
+    const promptBytes = await readFile(join(outsideTask, "PROMPT.md"), "utf8");
+    await symlink(outsideTask, projection.taskDir, "dir");
+    try {
+      await expect(importCccPrdBundle(request(suffix, key))).rejects.toMatchObject({
+        code: "CCC_PRD_IMPORT_WRITE_ROOT_REFUSED",
+      });
+      await expect(inspectCccPrdImport({
+        idempotencyKey: key,
+        layer: h.layer(),
+        rootDir: h.rootDir(),
+      })).resolves.toMatchObject({ state: "prepared", runnable: false });
+      expect(await readFile(join(outsideTask, "task.json"), "utf8")).toBe(taskBytes);
+      expect(await readFile(join(outsideTask, "PROMPT.md"), "utf8")).toBe(promptBytes);
+    } finally {
+      await rm(projection.taskDir, { force: true });
+      await rename(outsideTask, projection.taskDir);
+      await rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
 });
