@@ -542,6 +542,7 @@ export class PluginRunner {
 
     const byPlugin = new Map<string, PluginWorkflowExtensionRegistration[]>();
     for (const { pluginId, extension, hostProvenance } of current) {
+      if (extension.kind === "proof-admission") continue;
       const list = byPlugin.get(pluginId) ?? [];
       list.push({
         extension,
@@ -558,10 +559,8 @@ export class PluginRunner {
     }
 
     for (const [pluginId, contributions] of byPlugin) {
-      const currentIds = new Set(
-        contributions.map(({ extension }) =>
-          workflowExtensionRegistryId(pluginId, extension.extensionId)),
-      );
+      const currentIds = new Set(contributions.map(({ extension }) =>
+        workflowExtensionRegistryId(pluginId, extension.extensionId)));
       const previouslyRegistered = this.registeredPluginWorkflowExtensionIds.get(pluginId) ?? [];
       const staleIds = previouslyRegistered.filter((id) => !currentIds.has(id));
       if (staleIds.length > 0) {
@@ -619,6 +618,7 @@ export class PluginRunner {
     if (tracked && tracked.length > 0) return tracked;
     return this.getPluginWorkflowExtensions()
       .filter((entry) => entry.pluginId === pluginId)
+      .filter((entry) => entry.extension.kind !== "proof-admission")
       .map((entry) => workflowExtensionRegistryId(pluginId, entry.extension.extensionId));
   }
 

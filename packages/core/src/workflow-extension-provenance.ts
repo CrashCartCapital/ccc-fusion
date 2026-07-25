@@ -336,10 +336,10 @@ function tokenizeSource(source: string): SourceToken[] {
 }
 
 function requireAllowedRuntimeSpecifier(specifier: string): void {
-  if (specifier.startsWith("node:")) return;
+  if (specifier === "node:crypto") return;
   throw provenanceError(
     "external-runtime-dependency",
-    `fixed proof entry must be self-contained; runtime dependency '${specifier}' is not allowed`,
+    `fixed proof entry must be self-contained and may import only node:crypto; runtime dependency '${specifier}' is not allowed`,
   );
 }
 
@@ -384,6 +384,16 @@ export function validateWorkflowExtensionFixedEntrySource(source: Buffer | strin
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
     if (token.kind !== "identifier") continue;
+    const next = tokens[index + 1]?.value;
+    if (
+      (["getBuiltinModule", "eval", "Function"].includes(token.value) && next === "(")
+      || (token.value === "WebAssembly" && (next === "." || next === "("))
+    ) {
+      throw provenanceError(
+        "external-runtime-dependency",
+        `fixed proof entry must be self-contained; runtime capability '${token.value}' is not allowed`,
+      );
+    }
     if (token.value === "require" && tokens[index + 1]?.value === "(") {
       const specifier = tokens[index + 2];
       if (specifier?.kind !== "string" || tokens[index + 3]?.value !== ")") {
@@ -398,15 +408,10 @@ export function validateWorkflowExtensionFixedEntrySource(source: Buffer | strin
     if (token.value === "import") {
       if (tokens[index + 1]?.value === ".") continue;
       if (tokens[index + 1]?.value === "(") {
-        const specifier = tokens[index + 2];
-        if (specifier?.kind !== "string" || tokens[index + 3]?.value !== ")") {
-          throw provenanceError(
-            "external-runtime-dependency",
-            "fixed proof entry must be self-contained; dynamic import is not allowed",
-          );
-        }
-        requireAllowedRuntimeSpecifier(specifier.value);
-        continue;
+        throw provenanceError(
+          "external-runtime-dependency",
+          "fixed proof entry must be self-contained; dynamic import is not allowed",
+        );
       }
       if (tokens[index + 1]?.kind === "string") {
         requireAllowedRuntimeSpecifier(tokens[index + 1]!.value);

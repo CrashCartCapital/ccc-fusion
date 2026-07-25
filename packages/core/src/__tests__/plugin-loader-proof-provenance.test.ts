@@ -1,16 +1,12 @@
-import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PluginLoader } from "../plugin-loader.js";
 import type { PluginInstallation } from "../plugin-types.js";
-import {
-  getWorkflowExtensionHostProvenanceBinding,
-  type WorkflowExtensionHostProvenance,
-} from "../workflow-extension-provenance.js";
+import { type WorkflowExtensionHostProvenance } from "../workflow-extension-provenance.js";
 import type { WorkflowExtensionContribution } from "../workflow-extension-types.js";
 
 type EnumeratedWorkflowExtension = {
@@ -33,10 +29,6 @@ type FixtureOptions = {
 
 const roots: string[] = [];
 const loaders: PluginLoader[] = [];
-
-function sha256(bytes: Buffer | string): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
 
 function pluginSource(options: FixtureOptions = {}): string {
   const version = options.version ?? "1.0.0";
@@ -162,12 +154,6 @@ function extensions(loader: PluginLoader): EnumeratedWorkflowExtension[] {
   return loader.getPluginWorkflowExtensions() as EnumeratedWorkflowExtension[];
 }
 
-function proofEntry(loader: PluginLoader): EnumeratedWorkflowExtension {
-  const entry = extensions(loader).find(({ extension }) => extension.kind === "proof-admission");
-  if (!entry) throw new Error("expected proof contribution");
-  return entry;
-}
-
 describe("PluginLoader proof provenance custody", () => {
   afterEach(async () => {
     delete (globalThis as typeof globalThis & { __fusionMutateProofEntry?: () => void })
@@ -177,20 +163,11 @@ describe("PluginLoader proof provenance custody", () => {
     vi.restoreAllMocks();
   });
 
-  it("enumerates proof contributions with opaque host-derived provenance while ordinary entries remain unchanged", async () => {
-    const { entry, loader } = await createFixture();
+  it("withholds external proof contributions while ordinary entries remain unchanged", async () => {
+    const { loader } = await createFixture();
     await loader.loadPlugin("proof-plugin");
 
-    const proof = proofEntry(loader);
-    expect(proof.hostProvenance).toBeDefined();
-    const binding = getWorkflowExtensionHostProvenanceBinding(proof.hostProvenance!);
-    expect(binding).toMatchObject({
-      pluginId: "proof-plugin",
-      pluginVersion: "1.0.0",
-      extensionRootRelativeSource: "dist/index.mjs",
-      extensionSourceSha256: sha256(await readFile(entry)),
-    });
-    expect(binding.extensionManifestSha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(extensions(loader).some(({ extension }) => extension.kind === "proof-admission")).toBe(false);
 
     const ordinary = extensions(loader).find(
       ({ extension }) => extension.kind === "move-policy",
@@ -217,7 +194,7 @@ describe("PluginLoader proof provenance custody", () => {
         manifest: { id: "proof-plugin" },
       });
 
-      expect(proofEntry(loader).hostProvenance).toBeUndefined();
+      expect(extensions(loader).some(({ extension }) => extension.kind === "proof-admission")).toBe(false);
       expect(extensions(loader)).toContainEqual({
         pluginId: "proof-plugin",
         extension: expect.objectContaining({
@@ -232,13 +209,13 @@ describe("PluginLoader proof provenance custody", () => {
     const { loader } = await createFixture({ mutateCanonicalOnImport: true });
     await loader.loadPlugin("proof-plugin");
 
-    expect(proofEntry(loader).hostProvenance).toBeUndefined();
+    expect(extensions(loader).some(({ extension }) => extension.kind === "proof-admission")).toBe(false);
   });
 
   it("restores the original proof provenance after a failed reload rolls back", async () => {
     const { entry, loader } = await createFixture();
     await loader.loadPlugin("proof-plugin");
-    const original = proofEntry(loader).hostProvenance;
+    const original = extensions(loader);
 
     await writeFile(entry, pluginSource({
       summary: "replacement",
@@ -246,7 +223,7 @@ describe("PluginLoader proof provenance custody", () => {
     }));
     await expect(loader.reloadPlugin("proof-plugin")).rejects.toThrow("replacement failed");
 
-    expect(proofEntry(loader).hostProvenance).toBe(original);
+    expect(extensions(loader)).toEqual(original);
   });
 
   it("removes proof provenance after unload and after reload plus rollback total failure", async () => {

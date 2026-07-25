@@ -197,6 +197,15 @@ describe("workflow extension host provenance", () => {
     ['export { helper } from "file:///tmp/helper.js";\n', "file URL"],
     ['const helper = await import("./helper.js");\nexport { helper };\n', "dynamic local import"],
     ['const helper = require("third-party");\nexport { helper };\n', "bare runtime import"],
+    ['import { createRequire } from "node:module";\nconst load = createRequire(import.meta.url);\nload("./local.js");\n', "node module createRequire local alias"],
+    ['const load = await import("node:module");\nload.createRequire(import.meta.url)("./local.js");\n', "dynamic node module"],
+    ['const crypto = await import("node:crypto");\nexport { crypto };\n', "dynamic node crypto"],
+    ['import { createRequire as load } from "node:module";\nload(import.meta.url)("./local.js");\n', "aliased node module"],
+    ['process.getBuiltinModule("node:fs");\n', "process builtin module capability"],
+    ['import "node:fs";\n', "node fs runtime import"],
+    ['import "node:vm";\n', "node vm runtime import"],
+    ['import "node:child_process";\n', "node child process runtime import"],
+    ['import "node:worker_threads";\n', "node worker threads runtime import"],
   ])("rejects a fixed entry with a %s", async (entry) => {
     const module = await loadProvenanceModule();
     expect(module.deriveWorkflowExtensionHostProvenance).toBeTypeOf("function");
@@ -216,6 +225,7 @@ describe("workflow extension host provenance", () => {
     expect(module.deriveWorkflowExtensionHostProvenance).toBeTypeOf("function");
     const fixture = await createFixture(
       'import type { Proof } from "./types.js";\n'
+      + 'import type { Function, WebAssembly } from "./runtime-types.js";\n'
       + 'import { type InlineProof } from "./inline-types.js";\n'
       + 'export type { ProofResult } from "./types.js";\n'
       + 'export { type InlineResult } from "./inline-types.js";\n'

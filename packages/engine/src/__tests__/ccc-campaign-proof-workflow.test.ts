@@ -20,6 +20,7 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK,
 } from "../ccc-campaign-proof-admission.js";
 import {
   createCccCampaignProofNodeAdmission,
@@ -288,6 +289,40 @@ describe("CCC campaign proof workflow admission", () => {
     await expect(harness.admit(harness.node, harness.signal))
       .rejects.toThrow("audit unavailable");
     expect(evaluate).toHaveBeenCalledOnce();
+  });
+
+  it("audits and refuses the native binding self-check before any task execution can follow", async () => {
+    const evaluate: WorkflowProofAdmissionEvaluator = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "proof binding semantics verified; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const definition = {
+      ...fixture.proof,
+      command: CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.command,
+      positiveOracle: CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.positiveOracle,
+      negativeControls: [...CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.negativeControls],
+    };
+    fixture.proof = {
+      ...definition,
+      admission: {
+        ...fixture.proof.admission!,
+        definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+      },
+    };
+    const harness = admissionHarness(fixture);
+
+    await expect(harness.admit(harness.node, harness.signal))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).toHaveBeenCalledOnce();
+    expect(harness.recordFencedAudit).toHaveBeenCalledOnce();
+    expect(harness.recordFencedAudit.mock.calls[0]?.[0]?.event).toMatchObject({
+      metadata: {
+        outcome: "fail",
+        summary: "CCC proof binding self-check is non-authorizing for campaign task execution",
+      },
+    });
   });
 
   it("does not require proofs for orchestration-only nodes", async () => {

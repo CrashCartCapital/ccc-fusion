@@ -26,18 +26,19 @@ const roots: string[] = [];
 
 async function provenance(
   source = "export default {};\n",
+  pluginId = "proof-plugin",
 ): Promise<WorkflowExtensionHostProvenance> {
   const root = await mkdtemp(join(tmpdir(), "fusion-proof-runner-"));
   roots.push(root);
   await mkdir(join(root, "dist"), { recursive: true });
   await writeFile(join(root, "dist", "index.mjs"), source);
   await writeFile(join(root, "manifest.json"), JSON.stringify({
-    id: "proof-plugin",
+    id: pluginId,
     name: "Proof Plugin",
     version: "1.0.0",
   }));
   return deriveWorkflowExtensionHostProvenance({
-    pluginId: "proof-plugin",
+    pluginId,
     pluginVersion: "1.0.0",
     trustedRootPath: root,
     entryRelativePath: "dist/index.mjs",
@@ -47,9 +48,10 @@ async function provenance(
 
 function proof(
   summary: string,
+  extensionId = "native-proof",
 ): WorkflowProofAdmissionExtensionContribution {
   return {
-    extensionId: "native-proof",
+    extensionId,
     name: "Native proof",
     kind: "proof-admission",
     schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
@@ -109,7 +111,7 @@ describe("PluginRunner proof provenance lifecycle", () => {
     vi.restoreAllMocks();
   });
 
-  it("retains and degrades the old sealed proof when a successful reload changes custodied source identity", async () => {
+  it("does not ambiently register an external proof after reload", async () => {
     const oldProvenance = await provenance("export const evaluator = 'old';\n");
     const newProvenance = await provenance("export const evaluator = 'new';\n");
     const oldProof = proof("old evaluator");
@@ -132,20 +134,58 @@ describe("PluginRunner proof provenance lifecycle", () => {
 
     await runner.reloadPlugin("proof-plugin");
 
-    const definition = getWorkflowExtensionRegistry().get(
-      "plugin:proof-plugin:native-proof",
-    );
-    expect(definition?.extension.kind).toBe("proof-admission");
-    if (definition?.extension.kind !== "proof-admission") {
-      throw new Error("proof extension missing");
-    }
-    expect(definition.extension.evaluate).toBe(oldProof.evaluate);
-    expect(definition?.degraded).toMatchObject({
-      reason: "runtime-fault",
-    });
+    expect(getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof")).toBeUndefined();
   });
 
-  it("keeps a byte-identical reload healthy while retaining the sealed original evaluator", async () => {
+  it("leaves a preloaded fixed-native proof untouched through ambient sync, unload, and force-disable", async () => {
+    const nativeProvenance = await provenance("export const fixed = true;\n", "fusion-native");
+    const fixed = proof("fixed evaluator", "ccc-proof-admission");
+    const registry = getWorkflowExtensionRegistry();
+    registry.register("fusion-native", fixed, nativeProvenance);
+    const loader = new LoaderHarness();
+    loader.current = [{
+      pluginId: "fusion-native",
+      extension: proof("ambient collision", "ccc-proof-admission"),
+      hostProvenance: nativeProvenance,
+    }, {
+      pluginId: "fusion-native",
+      extension: {
+        extensionId: "ordinary-policy",
+        name: "Ordinary policy",
+        kind: "move-policy",
+        schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
+        fallback: "degradeToDefault",
+      },
+    }];
+    const runner = createRunner(loader);
+
+    await runner.init();
+    expect(registry.get("plugin:fusion-native:ordinary-policy")).toBeDefined();
+    loader.current = [];
+    loader.emit("plugin:unloaded", { pluginId: "fusion-native" });
+    expect(registry.get("plugin:fusion-native:ordinary-policy")).toBeUndefined();
+    loader.current = [{
+      pluginId: "fusion-native",
+      extension: proof("ambient collision", "ccc-proof-admission"),
+      hostProvenance: nativeProvenance,
+    }, {
+      pluginId: "fusion-native",
+      extension: {
+        extensionId: "ordinary-policy", name: "Ordinary policy", kind: "move-policy",
+        schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION, fallback: "degradeToDefault",
+      },
+    }];
+    runner.syncPluginWorkflowExtensions();
+    expect(runner.disablePluginWorkflowExtensions("fusion-native", { force: true }).degraded)
+      .toEqual([]);
+    expect(registry.get("plugin:fusion-native:ordinary-policy")).toBeUndefined();
+    expect(registry.get("plugin:fusion-native:ccc-proof-admission")?.extension.evaluate)
+      .toBe(fixed.evaluate);
+    expect(registry.get("plugin:fusion-native:ccc-proof-admission")?.degraded).toBeUndefined();
+    await runner.shutdown();
+  });
+
+  it("does not ambiently register an external proof on a byte-identical reload", async () => {
     const hostProvenance = await provenance();
     const oldProof = proof("same source");
     const reimportedProof = proof("same source");
@@ -163,18 +203,10 @@ describe("PluginRunner proof provenance lifecycle", () => {
 
     await runner.reloadPlugin("proof-plugin");
 
-    const definition = getWorkflowExtensionRegistry().get(
-      "plugin:proof-plugin:native-proof",
-    );
-    expect(definition?.extension.kind).toBe("proof-admission");
-    if (definition?.extension.kind !== "proof-admission") {
-      throw new Error("proof extension missing");
-    }
-    expect(definition.extension.evaluate).toBe(oldProof.evaluate);
-    expect(definition.degraded).toBeUndefined();
+    expect(getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof")).toBeUndefined();
   });
 
-  it("restores the same proof authority when a failed reload rolls back", async () => {
+  it("does not ambiently restore proof authority when reload rolls back", async () => {
     const hostProvenance = await provenance();
     const oldProof = proof("old evaluator");
     const loader = new LoaderHarness();
@@ -185,18 +217,10 @@ describe("PluginRunner proof provenance lifecycle", () => {
 
     await expect(runner.reloadPlugin("proof-plugin")).rejects.toThrow("reload rolled back");
 
-    const definition = getWorkflowExtensionRegistry().get(
-      "plugin:proof-plugin:native-proof",
-    );
-    expect(definition?.extension.kind).toBe("proof-admission");
-    if (definition?.extension.kind !== "proof-admission") {
-      throw new Error("proof extension missing");
-    }
-    expect(definition.extension.evaluate).toBe(oldProof.evaluate);
-    expect(definition?.degraded).toBeUndefined();
+    expect(getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof")).toBeUndefined();
   });
 
-  it("removes old proof authority in reload finally after total failure removes the plugin", async () => {
+  it("keeps external proof authority absent after total reload failure", async () => {
     const hostProvenance = await provenance();
     const loader = new LoaderHarness();
     loader.current = [{
@@ -220,7 +244,7 @@ describe("PluginRunner proof provenance lifecycle", () => {
     ).toBeUndefined();
   });
 
-  it("removes proof authority when the loader emits plugin:unloaded", async () => {
+  it("keeps external proof authority absent when the loader emits plugin:unloaded", async () => {
     const hostProvenance = await provenance();
     const loader = new LoaderHarness();
     loader.current = [{
@@ -230,9 +254,7 @@ describe("PluginRunner proof provenance lifecycle", () => {
     }];
     const runner = createRunner(loader);
     await runner.init();
-    expect(
-      getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof"),
-    ).toBeDefined();
+    expect(getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof")).toBeUndefined();
 
     loader.current = [];
     loader.emit("plugin:unloaded", { pluginId: "proof-plugin" });
@@ -242,7 +264,7 @@ describe("PluginRunner proof provenance lifecycle", () => {
     ).toBeUndefined();
   });
 
-  it("removes stale proof authority when a successful sync keeps the plugin but drops that contribution", async () => {
+  it("removes a previously tracked ambient proof id on resync while retaining ordinary extensions", async () => {
     const hostProvenance = await provenance();
     const loader = new LoaderHarness();
     loader.current = [{
@@ -251,12 +273,16 @@ describe("PluginRunner proof provenance lifecycle", () => {
       hostProvenance,
     }];
     const runner = createRunner(loader);
-    runner.syncPluginWorkflowExtensions();
-    expect(
-      getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof"),
-    ).toBeDefined();
+    getWorkflowExtensionRegistry().register("proof-plugin", proof("old evaluator"), hostProvenance);
+    (runner as unknown as {
+      registeredPluginWorkflowExtensionIds: Map<string, string[]>;
+    }).registeredPluginWorkflowExtensionIds.set("proof-plugin", ["plugin:proof-plugin:native-proof"]);
 
     loader.current = [{
+      pluginId: "proof-plugin",
+      extension: proof("ambient replacement"),
+      hostProvenance,
+    }, {
       pluginId: "proof-plugin",
       extension: {
         extensionId: "ordinary-policy",
@@ -266,9 +292,7 @@ describe("PluginRunner proof provenance lifecycle", () => {
         fallback: "degradeToDefault",
       },
     }];
-    (runner as unknown as {
-      invalidateWorkflowExtensionsCache(): void;
-    }).invalidateWorkflowExtensionsCache();
+    runner.syncPluginWorkflowExtensions();
 
     expect(
       getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof"),
@@ -278,7 +302,7 @@ describe("PluginRunner proof provenance lifecycle", () => {
     ).toBeDefined();
   });
 
-  it("fails closed when the current proof contribution loses host provenance", async () => {
+  it("keeps an ambient proof absent when a current contribution lacks provenance", async () => {
     const hostProvenance = await provenance();
     const oldProof = proof("old evaluator");
     const loader = new LoaderHarness();
@@ -298,12 +322,6 @@ describe("PluginRunner proof provenance lifecycle", () => {
       invalidateWorkflowExtensionsCache(): void;
     }).invalidateWorkflowExtensionsCache();
 
-    const retained = getWorkflowExtensionRegistry().get(
-      "plugin:proof-plugin:native-proof",
-    );
-    expect(retained?.extension.kind).toBe("proof-admission");
-    expect(retained?.degraded).toMatchObject({
-      reason: "runtime-fault",
-    });
+    expect(getWorkflowExtensionRegistry().get("plugin:proof-plugin:native-proof")).toBeUndefined();
   });
 });

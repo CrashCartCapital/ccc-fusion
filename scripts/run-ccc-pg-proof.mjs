@@ -212,7 +212,6 @@ const expectedRetryNames = [
 const expectedWave5CliNames = [
   "prd built CLI user contract > advertises author, validate, and compile from top-level help",
   "prd built CLI user contract > author writes the requested sidecar and validate/compile are zero-store user commands",
-  "prd built CLI user contract > cannot author successfully when the built proof entry and manifest are absent",
   "prd built CLI user contract > returns stable usage and semantic-refusal exit codes",
   "prd built CLI user contract > refuses a foreign admitted target through built validate and compile",
   "prd built CLI user contract > refuses a foreign admitted base through built validate and compile",
@@ -221,7 +220,6 @@ const expectedWave5CliNames = [
   "prd built CLI user contract > refuses author output that would overwrite an unrelated existing file",
   "prd built CLI user contract > maintains an existing valid versioned sidecar",
   "prd command exit contract > returns usage exit 2 before any compiler or filesystem work",
-  "prd command exit contract > bootstraps the fixed native proof host before compatibility authoring",
 ];
 const expectedWave5CoreContractNames = [
   "ccc-prd public schema > normalizes each protected action to a specific operator decision",
@@ -285,16 +283,6 @@ const expectedWave5EngineContractNames = [
   "ccc-prd admitted ccc-lab-super oracle > generates the frozen sidecar from unchanged dense Markdown through the production authoring seam",
   "ccc-prd admitted ccc-lab-super oracle > compiles exact non-zero entity counts and stable real-packet identities",
   "ccc-prd structural sidecar > authors raw-byte custody and compiles the complete structural graph in code-unit order",
-  "ccc-prd structural sidecar > refuses a proof admission with wrong schema",
-  "ccc-prd structural sidecar > refuses a proof admission with blank fixed identity",
-  "ccc-prd structural sidecar > refuses a proof admission with malformed source hash",
-  "ccc-prd structural sidecar > refuses a proof admission with parent-relative source path",
-  "ccc-prd structural sidecar > refuses a proof admission with absolute source path",
-  "ccc-prd structural sidecar > refuses a proof admission with backslash traversal source path",
-  "ccc-prd structural sidecar > refuses a proof admission with file URL source path",
-  "ccc-prd structural sidecar > refuses a proof admission with uppercase file URL source path",
-  "ccc-prd structural sidecar > refuses a proof admission with stale definition hash",
-  "ccc-prd structural sidecar > accepts and compiles a legacy sidecar whose proofs omit admission",
   "ccc-prd structural sidecar > refuses raw byte mutation deterministically",
   "ccc-prd structural sidecar > refuses stale span deterministically",
   "ccc-prd structural sidecar > refuses duplicate id deterministically",

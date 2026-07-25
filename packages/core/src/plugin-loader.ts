@@ -1763,13 +1763,13 @@ export class PluginLoader extends EventEmitter<{
     for (const [pluginId, plugin] of this.plugins) {
       if (plugin.workflowExtensions) {
         for (const extension of plugin.workflowExtensions) {
-          const hostProvenance = extension.kind === "proof-admission"
-            ? this.workflowExtensionProofProvenance.get(pluginId)
-            : undefined;
+          // External proof-admission contributions need persisted selection and
+          // dependency closure. PluginLoader has neither, so its independently
+          // imported module bytes are never proof authority.
+          if (extension.kind === "proof-admission") continue;
           extensions.push({
             pluginId,
             extension,
-            ...(hostProvenance ? { hostProvenance } : {}),
           });
         }
       }

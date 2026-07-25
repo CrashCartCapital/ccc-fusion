@@ -9,6 +9,7 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK,
   createCccCampaignProofAdmissionEvaluatorInput,
   computeCccCampaignProofAdmissionInputSha256,
   evaluateCccCampaignProofAdmission,
@@ -20,12 +21,9 @@ function admittedProof(
   const definition: CccPrdProof = {
     id: "PROOF-ADMISSION-1",
     requirementIds: ["REQ-ADMISSION-1"],
-    command: "pnpm --filter @fusion/engine test -- proof-admission",
-    positiveOracle: "the named proof-admission assertions all pass",
-    negativeControls: [
-      "a stale definition hash is refused before any command can run",
-      "a generic exit-zero verifier is refused before any command can run",
-    ],
+    command: CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.command,
+    positiveOracle: CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.positiveOracle,
+    negativeControls: [...CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.negativeControls],
     spans: [],
     confidence: "high",
     ...overrides,
@@ -64,13 +62,13 @@ function evaluatorInput(proof = admittedProof(), signal = new AbortController().
 }
 
 describe("CCC native campaign proof admission", () => {
-  it("admits an exact non-generic proof definition without executing its command", async () => {
+  it("verifies the exact immutable binding self-check without executing a command", async () => {
     const input = evaluatorInput();
 
     await expect(evaluateCccCampaignProofAdmission(input)).resolves.toEqual({
       outcome: "pass",
       evaluatedInputSha256: input.inputSha256,
-      summary: "definition admitted; command not executed",
+      summary: "proof binding semantics verified; command not executed",
     });
   });
 
@@ -212,6 +210,20 @@ describe("CCC native campaign proof admission", () => {
     ).resolves.toMatchObject({
       outcome: "fail",
       summary: expect.stringContaining("command not executed"),
+    });
+  });
+
+  it("refuses arbitrary shell and prose declarations without executing them", async () => {
+    const input = evaluatorInput(admittedProof({
+      command: "rm -rf /",
+      positiveOracle: "the moon is cheese",
+      negativeControls: ["unicorn returns purple"],
+    }));
+
+    await expect(evaluateCccCampaignProofAdmission(input)).resolves.toMatchObject({
+      outcome: "fail",
+      evaluatedInputSha256: input.inputSha256,
+      summary: "unsupported proof binding declaration; command not executed",
     });
   });
 

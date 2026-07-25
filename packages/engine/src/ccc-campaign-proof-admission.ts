@@ -17,23 +17,16 @@ export const CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION = "ccc-proof-admission.v
 export const CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID =
   "plugin:fusion-native:ccc-proof-admission" as const;
 
+export const CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK = Object.freeze({
+  command: "ccc-proof-admission:binding-self-check.v1",
+  positiveOracle: "immutable proof binding semantics are verified",
+  negativeControls: Object.freeze([
+    "stale evaluator input hash is refused",
+    "stale proof definition hash is refused",
+  ]),
+});
+
 const LOWER_HEX_SHA256_PATTERN = new RegExp("^[0-9a-f]{64}$", "u");
-const COLLAPSE_WHITESPACE_PATTERN = new RegExp("\\s+", "gu");
-const TRAILING_PUNCTUATION_PATTERN = new RegExp("[.;]+$", "u");
-const GENERIC_ECHO_PATTERN = new RegExp(
-  "^(?:echo|printf)\\s+['\"]?(?:ok|true|false|pass|passed|success|failure)['\"]?$",
-  "u",
-);
-const TRUE_EXECUTABLE_PATTERN = new RegExp("^(?:\\/(?:usr\\/)?bin\\/)?true$", "u");
-const SHELL_WRAPPER_PATTERN = new RegExp(
-  "^(?:(?:\\/usr)?\\/bin\\/)?(?:sh|bash|zsh|dash|ksh)\\s+-c\\s+(.+)$",
-  "u",
-);
-const NODE_WRAPPER_PATTERN = new RegExp(
-  "^(?:node|nodejs)(?:\\.exe)?\\s+(?:-e|--eval)\\s+(.+)$",
-  "u",
-);
-const TRAILING_SEMICOLON_PATTERN = new RegExp(";+$", "u");
 
 export type CccCampaignProofAdmissionDigestInput = Omit<
   WorkflowProofAdmissionEvaluatorInput,
@@ -154,109 +147,32 @@ export async function evaluateCccCampaignProofAdmission(
     return fail("proof requirement ids are missing or duplicated");
   }
 
-  const command = input.proof.command;
-  const positiveOracle = input.proof.positiveOracle;
-  const negativeControls = input.proof.negativeControls;
+  const { command, positiveOracle, negativeControls } = input.proof;
   if (
-    typeof command !== "string"
-    || command.trim() === ""
-    || isGenericProofDeclaration(command)
+    command !== CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.command
+    || positiveOracle !== CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.positiveOracle
+    || !Array.isArray(negativeControls)
+    || negativeControls.length !== CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.negativeControls.length
+    || negativeControls.some(
+      (control, index) => control !== CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.negativeControls[index],
+    )
   ) {
-    return fail("proof verifier command is blank or generic");
-  }
-  if (
-    typeof positiveOracle !== "string"
-    || positiveOracle.trim() === ""
-    || isGenericProofDeclaration(positiveOracle)
-  ) {
-    return fail("proof positive oracle is blank or generic");
-  }
-  if (
-    !Array.isArray(negativeControls)
-    || negativeControls.length === 0
-    || negativeControls.some((control) => (
-      typeof control !== "string"
-      || control.trim() === ""
-      || isGenericProofDeclaration(control)
-    ))
-    || new Set(negativeControls).size !== negativeControls.length
-  ) {
-    return fail("proof negative controls are blank, generic, or duplicated");
-  }
-  if (negativeControls.some((control) => control.trim() === positiveOracle.trim())) {
-    return fail("proof positive oracle is repeated as a negative control");
+    return fail("unsupported proof binding declaration");
   }
 
   input.signal.throwIfAborted();
   return Object.freeze({
     outcome: "pass",
     evaluatedInputSha256,
-    summary: "definition admitted; command not executed",
+    summary: "proof binding semantics verified; command not executed",
   });
-}
-
-const GENERIC_PROOF_DECLARATIONS = new Set([
-  ":",
-  "true",
-  "false",
-  "ok",
-  "pass",
-  "passed",
-  "success",
-  "succeeded",
-  "failure",
-  "failed",
-  "exit 0",
-  "exit 1",
-  "zero exit",
-  "nonzero exit",
-  "command succeeds",
-  "command fails",
-]);
-
-function isGenericProofDeclaration(value: string): boolean {
-  const normalized = value
-    .trim()
-    .toLowerCase()
-    .replace(COLLAPSE_WHITESPACE_PATTERN, " ")
-    .replace(TRAILING_PUNCTUATION_PATTERN, "");
-  if (GENERIC_PROOF_DECLARATIONS.has(normalized)) return true;
-  if (
-    GENERIC_ECHO_PATTERN.test(normalized)
-    || TRUE_EXECUTABLE_PATTERN.test(normalized)
-  ) {
-    return true;
-  }
-  const shellWrapper = normalized.match(SHELL_WRAPPER_PATTERN);
-  if (shellWrapper) {
-    return isGenericProofDeclaration(unwrapSingleShellArgument(shellWrapper[1]!));
-  }
-  const nodeWrapper = normalized.match(NODE_WRAPPER_PATTERN);
-  if (nodeWrapper) {
-    const script = unwrapSingleShellArgument(nodeWrapper[1]!)
-      .replace(COLLAPSE_WHITESPACE_PATTERN, "")
-      .replace(TRAILING_SEMICOLON_PATTERN, "");
-    return script === "process.exit(0)" || script === "process.exitCode=0";
-  }
-  return false;
-}
-
-function unwrapSingleShellArgument(value: string): string {
-  if (
-    value.length >= 2
-    && ((value.startsWith("'") && value.endsWith("'"))
-      || (value.startsWith("\"") && value.endsWith("\"")))
-  ) {
-    return value.slice(1, -1);
-  }
-  return value;
 }
 
 export const CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION:
 WorkflowProofAdmissionExtensionContribution = Object.freeze({
   extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
   name: "CCC proof admission",
-  description: "Admits structurally bound CCC campaign proof definitions without executing them.",
+  description: "Validates the fixed native binding conformance self-check; campaign task authorization is refused at the workflow boundary.",
   kind: "proof-admission",
   schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
   fallback: "failClosed",

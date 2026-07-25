@@ -111,18 +111,12 @@ describe("plugin workflow-extension proof adapter", () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
-  it("passes the exact opaque host provenance into the proof registry", async () => {
+  it("does not publish an external proof even when it supplies host provenance", async () => {
     const registry = new WorkflowExtensionRegistry();
     const hostProvenance = await provenance();
 
-    expect(register(registry, [{ extension: proof("proof-a"), hostProvenance }])).toEqual([
-      "plugin:proof-plugin:proof-a",
-    ]);
-    expect(registry.get("plugin:proof-plugin:proof-a")?.hostProvenance).toMatchObject({
-      pluginId: "proof-plugin",
-      pluginVersion: "1.0.0",
-      extensionRootRelativeSource: "dist/index.mjs",
-    });
+    expect(register(registry, [{ extension: proof("proof-a"), hostProvenance }])).toEqual([]);
+    expect(registry.get("plugin:proof-plugin:proof-a")).toBeUndefined();
   });
 
   it("accepts a byte-identical reload with a fresh evaluator function identity", async () => {
@@ -140,22 +134,33 @@ describe("plugin workflow-extension proof adapter", () => {
     expect(registry.get("plugin:proof-plugin:native-proof")?.degraded).toBeUndefined();
   });
 
-  it("processes proofs before ordinary extensions and removes a newly-created proof after a later proof failure", async () => {
+  it("withholds proof entries from a mixed external contribution batch", async () => {
     const registry = new WorkflowExtensionRegistry();
     const hostProvenance = await provenance();
 
-    expect(() => register(registry, [
+    expect(register(registry, [
       { extension: ordinary() },
       { extension: proof("proof-a"), hostProvenance },
       { extension: proof("proof-b") },
-    ])).toThrow(/host-derived provenance/u);
+    ])).toEqual(["plugin:proof-plugin:ordinary-policy"]);
 
     expect(registry.get("plugin:proof-plugin:proof-a")).toBeUndefined();
     expect(registry.get("plugin:proof-plugin:proof-b")).toBeUndefined();
-    expect(registry.get("plugin:proof-plugin:ordinary-policy")).toBeUndefined();
+    expect(registry.get("plugin:proof-plugin:ordinary-policy")).toBeDefined();
   });
 
-  it("preserves an existing degraded proof while rolling back only proof records created by the failed batch", async () => {
+  it("withholds external proof contributions while retaining ordinary extension registration", () => {
+    const registry = new WorkflowExtensionRegistry();
+
+    expect(register(registry, [
+      { extension: proof("external-proof") },
+      { extension: ordinary() },
+    ])).toEqual(["plugin:proof-plugin:ordinary-policy"]);
+    expect(registry.get("plugin:proof-plugin:external-proof")).toBeUndefined();
+    expect(registry.get("plugin:proof-plugin:ordinary-policy")).toBeDefined();
+  });
+
+  it("does not revive an existing proof record through ambient external synchronization", async () => {
     const registry = new WorkflowExtensionRegistry();
     const hostProvenance = await provenance();
     const existing = proof("proof-existing");
@@ -166,11 +171,11 @@ describe("plugin workflow-extension proof adapter", () => {
       "operator disabled",
     );
 
-    expect(() => register(registry, [
+    expect(register(registry, [
       { extension: existing, hostProvenance },
       { extension: proof("proof-new"), hostProvenance },
       { extension: proof("proof-missing") },
-    ])).toThrow(/host-derived provenance/u);
+    ])).toEqual([]);
 
     expect(registry.get("plugin:proof-plugin:proof-new")).toBeUndefined();
     expect(registry.get("plugin:proof-plugin:proof-existing")?.degraded).toEqual({
@@ -179,14 +184,14 @@ describe("plugin workflow-extension proof adapter", () => {
     });
   });
 
-  it("rejects duplicate proof ids before publishing either duplicate", async () => {
+  it("withholds duplicate external proof ids without publishing either duplicate", async () => {
     const registry = new WorkflowExtensionRegistry();
     const hostProvenance = await provenance();
 
-    expect(() => register(registry, [
+    expect(register(registry, [
       { extension: proof("proof-duplicate", "first"), hostProvenance },
       { extension: proof("proof-duplicate", "second"), hostProvenance },
-    ])).toThrow(/duplicate proof-admission contribution/u);
+    ])).toEqual([]);
     expect(registry.get("plugin:proof-plugin:proof-duplicate")).toBeUndefined();
   });
 

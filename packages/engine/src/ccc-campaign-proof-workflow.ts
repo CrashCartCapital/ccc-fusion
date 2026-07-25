@@ -22,6 +22,7 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
   CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK,
   createCccCampaignProofAdmissionEvaluatorInput,
 } from "./ccc-campaign-proof-admission.js";
 import { PermanentError } from "./engine-errors.js";
@@ -277,7 +278,26 @@ async function admitProof(input: AdmitProofInput): Promise<void> {
     });
     refuse(summary);
   }
+  if (isNativeConformanceSelfCheck(input.proof)) {
+    const summary = "CCC proof binding self-check is non-authorizing for campaign task execution";
+    await recordProofAdmission(input, definitionSha256, evaluatorInput.inputSha256, {
+      outcome: "fail",
+      evaluatedInputSha256: evaluatorInput.inputSha256,
+      summary,
+    });
+    refuse(summary);
+  }
   await recordProofAdmission(input, definitionSha256, evaluatorInput.inputSha256, result);
+}
+
+function isNativeConformanceSelfCheck(proof: CccPrdProof): boolean {
+  return proof.command === CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.command
+    && proof.positiveOracle === CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.positiveOracle
+    && Array.isArray(proof.negativeControls)
+    && proof.negativeControls.length === CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.negativeControls.length
+    && proof.negativeControls.every(
+      (control, index) => control === CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.negativeControls[index],
+    );
 }
 
 async function requireProofEvaluator(
