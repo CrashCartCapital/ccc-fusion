@@ -8,11 +8,14 @@ import assert from "node:assert/strict";
 
 const stopPolicySelfTest = process.argv.length === 3 && process.argv[2] === "--self-test-stop-settlement";
 const runnerPolicySelfTest = process.argv.length === 3 && process.argv[2] === "--self-test-policies";
-if (!stopPolicySelfTest && !runnerPolicySelfTest && (process.argv.length !== 4 || process.argv[2] !== "--wave" || process.argv[3] !== "4")) {
-  throw new Error("usage: node scripts/run-ccc-pg-proof.mjs --wave 4");
+const selectedWave = process.argv.length === 4 && process.argv[2] === "--wave"
+  ? Number(process.argv[3])
+  : null;
+if (!stopPolicySelfTest && !runnerPolicySelfTest && selectedWave !== 4 && selectedWave !== 5) {
+  throw new Error("usage: node scripts/run-ccc-pg-proof.mjs --wave <4|5>");
 }
 if (!stopPolicySelfTest && !runnerPolicySelfTest && process.env.FUSION_PG_TEST_SKIP === "1") {
-  throw new Error("FUSION_PG_TEST_SKIP=1 disables the required Wave 4 PostgreSQL proof before test execution");
+  throw new Error(`FUSION_PG_TEST_SKIP=1 disables the required Wave ${selectedWave} PostgreSQL proof before test execution`);
 }
 
 function stopWithinBudgetPolicy(lifecycle, stopTimeoutMs) {
@@ -124,7 +127,7 @@ async function selfTestStopSettlementPolicy() {
 
 if (stopPolicySelfTest) {
   await selfTestStopSettlementPolicy();
-  console.log("Wave 4 stop-settlement policy self-test passed");
+  console.log("CCC proof-runner stop-settlement policy self-test passed");
   process.exit(0);
 }
 
@@ -206,6 +209,96 @@ const expectedRetryNames = [
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: consumed retrying cap fails closed without another handler call",
   "CCC Wave 4 PostgreSQL retry classification > Wave 4 RED: claimed retrying cap exhausts without dispatch through the native processor",
 ];
+const expectedWave5CliNames = [
+  "prd built CLI user contract > advertises author, validate, and compile from top-level help",
+  "prd built CLI user contract > author writes the requested sidecar and validate/compile are zero-store user commands",
+  "prd built CLI user contract > returns stable usage and semantic-refusal exit codes",
+  "prd built CLI user contract > refuses author output that would overwrite admitted packet.md bytes",
+  "prd built CLI user contract > refuses author output that would overwrite admitted manifest.json bytes",
+  "prd built CLI user contract > refuses author output that would overwrite an unrelated existing file",
+  "prd built CLI user contract > maintains an existing valid versioned sidecar",
+  "prd command exit contract > returns usage exit 2 before any compiler or filesystem work",
+];
+const expectedWave5CoreContractNames = [
+  "ccc-prd public schema > normalizes each protected action to a specific operator decision",
+  "ccc-prd public schema > makes source-addressable refusal bundles",
+  "ccc-prd sidecar public contract > publishes distinct sidecar and compiled-bundle schema versions",
+  "ccc-prd sidecar public contract > compares strings by JavaScript code units",
+  "ccc-prd sidecar public contract > canonicalizes nested plain objects without reordering arrays",
+  "ccc-prd sidecar public contract > rejects non-finite numbers, cycles, and non-plain objects",
+  "ccc-prd sidecar public contract > creates byte-custody spans without UTF-8 or UTF-16 column drift",
+];
+const expectedWave5CoreImportNames = [
+  "CCC PRD import public surface > exports the import, inspection, and reconciliation entry points",
+  "CCC PRD import public surface > uses canonical semantic content, not a fixed fixture literal, for bundle identity",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: campaign",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: task",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: dependency_edge",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: workflow",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: document",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: artifact",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: source",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: work_item",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: run_audit",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: after_prepared_db_commit",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: task_directory",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: task_json",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: prompt",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: artifact_bytes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: canonical_projection_move",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: before_activation",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > recovers a lost response after the activation commit without runnable filesystem drift",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > observes every preparation writer on one actual DbTransaction with no nested or top-level writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > invalidates native workflow caches only after the prepared database transaction commits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > commits exact semantic counts, projects task/document/artifact readers, and remains visible after restart",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rebuilds missing canonical prepared files for an active import after restart",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > serializes two concurrent active repairs over one staging prefix",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds active-repair lock waiting by the admitted reconciliation budget",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds same-key preparation admission while the creator transaction is uncommitted",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > is sequentially and concurrently idempotent, including a lost response after commit",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps a live projection claim beyond lease expiry while an identical import waits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps renewing through the activation handoff while an identical import waits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds an identical wait by the admitted bundle duration plus reconciliation overhead",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > retries one transient PostgreSQL lease-renewal failure without losing ownership",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > surfaces projection lease ownership loss as a deterministic reconciliation conflict",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > namespaces global workflow and artifact IDs so independent imports cannot collide",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > includes all three import custody tables in the shared PostgreSQL reset",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > allows failed-then-retry but refuses idempotency-key collisions on bundle, target, or base",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a symlink escape through the owned .fusion/tasks root without external writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a symlink escape through the owned .fusion/artifacts root without external writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a symlink escape through the owned .fusion/ccc-prd-import-staging root without external writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a dangling symlink at an existing canonical artifact path",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a byte-identical symlink at an existing canonical task directory",
+];
+const expectedWave5CoreMigrationNames = [
+  "CCC PRD import migration registry > keeps migration 0035 immutable and registers every custody table",
+  "CCC PRD import migration 0034 to 0035 > upgrades once with fresh-shape parity, forced RLS, triggers, FKs, checks, and indexes",
+];
+const expectedWave5EngineContractNames = [
+  "ccc-prd structural compiler boundary > refuses direct Markdown compilation without the generated structural sidecar",
+  "ccc-prd structural compiler boundary > validates the admitted Neo cold-review candidate but always refuses dispatch",
+  "ccc-prd admitted ccc-lab-super oracle > generates the frozen sidecar from unchanged dense Markdown through the production authoring seam",
+  "ccc-prd admitted ccc-lab-super oracle > compiles exact non-zero entity counts and stable real-packet identities",
+  "ccc-prd structural sidecar > authors raw-byte custody and compiles the complete structural graph in code-unit order",
+  "ccc-prd structural sidecar > refuses raw byte mutation deterministically",
+  "ccc-prd structural sidecar > refuses stale span deterministically",
+  "ccc-prd structural sidecar > refuses duplicate id deterministically",
+  "ccc-prd structural sidecar > refuses unresolved decision deterministically",
+  "ccc-prd structural sidecar > refuses unbounded limit deterministically",
+  "ccc-prd structural sidecar > refuses foreign target deterministically",
+  "ccc-prd structural sidecar > refuses foreign base deterministically",
+  "ccc-prd structural sidecar > refuses unknown top-level declaration deterministically",
+  "ccc-prd structural sidecar > refuses blank task title deterministically",
+  "ccc-prd structural sidecar > refuses invalid authority role deterministically",
+  "ccc-prd structural sidecar > refuses invalid proof confidence deterministically",
+  "ccc-prd structural sidecar > refuses blank workflow title deterministically",
+  "ccc-prd structural sidecar > refuses manifest, sidecar, and symlinked-ancestor escapes before reads",
+  "ccc-prd structural sidecar > does not infer actions, deferred state, or loops from prose",
+  "ccc-prd structural sidecar > validates with diagnostics only and never returns a bundle",
+];
+const expectedWave5EngineImportNames = [
+  "CCC PRD imported workflow execution > claims and executes the imported runnable item through the normal engine path",
+];
 
 function assertionName(assertion) {
   return [...(assertion.ancestorTitles ?? []), assertion.title].join(" > ");
@@ -245,6 +338,7 @@ function selfTestClosedNamePolicy() {
     ["duplicate", [...good, ...good]],
     ["skipped", [{ ...good[0], status: "skipped" }]],
     ["pending", [{ ...good[0], status: "pending" }]],
+    ["todo", [{ ...good[0], status: "todo" }]],
     ["failed", [{ ...good[0], status: "failed" }]],
   ]) {
     let rejected = false;
@@ -266,6 +360,7 @@ function assertSupervisorResult(result, commands) {
     if (!outcome) throw new Error(`missing command result: ${command.id}`);
     if (outcome.timedOut) throw new Error(`${command.id} exceeded its bounded timeout`);
     if (outcome.spawnError) throw new Error(`${command.id} spawn rejected: ${outcome.spawnError}`);
+    if (outcome.signal) throw new Error(`${command.id} terminated by ${outcome.signal}`);
     if (outcome.code !== 0) throw new Error(`${command.id} exited ${outcome.code}`);
   }
 }
@@ -277,6 +372,7 @@ function selfTestSupervisorFailurePolicy() {
   for (const result of [
     { ...passed, results: [{ id: "required", code: 1, timedOut: true }] },
     { ...passed, results: [{ id: "required", code: 1, spawnError: "injected rejection" }] },
+    { ...passed, results: [{ id: "required", code: 0, timedOut: false, signal: "SIGTERM" }] },
     { ...passed, stopError: "injected stop failure" },
     { ...passed, interrupted: "SIGTERM" },
   ]) {
@@ -289,18 +385,18 @@ selfTestSupervisorFailurePolicy();
 
 if (runnerPolicySelfTest) {
   await selfTestStopSettlementPolicy();
-  console.log("Wave 4 runner policy self-tests passed");
+  console.log("CCC proof-runner policy self-tests passed");
   process.exit(0);
 }
 
 const repoRoot = process.cwd();
-const proofRoot = await mkdtemp(join(tmpdir(), "ccc-wave-4-proof-"));
+const proofRoot = await mkdtemp(join(tmpdir(), `ccc-wave-${selectedWave}-proof-`));
 const dataRoot = join(proofRoot, "postgres-data");
 const resultRoot = join(dataRoot, "machine-results");
 const reportPath = join(proofRoot, "report.json");
 const manifestPath = join(proofRoot, "manifest.json");
 
-const commands = [
+const wave4Commands = [
   {
     id: "core-pg-gate",
     command: ["pnpm", "--filter", "@fusion/core", "test:pg-gate"],
@@ -330,6 +426,51 @@ const commands = [
     machineResults: true,
   },
 ];
+const wave5Commands = [
+  {
+    id: "ccc-prd-cli",
+    command: ["pnpm", "--filter", "@runfusion/fusion", "exec", "vitest", "run", "src/commands/__tests__/prd.test.ts", "src/commands/__tests__/prd-built-cli.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave5CliNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-prd-core-contract",
+    command: ["pnpm", "--filter", "@fusion/core", "exec", "vitest", "run", "src/__tests__/ccc-prd-schema.test.ts", "src/__tests__/ccc-prd-sidecar-contract.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave5CoreContractNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-prd-core-import",
+    command: ["pnpm", "--filter", "@fusion/core", "exec", "vitest", "run", "src/__tests__/postgres/ccc-prd-import.pg.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave5CoreImportNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-prd-core-migration",
+    command: ["pnpm", "--filter", "@fusion/core", "exec", "vitest", "run", "src/__tests__/postgres/ccc-prd-import-migration.pg.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave5CoreMigrationNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-prd-engine-contract",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-prd-compiler.test.ts", "src/__tests__/ccc-prd-corpus.test.ts", "src/__tests__/ccc-prd-structural.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave5EngineContractNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-prd-engine-import",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-prd-import-execution.real-pg.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave5EngineImportNames,
+    machineResults: true,
+  },
+];
+const commands = selectedWave === 5 ? wave5Commands : wave4Commands;
 
 function positiveBudget(name, fallback) {
   const value = process.env[name] === undefined ? fallback : Number(process.env[name]);
@@ -337,10 +478,12 @@ function positiveBudget(name, fallback) {
   return Math.floor(value);
 }
 
-const childTimeoutMs = positiveBudget("CCC_W4_CHILD_TIMEOUT_MS", 120_000);
-const childTerminateGraceMs = positiveBudget("CCC_W4_CHILD_TERMINATE_GRACE_MS", 2_000);
-const postgresStopBudgetMs = positiveBudget("CCC_W4_PG_STOP_TIMEOUT_MS", 10_000);
-const parentShutdownMarginMs = positiveBudget("CCC_W4_PARENT_SHUTDOWN_MARGIN_MS", 3_000);
+const budgetPrefix = selectedWave === 5 ? "CCC_W5" : "CCC_W4";
+const childTimeoutMs = positiveBudget(`${budgetPrefix}_CHILD_TIMEOUT_MS`, 120_000);
+const childTerminateGraceMs = positiveBudget(`${budgetPrefix}_CHILD_TERMINATE_GRACE_MS`, 2_000);
+const postgresStopBudgetMs = positiveBudget(`${budgetPrefix}_PG_STOP_TIMEOUT_MS`, 10_000);
+const parentShutdownMarginMs = positiveBudget(`${budgetPrefix}_PARENT_SHUTDOWN_MARGIN_MS`, 3_000);
+const proofDatabase = `ccc_wave${selectedWave}_proof`;
 
 const supervisor = `
   import { EmbeddedPostgresLifecycle } from ${JSON.stringify(join(repoRoot, "packages/core/src/postgres/embedded-lifecycle.ts"))};
@@ -349,22 +492,22 @@ const supervisor = `
   import { join } from "node:path";
   const lifecycleErrors = [];
   const lifecycle = new EmbeddedPostgresLifecycle({
-    dataDir: process.env.CCC_W4_DATA_ROOT,
-    database: "ccc_wave4_proof",
+    dataDir: process.env.CCC_PROOF_DATA_ROOT,
+    database: process.env.CCC_PROOF_DATABASE,
     // The supervisor owns SIGINT/SIGTERM for this disposable proof process.
     installShutdownHooks: false,
     throwOnStopError: true,
     onError: (error) => lifecycleErrors.push(String(error)),
   });
-  const commands = JSON.parse(process.env.CCC_W4_COMMANDS);
+  const commands = JSON.parse(process.env.CCC_PROOF_COMMANDS);
   const results = [];
-  const timeoutMs = Number(process.env.CCC_W4_CHILD_TIMEOUT_MS ?? 120000);
-  const terminateGraceMs = Number(process.env.CCC_W4_CHILD_TERMINATE_GRACE_MS ?? 2000);
-  const stopTimeoutMs = Number(process.env.CCC_W4_PG_STOP_TIMEOUT_MS ?? 10000);
+  const timeoutMs = Number(process.env.CCC_PROOF_CHILD_TIMEOUT_MS ?? 120000);
+  const terminateGraceMs = Number(process.env.CCC_PROOF_CHILD_TERMINATE_GRACE_MS ?? 2000);
+  const stopTimeoutMs = Number(process.env.CCC_PROOF_PG_STOP_TIMEOUT_MS ?? 10000);
   let activeTerminate = null;
   let interrupted = null;
   const run = (cmd, args, env) => new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: process.env.CCC_W4_REPO_ROOT, env, stdio: ["ignore", "ignore", "ignore"] });
+    const child = spawn(cmd, args, { cwd: process.env.CCC_PROOF_REPO_ROOT, env, stdio: ["ignore", "ignore", "ignore"] });
     let settled = false;
     let timedOut = false;
     let forcedKill = false;
@@ -394,10 +537,10 @@ const supervisor = `
   try {
     await lifecycle.start();
     const url = new URL(lifecycle.getConnectionUrl()); url.pathname = "/";
-    await mkdir(process.env.CCC_W4_RESULT_ROOT, { recursive: true });
+    await mkdir(process.env.CCC_PROOF_RESULT_ROOT, { recursive: true });
     for (const entry of commands) {
       if (interrupted) break;
-      const outputFile = entry.machineResults ? join(process.env.CCC_W4_RESULT_ROOT, entry.id + ".json") : null;
+      const outputFile = entry.machineResults ? join(process.env.CCC_PROOF_RESULT_ROOT, entry.id + ".json") : null;
       const args = entry.machineResults
         ? [...entry.command.slice(1), ...entry.vitestArgs, "--outputFile", outputFile]
         : entry.command.slice(1);
@@ -410,7 +553,7 @@ const supervisor = `
     process.removeListener("SIGTERM", onSigTerm);
     try { await stopWithinBudget(); } catch (error) { stopError = stopFailureText(error); }
   }
-  process.stdout.write("CCC_W4_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: "ccc_wave4_proof", stopError, lifecycleErrors, interrupted }) + "\\n");
+  process.stdout.write("CCC_PROOF_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: process.env.CCC_PROOF_DATABASE, stopError, lifecycleErrors, interrupted }) + "\\n");
   if (stopError || interrupted || results.some((result) => result.code !== 0) || results.length !== commands.length) process.exitCode = 1;
 `;
 
@@ -424,13 +567,14 @@ const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module",
   cwd: repoRoot,
   env: {
     ...process.env,
-    CCC_W4_DATA_ROOT: dataRoot,
-    CCC_W4_RESULT_ROOT: resultRoot,
-    CCC_W4_REPO_ROOT: repoRoot,
-    CCC_W4_COMMANDS: JSON.stringify(commands),
-    CCC_W4_CHILD_TIMEOUT_MS: String(childTimeoutMs),
-    CCC_W4_CHILD_TERMINATE_GRACE_MS: String(childTerminateGraceMs),
-    CCC_W4_PG_STOP_TIMEOUT_MS: String(postgresStopBudgetMs),
+    CCC_PROOF_DATA_ROOT: dataRoot,
+    CCC_PROOF_RESULT_ROOT: resultRoot,
+    CCC_PROOF_REPO_ROOT: repoRoot,
+    CCC_PROOF_DATABASE: proofDatabase,
+    CCC_PROOF_COMMANDS: JSON.stringify(commands),
+    CCC_PROOF_CHILD_TIMEOUT_MS: String(childTimeoutMs),
+    CCC_PROOF_CHILD_TERMINATE_GRACE_MS: String(childTerminateGraceMs),
+    CCC_PROOF_PG_STOP_TIMEOUT_MS: String(postgresStopBudgetMs),
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -464,13 +608,13 @@ process.removeListener("SIGINT", forwardSigInt);
 process.removeListener("SIGTERM", forwardSigTerm);
 if (parentForceKillTimer) clearTimeout(parentForceKillTimer);
 if (parentNormalTimeout) clearTimeout(parentNormalTimeout);
-const supervisorLine = stdout.split("\n").find((line) => line.startsWith("CCC_W4_SUPERVISOR_RESULT="));
-let supervisorResult = { results: [], database: "ccc_wave4_proof" };
+const supervisorLine = stdout.split("\n").find((line) => line.startsWith("CCC_PROOF_SUPERVISOR_RESULT="));
+let supervisorResult = { results: [], database: proofDatabase };
 let policyError;
 try {
   if (supervisorSpawnError) throw new Error(`supervisor spawn rejected: ${supervisorSpawnError}`);
   if (!supervisorLine) throw new Error("supervisor did not emit machine result");
-  supervisorResult = JSON.parse(supervisorLine.slice("CCC_W4_SUPERVISOR_RESULT=".length));
+  supervisorResult = JSON.parse(supervisorLine.slice("CCC_PROOF_SUPERVISOR_RESULT=".length));
   if (forwardedSignal) throw new Error(`proof runner interrupted by ${forwardedSignal}`);
   assertSupervisorResult(supervisorResult, commands);
   for (const command of commands) {
@@ -489,7 +633,7 @@ try {
 
 const passed = exitCode === 0 && policyError === undefined;
 const report = {
-  wave: 4,
+  wave: selectedWave,
   passed,
   commands: supervisorResult.results.map(({ outputFile, ...result }) => Object.fromEntries(
     Object.entries(result).map(([key, value]) => [key, typeof value === "string" ? redact(value) : value]),
@@ -497,12 +641,12 @@ const report = {
   policyError: policyError ?? null,
 };
 await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
-await writeFile(manifestPath, `${JSON.stringify({ wave: 4, passed, reportPath, database: supervisorResult.database }, null, 2)}\n`);
+await writeFile(manifestPath, `${JSON.stringify({ wave: selectedWave, passed, reportPath, database: supervisorResult.database }, null, 2)}\n`);
 if (passed) {
   await rm(dataRoot, { recursive: true, force: true });
-  console.log(`Wave 4 PostgreSQL proof passed; redacted report: ${reportPath}`);
+  console.log(`Wave ${selectedWave} PostgreSQL proof passed; redacted report: ${reportPath}`);
 } else {
   await writeFile(join(proofRoot, "supervisor.log"), redact(`${stdout}\n${stderr}`));
-  console.error(`Wave 4 PostgreSQL proof failed; preserved diagnosis: ${proofRoot}`);
+  console.error(`Wave ${selectedWave} PostgreSQL proof failed; preserved diagnosis: ${proofRoot}`);
   process.exitCode = 1;
 }
