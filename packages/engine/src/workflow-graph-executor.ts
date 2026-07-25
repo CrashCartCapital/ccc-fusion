@@ -649,6 +649,9 @@ export class WorkflowGraphExecutor {
             } else {
               context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY] = splitResult.failureReason;
             }
+            if (typeof splitResult.terminalAttempt === "number") {
+              context[CCC_RETRY_ATTEMPT_CONTEXT_KEY] = splitResult.terminalAttempt;
+            }
             return { outcome: "failure", value: splitResult.failureReason };
           }
           if (!inStack.has(splitResult.joinNodeId)) visitedNodeIds.push(splitResult.joinNodeId);

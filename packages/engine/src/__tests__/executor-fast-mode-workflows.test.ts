@@ -265,6 +265,67 @@ describe("fast mode workflow/runtime invariants", () => {
     } finally { customNode.mockRestore(); }
   });
 
+  it("Wave 4 RED: public TaskExecutor persists a branch terminal's consumed retry cap over a stale continuation", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const stale = { id: "WI-wave4-branch-stale", taskId: liveTask.id, runId: `${liveTask.id}:wave4-branch-retry`, nodeId: "split", kind: "task", state: "running", attempt: 9 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([stale]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue({ ...stale, state: "exhausted", attempt: 2 });
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    store.saveWorkflowRunBranch = vi.fn().mockResolvedValue(undefined);
+    store.loadWorkflowRunBranches = vi.fn().mockResolvedValue([]);
+    store.clearWorkflowRunBranches = vi.fn().mockResolvedValue(undefined);
+    const selected = { workflowId: "wave4-branch-two-attempt-transient", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 branch two attempts",
+      ir: {
+        version: "v2",
+        name: "Wave 4 branch two attempts",
+        columns: [],
+        nodes: [
+          { id: "start", kind: "start" },
+          { id: "split", kind: "split" },
+          { id: "retrying-branch", kind: "prompt", config: { maxRetries: 2 } },
+          { id: "sibling", kind: "prompt", config: {} },
+          { id: "join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+          { id: "end", kind: "end" },
+        ],
+        edges: [
+          { from: "start", to: "split" },
+          { from: "split", to: "retrying-branch" },
+          { from: "split", to: "sibling" },
+          { from: "retrying-branch", to: "join", condition: "success" },
+          { from: "sibling", to: "join", condition: "success" },
+          { from: "join", to: "end", condition: "success" },
+        ],
+      },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockImplementation(async (node: { id: string }) => {
+      if (node.id === "retrying-branch") {
+        throw new (await import("../engine-errors.js")).TransientError("retry", "CCC_BRANCH_TWO");
+      }
+      return { outcome: "success" };
+    });
+
+    try {
+      await executor.execute(liveTask);
+
+      expect(customNode).toHaveBeenCalledTimes(3);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(stale.id, "exhausted", expect.objectContaining({
+        attempt: 2,
+        lastError: "ccc-transient-retry-exhausted:CCC_BRANCH_TWO",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition",
+        metadata: expect.objectContaining({ classification: "ccc-transient-exhausted", attempt: 2 }),
+      }));
+    } finally {
+      customNode.mockRestore();
+    }
+  });
+
   it("graph executor with a custom workflow skips custom pre-merge prompt/gate nodes in fast mode", async () => {
     const { store, executor } = makeExecutorForTask(task({ executionMode: "fast", worktree: "/tmp/wt" }));
     const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true });

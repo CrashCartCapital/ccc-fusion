@@ -139,6 +139,8 @@ export interface SplitJoinResult {
   visitedNodeIds: string[];
   /** Stable fail-closed classification for a CCC terminal branch failure. */
   failureReason?: string;
+  /** Exact handler attempts consumed by the terminal CCC branch failure. */
+  terminalAttempt?: number;
 }
 
 interface ResolvedJoinConfig {
@@ -220,6 +222,7 @@ export async function runSplitJoin(
   let succeeded = 0;
   let failed = 0;
   let failureReason: string | undefined;
+  let terminalAttempt: number | undefined;
   let settled = false;
   let resolveJoin!: (outcome: WorkflowNodeOutcome) => void;
   const joinReached = new Promise<WorkflowNodeOutcome>((res) => {
@@ -232,8 +235,13 @@ export async function runSplitJoin(
     resolveJoin(outcome);
   };
 
-  const failClosedCccTerminal = (reason: string): void => {
-    failureReason ??= reason;
+  const failClosedCccTerminal = (reason: string, attempt?: number): void => {
+    if (failureReason === undefined) {
+      failureReason = reason;
+      terminalAttempt = attempt;
+    } else if (failureReason === reason && terminalAttempt === undefined && attempt !== undefined) {
+      terminalAttempt = attempt;
+    }
     env.onCccTerminalFailure?.(reason);
     controller.abort();
     settle("failure");
@@ -273,7 +281,7 @@ export async function runSplitJoin(
         branchOutcomes.push({ branchId, outcome: result.outcome, nodeId: result.lastNodeId });
         if (result.outcome === "success") succeeded += 1;
         else failed += 1;
-        if (result.failureReason) failClosedCccTerminal(result.failureReason);
+        if (result.failureReason) failClosedCccTerminal(result.failureReason, result.terminalAttempt);
         evaluateJoin(result.outcome === "failure", result.failureReason !== undefined);
       })
       .catch((err) => {
@@ -304,7 +312,7 @@ export async function runSplitJoin(
   const outcome = await joinReached;
   await Promise.allSettled(branchPromises);
 
-  return { joinNodeId: join, outcome, branchOutcomes, visitedNodeIds, failureReason };
+  return { joinNodeId: join, outcome, branchOutcomes, visitedNodeIds, failureReason, terminalAttempt };
 }
 
 interface BranchWalkResult {
@@ -312,15 +320,22 @@ interface BranchWalkResult {
   lastNodeId: string;
   /** CCC-only terminal classification which must bypass authored branch edges. */
   failureReason?: string;
+  /** Exact handler attempts consumed by a terminal CCC retry classification. */
+  terminalAttempt?: number;
 }
 
-function cccTerminalBranchReason(task: TaskDetail, result: WorkflowNodeResult): string | undefined {
+function cccTerminalBranchFailure(
+  task: TaskDetail,
+  result: WorkflowNodeResult,
+): { reason: string; attempt?: number } | undefined {
   if (!isCccFusionTask(task) || result.outcome !== "failure") return undefined;
   const value = result.contextPatch?.["ccc:retry-classification"];
   if (typeof value !== "string") return undefined;
-  return value.startsWith("ccc-permanent:") || value.startsWith("ccc-transient-retry-exhausted:")
-    ? value
-    : undefined;
+  if (!value.startsWith("ccc-permanent:") && !value.startsWith("ccc-transient-retry-exhausted:")) {
+    return undefined;
+  }
+  const attempt = result.contextPatch?.["ccc:retry-attempt"];
+  return { reason: value, ...(typeof attempt === "number" ? { attempt } : {}) };
 }
 
 /**
@@ -358,7 +373,12 @@ async function walkBranch(
         // FNXC:CCCBranchPersistence 2026-07-24-14:25: a nested CCC terminal
         // failure is not an authored branch outcome; bubble it to the owning
         // split so collect joins abort before any inner or outer failure edge.
-        return { outcome: "failure", lastNodeId: inner.joinNodeId, failureReason: inner.failureReason };
+        return {
+          outcome: "failure",
+          lastNodeId: inner.joinNodeId,
+          failureReason: inner.failureReason,
+          terminalAttempt: inner.terminalAttempt,
+        };
       }
       lastResult = { outcome: inner.outcome };
       const next = nextEdge(inner.joinNodeId, env, lastResult);
@@ -397,12 +417,20 @@ async function walkBranch(
         currentNodeId: currentId,
         status: "failed",
       }, "progress", isCccFusionTask(env.task));
-      const failureReason = cccTerminalBranchReason(env.task, lastResult);
-      if (failureReason) onCccTerminalFailure?.(failureReason);
+      /*
+      FNXC:CccWave4Retry 2026-07-24-18:20:
+      A split's terminal result crosses an asynchronous branch boundary before
+      TaskExecutor persists its durable continuation. Keep the exact consumed
+      retry count beside the CCC classification so an old continuation attempt
+      cannot overwrite the terminal branch's configured cap.
+      */
+      const terminalFailure = cccTerminalBranchFailure(env.task, lastResult);
+      if (terminalFailure) onCccTerminalFailure?.(terminalFailure.reason);
       return {
         outcome: "failure",
         lastNodeId: currentId,
-        failureReason,
+        failureReason: terminalFailure?.reason,
+        terminalAttempt: terminalFailure?.attempt,
       };
     }
 
