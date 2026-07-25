@@ -140,10 +140,22 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
   });
 
   it.each(["normal handler", "plugin handler"] as const)(
-    "Wave 4 RED: an aborted sibling cannot publish a task projection from the %s path",
+    "Wave 4 RED: an aborted sibling cannot commit an async task projection from the %s path",
     async (resultPath) => {
-      const siblingEntered = deferred<void>();
-      const projectionSink = vi.fn();
+      const projectionEntered = deferred<void>();
+      const siblingAborted = deferred<void>();
+      const committedUpdates: unknown[] = [];
+      const projectionSink = vi.fn(async (
+        _taskId: string,
+        patch: unknown,
+        _source: unknown,
+        signal?: AbortSignal,
+      ) => {
+        projectionEntered.resolve();
+        await siblingAborted.promise;
+        // Model TaskExecutor's updateTaskAtomic updater at the commit boundary.
+        if (!signal?.aborted) committedUpdates.push(patch);
+      });
       const extensionKey = workflowExtensionRegistryId("wave4-projection", "late-result");
       const workflow: WorkflowIr = {
         version: "v2",
@@ -170,12 +182,9 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
           { from: "join", to: "end", condition: "success" },
         ],
       };
-      const awaitAbort = (signal: AbortSignal | undefined) => signal?.aborted
-        ? Promise.resolve()
-        : new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
       const lateResult = async (signal: AbortSignal | undefined) => {
-        siblingEntered.resolve();
-        await awaitAbort(signal);
+        if (signal?.aborted) siblingAborted.resolve();
+        else signal?.addEventListener("abort", () => siblingAborted.resolve(), { once: true });
         return { outcome: "success" as const, contextPatch: { modifiedFiles: ["src/late.ts"] } };
       };
 
@@ -196,7 +205,7 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
         handlers: {
           prompt: async (node, context) => {
             if (node.id === "terminal") {
-              await siblingEntered.promise;
+              await projectionEntered.promise;
               throw new PermanentError("terminal", "CCC_ABORT");
             }
             if (node.id === "late-projection" && resultPath === "normal handler") {
@@ -216,7 +225,8 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
         );
 
         expect(result.outcome).toBe("failure");
-        expect(projectionSink).not.toHaveBeenCalled();
+        expect(projectionSink).toHaveBeenCalledTimes(1);
+        expect(committedUpdates).toEqual([]);
       } finally {
         __resetWorkflowExtensionRegistryForTests();
       }

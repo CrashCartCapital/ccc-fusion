@@ -6187,8 +6187,15 @@ export class TaskExecutor {
         prepareNodeExecution: (node, nodeTask, requirement) =>
           this.prepareGraphNodeExecution(node, nodeTask, settings, requirement),
         runCustomNode: customNodeExecution.runner(settings),
-        publishTaskProjection: async (taskId, patch) => {
+        publishTaskProjection: async (taskId, patch, _source, signal) => {
           await this.store.updateTaskAtomic(taskId, (liveTask) => {
+            /*
+            FNXC:CccWave4Projection 2026-07-24-19:10:
+            The branch may abort after projection persistence starts but before
+            the atomic updater owns the task lock. Recheck at that commit
+            boundary so a losing normal or plugin node produces no task patch.
+            */
+            if (signal?.aborted) return undefined;
             const update: Parameters<TaskStore["updateTask"]>[1] = {};
             if (patch.modifiedFiles) {
               const merged = [...new Set([...(liveTask.modifiedFiles ?? []), ...patch.modifiedFiles])].sort();

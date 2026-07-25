@@ -133,7 +133,12 @@ export interface WorkflowGraphTaskRunnerDeps {
   /** Enabled pre-merge optional-step REVISE remediation seam. Additive; absent preserves prior graph traversal. */
   requestPreMergeOptionalStepFix?: WorkflowGraphExecutorDeps["requestPreMergeOptionalStepFix"];
   /** Project node-published task metadata onto the task row for dispatcher/UI. */
-  publishTaskProjection?: (taskId: string, patch: WorkflowTaskProjection, source: { nodeId: string; nodeKind: string }) => void | Promise<void>;
+  publishTaskProjection?: (
+    taskId: string,
+    patch: WorkflowTaskProjection,
+    source: { nodeId: string; nodeKind: string },
+    signal?: AbortSignal,
+  ) => void | Promise<void>;
   /** @deprecated use publishTaskProjection. */
   publishTouchedFiles?: (taskId: string, files: string[], source: { nodeId: string; nodeKind: string }) => void | Promise<void>;
   /**

@@ -250,7 +250,12 @@ export interface WorkflowGraphExecutorDeps {
     maxRevisions?: unknown;
   }) => Promise<boolean> | boolean;
   /** Project node-published task metadata onto the task row for dispatcher/UI. */
-  publishTaskProjection?: (taskId: string, patch: WorkflowTaskProjection, source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] }) => void | Promise<void>;
+  publishTaskProjection?: (
+    taskId: string,
+    patch: WorkflowTaskProjection,
+    source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] },
+    signal?: AbortSignal,
+  ) => void | Promise<void>;
   /** @deprecated use publishTaskProjection. Kept for older callers. */
   publishTouchedFiles?: (taskId: string, files: string[], source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] }) => void | Promise<void>;
   /*
@@ -1537,7 +1542,7 @@ export class WorkflowGraphExecutor {
           if (signal?.aborted || this.isAbortNodeResult(pluginResult)) {
             return this.withEnginePauseAbortContext(node, pluginResult);
           }
-          const projected = await this.publishTaskProjectionFromResult(task.id, node, pluginResult);
+          const projected = await this.publishTaskProjectionFromResult(task.id, node, pluginResult, signal);
           if (this.isAbortNodeResult(projected)) {
             return this.withEnginePauseAbortContext(node, projected);
           }
@@ -1553,7 +1558,7 @@ export class WorkflowGraphExecutor {
         if (signal?.aborted || this.isAbortNodeResult(result)) {
           return this.withEnginePauseAbortContext(node, result);
         }
-        const projected = await this.publishTaskProjectionFromResult(task.id, node, result);
+        const projected = await this.publishTaskProjectionFromResult(task.id, node, result, signal);
         if (this.isAbortNodeResult(projected)) {
           return this.withEnginePauseAbortContext(node, projected);
         }
@@ -1757,12 +1762,14 @@ export class WorkflowGraphExecutor {
     taskId: string,
     node: WorkflowIrNode,
     result: WorkflowNodeResult,
+    signal?: AbortSignal,
   ): Promise<WorkflowNodeResult> {
     const patch = extractTaskProjection(result.contextPatch);
     if (!hasTaskProjection(patch)) return result;
     const source = { nodeId: node.id, nodeKind: node.kind };
     try {
-      await this.deps.publishTaskProjection?.(taskId, patch, source);
+      if (signal) await this.deps.publishTaskProjection?.(taskId, patch, source, signal);
+      else await this.deps.publishTaskProjection?.(taskId, patch, source);
     } catch (error) {
       /*
        * FNXC:WorkflowCompletion 2026-07-01-16:24:
@@ -1792,6 +1799,7 @@ export class WorkflowGraphExecutor {
         },
       };
     }
+    if (signal?.aborted) return { ...result, outcome: "failure", value: "aborted" };
     if (patch.modifiedFiles && patch.modifiedFiles.length > 0) {
       try {
         await this.deps.publishTouchedFiles?.(taskId, patch.modifiedFiles, source);
