@@ -30,13 +30,14 @@ This is the code-local continuation packet. The vault remains authoritative for 
 |---|---|---|
 | Accepted Wave 4 | Accepted and frozen | `726db7806c5964097f982b7048da680d2fdd750a` |
 | Accepted Wave 5 | Accepted after closed 80-test proof and three fresh no-P0/P1 council passes | `db486195224839ff10dee396d3b119623ae59661` |
+| Accepted Task 1 | Immutable campaign/execution-policy identity plus populated-0035 quarantine proof; closed Wave 5 mapping now 81/81 | `1cbcef3037a86917f5a1b769eac7d84059b7099b` |
 | Accepted Phase A/B contract | Generated sidecar, structural compiler, validate, and built CLI | `90c585766b37605aae4be5a9ad6880455e1b7afa` |
 | Accepted Phase C import | PostgreSQL/filesystem unit of work, recovery, and idempotency | `d0debd4ee1b50276b149741e23bbe69c18360ba2` |
 | Wave 5 integration branch | Current code-writing branch | `agent/ccc-fusion-wave-5-integration` |
 | Wave 6 and Wave 7 | Speculative evidence only; unchanged replay rejected | Isolated worktrees, not ancestors of integration |
 | Primary checkout | Not a product writing target | `main` has a generated-instruction descendant and one preserved pre-existing untracked report |
 
-Accepted Wave 5 is frozen at tree `c273946cfdd7aaceed9a1e7c50f3dcb8290c8149`. The closed proof inventory is exactly 80 uniquely named tests: built CLI 10, core sidecar/compiler contract 7, core import/recovery 40, import migration 2, engine authoring/compiler/corpus 20, and native imported execution 1. Wave 4 regression, relevant typechecks/builds, lint, runner policy and stop-settlement self-tests, manifests, diff hygiene, user-like built CLI, loopback PostgreSQL, and all three fresh council lanes passed. The earlier compiler-only baseline `e29732e74f38393eeb0ba25e899dd14e012b9fbf` remains historical custody evidence only.
+Accepted Wave 5 is frozen at tree `c273946cfdd7aaceed9a1e7c50f3dcb8290c8149`. Its original closed proof inventory was exactly 80 uniquely named tests: built CLI 10, core sidecar/compiler contract 7, core import/recovery 40, import migration 2, engine authoring/compiler/corpus 20, and native imported execution 1. Accepted Task 1 descendant `1cbcef3037a86917f5a1b769eac7d84059b7099b`, tree `ee4926193a230fb71f0bea97a2d03417ff672b5c`, adds the populated-runnable `0035→0036` quarantine regression and advances the same closed mapping to 81/81 without changing production behavior. Wave 4 regression, relevant typechecks/builds, lint, runner policy and stop-settlement self-tests, manifests, diff hygiene, user-like built CLI, loopback PostgreSQL, and all three fresh Task 1 council lanes passed. The earlier compiler-only baseline `e29732e74f38393eeb0ba25e899dd14e012b9fbf` remains historical custody evidence only.
 
 ## Implemented Compiler Surface
 
@@ -140,7 +141,7 @@ Reject work whose only defense is architectural neatness, theoretical future sca
 - The accepted spine remains linear even when scaffolding proceeds in parallel.
 - Shared persistence and import stay serial under one writer.
 - Fanout is for independent evidence and isolated scaffolding, not parallel edits to one interface.
-- Wave 5 is accepted. The next implementation action is the RED for the native campaign binding, execution-policy identity, audit, and approval CAS contract.
+- Task 1 campaign binding and execution-policy identity are accepted. The next implementation action is the Task 2 RED for native run-audit idempotency/collision, approval compare-and-swap authority, and effect binding after the forward-migration amendment below is reviewed.
 
 ## Settled Post-Audit Decisions
 
@@ -159,9 +160,10 @@ Extend existing Fusion production seams so an imported CCC campaign is admitted,
 
 ### Preconditions
 
-- Accepted predecessor: `db486195224839ff10dee396d3b119623ae59661`.
-- Accepted tree: `c273946cfdd7aaceed9a1e7c50f3dcb8290c8149`.
-- Accepted Wave 5 proof inventory: 80 exact tests.
+- Accepted predecessor: Task 1 `1cbcef3037a86917f5a1b769eac7d84059b7099b`.
+- Accepted tree: `ee4926193a230fb71f0bea97a2d03417ff672b5c`.
+- Preserved closed Wave 5 proof inventory: 81 exact tests. The original accepted Wave 5 product commit remains `db486195224839ff10dee396d3b119623ae59661`; Task 1 adds only the durable populated-0035 regression and its exact expected name.
+- Task 1 owns immutable migration `0036_ccc_campaign_native_enforcement.sql`. Task 2 must advance through new forward migration `0037_ccc_campaign_governance.sql`; it must not edit or repurpose `0036`.
 - Package, workspace, and lockfile hashes remain unchanged.
 - Wave 6 `2f01f5f559f44cd60733d304d30976e973a5e894` and Wave 7 `8be022a734fe47aa2deec2d6d9e494b31bef66a3` are non-ancestors and may supply test ideas only.
 - Provider, credential, billing, non-loopback, fetch, push, merge, release, publication, upstream-adoption, and `main` actions remain unissued.
@@ -200,12 +202,12 @@ Extend existing Fusion production seams so an imported CCC campaign is admitted,
 
 ### Task 2 — Native Run-Audit Receipt, Approval CAS, And Effect Binding
 
-- Surfaces: `packages/core/src/types/run-audit.ts`, `packages/core/src/types/agents.ts`, `packages/core/src/task-store/async-audit.ts`, `packages/core/src/postgres/data-layer.ts`, `packages/core/src/async-approval-request-store.ts`, `packages/core/src/approval-request-store.ts`, `packages/core/src/ccc-effect-receipts.ts`, `packages/core/src/cli-session-store.ts`, new `packages/core/src/postgres/schema/campaign-governance.ts`, `packages/core/src/postgres/schema/project.ts`, migration `0036`, fresh schema `0000_initial.sql`, core exports, new PostgreSQL campaign test, existing approval and CLI-session-store tests.
+- Surfaces: `packages/core/src/types/run-audit.ts`, `packages/core/src/types/agents.ts`, `packages/core/src/task-store/async-audit.ts`, `packages/core/src/postgres/data-layer.ts`, `packages/core/src/async-approval-request-store.ts`, `packages/core/src/approval-request-store.ts`, `packages/core/src/ccc-effect-receipts.ts`, `packages/core/src/cli-session-store.ts`, new `packages/core/src/postgres/schema/campaign-governance.ts`, `packages/core/src/postgres/schema/project.ts`, `packages/core/src/postgres/schema-applier.ts`, new forward migration `packages/core/src/postgres/migrations/0037_ccc_campaign_governance.sql`, fresh schema `packages/core/src/postgres/migrations/0000_initial.sql`, core exports, new `packages/core/src/__tests__/postgres/ccc-campaign-governance-migration.pg.test.ts`, existing PostgreSQL campaign, approval, effect-receipt, and CLI-session-store tests. Do not modify `0036_ccc_campaign_native_enforcement.sql` or add Task 2 names to the closed Wave 5 migration file.
 - RED: identical campaign audit event replay must return one row; the same event key with changed binding must refuse; two concurrent approval claims must produce exactly one winner; not-before and issued-expiry must refuse; a claimed approval must not expire mid-effect; only the winning claim token may consume; denial/expiry/consume must append one same-transaction audit transition; an admitted protected action must persist and reuse that winning claim token across an identical retry, consume it exactly once after authoritative completion, keep it claimed while completion is unknown, and expire rather than silently reissue it after bounded abandonment; a campaign effect with no complete TaskStore-derived binding must refuse before effect execution; receipt binding drift must collide; an unresolved dispatch must reject blind retry yet accept one exact authoritative no-effect proof.
 - GREEN: add first-class campaign/action/event/idempotency/packet/bundle/target/base/provider/model/manifest/binding fields to native RunAuditEvent and deterministic insert-or-read collision semantics. Extend ApprovalRequest compatibly with `issued`, `claimed`, `consumed`, and `expired`; preserve legacy pending/approved/completed callers; make legacy and campaign transitions conditional updates with exact-one-row enforcement. New CCC authority methods require PostgreSQL and fail closed in legacy SQLite mode. Add a nullable campaign binding hash to the existing CCC effect receipt row only for legacy-row compatibility. Every campaign effect reservation, dispatch, commit, replay, and reconciliation must reload and bind the complete campaign identity through `TaskStore.getCccCampaignContextForTask`; caller metadata cannot supply it and omission refuses before the effect seam. Preserve `dispatched_unknown` as manual/reconciliation truth until a new native reconcile method receives exact campaign binding, controller generation, authoritative observer identity, observation digest, and a no-effect result; only that evidence may transition `dispatched_unknown → proved_failed`. A committed observation remains committed and any mismatched observation collides.
-- REFACTOR: split run-audit and approval Drizzle definitions out of oversized `project.ts` while re-exporting the same symbols. Keep one forward migration, RLS/project binding, fresh-schema parity, upgrade-once proof, and unchanged legacy read shapes.
-- Verification: `pnpm --filter @fusion/core exec vitest run --config vitest.pg.config.ts src/__tests__/postgres/ccc-campaign-native.pg.test.ts src/__tests__/postgres/cli-session-store.pg.test.ts src/__tests__/postgres/satellite-db-injected-stores.test.ts --silent=passed-only --reporter=dot`; focused sync approval tests; core typecheck/build; focused lint; schema parity; `git diff --check`.
-- Done when: audit replay/collision, approval one-winner authority, expiry/not-before, exact-token completion consumption, same-transaction history, effect collision, and restart reads are directly proven.
+- REFACTOR: split run-audit and approval Drizzle definitions out of oversized `project.ts` while re-exporting the same symbols. Keep one new forward migration at `0037`, explicit constant/path/apply registration in `schema-applier.ts`, RLS/project binding, fresh-schema parity, `0036→0037` upgrade-once proof, and unchanged legacy read shapes. Never rewrite committed migration `0036`.
+- Verification: `pnpm --filter @fusion/core exec vitest run --config vitest.pg.config.ts src/__tests__/postgres/ccc-campaign-governance-migration.pg.test.ts src/__tests__/postgres/ccc-campaign-native.pg.test.ts src/__tests__/postgres/cli-session-store.pg.test.ts src/__tests__/postgres/satellite-db-injected-stores.test.ts --silent=passed-only --reporter=dot`; focused sync approval and effect-receipt tests; schema-applier registration/parity; core typecheck/build; focused lint; `git diff --check`. Task 2 tests enter the future consolidated `--wave 6` inventory only after their exact names freeze; the accepted Wave 5 command and its 81-name mapping remain unchanged.
+- Done when: `0036→0037` upgrade and fresh-schema parity, audit replay/collision, approval one-winner authority, expiry/not-before, exact-token completion consumption, same-transaction history, effect collision, and restart reads are directly proven.
 
 ### Task 3 — Fail-Closed Proof Admission And Fenced Workflow Ownership
 
@@ -251,7 +253,7 @@ Extend existing Fusion production seams so an imported CCC campaign is admitted,
 - RED: the runner must reject `--wave 6` before the inventory is added; after test creation, the old mapping must reject every new extra name.
 - GREEN: add one closed consolidated E/F mapping only after exact names and counts are frozen. Reject missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, forced-killed, failed, missing-output, stale, interrupted, or teardown-failed results. Preserve Wave 4 and Wave 5 mappings unchanged.
 - REFACTOR: timing-bearing logs stay outside identity bytes; report exact commands, counts, hashes, Git identities, and cleanup state.
-- Verification: focused suites; Wave 4 regression; accepted Wave 5 80/80; consolidated runner; core/engine/CLI typechecks and builds; root lint; real local Git plus loopback PostgreSQL; built CLI; `git diff --check`; exact manifests; clean status.
+- Verification: focused suites; Wave 4 regression; preserved Wave 5 81/81; consolidated runner; core/engine/CLI typechecks and builds; root lint; real local Git plus loopback PostgreSQL; built CLI; `git diff --check`; exact manifests; clean status.
 - Done when: one frozen commit/tree passes central proof and fresh behavioral/PostgreSQL, static/build, and adversarial final-byte council lanes with no P0/P1. Any code or test repair creates a new candidate and invalidates every verdict.
 
 ### Plan-Freeze Acceptance Gate
@@ -262,10 +264,10 @@ Extend existing Fusion production seams so an imported CCC campaign is admitted,
 - Lower-reasoning Sol lane challenges workflow leasing, cancellation, proof provenance, path/ref admission, crash reconciliation, and false-green coverage.
 - AGY adversarial review is advisory only. Native council evidence remains authoritative.
 - Accepted verdict: the repaired plan received a fresh native final-byte `PASS — no unresolved P0/P1` after closing per-transport Pi/CLI/non-Pi bounds, full-graph work-processor routing, mandatory TaskStore-derived effect binding, and exact approval-claim reconciliation.
-- This accepted documentation commit is the execution predecessor for Task 1 RED. Any implementation discovery that invalidates a frozen contract must amend the plan, update the checkpoint, and receive a fresh review before production edits continue.
+- The original accepted documentation commit remains the execution-plan predecessor for Task 1. This Task 2 amendment preserves every accepted Task 1 byte, reserves `0037` for campaign governance, isolates its migration proof from the closed Wave 5 runner, and requires a fresh amendment review before Task 2 production edits. Any later discovery that invalidates a frozen contract must amend the plan, update the checkpoint, and receive a fresh review before dependent production edits continue.
 
 ## Recovery And Handoff
 
 - Recovery Rule: after compaction or a fresh session, read the vault checkpoint first, then this note, then verify live branch/HEAD/tree/status before issuing work.
-- Handoff Rule: the active goal already exists. The sole accepted-spine writer resumes at Task 1 RED and updates the vault checkpoint after each material contract, RED, GREEN, commit, review, or operator gate.
-- Resume Rule: local product implementation resumes from accepted Wave 5 `db4861952` through the consolidated native E/F plan above. It does not begin a live provider, credential, billing, non-loopback, fetch, push, merge, release, publication, protected-path, upstream-adoption, or `main` action.
+- Handoff Rule: the active goal already exists. The sole accepted-spine writer resumes from accepted Task 1 `1cbcef3037a86917f5a1b769eac7d84059b7099b`, freezes the Task 2 amendment, and updates the vault checkpoint after each material contract, RED, GREEN, commit, review, or operator gate.
+- Resume Rule: local product implementation resumes from accepted Task 1 through the consolidated native E/F plan above. It does not begin a live provider, credential, billing, non-loopback, fetch, push, merge, release, publication, protected-path, upstream-adoption, or `main` action.

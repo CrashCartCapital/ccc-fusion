@@ -74,7 +74,7 @@ node scripts/run-ccc-pg-proof.mjs --wave 4
 
 The first command must fail before tests for the intended skip-policy reason. The second must enforce its exact named mapping and reject missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, or failed tests.
 
-For the pending Wave 5 import slice, targeted proof must cover all of these before broad gates:
+The accepted Wave 5 import slice is frozen, but any repair to its production or mapped tests must still cover all of these before broad gates:
 
 - zero-store compile and validate;
 - one successful import with independent exact campaign, task, edge, workflow, document, artifact, source, work-item, and audit counts confirmed by direct tables and normal Fusion APIs;
@@ -87,7 +87,9 @@ For the pending Wave 5 import slice, targeted proof must cover all of these befo
 - imported tasks and workflows visible through normal list/show/read surfaces after restart;
 - zero provider execution.
 
-The closed Wave 5 proof mapping does not exist yet. Add `--wave 5` only with the final named test inventory, then prove the runner rejects missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, and failed tests. Do not add placeholder mappings for later waves.
+The closed Wave 5 proof mapping exists at 81 exact names: built CLI 10, core contract 7, core import/recovery 40, core migration 3, engine contract 20, and native imported execution 1. Run it with `node scripts/run-ccc-pg-proof.mjs --wave 5`. The runner rejects missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, forced-killed, and failed results. Preserve this mapping unchanged during consolidated Phase E/F work.
+
+Task 2 owns new forward migration `0037_ccc_campaign_governance.sql`; Task 1 migration `0036_ccc_campaign_native_enforcement.sql` is immutable. Keep the Task 2 `0036→0037` upgrade proof in a dedicated `ccc-campaign-governance-migration.pg.test.ts` file so the closed Wave 5 migration command remains exactly three tests. Add Task 2 names only to the future consolidated `--wave 6` mapping after the exact inventory is complete; do not add a placeholder mapping.
 
 After Wave 5 acceptance, speculative Wave 6 and Wave 7 tests remain development evidence only. Any harvested enforcement test must hit native PostgreSQL audit/approval services or the production merger/ref-update/real-Git seam. Standalone classifier passes cannot close an integrated acceptance gate.
 
