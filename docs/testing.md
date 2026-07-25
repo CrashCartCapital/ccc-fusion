@@ -59,7 +59,9 @@ pnpm build
 git diff --check
 ```
 
-Run the compiler twice against the same admitted fixture and compare semantic output, source hash, bundle hash, and full serialized output. `compile` and `validate` must leave no task, workflow, document, artifact, project, database, or `.fusion` state behind.
+Run the compiler twice against the same admitted fixture and compare semantic output, source hash, bundle hash, and full serialized output. This existing lane proves custody and repeatability only: the current 18-source `ccc-lab-super` fixture produces zero requirements, so it cannot satisfy semantic or Wave 5 acceptance. The repaired lane must exercise the designated authoring workflow on an unchanged representative packet, prove it generates a traceable candidate sidecar plus a bounded ambiguity/exception/protected-decision list without Ryan manually recreating requirements or tasks, and then use that versioned sidecar/index to assert exact non-zero requirement, proof, action, dependency, workflow, document, artifact, and import-intent counts. Every sidecar record must reference exact unchanged Markdown spans and raw source hashes. Use code-unit canonical ordering, not locale collation.
+
+Test the built CLI rather than only `runPrdCommand`. Top-level help must expose `prd`; validate must emit bounded diagnostics without a full bundle; compile must emit the bundle; import must report exact created/existing counts. Success is `0`, semantic refusal is `1`, and usage error is `2`. Define zero-store as no mutation to admitted repository/vault/database roots plus removal of bounded owned temporary bootstrap state; do not treat arbitrary global filesystem immutability as a meaningful oracle.
 
 PostgreSQL-backed ccc proof uses a disposable loopback fixture on a free port. Never reuse, stop, or modify an unrelated listener; port `55439` is a preserved existing listener in the current Phase 5 environment. Keep failed fixture roots and machine-readable reports for diagnosis. A successful owned fixture must stop its processes and release its listener before the lane returns.
 
@@ -75,12 +77,19 @@ The first command must fail before tests for the intended skip-policy reason. Th
 For the pending Wave 5 import slice, targeted proof must cover all of these before broad gates:
 
 - zero-store compile and validate;
-- one successful transactional import with exact task, edge, workflow, document, artifact, and campaign counts;
-- injected failure at each write class with complete rollback;
-- identical replay without duplicate rows or runnable work;
+- one successful import with independent exact campaign, task, edge, workflow, document, artifact, source, work-item, and audit counts confirmed by direct tables and normal Fusion APIs;
+- every database writer receives the same import-owned transaction handle; fail the proof if any helper opens an inner/top-level transaction;
+- derived task/prompt/artifact files, allocator reservations, caches, hooks, and events are staged, compensated, or restart-reconciled without a runnable partial campaign;
+- injected failure after each database and filesystem write class, after the final audit row, and at commit/projection/activation boundaries with complete rollback or one non-runnable reconcilable state;
+- sequential and concurrent identical replay, lost-response retry, failed-then-retried import, and identical replay after restart without duplicate rows, files, IDs, hooks, or runnable work;
 - mismatched bundle, target, or base identity rejected before mutation;
-- CLI exit codes and operator output for success, refusal, replay, and rollback failure;
+- CLI exit codes and bounded redacted operator output for success, refusal, replay, rollback failure, and identity collision;
+- imported tasks and workflows visible through normal list/show/read surfaces after restart;
 - zero provider execution.
+
+The closed Wave 5 proof mapping does not exist yet. Add `--wave 5` only with the final named test inventory, then prove the runner rejects missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, and failed tests. Do not add placeholder mappings for later waves.
+
+After Wave 5 acceptance, speculative Wave 6 and Wave 7 tests remain development evidence only. Any harvested enforcement test must hit native PostgreSQL audit/approval services or the production merger/ref-update/real-Git seam. Standalone classifier passes cannot close an integrated acceptance gate.
 
 Freeze branch, HEAD, tree, manifest hashes, accepted-predecessor diff digest, status, and proof artifacts before independent behavioral, static/build, and final-artifact review. Any source or test repair creates a new candidate and invalidates prior reviewer verdicts.
 
