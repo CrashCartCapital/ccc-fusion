@@ -40,6 +40,7 @@ export type CccPrdImportFailureCheckpoint =
   | "task_json"
   | "prompt"
   | "artifact_bytes"
+  | "after_projection_claim"
   | "canonical_projection_move"
   | "before_activation"
   | "activation_handoff"
@@ -1762,12 +1763,27 @@ async function reconcileOwned(
       leaseDurationMs,
     );
     const row = claim.row;
-    const currentRoot = await physicalCccPrdImportRoot(input.rootDir);
-    if (row.rootDir !== currentRoot) {
-      throw new CccPrdImportError(
-        "CCC_PRD_IMPORT_ROOT_MISMATCH",
-        `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${currentRoot}`,
-      );
+    try {
+      if (claim.claimed) await inject(failureInjection, "after_projection_claim");
+      const currentRoot = await physicalCccPrdImportRoot(input.rootDir);
+      if (row.rootDir !== currentRoot) {
+        throw new CccPrdImportError(
+          "CCC_PRD_IMPORT_ROOT_MISMATCH",
+          `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${currentRoot}`,
+        );
+      }
+    } catch (error) {
+      if (claim.claimed) {
+        try {
+          await releaseProjection(input.layer, row, token, error);
+        } catch (releaseError) {
+          throw new AggregateError(
+            [error, releaseError],
+            `CCC PRD import ${row.importId} could not release its projection claim`,
+          );
+        }
+      }
+      throw error;
     }
     const campaignIdentity = persistedCampaignIdentity(row);
     const projection = buildCccPrdProjection({

@@ -380,6 +380,55 @@ pgTest("CCC campaign native persistence", () => {
     });
   });
 
+  it("releases its projection claim when the physical root drifts immediately after claim", async () => {
+    const linkPath = join(h.rootDir(), "claimed-target-link");
+    const retargetPath = join(h.rootDir(), "claimed-retarget-root");
+    await symlink(h.rootDir(), linkPath, "dir");
+    let announceClaim!: () => void;
+    let releaseClaim!: () => void;
+    const claimed = new Promise<void>((resolveClaimed) => {
+      announceClaim = resolveClaimed;
+    });
+    const holdClaim = new Promise<void>((resolveHeld) => {
+      releaseClaim = resolveHeld;
+    });
+    try {
+      const source = bundle(linkPath, "claimed-retarget");
+      const importing = importCccPrdBundle({
+        ...request(source, "idem-claimed-retarget", policyFor(source)),
+        rootDir: linkPath,
+        failureInjection: {
+          pause: {
+            checkpoint: "after_projection_claim",
+            entered: announceClaim,
+            until: holdClaim,
+          },
+        },
+      });
+      await claimed;
+      await mkdir(retargetPath);
+      await unlink(linkPath);
+      await symlink(retargetPath, linkPath, "dir");
+      releaseClaim();
+      await expect(importing).rejects.toMatchObject({
+        code: "CCC_PRD_IMPORT_ROOT_MISMATCH",
+      });
+      const rows = await h.layer().db.execute(sql`
+        SELECT state, runnable, projection_owner
+        FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${"idem-claimed-retarget"}
+      `);
+      expect(rows).toEqual([{
+        state: "prepared",
+        runnable: 0,
+        projection_owner: null,
+      }]);
+    } finally {
+      releaseClaim?.();
+      await unlink(linkPath).catch(() => {});
+    }
+  });
+
   it("refuses reconciliation of an explicitly unadmitted legacy campaign row", async () => {
     const source = bundle(h.rootDir(), "unadmitted-reconcile");
     await importCccPrdBundle(
