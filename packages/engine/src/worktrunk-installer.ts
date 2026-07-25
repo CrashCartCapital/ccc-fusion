@@ -2,7 +2,13 @@ import { exec } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { ApprovalRequest, ApprovalRequestActorSnapshot, ApprovalRequestStore, WorktrunkSettings } from "@fusion/core";
+import type {
+  ApprovalRequest,
+  ApprovalRequestActorSnapshot,
+  ApprovalRequestStatus,
+  ApprovalRequestStore,
+  WorktrunkSettings,
+} from "@fusion/core";
 import type { ExternalIntegrationReleaseManifest } from "./external-integrations/manifest.js";
 import { validateExternalIntegrationManifest } from "./external-integrations/manifest.js";
 import { createLogger } from "./logger.js";
@@ -306,7 +312,7 @@ export async function requestWorktrunkInstallApproval(opts: {
   approvalStore: ApprovalRequestStore;
   actor: ApprovalRequestActorSnapshot;
   projectId?: string;
-}): Promise<{ approvalRequestId: string; status: "pending" | "approved" | "denied" | "completed" }> {
+}): Promise<{ approvalRequestId: string; status: ApprovalRequestStatus }> {
   const dedupeKey = worktrunkInstallDedupeKey();
   const existing = await opts.approvalStore.findLatestByDedupeKey({
     requesterActorId: opts.actor.actorId,

@@ -3,6 +3,8 @@
  * Run-audit domain types peeled from types.ts.
  */
 
+import type { CccCampaignAuthorityBinding } from "../ccc-campaign/types.js";
+
 // ── Run Audit Types ───────────────────────────────────────────────────────────
 
 /** Domain categories for run-audit events.
@@ -22,6 +24,12 @@ export type RunAuditMutationType =
   | "overseer:intervention"
   | (string & {});
 
+/** Complete immutable provenance for a campaign-bound run-audit receipt. */
+export interface RunAuditCampaignEvent {
+  readonly eventKey: string;
+  readonly binding: CccCampaignAuthorityBinding;
+}
+
 /** Input for recording a run-audit event. */
 export interface RunAuditEventInput {
   /** ISO-8601 timestamp when the event occurred. Defaults to current time if not provided. */
@@ -40,6 +48,8 @@ export interface RunAuditEventInput {
   target: string;
   /** Optional structured metadata about the mutation (compact, actionable data). */
   metadata?: Record<string, unknown>;
+  /** Campaign provenance; omitted only for legacy audit events. */
+  campaign?: RunAuditCampaignEvent;
 }
 
 /** A persisted run-audit event record. */
@@ -62,6 +72,8 @@ export interface RunAuditEvent {
   target: string;
   /** Optional structured metadata about the mutation */
   metadata?: Record<string, unknown>;
+  /** Campaign provenance; absent for legacy audit events. */
+  campaign?: RunAuditCampaignEvent;
 }
 
 /** Filter options for querying run-audit events. */
@@ -83,4 +95,3 @@ export interface RunAuditEventFilter {
   /** Maximum number of events to return. */
   limit?: number;
 }
-

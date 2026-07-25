@@ -31,8 +31,32 @@ import {
   recordRunAuditEvent,
   type RunAuditEvent,
 } from "../postgres/data-layer.js";
+import { assertCccCampaignAuthorityBinding } from "../ccc-campaign/canonical.js";
+import type { CccCampaignAuthorityBinding } from "../ccc-campaign/types.js";
 import type { ActivityLogEntry, ActivityEventType, RunAuditEventFilter } from "../types.js";
 import type { ActivityLogRow, RunAuditEventRow } from "./row-types.js";
+
+type CampaignRunAuditEventRow = RunAuditEventRow & {
+  projectId: string | null;
+  campaignProjectId: string | null;
+  campaignEventKey: string | null;
+  campaignImportId: string | null;
+  campaignId: string | null;
+  campaignTaskId: string | null;
+  campaignActionId: string | null;
+  campaignActionTarget: string | null;
+  campaignIdempotencyKey: string | null;
+  campaignPacketHash: string | null;
+  campaignSidecarHash: string | null;
+  campaignBundleHash: string | null;
+  campaignTargetRepository: string | null;
+  campaignTargetBase: string | null;
+  campaignProviderId: string | null;
+  campaignModelId: string | null;
+  campaignTransport: string | null;
+  campaignManifestHash: string | null;
+  campaignBindingHash: string | null;
+};
 
 // ── Run-audit events ─────────────────────────────────────────────────
 
@@ -53,6 +77,36 @@ function rowToRunAuditEvent(row: RunAuditEventRow): RunAuditEvent {
     typeof row.metadata === "string"
       ? safeJsonParse(row.metadata)
       : (row.metadata as Record<string, unknown> | null);
+  const campaignRow = row as CampaignRunAuditEventRow;
+  const campaignColumns = [
+    campaignRow.campaignProjectId, campaignRow.campaignEventKey, campaignRow.campaignImportId, campaignRow.campaignId, campaignRow.campaignTaskId,
+    campaignRow.campaignActionId, campaignRow.campaignActionTarget, campaignRow.campaignIdempotencyKey,
+    campaignRow.campaignPacketHash, campaignRow.campaignSidecarHash, campaignRow.campaignBundleHash,
+    campaignRow.campaignTargetRepository, campaignRow.campaignTargetBase, campaignRow.campaignProviderId,
+    campaignRow.campaignModelId, campaignRow.campaignTransport, campaignRow.campaignManifestHash,
+    campaignRow.campaignBindingHash,
+  ];
+  const campaignPresent = campaignColumns.some((column) => column !== null);
+  if (campaignPresent && (
+    campaignRow.projectId === null
+    || campaignColumns.some((column) => column === null)
+    || campaignRow.campaignProjectId !== campaignRow.projectId
+  )) {
+    throw new TypeError("CCC run-audit row has a partial campaign binding");
+  }
+  const campaign = campaignPresent ? {
+    eventKey: campaignRow.campaignEventKey!,
+    binding: assertCccCampaignAuthorityBinding({
+      projectId: campaignRow.campaignProjectId!, importId: campaignRow.campaignImportId!, campaignId: campaignRow.campaignId!,
+      taskId: campaignRow.campaignTaskId!, actionId: campaignRow.campaignActionId!, actionTarget: campaignRow.campaignActionTarget!,
+      idempotencyKey: campaignRow.campaignIdempotencyKey!, packetHash: campaignRow.campaignPacketHash!,
+      sidecarHash: campaignRow.campaignSidecarHash!, bundleHash: campaignRow.campaignBundleHash!,
+      targetRepository: campaignRow.campaignTargetRepository!, targetBase: campaignRow.campaignTargetBase!,
+      providerId: campaignRow.campaignProviderId!, modelId: campaignRow.campaignModelId!,
+      transport: campaignRow.campaignTransport! as CccCampaignAuthorityBinding["transport"],
+      manifestHash: campaignRow.campaignManifestHash!, bindingHash: campaignRow.campaignBindingHash!,
+    }),
+  } : undefined;
   return {
     id: row.id,
     timestamp: row.timestamp,
@@ -63,6 +117,7 @@ function rowToRunAuditEvent(row: RunAuditEventRow): RunAuditEvent {
     mutationType: row.mutationType,
     target: row.target,
     metadata,
+    ...(campaign ? { campaign } : {}),
   };
 }
 

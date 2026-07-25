@@ -7,10 +7,13 @@
  */
 
 import { beforeAll, beforeEach, afterAll, afterEach, describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { mkdir, realpath, symlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { importCccPrdBundle, reconcileCccPrdImport } from "../../index.js";
+import * as campaignCanonical from "../../ccc-campaign/canonical.js";
+import { canonicalCccPrdJson } from "../../ccc-prd/contract.js";
 import { TaskStore } from "../../store.js";
 import {
   createSharedPgTaskStoreTestHarness,
@@ -19,8 +22,10 @@ import {
 } from "../../__test-utils__/pg-test-harness.js";
 import {
   createCccPrdImportTestBundle as bundle,
+  rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
 import type { CccPrdSemanticBundle } from "../../ccc-prd/types.js";
+import type { DbTransaction } from "../../postgres/data-layer.js";
 
 type ExecutionRoute = Readonly<{
   taskId: string;
@@ -61,7 +66,86 @@ type CampaignContext = Readonly<{
 
 type CampaignContextStore = {
   getCccCampaignContextForTask(taskId: string): Promise<CampaignContext | null>;
+  getCccCampaignContextForTaskWithinTransaction(
+    tx: DbTransaction,
+    taskId: string,
+  ): Promise<CampaignContext | null>;
+  claimCccCampaignActionLease(
+    taskId: string,
+    action: { actionId: string; actionTarget: string },
+    claim: {
+      approvalRequestId: string;
+      claimToken: string;
+      claimedAt: string;
+      expiresAt: string;
+    },
+    tx?: DbTransaction,
+  ): Promise<{ lease: ActionLease; binding: AuthorityBinding }>;
+  inspectCccCampaignActionLease(
+    taskId: string,
+    action: { actionId: string; actionTarget: string },
+    tx?: DbTransaction,
+  ): Promise<{ lease: ActionLease; binding: AuthorityBinding } | null>;
+  settleCccCampaignActionLease(
+    taskId: string,
+    action: { actionId: string; actionTarget: string },
+    claimToken: string,
+    tx?: DbTransaction,
+  ): Promise<void>;
 };
+
+type AuthorityBinding = Readonly<{
+  projectId: string;
+  importId: string;
+  campaignId: string;
+  taskId: string;
+  actionId: string;
+  actionTarget: string;
+  idempotencyKey: string;
+  packetHash: string;
+  sidecarHash: string;
+  bundleHash: string;
+  targetRepository: string;
+  targetBase: string;
+  providerId: string;
+  modelId: string;
+  transport: "pi" | "cli" | "workflow";
+  manifestHash: string;
+  bindingHash: string;
+}>;
+
+type ActionLease = Readonly<{
+  actionId: string;
+  actionTarget: string;
+  approvalRequestId: string;
+  claimToken: string;
+  claimedAt: string;
+  expiresAt: string;
+  bindingHash: string;
+}>;
+
+function errorChainText(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  const seen = new Set<unknown>();
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const record = current as { message?: unknown; code?: unknown; cause?: unknown };
+    if (typeof record.message === "string") parts.push(record.message);
+    if (typeof record.code === "string") parts.push(record.code);
+    current = record.cause;
+  }
+  return parts.join("\n");
+}
+
+type CampaignAuthorityApi = {
+  createCccCampaignAuthorityBinding(
+    context: CampaignContext,
+    action: { actionId: string; actionTarget: string; requireProtected?: boolean },
+  ): AuthorityBinding;
+};
+
+const authorityApi = campaignCanonical as unknown as CampaignAuthorityApi;
 
 function routesFor(source: CccPrdSemanticBundle): ExecutionRoute[] {
   return source.tasks.map((task) => ({
@@ -77,6 +161,26 @@ function policyFor(source: CccPrdSemanticBundle, routes = routesFor(source)): Ex
     schema: "ccc-campaign.execution-policy.v1",
     routes,
   };
+}
+
+function withProtectedActions(
+  source: CccPrdSemanticBundle,
+  actions: readonly { actionId: string; actionTarget: string }[],
+): CccPrdSemanticBundle {
+  return rehashCccPrdImportTestBundle({
+    ...source,
+    tasks: source.tasks.map((task, index) => index === 0
+      ? { ...task, protectedActionIds: actions.map(({ actionId }) => actionId) }
+      : task),
+    protectedActions: actions.map(({ actionId, actionTarget }) => ({
+      id: actionId,
+      kind: "merge" as const,
+      target: actionTarget,
+      operatorDecision: "approve_merge" as const,
+      requiresOperatorDecision: true as const,
+      spans: [source.tasks[0]!.spans[0]!],
+    })),
+  });
 }
 
 describe("CCC campaign native public surface", () => {
@@ -111,6 +215,351 @@ pgTest("CCC campaign native persistence", () => {
       executionPolicy,
     };
   }
+
+  async function importContext(
+    suffix: string,
+    options: {
+      protectedAction?: { actionId: string; actionTarget: string };
+      protectedActions?: readonly { actionId: string; actionTarget: string }[];
+    } = {},
+  ): Promise<CampaignContext> {
+    const initial = bundle(h.rootDir(), suffix);
+    const protectedActions = options.protectedActions
+      ?? (options.protectedAction ? [options.protectedAction] : []);
+    const source = protectedActions.length > 0
+      ? withProtectedActions(initial, protectedActions)
+      : initial;
+    await importCccPrdBundle(request(source, `idem-${suffix}`, policyFor(source)));
+    const context = await (h.store() as unknown as CampaignContextStore)
+      .getCccCampaignContextForTask(`TASK-${suffix}`);
+    expect(context).not.toBeNull();
+    return context!;
+  }
+
+  function claimInput(
+    context: CampaignContext,
+    overrides: Partial<{
+      approvalRequestId: string;
+      claimToken: string;
+      claimedAt: string;
+      expiresAt: string;
+    }> = {},
+  ) {
+    return {
+      approvalRequestId: "approval-request-1",
+      claimToken: "claim-token-1",
+      claimedAt: context.campaignStartedAt,
+      expiresAt: context.campaignDeadlineAt,
+      ...overrides,
+    };
+  }
+
+  it("uses a supplied transaction for a campaign-context reload", async () => {
+    const context = await importContext("transaction-aware-context");
+    const store = h.store() as unknown as CampaignContextStore;
+
+    await h.layer().transaction(async (tx) => {
+      await tx.execute(sql`
+        UPDATE project.ccc_prd_imports
+        SET request_count = 7
+        WHERE idempotency_key = ${context.idempotencyKey}
+      `);
+      await expect(
+        store.getCccCampaignContextForTaskWithinTransaction(tx, context.taskId),
+      ).resolves.toMatchObject({ requestCount: 7 });
+    });
+  });
+
+  it("locks the campaign import for a transaction-scoped authority read", async () => {
+    const context = await importContext("transaction-context-lock");
+    const store = h.store() as unknown as CampaignContextStore;
+
+    await h.layer().transaction(async (tx) => {
+      await expect(
+        store.getCccCampaignContextForTaskWithinTransaction(tx, context.taskId),
+      ).resolves.toMatchObject({ importId: context.importId });
+      await expect(h.layer().transaction(async (contender) => {
+        await contender.execute(sql`SET LOCAL lock_timeout = '100ms'`);
+        await contender.execute(sql`
+          UPDATE project.ccc_prd_imports
+          SET request_count = request_count
+          WHERE idempotency_key = ${context.idempotencyKey}
+        `);
+      })).rejects.toSatisfy((error) =>
+        /lock timeout|55P03/i.test(errorChainText(error)),
+      );
+    });
+  });
+
+  it("derives a full authority binding and canonical hash from persisted campaign context", async () => {
+    const context = await importContext("authority-binding");
+    const binding = authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "receipt-action",
+      actionTarget: "local://receipt",
+    });
+    const { bindingHash, ...bindingFields } = binding;
+
+    expect(binding).toEqual({
+      projectId: context.projectId,
+      importId: context.importId,
+      campaignId: context.campaignId,
+      taskId: context.taskId,
+      actionId: "receipt-action",
+      actionTarget: "local://receipt",
+      idempotencyKey: context.idempotencyKey,
+      packetHash: context.packetHash,
+      sidecarHash: context.sidecarHash,
+      bundleHash: context.bundleHash,
+      targetRepository: context.targetRepository.path,
+      targetBase: context.targetRepository.baseCommit,
+      providerId: context.route.providerId,
+      modelId: context.route.modelId,
+      transport: context.route.transport,
+      manifestHash: context.manifestHash,
+      bindingHash: createHash("sha256")
+        .update(canonicalCccPrdJson(bindingFields), "utf8")
+        .digest("hex"),
+    });
+    expect(bindingHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("refuses protected action target drift", async () => {
+    const context = await importContext("protected-target-drift", {
+      protectedAction: {
+        actionId: "merge-main",
+        actionTarget: "refs/heads/main",
+      },
+    });
+
+    expect(() => authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "merge-main",
+      actionTarget: "refs/heads/release",
+    })).toThrow("CCC campaign protected action merge-main target must match exactly");
+  });
+
+  it("refuses an undeclared action when protected authority is required", async () => {
+    const context = await importContext("undeclared-protected-action");
+
+    expect(() => authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "not-declared",
+      actionTarget: "refs/heads/main",
+      requireProtected: true,
+    })).toThrow("CCC campaign action not-declared is not a declared protected action");
+  });
+
+  it("allows one action-lease winner under two concurrent claims", async () => {
+    const context = await importContext("concurrent-action-lease", {
+      protectedAction: {
+        actionId: "receipt-concurrent",
+        actionTarget: "local://receipt/concurrent",
+      },
+    });
+    const binding = authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "receipt-concurrent",
+      actionTarget: "local://receipt/concurrent",
+      requireProtected: true,
+    });
+    const results = await Promise.allSettled([
+      (h.store() as unknown as CampaignContextStore).claimCccCampaignActionLease(context.taskId, {
+        actionId: binding.actionId,
+        actionTarget: binding.actionTarget,
+      }, claimInput(context, {
+        claimToken: "claim-token-left",
+      })),
+      (h.store() as unknown as CampaignContextStore).claimCccCampaignActionLease(context.taskId, {
+        actionId: binding.actionId,
+        actionTarget: binding.actionTarget,
+      }, claimInput(context, {
+        claimToken: "claim-token-right",
+      })),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const winner = results.find((result) => result.status === "fulfilled");
+    expect(winner).toMatchObject({
+      value: {
+        lease: {
+          actionId: binding.actionId,
+          actionTarget: binding.actionTarget,
+          bindingHash: binding.bindingHash,
+        },
+        binding,
+      },
+    });
+  });
+
+  it("replays an identical action lease without changing its owner", async () => {
+    const context = await importContext("identical-action-lease", {
+      protectedAction: {
+        actionId: "receipt-identical",
+        actionTarget: "local://receipt/identical",
+      },
+    });
+    const binding = authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "receipt-identical",
+      actionTarget: "local://receipt/identical",
+      requireProtected: true,
+    });
+    const store = h.store() as unknown as CampaignContextStore;
+    const action = { actionId: binding.actionId, actionTarget: binding.actionTarget };
+    const input = claimInput(context);
+    const first = await store.claimCccCampaignActionLease(context.taskId, action, input);
+    const replay = await store.claimCccCampaignActionLease(context.taskId, action, input);
+
+    expect(replay).toEqual(first);
+    await expect(store.inspectCccCampaignActionLease(context.taskId, action)).resolves.toEqual(first);
+  });
+
+  it("refuses an action lease collision with a changed winning token", async () => {
+    const context = await importContext("action-lease-collision", {
+      protectedAction: {
+        actionId: "receipt-collision",
+        actionTarget: "local://receipt/collision",
+      },
+    });
+    const binding = authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "receipt-collision",
+      actionTarget: "local://receipt/collision",
+      requireProtected: true,
+    });
+    const store = h.store() as unknown as CampaignContextStore;
+    const action = { actionId: binding.actionId, actionTarget: binding.actionTarget };
+    await store.claimCccCampaignActionLease(context.taskId, action, claimInput(context));
+
+    await expect(store.claimCccCampaignActionLease(context.taskId, action, claimInput(context, {
+      claimToken: "different-winning-token",
+    }))).rejects.toThrow(
+      "CCC campaign action lease receipt-collision collision: claim token differs",
+    );
+  });
+
+  it("settles only the exact winning action lease", async () => {
+    const context = await importContext("exact-action-settle", {
+      protectedActions: [
+        {
+          actionId: "receipt-settle-first",
+          actionTarget: "local://receipt/settle-first",
+        },
+        {
+          actionId: "receipt-settle-second",
+          actionTarget: "local://receipt/settle-second",
+        },
+      ],
+    });
+    const firstBinding = authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "receipt-settle-first",
+      actionTarget: "local://receipt/settle-first",
+      requireProtected: true,
+    });
+    const secondBinding = authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "receipt-settle-second",
+      actionTarget: "local://receipt/settle-second",
+      requireProtected: true,
+    });
+    const store = h.store() as unknown as CampaignContextStore;
+    const firstAction = {
+      actionId: firstBinding.actionId,
+      actionTarget: firstBinding.actionTarget,
+    };
+    const secondAction = {
+      actionId: secondBinding.actionId,
+      actionTarget: secondBinding.actionTarget,
+    };
+    const firstLease = await store.claimCccCampaignActionLease(
+      context.taskId,
+      firstAction,
+      claimInput(context, { claimToken: "first-winning-token" }),
+    );
+    const secondLease = await store.claimCccCampaignActionLease(
+      context.taskId,
+      secondAction,
+      claimInput(context, { claimToken: "second-winning-token" }),
+    );
+
+    await expect(store.settleCccCampaignActionLease(
+      context.taskId,
+      firstAction,
+      "wrong-token",
+    )).rejects.toThrow(
+      "CCC campaign action lease receipt-settle-first can only settle with its winning claim token and binding",
+    );
+
+    await store.settleCccCampaignActionLease(
+      context.taskId,
+      firstAction,
+      firstLease.lease.claimToken,
+    );
+    await expect(store.inspectCccCampaignActionLease(context.taskId, firstAction)).resolves.toBeNull();
+    await expect(store.inspectCccCampaignActionLease(context.taskId, secondAction)).resolves.toEqual(secondLease);
+  });
+
+  it("keeps an action lease visible after a TaskStore restart", async () => {
+    const context = await importContext("restart-action-lease", {
+      protectedAction: {
+        actionId: "receipt-restart",
+        actionTarget: "local://receipt/restart",
+      },
+    });
+    const binding = authorityApi.createCccCampaignAuthorityBinding(context, {
+      actionId: "receipt-restart",
+      actionTarget: "local://receipt/restart",
+      requireProtected: true,
+    });
+    const action = { actionId: binding.actionId, actionTarget: binding.actionTarget };
+    const lease = await (h.store() as unknown as CampaignContextStore)
+      .claimCccCampaignActionLease(context.taskId, action, claimInput(context));
+    const restarted = new TaskStore(
+      h.rootDir(),
+      undefined,
+      { asyncLayer: h.layer() },
+    ) as unknown as CampaignContextStore;
+
+    await expect(
+      restarted.getCccCampaignContextForTask(context.taskId),
+    ).resolves.toMatchObject({
+      activeActionLeases: {
+        [binding.actionId]: lease.lease,
+      },
+    });
+    await expect(restarted.inspectCccCampaignActionLease(context.taskId, action)).resolves.toEqual(lease);
+  });
+
+  it("refuses a persisted action lease whose protected binding has drifted", async () => {
+    const context = await importContext("drifted-action-lease", {
+      protectedAction: {
+        actionId: "receipt-drifted",
+        actionTarget: "local://receipt/drifted",
+      },
+    });
+    const action = {
+      actionId: "receipt-drifted",
+      actionTarget: "local://receipt/drifted",
+    };
+    const lease = await (h.store() as unknown as CampaignContextStore)
+      .claimCccCampaignActionLease(context.taskId, action, claimInput(context));
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET active_action_leases = ${JSON.stringify({
+        [action.actionId]: {
+          ...lease.lease,
+          bindingHash: "0".repeat(64),
+        },
+      })}::jsonb
+      WHERE idempotency_key = ${context.idempotencyKey}
+    `);
+    const restarted = new TaskStore(
+      h.rootDir(),
+      undefined,
+      { asyncLayer: h.layer() },
+    ) as unknown as CampaignContextStore;
+
+    await expect(
+      restarted.getCccCampaignContextForTask(context.taskId),
+    ).rejects.toThrow(
+      "CCC campaign action lease receipt-drifted binding does not match persisted campaign context",
+    );
+  });
 
   it.each([
     ["missing", (source: CccPrdSemanticBundle) => policyFor(source, routesFor(source).slice(1))],

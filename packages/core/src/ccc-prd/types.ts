@@ -334,10 +334,19 @@ export type CccPrdAuthoringProposal = Omit<
   exceptions: CccPrdProposalReviewItem[];
 };
 
+export type CccPrdAuthoringConstraints = {
+  targetRepository: CccPrdTargetRepository;
+  bounds: CccPrdExecutionBounds;
+  /** Maximum combined ambiguity, unresolved-decision, exception, and protected-action rows. */
+  maxReviewItems: number;
+};
+
 export type CccPrdAuthoringRequest = {
   sourceVersion: string;
   packetHash: string;
   sources: Array<CccPrdSource & { content: string }>;
+  constraints?: CccPrdAuthoringConstraints;
+  previousSidecar?: CccPrdSidecar;
 };
 
 export type CccPrdAuthoringAdapter = {

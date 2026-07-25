@@ -4,21 +4,84 @@
  * lifecycle through PostgreSQL; no SQLite database is available at runtime.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { CliSessionStore } from "../../cli-session-store.js";
+import { importCccPrdBundle } from "../../index.js";
+import {
+  claimCccCampaignApproval,
+  getApprovalRequest,
+  issueCccCampaignApproval,
+} from "../../async-approval-request-store.js";
+import * as effectReceipts from "../../ccc-effect-receipts.js";
 import {
   abandonCccEffectReceipt,
+  canonicalCccEffectJson,
   cccEffectReceiptIdentity,
   commitCccEffectReceipt,
   hasCccEffectReceipt,
   markCccEffectReceiptDispatched,
   reserveCccEffectReceipt,
 } from "../../ccc-effect-receipts.js";
+import { recordRunAuditEvent } from "../../postgres/data-layer.js";
+import {
+  createCccPrdImportTestBundle,
+  rehashCccPrdImportTestBundle,
+} from "../../__test-utils__/ccc-prd-import-fixture.js";
+import type { CccPrdSemanticBundle } from "../../ccc-prd/types.js";
+import type { ApprovalRequestActorSnapshot } from "../../types.js";
 import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
   type SharedPgTaskStoreHarness,
 } from "../../__test-utils__/pg-test-harness.js";
+
+const campaignAction = {
+  actionId: "PA-effect-receipt",
+  actionTarget: "refs/heads/main",
+};
+
+const campaignRequester: ApprovalRequestActorSnapshot = {
+  actorId: "operator-effect",
+  actorType: "user",
+  actorName: "Effect operator",
+};
+
+const campaignWorker: ApprovalRequestActorSnapshot = {
+  actorId: "worker-effect",
+  actorType: "agent",
+  actorName: "Effect worker",
+};
+
+function campaignBundle(source: CccPrdSemanticBundle): CccPrdSemanticBundle {
+  return rehashCccPrdImportTestBundle({
+    ...source,
+    bounds: { maxRequests: 2, maxDurationMs: 120_000, maxConcurrency: 1 },
+    tasks: source.tasks.map((task, index) => index === 0
+      ? { ...task, protectedActionIds: [campaignAction.actionId] }
+      : task),
+    protectedActions: [{
+      id: campaignAction.actionId,
+      kind: "merge",
+      target: campaignAction.actionTarget,
+      operatorDecision: "approve_merge",
+      requiresOperatorDecision: true,
+      spans: [source.tasks[0]!.spans[0]!],
+    }],
+  });
+}
+
+function campaignPolicy(source: CccPrdSemanticBundle) {
+  return {
+    schema: "ccc-campaign.execution-policy.v1" as const,
+    routes: source.tasks.map((task) => ({
+      taskId: task.id,
+      providerId: "deterministic-fake",
+      modelId: "fixture-v1",
+      transport: "pi" as const,
+    })),
+  };
+}
 
 pgDescribe("CliSessionStore PostgreSQL persistence", () => {
   const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
@@ -29,6 +92,475 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
   beforeEach(h.beforeEach);
   afterEach(h.afterEach);
   afterAll(h.afterAll);
+
+  async function claimedCampaignAuthority(suffix: string, claimToken = `claim-${suffix}`) {
+    const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), suffix));
+    await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: `effect-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy: campaignPolicy(source),
+    });
+    const taskId = `TASK-${suffix}`;
+    const campaign = await h.store().getCccCampaignContextForTask(taskId);
+    if (!campaign) throw new Error(`missing campaign context for ${taskId}`);
+    const rootDir = campaign.targetRepository.path;
+    const issued = await issueCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir,
+      taskId,
+      action: campaignAction,
+      requester: campaignRequester,
+      runId: `effect-issue:${suffix}`,
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    const claimed = await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir,
+      taskId,
+      action: campaignAction,
+      claimant: campaignWorker,
+      runId: `effect-claim:${suffix}`,
+      claimToken,
+    });
+    return { taskId, rootDir, issued, claimed, claimToken };
+  }
+
+  it("refuses campaign receipt reservation before an authority reader is injected", async () => {
+    const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), "effect-missing-authority"));
+    await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: "effect-missing-authority",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy: campaignPolicy(source),
+    });
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__");
+    store.createSession({
+      id: "cli-pg-campaign-missing-authority",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: "TASK-effect-missing-authority",
+    });
+    await store.flush();
+
+    await expect(reserveCccEffectReceipt(store, {
+      sessionId: "cli-pg-campaign-missing-authority",
+      controllerToken: "campaign-controller",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-effect" } },
+    })).rejects.toThrow(/campaign authority store|campaign receipt/i);
+  });
+
+  it("derives and persists complete campaign effect authority from the stored session task", async () => {
+    const claimed = await claimedCampaignAuthority("effect-binding");
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    store.createSession({
+      id: "cli-pg-campaign-binding",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: claimed.taskId,
+    });
+    await store.flush();
+
+    await reserveCccEffectReceipt(store, {
+      sessionId: "cli-pg-campaign-binding",
+      controllerToken: "campaign-binding-controller",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-binding-effect" } },
+      campaign: {
+        actionId: campaignAction.actionId,
+        actionTarget: campaignAction.actionTarget,
+        approvalRequestId: claimed.issued.id,
+        claimToken: claimed.claimToken,
+      },
+    });
+
+    const persisted = await store.getCccEffectReceipt("cli-pg-campaign-binding", "campaign-binding-effect");
+    expect(persisted).toMatchObject({
+      campaign: {
+        binding: {
+          taskId: claimed.taskId,
+          actionId: campaignAction.actionId,
+          actionTarget: campaignAction.actionTarget,
+        },
+      },
+    });
+    const binding = persisted?.campaign?.binding;
+    if (!binding) throw new Error("missing campaign receipt binding");
+    await expect(h.layer().db.execute(sql`
+      UPDATE project.ccc_effect_receipts
+      SET campaign_import_id = ${`${binding.importId}-foreign`}
+      WHERE project_id = ${binding.projectId}
+        AND effect_scope_id = 'cli-pg-campaign-binding'
+        AND logical_key = 'campaign-binding-effect'
+    `)).rejects.toMatchObject({
+      cause: expect.objectContaining({
+        constraint_name: "ccc_effect_receipts_campaign_import_fkey",
+      }),
+    });
+  });
+
+  it("refuses a campaign receipt when its hydrated session task is stale against PostgreSQL", async () => {
+    const claimed = await claimedCampaignAuthority("effect-persisted-session");
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    store.createSession({
+      id: "cli-pg-campaign-persisted-session",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: claimed.taskId,
+    });
+    await store.flush();
+    await h.layer().db.execute(sql`
+      UPDATE project.cli_sessions
+      SET task_id = 'TASK-not-campaign'
+      WHERE owner_project_id = '__legacy_unscoped__'
+        AND id = 'cli-pg-campaign-persisted-session'
+    `);
+
+    await expect(reserveCccEffectReceipt(store, {
+      sessionId: "cli-pg-campaign-persisted-session",
+      controllerToken: "campaign-persisted-session-controller",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-persisted-session-effect" } },
+      campaign: {
+        actionId: campaignAction.actionId,
+        actionTarget: campaignAction.actionTarget,
+        approvalRequestId: claimed.issued.id,
+        claimToken: claimed.claimToken,
+      },
+    })).rejects.toMatchObject({ code: "CCC_EFFECT_RECONCILIATION_REQUIRED" });
+  });
+
+  it("does not transfer a campaign reservation after a controller restart without reconciliation", async () => {
+    const claimed = await claimedCampaignAuthority("effect-no-blind-takeover");
+    const first = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    first.createSession({
+      id: "cli-pg-campaign-no-blind-takeover",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: claimed.taskId,
+      agentState: "dead",
+      terminationReason: "engineDeath",
+      autonomyPosture: {
+        cccControllerGeneration: "campaign-controller-one",
+        cccControllerFenced: true,
+      },
+    });
+    await first.flush();
+    const effectInput = {
+      sessionId: "cli-pg-campaign-no-blind-takeover",
+      controllerToken: "campaign-controller-one",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-no-blind-takeover" } },
+      campaign: {
+        actionId: campaignAction.actionId,
+        actionTarget: campaignAction.actionTarget,
+        approvalRequestId: claimed.issued.id,
+        claimToken: claimed.claimToken,
+      },
+    };
+    await reserveCccEffectReceipt(first, effectInput);
+
+    const restarted = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    await expect(reserveCccEffectReceipt(restarted, {
+      ...effectInput,
+      controllerToken: "campaign-controller-two",
+    })).rejects.toMatchObject({ code: "CCC_EFFECT_RECONCILIATION_REQUIRED" });
+  });
+
+  it("reconciles a campaign dispatched receipt to committed with the claimed approval in one durable path", async () => {
+    const claimed = await claimedCampaignAuthority("effect-reconcile-committed");
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    store.createSession({
+      id: "cli-pg-campaign-reconcile-committed",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: claimed.taskId,
+      autonomyPosture: { cccControllerGeneration: "campaign-reconcile-generation" },
+    });
+    await store.flush();
+    const effectInput = {
+      sessionId: "cli-pg-campaign-reconcile-committed",
+      controllerToken: "campaign-reconcile-generation",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-reconcile-committed" } },
+      campaign: {
+        actionId: campaignAction.actionId,
+        actionTarget: campaignAction.actionTarget,
+        approvalRequestId: claimed.issued.id,
+        claimToken: claimed.claimToken,
+      },
+    };
+    await reserveCccEffectReceipt(store, effectInput);
+    await markCccEffectReceiptDispatched(store, effectInput);
+    const reconciliation = {
+      ...effectInput,
+      controllerGeneration: "campaign-reconcile-generation",
+      observerId: "loopback-effect-observer",
+      observationDigest: "a".repeat(64),
+      observation: { kind: "committed" as const, result: { merged: true, revision: "fixture" } },
+      actor: campaignWorker,
+      runId: "effect-reconcile:committed",
+    };
+
+    const reconcile = (effectReceipts as unknown as {
+      reconcileCccEffectReceipt: (store: CliSessionStore, input: typeof reconciliation) => Promise<unknown>;
+    }).reconcileCccEffectReceipt;
+    await expect(reconcile(store, reconciliation)).resolves.toMatchObject({
+      state: "committed",
+      result: { merged: true, revision: "fixture" },
+    });
+    await expect(reconcile(store, {
+      ...reconciliation,
+      campaign: { ...reconciliation.campaign, claimToken: "wrong-campaign-claim-token" },
+    })).rejects.toThrow(/consumed|approval|claim/i);
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toBeNull();
+
+    await expect(reconcile(store, reconciliation)).resolves.toMatchObject({
+      state: "committed",
+      result: { merged: true, revision: "fixture" },
+    });
+  });
+
+  it("rolls back campaign receipt, approval, and lease when the deterministic reconciliation audit collides", async () => {
+    const claimed = await claimedCampaignAuthority("effect-reconcile-audit-rollback");
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    store.createSession({
+      id: "cli-pg-campaign-reconcile-audit-rollback",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: claimed.taskId,
+      autonomyPosture: { cccControllerGeneration: "campaign-audit-rollback-generation" },
+    });
+    await store.flush();
+    const effectInput = {
+      sessionId: "cli-pg-campaign-reconcile-audit-rollback",
+      controllerToken: "campaign-audit-rollback-generation",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-reconcile-audit-rollback" } },
+      campaign: {
+        actionId: campaignAction.actionId,
+        actionTarget: campaignAction.actionTarget,
+        approvalRequestId: claimed.issued.id,
+        claimToken: claimed.claimToken,
+      },
+    };
+    await reserveCccEffectReceipt(store, effectInput);
+    await markCccEffectReceiptDispatched(store, effectInput);
+    const reconciliation = {
+      ...effectInput,
+      controllerGeneration: "campaign-audit-rollback-generation",
+      observerId: "loopback-effect-observer",
+      observationDigest: "c".repeat(64),
+      observation: { kind: "committed" as const, result: { merged: true, revision: "rollback" } },
+      actor: campaignWorker,
+      runId: "effect-reconcile:audit-rollback",
+    };
+    const reserved = await store.getCccEffectReceipt(effectInput.sessionId, "campaign-reconcile-audit-rollback");
+    const binding = reserved?.campaign?.binding;
+    if (!binding) throw new Error("missing campaign binding for audit collision proof");
+    const evidenceDigest = createHash("sha256").update(canonicalCccEffectJson({
+      schema: "ccc-effect-reconciliation-evidence/v1",
+      effectScopeId: effectInput.sessionId,
+      logicalKey: "campaign-reconcile-audit-rollback",
+      controllerGeneration: reconciliation.controllerGeneration,
+      observerId: reconciliation.observerId,
+      observationDigest: reconciliation.observationDigest,
+      observation: reconciliation.observation,
+      actionId: effectInput.campaign.actionId,
+      actionTarget: effectInput.campaign.actionTarget,
+      approvalRequestId: effectInput.campaign.approvalRequestId,
+      claimToken: effectInput.campaign.claimToken,
+    })).digest("hex");
+    await recordRunAuditEvent(h.layer(), {
+      timestamp: "2026-01-01T00:00:00.000Z",
+      taskId: claimed.taskId,
+      agentId: "audit-collision-fixture",
+      runId: "audit-collision-fixture",
+      domain: "ccc-effect",
+      mutationType: "effect-receipt:committed",
+      target: binding.actionTarget,
+      metadata: { injected: true },
+      campaign: {
+        eventKey: `ccc-effect:${binding.bindingHash}:${effectInput.sessionId}:campaign-reconcile-audit-rollback:committed:${evidenceDigest}`,
+        binding,
+      },
+    });
+    const reconcile = (effectReceipts as unknown as {
+      reconcileCccEffectReceipt: (store: CliSessionStore, input: typeof reconciliation) => Promise<unknown>;
+    }).reconcileCccEffectReceipt;
+
+    await expect(reconcile(store, reconciliation)).rejects.toThrow(/collid|audit/i);
+    await expect(store.getCccEffectReceipt(effectInput.sessionId, "campaign-reconcile-audit-rollback"))
+      .resolves.toMatchObject({ state: "dispatched_unknown" });
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "claimed" });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toMatchObject({
+      lease: { claimToken: claimed.claimToken },
+    });
+  });
+
+  it("records local no-effect evidence without releasing an unexpired campaign claim", async () => {
+    const claimed = await claimedCampaignAuthority("effect-reconcile-no-effect");
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    store.createSession({
+      id: "cli-pg-campaign-reconcile-no-effect",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: claimed.taskId,
+      autonomyPosture: { cccControllerGeneration: "campaign-no-effect-generation" },
+    });
+    await store.flush();
+    const effectInput = {
+      sessionId: "cli-pg-campaign-reconcile-no-effect",
+      controllerToken: "campaign-no-effect-generation",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-reconcile-no-effect" } },
+      campaign: {
+        actionId: campaignAction.actionId,
+        actionTarget: campaignAction.actionTarget,
+        approvalRequestId: claimed.issued.id,
+        claimToken: claimed.claimToken,
+      },
+    };
+    await reserveCccEffectReceipt(store, effectInput);
+    await markCccEffectReceiptDispatched(store, effectInput);
+    const reconciliation = {
+      ...effectInput,
+      controllerGeneration: "campaign-no-effect-generation",
+      observerId: "loopback-effect-observer",
+      observationDigest: "b".repeat(64),
+      observation: { kind: "no_effect" as const },
+      actor: campaignWorker,
+      runId: "effect-reconcile:no-effect",
+    };
+    const reconcile = (effectReceipts as unknown as {
+      reconcileCccEffectReceipt: (store: CliSessionStore, input: typeof reconciliation) => Promise<unknown>;
+    }).reconcileCccEffectReceipt;
+
+    await expect(reconcile(store, reconciliation)).resolves.toMatchObject({ state: "proved_failed" });
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "claimed" });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toMatchObject({
+      lease: { claimToken: claimed.claimToken },
+    });
+    await expect(reconcile(store, {
+      ...reconciliation,
+      observerId: "different-observer",
+    })).rejects.toMatchObject({ code: "CCC_EFFECT_KEY_COLLISION" });
+    // Simulate the authoritative database deadline crossing after a local
+    // observer proved no dispatch. The identical replay must expire/settle,
+    // not return early with a permanently claimed lease.
+    await h.layer().db.execute(sql`
+      UPDATE project.approval_requests
+      SET not_before_at = to_char(
+            (clock_timestamp() AT TIME ZONE 'UTC') - interval '2 seconds',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          ),
+          expires_at = to_char(
+            (clock_timestamp() AT TIME ZONE 'UTC') - interval '1 second',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          )
+      WHERE id = ${claimed.issued.id}
+    `);
+    await expect(reconcile(store, reconciliation)).resolves.toMatchObject({ state: "proved_failed" });
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "expired" });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toBeNull();
+    await expect(reconcile(store, reconciliation)).resolves.toMatchObject({ state: "proved_failed" });
+  });
+
+  it("directly commits a campaign receipt only with atomic approval consumption and lease settlement", async () => {
+    const claimed = await claimedCampaignAuthority("effect-direct-commit");
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    store.createSession({
+      id: "cli-pg-campaign-direct-commit",
+      projectId: "__legacy_unscoped__",
+      adapterId: "pi",
+      purpose: "execute",
+      taskId: claimed.taskId,
+    });
+    await store.flush();
+    const effectInput = {
+      sessionId: "cli-pg-campaign-direct-commit",
+      controllerToken: "campaign-direct-controller",
+      toolName: "merge_candidate",
+      arguments: { target: "refs/heads/main", __fusion_effect: { key: "campaign-direct-commit" } },
+      campaign: {
+        actionId: campaignAction.actionId,
+        actionTarget: campaignAction.actionTarget,
+        approvalRequestId: claimed.issued.id,
+        claimToken: claimed.claimToken,
+      },
+    };
+    await reserveCccEffectReceipt(store, effectInput);
+    await markCccEffectReceiptDispatched(store, effectInput);
+
+    await expect(commitCccEffectReceipt(store, effectInput, { merged: true })).resolves.toMatchObject({
+      state: "committed",
+      campaign: { binding: { taskId: claimed.taskId } },
+    });
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toBeNull();
+    await expect(commitCccEffectReceipt(store, effectInput, { merged: true })).resolves.toMatchObject({
+      state: "committed",
+      campaign: { binding: { taskId: claimed.taskId } },
+    });
+    await expect(commitCccEffectReceipt(store, {
+      ...effectInput,
+      campaign: { ...effectInput.campaign, claimToken: "wrong-campaign-claim-token" },
+    }, { merged: true })).rejects.toThrow(/consumed|approval|claim/i);
+    const restarted = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    await expect(reserveCccEffectReceipt(restarted, effectInput)).resolves.toMatchObject({
+      state: "committed",
+      campaign: { binding: { taskId: claimed.taskId } },
+    });
+    await expect(reserveCccEffectReceipt(restarted, {
+      ...effectInput,
+      campaign: { ...effectInput.campaign, claimToken: "wrong-campaign-claim-token" },
+    })).rejects.toThrow(/consumed|approval|claim/i);
+    await expect(reserveCccEffectReceipt(restarted, {
+      ...effectInput,
+      campaign: { ...effectInput.campaign, approvalRequestId: "foreign-approval-request" },
+    })).rejects.toThrow(/consumed|approval|claim/i);
+  });
 
   it("persists, updates, filters, deletes, and rehydrates project sessions", async () => {
     const store = await CliSessionStore.create(h.layer(), "project-a");

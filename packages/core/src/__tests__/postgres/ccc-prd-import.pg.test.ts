@@ -113,16 +113,6 @@ type FailureCheckpoint =
   | "after_activation"
   | "lost_response_after_commit";
 
-type EmissionObserver = {
-  emissions: unknown[];
-  emit: (emission: unknown) => void;
-};
-
-function emissionObserver(): EmissionObserver {
-  const emissions: unknown[] = [];
-  return { emissions, emit: (emission) => emissions.push(emission) };
-}
-
 pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_ccc_prd_import",
@@ -133,7 +123,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   afterEach(h.afterEach);
   afterAll(h.afterAll);
 
-  function request(suffix = "base", key = "idem-base", checkpoint?: FailureCheckpoint, observer?: EmissionObserver) {
+  function request(suffix = "base", key = "idem-base", checkpoint?: FailureCheckpoint) {
     const semanticBundle = bundle(h.rootDir(), suffix);
     return {
       bundle: semanticBundle,
@@ -143,11 +133,35 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       layer: h.layer(),
       rootDir: h.rootDir(),
       failureInjection: checkpoint ? { checkpoint } : undefined,
-      // The importer must not emit events, invoke hooks, schedule actions, or
-      // touch providers until an active import is durably reconciled.
-      effects: observer,
-      events: observer,
     };
+  }
+
+  async function assertNoExternalEffects() {
+    const receiptRows = (await h.layer().db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM project.ccc_effect_receipts
+    `)) as unknown as Array<{ count: number }>;
+    expect(receiptRows).toEqual([{ count: 0 }]);
+    const foreignAuditDomains = (await h.layer().db.execute(sql`
+      SELECT DISTINCT domain
+      FROM project.run_audit_events
+      WHERE domain <> 'database'
+      ORDER BY domain
+    `)) as unknown as Array<{ domain: string }>;
+    expect(foreignAuditDomains).toEqual([]);
+  }
+
+  async function assertImportAuditHistory(importId: string) {
+    const rows = (await h.layer().db.execute(sql`
+      SELECT mutation_type, domain
+      FROM project.run_audit_events
+      WHERE run_id = ${`ccc-prd:${importId}`}
+      ORDER BY timestamp, id
+    `)) as unknown as Array<{ mutation_type: string; domain: string }>;
+    expect(rows).toEqual([
+      { mutation_type: "ccc-prd-import:prepared", domain: "database" },
+      { mutation_type: "ccc-prd-import:active", domain: "database" },
+    ]);
   }
 
   async function assertNoRunnableState(key: string) {
@@ -213,22 +227,20 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it.each<FailureCheckpoint>([
     "campaign", "task", "dependency_edge", "workflow", "document", "artifact", "source", "work_item", "run_audit",
   ])("rolls back every database entity/final-audit boundary without effects: %s", async (checkpoint) => {
-    const observer = emissionObserver();
-    await expect(importCccPrdBundle(request("rollback", `idem-${checkpoint}`, checkpoint, observer))).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_INJECTED_FAILURE" });
+    await expect(importCccPrdBundle(request("rollback", `idem-${checkpoint}`, checkpoint))).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_INJECTED_FAILURE" });
     await assertNoRunnableState(`idem-${checkpoint}`);
     const projection = canonicalProjectionPaths("rollback");
     expect(await fileExists(projection.taskDir)).toBe(false);
     expect(await fileExists(projection.taskJson)).toBe(false);
     expect(await fileExists(projection.prompt)).toBe(false);
     expect(await fileExists(projection.artifact)).toBe(false);
-    expect(observer.emissions).toEqual([]);
+    await assertNoExternalEffects();
   });
 
   it.each<FailureCheckpoint>(["after_prepared_db_commit", "task_directory", "task_json", "prompt", "artifact_bytes", "canonical_projection_move", "before_activation"])("leaves only a prepared, non-runnable state across projection boundary: %s", async (checkpoint) => {
     const key = `idem-prepared-${checkpoint}`;
     const suffix = `prepared-${checkpoint}`;
-    const observer = emissionObserver();
-    await expect(importCccPrdBundle(request(suffix, key, checkpoint, observer))).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_INJECTED_FAILURE" });
+    await expect(importCccPrdBundle(request(suffix, key, checkpoint))).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_INJECTED_FAILURE" });
     const before = await inspectCccPrdImport({ idempotencyKey: key, layer: h.layer(), rootDir: h.rootDir() });
     expect(before).toMatchObject({
       state: "prepared",
@@ -253,13 +265,13 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       blockedReason: "ccc-prd-import-prepared",
     });
     await assertPreparedStagingOnly(before ?? {}, suffix, checkpoint);
-    expect(observer.emissions).toEqual([]);
+    await assertNoExternalEffects();
 
     // Restart before reconciliation. Normal list/show is intentionally not
     // used as a non-runnable oracle: legacy paused triage tasks may be listed.
     const { TaskStore } = await import("../../store.js");
     const restarted = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
-    const reconciled = await reconcileCccPrdImport({ idempotencyKey: key, layer: h.layer(), store: restarted, rootDir: h.rootDir(), effects: observer, events: observer });
+    const reconciled = await reconcileCccPrdImport({ idempotencyKey: key, layer: h.layer(), store: restarted, rootDir: h.rootDir() });
     expect(reconciled).toMatchObject({ state: "active", runnable: true });
     expect(await restarted.getTask(`TASK-${suffix}`)).toMatchObject({
       column: "todo",
@@ -270,7 +282,8 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       blockedReason: null,
     });
     expect(await fileExists(resolve(h.rootDir(), reconciled.stagingRelativePath))).toBe(false);
-    expect(observer.emissions).toEqual([]);
+    await assertNoExternalEffects();
+    await assertImportAuditHistory(reconciled.importId);
   });
 
   it("recovers a lost response after the activation commit without runnable filesystem drift", async () => {
@@ -386,10 +399,10 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
 
   it("commits exact semantic counts, projects task/document/artifact readers, and remains visible after restart", async () => {
     const key = "idem-success";
-    const observer = emissionObserver();
-    const imported = await importCccPrdBundle(request("success", key, undefined, observer));
+    const imported = await importCccPrdBundle(request("success", key));
     expect(imported).toMatchObject({ state: "active", replayed: false });
-    expect(observer.emissions).toEqual([]);
+    await assertNoExternalEffects();
+    await assertImportAuditHistory(imported.importId);
 
     const inspection = await inspectCccPrdImport({ idempotencyKey: key, layer: h.layer(), rootDir: h.rootDir() });
     expect(inspection).toMatchObject({
@@ -661,25 +674,26 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
 
   it("is sequentially and concurrently idempotent, including a lost response after commit", async () => {
     const key = "idem-replay";
-    const replayObserver = emissionObserver();
-    const first = await importCccPrdBundle(request("replay", key, undefined, replayObserver));
-    const replay = await importCccPrdBundle(request("replay", key, undefined, replayObserver));
+    const first = await importCccPrdBundle(request("replay", key));
+    const replay = await importCccPrdBundle(request("replay", key));
     expect(first).toMatchObject({ state: "active", replayed: false });
     expect(replay).toMatchObject({ state: "active", replayed: true });
-    expect(replayObserver.emissions).toEqual([]);
+    await assertNoExternalEffects();
+    await assertImportAuditHistory(first.importId);
 
     const concurrentKey = "idem-concurrent";
-    const concurrentObserver = emissionObserver();
     const [left, right] = await Promise.all([
-      importCccPrdBundle(request("concurrent", concurrentKey, undefined, concurrentObserver)),
-      importCccPrdBundle(request("concurrent", concurrentKey, undefined, concurrentObserver)),
+      importCccPrdBundle(request("concurrent", concurrentKey)),
+      importCccPrdBundle(request("concurrent", concurrentKey)),
     ]);
     expect([left.replayed, right.replayed].filter(Boolean)).toHaveLength(1);
-    expect(concurrentObserver.emissions).toEqual([]);
-    const lostObserver = emissionObserver();
-    await expect(importCccPrdBundle(request("lost", "idem-lost", "lost_response_after_commit", lostObserver))).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_LOST_RESPONSE" });
-    expect(await importCccPrdBundle(request("lost", "idem-lost", undefined, lostObserver))).toMatchObject({ state: "active", replayed: true });
-    expect(lostObserver.emissions).toEqual([]);
+    await assertNoExternalEffects();
+    await assertImportAuditHistory(left.importId);
+    await expect(importCccPrdBundle(request("lost", "idem-lost", "lost_response_after_commit"))).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_LOST_RESPONSE" });
+    const lostReplay = await importCccPrdBundle(request("lost", "idem-lost"));
+    expect(lostReplay).toMatchObject({ state: "active", replayed: true });
+    await assertNoExternalEffects();
+    await assertImportAuditHistory(lostReplay.importId);
   });
 
   it("keeps a live projection claim beyond lease expiry while an identical import waits", async () => {

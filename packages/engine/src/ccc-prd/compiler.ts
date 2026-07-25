@@ -95,6 +95,17 @@ const IMPORT_ENTITY_VALUES = new Set([
   "work_item",
   "run_audit",
 ]);
+const IMPORT_TARGETS = new Map([
+  ["campaign", "project.missions"],
+  ["task", "project.tasks"],
+  ["dependency_edge", "project.tasks.dependencies"],
+  ["workflow", "project.workflow_work_items"],
+  ["document", "project.task_documents"],
+  ["artifact", "project.artifacts"],
+  ["source", "project.ccc_prd_import_sources"],
+  ["work_item", "project.workflow_work_items"],
+  ["run_audit", "project.run_audit_events"],
+]);
 
 function validateExactKeys(
   label: string,
@@ -757,6 +768,7 @@ function validateSidecar(
     ["document", collections.documents],
     ["artifact", collections.artifacts],
   ]);
+  const intentsByType = new Map<string, Record<string, unknown>[]>();
   for (const intent of collections.importIntents.values()) {
     validateExactKeys(
       `import intent ${String(intent.id)}`,
@@ -774,9 +786,30 @@ function validateSidecar(
       diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `import intent ${String(intent.id)} is incomplete`));
       continue;
     }
+    const typedIntents = intentsByType.get(intent.entityType) ?? [];
+    typedIntents.push(intent);
+    intentsByType.set(intent.entityType, typedIntents);
+    if (intent.target !== IMPORT_TARGETS.get(intent.entityType)) {
+      diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `import intent ${String(intent.id)} has invalid native target`));
+    }
     const target = entityMaps.get(intent.entityType);
     if (target && !target.has(intent.entityId)) {
       diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `import intent ${String(intent.id)} references unknown entity`));
+    }
+    if (intent.entityType === "work_item" && !collections.workflows.has(intent.entityId)) {
+      diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `import intent ${String(intent.id)} references unknown workflow`));
+    }
+  }
+  for (const entityType of ["campaign", "source", "run_audit"]) {
+    const intents = intentsByType.get(entityType) ?? [];
+    if (intents.length !== 1) {
+      diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_CARDINALITY", `sidecar requires exactly one ${entityType} import intent; received ${intents.length}`));
+    }
+  }
+  const campaign = intentsByType.get("campaign")?.[0];
+  for (const intent of intentsByType.get("run_audit") ?? []) {
+    if (intent.entityId !== campaign?.entityId) {
+      diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `run audit import intent ${String(intent.id)} must reference the campaign entity`));
     }
   }
 }

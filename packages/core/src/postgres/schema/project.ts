@@ -41,6 +41,14 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { PROJECT_SCHEMA, bytea, tsvector } from "./_shared.js";
+import { cccPrdImports } from "./ccc-prd-import.js";
+import {
+  approvalRequestAuditEvents,
+  approvalRequests,
+  runAuditEvents,
+} from "./campaign-governance.js";
+
+export { approvalRequestAuditEvents, approvalRequests, runAuditEvents };
 
 /**
  * FNXC:PostgresSchema 2026-06-24-02:25:
@@ -1933,12 +1941,76 @@ export const cccEffectReceipts = projectSchema.table("ccc_effect_receipts", {
   resultJson: text("result_json"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
+  campaignProjectId: text("campaign_project_id"),
+  campaignImportId: text("campaign_import_id"),
+  campaignId: text("campaign_id"),
+  campaignTaskId: text("campaign_task_id"),
+  campaignActionId: text("campaign_action_id"),
+  campaignActionTarget: text("campaign_action_target"),
+  campaignIdempotencyKey: text("campaign_idempotency_key"),
+  campaignPacketHash: text("campaign_packet_hash"),
+  campaignSidecarHash: text("campaign_sidecar_hash"),
+  campaignBundleHash: text("campaign_bundle_hash"),
+  campaignTargetRepository: text("campaign_target_repository"),
+  campaignTargetBase: text("campaign_target_base"),
+  campaignProviderId: text("campaign_provider_id"),
+  campaignModelId: text("campaign_model_id"),
+  campaignTransport: text("campaign_transport"),
+  campaignManifestHash: text("campaign_manifest_hash"),
+  campaignBindingHash: text("campaign_binding_hash"),
 }, (t) => [
   primaryKey({ columns: [t.projectId, t.effectScopeId, t.logicalKey] }),
   index("idx_ccc_effect_receipts_scope_authority_digest")
     .on(t.projectId, t.effectScopeId, t.toolAuthority, t.argumentsDigest),
   index("idx_ccc_effect_receipts_turn_slot")
     .on(t.projectId, t.effectScopeId, t.turnKey, t.slotOrdinal),
+  index("idx_ccc_effect_receipts_campaign_import").on(t.projectId, t.campaignImportId),
+  check("ccc_effect_receipts_campaign_binding_check", sql`
+    (
+      ${t.campaignProjectId} IS NULL
+      AND ${t.campaignImportId} IS NULL
+      AND ${t.campaignId} IS NULL
+      AND ${t.campaignTaskId} IS NULL
+      AND ${t.campaignActionId} IS NULL
+      AND ${t.campaignActionTarget} IS NULL
+      AND ${t.campaignIdempotencyKey} IS NULL
+      AND ${t.campaignPacketHash} IS NULL
+      AND ${t.campaignSidecarHash} IS NULL
+      AND ${t.campaignBundleHash} IS NULL
+      AND ${t.campaignTargetRepository} IS NULL
+      AND ${t.campaignTargetBase} IS NULL
+      AND ${t.campaignProviderId} IS NULL
+      AND ${t.campaignModelId} IS NULL
+      AND ${t.campaignTransport} IS NULL
+      AND ${t.campaignManifestHash} IS NULL
+      AND ${t.campaignBindingHash} IS NULL
+    )
+    OR (
+      ${t.campaignProjectId} IS NOT NULL
+      AND ${t.campaignImportId} IS NOT NULL
+      AND ${t.campaignId} IS NOT NULL
+      AND ${t.campaignTaskId} IS NOT NULL
+      AND ${t.campaignActionId} IS NOT NULL
+      AND ${t.campaignActionTarget} IS NOT NULL
+      AND ${t.campaignIdempotencyKey} IS NOT NULL
+      AND ${t.campaignPacketHash} IS NOT NULL
+      AND ${t.campaignSidecarHash} IS NOT NULL
+      AND ${t.campaignBundleHash} IS NOT NULL
+      AND ${t.campaignTargetRepository} IS NOT NULL
+      AND ${t.campaignTargetBase} IS NOT NULL
+      AND ${t.campaignProviderId} IS NOT NULL
+      AND ${t.campaignModelId} IS NOT NULL
+      AND ${t.campaignTransport} IS NOT NULL
+      AND ${t.campaignManifestHash} IS NOT NULL
+      AND ${t.campaignBindingHash} IS NOT NULL
+      AND ${t.campaignProjectId} = ${t.projectId}
+    )
+  `),
+  foreignKey({
+    name: "ccc_effect_receipts_campaign_import_fkey",
+    columns: [t.projectId, t.campaignImportId],
+    foreignColumns: [cccPrdImports.projectId, cccPrdImports.importId],
+  }).onDelete("no action").onUpdate("no action"),
 ]);
 
 export const cccEffectTurns = projectSchema.table("ccc_effect_turns", {
@@ -1993,22 +2065,6 @@ export const chatTokenUsage = projectSchema.table("chat_token_usage", {
   createdAt: text("created_at").notNull(),
 }, (t) => [
   index("idxChatTokenUsageCreatedAt").on(t.createdAt),
-]);
-
-export const runAuditEvents = projectSchema.table("run_audit_events", {
-  id: text("id").primaryKey(),
-  timestamp: text("timestamp").notNull(),
-  taskId: text("task_id"),
-  agentId: text("agent_id").notNull(),
-  runId: text("run_id").notNull(),
-  domain: text("domain").notNull(),
-  mutationType: text("mutation_type").notNull(),
-  target: text("target").notNull(),
-  metadata: jsonb("metadata"),
-}, (t) => [
-  index("idxRunAuditEventsRunIdTimestamp").on(t.runId, t.timestamp),
-  index("idxRunAuditEventsTaskIdTimestamp").on(t.taskId, t.timestamp),
-  index("idxRunAuditEventsTimestamp").on(t.timestamp),
 ]);
 
 export const missionContractAssertions = projectSchema.table("mission_contract_assertions", {
@@ -2142,46 +2198,6 @@ export const importTranslationCache = projectSchema.table("import_translation_ca
     columns: [t.projectId, t.provider, t.repoKey, t.issueNumber, t.targetLocale],
   }),
   index("idxImportTranslationCacheRecordedAt").on(t.recordedAt),
-]);
-
-export const approvalRequests = projectSchema.table("approval_requests", {
-  id: text("id").primaryKey(),
-  status: text("status").notNull(),
-  requesterActorId: text("requester_actor_id").notNull(),
-  requesterActorType: text("requester_actor_type").notNull(),
-  requesterActorName: text("requester_actor_name").notNull(),
-  targetActionCategory: text("target_action_category").notNull(),
-  targetActionOperation: text("target_action_operation").notNull(),
-  targetActionSummary: text("target_action_summary").notNull(),
-  targetResourceType: text("target_resource_type").notNull(),
-  targetResourceId: text("target_resource_id").notNull(),
-  targetContext: jsonb("target_context"),
-  taskId: text("task_id"),
-  runId: text("run_id"),
-  requestedAt: text("requested_at").notNull(),
-  decidedAt: text("decided_at"),
-  completedAt: text("completed_at"),
-  createdAt: text("created_at").notNull(),
-  updatedAt: text("updated_at").notNull(),
-}, (t) => [
-  index("idxApprovalRequestsStatusCreatedAt").on(t.status, t.createdAt),
-  index("idxApprovalRequestsRequesterCreatedAt").on(t.requesterActorId, t.createdAt),
-  index("idxApprovalRequestsTaskCreatedAt").on(t.taskId, t.createdAt),
-]);
-
-export const approvalRequestAuditEvents = projectSchema.table("approval_request_audit_events", {
-  projectId: text("project_id").notNull().default(""),
-  id: text("id").primaryKey(),
-  requestId: text("request_id").notNull(),
-  eventType: text("event_type").notNull(),
-  actorId: text("actor_id").notNull(),
-  actorType: text("actor_type").notNull(),
-  actorName: text("actor_name").notNull(),
-  note: text("note"),
-  createdAt: text("created_at").notNull(),
-}, (t) => [
-  index("idxApprovalRequestAuditRequestCreatedAt").on(t.requestId, t.createdAt, t.id),
-  index("idxApprovalRequestAuditProjectCreatedAt").on(t.projectId, t.createdAt),
 ]);
 
 export const chatRooms = projectSchema.table("chat_rooms", {

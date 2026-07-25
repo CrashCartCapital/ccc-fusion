@@ -302,8 +302,10 @@ fn — AI-orchestrated task board
 
 Usage:
   fn                                  Launch the dashboard (same as fn dashboard)
+  fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+                                      Generate a traceable candidate sidecar from an admitted packet through native bounded authoring
   fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
-                                      Generate a traceable candidate sidecar through the local deterministic authoring adapter
+                                      Compatibility fixture authoring path for deterministic tests
   fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Validate custody and semantics; emit diagnostics only
   fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>

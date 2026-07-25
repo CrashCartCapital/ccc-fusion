@@ -510,6 +510,7 @@ async function startSharedToolFixture(options: {
   name: string;
   readOnly: boolean;
   structuredResult: Record<string, unknown>;
+  acknowledgedErrorSlot?: string;
 }): Promise<{ readonly url: string; readonly upstreamExecutions: () => number; close(): Promise<void> }> {
   let upstreamExecutions = 0;
   const sockets = new Set<Socket>();
@@ -520,9 +521,15 @@ async function startSharedToolFixture(options: {
       inputSchema: { type: "object", properties: { slot: { type: "string" } }, required: ["slot"], additionalProperties: false },
       annotations: { readOnlyHint: options.readOnly, destructiveHint: false, idempotentHint: options.readOnly, openWorldHint: false },
     }] }));
-    protocolServer.setRequestHandler(CallToolRequestSchema, async () => {
+    protocolServer.setRequestHandler(CallToolRequestSchema, async (call) => {
       upstreamExecutions += 1;
-      return { content: [{ type: "text", text: `${options.name}:shared` }], structuredContent: options.structuredResult, isError: false };
+      const slot = (call.params.arguments as { slot?: unknown } | undefined)?.slot;
+      const isError = typeof slot === "string" && slot === options.acknowledgedErrorSlot;
+      return {
+        content: [{ type: "text", text: `${options.name}:shared:${String(slot)}` }],
+        structuredContent: options.structuredResult,
+        isError,
+      };
     });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     await protocolServer.connect(transport);
@@ -1372,6 +1379,121 @@ pgDescribe("ccc native MCP durable receipt proxy", () => {
         expect(fixture.upstreamExecutions()).toBe(1);
       } finally { await disposeManager(resumed.manager); }
     } finally { await harness.teardown(); await fixture.close(); }
+  });
+
+  it("commits and replays an acknowledged MCP tool error without blocking the next effect", async () => {
+    const fixture = await startSharedToolFixture({
+      name: "ccc-native-acknowledged-error",
+      readOnly: false,
+      structuredResult: { route: "effectful", status: "acknowledged" },
+      acknowledgedErrorSlot: "error-slot",
+    });
+    const harness = await createTaskStoreForTest({ prefix: "fusion_wave3_native_acknowledged_error" });
+    const projectId = "ccc-native-acknowledged-error";
+    const store = await CliSessionStore.create(harness.layer, projectId);
+    const first = makeManager(store as never);
+    try {
+      const record = await first.manager.spawn({
+        adapterId: "codex",
+        projectId,
+        purpose: "execute",
+        taskId: "task-native-acknowledged-error",
+        worktreePath: tmpdir(),
+        settings: {
+          profile: CCC_PROFILE,
+          subscriptionReady: true,
+          model: "codex-native-acknowledged-error",
+          mcpServers: [{
+            name: "acknowledged-error",
+            transport: "streamable-http",
+            url: fixture.url,
+            enabled: true,
+          }],
+        },
+      });
+      const proxyUrl = codexConfiguredUrl(first.captures[0]!.args, "acknowledged-error");
+      await postNativeJsonRpc(proxyUrl, {
+        jsonrpc: "2.0",
+        id: "acknowledged-list",
+        method: "tools/list",
+        params: {},
+      });
+      const acknowledgedError = await postNativeJsonRpc(proxyUrl, {
+        jsonrpc: "2.0",
+        id: "acknowledged-error",
+        method: "tools/call",
+        params: { name: "shared", arguments: { slot: "error-slot" } },
+      });
+      expect(acknowledgedError).toMatchObject({
+        id: "acknowledged-error",
+        result: { isError: true },
+      });
+      const laterEffect = await postNativeJsonRpc(proxyUrl, {
+        jsonrpc: "2.0",
+        id: "later-effect",
+        method: "tools/call",
+        params: { name: "shared", arguments: { slot: "later-slot" } },
+      });
+      expect(laterEffect).toMatchObject({
+        id: "later-effect",
+        result: { isError: false },
+      });
+      expect(fixture.upstreamExecutions()).toBe(2);
+      expect((await readNativeDurableRows(harness.layer, projectId, record.id)).receipts)
+        .toEqual([
+          expect.objectContaining({ slot_ordinal: 0, state: "committed" }),
+          expect.objectContaining({ slot_ordinal: 1, state: "committed" }),
+        ]);
+
+      captureNativeSessionId(store as never, record.id, "native-acknowledged-error");
+      await store.flush();
+      await disposeManager(first.manager);
+
+      const restartedStore = await CliSessionStore.create(harness.layer, projectId);
+      const resumed = makeManager(restartedStore as never);
+      try {
+        await resumed.manager.spawn({
+          adapterId: "codex",
+          projectId,
+          purpose: "execute",
+          taskId: "task-native-acknowledged-error",
+          worktreePath: tmpdir(),
+          settings: { subscriptionReady: true },
+          resume: {
+            sessionId: record.id,
+            nativeSessionId: "native-acknowledged-error",
+          },
+        });
+        const replayUrl = codexConfiguredUrl(resumed.captures[0]!.args, "acknowledged-error");
+        const errorReplay = await postNativeJsonRpc(replayUrl, {
+          jsonrpc: "2.0",
+          id: "acknowledged-error-replay",
+          method: "tools/call",
+          params: { name: "shared", arguments: { slot: "error-slot" } },
+        });
+        expect(errorReplay).toEqual({
+          ...acknowledgedError,
+          id: "acknowledged-error-replay",
+        });
+        const laterReplay = await postNativeJsonRpc(replayUrl, {
+          jsonrpc: "2.0",
+          id: "later-effect-replay",
+          method: "tools/call",
+          params: { name: "shared", arguments: { slot: "later-slot" } },
+        });
+        expect(laterReplay).toEqual({
+          ...laterEffect,
+          id: "later-effect-replay",
+        });
+        expect(fixture.upstreamExecutions()).toBe(2);
+      } finally {
+        await disposeManager(resumed.manager);
+      }
+    } finally {
+      await disposeManager(first.manager);
+      await harness.teardown();
+      await fixture.close();
+    }
   });
 
   it("keeps same-named native MCP tools classified by their canonical server route", async () => {

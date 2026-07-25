@@ -5,7 +5,18 @@ import { and, eq, isNull, ne, sql } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
 import { type FSWatcher } from "node:fs";
 import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, ColumnId, CheckoutClaimPrecondition, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, ArchivedTaskDocumentAdditionInput, ArchivedTaskDocumentAdditionResult, TaskDocumentWithTask, Artifact, ArtifactCreateInput, ArtifactType, ArtifactWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, WorkflowStepTemplate, Agent, AutostashOrphanRecord, TaskCommitAssociation, CommitAssociationDiffBackfillReport, GithubIssueAction, MergeQueueEntry, MergeQueueEnqueueOptions, MergeQueueAcquireOptions, MergeQueueReleaseOutcome, HandoffToReviewOptions, GoalCitation, GoalCitationFilter, GoalCitationInput, GoalCitationSurface, BranchGroup, BranchGroupCreateInput, BranchGroupUpdate, TaskBranchAssignmentMode, MergeRequestRecord, MergeRequestState, MergeRequestWorkflowProjectionOptions, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemDueFilter, WorkflowWorkItemKind, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput, PrEntity, PrEntityCreateInput, PrEntityUpdate, PrThreadState, PrThreadOutcome, PluginActivation, PluginActivationInput } from "./types.js";
-import { loadCccCampaignContextForTask, type CccCampaignContext } from "./ccc-campaign/index.js";
+import {
+  claimCccCampaignActionLease,
+  inspectCccCampaignActionLease,
+  loadCccCampaignContextForTask,
+  settleCccCampaignActionLease,
+  type CccCampaignActionLeaseClaim,
+  type CccCampaignActionLeaseResult,
+} from "./ccc-campaign/store.js";
+import type {
+  CccCampaignActionLookup,
+  CccCampaignContext,
+} from "./ccc-campaign/types.js";
 export type OverlapBlockerRepairReason =
   | "task-not-found"
   | "no-overlap-blocker"
@@ -955,7 +966,63 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async getTask(id: string, options?: { activityLogLimit?: number; includeDeleted?: boolean }): Promise<TaskDetail> {
     return getTaskImpl(this, id, options);
   }
-  async getCccCampaignContextForTask(taskId: string): Promise<CccCampaignContext | null> { if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore"); return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId); }
+  async getCccCampaignContextForTask(taskId: string): Promise<CccCampaignContext | null> {
+    if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore");
+    return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId);
+  }
+  async getCccCampaignContextForTaskWithinTransaction(
+    tx: DbTransaction,
+    taskId: string,
+  ): Promise<CccCampaignContext | null> {
+    if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore");
+    return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId, tx, true);
+  }
+  async claimCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    claim: CccCampaignActionLeaseClaim,
+    tx?: DbTransaction,
+  ): Promise<CccCampaignActionLeaseResult> {
+    if (!this.asyncLayer) throw new Error("CCC campaign action leases require a PostgreSQL-backed TaskStore");
+    return claimCccCampaignActionLease({
+      layer: this.asyncLayer,
+      rootDir: this.rootDir,
+      taskId,
+      action,
+      claim,
+      tx,
+    });
+  }
+  async inspectCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    tx?: DbTransaction,
+  ): Promise<CccCampaignActionLeaseResult | null> {
+    if (!this.asyncLayer) throw new Error("CCC campaign action leases require a PostgreSQL-backed TaskStore");
+    return inspectCccCampaignActionLease({
+      layer: this.asyncLayer,
+      rootDir: this.rootDir,
+      taskId,
+      action,
+      tx,
+    });
+  }
+  async settleCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    claimToken: string,
+    tx?: DbTransaction,
+  ): Promise<void> {
+    if (!this.asyncLayer) throw new Error("CCC campaign action leases require a PostgreSQL-backed TaskStore");
+    return settleCccCampaignActionLease({
+      layer: this.asyncLayer,
+      rootDir: this.rootDir,
+      taskId,
+      action,
+      claimToken,
+      tx,
+    });
+  }
 
   /**
    * FNXC:RuntimeWorkflowAsync 2026-06-24-16:20:

@@ -324,6 +324,16 @@ function assertClosedNamedResults(expectedNames, assertions, label) {
   }
 }
 
+function assertMachineResultInventory(command) {
+  if (!command.machineResults) return;
+  if (!Array.isArray(command.expectedNames) || command.expectedNames.length === 0) {
+    throw new Error(`${command.id ?? "machine-result command"}: machine results require a non-empty expected-name inventory`);
+  }
+  if (new Set(command.expectedNames).size !== command.expectedNames.length) {
+    throw new Error(`${command.id ?? "machine-result command"}: expected-name inventory contains duplicates`);
+  }
+}
+
 /*
 FNXC:CccWave4Proof 2026-07-24-12:12:
 The proof runner's policy is itself a correctness boundary. Exercise the
@@ -335,6 +345,26 @@ function selfTestClosedNamePolicy() {
   const expected = ["suite > required"];
   const good = [{ ancestorTitles: ["suite"], title: "required", status: "passed" }];
   assertClosedNamedResults(expected, good, "policy-self-test");
+  assertMachineResultInventory({ machineResults: true, expectedNames: expected });
+  let duplicateInventoryRejected = false;
+  try {
+    assertMachineResultInventory({ machineResults: true, expectedNames: [...expected, ...expected] });
+  } catch {
+    duplicateInventoryRejected = true;
+  }
+  if (!duplicateInventoryRejected) throw new Error("policy-self-test: duplicate expected-name inventory was accepted");
+  for (const command of [
+    { machineResults: true },
+    { machineResults: true, expectedNames: [] },
+  ]) {
+    let rejected = false;
+    try {
+      assertMachineResultInventory(command);
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw new Error("policy-self-test: machine result without a closed expected-name inventory was accepted");
+  }
   for (const [label, assertions] of [
     ["missing", []],
     ["extra", [...good, { ancestorTitles: ["suite"], title: "extra", status: "passed" }]],
@@ -474,6 +504,7 @@ const wave5Commands = [
   },
 ];
 const commands = selectedWave === 5 ? wave5Commands : wave4Commands;
+for (const command of commands) assertMachineResultInventory(command);
 
 function positiveBudget(name, fallback) {
   const value = process.env[name] === undefined ? fallback : Number(process.env[name]);
@@ -628,7 +659,7 @@ try {
     if (json.numFailedTests !== 0 || json.numPendingTests !== 0 || json.numTodoTests !== 0 || json.numPassedTests === 0) {
       throw new Error(`${command.id}: failed, skipped, pending, todo, or empty machine result`);
     }
-    if (command.expectedNames) assertClosedNamedResults(command.expectedNames, assertions, command.id);
+    assertClosedNamedResults(command.expectedNames, assertions, command.id);
   }
 } catch (error) {
   policyError = redact(error instanceof Error ? error.message : String(error));

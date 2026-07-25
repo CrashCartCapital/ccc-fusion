@@ -78,6 +78,7 @@ import {
   LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
   TASK_WEDGE_NOTIFICATION_VERSION,
   CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+  CCC_CAMPAIGN_GOVERNANCE_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -215,6 +216,17 @@ describe("schema-applier: immutable migration identities", () => {
     expect(applierSource).toContain("0026_bigint_counters.sql");
     expect(applierSource).toContain("BIGINT_COUNTERS_VERSION");
     expect(applierSource).toMatch(/applied\.includes\(\s*BIGINT_COUNTERS_VERSION\s*\)/);
+  });
+
+  it("registers the complete campaign-governance migration at 0037", () => {
+    expect(CCC_CAMPAIGN_GOVERNANCE_VERSION).toBe("0037");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0037");
+    const applierSource = readFileSync(
+      fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(applierSource).toContain("0037_ccc_campaign_governance.sql");
+    expect(applierSource).toMatch(/cccCampaignGovernanceAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_GOVERNANCE_VERSION\s*,?\s*\)/);
   });
 });
 
@@ -1492,15 +1504,54 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
         updated_at text NOT NULL
       );
       /* FNXC:GitHubImportTranslate 2026-07-16-23:30: Later durable-task migrations run after this historical 0000 fixture, so retain their required task table surface. */
-      CREATE TABLE project.tasks (id text PRIMARY KEY);
+      CREATE TABLE project.tasks (
+        id text PRIMARY KEY,
+        "column" text,
+        status text,
+        paused integer,
+        user_paused integer,
+        paused_reason text
+      );
       /* FNXC:WorkflowTaskContinuations: 0031 alters and indexes this pre-existing durable work-item surface. */
       CREATE TABLE project.workflow_work_items (
         id text PRIMARY KEY,
         task_id text NOT NULL,
         kind text NOT NULL,
         state text NOT NULL,
+        blocked_reason text,
         lease_owner text,
         lease_expires_at text,
+        updated_at text NOT NULL
+      );
+      CREATE TABLE project.run_audit_events (
+        id text PRIMARY KEY,
+        timestamp text NOT NULL,
+        task_id text,
+        agent_id text NOT NULL,
+        run_id text NOT NULL,
+        domain text NOT NULL,
+        mutation_type text NOT NULL,
+        target text NOT NULL,
+        metadata jsonb
+      );
+      CREATE TABLE project.approval_requests (
+        id text PRIMARY KEY,
+        status text NOT NULL,
+        requester_actor_id text NOT NULL,
+        requester_actor_type text NOT NULL,
+        requester_actor_name text NOT NULL,
+        target_action_category text NOT NULL,
+        target_action_operation text NOT NULL,
+        target_action_summary text NOT NULL,
+        target_resource_type text NOT NULL,
+        target_resource_id text NOT NULL,
+        target_context jsonb,
+        task_id text,
+        run_id text,
+        requested_at text NOT NULL,
+        decided_at text,
+        completed_at text,
+        created_at text NOT NULL,
         updated_at text NOT NULL
       );
       /*
@@ -1607,6 +1658,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1667,6 +1719,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 
@@ -1860,6 +1913,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 
@@ -1934,6 +1988,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 
@@ -2008,6 +2063,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 });
@@ -2472,10 +2528,11 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
     // through 0033, but no v2 receipt table or 0034 marker.
     await ctx.db.execute(sql.raw(`
       DROP TABLE IF EXISTS project.ccc_effect_receipts;
-      DELETE FROM public.fusion_schema_migrations WHERE version = '0034';
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0034', '0037');
     `));
     expect(await getAppliedMigrations(ctx.db)).toContain("0033");
     expect(await getAppliedMigrations(ctx.db)).not.toContain("0034");
+    expect(await getAppliedMigrations(ctx.db)).not.toContain("0037");
     const before = (await ctx.db.execute(sql`
       SELECT to_regclass('project.ccc_effect_receipts') AS receipt_table
     `)) as unknown as Array<{ receipt_table: string | null }>;
@@ -2483,6 +2540,7 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
 
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
     expect(await getAppliedMigrations(ctx.db)).toContain("0034");
+    expect(await getAppliedMigrations(ctx.db)).toContain("0037");
 
     const catalog = (await ctx.db.execute(sql`
       SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,

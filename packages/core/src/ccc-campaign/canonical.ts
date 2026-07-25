@@ -3,8 +3,13 @@ import { resolve } from "node:path";
 import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "../ccc-prd/contract.js";
 import type { CccPrdSemanticBundle } from "../ccc-prd/types.js";
 import {
+  CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
   CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
+  CccCampaignContextError,
+  type CccCampaignActionLookup,
+  type CccCampaignAuthorityBinding,
+  type CccCampaignContext,
   type CccCampaignExecutionPolicy,
   type CccCampaignExecutionRoute,
   type CccCampaignManifest,
@@ -13,6 +18,25 @@ import {
 
 const ROUTE_KEYS = ["modelId", "providerId", "taskId", "transport"] as const;
 const POLICY_KEYS = ["routes", "schema"] as const;
+const AUTHORITY_BINDING_KEYS = [
+  "actionId",
+  "actionTarget",
+  "bindingHash",
+  "bundleHash",
+  "campaignId",
+  "idempotencyKey",
+  "importId",
+  "manifestHash",
+  "modelId",
+  "packetHash",
+  "projectId",
+  "providerId",
+  "sidecarHash",
+  "targetBase",
+  "targetRepository",
+  "taskId",
+  "transport",
+] as const;
 const TRANSPORTS = new Set<CccCampaignTransport>(["pi", "cli", "workflow"]);
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 
@@ -184,4 +208,183 @@ export function hashCccCampaignManifest(manifest: CccCampaignManifest): string {
   return createHash("sha256")
     .update(canonicalCccPrdJson(manifest), "utf8")
     .digest("hex");
+}
+
+function requireAuthorityText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+    throw new CccCampaignContextError(`${label} must be a non-empty canonical string`);
+  }
+  return value;
+}
+
+function requireAuthorityHash(value: unknown, label: string): string {
+  const hash = requireAuthorityText(value, label);
+  if (!/^[0-9a-f]{64}$/.test(hash)) {
+    throw new CccCampaignContextError(`${label} must be a lowercase SHA-256 hash`);
+  }
+  return hash;
+}
+
+function requireAuthorityTransport(value: unknown): CccCampaignTransport {
+  if (typeof value !== "string" || !TRANSPORTS.has(value as CccCampaignTransport)) {
+    throw new CccCampaignContextError("campaign route transport is invalid");
+  }
+  return value as CccCampaignTransport;
+}
+
+function requireAuthorityContext(
+  context: CccCampaignContext,
+): Omit<CccCampaignAuthorityBinding, "actionId" | "actionTarget" | "bindingHash"> {
+  if (!context || typeof context !== "object") {
+    throw new CccCampaignContextError("CCC campaign context is missing");
+  }
+  if (context.schema !== CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION) {
+    throw new CccCampaignContextError("CCC campaign context schema is invalid");
+  }
+  if (!context.targetRepository || typeof context.targetRepository !== "object") {
+    throw new CccCampaignContextError("CCC campaign context target repository is missing");
+  }
+  if (!context.route || typeof context.route !== "object") {
+    throw new CccCampaignContextError("CCC campaign context execution route is missing");
+  }
+  const taskId = requireAuthorityText(context.taskId, "campaign taskId");
+  if (requireAuthorityText(context.route.taskId, "campaign route taskId") !== taskId) {
+    throw new CccCampaignContextError("CCC campaign route taskId does not match campaign taskId");
+  }
+  return {
+    projectId: requireAuthorityText(context.projectId, "campaign projectId"),
+    importId: requireAuthorityText(context.importId, "campaign importId"),
+    campaignId: requireAuthorityText(context.campaignId, "campaign campaignId"),
+    taskId,
+    idempotencyKey: requireAuthorityText(
+      context.idempotencyKey,
+      "campaign idempotencyKey",
+    ),
+    packetHash: requireAuthorityHash(context.packetHash, "campaign packetHash"),
+    sidecarHash: requireAuthorityHash(context.sidecarHash, "campaign sidecarHash"),
+    bundleHash: requireAuthorityHash(context.bundleHash, "campaign bundleHash"),
+    targetRepository: requireAuthorityText(
+      context.targetRepository.path,
+      "campaign targetRepository",
+    ),
+    targetBase: requireAuthorityText(
+      context.targetRepository.baseCommit,
+      "campaign targetBase",
+    ),
+    providerId: requireAuthorityText(context.route.providerId, "campaign providerId"),
+    modelId: requireAuthorityText(context.route.modelId, "campaign modelId"),
+    transport: requireAuthorityTransport(context.route.transport),
+    manifestHash: requireAuthorityHash(context.manifestHash, "campaign manifestHash"),
+  };
+}
+
+function protectedActionFor(
+  context: CccCampaignContext,
+  actionId: string,
+): { id: string; target: string } | undefined {
+  if (!Array.isArray(context.protectedActions)) {
+    throw new CccCampaignContextError("CCC campaign protected actions are missing");
+  }
+  const matches = context.protectedActions.filter((action) => {
+    if (!action || typeof action !== "object") {
+      throw new CccCampaignContextError("CCC campaign protected action is invalid");
+    }
+    const id = requireAuthorityText(action.id, "campaign protected action id");
+    requireAuthorityText(action.target, `campaign protected action ${id} target`);
+    return id === actionId;
+  });
+  if (matches.length > 1) {
+    throw new CccCampaignContextError(
+      `CCC campaign protected action ${actionId} is declared more than once`,
+    );
+  }
+  return matches[0];
+}
+
+export function assertCccCampaignAuthorityBinding(
+  binding: CccCampaignAuthorityBinding,
+): CccCampaignAuthorityBinding {
+  if (!binding || typeof binding !== "object" || Array.isArray(binding)) {
+    throw new CccCampaignContextError("CCC campaign authority binding is missing");
+  }
+  const record = binding as Record<string, unknown>;
+  const observedKeys = Object.keys(record).sort(compareCccPrdCodeUnits);
+  const expectedKeys = [...AUTHORITY_BINDING_KEYS].sort(compareCccPrdCodeUnits);
+  if (canonicalCccPrdJson(observedKeys) !== canonicalCccPrdJson(expectedKeys)) {
+    throw new CccCampaignContextError(
+      `CCC campaign authority binding fields must be exactly ${expectedKeys.join(", ")}`,
+    );
+  }
+  const fields = {
+    projectId: requireAuthorityText(record.projectId, "campaign binding projectId"),
+    importId: requireAuthorityText(record.importId, "campaign binding importId"),
+    campaignId: requireAuthorityText(record.campaignId, "campaign binding campaignId"),
+    taskId: requireAuthorityText(record.taskId, "campaign binding taskId"),
+    actionId: requireAuthorityText(record.actionId, "campaign binding actionId"),
+    actionTarget: requireAuthorityText(record.actionTarget, "campaign binding actionTarget"),
+    idempotencyKey: requireAuthorityText(
+      record.idempotencyKey,
+      "campaign binding idempotencyKey",
+    ),
+    packetHash: requireAuthorityHash(record.packetHash, "campaign binding packetHash"),
+    sidecarHash: requireAuthorityHash(record.sidecarHash, "campaign binding sidecarHash"),
+    bundleHash: requireAuthorityHash(record.bundleHash, "campaign binding bundleHash"),
+    targetRepository: requireAuthorityText(
+      record.targetRepository,
+      "campaign binding targetRepository",
+    ),
+    targetBase: requireAuthorityText(record.targetBase, "campaign binding targetBase"),
+    providerId: requireAuthorityText(record.providerId, "campaign binding providerId"),
+    modelId: requireAuthorityText(record.modelId, "campaign binding modelId"),
+    transport: requireAuthorityTransport(record.transport),
+    manifestHash: requireAuthorityHash(record.manifestHash, "campaign binding manifestHash"),
+  };
+  const bindingHash = requireAuthorityHash(record.bindingHash, "campaign binding bindingHash");
+  const expectedHash = createHash("sha256")
+    .update(canonicalCccPrdJson(fields), "utf8")
+    .digest("hex");
+  if (bindingHash !== expectedHash) {
+    throw new CccCampaignContextError("CCC campaign authority binding hash does not match its fields");
+  }
+  return { ...fields, bindingHash };
+}
+
+export function createCccCampaignAuthorityBinding(
+  context: CccCampaignContext,
+  action: CccCampaignActionLookup,
+): CccCampaignAuthorityBinding {
+  const bindingContext = requireAuthorityContext(context);
+  if (!action || typeof action !== "object") {
+    throw new CccCampaignContextError("CCC campaign action lookup is missing");
+  }
+  const actionId = requireAuthorityText(action.actionId, "CCC campaign actionId");
+  const actionTarget = requireAuthorityText(
+    action.actionTarget,
+    "CCC campaign actionTarget",
+  );
+  if (action.requireProtected !== undefined && typeof action.requireProtected !== "boolean") {
+    throw new CccCampaignContextError("CCC campaign requireProtected must be a boolean");
+  }
+  const protectedAction = protectedActionFor(context, actionId);
+  if (protectedAction && protectedAction.target !== actionTarget) {
+    throw new CccCampaignContextError(
+      `CCC campaign protected action ${actionId} target must match exactly`,
+    );
+  }
+  if (action.requireProtected === true && !protectedAction) {
+    throw new CccCampaignContextError(
+      `CCC campaign action ${actionId} is not a declared protected action`,
+    );
+  }
+  const fields = {
+    ...bindingContext,
+    actionId,
+    actionTarget,
+  };
+  return assertCccCampaignAuthorityBinding({
+    ...fields,
+    bindingHash: createHash("sha256")
+      .update(canonicalCccPrdJson(fields), "utf8")
+      .digest("hex"),
+  });
 }

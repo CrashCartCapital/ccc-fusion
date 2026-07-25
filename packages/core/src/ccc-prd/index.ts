@@ -22,6 +22,7 @@ export type {
   CccPrdAdmittedWriteRoot,
   CccPrdArtifact,
   CccPrdAuthoringAdapter,
+  CccPrdAuthoringConstraints,
   CccPrdAuthoringProposal,
   CccPrdAuthoringRequest,
   CccPrdAuthoringResult,

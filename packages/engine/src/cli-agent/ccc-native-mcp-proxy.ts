@@ -13,10 +13,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isUntrustedToolFailure(result: ToolResult): boolean {
-  if (result.error !== undefined) return true;
-  const rpcResult = result.result;
-  return Boolean(rpcResult && typeof rpcResult === "object" && (rpcResult as Record<string, unknown>).isError === true);
+function isUnresolvedToolResponse(result: ToolResult): boolean {
+  return result.error !== undefined;
 }
 
 /** Canonical, redacted receipt authority: policy route and tool, never upstream URL. */
@@ -40,7 +38,7 @@ function decodeLegacyEnvelopeResult(candidate: unknown): unknown | undefined {
 }
 
 function decodeCommittedResult(candidate: unknown): unknown | undefined {
-  if (!isRecord(candidate) || candidate.isError === true) return undefined;
+  if (!isRecord(candidate)) return undefined;
   return Object.prototype.hasOwnProperty.call(candidate, "jsonrpc")
     ? decodeLegacyEnvelopeResult(candidate)
     : candidate;
@@ -222,7 +220,7 @@ export async function startCccNativeMcpProxy(options: {
             try { envelope = JSON.parse(upstreamResult.bytes.toString("utf8")) as ToolResult; } catch {
               throw new Error("CCC native MCP effect response is not a bounded structured result");
             }
-            if (isUntrustedToolFailure(envelope) || !Object.prototype.hasOwnProperty.call(envelope, "result")) {
+            if (isUnresolvedToolResponse(envelope) || !Object.prototype.hasOwnProperty.call(envelope, "result")) {
               response.writeHead(upstreamResult.response.status, copyHeaders(upstreamResult.response.headers));
               response.end(upstreamResult.bytes);
               return;

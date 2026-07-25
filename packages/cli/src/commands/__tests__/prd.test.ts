@@ -6,7 +6,11 @@ describe("prd command exit contract", () => {
     const output: string[] = [];
     expect(await runPrdCommand(["compile"], { write: (line) => output.push(line) })).toBe(2);
     expect(output).toEqual([
-      "usage: fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> | fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
+      [
+        "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
+        "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+        "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
+      ].join("\n"),
     ]);
   });
 });

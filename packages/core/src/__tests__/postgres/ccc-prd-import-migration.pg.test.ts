@@ -54,19 +54,27 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       copyFromGolden: true,
     });
     await upgraded.adminDb.execute(sql.raw(`
+      ALTER TABLE project.run_audit_events
+        DROP CONSTRAINT run_audit_events_campaign_import_fkey;
+      ALTER TABLE project.approval_requests
+        DROP CONSTRAINT approval_requests_campaign_import_fkey;
+      ALTER TABLE project.ccc_effect_receipts
+        DROP CONSTRAINT ccc_effect_receipts_campaign_import_fkey;
       DROP TABLE project.ccc_prd_import_sources;
       DROP TABLE project.ccc_prd_import_entities;
       DROP TABLE project.ccc_prd_imports;
-      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036');
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037');
     `));
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0034");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0035");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0036");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0037");
 
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0035");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0036");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0037");
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] })).toEqual({
       applied: false,
       pluginHooksRun: 0,
@@ -245,11 +253,6 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
     const taskId = `TASK-${suffix}`;
     const idempotencyKey = "test-test-test-0035";
     const bundle = createCccPrdImportTestBundle(harness.rootDir, suffix);
-    const emissions: unknown[] = [];
-    const observer = {
-      emissions,
-      emit: (value: unknown) => emissions.push(value),
-    };
     await expect(importCccPrdBundle({
       bundle,
       executionPolicy: createCccPrdImportTestExecutionPolicy(bundle),
@@ -257,15 +260,12 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
       store: harness.store,
       layer: harness.layer,
       rootDir: harness.rootDir,
-      effects: observer,
-      events: observer,
     })).resolves.toMatchObject({
       state: "active",
       runnable: true,
     });
     await expect(harness.store.getCccCampaignContextForTask(taskId))
       .resolves.toMatchObject({ taskId, idempotencyKey });
-    expect(emissions).toEqual([]);
 
     await harness.adminDb.execute(sql.raw(`
       ALTER TABLE project.ccc_prd_imports
@@ -328,14 +328,11 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
       store: restarted,
       layer: harness.layer,
       rootDir: harness.rootDir,
-      effects: observer,
-      events: observer,
     })).rejects.toMatchObject({
       code: "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
     });
 
     const refusedRows = await readCampaignState();
     expect(refusedRows).toEqual(migratedRows);
-    expect(emissions).toEqual([]);
   });
 });

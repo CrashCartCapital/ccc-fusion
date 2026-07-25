@@ -1,21 +1,20 @@
 import { realpath } from "node:fs/promises";
 import { and, eq } from "drizzle-orm";
-import type { AsyncDataLayer } from "../postgres/data-layer.js";
+import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "../ccc-prd/contract.js";
+import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
+import { createCccCampaignAuthorityBinding } from "./canonical.js";
 import { reconstructCccCampaignCustody } from "./custody.js";
 import {
   CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
+  CccCampaignContextError,
+  type CccCampaignActionLease,
+  type CccCampaignActionLookup,
+  type CccCampaignAuthorityBinding,
   type CccCampaignContext,
 } from "./types.js";
 
-export class CccCampaignContextError extends Error {
-  public readonly code = "CCC_CAMPAIGN_CONTEXT_REFUSED";
-
-  public constructor(message: string) {
-    super(message);
-    this.name = "CccCampaignContextError";
-  }
-}
+export { CccCampaignContextError } from "./types.js";
 
 function projectIdFor(layer: AsyncDataLayer): string {
   return layer.projectId?.trim() || "__legacy_unscoped__";
@@ -29,13 +28,129 @@ function requireIsoTimestamp(value: string, label: string): number {
   return timestamp;
 }
 
+const LEASE_KEYS = [
+  "actionId",
+  "actionTarget",
+  "approvalRequestId",
+  "bindingHash",
+  "claimToken",
+  "claimedAt",
+  "expiresAt",
+] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function requireLeaseText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+    throw new CccCampaignContextError(`${label} must be a non-empty canonical string`);
+  }
+  return value;
+}
+
+function requireLeaseHash(value: unknown, label: string): string {
+  const hash = requireLeaseText(value, label);
+  if (!/^[0-9a-f]{64}$/.test(hash)) {
+    throw new CccCampaignContextError(`${label} must be a lowercase SHA-256 hash`);
+  }
+  return hash;
+}
+
+function exactLeaseKeys(value: Record<string, unknown>, actionId: string): void {
+  const observed = Object.keys(value).sort(compareCccPrdCodeUnits);
+  const expected = [...LEASE_KEYS].sort(compareCccPrdCodeUnits);
+  if (canonicalCccPrdJson(observed) !== canonicalCccPrdJson(expected)) {
+    throw new CccCampaignContextError(
+      `CCC campaign action lease ${actionId} fields must be exactly ${expected.join(", ")}`,
+    );
+  }
+}
+
+function parseCccCampaignActionLease(
+  value: unknown,
+  actionId: string,
+  campaignDeadlineAt: string,
+): CccCampaignActionLease {
+  requireLeaseText(actionId, "CCC campaign action lease key");
+  if (!isRecord(value)) {
+    throw new CccCampaignContextError(`CCC campaign action lease ${actionId} must be an object`);
+  }
+  exactLeaseKeys(value, actionId);
+  const lease: CccCampaignActionLease = {
+    actionId: requireLeaseText(value.actionId, `CCC campaign action lease ${actionId} actionId`),
+    actionTarget: requireLeaseText(
+      value.actionTarget,
+      `CCC campaign action lease ${actionId} actionTarget`,
+    ),
+    approvalRequestId: requireLeaseText(
+      value.approvalRequestId,
+      `CCC campaign action lease ${actionId} approvalRequestId`,
+    ),
+    claimToken: requireLeaseText(
+      value.claimToken,
+      `CCC campaign action lease ${actionId} claimToken`,
+    ),
+    claimedAt: requireLeaseText(
+      value.claimedAt,
+      `CCC campaign action lease ${actionId} claimedAt`,
+    ),
+    expiresAt: requireLeaseText(
+      value.expiresAt,
+      `CCC campaign action lease ${actionId} expiresAt`,
+    ),
+    bindingHash: requireLeaseHash(
+      value.bindingHash,
+      `CCC campaign action lease ${actionId} bindingHash`,
+    ),
+  };
+  if (lease.actionId !== actionId) {
+    throw new CccCampaignContextError(
+      `CCC campaign action lease ${actionId} key does not match actionId`,
+    );
+  }
+  const claimedAt = requireIsoTimestamp(lease.claimedAt, `CCC campaign action lease ${actionId} claimedAt`);
+  const expiresAt = requireIsoTimestamp(lease.expiresAt, `CCC campaign action lease ${actionId} expiresAt`);
+  const deadlineAt = requireIsoTimestamp(campaignDeadlineAt, "campaignDeadlineAt");
+  if (expiresAt <= claimedAt || expiresAt > deadlineAt) {
+    throw new CccCampaignContextError(
+      `CCC campaign action lease ${actionId} expiry must be after claim and no later than campaign deadline`,
+    );
+  }
+  return lease;
+}
+
+function parseCccCampaignActionLeases(
+  value: unknown,
+  campaignDeadlineAt: string,
+): Record<string, CccCampaignActionLease> {
+  if (!isRecord(value)) {
+    throw new CccCampaignContextError("CCC campaign action leases must be an object");
+  }
+  const leases: Record<string, CccCampaignActionLease> = {};
+  for (const actionId of Object.keys(value).sort(compareCccPrdCodeUnits)) {
+    leases[actionId] = parseCccCampaignActionLease(
+      value[actionId],
+      actionId,
+      campaignDeadlineAt,
+    );
+  }
+  return leases;
+}
+
 export async function loadCccCampaignContextForTask(
   layer: AsyncDataLayer,
   rootDir: string,
   taskId: string,
+  tx?: DbTransaction,
+  lockForUpdate = false,
 ): Promise<CccCampaignContext | null> {
   const projectId = projectIdFor(layer);
-  const rows = await layer.db
+  const query = tx ?? layer.db;
+  const selection = query
     .select({
       projectId: schema.project.cccPrdImports.projectId,
       idempotencyKey: schema.project.cccPrdImports.idempotencyKey,
@@ -60,17 +175,17 @@ export async function loadCccCampaignContextForTask(
       semanticTaskId: schema.project.cccPrdImportEntities.entityId,
       nativeTaskId: schema.project.cccPrdImportEntities.nativeId,
     })
-    .from(schema.project.cccPrdImportEntities)
+    .from(schema.project.cccPrdImports)
     .innerJoin(
-      schema.project.cccPrdImports,
+      schema.project.cccPrdImportEntities,
       and(
         eq(
-          schema.project.cccPrdImports.projectId,
           schema.project.cccPrdImportEntities.projectId,
+          schema.project.cccPrdImports.projectId,
         ),
         eq(
-          schema.project.cccPrdImports.importId,
           schema.project.cccPrdImportEntities.importId,
+          schema.project.cccPrdImports.importId,
         ),
       ),
     )
@@ -80,6 +195,7 @@ export async function loadCccCampaignContextForTask(
       eq(schema.project.cccPrdImportEntities.nativeId, taskId),
     ))
     .limit(2);
+  const rows = lockForUpdate ? await selection.for("update") : await selection;
   if (rows.length === 0) return null;
   if (rows.length !== 1) {
     throw new CccCampaignContextError(
@@ -139,17 +255,12 @@ export async function loadCccCampaignContextForTask(
       `Task ${taskId} campaign request count is invalid`,
     );
   }
-  if (
-    !row.activeActionLeases
-    || typeof row.activeActionLeases !== "object"
-    || Array.isArray(row.activeActionLeases)
-  ) {
-    throw new CccCampaignContextError(
-      `Task ${taskId} campaign action leases are invalid`,
-    );
-  }
+  const activeActionLeases = parseCccCampaignActionLeases(
+    row.activeActionLeases,
+    row.campaignDeadlineAt,
+  );
 
-  return {
+  const context: CccCampaignContext = {
     schema: CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
     projectId: manifest.projectId,
     importId: manifest.importId,
@@ -171,6 +282,311 @@ export async function loadCccCampaignContextForTask(
     campaignStartedAt: manifest.campaignStartedAt,
     campaignDeadlineAt: manifest.campaignDeadlineAt,
     requestCount: row.requestCount,
-    activeActionLeases: { ...row.activeActionLeases },
+    activeActionLeases,
   };
+  for (const [actionId, lease] of Object.entries(activeActionLeases)) {
+    const binding = createCccCampaignAuthorityBinding(context, {
+      actionId,
+      actionTarget: lease.actionTarget,
+      requireProtected: true,
+    });
+    if (lease.bindingHash !== binding.bindingHash) {
+      throw new CccCampaignContextError(
+        `CCC campaign action lease ${actionId} binding does not match persisted campaign context`,
+      );
+    }
+  }
+  return context;
+}
+
+export type CccCampaignActionLeaseClaim = {
+  approvalRequestId: string;
+  claimToken: string;
+  claimedAt: string;
+  expiresAt: string;
+};
+
+export type CccCampaignActionLeaseResult = {
+  lease: CccCampaignActionLease;
+  binding: CccCampaignAuthorityBinding;
+};
+
+type CccCampaignActionLeaseBaseInput = {
+  layer: AsyncDataLayer;
+  rootDir: string;
+  taskId: string;
+  action: CccCampaignActionLookup;
+  tx?: DbTransaction;
+};
+
+export type ClaimCccCampaignActionLeaseInput = CccCampaignActionLeaseBaseInput & {
+  claim: CccCampaignActionLeaseClaim;
+};
+
+export type InspectCccCampaignActionLeaseInput = CccCampaignActionLeaseBaseInput;
+
+export type SettleCccCampaignActionLeaseInput = CccCampaignActionLeaseBaseInput & {
+  claimToken: string;
+};
+
+export interface CccCampaignAuthorityStore {
+  getCccCampaignContextForTaskWithinTransaction(
+    tx: DbTransaction,
+    taskId: string,
+  ): Promise<CccCampaignContext | null>;
+  claimCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    claim: CccCampaignActionLeaseClaim,
+    tx?: DbTransaction,
+  ): Promise<CccCampaignActionLeaseResult>;
+  inspectCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    tx?: DbTransaction,
+  ): Promise<CccCampaignActionLeaseResult | null>;
+  settleCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    claimToken: string,
+    tx?: DbTransaction,
+  ): Promise<void>;
+}
+
+function requireCampaignContext(
+  context: CccCampaignContext | null,
+  taskId: string,
+): CccCampaignContext {
+  if (!context) {
+    throw new CccCampaignContextError(`Task ${taskId} has no persisted CCC campaign context`);
+  }
+  return context;
+}
+
+function createProtectedLeaseBinding(
+  context: CccCampaignContext,
+  action: CccCampaignActionLookup,
+): CccCampaignAuthorityBinding {
+  return createCccCampaignAuthorityBinding(context, {
+    actionId: action.actionId,
+    actionTarget: action.actionTarget,
+    requireProtected: true,
+  });
+}
+
+function createActionLease(
+  binding: CccCampaignAuthorityBinding,
+  claim: CccCampaignActionLeaseClaim,
+  campaignDeadlineAt: string,
+): CccCampaignActionLease {
+  if (!claim || typeof claim !== "object") {
+    throw new CccCampaignContextError("CCC campaign action lease claim is missing");
+  }
+  const lease: CccCampaignActionLease = {
+    actionId: binding.actionId,
+    actionTarget: binding.actionTarget,
+    approvalRequestId: requireLeaseText(
+      claim.approvalRequestId,
+      `CCC campaign action lease ${binding.actionId} approvalRequestId`,
+    ),
+    claimToken: requireLeaseText(
+      claim.claimToken,
+      `CCC campaign action lease ${binding.actionId} claimToken`,
+    ),
+    claimedAt: requireLeaseText(
+      claim.claimedAt,
+      `CCC campaign action lease ${binding.actionId} claimedAt`,
+    ),
+    expiresAt: requireLeaseText(
+      claim.expiresAt,
+      `CCC campaign action lease ${binding.actionId} expiresAt`,
+    ),
+    bindingHash: binding.bindingHash,
+  };
+  parseCccCampaignActionLease(lease, lease.actionId, campaignDeadlineAt);
+  return lease;
+}
+
+async function lockActionLeases(
+  tx: DbTransaction,
+  context: CccCampaignContext,
+): Promise<Record<string, CccCampaignActionLease>> {
+  const rows = await tx
+    .select({
+      projectId: schema.project.cccPrdImports.projectId,
+      idempotencyKey: schema.project.cccPrdImports.idempotencyKey,
+      importId: schema.project.cccPrdImports.importId,
+      campaignManifestHash: schema.project.cccPrdImports.campaignManifestHash,
+      campaignDeadlineAt: schema.project.cccPrdImports.campaignDeadlineAt,
+      activeActionLeases: schema.project.cccPrdImports.activeActionLeases,
+    })
+    .from(schema.project.cccPrdImports)
+    .where(and(
+      eq(schema.project.cccPrdImports.projectId, context.projectId),
+      eq(schema.project.cccPrdImports.idempotencyKey, context.idempotencyKey),
+      eq(schema.project.cccPrdImports.importId, context.importId),
+    ))
+    .limit(2)
+    .for("update");
+  if (rows.length !== 1) {
+    throw new CccCampaignContextError(
+      `Task ${context.taskId} has no unique persisted CCC campaign import for its action lease`,
+    );
+  }
+  const row = rows[0]!;
+  if (
+    row.campaignManifestHash !== context.manifestHash
+    || row.campaignDeadlineAt !== context.campaignDeadlineAt
+  ) {
+    throw new CccCampaignContextError(
+      `Task ${context.taskId} CCC campaign action lease context drifted before lock`,
+    );
+  }
+  return parseCccCampaignActionLeases(row.activeActionLeases, row.campaignDeadlineAt);
+}
+
+async function writeActionLeases(
+  tx: DbTransaction,
+  context: CccCampaignContext,
+  leases: Record<string, CccCampaignActionLease>,
+): Promise<void> {
+  const updated = await tx
+    .update(schema.project.cccPrdImports)
+    .set({
+      activeActionLeases: leases,
+      updatedAt: new Date().toISOString(),
+    })
+    .where(and(
+      eq(schema.project.cccPrdImports.projectId, context.projectId),
+      eq(schema.project.cccPrdImports.idempotencyKey, context.idempotencyKey),
+      eq(schema.project.cccPrdImports.importId, context.importId),
+      eq(schema.project.cccPrdImports.campaignManifestHash, context.manifestHash),
+      eq(schema.project.cccPrdImports.campaignDeadlineAt, context.campaignDeadlineAt),
+    ))
+    .returning({ idempotencyKey: schema.project.cccPrdImports.idempotencyKey });
+  if (updated.length !== 1) {
+    throw new CccCampaignContextError(
+      `Task ${context.taskId} CCC campaign action lease update did not affect exactly one import`,
+    );
+  }
+}
+
+function assertLeaseMatchesBinding(
+  lease: CccCampaignActionLease,
+  binding: CccCampaignAuthorityBinding,
+): void {
+  if (
+    lease.actionId !== binding.actionId
+    || lease.actionTarget !== binding.actionTarget
+    || lease.bindingHash !== binding.bindingHash
+  ) {
+    throw new CccCampaignContextError(
+      `CCC campaign action lease ${binding.actionId} binding does not match persisted campaign context`,
+    );
+  }
+}
+
+function collisionMessage(
+  existing: CccCampaignActionLease,
+  requested: CccCampaignActionLease,
+): string {
+  const actionId = requested.actionId;
+  if (existing.claimToken !== requested.claimToken) {
+    return `CCC campaign action lease ${actionId} collision: claim token differs`;
+  }
+  if (existing.approvalRequestId !== requested.approvalRequestId) {
+    return `CCC campaign action lease ${actionId} collision: approval request differs`;
+  }
+  if (existing.bindingHash !== requested.bindingHash) {
+    return `CCC campaign action lease ${actionId} collision: binding hash differs`;
+  }
+  return `CCC campaign action lease ${actionId} collision: lease fields differ`;
+}
+
+async function claimCccCampaignActionLeaseWithinTransaction(
+  input: ClaimCccCampaignActionLeaseInput,
+  tx: DbTransaction,
+): Promise<CccCampaignActionLeaseResult> {
+  const context = requireCampaignContext(
+    await loadCccCampaignContextForTask(input.layer, input.rootDir, input.taskId, tx, true),
+    input.taskId,
+  );
+  const binding = createProtectedLeaseBinding(context, input.action);
+  const requested = createActionLease(binding, input.claim, context.campaignDeadlineAt);
+  const leases = await lockActionLeases(tx, context);
+  const existing = leases[requested.actionId];
+  if (existing) {
+    assertLeaseMatchesBinding(existing, binding);
+    if (canonicalCccPrdJson(existing) === canonicalCccPrdJson(requested)) {
+      return { lease: existing, binding };
+    }
+    throw new CccCampaignContextError(collisionMessage(existing, requested));
+  }
+  const next = { ...leases, [requested.actionId]: requested };
+  await writeActionLeases(tx, context, next);
+  return { lease: requested, binding };
+}
+
+export async function claimCccCampaignActionLease(
+  input: ClaimCccCampaignActionLeaseInput,
+): Promise<CccCampaignActionLeaseResult> {
+  if (input.tx) return claimCccCampaignActionLeaseWithinTransaction(input, input.tx);
+  return input.layer.transactionImmediate((tx) =>
+    claimCccCampaignActionLeaseWithinTransaction(input, tx));
+}
+
+export async function inspectCccCampaignActionLease(
+  input: InspectCccCampaignActionLeaseInput,
+): Promise<CccCampaignActionLeaseResult | null> {
+  const context = requireCampaignContext(
+    await loadCccCampaignContextForTask(
+      input.layer,
+      input.rootDir,
+      input.taskId,
+      input.tx,
+      input.tx !== undefined,
+    ),
+    input.taskId,
+  );
+  const binding = createProtectedLeaseBinding(context, input.action);
+  const lease = context.activeActionLeases[binding.actionId];
+  if (!lease) return null;
+  assertLeaseMatchesBinding(lease, binding);
+  return { lease, binding };
+}
+
+async function settleCccCampaignActionLeaseWithinTransaction(
+  input: SettleCccCampaignActionLeaseInput,
+  tx: DbTransaction,
+): Promise<void> {
+  const context = requireCampaignContext(
+    await loadCccCampaignContextForTask(input.layer, input.rootDir, input.taskId, tx, true),
+    input.taskId,
+  );
+  const binding = createProtectedLeaseBinding(context, input.action);
+  const claimToken = requireLeaseText(
+    input.claimToken,
+    `CCC campaign action lease ${binding.actionId} claimToken`,
+  );
+  const leases = await lockActionLeases(tx, context);
+  const lease = leases[binding.actionId];
+  if (!lease) {
+    throw new CccCampaignContextError(`CCC campaign action lease ${binding.actionId} is missing`);
+  }
+  if (lease.claimToken !== claimToken || lease.bindingHash !== binding.bindingHash) {
+    throw new CccCampaignContextError(
+      `CCC campaign action lease ${binding.actionId} can only settle with its winning claim token and binding`,
+    );
+  }
+  assertLeaseMatchesBinding(lease, binding);
+  const { [binding.actionId]: _settled, ...remaining } = leases;
+  await writeActionLeases(tx, context, remaining);
+}
+
+export async function settleCccCampaignActionLease(
+  input: SettleCccCampaignActionLeaseInput,
+): Promise<void> {
+  if (input.tx) return settleCccCampaignActionLeaseWithinTransaction(input, input.tx);
+  return input.layer.transactionImmediate((tx) =>
+    settleCccCampaignActionLeaseWithinTransaction(input, tx));
 }

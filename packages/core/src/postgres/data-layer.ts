@@ -51,12 +51,24 @@
  *   Drizzle transaction callback wrapper.
  */
 
-import { sql, eq, type SQL } from "drizzle-orm";
+import { and, sql, eq, type SQL } from "drizzle-orm";
 import type { PostgresJsDatabase, PostgresJsTransaction } from "drizzle-orm/postgres-js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { PostgresConnections } from "./connection.js";
 import * as schema from "./schema/index.js";
 import { PROJECT_SCHEMA } from "./schema/_shared.js";
+import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
+import {
+  assertCccCampaignAuthorityBinding,
+  createCccCampaignAuthorityBinding,
+} from "../ccc-campaign/canonical.js";
+import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
+import {
+  CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
+  CccCampaignContextError,
+  type CccCampaignAuthorityBinding,
+  type CccCampaignContext,
+} from "../ccc-campaign/types.js";
 
 /**
  * FNXC:AsyncDataLayer 2026-06-24-09:00:
@@ -195,6 +207,12 @@ export interface RunAuditEventInput {
   readonly mutationType: string;
   readonly target: string;
   readonly metadata?: Record<string, unknown> | null;
+  readonly campaign?: RunAuditCampaignEvent;
+}
+
+export interface RunAuditCampaignEvent {
+  readonly eventKey: string;
+  readonly binding: CccCampaignAuthorityBinding;
 }
 
 /** A persisted run-audit event row. */
@@ -208,6 +226,16 @@ export interface RunAuditEvent {
   readonly mutationType: string;
   readonly target: string;
   readonly metadata: Record<string, unknown> | null;
+  readonly campaign?: RunAuditCampaignEvent;
+}
+
+export class RunAuditEventCollisionError extends Error {
+  public readonly code = "CCC_RUN_AUDIT_EVENT_COLLISION";
+
+  public constructor(eventKey: string) {
+    super(`CCC run-audit event ${eventKey} collides with different persisted content`);
+    this.name = "RunAuditEventCollisionError";
+  }
 }
 
 /**
@@ -317,10 +345,12 @@ export async function recordRunAuditEventWithinTransaction(
   tx: DbTransaction,
   input: RunAuditEventInput,
 ): Promise<RunAuditEvent> {
-  const id = randomUUID();
-  const timestamp = input.timestamp ?? new Date().toISOString();
+  const campaign = input.campaign ? normalizeCampaignEvent(input.campaign) : undefined;
+  const timestamp = campaign
+    ? requireCanonicalCampaignTimestamp(input.timestamp)
+    : (input.timestamp ?? new Date().toISOString());
   const event: RunAuditEvent = {
-    id,
+    id: campaign ? campaignRunAuditEventId(campaign.eventKey) : randomUUID(),
     timestamp,
     taskId: input.taskId ?? null,
     agentId: input.agentId,
@@ -329,9 +359,28 @@ export async function recordRunAuditEventWithinTransaction(
     mutationType: input.mutationType,
     target: input.target,
     metadata: input.metadata ?? null,
+    ...(campaign ? { campaign } : {}),
   };
 
-  await tx.insert(schema.project.runAuditEvents).values({
+  if (!campaign) {
+    await tx.insert(schema.project.runAuditEvents).values({
+      id: event.id,
+      timestamp: event.timestamp,
+      taskId: event.taskId,
+      agentId: event.agentId,
+      runId: event.runId,
+      domain: event.domain,
+      mutationType: event.mutationType,
+      target: event.target,
+      metadata: event.metadata,
+    });
+    return event;
+  }
+
+  assertCampaignEventMatchesBinding(event, campaign.binding);
+  await assertCampaignBindingMatchesPersistedCustody(tx, campaign.binding);
+
+  const inserted = await tx.insert(schema.project.runAuditEvents).values({
     id: event.id,
     timestamp: event.timestamp,
     taskId: event.taskId,
@@ -341,9 +390,248 @@ export async function recordRunAuditEventWithinTransaction(
     mutationType: event.mutationType,
     target: event.target,
     metadata: event.metadata,
-  });
+    projectId: campaign.binding.projectId,
+    campaignProjectId: campaign.binding.projectId,
+    campaignEventKey: campaign.eventKey,
+    campaignImportId: campaign.binding.importId,
+    campaignId: campaign.binding.campaignId,
+    campaignTaskId: campaign.binding.taskId,
+    campaignActionId: campaign.binding.actionId,
+    campaignActionTarget: campaign.binding.actionTarget,
+    campaignIdempotencyKey: campaign.binding.idempotencyKey,
+    campaignPacketHash: campaign.binding.packetHash,
+    campaignSidecarHash: campaign.binding.sidecarHash,
+    campaignBundleHash: campaign.binding.bundleHash,
+    campaignTargetRepository: campaign.binding.targetRepository,
+    campaignTargetBase: campaign.binding.targetBase,
+    campaignProviderId: campaign.binding.providerId,
+    campaignModelId: campaign.binding.modelId,
+    campaignTransport: campaign.binding.transport,
+    campaignManifestHash: campaign.binding.manifestHash,
+    campaignBindingHash: campaign.binding.bindingHash,
+  }).onConflictDoNothing().returning();
+  if (inserted.length > 0) return event;
 
-  return event;
+  const existingRows = await tx.select().from(schema.project.runAuditEvents).where(and(
+    eq(schema.project.runAuditEvents.projectId, campaign.binding.projectId),
+    eq(schema.project.runAuditEvents.campaignEventKey, campaign.eventKey),
+  ));
+  const existing = existingRows[0];
+  if (!existing) throw new RunAuditEventCollisionError(campaign.eventKey);
+  const existingEvent = rowToRunAuditEvent(existing);
+  if (canonicalCccPrdJson(runAuditComparable(existingEvent)) !== canonicalCccPrdJson(runAuditComparable(event))) {
+    throw new RunAuditEventCollisionError(campaign.eventKey);
+  }
+  return existingEvent;
+}
+
+function assertCampaignEventMatchesBinding(
+  event: RunAuditEvent,
+  binding: CccCampaignAuthorityBinding,
+): void {
+  if (event.taskId !== binding.taskId) {
+    throw new CccCampaignContextError(
+      `CCC run-audit event taskId must match campaign binding taskId ${binding.taskId}`,
+    );
+  }
+  if (event.target !== binding.actionTarget) {
+    throw new CccCampaignContextError(
+      `CCC run-audit event target must match campaign binding actionTarget ${binding.actionTarget}`,
+    );
+  }
+}
+
+async function assertCampaignBindingMatchesPersistedCustody(
+  tx: DbTransaction,
+  binding: CccCampaignAuthorityBinding,
+): Promise<void> {
+  const rows = await tx
+    .select({
+      projectId: schema.project.cccPrdImports.projectId,
+      idempotencyKey: schema.project.cccPrdImports.idempotencyKey,
+      importId: schema.project.cccPrdImports.importId,
+      identityHash: schema.project.cccPrdImports.identityHash,
+      bundleHash: schema.project.cccPrdImports.bundleHash,
+      packetHash: schema.project.cccPrdImports.packetHash,
+      sidecarHash: schema.project.cccPrdImports.sidecarHash,
+      sourceVersion: schema.project.cccPrdImports.sourceVersion,
+      targetRepository: schema.project.cccPrdImports.targetRepository,
+      targetBase: schema.project.cccPrdImports.targetBase,
+      state: schema.project.cccPrdImports.state,
+      runnable: schema.project.cccPrdImports.runnable,
+      canonicalBundle: schema.project.cccPrdImports.canonicalBundle,
+      executionPolicy: schema.project.cccPrdImports.executionPolicy,
+      campaignManifest: schema.project.cccPrdImports.campaignManifest,
+      campaignManifestHash: schema.project.cccPrdImports.campaignManifestHash,
+      campaignStartedAt: schema.project.cccPrdImports.campaignStartedAt,
+      campaignDeadlineAt: schema.project.cccPrdImports.campaignDeadlineAt,
+      requestCount: schema.project.cccPrdImports.requestCount,
+      activeActionLeases: schema.project.cccPrdImports.activeActionLeases,
+      semanticTaskId: schema.project.cccPrdImportEntities.entityId,
+      nativeTaskId: schema.project.cccPrdImportEntities.nativeId,
+    })
+    .from(schema.project.cccPrdImports)
+    .innerJoin(
+      schema.project.cccPrdImportEntities,
+      and(
+        eq(schema.project.cccPrdImportEntities.projectId, schema.project.cccPrdImports.projectId),
+        eq(schema.project.cccPrdImportEntities.importId, schema.project.cccPrdImports.importId),
+      ),
+    )
+    .where(and(
+      eq(schema.project.cccPrdImports.projectId, binding.projectId),
+      eq(schema.project.cccPrdImports.importId, binding.importId),
+      eq(schema.project.cccPrdImportEntities.projectId, binding.projectId),
+      eq(schema.project.cccPrdImportEntities.importId, binding.importId),
+      eq(schema.project.cccPrdImportEntities.entityType, "task"),
+      eq(schema.project.cccPrdImportEntities.nativeId, binding.taskId),
+    ))
+    .limit(2)
+    .for("update");
+
+  if (rows.length !== 1) {
+    throw new CccCampaignContextError(
+      `Task ${binding.taskId} has no unique persisted CCC campaign custody for run-audit`,
+    );
+  }
+  const row = rows[0]!;
+  if (row.state !== "active" || row.runnable !== 1) {
+    throw new CccCampaignContextError(
+      `Task ${binding.taskId} belongs to a non-runnable CCC campaign import`,
+    );
+  }
+  let custody;
+  try {
+    custody = reconstructCccCampaignCustody(row);
+  } catch {
+    throw new CccCampaignContextError(
+      `Task ${binding.taskId} campaign custody is missing, unadmitted, or drifted`,
+    );
+  }
+  const { executionPolicy, manifest, manifestHash } = custody;
+  const route = executionPolicy.routes.find(
+    ({ taskId }) => taskId === row.semanticTaskId,
+  );
+  if (!route || row.nativeTaskId !== binding.taskId) {
+    throw new CccCampaignContextError(
+      `Task ${binding.taskId} has no exact persisted campaign execution route`,
+    );
+  }
+  const context: CccCampaignContext = {
+    schema: CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
+    projectId: manifest.projectId,
+    importId: manifest.importId,
+    idempotencyKey: manifest.idempotencyKey,
+    campaignId: manifest.campaignId,
+    taskId: binding.taskId,
+    packetHash: manifest.packetHash,
+    sidecarHash: manifest.sidecarHash,
+    bundleHash: manifest.bundleHash,
+    manifestHash,
+    sourceVersion: manifest.sourceVersion,
+    targetRepository: manifest.targetRepository,
+    bounds: manifest.bounds,
+    admittedWriteRoots: manifest.admittedWriteRoots,
+    proofs: manifest.proofs,
+    protectedActions: manifest.protectedActions,
+    executionPolicy: manifest.executionPolicy,
+    route: { ...route },
+    campaignStartedAt: manifest.campaignStartedAt,
+    campaignDeadlineAt: manifest.campaignDeadlineAt,
+    requestCount: row.requestCount,
+    activeActionLeases: row.activeActionLeases as CccCampaignContext["activeActionLeases"],
+  };
+  const expected = createCccCampaignAuthorityBinding(context, {
+    actionId: binding.actionId,
+    actionTarget: binding.actionTarget,
+    requireProtected: true,
+  });
+  if (canonicalCccPrdJson(expected) !== canonicalCccPrdJson(binding)) {
+    throw new CccCampaignContextError(
+      `Task ${binding.taskId} run-audit campaign binding does not match persisted campaign context`,
+    );
+  }
+}
+
+function normalizeCampaignEvent(value: RunAuditCampaignEvent): RunAuditCampaignEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("CCC run-audit campaign event is required");
+  }
+  const record = value as unknown as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (canonicalCccPrdJson(keys) !== canonicalCccPrdJson(["binding", "eventKey"])) {
+    throw new TypeError("CCC run-audit campaign event must include exactly eventKey and binding");
+  }
+  if (typeof record.eventKey !== "string" || record.eventKey.length === 0 || record.eventKey !== record.eventKey.trim()) {
+    throw new TypeError("CCC run-audit campaign event key must be a non-empty canonical string");
+  }
+  return {
+    eventKey: record.eventKey,
+    binding: assertCccCampaignAuthorityBinding(record.binding as CccCampaignAuthorityBinding),
+  };
+}
+
+function requireCanonicalCampaignTimestamp(value: string | undefined): string {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value) {
+    throw new TypeError("CCC run-audit campaign timestamp must be a canonical ISO timestamp");
+  }
+  return value;
+}
+
+function campaignRunAuditEventId(eventKey: string): string {
+  return `ccc-audit-${createHash("sha256").update(`ccc-run-audit/v1\0${eventKey}`, "utf8").digest("hex")}`;
+}
+
+function runAuditComparable(event: RunAuditEvent): Record<string, unknown> {
+  return {
+    timestamp: event.timestamp,
+    taskId: event.taskId,
+    agentId: event.agentId,
+    runId: event.runId,
+    domain: event.domain,
+    mutationType: event.mutationType,
+    target: event.target,
+    metadata: event.metadata,
+    campaign: event.campaign ?? null,
+  };
+}
+
+function rowToRunAuditEvent(row: typeof schema.project.runAuditEvents.$inferSelect): RunAuditEvent {
+  const campaignColumns = [
+    row.campaignProjectId, row.campaignEventKey, row.campaignImportId, row.campaignId, row.campaignTaskId,
+    row.campaignActionId, row.campaignActionTarget, row.campaignIdempotencyKey,
+    row.campaignPacketHash, row.campaignSidecarHash, row.campaignBundleHash,
+    row.campaignTargetRepository, row.campaignTargetBase, row.campaignProviderId,
+    row.campaignModelId, row.campaignTransport, row.campaignManifestHash,
+    row.campaignBindingHash,
+  ];
+  const campaignPresent = campaignColumns.some((column) => column !== null);
+  if (campaignPresent && (
+    row.projectId === null
+    || campaignColumns.some((column) => column === null)
+    || row.campaignProjectId !== row.projectId
+  )) {
+    throw new TypeError("CCC run-audit row has a partial campaign binding");
+  }
+  const campaign = campaignPresent ? {
+    eventKey: row.campaignEventKey!,
+    binding: assertCccCampaignAuthorityBinding({
+      projectId: row.campaignProjectId!, importId: row.campaignImportId!, campaignId: row.campaignId!,
+      taskId: row.campaignTaskId!, actionId: row.campaignActionId!, actionTarget: row.campaignActionTarget!,
+      idempotencyKey: row.campaignIdempotencyKey!, packetHash: row.campaignPacketHash!,
+      sidecarHash: row.campaignSidecarHash!, bundleHash: row.campaignBundleHash!,
+      targetRepository: row.campaignTargetRepository!, targetBase: row.campaignTargetBase!,
+      providerId: row.campaignProviderId!, modelId: row.campaignModelId!,
+      transport: row.campaignTransport! as CccCampaignAuthorityBinding["transport"],
+      manifestHash: row.campaignManifestHash!, bindingHash: row.campaignBindingHash!,
+    }),
+  } : undefined;
+  return {
+    id: row.id, timestamp: row.timestamp, taskId: row.taskId, agentId: row.agentId,
+    runId: row.runId, domain: row.domain, mutationType: row.mutationType,
+    target: row.target, metadata: row.metadata as Record<string, unknown> | null,
+    ...(campaign ? { campaign } : {}),
+  };
 }
 
 /**

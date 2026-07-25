@@ -22,6 +22,51 @@ export type CccCampaignExecutionRoute = {
   transport: CccCampaignTransport;
 };
 
+export type CccCampaignActionLookup = {
+  actionId: string;
+  actionTarget: string;
+  requireProtected?: boolean;
+};
+
+export type CccCampaignAuthorityBinding = {
+  projectId: string;
+  importId: string;
+  campaignId: string;
+  taskId: string;
+  actionId: string;
+  actionTarget: string;
+  idempotencyKey: string;
+  packetHash: string;
+  sidecarHash: string;
+  bundleHash: string;
+  targetRepository: string;
+  targetBase: string;
+  providerId: string;
+  modelId: string;
+  transport: CccCampaignTransport;
+  manifestHash: string;
+  bindingHash: string;
+};
+
+export type CccCampaignActionLease = {
+  actionId: string;
+  actionTarget: string;
+  approvalRequestId: string;
+  claimToken: string;
+  claimedAt: string;
+  expiresAt: string;
+  bindingHash: string;
+};
+
+export class CccCampaignContextError extends Error {
+  public readonly code = "CCC_CAMPAIGN_CONTEXT_REFUSED";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccCampaignContextError";
+  }
+}
+
 export type CccCampaignExecutionPolicy = {
   schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION;
   routes: CccCampaignExecutionRoute[];
@@ -53,5 +98,5 @@ export type CccCampaignContext = Omit<CccCampaignManifest, "schema"> & {
   route: CccCampaignExecutionRoute;
   manifestHash: string;
   requestCount: number;
-  activeActionLeases: Record<string, unknown>;
+  activeActionLeases: Record<string, CccCampaignActionLease>;
 };

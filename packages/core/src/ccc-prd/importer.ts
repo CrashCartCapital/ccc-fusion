@@ -90,8 +90,6 @@ export type CccPrdImportResult = CccPrdImportInspection & {
   replayed: boolean;
 };
 
-type EmissionSink = { emit(value: unknown): void };
-
 export type ImportCccPrdBundleInput = {
   bundle: CccPrdSemanticBundle;
   executionPolicy: CccCampaignExecutionPolicy;
@@ -110,8 +108,6 @@ export type ImportCccPrdBundleInput = {
     };
   };
   transactionProbe?: CccPrdImportTransactionProbe;
-  effects?: EmissionSink;
-  events?: EmissionSink;
 };
 
 export type ReconcileCccPrdImportInput = {
@@ -119,8 +115,6 @@ export type ReconcileCccPrdImportInput = {
   store: TaskStore;
   layer: AsyncDataLayer;
   rootDir: string;
-  effects?: EmissionSink;
-  events?: EmissionSink;
 };
 
 export type InspectCccPrdImportInput = {
@@ -1476,7 +1470,6 @@ async function activateImport(
     const campaignIds = ids("campaign");
     const taskIds = ids("task");
     const workItemIds = ids("work_item");
-    const auditIds = ids("run_audit");
     if (campaignIds.length > 0) {
       await tx
         .update(schema.project.missions)
@@ -1516,23 +1509,22 @@ async function activateImport(
           inArray(schema.project.workflowWorkItems.id, workItemIds),
         ));
     }
-    if (auditIds.length > 0) {
-      await tx
-        .update(schema.project.runAuditEvents)
-        .set({
-          timestamp: now,
-          mutationType: "ccc-prd-import:active",
-          metadata: {
-            projectId: row.projectId,
-            importId: row.importId,
-            bundleHash: row.bundleHash,
-            packetHash: row.packetHash,
-            targetBase: row.targetBase,
-            state: "active",
-          },
-        })
-        .where(inArray(schema.project.runAuditEvents.id, auditIds));
-    }
+    await recordRunAuditEventWithinTransaction(tx, {
+      timestamp: now,
+      agentId: "ccc-prd-import",
+      runId: `ccc-prd:${row.importId}`,
+      domain: "database",
+      mutationType: "ccc-prd-import:active",
+      target: row.targetRepository,
+      metadata: {
+        projectId: row.projectId,
+        importId: row.importId,
+        bundleHash: row.bundleHash,
+        packetHash: row.packetHash,
+        targetBase: row.targetBase,
+        state: "active",
+      },
+    });
     await tx
       .update(schema.project.cccPrdImports)
       .set({
@@ -1930,8 +1922,6 @@ export async function importCccPrdBundle(
     layer: input.layer,
     store: input.store,
     rootDir: input.rootDir,
-    effects: input.effects,
-    events: input.events,
   }, input.failureInjection);
   await inject(input.failureInjection, "lost_response_after_commit");
   return { ...reconciled, replayed: !prepared.created };
