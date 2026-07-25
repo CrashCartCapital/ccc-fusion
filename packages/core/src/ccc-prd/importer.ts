@@ -341,6 +341,19 @@ function importIdFor(projectId: string, idempotencyKey: string): string {
   return `ccc-prd-${sha256(`${projectId}\0${idempotencyKey}`).slice(0, 32)}`;
 }
 
+function reconciliationAllowance(
+  failureInjection?: ImportCccPrdBundleInput["failureInjection"],
+): number {
+  const value = failureInjection?.reconciliationOverheadMs ?? 5_000;
+  if (!Number.isFinite(value) || value < 0) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_FAILURE_INJECTION",
+      "CCC PRD reconciliation overhead test override must be finite and non-negative",
+    );
+  }
+  return value;
+}
+
 function intentRows(bundle: CccPrdSemanticBundle, entityType: CccPrdImportEntityType): CccPrdImportIntent[] {
   return bundle.importIntents.filter((intent) => intent.entityType === entityType);
 }
@@ -961,11 +974,11 @@ async function selectImportRow(
 async function prepareDatabaseImport(
   input: ImportCccPrdBundleInput,
   identityHash: string,
+  waitBudgetMs: number,
 ): Promise<{ row: ImportRow; created: boolean }> {
   const { bundle, layer, idempotencyKey, store, failureInjection } = input;
   const projectId = projectIdFor(layer);
-  return serializable(layer, () =>
-    layer.transactionImmediate(async (tx) => {
+  return withImportIdentityLock(layer, projectId, idempotencyKey, waitBudgetMs, async (tx) => {
       const existing = await selectImportRow(tx, projectId, idempotencyKey);
       if (existing) {
         if (
@@ -1065,7 +1078,7 @@ async function prepareDatabaseImport(
       } finally {
         input.transactionProbe?.onPrepareComplete(tx);
       }
-    }, { isolationLevel: "serializable", accessMode: "read write" }));
+    });
 }
 
 function artifactForTask(bundle: CccPrdSemanticBundle, taskId: string): CccPrdArtifact[] {
@@ -1703,13 +1716,14 @@ async function cleanupStagingProjection(
   }
 }
 
-async function withProjectionLock<T>(
+async function withImportIdentityLock<T>(
   layer: AsyncDataLayer,
-  row: ImportRow,
+  projectId: string,
+  idempotencyKey: string,
   waitBudgetMs: number,
   operation: (tx: DbTransaction) => Promise<T>,
 ): Promise<T> {
-  const lockIdentity = canonicalCccPrdJson([row.projectId, row.idempotencyKey]);
+  const lockIdentity = canonicalCccPrdJson([projectId, idempotencyKey]);
   const deadline = Date.now() + waitBudgetMs;
   while (true) {
     const attempt = await serializable(layer, () => layer.transactionImmediate(async (tx) => {
@@ -1718,12 +1732,12 @@ async function withProjectionLock<T>(
       `) as unknown as Array<{ acquired: boolean }>;
       if (!rows[0]?.acquired) return { acquired: false as const };
       return { acquired: true as const, value: await operation(tx) };
-    }));
+    }, { isolationLevel: "serializable", accessMode: "read write" }));
     if (attempt.acquired) return attempt.value;
     if (Date.now() >= deadline) {
       throw new CccPrdImportError(
         "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
-        `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${row.importId} projection lock`,
+        `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${importIdFor(projectId, idempotencyKey)} identity lock`,
       );
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
@@ -1842,17 +1856,11 @@ async function reconcileOwned(
   const token = randomUUID();
   const waitStartedAt = Date.now();
   const leaseDurationMs = failureInjection?.projectionLeaseMs ?? 5_000;
-  const reconciliationOverheadMs = failureInjection?.reconciliationOverheadMs ?? 5_000;
+  const reconciliationOverheadMs = reconciliationAllowance(failureInjection);
   if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_INVALID_FAILURE_INJECTION",
       "CCC PRD projection lease test override must be positive and finite",
-    );
-  }
-  if (!Number.isFinite(reconciliationOverheadMs) || reconciliationOverheadMs < 0) {
-    throw new CccPrdImportError(
-      "CCC_PRD_IMPORT_INVALID_FAILURE_INJECTION",
-      "CCC PRD reconciliation overhead test override must be finite and non-negative",
     );
   }
   while (true) {
@@ -1878,7 +1886,7 @@ async function reconcileOwned(
     );
     const waitBudgetMs = row.canonicalBundle.bounds.maxDurationMs + reconciliationOverheadMs;
     if (row.state === "active") {
-      await withProjectionLock(input.layer, row, waitBudgetMs, async (tx) => {
+      await withImportIdentityLock(input.layer, row.projectId, row.idempotencyKey, waitBudgetMs, async (tx) => {
         const locked = await selectImportRow(tx, row.projectId, row.idempotencyKey);
         if (locked?.state !== "active") {
           throw new CccPrdImportError(
@@ -1928,9 +1936,10 @@ async function reconcileOwned(
       await activateImport({ layer: input.layer, row, token });
       await heartbeat.stop();
       await inject(failureInjection, "after_activation");
-      await withProjectionLock(
+      await withImportIdentityLock(
         input.layer,
-        row,
+        row.projectId,
+        row.idempotencyKey,
         waitBudgetMs,
         async () => cleanupStagingProjection(input.rootDir, row),
       );
@@ -1970,7 +1979,8 @@ export async function importCccPrdBundle(
   input: ImportCccPrdBundleInput,
 ): Promise<CccPrdImportResult> {
   const identityHash = assertBundleContract(input.bundle, input.rootDir, input.idempotencyKey);
-  const prepared = await prepareDatabaseImport(input, identityHash);
+  const waitBudgetMs = input.bundle.bounds.maxDurationMs + reconciliationAllowance(input.failureInjection);
+  const prepared = await prepareDatabaseImport(input, identityHash, waitBudgetMs);
   invalidateImportReadCaches(input.store);
   if (prepared.created) {
     await inject(input.failureInjection, "after_prepared_db_commit");

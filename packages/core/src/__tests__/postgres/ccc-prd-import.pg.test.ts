@@ -595,6 +595,67 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(await fileExists(resolve(h.rootDir(), imported.stagingRelativePath))).toBe(false);
   });
 
+  it("bounds same-key preparation admission while the creator transaction is uncommitted", async () => {
+    const suffix = "preparation-timeout";
+    const key = "idem-preparation-timeout";
+    const boundedBundle = rehashBundle({
+      ...bundle(h.rootDir(), suffix),
+      bounds: { maxRequests: 1, maxDurationMs: 40, maxConcurrency: 1 },
+    });
+    let announceEntered!: () => void;
+    let releaseCreator!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdCreator = new Promise<void>((resolveCreator) => {
+      releaseCreator = resolveCreator;
+    });
+    const creator = importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+      failureInjection: {
+        pause: {
+          checkpoint: "campaign",
+          entered: announceEntered,
+          until: holdCreator,
+        },
+      },
+    });
+    await entered;
+    const waiterOutcome = importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+      failureInjection: { reconciliationOverheadMs: 40 },
+    }).then(
+      (result) => ({ status: "fulfilled" as const, result }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    const observed = await Promise.race([
+      waiterOutcome,
+      new Promise<{ status: "still-waiting" }>((resolveDelay) => {
+        setTimeout(() => resolveDelay({ status: "still-waiting" }), 250);
+      }),
+    ]);
+    let assertionError: unknown;
+    try {
+      expect(observed).toMatchObject({
+        status: "rejected",
+        error: { code: "CCC_PRD_IMPORT_RECONCILE_TIMEOUT" },
+      });
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      releaseCreator();
+    }
+    await creator;
+    await waiterOutcome;
+    if (assertionError) throw assertionError;
+    await expect(importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+    })).resolves.toMatchObject({ state: "active", replayed: true });
+  });
+
   it("is sequentially and concurrently idempotent, including a lost response after commit", async () => {
     const key = "idem-replay";
     const replayObserver = emissionObserver();
