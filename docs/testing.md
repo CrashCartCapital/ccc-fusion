@@ -40,6 +40,50 @@ pnpm build             # build workspace packages (excludes desktop/mobile; skip
 pnpm verify:workspace  # deep opt-in verification: lint -> test:full -> build (NOT the merge gate)
 ```
 
+## ccc-fusion conversion proof lanes
+
+ccc-fusion conversion work uses focused behavioral proof before broad workspace gates. Speculative or historical test results are development evidence only; acceptance requires a fresh run against one frozen commit and tree.
+
+The current pure PRD compiler lane is:
+
+```bash
+pnpm --filter @fusion/core exec vitest run src/__tests__/ccc-prd-schema.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-prd-compiler.test.ts src/__tests__/ccc-prd-corpus.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @runfusion/fusion exec vitest run src/commands/__tests__/prd.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @fusion/core typecheck
+pnpm --filter @fusion/engine typecheck
+pnpm --filter @runfusion/fusion typecheck
+pnpm lint
+pnpm test:gate
+pnpm build
+git diff --check
+```
+
+Run the compiler twice against the same admitted fixture and compare semantic output, source hash, bundle hash, and full serialized output. `compile` and `validate` must leave no task, workflow, document, artifact, project, database, or `.fusion` state behind.
+
+PostgreSQL-backed ccc proof uses a disposable loopback fixture on a free port. Never reuse, stop, or modify an unrelated listener; port `55439` is a preserved existing listener in the current Phase 5 environment. Keep failed fixture roots and machine-readable reports for diagnosis. A successful owned fixture must stop its processes and release its listener before the lane returns.
+
+The closed Wave 4 proof contract is:
+
+```bash
+FUSION_PG_TEST_SKIP=1 node scripts/run-ccc-pg-proof.mjs --wave 4
+node scripts/run-ccc-pg-proof.mjs --wave 4
+```
+
+The first command must fail before tests for the intended skip-policy reason. The second must enforce its exact named mapping and reject missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, or failed tests.
+
+For the pending Wave 5 import slice, targeted proof must cover all of these before broad gates:
+
+- zero-store compile and validate;
+- one successful transactional import with exact task, edge, workflow, document, artifact, and campaign counts;
+- injected failure at each write class with complete rollback;
+- identical replay without duplicate rows or runnable work;
+- mismatched bundle, target, or base identity rejected before mutation;
+- CLI exit codes and operator output for success, refusal, replay, and rollback failure;
+- zero provider execution.
+
+Freeze branch, HEAD, tree, manifest hashes, accepted-predecessor diff digest, status, and proof artifacts before independent behavioral, static/build, and final-artifact review. Any source or test repair creates a new candidate and invalidates prior reviewer verdicts.
+
 <!-- FNXC:TestInfrastructure 2026-06-25-00:00: verify:fast is the opt-in test-free verification path. docs/testing.md observes the broad test gate caught no recalled real bugs while consuming ~70% of shipping time in flake triage; typecheck+build+boot-smoke gives deterministic, flake-free signal without running tests. It changes no default — pnpm test, the merge gate, and CI are untouched; the full suite stays available and runs non-blocking. -->
 <!-- FNXC:TestInfrastructure 2026-06-26-00:49: verify:fast must bootstrap missing workspace dist artifacts and build @runfusion/fusion even when the CLI package is not in the changed-package set because package builds and the boot smoke invoke source-checkout wrappers that require dist outputs in fresh worktrees. -->
 <!-- FNXC:TestInfrastructure 2026-07-22-12:00: Cheap deterministic policy gates must fail before verify:fast's expensive work. Read canonical package.json pretest commands and invoke their validator entry points directly so test-free verification and the merge gate cannot drift. -->
