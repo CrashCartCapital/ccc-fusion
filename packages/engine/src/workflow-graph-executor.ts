@@ -1522,10 +1522,18 @@ export class WorkflowGraphExecutor {
       : this.maxRetriesPerNode;
 
     let lastError: unknown;
+    /*
+    FNXC:CccWave4Retry 2026-07-24-19:15:
+    Permanent CCC failures stop after their first real invocation even when the
+    configured cap is larger. Persist the loop index actually consumed, while
+    exhausted transient failures naturally retain their final retry index.
+    */
+    let attemptsConsumed = 0;
     const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // Fail-fast cancellation: a branch or top-level graph abort mid-retry stops re-trying.
       if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
+      attemptsConsumed = attempt + 1;
       try {
         await this.prepareNodeExecution(node, task, context, settings);
         const progressRecord = recordProgress && this.shouldRecordNodeProgress(node)
@@ -1624,7 +1632,7 @@ export class WorkflowGraphExecutor {
       value: cccClassification ?? "exception",
       contextPatch: {
         ...(cccClassification ? { [CCC_RETRY_CLASSIFICATION_CONTEXT_KEY]: cccClassification } : {}),
-        ...(cccClassification ? { [CCC_RETRY_ATTEMPT_CONTEXT_KEY]: maxAttempts } : {}),
+        ...(cccClassification ? { [CCC_RETRY_ATTEMPT_CONTEXT_KEY]: attemptsConsumed } : {}),
         [`node:${node.id}:error`]: lastError instanceof Error ? lastError.message : String(lastError),
       },
     };

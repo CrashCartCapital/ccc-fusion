@@ -326,6 +326,84 @@ describe("fast mode workflow/runtime invariants", () => {
     }
   });
 
+  it("Wave 4 RED: public TaskExecutor persists one consumed attempt for a permanent nested branch", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const stale = {
+      id: "WI-wave4-nested-permanent-stale",
+      taskId: liveTask.id,
+      runId: `${liveTask.id}:wave4-nested-permanent`,
+      nodeId: "outer-split",
+      kind: "task",
+      state: "running",
+      attempt: 9,
+    };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([stale]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue({ ...stale, state: "manual-required", attempt: 1 });
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    store.saveWorkflowRunBranch = vi.fn().mockResolvedValue(undefined);
+    store.loadWorkflowRunBranches = vi.fn().mockResolvedValue([]);
+    store.clearWorkflowRunBranches = vi.fn().mockResolvedValue(undefined);
+    const selected = { workflowId: "wave4-nested-permanent", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 nested permanent",
+      ir: {
+        version: "v2",
+        name: "Wave 4 nested permanent",
+        columns: [],
+        nodes: [
+          { id: "start", kind: "start" },
+          { id: "outer-split", kind: "split" },
+          { id: "inner-split", kind: "split" },
+          { id: "permanent-branch", kind: "prompt", config: { maxRetries: 4 } },
+          { id: "inner-sibling", kind: "prompt", config: {} },
+          { id: "inner-join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+          { id: "outer-sibling", kind: "prompt", config: {} },
+          { id: "outer-join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+          { id: "end", kind: "end" },
+        ],
+        edges: [
+          { from: "start", to: "outer-split" },
+          { from: "outer-split", to: "inner-split" },
+          { from: "outer-split", to: "outer-sibling" },
+          { from: "inner-split", to: "permanent-branch" },
+          { from: "inner-split", to: "inner-sibling" },
+          { from: "permanent-branch", to: "inner-join", condition: "success" },
+          { from: "inner-sibling", to: "inner-join", condition: "success" },
+          { from: "inner-join", to: "outer-join", condition: "success" },
+          { from: "outer-sibling", to: "outer-join", condition: "success" },
+          { from: "outer-join", to: "end", condition: "success" },
+        ],
+      },
+    });
+    let permanentCalls = 0;
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockImplementation(async (node: { id: string }) => {
+      if (node.id === "permanent-branch") {
+        permanentCalls += 1;
+        throw new (await import("../engine-errors.js")).PermanentError("operator action", "CCC_NESTED_PERMANENT");
+      }
+      return { outcome: "success" };
+    });
+
+    try {
+      await executor.execute(liveTask);
+
+      expect(permanentCalls).toBe(1);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(stale.id, "manual-required", expect.objectContaining({
+        attempt: 1,
+        lastError: "ccc-permanent:CCC_NESTED_PERMANENT",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition",
+        metadata: expect.objectContaining({ classification: "ccc-permanent", attempt: 1 }),
+      }));
+    } finally {
+      customNode.mockRestore();
+    }
+  });
+
   it("graph executor with a custom workflow skips custom pre-merge prompt/gate nodes in fast mode", async () => {
     const { store, executor } = makeExecutorForTask(task({ executionMode: "fast", worktree: "/tmp/wt" }));
     const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true });

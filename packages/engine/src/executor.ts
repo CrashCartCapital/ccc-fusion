@@ -6373,7 +6373,9 @@ export class TaskExecutor {
             nodeId: terminalCccBranchPersistenceFailure ? "ccc-branch-persistence" : "ccc-retry-classification",
             kind: "task",
             state: "running",
-            attempt: terminalCccTransientExhaustion ? (terminalAttempt ?? 1) : 1,
+            attempt: terminalCccPermanentFailure || terminalCccTransientExhaustion
+              ? (terminalAttempt ?? 1)
+              : 1,
           });
         }
         if (continuation) {
@@ -6391,8 +6393,16 @@ export class TaskExecutor {
               ? retryClassification as string
               : undefined;
           const terminalState = terminalCccTransientExhaustion ? "exhausted" : terminalCccFailure ? "manual-required" : "failed";
+          /*
+          FNXC:CccWave4Retry 2026-07-24-19:15:
+          The graph's terminal count is authoritative for both one-shot
+          permanent failures and exhausted transient failures. Replace any
+          stale continuation count in the durable transition and audit.
+          */
           await this.store.transitionWorkflowWorkItem(continuation.id, terminalState, {
-            ...(terminalCccTransientExhaustion && terminalAttempt !== undefined ? { attempt: terminalAttempt } : {}),
+            ...((terminalCccPermanentFailure || terminalCccTransientExhaustion) && terminalAttempt !== undefined
+              ? { attempt: terminalAttempt }
+              : {}),
             leaseOwner: null,
             leaseExpiresAt: null,
             lastError: terminalCccFailure
@@ -6408,7 +6418,11 @@ export class TaskExecutor {
               domain: "database",
               mutationType: "workflow:work-item-transition",
               target: continuation.id,
-              metadata: { state: "manual-required", attempt: continuation.attempt, classification: "ccc-permanent" },
+              metadata: {
+                state: "manual-required",
+                attempt: terminalAttempt ?? continuation.attempt,
+                classification: "ccc-permanent",
+              },
             });
           }
           if (terminalCccTransientExhaustion) {
