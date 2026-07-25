@@ -966,8 +966,6 @@ async function prepareDatabaseImport(
   const projectId = projectIdFor(layer);
   return serializable(layer, () =>
     layer.transactionImmediate(async (tx) => {
-      const lockIdentity = canonicalCccPrdJson([projectId, idempotencyKey]);
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockIdentity}, 0))`);
       const existing = await selectImportRow(tx, projectId, idempotencyKey);
       if (existing) {
         if (
@@ -1708,13 +1706,28 @@ async function cleanupStagingProjection(
 async function withProjectionLock<T>(
   layer: AsyncDataLayer,
   row: ImportRow,
+  waitBudgetMs: number,
   operation: (tx: DbTransaction) => Promise<T>,
 ): Promise<T> {
   const lockIdentity = canonicalCccPrdJson([row.projectId, row.idempotencyKey]);
-  return serializable(layer, () => layer.transactionImmediate(async (tx) => {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockIdentity}, 0))`);
-    return operation(tx);
-  }));
+  const deadline = Date.now() + waitBudgetMs;
+  while (true) {
+    const attempt = await serializable(layer, () => layer.transactionImmediate(async (tx) => {
+      const rows = await tx.execute(sql`
+        SELECT pg_try_advisory_xact_lock(hashtextextended(${lockIdentity}, 0)) AS acquired
+      `) as unknown as Array<{ acquired: boolean }>;
+      if (!rows[0]?.acquired) return { acquired: false as const };
+      return { acquired: true as const, value: await operation(tx) };
+    }));
+    if (attempt.acquired) return attempt.value;
+    if (Date.now() >= deadline) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
+        `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${row.importId} projection lock`,
+      );
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+  }
 }
 
 async function inspectDirectCounts(
@@ -1863,8 +1876,9 @@ async function reconcileOwned(
       row.identityHash,
       row.createdAt,
     );
+    const waitBudgetMs = row.canonicalBundle.bounds.maxDurationMs + reconciliationOverheadMs;
     if (row.state === "active") {
-      await withProjectionLock(input.layer, row, async (tx) => {
+      await withProjectionLock(input.layer, row, waitBudgetMs, async (tx) => {
         const locked = await selectImportRow(tx, row.projectId, row.idempotencyKey);
         if (locked?.state !== "active") {
           throw new CccPrdImportError(
@@ -1881,7 +1895,6 @@ async function reconcileOwned(
       return active;
     }
     if (!claim.claimed) {
-      const waitBudgetMs = row.canonicalBundle.bounds.maxDurationMs + reconciliationOverheadMs;
       if (Date.now() - waitStartedAt >= waitBudgetMs) {
         throw new CccPrdImportError(
           "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
@@ -1918,6 +1931,7 @@ async function reconcileOwned(
       await withProjectionLock(
         input.layer,
         row,
+        waitBudgetMs,
         async () => cleanupStagingProjection(input.rootDir, row),
       );
       const active = await inspectCccPrdImport(input);
@@ -1958,14 +1972,7 @@ export async function importCccPrdBundle(
   const identityHash = assertBundleContract(input.bundle, input.rootDir, input.idempotencyKey);
   const prepared = await prepareDatabaseImport(input, identityHash);
   invalidateImportReadCaches(input.store);
-  const projection = buildProjection(
-    prepared.row.canonicalBundle,
-    prepared.row.importId,
-    prepared.row.identityHash,
-    prepared.row.createdAt,
-  );
   if (prepared.created) {
-    await ensureStagingManifest(input.rootDir, prepared.row, projection);
     await inject(input.failureInjection, "after_prepared_db_commit");
   }
   const reconciled = await reconcileOwned({

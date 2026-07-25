@@ -177,6 +177,12 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     const stagingPath = resolve(h.rootDir(), stagingRelativePath);
     const descendant = relative(stagingRoot, stagingPath);
     expect(descendant && !descendant.startsWith(`..${sep}`) && descendant !== "..").toBe(true);
+    if (checkpoint === "after_prepared_db_commit") {
+      expect(await fileExists(stagingPath)).toBe(false);
+      expect(await fileExists(projection.taskDir)).toBe(false);
+      expect(await fileExists(projection.artifact)).toBe(false);
+      return;
+    }
     expect(await fileExists(join(stagingPath, "manifest.json"))).toBe(true);
 
     const earlyStagingCheckpoint =
@@ -521,6 +527,71 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       runnable: false,
     });
     expect(await readFile(projection.artifact, "utf8")).toBe("artifact bytes");
+    expect(await fileExists(resolve(h.rootDir(), imported.stagingRelativePath))).toBe(false);
+  });
+
+  it("bounds active-repair lock waiting by the admitted reconciliation budget", async () => {
+    const suffix = "active-repair-timeout";
+    const key = "idem-active-repair-timeout";
+    const boundedBundle = rehashBundle({
+      ...bundle(h.rootDir(), suffix),
+      bounds: { maxRequests: 1, maxDurationMs: 40, maxConcurrency: 1 },
+    });
+    const imported = await importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+    });
+    const projection = canonicalProjectionPaths(suffix, imported.importId);
+    await rm(projection.taskDir, { recursive: true });
+    await rm(projection.artifact);
+    let announceEntered!: () => void;
+    let releaseRepair!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdRepair = new Promise<void>((resolveRepair) => {
+      releaseRepair = resolveRepair;
+    });
+    const first = importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+      failureInjection: {
+        pause: {
+          checkpoint: "artifact_bytes",
+          entered: announceEntered,
+          until: holdRepair,
+        },
+      },
+    });
+    await entered;
+    const secondOutcome = importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: boundedBundle,
+      failureInjection: { reconciliationOverheadMs: 40 },
+    }).then(
+      (result) => ({ status: "fulfilled" as const, result }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+    const observed = await Promise.race([
+      secondOutcome,
+      new Promise<{ status: "still-waiting" }>((resolveDelay) => {
+        setTimeout(() => resolveDelay({ status: "still-waiting" }), 250);
+      }),
+    ]);
+    let assertionError: unknown;
+    try {
+      expect(observed).toMatchObject({
+        status: "rejected",
+        error: { code: "CCC_PRD_IMPORT_RECONCILE_TIMEOUT" },
+      });
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      releaseRepair();
+    }
+    await first;
+    await secondOutcome;
+    if (assertionError) throw assertionError;
     expect(await fileExists(resolve(h.rootDir(), imported.stagingRelativePath))).toBe(false);
   });
 
