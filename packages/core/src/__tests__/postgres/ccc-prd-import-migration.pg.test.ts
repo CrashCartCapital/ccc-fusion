@@ -10,12 +10,16 @@ import {
   getAppliedMigrations,
   SCHEMA_BASELINE_VERSION,
 } from "../../postgres/index.js";
-import { CCC_PRD_IMPORTS_VERSION } from "../../postgres/schema-applier.js";
+import {
+  CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+  CCC_PRD_IMPORTS_VERSION,
+} from "../../postgres/schema-applier.js";
 import { projectTableNames } from "../../postgres/schema/project.js";
 
 describe("CCC PRD import migration registry", () => {
   it("keeps migration 0035 immutable and registers every custody table", () => {
     expect(CCC_PRD_IMPORTS_VERSION).toBe("0035");
+    expect(CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION).toBe("0036");
     expect(Number(SCHEMA_BASELINE_VERSION))
       .toBeGreaterThanOrEqual(Number(CCC_PRD_IMPORTS_VERSION));
     expect(projectTableNames).toEqual(expect.arrayContaining([
@@ -47,14 +51,16 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       DROP TABLE project.ccc_prd_import_sources;
       DROP TABLE project.ccc_prd_import_entities;
       DROP TABLE project.ccc_prd_imports;
-      DELETE FROM public.fusion_schema_migrations WHERE version = '0035';
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036');
     `));
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0034");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0035");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0036");
 
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0035");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0036");
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] })).toEqual({
       applied: false,
       pluginHooksRun: 0,
@@ -142,6 +148,7 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
     expect(constraintNames.map(({ conname }) => conname)).toEqual(expect.arrayContaining([
       "ccc_prd_imports_state_check",
       "ccc_prd_imports_runnable_check",
+      "ccc_prd_imports_request_count_check",
       "ccc_prd_imports_state_runnable_check",
       "ccc_prd_import_sources_authoritative_check",
       "ccc_prd_import_sources_ordinal_check",
@@ -164,6 +171,7 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
     expect(indexNames.map(({ indexname }) => indexname)).toEqual(expect.arrayContaining([
       "idx_ccc_prd_imports_state",
       "idx_ccc_prd_imports_identity",
+      "idx_ccc_prd_imports_campaign_manifest",
       "idx_ccc_prd_import_entities_native",
     ]));
 

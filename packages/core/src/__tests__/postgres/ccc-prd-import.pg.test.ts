@@ -28,6 +28,7 @@ import type { AsyncDataLayer, DbTransaction } from "../../postgres/data-layer.js
 import type { CccPrdImportEntityType } from "../../ccc-prd/types.js";
 import {
   CCC_PRD_TEST_BASE as BASE,
+  createCccPrdImportTestExecutionPolicy as executionPolicy,
   createCccPrdImportTestBundle as bundle,
   rehashCccPrdImportTestBundle as rehashBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
@@ -133,8 +134,10 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   afterAll(h.afterAll);
 
   function request(suffix = "base", key = "idem-base", checkpoint?: FailureCheckpoint, observer?: EmissionObserver) {
+    const semanticBundle = bundle(h.rootDir(), suffix);
     return {
-      bundle: bundle(h.rootDir(), suffix),
+      bundle: semanticBundle,
+      executionPolicy: executionPolicy(semanticBundle),
       idempotencyKey: key,
       store: h.store(),
       layer: h.layer(),

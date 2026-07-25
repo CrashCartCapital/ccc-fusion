@@ -1450,10 +1450,18 @@ CREATE TABLE IF NOT EXISTS project.ccc_prd_imports (
   created_at text NOT NULL,
   updated_at text NOT NULL,
   activated_at text,
+  execution_policy jsonb NOT NULL,
+  campaign_manifest jsonb NOT NULL,
+  campaign_manifest_hash text NOT NULL,
+  campaign_started_at text NOT NULL,
+  campaign_deadline_at text NOT NULL,
+  request_count integer NOT NULL DEFAULT 0,
+  active_action_leases jsonb NOT NULL DEFAULT '{}'::jsonb,
   PRIMARY KEY (project_id, idempotency_key),
   CONSTRAINT ccc_prd_imports_project_import_unique UNIQUE (project_id, import_id),
   CONSTRAINT ccc_prd_imports_state_check CHECK (state IN ('prepared', 'projecting', 'active')),
   CONSTRAINT ccc_prd_imports_runnable_check CHECK (runnable IN (0, 1)),
+  CONSTRAINT ccc_prd_imports_request_count_check CHECK (request_count >= 0),
   CONSTRAINT ccc_prd_imports_state_runnable_check
     CHECK ((state = 'active' AND runnable = 1) OR (state <> 'active' AND runnable = 0))
 );
@@ -1765,6 +1773,8 @@ CREATE INDEX IF NOT EXISTS "idx_ccc_prd_imports_state"
   ON project.ccc_prd_imports(project_id, state, updated_at);
 CREATE INDEX IF NOT EXISTS "idx_ccc_prd_imports_identity"
   ON project.ccc_prd_imports(project_id, target_repository, target_base, identity_hash);
+CREATE INDEX IF NOT EXISTS "idx_ccc_prd_imports_campaign_manifest"
+  ON project.ccc_prd_imports(project_id, campaign_manifest_hash);
 CREATE INDEX IF NOT EXISTS "idx_ccc_prd_import_entities_native"
   ON project.ccc_prd_import_entities(project_id, import_id, entity_type, native_id);
 

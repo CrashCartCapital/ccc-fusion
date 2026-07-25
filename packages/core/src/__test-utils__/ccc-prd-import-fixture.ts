@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { CccCampaignExecutionPolicy } from "../ccc-campaign/types.js";
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
 import type { CccPrdSemanticBundle } from "../ccc-prd/types.js";
 
@@ -35,6 +36,20 @@ export function rehashCccPrdImportTestBundle(
 ): CccPrdSemanticBundle {
   const { bundleHash: _oldBundleHash, ...bundleWithoutHash } = bundleWithOldHash;
   return hashCccPrdImportTestBundle(bundleWithoutHash);
+}
+
+export function createCccPrdImportTestExecutionPolicy(
+  bundle: Pick<CccPrdSemanticBundle, "tasks">,
+): CccCampaignExecutionPolicy {
+  return {
+    schema: "ccc-campaign.execution-policy.v1",
+    routes: bundle.tasks.map(({ id }) => ({
+      taskId: id,
+      providerId: "deterministic-fake",
+      modelId: "fixture-v1",
+      transport: "pi",
+    })),
+  };
 }
 
 export function createCccPrdImportTestBundle(

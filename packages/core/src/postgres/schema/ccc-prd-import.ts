@@ -9,6 +9,10 @@ import {
   text,
   unique,
 } from "drizzle-orm/pg-core";
+import type {
+  CccCampaignExecutionPolicy,
+  CccCampaignManifest,
+} from "../../ccc-campaign/types.js";
 import { PROJECT_SCHEMA } from "./_shared.js";
 
 const cccPrdSchema = pgSchema(PROJECT_SCHEMA);
@@ -37,11 +41,19 @@ export const cccPrdImports = cccPrdSchema.table("ccc_prd_imports", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
   activatedAt: text("activated_at"),
+  executionPolicy: jsonb("execution_policy").$type<CccCampaignExecutionPolicy>().notNull(),
+  campaignManifest: jsonb("campaign_manifest").$type<CccCampaignManifest>().notNull(),
+  campaignManifestHash: text("campaign_manifest_hash").notNull(),
+  campaignStartedAt: text("campaign_started_at").notNull(),
+  campaignDeadlineAt: text("campaign_deadline_at").notNull(),
+  requestCount: integer("request_count").notNull().default(0),
+  activeActionLeases: jsonb("active_action_leases").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
 }, (t) => [
   primaryKey({ columns: [t.projectId, t.idempotencyKey] }),
   unique("ccc_prd_imports_project_import_unique").on(t.projectId, t.importId),
   index("idx_ccc_prd_imports_state").on(t.projectId, t.state, t.updatedAt),
   index("idx_ccc_prd_imports_identity").on(t.projectId, t.targetRepository, t.targetBase, t.identityHash),
+  index("idx_ccc_prd_imports_campaign_manifest").on(t.projectId, t.campaignManifestHash),
 ]);
 
 export const cccPrdImportSources = cccPrdSchema.table("ccc_prd_import_sources", {

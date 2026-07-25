@@ -78,6 +78,7 @@ import {
   LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
   TASK_WEDGE_NOTIFICATION_VERSION,
   CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION,
+  CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -1607,6 +1608,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION,
+      CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1667,6 +1669,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION,
+      CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
     ]);
   });
 
@@ -1860,6 +1863,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION,
+      CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
     ]);
   });
 
@@ -1934,6 +1938,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION,
+      CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
     ]);
   });
 
@@ -2008,6 +2013,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION,
+      CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
     ]);
   });
 });

@@ -9,14 +9,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import {
-  dirname,
-  isAbsolute,
-  join,
-  relative,
-  resolve,
-  sep,
-} from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
 import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
@@ -24,17 +17,13 @@ import { recordRunAuditEventWithinTransaction } from "../postgres/data-layer.js"
 import type { TaskStore } from "../store.js";
 import { insertTaskRowInTransaction } from "../task-store/async-persistence.js";
 import type { Task } from "../types.js";
+import { createCccCampaignManifest, hashCccCampaignManifest, parseCccCampaignExecutionPolicy } from "../ccc-campaign/canonical.js";
+import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
+import type { CccCampaignExecutionPolicy, CccCampaignManifest } from "../ccc-campaign/types.js";
 import { canonicalCccPrdJson } from "./contract.js";
-import type {
-  CccPrdArtifact,
-  CccPrdImportEntityType,
-  CccPrdImportIntent,
-  CccPrdSemanticBundle,
-  CccPrdTask,
-  CccPrdWorkflow,
-} from "./types.js";
+import { buildCccPrdProjection, CCC_PRD_IMPORT_PREPARED_STATUS, nativeCccPrdScopedId, preparedCccPrdTask, type PreparedCccPrdProjection } from "./projection.js";
+import type { CccPrdImportEntityType, CccPrdImportIntent, CccPrdSemanticBundle, CccPrdWorkflow } from "./types.js";
 
-const PREPARED_STATUS = "ccc-prd-import-prepared";
 const STAGING_PREFIX = join(".fusion", "ccc-prd-import-staging");
 const WRITER_CLASSES = [
   "campaign",
@@ -110,6 +99,7 @@ type EmissionSink = { emit(value: unknown): void };
 
 export type ImportCccPrdBundleInput = {
   bundle: CccPrdSemanticBundle;
+  executionPolicy: CccCampaignExecutionPolicy;
   idempotencyKey: string;
   store: TaskStore;
   layer: AsyncDataLayer;
@@ -168,25 +158,19 @@ type ImportRow = {
   createdAt: string;
   updatedAt: string;
   activatedAt: string | null;
+  executionPolicy: CccCampaignExecutionPolicy;
+  campaignManifest: CccCampaignManifest;
+  campaignManifestHash: string;
+  campaignStartedAt: string;
+  campaignDeadlineAt: string;
+  requestCount: number;
+  activeActionLeases: Record<string, unknown>;
 };
 
-type PreparedProjection = {
-  schema: "ccc-prd.import-projection.v1";
-  importId: string;
-  identityHash: string;
-  bundleHash: string;
-  state: "prepared";
-  runnable: false;
-  taskFiles: Array<{
-    id: string;
-    taskJson: string;
-    prompt: string;
-  }>;
-  artifactFiles: Array<{
-    id: string;
-    content: string;
-    taskId: string;
-  }>;
+type CccCampaignImportIdentity = {
+  executionPolicy: CccCampaignExecutionPolicy;
+  manifest: CccCampaignManifest;
+  manifestHash: string;
 };
 
 type ImportTransactionWitnessRecorder = {
@@ -383,10 +367,6 @@ function observeWriter(
   recorder.probe?.onWriter(writerClass, tx);
 }
 
-function nativeScopedId(importId: string, semanticId: string): string {
-  return `${importId}--${semanticId}`;
-}
-
 async function insertEntityLedger(
   tx: DbTransaction,
   projectId: string,
@@ -416,43 +396,6 @@ function oneIntent(bundle: CccPrdSemanticBundle, type: CccPrdImportEntityType): 
     );
   }
   return intents[0]!;
-}
-
-function preparedTask(
-  source: CccPrdTask,
-  missionId: string,
-  identityHash: string,
-  now: string,
-): Task & { state: "prepared"; runnable: false } {
-  return {
-    id: source.id,
-    lineageId: `ccc-prd:${identityHash.slice(0, 24)}:${source.id}`,
-    title: source.title,
-    description: source.description,
-    priority: "normal",
-    column: "triage",
-    status: PREPARED_STATUS,
-    dependencies: [...source.dependencyTaskIds],
-    steps: [],
-    currentStep: 0,
-    log: [{ timestamp: now, action: "CCC PRD import prepared" }],
-    paused: true,
-    userPaused: true,
-    pausedReason: PREPARED_STATUS,
-    missionId,
-    sourceType: "api",
-    sourceMetadata: {
-      bundleHash: identityHash,
-      requirementIds: source.requirementIds,
-      proofIds: source.proofIds,
-      accountableProducer: source.accountableProducer,
-    },
-    createdAt: now,
-    updatedAt: now,
-    columnMovedAt: now,
-    state: "prepared",
-    runnable: false,
-  };
 }
 
 async function writeCampaign(
@@ -498,6 +441,7 @@ async function writeTasks(
   importId: string,
   missionId: string,
   identityHash: string,
+  executionPolicy: CccCampaignExecutionPolicy,
   store: TaskStore,
   now: string,
 ): Promise<Array<Task & { state: "prepared"; runnable: false }>> {
@@ -512,6 +456,7 @@ async function writeTasks(
   }
   const tasks: Array<Task & { state: "prepared"; runnable: false }> = [];
   const ledger: Array<{ intent: CccPrdImportIntent; nativeId: string; value: unknown }> = [];
+  const routes = new Map(executionPolicy.routes.map((route) => [route.taskId, route]));
   for (const intent of intents) {
     const source = byId.get(intent.entityId);
     if (!source) {
@@ -520,7 +465,22 @@ async function writeTasks(
         `CCC PRD task intent references unknown task ${intent.entityId}`,
       );
     }
-    const task = preparedTask(source, missionId, identityHash, now);
+    const route = routes.get(source.id);
+    if (!route) {
+      throw new CccPrdImportError(
+        "CCC_PRD_EXECUTION_ROUTE_REFUSED",
+        `CCC campaign execution route disappeared for task ${source.id}`,
+      );
+    }
+    const task = preparedCccPrdTask(
+      source,
+      missionId,
+      identityHash,
+      bundle.bundleHash,
+      bundle.targetRepository.baseCommit,
+      route,
+      now,
+    );
     await insertTaskRowInTransaction(
       tx,
       task as unknown as Record<string, unknown>,
@@ -602,7 +562,7 @@ async function writeWorkflows(
     );
   }
   for (const workflow of bundle.workflows) {
-    const nativeWorkflowId = nativeScopedId(importId, workflow.id);
+    const nativeWorkflowId = nativeCccPrdScopedId(importId, workflow.id);
     await tx.insert(schema.project.workflows).values({
       id: nativeWorkflowId,
       name: workflow.title,
@@ -636,7 +596,7 @@ async function writeWorkflows(
           `CCC PRD workflow intent references unknown workflow ${intent.entityId}`,
         );
       }
-      return { intent, nativeId: nativeScopedId(importId, workflow.id), value: workflow };
+      return { intent, nativeId: nativeCccPrdScopedId(importId, workflow.id), value: workflow };
     }),
   );
 }
@@ -776,7 +736,7 @@ async function writeArtifacts(
     );
   }
   for (const artifact of bundle.artifacts) {
-    const nativeArtifactId = nativeScopedId(importId, artifact.id);
+    const nativeArtifactId = nativeCccPrdScopedId(importId, artifact.id);
     await tx.insert(schema.project.artifacts).values({
       id: nativeArtifactId,
       type: artifact.type,
@@ -807,7 +767,7 @@ async function writeArtifacts(
           `CCC PRD artifact intent references unknown artifact ${intent.entityId}`,
         );
       }
-      return { intent, nativeId: nativeScopedId(importId, artifact.id), value: artifact };
+      return { intent, nativeId: nativeCccPrdScopedId(importId, artifact.id), value: artifact };
     }),
   );
 }
@@ -874,7 +834,7 @@ async function writeWorkItems(
       kind: "task",
       state: "held",
       attempt: 0,
-      blockedReason: PREPARED_STATUS,
+      blockedReason: CCC_PRD_IMPORT_PREPARED_STATUS,
       stableWorkflowRunId: `ccc-prd:${importId}`,
       irHash: contentDigest(workflow),
       createdAt: now,
@@ -971,25 +931,42 @@ async function selectImportRow(
   return (rows[0] as ImportRow | undefined) ?? null;
 }
 
+function persistedCampaignIdentity(row: ImportRow): CccCampaignImportIdentity {
+  try {
+    const { executionPolicy, manifest, manifestHash } =
+      reconstructCccCampaignCustody(row);
+    return { executionPolicy, manifest, manifestHash };
+  } catch {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+      `CCC PRD import ${row.importId} has missing, unadmitted, or drifted campaign custody`,
+    );
+  }
+}
+
 async function prepareDatabaseImport(
   input: ImportCccPrdBundleInput,
-  identityHash: string,
+  campaignIdentity: CccCampaignImportIdentity,
   waitBudgetMs: number,
 ): Promise<{ row: ImportRow; created: boolean }> {
   const { bundle, layer, idempotencyKey, store, failureInjection } = input;
-  const projectId = projectIdFor(layer);
+  const { executionPolicy, manifest, manifestHash: identityHash } = campaignIdentity;
+  const projectId = manifest.projectId;
   return withImportIdentityLock(layer, projectId, idempotencyKey, waitBudgetMs, async (tx) => {
       const existing = await selectImportRow(tx, projectId, idempotencyKey);
       if (existing) {
         if (
           existing.bundleHash !== bundle.bundleHash
           || existing.identityHash !== identityHash
+          || existing.campaignManifestHash !== identityHash
+          || canonicalCccPrdJson(existing.executionPolicy) !== canonicalCccPrdJson(executionPolicy)
+          || canonicalCccPrdJson(existing.campaignManifest) !== canonicalCccPrdJson(manifest)
           || normalizeRoot(existing.targetRepository) !== normalizeRoot(bundle.targetRepository.path)
           || existing.targetBase !== bundle.targetRepository.baseCommit
         ) {
           throw new CccPrdImportError(
             "CCC_PRD_IMPORT_IDEMPOTENCY_COLLISION",
-            `CCC PRD idempotency key ${JSON.stringify(idempotencyKey)} is already bound to a different bundle, target, or base`,
+            `CCC PRD idempotency key ${JSON.stringify(idempotencyKey)} is already bound to a different bundle, target, base, or execution policy`,
           );
         }
         return { row: existing, created: false };
@@ -1004,14 +981,24 @@ async function prepareDatabaseImport(
       input.transactionProbe?.onPrepareTransaction(tx);
       try {
         const now = new Date().toISOString();
-        const importId = importIdFor(projectId, idempotencyKey);
+        const importId = manifest.importId;
         const stagingRelativePath = join(STAGING_PREFIX, importId);
         const transactionWitness: CccPrdImportTransactionWitness = {
           transactionId: recorder.transactionId,
           writerClasses: [],
         };
-        const projection = buildProjection(bundle, importId, identityHash, now);
+        const projection = buildCccPrdProjection({
+          bundle,
+          executionPolicy,
+          importId,
+          identityHash,
+          campaignId: manifest.campaignId,
+          now,
+        });
         const projectionDigest = contentDigest(projection);
+        const campaignDeadlineAt = new Date(
+          Date.parse(now) + bundle.bounds.maxDurationMs,
+        ).toISOString();
         await tx.insert(schema.project.cccPrdImports).values({
           projectId,
           idempotencyKey,
@@ -1030,13 +1017,31 @@ async function prepareDatabaseImport(
           canonicalBundle: bundle,
           transactionWitness,
           projectionDigest,
+          executionPolicy,
+          campaignManifest: manifest,
+          campaignManifestHash: identityHash,
+          campaignStartedAt: now,
+          campaignDeadlineAt,
+          requestCount: 0,
+          activeActionLeases: {},
           createdAt: now,
           updatedAt: now,
         });
 
         const missionId = await writeCampaign(tx, recorder, bundle, projectId, importId, now);
         await inject(failureInjection, "campaign");
-        await writeTasks(tx, recorder, bundle, projectId, importId, missionId, identityHash, store, now);
+        await writeTasks(
+          tx,
+          recorder,
+          bundle,
+          projectId,
+          importId,
+          missionId,
+          identityHash,
+          executionPolicy,
+          store,
+          now,
+        );
         await inject(failureInjection, "task");
         await writeDependencyEdges(tx, recorder, bundle, projectId, importId);
         await inject(failureInjection, "dependency_edge");
@@ -1079,50 +1084,6 @@ async function prepareDatabaseImport(
         input.transactionProbe?.onPrepareComplete(tx);
       }
     });
-}
-
-function artifactForTask(bundle: CccPrdSemanticBundle, taskId: string): CccPrdArtifact[] {
-  return bundle.artifacts.filter((artifact) => artifact.taskId === taskId);
-}
-
-function promptForTask(bundle: CccPrdSemanticBundle, task: CccPrdTask): string {
-  const prompt = bundle.documents.find((document) =>
-    document.taskId === task.id && document.key.toLowerCase() === "prompt.md");
-  if (prompt) return prompt.content;
-  return `# ${task.title}\n\n${task.description}\n`;
-}
-
-function buildProjection(
-  bundle: CccPrdSemanticBundle,
-  importId: string,
-  identityHash: string,
-  now: string,
-): PreparedProjection {
-  const missionId = oneIntent(bundle, "campaign").entityId;
-  const taskFiles = bundle.tasks.map((source) => {
-    const prepared = preparedTask(source, missionId, identityHash, now);
-    return {
-      id: source.id,
-      taskJson: `${canonicalCccPrdJson(prepared)}\n`,
-      prompt: promptForTask(bundle, source),
-    };
-  });
-  const artifactFiles = bundle.tasks.flatMap((task) =>
-    artifactForTask(bundle, task.id).map((artifact) => ({
-      id: nativeScopedId(importId, artifact.id),
-      content: artifact.content,
-      taskId: task.id,
-    })));
-  return {
-    schema: "ccc-prd.import-projection.v1",
-    importId,
-    identityHash,
-    bundleHash: bundle.bundleHash,
-    state: "prepared",
-    runnable: false,
-    taskFiles,
-    artifactFiles,
-  };
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -1239,7 +1200,7 @@ async function assertOwnedFusionRoot(rootDir: string): Promise<string> {
 async function ensureStagingManifest(
   rootDir: string,
   row: ImportRow,
-  projection: PreparedProjection,
+  projection: PreparedCccPrdProjection,
 ): Promise<string> {
   const root = await assertOwnedFusionRoot(rootDir);
   if (isAbsolute(row.stagingRelativePath)) {
@@ -1275,7 +1236,7 @@ async function ensureStagingManifest(
 async function ensureStagedFiles(
   rootDir: string,
   row: ImportRow,
-  projection: PreparedProjection,
+  projection: PreparedCccPrdProjection,
   failureInjection?: ImportCccPrdBundleInput["failureInjection"],
 ): Promise<string> {
   const stagingPath = await ensureStagingManifest(rootDir, row, projection);
@@ -1303,7 +1264,7 @@ async function ensureStagedFiles(
 
 async function verifyProjectedTask(
   path: string,
-  task: PreparedProjection["taskFiles"][number],
+  task: PreparedCccPrdProjection["taskFiles"][number],
 ): Promise<void> {
   const expected = [
     [join(path, "task.json"), task.taskJson],
@@ -1324,7 +1285,7 @@ async function verifyProjectedTask(
 async function moveCanonicalProjection(
   rootDir: string,
   stagingPath: string,
-  projection: PreparedProjection,
+  projection: PreparedCccPrdProjection,
   assertClaim?: () => Promise<void>,
 ): Promise<void> {
   await assertClaim?.();
@@ -1853,6 +1814,18 @@ async function reconcileOwned(
   failureInjection?: ImportCccPrdBundleInput["failureInjection"],
 ): Promise<CccPrdImportInspection> {
   const projectId = projectIdFor(input.layer);
+  const preflightRow = await selectImportRow(
+    input.layer.db,
+    projectId,
+    input.idempotencyKey,
+  );
+  if (!preflightRow) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_NOT_FOUND",
+      `CCC PRD import not found for ${JSON.stringify(input.idempotencyKey)}`,
+    );
+  }
+  persistedCampaignIdentity(preflightRow);
   const token = randomUUID();
   const waitStartedAt = Date.now();
   const leaseDurationMs = failureInjection?.projectionLeaseMs ?? 5_000;
@@ -1878,12 +1851,15 @@ async function reconcileOwned(
         `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${normalizeRoot(input.rootDir)}`,
       );
     }
-    const projection = buildProjection(
-      row.canonicalBundle,
-      row.importId,
-      row.identityHash,
-      row.createdAt,
-    );
+    const campaignIdentity = persistedCampaignIdentity(row);
+    const projection = buildCccPrdProjection({
+      bundle: row.canonicalBundle,
+      executionPolicy: campaignIdentity.executionPolicy,
+      importId: row.importId,
+      identityHash: row.identityHash,
+      campaignId: campaignIdentity.manifest.campaignId,
+      now: row.createdAt,
+    });
     const waitBudgetMs = row.canonicalBundle.bounds.maxDurationMs + reconciliationOverheadMs;
     if (row.state === "active") {
       await withImportIdentityLock(input.layer, row.projectId, row.idempotencyKey, waitBudgetMs, async (tx) => {
@@ -1978,9 +1954,29 @@ export async function reconcileCccPrdImport(
 export async function importCccPrdBundle(
   input: ImportCccPrdBundleInput,
 ): Promise<CccPrdImportResult> {
-  const identityHash = assertBundleContract(input.bundle, input.rootDir, input.idempotencyKey);
+  assertBundleContract(input.bundle, input.rootDir, input.idempotencyKey);
+  const executionPolicy = parseCccCampaignExecutionPolicy(
+    input.executionPolicy,
+    input.bundle,
+  );
+  const projectId = projectIdFor(input.layer);
+  const importId = importIdFor(projectId, input.idempotencyKey);
+  const campaignId = oneIntent(input.bundle, "campaign").entityId;
+  const manifest = createCccCampaignManifest({
+    projectId,
+    importId,
+    idempotencyKey: input.idempotencyKey,
+    campaignId,
+    bundle: input.bundle,
+    executionPolicy,
+  });
+  const campaignIdentity: CccCampaignImportIdentity = {
+    executionPolicy,
+    manifest,
+    manifestHash: hashCccCampaignManifest(manifest),
+  };
   const waitBudgetMs = input.bundle.bounds.maxDurationMs + reconciliationAllowance(input.failureInjection);
-  const prepared = await prepareDatabaseImport(input, identityHash, waitBudgetMs);
+  const prepared = await prepareDatabaseImport(input, campaignIdentity, waitBudgetMs);
   invalidateImportReadCaches(input.store);
   if (prepared.created) {
     await inject(input.failureInjection, "after_prepared_db_commit");

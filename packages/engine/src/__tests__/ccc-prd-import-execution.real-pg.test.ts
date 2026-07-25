@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { importCccPrdBundle } from "@fusion/core";
 import {
+  createCccPrdImportTestExecutionPolicy,
   createCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import {
@@ -17,8 +18,10 @@ pgDescribe("CCC PRD imported workflow execution", () => {
     });
     try {
       const suffix = "engine-execution";
+      const semanticBundle = createCccPrdImportTestBundle(harness.rootDir, suffix);
       await importCccPrdBundle({
-        bundle: createCccPrdImportTestBundle(harness.rootDir, suffix),
+        bundle: semanticBundle,
+        executionPolicy: createCccPrdImportTestExecutionPolicy(semanticBundle),
         idempotencyKey: "idem-engine-execution",
         store: harness.store,
         layer: harness.layer,

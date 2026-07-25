@@ -2639,4 +2639,5 @@ export type { ResearchFeaturePromotionInput } from "./research-feature-promotion
 export { getTotalAgentActiveMs, startPlanningSegment, finalizePlanningSegment } from "./task-timing.js";
 export { ACTIVE_WORKFLOW_WORK_ITEM_STATES } from "./types.js";
 export * from "./task-document-concurrency.js";
+export * from "./ccc-campaign/index.js";
 export * from "./ccc-prd/index.js";
