@@ -470,6 +470,60 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(await fileExists(resolve(h.rootDir(), imported.stagingRelativePath))).toBe(false);
   });
 
+  it("serializes two concurrent active repairs over one staging prefix", async () => {
+    const suffix = "active-repair-concurrent";
+    const key = "idem-active-repair-concurrent";
+    const imported = await importCccPrdBundle(request(suffix, key));
+    const projection = canonicalProjectionPaths(suffix, imported.importId);
+    await rm(projection.taskDir, { recursive: true });
+    await rm(projection.artifact);
+    let announceEntered!: () => void;
+    let releaseRepair!: () => void;
+    const entered = new Promise<void>((resolveEntered) => {
+      announceEntered = resolveEntered;
+    });
+    const holdRepair = new Promise<void>((resolveRepair) => {
+      releaseRepair = resolveRepair;
+    });
+    const first = importCccPrdBundle({
+      ...request(suffix, key),
+      failureInjection: {
+        pause: {
+          checkpoint: "artifact_bytes",
+          entered: announceEntered,
+          until: holdRepair,
+        },
+      },
+    });
+    await entered;
+    let secondSettled = false;
+    const second = importCccPrdBundle(request(suffix, key))
+      .finally(() => {
+        secondSettled = true;
+      });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
+
+    let assertionError: unknown;
+    try {
+      expect(secondSettled).toBe(false);
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      releaseRepair();
+    }
+    const results = await Promise.allSettled([first, second]);
+    if (assertionError) throw assertionError;
+    expect(results.every(({ status }) => status === "fulfilled")).toBe(true);
+    expect(results.map((result) => result.status === "fulfilled" && result.value.replayed))
+      .toEqual([true, true]);
+    expect(JSON.parse(await readFile(projection.taskJson, "utf8"))).toMatchObject({
+      state: "prepared",
+      runnable: false,
+    });
+    expect(await readFile(projection.artifact, "utf8")).toBe("artifact bytes");
+    expect(await fileExists(resolve(h.rootDir(), imported.stagingRelativePath))).toBe(false);
+  });
+
   it("is sequentially and concurrently idempotent, including a lost response after commit", async () => {
     const key = "idem-replay";
     const replayObserver = emissionObserver();

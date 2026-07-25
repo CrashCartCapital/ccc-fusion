@@ -1705,6 +1705,18 @@ async function cleanupStagingProjection(
   }
 }
 
+async function withProjectionLock<T>(
+  layer: AsyncDataLayer,
+  row: ImportRow,
+  operation: (tx: DbTransaction) => Promise<T>,
+): Promise<T> {
+  const lockIdentity = canonicalCccPrdJson([row.projectId, row.idempotencyKey]);
+  return serializable(layer, () => layer.transactionImmediate(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockIdentity}, 0))`);
+    return operation(tx);
+  }));
+}
+
 async function inspectDirectCounts(
   layer: AsyncDataLayer,
   row: ImportRow,
@@ -1852,13 +1864,18 @@ async function reconcileOwned(
       row.createdAt,
     );
     if (row.state === "active") {
-      const stagingPath = await ensureStagedFiles(input.rootDir, row, projection);
-      await moveCanonicalProjection(
-        input.rootDir,
-        stagingPath,
-        projection,
-      );
-      await cleanupStagingProjection(input.rootDir, row);
+      await withProjectionLock(input.layer, row, async (tx) => {
+        const locked = await selectImportRow(tx, row.projectId, row.idempotencyKey);
+        if (locked?.state !== "active") {
+          throw new CccPrdImportError(
+            "CCC_PRD_IMPORT_RECONCILE_CONFLICT",
+            `CCC PRD import ${row.importId} left active state during projection repair`,
+          );
+        }
+        const stagingPath = await ensureStagedFiles(input.rootDir, row, projection, failureInjection);
+        await moveCanonicalProjection(input.rootDir, stagingPath, projection);
+        await cleanupStagingProjection(input.rootDir, row);
+      });
       const active = await inspectCccPrdImport(input);
       if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
       return active;
@@ -1898,7 +1915,11 @@ async function reconcileOwned(
       await activateImport({ layer: input.layer, row, token });
       await heartbeat.stop();
       await inject(failureInjection, "after_activation");
-      await cleanupStagingProjection(input.rootDir, row);
+      await withProjectionLock(
+        input.layer,
+        row,
+        async () => cleanupStagingProjection(input.rootDir, row),
+      );
       const active = await inspectCccPrdImport(input);
       if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
       return active;
@@ -1943,8 +1964,10 @@ export async function importCccPrdBundle(
     prepared.row.identityHash,
     prepared.row.createdAt,
   );
-  await ensureStagingManifest(input.rootDir, prepared.row, projection);
-  await inject(input.failureInjection, "after_prepared_db_commit");
+  if (prepared.created) {
+    await ensureStagingManifest(input.rootDir, prepared.row, projection);
+    await inject(input.failureInjection, "after_prepared_db_commit");
+  }
   const reconciled = await reconcileOwned({
     idempotencyKey: input.idempotencyKey,
     layer: input.layer,
