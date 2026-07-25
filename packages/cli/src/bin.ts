@@ -304,9 +304,9 @@ Usage:
   fn                                  Launch the dashboard (same as fn dashboard)
   fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
                                       Generate a traceable candidate sidecar through the local deterministic authoring adapter
-  fn prd validate <root-dir> <manifest-path> <sidecar-path>
+  fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Validate custody and semantics; emit diagnostics only
-  fn prd compile <root-dir> <manifest-path> <sidecar-path>
+  fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Compile a validated sidecar into the complete deterministic semantic bundle
   fn init [opts]                      Initialize a new fn project (--name, --path, --git)
   fn onboard [--force] [--skip-onboarding]

@@ -33,16 +33,20 @@ type Compiler = {
     rootDir: string;
     manifestPath: string;
     sidecarPath: string;
+    expectedTarget: string;
+    expectedBase: string;
   }): { kind: "bundle" | "refusal" };
   validateCccPrdPacket(input: {
     rootDir: string;
     manifestPath: string;
     sidecarPath: string;
+    expectedTarget: string;
+    expectedBase: string;
   }): { kind: "validation"; valid: boolean; diagnostics: unknown[] };
 };
 
 const compiler = engine as typeof engine & Compiler;
-const usage = "usage: fn prd <author|validate|compile> <root-dir> <manifest-path> <proposal-or-sidecar-path> [sidecar-output]";
+const usage = "usage: fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> | fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>";
 
 function isEscaping(path: string): boolean {
   return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
@@ -177,19 +181,27 @@ export async function runPrdCommand(
   args: string[],
   io: PrdCommandIo = { write: (line) => console.log(line) },
 ): Promise<number> {
-  const [subcommand, rootDir, manifestPath, inputPath, outputPath] = args;
+  const [subcommand, rootDir, manifestPath, inputPath, fifth, sixth] = args;
+  const author = subcommand === "author";
+  const compilerCommand = subcommand === "validate" || subcommand === "compile";
   if (
     !rootDir
     || !manifestPath
     || !inputPath
-    || (subcommand === "author" && !outputPath)
-    || !["author", "validate", "compile"].includes(subcommand ?? "")
+    || (author && (args.length !== 5 || !fifth))
+    || (compilerCommand && (
+      args.length !== 6
+      || !fifth
+      || !sixth
+      || !/^[0-9a-f]{40}$/.test(sixth)
+    ))
+    || (!author && !compilerCommand)
   ) {
     io.write(usage);
     return 2;
   }
 
-  if (subcommand === "author") {
+  if (author) {
     let proposal: CccPrdAuthoringProposal;
     try {
       proposal = JSON.parse(readFileSync(resolveAuthorInput(rootDir, inputPath), "utf8")) as CccPrdAuthoringProposal;
@@ -217,7 +229,7 @@ export async function runPrdCommand(
       return 1;
     }
     try {
-      writeSidecarAtomically(rootDir, manifestPath, inputPath, outputPath!, result.sidecar);
+      writeSidecarAtomically(rootDir, manifestPath, inputPath, fifth!, result.sidecar);
     } catch (error) {
       io.write(JSON.stringify({
         kind: "refusal",
@@ -230,7 +242,7 @@ export async function runPrdCommand(
     }
     io.write(JSON.stringify({
       kind: "candidate",
-      sidecarPath: resolve(outputPath!),
+      sidecarPath: resolve(fifth!),
       review: result.review,
     }));
     return 0;
@@ -240,6 +252,8 @@ export async function runPrdCommand(
     rootDir,
     manifestPath,
     sidecarPath: inputPath,
+    expectedTarget: fifth!,
+    expectedBase: sixth!,
   };
   if (subcommand === "validate") {
     const result = compiler.validateCccPrdPacket(input);

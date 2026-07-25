@@ -213,6 +213,8 @@ const expectedWave5CliNames = [
   "prd built CLI user contract > advertises author, validate, and compile from top-level help",
   "prd built CLI user contract > author writes the requested sidecar and validate/compile are zero-store user commands",
   "prd built CLI user contract > returns stable usage and semantic-refusal exit codes",
+  "prd built CLI user contract > refuses a foreign admitted target through built validate and compile",
+  "prd built CLI user contract > refuses a foreign admitted base through built validate and compile",
   "prd built CLI user contract > refuses author output that would overwrite admitted packet.md bytes",
   "prd built CLI user contract > refuses author output that would overwrite admitted manifest.json bytes",
   "prd built CLI user contract > refuses author output that would overwrite an unrelated existing file",

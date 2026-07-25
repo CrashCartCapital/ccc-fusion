@@ -33,6 +33,8 @@ function runFn(args: string[], cwd = repoRoot) {
 function createPacketRoot() {
   const root = mkdtempSync(join(tmpdir(), "ccc-prd-built-cli-"));
   roots.push(root);
+  const target = "fixture/repo";
+  const base = "a".repeat(40);
   const source = [
     "# Dense PRD Packet",
     "",
@@ -203,7 +205,7 @@ function createPacketRoot() {
     }],
     bounds: { maxRequests: 1, maxDurationMs: 30_000, maxConcurrency: 1 },
     admittedWriteRoots: [{ path: ".", purpose: "fixture projection" }],
-    targetRepository: { path: "fixture/repo", baseCommit: "a".repeat(40) },
+    targetRepository: { path: target, baseCommit: base },
     nonGoals: ["live provider call"],
     unresolvedDecisions: [],
     ambiguities: [],
@@ -215,6 +217,8 @@ function createPacketRoot() {
     manifest: join(root, "manifest.json"),
     proposal,
     sidecar: join(root, "candidate.sidecar.json"),
+    target,
+    base,
   };
 }
 
@@ -224,8 +228,8 @@ describe("prd built CLI user contract", () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>");
-    expect(result.stdout).toContain("fn prd validate <root-dir> <manifest-path> <sidecar-path>");
-    expect(result.stdout).toContain("fn prd compile <root-dir> <manifest-path> <sidecar-path>");
+    expect(result.stdout).toContain("fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>");
+    expect(result.stdout).toContain("fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>");
   });
 
   it("author writes the requested sidecar and validate/compile are zero-store user commands", () => {
@@ -236,13 +240,13 @@ describe("prd built CLI user contract", () => {
     expect(author.status, `${author.stdout}\n${author.stderr}`).toBe(0);
     expect(existsSync(packet.sidecar)).toBe(true);
 
-    const validate = runFn(["prd", "validate", packet.root, packet.manifest, packet.sidecar]);
+    const validate = runFn(["prd", "validate", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base]);
     expect(validate.status).toBe(0);
     const diagnostics = JSON.parse(validate.stdout) as Record<string, unknown>;
     expect(diagnostics.kind).toBe("diagnostics");
     expect(diagnostics).not.toHaveProperty("requirements");
 
-    const compile = runFn(["prd", "compile", packet.root, packet.manifest, packet.sidecar]);
+    const compile = runFn(["prd", "compile", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base]);
     expect(compile.status).toBe(0);
     const bundle = JSON.parse(compile.stdout) as Record<string, unknown>;
     expect(bundle.kind).toBe("bundle");
@@ -257,9 +261,32 @@ describe("prd built CLI user contract", () => {
     expect(usage.status, `${usage.stdout}\n${usage.stderr}`).toBe(2);
 
     const packet = createPacketRoot();
-    const semantic = runFn(["prd", "validate", packet.root, packet.manifest, join(packet.root, "missing.sidecar.json")]);
+    const semantic = runFn([
+      "prd", "validate", packet.root, packet.manifest, join(packet.root, "missing.sidecar.json"),
+      packet.target, packet.base,
+    ]);
     expect(semantic.status).toBe(1);
     expect(semantic.stdout).toContain("CCC_PRD_UNDECLARED_COMPANION");
+  });
+
+  it("refuses a foreign admitted target through built validate and compile", () => {
+    const packet = createPacketRoot();
+    expect(runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]).status).toBe(0);
+    for (const command of ["validate", "compile"]) {
+      const result = runFn(["prd", command, packet.root, packet.manifest, packet.sidecar, "foreign/repo", packet.base]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("CCC_PRD_FOREIGN_TARGET");
+    }
+  });
+
+  it("refuses a foreign admitted base through built validate and compile", () => {
+    const packet = createPacketRoot();
+    expect(runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]).status).toBe(0);
+    for (const command of ["validate", "compile"]) {
+      const result = runFn(["prd", command, packet.root, packet.manifest, packet.sidecar, packet.target, "b".repeat(40)]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("CCC_PRD_FOREIGN_BASE");
+    }
   });
 
   it.each(["packet.md", "manifest.json"])(
