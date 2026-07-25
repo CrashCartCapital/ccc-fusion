@@ -1,11 +1,17 @@
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  WorkflowExtensionRegistry,
   canonicalCccPrdJson,
+  deriveWorkflowExtensionHostProvenance,
   type CccPrdAuthoringProposal,
   type CccPrdSemanticBundle,
 } from "@fusion/core";
 import * as engine from "@fusion/engine";
+import {
+  CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+} from "../ccc-campaign-proof-admission.js";
 
 const ccc = engine as typeof engine & {
   authorCccPrdPacket(input: {
@@ -16,6 +22,7 @@ const ccc = engine as typeof engine & {
       model: string;
       generateCandidate(): Promise<CccPrdAuthoringProposal>;
     };
+    workflowExtensionRegistry: WorkflowExtensionRegistry;
   }): Promise<{ kind: string; sidecar?: unknown; review?: Record<string, unknown[]> }>;
   compileCccPrdPacket(input: {
     rootDir: string;
@@ -42,6 +49,18 @@ afterEach(() => {
 describe("ccc-prd admitted ccc-lab-super oracle", () => {
   it("generates the frozen sidecar from unchanged dense Markdown through the production authoring seam", async () => {
     const proposal = JSON.parse(readFileSync(proposalPath, "utf8")) as CccPrdAuthoringProposal;
+    const workflowExtensionRegistry = new WorkflowExtensionRegistry();
+    workflowExtensionRegistry.register(
+      CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+      CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+      await deriveWorkflowExtensionHostProvenance({
+        pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+        pluginVersion: "1.0.0",
+        trustedRootPath: fixture.pathname,
+        entryRelativePath: "authoring-response.fixture.json",
+        manifestRelativePath: "manifest.json",
+      }),
+    );
     const authored = await ccc.authorCccPrdPacket({
       rootDir: fixture.pathname,
       manifestPath,
@@ -50,6 +69,7 @@ describe("ccc-prd admitted ccc-lab-super oracle", () => {
         model: "proposal-file-v1",
         generateCandidate: async () => proposal,
       },
+      workflowExtensionRegistry,
     });
     expect(authored.kind).toBe("candidate");
     expect(authored.review).toMatchObject({
@@ -61,7 +81,23 @@ describe("ccc-prd admitted ccc-lab-super oracle", () => {
         { id: "ACTION-PHYSICAL-DELETION", target: "ccc-lab-super:cleanup_eligibility.physical_delete" },
       ],
     });
-    expect(`${canonicalCccPrdJson(authored.sidecar)}\n`).toBe(readFileSync(sidecarPath, "utf8"));
+    const legacyProjection = structuredClone(authored.sidecar) as {
+      proofs: Array<{ admission?: unknown }>;
+    };
+    expect(legacyProjection.proofs).toHaveLength(3);
+    for (const proof of legacyProjection.proofs) {
+      expect(proof.admission).toMatchObject({
+        schema: "ccc-prd.proof-admission.v1",
+        pluginId: "fusion-native",
+        pluginVersion: "1.0.0",
+        extensionId: "ccc-proof-admission",
+        proofVersion: "ccc-proof-admission.v1",
+      });
+      delete proof.admission;
+    }
+    expect(`${canonicalCccPrdJson(legacyProjection)}\n`).toBe(
+      readFileSync(sidecarPath, "utf8"),
+    );
   });
 
   it("compiles exact non-zero entity counts and stable real-packet identities", () => {

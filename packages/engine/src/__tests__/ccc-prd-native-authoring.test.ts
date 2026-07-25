@@ -1,10 +1,17 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
+  CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  WorkflowExtensionRegistry,
   canonicalCccPrdJson,
+  computeCccPrdProofDefinitionSha256,
+  deriveWorkflowExtensionHostProvenance,
   type CccPrdAuthoringProposal,
+  type WorkflowProofAdmissionExtensionContribution,
 } from "@fusion/core";
-import { authorCccPrdPacket } from "../ccc-prd/authoring.js";
+import {
+  authorCccPrdPacket as authorCccPrdPacketWithoutProofAdmission,
+} from "../ccc-prd/authoring.js";
 import {
   createNativeCccPrdAuthoringAdapter,
   type CccPrdNativeAuthoringTransport,
@@ -26,6 +33,44 @@ const constraints = {
   bounds: proposal.bounds,
   maxReviewItems: 8,
 };
+
+async function proofAdmissionRegistry(
+  proofVersion = "ccc-proof-admission.v1",
+): Promise<WorkflowExtensionRegistry> {
+  const registry = new WorkflowExtensionRegistry();
+  const contribution: WorkflowProofAdmissionExtensionContribution = {
+    extensionId: "ccc-proof-admission",
+    name: "CCC proof admission",
+    kind: "proof-admission",
+    schemaVersion: 1,
+    fallback: "failClosed",
+    proofVersion,
+    evaluate: async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }),
+  };
+  const provenance = await deriveWorkflowExtensionHostProvenance({
+    pluginId: "fusion-native",
+    pluginVersion: "1.0.0",
+    trustedRootPath: fixture.pathname,
+    entryRelativePath: "authoring-response.fixture.json",
+    manifestRelativePath: "manifest.json",
+  });
+  registry.register("fusion-native", contribution, provenance);
+  return registry;
+}
+
+async function authorCccPrdPacket(
+  input: Parameters<typeof authorCccPrdPacketWithoutProofAdmission>[0],
+) {
+  return authorCccPrdPacketWithoutProofAdmission({
+    ...input,
+    workflowExtensionRegistry:
+      input.workflowExtensionRegistry ?? await proofAdmissionRegistry(),
+  });
+}
 
 function nativeAdapter(
   transport: CccPrdNativeAuthoringTransport,
@@ -53,12 +98,14 @@ describe("CCC PRD native authoring adapter", () => {
       model: request.model,
     }));
     const adapter = nativeAdapter(generate);
+    const workflowExtensionRegistry = await proofAdmissionRegistry();
 
     const result = await authorCccPrdPacket({
       rootDir: fixture.pathname,
       manifestPath,
       adapter,
       constraints,
+      workflowExtensionRegistry,
     });
 
     expect(result.kind, JSON.stringify(result)).toBe("candidate");
@@ -91,6 +138,82 @@ describe("CCC PRD native authoring adapter", () => {
         unresolvedDecisions: [],
         exceptions: [],
       },
+    });
+    if (result.kind !== "candidate") throw new Error("expected candidate");
+    expect(result.sidecar.proofs).toHaveLength(proposal.proofs.length);
+    for (const proof of result.sidecar.proofs) {
+      expect(proof.admission).toMatchObject({
+        schema: CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+        pluginId: "fusion-native",
+        pluginVersion: "1.0.0",
+        extensionId: "ccc-proof-admission",
+        proofVersion: "ccc-proof-admission.v1",
+        definitionSha256: computeCccPrdProofDefinitionSha256(proof),
+      });
+    }
+  });
+
+  it("refuses authoring when the fixed native proof admission entry is missing", async () => {
+    const result = await authorCccPrdPacket({
+      rootDir: fixture.pathname,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(proposal),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+      workflowExtensionRegistry: new WorkflowExtensionRegistry(),
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_PROOF_ADMISSION_MISSING" }],
+    });
+  });
+
+  it("refuses authoring when the fixed native proof admission entry is degraded", async () => {
+    const workflowExtensionRegistry = await proofAdmissionRegistry();
+    workflowExtensionRegistry.degrade(
+      ["plugin:fusion-native:ccc-proof-admission"],
+      "runtime-fault",
+      "test degradation",
+    );
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixture.pathname,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(proposal),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+      workflowExtensionRegistry,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_PROOF_ADMISSION_DEGRADED" }],
+    });
+  });
+
+  it("refuses authoring when the fixed registry id is occupied by the wrong proof identity", async () => {
+    const result = await authorCccPrdPacket({
+      rootDir: fixture.pathname,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(proposal),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+      workflowExtensionRegistry: await proofAdmissionRegistry("wrong-proof-version"),
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_PROOF_ADMISSION_IDENTITY" }],
     });
   });
 

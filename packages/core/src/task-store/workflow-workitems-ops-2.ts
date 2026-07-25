@@ -9,13 +9,105 @@
 import {TaskStore} from "../store.js";
 import * as schema from "../postgres/schema/index.js";
 import {randomUUID} from "node:crypto";
-import {and, eq, inArray, isNull, lte, or} from "drizzle-orm";
-import type {WorkflowWorkItem, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput} from "../types.js";
+import {and, eq, gt, inArray, isNull, lte, or, sql} from "drizzle-orm";
+import type {RunAuditEventInput, WorkflowWorkItem, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput} from "../types.js";
 import "../builtin-traits.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {replaceActiveTaskWorkflowContinuation as replaceActiveTaskWorkflowContinuationAsync, upsertWorkflowWorkItem as upsertWorkflowWorkItemAsync, transitionWorkflowWorkItem as transitionWorkflowWorkItemAsync} from "../task-store/async-workflow-workitems.js";
 import type {WorkflowWorkItemRow} from "../task-store/row-types.js";
 import type {DbTransaction} from "../postgres/data-layer.js";
+import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
+
+export type FencedCccCampaignProofAuditInput = Readonly<{
+  workItemId: string;
+  originTaskId: string;
+  leaseOwner: string;
+  attempt: number;
+  runId: string;
+  event: RunAuditEventInput;
+}>;
+
+export type CccCampaignWorkflowLeaseFenceInput = Readonly<{
+  workItemId: string;
+  originTaskId: string;
+  leaseOwner: string;
+  attempt: number;
+  runId: string;
+}>;
+
+export class CccCampaignWorkflowLeaseFenceError extends Error {
+  public readonly code = "CCC_CAMPAIGN_WORKFLOW_LEASE_REFUSED";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccCampaignWorkflowLeaseFenceError";
+  }
+}
+
+export class CccCampaignProofAuditLeaseError extends Error {
+  public readonly code = "CCC_PROOF_AUDIT_LEASE_REFUSED";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccCampaignProofAuditLeaseError";
+  }
+}
+
+export async function assertCccCampaignWorkflowLeaseFenceImpl(
+  store: TaskStore,
+  input: CccCampaignWorkflowLeaseFenceInput,
+): Promise<void> {
+  if (!store.backendMode || !store.asyncLayer) {
+    throw new CccCampaignWorkflowLeaseFenceError(
+      "CCC campaign workflow lease preflight requires the PostgreSQL TaskStore",
+    );
+  }
+  requireCccCampaignWorkflowLeaseFenceInput(input);
+  const rows = await store.asyncLayer.db
+    .select({ id: schema.project.workflowWorkItems.id })
+    .from(schema.project.workflowWorkItems)
+    .where(and(
+      eq(schema.project.workflowWorkItems.id, input.workItemId),
+      eq(schema.project.workflowWorkItems.taskId, input.originTaskId),
+      eq(schema.project.workflowWorkItems.runId, input.runId),
+      eq(schema.project.workflowWorkItems.state, "running"),
+      eq(schema.project.workflowWorkItems.leaseOwner, input.leaseOwner),
+      eq(schema.project.workflowWorkItems.attempt, input.attempt),
+      sql`${schema.project.workflowWorkItems.leaseExpiresAt} IS NOT NULL
+        AND ${schema.project.workflowWorkItems.leaseExpiresAt}::timestamptz > clock_timestamp()`,
+    ))
+    .limit(1);
+  if (rows.length !== 1) {
+    throw new CccCampaignWorkflowLeaseFenceError(
+      `CCC campaign workflow lease fence refused work item ${input.workItemId}`,
+    );
+  }
+}
+
+function requireCccCampaignWorkflowLeaseFenceInput(
+  input: CccCampaignWorkflowLeaseFenceInput,
+): void {
+  if (!input || typeof input !== "object") {
+    throw new CccCampaignWorkflowLeaseFenceError("CCC campaign workflow lease fence input is missing");
+  }
+  for (const [label, value] of [
+    ["work item id", input.workItemId],
+    ["origin task id", input.originTaskId],
+    ["lease owner", input.leaseOwner],
+    ["run id", input.runId],
+  ] as const) {
+    if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+      throw new CccCampaignWorkflowLeaseFenceError(
+        `CCC campaign workflow lease fence ${label} must be a canonical string`,
+      );
+    }
+  }
+  if (!Number.isSafeInteger(input.attempt) || input.attempt < 1) {
+    throw new CccCampaignWorkflowLeaseFenceError(
+      "CCC campaign workflow lease fence attempt must be a positive safe integer",
+    );
+  }
+}
 
 export async function upsertWorkflowWorkItemImpl(store: TaskStore, input: WorkflowWorkItemUpsertInput, tx?: DbTransaction): Promise<WorkflowWorkItem> {
     if (store.backendMode) {
@@ -133,7 +225,7 @@ export async function transitionWorkflowWorkItemImpl(store: TaskStore, id: strin
   }
 
 export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: string, leaseOwner: string, opts: { leaseDurationMs: number; now?: string },): Promise<WorkflowWorkItem | null> {
-    if (opts.leaseDurationMs <= 0) {
+    if (!Number.isFinite(opts.leaseDurationMs) || opts.leaseDurationMs <= 0) {
       throw new Error(`workflow work item leaseDurationMs must be > 0 (received ${opts.leaseDurationMs})`);
     }
 
@@ -217,3 +309,143 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
       return store.rowToWorkflowWorkItem(row);
     });
   }
+
+export async function renewWorkflowWorkItemLeaseImpl(store: TaskStore, id: string, leaseOwner: string, expectedAttempt: number, opts: { leaseDurationMs: number; now?: string },): Promise<WorkflowWorkItem | null> {
+  if (!Number.isFinite(opts.leaseDurationMs) || opts.leaseDurationMs <= 0) {
+    throw new Error(`workflow work item leaseDurationMs must be a positive finite number (received ${opts.leaseDurationMs})`);
+  }
+  const now = opts.now ?? new Date().toISOString();
+  const leaseExpiresAt = new Date(new Date(now).getTime() + opts.leaseDurationMs).toISOString();
+
+  if (store.backendMode) {
+    return store.asyncLayer!.transactionImmediate(async (tx) => {
+      const renewedRows = await tx
+        .update(schema.project.workflowWorkItems)
+        .set({ leaseExpiresAt, updatedAt: now })
+        .where(and(
+          eq(schema.project.workflowWorkItems.id, id),
+          eq(schema.project.workflowWorkItems.state, "running"),
+          eq(schema.project.workflowWorkItems.leaseOwner, leaseOwner),
+          eq(schema.project.workflowWorkItems.attempt, expectedAttempt),
+          gt(schema.project.workflowWorkItems.leaseExpiresAt, now),
+        ))
+        .returning();
+      const row = renewedRows[0] as WorkflowWorkItemRow | undefined;
+      if (renewedRows.length !== 1 || !row) return null;
+      await recordRunAuditEventWithinTransaction(tx, {
+        taskId: row.taskId,
+        agentId: "system",
+        runId: row.runId,
+        domain: "database",
+        mutationType: "workflowWorkItem:lease-renewed",
+        target: row.id,
+        metadata: { id: row.id, leaseOwner, attempt: expectedAttempt, leaseExpiresAt },
+      });
+      return store.rowToWorkflowWorkItem(row);
+    });
+  }
+
+  return store.db.transactionImmediate(() => {
+    const result = store.db.prepare(
+      `UPDATE workflow_work_items
+          SET leaseExpiresAt = ?, updatedAt = ?
+        WHERE id = ?
+          AND state = 'running'
+          AND leaseOwner = ?
+          AND attempt = ?
+          AND leaseExpiresAt IS NOT NULL
+          AND leaseExpiresAt > ?`,
+    ).run(leaseExpiresAt, now, id, leaseOwner, expectedAttempt, now);
+    if (result.changes !== 1) return null;
+    const row = store.db.prepare("SELECT * FROM workflow_work_items WHERE id = ?").get(id) as WorkflowWorkItemRow | undefined;
+    if (!row) throw new Error(`Workflow work item ${id} disappeared after lease renewal`);
+    store.insertRunAuditEventRow({
+      taskId: row.taskId,
+      runId: row.runId,
+      domain: "database",
+      mutationType: "workflowWorkItem:lease-renewed",
+      target: row.id,
+      metadata: { id: row.id, leaseOwner, attempt: expectedAttempt, leaseExpiresAt },
+    });
+    return store.rowToWorkflowWorkItem(row);
+  });
+}
+
+export async function recordFencedCccCampaignProofAuditImpl(
+  store: TaskStore,
+  input: FencedCccCampaignProofAuditInput,
+): Promise<void> {
+  if (!store.backendMode || !store.asyncLayer) {
+    throw new CccCampaignProofAuditLeaseError(
+      "CCC campaign proof audit requires the PostgreSQL TaskStore",
+    );
+  }
+  requireFencedProofAuditInput(input);
+  await store.asyncLayer.transactionImmediate(async (tx) => {
+    const rows = await tx
+      .select({
+        id: schema.project.workflowWorkItems.id,
+        taskId: schema.project.workflowWorkItems.taskId,
+        runId: schema.project.workflowWorkItems.runId,
+      })
+      .from(schema.project.workflowWorkItems)
+      .where(and(
+        eq(schema.project.workflowWorkItems.id, input.workItemId),
+        eq(schema.project.workflowWorkItems.taskId, input.originTaskId),
+        eq(schema.project.workflowWorkItems.runId, input.runId),
+        eq(schema.project.workflowWorkItems.state, "running"),
+        eq(schema.project.workflowWorkItems.leaseOwner, input.leaseOwner),
+        eq(schema.project.workflowWorkItems.attempt, input.attempt),
+        sql`${schema.project.workflowWorkItems.leaseExpiresAt} IS NOT NULL
+          AND ${schema.project.workflowWorkItems.leaseExpiresAt}::timestamptz > clock_timestamp()`,
+      ))
+      .limit(1)
+      .for("update");
+    if (rows.length !== 1) {
+      throw new CccCampaignProofAuditLeaseError(
+        `CCC campaign proof audit lease fence refused work item ${input.workItemId}`,
+      );
+    }
+    await recordRunAuditEventWithinTransaction(tx, input.event);
+  });
+}
+
+function requireFencedProofAuditInput(
+  input: FencedCccCampaignProofAuditInput,
+): void {
+  if (!input || typeof input !== "object") {
+    throw new CccCampaignProofAuditLeaseError("CCC campaign proof audit input is missing");
+  }
+  for (const [label, value] of [
+    ["work item id", input.workItemId],
+    ["origin task id", input.originTaskId],
+    ["lease owner", input.leaseOwner],
+    ["run id", input.runId],
+  ] as const) {
+    if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+      throw new CccCampaignProofAuditLeaseError(
+        `CCC campaign proof audit ${label} must be a canonical string`,
+      );
+    }
+  }
+  if (!Number.isSafeInteger(input.attempt) || input.attempt < 1) {
+    throw new CccCampaignProofAuditLeaseError(
+      "CCC campaign proof audit attempt must be a positive safe integer",
+    );
+  }
+  const event = input.event;
+  if (
+    !event
+    || event.agentId !== input.leaseOwner
+    || event.runId !== input.runId
+    || event.mutationType !== "ccc-campaign:proof-admission"
+    || !event.campaign
+    || !event.campaign.binding.actionId.startsWith("proof:")
+    || event.campaign.binding.taskId !== event.taskId
+    || event.campaign.binding.actionTarget !== event.target
+  ) {
+    throw new CccCampaignProofAuditLeaseError(
+      "CCC campaign proof audit event does not match its workflow lease fence",
+    );
+  }
+}

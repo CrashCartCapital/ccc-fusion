@@ -98,6 +98,10 @@ export interface WorkflowWorkItemUpsertInput {
 }
 
 export interface WorkflowWorkItemTransitionPatch {
+  /** Compare-and-swap preconditions; never persisted as work-item fields. */
+  expectedState?: WorkflowWorkItemState;
+  expectedLeaseOwner?: string | null;
+  expectedAttempt?: number;
   attempt?: number;
   retryAfter?: string | null;
   leaseOwner?: string | null;

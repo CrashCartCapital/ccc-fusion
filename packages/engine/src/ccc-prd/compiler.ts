@@ -1,14 +1,18 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { isAbsolute, win32 } from "node:path";
 import {
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
+  CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
+  computeCccPrdProofDefinitionSha256,
   createCccPrdSpanFromBytes,
   createRefusalBundle,
   normalizeProtectedAction,
   type CccPrdDiagnostic,
+  type CccPrdProof,
   type CccPrdRefusalBundle,
   type CccPrdSemanticBundle,
   type CccPrdSidecar,
@@ -56,6 +60,22 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isPositiveBound(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function isCanonicalRootRelativeSource(value: unknown): value is string {
+  if (!isNonEmptyString(value) || value !== value.trim()) return false;
+  if (
+    value.includes("\\")
+    || value.includes("\0")
+    || value.toLowerCase().startsWith("file:")
+    || isAbsolute(value)
+    || win32.isAbsolute(value)
+  ) {
+    return false;
+  }
+  return value.split("/").every((segment) => (
+    segment !== "" && segment !== "." && segment !== ".."
+  ));
 }
 
 const SIDECAR_FIELDS = new Set([
@@ -106,6 +126,17 @@ const IMPORT_TARGETS = new Map([
   ["work_item", "project.workflow_work_items"],
   ["run_audit", "project.run_audit_events"],
 ]);
+const PROOF_ADMISSION_FIELDS = [
+  "schema",
+  "pluginId",
+  "pluginVersion",
+  "extensionId",
+  "proofVersion",
+  "extensionRootRelativeSource",
+  "extensionSourceSha256",
+  "extensionManifestSha256",
+  "definitionSha256",
+] as const;
 
 function validateExactKeys(
   label: string,
@@ -155,6 +186,58 @@ function validateConfidence(
 ): void {
   if (typeof value !== "string" || !CONFIDENCE_VALUES.has(value)) {
     diagnostics.push(diagnostic("CCC_PRD_DECLARATION_INVALID", `${label} confidence is invalid`));
+  }
+}
+
+function validateProofAdmission(
+  proof: Record<string, unknown>,
+  diagnostics: CccPrdDiagnostic[],
+): void {
+  if (proof.admission === undefined) return;
+  const label = `proof ${String(proof.id)} admission`;
+  if (!isPlainRecord(proof.admission)) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_ADMISSION_INVALID",
+      `${label} must be an object`,
+    ));
+    return;
+  }
+  const admission = proof.admission;
+  validateExactKeys(label, admission, PROOF_ADMISSION_FIELDS, diagnostics);
+  if (
+    admission.schema !== CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION
+    || !isNonEmptyString(admission.pluginId)
+    || !isNonEmptyString(admission.pluginVersion)
+    || !isNonEmptyString(admission.extensionId)
+    || !isNonEmptyString(admission.proofVersion)
+    || !isCanonicalRootRelativeSource(admission.extensionRootRelativeSource)
+    || !/^[0-9a-f]{64}$/u.test(String(admission.extensionSourceSha256))
+    || !/^[0-9a-f]{64}$/u.test(String(admission.extensionManifestSha256))
+    || !/^[0-9a-f]{64}$/u.test(String(admission.definitionSha256))
+  ) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_ADMISSION_INVALID",
+      `${label} has a malformed schema, identity, or hash`,
+    ));
+    return;
+  }
+  let expectedDefinitionSha256: string;
+  try {
+    expectedDefinitionSha256 = computeCccPrdProofDefinitionSha256(
+      proof as unknown as CccPrdProof,
+    );
+  } catch {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_ADMISSION_INVALID",
+      `${label} cannot bind a malformed proof definition`,
+    ));
+    return;
+  }
+  if (admission.definitionSha256 !== expectedDefinitionSha256) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_ADMISSION_STALE",
+      `${label} definition hash does not match the current proof`,
+    ));
   }
 }
 
@@ -609,7 +692,16 @@ function validateSidecar(
     validateExactKeys(
       `proof ${String(proof.id)}`,
       proof,
-      ["id", "requirementIds", "command", "positiveOracle", "negativeControls", "spans", "confidence"],
+      [
+        "id",
+        "requirementIds",
+        "command",
+        "positiveOracle",
+        "negativeControls",
+        "spans",
+        "confidence",
+        "admission",
+      ],
       diagnostics,
     );
     requireReferences(`proof ${String(proof.id)}`, proof.requirementIds, collections.requirements, diagnostics);
@@ -623,6 +715,7 @@ function validateSidecar(
       diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `proof ${String(proof.id)} is incomplete`));
     }
     validateConfidence(`proof ${String(proof.id)}`, proof.confidence, diagnostics);
+    validateProofAdmission(proof, diagnostics);
   }
 
   for (const task of collections.tasks.values()) {

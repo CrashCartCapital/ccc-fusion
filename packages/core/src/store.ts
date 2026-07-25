@@ -15,7 +15,7 @@ import {
 } from "./ccc-campaign/store.js";
 import type {
   CccCampaignActionLookup,
-  CccCampaignContext,
+  CccCampaignTaskContext,
 } from "./ccc-campaign/types.js";
 export type OverlapBlockerRepairReason =
   | "task-not-found"
@@ -128,7 +128,7 @@ import { acquireSymbolLocksAsync, inspectSymbolLockConflictsAsync, reconcileStal
 import type { AcquireSymbolLocksResult, ReconcileStaleSymbolLocksResult, ReleaseSymbolLocksResult, RenewSymbolLocksResult, SymbolLockConflict, SymbolLockOwner } from "./symbol-lock-types.js";
 import { queryRunAuditEvents } from "./task-store/async-audit.js";
 import { isValidMergeRequestTransitionImpl, enqueueMergeQueueSyncInternalImpl, releaseMergeQueueLeaseImpl, collectMergeDetailsImpl, applyPrMergedTransitionImpl } from "./task-store/merge-queue-ops-2.js";
-import { upsertWorkflowWorkItemImpl, replaceActiveTaskWorkflowContinuationImpl, transitionWorkflowWorkItemImpl, acquireWorkflowWorkItemLeaseImpl } from "./task-store/workflow-workitems-ops-2.js";
+import { upsertWorkflowWorkItemImpl, replaceActiveTaskWorkflowContinuationImpl, transitionWorkflowWorkItemImpl, acquireWorkflowWorkItemLeaseImpl, renewWorkflowWorkItemLeaseImpl, assertCccCampaignWorkflowLeaseFenceImpl, recordFencedCccCampaignProofAuditImpl, type CccCampaignWorkflowLeaseFenceInput, type FencedCccCampaignProofAuditInput } from "./task-store/workflow-workitems-ops-2.js";
 import { getSettingsImpl, getSettingsFastImpl, getSettingsByScopeImpl, getSettingsByScopeFastImpl } from "./task-store/settings-ops-2.js";
 import { runPluginColumnTransitionHooksImpl, logEntryImpl } from "./task-store/audit-ops.js";
 import { clearWorkflowRunBranchesImpl, projectMergeRequestToWorkflowWorkItemImpl, createCompletionHandoffWorkflowWorkImpl } from "./task-store/workflow-workitems-ops.js";
@@ -966,14 +966,14 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async getTask(id: string, options?: { activityLogLimit?: number; includeDeleted?: boolean }): Promise<TaskDetail> {
     return getTaskImpl(this, id, options);
   }
-  async getCccCampaignContextForTask(taskId: string): Promise<CccCampaignContext | null> {
-    if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore");
+  async getCccCampaignContextForTask(taskId: string): Promise<CccCampaignTaskContext | null> {
+    if (!this.asyncLayer) return null;
     return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId);
   }
   async getCccCampaignContextForTaskWithinTransaction(
     tx: DbTransaction,
     taskId: string,
-  ): Promise<CccCampaignContext | null> {
+  ): Promise<CccCampaignTaskContext | null> {
     if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore");
     return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId, tx, true);
   }
@@ -1636,6 +1636,19 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
   async acquireWorkflowWorkItemLease( id: string, leaseOwner: string, opts: { leaseDurationMs: number; now?: string }, ): Promise<WorkflowWorkItem | null> {
     return acquireWorkflowWorkItemLeaseImpl(this, id, leaseOwner, opts);
+  }
+  async renewWorkflowWorkItemLease( id: string, leaseOwner: string, expectedAttempt: number, opts: { leaseDurationMs: number; now?: string }, ): Promise<WorkflowWorkItem | null> {
+    return renewWorkflowWorkItemLeaseImpl(this, id, leaseOwner, expectedAttempt, opts);
+  }
+  async assertCccCampaignWorkflowLeaseFence(
+    input: CccCampaignWorkflowLeaseFenceInput,
+  ): Promise<void> {
+    return assertCccCampaignWorkflowLeaseFenceImpl(this, input);
+  }
+  async recordFencedCccCampaignProofAudit(
+    input: FencedCccCampaignProofAuditInput,
+  ): Promise<void> {
+    return recordFencedCccCampaignProofAuditImpl(this, input);
   }
   async setCompletionHandoffAcceptedMarker( taskId: string, opts: { source: string; acceptedAt?: string }, ): Promise<CompletionHandoffMarker> {
     return setCompletionHandoffAcceptedMarkerImpl(this, taskId, opts);

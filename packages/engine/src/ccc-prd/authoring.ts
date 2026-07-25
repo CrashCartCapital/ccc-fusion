@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
 import {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
+  CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
+  computeCccPrdProofDefinitionSha256,
   createCccPrdSpanFromBytes,
   createRefusalBundle,
+  getWorkflowExtensionRegistry,
   normalizeProtectedAction,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringConstraints,
@@ -22,7 +25,15 @@ import {
   type CccPrdSourceReferenceProposal,
   type CccPrdSourceSpan,
   type CccPrdSidecar,
+  type WorkflowExtensionRegistry,
 } from "@fusion/core";
+import {
+  CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID,
+} from "../ccc-campaign-proof-admission.js";
 import {
   CccPrdCustodyError,
   readCccPrdPacketCustody,
@@ -35,6 +46,7 @@ export type AuthorCccPrdInput = {
   adapter: CccPrdAuthoringAdapter;
   constraints?: CccPrdAuthoringConstraints;
   previousSidecar?: CccPrdSidecar;
+  workflowExtensionRegistry?: WorkflowExtensionRegistry;
 };
 
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
@@ -392,6 +404,74 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
         message: "authoring proposal rebound stable declaration IDs to different source evidence for an unchanged admitted packet",
       });
     }
+    const registry = input.workflowExtensionRegistry ?? getWorkflowExtensionRegistry();
+    const proofAdmissionDefinition = registry.get(CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID);
+    if (!proofAdmissionDefinition) {
+      return createRefusalBundle({
+        code: "CCC_PRD_PROOF_ADMISSION_MISSING",
+        message: `fixed proof-admission extension is not registered: ${CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID}`,
+      });
+    }
+    if (proofAdmissionDefinition.degraded) {
+      return createRefusalBundle({
+        code: "CCC_PRD_PROOF_ADMISSION_DEGRADED",
+        message: `fixed proof-admission extension is degraded: ${proofAdmissionDefinition.degraded.message}`,
+      });
+    }
+    if (
+      proofAdmissionDefinition.id !== CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID
+      || proofAdmissionDefinition.pluginId !== CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID
+      || proofAdmissionDefinition.extension.kind !== "proof-admission"
+      || proofAdmissionDefinition.extension.extensionId
+        !== CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID
+      || proofAdmissionDefinition.extension.proofVersion
+        !== CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION
+      || proofAdmissionDefinition.hostProvenance?.pluginId
+        !== CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID
+      || proofAdmissionDefinition.hostProvenance.pluginVersion
+        !== CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION
+    ) {
+      return createRefusalBundle({
+        code: "CCC_PRD_PROOF_ADMISSION_IDENTITY",
+        message: `fixed proof-admission registry identity is inconsistent: ${CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID}`,
+      });
+    }
+    let proofAdmissionBinding;
+    try {
+      proofAdmissionBinding = await registry.reverifyHostProvenance(
+        CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID,
+      );
+    } catch (error) {
+      return createRefusalBundle({
+        code: "CCC_PRD_PROOF_ADMISSION_PROVENANCE",
+        message: error instanceof Error
+          ? error.message
+          : "fixed proof-admission provenance could not be reverified",
+      });
+    }
+    if (
+      canonicalCccPrdJson(proofAdmissionBinding)
+      !== canonicalCccPrdJson(proofAdmissionDefinition.hostProvenance)
+    ) {
+      return createRefusalBundle({
+        code: "CCC_PRD_PROOF_ADMISSION_IDENTITY",
+        message: `fixed proof-admission provenance changed during re-verification: ${CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID}`,
+      });
+    }
+    const stampedProofs = mapped.proofs.map((proof) => ({
+      ...proof,
+      admission: {
+        schema: CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+        pluginId: proofAdmissionBinding.pluginId,
+        pluginVersion: proofAdmissionBinding.pluginVersion,
+        extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+        proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+        extensionRootRelativeSource: proofAdmissionBinding.extensionRootRelativeSource,
+        extensionSourceSha256: proofAdmissionBinding.extensionSourceSha256,
+        extensionManifestSha256: proofAdmissionBinding.extensionManifestSha256,
+        definitionSha256: computeCccPrdProofDefinitionSha256(proof),
+      },
+    }));
     const proposalHash = sha256(canonicalCccPrdJson(proposalValue));
     const sidecar: CccPrdSidecar = {
       schema: CCC_PRD_SIDECAR_SCHEMA_VERSION,
@@ -405,7 +485,7 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       },
       authorityRoles: sortCccPrdById(proposalValue.authorityRoles),
       requirements: mapped.requirements,
-      proofs: mapped.proofs,
+      proofs: stampedProofs,
       tasks: mapped.tasks,
       edges: sortCccPrdById(proposalValue.edges),
       workflows: mapped.workflows,

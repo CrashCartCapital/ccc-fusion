@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import type {
   CccPrdDiagnostic,
   CccPrdOperatorDecision,
+  CccPrdProof,
   CccPrdProtectedActionIntent,
   CccPrdProtectedActionKind,
   CccPrdRefusalBundle,
+  CccPrdSemanticBundle,
   CccPrdSourceSpan,
 } from "./types.js";
 
@@ -58,6 +60,61 @@ function canonicalJson(value: unknown, seen: Set<object>): string {
 
 export function canonicalCccPrdJson(value: unknown): string {
   return canonicalJson(value, new Set<object>());
+}
+
+function sha256CanonicalCccPrdJson(value: unknown): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(value), "utf8")
+    .digest("hex");
+}
+
+export function computeCccPrdProofDefinitionSha256(proof: CccPrdProof): string {
+  return sha256CanonicalCccPrdJson({
+    id: proof.id,
+    requirementIds: proof.requirementIds,
+    command: proof.command,
+    positiveOracle: proof.positiveOracle,
+    negativeControls: proof.negativeControls,
+    spans: proof.spans,
+    confidence: proof.confidence,
+  });
+}
+
+export type CccPrdSemanticBundleHashInput = Omit<CccPrdSemanticBundle, "bundleHash">;
+
+export function projectCccPrdSemanticBundleForHash(
+  bundle: CccPrdSemanticBundle | CccPrdSemanticBundleHashInput,
+): CccPrdSemanticBundleHashInput {
+  return {
+    kind: bundle.kind,
+    schema: bundle.schema,
+    sourceHash: bundle.sourceHash,
+    sidecarHash: bundle.sidecarHash,
+    sourceVersion: bundle.sourceVersion,
+    orderedSources: bundle.orderedSources,
+    provenance: bundle.provenance,
+    authorityRoles: bundle.authorityRoles,
+    requirements: bundle.requirements,
+    proofs: bundle.proofs,
+    tasks: bundle.tasks,
+    edges: bundle.edges,
+    workflows: bundle.workflows,
+    documents: bundle.documents,
+    artifacts: bundle.artifacts,
+    importIntents: bundle.importIntents,
+    protectedActions: bundle.protectedActions,
+    bounds: bundle.bounds,
+    admittedWriteRoots: bundle.admittedWriteRoots,
+    targetRepository: bundle.targetRepository,
+    nonGoals: bundle.nonGoals,
+    confidence: bundle.confidence,
+  };
+}
+
+export function computeCccPrdSemanticBundleSha256(
+  bundle: CccPrdSemanticBundle | CccPrdSemanticBundleHashInput,
+): string {
+  return sha256CanonicalCccPrdJson(projectCccPrdSemanticBundleForHash(bundle));
 }
 
 function displayPosition(prefix: Buffer): { line: number; column: number } {

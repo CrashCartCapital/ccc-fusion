@@ -123,6 +123,14 @@ export interface WorkflowNodePreparationRequirement {
 
 export interface WorkflowGraphExecutorDeps {
   handlers?: Partial<Record<WorkflowIrNode["kind"], WorkflowNodeHandler>>;
+  /** Fail-closed admission for executable nodes. Runs once before preparation,
+   * plugin dispatch, or a default handler. Orchestration-only nodes never enter
+   * this seam. */
+  admitNodeExecution?: (
+    node: WorkflowIrNode,
+    task: TaskDetail,
+    signal?: AbortSignal,
+  ) => void | Promise<void>;
   /*
    * FNXC:WorkflowNodeRunners 2026-07-01-00:00:
    * Node runners are the new ownership boundary for workflow node behavior. During migration the graph accepts a registry and adapts it into handlers, while explicit handlers remain the highest-precedence test/plugin override so existing graph semantics do not drift.
@@ -1522,6 +1530,7 @@ export class WorkflowGraphExecutor {
       : this.maxRetriesPerNode;
 
     let lastError: unknown;
+    let admissionCompleted = false;
     /*
     FNXC:CccWave4Retry 2026-07-24-19:15:
     Permanent CCC failures stop after their first real invocation even when the
@@ -1535,6 +1544,10 @@ export class WorkflowGraphExecutor {
       if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
       attemptsConsumed = attempt + 1;
       try {
+        if (!admissionCompleted) {
+          await this.deps.admitNodeExecution?.(node, task, signal);
+          admissionCompleted = true;
+        }
         await this.prepareNodeExecution(node, task, context, settings);
         const progressRecord = recordProgress && this.shouldRecordNodeProgress(node)
           ? await this.recordNodeProgressStart(task.id, node)

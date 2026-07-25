@@ -11,6 +11,41 @@ function settingsOn() {
 }
 
 describe("WorkflowGraphExecutor traversal", () => {
+  it("runs pre-node admission before preparation and the handler, excluding start/end", async () => {
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "pre-node-admission",
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "a", kind: "script", config: { cccPrdTaskId: "TASK-A" } },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+    const order: string[] = [];
+    const executor = new WorkflowGraphExecutor({
+      admitNodeExecution: async (node) => {
+        order.push(`admit:${node.id}`);
+      },
+      prepareNodeExecution: async (node) => {
+        order.push(`prepare:${node.id}`);
+      },
+      handlers: {
+        script: async (node) => {
+          order.push(`handler:${node.id}`);
+          return { outcome: "success" };
+        },
+      },
+    });
+
+    await executor.run(task, settingsOn(), ir);
+
+    expect(order).toEqual(["admit:a", "prepare:a", "handler:a"]);
+  });
+
   it("walks linear graph", async () => {
     const ir: WorkflowIr = {
       version: "v1",

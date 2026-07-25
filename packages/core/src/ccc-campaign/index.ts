@@ -1,5 +1,6 @@
 export {
   CccCampaignExecutionPolicyError,
+  createCccCampaignAuthorityBinding,
   createCccCampaignManifest,
   hashCccCampaignManifest,
   parseCccCampaignExecutionPolicy,
@@ -18,5 +19,6 @@ export type {
   CccCampaignExecutionPolicy,
   CccCampaignExecutionRoute,
   CccCampaignManifest,
+  CccCampaignTaskContext,
   CccCampaignTransport,
 } from "./types.js";

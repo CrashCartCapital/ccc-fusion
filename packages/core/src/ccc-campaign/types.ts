@@ -100,3 +100,8 @@ export type CccCampaignContext = Omit<CccCampaignManifest, "schema"> & {
   requestCount: number;
   activeActionLeases: Record<string, CccCampaignActionLease>;
 };
+
+export type CccCampaignTaskContext = CccCampaignContext & {
+  semanticTaskId: string;
+  proofIds: readonly string[];
+};

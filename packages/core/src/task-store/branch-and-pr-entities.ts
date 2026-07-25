@@ -1584,7 +1584,26 @@ export function transitionWorkflowWorkItemSyncImpl(store: TaskStore,
         throw new Error(`Workflow work item ${id} is terminal (${fromState}) and cannot transition to ${state}`);
       }
 
-      store.db
+      const guards: string[] = ["id = ?", "(state = ? OR state NOT IN ('succeeded', 'failed', 'cancelled', 'exhausted'))"];
+      const guardValues: Array<string | number | null> = [id, state];
+      if (patch.expectedState !== undefined) {
+        guards.push("state = ?");
+        guardValues.push(patch.expectedState);
+      }
+      if (patch.expectedLeaseOwner !== undefined) {
+        if (patch.expectedLeaseOwner === null) {
+          guards.push("leaseOwner IS NULL");
+        } else {
+          guards.push("leaseOwner = ?");
+          guardValues.push(patch.expectedLeaseOwner);
+        }
+      }
+      if (patch.expectedAttempt !== undefined) {
+        guards.push("attempt = ?");
+        guardValues.push(patch.expectedAttempt);
+      }
+
+      const result = store.db
         .prepare(
           `UPDATE workflow_work_items
               SET state = ?,
@@ -1595,7 +1614,7 @@ export function transitionWorkflowWorkItemSyncImpl(store: TaskStore,
                   lastError = ?,
                   blockedReason = ?,
                   updatedAt = ?
-            WHERE id = ?`,
+            WHERE ${guards.join(" AND ")}`,
         )
         .run(
           state,
@@ -1606,8 +1625,11 @@ export function transitionWorkflowWorkItemSyncImpl(store: TaskStore,
           patch.lastError === undefined ? existing.lastError : patch.lastError,
           patch.blockedReason === undefined ? existing.blockedReason : patch.blockedReason,
           now,
-          id,
+          ...guardValues,
         );
+      if (result.changes !== 1) {
+        throw new Error(`Workflow work item ${id} transition precondition failed`);
+      }
 
       const updated = store.db.prepare("SELECT * FROM workflow_work_items WHERE id = ?").get(id) as WorkflowWorkItemRow | undefined;
       if (!updated) throw new Error(`Workflow work item ${id} disappeared`);

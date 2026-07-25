@@ -1,4 +1,7 @@
-import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
+import {
+  canonicalCccPrdJson,
+  computeCccPrdSemanticBundleSha256,
+} from "../ccc-prd/contract.js";
 import {
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
   type CccPrdSemanticBundle,
@@ -91,6 +94,7 @@ export function reconstructCccCampaignCustody(
   try {
     const persistedManifest = storedManifest(row.campaignManifest);
     const bundle = storedBundle(row.canonicalBundle);
+    const computedBundleHash = computeCccPrdSemanticBundleSha256(bundle);
     const executionPolicy = parseCccCampaignExecutionPolicy(
       row.executionPolicy,
       bundle,
@@ -110,6 +114,7 @@ export function reconstructCccCampaignCustody(
       canonicalCccPrdJson(persistedManifest) !== canonicalCccPrdJson(manifest)
       || row.campaignManifestHash !== manifestHash
       || row.identityHash !== manifestHash
+      || computedBundleHash !== bundle.bundleHash
       || row.bundleHash !== bundle.bundleHash
       || row.packetHash !== bundle.sourceHash
       || row.sidecarHash !== bundle.sidecarHash

@@ -960,6 +960,7 @@ const WORKFLOW_EXTENSION_KINDS: ReadonlySet<WorkflowExtensionKind> = new Set([
   "node-handler",
   "verdict-provider",
   "merge-fact-provider",
+  "proof-admission",
 ]);
 
 const WORKFLOW_EXTENSION_FALLBACKS: ReadonlySet<WorkflowExtensionFallback> = new Set([
@@ -1023,6 +1024,33 @@ export function validateWorkflowExtensionContribution(
       const fields = (e.configSchema as { fields?: unknown }).fields;
       if (!Array.isArray(fields)) {
         errors.push(`${prefix}.configSchema.fields must be an array`);
+      }
+    }
+  }
+
+  if (e.kind === "proof-admission") {
+    if (e.fallback !== "failClosed") {
+      errors.push(`${prefix}.fallback must be failClosed for proof-admission contributions`);
+    }
+    if (typeof e.proofVersion !== "string" || e.proofVersion.trim() === "") {
+      errors.push(`${prefix}.proofVersion is required and must be a non-empty string`);
+    }
+    if (typeof e.evaluate !== "function") {
+      errors.push(`${prefix}.evaluate is required and must be a function`);
+    }
+    const allowedKeys = new Set([
+      "extensionId",
+      "name",
+      "description",
+      "kind",
+      "schemaVersion",
+      "fallback",
+      "proofVersion",
+      "evaluate",
+    ]);
+    for (const key of Object.keys(e)) {
+      if (!allowedKeys.has(key)) {
+        errors.push(`${prefix}.${key} is not allowed for proof-admission contributions`);
       }
     }
   }

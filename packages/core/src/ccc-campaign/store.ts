@@ -1,6 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { and, eq } from "drizzle-orm";
 import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "../ccc-prd/contract.js";
+import type { CccPrdTask } from "../ccc-prd/types.js";
 import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
 import { createCccCampaignAuthorityBinding } from "./canonical.js";
@@ -12,6 +13,7 @@ import {
   type CccCampaignActionLookup,
   type CccCampaignAuthorityBinding,
   type CccCampaignContext,
+  type CccCampaignTaskContext,
 } from "./types.js";
 
 export { CccCampaignContextError } from "./types.js";
@@ -58,6 +60,87 @@ function requireLeaseHash(value: unknown, label: string): string {
     throw new CccCampaignContextError(`${label} must be a lowercase SHA-256 hash`);
   }
   return hash;
+}
+
+function requireCanonicalProofIds(value: unknown, label: string): readonly string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new CccCampaignContextError(`${label} must be a non-empty canonical proof ID set`);
+  }
+  const proofIds = value.map((entry, index) => {
+    if (typeof entry !== "string" || entry.length === 0 || entry !== entry.trim()) {
+      throw new CccCampaignContextError(`${label}[${index}] must be a non-empty canonical string`);
+    }
+    return entry;
+  });
+  const canonical = [...proofIds].sort(compareCccPrdCodeUnits);
+  if (
+    new Set(proofIds).size !== proofIds.length
+    || canonicalCccPrdJson(proofIds) !== canonicalCccPrdJson(canonical)
+  ) {
+    throw new CccCampaignContextError(`${label} must be unique and sorted canonically`);
+  }
+  return Object.freeze([...proofIds]);
+}
+
+function taskProofIds(
+  bundleTasks: readonly CccPrdTask[],
+  semanticTaskId: string,
+  taskId: string,
+): readonly string[] {
+  const matches = bundleTasks.filter(({ id }) => id === semanticTaskId);
+  if (matches.length !== 1) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} has no exact semantic campaign task authority`,
+    );
+  }
+  return requireCanonicalProofIds(
+    matches[0]!.proofIds,
+    `Task ${taskId} semantic campaign proof IDs`,
+  );
+}
+
+function assertProofIdsExist(
+  proofIds: readonly string[],
+  bundleProofIds: readonly string[],
+  taskId: string,
+): void {
+  const bundleProofSet = new Set(bundleProofIds);
+  if (!proofIds.every((proofId) => bundleProofSet.has(proofId))) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} campaign proof IDs are not declared bundle proofs`,
+    );
+  }
+}
+
+function nativeTaskProofIds(
+  sourceMetadata: unknown,
+  taskId: string,
+  bundleHash: string,
+): readonly string[] {
+  if (!isRecord(sourceMetadata)) {
+    throw new CccCampaignContextError(`Task ${taskId} native source metadata is missing`);
+  }
+  if (sourceMetadata.bundleHash !== bundleHash) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} native source metadata bundle hash does not match campaign custody`,
+    );
+  }
+  return requireCanonicalProofIds(
+    sourceMetadata.proofIds,
+    `Task ${taskId} native source metadata proof IDs`,
+  );
+}
+
+function assertExactProofIds(
+  actual: readonly string[],
+  expected: readonly string[],
+  taskId: string,
+): void {
+  if (canonicalCccPrdJson(actual) !== canonicalCccPrdJson(expected)) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} campaign proof IDs do not match immutable semantic task authority`,
+    );
+  }
 }
 
 function exactLeaseKeys(value: Record<string, unknown>, actionId: string): void {
@@ -147,7 +230,7 @@ export async function loadCccCampaignContextForTask(
   taskId: string,
   tx?: DbTransaction,
   lockForUpdate = false,
-): Promise<CccCampaignContext | null> {
+): Promise<CccCampaignTaskContext | null> {
   const projectId = projectIdFor(layer);
   const query = tx ?? layer.db;
   const selection = query
@@ -174,6 +257,7 @@ export async function loadCccCampaignContextForTask(
       activeActionLeases: schema.project.cccPrdImports.activeActionLeases,
       semanticTaskId: schema.project.cccPrdImportEntities.entityId,
       nativeTaskId: schema.project.cccPrdImportEntities.nativeId,
+      nativeTaskSourceMetadata: schema.project.tasks.sourceMetadata,
     })
     .from(schema.project.cccPrdImports)
     .innerJoin(
@@ -187,6 +271,13 @@ export async function loadCccCampaignContextForTask(
           schema.project.cccPrdImportEntities.importId,
           schema.project.cccPrdImports.importId,
         ),
+      ),
+    )
+    .innerJoin(
+      schema.project.tasks,
+      and(
+        eq(schema.project.tasks.projectId, schema.project.cccPrdImportEntities.projectId),
+        eq(schema.project.tasks.id, schema.project.cccPrdImportEntities.nativeId),
       ),
     )
     .where(and(
@@ -243,6 +334,18 @@ export async function loadCccCampaignContextForTask(
       `Task ${taskId} has no exact persisted campaign execution route`,
     );
   }
+  const proofIds = taskProofIds(bundle.tasks, row.semanticTaskId, taskId);
+  assertProofIdsExist(
+    proofIds,
+    bundle.proofs.map(({ id }) => id),
+    taskId,
+  );
+  const metadataProofIds = nativeTaskProofIds(
+    row.nativeTaskSourceMetadata,
+    taskId,
+    bundle.bundleHash,
+  );
+  assertExactProofIds(metadataProofIds, proofIds, taskId);
   const startedAt = requireIsoTimestamp(row.campaignStartedAt, "campaignStartedAt");
   const deadlineAt = requireIsoTimestamp(row.campaignDeadlineAt, "campaignDeadlineAt");
   if (deadlineAt !== startedAt + bundle.bounds.maxDurationMs) {
@@ -260,13 +363,15 @@ export async function loadCccCampaignContextForTask(
     row.campaignDeadlineAt,
   );
 
-  const context: CccCampaignContext = {
+  const context: CccCampaignTaskContext = {
     schema: CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
     projectId: manifest.projectId,
     importId: manifest.importId,
     idempotencyKey: manifest.idempotencyKey,
     campaignId: manifest.campaignId,
     taskId,
+    semanticTaskId: row.semanticTaskId,
+    proofIds,
     packetHash: manifest.packetHash,
     sidecarHash: manifest.sidecarHash,
     bundleHash: manifest.bundleHash,
@@ -333,7 +438,7 @@ export interface CccCampaignAuthorityStore {
   getCccCampaignContextForTaskWithinTransaction(
     tx: DbTransaction,
     taskId: string,
-  ): Promise<CccCampaignContext | null>;
+  ): Promise<CccCampaignTaskContext | null>;
   claimCccCampaignActionLease(
     taskId: string,
     action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,

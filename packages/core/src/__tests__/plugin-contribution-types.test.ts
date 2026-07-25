@@ -185,6 +185,7 @@ describe("plugin contribution type constraints", () => {
       "node-handler",
       "verdict-provider",
       "merge-fact-provider",
+      "proof-admission",
     ];
     const fallback: WorkflowExtensionFallback = "degradeToDefault";
     const extensions: WorkflowExtensionContribution[] = kinds.map((kind) => ({
@@ -192,7 +193,17 @@ describe("plugin contribution type constraints", () => {
       name: `${kind} demo`,
       kind,
       schemaVersion: 1,
-      fallback,
+      fallback: kind === "proof-admission" ? "failClosed" : fallback,
+      ...(kind === "proof-admission"
+        ? {
+            proofVersion: "v1",
+            evaluate: async () => ({
+              outcome: "pass" as const,
+              evaluatedInputSha256: "a".repeat(64),
+              summary: "proof passed",
+            }),
+          }
+        : {}),
     } as WorkflowExtensionContribution));
 
     const plugin: FusionPlugin = {
@@ -202,8 +213,9 @@ describe("plugin contribution type constraints", () => {
       workflowExtensions: extensions,
     };
 
-    expect(plugin.workflowExtensions).toHaveLength(6);
+    expect(plugin.workflowExtensions).toHaveLength(7);
     expect(validateWorkflowExtensionContribution(extensions[0])).toEqual([]);
+    expect(validateWorkflowExtensionContribution(extensions[6])).toEqual([]);
     expect(
       validateWorkflowExtensionContribution({
         extensionId: "bad",
@@ -215,6 +227,26 @@ describe("plugin contribution type constraints", () => {
     ).toEqual([
       "workflowExtensions[0].schemaVersion must be 1; got 99",
       "workflowExtensions[0].fallback must be one of: degradeToDefault, parkNeedsAttention, failClosed",
+    ]);
+  });
+
+  it("rejects incomplete or provenance-asserting proof-admission contributions", () => {
+    expect(
+      validateWorkflowExtensionContribution({
+        extensionId: "proof",
+        name: "Proof",
+        kind: "proof-admission",
+        schemaVersion: 1,
+        fallback: "degradeToDefault",
+        pluginVersion: "caller-owned",
+        extensionSourceSha256: "a".repeat(64),
+      }),
+    ).toEqual([
+      "workflowExtensions[0].fallback must be failClosed for proof-admission contributions",
+      "workflowExtensions[0].proofVersion is required and must be a non-empty string",
+      "workflowExtensions[0].evaluate is required and must be a function",
+      "workflowExtensions[0].pluginVersion is not allowed for proof-admission contributions",
+      "workflowExtensions[0].extensionSourceSha256 is not allowed for proof-admission contributions",
     ]);
   });
 

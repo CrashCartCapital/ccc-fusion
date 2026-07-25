@@ -2,6 +2,7 @@ export const CCC_PRD_PACKET_SCHEMA_VERSION = "ccc-prd.packet.v1" as const;
 export const CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION = "ccc-prd.authoring-proposal.v1" as const;
 export const CCC_PRD_SIDECAR_SCHEMA_VERSION = "ccc-prd.sidecar.v1" as const;
 export const CCC_PRD_BUNDLE_SCHEMA_VERSION = "ccc-prd.bundle.v1" as const;
+export const CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION = "ccc-prd.proof-admission.v1" as const;
 
 /** @deprecated Use the specific packet, sidecar, or bundle schema constant. */
 export const CCC_PRD_SCHEMA_VERSION = CCC_PRD_BUNDLE_SCHEMA_VERSION;
@@ -31,6 +32,18 @@ export type CccPrdDiagnostic = {
 
 export type CccPrdConfidence = "high" | "medium" | "low";
 
+export type CccPrdProofAdmission = {
+  schema: typeof CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION;
+  pluginId: string;
+  pluginVersion: string;
+  extensionId: string;
+  proofVersion: string;
+  extensionRootRelativeSource: string;
+  extensionSourceSha256: string;
+  extensionManifestSha256: string;
+  definitionSha256: string;
+};
+
 export type CccPrdAuthorityRole = {
   id: string;
   role: "root" | "production_module" | "blocking_test_index" | "support";
@@ -46,6 +59,7 @@ export type CccPrdProof = {
   negativeControls: string[];
   spans: CccPrdSourceSpan[];
   confidence: CccPrdConfidence;
+  admission?: CccPrdProofAdmission;
 };
 
 export type CccPrdRequirement = {
@@ -273,7 +287,7 @@ export type CccPrdProposalRequirement = Omit<CccPrdRequirement, "spans"> & {
   sourceRefs: CccPrdSourceReferenceProposal[];
 };
 
-export type CccPrdProposalProof = Omit<CccPrdProof, "spans"> & {
+export type CccPrdProposalProof = Omit<CccPrdProof, "spans" | "admission"> & {
   sourceRefs: CccPrdSourceReferenceProposal[];
 };
 

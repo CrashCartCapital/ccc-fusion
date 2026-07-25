@@ -1,9 +1,15 @@
 export {
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
+  computeCccPrdProofDefinitionSha256,
+  computeCccPrdSemanticBundleSha256,
   createCccPrdSpanFromBytes,
   createRefusalBundle,
   normalizeProtectedAction,
+  projectCccPrdSemanticBundleForHash,
+} from "./contract.js";
+export type {
+  CccPrdSemanticBundleHashInput,
 } from "./contract.js";
 export {
   CccPrdImportError,
@@ -15,6 +21,7 @@ export {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
   CCC_PRD_PACKET_SCHEMA_VERSION,
+  CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
 } from "./types.js";
@@ -39,6 +46,7 @@ export type {
   CccPrdManifestPacket,
   CccPrdOperatorDecision,
   CccPrdProof,
+  CccPrdProofAdmission,
   CccPrdProposalArtifact,
   CccPrdProposalDocument,
   CccPrdProposalProof,

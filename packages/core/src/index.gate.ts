@@ -1315,6 +1315,10 @@ export type {
   AutoMergeFactProviderInput,
   AutoMergeFactProviderResult,
   AutoMergeFactProviderHandler,
+  WorkflowProofAdmissionEvaluatorInput,
+  WorkflowProofAdmissionEvaluatorResult,
+  WorkflowProofAdmissionEvaluator,
+  WorkflowProofAdmissionExtensionContribution,
 } from "./workflow-extension-types.js";
 export {
   WORKFLOW_EXTENSION_SCHEMA_VERSION,
@@ -1330,6 +1334,20 @@ export type {
   WorkflowExtensionDefinition,
   WorkflowExtensionRegistrationReason,
 } from "./workflow-extension-registry.js";
+export {
+  WorkflowExtensionProvenanceError,
+  deriveWorkflowExtensionHostProvenance,
+  getWorkflowExtensionHostProvenanceBinding,
+  hasSameWorkflowExtensionHostProvenanceIdentity,
+  validateWorkflowExtensionFixedEntrySource,
+  verifyWorkflowExtensionHostProvenance,
+} from "./workflow-extension-provenance.js";
+export type {
+  DeriveWorkflowExtensionHostProvenanceInput,
+  WorkflowExtensionHostProvenance,
+  WorkflowExtensionHostProvenanceBinding,
+  WorkflowExtensionProvenanceErrorReason,
+} from "./workflow-extension-provenance.js";
 export {
   createBoardActionServices,
 } from "./board-action-services.js";

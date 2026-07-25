@@ -1,5 +1,6 @@
 import type { Task, TaskDetail } from "./types.js";
 import type { WorkflowIr, WorkflowIrNode } from "./workflow-ir-types.js";
+import type { CccPrdProof } from "./ccc-prd/types.js";
 
 export const WORKFLOW_EXTENSION_SCHEMA_VERSION = 1 as const;
 
@@ -11,7 +12,8 @@ export type WorkflowExtensionKind =
   | "work-engine"
   | "node-handler"
   | "verdict-provider"
-  | "merge-fact-provider";
+  | "merge-fact-provider"
+  | "proof-admission";
 
 export interface WorkflowExtensionBaseContribution {
   extensionId: string;
@@ -158,13 +160,48 @@ export interface AutoMergeFactProviderExtensionContribution extends WorkflowExte
   configSchema?: WorkflowExtensionConfigSchema;
 }
 
+export type WorkflowProofAdmissionEvaluatorInput = Readonly<{
+  campaignId: string;
+  importId: string;
+  bundleHash: string;
+  manifestHash: string;
+  taskId: string;
+  nodeId: string;
+  workItemId: string;
+  owner: string;
+  attempt: number;
+  proofDefinitionSha256: string;
+  inputSha256: string;
+  proof: Readonly<CccPrdProof>;
+  signal: AbortSignal;
+}>;
+
+export type WorkflowProofAdmissionEvaluatorResult = Readonly<{
+  outcome: "pass" | "fail";
+  evaluatedInputSha256: string;
+  summary: string;
+}>;
+
+export type WorkflowProofAdmissionEvaluator = (
+  input: WorkflowProofAdmissionEvaluatorInput,
+) => Promise<WorkflowProofAdmissionEvaluatorResult>;
+
+export interface WorkflowProofAdmissionExtensionContribution extends WorkflowExtensionBaseContribution {
+  kind: "proof-admission";
+  fallback: "failClosed";
+  proofVersion: string;
+  evaluate: WorkflowProofAdmissionEvaluator;
+  configSchema?: never;
+}
+
 export type WorkflowExtensionContribution =
   | WorkflowColumnMetadataExtensionContribution
   | WorkflowMovePolicyExtensionContribution
   | WorkflowWorkEngineExtensionContribution
   | WorkflowNodeHandlerExtensionContribution
   | TaskVerdictProviderExtensionContribution
-  | AutoMergeFactProviderExtensionContribution;
+  | AutoMergeFactProviderExtensionContribution
+  | WorkflowProofAdmissionExtensionContribution;
 
 export interface WorkflowExtensionMetadata {
   extensionId: string;

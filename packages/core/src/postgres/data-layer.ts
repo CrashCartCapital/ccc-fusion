@@ -544,7 +544,6 @@ async function assertCampaignBindingMatchesPersistedCustody(
   const expected = createCccCampaignAuthorityBinding(context, {
     actionId: binding.actionId,
     actionTarget: binding.actionTarget,
-    requireProtected: true,
   });
   if (canonicalCccPrdJson(expected) !== canonicalCccPrdJson(binding)) {
     throw new CccCampaignContextError(

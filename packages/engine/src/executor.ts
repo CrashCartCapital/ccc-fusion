@@ -23,6 +23,7 @@ import { generateFeatureVideo, type GenerateFeatureVideoOptions } from "./review
 import { moveTaskToReplanColumn, resolveReplanTargetColumn } from "./replan-target.js";
 import type { TaskStep, WorkflowIr, WorkflowFieldDefinition, WorkflowColumnAgent, EffectiveAgentInput, WorkflowWorkEngineDispatchResult, WorkflowWorkItem } from "@fusion/core";
 import { WorkflowGraphTaskRunner, type WorkflowGraphTaskRunResult, type WorkflowColumnBoundaryHooks } from "./workflow-graph-task-runner.js";
+import { isImportedCccCampaignTask, isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflow-column-boundary.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { createCodeNodeRunner } from "./code-node-runner.js";
@@ -5979,6 +5980,37 @@ export class TaskExecutor {
    * Returns true when the graph owned the task to a terminal disposition
    * (completed or failed); false when the legacy pipeline should run.
    */
+  private async shouldDeferGenericCccCampaignExecution(task: Task): Promise<boolean> {
+    const importedCampaignTask = isImportedCccCampaignTask(task);
+    const getCampaignContext = this.store.getCccCampaignContextForTask;
+    if (typeof getCampaignContext !== "function") {
+      if (importedCampaignTask) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign task: custody lookup is unwired`);
+        return true;
+      }
+      return false;
+    }
+    try {
+      const campaignContext = await getCampaignContext.call(this.store, task.id);
+      if (campaignContext) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring CCC campaign task to native workflow work processor`);
+        return true;
+      }
+      if (importedCampaignTask) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign task: custody is missing`);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      if (importedCampaignTask) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign task: custody lookup failed (${err instanceof Error ? err.message : String(err)})`);
+        return true;
+      }
+      executorLog.warn(`[workflow-graph] ${task.id} preserving ordinary graph dispatch after CCC custody lookup failed (${err instanceof Error ? err.message : String(err)})`);
+      return false;
+    }
+  }
+
   private async executeWorkflowGraph(task: Task, opts?: { alreadyClaimed?: boolean }): Promise<void> {
     // Claim synchronously before any await so concurrent execute() calls for
     // the same task cannot both enter graph routing (mirrors executingTaskLock).
@@ -5996,6 +6028,7 @@ export class TaskExecutor {
       this.outerConcurrencyClaims.add(task.id);
     }
     try {
+      if (await this.shouldDeferGenericCccCampaignExecution(task)) return;
       let settings: Settings;
       try {
         settings = await this.store.getSettings();
@@ -6304,6 +6337,11 @@ export class TaskExecutor {
             break;
           }
         }
+        if (continuation && isImportedCccCampaignWorkItem(continuation)) {
+          executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign work item ${continuation.id} to native workflow work processor`);
+          return;
+        }
+        if (await this.shouldDeferGenericCccCampaignExecution(task)) return;
         if (continuation && continuation.state !== "running") {
           continuation = await this.store.transitionWorkflowWorkItem(continuation.id, "running", {
             leaseOwner: `executor:${task.id}`,
@@ -11547,6 +11585,7 @@ export class TaskExecutor {
   invocation to exclude and the gates are unconditional.
   */
   private async executeCore(task: Task): Promise<void> {
+    if (await this.shouldDeferGenericCccCampaignExecution(task)) return;
     this.completionFinalizedTaskIds.delete(task.id);
     /*
     FNXC:ExecutorSoftDelete 2026-07-20-23:30:

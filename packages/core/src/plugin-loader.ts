@@ -9,7 +9,8 @@
  * - Error isolation (plugin crashes don't crash the loader)
  */
 
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { copyFile, readFile, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
@@ -42,6 +43,11 @@ import type {
 } from "./plugin-types.js";
 import type { LoadedPluginSchemaContract } from "./postgres/plugin-schema-hook.js";
 import type { WorkflowExtensionContribution } from "./workflow-extension-types.js";
+import {
+  deriveWorkflowExtensionHostProvenance,
+  getWorkflowExtensionHostProvenanceBinding,
+  type WorkflowExtensionHostProvenance,
+} from "./workflow-extension-provenance.js";
 import { normalizePluginUiContributionDefinition, validatePluginManifest } from "./plugin-types.js";
 import { createLogger } from "./logger.js";
 import { getCreateAiSessionFactory, getCreateInteractiveAiSessionFactory } from "./ai-engine-loader.js";
@@ -55,6 +61,10 @@ const PLUGIN_MANIFEST_PARENT_DIR_NAMES = new Set(["dist", "build", "lib", "src"]
 type CurrentManifestDashboardViewsResult =
   | { found: true; dashboardViews: PluginDashboardViewDefinition[] }
   | { found: false };
+type ImportedPluginModule = Readonly<{
+  module: unknown;
+  sourceSha256: string;
+}>;
 
 /**
  * Resolve the actual loadable entry FILE path for a plugin directory. Node ESM
@@ -211,11 +221,13 @@ export class PluginLoader extends EventEmitter<{
   private plugins: Map<string, FusionPlugin> = new Map();
 
   /** Cache of dynamically imported modules */
-  private loadedModules: Map<string, unknown> = new Map();
+  private loadedModules: Map<string, ImportedPluginModule> = new Map();
 
   /** Absolute plugin package roots keyed by plugin id. */
   private pluginRoots: Map<string, string> = new Map();
   private pluginSchemaContracts: Map<string, LoadedPluginSchemaContract> = new Map();
+  /** Opaque host custody is retained only for plugins that declare proof admission. */
+  private workflowExtensionProofProvenance = new Map<string, WorkflowExtensionHostProvenance>();
 
   /*
   FNXC:PluginLoader 2026-07-22-10:15:
@@ -371,7 +383,12 @@ export class PluginLoader extends EventEmitter<{
     if (existingLifecycle) {
       existingLifecycle.participants.add(this);
       const plugin = await existingLifecycle.promise;
-      return this.adoptProcessLoadedPlugin(pluginId, pluginPath, plugin);
+      return this.adoptProcessLoadedPlugin(
+        pluginId,
+        pluginPath,
+        plugin,
+        existingLifecycle.owner,
+      );
     }
 
     const lifecycle = this.loadPluginFresh(pluginId, installation, pluginPath);
@@ -396,10 +413,16 @@ export class PluginLoader extends EventEmitter<{
     return `${resolve(this.getProjectRoot())}\u0000${pluginId}\u0000${resolve(pluginPath)}`;
   }
 
-  private adoptProcessLoadedPlugin(pluginId: string, pluginPath: string, plugin: FusionPlugin): FusionPlugin {
+  private adoptProcessLoadedPlugin(
+    pluginId: string,
+    pluginPath: string,
+    plugin: FusionPlugin,
+    owner: PluginLoader,
+  ): FusionPlugin {
     plugin.state = "started";
     this.plugins.set(pluginId, plugin);
     this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+    this.copyWorkflowExtensionProofProvenance(pluginId, owner);
     this.emit("plugin:loaded", { pluginId, plugin });
     return plugin;
   }
@@ -424,8 +447,8 @@ export class PluginLoader extends EventEmitter<{
 
       // Dynamic import the plugin - always bypass cache to get fresh code
       // Our loadedModules cache is cleared on stop, but Node.js ESM cache persists
-      const mod = await this.importPluginModule(pluginPath, true);
-      const plugin = this.extractPluginFromModule(mod);
+      const imported = await this.importPluginModule(pluginPath, true);
+      const plugin = this.extractPluginFromModule(imported.module);
 
       // Validate manifest
       const manifestValidation = validatePluginManifest(plugin.manifest);
@@ -434,6 +457,13 @@ export class PluginLoader extends EventEmitter<{
           `Invalid plugin manifest: ${manifestValidation.errors.join(", ")}`,
         );
       }
+
+      const proofProvenance = await this.derivePluginProofProvenance(
+        pluginId,
+        pluginPath,
+        plugin,
+        imported.sourceSha256,
+      );
 
       await this.refreshPersistedManifestMetadata(installation, plugin.manifest);
 
@@ -468,6 +498,7 @@ export class PluginLoader extends EventEmitter<{
       plugin.state = "started";
       this.plugins.set(pluginId, plugin);
       this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      this.setWorkflowExtensionProofProvenance(pluginId, proofProvenance);
       if (schemaContract) this.pluginSchemaContracts.set(pluginId, schemaContract);
 
       // Call onLoad hook
@@ -479,6 +510,7 @@ export class PluginLoader extends EventEmitter<{
         this.plugins.delete(pluginId);
         this.pluginRoots.delete(pluginId);
         this.pluginSchemaContracts.delete(pluginId);
+        this.workflowExtensionProofProvenance.delete(pluginId);
         const errorMsg = loadErr instanceof Error ? loadErr.message : String(loadErr);
         await this.updatePluginState(
           pluginId,
@@ -501,6 +533,7 @@ export class PluginLoader extends EventEmitter<{
       this.plugins.delete(pluginId);
       this.pluginRoots.delete(pluginId);
       this.pluginSchemaContracts.delete(pluginId);
+      this.workflowExtensionProofProvenance.delete(pluginId);
 
       // Error isolation: set error state but don't crash
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -567,6 +600,135 @@ export class PluginLoader extends EventEmitter<{
     return JSON.stringify(value);
   }
 
+  private sha256(bytes: Buffer): string {
+    return createHash("sha256").update(bytes).digest("hex");
+  }
+
+  private setWorkflowExtensionProofProvenance(
+    pluginId: string,
+    provenance: WorkflowExtensionHostProvenance | undefined,
+  ): void {
+    if (provenance) {
+      this.workflowExtensionProofProvenance.set(pluginId, provenance);
+    } else {
+      this.workflowExtensionProofProvenance.delete(pluginId);
+    }
+  }
+
+  private copyWorkflowExtensionProofProvenance(
+    pluginId: string,
+    owner: PluginLoader,
+  ): void {
+    this.setWorkflowExtensionProofProvenance(
+      pluginId,
+      owner.workflowExtensionProofProvenance.get(pluginId),
+    );
+  }
+
+  private async resolveUnambiguousProofManifest(
+    pluginPath: string,
+  ): Promise<{ pluginRoot: string; manifestPath: string } | null> {
+    const pluginRoot = resolvePluginRootFromEntryPath(pluginPath);
+    const candidates = new Set([
+      join(pluginRoot, "manifest.json"),
+      join(dirname(pluginPath), "manifest.json"),
+    ]);
+    const manifestPaths: string[] = [];
+    for (const candidate of candidates) {
+      try {
+        const candidateStats = await stat(candidate);
+        if (candidateStats.isFile()) manifestPaths.push(candidate);
+      } catch {
+        // Missing candidates are expected for ordinary/legacy plugins.
+      }
+    }
+    return manifestPaths.length === 1
+      ? { pluginRoot, manifestPath: manifestPaths[0]! }
+      : null;
+  }
+
+  private async derivePluginProofProvenance(
+    pluginId: string,
+    pluginPath: string,
+    plugin: FusionPlugin,
+    importedSourceSha256: string,
+  ): Promise<WorkflowExtensionHostProvenance | undefined> {
+    if (!plugin.workflowExtensions?.some((extension) => extension.kind === "proof-admission")) {
+      return undefined;
+    }
+
+    try {
+      const manifestLocation = await this.resolveUnambiguousProofManifest(pluginPath);
+      if (!manifestLocation) {
+        this.log.warn(
+          `Proof admission disabled for ${pluginId}: expected one unambiguous on-disk manifest.json`,
+        );
+        return undefined;
+      }
+      const manifestBytes = await readFile(manifestLocation.manifestPath);
+      let diskManifest: unknown;
+      try {
+        diskManifest = JSON.parse(manifestBytes.toString("utf8"));
+      } catch {
+        this.log.warn(`Proof admission disabled for ${pluginId}: manifest.json is not valid JSON`);
+        return undefined;
+      }
+      const diskManifestValidation = validatePluginManifest(diskManifest);
+      if (!diskManifestValidation.valid) {
+        this.log.warn(
+          `Proof admission disabled for ${pluginId}: invalid manifest.json (${diskManifestValidation.errors.join(", ")})`,
+        );
+        return undefined;
+      }
+      const diskIdentity = diskManifest as PluginManifest;
+      if (
+        plugin.manifest.id !== pluginId
+        || diskIdentity.id !== pluginId
+        || diskIdentity.id !== plugin.manifest.id
+        || diskIdentity.version !== plugin.manifest.version
+      ) {
+        this.log.warn(
+          `Proof admission disabled for ${pluginId}: on-disk and loaded manifest identity differ`,
+        );
+        return undefined;
+      }
+
+      const entryRelativePath = relative(
+        manifestLocation.pluginRoot,
+        pluginPath,
+      ).split(sep).join("/");
+      const manifestRelativePath = relative(
+        manifestLocation.pluginRoot,
+        manifestLocation.manifestPath,
+      ).split(sep).join("/");
+      const provenance = await deriveWorkflowExtensionHostProvenance({
+        pluginId,
+        pluginVersion: plugin.manifest.version,
+        trustedRootPath: manifestLocation.pluginRoot,
+        entryRelativePath,
+        manifestRelativePath,
+      });
+      const binding = getWorkflowExtensionHostProvenanceBinding(provenance);
+      if (
+        binding.extensionSourceSha256 !== importedSourceSha256
+        || binding.extensionManifestSha256 !== this.sha256(manifestBytes)
+      ) {
+        this.log.warn(
+          `Proof admission disabled for ${pluginId}: imported module bytes differ from custodied source`,
+        );
+        return undefined;
+      }
+      return provenance;
+    } catch (error) {
+      this.log.warn(
+        `Proof admission disabled for ${pluginId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return undefined;
+    }
+  }
+
   private resolvePluginPath(path: string): string {
     // If already absolute, use as-is
     if (isAbsolute(path)) {
@@ -584,7 +746,10 @@ export class PluginLoader extends EventEmitter<{
     return resolve(this.getProjectRoot(), path);
   }
 
-  private async importPluginModule(path: string, bypassCache = false): Promise<unknown> {
+  private async importPluginModule(
+    path: string,
+    bypassCache = false,
+  ): Promise<ImportedPluginModule> {
     // Check cache first (unless bypassing cache for reload)
     if (!bypassCache && this.loadedModules.has(path)) {
       return this.loadedModules.get(path)!;
@@ -606,6 +771,7 @@ export class PluginLoader extends EventEmitter<{
     // consistently across Node + Vitest environments.
     const moduleUrl = pathToFileURL(path).href;
     let mod: unknown;
+    let importedSourceBytes: Buffer;
 
     if (bypassCache) {
       moduleImportVersion += 1;
@@ -613,12 +779,18 @@ export class PluginLoader extends EventEmitter<{
       const baseName = basename(path, ext);
       const reloadedPath = resolve(dirname(path), `.${baseName}.reload-${moduleImportVersion}${ext}`);
       await copyFile(path, reloadedPath);
+      importedSourceBytes = await readFile(reloadedPath);
       mod = await import(pathToFileURL(reloadedPath).href);
     } else {
+      importedSourceBytes = await readFile(path);
       mod = await import(moduleUrl);
     }
-    this.loadedModules.set(path, mod);
-    return mod;
+    const imported = Object.freeze({
+      module: mod,
+      sourceSha256: this.sha256(importedSourceBytes),
+    });
+    this.loadedModules.set(path, imported);
+    return imported;
   }
 
   /**
@@ -691,6 +863,7 @@ export class PluginLoader extends EventEmitter<{
       loader.plugins.set(pluginId, plugin);
       loader.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
       loader.pluginSchemaContracts.delete(pluginId);
+      loader.copyWorkflowExtensionProofProvenance(pluginId, lifecycle.owner);
     }
   }
 
@@ -747,11 +920,12 @@ export class PluginLoader extends EventEmitter<{
     // Snapshot old plugin for rollback
     const snapshot = { ...oldPlugin };
     const oldSchemaContract = this.pluginSchemaContracts.get(pluginId);
+    const oldProofProvenance = this.workflowExtensionProofProvenance.get(pluginId);
 
     try {
       // Re-import the plugin module
-      const mod = await this.importPluginModule(pluginPath, true);
-      const newPlugin = this.extractPluginFromModule(mod);
+      const imported = await this.importPluginModule(pluginPath, true);
+      const newPlugin = this.extractPluginFromModule(imported.module);
 
       // Validate manifest
       const manifestValidation = validatePluginManifest(newPlugin.manifest);
@@ -761,6 +935,13 @@ export class PluginLoader extends EventEmitter<{
         );
       }
 
+      const proofProvenance = await this.derivePluginProofProvenance(
+        pluginId,
+        pluginPath,
+        newPlugin,
+        imported.sourceSha256,
+      );
+
       // Update plugin state
       const schemaContract = this.options.taskStore.preflightPluginSchema(pluginId, newPlugin.hooks);
       if (schemaContract) await this.options.taskStore.runPluginSchemaInits([schemaContract]);
@@ -769,6 +950,7 @@ export class PluginLoader extends EventEmitter<{
       // Replace in plugins map
       this.plugins.set(pluginId, newPlugin);
       this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      this.setWorkflowExtensionProofProvenance(pluginId, proofProvenance);
       if (schemaContract) this.pluginSchemaContracts.set(pluginId, schemaContract);
       else this.pluginSchemaContracts.delete(pluginId);
 
@@ -798,6 +980,7 @@ export class PluginLoader extends EventEmitter<{
         // Restore old plugin
         this.plugins.set(pluginId, snapshot);
         this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+        this.setWorkflowExtensionProofProvenance(pluginId, oldProofProvenance);
         if (oldSchemaContract) this.pluginSchemaContracts.set(pluginId, oldSchemaContract);
         else this.pluginSchemaContracts.delete(pluginId);
 
@@ -823,6 +1006,7 @@ export class PluginLoader extends EventEmitter<{
         this.plugins.delete(pluginId);
         this.pluginRoots.delete(pluginId);
         this.pluginSchemaContracts.delete(pluginId);
+        this.workflowExtensionProofProvenance.delete(pluginId);
 
         const originalError = err instanceof Error ? err.message : String(err);
         const rollbackError = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
@@ -1075,6 +1259,7 @@ export class PluginLoader extends EventEmitter<{
     this.plugins.delete(pluginId);
     this.pluginRoots.delete(pluginId);
     this.pluginSchemaContracts.delete(pluginId);
+    this.workflowExtensionProofProvenance.delete(pluginId);
     this.invalidateModuleCache(pluginPath);
   }
 
@@ -1565,12 +1750,27 @@ export class PluginLoader extends EventEmitter<{
   /**
    * Get all workflow extension contributions from loaded plugins.
    */
-  getPluginWorkflowExtensions(): Array<{ pluginId: string; extension: WorkflowExtensionContribution }> {
-    const extensions: Array<{ pluginId: string; extension: WorkflowExtensionContribution }> = [];
+  getPluginWorkflowExtensions(): Array<{
+    pluginId: string;
+    extension: WorkflowExtensionContribution;
+    hostProvenance?: WorkflowExtensionHostProvenance;
+  }> {
+    const extensions: Array<{
+      pluginId: string;
+      extension: WorkflowExtensionContribution;
+      hostProvenance?: WorkflowExtensionHostProvenance;
+    }> = [];
     for (const [pluginId, plugin] of this.plugins) {
       if (plugin.workflowExtensions) {
         for (const extension of plugin.workflowExtensions) {
-          extensions.push({ pluginId, extension });
+          const hostProvenance = extension.kind === "proof-admission"
+            ? this.workflowExtensionProofProvenance.get(pluginId)
+            : undefined;
+          extensions.push({
+            pluginId,
+            extension,
+            ...(hostProvenance ? { hostProvenance } : {}),
+          });
         }
       }
     }

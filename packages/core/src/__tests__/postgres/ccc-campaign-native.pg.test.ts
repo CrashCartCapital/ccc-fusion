@@ -13,6 +13,7 @@ import { mkdir, realpath, symlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { importCccPrdBundle, reconcileCccPrdImport } from "../../index.js";
 import * as campaignCanonical from "../../ccc-campaign/canonical.js";
+import type { CccCampaignTaskContext } from "../../ccc-campaign/index.js";
 import { canonicalCccPrdJson } from "../../ccc-prd/contract.js";
 import { TaskStore } from "../../store.js";
 import {
@@ -39,30 +40,7 @@ type ExecutionPolicy = Readonly<{
   routes: readonly ExecutionRoute[];
 }>;
 
-type CampaignContext = Readonly<{
-  schema: "ccc-campaign.context.v1";
-  projectId: string;
-  importId: string;
-  idempotencyKey: string;
-  campaignId: string;
-  taskId: string;
-  packetHash: string;
-  sidecarHash: string;
-  bundleHash: string;
-  manifestHash: string;
-  sourceVersion: string;
-  targetRepository: { path: string; baseCommit: string };
-  bounds: { maxRequests: number; maxDurationMs: number; maxConcurrency: number };
-  admittedWriteRoots: readonly { path: string; purpose: string }[];
-  proofs: CccPrdSemanticBundle["proofs"];
-  protectedActions: readonly unknown[];
-  executionPolicy: ExecutionPolicy;
-  route: ExecutionRoute;
-  campaignStartedAt: string;
-  campaignDeadlineAt: string;
-  requestCount: number;
-  activeActionLeases: Readonly<Record<string, unknown>>;
-}>;
+type CampaignContext = Readonly<CccCampaignTaskContext>;
 
 type CampaignContextStore = {
   getCccCampaignContextForTask(taskId: string): Promise<CampaignContext | null>;
@@ -70,6 +48,13 @@ type CampaignContextStore = {
     tx: DbTransaction,
     taskId: string,
   ): Promise<CampaignContext | null>;
+  assertCccCampaignWorkflowLeaseFence(input: {
+    workItemId: string;
+    originTaskId: string;
+    leaseOwner: string;
+    attempt: number;
+    runId: string;
+  }): Promise<void>;
   claimCccCampaignActionLease(
     taskId: string,
     action: { actionId: string; actionTarget: string },
@@ -234,6 +219,92 @@ pgTest("CCC campaign native persistence", () => {
       .getCccCampaignContextForTask(`TASK-${suffix}`);
     expect(context).not.toBeNull();
     return context!;
+  }
+
+  it("Task 3 RED: read-only workflow lease preflight validates every fence field with database time", async () => {
+    const context = await importContext("workflow-fence-preflight");
+    const store = h.store() as unknown as CampaignContextStore;
+    const [workItem] = await h.store().listWorkflowWorkItemsForTask(context.taskId, { kinds: ["task"] });
+    expect(workItem).toBeDefined();
+    const leaseOwner = "workflow-fence-worker";
+    const attempt = 3;
+    await h.store().transitionWorkflowWorkItem(workItem!.id, "running", {
+      attempt,
+      leaseOwner,
+      leaseExpiresAt: "2999-07-25T12:00:00.000Z",
+    });
+    const input = {
+      workItemId: workItem!.id,
+      originTaskId: context.taskId,
+      leaseOwner,
+      attempt,
+      runId: workItem!.runId,
+    };
+    const proofAuditCount = async () => h.layer().db.execute(sql`
+      SELECT count(*)::int AS count
+      FROM project.run_audit_events
+      WHERE mutation_type = 'ccc-campaign:proof-admission'
+    `) as Promise<Array<{ count: number }>>;
+    const before = await proofAuditCount();
+
+    await expect(store.assertCccCampaignWorkflowLeaseFence(input)).resolves.toBeUndefined();
+    for (const changed of [
+      { ...input, workItemId: `${input.workItemId}-wrong` },
+      { ...input, originTaskId: `${input.originTaskId}-wrong` },
+      { ...input, runId: `${input.runId}-wrong` },
+      { ...input, leaseOwner: `${input.leaseOwner}-wrong` },
+      { ...input, attempt: input.attempt + 1 },
+      { ...input, workItemId: ` ${input.workItemId}` },
+      { ...input, attempt: 0 },
+    ]) {
+      await expect(store.assertCccCampaignWorkflowLeaseFence(changed))
+        .rejects.toMatchObject({ code: "CCC_CAMPAIGN_WORKFLOW_LEASE_REFUSED" });
+    }
+
+    await h.layer().db.execute(sql`
+      UPDATE project.workflow_work_items SET state = 'held' WHERE id = ${input.workItemId}
+    `);
+    await expect(store.assertCccCampaignWorkflowLeaseFence(input))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_WORKFLOW_LEASE_REFUSED" });
+    await h.layer().db.execute(sql`
+      UPDATE project.workflow_work_items
+      SET state = 'running', lease_expires_at = NULL
+      WHERE id = ${input.workItemId}
+    `);
+    await expect(store.assertCccCampaignWorkflowLeaseFence(input))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_WORKFLOW_LEASE_REFUSED" });
+    await h.layer().db.execute(sql`
+      UPDATE project.workflow_work_items
+      SET lease_expires_at = '2000-01-01T00:00:00.000Z'
+      WHERE id = ${input.workItemId}
+    `);
+    await expect(store.assertCccCampaignWorkflowLeaseFence(input))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_WORKFLOW_LEASE_REFUSED" });
+
+    expect(await proofAuditCount()).toEqual(before);
+  });
+
+  async function mutateCanonicalBundleTask(
+    idempotencyKey: string,
+    semanticTaskId: string,
+    patchSql: ReturnType<typeof sql>,
+  ): Promise<void> {
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET canonical_bundle = jsonb_set(
+        canonical_bundle,
+        ARRAY[
+          'tasks',
+          (
+            SELECT (ordinality - 1)::text
+            FROM jsonb_array_elements(canonical_bundle->'tasks') WITH ORDINALITY AS task(value, ordinality)
+            WHERE task.value->>'id' = ${semanticTaskId}
+          )
+        ],
+        ${patchSql}
+      )
+      WHERE idempotency_key = ${idempotencyKey}
+    `);
   }
 
   function claimInput(
@@ -685,6 +756,8 @@ pgTest("CCC campaign native persistence", () => {
       idempotencyKey: "idem-context",
       campaignId: "CAMPAIGN-context",
       taskId: "TASK-context",
+      semanticTaskId: "TASK-context",
+      proofIds: ["PROOF-context"],
       packetHash: source.sourceHash,
       sidecarHash: source.sidecarHash,
       bundleHash: source.bundleHash,
@@ -718,6 +791,8 @@ pgTest("CCC campaign native persistence", () => {
     const executionPolicy = policyFor(source);
     await importCccPrdBundle(request(source, "idem-caller-metadata", executionPolicy));
     const callerMetadata = JSON.stringify({
+      bundleHash: source.bundleHash,
+      proofIds: source.tasks[0]!.proofIds,
       campaignId: "caller-asserted",
       providerId: "caller-asserted",
       modelId: "caller-asserted",
@@ -732,12 +807,68 @@ pgTest("CCC campaign native persistence", () => {
     const context = await restarted.getCccCampaignContextForTask("TASK-caller-metadata");
     expect(context).toMatchObject({
       campaignId: "CAMPAIGN-caller-metadata",
+      semanticTaskId: "TASK-caller-metadata",
+      proofIds: ["PROOF-caller-metadata"],
       executionPolicy,
       route: routesFor(source)[0],
     });
     expect(context).not.toMatchObject({
       campaignId: "caller-asserted",
       route: { providerId: "caller-asserted", modelId: "caller-asserted" },
+    });
+  });
+
+  it("refuses a canonical bundle task proof-id mutation that is not rehashed", async () => {
+    const source = bundle(h.rootDir(), "bundle-proof-drift");
+    await importCccPrdBundle(
+      request(source, "idem-bundle-proof-drift", policyFor(source)),
+    );
+    await mutateCanonicalBundleTask(
+      "idem-bundle-proof-drift",
+      "TASK-bundle-proof-drift",
+      sql`${JSON.stringify({
+        ...source.tasks[0]!,
+        proofIds: ["PROOF-bundle-proof-drift-mutated"],
+      })}::jsonb`,
+    );
+
+    const restarted = new TaskStore(
+      h.rootDir(),
+      undefined,
+      { asyncLayer: h.layer() },
+    ) as unknown as CampaignContextStore;
+    await expect(
+      restarted.getCccCampaignContextForTask("TASK-bundle-proof-drift"),
+    ).rejects.toMatchObject({
+      name: "CccCampaignContextError",
+      code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
+    });
+  });
+
+  it.each([
+    ["proof IDs", "native-metadata-proof-drift", { proofIds: ["PROOF-native-metadata-proof-drift-mutated"] }],
+    ["bundle hash", "native-metadata-hash-drift", { bundleHash: "0".repeat(64) }],
+  ] as const)("refuses native task source metadata drift in %s", async (_kind, suffix, patch) => {
+    const source = bundle(h.rootDir(), suffix);
+    await importCccPrdBundle(
+      request(source, `idem-${suffix}`, policyFor(source)),
+    );
+    await h.layer().db.execute(sql`
+      UPDATE project.tasks
+      SET source_metadata = source_metadata || ${JSON.stringify(patch)}::jsonb
+      WHERE id = ${`TASK-${suffix}`}
+    `);
+
+    const restarted = new TaskStore(
+      h.rootDir(),
+      undefined,
+      { asyncLayer: h.layer() },
+    ) as unknown as CampaignContextStore;
+    await expect(
+      restarted.getCccCampaignContextForTask(`TASK-${suffix}`),
+    ).rejects.toMatchObject({
+      name: "CccCampaignContextError",
+      code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
     });
   });
 

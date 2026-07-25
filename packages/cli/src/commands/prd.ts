@@ -16,8 +16,10 @@ import {
   type CccPrdAuthoringConstraints,
   type CccPrdAuthoringProposal,
   type CccPrdSidecar,
+  type WorkflowExtensionRegistry,
 } from "@fusion/core";
 import * as engine from "@fusion/engine";
+import { bootstrapCccCampaignProofAdmissionHost } from "./ccc-native-proof-host.js";
 
 export type PrdCommandIo = {
   write(line: string): void;
@@ -30,6 +32,7 @@ type Compiler = {
     adapter: CccPrdAuthoringAdapter;
     constraints?: CccPrdAuthoringConstraints;
     previousSidecar?: CccPrdSidecar;
+    workflowExtensionRegistry?: WorkflowExtensionRegistry;
   }): Promise<{ kind: "candidate"; sidecar: unknown; review: unknown } | { kind: "refusal" }>;
   createNativeCccPrdAuthoringAdapter(input: {
     provider: string;
@@ -55,6 +58,9 @@ type Compiler = {
 };
 
 const compiler = engine as typeof engine & Compiler;
+export type PrdCommandDependencies = {
+  bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
+};
 const usage = [
   "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
@@ -295,6 +301,7 @@ function writeSidecarAtomically(
 async function runGeneratedAuthor(
   input: GeneratedAuthorArgs,
   io: PrdCommandIo,
+  bootstrapProofAdmission: () => Promise<WorkflowExtensionRegistry>,
 ): Promise<number> {
   let outputPath: string;
   let previousSidecar: CccPrdSidecar | undefined;
@@ -339,12 +346,29 @@ async function runGeneratedAuthor(
     return 1;
   }
 
+  let workflowExtensionRegistry: WorkflowExtensionRegistry;
+  try {
+    workflowExtensionRegistry = await bootstrapProofAdmission();
+  } catch (error) {
+    io.write(JSON.stringify({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_PROOF_ADMISSION_BOOTSTRAP_FAILED",
+        message: error instanceof Error
+          ? error.message
+          : "fixed proof-admission host could not be bootstrapped",
+      }],
+    }));
+    return 1;
+  }
+
   const result = await compiler.authorCccPrdPacket({
     rootDir: input.rootDir,
     manifestPath: input.manifestPath,
     adapter,
     constraints: input.constraints,
     ...(previousSidecar ? { previousSidecar } : {}),
+    workflowExtensionRegistry,
   });
   if (result.kind === "refusal") {
     io.write(JSON.stringify(result));
@@ -379,6 +403,7 @@ async function runGeneratedAuthor(
 export async function runPrdCommand(
   args: string[],
   io: PrdCommandIo = { write: (line) => console.log(line) },
+  dependencies: PrdCommandDependencies = {},
 ): Promise<number> {
   const [subcommand, rootDir, manifestPath, inputPath, fifth, sixth] = args;
   const author = subcommand === "author";
@@ -403,7 +428,11 @@ export async function runPrdCommand(
   }
 
   if (generatedAuthor) {
-    return runGeneratedAuthor(generatedAuthor, io);
+    return runGeneratedAuthor(
+      generatedAuthor,
+      io,
+      dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost,
+    );
   }
 
   if (author) {
@@ -420,6 +449,23 @@ export async function runPrdCommand(
       }));
       return 1;
     }
+    let workflowExtensionRegistry: WorkflowExtensionRegistry;
+    try {
+      workflowExtensionRegistry = await (
+        dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost
+      )();
+    } catch (error) {
+      io.write(JSON.stringify({
+        kind: "refusal",
+        diagnostics: [{
+          code: "CCC_PRD_PROOF_ADMISSION_BOOTSTRAP_FAILED",
+          message: error instanceof Error
+            ? error.message
+            : "fixed proof-admission host could not be bootstrapped",
+        }],
+      }));
+      return 1;
+    }
     const result = await compiler.authorCccPrdPacket({
       rootDir,
       manifestPath,
@@ -428,6 +474,7 @@ export async function runPrdCommand(
         model: "proposal-file-v1",
         generateCandidate: async () => proposal,
       },
+      workflowExtensionRegistry,
     });
     if (result.kind === "refusal") {
       io.write(JSON.stringify(result));

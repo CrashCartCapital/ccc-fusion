@@ -11,6 +11,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import * as engine from "@fusion/engine";
+import {
+  WorkflowExtensionRegistry,
+  deriveWorkflowExtensionHostProvenance,
+} from "@fusion/core";
+import {
+  CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+} from "../ccc-campaign-proof-admission.js";
 
 const ccc = engine as typeof engine & {
   authorCccPrdPacket(input: {
@@ -214,6 +222,18 @@ function proposal() {
 }
 
 async function author(input: ReturnType<typeof packet>) {
+  const workflowExtensionRegistry = new WorkflowExtensionRegistry();
+  workflowExtensionRegistry.register(
+    CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+    CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+    await deriveWorkflowExtensionHostProvenance({
+      pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+      pluginVersion: "1.0.0",
+      trustedRootPath: input.root,
+      entryRelativePath: "source.md",
+      manifestRelativePath: input.manifestPath.slice(input.root.length + 1),
+    }),
+  );
   let request: unknown;
   const result = await ccc.authorCccPrdPacket({
     rootDir: input.root,
@@ -226,6 +246,7 @@ async function author(input: ReturnType<typeof packet>) {
         return proposal();
       },
     },
+    workflowExtensionRegistry,
   });
   expect(result.kind, JSON.stringify(result)).toBe("candidate");
   expect(request).toMatchObject({
@@ -262,6 +283,9 @@ describe("ccc-prd structural sidecar", () => {
     };
     expect(compiled.kind, JSON.stringify(compiled)).toBe("bundle");
     expect(compiled.requirements.map((item) => item.id)).toEqual(["REQ-1", "REQ-2"]);
+    expect((compiled.proofs as Array<{ admission?: unknown }>)[0]?.admission).toEqual(
+      (authored.sidecar.proofs as Array<{ admission?: unknown }>)[0]?.admission,
+    );
     expect(compiled.requirements[0].spans[0]).toMatchObject({
       byteStart: Buffer.byteLength(source.slice(0, source.indexOf("first requirement")), "utf8"),
       byteEnd: Buffer.byteLength(source.slice(0, source.indexOf("first requirement") + "first requirement".length), "utf8"),
@@ -280,6 +304,88 @@ describe("ccc-prd structural sidecar", () => {
       expect(compiled[collection], collection).toBeInstanceOf(Array);
       expect((compiled[collection] as unknown[]).length, collection).toBeGreaterThan(0);
     }
+  });
+
+  it.each([
+    ["wrong schema", (admission: Record<string, unknown>) => {
+      admission.schema = "ccc-prd.proof-admission.v0";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["blank fixed identity", (admission: Record<string, unknown>) => {
+      admission.pluginId = "";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["malformed source hash", (admission: Record<string, unknown>) => {
+      admission.extensionSourceSha256 = "not-a-hash";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["parent-relative source path", (admission: Record<string, unknown>) => {
+      admission.extensionRootRelativeSource = "../foreign.js";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["absolute source path", (admission: Record<string, unknown>) => {
+      admission.extensionRootRelativeSource = "/tmp/foreign.js";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["backslash traversal source path", (admission: Record<string, unknown>) => {
+      admission.extensionRootRelativeSource = "..\\foreign.js";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["file URL source path", (admission: Record<string, unknown>) => {
+      admission.extensionRootRelativeSource = "file:///tmp/foreign.js";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["uppercase file URL source path", (admission: Record<string, unknown>) => {
+      admission.extensionRootRelativeSource = "FiLe:foreign.js";
+    }, "CCC_PRD_PROOF_ADMISSION_INVALID"],
+    ["stale definition hash", (admission: Record<string, unknown>) => {
+      admission.definitionSha256 = "0".repeat(64);
+    }, "CCC_PRD_PROOF_ADMISSION_STALE"],
+  ] as const)("refuses a proof admission with %s", async (_label, mutate, expectedCode) => {
+    const input = packet();
+    const authored = await author(input);
+    const sidecar = structuredClone(authored.sidecar) as Record<string, any>;
+    mutate(sidecar.proofs[0].admission);
+    writeFileSync(authored.sidecarPath, JSON.stringify(sidecar));
+    const compileInput = {
+      ...input,
+      sidecarPath: authored.sidecarPath,
+      expectedTarget: target,
+      expectedBase: base,
+    };
+
+    const validation = ccc.validateCccPrdPacket(compileInput) as {
+      valid: boolean;
+      diagnostics: Array<{ code: string }>;
+    };
+    const compiled = ccc.compileCccPrdPacket(compileInput) as {
+      kind: string;
+      diagnostics: Array<{ code: string }>;
+    };
+    expect(validation.valid).toBe(false);
+    expect(validation.diagnostics).toContainEqual(expect.objectContaining({ code: expectedCode }));
+    expect(compiled.kind).toBe("refusal");
+    expect(compiled.diagnostics).toContainEqual(expect.objectContaining({ code: expectedCode }));
+  });
+
+  it("accepts and compiles a legacy sidecar whose proofs omit admission", async () => {
+    const input = packet();
+    const authored = await author(input);
+    const sidecar = structuredClone(authored.sidecar) as Record<string, any>;
+    for (const proof of sidecar.proofs) delete proof.admission;
+    writeFileSync(authored.sidecarPath, JSON.stringify(sidecar));
+    const compileInput = {
+      ...input,
+      sidecarPath: authored.sidecarPath,
+      expectedTarget: target,
+      expectedBase: base,
+    };
+
+    expect(ccc.validateCccPrdPacket(compileInput)).toEqual({
+      kind: "validation",
+      valid: true,
+      diagnostics: [],
+    });
+    expect(ccc.compileCccPrdPacket(compileInput)).toMatchObject({
+      kind: "bundle",
+      proofs: [
+        expect.not.objectContaining({ admission: expect.anything() }),
+        expect.not.objectContaining({ admission: expect.anything() }),
+      ],
+    });
   });
 
   it.each([

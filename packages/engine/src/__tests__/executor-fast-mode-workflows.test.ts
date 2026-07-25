@@ -12,6 +12,12 @@ import { TaskExecutor } from "../executor.js";
 import { WorkflowGraphTaskRunner } from "../workflow-graph-task-runner.js";
 import { FOREACH_ACTIVE_CONTEXT_KEY } from "../workflow-node-handlers.js";
 import {
+  AgentSemaphore,
+  clearPreHeldExecutorSlotsForTests,
+  hasPreHeldExecutorSlot,
+  registerPreHeldExecutorSlot,
+} from "../concurrency.js";
+import {
   createMockStore,
   mockedCreateFnAgent,
   mockedExistsSync,
@@ -70,7 +76,107 @@ function workflowResult() {
 describe("fast mode workflow/runtime invariants", () => {
   beforeEach(() => {
     resetExecutorMocks();
+    clearPreHeldExecutorSlotsForTests();
     mockedExistsSync.mockReturnValue(true);
+  });
+
+  it.each(["persisted context", "imported marker"])("Task 3 RED: public execute refuses %s before dependency and ephemeral side effects", async (caseName) => {
+    const liveTask = task({
+      dependencies: ["FN-BLOCKER"],
+      ...(caseName === "imported marker"
+        ? { lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1" }
+        : {}),
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(liveTask);
+    store.getSettings.mockResolvedValue({ ephemeralAgentsEnabled: false });
+    store.listTasks.mockResolvedValue([
+      liveTask,
+      task({ id: "FN-BLOCKER", column: "todo" }),
+    ]);
+    store.getCccCampaignContextForTask = vi.fn(async () => caseName === "persisted context"
+      ? { campaignId: "CAMPAIGN-1" }
+      : null);
+    const semaphore = new AgentSemaphore(1);
+    expect(semaphore.tryAcquire()).toBe(true);
+    registerPreHeldExecutorSlot(liveTask.id);
+    const executor = new TaskExecutor(store as any, "/tmp/test", { semaphore });
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await executor.execute(liveTask as any);
+
+      expect(store.listTasks).not.toHaveBeenCalled();
+      expect(store.getSettings).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(store.updateTask).not.toHaveBeenCalled();
+      expect(store.logEntry).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(hasPreHeldExecutorSlot(liveTask.id)).toBe(false);
+      expect(semaphore.activeCount).toBe(0);
+      expect((executor as any).graphRouting.has(liveTask.id)).toBe(false);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: public execute releases custody refusal so a later ordinary redispatch can proceed", async () => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn()
+      .mockResolvedValueOnce({ campaignId: "CAMPAIGN-1" })
+      .mockResolvedValue(null);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "completed",
+      outcome: "success",
+      visitedNodeIds: ["start"],
+    });
+
+    try {
+      await executor.execute(liveTask as any);
+      expect(run).not.toHaveBeenCalled();
+      expect((executor as any).graphRouting.has(liveTask.id)).toBe(false);
+
+      await executor.execute(liveTask as any);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect((executor as any).graphRouting.has(liveTask.id)).toBe(false);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: a final custody recheck closes the continuation transition race", async () => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ campaignId: "CAMPAIGN-1" });
+    const continuation = {
+      id: "WORK-ORDINARY-1",
+      taskId: liveTask.id,
+      kind: "task",
+      state: "runnable",
+      attempt: 1,
+      runId: "ordinary-run",
+      stableWorkflowRunId: "ordinary-run",
+      irHash: "a".repeat(64),
+    };
+    store.listWorkflowWorkItemsForTask = vi.fn(async () => [continuation]);
+    store.transitionWorkflowWorkItem = vi.fn(async () => continuation);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await executor.execute(liveTask as any);
+
+      expect(store.getCccCampaignContextForTask).toHaveBeenCalledTimes(3);
+      expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
   });
 
   /*
@@ -112,6 +218,94 @@ describe("fast mode workflow/runtime invariants", () => {
       expect(run).toHaveBeenCalledTimes(1);
     } finally {
       // Prototype spy: restore even on failure so it cannot leak into sibling runner tests.
+      run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: the generic executor defers persisted CCC campaign custody before settings or graph effects", async () => {
+    const liveTask = task({ lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1" });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({ campaignId: "CAMPAIGN-1" }));
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask, { alreadyClaimed: true });
+
+      expect(store.getCccCampaignContextForTask).toHaveBeenCalledWith(liveTask.id);
+      expect(store.getSettings).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: an imported campaign work item is left runnable for the native processor", async () => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn(async () => null);
+    const importedWorkItem = {
+      id: "WI-CCC-1",
+      taskId: liveTask.id,
+      kind: "task",
+      state: "runnable",
+      attempt: 1,
+      runId: "ccc-prd:import-1",
+      stableWorkflowRunId: "ccc-prd:import-1",
+      irHash: "a".repeat(64),
+    };
+    store.listWorkflowWorkItemsForTask = vi.fn(async () => [importedWorkItem]);
+    store.transitionWorkflowWorkItem = vi.fn(async () => importedWorkItem);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it.each([
+    ["unwired", undefined],
+    ["missing", async () => null],
+    ["error", async () => { throw new Error("custody unavailable"); }],
+  ])("Task 3: imported task %s custody defers generic execution", async (_case, getCccCampaignContextForTask) => {
+    const liveTask = task({ lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1" });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    if (getCccCampaignContextForTask) store.getCccCampaignContextForTask = vi.fn(getCccCampaignContextForTask);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.getSettings).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it.each([
+    ["missing", async () => null],
+    ["error", async () => { throw new Error("custody unavailable"); }],
+  ])("Task 3: ordinary task %s custody preserves generic execution", async (_case, getCccCampaignContextForTask) => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn(getCccCampaignContextForTask);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "completed",
+      outcome: "success",
+      visitedNodeIds: ["start"],
+    });
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.getSettings).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally {
       run.mockRestore();
     }
   });

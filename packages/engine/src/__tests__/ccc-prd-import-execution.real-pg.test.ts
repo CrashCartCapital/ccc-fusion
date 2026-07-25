@@ -1,24 +1,49 @@
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, it, vi } from "vitest";
-import { importCccPrdBundle } from "@fusion/core";
+import {
+  CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  WORKFLOW_EXTENSION_SCHEMA_VERSION,
+  __resetWorkflowExtensionRegistryForTests,
+  computeCccPrdProofDefinitionSha256,
+  deriveWorkflowExtensionHostProvenance,
+  getWorkflowExtensionHostProvenanceBinding,
+  getWorkflowExtensionRegistry,
+  importCccPrdBundle,
+  reconcileCccPrdImport,
+  type CccPrdProof,
+} from "@fusion/core";
 import {
   createCccPrdImportTestExecutionPolicy,
   createCccPrdImportTestBundle,
+  rehashCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import {
   createTaskStoreForTest,
   pgDescribe,
 } from "../../../core/src/__test-utils__/pg-test-harness.js";
+import {
+  CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+  evaluateCccCampaignProofAdmission,
+} from "../ccc-campaign-proof-admission.js";
 import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
+import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
 
 pgDescribe("CCC PRD imported workflow execution", () => {
-  it("claims and executes the imported runnable item through the normal engine path", async () => {
+  it("claims the imported runnable item through the fenced full-graph processor", async () => {
     const harness = await createTaskStoreForTest({
       prefix: "fusion_ccc_prd_execute",
       copyFromGolden: true,
     });
+    const proofRoot = await mkdtemp(join(tmpdir(), "fusion-ccc-proof-host-"));
     try {
       const suffix = "engine-execution";
-      const semanticBundle = createCccPrdImportTestBundle(harness.rootDir, suffix);
+      const semanticBundle = await admittedBundle(harness.rootDir, suffix, proofRoot);
       await importCccPrdBundle({
         bundle: semanticBundle,
         executionPolicy: createCccPrdImportTestExecutionPolicy(semanticBundle),
@@ -27,35 +52,129 @@ pgDescribe("CCC PRD imported workflow execution", () => {
         layer: harness.layer,
         rootDir: harness.rootDir,
       });
-      const handler = vi.fn(async () => ({ outcome: "success" as const }));
+      await reconcileCccPrdImport({
+        idempotencyKey: "idem-engine-execution",
+        store: harness.store,
+        layer: harness.layer,
+        rootDir: harness.rootDir,
+      });
+      expect(await harness.store.listDueWorkflowWorkItems({ kinds: ["task"] })).toEqual([
+        expect.objectContaining({ id: `WORK-${suffix}`, state: "runnable" }),
+      ]);
+      const handler = vi.fn(async (node: { id: string }) => ({
+        outcome: "success" as const,
+        context: { [`handled:${node.id}`]: true },
+      }));
       const runtime = new WorkflowTaskRuntime({
         store: harness.store,
         primitives: {} as never,
         runCustomNode: async () => ({ outcome: "success" }),
         handlers: { prompt: handler },
       });
-
-      const claimed = await harness.store.acquireWorkflowWorkItemLease(
-        `WORK-${suffix}`,
-        "ccc-prd-test-processor",
-        { leaseDurationMs: 60_000 },
-      );
-      expect(claimed).not.toBeNull();
-      const result = await runtime.runWorkItem(claimed!, {});
-      const durable = await harness.store.getWorkflowWorkItem(`WORK-${suffix}`);
-
-      expect(result.reason).toBeUndefined();
-      expect(result).toMatchObject({
-        disposition: "completed",
-        outcome: "success",
+      const directRunWorkItem = vi.spyOn(runtime, "runWorkItem");
+      // The imported fixture has no separately admitted Mission lineage. Keep
+      // the real TaskStore persistence seam, while taking the scheduler's
+      // documented non-mission fallback rather than testing Mission policy here.
+      const processorStore = Object.assign(Object.create(harness.store), {
+        getMissionStore: undefined,
+        acquireSymbolLocks: undefined,
       });
-      expect(handler).toHaveBeenCalledTimes(1);
+      const processed = await processDueWorkflowWorkItem(processorStore, runtime, {}, {
+        leaseOwner: "ccc-prd-test-processor",
+        leaseDurationMs: 60_000,
+        kinds: ["task"],
+      });
+      const durable = await harness.store.getWorkflowWorkItem(`WORK-${suffix}`);
+      const audits = await harness.store.getRunAuditEventsAsync({
+        mutationType: "ccc-campaign:proof-admission",
+        limit: 20,
+      });
+
+      expect(processed.runtime?.reason).toBeUndefined();
+      expect(processed).toMatchObject({
+        claimed: true,
+        workItemId: `WORK-${suffix}`,
+        taskId: `TASK-${suffix}`,
+        runtime: {
+          disposition: "completed",
+          outcome: "success",
+        },
+      });
+      expect(directRunWorkItem).not.toHaveBeenCalled();
+      expect(processed.runtime?.visitedNodeIds).toEqual([
+        "start",
+        cccTaskNodeId(`TASK-${suffix}`),
+        cccTaskNodeId(`TASK-terminal-${suffix}`),
+      ]);
+      expect(handler.mock.calls.map(([node]) => node.id)).toEqual([
+        cccTaskNodeId(`TASK-${suffix}`),
+        cccTaskNodeId(`TASK-terminal-${suffix}`),
+      ]);
       expect(durable).toMatchObject({
         state: "succeeded",
         taskId: `TASK-${suffix}`,
       });
+      expect(audits).toHaveLength(2);
+      expect(audits.map((event) => event.campaign?.binding.taskId)).toEqual([
+        `TASK-${suffix}`,
+        `TASK-terminal-${suffix}`,
+      ]);
     } finally {
+      __resetWorkflowExtensionRegistryForTests();
+      await rm(proofRoot, { recursive: true, force: true });
       await harness.teardown();
     }
   });
 });
+
+async function admittedBundle(targetRoot: string, suffix: string, proofRoot: string) {
+  const source = createCccPrdImportTestBundle(targetRoot, suffix);
+  await mkdir(join(proofRoot, "dist"), { recursive: true });
+  await writeFile(join(proofRoot, "dist", "proof.mjs"), "export const proof = true;\n");
+  await writeFile(
+    join(proofRoot, "plugin.json"),
+    `${JSON.stringify({ id: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID, version: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION })}\n`,
+  );
+  const provenance = await deriveWorkflowExtensionHostProvenance({
+    pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+    pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+    trustedRootPath: proofRoot,
+    entryRelativePath: "dist/proof.mjs",
+    manifestRelativePath: "plugin.json",
+  });
+  const binding = getWorkflowExtensionHostProvenanceBinding(provenance);
+  const definition = source.proofs[0]!;
+  const proof: CccPrdProof = {
+    ...definition,
+    admission: {
+      schema: CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+      pluginId: binding.pluginId,
+      pluginVersion: binding.pluginVersion,
+      extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+      proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+      extensionRootRelativeSource: binding.extensionRootRelativeSource,
+      extensionSourceSha256: binding.extensionSourceSha256,
+      extensionManifestSha256: binding.extensionManifestSha256,
+      definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+    },
+  };
+  __resetWorkflowExtensionRegistryForTests();
+  getWorkflowExtensionRegistry().register(
+    CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+    {
+      extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+      name: "CCC proof admission",
+      kind: "proof-admission",
+      schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
+      fallback: "failClosed",
+      proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+      evaluate: evaluateCccCampaignProofAdmission,
+    },
+    provenance,
+  );
+  return rehashCccPrdImportTestBundle({ ...source, proofs: [proof] });
+}
+
+function cccTaskNodeId(taskId: string): string {
+  return `ccc-task-${createHash("sha256").update(taskId, "utf8").digest("hex").slice(0, 24)}`;
+}

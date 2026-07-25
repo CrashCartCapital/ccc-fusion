@@ -298,6 +298,23 @@ export {
   type WorkflowTaskRuntimeDisposition,
   type WorkflowTaskRuntimeResult,
 } from "./workflow-task-runtime.js";
+export {
+  CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID,
+  computeCccCampaignProofAdmissionInputSha256,
+  createCccCampaignProofAdmissionEvaluatorInput,
+  evaluateCccCampaignProofAdmission,
+} from "./ccc-campaign-proof-admission.js";
+export {
+  createCccCampaignProofNodeAdmission,
+  type CccCampaignProofNodeAdmission,
+  type CccCampaignProofWorkflowStore,
+  type CccCampaignProofWorkItemFence,
+  type CreateCccCampaignProofNodeAdmissionInput,
+} from "./ccc-campaign-proof-workflow.js";
 export { collectTaskEvaluationEvidence } from "./evaluator-evidence.js";
 export { Scheduler, type SchedulerOptions } from "./scheduler.js";
 export {

@@ -23,7 +23,7 @@
  *   These helpers are the async target the migrating store and the PostgreSQL
  *   integration tests consume.
  */
-import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import * as schema from "../postgres/schema/index.js";
 import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
@@ -48,6 +48,7 @@ const TERMINAL_WORKFLOW_WORK_ITEM_STATES: ReadonlySet<string> = new Set([
   "succeeded",
   "failed",
   "cancelled",
+  "exhausted",
 ]);
 
 const ACTIVE_TASK_CONTINUATION_STATES: WorkflowWorkItemState[] = [
@@ -322,7 +323,28 @@ export async function transitionWorkflowWorkItem(
       );
     }
 
-    await tx
+    const guards = [
+      eq(schema.project.workflowWorkItems.id, id),
+      or(
+        eq(schema.project.workflowWorkItems.state, state),
+        notInArray(schema.project.workflowWorkItems.state, [...TERMINAL_WORKFLOW_WORK_ITEM_STATES]),
+      ),
+    ];
+    if (patch.expectedState !== undefined) {
+      guards.push(eq(schema.project.workflowWorkItems.state, patch.expectedState));
+    }
+    if (patch.expectedLeaseOwner !== undefined) {
+      guards.push(
+        patch.expectedLeaseOwner === null
+          ? isNull(schema.project.workflowWorkItems.leaseOwner)
+          : eq(schema.project.workflowWorkItems.leaseOwner, patch.expectedLeaseOwner),
+      );
+    }
+    if (patch.expectedAttempt !== undefined) {
+      guards.push(eq(schema.project.workflowWorkItems.attempt, patch.expectedAttempt));
+    }
+
+    const updatedRows = await tx
       .update(schema.project.workflowWorkItems)
       .set({
         state,
@@ -335,15 +357,12 @@ export async function transitionWorkflowWorkItem(
         blockedReason: patch.blockedReason === undefined ? existing.blockedReason : patch.blockedReason,
         updatedAt: now,
       })
-      .where(eq(schema.project.workflowWorkItems.id, id));
-
-    const updatedRows = await tx
-      .select()
-      .from(schema.project.workflowWorkItems)
-      .where(eq(schema.project.workflowWorkItems.id, id))
-      .limit(1);
+      .where(and(...guards))
+      .returning();
     const updated = updatedRows[0] as WorkflowWorkItemRow | undefined;
-    if (!updated) throw new Error(`Workflow work item ${id} disappeared`);
+    if (updatedRows.length !== 1 || !updated) {
+      throw new Error(`Workflow work item ${id} transition precondition failed`);
+    }
 
     // Run-audit event inside the same transaction.
     await recordRunAuditEventWithinTransaction(tx, {

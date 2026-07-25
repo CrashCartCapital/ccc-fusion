@@ -1,5 +1,19 @@
-import { describe, expect, it } from "vitest";
+import {
+  WorkflowExtensionRegistry,
+  deriveWorkflowExtensionHostProvenance,
+} from "@fusion/core";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+} from "../../../../engine/src/ccc-campaign-proof-admission.js";
 import { runPrdCommand } from "../prd.js";
+import {
+  cleanupPacketRoots,
+  createPacketRoot,
+} from "./prd-built-cli-fixture.js";
+
+afterEach(cleanupPacketRoots);
 
 describe("prd command exit contract", () => {
   it("returns usage exit 2 before any compiler or filesystem work", async () => {
@@ -12,5 +26,32 @@ describe("prd command exit contract", () => {
         "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
       ].join("\n"),
     ]);
+  });
+
+  it("bootstraps the fixed native proof host before compatibility authoring", async () => {
+    const packet = createPacketRoot();
+    const registry = new WorkflowExtensionRegistry();
+    registry.register(
+      CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+      CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+      await deriveWorkflowExtensionHostProvenance({
+        pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+        pluginVersion: "1.0.0",
+        trustedRootPath: packet.root,
+        entryRelativePath: "packet.md",
+        manifestRelativePath: "manifest.json",
+      }),
+    );
+    const bootstrapProofAdmission = vi.fn(async () => registry);
+    const output: string[] = [];
+
+    const exit = await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: (line) => output.push(line) },
+      { bootstrapProofAdmission },
+    );
+
+    expect(exit, output.join("\n")).toBe(0);
+    expect(bootstrapProofAdmission).toHaveBeenCalledTimes(1);
   });
 });
