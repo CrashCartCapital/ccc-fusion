@@ -1137,12 +1137,11 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
     let releaseStart!: () => void;
     const delayedStart = new Promise<void>((resolve) => { releaseStart = resolve; });
-    let resolveLateStop!: () => void;
-    const lateStop = new Promise<void>((resolve) => { resolveLateStop = resolve; });
     const running = { value: false };
+    let stopCalls = 0;
     const stop = vi.fn(async () => {
+      stopCalls += 1;
       running.value = false;
-      resolveLateStop();
     });
 
     class DelayedEmbeddedPostgres {
@@ -1150,7 +1149,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
       async start() {
         await delayedStart;
         running.value = true;
-        writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n0\n55439\n`);
+        writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n0\n55493\n`);
       }
       stop = stop;
       createDatabase = vi.fn(async () => {});
@@ -1167,7 +1166,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     const beforeExitListeners = process.listenerCount("beforeExit");
     const lifecycle = new EmbeddedPostgresLifecycle({
       ...baseOptions(dataDir),
-      port: 55439,
+      port: 55493,
       startTimeoutMs: 25,
     });
 
@@ -1175,16 +1174,58 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     const timeoutRejection = expect(start).rejects.toBeInstanceOf(EmbeddedStartTimeoutError);
     await vi.advanceTimersByTimeAsync(25);
     await timeoutRejection;
+    const stopCallsAtTimeout = stop.mock.calls.length;
     expect(running.value).toBe(false);
 
     releaseStart();
-    await lateStop;
+    await vi.advanceTimersByTimeAsync(0);
+    const stopCallsAfterLateStart = stop.mock.calls.length;
+    rmSync(dataDir, { recursive: true, force: true });
 
-    expect(stop).toHaveBeenCalledTimes(1);
+    expect(stopCallsAtTimeout).toBe(1);
+    expect(stopCallsAfterLateStart).toBe(2);
     expect(running.value).toBe(false);
     expect(lifecycle.isRunning()).toBe(false);
     expect(process.listenerCount("beforeExit")).toBe(beforeExitListeners);
-    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("Wave 4 RED: an actual owned start clears its stale PID after confirmed stop", async () => {
+    const dataDir = makeDataDir();
+    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    const stop = vi.fn(async () => {});
+    class OwnedEmbeddedPostgres {
+      initialise = vi.fn(async () => {});
+      async start() {
+        writeFileSync(join(dataDir, "postmaster.pid"), `43210\n${dataDir}\n0\n55494\n`);
+      }
+      stop = stop;
+    }
+
+    __setEmbeddedPostgresCtorForTests(OwnedEmbeddedPostgres as never);
+    const ensureDatabase = vi.spyOn(EmbeddedPostgresLifecycle.prototype, "ensureDatabase").mockResolvedValue(undefined);
+    const lifecycle = new EmbeddedPostgresLifecycle({
+      ...baseOptions(dataDir),
+      port: 55494,
+      installShutdownHooks: false,
+    });
+    const realKill = process.kill;
+    const kill = vi.fn();
+    try {
+      await lifecycle.start();
+      expect(lifecycle.getOwnsProcess()).toBe(true);
+
+      await lifecycle.stop();
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(lifecycle.getOwnsProcess()).toBe(false);
+
+      (process as unknown as { kill: typeof process.kill }).kill = kill as typeof process.kill;
+      await lifecycle.terminateOwnedPostmaster();
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+      ensureDatabase.mockRestore();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 

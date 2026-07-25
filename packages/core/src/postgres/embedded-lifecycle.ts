@@ -1225,6 +1225,13 @@ export class EmbeddedPostgresLifecycle {
   };
 
   private pg: EmbeddedPostgresInstance | null = null;
+  /*
+  FNXC:CccWave4PendingStart 2026-07-24-18:40:
+  Keep the exact launch handle while pg.start() is unresolved. A timeout is
+  still responsible for that handle even though ownership is not published
+  until postmaster.pid gives us an exact PID.
+  */
+  private pendingStart: EmbeddedPostgresInstance | null = null;
   private resolvedPort: number | undefined;
   private running = false;
   // FNXC:PostgresCutover 2026-06-27-11:10:
@@ -1371,7 +1378,7 @@ export class EmbeddedPostgresLifecycle {
    * tries to start its own EmbeddedPostgresLifecycle against the same dir.
    */
   async start(): Promise<ResolvedBackend> {
-    if (this.running) {
+    if (this.running || this.pendingStart) {
       throw new Error("EmbeddedPostgresLifecycle already running");
     }
 
@@ -1385,6 +1392,7 @@ export class EmbeddedPostgresLifecycle {
       this.resolvedPort = existing.port;
       this.running = false; // We didn't start it, so we won't stop it
       this.ownsProcess = false;
+      this.ownedPostmasterPid = null;
 
       // FNXC:PostgresStartupRace 2026-07-15-20:45: the owner may not have created the
       // database yet — it does so only after its own start() resolves, while the signals
@@ -1468,6 +1476,7 @@ export class EmbeddedPostgresLifecycle {
       onError: this.options.onError,
     });
     this.pg = pg;
+    this.pendingStart = pg;
 
     // FNXC:PostgresEmbedded 2026-06-24-09:06:
     // initialise() always runs initdb, which fails on an existing data dir.
@@ -1544,7 +1553,10 @@ export class EmbeddedPostgresLifecycle {
       // from inside this try, so without this guard a timeout-cancelled launch
       // that happens to see a postmaster.pid would publish a joined instance
       // instead of the EmbeddedStartCancelledError the post-start phases raise.
-      if (signal?.aborted) throw error;
+      if (signal?.aborted) {
+        await this.settleCancelledStart(pg);
+        throw new EmbeddedStartCancelledError(this.options.dataDir);
+      }
       /*
       FNXC:PostgresStartupRace 2026-07-15-21:10:
       Join ONLY on a lock collision — the one failure that proves our postgres refused to start
@@ -1574,9 +1586,11 @@ export class EmbeddedPostgresLifecycle {
         }
       }
       this.pg = null;
+      this.pendingStart = null;
       this.nonAdminHandle = null;
       this.resolvedPort = existing.port;
       this.ownsProcess = false;
+      this.ownedPostmasterPid = null;
       this.options.onLog(
         `embedded postgres: startup raced with an existing instance on port ${existing.port} (data dir ${this.options.dataDir}), connecting without starting a new instance`,
       );
@@ -1609,6 +1623,7 @@ export class EmbeddedPostgresLifecycle {
     this.ownedPostmasterPid = ownedPid;
     this.running = true;
     this.ownsProcess = true;
+    if (this.pendingStart === pg) this.pendingStart = null;
 
     // Register in the process-level map so other callers can detect us
     runningInstances.set(this.options.dataDir, {
@@ -1670,22 +1685,21 @@ export class EmbeddedPostgresLifecycle {
     this.recoveryInFlight = (async () => {
       this.options.onLog("embedded postgres: detected Windows DLL initialization shutdown; attempting one owned-cluster recovery");
       try {
-        if (this.nonAdminHandle) await this.nonAdminHandle.stop();
-        else await this.pg?.stop();
-        this.pg = null;
-        this.nonAdminHandle = null;
-        this.running = false;
-        runningInstances.delete(this.options.dataDir);
-        if (this.stopRequested || !this.ownsProcess) return;
         const recoveryPort = this.resolvedPort;
         if (recoveryPort === undefined) {
           throw new Error("embedded postgres: recovery lost its resolved port");
         }
+        const pg = this.pg;
+        if (!pg) {
+          throw new Error("embedded postgres: recovery lost its owned process handle");
+        }
+        const stopError = await this.stopExactOwnedProcess(pg, "Windows fatal recovery");
+        if (stopError) throw stopError;
+        this.clearStoppedOwnership();
+        if (this.stopRequested) return;
         await this.startBounded(recoveryPort);
         this.options.onLog("embedded postgres: Windows owned-cluster recovery completed; existing pools may reconnect");
       } catch (error) {
-        this.running = false;
-        runningInstances.delete(this.options.dataDir);
         this.options.onError(
           `embedded postgres: Windows DLL initialization recovery failed after one retry; restart Fusion and inspect the System log. ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -1696,31 +1710,42 @@ export class EmbeddedPostgresLifecycle {
     await this.recoveryInFlight;
   }
 
-  private async settleCancelledStart(pg: EmbeddedPostgresInstance): Promise<void> {
-    // FNXC:WindowsDesktopPackaging 2026-07-15-05:20:
-    // Prefer stopping a non-admin handle (if already assigned) before asking
-    // embedded-postgres to stop a process it never started.
+  /** FNXC:CccWave4PendingStart 2026-07-24-18:40: clear local ownership only after the exact owned process has stopped or exited. */
+  private clearStoppedOwnership(options: { preservePendingStart?: boolean } = {}): void {
+    this.pg = null;
+    this.nonAdminHandle = null;
+    if (!options.preservePendingStart) this.pendingStart = null;
+    this.running = false;
+    this.ownsProcess = false;
+    this.ownedPostmasterPid = null;
+    runningInstances.delete(this.options.dataDir);
+    this.uninstallShutdownHook();
+  }
+
+  /** FNXC:CccWave4PendingStart 2026-07-24-18:40: stop the concrete process handle this lifecycle created without clearing ownership on failure. */
+  private async stopExactOwnedProcess(pg: EmbeddedPostgresInstance, phase: string): Promise<unknown | null> {
     if (this.nonAdminHandle) {
       try {
         await this.nonAdminHandle.stop();
+        return null;
       } catch (error) {
-        this.options.onError(
-          `embedded postgres: cancelled non-admin cleanup failed: ${String(error)}`,
-        );
-      } finally {
-        this.nonAdminHandle = null;
+        this.options.onError(`embedded postgres: error during ${phase} non-admin stop: ${String(error)}`);
+        return error;
       }
     }
     try {
       await pg.stop();
+      return null;
     } catch (error) {
-      this.options.onError(`embedded postgres: cancelled startup cleanup failed: ${String(error)}`);
-    } finally {
-      if (this.pg === pg) this.pg = null;
-      this.running = false;
-      runningInstances.delete(this.options.dataDir);
-      this.uninstallShutdownHook();
+      this.options.onError(`embedded postgres: error during ${phase}: ${String(error)}`);
+      return error;
     }
+  }
+
+  private async settleCancelledStart(pg: EmbeddedPostgresInstance): Promise<void> {
+    const stopError = await this.stopExactOwnedProcess(pg, "cancelled startup cleanup");
+    if (stopError) return;
+    this.clearStoppedOwnership();
   }
 
   /**
@@ -1941,9 +1966,11 @@ export class EmbeddedPostgresLifecycle {
     this.uninstallShutdownHook();
     this.nonAdminHandle?.stopMonitoring();
     this.pg = null;
+    this.pendingStart = null;
     this.nonAdminHandle = null;
     this.running = false;
     this.ownsProcess = false;
+    this.ownedPostmasterPid = null;
     runningInstances.delete(this.options.dataDir);
   }
 
@@ -1955,6 +1982,13 @@ export class EmbeddedPostgresLifecycle {
     // If we didn't start the postmaster (detected an already-running instance),
     // don't stop it — the owning instance handles shutdown.
     if (!this.ownsProcess) {
+      const pendingStart = this.pendingStart;
+      if (pendingStart) {
+        const stopError = await this.stopExactOwnedProcess(pendingStart, "pending startup cleanup");
+        if (!stopError) this.clearStoppedOwnership({ preservePendingStart: true });
+        if (stopError && this.options.throwOnStopError) throw stopError;
+        return;
+      }
       this.running = false;
       return;
     }
@@ -1963,40 +1997,11 @@ export class EmbeddedPostgresLifecycle {
     // Elevated Windows path: the postmaster was started under a dedicated
     // non-admin user; stop it via the handle instead of embedded-postgres
     // (which never called .start() and has no process handle).
-    if (this.nonAdminHandle) {
-      let stopError: unknown;
-      try {
-        await this.nonAdminHandle.stop();
-      } catch (err) {
-        stopError = err;
-        this.options.onError(`embedded postgres: error during non-admin stop: ${String(err)}`);
-      } finally {
-        this.nonAdminHandle = null;
-        this.pg = null;
-        this.running = false;
-        runningInstances.delete(this.options.dataDir);
-      }
-      if (stopError && this.options.throwOnStopError) throw stopError;
-      return;
-    }
-
     if (!this.pg) {
-      this.running = false;
-      // Clean up the registry even if pg is null
-      runningInstances.delete(this.options.dataDir);
       return;
     }
-    let stopError: unknown;
-    try {
-      await this.pg.stop();
-    } catch (err) {
-      stopError = err;
-      this.options.onError(`embedded postgres: error during stop: ${String(err)}`);
-    } finally {
-      this.pg = null;
-      this.running = false;
-      runningInstances.delete(this.options.dataDir);
-    }
+    const stopError = await this.stopExactOwnedProcess(this.pg, "stop");
+    if (!stopError) this.clearStoppedOwnership();
     if (stopError && this.options.throwOnStopError) throw stopError;
   }
 
@@ -2026,17 +2031,27 @@ export class EmbeddedPostgresLifecycle {
       }
     };
     try { process.kill(pid, "SIGTERM"); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        this.clearStoppedOwnership();
+        return;
+      }
       throw error;
     }
-    if (await waitForExit(1_000)) return;
+    if (await waitForExit(1_000)) {
+      this.clearStoppedOwnership();
+      return;
+    }
     try { process.kill(pid, "SIGKILL"); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        this.clearStoppedOwnership();
+        return;
+      }
       throw error;
     }
     if (!await waitForExit(1_000)) {
       throw new Error(`embedded postgres: owned postmaster ${pid} did not exit after SIGKILL`);
     }
+    this.clearStoppedOwnership();
   }
 
   /**
