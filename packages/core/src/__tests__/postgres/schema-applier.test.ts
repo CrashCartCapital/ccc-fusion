@@ -78,9 +78,11 @@ import {
   LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
   TASK_WEDGE_NOTIFICATION_VERSION,
   CCC_EFFECT_RECEIPTS_VERSION,
+  CCC_PRD_IMPORTS_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
+import { projectTableNames } from "../../postgres/schema/project.js";
 
 const PG_ADMIN_URL =
   process.env.FUSION_PG_TEST_ADMIN_URL ?? "postgresql://localhost:5432/postgres";
@@ -199,6 +201,11 @@ describe("schema-applier: immutable migration identities", () => {
     expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION));
   });
 
+  it("keeps CCC PRD import custody assigned to migration version 0035", () => {
+    expect(CCC_PRD_IMPORTS_VERSION).toBe("0035");
+    expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(CCC_PRD_IMPORTS_VERSION));
+  });
+
   /*
   FNXC:PostgresBigintCounters 2026-07-19-12:00:
   0026 widens overflow-prone counters to bigint. Keep identity fixed and at-or-before SCHEMA_BASELINE_VERSION.
@@ -253,6 +260,15 @@ describe("schema-applier: migration wiring integrity", () => {
     // constant. A file present on disk but absent from the source is unwired.
     const unwired = migrationFiles.filter((f) => !applierSource.includes(f));
     expect(unwired).toEqual([]);
+  });
+
+  it("registers every CCC PRD import table in shared project-table resets", () => {
+    expect(projectTableNames).toEqual(expect.arrayContaining([
+      "ccc_prd_imports",
+      "ccc_prd_import_sources",
+      "ccc_prd_import_entities",
+    ]));
+    expect(new Set(projectTableNames).size).toBe(projectTableNames.length);
   });
 });
 
@@ -642,7 +658,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 96 project tables, 18 central tables, 1 archive table", async () => {
+  it("creates all 100 project tables, 18 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -663,9 +679,10 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 2 ideation_sessions/ideation_candidates (FNXC:Ideation 2026-07-18-13:25 / FN-8295)
     // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
     // + 1 durable ccc_effect_receipts table and its ccc_effect_turns authority
-    // table (FNXC:CCCEffectReceipts).
+    // table (FNXC:CCCEffectReceipts)
+    // + 3 CCC PRD import custody/source/entity tables.
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(97);
+    expect(bySchema.project).toBe(100);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -1610,6 +1627,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION,
+      CCC_PRD_IMPORTS_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1670,6 +1688,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION,
+      CCC_PRD_IMPORTS_VERSION,
     ]);
   });
 
@@ -1863,6 +1882,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION,
+      CCC_PRD_IMPORTS_VERSION,
     ]);
   });
 
@@ -1937,6 +1957,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION,
+      CCC_PRD_IMPORTS_VERSION,
     ]);
   });
 
@@ -2011,6 +2032,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION,
+      CCC_PRD_IMPORTS_VERSION,
     ]);
   });
 });
@@ -2599,6 +2621,181 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
     freshCtx = await setupFreshDb();
     await applySchemaBaseline(freshCtx.db, { pluginHooks: [] });
     expect(await receiptShape(ctx)).toEqual(await receiptShape(freshCtx));
+  });
+});
+
+pgDescribe("schema-applier: CCC PRD import 0034 to 0035 upgrade", () => {
+  let ctx: TestContext | null = null;
+  let freshCtx: TestContext | null = null;
+
+  afterEach(async () => {
+    await teardownDb(ctx);
+    await teardownDb(freshCtx);
+    ctx = null;
+    freshCtx = null;
+  });
+
+  it("upgrades exactly once with fresh-shape parity, forced RLS, triggers, FKs, checks, and indexes", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      DROP TABLE project.ccc_prd_import_sources;
+      DROP TABLE project.ccc_prd_import_entities;
+      DROP TABLE project.ccc_prd_imports;
+      DELETE FROM public.fusion_schema_migrations WHERE version = '0035';
+    `));
+    expect(await getAppliedMigrations(ctx.db)).toContain("0034");
+    expect(await getAppliedMigrations(ctx.db)).not.toContain("0035");
+
+    expect(await applySchemaBaseline(ctx.db, { pluginHooks: [] })).toMatchObject({ applied: true });
+    expect(await getAppliedMigrations(ctx.db)).toContain("0035");
+    expect(await applySchemaBaseline(ctx.db, { pluginHooks: [] })).toEqual({
+      applied: false,
+      pluginHooksRun: 0,
+    });
+
+    const custodyCatalog = (await ctx.db.execute(sql`
+      SELECT c.relname AS table_name,
+        c.relrowsecurity AS rls,
+        c.relforcerowsecurity AS forced,
+        EXISTS (
+          SELECT 1 FROM pg_policies
+          WHERE schemaname = 'project' AND tablename = c.relname
+            AND policyname = 'fusion_project_isolation'
+        ) AS policy,
+        EXISTS (
+          SELECT 1 FROM pg_trigger
+          WHERE tgrelid = c.oid AND tgname = 'fusion_assign_project_id'
+            AND NOT tgisinternal
+        ) AS trigger
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'project'
+        AND c.relname IN (
+          'ccc_prd_imports',
+          'ccc_prd_import_sources',
+          'ccc_prd_import_entities'
+        )
+      ORDER BY c.relname
+    `)) as unknown as Array<{
+      table_name: string;
+      rls: boolean;
+      forced: boolean;
+      policy: boolean;
+      trigger: boolean;
+    }>;
+    expect(custodyCatalog).toEqual([
+      { table_name: "ccc_prd_import_entities", rls: true, forced: true, policy: true, trigger: true },
+      { table_name: "ccc_prd_import_sources", rls: true, forced: true, policy: true, trigger: true },
+      { table_name: "ccc_prd_imports", rls: true, forced: true, policy: true, trigger: true },
+    ]);
+
+    const foreignKeys = (await ctx.db.execute(sql`
+      SELECT conname, confdeltype,
+        confrelid = 'project.ccc_prd_imports'::regclass AS targets_import
+      FROM pg_constraint
+      WHERE conname IN (
+        'ccc_prd_import_sources_import_fkey',
+        'ccc_prd_import_entities_import_fkey'
+      )
+      ORDER BY conname
+    `)) as unknown as Array<{
+      conname: string;
+      confdeltype: string;
+      targets_import: boolean;
+    }>;
+    expect(foreignKeys).toEqual([
+      {
+        conname: "ccc_prd_import_entities_import_fkey",
+        confdeltype: "c",
+        targets_import: true,
+      },
+      {
+        conname: "ccc_prd_import_sources_import_fkey",
+        confdeltype: "c",
+        targets_import: true,
+      },
+    ]);
+
+    const constraintNames = (await ctx.db.execute(sql`
+      SELECT conname
+      FROM pg_constraint
+      WHERE conrelid IN (
+        'project.ccc_prd_imports'::regclass,
+        'project.ccc_prd_import_sources'::regclass,
+        'project.ccc_prd_import_entities'::regclass
+      )
+      ORDER BY conname
+    `)) as unknown as Array<{ conname: string }>;
+    expect(constraintNames.map(({ conname }) => conname)).toEqual(expect.arrayContaining([
+      "ccc_prd_imports_state_check",
+      "ccc_prd_imports_runnable_check",
+      "ccc_prd_imports_state_runnable_check",
+      "ccc_prd_import_sources_authoritative_check",
+      "ccc_prd_import_sources_ordinal_check",
+      "ccc_prd_import_sources_byte_length_check",
+      "ccc_prd_import_entities_type_check",
+      "ccc_prd_import_entities_ordinal_check",
+    ]));
+
+    const indexNames = (await ctx.db.execute(sql`
+      SELECT indexname
+      FROM pg_indexes
+      WHERE schemaname = 'project'
+        AND tablename IN (
+          'ccc_prd_imports',
+          'ccc_prd_import_sources',
+          'ccc_prd_import_entities'
+        )
+      ORDER BY indexname
+    `)) as unknown as Array<{ indexname: string }>;
+    expect(indexNames.map(({ indexname }) => indexname)).toEqual(expect.arrayContaining([
+      "idx_ccc_prd_imports_state",
+      "idx_ccc_prd_imports_identity",
+      "idx_ccc_prd_import_entities_native",
+    ]));
+
+    const importShape = async (target: TestContext) => ({
+      columns: await target.db.execute(sql`
+        SELECT table_name, column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = 'project'
+          AND table_name IN (
+            'ccc_prd_imports',
+            'ccc_prd_import_sources',
+            'ccc_prd_import_entities'
+          )
+        ORDER BY table_name, ordinal_position
+      `),
+      constraints: await target.db.execute(sql`
+        SELECT c.relname AS table_name, con.conname, con.contype,
+          pg_get_constraintdef(con.oid) AS definition
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'project'
+          AND c.relname IN (
+            'ccc_prd_imports',
+            'ccc_prd_import_sources',
+            'ccc_prd_import_entities'
+          )
+        ORDER BY c.relname, con.conname
+      `),
+      indexes: await target.db.execute(sql`
+        SELECT tablename, indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'project'
+          AND tablename IN (
+            'ccc_prd_imports',
+            'ccc_prd_import_sources',
+            'ccc_prd_import_entities'
+          )
+        ORDER BY tablename, indexname
+      `),
+    });
+    freshCtx = await setupFreshDb();
+    await applySchemaBaseline(freshCtx.db, { pluginHooks: [] });
+    expect(await importShape(ctx)).toEqual(await importShape(freshCtx));
   });
 });
 

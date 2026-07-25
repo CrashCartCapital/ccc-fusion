@@ -6,6 +6,12 @@ export {
   normalizeProtectedAction,
 } from "./contract.js";
 export {
+  CccPrdImportError,
+  importCccPrdBundle,
+  inspectCccPrdImport,
+  reconcileCccPrdImport,
+} from "./importer.js";
+export {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
   CCC_PRD_PACKET_SCHEMA_VERSION,
@@ -59,3 +65,15 @@ export type {
   CccPrdValidationResult,
   CccPrdWorkflow,
 } from "./types.js";
+export type {
+  CccPrdImportDirectCounts,
+  CccPrdImportFailureCheckpoint,
+  CccPrdImportInspection,
+  CccPrdImportResult,
+  CccPrdImportState,
+  CccPrdImportTransactionProbe,
+  CccPrdImportTransactionWitness,
+  ImportCccPrdBundleInput,
+  InspectCccPrdImportInput,
+  ReconcileCccPrdImportInput,
+} from "./importer.js";
