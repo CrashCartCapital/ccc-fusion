@@ -125,6 +125,7 @@ export type WorkflowMaterializedVisitIdentity = Readonly<{
   reworkPass?: number;
   loopNodeId?: string;
   iteration?: number;
+  optionalGroupNodeId?: string;
 }>;
 
 export type WorkflowNodeExecutionResolverInput = Readonly<{
@@ -967,7 +968,7 @@ export class WorkflowGraphExecutor {
 
           const groupResult = await runOptionalGroup(node, {
             context,
-            runTemplateNode: (tNode, sig, contextOverride) => {
+            runTemplateNode: (tNode, sig, contextOverride, visitIdentity) => {
               /*
               FNXC:FastOptionalSteps 2026-06-30-09:12:
               Optional-group template execution carries the parent group id in context so fast mode can skip only top-level review/validation gates. Once an operator explicitly enables an optional group, that selection is stronger than the fast default and its prompt/script/gate body must run.
@@ -976,7 +977,7 @@ export class WorkflowGraphExecutor {
                 ...(contextOverride ?? context),
                 [WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY]: node.id,
               };
-              return this.executeNodeWithRetries(tNode, task, settings, optionalGroupContext, ir, sig, false);
+              return this.executeNodeWithRetries(tNode, task, settings, optionalGroupContext, ir, sig, false, visitIdentity);
             },
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             signal: this.deps.signal,

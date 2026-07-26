@@ -227,6 +227,7 @@ export interface OptionalGroupEnvironment {
     node: WorkflowIrNode,
     signal?: AbortSignal,
     contextOverride?: Record<string, unknown>,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ) => Promise<WorkflowNodeResult>;
   shouldTraverseEdge: (edge: WorkflowIrEdge, source: WorkflowNodeResult) => boolean;
   signal?: AbortSignal;
@@ -286,7 +287,12 @@ export async function runOptionalGroup(
 
     const materializedId = `${groupNode.id}::${current.id}`;
     visitedNodeIds.push(materializedId);
-    lastResult = await env.runTemplateNode(current, env.signal, groupContext);
+    const visitIdentity = Object.freeze({
+      nodeId: current.id,
+      materializedNodeId: materializedId,
+      optionalGroupNodeId: groupNode.id,
+    });
+    lastResult = await env.runTemplateNode(current, env.signal, groupContext, visitIdentity);
     if (lastResult.contextPatch) Object.assign(groupContext, lastResult.contextPatch);
     groupContext[`node:${current.id}:outcome`] = lastResult.outcome;
     if (lastResult.value !== undefined) groupContext[`node:${current.id}:value`] = lastResult.value;
