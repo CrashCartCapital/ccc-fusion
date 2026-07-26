@@ -659,6 +659,23 @@ Final adversarial review returned PASS with no P0/P1/P2. Accepted repairs includ
 
 Current boundaries for future tests: the engine Git inspector is still an injected trusted interface, not production local-Git admission; Pi `ModelRuntime.stream`/`streamSimple`, CLI `manager.spawn`, and provider-capable workflow call sites are not yet wired to the attempt scope; durable cancellation, approval-terminal reconciliation, production local-Git admission, and user-like restart/transport inspection remain open Task 4 acceptance work. Task 4 does not implement or own long-lived `InProcessRuntime` bootstrap; Task 5 owns it, together with production merger/ref-update reconciliation and terminal Git receipts. No live provider, credential, billing, non-loopback, fetch, push, merge, release, publication, upstream adoption, or `main` gate has been issued. Package, workspace, and lockfile hashes remain unchanged: `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
 
+## Task 4 Controller Component Freeze — 2026-07-25
+
+Task 4 controller component commit `79c91f8be245038100741cb5e405b34e01a4b46e`, tree `e47902c4220e6bf3f8178c53dc7cac6495d96f94`, parent `8f10f7c08217b94c7a31bc4f1052aaafe24d7854`, is accepted as a component only. Task 4 remains unaccepted.
+
+Final focused proof on the committed controller bytes:
+
+- `FUSION_PG_TEST_URL_BASE='postgresql://postgres:password@127.0.0.1:61316' node_modules/.bin/vitest run src/__tests__/postgres/ccc-campaign-provider-controller.pg.test.ts --reporter=dot` from `packages/core` — PASS, `13/13`.
+- `node_modules/.bin/vitest run src/__tests__/ccc-campaign-provider-controller.test.ts src/__tests__/ccc-campaign-provider-controller.real-packet.test.ts --reporter=dot` from `packages/engine` — PASS, `5/5`.
+- `pnpm --filter @fusion/core typecheck` — PASS.
+- `pnpm --filter @fusion/engine typecheck` — PASS.
+- `pnpm exec eslint packages/core/src/ccc-campaign/provider-controller.ts packages/engine/src/ccc-campaign-provider-controller.ts --max-warnings=0` — PASS.
+- `git diff --check` — PASS.
+
+The RED/GREEN closure covers the two P1 false-greens found during review: no core `routeKind` or ordinary bypass remains, and the real ccc-lab-super sidecar action is `ACTION-LIVE-EXECUTION -> ccc-lab-super:pre-live-provider-gate` rather than a hardcoded `provider:direct` or semantic-task target. The PostgreSQL suite proves approval expiry, not-before, wrong identity, wrong claim token, missing lease, route/semantic custody corruption, rollback after begin interruption, foreign Git custody, noncanonical Git head, lost-response replay hold, non-imported-task refusal, and missing/ambiguous/wrong-kind live-action refusal. The engine suite proves production Git recheck occurs before core, core is not called after Git refusal or post-Git abort, no `routeKind` is present on the full admission input, and the unchanged real packet selects the exact declared live-execution action without rewriting bytes.
+
+Final-byte review returned PASS with no P0/P1. Package, workspace, and lockfile hashes remain unchanged: `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
+
 ## Task 4 Transport Plan-Freeze RED Inventory — 2026-07-25
 
 This is the intended RED inventory for the frozen transport contract, not completed proof and not a test-count claim.
