@@ -437,6 +437,667 @@ describe("WorkflowGraphExecutor traversal", () => {
     expect.soft(attempts).toBe(2);
   });
 
+  it("Task 4 RED: resolves top-level semantic execution into a sealed admission context", async () => {
+    const ORIGIN = "ORIGIN";
+    const SEMANTIC = "SEMANTIC";
+    const runId = "RUN-TASK-4-RED";
+    const originTask = { ...task, id: ORIGIN } as TaskDetail;
+    const semanticTask = { ...task, id: SEMANTIC } as TaskDetail;
+    const resolveNodeExecution = vi.fn(async (_input: unknown) => {
+      return {
+        semanticTask,
+        originTaskId: "forged-origin",
+        runId: "forged-run",
+        visitIdentity: {
+          nodeId: "forged-node",
+          materializedNodeId: "forged-node",
+        },
+      };
+    });
+    const admissions: unknown[] = [];
+    const preparations: unknown[] = [];
+    const handlerExecutions: unknown[] = [];
+    const admissionTaskIds: string[] = [];
+    const preparationTaskIds: string[] = [];
+    const handlerContextTaskIds: string[] = [];
+    const progressTaskIds: string[] = [];
+    const projectionTaskIds: string[] = [];
+    const projectionSources: unknown[] = [];
+    const projectionPatches: unknown[] = [];
+    const resolveVisitIdentities: unknown[] = [];
+    const resolveInputs: Array<{
+      nodeId: string;
+      runId: string;
+      visitIdentity: unknown;
+      originTaskId: string;
+    }> = [];
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-semantics-red",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "a",
+          kind: "prompt",
+          config: {
+            toolMode: "coding",
+            skillName: "compound-engineering:ce-plan",
+            cccPrdTaskId: SEMANTIC,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+
+    let attempts = 0;
+    const executor = new WorkflowGraphExecutor({
+      runId,
+      maxRetriesPerNode: 2,
+      resolveNodeExecution: (async (input: unknown) => {
+        const typedInput = input as {
+          node: { id: string };
+          originTask: { id: string };
+          runId: string;
+          visitIdentity: { nodeId: string; materializedNodeId: string };
+        };
+        resolveInputs.push({
+          nodeId: typedInput.node.id,
+          runId: typedInput.runId,
+          visitIdentity: typedInput.visitIdentity,
+          originTaskId: typedInput.originTask.id,
+        });
+        resolveVisitIdentities.push(typedInput.visitIdentity);
+        return resolveNodeExecution();
+      }) as unknown,
+      admitNodeExecution: (async (
+        _node,
+        taskArg,
+        _signal,
+        _visitIdentity,
+        resolvedExecution,
+      ) => {
+        admissions.push(resolvedExecution);
+        admissionTaskIds.push((taskArg as { id: string }).id);
+      }) as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution: (async (
+        _node,
+        taskArg,
+        _requirement,
+        _visitIdentity,
+        resolvedExecution,
+      ) => {
+        preparations.push(resolvedExecution);
+        preparationTaskIds.push((taskArg as { id: string }).id);
+      }) as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      recordWorkflowStepResult: vi.fn(async (_taskId) => {
+        progressTaskIds.push(_taskId);
+      }),
+      handlers: {
+        prompt: async (_node, ctx) => {
+          attempts += 1;
+          const execution = (ctx as { execution?: unknown }).execution;
+          handlerExecutions.push(execution);
+          handlerContextTaskIds.push((ctx as { task?: { id: string } }).task?.id as string);
+          expect((ctx as { originTask?: unknown }).originTask).toBeUndefined();
+          if (attempts === 1) {
+            throw new TransientError("provider down", "CCC_TRANSIENT");
+          }
+          return {
+            outcome: "success",
+            contextPatch: { modifiedFiles: ["src/graph-output.ts"] },
+          };
+        },
+      },
+      publishTaskProjection: vi.fn(async (_taskId, patch, source) => {
+        projectionPatches.push(patch as Record<string, unknown>);
+        projectionSources.push(source);
+        projectionTaskIds.push(_taskId);
+      }),
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    const result = await executor.run(originTask, settingsOn(), ir);
+    const expectedExecution = admissions[0] as {
+      originTaskId?: string;
+      semanticTaskId?: string;
+      semanticTask?: unknown;
+      runId?: string;
+      visitIdentity?: unknown;
+    };
+
+    expect(result.outcome).toBe("success");
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
+    expect(resolveInputs).toEqual([
+      {
+        nodeId: "a",
+        runId,
+        visitIdentity: expect.objectContaining({
+          nodeId: "a",
+          materializedNodeId: "a",
+        }),
+        originTaskId: ORIGIN,
+      },
+    ]);
+    expect(admissions).toHaveLength(1);
+    expect(preparations).toHaveLength(2);
+    expect(handlerExecutions).toHaveLength(2);
+    expect(progressTaskIds).toEqual([SEMANTIC, SEMANTIC, SEMANTIC]);
+    expect(projectionPatches).toHaveLength(1);
+    expect(projectionSources).toHaveLength(1);
+    expect(projectionTaskIds).toEqual([SEMANTIC]);
+    expect(admissionTaskIds).toEqual([SEMANTIC]);
+    expect(preparationTaskIds).toEqual([SEMANTIC, SEMANTIC]);
+    expect(handlerContextTaskIds).toEqual([SEMANTIC, SEMANTIC]);
+    expect.soft(expectedExecution?.originTaskId).toBe(ORIGIN);
+    expect.soft(expectedExecution?.semanticTaskId).toBe(SEMANTIC);
+    expect.soft(expectedExecution?.runId).toBe(runId);
+    expect.soft(Object.isFrozen(expectedExecution?.visitIdentity)).toBe(true);
+    expect.soft((expectedExecution as { semanticTask?: unknown }).semanticTask).not.toBe(semanticTask);
+    expect.soft((expectedExecution as { semanticTask?: unknown }).semanticTask).toEqual(semanticTask);
+    expect.soft(resolveVisitIdentities[0]).toBe(expectedExecution?.visitIdentity);
+    expect(admissions[0]).toBe(expectedExecution);
+    expect(preparations[0]).toBe(expectedExecution);
+    expect(preparations[1]).toBe(expectedExecution);
+    expect(handlerExecutions[0]).toBe(expectedExecution);
+    expect(handlerExecutions[1]).toBe(expectedExecution);
+    expect.soft((projectionSources[0] as { execution?: unknown }).execution).toBe(expectedExecution);
+    expect.soft(Object.isFrozen(expectedExecution as object)).toBe(true);
+  });
+
+  it("Task 4 RED: seals top-level semantic task identity from handler mutation", async () => {
+    const ORIGIN = "ORIGIN";
+    const SEMANTIC = "SEMANTIC";
+    const runId = "RUN-TASK-4-SEAL";
+    const originTask = { ...task, id: ORIGIN } as TaskDetail;
+    const semanticTask = { ...task, id: SEMANTIC } as TaskDetail;
+    const resolveNodeExecution = vi.fn(async () => ({ semanticTask }));
+    const publishTaskIds: string[] = [];
+    const publishedExecution: unknown[] = [];
+
+    let handlerTask: TaskDetail | undefined;
+    let handlerTaskSnapshot: TaskDetail | undefined;
+    let execution: unknown;
+    let reflectSetResult: boolean | undefined;
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-semantics-red-seal",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "a",
+          kind: "prompt",
+          config: {
+            toolMode: "coding",
+            skillName: "compound-engineering:ce-plan",
+            cccPrdTaskId: SEMANTIC,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      runId,
+      maxRetriesPerNode: 1,
+      resolveNodeExecution: (async () => resolveNodeExecution()) as unknown,
+      admitNodeExecution: async (_node, _task, _signal, _visitIdentity, resolvedExecution) => {
+        expect((resolvedExecution as { task: unknown } | undefined)?.task).toBeUndefined();
+      },
+      prepareNodeExecution: async (_node, _task, _requirement, _visitIdentity, resolvedExecution) => {
+        expect((resolvedExecution as { task: unknown } | undefined)?.task).toBeUndefined();
+      },
+      handlers: {
+        prompt: async (_node, ctx) => {
+          handlerTask = (ctx as { task: TaskDetail }).task;
+          handlerTaskSnapshot = { ...handlerTask } as TaskDetail;
+          execution = (ctx as { execution: unknown }).execution;
+          reflectSetResult = Reflect.set(handlerTask, "id", "DRIFT");
+          return {
+            outcome: "success",
+            contextPatch: { modifiedFiles: ["src/graph-output.ts"] },
+          };
+        },
+      },
+      publishTaskProjection: async (taskId, _patch, source) => {
+        publishTaskIds.push(taskId);
+        publishedExecution.push((source as { execution?: unknown }).execution);
+      },
+      recordWorkflowStepResult: async () => {
+        return Promise.resolve();
+      },
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    const result = await executor.run(originTask, settingsOn(), ir);
+
+    expect(result.outcome).toBe("success");
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
+    expect(reflectSetResult).toBe(false);
+    expect((handlerTask as { semanticTaskId?: unknown }).semanticTaskId).toBeUndefined();
+    expect(semanticTask.id).toBe(SEMANTIC);
+    expect(handlerTask).not.toBe(semanticTask);
+    expect(handlerTaskSnapshot).toEqual(semanticTask);
+    expect(execution).toBe(publishedExecution[0]);
+    expect((execution as { semanticTask: TaskDetail }).semanticTask).toBe(handlerTask);
+    expect((execution as { semanticTaskId: string }).semanticTaskId).toBe(SEMANTIC);
+    expect(publishTaskIds).toEqual([SEMANTIC]);
+  });
+
+  it.each([
+    ["undefined output", undefined],
+    ["empty object", {}],
+    ["blank semanticTask id", { semanticTask: { id: "" } }],
+    ["whitespace semanticTask id", { semanticTask: { id: " SEMANTIC " } }],
+  ])("Task 4: rejects non-canonical semantic task outputs (%s)", async (_label, resolverResult) => {
+    const SEMANTIC = "SEMANTIC";
+    const runId = "RUN-TASK-4-INVALID";
+    const originTask = { ...task, id: "ORIGIN" } as TaskDetail;
+    const resolveNodeExecution = vi.fn(async () => resolverResult);
+    const admitNodeExecution = vi.fn();
+    const prepareNodeExecution = vi.fn();
+    const handler = vi.fn();
+    const recordWorkflowStepResult = vi.fn();
+    const publishTaskProjection = vi.fn();
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-semantics-red-invalid",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "a",
+          kind: "prompt",
+          config: {
+            toolMode: "coding",
+            skillName: "compound-engineering:ce-plan",
+            cccPrdTaskId: SEMANTIC,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      runId,
+      resolveNodeExecution: (async () => resolveNodeExecution()) as unknown,
+      admitNodeExecution: admitNodeExecution as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution:
+        prepareNodeExecution as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      handlers: {
+        prompt: handler,
+      },
+      recordWorkflowStepResult: recordWorkflowStepResult as unknown as WorkflowGraphExecutorDeps["recordWorkflowStepResult"],
+      publishTaskProjection: publishTaskProjection as unknown as WorkflowGraphExecutorDeps["publishTaskProjection"],
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    await expect(executor.run(originTask, settingsOn(), ir)).rejects.toThrowError(
+      "resolved a semantic task without a canonical id",
+    );
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
+    expect(admitNodeExecution).toHaveBeenCalledTimes(0);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(0);
+    expect(handler).toHaveBeenCalledTimes(0);
+    expect(recordWorkflowStepResult).toHaveBeenCalledTimes(0);
+    expect(publishTaskProjection).toHaveBeenCalledTimes(0);
+  });
+
+  it("Task 4 RED: skips semantic resolver when abort signal is pre-cancelled", async () => {
+    const SEMANTIC = "SEMANTIC";
+    const runId = "RUN-TASK-4-ABORT";
+    const originTask = { ...task, id: "ORIGIN" } as TaskDetail;
+    const resolveNodeExecution = vi.fn(async () => ({ semanticTask: { ...task, id: SEMANTIC } }));
+    const admitNodeExecution = vi.fn();
+    const prepareNodeExecution = vi.fn();
+    const handler = vi.fn();
+    const recordWorkflowStepResult = vi.fn();
+    const publishTaskProjection = vi.fn();
+
+    const abortController = new AbortController();
+    abortController.abort();
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-semantics-red-abort",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "a",
+          kind: "prompt",
+          config: {
+            toolMode: "coding",
+            skillName: "compound-engineering:ce-plan",
+            cccPrdTaskId: SEMANTIC,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      runId,
+      signal: abortController.signal,
+      resolveNodeExecution: (async () => resolveNodeExecution()) as unknown,
+      admitNodeExecution: admitNodeExecution as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution:
+        prepareNodeExecution as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      handlers: {
+        prompt: handler,
+      },
+      recordWorkflowStepResult: recordWorkflowStepResult as unknown as WorkflowGraphExecutorDeps["recordWorkflowStepResult"],
+      publishTaskProjection: publishTaskProjection as unknown as WorkflowGraphExecutorDeps["publishTaskProjection"],
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    const result = await executor.run(originTask, settingsOn(), ir);
+    expect(result.outcome).toBe("failure");
+    expect(result.context["node:a:value"]).toBe("aborted");
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(0);
+    expect(admitNodeExecution).toHaveBeenCalledTimes(0);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(0);
+    expect(handler).toHaveBeenCalledTimes(0);
+    expect(recordWorkflowStepResult).toHaveBeenCalledTimes(0);
+    expect(publishTaskProjection).toHaveBeenCalledTimes(0);
+  });
+
+  it("Task 4 RED: preserves origin provenance against resolver task mutation", async () => {
+    const ORIGIN = "ORIGIN";
+    const SEMANTIC = "SEMANTIC";
+    const originTask = {
+      ...task,
+      id: ORIGIN,
+      customFields: { marker: "original" },
+    } as TaskDetail;
+    const resolveNodeExecution = vi.fn(async (input: unknown) => {
+      const typedInput = input as {
+        originTask: {
+          id: string;
+          execution?: unknown;
+          customFields?: { marker: string };
+        };
+      };
+      originTaskFrozen = Object.isFrozen(typedInput.originTask);
+      originTaskCustomFieldsFrozen = Object.isFrozen(typedInput.originTask.customFields ?? {});
+      originTaskCustomFieldsMutation = Reflect.set(
+        typedInput.originTask.customFields,
+        "marker",
+        "FORGED",
+      );
+      reflectSetResult = Reflect.set(typedInput.originTask, "id", "FORGED");
+      resolverInputOriginTask = typedInput.originTask as TaskDetail;
+      return { semanticTask: { ...task, id: SEMANTIC } };
+    });
+    const admitNodeExecution = vi.fn();
+    const prepareNodeExecution = vi.fn();
+    const handler = vi.fn(async (_node, ctx) => {
+      execution = (ctx as { execution: unknown }).execution;
+      return {
+        outcome: "success",
+        contextPatch: { modifiedFiles: ["src/graph-output.ts"] },
+      };
+    });
+    const recordWorkflowStepResult = vi.fn();
+    const publishTaskProjection = vi.fn();
+
+    let resolverInputOriginTask: TaskDetail | undefined;
+    let originTaskFrozen = false;
+    let originTaskCustomFieldsFrozen = false;
+    let originTaskCustomFieldsMutation = false;
+    let reflectSetResult: boolean | undefined;
+    let execution: unknown;
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-semantics-origin-provenance-red",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "a",
+          kind: "prompt",
+          config: {
+            toolMode: "coding",
+            skillName: "compound-engineering:ce-plan",
+            cccPrdTaskId: SEMANTIC,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      resolveNodeExecution: (async (input) => resolveNodeExecution(input)) as unknown,
+      admitNodeExecution: admitNodeExecution as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution: prepareNodeExecution as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      handlers: {
+        prompt: handler,
+      },
+      recordWorkflowStepResult: recordWorkflowStepResult as unknown as WorkflowGraphExecutorDeps["recordWorkflowStepResult"],
+      publishTaskProjection: publishTaskProjection as unknown as WorkflowGraphExecutorDeps["publishTaskProjection"],
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    const result = await executor.run(originTask, settingsOn(), ir);
+
+    expect(result.outcome).toBe("success");
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
+    expect(originTask.id).toBe(ORIGIN);
+    expect(resolverInputOriginTask).not.toBe(originTask);
+    expect.soft(resolverInputOriginTask).toEqual(originTask);
+    expect(originTaskFrozen).toBe(true);
+    expect(originTaskCustomFieldsFrozen).toBe(true);
+    expect(originTaskCustomFieldsMutation).toBe(false);
+    expect(reflectSetResult).toBe(false);
+    expect.soft((resolverInputOriginTask as { execution?: unknown }).execution).toBeUndefined();
+    expect(originTask.customFields).toEqual({ marker: "original" });
+    expect.soft(((execution as { semanticTaskId?: unknown }).semanticTaskId)).toBe(SEMANTIC);
+    expect.soft((execution as { semanticTask?: unknown }).semanticTask).toBeDefined();
+    expect.soft((execution as { originTaskId?: unknown }).originTaskId).toBe(ORIGIN);
+    expect.soft((execution as { runId?: unknown }).runId).toBe("ORIGIN:run");
+    expect(publishTaskProjection).toHaveBeenCalledTimes(1);
+    expect(admitNodeExecution).toHaveBeenCalledTimes(1);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(1);
+    expect(recordWorkflowStepResult).toHaveBeenCalledTimes(2);
+    expect(admitNodeExecution.mock.calls[0]?.[1]?.id).toBe(SEMANTIC);
+    expect(prepareNodeExecution.mock.calls[0]?.[1]?.id).toBe(SEMANTIC);
+    expect(publishTaskProjection.mock.calls[0]?.[0]).toBe(SEMANTIC);
+  });
+
+  it("Task 4 RED: resolveNodeExecution receives an immutable node snapshot", async () => {
+    const ORIGIN = "ORIGIN";
+    const SEMANTIC = "SEMANTIC";
+    const originTask = { ...task, id: ORIGIN } as TaskDetail;
+    const resolveNodeExecution = vi.fn(async (input: unknown) => {
+      const typedInput = input as {
+        node: {
+          id: string;
+          kind: string;
+          config?: { extensions?: { provenance: string } };
+        };
+        visitIdentity: unknown;
+      };
+      inputNodeFrozen = Object.isFrozen(typedInput.node);
+      inputConfigFrozen = Object.isFrozen(typedInput.node.config ?? {});
+      inputExtensionsFrozen = Object.isFrozen(typedInput.node.config?.extensions ?? {});
+      resolverInputNode = {
+        id: typedInput.node.id,
+        kind: typedInput.node.kind,
+        config: typedInput.node.config ? { extensions: { ...typedInput.node.config.extensions } } : undefined,
+      };
+      nodeIdMutation = Reflect.set(typedInput.node, "id", "MUTATED");
+      if (typedInput.node.config?.extensions) {
+        extensionMutation = Reflect.set(typedInput.node.config.extensions, "forged", "yes");
+      }
+      resolveVisitIdentities.push(typedInput.visitIdentity);
+      return { semanticTask: { ...task, id: SEMANTIC } };
+    }) as unknown as WorkflowGraphExecutorDeps["resolveNodeExecution"];
+    const admitNodeExecution = vi.fn();
+    const prepareNodeExecution = vi.fn();
+    const publishTaskProjection = vi.fn();
+    const resolveVisitIdentities: unknown[] = [];
+    const projectedSources: unknown[] = [];
+    const handlerNodes: Array<{ id: string; kind: string; extensions?: { provenance: string } }> = [];
+    let inputNodeFrozen = false;
+    let inputConfigFrozen = false;
+    let inputExtensionsFrozen = false;
+    let resolverInputNode: { id: string; kind: string; config?: { extensions?: { provenance: string } } } | undefined;
+    let nodeIdMutation = false;
+    let extensionMutation = false;
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-semantics-red-immutable-node",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "a",
+          kind: "prompt",
+          config: {
+            toolMode: "coding",
+            skillName: "compound-engineering:ce-plan",
+            cccPrdTaskId: SEMANTIC,
+            extensions: { provenance: "prompt-node" },
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      runId: "RUN-TASK-4-IMMUTABLE",
+      resolveNodeExecution,
+      admitNodeExecution: admitNodeExecution as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution:
+        prepareNodeExecution as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      handlers: {
+        prompt: async (node) => {
+          handlerNodes.push({
+            id: node.id,
+            kind: node.kind,
+            extensions: node.config ? { ...(node.config as { extensions?: { provenance: string } }).extensions! } : undefined,
+          });
+          return {
+            outcome: "success",
+            contextPatch: { modifiedFiles: ["src/graph-output.ts"] },
+          };
+        },
+      },
+      publishTaskProjection: async (_taskId, _patch, source) => {
+        publishTaskProjection();
+        projectedSources.push(source);
+      },
+      publishTouchedFiles: vi.fn(),
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    const result = await executor.run(originTask, settingsOn(), ir);
+
+    expect(result.outcome).toBe("success");
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
+    expect(publishTaskProjection).toHaveBeenCalledTimes(1);
+    expect(admitNodeExecution).toHaveBeenCalledTimes(1);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(1);
+    expect(handlerNodes).toEqual([{ id: "a", kind: "prompt", extensions: { provenance: "prompt-node" } }]);
+    expect(resolveVisitIdentities).toHaveLength(1);
+    expect((resolveVisitIdentities[0] as { nodeId: string; materializedNodeId: string }).nodeId).toBe("a");
+    expect((resolveVisitIdentities[0] as { materializedNodeId: string }).materializedNodeId).toBe("a");
+    expect((projectedSources[0] as { nodeId: string; nodeKind: string }).nodeId).toBe("a");
+    expect((projectedSources[0] as { nodeId: string; nodeKind: string }).nodeKind).toBe("prompt");
+    expect(resolverInputNode).toEqual({
+      id: "a",
+      kind: "prompt",
+      config: { extensions: { provenance: "prompt-node" } },
+    });
+    expect(inputNodeFrozen).toBe(true);
+    expect(inputConfigFrozen).toBe(true);
+    expect(inputExtensionsFrozen).toBe(true);
+    expect(nodeIdMutation).toBe(false);
+    expect(extensionMutation).toBe(false);
+  });
+
+  it("Task 4 RED: publishTouchedFiles receives node metadata without execution", async () => {
+    const SEMANTIC = "SEMANTIC";
+    const originTask = { ...task, id: "ORIGIN" } as TaskDetail;
+    const resolveNodeExecution = vi.fn(async () => ({ semanticTask: { ...task, id: SEMANTIC } }));
+    const publishTouchedFiles = vi.fn();
+    const publishTaskProjection = vi.fn();
+    const publishTouchPayloads: Array<{ taskId: string; files: string[]; source: unknown }> = [];
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-semantics-red-legacy-touch",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "a",
+          kind: "prompt",
+          config: {
+            toolMode: "coding",
+            skillName: "compound-engineering:ce-plan",
+            cccPrdTaskId: SEMANTIC,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "a" },
+        { from: "a", to: "end", condition: "success" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      runId: "RUN-TASK-4-LEGACY-TOUCH",
+      resolveNodeExecution: resolveNodeExecution as unknown,
+      handlers: {
+        prompt: async () => ({
+          outcome: "success",
+          contextPatch: { modifiedFiles: ["src/top-level-touched.ts"] },
+        }),
+      },
+      publishTaskProjection: publishTaskProjection as unknown as WorkflowGraphExecutorDeps["publishTaskProjection"],
+      publishTouchedFiles: async (taskId, files, source) => {
+        publishTouchedFiles(taskId, files, source);
+        publishTouchPayloads.push({ taskId, files, source });
+      },
+    });
+
+    const result = await executor.run(originTask, settingsOn(), ir);
+
+    expect(result.outcome).toBe("success");
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
+    expect(publishTaskProjection).toHaveBeenCalledTimes(1);
+    expect(publishTouchedFiles).toHaveBeenCalledTimes(1);
+    expect(publishTaskProjection).toHaveBeenCalledWith(
+      SEMANTIC,
+      { modifiedFiles: ["src/top-level-touched.ts"] },
+      expect.objectContaining({ nodeId: "a", nodeKind: "prompt", execution: expect.any(Object) }),
+    );
+    expect(publishTouchPayloads[0]).toEqual({
+      taskId: SEMANTIC,
+      files: ["src/top-level-touched.ts"],
+      source: { nodeId: "a", nodeKind: "prompt" },
+    });
+  });
+
   it("increments foreach rework pass across a bounded rework loop", async () => {
     const ir: WorkflowIr = {
       version: "v2",

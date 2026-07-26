@@ -110,6 +110,7 @@ export interface WorkflowNodeExecutionContext {
   settings: WorkflowNodeSettings | undefined;
   context: Record<string, unknown>;
   visitIdentity?: WorkflowMaterializedVisitIdentity;
+  execution?: WorkflowNodeSealedExecution;
   /** Set during concurrent branch execution; fail-fast aborts via this signal.
    *  Undefined on the sequential path (zero behavior change for linear graphs). */
   signal?: AbortSignal;
@@ -126,6 +127,26 @@ export type WorkflowMaterializedVisitIdentity = Readonly<{
   iteration?: number;
 }>;
 
+export type WorkflowNodeExecutionResolverInput = Readonly<{
+  node: WorkflowIrNode;
+  originTask: TaskDetail;
+  runId: string;
+  visitIdentity: WorkflowMaterializedVisitIdentity;
+  signal?: AbortSignal;
+}>;
+
+export type WorkflowNodeExecutionResolverOutput = Readonly<{
+  semanticTask: TaskDetail;
+}>;
+
+export type WorkflowNodeSealedExecution = Readonly<{
+  originTaskId: string;
+  semanticTaskId: string;
+  semanticTask: TaskDetail;
+  runId: string;
+  visitIdentity: WorkflowMaterializedVisitIdentity;
+}>;
+
 export type WorkflowNodeHandler = (node: WorkflowIrNode, context: WorkflowNodeExecutionContext) => Promise<WorkflowNodeResult>;
 
 export interface WorkflowNodePreparationRequirement {
@@ -135,6 +156,10 @@ export interface WorkflowNodePreparationRequirement {
 
 export interface WorkflowGraphExecutorDeps {
   handlers?: Partial<Record<WorkflowIrNode["kind"], WorkflowNodeHandler>>;
+  /** Resolves the task that owns node execution without accepting execution provenance. */
+  resolveNodeExecution?: (
+    input: WorkflowNodeExecutionResolverInput,
+  ) => WorkflowNodeExecutionResolverOutput | Promise<WorkflowNodeExecutionResolverOutput>;
   /** Fail-closed admission for executable nodes. Runs once before preparation,
    * plugin dispatch, or a default handler. Orchestration-only nodes never enter
    * this seam. */
@@ -143,6 +168,7 @@ export interface WorkflowGraphExecutorDeps {
     task: TaskDetail,
     signal?: AbortSignal,
     visitIdentity?: WorkflowMaterializedVisitIdentity,
+    execution?: WorkflowNodeSealedExecution,
   ) => void | Promise<void>;
   /*
    * FNXC:WorkflowNodeRunners 2026-07-01-00:00:
@@ -164,6 +190,7 @@ export interface WorkflowGraphExecutorDeps {
     task: TaskDetail,
     requirement: WorkflowNodePreparationRequirement,
     visitIdentity?: WorkflowMaterializedVisitIdentity,
+    execution?: WorkflowNodeSealedExecution,
   ) => void | Promise<void>;
   /** Step-inversion (U12, KTD-12): dependencies for the `parse-steps` node
    *  handler (artifact read, projection write, pin-protection probe, audit).
@@ -275,7 +302,7 @@ export interface WorkflowGraphExecutorDeps {
   publishTaskProjection?: (
     taskId: string,
     patch: WorkflowTaskProjection,
-    source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] },
+    source: { nodeId: string; nodeKind: WorkflowIrNode["kind"]; execution?: WorkflowNodeSealedExecution },
     signal?: AbortSignal,
   ) => void | Promise<void>;
   /** @deprecated use publishTaskProjection. Kept for older callers. */
@@ -401,6 +428,51 @@ function extractTaskProjection(contextPatch: Record<string, unknown> | undefined
 
 function hasTaskProjection(patch: WorkflowTaskProjection): boolean {
   return Object.keys(patch).length > 0;
+}
+
+function cloneTaskWithLockedId(task: TaskDetail, id: string): TaskDetail {
+  const cloned = { ...task } as TaskDetail;
+  Object.defineProperty(cloned, "id", {
+    value: id,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+  return cloned;
+}
+
+function snapshotResolverInput<T extends object>(value: T, lockedId?: string): T {
+  const seen = new WeakMap<object, object>();
+  const cloneAndFreeze = (current: unknown, root = false): unknown => {
+    if (current === null || typeof current !== "object") return current;
+    const existing = seen.get(current);
+    if (existing) return existing;
+    if (Array.isArray(current)) {
+      const cloned: unknown[] = [];
+      seen.set(current, cloned);
+      for (let index = 0; index < current.length; index++) {
+        if (index in current) cloned[index] = cloneAndFreeze(current[index]);
+      }
+      cloned.length = current.length;
+      return Object.freeze(cloned);
+    }
+    const cloned: Record<string, unknown> = {};
+    seen.set(current, cloned);
+    for (const [key, entry] of Object.entries(current)) {
+      if (root && lockedId !== undefined && key === "id") continue;
+      cloned[key] = cloneAndFreeze(entry);
+    }
+    if (root && lockedId !== undefined) {
+      Object.defineProperty(cloned, "id", {
+        value: lockedId,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
+    }
+    return Object.freeze(cloned);
+  };
+  return cloneAndFreeze(value, true) as T;
 }
 
 export class WorkflowGraphExecutor {
@@ -1537,6 +1609,38 @@ export class WorkflowGraphExecutor {
     visitIdentity?: WorkflowMaterializedVisitIdentity,
   ): Promise<WorkflowNodeResult> {
     const handler = this.handlers[node.kind];
+    if (signal?.aborted) {
+      return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
+    }
+    const originTaskId = task.id;
+    const effectiveVisitIdentity = Object.freeze({
+      ...(visitIdentity ?? { nodeId: node.id, materializedNodeId: node.id }),
+    }) as WorkflowMaterializedVisitIdentity;
+    const runId = this.deps.runId ?? `${originTaskId}:run`;
+    const resolvedExecution = this.deps.resolveNodeExecution
+      ? await this.deps.resolveNodeExecution({
+        node: snapshotResolverInput(node),
+        originTask: snapshotResolverInput(task, originTaskId),
+        runId,
+        visitIdentity: effectiveVisitIdentity,
+        signal,
+      })
+      : undefined;
+    let semanticTask = this.deps.resolveNodeExecution ? resolvedExecution?.semanticTask : task;
+    if (typeof semanticTask?.id !== "string" || semanticTask.id.length === 0 || semanticTask.id !== semanticTask.id.trim()) {
+      throw new WorkflowIrError(`Workflow node ${node.id} resolved a semantic task without a canonical id`);
+    }
+    const semanticTaskId = semanticTask.id;
+    if (this.deps.resolveNodeExecution) {
+      semanticTask = cloneTaskWithLockedId(semanticTask, semanticTaskId);
+    }
+    const execution = Object.freeze({
+      originTaskId,
+      semanticTaskId,
+      semanticTask,
+      runId,
+      visitIdentity: effectiveVisitIdentity,
+    }) as WorkflowNodeSealedExecution;
 
     // Per-node override: config.maxRetries beats the executor-wide default.
     const configured = Number(node.config?.maxRetries);
@@ -1560,14 +1664,14 @@ export class WorkflowGraphExecutor {
       attemptsConsumed = attempt + 1;
       try {
         if (!admissionCompleted) {
-          await this.deps.admitNodeExecution?.(node, task, signal, visitIdentity);
+          await this.deps.admitNodeExecution?.(node, semanticTask, signal, effectiveVisitIdentity, execution);
           admissionCompleted = true;
         }
-        await this.prepareNodeExecution(node, task, context, settings, visitIdentity);
+        await this.prepareNodeExecution(node, semanticTask, context, settings, effectiveVisitIdentity, execution);
         const progressRecord = recordProgress && this.shouldRecordNodeProgress(node)
-          ? await this.recordNodeProgressStart(task.id, node)
+          ? await this.recordNodeProgressStart(semanticTaskId, node)
           : null;
-        const pluginResult = await this.executePluginNodeHandler(node, task, workflow, context, signal);
+        const pluginResult = await this.executePluginNodeHandler(node, semanticTask, workflow, context, signal);
         if (pluginResult) {
           /*
           FNXC:CccWave4Projection 2026-07-24-18:25:
@@ -1578,28 +1682,28 @@ export class WorkflowGraphExecutor {
           if (signal?.aborted || this.isAbortNodeResult(pluginResult)) {
             return this.withEnginePauseAbortContext(node, pluginResult);
           }
-          const projected = await this.publishTaskProjectionFromResult(task.id, node, pluginResult, signal);
+          const projected = await this.publishTaskProjectionFromResult(semanticTaskId, node, pluginResult, signal, this.deps.resolveNodeExecution ? execution : undefined);
           if (this.isAbortNodeResult(projected)) {
             return this.withEnginePauseAbortContext(node, projected);
           }
           if (progressRecord) {
-            await this.recordNodeProgressFinish(task.id, node, progressRecord, projected);
+            await this.recordNodeProgressFinish(semanticTaskId, node, progressRecord, projected);
           }
           return projected;
         }
         if (!handler) {
           throw new WorkflowIrError(`No handler registered for node kind: ${node.kind}`);
         }
-        const result = await handler(node, { task, settings, context, signal, visitIdentity });
+        const result = await handler(node, { task: semanticTask, settings, context, signal, visitIdentity: effectiveVisitIdentity, execution });
         if (signal?.aborted || this.isAbortNodeResult(result)) {
           return this.withEnginePauseAbortContext(node, result);
         }
-        const projected = await this.publishTaskProjectionFromResult(task.id, node, result, signal);
+        const projected = await this.publishTaskProjectionFromResult(semanticTaskId, node, result, signal, this.deps.resolveNodeExecution ? execution : undefined);
         if (this.isAbortNodeResult(projected)) {
           return this.withEnginePauseAbortContext(node, projected);
         }
         if (progressRecord) {
-          await this.recordNodeProgressFinish(task.id, node, progressRecord, projected);
+          await this.recordNodeProgressFinish(semanticTaskId, node, progressRecord, projected);
         }
         return projected;
       } catch (error) {
@@ -1651,7 +1755,7 @@ export class WorkflowGraphExecutor {
         },
       };
       if (recordProgress && this.shouldRecordNodeProgress(node)) {
-        await this.recordNodeProgressFinish(task.id, node, null, degraded);
+        await this.recordNodeProgressFinish(semanticTaskId, node, null, degraded);
       }
       return degraded;
     }
@@ -1665,7 +1769,7 @@ export class WorkflowGraphExecutor {
       },
     };
     if (recordProgress && this.shouldRecordNodeProgress(node)) {
-      await this.recordNodeProgressFinish(task.id, node, null, failureResult);
+      await this.recordNodeProgressFinish(semanticTaskId, node, null, failureResult);
     }
     return failureResult;
   }
@@ -1742,10 +1846,11 @@ export class WorkflowGraphExecutor {
     context: Record<string, unknown>,
     settings: WorkflowNodeSettings | undefined,
     visitIdentity?: WorkflowMaterializedVisitIdentity,
+    execution?: WorkflowNodeSealedExecution,
   ): Promise<void> {
     const requirement = this.classifyNodePreparation(node, context, settings);
     if (!requirement.requiresWorktree) return;
-    await this.deps.prepareNodeExecution?.(node, task, requirement, visitIdentity);
+    await this.deps.prepareNodeExecution?.(node, task, requirement, visitIdentity, execution);
   }
 
   private classifyNodePreparation(
@@ -1800,10 +1905,12 @@ export class WorkflowGraphExecutor {
     node: WorkflowIrNode,
     result: WorkflowNodeResult,
     signal?: AbortSignal,
+    execution?: WorkflowNodeSealedExecution,
   ): Promise<WorkflowNodeResult> {
     const patch = extractTaskProjection(result.contextPatch);
     if (!hasTaskProjection(patch)) return result;
-    const source = { nodeId: node.id, nodeKind: node.kind };
+    const legacySource = { nodeId: node.id, nodeKind: node.kind };
+    const source = { ...legacySource, ...(execution ? { execution } : {}) };
     try {
       if (signal) await this.deps.publishTaskProjection?.(taskId, patch, source, signal);
       else await this.deps.publishTaskProjection?.(taskId, patch, source);
@@ -1839,7 +1946,7 @@ export class WorkflowGraphExecutor {
     if (signal?.aborted) return { ...result, outcome: "failure", value: "aborted" };
     if (patch.modifiedFiles && patch.modifiedFiles.length > 0) {
       try {
-        await this.deps.publishTouchedFiles?.(taskId, patch.modifiedFiles, source);
+        await this.deps.publishTouchedFiles?.(taskId, patch.modifiedFiles, legacySource);
       } catch {
         // Deprecated compatibility hook; primary projection persistence owns node outcome.
       }
