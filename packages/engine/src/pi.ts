@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { lazyStream } from "@earendil-works/pi-ai/api/lazy";
 
 const execAsync = promisify(exec);
 import {
@@ -39,6 +40,8 @@ import {
 import {
   customProviderRegistryKey,
   getEnabledPiExtensionPaths,
+  canonicalCccPrdJson,
+  compareCccPrdCodeUnits,
   getFusionAgentDir,
   getLegacyPiAgentDir,
   getProjectRootFromWorktree,
@@ -56,10 +59,14 @@ import {
 } from "@fusion/core";
 import type {
   AgentPermissionPolicyActionCategory,
+  CccCampaignProviderControllerDecision,
+  CccCampaignProviderDispatchInput,
   PermanentAgentActionCategory,
   PermanentAgentGatingContext,
   ResolvedMcpServerDefinition,
   CccEffectReceiptStore,
+  CccProviderAttemptReconciliation,
+  CccProviderAttemptScope,
 } from "@fusion/core";
 import {
   resolveSessionSkills,
@@ -466,6 +473,353 @@ function restoreCccStreamRequestModel<TStream extends AsyncIterable<any> & {
       return result;
     },
   } as unknown as TStream;
+}
+
+function cccProviderAttemptEvidenceDigest(value: unknown): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(value), "utf8")
+    .digest("hex");
+}
+
+function exactObjectKeys(value: Record<string, unknown>, expected: string[], label: string): void {
+  const keys = Object.keys(value).sort(compareCccPrdCodeUnits);
+  const expectedKeys = [...expected].sort(compareCccPrdCodeUnits);
+  if (canonicalCccPrdJson(keys) !== canonicalCccPrdJson(expectedKeys)) {
+    throw new Error(`${label} must expose exactly ${expectedKeys.join(", ")}`);
+  }
+}
+
+function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBinding | undefined {
+  if (input === undefined) return undefined;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("cccProviderAttemptBinding must be a frozen object");
+  }
+  if (!Object.isFrozen(input)) {
+    throw new Error("cccProviderAttemptBinding must be frozen");
+  }
+  exactObjectKeys(input as Record<string, unknown>, ["controller", "turnKey"], "cccProviderAttemptBinding");
+  const binding = input as Record<string, unknown>;
+  if (typeof binding.turnKey !== "string" || binding.turnKey.trim().length === 0) {
+    throw new Error("cccProviderAttemptBinding.turnKey must be a non-empty string");
+  }
+  const controller = binding.controller;
+  if (!controller || typeof controller !== "object" || Array.isArray(controller)) {
+    throw new Error("cccProviderAttemptBinding.controller must be a frozen object");
+  }
+  if (!Object.isFrozen(controller)) {
+    throw new Error("cccProviderAttemptBinding.controller must be frozen");
+  }
+  exactObjectKeys(controller as Record<string, unknown>, ["preDispatch", "reconcile"], "cccProviderAttemptBinding.controller");
+  const controllerRecord = controller as Record<string, unknown>;
+  if (typeof controllerRecord.preDispatch !== "function" || typeof controllerRecord.reconcile !== "function") {
+    throw new Error("cccProviderAttemptBinding.controller methods must be functions");
+  }
+  return input as CccProviderAttemptBinding;
+}
+
+type CccProviderAttemptSubmittedReconciliation = CccProviderAttemptReconciliation
+  & Pick<
+    CccProviderAttemptScope,
+    "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "binding"
+  >;
+
+type CccProviderAttemptSessionState = {
+  nextSlot: number;
+  tail?: Promise<void>;
+};
+
+function createCccProviderAttemptSessionState(): CccProviderAttemptSessionState {
+  return { nextSlot: 1 };
+}
+
+function cccProviderAttemptHoldError(decision: Extract<CccCampaignProviderControllerDecision, { kind: "hold" }>, dispatchKey: string): Error {
+  if (decision.reason === "terminal") {
+    return new Error(`ccc-fusion provider attempt ${dispatchKey} is already ${decision.scope.state ?? "terminal"}`);
+  }
+  return new Error(`ccc-fusion provider attempt ${dispatchKey} is still dispatched_unknown`);
+}
+
+function assertCccProviderAttemptDoneMatchesResult(event: unknown, result: unknown): void {
+  const message = event && typeof event === "object" ? (event as { message?: unknown }).message : undefined;
+  if (canonicalCccPrdJson(message) !== canonicalCccPrdJson(result)) {
+    throw new Error("ccc-fusion provider attempt terminal done event did not match stream result");
+  }
+}
+
+function cccProviderAttemptStreamFailure(error: unknown): Error {
+  if (error instanceof Error) return error;
+  if (error && typeof error === "object") {
+    const message = (error as { errorMessage?: unknown; message?: unknown }).errorMessage
+      ?? (error as { errorMessage?: unknown; message?: unknown }).message;
+    if (typeof message === "string" && message.trim().length > 0) {
+      return new Error(message);
+    }
+  }
+  return new Error("ccc-fusion provider attempt stream failed");
+}
+
+function assertCccProviderAttemptReconciledScope(
+  requested: CccProviderAttemptSubmittedReconciliation,
+  observed: CccProviderAttemptScope,
+): void {
+  const requestedIdentity = {
+    attemptKey: requested.attemptKey,
+    controllerToken: requested.controllerToken,
+    taskId: requested.taskId,
+    semanticTaskId: requested.semanticTaskId,
+    campaignDeadlineAt: requested.campaignDeadlineAt,
+    turnKey: requested.turnKey,
+    dispatchKey: requested.dispatchKey,
+    attemptOrdinal: requested.attemptOrdinal,
+    requestCount: requested.requestCount,
+    binding: requested.binding,
+  };
+  const observedIdentity = {
+    attemptKey: observed.attemptKey,
+    controllerToken: observed.controllerToken,
+    taskId: observed.taskId,
+    semanticTaskId: observed.semanticTaskId,
+    campaignDeadlineAt: observed.campaignDeadlineAt,
+    turnKey: observed.turnKey,
+    dispatchKey: observed.dispatchKey,
+    attemptOrdinal: observed.attemptOrdinal,
+    requestCount: observed.requestCount,
+    binding: observed.binding,
+  };
+  if (canonicalCccPrdJson(observedIdentity) !== canonicalCccPrdJson(requestedIdentity)) {
+    throw new Error("ccc-fusion provider attempt reconciliation identity mismatch");
+  }
+  if (observed.state !== "committed") {
+    throw new Error(`ccc-fusion provider attempt reconciliation did not return committed state: ${observed.state}`);
+  }
+  const expectedTerminal = {
+    kind: "reconciled",
+    state: "committed",
+    evidenceDigest: requested.evidenceDigest,
+    observerId: requested.observerId,
+  };
+  if (canonicalCccPrdJson(observed.terminal) !== canonicalCccPrdJson(expectedTerminal)) {
+    throw new Error("ccc-fusion provider attempt reconciliation terminal evidence mismatch");
+  }
+}
+
+function assertCccProviderAttemptScopeAssociation(
+  request: CccCampaignProviderDispatchInput,
+  scope: CccProviderAttemptScope,
+  label: string,
+): void {
+  if (scope.turnKey !== request.turnKey) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: turnKey`);
+  }
+  if (scope.dispatchKey !== request.dispatchKey) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: dispatchKey`);
+  }
+  if (scope.binding.taskId !== scope.taskId) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.taskId`);
+  }
+  if (scope.binding.providerId !== request.providerId) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.providerId`);
+  }
+  if (scope.binding.modelId !== request.modelId) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.modelId`);
+  }
+  if (scope.binding.transport !== request.transport) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.transport`);
+  }
+}
+
+function assertCccProviderAttemptPermitScope(
+  request: CccCampaignProviderDispatchInput,
+  scope: CccProviderAttemptScope,
+): void {
+  assertCccProviderAttemptScopeAssociation(request, scope, "dispatch-permit");
+  if (scope.state !== "dispatched_unknown") {
+    throw new Error(`ccc-fusion dispatch-permit scope must be dispatched_unknown, got ${scope.state}`);
+  }
+  if (scope.terminal !== undefined) {
+    throw new Error("ccc-fusion dispatch-permit scope must not include terminal evidence");
+  }
+}
+
+function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAttemptScope): void {
+  const terminal = scope.terminal;
+  if (!terminal || typeof terminal !== "object" || Array.isArray(terminal)) {
+    throw new Error("ccc-fusion terminal hold scope must include proved_failed terminal evidence");
+  }
+  if (terminal.kind === "not-dispatched") {
+    exactObjectKeys(terminal as unknown as Record<string, unknown>, ["kind", "state"], "ccc-fusion proved_failed terminal evidence");
+    const rawTerminal = terminal as unknown as Record<string, unknown>;
+    if (rawTerminal.state !== "proved_failed") {
+      throw new Error(`ccc-fusion terminal hold scope proved_failed evidence has wrong state: ${String(rawTerminal.state)}`);
+    }
+    return;
+  }
+  if (terminal.kind === "reconciled") {
+    exactObjectKeys(
+      terminal as unknown as Record<string, unknown>,
+      ["evidenceDigest", "kind", "observerId", "state"],
+      "ccc-fusion proved_failed terminal evidence",
+    );
+    if (terminal.state !== "proved_failed") {
+      throw new Error(`ccc-fusion terminal hold scope proved_failed evidence has wrong state: ${terminal.state}`);
+    }
+    if (typeof terminal.evidenceDigest !== "string" || !/^[a-f0-9]{64}$/.test(terminal.evidenceDigest)) {
+      throw new Error("ccc-fusion terminal hold scope proved_failed evidence has invalid evidenceDigest");
+    }
+    if (typeof terminal.observerId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(terminal.observerId)) {
+      throw new Error("ccc-fusion terminal hold scope proved_failed evidence has invalid observerId");
+    }
+    return;
+  }
+  throw new Error("ccc-fusion terminal hold scope has invalid proved_failed terminal evidence");
+}
+
+function createCccProviderAttemptControlledStream(input: {
+  binding: CccProviderAttemptBinding;
+  state: CccProviderAttemptSessionState;
+  dispatch: (...args: any[]) => AsyncIterable<any> & { result: () => Promise<any> };
+  model: any;
+  dispatchModel: any;
+  context: any;
+  requestOptions: any;
+}) {
+  let failure: unknown;
+  const outer = lazyStream(input.model, async () => {
+    const priorTail = input.state.tail;
+    let release!: () => void;
+    input.state.tail = new Promise<void>((resolve) => { release = resolve; });
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+    try {
+      if (priorTail) {
+        await priorTail.catch(() => undefined);
+      }
+      let source!: AsyncIterable<any> & { result: () => Promise<any> };
+      let scope!: CccProviderAttemptScope;
+      while (true) {
+        const dispatchKey = `pi-stream:${input.state.nextSlot}`;
+        const request = {
+          turnKey: input.binding.turnKey,
+          dispatchKey,
+          providerId: String(input.model.provider),
+          modelId: String(input.model.id),
+          transport: "pi",
+        } as const;
+        const decision = await input.binding.controller.preDispatch(request);
+        if (decision.kind === "dispatch-permit") {
+          assertCccProviderAttemptPermitScope(request, decision.scope);
+          scope = decision.scope;
+          source = input.dispatch(input.dispatchModel, input.context, input.requestOptions);
+          break;
+        }
+        assertCccProviderAttemptScopeAssociation(request, decision.scope, `${decision.reason} hold`);
+        if (decision.reason === "terminal" && decision.scope.state === "proved_failed") {
+          assertCccProviderAttemptProvedFailedTerminalScope(decision.scope);
+          input.state.nextSlot += 1;
+          continue;
+        }
+        throw cccProviderAttemptHoldError(decision, dispatchKey);
+      }
+
+      let terminalDoneEvent: unknown;
+      let finalResultPromise: Promise<any> | undefined;
+      let reconciled = false;
+      let deliveredTerminal = false;
+      const advanceAfterTerminalDelivery = () => {
+        if (!reconciled || deliveredTerminal) return;
+        deliveredTerminal = true;
+        input.state.nextSlot += 1;
+        releaseOnce();
+      };
+      const finalResult = async () => {
+        if (!finalResultPromise) {
+          finalResultPromise = Promise.resolve(source.result())
+            .then(async (result) => {
+              if (terminalDoneEvent === undefined) {
+                throw failure instanceof Error
+                  ? failure
+                  : new Error("ccc-fusion provider attempt did not observe a terminal done event");
+              }
+              assertCccProviderAttemptDoneMatchesResult(terminalDoneEvent, result);
+              const reconciliation: CccProviderAttemptSubmittedReconciliation = {
+                ...scope,
+                outcome: "committed" as const,
+                evidenceDigest: cccProviderAttemptEvidenceDigest({
+                  transport: "pi",
+                  turnKey: input.binding.turnKey,
+                  dispatchKey: `pi-stream:${input.state.nextSlot}`,
+                  message: result,
+                }),
+                observerId: "pi",
+              };
+              const reconciledScope = await input.binding.controller.reconcile(reconciliation);
+              assertCccProviderAttemptReconciledScope(reconciliation, reconciledScope);
+              reconciled = true;
+              return result;
+            });
+        }
+        return finalResultPromise;
+      };
+
+      return {
+        async *[Symbol.asyncIterator]() {
+          try {
+            for await (const event of source) {
+              if (event && typeof event === "object" && (event as { type?: unknown }).type === "done") {
+                terminalDoneEvent = event;
+                await finalResult();
+                yield event;
+                advanceAfterTerminalDelivery();
+                continue;
+              }
+              if (event && typeof event === "object" && (event as { type?: unknown }).type === "error") {
+                failure = cccProviderAttemptStreamFailure((event as { error?: unknown }).error);
+                yield event;
+                return;
+              }
+              yield event;
+            }
+          } catch (error) {
+            failure = error;
+            throw error;
+          } finally {
+            if (!deliveredTerminal) releaseOnce();
+          }
+        },
+        async result() {
+          try {
+            return await finalResult();
+          } catch (error) {
+            failure = error;
+            releaseOnce();
+            throw error;
+          }
+        },
+      };
+    } catch (error) {
+      failure = error;
+      releaseOnce();
+      throw error;
+    }
+  });
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const event of outer) {
+        yield event;
+      }
+    },
+    async result() {
+      const result = await outer.result();
+      if (failure) {
+        throw failure;
+      }
+      return result;
+    },
+  };
 }
 
 function isThinkingReasoningConflictError(message: string): boolean {
@@ -1174,6 +1528,16 @@ export class ModelFallbackExhaustedError extends Error {
 
 export type BuiltinWebToolName = "WebSearch" | "WebFetch";
 
+type CccProviderAttemptController = Readonly<{
+  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
+  reconcile(input: CccProviderAttemptReconciliation): Promise<CccProviderAttemptScope>;
+}>;
+
+type CccProviderAttemptBinding = Readonly<{
+  turnKey: string;
+  controller: CccProviderAttemptController;
+}>;
+
 export interface AgentOptions {
   cwd: string;
   systemPrompt: string;
@@ -1261,6 +1625,8 @@ export interface AgentOptions {
   cccEffectReceiptSessionId?: string;
   /** Durable controller-generation fence supplied by the owning runtime. */
   cccEffectReceiptControllerToken?: string;
+  /** Optional ccc-fusion provider-attempt admission controller supplied by the owning runtime. */
+  cccProviderAttemptBinding?: CccProviderAttemptBinding;
   /** Late-bound durable ownership selected from PI's final offered-tool boundary. */
   cccEffectReceiptBinder?: CccEffectReceiptBinder;
   /** Task retries share one incomplete durable turn until their owner settles it. */
@@ -2434,6 +2800,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
    * neither probes auth nor reads credentials.
    */
   assertCccFusionSubscriptionReady(options);
+  const cccProviderAttemptBinding = validateCccProviderAttemptBinding(options.cccProviderAttemptBinding);
+  if (cccProviderAttemptBinding && options.profile !== CCC_FUSION_PROFILE) {
+    throw new Error("cccProviderAttemptBinding is only allowed for the ccc-fusion profile");
+  }
   const customProviders = readCustomProviders();
   assertCccCustomProviderEgress(options, customProviders);
   piLog.log(`createFnAgent called (tools=${options.tools}, provider=${options.defaultProvider}, model=${options.defaultModelId})`);
@@ -2450,6 +2820,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const cccTransportClosures = new Set<Promise<void>>();
 
   if (options.profile === CCC_FUSION_PROFILE) {
+    const cccProviderAttemptState = createCccProviderAttemptSessionState();
     /*
      * FNXC:CCCSubscriptionPolicy 2026-07-23-14:38:
      * createAgentSession dispatches provider traffic through this per-session
@@ -2493,11 +2864,18 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
        * model on every event/result. A missing provider model stays missing, an
        * alias stays visible, and an exact echo becomes independently observable.
        */
-      const source = dispatch(
-        { ...model, id: `__fusion_ccc_response_probe__${expectedModelId}` },
-        context,
-        optionsWithBoundary,
-      );
+      const dispatchModel = { ...model, id: `__fusion_ccc_response_probe__${expectedModelId}` };
+      const source = cccProviderAttemptBinding
+        ? createCccProviderAttemptControlledStream({
+          binding: cccProviderAttemptBinding,
+          state: cccProviderAttemptState,
+          dispatch,
+          model,
+          dispatchModel,
+          context,
+          requestOptions: optionsWithBoundary,
+        })
+        : dispatch(dispatchModel, context, optionsWithBoundary);
       const closed = Promise.resolve(source.result())
         .catch(() => undefined)
         .then(() => awaitNodeTransportCloseCallbacks());
