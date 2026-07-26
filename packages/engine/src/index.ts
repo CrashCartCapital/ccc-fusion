@@ -1189,4 +1189,10 @@ export {
   type CccCampaignLocalGitSnapshot,
   type InspectCccCampaignLocalGitInput,
 } from "./ccc-campaign-local-git.js";
+export {
+  preDispatchCccCampaignProviderFromEngine,
+} from "./ccc-campaign-provider-controller.js";
+export type {
+  CccCampaignEngineProviderControllerInput,
+} from "./ccc-campaign-provider-controller.js";
 export * from "./ccc-prd/index.js";
