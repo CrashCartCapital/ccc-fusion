@@ -1,7 +1,7 @@
 import type { TaskDetail, TaskStep, WorkflowIrEdge, WorkflowIrNode } from "@fusion/core";
 import { WorkflowIrError, instanceNodeId, resolveMaxReworkCycles } from "@fusion/core";
 
-import type { WorkflowNodeOutcome, WorkflowNodeResult } from "./workflow-graph-executor.js";
+import type { WorkflowMaterializedVisitIdentity, WorkflowNodeOutcome, WorkflowNodeResult } from "./workflow-graph-executor.js";
 import {
   FOREACH_ACTIVE_CONTEXT_KEY,
   INTEGRATION_CONFLICT_CONTEXT_KEY,
@@ -151,6 +151,7 @@ export interface ForeachEnvironment {
     node: WorkflowIrNode,
     signal?: AbortSignal,
     contextOverride?: Record<string, unknown>,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ) => Promise<WorkflowNodeResult>;
   shouldTraverseEdge: (edge: WorkflowIrEdge, source: WorkflowNodeResult) => boolean;
   persistence?: WorkflowStepInstancePersistence;
@@ -818,7 +819,15 @@ async function runWorktreeInstanceSubWalk(
 
     visitedNodeIds.push(instanceNodeId(foreachNode.id, stepIndex, currentId));
 
-    lastResult = await env.runTemplateNode(node, env.signal, instanceContext);
+    const visitIdentity = Object.freeze({
+      nodeId: node.id,
+      foreachNodeId: foreachNode.id,
+      stepIndex,
+      instanceId: active.instanceId,
+      materializedNodeId: instanceNodeId(foreachNode.id, stepIndex, currentId),
+      reworkPass: inst.reworkCount,
+    });
+    lastResult = await env.runTemplateNode(node, env.signal, instanceContext, visitIdentity);
     syncActiveFromContext(instanceContext, active);
     // Persist captured baseline/checkpoint back onto the instance (survives rework).
     inst.baselineSha = active.baselineSha;
@@ -945,7 +954,15 @@ async function runInstance(
 
       visitedNodeIds.push(instanceNodeId(foreachNode.id, stepIndex, currentId));
 
-      lastResult = await env.runTemplateNode(node, env.signal);
+      const visitIdentity = Object.freeze({
+        nodeId: node.id,
+        foreachNodeId: foreachNode.id,
+        stepIndex,
+        instanceId: active.instanceId,
+        materializedNodeId: instanceNodeId(foreachNode.id, stepIndex, currentId),
+        reworkPass: reworkCount,
+      });
+      lastResult = await env.runTemplateNode(node, env.signal, undefined, visitIdentity);
       // step-execute (and U5 nodes) write captured baseline/checkpoint into the
       // active context via their contextPatch; mirror them onto `active` so the
       // reserved key stays the single source of truth for later nodes.

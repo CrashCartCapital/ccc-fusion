@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { BUILTIN_CODING_WORKFLOW_IR } from "@fusion/core";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
+import { TransientError } from "../engine-errors.js";
 
-import { WorkflowGraphExecutor } from "../workflow-graph-executor.js";
+import { WorkflowGraphExecutor, type WorkflowGraphExecutorDeps } from "../workflow-graph-executor.js";
 
 const task = { id: "FN-5767" } as TaskDetail;
 
@@ -295,6 +296,274 @@ describe("WorkflowGraphExecutor traversal", () => {
       { modifiedFiles: ["src/from-loop.ts"] },
       { nodeId: "inner", nodeKind: "prompt" },
     );
+  });
+
+  it("passes materialized visit identity to foreach template handlers", async () => {
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "foreach-visit-identity",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "each-step",
+          kind: "foreach",
+          config: {
+            source: "task-steps",
+            template: {
+              nodes: [{ id: "do-step", kind: "script" }],
+              edges: [],
+            },
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "each-step" },
+        { from: "each-step", to: "end", condition: "success" },
+      ],
+    };
+    const admittedVisitIdentities: unknown[] = [];
+    const preparedVisitIdentities: unknown[] = [];
+    const handledVisitIdentities: unknown[] = [];
+    const executor = new WorkflowGraphExecutor({
+      admitNodeExecution: (async (_node, _task, _signal, visitIdentity?: unknown) => {
+        admittedVisitIdentities.push(visitIdentity);
+      }) as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution: (async (_node, _task, _requirement, visitIdentity?: unknown) => {
+        preparedVisitIdentities.push(visitIdentity);
+      }) as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      getTaskSteps: () => [{ name: "Do step", status: "pending" }],
+      handlers: {
+        script: async (_node, ctx) => {
+          handledVisitIdentities.push((ctx as { visitIdentity?: unknown }).visitIdentity);
+          return { outcome: "success" };
+        },
+      },
+    });
+
+    await executor.run(task, settingsOn(), ir);
+
+    const expectedIdentity = expect.objectContaining({
+      nodeId: "do-step",
+      foreachNodeId: "each-step",
+      stepIndex: 0,
+      instanceId: "each-step#0",
+      materializedNodeId: "each-step#0:do-step",
+      reworkPass: 0,
+    });
+    expect.soft(admittedVisitIdentities).toEqual([expectedIdentity]);
+    expect.soft(preparedVisitIdentities).toEqual([expectedIdentity]);
+    expect.soft(handledVisitIdentities).toEqual([
+      expect.objectContaining({
+        nodeId: "do-step",
+        foreachNodeId: "each-step",
+        stepIndex: 0,
+        instanceId: "each-step#0",
+        materializedNodeId: "each-step#0:do-step",
+        reworkPass: 0,
+      }),
+    ]);
+  });
+
+  it("reuses the same foreach visit identity across a transient handler retry", async () => {
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "foreach-visit-identity-retry",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "each-step",
+          kind: "foreach",
+          config: {
+            source: "task-steps",
+            template: {
+              nodes: [{ id: "do-step", kind: "script" }],
+              edges: [],
+            },
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "each-step" },
+        { from: "each-step", to: "end", condition: "success" },
+      ],
+    };
+    const admittedVisitIdentities: unknown[] = [];
+    const preparedVisitIdentities: unknown[] = [];
+    const handledVisitIdentities: unknown[] = [];
+    let attempts = 0;
+    const executor = new WorkflowGraphExecutor({
+      maxRetriesPerNode: 2,
+      admitNodeExecution: (async (_node, _task, _signal, visitIdentity?: unknown) => {
+        admittedVisitIdentities.push(visitIdentity);
+      }) as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution: (async (_node, _task, _requirement, visitIdentity?: unknown) => {
+        preparedVisitIdentities.push(visitIdentity);
+      }) as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      getTaskSteps: () => [{ name: "Do step", status: "pending" }],
+      handlers: {
+        script: async (_node, ctx) => {
+          handledVisitIdentities.push((ctx as { visitIdentity?: unknown }).visitIdentity);
+          attempts += 1;
+          if (attempts === 1) {
+            throw new TransientError("provider blip", "CCC_TRANSIENT");
+          }
+          return { outcome: "success" };
+        },
+      },
+    });
+
+    await executor.run(task, settingsOn(), ir);
+
+    const expectedIdentity = expect.objectContaining({
+      nodeId: "do-step",
+      foreachNodeId: "each-step",
+      stepIndex: 0,
+      instanceId: "each-step#0",
+      materializedNodeId: "each-step#0:do-step",
+      reworkPass: 0,
+    });
+    expect.soft(admittedVisitIdentities).toHaveLength(1);
+    expect.soft(preparedVisitIdentities).toHaveLength(2);
+    expect.soft(handledVisitIdentities).toHaveLength(2);
+    expect.soft(handledVisitIdentities[0]).toEqual(expectedIdentity);
+    expect.soft(handledVisitIdentities[1]).toEqual(expectedIdentity);
+    expect.soft(handledVisitIdentities[0]).toBe(handledVisitIdentities[1]);
+    expect.soft(Object.isFrozen(handledVisitIdentities[0])).toBe(true);
+    expect.soft(admittedVisitIdentities[0]).toBe(handledVisitIdentities[0]);
+    expect.soft(preparedVisitIdentities[0]).toBe(handledVisitIdentities[0]);
+    expect.soft(preparedVisitIdentities[1]).toBe(handledVisitIdentities[0]);
+    expect.soft(attempts).toBe(2);
+  });
+
+  it("increments foreach rework pass across a bounded rework loop", async () => {
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "foreach-visit-identity-rework",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "each-step",
+          kind: "foreach",
+          config: {
+            source: "task-steps",
+            maxReworkCycles: 1,
+            template: {
+              nodes: [{ id: "do-step", kind: "script" }],
+              edges: [{ from: "do-step", to: "do-step", kind: "rework", condition: "outcome:revise" }],
+            },
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "each-step" },
+        { from: "each-step", to: "end", condition: "success" },
+      ],
+    };
+    const handledVisitIdentities: unknown[] = [];
+    let attempts = 0;
+    const executor = new WorkflowGraphExecutor({
+      getTaskSteps: () => [{ name: "Do step", status: "pending" }],
+      handlers: {
+        script: async (_node, ctx) => {
+          handledVisitIdentities.push((ctx as { visitIdentity?: unknown }).visitIdentity);
+          attempts += 1;
+          if (attempts === 1) return { outcome: "success", value: "revise" };
+          return { outcome: "success" };
+        },
+      },
+    });
+
+    await executor.run(task, settingsOn(), ir);
+
+    expect.soft(handledVisitIdentities).toHaveLength(2);
+    expect.soft(handledVisitIdentities[0]).toEqual(
+      expect.objectContaining({
+        nodeId: "do-step",
+        foreachNodeId: "each-step",
+        stepIndex: 0,
+        instanceId: "each-step#0",
+        materializedNodeId: "each-step#0:do-step",
+        reworkPass: 0,
+      }),
+    );
+    expect.soft(handledVisitIdentities[1]).toEqual(
+      expect.objectContaining({
+        nodeId: "do-step",
+        foreachNodeId: "each-step",
+        stepIndex: 0,
+        instanceId: "each-step#0",
+        materializedNodeId: "each-step#0:do-step",
+        reworkPass: 1,
+      }),
+    );
+    expect.soft(handledVisitIdentities[0]).not.toBe(handledVisitIdentities[1]);
+    expect.soft(attempts).toBe(2);
+  });
+
+  it("passes materialized visit identity to loop template handlers", async () => {
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "loop-visit-identity",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "wait-loop",
+          kind: "loop",
+          config: {
+            maxIterations: 2,
+            exitWhen: { type: "output-contains", value: "done" },
+            template: {
+              nodes: [{ id: "poll", kind: "script" }],
+              edges: [],
+            },
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "wait-loop" },
+        { from: "wait-loop", to: "end", condition: "success" },
+      ],
+    };
+    const admittedVisitIdentities: unknown[] = [];
+    const preparedVisitIdentities: unknown[] = [];
+    const handledVisitIdentities: unknown[] = [];
+    const executor = new WorkflowGraphExecutor({
+      admitNodeExecution: (async (_node, _task, _signal, visitIdentity?: unknown) => {
+        admittedVisitIdentities.push(visitIdentity);
+      }) as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution: (async (_node, _task, _requirement, visitIdentity?: unknown) => {
+        preparedVisitIdentities.push(visitIdentity);
+      }) as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      handlers: {
+        script: async (_node, ctx) => {
+          handledVisitIdentities.push((ctx as { visitIdentity?: unknown }).visitIdentity);
+          return { outcome: "success", value: "done" };
+        },
+      },
+    });
+
+    await executor.run(task, settingsOn(), ir);
+
+    const expectedIdentity = expect.objectContaining({
+      nodeId: "poll",
+      loopNodeId: "wait-loop",
+      iteration: 1,
+      materializedNodeId: "wait-loop#1:poll",
+    });
+    expect.soft(admittedVisitIdentities).toEqual([expectedIdentity]);
+    expect.soft(preparedVisitIdentities).toEqual([expectedIdentity]);
+    expect.soft(handledVisitIdentities).toEqual([
+      expect.objectContaining({
+        nodeId: "poll",
+        loopNodeId: "wait-loop",
+        iteration: 1,
+        materializedNodeId: "wait-loop#1:poll",
+      }),
+    ]);
   });
 
   it("does not retry an already-executed node when projection publishing fails", async () => {

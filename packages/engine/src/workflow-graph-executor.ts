@@ -109,10 +109,22 @@ export interface WorkflowNodeExecutionContext {
   task: TaskDetail;
   settings: WorkflowNodeSettings | undefined;
   context: Record<string, unknown>;
+  visitIdentity?: WorkflowMaterializedVisitIdentity;
   /** Set during concurrent branch execution; fail-fast aborts via this signal.
    *  Undefined on the sequential path (zero behavior change for linear graphs). */
   signal?: AbortSignal;
 }
+
+export type WorkflowMaterializedVisitIdentity = Readonly<{
+  nodeId: string;
+  materializedNodeId: string;
+  foreachNodeId?: string;
+  stepIndex?: number;
+  instanceId?: string;
+  reworkPass?: number;
+  loopNodeId?: string;
+  iteration?: number;
+}>;
 
 export type WorkflowNodeHandler = (node: WorkflowIrNode, context: WorkflowNodeExecutionContext) => Promise<WorkflowNodeResult>;
 
@@ -130,6 +142,7 @@ export interface WorkflowGraphExecutorDeps {
     node: WorkflowIrNode,
     task: TaskDetail,
     signal?: AbortSignal,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ) => void | Promise<void>;
   /*
    * FNXC:WorkflowNodeRunners 2026-07-01-00:00:
@@ -150,6 +163,7 @@ export interface WorkflowGraphExecutorDeps {
     node: WorkflowIrNode,
     task: TaskDetail,
     requirement: WorkflowNodePreparationRequirement,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ) => void | Promise<void>;
   /** Step-inversion (U12, KTD-12): dependencies for the `parse-steps` node
    *  handler (artifact read, projection write, pin-protection probe, audit).
@@ -687,8 +701,8 @@ export class WorkflowGraphExecutor {
             steps,
             getLiveSteps: () => this.resolveTaskSteps(task),
             context,
-            runTemplateNode: (tNode, sig, contextOverride) =>
-              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false),
+            runTemplateNode: (tNode, sig, contextOverride, visitIdentity) =>
+              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentity),
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             persistence: this.deps.stepInstancePersistence,
             onReworkReset: this.deps.onReworkReset,
@@ -715,8 +729,8 @@ export class WorkflowGraphExecutor {
         if (node.kind === "loop") {
           const loopResult = await runLoop(node, {
             context,
-            runTemplateNode: (tNode, sig, contextOverride) =>
-              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false),
+            runTemplateNode: (tNode, sig, contextOverride, visitIdentity) =>
+              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentity),
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             signal: this.deps.signal,
             now: this.deps.runLoopNowForTests,
@@ -1520,6 +1534,7 @@ export class WorkflowGraphExecutor {
     workflow: WorkflowIr,
     signal?: AbortSignal,
     recordProgress = true,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ): Promise<WorkflowNodeResult> {
     const handler = this.handlers[node.kind];
 
@@ -1545,10 +1560,10 @@ export class WorkflowGraphExecutor {
       attemptsConsumed = attempt + 1;
       try {
         if (!admissionCompleted) {
-          await this.deps.admitNodeExecution?.(node, task, signal);
+          await this.deps.admitNodeExecution?.(node, task, signal, visitIdentity);
           admissionCompleted = true;
         }
-        await this.prepareNodeExecution(node, task, context, settings);
+        await this.prepareNodeExecution(node, task, context, settings, visitIdentity);
         const progressRecord = recordProgress && this.shouldRecordNodeProgress(node)
           ? await this.recordNodeProgressStart(task.id, node)
           : null;
@@ -1575,7 +1590,7 @@ export class WorkflowGraphExecutor {
         if (!handler) {
           throw new WorkflowIrError(`No handler registered for node kind: ${node.kind}`);
         }
-        const result = await handler(node, { task, settings, context, signal });
+        const result = await handler(node, { task, settings, context, signal, visitIdentity });
         if (signal?.aborted || this.isAbortNodeResult(result)) {
           return this.withEnginePauseAbortContext(node, result);
         }
@@ -1726,10 +1741,11 @@ export class WorkflowGraphExecutor {
     task: TaskDetail,
     context: Record<string, unknown>,
     settings: WorkflowNodeSettings | undefined,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ): Promise<void> {
     const requirement = this.classifyNodePreparation(node, context, settings);
     if (!requirement.requiresWorktree) return;
-    await this.deps.prepareNodeExecution?.(node, task, requirement);
+    await this.deps.prepareNodeExecution?.(node, task, requirement, visitIdentity);
   }
 
   private classifyNodePreparation(
