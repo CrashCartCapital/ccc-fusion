@@ -691,6 +691,128 @@ describe("WorkflowGraphExecutor traversal", () => {
     expect(publishTaskIds).toEqual([SEMANTIC]);
   });
 
+
+
+  it("Task 4 RED: seals one provider turn identity across a handler retry", async () => {
+    const runAttempt = async (attempt: number) => {
+      const executionFence = Object.freeze({
+        workItemId: "WORK-TURN-1",
+        attempt,
+        runId: "ccc-prd:turn-1",
+      });
+
+      const originTask = { ...task, id: "FN-ONE" } as TaskDetail;
+      const capturedExecutions: unknown[] = [];
+      let calls = 0;
+
+      const executor = new WorkflowGraphExecutor({
+        runId: executionFence.runId,
+        maxRetriesPerNode: 2,
+        executionFence,
+        resolveNodeExecution: (async () => {
+          return { semanticTask: { ...task, id: "TASK-TURN-1" } as TaskDetail };
+        }) as WorkflowGraphExecutorDeps["resolveNodeExecution"],
+        handlers: {
+          prompt: async (_node, ctx) => {
+            capturedExecutions.push((ctx as { execution: unknown }).execution);
+            calls += 1;
+            if (calls === 1) {
+              throw new TransientError("retry");
+            }
+            return { outcome: "success" };
+          },
+        },
+      } as unknown as WorkflowGraphExecutorDeps);
+
+      const ir: WorkflowIr = {
+        version: "v1",
+        name: "provider-turn-red",
+        nodes: [
+          { id: "start", kind: "start" },
+          { id: "prompt", kind: "prompt", config: { cccPrdTaskId: "TASK-TURN-1" } },
+          { id: "end", kind: "end" },
+        ],
+        edges: [
+          { from: "start", to: "prompt", condition: "success" },
+          { from: "prompt", to: "end", condition: "success" },
+        ],
+      };
+
+      return {
+        attempt,
+        executionFence,
+        result: await executor.run(originTask, settingsOn(), ir),
+        capturedExecutions,
+      };
+    };
+
+    const first = await runAttempt(2);
+    const second = await runAttempt(3);
+
+    expect(first.result.outcome).toBe("success");
+    expect(second.result.outcome).toBe("success");
+
+    expect(first.capturedExecutions).toHaveLength(2);
+    expect(second.capturedExecutions).toHaveLength(2);
+
+    const firstAttemptExecutionOne = first.capturedExecutions[0] as {
+      executionFence: typeof first.executionFence;
+      providerAttemptTurnKey?: string;
+    };
+    const firstAttemptExecutionTwo = first.capturedExecutions[1] as {
+      executionFence: typeof first.executionFence;
+      providerAttemptTurnKey?: string;
+    };
+    const secondAttemptExecutionOne = second.capturedExecutions[0] as {
+      executionFence: typeof second.executionFence;
+      providerAttemptTurnKey?: string;
+    };
+
+    expect(firstAttemptExecutionOne).toBe(firstAttemptExecutionTwo);
+    expect(Object.isFrozen(firstAttemptExecutionOne)).toBe(true);
+    expect(Object.isFrozen(firstAttemptExecutionOne.executionFence)).toBe(true);
+    expect(firstAttemptExecutionOne.executionFence).toBe(first.executionFence);
+
+    expect(firstAttemptExecutionOne.providerAttemptTurnKey).toMatch(/^ccc-cli-turn-[a-f0-9]{64}$/);
+    expect(firstAttemptExecutionTwo.providerAttemptTurnKey).toMatch(/^ccc-cli-turn-[a-f0-9]{64}$/);
+    expect(firstAttemptExecutionOne.providerAttemptTurnKey).not.toBe(secondAttemptExecutionOne.providerAttemptTurnKey);
+  });
+
+  it("Task 4 RED: refuses an explicitly malformed provider execution fence before effects", async () => {
+    const resolveNodeExecution = vi.fn(async () => ({ semanticTask: { ...task, id: "SEMANTIC" } }));
+    const prepareNodeExecution = vi.fn();
+    const handler = vi.fn(async () => ({ outcome: "success" as const }));
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "malformed-fence-red",
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "prompt", kind: "prompt", config: { cccPrdTaskId: "SEMANTIC" } },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "prompt", condition: "success" },
+        { from: "prompt", to: "end", condition: "success" },
+      ],
+    };
+    const executor = new WorkflowGraphExecutor({
+      runId: "ccc-prd:malformed-fence",
+      resolveNodeExecution: resolveNodeExecution as unknown as WorkflowGraphExecutorDeps["resolveNodeExecution"],
+      prepareNodeExecution: prepareNodeExecution as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+      handlers: {
+        prompt: handler,
+      },
+      executionFence: null as unknown as WorkflowGraphExecutorDeps["executionFence"],
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    await expect(executor.run(task, settingsOn(), ir)).rejects.toThrowError(
+      /WORKFLOW_EXECUTION_FENCE_REFUSED|execution fence/i,
+    );
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(0);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(0);
+    expect(handler).toHaveBeenCalledTimes(0);
+  });
+
   it.each([
     ["undefined output", undefined],
     ["empty object", {}],

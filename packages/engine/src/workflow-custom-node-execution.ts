@@ -1,6 +1,6 @@
 import type { Settings, TaskDetail, WorkflowColumnAgent, WorkflowIrNode } from "@fusion/core";
 
-import type { WorkflowNodeResult } from "./workflow-graph-executor.js";
+import type { WorkflowNodeExecutionContext, WorkflowNodeResult } from "./workflow-graph-executor.js";
 import type { WorkflowCustomNodeRunner } from "./workflow-node-handlers.js";
 
 export interface WorkflowCustomNodeExecutionServiceDeps {
@@ -10,6 +10,7 @@ export interface WorkflowCustomNodeExecutionServiceDeps {
     settings: Settings,
     columnBinding?: WorkflowColumnAgent,
     context?: Record<string, unknown>,
+    executionContext?: WorkflowNodeExecutionContext,
   ) => Promise<WorkflowNodeResult>;
   resolveColumnBinding?: (nodeId: string) => WorkflowColumnAgent | undefined;
 }
@@ -25,13 +26,24 @@ export class WorkflowCustomNodeExecutionService {
   public constructor(private readonly deps: WorkflowCustomNodeExecutionServiceDeps) {}
 
   public runner(settings: Settings): WorkflowCustomNodeRunner {
-    return (node, task, context) =>
-      this.deps.execute(
+    return (node, task, context, executionContext) => {
+      if (executionContext === undefined) {
+        return this.deps.execute(
+          node,
+          task,
+          settings,
+          this.deps.resolveColumnBinding?.(node.id),
+          context,
+        );
+      }
+      return this.deps.execute(
         node,
         task,
         settings,
         this.deps.resolveColumnBinding?.(node.id),
         context,
+        executionContext,
       );
+    };
   }
 }

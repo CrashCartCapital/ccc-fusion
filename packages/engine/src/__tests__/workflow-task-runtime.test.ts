@@ -435,6 +435,80 @@ describe("WorkflowTaskRuntime", () => {
     });
   });
 
+
+  it("Task 4 RED: freezes the work-item fence before the first await", async () => {
+    let releaseLookup!: () => void;
+    let lookupEntered = false;
+    let capturedFenceInput: {
+      workItemId: string;
+      originTaskId: string;
+      leaseOwner: string;
+      attempt: number;
+      runId: string;
+    } | undefined;
+
+    const getCccCampaignContextForTask = vi.fn(async () => {
+      lookupEntered = true;
+      await new Promise<void>((resolve) => {
+        releaseLookup = resolve;
+      });
+      return { campaignId: "CAMPAIGN-1" } as CccCampaignTaskContext;
+    });
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async (input) => {
+      capturedFenceInput = input;
+    });
+
+    const resolve = vi.fn(() => ({ workflowId: "WF-orchestration", stepIds: [] }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: resolve,
+        getWorkflowDefinition: async () => ({
+          ir: {
+            version: "v1",
+            name: "orchestration-only",
+            nodes: [{ id: "start", kind: "start" }, { id: "end", kind: "end" }],
+            edges: [{ from: "start", to: "end", condition: "success" }],
+          },
+        }),
+        getCccCampaignContextForTask,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const fence = {
+      workItemId: "WORK-1",
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const processing = runtime.run(task, flagOff, { workItemFence: fence });
+
+    await vi.waitFor(() => expect(lookupEntered).toBe(true));
+    fence.workItemId = "WORK-MUTATED";
+    fence.leaseOwner = "worker-2";
+    fence.attempt = 9;
+    fence.runId = "ccc-prd:import-mutated";
+    fence.eventTimestamp = "2026-07-25T13:00:00.000Z";
+    releaseLookup();
+
+    const result = await processing;
+
+    expect(result.disposition).toBe("completed");
+    expect(capturedFenceInput).toEqual({
+      workItemId: "WORK-1",
+      originTaskId: task.id,
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-1",
+    });
+    expect(getCccCampaignContextForTask).toHaveBeenCalledTimes(1);
+    expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledTimes(1);
+  });
+
   it("Task 4 RED: resolves semantic task via store.getTask before proof admission", async () => {
     const getTask = vi.fn(async () => ({ id: "TASK-SEMANTIC" } as TaskDetail));
     const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);

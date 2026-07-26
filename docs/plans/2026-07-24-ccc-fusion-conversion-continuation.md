@@ -522,3 +522,52 @@ This receipt accepts only the controller component. Task 4 remains unaccepted, a
 - **Final-byte review:** fresh read-only review returned PASS with no P0/P1. It verified the prior route/action false-greens were closed, approval and lease checks use real PostgreSQL row locks and custody, rollback/lost-response proofs use real audit/import tables, and provider-attempt replay holds instead of redispatching on unknown output.
 - **Manifest hashes:** package manifest `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`; workspace manifest `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`; lockfile `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
 - **Next order:** graph/runtime/plugin implementation is next, using the accepted controller interface. Pi/CLI and root-owned `executor.ts` integration follow after the workflow posture and materialized-visit identity are proven.
+
+## Task 4 Native CLI Plan Freeze — 2026-07-26
+
+This correction freezes the Native CLI implementation route only. Base accepted product remains `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `c222be6c7a527c3965592b41b08e539c8d35c1c6`. Task 4 is not accepted, and no operator gate has been issued. Luna was unavailable; this documentation update is the Terra evidence/docs substitute. The council was Terra implementation-readiness plus native Sol architectural review; AGY was unavailable or permission-blocked, so native Sol substituted for that review lane. Verdict: CORRECTIONS REQUIRED with no P0 and three accepted P1s.
+
+### Frozen Slices
+
+- **Slice A — sealed workflow identity:** clone and freeze the processor `workItemFence` before the first `WorkflowTaskRuntime` await, validate the exact snapshot, reuse it for proof admission, and pass a host-owned `executionFence` containing only `workItemId`, `attempt`, and `runId`. `WorkflowGraphExecutor` seals that with origin, semantic task, and materialized visit identity, then derives a schema-versioned canonical SHA-256 `turnKey`. The custom-node runner and service forward only the sealed context. Missing, unvalidated, or mutated fence data refuses.
+- **Slice B — host-native CLI binding:** add a separate frozen host-native CLI binding/resolver, not a sentinel or plugin capability. The binding has fixed kind, version, id, exact adapter/provider/model/`transport=cli`, `maxRequests=1`, finite lifetime, TERM grace, KILL closure bounds, `followUp=false`, observer, and controller `preDispatch` plus `reconcile`. Current `createCliAgentRuntime` and bundled interactive, generic, or opaque adapters publish no binding and therefore fail closed before log mutation, MCP/auth, kill, scratch, session row, or spawn. Exact keys, freeze, routes, and permit scope validate before launch.
+- **Slice C — campaign termination and receipt:** campaign-only manager policy owns per-session termination: TERM, full bounded grace, KILL, full bounded process-group closure, proxy closure, durable fence flush, and registry-slot release. Observer runs only after closure receipt; then reconciliation uses the exact retained scope/token and validates exact terminal scope. Native done, exit, or cancel alone is never terminal provider evidence. Timeout, nonclosure, signal, observer, or reconcile uncertainty leaves `dispatched_unknown` and session `needsAttention` with fence and slot retained.
+- **Slice D — integration:** focused real-PostgreSQL and restart integration proves the public route. Ordinary CLI remains unchanged and writes zero campaign rows.
+
+### Required RED Inventory
+
+- `workItemId` or `attempt` changes the `turnKey`; retry of the same sealed visit does not.
+- Caller fence mutation causes no drift; missing fence gives no controller.
+- Malformed, mutable, extra-key, and current interactive/generic/opaque adapters have zero effects.
+- `preDispatch` happens before MCP, kill, scratch, session row, or spawn.
+- Hold/restart paths produce zero spawn.
+- Admitted path produces exactly one spawn and no `followUp`.
+- Fake-clock termination proves TERM, grace, KILL, and closure.
+- Nonclosure retains fence and slot.
+- Native done, exit, and cancel never reconcile by themselves.
+- Closure happens before observer, and observer before reconcile.
+- Committed and `proved_failed` terminal reconciliation is exact and idempotent.
+- Lost response stays unknown.
+- Ordinary CLI compatibility is retained with zero campaign rows.
+
+### Next Execution
+
+Start with Slice A RED:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-custom-node-execution.test.ts -t "forwards sealed workflow execution context to cli-agent custom runner"
+```
+
+Then add workflow task-runtime identity REDs before implementing the host-native CLI binding. Do not claim Task 4 accepted.
+
+## Task 4 Native CLI Slice A Candidate Invalidation — 2026-07-26
+
+Accepted product remains HEAD `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `c222be6c7a527c3965592b41b08e539c8d35c1c6`. Frozen 10-path candidate diff SHA-256 `3a493efef1857d74b415d94991a7a7d6f7858d8146c26990ba4208ff44a11b98` passed `89/89`, typecheck, build, changed production and test lint, and diff check, but fresh Sol exact-byte review returned FAIL with no P0 and one P1: top-level rework re-enters the same node with default `{nodeId, materializedNodeId}` identity, so later materialized passes reuse `providerAttemptTurnKey`.
+
+Candidate bytes and all acceptance verdicts are invalidated. No commit, tree, manifest, or operator gate changed. Terra-for-Luna and native Sol-for-AGY substitutions remain recorded for this documentation evidence lane. P2 legacy `WorkflowGraphTaskRunner` and `TaskExecutor` fourth/sixth context wiring remains deliberately deferred to Slice B/Task 5 owning-runtime integration and is not authority.
+
+Exact RED now active:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/pr-rework-bound.test.ts -t "gives each top-level rework pass a distinct provider turn key" --reporter=dot
+```

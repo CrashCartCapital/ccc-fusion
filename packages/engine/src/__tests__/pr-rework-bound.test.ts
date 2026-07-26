@@ -13,8 +13,9 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
+import { TransientError } from "../engine-errors.js";
 
-import { WorkflowGraphExecutor } from "../workflow-graph-executor.js";
+import { WorkflowGraphExecutor, type WorkflowGraphExecutorDeps } from "../workflow-graph-executor.js";
 
 const task = { id: "FN-U6" } as TaskDetail;
 const settingsOn = () => ({ experimentalFeatures: { workflowGraphExecutor: true } });
@@ -199,5 +200,80 @@ describe("WorkflowGraphExecutor bounded-rework generalization (U6)", () => {
     const result = await executor.run(task, settingsOn(), ir);
     expect(result.outcome).toBe("success");
     expect(a).toHaveBeenCalledTimes(4); // initial + 3 reworks (default cap)
+  });
+
+  it("Task 4 RED: gives each top-level rework pass a distinct provider turn key", async () => {
+    const executionFence = Object.freeze({
+      workItemId: "WORK-REWORK-1",
+      attempt: 4,
+      runId: "ccc-prd:rework-turn-1",
+    });
+
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "top-level-rework-pass-keys",
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "A", kind: "gate", config: { maxReworkCycles: 2 } },
+        { id: "B", kind: "prompt", config: { cccPrdTaskId: "TASK-REWORK" } },
+        { id: "done", kind: "script" },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "A", condition: "success" },
+        { from: "A", to: "B", condition: "success" },
+        { from: "A", to: "done", condition: "outcome:rework-exhausted" },
+        { from: "B", to: "A", kind: "rework", condition: "outcome:again" },
+        { from: "B", to: "done", condition: "outcome:ok" },
+        { from: "done", to: "end" },
+      ],
+    };
+
+    const executions: Array<{ visitIdentity: { reworkPass: number }; providerAttemptTurnKey?: string }> = [];
+    const keys: string[] = [];
+    let bCalls = 0;
+
+    const executor = new WorkflowGraphExecutor({
+      runId: executionFence.runId,
+      maxRetriesPerNode: 2,
+      executionFence,
+      resolveNodeExecution: (async () => {
+        return {
+          semanticTask: { ...task, id: "TASK-REWORK-CANONICAL" } as TaskDetail,
+        };
+      }) as WorkflowGraphExecutorDeps["resolveNodeExecution"],
+      handlers: {
+        gate: async () => ({ outcome: "success" as const }),
+        script: async () => ({ outcome: "success" as const }),
+        prompt: async (_node, ctx) => {
+          const execution = (ctx as { execution: unknown }).execution as {
+            providerAttemptTurnKey?: string;
+            visitIdentity: { reworkPass: number };
+          };
+          executions.push({ visitIdentity: execution.visitIdentity, providerAttemptTurnKey: execution.providerAttemptTurnKey });
+          keys.push(execution.providerAttemptTurnKey || "");
+          bCalls += 1;
+          if (bCalls % 2 === 1) {
+            throw new TransientError("retry");
+          }
+          return { outcome: "success", value: bCalls < 3 ? "again" : "ok" };
+        },
+      },
+    } as unknown as WorkflowGraphExecutorDeps);
+
+    const result = await executor.run(task, settingsOn(), ir);
+
+    expect(result.outcome).toBe("success");
+    expect(executions).toHaveLength(4);
+    expect(keys).toHaveLength(4);
+    expect(bCalls).toBe(4);
+    expect(keys[0]).toMatch(/^ccc-cli-turn-[a-f0-9]{64}$/);
+    expect(keys[1]).toMatch(/^ccc-cli-turn-[a-f0-9]{64}$/);
+    expect(keys[2]).toMatch(/^ccc-cli-turn-[a-f0-9]{64}$/);
+    expect(keys[3]).toMatch(/^ccc-cli-turn-[a-f0-9]{64}$/);
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[2]).toBe(keys[3]);
+    expect(keys[0]).not.toBe(keys[2]);
+    expect(executions.map((execution) => execution.visitIdentity.reworkPass)).toEqual([0, 0, 1, 1]);
   });
 });

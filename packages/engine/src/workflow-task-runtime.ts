@@ -8,6 +8,7 @@ import {
 
 import {
   WorkflowGraphExecutor,
+  type WorkflowNodeExecutionFence,
   type WorkflowGraphExecutorDeps,
   type WorkflowNodeHandler,
   type WorkflowNodeOutcome,
@@ -53,7 +54,7 @@ export interface WorkflowTaskRuntimeResult {
   reason?: string;
 }
 
-export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps, "seams" | "runCustomNode"> {
+export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps, "seams" | "runCustomNode" | "executionFence"> {
   store: WorkflowIrResolverStore & {
     getTask?: (taskId: string) => Promise<TaskDetail>;
     getTaskDocument?: (taskId: string, key: string) => Promise<unknown | null>;
@@ -89,6 +90,39 @@ export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps,
   onEvent?: (event: { type: "start" | "terminal"; taskId: string; detail: string }) => void;
 }
 
+type WorkflowTaskRuntimeRunOptionsSnapshot = Readonly<{
+  signal?: AbortSignal;
+  workItemFence?: WorkflowWorkItemFence;
+  deferCompletionSummary?: boolean;
+}>;
+
+function snapshotWorkItemFence(fence: WorkflowWorkItemFence | undefined): WorkflowWorkItemFence | undefined {
+  if (!fence) return undefined;
+  return Object.freeze({
+    workItemId: fence.workItemId,
+    leaseOwner: fence.leaseOwner,
+    attempt: fence.attempt,
+    runId: fence.runId,
+    eventTimestamp: fence.eventTimestamp,
+  });
+}
+
+function snapshotRunOptions(options: WorkflowTaskRuntimeRunOptions): WorkflowTaskRuntimeRunOptionsSnapshot {
+  return Object.freeze({
+    signal: options.signal,
+    workItemFence: snapshotWorkItemFence(options.workItemFence),
+    deferCompletionSummary: options.deferCompletionSummary,
+  });
+}
+
+function createGraphExecutionFence(fence: WorkflowWorkItemFence): WorkflowNodeExecutionFence {
+  return Object.freeze({
+    workItemId: fence.workItemId,
+    attempt: fence.attempt,
+    runId: fence.runId,
+  });
+}
+
 /**
  * WorkflowTaskRuntime is the workflow-engine execution facade.
  *
@@ -114,9 +148,10 @@ export class WorkflowTaskRuntime {
     settings: (Pick<Settings, "experimentalFeatures"> & Partial<Settings>) | undefined,
     options: WorkflowTaskRuntimeRunOptions = {},
   ): Promise<WorkflowTaskRuntimeResult> {
-    const campaignCustodyRefusal = await this.campaignCustodyRefusal(task, options);
+    const runOptions = snapshotRunOptions(options);
+    const campaignCustodyRefusal = await this.campaignCustodyRefusal(task, runOptions);
     if (campaignCustodyRefusal) return campaignCustodyRefusal;
-    const campaignFenceRefusal = await this.campaignFenceRefusal(task, options);
+    const campaignFenceRefusal = await this.campaignFenceRefusal(task, runOptions);
     if (campaignFenceRefusal) return campaignFenceRefusal;
     this.emit("start", task.id, "resolve-workflow");
 
@@ -135,18 +170,22 @@ export class WorkflowTaskRuntime {
       };
     }
 
-    const runtimeRunId = options.workItemFence?.runId ?? this.deps.runId ?? `${task.id}:${target.workflowId}`;
+    const runtimeRunId = runOptions.workItemFence?.runId ?? this.deps.runId ?? `${task.id}:${target.workflowId}`;
     const invoked: string[] = [];
-    const campaignProofAdmission = this.campaignProofAdmission(task, options);
+    const campaignProofAdmission = this.campaignProofAdmission(task, runOptions);
+    const graphExecutionFence = runOptions.workItemFence
+      ? createGraphExecutionFence(runOptions.workItemFence)
+      : undefined;
     const {
       store: _store,
       onEvent: _onEvent,
       resolveNodeExecution: ordinaryResolveNodeExecution,
       resolveNodeProviderController: ordinaryResolveNodeProviderController,
       admitNodeExecution: ordinaryAdmitNodeExecution,
+      executionFence: _executionFence,
       ...graphDeps
-    } = this.deps;
-    const fencedCampaignRun = options.workItemFence !== undefined;
+    } = this.deps as WorkflowTaskRuntimeDeps & { executionFence?: unknown };
+    const fencedCampaignRun = runOptions.workItemFence !== undefined;
     const executor = new WorkflowGraphExecutor({
       ...graphDeps,
       primitives: this.deps.primitives,
@@ -162,6 +201,7 @@ export class WorkflowTaskRuntime {
               campaignProofAdmission?.(node, signal, execution && visitIdentity
                 ? { semanticTask, visitIdentity, execution }
                 : undefined),
+            executionFence: graphExecutionFence,
           }
         : {
             ...(ordinaryResolveNodeExecution ? { resolveNodeExecution: ordinaryResolveNodeExecution } : {}),
@@ -174,7 +214,7 @@ export class WorkflowTaskRuntime {
       // executor is authoritative even before the old feature flag plumbing is
       // deleted from legacy entry points.
       runId: runtimeRunId,
-      signal: options.signal,
+      signal: runOptions.signal,
     });
 
     const runtimeSettings = buildWorkflowRuntimeSettings(settings);
@@ -192,7 +232,7 @@ export class WorkflowTaskRuntime {
         reason,
       };
     }
-    if (options.signal?.aborted && result.outcome === "success") {
+    if (runOptions.signal?.aborted && result.outcome === "success") {
       const reason = "workflow-aborted";
       this.emit("terminal", task.id, `failed:${reason}`);
       return {
@@ -205,7 +245,7 @@ export class WorkflowTaskRuntime {
     }
     if (result.outcome === "success") {
       const missingArtifactKeys = await this.findMissingRequiredArtifacts(task.id, target.ir);
-      if (options.signal?.aborted) {
+      if (runOptions.signal?.aborted) {
         const reason = "workflow-aborted";
         this.emit("terminal", task.id, `failed:${reason}`);
         return {
@@ -231,7 +271,7 @@ export class WorkflowTaskRuntime {
           reason,
         };
       }
-      if (!options.deferCompletionSummary) {
+      if (!runOptions.deferCompletionSummary) {
         const latestTask = await this.deps.store.getTask?.(task.id).catch(() => undefined);
         await ensureWorkflowCompletionSummary(this.deps.store, latestTask ?? task, {
           reason: "workflow-runtime-completed",
@@ -243,7 +283,7 @@ export class WorkflowTaskRuntime {
 
     const disposition: WorkflowTaskRuntimeDisposition = result.outcome === "success" ? "completed" : "failed";
     this.emit("terminal", task.id, disposition);
-    const reason = result.outcome === "failure" && options.signal?.aborted ? "workflow-aborted" : undefined;
+    const reason = result.outcome === "failure" && runOptions.signal?.aborted ? "workflow-aborted" : undefined;
     return {
       disposition,
       outcome: result.outcome,

@@ -696,3 +696,37 @@ pnpm --filter @fusion/engine typecheck
 pnpm --filter @fusion/engine build
 git diff --check
 ```
+
+## Task 4 Native CLI Plan Freeze — 2026-07-26
+
+Base accepted product is `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `c222be6c7a527c3965592b41b08e539c8d35c1c6`. This is a testing correction and plan freeze only; Task 4 is not accepted. Luna was unavailable, so this receipt uses Terra as the evidence/docs substitute. Council evidence was Terra implementation-readiness plus native Sol architectural review; AGY was unavailable or permission-blocked and native Sol substituted. Verdict: CORRECTIONS REQUIRED with no P0 and three accepted P1s.
+
+Focused RED sequence:
+
+1. Slice A starts with sealed workflow identity:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-custom-node-execution.test.ts -t "forwards sealed workflow execution context to cli-agent custom runner"
+```
+
+Then add workflow task-runtime identity REDs for exact cloned/frozen `workItemFence`, immutable host-owned `executionFence`, schema-versioned canonical SHA-256 `turnKey`, and refusal on missing, unvalidated, or mutated fence data.
+
+2. Slice B proves host-native CLI binding admission: current `createCliAgentRuntime` and bundled interactive, generic, or opaque adapters publish no frozen campaign binding and fail closed before log mutation, MCP/auth, kill, scratch, session row, or spawn. The admitted fake binding must validate exact keys, frozen route, `providerId`, `modelId`, `transport=cli`, `maxRequests=1`, lifetime bounds, `followUp=false`, observer, and controller permit scope before launch.
+3. Slice C proves campaign-only termination and receipt ordering with fake clock: TERM, bounded grace, KILL, bounded process-group closure, proxy closure, durable fence flush, registry-slot release, observer only after closure receipt, and reconcile only after exact retained scope/token validation. Native done, exit, or cancel alone must never reconcile. Timeout, nonclosure, signal, observer, or reconcile uncertainty leaves `dispatched_unknown` plus `needsAttention` with fence and slot retained.
+4. Slice D is focused real-PostgreSQL/restart integration. It must prove committed and `proved_failed` terminal reconciliation is exact and idempotent, lost response stays unknown, restart holds do not spawn, admitted path spawns once, and ordinary CLI remains behavior-compatible with zero campaign rows.
+
+No operator gate has been issued. P2 controller provenance and owning-runtime wiring carry into CLI integration proof; they are not accepted as authority by this plan freeze.
+
+## Task 4 Native CLI Slice A Candidate Invalidation — 2026-07-26
+
+Accepted product remains HEAD `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `c222be6c7a527c3965592b41b08e539c8d35c1c6`. Frozen 10-path candidate diff SHA-256 `3a493efef1857d74b415d94991a7a7d6f7858d8146c26990ba4208ff44a11b98` is invalidated despite development proof `89/89`, typecheck, build, changed production and test lint, and diff check.
+
+Fresh Sol exact-byte review returned FAIL with no P0 and one P1: top-level rework re-enters the same node with default `{nodeId, materializedNodeId}` identity, so later materialized passes reuse `providerAttemptTurnKey`. P2 legacy `WorkflowGraphTaskRunner` and `TaskExecutor` fourth/sixth context wiring remains deferred to Slice B/Task 5 owning-runtime integration and is not authority. Terra-for-Luna and native Sol-for-AGY substitutions remain recorded.
+
+Active RED:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/pr-rework-bound.test.ts -t "gives each top-level rework pass a distinct provider turn key" --reporter=dot
+```
+
+No commit, tree, manifest, operator gate, or Task 4 acceptance changed.

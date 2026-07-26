@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   Settings,
   TaskDetail,
@@ -11,7 +12,7 @@ import type {
   WorkflowNodeProviderController,
   WorkflowStepResult,
 } from "@fusion/core";
-import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
+import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, canonicalCccPrdJson, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
 import { isNonPlanDefectPlanReviewFailure } from "./transient-error-detector.js";
 import { isRequiredArtifactReadFailedValue, parseRequiredArtifactMissingValue } from "./required-workflow-artifacts.js";
 import { PermanentError, TransientError } from "./engine-errors.js";
@@ -128,6 +129,14 @@ export type WorkflowMaterializedVisitIdentity = Readonly<{
   loopNodeId?: string;
   iteration?: number;
   optionalGroupNodeId?: string;
+  topLevelReworkHeadNodeId?: string;
+  topLevelReworkPass?: number;
+}>;
+
+export type WorkflowNodeExecutionFence = Readonly<{
+  workItemId: string;
+  attempt: number;
+  runId: string;
 }>;
 
 export type WorkflowNodeExecutionResolverInput = Readonly<{
@@ -148,6 +157,8 @@ export type WorkflowNodeSealedExecution = Readonly<{
   semanticTask: TaskDetail;
   runId: string;
   visitIdentity: WorkflowMaterializedVisitIdentity;
+  executionFence?: WorkflowNodeExecutionFence;
+  providerAttemptTurnKey?: string;
 }>;
 
 export type WorkflowNodeProviderControllerResolverInput = Readonly<{
@@ -230,6 +241,8 @@ export interface WorkflowGraphExecutorDeps {
   onBranchProgress?: (progress: WorkflowBranchProgress) => void;
   /** Stable identifier for this run, used to key persisted branch state. */
   runId?: string;
+  /** Host-owned sealed workflow work-item fence for CCC provider turn identity. */
+  executionFence?: WorkflowNodeExecutionFence;
   /** Test seam for bounded loop timeout checks. Defaults to Date.now. */
   runLoopNowForTests?: () => number;
   /**
@@ -408,6 +421,77 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isCanonicalNonblankString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value === value.trim();
+}
+
+function requireWorkflowNodeExecutionFence(
+  fence: WorkflowNodeExecutionFence,
+  runId: string,
+): WorkflowNodeExecutionFence {
+  if (
+    !isPlainObject(fence)
+    || !Object.isFrozen(fence)
+    || Object.keys(fence).length !== 3
+    || !Object.hasOwn(fence, "workItemId")
+    || !Object.hasOwn(fence, "attempt")
+    || !Object.hasOwn(fence, "runId")
+    || !isCanonicalNonblankString(fence.workItemId)
+    || !Number.isSafeInteger(fence.attempt)
+    || fence.attempt <= 0
+    || !isCanonicalNonblankString(fence.runId)
+    || fence.runId !== runId
+  ) {
+    throw new PermanentError(
+      "Workflow graph execution fence is missing or malformed",
+      "WORKFLOW_EXECUTION_FENCE_REFUSED",
+    );
+  }
+  return fence;
+}
+
+function materializedVisitIdentityForTurnKey(
+  identity: WorkflowMaterializedVisitIdentity,
+): Record<string, string | number> {
+  const stable: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(identity)) {
+    if (typeof value === "string" || typeof value === "number") {
+      stable[key] = value;
+    }
+  }
+  return stable;
+}
+
+function createProviderAttemptTurnKey(input: {
+  originTaskId: string;
+  semanticTaskId: string;
+  executionFence: WorkflowNodeExecutionFence;
+  visitIdentity: WorkflowMaterializedVisitIdentity;
+}): string {
+  const identity = {
+    schema: "ccc-cli-provider-attempt-turn-key",
+    version: 1,
+    originTaskId: input.originTaskId,
+    semanticTaskId: input.semanticTaskId,
+    executionFence: {
+      workItemId: input.executionFence.workItemId,
+      attempt: input.executionFence.attempt,
+      runId: input.executionFence.runId,
+    },
+    visitIdentity: materializedVisitIdentityForTurnKey(input.visitIdentity),
+  };
+  const digest = createHash("sha256")
+    .update(`ccc-cli-turn/v1\0${canonicalCccPrdJson(identity)}`, "utf8")
+    .digest("hex");
+  return `ccc-cli-turn-${digest}`;
 }
 
 function finiteCount(value: unknown): number | undefined {
@@ -666,6 +750,23 @@ export class WorkflowGraphExecutor {
     }
     const isReworkSignal = (r: WorkflowNodeResult | ReworkSignal): r is ReworkSignal =>
       (r as ReworkSignal).__rework === true;
+    type TopLevelReworkVisit = Readonly<{ headNodeId: string; pass: number }>;
+    const visitIdentityWithTopLevelRework = (
+      node: WorkflowIrNode,
+      topLevelReworkVisit: TopLevelReworkVisit | undefined,
+      visitIdentity?: WorkflowMaterializedVisitIdentity,
+    ): WorkflowMaterializedVisitIdentity | undefined => {
+      if (!topLevelReworkVisit) return visitIdentity;
+      return Object.freeze({
+        ...(visitIdentity ?? {
+          nodeId: node.id,
+          materializedNodeId: node.id,
+          reworkPass: topLevelReworkVisit.pass,
+        }),
+        topLevelReworkHeadNodeId: topLevelReworkVisit.headNodeId,
+        topLevelReworkPass: topLevelReworkVisit.pass,
+      }) as WorkflowMaterializedVisitIdentity;
+    };
 
     // On resume, completed branch nodes (from a prior crashed run) are skipped
     // so their handlers do not re-fire (idempotency).
@@ -724,13 +825,22 @@ export class WorkflowGraphExecutor {
     await this.pruneStaleInstances(task.id, runId);
 
     // Shared branch environment: built lazily so the sequential path pays nothing.
-    const branchEnv = (): BranchEnvironment => ({
+    const branchEnv = (topLevelReworkVisit?: TopLevelReworkVisit): BranchEnvironment => ({
       task,
       settings,
       runId,
       nodeMap,
       outgoingMap,
-      runBranchNode: (node, signal) => this.executeNodeWithRetries(node, task, settings, context, ir, signal),
+      runBranchNode: (node, signal) => this.executeNodeWithRetries(
+        node,
+        task,
+        settings,
+        context,
+        ir,
+        signal,
+        true,
+        visitIdentityWithTopLevelRework(node, topLevelReworkVisit),
+      ),
       shouldTraverseEdge: (edge, source) => this.shouldTraverseEdge(edge, source),
       persistence: this.deps.branchPersistence,
       semaphore: this.deps.branchSemaphore,
@@ -743,9 +853,10 @@ export class WorkflowGraphExecutor {
     // (a rework back-edge fired); the caller frame propagates or consumes it.
     const runNodeAndTraverse = async (
       node: WorkflowIrNode,
+      topLevelReworkVisit?: TopLevelReworkVisit,
     ): Promise<WorkflowNodeResult | ReworkSignal> => {
         if (node.kind === "start") {
-          return await traverseChildren(node, { outcome: "success" });
+          return await traverseChildren(node, { outcome: "success" }, topLevelReworkVisit);
         }
         if (node.kind === "end") {
           // KTD-1: `end` is a graph terminal, not a column destination — the card
@@ -756,7 +867,7 @@ export class WorkflowGraphExecutor {
         }
 
         if (cccFusionTask && completedNodeIds?.has(node.id)) {
-          return await traverseChildren(node, { outcome: "success" });
+          return await traverseChildren(node, { outcome: "success" }, topLevelReworkVisit);
         }
 
         // U1: cross the lifecycle column boundary on node entry (KTD-1/2/3). A
@@ -782,7 +893,7 @@ export class WorkflowGraphExecutor {
           context[SPLIT_ACTIVE_CONTEXT_KEY] = true;
           let splitResult: Awaited<ReturnType<typeof runSplitJoin>>;
           try {
-            splitResult = await runSplitJoin(node, branchEnv());
+            splitResult = await runSplitJoin(node, branchEnv(topLevelReworkVisit));
           } finally {
             if (priorSplitActive === undefined) delete context[SPLIT_ACTIVE_CONTEXT_KEY];
             else context[SPLIT_ACTIVE_CONTEXT_KEY] = priorSplitActive;
@@ -806,6 +917,7 @@ export class WorkflowGraphExecutor {
           return await traverseChildren(
             nodeMap.get(splitResult.joinNodeId)!,
             { outcome: splitResult.outcome },
+            topLevelReworkVisit,
           );
         }
 
@@ -823,7 +935,7 @@ export class WorkflowGraphExecutor {
             getLiveSteps: () => this.resolveTaskSteps(task),
             context,
             runTemplateNode: (tNode, sig, contextOverride, visitIdentity) =>
-              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentity),
+              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentityWithTopLevelRework(tNode, topLevelReworkVisit, visitIdentity)),
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             persistence: this.deps.stepInstancePersistence,
             onReworkReset: this.deps.onReworkReset,
@@ -844,14 +956,14 @@ export class WorkflowGraphExecutor {
           };
           context[`node:${node.id}:outcome`] = result.outcome;
           if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
-          return await traverseChildren(node, result);
+          return await traverseChildren(node, result, topLevelReworkVisit);
         }
 
         if (node.kind === "loop") {
           const loopResult = await runLoop(node, {
             context,
             runTemplateNode: (tNode, sig, contextOverride, visitIdentity) =>
-              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentity),
+              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentityWithTopLevelRework(tNode, topLevelReworkVisit, visitIdentity)),
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             signal: this.deps.signal,
             now: this.deps.runLoopNowForTests,
@@ -863,7 +975,7 @@ export class WorkflowGraphExecutor {
           };
           context[`node:${node.id}:outcome`] = result.outcome;
           if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
-          return await traverseChildren(node, result);
+          return await traverseChildren(node, result, topLevelReworkVisit);
         }
 
         if (node.kind === "optional-group") {
@@ -912,7 +1024,7 @@ export class WorkflowGraphExecutor {
             // could let an `outcome:*` edge preempt the success edge in
             // traverseChildren, breaking the "disabled == node absent" inertness
             // invariant. (Code review: CodeRabbit.)
-            return await traverseChildren(node, { outcome: "success" });
+            return await traverseChildren(node, { outcome: "success" }, topLevelReworkVisit);
           }
           /*
            * FNXC:WorkflowStepResults 2026-06-25-12:00:
@@ -942,7 +1054,7 @@ export class WorkflowGraphExecutor {
           ) {
             context[`node:${node.id}:outcome`] = "success";
             this.deps.logTaskEntry?.("[pre-merge] Workflow step already passed: Plan Review");
-            return await traverseChildren(node, { outcome: "success", value: "already-passed" });
+            return await traverseChildren(node, { outcome: "success", value: "already-passed" }, topLevelReworkVisit);
           }
           const repairedPlanReview = node.id === PLAN_REVIEW_GROUP_ID
             ? recoverPassedPlanReviewFromLatestLog(task)
@@ -951,7 +1063,7 @@ export class WorkflowGraphExecutor {
             await this.recordOptionalGroupStepResult(task.id, repairedPlanReview);
             context[`node:${node.id}:outcome`] = "success";
             this.deps.logTaskEntry?.("[pre-merge] Workflow step already passed: Plan Review");
-            return await traverseChildren(node, { outcome: "success", value: "already-passed" });
+            return await traverseChildren(node, { outcome: "success", value: "already-passed" }, topLevelReworkVisit);
           }
           /*
            * FNXC:PlanReviewLease 2026-07-18-23:50:
@@ -1025,7 +1137,7 @@ export class WorkflowGraphExecutor {
                 ...(contextOverride ?? context),
                 [WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY]: node.id,
               };
-              return this.executeNodeWithRetries(tNode, task, settings, optionalGroupContext, ir, sig, false, visitIdentity);
+              return this.executeNodeWithRetries(tNode, task, settings, optionalGroupContext, ir, sig, false, visitIdentityWithTopLevelRework(tNode, topLevelReworkVisit, visitIdentity));
             },
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             signal: this.deps.signal,
@@ -1189,7 +1301,7 @@ export class WorkflowGraphExecutor {
               return action === "plan-replan" || action === "pre-merge-remediation";
             });
             if (explicitWorkflowRemediationRoute) {
-              return await traverseChildren(node, remediationRouteSource);
+              return await traverseChildren(node, remediationRouteSource, topLevelReworkVisit);
             }
             const fixScheduled = await this.deps.requestPreMergeOptionalStepFix?.(task.id, failureContext);
             if (fixScheduled) {
@@ -1197,7 +1309,7 @@ export class WorkflowGraphExecutor {
               return { outcome: "success", value: "pre-merge-optional-step-fix-scheduled" };
             }
           }
-          return await traverseChildren(node, result);
+          return await traverseChildren(node, result, topLevelReworkVisit);
         }
 
         const workflowAction = node.config?.workflowAction;
@@ -1228,7 +1340,16 @@ export class WorkflowGraphExecutor {
           return { outcome: "success", value: "remediation-scheduled" };
         }
 
-        const result = await this.executeNodeWithRetries(node, task, settings, context, ir, this.deps.signal);
+        const result = await this.executeNodeWithRetries(
+          node,
+          task,
+          settings,
+          context,
+          ir,
+          this.deps.signal,
+          true,
+          visitIdentityWithTopLevelRework(node, topLevelReworkVisit),
+        );
         if (result.contextPatch) Object.assign(context, result.contextPatch);
         context[`node:${node.id}:outcome`] = result.outcome;
         if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
@@ -1246,7 +1367,7 @@ export class WorkflowGraphExecutor {
           }
         }
 
-        return await traverseChildren(node, result);
+        return await traverseChildren(node, result, topLevelReworkVisit);
     };
 
     // Recursive walk into a node. A rework region head (target of a `kind:
@@ -1255,7 +1376,10 @@ export class WorkflowGraphExecutor {
     // re-runs; budget exhaustion re-routes the head with an
     // `outcome:rework-exhausted` source so its forward edge carries the flow out.
     // Every NON-rework back-edge still hits the cycle detector and throws.
-    const walk = async (nodeId: string): Promise<WorkflowNodeResult | ReworkSignal> => {
+    const walk = async (
+      nodeId: string,
+      topLevelReworkVisit?: TopLevelReworkVisit,
+    ): Promise<WorkflowNodeResult | ReworkSignal> => {
       const node = nodeMap.get(nodeId);
       if (!node) throw new WorkflowIrError(`Unknown workflow node: ${nodeId}`);
       if (inStack.has(nodeId)) throw new WorkflowIrError(`Cycle detected at node: ${nodeId}`);
@@ -1264,8 +1388,12 @@ export class WorkflowGraphExecutor {
 
       try {
         const isReworkHead = reworkHeads.has(nodeId);
+        let reworkPass = 0;
         for (;;) {
-          const outcome = await runNodeAndTraverse(node);
+          const activeTopLevelReworkVisit = isReworkHead
+            ? Object.freeze({ headNodeId: nodeId, pass: reworkPass })
+            : topLevelReworkVisit;
+          const outcome = await runNodeAndTraverse(node, activeTopLevelReworkVisit);
           if (!isReworkSignal(outcome)) return outcome;
           // A rework back-edge fired. It must target THIS head (the deepest
           // enclosing rework head); a signal for an outer head propagates up.
@@ -1273,6 +1401,7 @@ export class WorkflowGraphExecutor {
           const remaining = reworkBudgetFor(nodeId);
           if (remaining > 0) {
             reworkBudget.set(nodeId, remaining - 1);
+            reworkPass += 1;
             continue; // re-run the head node fresh (await-review re-evaluates)
           }
           // Budget exhausted: route the head's `outcome:rework-exhausted` forward
@@ -1282,7 +1411,11 @@ export class WorkflowGraphExecutor {
           // `condition:"success"` forward edge (which would re-enter the loop body
           // and never terminate). Never loops forever; never throws "Cycle
           // detected" for the legal rework edge.
-          const exhausted = await traverseChildren(node, { outcome: "failure", value: "rework-exhausted" });
+          const exhausted = await traverseChildren(
+            node,
+            { outcome: "failure", value: "rework-exhausted" },
+            activeTopLevelReworkVisit,
+          );
           // If no `outcome:rework-exhausted` edge exists the source bubbles back
           // (a failure outcome) — a finite, routable terminal, never an infinite loop.
           return exhausted;
@@ -1292,7 +1425,10 @@ export class WorkflowGraphExecutor {
       }
     };
 
-    const runLegacyMergeSeam = async (regionNode?: WorkflowIrNode): Promise<WorkflowNodeResult> => {
+    const runLegacyMergeSeam = async (
+      regionNode: WorkflowIrNode | undefined,
+      topLevelReworkVisit?: TopLevelReworkVisit,
+    ): Promise<WorkflowNodeResult> => {
       // The merge-policy primitive region is interpreter-owned policy. While the
       // legacy lifecycle remains authoritative, reaching any of its node kinds is
       // the terminal merge boundary: dispatch the same prompt/seam handler a
@@ -1311,6 +1447,8 @@ export class WorkflowGraphExecutor {
         context,
         ir,
         this.deps.signal,
+        true,
+        visitIdentityWithTopLevelRework(mergeNode, topLevelReworkVisit),
       );
       if (result.contextPatch) Object.assign(context, result.contextPatch);
       context[`node:${mergeNode.id}:outcome`] = result.outcome;
@@ -1321,6 +1459,7 @@ export class WorkflowGraphExecutor {
     const traverseChildren = async (
       node: WorkflowIrNode,
       sourceResult: WorkflowNodeResult,
+      topLevelReworkVisit?: TopLevelReworkVisit,
     ): Promise<WorkflowNodeResult | ReworkSignal> => {
       const edges = outgoingMap.get(node.id) ?? [];
       if (edges.length === 0) {
@@ -1352,7 +1491,7 @@ export class WorkflowGraphExecutor {
           continue;
         }
         if (target && isMergeRegionKind(target.kind)) {
-          aggregate = await runLegacyMergeSeam(target);
+          aggregate = await runLegacyMergeSeam(target, topLevelReworkVisit);
           if (aggregate.outcome === "failure") break;
           /*
            * FNXC:WorkflowPostMerge 2026-06-26-09:00:
@@ -1377,7 +1516,7 @@ export class WorkflowGraphExecutor {
              * not overwrite already-proven merge state.
              */
             try {
-              const postMerge = await walk(entryId);
+              const postMerge = await walk(entryId, topLevelReworkVisit);
               // A post-merge entry node is never an enclosing rework head, so a
               // ReworkSignal here would be malformed IR; ignore it rather than bubble a
               // rework loop out of the merge boundary.
@@ -1414,7 +1553,7 @@ export class WorkflowGraphExecutor {
           }
           continue;
         }
-        const child = await walk(edge.to);
+        const child = await walk(edge.to, topLevelReworkVisit);
         // A ReworkSignal propagated from deeper: bubble it further up unchanged.
         if (isReworkSignal(child)) return child;
         if (child.outcome === "failure") {
@@ -1739,6 +1878,9 @@ export class WorkflowGraphExecutor {
       ...(visitIdentity ?? { nodeId: node.id, materializedNodeId: node.id }),
     }) as WorkflowMaterializedVisitIdentity;
     const runId = this.deps.runId ?? `${originTaskId}:run`;
+    const executionFence = this.deps.executionFence !== undefined
+      ? requireWorkflowNodeExecutionFence(this.deps.executionFence as WorkflowNodeExecutionFence, runId)
+      : undefined;
     const resolvedExecution = this.deps.resolveNodeExecution
       ? await this.deps.resolveNodeExecution({
         node: snapshotResolverInput(node),
@@ -1756,12 +1898,22 @@ export class WorkflowGraphExecutor {
     if (this.deps.resolveNodeExecution) {
       semanticTask = cloneTaskWithLockedId(semanticTask, semanticTaskId);
     }
+    const providerAttemptTurnKey = executionFence
+      ? createProviderAttemptTurnKey({
+          originTaskId,
+          semanticTaskId,
+          executionFence,
+          visitIdentity: effectiveVisitIdentity,
+        })
+      : undefined;
     const execution = Object.freeze({
       originTaskId,
       semanticTaskId,
       semanticTask,
       runId,
       visitIdentity: effectiveVisitIdentity,
+      ...(executionFence ? { executionFence } : {}),
+      ...(providerAttemptTurnKey ? { providerAttemptTurnKey } : {}),
     }) as WorkflowNodeSealedExecution;
 
     // Per-node override: config.maxRetries beats the executor-wide default.
