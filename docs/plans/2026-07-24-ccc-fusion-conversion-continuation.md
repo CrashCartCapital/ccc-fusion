@@ -473,7 +473,7 @@ This section supersedes only the earlier Task 4 transport-plan wording where it 
 #### Local-Git Candidate Disposition
 
 - Local-Git candidate hashes `08f48f`, `a7ee71`, and `dd69c0` are **INVALIDATED** despite their reported `23/23`: repository `stat` produced a false-clean result, the repository filter was executed instead of proved structurally, and the timeout was not a hard deadline.
-- The exact two-file TDD repair is active in `packages/engine/src/ccc-campaign-local-git.ts` and `packages/engine/src/__tests__/ccc-campaign-local-git.real-git.test.ts`. No controller production edit may consume, import, export, or rely on this candidate until the repair is re-proven and frozen.
+- The exact two-file TDD repair in `packages/engine/src/ccc-campaign-local-git.ts` and `packages/engine/src/__tests__/ccc-campaign-local-git.real-git.test.ts` is no longer active-candidate work: accepted local-Git commit `9ed1839827ced133ff435499a7ab3a8e9f4416a4` re-proved and froze it before controller commit `79c91f8be245038100741cb5e405b34e01a4b46e` consumed the production wrapper.
 - Component `499068fa730d31835bc0437fc1f99d05f4872ac1` remains the committed provider-attempt identity component only. It is not Task 4 transport acceptance, local-Git acceptance, or Task 4 acceptance.
 
 #### Revised Task 4 RED Inventory
@@ -488,7 +488,7 @@ Task 4 cannot freeze an acceptance candidate until these exact negative controls
 6. External or self-declared plugin posture must remain opaque; fixed host `no-provider` must prove zero controller effects, fixed host scoped-provider must receive only the narrow controller, and same-ID posture drift must fail before handler execution.
 7. Every new dispatch must reassert the exact approval claim against database time. Expired authority must produce zero new dispatch, no autonomous renewal, and no subclaim; post-begin uncertainty must remain unknown unless authoritative evidence proves no accepted effect.
 8. Initial Git admission must detect repository `stat` drift, symlink or physical-custody drift, filter execution, dirty state, changed `HEAD`, and non-hard timeout false greens. No model output may advance the admitted snapshot; absent the Task 5 native effect/merger receipt seam, changed state must hold before another stream.
-9. `provider:direct` must bind one exact semantic task target, and dynamic mutation targets must prove separate exact native admission and receipt; wildcard targets must refuse.
+9. The single declared `live_execution` action ID and target must bind approval and provider-attempt action authority, while `semanticTaskId` binds the task independently; dynamic mutation targets must prove separate exact native admission and receipt, and wildcard targets must refuse.
 10. Ordinary workflows must retain existing behavior and produce exactly zero campaign provider-attempt rows, while campaign cancellation, restart, lost begin response, and terminal settlement remain truthful through normal public readers.
 
 #### Collision-Free Writer Ownership
