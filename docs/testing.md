@@ -633,18 +633,28 @@ Use the exact heading `## Symptom Verification` and include all three required c
 
 Symptom-based acceptance is mandatory for bug fixes: reproduce the original failure, prove it is gone, and keep the invariant covered across the `## Surface Enumeration` checklist. Green build/tests alone are insufficient when they do not exercise the reported symptom.
 
-## Task 4 Pre-Provider Admission Test Freeze — 2026-07-25
+## Task 4 Pre-Provider Admission Foundation Freeze — 2026-07-25
 
-Task 4 starts from RED scaffold, not accepted code. `ccc-campaign-admission.ts` and `ccc-campaign-execution.test.ts` are untracked; the focused result is one expected failure and three passes because the draft assumes top-level `providerId`/`modelId` instead of persisted route custody. Typecheck additionally finds two unexported draft imports. Do not count these as acceptance evidence.
+Task 4 foundation commit `0ff3748319036ba57356afe1625e2d04e95ef850`, tree `7a73a5595c013126b06337bfdd417cda0622c5db`, is committed on `agent/ccc-fusion-task4-preprovider`. It is a foundation only: it proves pre-provider admission and provider-attempt accounting seams, not Task 4 acceptance, not production Pi/CLI/workflow transport wiring, not production local-Git admission, not downstream Task 5 merger/ref-update behavior, and not any live provider call.
 
-The implementation must prove two authorities: one coarse campaign/action admission authority and one per-transport `CccProviderAttemptScope`. Reuse `ccc_prd_imports` under its existing serialized row lock and native `run_audit_events`; do not introduce a migration, table, store, receipt family, or alternate control plane. The first new attempt increments `request_count` once under that lock. Replay must find its deterministic event before generating a timestamp or incrementing; a same-key changed-content replay refuses. Active attempts are computed from exact campaign-bound audit history, never from `active_action_leases`.
+Final focused proof on the committed foundation:
 
-Required named REDs before any GREEN are:
+- `FUSION_PG_TEST_URL_BASE=postgresql://postgres:password@localhost:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/ccc-campaign-provider-attempt.pg.test.ts --silent=passed-only --reporter=dot` — PASS, `10/10`.
+- `pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-execution.test.ts --silent=passed-only --reporter=dot` — PASS, `26/26`.
+- `pnpm --filter @fusion/core typecheck` — PASS.
+- `pnpm --filter @fusion/engine typecheck` — PASS.
+- `pnpm --filter @fusion/engine build` — PASS.
+- Targeted lint for the touched core/engine files — PASS.
+- `git diff --check` — PASS.
 
-- max-concurrency race and lost-response replay;
-- same-key changed-content collision;
-- Pi initial, fallback, and compaction attempts at `ModelRuntime.stream` and `streamSimple`;
-- CLI finite-bound reservation immediately before `manager.spawn`, plus abort-to-`dispatched_unknown`;
-- opaque provider-capable plugin refusal, null imported custody, and approval retention while unknown remains active.
+Observed RED/GREEN sequence:
 
-An authoritative terminal observation may settle `dispatched_unknown`; abort alone may not mark it `proved_failed`. Provider-capable workflow plugins must receive a scope or fail closed unless explicitly no-provider. Imported marker plus null custody fails closed.
+- Engine admission initially passed 19 existing cases and failed 3 new negative controls for non-canonical Git head, empty protected claim token, and mutable returned lease; after repair it passed `22/22`.
+- Engine admission then passed 22 existing cases and failed 2 new controls for unprotected binding/context mutation; callback-timing controls added another `24 pass / 2 fail` RED; final repair passed `26/26`.
+- Core provider-attempt PostgreSQL initially passed 9 existing cases and failed 1 immutability control for returned attempt scope mutation; final repair passed `10/10`.
+
+The foundation reuses `ccc_prd_imports` under its existing serialized row lock and native `run_audit_events`; it does not introduce a migration, table, store, receipt family, parser, scheduler, or alternate control plane. Public `TaskStore` provider-attempt methods own their own transaction and return only after commit. Active attempts are computed from exact campaign-bound audit history, never from `active_action_leases`. Replay finds a deterministic event before timestamp generation or request-count increment, and same-key changed content refuses. `dispatched_unknown` remains active until authoritative reconciliation.
+
+Final adversarial review returned PASS with no P0/P1/P2. Accepted repairs include public transaction ownership, native action-lease validation, canonical Git object-ID refusal, immutable context before async callbacks, immutable returned authority/binding/approval/provider-attempt scopes, restart visibility for unknown dispatch, changed-content collision refusal, and zero provider/action/hook callback effects before admission.
+
+Current boundaries for future tests: the engine Git inspector is still an injected trusted interface, not production local-Git admission; Pi `ModelRuntime.stream`/`streamSimple`, CLI `manager.spawn`, and provider-capable workflow call sites are not yet wired to the attempt scope; durable cancellation, approval-terminal reconciliation, long-lived proof bootstrap, production local-Git admission, and user-like restart/transport inspection remain open Task 4 acceptance work. Downstream Task 5 owns production merger/ref-update reconciliation and terminal Git receipts. No live provider, credential, billing, non-loopback, fetch, push, merge, release, publication, upstream adoption, or `main` gate has been issued. Package, workspace, and lockfile hashes remain unchanged: `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.

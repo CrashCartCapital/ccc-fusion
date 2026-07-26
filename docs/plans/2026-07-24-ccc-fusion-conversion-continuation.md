@@ -33,6 +33,7 @@ This is the code-local continuation packet. The vault remains authoritative for 
 | Accepted Task 1 | Immutable campaign/execution-policy identity plus populated-0035 quarantine proof; closed Wave 5 mapping now 81/81 | `1cbcef3037a86917f5a1b769eac7d84059b7099b` |
 | Accepted Task 2 descendant | Native campaign governance, final indivisible `0037`, Task A/B corrections, and P1-03/P1-04 repair | `bdd5cfce44271ba2f13636098e6d736dcf7ea874` |
 | Accepted Task 3 descendant | Fail-closed native proof-admission binding, sealed provenance registry, fenced workflow ownership, built-CLI proof host bootstrap, generic-executor refusal, and preserved Wave 5 81-name proof mapping | `dc2d4968d828d623986991f504a530112ba59c3a` |
+| Task 4 foundation | Committed pre-provider admission foundation only: coarse campaign/action admission and native provider-attempt accounting, not transport wiring or Task 4 acceptance | `0ff3748319036ba57356afe1625e2d04e95ef850` |
 | Accepted Phase A/B contract | Generated sidecar, structural compiler, validate, and built CLI | `90c585766b37605aae4be5a9ad6880455e1b7afa` |
 | Accepted Phase C import | PostgreSQL/filesystem unit of work, recovery, and idempotency | `d0debd4ee1b50276b149741e23bbe69c18360ba2` |
 | Task 3 acceptance branch | Accepted product plus this documentation descendant for Task 4 | `agent/ccc-fusion-task2-plan-repair` |
@@ -395,34 +396,43 @@ Extend existing Fusion production seams so an imported CCC campaign is admitted,
 - Handoff Rule: the active goal already exists. The sole accepted-spine writer resumes from accepted Task 3 `dc2d4968d828d623986991f504a530112ba59c3a`, then advances Tasks 4–10 and updates the vault checkpoint after each material contract, RED, GREEN, commit, review, or operator gate.
 - Resume Rule: local product implementation resumes from accepted Task 3 through Task 4 pre-provider admission, bounds, drift, and durable cancellation. It does not begin a live provider, credential, billing, non-loopback, fetch, push, merge, release, publication, protected-path, upstream-adoption, or `main` action.
 
-## Current Task 3 Receipt And Task 4 Plan Freeze — 2026-07-25
+## Current Task 4 Foundation Receipt — 2026-07-25
 
-This section is the current correction layer for this continuation packet. It supersedes contradictory historical wording in earlier receipts, including any statement that an AGY session rendered Task 3 acceptance.
+This section is the current correction layer for this continuation packet. It supersedes contradictory historical wording in earlier receipts, including the pre-foundation Task 4 RED-scaffold freeze below. It does not reopen Waves 1–5 or accepted Task 1–3.
 
 ### Accepted Spine And Recovery
 
 - The accepted Task 3 product is `dc2d4968d828d623986991f504a530112ba59c3a`, tree `5aed8833cd8345b967945052c005cd50f11cb19f`, from a clean detached candidate.
-- Its focused built-CLI proof contained three files and 13 tests. Wave 5 preserves exactly 81 unique proof names. The recorded report is `/var/folders/m0/q5ny02wd0wd5lf0tt9w2jwqr0000gn/T/ccc-wave-5-proof-0PaA8T/report.json`.
-- Three fresh lanes passed with no P0/P1: behavioral/PostgreSQL, static/build, and native adversarial final-byte. The dedicated AGY request was permission-denied and produced no verdict; the native Sol adversarial child is the recorded substitute, not AGY.
+- The Task 4 foundation product is `0ff3748319036ba57356afe1625e2d04e95ef850`, parent `5fcaff1ea47121eea476e09a1ccaec03d2f7046f`, tree `7a73a5595c013126b06337bfdd417cda0622c5db`, on `agent/ccc-fusion-task4-preprovider`. It is a committed foundation only, not Task 4 acceptance, not transport integration, and not provider proof.
+- Task 4 foundation reused existing `ccc_prd_imports` locking and native `run_audit_events`. It added no migration, table, receipt store, scheduler, parser, or parallel control plane. Public `TaskStore` provider-attempt methods own their own database transactions and return only after commit; they do not accept caller-provided transaction handles.
+- The foundation freezes two native authorities: coarse campaign/action admission before a provider-capable path, and immutable per-attempt scope returned by native provider-attempt reservation. Attempt states are `reserved`, `dispatched_unknown`, `committed`, and `proved_failed`; `dispatched_unknown` remains active until authoritative reconciliation.
+- Final focused proof on the committed foundation: engine admission/execution `26/26`; core loopback PostgreSQL provider-attempt `10/10`; core typecheck PASS; engine typecheck PASS; engine build PASS; targeted lint PASS; `git diff --check` PASS.
+- Final adversarial review returned PASS with no P0/P1/P2. Accepted repairs include native lease validation, canonical Git object-ID refusal for non-object heads, immutable context before async callbacks, immutable returned authority/attempt scopes, public transaction ownership, restart-visible unknown dispatch, and collision refusal for changed replay evidence.
+- RED/GREEN trail preserved: initial engine negative controls for Git OID, empty claim token, and mutable returned lease produced `19 pass / 3 fail`, then `22/22`; later unprotected binding/context mutation controls produced `22 pass / 2 fail`, callback-timing controls produced `24 pass / 2 fail`, then final `26/26`; core provider-scope immutability produced `9 pass / 1 fail`, then final `10/10`.
 - Documentation descendant `c59a46310af4ed2f3121423fbeeaa6aa575ea8d4` was preserved. The old Task 2 worktree has an unstaged provenance experiment quarantined as non-accepted evidence. The sole product-writing surface is `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/task4-preprovider-admission` on `agent/ccc-fusion-task4-preprovider`.
+- Package, workspace, and lockfile hashes remain unchanged: `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`. The read-only dependency-hydration symlinks `node_modules` and `packages/core/node_modules` were removed before the clean freeze; their targets under `wave-3-retry` were not modified.
+- Speculative Wave 6 `2a739f13bfbea4e2c10a46570719fbd6441ba0a6` and Wave 7 `93309dcaa111614dfd2c2362d96525f9af597dc7` remain unaccepted, non-ancestral development evidence only. Neither is replayed unchanged.
 
 ### Task 4 Scope, Authorities, And Non-Goals
 
-Task 4 is a RED-to-GREEN pre-provider admission slice, not accepted implementation. Its current untracked `packages/engine/src/ccc-campaign-admission.ts` and `packages/engine/src/__tests__/ccc-campaign-execution.test.ts` are RED scaffold only. The focused command currently has one expected failure and three passes because the scaffold expects top-level `providerId`/`modelId`, while persisted route custody is authoritative; typecheck also sees two unexported draft imports. Do not promote either result to a product claim.
+Task 4 remains incomplete after the foundation commit. The committed foundation admits or refuses campaign actions before provider-capable dispatch and can reserve/reconcile provider attempts, but no production Pi, CLI-agent, or provider-capable workflow call site is wired yet. The injected Git inspector in `packages/engine/src/ccc-campaign-admission.ts` is a trusted interface boundary for focused proof; Task 4 must replace that with production local-Git admission and live local-Git proof. Production merger/ref-update reconciliation and terminal Git receipts remain downstream Task 5 work.
 
-Freeze two complementary authorities:
+The frozen authorities are:
 
 1. One coarse campaign/action-admission authority controls whether a campaign action may reach a provider-capable path.
 2. One per-transport `CccProviderAttemptScope` controls each actual transport request, reserve, settlement, and concurrency observation.
 
-Reuse the existing serialized `ccc_prd_imports` row and native `run_audit_events`. Do not add a migration, table, store, receipt family, or alternative control plane. Under the same import-row lock, the first new attempt increments `request_count` exactly once. Active attempts derive from exact campaign-bound audit history. Replay reads the deterministic event before timestamp generation or increment; same-key changed content refuses. Do not overload `active_action_leases`.
+The next implementation sequence must wire these authorities into actual provider-capable transports without widening scope:
 
-Pi reserves immediately at `ModelRuntime.stream` and `streamSimple`; the CLI-agent reserves immediately before `manager.spawn`. A spawned process without authoritative terminal observation becomes `dispatched_unknown`; unknown remains active and keeps claimed approval until authoritative settlement. A provider-capable workflow plugin receives a scope or fails closed unless explicitly declared no-provider. An imported marker with null custody fails closed.
+- Pi reserves immediately at `ModelRuntime.stream` and `streamSimple`, including initial, fallback, and compaction transports.
+- CLI-agent reserves immediately before `manager.spawn`, proves finite supported bounds before launch, and holds the attempt for the authoritative subprocess lifetime.
+- Provider-capable workflow handlers either receive and use the scope at their owned dispatch seam or fail closed unless explicitly declared no-provider.
+- Production local-Git admission rederives target, base, `HEAD`, ancestry, dirty state, approval claim, and restart-visible custody before any provider-capable dispatch. Production merger/ref-update reconciliation and terminal Git receipts are Task 5 downstream.
 
 ### Required RED Inventory And Adjudication
 
-Before GREEN, capture named REDs for: max-concurrency race; lost-response replay; same-key changed-content collision; Pi initial, fallback, and compaction transports; CLI finite bounds and abort-to-unknown; opaque-plugin refusal; null custody; and approval retention across unknown settlement.
+Closed by the foundation: max-concurrency race, lost-response replay, same-key changed-content collision, missing/null imported custody, provider/model/target/base drift, protected-action claim refusal, expired campaign deadline, pre-aborted signal, invalid native lease, non-canonical Git head, mutable returned authority, public transaction false-green, restart-visible unknown dispatch, and zero provider/action/hook callback effects before admission.
 
-AGY audit evidence is adjudicated as follows: accept the caller protected-action bypass, empty `bindingHash`, missing request/concurrency accounting, unwired routes, incomplete Git drift, and imported-null-custody findings. Partially accept cancellation: authoritative observation may reconcile unknown, but abort alone cannot. Reject automatic `proved_failed` after dispatched abort. The native architecture challenge remains BLOCK until replay and route REDs are GREEN; it is a plan/implementation gate, not a product P0.
+Still open for Task 4 acceptance: Pi initial/fallback/compaction wiring; CLI finite-bound launch and abort-to-`dispatched_unknown`; provider-capable workflow scope admission and opaque-plugin refusal at production extension boundaries; durable cancellation; approval-retention and authoritative terminal settlement across unknown dispatch; production local-Git admission; long-lived proof bootstrap; and user-like transport/restart inspection. Downstream Task 5 still owns production merger/ref-update reconciliation and terminal Git receipts. Abort alone still may not mark a dispatched attempt `proved_failed`; only authoritative terminal observation may settle it.
 
 No operator gate has been issued. Manifests remain unchanged.
