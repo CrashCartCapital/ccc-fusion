@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Settings, TaskDetail, WorkflowIr, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
+import type {
+  CccCampaignTaskContext,
+  Settings,
+  TaskDetail,
+  WorkflowIr,
+  WorkflowWorkItem,
+  WorkflowWorkItemState,
+} from "@fusion/core";
 
 import { WorkflowTaskRuntime, type WorkflowTaskRuntimeDeps } from "../workflow-task-runtime.js";
 import type { WorkflowNodeResult } from "../workflow-graph-executor.js";
@@ -343,6 +350,51 @@ describe("WorkflowTaskRuntime", () => {
     const result = await runtime.run(task, flagOff, { workItemFence: fence });
 
     expect(result.disposition).toBe("completed");
+    expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledWith({
+      workItemId: fence.workItemId,
+      originTaskId: task.id,
+      leaseOwner: fence.leaseOwner,
+      attempt: fence.attempt,
+      runId: fence.runId,
+    });
+  });
+
+  it("Task 4 RED: fenced campaign run identity comes from the persisted work-item fence", async () => {
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
+    const getCccCampaignContextForTask = vi.fn(async () =>
+      ({ campaignId: "CAMPAIGN-1" } as CccCampaignTaskContext),
+    );
+    const runtime = new WorkflowTaskRuntime({
+      runId: "ambient-deps-run-id",
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-orchestration", stepIds: [] }),
+        getWorkflowDefinition: async () => ({
+          ir: {
+            version: "v1",
+            name: "orchestration-only",
+            nodes: [{ id: "start", kind: "start" }, { id: "end", kind: "end" }],
+            edges: [{ from: "start", to: "end", condition: "success" }],
+          },
+        }),
+        getCccCampaignContextForTask,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const fence = {
+      workItemId: "WORK-FENCE-1",
+      leaseOwner: "worker-1",
+      attempt: 1,
+      runId: "ccc-prd:import-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const result = await runtime.run(task, flagOff, { workItemFence: fence });
+
+    expect(result.context["workflow:run-id"]).toBe(fence.runId);
+    expect(getCccCampaignContextForTask).toHaveBeenCalledTimes(1);
     expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledWith({
       workItemId: fence.workItemId,
       originTaskId: task.id,

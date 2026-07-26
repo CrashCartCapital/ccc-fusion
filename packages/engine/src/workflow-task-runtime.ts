@@ -135,6 +135,7 @@ export class WorkflowTaskRuntime {
       };
     }
 
+    const runtimeRunId = options.workItemFence?.runId ?? this.deps.runId ?? `${task.id}:${target.workflowId}`;
     const invoked: string[] = [];
     const campaignProofAdmission = this.campaignProofAdmission(task, options);
     const executor = new WorkflowGraphExecutor({
@@ -150,7 +151,7 @@ export class WorkflowTaskRuntime {
       // WorkflowTaskRuntime is the execution engine, so internally the graph
       // executor is authoritative even before the old feature flag plumbing is
       // deleted from legacy entry points.
-      runId: this.deps.runId ?? `${task.id}:${target.workflowId}`,
+      runId: runtimeRunId,
       signal: options.signal,
     });
 
@@ -213,7 +214,7 @@ export class WorkflowTaskRuntime {
         await ensureWorkflowCompletionSummary(this.deps.store, latestTask ?? task, {
           reason: "workflow-runtime-completed",
           workflowId: target.workflowId,
-          runId: this.deps.runId ?? `${task.id}:${target.workflowId}`,
+          runId: runtimeRunId,
         }).catch(() => undefined);
       }
     }
