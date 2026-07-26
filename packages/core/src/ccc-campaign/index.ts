@@ -33,8 +33,10 @@ export type {
   CccCampaignTaskContext,
   CccCampaignTransport,
   CccProviderAttemptReconciliation,
+  CccProviderAttemptDispatchDecision,
   CccProviderAttemptRequest,
   CccProviderAttemptScope,
   CccProviderAttemptState,
+  CccProviderAttemptTerminalEvidence,
   CccProviderAttemptTransition,
 } from "./types.js";

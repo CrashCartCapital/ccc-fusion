@@ -24,9 +24,11 @@ import {
   type CccCampaignAuthorityBinding,
   type CccCampaignTaskContext,
   type CccProviderAttemptReconciliation,
+  type CccProviderAttemptDispatchDecision,
   type CccProviderAttemptRequest,
   type CccProviderAttemptScope,
   type CccProviderAttemptState,
+  type CccProviderAttemptTerminalEvidence,
   type CccProviderAttemptTransition,
 } from "./types.js";
 
@@ -37,12 +39,7 @@ const PROVIDER_ATTEMPT_AGENT_ID = "ccc-provider-attempt";
 
 type AttemptStage = "reserved" | "dispatched" | "terminal";
 
-type TerminalReceipt = Readonly<{
-  kind: "not-dispatched" | "reconciled";
-  state: Extract<CccProviderAttemptState, "committed" | "proved_failed">;
-  evidenceDigest?: string;
-  observerId?: string;
-}>;
+type TerminalReceipt = CccProviderAttemptTerminalEvidence;
 
 type StoredAttempt = {
   scope: CccProviderAttemptScope;
@@ -63,6 +60,7 @@ type ProviderAttemptMetadata = Readonly<{
   semanticTaskId: string;
   campaignDeadlineAt: string;
   turnKey: string;
+  dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
   bindingHash: string;
@@ -179,6 +177,7 @@ function scopeIdentity(scope: CccProviderAttemptScope): Record<string, unknown> 
     semanticTaskId: scope.semanticTaskId,
     campaignDeadlineAt: scope.campaignDeadlineAt,
     turnKey: scope.turnKey,
+    dispatchKey: scope.dispatchKey,
     attemptOrdinal: scope.attemptOrdinal,
     requestCount: scope.requestCount,
     binding: scope.binding,
@@ -188,6 +187,7 @@ function scopeIdentity(scope: CccProviderAttemptScope): Record<string, unknown> 
 function scopeWithState(
   scope: CccProviderAttemptScope,
   state: CccProviderAttemptState,
+  terminal?: TerminalReceipt,
 ): CccProviderAttemptScope {
   const binding = Object.freeze({ ...scope.binding });
   return Object.freeze({
@@ -197,9 +197,11 @@ function scopeWithState(
     semanticTaskId: scope.semanticTaskId,
     campaignDeadlineAt: scope.campaignDeadlineAt,
     turnKey: scope.turnKey,
+    dispatchKey: scope.dispatchKey,
     attemptOrdinal: scope.attemptOrdinal,
     requestCount: scope.requestCount,
     state,
+    ...(terminal ? { terminal: Object.freeze({ ...terminal }) } : {}),
     binding,
   });
 }
@@ -211,10 +213,12 @@ function createScope(input: {
   semanticTaskId: string;
   campaignDeadlineAt: string;
   turnKey: string;
+  dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
   state: CccProviderAttemptState;
   binding: CccCampaignAuthorityBinding;
+  terminal?: TerminalReceipt;
 }): CccProviderAttemptScope {
   const binding = Object.freeze({ ...input.binding });
   return Object.freeze({
@@ -224,9 +228,11 @@ function createScope(input: {
     semanticTaskId: input.semanticTaskId,
     campaignDeadlineAt: input.campaignDeadlineAt,
     turnKey: input.turnKey,
+    dispatchKey: input.dispatchKey,
     attemptOrdinal: input.attemptOrdinal,
     requestCount: input.requestCount,
     state: input.state,
+    ...(input.terminal ? { terminal: Object.freeze({ ...input.terminal }) } : {}),
     binding,
   });
 }
@@ -279,6 +285,7 @@ function parseMetadata(value: unknown, stage: AttemptStage): ProviderAttemptMeta
     "stageOrdinal",
     "state",
     "turnKey",
+    "dispatchKey",
   ] as const;
   const terminalKind = value.terminalKind;
   if (stage !== "terminal") {
@@ -290,6 +297,9 @@ function parseMetadata(value: unknown, stage: AttemptStage): ProviderAttemptMeta
   } else {
     throw new CccCampaignContextError("CCC provider attempt terminal metadata has an invalid terminal kind");
   }
+  // Task 4 is the first production transport admission surface, so no live
+  // transport can have emitted v1. Refuse v1 deterministically rather than
+  // guessing a missing dispatchKey or introducing migration compatibility.
   if (value.schema !== CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION) {
     throw new CccCampaignContextError("CCC provider attempt metadata schema is invalid");
   }
@@ -336,6 +346,7 @@ function parseMetadata(value: unknown, stage: AttemptStage): ProviderAttemptMeta
     semanticTaskId: requireCanonicalIdentifier(value.semanticTaskId, "semantic task ID"),
     campaignDeadlineAt: assertCanonicalTimestamp(value.campaignDeadlineAt, "campaign deadline"),
     turnKey: requireCanonicalIdentifier(value.turnKey, "turn key"),
+    dispatchKey: requireCanonicalIdentifier(value.dispatchKey, "dispatch key"),
     attemptOrdinal: requirePositiveSafeInteger(value.attemptOrdinal, "attempt ordinal"),
     requestCount: requirePositiveSafeInteger(value.requestCount, "request count"),
     bindingHash: requireLowercaseSha256(value.bindingHash, "binding hash"),
@@ -424,6 +435,7 @@ function assertAuditRow(
       semanticTaskId: metadata.semanticTaskId,
       campaignDeadlineAt: metadata.campaignDeadlineAt,
       turnKey: metadata.turnKey,
+      dispatchKey: metadata.dispatchKey,
       attemptOrdinal: metadata.attemptOrdinal,
       requestCount: metadata.requestCount,
       state: metadata.state,
@@ -485,6 +497,11 @@ function assembleHistory(
     if (attempt.scope.campaignDeadlineAt !== context.campaignDeadlineAt) {
       throw new CccCampaignContextError("CCC provider attempt history campaign deadline drifted");
     }
+    if (attempt.scope.attemptOrdinal !== attempt.scope.requestCount) {
+      throw new CccCampaignContextError(
+        "CCC provider attempt history attempt ordinal does not match its persisted request count",
+      );
+    }
     requestCounts.push(attempt.scope.requestCount);
     if (attempt.terminal) {
       if (attempt.terminal.kind === "not-dispatched" && attempt.dispatched) {
@@ -493,7 +510,7 @@ function assembleHistory(
       if (attempt.terminal.kind === "reconciled" && !attempt.dispatched) {
         throw new CccCampaignContextError("CCC provider attempt history reconciles an attempt that was never dispatched");
       }
-      attempt.scope = scopeWithState(attempt.scope, attempt.terminal.state);
+      attempt.scope = scopeWithState(attempt.scope, attempt.terminal.state, attempt.terminal);
     } else if (attempt.dispatched) {
       attempt.scope = scopeWithState(attempt.scope, "dispatched_unknown");
       activeCount += 1;
@@ -595,7 +612,7 @@ function assertRequestRoute(
 function deriveAttemptKey(
   context: CccCampaignTaskContext,
   turnKey: string,
-  attemptOrdinal: number,
+  dispatchKey: string,
 ): string {
   const identity = {
     projectId: context.projectId,
@@ -604,17 +621,17 @@ function deriveAttemptKey(
     taskId: context.taskId,
     semanticTaskId: context.semanticTaskId,
     turnKey,
-    attemptOrdinal,
+    dispatchKey,
   };
   return `ccc-provider-attempt-${createHash("sha256")
-    .update(`ccc-provider-attempt/v1\\0${canonicalCccPrdJson(identity)}`, "utf8")
+    .update(`ccc-provider-attempt/v2\\0${canonicalCccPrdJson(identity)}`, "utf8")
     .digest("hex")}`;
 }
 
 function requestedReservation(
   context: CccCampaignTaskContext,
   request: CccProviderAttemptRequest,
-): { binding: CccCampaignAuthorityBinding; attemptKey: string; turnKey: string; attemptOrdinal: number } {
+): { binding: CccCampaignAuthorityBinding; attemptKey: string; turnKey: string; dispatchKey: string; routeMatches: boolean } {
   const taskId = requireCanonicalText(request.taskId, "task ID");
   if (taskId !== context.taskId) {
     throw new CccProviderAttemptIdentityError(
@@ -622,18 +639,20 @@ function requestedReservation(
       `CCC provider attempt task ${taskId} does not match locked task ${context.taskId}`,
     );
   }
-  assertRequestRoute(context, request);
   const turnKey = requireCanonicalIdentifier(request.turnKey, "turn key");
-  const attemptOrdinal = requirePositiveSafeInteger(request.attemptOrdinal, "attempt ordinal");
+  const dispatchKey = requireCanonicalIdentifier(request.dispatchKey, "dispatch key");
   const binding = createCccCampaignAuthorityBinding(context, {
     actionId: requireCanonicalText(request.actionId, "action ID"),
     actionTarget: requireCanonicalText(request.actionTarget, "action target"),
   });
   return {
     binding,
-    attemptKey: deriveAttemptKey(context, turnKey, attemptOrdinal),
+    attemptKey: deriveAttemptKey(context, turnKey, dispatchKey),
     turnKey,
-    attemptOrdinal,
+    dispatchKey,
+    routeMatches: request.providerId === context.route.providerId
+      && request.modelId === context.route.modelId
+      && request.transport === context.route.transport,
   };
 }
 
@@ -643,7 +662,7 @@ function assertReservationReplay(
     binding: CccCampaignAuthorityBinding;
     attemptKey: string;
     turnKey: string;
-    attemptOrdinal: number;
+    dispatchKey: string;
   },
   context: CccCampaignTaskContext,
 ): CccProviderAttemptScope {
@@ -653,7 +672,7 @@ function assertReservationReplay(
     || scope.taskId !== context.taskId
     || scope.semanticTaskId !== context.semanticTaskId
     || scope.turnKey !== request.turnKey
-    || scope.attemptOrdinal !== request.attemptOrdinal
+    || scope.dispatchKey !== request.dispatchKey
     || !sameCanonicalValue(scope.binding, request.binding)
   ) {
     throw new CccProviderAttemptCollisionError(
@@ -694,6 +713,7 @@ function metadataFor(
     semanticTaskId: scope.semanticTaskId,
     campaignDeadlineAt: scope.campaignDeadlineAt,
     turnKey: scope.turnKey,
+    dispatchKey: scope.dispatchKey,
     attemptOrdinal: scope.attemptOrdinal,
     requestCount: scope.requestCount,
     bindingHash: scope.binding.bindingHash,
@@ -791,19 +811,21 @@ export async function reserveCccProviderAttempt(input: ReserveInput): Promise<Cc
     const requested = requestedReservation(context, input.request);
     const history = await loadHistory(tx, context);
     const existing = history.attempts.get(requested.attemptKey);
-    if (existing) return assertReservationReplay(existing, requested, context);
+    if (existing) {
+      if (!requested.routeMatches) {
+        throw new CccProviderAttemptCollisionError(
+          `CCC provider attempt ${requested.attemptKey} collides with changed campaign route`,
+        );
+      }
+      return assertReservationReplay(existing, requested, context);
+    }
+    if (!requested.routeMatches) assertRequestRoute(context, input.request);
 
     const { maxRequests, maxConcurrency } = admittedBounds(context);
     if (history.activeCount >= maxConcurrency) {
       throw new CccProviderAttemptLimitError(
         "max-concurrency",
         `CCC provider attempt for ${context.taskId} exceeds its admitted concurrency bound`,
-      );
-    }
-    if (requested.attemptOrdinal !== context.requestCount + 1) {
-      throw new CccProviderAttemptIdentityError(
-        "invalid-input",
-        `CCC provider attempt ordinal must advance from ${context.requestCount} to ${context.requestCount + 1}`,
       );
     }
     const now = await databaseNow(tx);
@@ -821,7 +843,8 @@ export async function reserveCccProviderAttempt(input: ReserveInput): Promise<Cc
       semanticTaskId: context.semanticTaskId,
       campaignDeadlineAt: context.campaignDeadlineAt,
       turnKey: requested.turnKey,
-      attemptOrdinal: requested.attemptOrdinal,
+      dispatchKey: requested.dispatchKey,
+      attemptOrdinal: context.requestCount + 1,
       requestCount: context.requestCount + 1,
       state: "reserved",
       binding: requested.binding,
@@ -833,23 +856,27 @@ export async function reserveCccProviderAttempt(input: ReserveInput): Promise<Cc
 }
 
 export async function markCccProviderAttemptDispatched(
-  input: TransitionInput,
+  _input: TransitionInput,
 ): Promise<CccProviderAttemptScope> {
+  throw new CccProviderAttemptStateError(
+    "CCC provider attempt legacy mark-dispatched is fail-closed; use beginCccProviderAttemptDispatch",
+  );
+}
+
+export async function beginCccProviderAttemptDispatch(
+  input: TransitionInput,
+): Promise<CccProviderAttemptDispatchDecision> {
   requireCanonicalText(input.transition.taskId, "task ID");
   return withinWriteTransaction(input, async (tx) => {
     const context = await lockedContext(input, tx, input.transition.taskId);
     const attempt = transitionAttempt(await loadHistory(tx, context), input.transition, context.taskId);
-    if (attempt.scope.state === "dispatched_unknown") return attempt.scope;
-    if (attempt.scope.state !== "reserved") {
-      throw new CccProviderAttemptStateError(
-        `CCC provider attempt ${attempt.scope.attemptKey} cannot dispatch from ${attempt.scope.state}`,
-      );
-    }
+    if (attempt.scope.state === "dispatched_unknown") return Object.freeze({ kind: "dispatched-unknown", scope: attempt.scope });
+    if (attempt.scope.state !== "reserved") return Object.freeze({ kind: "terminal", scope: attempt.scope });
     const now = await databaseNow(tx);
     assertBeforeDeadline(context, now);
     const dispatched = scopeWithState(attempt.scope, "dispatched_unknown");
     await appendAttemptEvent(tx, now, dispatched, "dispatched");
-    return dispatched;
+    return Object.freeze({ kind: "dispatch-permit", scope: dispatched });
   });
 }
 
@@ -866,13 +893,14 @@ export async function proveCccProviderAttemptNotDispatched(
         `CCC provider attempt ${attempt.scope.attemptKey} cannot prove no dispatch from ${attempt.scope.state}`,
       );
     }
-    const terminal = scopeWithState(attempt.scope, "proved_failed");
+    const terminalReceipt: TerminalReceipt = { kind: "not-dispatched", state: "proved_failed" };
+    const terminal = scopeWithState(attempt.scope, "proved_failed", terminalReceipt);
     await appendAttemptEvent(
       tx,
       await databaseNow(tx),
       terminal,
       "terminal",
-      { kind: "not-dispatched", state: "proved_failed" },
+      terminalReceipt,
     );
     return terminal;
   });
@@ -913,7 +941,7 @@ export async function reconcileCccProviderAttempt(
       evidenceDigest,
       observerId,
     };
-    const terminal = scopeWithState(attempt.scope, outcome);
+    const terminal = scopeWithState(attempt.scope, outcome, terminalReceipt);
     await appendAttemptEvent(
       tx,
       await databaseNow(tx),

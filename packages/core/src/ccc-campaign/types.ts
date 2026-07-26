@@ -16,7 +16,7 @@ export const CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION =
 export type CccCampaignTransport = "pi" | "cli" | "workflow";
 
 export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
-  "ccc-campaign.provider-attempt.v1" as const;
+  "ccc-campaign.provider-attempt.v2" as const;
 
 export type CccProviderAttemptState =
   | "reserved"
@@ -29,7 +29,7 @@ export type CccProviderAttemptRequest = Readonly<{
   actionId: string;
   actionTarget: string;
   turnKey: string;
-  attemptOrdinal: number;
+  dispatchKey: string;
   providerId: string;
   modelId: string;
   transport: CccCampaignTransport;
@@ -47,6 +47,15 @@ export type CccProviderAttemptReconciliation = CccProviderAttemptTransition & Re
   observerId: string;
 }>;
 
+export type CccProviderAttemptTerminalEvidence =
+  | Readonly<{ kind: "not-dispatched"; state: "proved_failed" }>
+  | Readonly<{
+    kind: "reconciled";
+    state: Extract<CccProviderAttemptState, "committed" | "proved_failed">;
+    evidenceDigest: string;
+    observerId: string;
+  }>;
+
 export type CccProviderAttemptScope = Readonly<{
   attemptKey: string;
   controllerToken: string;
@@ -54,11 +63,17 @@ export type CccProviderAttemptScope = Readonly<{
   semanticTaskId: string;
   campaignDeadlineAt: string;
   turnKey: string;
+  dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
   state: CccProviderAttemptState;
+  terminal?: CccProviderAttemptTerminalEvidence;
   binding: Readonly<CccCampaignAuthorityBinding>;
 }>;
+
+export type CccProviderAttemptDispatchDecision =
+  | Readonly<{ kind: "dispatch-permit"; scope: CccProviderAttemptScope }>
+  | Readonly<{ kind: "dispatched-unknown" | "terminal"; scope: CccProviderAttemptScope }>;
 
 export class CccProviderAttemptIdentityError extends Error {
   public readonly code = "CCC_PROVIDER_ATTEMPT_IDENTITY_REFUSED";

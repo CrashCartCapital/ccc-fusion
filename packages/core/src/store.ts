@@ -15,6 +15,7 @@ import {
 } from "./ccc-campaign/store.js";
 import {
   inspectCccProviderAttempt,
+  beginCccProviderAttemptDispatch,
   markCccProviderAttemptDispatched,
   proveCccProviderAttemptNotDispatched,
   reconcileCccProviderAttempt,
@@ -24,6 +25,7 @@ import type {
   CccCampaignActionLookup,
   CccCampaignTaskContext,
   CccProviderAttemptReconciliation,
+  CccProviderAttemptDispatchDecision,
   CccProviderAttemptRequest,
   CccProviderAttemptScope,
   CccProviderAttemptTransition,
@@ -999,6 +1001,12 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   ): Promise<CccProviderAttemptScope> {
     if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
     return markCccProviderAttemptDispatched({ layer: this.asyncLayer, rootDir: this.rootDir, transition: input });
+  }
+  async beginCccProviderAttemptDispatch(
+    input: CccProviderAttemptTransition,
+  ): Promise<CccProviderAttemptDispatchDecision> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return beginCccProviderAttemptDispatch({ layer: this.asyncLayer, rootDir: this.rootDir, transition: input });
   }
   async proveCccProviderAttemptNotDispatched(
     input: CccProviderAttemptTransition,

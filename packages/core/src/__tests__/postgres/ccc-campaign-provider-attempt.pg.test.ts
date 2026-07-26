@@ -24,7 +24,7 @@ type ProviderAttemptRequest = Readonly<{
   actionId: string;
   actionTarget: string;
   turnKey: string;
-  attemptOrdinal: number;
+  dispatchKey: string;
   providerId: string;
   modelId: string;
   transport: "pi" | "cli" | "workflow";
@@ -43,9 +43,13 @@ type ProviderAttemptScope = Readonly<{
   semanticTaskId: string;
   campaignDeadlineAt: string;
   turnKey: string;
+  dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
   state: "reserved" | "dispatched_unknown" | "committed" | "proved_failed";
+  terminal?:
+    | Readonly<{ kind: "not-dispatched"; state: "proved_failed" }>
+    | Readonly<{ kind: "reconciled"; state: "committed" | "proved_failed"; evidenceDigest: string; observerId: string }>;
   binding: Readonly<{
     actionId: string;
     actionTarget: string;
@@ -62,6 +66,10 @@ type ProviderAttemptScope = Readonly<{
 
 type ProviderAttemptStore = {
   reserveCccProviderAttempt(input: ProviderAttemptRequest): Promise<ProviderAttemptScope>;
+  beginCccProviderAttemptDispatch(input: ProviderAttemptTransition): Promise<
+    | Readonly<{ kind: "dispatch-permit"; scope: ProviderAttemptScope }>
+    | Readonly<{ kind: "dispatched-unknown" | "terminal"; scope: ProviderAttemptScope }>
+  >;
   markCccProviderAttemptDispatched(input: ProviderAttemptTransition): Promise<ProviderAttemptScope>;
   proveCccProviderAttemptNotDispatched(input: ProviderAttemptTransition): Promise<ProviderAttemptScope>;
   reconcileCccProviderAttempt(input: ProviderAttemptTransition & {
@@ -110,7 +118,6 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     taskId: string,
     actionTarget: string,
     turnKey: string,
-    attemptOrdinal: number,
     route: Partial<Pick<ProviderAttemptRequest, "providerId" | "modelId" | "transport">> = {},
   ): ProviderAttemptRequest {
     return {
@@ -118,7 +125,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       actionId: taskId,
       actionTarget,
       turnKey,
-      attemptOrdinal,
+      dispatchKey: `dispatch-${turnKey}`,
       providerId: route.providerId ?? "deterministic-fake",
       modelId: route.modelId ?? "fixture-v1",
       transport: route.transport ?? "pi",
@@ -173,9 +180,16 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     }
   }
 
+  async function dispatch(store: ProviderAttemptStore, transition: ProviderAttemptTransition): Promise<ProviderAttemptScope> {
+    const decision = await store.beginCccProviderAttemptDispatch(transition);
+    expect(decision.kind).toBe("dispatch-permit");
+    return decision.scope;
+  }
+
   it("reserves all named TaskStore methods, replays a lost reservation byte-identically, and persists one admission event", async () => {
     const store = api(h.store());
     expect(typeof store.reserveCccProviderAttempt).toBe("function");
+    expect(typeof store.beginCccProviderAttemptDispatch).toBe("function");
     expect(typeof store.markCccProviderAttemptDispatched).toBe("function");
     expect(typeof store.proveCccProviderAttemptNotDispatched).toBe("function");
     expect(typeof store.reconcileCccProviderAttempt).toBe("function");
@@ -184,7 +198,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     const { taskId, campaign } = await context("replay");
     // The fixture declares no protected action. Its task import intent is the
     // exact non-protected action identity: TASK-replay targeting rootDir.
-    const input = request(taskId, h.rootDir(), "turn-replay", 1);
+    const input = request(taskId, h.rootDir(), "turn-replay");
     const first = await store.reserveCccProviderAttempt(input);
     const replay = await store.reserveCccProviderAttempt(input);
     expect(replay).toEqual(first);
@@ -229,10 +243,49 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     });
   });
 
+  it("refuses audit history whose persisted attempt ordinal no longer matches its request count", async () => {
+    const { taskId } = await context("ordinal-custody");
+    const store = api(h.store());
+    const reserved = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-ordinal-custody"));
+
+    await h.layer().db.execute(sql`
+      UPDATE project.run_audit_events
+      SET metadata = jsonb_set(metadata, '{attemptOrdinal}', '2'::jsonb)
+      WHERE metadata->>'attemptKey' = ${reserved.attemptKey}
+    `);
+
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: reserved.attemptKey }))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_CONTEXT_REFUSED" });
+  });
+
+  it("allocates an ordinal in the store and grants only one dispatch permit after a lost reservation response", async () => {
+    const { taskId, campaign } = await context("store-owned-dispatch", {
+      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 2,
+    });
+    const store = api(h.store());
+    const input = request(taskId, h.rootDir(), "turn-owned");
+    const first = await store.reserveCccProviderAttempt(input);
+    const replay = await api(new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }))
+      .reserveCccProviderAttempt(input);
+    expect(replay).toEqual(first);
+    expect(first).toMatchObject({ attemptOrdinal: 1, requestCount: 1, dispatchKey: "dispatch-turn-owned" });
+    expect(await persistedRequestCount(campaign.importId)).toBe(1);
+
+    const transition = { taskId, attemptKey: first.attemptKey, controllerToken: first.controllerToken };
+    const decisions = await Promise.all([
+      store.beginCccProviderAttemptDispatch(transition),
+      store.beginCccProviderAttemptDispatch(transition),
+    ]);
+    expect(decisions.filter((decision) => decision.kind === "dispatch-permit")).toHaveLength(1);
+    expect(decisions.filter((decision) => decision.kind === "dispatched-unknown")).toHaveLength(1);
+    const restarted = api(new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }));
+    await expect(restarted.beginCccProviderAttemptDispatch(transition)).resolves.toMatchObject({ kind: "dispatched-unknown" });
+  });
+
   it("returns immutable provider-attempt authority snapshots without changing persisted bytes", async () => {
     const { taskId } = await context("immutable-scope");
     const store = api(h.store());
-    const reserved = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-immutable", 1));
+    const reserved = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-immutable"));
     const reservedBytes = JSON.stringify(reserved);
     const transition = {
       taskId,
@@ -246,7 +299,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     expect.soft(Object.isFrozen(reserved.binding)).toBe(true);
     expect.soft(JSON.stringify(reserved)).toBe(reservedBytes);
 
-    const dispatched = await store.markCccProviderAttemptDispatched(transition);
+    const dispatched = await dispatch(store, transition);
     const dispatchedBytes = JSON.stringify(dispatched);
 
     mutateReturnedScope(dispatched);
@@ -268,8 +321,8 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     const { taskId } = await context("concurrent");
     const store = api(h.store());
     const outcomes = await Promise.allSettled([
-      store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-winner", 1)),
-      store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-loser", 1)),
+      store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-winner")),
+      store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-loser")),
     ]);
     const winners = outcomes.filter((outcome) => outcome.status === "fulfilled");
     const losers = outcomes.filter((outcome) => outcome.status === "rejected");
@@ -279,13 +332,36 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     expect(await auditRows()).toHaveLength(1);
   });
 
+  it("allocates unique contiguous store-owned ordinals for concurrent distinct dispatch keys", async () => {
+    const { taskId, campaign } = await context("concurrent-ordinals", {
+      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 2,
+    });
+    const results = await Promise.all([
+      api(h.store()).reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-one")),
+      api(h.store()).reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-two")),
+    ]);
+    expect(results.map((result) => result.attemptOrdinal).sort()).toEqual([1, 2]);
+    expect(results.map((result) => result.requestCount).sort()).toEqual([1, 2]);
+    expect(await persistedRequestCount(campaign.importId)).toBe(2);
+  });
+
   it("collision-refuses a changed action target for one logical attempt without another audit or request", async () => {
     const { taskId, campaign } = await context("action-collision");
     const store = api(h.store());
-    await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-action", 1));
+    await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-action"));
     await expect(store.reserveCccProviderAttempt(
-      request(taskId, `${h.rootDir()}-changed`, "turn-action", 1),
+      request(taskId, `${h.rootDir()}-changed`, "turn-action"),
     )).rejects.toMatchObject({ code: "CCC_PROVIDER_ATTEMPT_COLLISION" });
+    expect(await auditRows()).toHaveLength(1);
+    expect(await persistedRequestCount(campaign.importId)).toBe(1);
+  });
+
+  it("collision-refuses changed route for one stable dispatch key without another audit or request", async () => {
+    const { taskId, campaign } = await context("route-collision");
+    const store = api(h.store());
+    await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-route"));
+    await expect(store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-route", { modelId: "fixture-v2" })))
+      .rejects.toMatchObject({ code: "CCC_PROVIDER_ATTEMPT_COLLISION" });
     expect(await auditRows()).toHaveLength(1);
     expect(await persistedRequestCount(campaign.importId)).toBe(1);
   });
@@ -293,7 +369,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
   it("refuses provider route drift before writing an audit event or incrementing request_count", async () => {
     const { taskId, campaign } = await context("route-drift");
     const store = api(h.store());
-    await expect(store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-route", 1, {
+    await expect(store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-route", {
       modelId: "fixture-v2",
     }))).rejects.toMatchObject({
       code: "CCC_PROVIDER_ATTEMPT_IDENTITY_REFUSED",
@@ -308,37 +384,33 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       maxRequests: 2, maxDurationMs: 60_000, maxConcurrency: 1,
     });
     const store = api(h.store());
-    for (const [turnKey, attemptOrdinal] of [["turn-one", 1], ["turn-two", 2]] as const) {
-      const attempt = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), turnKey, attemptOrdinal));
+    for (const turnKey of ["turn-one", "turn-two"] as const) {
+      const attempt = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), turnKey));
       await store.proveCccProviderAttemptNotDispatched({
         taskId, attemptKey: attempt.attemptKey, controllerToken: attempt.controllerToken,
       });
     }
-    await expect(store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-three", 3))).rejects.toMatchObject({
+    await expect(store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-three"))).rejects.toMatchObject({
       code: "CCC_PROVIDER_ATTEMPT_LIMIT_REFUSED",
       reason: "max-requests",
     });
     expect(await persistedRequestCount(campaign.importId)).toBe(2);
   });
 
-  it("refuses a non-next attempt ordinal after a terminal attempt without another audit or request", async () => {
+  it("allocates the next ordinal after a terminal attempt without accepting caller ordinal", async () => {
     const { taskId, campaign } = await context("ordinal", {
       maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1,
     });
     const store = api(h.store());
-    const first = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-one", 1));
+    const first = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-one"));
     await store.proveCccProviderAttemptNotDispatched({
       taskId, attemptKey: first.attemptKey, controllerToken: first.controllerToken,
     });
     expect(await auditRows()).toHaveLength(2);
-    await expect(store.reserveCccProviderAttempt(
-      request(taskId, h.rootDir(), "turn-skipped", 3),
-    )).rejects.toMatchObject({
-      code: "CCC_PROVIDER_ATTEMPT_IDENTITY_REFUSED",
-      reason: "invalid-input",
-    });
-    expect(await auditRows()).toHaveLength(2);
-    expect(await persistedRequestCount(campaign.importId)).toBe(1);
+    const next = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-skipped"));
+    expect(next.attemptOrdinal).toBe(2);
+    expect(await auditRows()).toHaveLength(3);
+    expect(await persistedRequestCount(campaign.importId)).toBe(2);
   });
 
   it("uses the database clock to refuse a reservation after the campaign deadline", async () => {
@@ -347,7 +419,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     });
     await h.layer().db.execute(sql`SELECT pg_sleep(0.01)`);
     await expect(api(h.store()).reserveCccProviderAttempt(
-      request(taskId, h.rootDir(), "turn-deadline", 1),
+      request(taskId, h.rootDir(), "turn-deadline"),
     )).rejects.toMatchObject({
       code: "CCC_PROVIDER_ATTEMPT_LIMIT_REFUSED",
       reason: "deadline",
@@ -359,16 +431,16 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
   it("keeps dispatched-unknown across restart, releases only after authoritative committed reconciliation, and advances ordinal", async () => {
     const { taskId } = await context("restart");
     const store = api(h.store());
-    const firstInput = request(taskId, h.rootDir(), "turn-one", 1);
+    const firstInput = request(taskId, h.rootDir(), "turn-one");
     const first = await store.reserveCccProviderAttempt(firstInput);
     const transition = { taskId, attemptKey: first.attemptKey, controllerToken: first.controllerToken };
-    const dispatched = await store.markCccProviderAttemptDispatched(transition);
+    const dispatched = await dispatch(store, transition);
     const restarted = api(new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }));
     await expect(restarted.inspectCccProviderAttempt({
       taskId,
       attemptKey: first.attemptKey,
     })).resolves.toEqual(dispatched);
-    await expect(restarted.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-two", 2))).rejects.toMatchObject({
+    await expect(restarted.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-two"))).rejects.toMatchObject({
       code: "CCC_PROVIDER_ATTEMPT_LIMIT_REFUSED",
       reason: "max-concurrency",
     });
@@ -378,7 +450,16 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       evidenceDigest: "b".repeat(64),
       observerId: "provider-observer-committed",
     });
-    const second = await restarted.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-two", 2));
+    const committed = await restarted.inspectCccProviderAttempt({ taskId, attemptKey: first.attemptKey });
+    expect(committed).toMatchObject({
+      state: "committed",
+      terminal: {
+        kind: "reconciled", state: "committed", evidenceDigest: "b".repeat(64), observerId: "provider-observer-committed",
+      },
+    });
+    expect(Object.isFrozen(committed?.terminal)).toBe(true);
+    await expect(restarted.beginCccProviderAttemptDispatch(transition)).resolves.toMatchObject({ kind: "terminal" });
+    const second = await restarted.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-two"));
     expect(second.attemptOrdinal).toBe(2);
     expect(second.requestCount).toBe(2);
   });
@@ -386,19 +467,22 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
   it("only proves reserved attempts as not dispatched and collision-refuses changed terminal reconciliation", async () => {
     const { taskId } = await context("terminal");
     const store = api(h.store());
-    const reservedInput = request(taskId, h.rootDir(), "turn-reserved", 1);
+    const reservedInput = request(taskId, h.rootDir(), "turn-reserved");
     const reserved = await store.reserveCccProviderAttempt(reservedInput);
     const reservedTransition = {
       taskId, attemptKey: reserved.attemptKey, controllerToken: reserved.controllerToken,
     };
     const preDispatch = await store.proveCccProviderAttemptNotDispatched(reservedTransition);
     expect(preDispatch).toMatchObject({ state: "proved_failed" });
+    expect(preDispatch.terminal).toEqual({ kind: "not-dispatched", state: "proved_failed" });
+    expect(Object.isFrozen(preDispatch.terminal)).toBe(true);
+    await expect(store.beginCccProviderAttemptDispatch(reservedTransition)).resolves.toMatchObject({ kind: "terminal" });
     await expect(store.proveCccProviderAttemptNotDispatched(reservedTransition)).resolves.toEqual(preDispatch);
 
-    const dispatchedInput = request(taskId, h.rootDir(), "turn-dispatched", 2);
+    const dispatchedInput = request(taskId, h.rootDir(), "turn-dispatched");
     const dispatched = await store.reserveCccProviderAttempt(dispatchedInput);
     const transition = { taskId, attemptKey: dispatched.attemptKey, controllerToken: dispatched.controllerToken };
-    await store.markCccProviderAttemptDispatched(transition);
+    await dispatch(store, transition);
     await expect(store.proveCccProviderAttemptNotDispatched(transition)).rejects.toMatchObject({
       code: "CCC_PROVIDER_ATTEMPT_STATE_REFUSED",
     });
@@ -409,6 +493,11 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       evidenceDigest: "a".repeat(64),
       observerId: "provider-observer-1",
     });
+    expect(first.terminal).toEqual({
+      kind: "reconciled", state: "proved_failed", evidenceDigest: "a".repeat(64), observerId: "provider-observer-1",
+    });
+    expect(Object.isFrozen(first.terminal)).toBe(true);
+    await expect(store.beginCccProviderAttemptDispatch(transition)).resolves.toMatchObject({ kind: "terminal" });
     await expect(store.proveCccProviderAttemptNotDispatched(transition)).rejects.toMatchObject({
       code: "CCC_PROVIDER_ATTEMPT_STATE_REFUSED",
     });
@@ -426,5 +515,16 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     })).rejects.toMatchObject({
       code: "CCC_RUN_AUDIT_EVENT_COLLISION",
     });
+  });
+
+  it("keeps legacy mark-dispatched fail-closed without an audit write", async () => {
+    const { taskId } = await context("legacy-fail-closed");
+    const store = api(h.store());
+    const reserved = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-legacy"));
+    const transition = { taskId, attemptKey: reserved.attemptKey, controllerToken: reserved.controllerToken };
+    await expect(store.markCccProviderAttemptDispatched(transition)).rejects.toMatchObject({
+      code: "CCC_PROVIDER_ATTEMPT_STATE_REFUSED",
+    });
+    expect(await auditRows()).toHaveLength(1);
   });
 });
