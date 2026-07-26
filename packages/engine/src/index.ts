@@ -155,6 +155,9 @@ export {
   WorkflowGraphExecutor,
   type WorkflowGraphExecutorDeps,
   type WorkflowGraphExecutorResult,
+  type WorkflowMaterializedVisitIdentity,
+  type WorkflowNodeSealedExecution,
+  type WorkflowNodeProviderControllerResolverInput,
 } from "./workflow-graph-executor.js";
 export {
   runSplitJoin,
@@ -314,6 +317,7 @@ export {
   type CccCampaignProofWorkflowStore,
   type CccCampaignProofWorkItemFence,
   type CreateCccCampaignProofNodeAdmissionInput,
+  type CccCampaignProofAdmissionExecutionBinding,
 } from "./ccc-campaign-proof-workflow.js";
 export { collectTaskEvaluationEvidence } from "./evaluator-evidence.js";
 export { Scheduler, type SchedulerOptions } from "./scheduler.js";

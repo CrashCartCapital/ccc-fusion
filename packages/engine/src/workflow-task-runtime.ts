@@ -138,16 +138,38 @@ export class WorkflowTaskRuntime {
     const runtimeRunId = options.workItemFence?.runId ?? this.deps.runId ?? `${task.id}:${target.workflowId}`;
     const invoked: string[] = [];
     const campaignProofAdmission = this.campaignProofAdmission(task, options);
+    const {
+      store: _store,
+      onEvent: _onEvent,
+      resolveNodeExecution: ordinaryResolveNodeExecution,
+      resolveNodeProviderController: ordinaryResolveNodeProviderController,
+      admitNodeExecution: ordinaryAdmitNodeExecution,
+      ...graphDeps
+    } = this.deps;
+    const fencedCampaignRun = options.workItemFence !== undefined;
     const executor = new WorkflowGraphExecutor({
-      ...this.deps,
+      ...graphDeps,
       primitives: this.deps.primitives,
       handlers: this.recordingHandlers(invoked),
-      ...(campaignProofAdmission
+      ...(fencedCampaignRun
         ? {
-            admitNodeExecution: (node, _task, signal) =>
-              campaignProofAdmission(node, signal),
+            resolveNodeExecution: this.campaignNodeExecutionResolver(task),
+            // Presence is the native campaign enforcement marker. A missing
+            // producer remains a closed capability, not an ordinary plugin run.
+            resolveNodeProviderController: async (input) =>
+              ordinaryResolveNodeProviderController?.(input),
+            admitNodeExecution: (node, semanticTask, signal, visitIdentity, execution) =>
+              campaignProofAdmission?.(node, signal, execution && visitIdentity
+                ? { semanticTask, visitIdentity, execution }
+                : undefined),
           }
-        : {}),
+        : {
+            ...(ordinaryResolveNodeExecution ? { resolveNodeExecution: ordinaryResolveNodeExecution } : {}),
+            ...(ordinaryResolveNodeProviderController
+              ? { resolveNodeProviderController: ordinaryResolveNodeProviderController }
+              : {}),
+            ...(ordinaryAdmitNodeExecution ? { admitNodeExecution: ordinaryAdmitNodeExecution } : {}),
+          }),
       // WorkflowTaskRuntime is the execution engine, so internally the graph
       // executor is authoritative even before the old feature flag plumbing is
       // deleted from legacy entry points.
@@ -318,7 +340,54 @@ export class WorkflowTaskRuntime {
       },
       originTaskId: task.id,
       fence: options.workItemFence,
+      requireExecutionBinding: true,
     });
+  }
+
+  private campaignNodeExecutionResolver(originTask: TaskDetail): NonNullable<WorkflowGraphExecutorDeps["resolveNodeExecution"]> {
+    return async ({ node }) => {
+      const semanticTaskId = node.config?.cccPrdTaskId;
+      // Structural graph nodes do not execute a campaign task or proof and retain
+      // the origin task as their sealed semantic identity.
+      if (semanticTaskId === undefined && (node.kind === "start" || node.kind === "end" || node.kind === "split" || node.kind === "join" || node.kind === "foreach" || node.kind === "loop" || node.kind === "optional-group")) {
+        return { semanticTask: originTask };
+      }
+      if (typeof semanticTaskId !== "string" || semanticTaskId.length === 0 || semanticTaskId !== semanticTaskId.trim()) {
+        throw new PermanentError(
+          `CCC campaign semantic task id for node ${node.id} is missing or invalid`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      const getTask = this.deps.store.getTask;
+      if (typeof getTask !== "function") {
+        throw new PermanentError(
+          "CCC campaign semantic task store is unwired",
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      let semanticTask: TaskDetail | undefined;
+      try {
+        semanticTask = await getTask.call(this.deps.store, semanticTaskId);
+      } catch {
+        throw new PermanentError(
+          `CCC campaign semantic task ${semanticTaskId} lookup failed`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      if (!semanticTask) {
+        throw new PermanentError(
+          `CCC campaign semantic task ${semanticTaskId} is missing`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      if (semanticTask.id !== semanticTaskId) {
+        throw new PermanentError(
+          `CCC campaign semantic task identity does not match ${semanticTaskId}`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      return { semanticTask };
+    };
   }
 
   public async runWorkItem(

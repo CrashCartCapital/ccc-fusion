@@ -104,6 +104,8 @@ export type {
   WorkflowWorkEngineInput,
   WorkflowWorkEngineHandler,
   WorkflowNodeExtensionResult,
+  WorkflowNodeProviderDispatchInput,
+  WorkflowNodeProviderController,
   WorkflowNodeHandlerInput,
   WorkflowNodeExtensionHandler,
   TaskVerdictStatus,

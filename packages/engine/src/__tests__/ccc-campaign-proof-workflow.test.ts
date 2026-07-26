@@ -12,6 +12,7 @@ import {
   type CccCampaignTaskContext,
   type CccPrdProof,
   type RunAuditEventInput,
+  type TaskDetail,
   type WorkflowProofAdmissionEvaluator,
 } from "@fusion/core";
 import { describe, expect, it, vi } from "vitest";
@@ -24,10 +25,79 @@ import {
 } from "../ccc-campaign-proof-admission.js";
 import {
   createCccCampaignProofNodeAdmission,
+  type CccCampaignProofAdmissionExecutionBinding,
 } from "../ccc-campaign-proof-workflow.js";
 
 type ProofWorkflowModule = {
   createCccCampaignProofNodeAdmission?: (...args: never[]) => unknown;
+};
+
+const exactBinding = ({
+  originTaskId,
+  semanticTaskId,
+  runId,
+  nodeId,
+}: {
+  originTaskId: string;
+  semanticTaskId: string;
+  runId: string;
+  nodeId: string;
+}): CccCampaignProofAdmissionExecutionBinding => {
+  const semanticTask = Object.freeze({ id: semanticTaskId } as TaskDetail);
+  const visitIdentity = Object.freeze({ nodeId, materializedNodeId: nodeId });
+  const execution = Object.freeze({
+    originTaskId,
+    semanticTaskId,
+    semanticTask,
+    runId,
+    visitIdentity,
+  });
+  return Object.freeze({
+    semanticTask,
+    visitIdentity,
+    execution,
+  });
+};
+
+const requiredBindingAdmitter = (fixture: Awaited<ReturnType<typeof proofFixture>>, signal = new AbortController().signal, proofIds = [fixture.proof.id]) => {
+  const origin = campaignContext(
+    "TASK-ORIGIN",
+    "TASK-ORIGIN",
+    proofIds,
+    fixture.proof,
+  );
+  const nodeContext = campaignContext(
+    "TASK-NODE",
+    "TASK-NODE",
+    proofIds,
+    fixture.proof,
+  );
+  const recordFencedAudit = vi.fn(async (input: FencedAuditInput) => input.event);
+  const store = {
+    getCccCampaignContextForTask: vi.fn(async (taskId: string) => {
+      if (taskId === origin.taskId) return origin;
+      if (taskId === nodeContext.taskId) return nodeContext;
+      return null;
+    }),
+    recordFencedCccCampaignProofAudit: recordFencedAudit,
+  };
+  const input = {
+    store,
+    originTaskId: origin.taskId,
+    fence: proofFence(),
+    registry: fixture.registry,
+    requireExecutionBinding: true,
+  } satisfies Parameters<typeof createCccCampaignProofNodeAdmission>[0];
+  return {
+    node: {
+      id: "node-1",
+      kind: "prompt",
+      config: { cccPrdTaskId: nodeContext.semanticTaskId },
+    } as const,
+    signal,
+    recordFencedAudit,
+    admit: createCccCampaignProofNodeAdmission(input),
+  };
 };
 
 type FencedAuditInput = {
@@ -135,6 +205,208 @@ describe("CCC campaign proof workflow admission", () => {
         },
       },
     });
+  });
+
+  it("admits a fixture with exact admission binding and sealed execution provenance", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-ORIGIN",
+      semanticTaskId: "TASK-NODE",
+      runId: "run-1",
+      nodeId: "node-1",
+    });
+
+    await harness.admit(harness.node, harness.signal, binding);
+
+    expect(evaluate).toHaveBeenCalledOnce();
+    expect(evaluate.mock.calls[0]).toHaveLength(1);
+    expect(harness.recordFencedAudit).toHaveBeenCalledOnce();
+  });
+
+  it("refuses before evaluator dispatch when execution origin differs from factory origin", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-UNMATCHED",
+      semanticTaskId: "TASK-NODE",
+      runId: "run-1",
+      nodeId: "node-1",
+    });
+
+    await expect(harness.admit(harness.node, harness.signal, binding))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
+  });
+
+  it("refuses before evaluator dispatch when execution semantic id differs from node config", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-ORIGIN",
+      semanticTaskId: "TASK-UNMATCHED",
+      runId: "run-1",
+      nodeId: "node-1",
+    });
+
+    await expect(harness.admit(harness.node, harness.signal, binding))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
+  });
+
+  it("refuses before evaluator dispatch when semantic task id differs from execution semantic task", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-ORIGIN",
+      semanticTaskId: "TASK-NODE",
+      runId: "run-1",
+      nodeId: "node-1",
+    });
+    const topLevel = { ...binding.semanticTask, id: "TASK-UNMATCHED" };
+    const topLevelMismatchedBinding = { ...binding, semanticTask: topLevel };
+
+    await expect(harness.admit(harness.node, harness.signal, topLevelMismatchedBinding))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
+  });
+
+  it("refuses before evaluator dispatch when execution run id differs from fenced run id", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-ORIGIN",
+      semanticTaskId: "TASK-NODE",
+      runId: "run-UNMATCHED",
+      nodeId: "node-1",
+    });
+
+    await expect(harness.admit(harness.node, harness.signal, binding))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
+  });
+
+  it("refuses before evaluator dispatch when visit identity nodeId differs from node id", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-ORIGIN",
+      semanticTaskId: "TASK-NODE",
+      runId: "run-1",
+      nodeId: "node-UNMATCHED",
+    });
+
+    await expect(harness.admit(harness.node, harness.signal, binding))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
+  });
+
+  it("refuses before evaluator dispatch when execution visit identity is not the exact same visit identity", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-ORIGIN",
+      semanticTaskId: "TASK-NODE",
+      runId: "run-1",
+      nodeId: "node-1",
+    });
+    const altVisitIdentity = Object.freeze({ nodeId: "node-1", materializedNodeId: "node-1" });
+    const mismatchedBinding = {
+      ...binding,
+      execution: {
+        ...binding.execution,
+        visitIdentity: altVisitIdentity,
+      },
+    };
+
+    await expect(harness.admit(harness.node, harness.signal, mismatchedBinding))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
+  });
+
+  it("refuses before evaluator dispatch when materialized visit identity drifts", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+    const binding = exactBinding({
+      originTaskId: "TASK-ORIGIN",
+      semanticTaskId: "TASK-NODE",
+      runId: "run-1",
+      nodeId: "node-1",
+    });
+    const executionVisitIdentity = { ...binding.execution.visitIdentity, materializedNodeId: "node-UNMATCHED" };
+    const mismatchedBinding = {
+      ...binding,
+      execution: {
+        ...binding.execution,
+        visitIdentity: executionVisitIdentity,
+      },
+    };
+
+    await expect(harness.admit(harness.node, harness.signal, mismatchedBinding))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
+  });
+
+  it("refuses missing runtime-safe admission binding before evaluator dispatch", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const harness = requiredBindingAdmitter(fixture);
+
+    await expect(harness.admit(harness.node, harness.signal))
+      .rejects.toMatchObject({ code: "CCC_PROOF_ADMISSION_REFUSED" });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(harness.recordFencedAudit).not.toHaveBeenCalled();
   });
 
   it("refuses a missing semantic task binding before loading campaign custody", async () => {

@@ -42,6 +42,37 @@ function selectedIr(): WorkflowIr {
   };
 }
 
+function selectedSemanticIr(): WorkflowIr {
+  return {
+    version: "v1",
+    name: "selected-semantic",
+    nodes: [
+      { id: "start", kind: "start" },
+      { id: "semantic", kind: "prompt", config: { cccPrdTaskId: "TASK-SEMANTIC" } },
+      { id: "end", kind: "end" },
+    ],
+    edges: [
+      { from: "start", to: "semantic", condition: "success" },
+      { from: "semantic", to: "end", condition: "success" },
+      { from: "semantic", to: "end", condition: "failure" },
+    ],
+  };
+}
+
+function campaignProofContext(taskId: string): CccCampaignTaskContext {
+  return {
+    schema: "ccc-campaign.context.v1" as CccCampaignTaskContext["schema"],
+    taskId,
+    semanticTaskId: taskId,
+    proofIds: [],
+    proofs: [],
+    admittedWriteRoots: [],
+    protectedActions: [],
+    requestCount: 0,
+    activeActionLeases: {},
+  } as unknown as CccCampaignTaskContext;
+}
+
 function recordingPrimitives(
   calls: string[],
   overrides: Partial<Record<"prepare" | "execute" | "workflowStep", WorkflowNodeResult>> & {
@@ -268,7 +299,7 @@ describe("WorkflowTaskRuntime", () => {
         }),
         getCccCampaignContextForTask: async () => ({ campaignId: "CAMPAIGN-1" }),
         assertCccCampaignWorkflowLeaseFence,
-      } as any,
+      } as WorkflowTaskRuntimeDeps["store"],
       primitives: recordingPrimitives([]),
       runCustomNode: handler,
     });
@@ -335,7 +366,7 @@ describe("WorkflowTaskRuntime", () => {
         }),
         getCccCampaignContextForTask: async () => ({ campaignId: "CAMPAIGN-1" }),
         assertCccCampaignWorkflowLeaseFence,
-      } as any,
+      } as WorkflowTaskRuntimeDeps["store"],
       primitives: recordingPrimitives([]),
       runCustomNode: async () => ({ outcome: "success" }),
     });
@@ -402,6 +433,117 @@ describe("WorkflowTaskRuntime", () => {
       attempt: fence.attempt,
       runId: fence.runId,
     });
+  });
+
+  it("Task 4 RED: resolves semantic task via store.getTask before proof admission", async () => {
+    const getTask = vi.fn(async () => ({ id: "TASK-SEMANTIC" } as TaskDetail));
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
+    const recordFencedCccCampaignProofAudit = vi.fn();
+    const handler = vi.fn(async () => ({ outcome: "success" as const }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-SEM", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedSemanticIr() }),
+        getTask,
+        getCccCampaignContextForTask: async (taskId: string) => campaignProofContext(taskId),
+        recordFencedCccCampaignProofAudit,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: handler,
+    });
+    const fence = {
+      workItemId: "WORK-SEM-1",
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-semantic-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const result = await runtime.run(task, flagOff, {
+      workItemFence: fence,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.disposition).toBe("failed");
+    expect(result.outcome).toBe("failure");
+    expect(getTask).toHaveBeenCalledTimes(1);
+    expect(getTask).toHaveBeenCalledWith("TASK-SEMANTIC");
+    expect(handler).not.toHaveBeenCalled();
+    expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledTimes(1);
+    expect(recordFencedCccCampaignProofAudit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unwired", undefined, /CCC campaign semantic task|lookup|semantic/i],
+    ["missing", async () => undefined, /CCC campaign semantic task TASK-SEMANTIC is missing/i],
+    ["throws", async () => { throw new Error("resolver failed"); }, /CCC campaign semantic task TASK-SEMANTIC lookup failed/i],
+    ["mismatched-id", async () => ({ id: "TASK-OTHER" } as TaskDetail), /CCC campaign semantic task identity does not match TASK-SEMANTIC/i],
+  ])("Task 4 RED: semantic resolver refuses before proof/evaluator when getTask is %s", async (_case, getTaskResult, token) => {
+    const signal = new AbortController().signal;
+    const getTask = getTaskResult
+      ? vi.fn(async (_taskId: string) => getTaskResult())
+      : undefined;
+    const handler = vi.fn(async () => ({ outcome: "success" as const }));
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
+    const recordFencedCccCampaignProofAudit = vi.fn();
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-SEM", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedSemanticIr() }),
+        ...(getTask ? { getTask } : {}),
+        getCccCampaignContextForTask: async (taskId: string) => campaignProofContext(taskId),
+        recordFencedCccCampaignProofAudit,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: handler,
+    });
+    const fence = {
+      workItemId: "WORK-SEM-1",
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-semantic-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const result = await runtime.run(task, flagOff, { workItemFence: fence, signal });
+
+    expect(result.disposition).toBe("failed");
+    expect(result.outcome).toBe("failure");
+    if (getTask) {
+      expect(getTask).toHaveBeenCalledTimes(1);
+      expect(getTask).toHaveBeenCalledWith("TASK-SEMANTIC");
+    }
+    expect(handler).not.toHaveBeenCalled();
+    expect(recordFencedCccCampaignProofAudit).not.toHaveBeenCalled();
+    expect(result.context["node:semantic:error"] ?? result.reason ?? "").toMatch(token);
+  });
+
+  it("Task 4 RED: ordinary unfenced workflow does not perform semantic task substitution", async () => {
+    const getTask = vi.fn(async () => ({ id: "TASK-SEMANTIC" } as TaskDetail));
+    const calls: string[] = [];
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-SEM", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedSemanticIr() }),
+        getTask,
+      },
+      primitives: recordingPrimitives(calls),
+      runCustomNode: async (node) => {
+        calls.push(`custom:${node.id}`);
+        return { outcome: "success" };
+      },
+    });
+
+    const result = await runtime.run(task, flagOff, { deferCompletionSummary: true });
+
+    expect(result.disposition).toBe("completed");
+    expect(result.outcome).toBe("success");
+    expect(calls).toContain("custom:semantic");
+    expect(calls).not.toContain("custom:prepare");
+    expect(calls).not.toContain("custom:workflow-step");
+    expect(getTask).not.toHaveBeenCalled();
   });
 
   it("Task 3 RED: imported campaign lineage fails closed when custody lookup is missing", async () => {
@@ -570,7 +712,7 @@ describe("WorkflowTaskRuntime", () => {
       },
     });
 
-    const processing = (runtime.run as any)(task, flagOff, { signal: controller.signal });
+    const processing = runtime.run(task, flagOff, { signal: controller.signal });
     await vi.waitFor(() => expect(observedSignal).toBe(controller.signal));
     controller.abort();
     releaseHandler();
@@ -605,7 +747,7 @@ describe("WorkflowTaskRuntime", () => {
       runCustomNode: async () => ({ outcome: "success" }),
     });
 
-    const processing = (runtime.run as any)(task, flagOff, { signal: controller.signal });
+    const processing = runtime.run(task, flagOff, { signal: controller.signal });
     await vi.waitFor(() => expect(releaseArtifactRead).toBeTypeOf("function"));
     controller.abort();
     releaseArtifactRead();

@@ -6,7 +6,9 @@ import type {
   WorkflowIrEdge,
   WorkflowIrNode,
   WorkflowIrNodeKind,
+  WorkflowExtensionDefinition,
   WorkflowNodeExtensionResult,
+  WorkflowNodeProviderController,
   WorkflowStepResult,
 } from "@fusion/core";
 import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
@@ -148,6 +150,15 @@ export type WorkflowNodeSealedExecution = Readonly<{
   visitIdentity: WorkflowMaterializedVisitIdentity;
 }>;
 
+export type WorkflowNodeProviderControllerResolverInput = Readonly<{
+  node: WorkflowIrNode;
+  semanticTask: TaskDetail;
+  workflow: WorkflowIr;
+  extensionId: string;
+  execution: WorkflowNodeSealedExecution;
+  signal?: AbortSignal;
+}>;
+
 export type WorkflowNodeHandler = (node: WorkflowIrNode, context: WorkflowNodeExecutionContext) => Promise<WorkflowNodeResult>;
 
 export interface WorkflowNodePreparationRequirement {
@@ -161,6 +172,10 @@ export interface WorkflowGraphExecutorDeps {
   resolveNodeExecution?: (
     input: WorkflowNodeExecutionResolverInput,
   ) => WorkflowNodeExecutionResolverOutput | Promise<WorkflowNodeExecutionResolverOutput>;
+  /** Native campaign marker and capability resolver for provider-scoped plugin handlers. */
+  resolveNodeProviderController?: (
+    input: WorkflowNodeProviderControllerResolverInput,
+  ) => WorkflowNodeProviderController | undefined | Promise<WorkflowNodeProviderController | undefined>;
   /** Fail-closed admission for executable nodes. Runs once before preparation,
    * plugin dispatch, or a default handler. Orchestration-only nodes never enter
    * this seam. */
@@ -474,6 +489,39 @@ function snapshotResolverInput<T extends object>(value: T, lockedId?: string): T
     return Object.freeze(cloned);
   };
   return cloneAndFreeze(value, true) as T;
+}
+
+function requireSealedExecution(
+  execution: WorkflowNodeSealedExecution | undefined,
+  nodeId: string,
+): WorkflowNodeSealedExecution {
+  if (!execution || !Object.isFrozen(execution)) {
+    throw new PermanentError(
+      `Workflow node ${nodeId} provider controller requires sealed execution`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return execution;
+}
+
+function requireWorkflowNodeProviderController(
+  candidate: WorkflowNodeProviderController | undefined,
+  extensionId: string,
+): WorkflowNodeProviderController {
+  if (
+    !candidate
+    || typeof candidate !== "object"
+    || !Object.isFrozen(candidate)
+    || !Object.hasOwn(candidate, "preDispatch")
+    || Object.keys(candidate).length !== 1
+    || typeof candidate.preDispatch !== "function"
+  ) {
+    throw new PermanentError(
+      `Workflow node provider controller is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return candidate;
 }
 
 export class WorkflowGraphExecutor {
@@ -1546,12 +1594,74 @@ export class WorkflowGraphExecutor {
     };
   }
 
+  private async resolvePluginNodeProviderController(
+    node: WorkflowIrNode,
+    task: TaskDetail,
+    workflow: WorkflowIr,
+    extensionId: string,
+    definition: WorkflowExtensionDefinition,
+    signal: AbortSignal | undefined,
+    execution: WorkflowNodeSealedExecution | undefined,
+    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderController>>,
+  ): Promise<WorkflowNodeProviderController | undefined> {
+    if (!this.deps.resolveNodeProviderController) return undefined;
+    if (definition.providerPosture === "opaque") {
+      throw new PermanentError(
+        `Workflow node ${node.id} refuses opaque provider posture for extension ${extensionId}`,
+        "WORKFLOW_NODE_PROVIDER_REFUSED",
+      );
+    }
+    if (definition.providerPosture !== "scoped-provider") return undefined;
+
+    const cached = providerControllerPromises.get(extensionId) ?? Promise.resolve()
+      .then(() => this.deps.resolveNodeProviderController!({
+        node,
+        semanticTask: task,
+        workflow,
+        extensionId,
+        execution: requireSealedExecution(execution, node.id),
+        signal,
+      }))
+      .then((candidate) => requireWorkflowNodeProviderController(candidate, extensionId));
+    providerControllerPromises.set(extensionId, cached);
+    return await cached;
+  }
+
+  private async preflightPluginNodeProviderControllers(
+    node: WorkflowIrNode,
+    task: TaskDetail,
+    workflow: WorkflowIr,
+    signal: AbortSignal | undefined,
+    execution: WorkflowNodeSealedExecution | undefined,
+    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderController>>,
+  ): Promise<void> {
+    const registry = getWorkflowExtensionRegistry();
+    for (const extensionId of Object.keys(node.extensions ?? {})) {
+      const definition = registry.get(extensionId);
+      const extension = definition?.extension;
+      if (!definition || definition.degraded || extension?.kind !== "node-handler" || !extension.handle) continue;
+      if (extension.nodeKind && extension.nodeKind !== node.kind) continue;
+      await this.resolvePluginNodeProviderController(
+        node,
+        task,
+        workflow,
+        extensionId,
+        definition,
+        signal,
+        execution,
+        providerControllerPromises,
+      );
+    }
+  }
+
   private async executePluginNodeHandler(
     node: WorkflowIrNode,
     task: TaskDetail,
     workflow: WorkflowIr,
     context: Record<string, unknown>,
     signal?: AbortSignal,
+    execution?: WorkflowNodeSealedExecution,
+    providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderController>>(),
   ): Promise<WorkflowNodeResult | undefined> {
     const extensionIds = Object.keys(node.extensions ?? {});
     if (extensionIds.length === 0) return undefined;
@@ -1562,6 +1672,16 @@ export class WorkflowGraphExecutor {
       const extension = definition?.extension;
       if (!definition || definition.degraded || extension?.kind !== "node-handler" || !extension.handle) continue;
       if (extension.nodeKind && extension.nodeKind !== node.kind) continue;
+      const providerController = await this.resolvePluginNodeProviderController(
+        node,
+        task,
+        workflow,
+        extensionId,
+        definition,
+        signal,
+        execution,
+        providerControllerPromises,
+      );
       try {
         const result = await extension.handle({
           task,
@@ -1569,6 +1689,7 @@ export class WorkflowGraphExecutor {
           node,
           context,
           signal,
+          ...(providerController ? { providerController } : {}),
         });
         return this.normalizePluginNodeResult(result);
       } catch (error) {
@@ -1651,6 +1772,7 @@ export class WorkflowGraphExecutor {
 
     let lastError: unknown;
     let admissionCompleted = false;
+    const providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderController>>();
     /*
     FNXC:CccWave4Retry 2026-07-24-19:15:
     Permanent CCC failures stop after their first real invocation even when the
@@ -1668,11 +1790,27 @@ export class WorkflowGraphExecutor {
           await this.deps.admitNodeExecution?.(node, semanticTask, signal, effectiveVisitIdentity, execution);
           admissionCompleted = true;
         }
+        await this.preflightPluginNodeProviderControllers(
+          node,
+          semanticTask,
+          workflow,
+          signal,
+          execution,
+          providerControllerPromises,
+        );
         await this.prepareNodeExecution(node, semanticTask, context, settings, effectiveVisitIdentity, execution);
         const progressRecord = recordProgress && this.shouldRecordNodeProgress(node)
           ? await this.recordNodeProgressStart(semanticTaskId, node)
           : null;
-        const pluginResult = await this.executePluginNodeHandler(node, semanticTask, workflow, context, signal);
+        const pluginResult = await this.executePluginNodeHandler(
+          node,
+          semanticTask,
+          workflow,
+          context,
+          signal,
+          execution,
+          providerControllerPromises,
+        );
         if (pluginResult) {
           /*
           FNXC:CccWave4Projection 2026-07-24-18:25:

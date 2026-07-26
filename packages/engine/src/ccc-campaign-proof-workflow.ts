@@ -2,6 +2,7 @@ import type {
   CccCampaignTaskContext,
   CccPrdProof,
   RunAuditEventInput,
+  TaskDetail,
   WorkflowExtensionRegistry,
   WorkflowProofAdmissionEvaluator,
   WorkflowProofAdmissionEvaluatorResult,
@@ -26,6 +27,10 @@ import {
   createCccCampaignProofAdmissionEvaluatorInput,
 } from "./ccc-campaign-proof-admission.js";
 import { PermanentError } from "./engine-errors.js";
+import type {
+  WorkflowMaterializedVisitIdentity,
+  WorkflowNodeSealedExecution,
+} from "./workflow-graph-executor.js";
 
 export type CccCampaignProofWorkflowStore = {
   getCccCampaignContextForTask(
@@ -54,11 +59,19 @@ export type CreateCccCampaignProofNodeAdmissionInput = Readonly<{
   originTaskId: string;
   fence: CccCampaignProofWorkItemFence;
   registry?: WorkflowExtensionRegistry;
+  requireExecutionBinding?: true;
+}>;
+
+export type CccCampaignProofAdmissionExecutionBinding = Readonly<{
+  semanticTask: TaskDetail;
+  visitIdentity: WorkflowMaterializedVisitIdentity;
+  execution: WorkflowNodeSealedExecution;
 }>;
 
 export type CccCampaignProofNodeAdmission = (
   node: WorkflowIrNode,
   signal?: AbortSignal,
+  binding?: CccCampaignProofAdmissionExecutionBinding,
 ) => Promise<void>;
 
 export function createCccCampaignProofNodeAdmission(
@@ -67,9 +80,13 @@ export function createCccCampaignProofNodeAdmission(
   const fence = requireWorkItemFence(input.fence);
   const originTaskId = requireCanonicalText(input.originTaskId, "origin task id");
   const registry = input.registry ?? getWorkflowExtensionRegistry();
+  const requireExecutionBinding = input.requireExecutionBinding === true;
 
-  return async (node, signal) => {
+  return async (node, signal, binding) => {
     if (isOrchestrationOnlyNode(node)) return;
+    if (requireExecutionBinding) {
+      requireExactExecutionBinding(binding, node, originTaskId, fence);
+    }
     const liveSignal = requireLiveSignal(signal);
     const semanticTaskId = requireNodeSemanticTaskId(node);
     const [originContext, nodeContext] = await Promise.all([
@@ -98,6 +115,40 @@ export function createCccCampaignProofNodeAdmission(
       });
     }
   };
+}
+
+function requireExactExecutionBinding(
+  binding: CccCampaignProofAdmissionExecutionBinding | undefined,
+  node: WorkflowIrNode,
+  originTaskId: string,
+  fence: CccCampaignProofWorkItemFence,
+): void {
+  if (!binding || typeof binding !== "object") {
+    refuse("CCC proof admission requires a sealed execution binding");
+  }
+  const execution = binding.execution;
+  if (!execution || !Object.isFrozen(execution)) {
+    refuse("CCC proof admission execution binding is not frozen");
+  }
+  const visitIdentity = binding.visitIdentity;
+  if (!visitIdentity || !Object.isFrozen(visitIdentity)) {
+    refuse("CCC proof admission visit identity is not frozen");
+  }
+  const nodeSemanticTaskId = requireNodeSemanticTaskId(node);
+  if (
+    execution.originTaskId !== originTaskId
+    || execution.semanticTaskId !== nodeSemanticTaskId
+    || binding.semanticTask !== execution.semanticTask
+    || binding.semanticTask.id !== execution.semanticTaskId
+    || execution.semanticTask.id !== execution.semanticTaskId
+    || execution.runId !== fence.runId
+    || binding.visitIdentity !== execution.visitIdentity
+    || execution.visitIdentity.nodeId !== node.id
+    || requireCanonicalText(execution.visitIdentity.materializedNodeId, "materialized node id")
+      !== execution.visitIdentity.materializedNodeId
+  ) {
+    refuse("CCC proof admission execution binding does not match the sealed node visit");
+  }
 }
 
 type AdmitProofInput = Readonly<{

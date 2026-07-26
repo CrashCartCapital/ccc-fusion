@@ -1,6 +1,7 @@
 import type { Task, TaskDetail } from "./types.js";
 import type { WorkflowIr, WorkflowIrNode } from "./workflow-ir-types.js";
 import type { CccPrdProof } from "./ccc-prd/types.js";
+import type { CccCampaignProviderControllerDecision } from "./ccc-campaign/provider-controller.js";
 
 export const WORKFLOW_EXTENSION_SCHEMA_VERSION = 1 as const;
 
@@ -93,12 +94,22 @@ export type WorkflowNodeExtensionResult =
   | { outcome: "success" | "failure"; value?: string; contextPatch?: Record<string, unknown> }
   | { outcome: `outcome:${string}`; value?: string; contextPatch?: Record<string, unknown> };
 
+export type WorkflowNodeProviderDispatchInput = Readonly<{
+  turnKey: string;
+  dispatchKey: string;
+}>;
+
+export type WorkflowNodeProviderController = Readonly<{
+  preDispatch(input: WorkflowNodeProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
+}>;
+
 export interface WorkflowNodeHandlerInput {
   task: TaskDetail;
   workflow: WorkflowIr;
   node: WorkflowIrNode;
   context: Record<string, unknown>;
   signal?: AbortSignal;
+  providerController?: WorkflowNodeProviderController;
 }
 
 export type WorkflowNodeExtensionHandler =
