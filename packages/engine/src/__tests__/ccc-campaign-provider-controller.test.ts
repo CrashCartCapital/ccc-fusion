@@ -21,6 +21,9 @@ const preDispatch = Object.freeze({
   claimToken: "claim-1",
   turnKey: "turn-1",
   dispatchKey: "dispatch-1",
+  providerId: "provider-1",
+  modelId: "model-1",
+  transport: "pi",
 }) as never;
 
 describe("CCC campaign provider controller", () => {
@@ -45,6 +48,9 @@ describe("CCC campaign provider controller", () => {
         head: "c".repeat(40),
         headDescendsFromExpectedBase: true,
       },
+      providerId: "provider-1",
+      modelId: "model-1",
+      transport: "pi",
     }));
     expect(snapshot).toEqual(expect.objectContaining({ head: "a".repeat(40) }));
   });

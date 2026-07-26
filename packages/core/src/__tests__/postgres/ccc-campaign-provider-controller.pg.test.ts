@@ -53,7 +53,26 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
   }
 
   function input(f: Awaited<ReturnType<typeof fixture>>, suffix: string) {
-    return { layer: h.layer(), rootDir: h.rootDir(), authorityStore: h.store(), gitObservation: { targetRoot: f.campaign.targetRepository.path, expectedBaseObject: f.campaign.targetRepository.baseCommit, head: f.campaign.targetRepository.baseCommit, headDescendsFromExpectedBase: true as const }, taskId: f.taskId, approvalRequestId: f.issued.id, claimToken: f.claimToken, turnKey: `turn-${suffix}`, dispatchKey: `dispatch-${suffix}` };
+    const request = {
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      authorityStore: h.store(),
+      gitObservation: {
+        targetRoot: f.campaign.targetRepository.path,
+        expectedBaseObject: f.campaign.targetRepository.baseCommit,
+        head: f.campaign.targetRepository.baseCommit,
+        headDescendsFromExpectedBase: true as const,
+      },
+      taskId: f.taskId,
+      approvalRequestId: f.issued.id,
+      claimToken: f.claimToken,
+      turnKey: `turn-${suffix}`,
+      dispatchKey: `dispatch-${suffix}`,
+      providerId: f.campaign.route.providerId,
+      modelId: f.campaign.route.modelId,
+      transport: f.campaign.route.transport,
+    };
+    return request;
   }
 
   async function counts() {
@@ -116,6 +135,16 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     const semantic = await fixture("semantic-drift");
     await h.layer().db.execute(sql`UPDATE project.ccc_prd_import_entities SET entity_id = 'foreign-semantic-task' WHERE import_id = ${semantic.issued.campaign!.binding.importId} AND native_id = ${semantic.taskId}`);
     await expect(atomicReserveCccCampaignProviderDispatch(input(semantic, "semantic-drift"))).rejects.toThrow(/semantic|route|campaign/i);
+    expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
+  });
+
+  it.each([
+    ["actual provider", { providerId: "foreign-provider" }],
+    ["actual model", { modelId: "fixture-v2" }],
+    ["actual transport", { transport: "cli" }],
+  ])("refuses wrong %s route before any provider-attempt audit or request-count increment", async (_kind, mismatch) => {
+    const f = await fixture(`actual-${_kind.replace(" ", "-")}`);
+    await expect(atomicReserveCccCampaignProviderDispatch({ ...input(f, "actual"), ...(mismatch as any) })).rejects.toThrow(/route|provider|model|transport|campaign|custody/i);
     expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
   });
 

@@ -49,5 +49,6 @@ export type {
   CccCampaignLiveExecutionAction,
   CccCampaignProviderControllerDecision,
   CccCampaignProviderControllerHoldReason,
+  CccCampaignProviderDispatchInput,
   AtomicCccCampaignProviderDispatchInput,
 } from "./provider-controller.js";

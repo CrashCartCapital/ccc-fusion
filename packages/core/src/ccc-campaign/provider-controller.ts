@@ -6,13 +6,21 @@ import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import { beginCccProviderAttemptDispatch, reserveCccProviderAttempt } from "./provider-attempt.js";
 import { loadCccCampaignContextForTask, type CccCampaignAuthorityStore } from "./store.js";
 import type { CccPrdProtectedActionIntent } from "../ccc-prd/types.js";
-import type { CccProviderAttemptDispatchDecision, CccProviderAttemptScope } from "./types.js";
+import type { CccCampaignTransport, CccProviderAttemptDispatchDecision, CccProviderAttemptScope } from "./types.js";
 
 export type CccCampaignProviderControllerHoldReason = "dispatched-unknown" | "terminal";
 
 export type CccCampaignProviderControllerDecision =
   | Readonly<{ kind: "dispatch-permit"; scope: CccProviderAttemptScope }>
   | Readonly<{ kind: "hold"; reason: CccCampaignProviderControllerHoldReason; scope: CccProviderAttemptScope }>;
+
+export type CccCampaignProviderDispatchInput = Readonly<{
+  turnKey: string;
+  dispatchKey: string;
+  providerId: string;
+  modelId: string;
+  transport: CccCampaignTransport;
+}>;
 
 export type AtomicCccCampaignProviderDispatchInput = Readonly<{
   layer: AsyncDataLayer;
@@ -22,9 +30,7 @@ export type AtomicCccCampaignProviderDispatchInput = Readonly<{
   taskId: string;
   approvalRequestId: string;
   claimToken: string;
-  turnKey: string;
-  dispatchKey: string;
-}>;
+}> & CccCampaignProviderDispatchInput;
 
 export type CccCampaignLiveExecutionAction = Readonly<{
   actionId: string;
@@ -61,8 +67,8 @@ export function selectCccCampaignDeclaredLiveExecutionAction(
  * local-Git recheck and passes this primitive only the frozen observation needed for
  * locked-custody comparison inside the same database transaction.
  *
- * Every authority value used below is re-derived from locked campaign custody; callers only
- * supply stable replay coordinates and the already-issued approval claim identity.
+ * Locked campaign custody is checked in the reservation request. Callers supply the actual
+ * per-dispatch route together with replay coordinates and the issued approval claim identity.
  */
 export async function atomicReserveCccCampaignProviderDispatch(
   input: AtomicCccCampaignProviderDispatchInput,
@@ -99,9 +105,9 @@ export async function atomicReserveCccCampaignProviderDispatch(
         actionTarget: action.actionTarget,
         turnKey: input.turnKey,
         dispatchKey: input.dispatchKey,
-        providerId: context.route.providerId,
-        modelId: context.route.modelId,
-        transport: context.route.transport,
+        providerId: input.providerId,
+        modelId: input.modelId,
+        transport: input.transport,
       },
     });
     const begun = await beginCccProviderAttemptDispatch({
