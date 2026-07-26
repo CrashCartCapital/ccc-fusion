@@ -206,6 +206,14 @@ function parseCccCampaignActionLease(
   return lease;
 }
 
+export function assertCccCampaignActionLease(
+  value: unknown,
+  actionId: string,
+  campaignDeadlineAt: string,
+): CccCampaignActionLease {
+  return parseCccCampaignActionLease(value, actionId, campaignDeadlineAt);
+}
+
 function parseCccCampaignActionLeases(
   value: unknown,
   campaignDeadlineAt: string,

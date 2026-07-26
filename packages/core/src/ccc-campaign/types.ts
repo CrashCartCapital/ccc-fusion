@@ -15,6 +15,90 @@ export const CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION =
 
 export type CccCampaignTransport = "pi" | "cli" | "workflow";
 
+export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
+  "ccc-campaign.provider-attempt.v1" as const;
+
+export type CccProviderAttemptState =
+  | "reserved"
+  | "dispatched_unknown"
+  | "committed"
+  | "proved_failed";
+
+export type CccProviderAttemptRequest = Readonly<{
+  taskId: string;
+  actionId: string;
+  actionTarget: string;
+  turnKey: string;
+  attemptOrdinal: number;
+  providerId: string;
+  modelId: string;
+  transport: CccCampaignTransport;
+}>;
+
+export type CccProviderAttemptTransition = Readonly<{
+  taskId: string;
+  attemptKey: string;
+  controllerToken: string;
+}>;
+
+export type CccProviderAttemptReconciliation = CccProviderAttemptTransition & Readonly<{
+  outcome: Extract<CccProviderAttemptState, "committed" | "proved_failed">;
+  evidenceDigest: string;
+  observerId: string;
+}>;
+
+export type CccProviderAttemptScope = Readonly<{
+  attemptKey: string;
+  controllerToken: string;
+  taskId: string;
+  semanticTaskId: string;
+  campaignDeadlineAt: string;
+  turnKey: string;
+  attemptOrdinal: number;
+  requestCount: number;
+  state: CccProviderAttemptState;
+  binding: Readonly<CccCampaignAuthorityBinding>;
+}>;
+
+export class CccProviderAttemptIdentityError extends Error {
+  public readonly code = "CCC_PROVIDER_ATTEMPT_IDENTITY_REFUSED";
+
+  public constructor(public readonly reason: "route-drift" | "invalid-input", message: string) {
+    super(message);
+    this.name = "CccProviderAttemptIdentityError";
+  }
+}
+
+export class CccProviderAttemptLimitError extends Error {
+  public readonly code = "CCC_PROVIDER_ATTEMPT_LIMIT_REFUSED";
+
+  public constructor(
+    public readonly reason: "deadline" | "max-requests" | "max-concurrency",
+    message: string,
+  ) {
+    super(message);
+    this.name = "CccProviderAttemptLimitError";
+  }
+}
+
+export class CccProviderAttemptStateError extends Error {
+  public readonly code = "CCC_PROVIDER_ATTEMPT_STATE_REFUSED";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccProviderAttemptStateError";
+  }
+}
+
+export class CccProviderAttemptCollisionError extends Error {
+  public readonly code = "CCC_PROVIDER_ATTEMPT_COLLISION";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccProviderAttemptCollisionError";
+  }
+}
+
 export type CccCampaignExecutionRoute = {
   taskId: string;
   providerId: string;

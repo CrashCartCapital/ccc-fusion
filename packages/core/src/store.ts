@@ -13,9 +13,20 @@ import {
   type CccCampaignActionLeaseClaim,
   type CccCampaignActionLeaseResult,
 } from "./ccc-campaign/store.js";
+import {
+  inspectCccProviderAttempt,
+  markCccProviderAttemptDispatched,
+  proveCccProviderAttemptNotDispatched,
+  reconcileCccProviderAttempt,
+  reserveCccProviderAttempt,
+} from "./ccc-campaign/provider-attempt.js";
 import type {
   CccCampaignActionLookup,
   CccCampaignTaskContext,
+  CccProviderAttemptReconciliation,
+  CccProviderAttemptRequest,
+  CccProviderAttemptScope,
+  CccProviderAttemptTransition,
 } from "./ccc-campaign/types.js";
 export type OverlapBlockerRepairReason =
   | "task-not-found"
@@ -976,6 +987,36 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   ): Promise<CccCampaignTaskContext | null> {
     if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore");
     return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId, tx, true);
+  }
+  async reserveCccProviderAttempt(
+    input: CccProviderAttemptRequest,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return reserveCccProviderAttempt({ layer: this.asyncLayer, rootDir: this.rootDir, request: input });
+  }
+  async markCccProviderAttemptDispatched(
+    input: CccProviderAttemptTransition,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return markCccProviderAttemptDispatched({ layer: this.asyncLayer, rootDir: this.rootDir, transition: input });
+  }
+  async proveCccProviderAttemptNotDispatched(
+    input: CccProviderAttemptTransition,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return proveCccProviderAttemptNotDispatched({ layer: this.asyncLayer, rootDir: this.rootDir, transition: input });
+  }
+  async reconcileCccProviderAttempt(
+    input: CccProviderAttemptReconciliation,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return reconcileCccProviderAttempt({ layer: this.asyncLayer, rootDir: this.rootDir, reconciliation: input });
+  }
+  async inspectCccProviderAttempt(
+    input: Pick<CccProviderAttemptTransition, "taskId" | "attemptKey">,
+  ): Promise<CccProviderAttemptScope | null> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return inspectCccProviderAttempt({ layer: this.asyncLayer, rootDir: this.rootDir, ...input });
   }
   async claimCccCampaignActionLease(
     taskId: string,
