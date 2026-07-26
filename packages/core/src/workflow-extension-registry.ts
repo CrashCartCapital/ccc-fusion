@@ -18,6 +18,7 @@ export type WorkflowExtensionRegistrationReason =
   | "invalid-plugin-id"
   | "invalid-extension-id"
   | "invalid-proof-contribution"
+  | "invalid-provider-posture"
   | "missing-host-provenance"
   | "invalid-host-provenance"
   | "host-identity-mismatch"
@@ -37,11 +38,21 @@ export interface WorkflowExtensionDefinition {
   id: string;
   pluginId: string;
   extension: WorkflowExtensionContribution;
+  readonly providerPosture: WorkflowExtensionProviderPosture;
   readonly hostProvenance?: WorkflowExtensionHostProvenanceBinding;
   degraded?: {
     reason: "force-disabled" | "plugin-unloaded" | "runtime-fault";
     message: string;
   };
+}
+
+export type WorkflowExtensionProviderPosture =
+  | "opaque"
+  | "no-provider"
+  | "scoped-provider";
+
+export interface WorkflowExtensionHostRegistrationPolicy {
+  providerPosture?: WorkflowExtensionProviderPosture;
 }
 
 type WorkflowExtensionDegradeReason = NonNullable<WorkflowExtensionDefinition["degraded"]>["reason"];
@@ -50,12 +61,19 @@ type InternalWorkflowExtensionDefinition = {
   readonly id: string;
   readonly pluginId: string;
   readonly sealedProof: boolean;
+  readonly providerPosture: WorkflowExtensionProviderPosture;
   extension: WorkflowExtensionContribution;
   hostProvenance?: WorkflowExtensionHostProvenance;
   hostBinding?: WorkflowExtensionHostProvenanceBinding;
   degraded?: WorkflowExtensionDefinition["degraded"];
   snapshot?: WorkflowExtensionDefinition;
 };
+
+const WORKFLOW_EXTENSION_PROVIDER_POSTURES = new Set<WorkflowExtensionProviderPosture>([
+  "opaque",
+  "no-provider",
+  "scoped-provider",
+]);
 
 const PLUGIN_ID_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const PROOF_CONTRIBUTION_KEYS = new Set([
@@ -99,9 +117,16 @@ function snapshotOf(
       id: definition.id,
       pluginId: definition.pluginId,
       extension: definition.extension,
+      providerPosture: definition.providerPosture,
       ...(definition.hostBinding ? { hostProvenance: definition.hostBinding } : {}),
       ...(definition.degraded ? { degraded: definition.degraded } : {}),
     };
+    Object.defineProperty(snapshot, "providerPosture", {
+      value: definition.providerPosture,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
     definition.snapshot = definition.sealedProof ? Object.freeze(snapshot) : snapshot;
   }
   return definition.snapshot;
@@ -138,6 +163,30 @@ function validateRegistrationIds(
       `Workflow extension id '${extensionId}' is not a valid slug`,
     );
   }
+}
+
+function requireProviderPosture(
+  policy: WorkflowExtensionHostRegistrationPolicy | undefined,
+): WorkflowExtensionProviderPosture {
+  const providerPosture = policy?.providerPosture ?? "opaque";
+  if (!WORKFLOW_EXTENSION_PROVIDER_POSTURES.has(providerPosture)) {
+    throw new WorkflowExtensionRegistrationError(
+      "invalid-provider-posture",
+      `Workflow extension provider posture '${String(providerPosture)}' is not valid`,
+    );
+  }
+  return providerPosture;
+}
+
+function stripCallerProviderPosture(
+  extension: WorkflowExtensionContribution,
+): WorkflowExtensionContribution {
+  if (!Object.prototype.hasOwnProperty.call(extension, "providerPosture")) {
+    return extension;
+  }
+  const sanitized = { ...extension } as Record<string, unknown>;
+  delete sanitized.providerPosture;
+  return sanitized as unknown as WorkflowExtensionContribution;
 }
 
 function requireProofContribution(
@@ -242,9 +291,12 @@ export class WorkflowExtensionRegistry {
     pluginId: string,
     extension: WorkflowExtensionContribution,
     hostProvenance?: WorkflowExtensionHostProvenance,
+    policy?: WorkflowExtensionHostRegistrationPolicy,
   ): WorkflowExtensionDefinition {
     validateRegistrationIds(pluginId, extension.extensionId);
-    const hostBinding = requireProofHostAuthority(pluginId, extension, hostProvenance);
+    const providerPosture = requireProviderPosture(policy);
+    const sanitizedExtension = stripCallerProviderPosture(extension);
+    const hostBinding = requireProofHostAuthority(pluginId, sanitizedExtension, hostProvenance);
     const id = workflowExtensionRegistryId(pluginId, extension.extensionId);
     if (this.definitions.has(id)) {
       throw new WorkflowExtensionRegistrationError(
@@ -255,10 +307,11 @@ export class WorkflowExtensionRegistry {
     const definition: InternalWorkflowExtensionDefinition = {
       id,
       pluginId,
-      sealedProof: extension.kind === "proof-admission",
-      extension: extension.kind === "proof-admission"
-        ? cloneAndFreeze(extension)
-        : extension,
+      sealedProof: sanitizedExtension.kind === "proof-admission",
+      providerPosture,
+      extension: sanitizedExtension.kind === "proof-admission"
+        ? cloneAndFreeze(sanitizedExtension)
+        : sanitizedExtension,
       ...(hostProvenance ? { hostProvenance } : {}),
       ...(hostBinding ? { hostBinding } : {}),
     };
@@ -270,19 +323,33 @@ export class WorkflowExtensionRegistry {
     pluginId: string,
     extension: WorkflowExtensionContribution,
     hostProvenance?: WorkflowExtensionHostProvenance,
+    policy?: WorkflowExtensionHostRegistrationPolicy,
   ): WorkflowExtensionDefinition {
     validateRegistrationIds(pluginId, extension.extensionId);
-    const hostBinding = requireProofHostAuthority(pluginId, extension, hostProvenance);
+    const providerPosture = requireProviderPosture(policy);
+    const sanitizedExtension = stripCallerProviderPosture(extension);
+    const hostBinding = requireProofHostAuthority(pluginId, sanitizedExtension, hostProvenance);
     const id = workflowExtensionRegistryId(pluginId, extension.extensionId);
     const existing = this.definitions.get(id);
     if (!existing) {
-      return this.register(pluginId, extension, hostProvenance);
+      return this.register(pluginId, sanitizedExtension, hostProvenance, policy);
+    }
+    if (existing.providerPosture !== providerPosture) {
+      updateDegraded(
+        existing,
+        "runtime-fault",
+        `Workflow extension '${id}' refused a same-id provider posture replacement`,
+      );
+      throw new WorkflowExtensionRegistrationError(
+        "identity-drift",
+        `Workflow extension '${id}' changed its host provider posture`,
+      );
     }
     if (
       existing.extension.kind === "proof-admission"
-      || extension.kind === "proof-admission"
+      || sanitizedExtension.kind === "proof-admission"
     ) {
-      if (sameProofIdentity(existing, extension, hostProvenance, hostBinding)) {
+      if (sameProofIdentity(existing, sanitizedExtension, hostProvenance, hostBinding)) {
         return snapshotOf(existing);
       }
       updateDegraded(
@@ -295,8 +362,8 @@ export class WorkflowExtensionRegistry {
         `Proof-admission extension '${id}' changed its sealed identity`,
       );
     }
-    existing.extension = extension;
-    if (existing.snapshot) existing.snapshot.extension = extension;
+    existing.extension = sanitizedExtension;
+    if (existing.snapshot) existing.snapshot.extension = sanitizedExtension;
     return snapshotOf(existing);
   }
 

@@ -296,6 +296,72 @@ describe("WorkflowExtensionRegistry", () => {
     expect(registry.list("work-engine")).toEqual([]);
   });
 
+  it("defaults ordinary contributions to host-owned opaque provider posture", () => {
+    const registry = new WorkflowExtensionRegistry();
+    const registered = registry.register("plugin-a", extension());
+
+    expect((registered as { providerPosture?: string }).providerPosture).toBe("opaque");
+    expect(Object.getOwnPropertyDescriptor(registered, "providerPosture")?.writable).toBe(false);
+    expect(() => {
+      (registered as { providerPosture?: string }).providerPosture = "scoped-provider";
+    }).toThrow(TypeError);
+  });
+
+  it("accepts fixed-host provider posture through registration metadata and rejects posture drift", async () => {
+    const registry = new WorkflowExtensionRegistry();
+    const fixedPosture = "scoped-provider" as const;
+    const driftedPosture = "no-provider" as const;
+    const pluginProvenance = await hostProvenance({ pluginId: "plugin-a" });
+    const stable = registry.register(
+      "plugin-a",
+      extension("posture-policy", "move-policy"),
+      pluginProvenance,
+      { providerPosture: fixedPosture },
+    );
+
+    expect(stable.providerPosture).toBe(fixedPosture);
+
+    const samePostureUpsert = registry.upsert(
+      "plugin-a",
+      {
+        ...extension("posture-policy", "move-policy"),
+        name: "Updated posture policy",
+      },
+      pluginProvenance,
+      { providerPosture: fixedPosture },
+    );
+    expect(samePostureUpsert.extension.name).toBe("Updated posture policy");
+    expect((samePostureUpsert as { providerPosture?: string }).providerPosture).toBe(fixedPosture);
+
+    const driftPostureUpsert = () => registry.upsert(
+      "plugin-a",
+      {
+        ...extension("posture-policy", "move-policy"),
+      },
+      pluginProvenance,
+      { providerPosture: driftedPosture },
+    );
+    expect(driftPostureUpsert).toThrowError(expect.objectContaining({ reason: "identity-drift" }));
+    expect(registry.get("plugin:plugin-a:posture-policy")?.degraded).toMatchObject({
+      reason: "runtime-fault",
+    });
+  });
+
+  it("rejects invalid host registration posture and creates no entry", async () => {
+    const registry = new WorkflowExtensionRegistry();
+    const pluginProvenance = await hostProvenance({ pluginId: "plugin-a" });
+
+    expect(() =>
+      (registry as { register: (...args: unknown[]) => unknown }).register(
+        "plugin-a",
+        extension("invalid-posture-policy"),
+        pluginProvenance,
+        { providerPosture: "provider-capable" },
+      ),
+    ).toThrowError(expect.objectContaining({ reason: "invalid-provider-posture" }));
+    expect(registry.get("plugin:plugin-a:invalid-posture-policy")).toBeUndefined();
+  });
+
   it("preserves ordinary extension upsert replacement behavior", () => {
     const registry = new WorkflowExtensionRegistry();
     const original = extension();

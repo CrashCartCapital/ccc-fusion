@@ -25,7 +25,12 @@ export function registerPluginWorkflowExtensions(params: {
   // selection/dependency closure is established.
   for (const { extension } of ordinaryContributions) {
     const id = workflowExtensionRegistryId(params.pluginId, extension.extensionId);
-    params.registry.upsert(params.pluginId, extension);
+    params.registry.upsert(
+      params.pluginId,
+      extension,
+      undefined,
+      { providerPosture: "opaque" },
+    );
     registered.push(id);
   }
   return registered;

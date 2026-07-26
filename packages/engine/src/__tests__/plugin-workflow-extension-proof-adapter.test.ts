@@ -160,6 +160,46 @@ describe("plugin workflow-extension proof adapter", () => {
     expect(registry.get("plugin:proof-plugin:ordinary-policy")).toBeDefined();
   });
 
+  it("overrides external provider posture declarations to opaque for ambient extension registration", () => {
+    const registry = new WorkflowExtensionRegistry();
+
+    expect(register(registry, [{
+      extension: {
+        ...ordinary(),
+        providerPosture: "scoped-provider",
+      } as WorkflowExtensionContribution,
+    }])).toEqual(["plugin:proof-plugin:ordinary-policy"]);
+
+    expect(
+      (registry.get("plugin:proof-plugin:ordinary-policy") as
+        { providerPosture?: string } | undefined)?.providerPosture,
+    ).toBe("opaque");
+  });
+
+  it("does not interpret caller-declared provider posture as proof authorization", async () => {
+    const registry = new WorkflowExtensionRegistry();
+    const hostProvenance = await provenance();
+
+    expect(register(registry, [
+      {
+        extension: {
+          ...proof("external-proof"),
+          providerPosture: "scoped-provider",
+        } as WorkflowExtensionContribution,
+        hostProvenance,
+      },
+      { extension: ordinary() },
+    ])).toEqual(["plugin:proof-plugin:ordinary-policy"]);
+
+    expect(registry.get("plugin:proof-plugin:external-proof")).toBeUndefined();
+    expect((registry.get("plugin:proof-plugin:ordinary-policy")?.extension as
+      { providerPosture?: string } | undefined)?.providerPosture).toBeUndefined();
+    expect(
+      (registry.get("plugin:proof-plugin:ordinary-policy") as
+        { providerPosture?: string } | undefined)?.providerPosture,
+    ).toBe("opaque");
+  });
+
   it("does not revive an existing proof record through ambient external synchronization", async () => {
     const registry = new WorkflowExtensionRegistry();
     const hostProvenance = await provenance();
