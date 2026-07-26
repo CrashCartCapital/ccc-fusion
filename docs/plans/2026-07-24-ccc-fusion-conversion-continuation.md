@@ -394,3 +394,35 @@ Extend existing Fusion production seams so an imported CCC campaign is admitted,
 - Recovery Rule: after compaction or a fresh session, read the vault checkpoint first, then this note, then verify live branch/HEAD/tree/status before issuing work.
 - Handoff Rule: the active goal already exists. The sole accepted-spine writer resumes from accepted Task 3 `dc2d4968d828d623986991f504a530112ba59c3a`, then advances Tasks 4–10 and updates the vault checkpoint after each material contract, RED, GREEN, commit, review, or operator gate.
 - Resume Rule: local product implementation resumes from accepted Task 3 through Task 4 pre-provider admission, bounds, drift, and durable cancellation. It does not begin a live provider, credential, billing, non-loopback, fetch, push, merge, release, publication, protected-path, upstream-adoption, or `main` action.
+
+## Current Task 3 Receipt And Task 4 Plan Freeze — 2026-07-25
+
+This section is the current correction layer for this continuation packet. It supersedes contradictory historical wording in earlier receipts, including any statement that an AGY session rendered Task 3 acceptance.
+
+### Accepted Spine And Recovery
+
+- The accepted Task 3 product is `dc2d4968d828d623986991f504a530112ba59c3a`, tree `5aed8833cd8345b967945052c005cd50f11cb19f`, from a clean detached candidate.
+- Its focused built-CLI proof contained three files and 13 tests. Wave 5 preserves exactly 81 unique proof names. The recorded report is `/var/folders/m0/q5ny02wd0wd5lf0tt9w2jwqr0000gn/T/ccc-wave-5-proof-0PaA8T/report.json`.
+- Three fresh lanes passed with no P0/P1: behavioral/PostgreSQL, static/build, and native adversarial final-byte. The dedicated AGY request was permission-denied and produced no verdict; the native Sol adversarial child is the recorded substitute, not AGY.
+- Documentation descendant `c59a46310af4ed2f3121423fbeeaa6aa575ea8d4` was preserved. The old Task 2 worktree has an unstaged provenance experiment quarantined as non-accepted evidence. The sole product-writing surface is `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/task4-preprovider-admission` on `agent/ccc-fusion-task4-preprovider`.
+
+### Task 4 Scope, Authorities, And Non-Goals
+
+Task 4 is a RED-to-GREEN pre-provider admission slice, not accepted implementation. Its current untracked `packages/engine/src/ccc-campaign-admission.ts` and `packages/engine/src/__tests__/ccc-campaign-execution.test.ts` are RED scaffold only. The focused command currently has one expected failure and three passes because the scaffold expects top-level `providerId`/`modelId`, while persisted route custody is authoritative; typecheck also sees two unexported draft imports. Do not promote either result to a product claim.
+
+Freeze two complementary authorities:
+
+1. One coarse campaign/action-admission authority controls whether a campaign action may reach a provider-capable path.
+2. One per-transport `CccProviderAttemptScope` controls each actual transport request, reserve, settlement, and concurrency observation.
+
+Reuse the existing serialized `ccc_prd_imports` row and native `run_audit_events`. Do not add a migration, table, store, receipt family, or alternative control plane. Under the same import-row lock, the first new attempt increments `request_count` exactly once. Active attempts derive from exact campaign-bound audit history. Replay reads the deterministic event before timestamp generation or increment; same-key changed content refuses. Do not overload `active_action_leases`.
+
+Pi reserves immediately at `ModelRuntime.stream` and `streamSimple`; the CLI-agent reserves immediately before `manager.spawn`. A spawned process without authoritative terminal observation becomes `dispatched_unknown`; unknown remains active and keeps claimed approval until authoritative settlement. A provider-capable workflow plugin receives a scope or fails closed unless explicitly declared no-provider. An imported marker with null custody fails closed.
+
+### Required RED Inventory And Adjudication
+
+Before GREEN, capture named REDs for: max-concurrency race; lost-response replay; same-key changed-content collision; Pi initial, fallback, and compaction transports; CLI finite bounds and abort-to-unknown; opaque-plugin refusal; null custody; and approval retention across unknown settlement.
+
+AGY audit evidence is adjudicated as follows: accept the caller protected-action bypass, empty `bindingHash`, missing request/concurrency accounting, unwired routes, incomplete Git drift, and imported-null-custody findings. Partially accept cancellation: authoritative observation may reconcile unknown, but abort alone cannot. Reject automatic `proved_failed` after dispatched abort. The native architecture challenge remains BLOCK until replay and route REDs are GREEN; it is a plan/implementation gate, not a product P0.
+
+No operator gate has been issued. Manifests remain unchanged.

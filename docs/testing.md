@@ -632,3 +632,19 @@ Use the exact heading `## Symptom Verification` and include all three required c
 - [ ] **Assertion it is gone** — final verification reproduces the original failure condition and asserts it no longer occurs via a real automated test.
 
 Symptom-based acceptance is mandatory for bug fixes: reproduce the original failure, prove it is gone, and keep the invariant covered across the `## Surface Enumeration` checklist. Green build/tests alone are insufficient when they do not exercise the reported symptom.
+
+## Task 4 Pre-Provider Admission Test Freeze — 2026-07-25
+
+Task 4 starts from RED scaffold, not accepted code. `ccc-campaign-admission.ts` and `ccc-campaign-execution.test.ts` are untracked; the focused result is one expected failure and three passes because the draft assumes top-level `providerId`/`modelId` instead of persisted route custody. Typecheck additionally finds two unexported draft imports. Do not count these as acceptance evidence.
+
+The implementation must prove two authorities: one coarse campaign/action admission authority and one per-transport `CccProviderAttemptScope`. Reuse `ccc_prd_imports` under its existing serialized row lock and native `run_audit_events`; do not introduce a migration, table, store, receipt family, or alternate control plane. The first new attempt increments `request_count` once under that lock. Replay must find its deterministic event before generating a timestamp or incrementing; a same-key changed-content replay refuses. Active attempts are computed from exact campaign-bound audit history, never from `active_action_leases`.
+
+Required named REDs before any GREEN are:
+
+- max-concurrency race and lost-response replay;
+- same-key changed-content collision;
+- Pi initial, fallback, and compaction attempts at `ModelRuntime.stream` and `streamSimple`;
+- CLI finite-bound reservation immediately before `manager.spawn`, plus abort-to-`dispatched_unknown`;
+- opaque provider-capable plugin refusal, null imported custody, and approval retention while unknown remains active.
+
+An authoritative terminal observation may settle `dispatched_unknown`; abort alone may not mark it `proved_failed`. Provider-capable workflow plugins must receive a scope or fail closed unless explicitly no-provider. Imported marker plus null custody fails closed.
