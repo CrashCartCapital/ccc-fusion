@@ -13,6 +13,7 @@ import {
   claimCccCampaignApproval,
   consumeCccCampaignApprovalWithinTransaction,
   denyCccCampaignApproval,
+  assertActiveClaimedCccCampaignApprovalWithinTransaction,
   assertClaimedCccCampaignApprovalWithinTransaction,
   assertConsumedCccCampaignApprovalWithinTransaction,
   assertExpiredCccCampaignApprovalWithinTransaction,
@@ -413,6 +414,188 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
       authorityStore: h.store(), rootDir: h.rootDir(), taskId: replayContext.taskId, action,
       claimant: worker, runId: "approval-claim:missing-lease-replay", claimToken: "claim-missing-lease",
     })).rejects.toThrow(/persisted action lease|lease/i);
+  });
+
+  it("admits one exact active claimed approval before a new provider dispatch without writing lifecycle or audit state", async () => {
+    const { campaign, taskId } = await context("active-pre-dispatch");
+    const issued = await issueCccCampaignApproval(h.layer(), issueInput(taskId, campaign));
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      claimant: worker, runId: "approval-claim:active-pre-dispatch", claimToken: "claim-active-pre-dispatch",
+    });
+    const before = await getApprovalRequest(h.layer().db, issued.id);
+    const auditBefore = await getApprovalAuditHistory(h.layer().db, issued.id);
+    const assertionInput = {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      approvalRequestId: issued.id, claimToken: "claim-active-pre-dispatch",
+    };
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, assertionInput),
+    )).resolves.toMatchObject({ approval: { id: issued.id, status: "claimed" }, binding: issued.campaign!.binding });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toEqual(before);
+    await expect(getApprovalAuditHistory(h.layer().db, issued.id)).resolves.toEqual(auditBefore);
+  });
+
+  it("refuses provider dispatch when only the persisted action lease claim time drifts", async () => {
+    const { campaign, taskId } = await context("lease-claimed-at-drift");
+    const issued = await issueCccCampaignApproval(h.layer(), issueInput(taskId, campaign));
+    const claimed = await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      claimant: worker, runId: "approval-claim:lease-claimed-at-drift", claimToken: "claim-lease-claimed-at-drift",
+    });
+    const driftedClaimedAt = new Date(Date.parse(claimed.campaign!.claimedAt!) - 1).toISOString();
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET active_action_leases = jsonb_set(
+        active_action_leases,
+        ARRAY[${action.actionId}, 'claimedAt'],
+        to_jsonb(${driftedClaimedAt}::text),
+        true
+      )
+      WHERE project_id = ${issued.campaign!.binding.projectId}
+        AND import_id = ${issued.campaign!.binding.importId}
+    `);
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, {
+        authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+        approvalRequestId: issued.id, claimToken: "claim-lease-claimed-at-drift",
+      }),
+    )).rejects.toThrow(/lease|claim.*time|custody/i);
+  });
+
+  it("refuses provider dispatch when only the persisted action lease expiry drifts but remains active", async () => {
+    const { campaign, taskId } = await context("lease-expiry-drift");
+    const issued = await issueCccCampaignApproval(h.layer(), issueInput(taskId, campaign));
+    const claimed = await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      claimant: worker, runId: "approval-claim:lease-expiry-drift", claimToken: "claim-lease-expiry-drift",
+    });
+    const claimedAt = Date.parse(claimed.campaign!.claimedAt!);
+    const approvalExpiresAt = Date.parse(claimed.campaign!.expiresAt);
+    const driftedExpiresAt = new Date(claimedAt + Math.floor((approvalExpiresAt - claimedAt) / 2)).toISOString();
+    expect(Date.parse(driftedExpiresAt)).toBeGreaterThan(Date.now());
+    expect(Date.parse(driftedExpiresAt)).toBeLessThan(approvalExpiresAt);
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET active_action_leases = jsonb_set(
+        active_action_leases,
+        ARRAY[${action.actionId}, 'expiresAt'],
+        to_jsonb(${driftedExpiresAt}::text),
+        true
+      )
+      WHERE project_id = ${issued.campaign!.binding.projectId}
+        AND import_id = ${issued.campaign!.binding.importId}
+    `);
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, {
+        authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+        approvalRequestId: issued.id, claimToken: "claim-lease-expiry-drift",
+      }),
+    )).rejects.toThrow(/lease|expiry|custody/i);
+  });
+
+  it("refuses provider dispatch when only the claimed approval not-before moves into the future", async () => {
+    const { campaign, taskId } = await context("approval-not-before-drift");
+    const issued = await issueCccCampaignApproval(h.layer(), issueInput(taskId, campaign));
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      claimant: worker, runId: "approval-claim:approval-not-before-drift", claimToken: "claim-approval-not-before-drift",
+    });
+    const futureNotBeforeAt = new Date(Date.now() + 30_000).toISOString();
+    await h.layer().db.execute(sql`
+      UPDATE project.approval_requests
+      SET not_before_at = ${futureNotBeforeAt}
+      WHERE id = ${issued.id}
+    `);
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, {
+        authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+        approvalRequestId: issued.id, claimToken: "claim-approval-not-before-drift",
+      }),
+    )).rejects.toThrow(/window|not-before|active/i);
+  });
+
+  it("refuses a past database-clock approval window before dispatch while preserving after-effect consume", async () => {
+    const { campaign, taskId } = await context("expired-pre-dispatch");
+    const issued = await issueCccCampaignApproval(h.layer(), issueInput(taskId, campaign));
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      claimant: worker, runId: "approval-claim:expired-pre-dispatch", claimToken: "claim-expired-pre-dispatch",
+    });
+    await h.layer().db.execute(sql`
+      UPDATE project.approval_requests
+      SET not_before_at = ${new Date(Date.now() - 2_000).toISOString()}, expires_at = ${new Date(Date.now() - 1_000).toISOString()}
+      WHERE id = ${issued.id}
+    `);
+    const assertionInput = {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      approvalRequestId: issued.id, claimToken: "claim-expired-pre-dispatch",
+    };
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, assertionInput),
+    )).rejects.toThrow(/window|expiry|active/i);
+    await expect(h.layer().transactionImmediate((tx) => consumeCccCampaignApprovalWithinTransaction(tx, {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      actor: worker, runId: "approval-consume:expired-pre-dispatch", claimToken: "claim-expired-pre-dispatch",
+    }))).resolves.toMatchObject({ status: "consumed" });
+  });
+
+  it("refuses a wrong token, elapsed, missing, or drifted lease, and gives a restarted PostgreSQL reader the same active result", async () => {
+    const { campaign, taskId } = await context("active-custody");
+    const issued = await issueCccCampaignApproval(h.layer(), issueInput(taskId, campaign));
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      claimant: worker, runId: "approval-claim:active-custody", claimToken: "claim-active-custody",
+    });
+    const assertionInput = {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      approvalRequestId: issued.id, claimToken: "claim-active-custody",
+    };
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, { ...assertionInput, claimToken: "wrong-token" }),
+    )).rejects.toThrow(/claimed|token/i);
+    const restarted = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+    const reader = new ApprovalRequestStore(null, { asyncLayer: h.layer(), campaignAuthorityStore: restarted, rootDir: h.rootDir() });
+    await expect(reader.assertActiveClaimedCccCampaignApproval({
+      taskId, action, approvalRequestId: issued.id, claimToken: "claim-active-custody",
+    })).resolves.toMatchObject({ approval: { id: issued.id, status: "claimed" }, binding: issued.campaign!.binding });
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET active_action_leases = jsonb_set(
+        active_action_leases,
+        ARRAY[${action.actionId}, 'expiresAt'],
+        to_jsonb(${new Date(Date.now() - 1_000).toISOString()}::text),
+        true
+      )
+      WHERE project_id = ${issued.campaign!.binding.projectId}
+        AND import_id = ${issued.campaign!.binding.importId}
+    `);
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, assertionInput),
+    )).rejects.toThrow(/window|expiry|active/i);
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET active_action_leases = jsonb_set(
+        active_action_leases,
+        ARRAY[${action.actionId}, 'bindingHash'],
+        to_jsonb('drifted'::text),
+        true
+      )
+      WHERE project_id = ${issued.campaign!.binding.projectId}
+        AND import_id = ${issued.campaign!.binding.importId}
+    `);
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, assertionInput),
+    )).rejects.toThrow(/lease|binding|campaign/i);
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET active_action_leases = '{}'::jsonb
+      WHERE project_id = ${issued.campaign!.binding.projectId}
+        AND import_id = ${issued.campaign!.binding.importId}
+    `);
+    await expect(h.layer().transactionImmediate((tx) =>
+      assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, assertionInput),
+    )).rejects.toThrow(/lease/i);
   });
 
   it("expires a claimed approval only after exact native proved-failed receipt evidence and no unknown dispatch", async () => {

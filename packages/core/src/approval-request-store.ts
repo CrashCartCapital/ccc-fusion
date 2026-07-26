@@ -466,6 +466,18 @@ export class ApprovalRequestStore {
     });
   }
 
+  async assertActiveClaimedCccCampaignApproval(
+    input: Omit<asyncApprovalRequestStore.AssertActiveClaimedCccCampaignApprovalInput, "authorityStore" | "rootDir">,
+  ): Promise<asyncApprovalRequestStore.ClaimedCccCampaignApproval> {
+    const authority = this.campaignAuthority();
+    return authority.layer.transactionImmediate((tx) =>
+      asyncApprovalRequestStore.assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, {
+        ...input,
+        authorityStore: authority.authorityStore,
+        rootDir: authority.rootDir,
+      }));
+  }
+
   async getAuditHistory(requestId: string): Promise<ApprovalRequestAuditEvent[]> {
     if (this.backendMode) {
       return asyncApprovalRequestStore.getApprovalAuditHistory(this.asyncLayer!.db, requestId);

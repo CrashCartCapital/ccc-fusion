@@ -405,6 +405,14 @@ export type AssertClaimedCccCampaignApprovalInput = Pick<
 export type AssertConsumedCccCampaignApprovalInput =
   AssertClaimedCccCampaignApprovalInput;
 
+/**
+ * Exact approval identity required before a new provider dispatch. Unlike the
+ * after-effect assertion, this also proves the approval and action lease are
+ * still inside their database-clock windows.
+ */
+export type AssertActiveClaimedCccCampaignApprovalInput =
+  AssertClaimedCccCampaignApprovalInput;
+
 /** Named durable receipt evidence required to safely expire a claimed action. */
 export type ExpireClaimedCccCampaignApprovalAfterProvedNoEffectInput =
   AssertClaimedCccCampaignApprovalInput & {
@@ -935,6 +943,53 @@ export async function assertClaimedCccCampaignApprovalWithinTransaction(
     || canonicalCccPrdJson(approval.campaign.binding) !== canonicalCccPrdJson(binding)
   ) {
     throw new Error(`CCC campaign approval ${binding.actionId} is not exactly claimed by the supplied approval/token`);
+  }
+  return { approval, binding };
+}
+
+/**
+ * Re-derive and lock exact claimed custody before a new provider dispatch.
+ * This is deliberately read-only: it neither changes lifecycle state nor
+ * creates an audit event. Post-effect reconciliation keeps using the less
+ * restrictive asserted-claimed seam so an already-started effect can settle
+ * after nominal approval expiry.
+ */
+export async function assertActiveClaimedCccCampaignApprovalWithinTransaction(
+  tx: DbTransaction,
+  input: AssertActiveClaimedCccCampaignApprovalInput,
+): Promise<ClaimedCccCampaignApproval> {
+  const { approval, binding } = await assertClaimedCccCampaignApprovalWithinTransaction(tx, input);
+  const persistedLease = await input.authorityStore.inspectCccCampaignActionLease(
+    input.taskId,
+    input.action,
+    tx,
+  );
+  if (
+    !persistedLease
+    || persistedLease.binding.bindingHash !== binding.bindingHash
+    || persistedLease.lease.approvalRequestId !== approval.id
+    || persistedLease.lease.claimToken !== input.claimToken
+    || approval.campaign!.claimedAt === undefined
+    || persistedLease.lease.claimedAt !== approval.campaign!.claimedAt
+    || persistedLease.lease.actionId !== binding.actionId
+    || persistedLease.lease.actionTarget !== binding.actionTarget
+    || persistedLease.lease.bindingHash !== binding.bindingHash
+  ) {
+    throw new Error(`CCC campaign approval ${binding.actionId} has no exact persisted action lease for provider dispatch`);
+  }
+  const now = await dbNow(tx);
+  const notBeforeAt = requireCanonicalTimestamp(approval.campaign!.notBeforeAt, "not-before");
+  const approvalExpiresAt = requireCanonicalTimestamp(approval.campaign!.expiresAt, "expiry");
+  const leaseExpiresAt = requireCanonicalTimestamp(persistedLease.lease.expiresAt, "lease expiry");
+  const nowAt = requireCanonicalTimestamp(now, "database clock");
+  if (nowAt < notBeforeAt || nowAt >= approvalExpiresAt) {
+    throw new Error(`CCC campaign approval ${binding.actionId} is outside its active provider-dispatch window`);
+  }
+  if (persistedLease.lease.expiresAt !== approval.campaign!.expiresAt) {
+    throw new Error(`CCC campaign approval ${binding.actionId} has no exact persisted action lease for provider dispatch`);
+  }
+  if (nowAt >= leaseExpiresAt) {
+    throw new Error(`CCC campaign approval ${binding.actionId} is outside its active provider-dispatch window`);
   }
   return { approval, binding };
 }
