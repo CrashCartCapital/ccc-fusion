@@ -1182,4 +1182,11 @@ export {
   type LaunchCliTaskSessionOptions,
 } from "./cli-agent/task-session.js";
 export * from "./ccc-campaign-admission.js";
+export {
+  CccCampaignLocalGitError,
+  inspectCccCampaignLocalGit,
+  recheckCccCampaignLocalGit,
+  type CccCampaignLocalGitSnapshot,
+  type InspectCccCampaignLocalGitInput,
+} from "./ccc-campaign-local-git.js";
 export * from "./ccc-prd/index.js";
