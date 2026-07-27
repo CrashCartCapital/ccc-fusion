@@ -7,6 +7,7 @@ import {
 import {
   claimCccCampaignApproval,
   issueCccCampaignApproval,
+  consumeCccCampaignApproval,
 } from "../../async-approval-request-store.js";
 import { createSharedPgTaskStoreTestHarness, pgDescribe, type SharedPgTaskStoreHarness } from "../../__test-utils__/pg-test-harness.js";
 import { createCccPrdImportTestBundle, createCccPrdImportTestExecutionPolicy, rehashCccPrdImportTestBundle } from "../../__test-utils__/ccc-prd-import-fixture.js";
@@ -203,6 +204,61 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     const replay = await atomicReserveCccCampaignProviderDispatch(input(f, "replay"));
     expect(replay).toMatchObject({ kind: "hold", reason: "dispatched-unknown" });
     expect(await counts()).toEqual({ attempts: 2, requestCount: 1 });
+  });
+
+  it("holds terminal replay after attempted provider consumption without extra permit", async () => {
+    const f = await fixture("terminal");
+    const first = await atomicReserveCccCampaignProviderDispatch(input(f, "terminal"));
+    expect(first).toMatchObject({ kind: "dispatch-permit" });
+    const transition = {
+      taskId: first.scope.taskId,
+      attemptKey: first.scope.attemptKey,
+      controllerToken: first.scope.controllerToken,
+    };
+    const terminal = await h.store().reconcileCccProviderAttempt({
+      ...transition,
+      outcome: "committed",
+      evidenceDigest: "a".repeat(64),
+      observerId: "provider-observer-committed",
+    });
+    expect(terminal).toMatchObject({
+      terminal: { kind: "reconciled", state: "committed", evidenceDigest: "a".repeat(64), observerId: "provider-observer-committed" },
+      requestCount: 1,
+    });
+    await expect(
+      h.store().inspectCccCampaignActionLease(
+        f.taskId,
+        { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate" },
+      ),
+    ).resolves.toMatchObject({ lease: { approvalRequestId: f.issued.id } });
+    const before = await counts();
+    const initialApproval = await h.layer().db.execute(sql`SELECT status FROM project.approval_requests WHERE id = ${f.issued.id}`);
+    expect(initialApproval).toEqual(expect.arrayContaining([{ status: "claimed" }]));
+    await consumeCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: f.taskId,
+      action: { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate", requireProtected: true },
+      actor: worker,
+      runId: "consume-terminal-replay",
+      claimToken: f.claimToken,
+    });
+    await expect(
+      h.store().inspectCccCampaignActionLease(
+        f.taskId,
+        { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate" },
+      ),
+    ).resolves.toBeNull();
+    const consumedApproval = await h.layer().db.execute(sql`SELECT status FROM project.approval_requests WHERE id = ${f.issued.id}`);
+    expect(consumedApproval).toEqual(expect.arrayContaining([{ status: "consumed" }]));
+    const after = await counts();
+    await expect(atomicReserveCccCampaignProviderDispatch(input(f, "terminal"))).resolves.toMatchObject({
+      kind: "hold",
+      reason: "terminal",
+      scope: { state: "committed" },
+    });
+    expect(await counts()).toEqual(before);
+    expect(after.requestCount).toBe(before.requestCount);
   });
 
   it("refuses a task without imported campaign custody instead of treating it as ordinary", async () => {

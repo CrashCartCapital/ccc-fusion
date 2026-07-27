@@ -64,6 +64,11 @@ function isTaskExecutorOwnedPiReceiptLedger(session: CliSession): boolean {
     && session.autonomyPosture?.cccExecutionAuthority != null;
 }
 
+/** One-shot native sessions are intentionally never resumed. */
+function isCccNativeCliOneShot(session: CliSession): boolean {
+  return session.autonomyPosture?.cccNativeCliOneShot === true;
+}
+
 /** Default resume attempt cap (KTD = 2). */
 export const DEFAULT_MAX_RESUME_ATTEMPTS = 2;
 /** Default base backoff (ms) between resume attempts; doubled per attempt. */
@@ -171,6 +176,7 @@ export class CliResumeCoordinator {
   /** Whether a recorded session is currently resume-eligible (for sweep skipping). */
   isRecordResumeEligible(session: CliSession): boolean {
     if (isTaskExecutorOwnedPiReceiptLedger(session)) return false;
+    if (isCccNativeCliOneShot(session)) return false;
     if (session.resumeAttempts >= this.maxResumeAttempts) return false;
     // Found-live-on-restart → engineDeath (eligible).
     if (ORPHANED_LIVE_STATES.has(session.agentState)) return true;
@@ -234,6 +240,10 @@ export class CliResumeCoordinator {
     const reason: CliTerminationReason = ORPHANED_LIVE_STATES.has(session.agentState)
       ? "engineDeath"
       : session.terminationReason ?? "engineDeath";
+    if (isCccNativeCliOneShot(session)) {
+      this.toNeedsAttention(session, reason, "ineligible because ccc native CLI one-shot session");
+      return { ...base, disposition: "needsAttention-ineligible", reason };
+    }
 
     // Eligibility predicate: only crashed / engineDeath ever resume.
     if (!isResumeEligible(reason)) {
@@ -296,6 +306,10 @@ export class CliResumeCoordinator {
     const currentReason: CliTerminationReason = ORPHANED_LIVE_STATES.has(current.agentState)
       ? "engineDeath"
       : current.terminationReason ?? "engineDeath";
+    if (isCccNativeCliOneShot(current)) {
+      this.toNeedsAttention(current, currentReason, "ineligible because ccc native CLI one-shot session");
+      return { ...base, disposition: "needsAttention-ineligible", reason: currentReason };
+    }
     if (!isResumeEligible(currentReason) || current.agentState === "needsAttention") {
       return { ...base, disposition: "needsAttention-ineligible", reason: currentReason };
     }

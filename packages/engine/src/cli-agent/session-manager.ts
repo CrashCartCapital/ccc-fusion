@@ -35,6 +35,7 @@ import {
   type CliSession,
   type CliSessionPurpose,
   type CliTerminationReason,
+  type CccProviderAttemptScope,
 } from "@fusion/core";
 import { randomUUID } from "node:crypto";
 import { loadPtyModule } from "../pty-native.js";
@@ -55,6 +56,17 @@ import {
 } from "./ccc-native-mcp-policy.js";
 import { isResumeEligible } from "./state-machine.js";
 import { startCccNativeMcpProxy, type CccNativeMcpProxy } from "./ccc-native-mcp-proxy.js";
+import {
+  CCC_NATIVE_CLI_HELD_CLOSURE_KIND,
+  CCC_NATIVE_CLI_HELD_CLOSURE_VERSION,
+  CCC_NATIVE_CLI_OBSERVER_ID,
+  type CccNativeCliHeldClosureReceipt,
+  type CccNativeCliHeldClosureTrigger,
+  type CccNativeCliSessionPolicy,
+  validateCccNativeCliHeldClosureReceipt,
+  validateCccNativeCliSessionPolicy,
+  validateCccNativeCliTerminalScope,
+} from "./ccc-native-cli-binding.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -181,6 +193,7 @@ const CCC_PTY_SUPERVISOR_SOURCE = [
   "const { spawn } = require('node:child_process');",
   "const encoded = process.argv[1];",
   "const launch = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));",
+  "const termGraceMs = Number.isFinite(launch.termGraceMs) && launch.termGraceMs > 0 ? launch.termGraceMs : 0;",
   "const child = spawn(launch.command, launch.args, { cwd: process.cwd(), env: process.env, stdio: 'inherit', detached: process.platform !== 'win32' });",
   "let stopping = false;",
   "let childExited = false;",
@@ -198,6 +211,11 @@ const CCC_PTY_SUPERVISOR_SOURCE = [
   "  }",
   "  else setTimeout(exitWhenOwnedGroupCloses, 10);",
   "};",
+  "const signalOwnedGroup = (signal) => {",
+  "  if (!child.pid) return;",
+  "  if (process.platform !== 'win32') process.kill(-child.pid, signal);",
+  "  else child.kill(signal);",
+  "};",
   "child.once('error', () => process.exit(1));",
   "child.once('exit', (exitCode, signal) => {",
   "  childExited = true;",
@@ -209,9 +227,14 @@ const CCC_PTY_SUPERVISOR_SOURCE = [
   "  if (stopping) return;",
   "  stopping = true;",
   "  try {",
-  "    if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL');",
-  "    else child.kill('SIGKILL');",
+  "    signalOwnedGroup('SIGTERM');",
   "  } catch {}",
+  "  setTimeout(() => {",
+  "    if (groupAlive()) {",
+  "      try { signalOwnedGroup('SIGKILL'); } catch {}",
+  "    }",
+  "    exitWhenOwnedGroupCloses();",
+  "  }, termGraceMs).unref?.();",
   "  exitWhenOwnedGroupCloses();",
   "});",
 ].join("\n");
@@ -220,8 +243,12 @@ function useCccProcessSupervisor(adapterId: string, settings: Record<string, unk
   return CCC_SUPERVISED_ADAPTER_IDS.has(adapterId) && isCccFusionProfile(settings);
 }
 
-function buildCccSupervisedLaunch(launch: CliLaunchSpec): CliLaunchSpec {
-  const encoded = Buffer.from(JSON.stringify({ command: launch.command, args: launch.args }), "utf8").toString("base64");
+function buildCccSupervisedLaunch(launch: CliLaunchSpec, termGraceMs = 0): CliLaunchSpec {
+  const encoded = Buffer.from(JSON.stringify({
+    command: launch.command,
+    args: launch.args,
+    termGraceMs,
+  }), "utf8").toString("base64");
   return { command: process.execPath, args: ["-e", CCC_PTY_SUPERVISOR_SOURCE, encoded] };
 }
 
@@ -505,6 +532,7 @@ export interface SpawnCliSessionOptions {
     /** The recorded native (vendor) session id handed to `buildResume`. */
     nativeSessionId: string;
   };
+  cccNativeCliPolicy?: unknown;
 }
 
 // ── Internal live-session state ─────────────────────────────────────────────
@@ -548,6 +576,16 @@ interface LiveSession {
   /** Durable controller fence for this exact manager-owned generation. */
   controllerGeneration?: string;
   nativeMcpProxy?: CccNativeMcpProxy;
+  cccNativeCliPolicy?: CccNativeCliSessionPolicy;
+  cccNativeCliHeldClosure?: {
+    promise: Promise<CccNativeCliHeldClosureReceipt>;
+    receipt: CccNativeCliHeldClosureReceipt | null;
+  } | null;
+  cccNativeCliHeldClosureWaiters: Array<{
+    resolve: (receipt: CccNativeCliHeldClosureReceipt) => void;
+    reject: (cause: unknown) => void;
+  }>;
+  cccNativeCliLifetimeTimer?: ReturnType<typeof setTimeout>;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -641,6 +679,15 @@ export class CliSessionManager {
 
     const adapter = this.registry.get(options.adapterId);
     const requestedSettings = { ...((options.settings ?? {}) as Record<string, unknown>) };
+    const cccNativeCliPolicy = options.cccNativeCliPolicy === undefined
+      ? undefined
+      : validateCccNativeCliSessionPolicy(options.cccNativeCliPolicy, {
+          adapterId: options.adapterId,
+          taskId: options.taskId ?? "",
+          providerId: typeof requestedSettings.providerId === "string" ? requestedSettings.providerId : undefined,
+          modelId: typeof requestedSettings.model === "string" ? requestedSettings.model : undefined,
+          transport: "cli",
+        });
 
     // Resume vs fresh launch. A resume relaunches the recorded native session id
     // via the adapter's `buildResume` and REUSES the existing record (no
@@ -663,6 +710,9 @@ export class CliSessionManager {
       }
       const existing = this.store.getSession(options.resume.sessionId);
       if (!existing) throw new UnknownCliSessionError(options.resume.sessionId);
+      if (existing.autonomyPosture?.cccNativeCliOneShot === true) {
+        throw new CliResumeAdmissionError(existing.id, "one-shot native CLI sessions cannot resume");
+      }
       if (existing.agentState === "dead" && (!existing.terminationReason || !isResumeEligible(existing.terminationReason))) {
         throw new CliResumeAdmissionError(options.resume.sessionId, `terminal reason is ineligible: ${existing.terminationReason ?? "none"}`);
       }
@@ -718,12 +768,26 @@ export class CliSessionManager {
       global CliSessionManager policy. Non-CCC and predecessor rows retain
       their historical permissive model/autonomy resume semantics byte-for-byte.
       */
-      const posture = isCccFusionPosture(persistedPosture)
+      let posture = isCccFusionPosture(persistedPosture)
         ? withResumeContract(
             persistedPosture,
             buildResumeContract(options.adapterId, null, launchSettings, persistedPosture),
           )
         : persistedPosture;
+      if (cccNativeCliPolicy) {
+        posture = {
+          ...(posture ?? {}),
+          cccControllerGeneration: cccNativeCliPolicy.controllerToken,
+          cccControllerFenced: false,
+          cccNativeCliOneShot: true,
+          cccProviderAttemptKey: cccNativeCliPolicy.attemptKey,
+          cccProviderAttemptControllerToken: cccNativeCliPolicy.controllerToken,
+          cccAuthorityBindingHash: cccNativeCliPolicy.authorityBindingHash,
+          cccNativeCliTurnKey: cccNativeCliPolicy.turnKey,
+          cccNativeCliDispatchKey: cccNativeCliPolicy.dispatchKey,
+          cccNativeCliPolicy,
+        };
+      }
       launch = adapter.buildLaunch({ settings: launchSettings, posture });
       // Persist the session record BEFORE spawning so a crash mid-spawn still has
       // a durable record to reason about.
@@ -742,7 +806,9 @@ export class CliSessionManager {
     // A CCC native proxy has an independently recoverable effect turn. Its
     // durable admission below must see a resumed record's *prior* dead/fenced
     // generation before this new token replaces it.
-    if (isCccFusionProfile(launchSettings)) {
+    if (cccNativeCliPolicy) {
+      controllerGeneration = cccNativeCliPolicy.controllerToken;
+    } else if (isCccFusionProfile(launchSettings)) {
       controllerGeneration = randomUUID();
     }
 
@@ -773,12 +839,23 @@ export class CliSessionManager {
           ...currentPosture,
           cccControllerGeneration: controllerGeneration,
           cccControllerFenced: false,
+          ...(cccNativeCliPolicy
+            ? {
+                cccNativeCliOneShot: true,
+                cccProviderAttemptKey: cccNativeCliPolicy.attemptKey,
+                cccProviderAttemptControllerToken: cccNativeCliPolicy.controllerToken,
+                cccAuthorityBindingHash: cccNativeCliPolicy.authorityBindingHash,
+                cccNativeCliTurnKey: cccNativeCliPolicy.turnKey,
+                cccNativeCliDispatchKey: cccNativeCliPolicy.dispatchKey,
+                cccNativeCliPolicy,
+              }
+            : {}),
         },
       }) ?? record;
     }
 
-    if (useCccProcessSupervisor(options.adapterId, launchSettings)) {
-      launch = buildCccSupervisedLaunch(launch);
+    if (cccNativeCliPolicy || useCccProcessSupervisor(options.adapterId, launchSettings)) {
+      launch = buildCccSupervisedLaunch(launch, cccNativeCliPolicy?.limits.termGraceMs);
       usesOwnedCccProcessSupervisor = true;
     }
 
@@ -846,8 +923,12 @@ export class CliSessionManager {
       cancellationFailed: false,
       controllerGeneration,
       nativeMcpProxy,
+      cccNativeCliPolicy,
+      cccNativeCliHeldClosure: null,
+      cccNativeCliHeldClosureWaiters: [],
     };
     this.sessions.set(record.id, live);
+    this.armCccNativeCliLifetimeTimer(live);
 
     // Optional adapter telemetry wiring.
     let disposeTelemetry: (() => void) | void;
@@ -938,6 +1019,11 @@ export class CliSessionManager {
     // still observing closure. Never let that old generation touch the new one.
     if (live.terminated || this.sessions.get(live.id) !== live) return;
     this.settleExit(live, exitCode, signal);
+
+    if (live.cccNativeCliPolicy) {
+      void this.closeCccNativeCliSession(live.id, "exit").catch(() => undefined);
+      return;
+    }
 
     // The cancellation owner observes this registered resource first, then
     // writes + flushes its terminal state before releasing the registry slot.
@@ -1198,6 +1284,205 @@ export class CliSessionManager {
 
   // ── Teardown ─────────────────────────────────────────────────────────────
 
+  async closeCccNativeCliSession(
+    sessionId: string,
+    trigger: CccNativeCliHeldClosureTrigger,
+  ): Promise<CccNativeCliHeldClosureReceipt> {
+    const live = this.require(sessionId);
+    if (!live.cccNativeCliPolicy) throw new UnknownCliSessionError(sessionId);
+    if (trigger !== "done" && trigger !== "exit" && trigger !== "cancel" && trigger !== "lifetime") {
+      throw new Error("CCC native CLI close trigger must be one of: done, exit, cancel, lifetime");
+    }
+    this.clearCccNativeCliLifetimeTimer(live);
+    if (live.cccNativeCliHeldClosure) return live.cccNativeCliHeldClosure.promise;
+    const closure = {
+      promise: this.closeCccNativeCliSessionLive(live, trigger),
+      receipt: null as CccNativeCliHeldClosureReceipt | null,
+    };
+    live.cccNativeCliHeldClosure = closure;
+    try {
+      closure.receipt = await closure.promise;
+      const waiters = live.cccNativeCliHeldClosureWaiters.splice(0);
+      for (const waiter of waiters) waiter.resolve(closure.receipt);
+      return closure.receipt;
+    } catch (cause) {
+      const waiters = live.cccNativeCliHeldClosureWaiters.splice(0);
+      for (const waiter of waiters) waiter.reject(cause);
+      throw cause;
+    }
+  }
+
+  /** Observe a manager-issued held closure without initiating lifecycle work. */
+  waitForCccNativeCliHeldClosure(sessionId: string): Promise<CccNativeCliHeldClosureReceipt> {
+    const live = this.require(sessionId);
+    if (!live.cccNativeCliPolicy) throw new UnknownCliSessionError(sessionId);
+    if (live.cccNativeCliHeldClosure) return live.cccNativeCliHeldClosure.promise;
+    return new Promise((resolve, reject) => {
+      live.cccNativeCliHeldClosureWaiters.push({ resolve, reject });
+    });
+  }
+
+  async releaseCccNativeCliSession(receiptValue: unknown, terminalScopeValue: unknown): Promise<void> {
+    if (!receiptValue || typeof receiptValue !== "object") throw new UnknownCliSessionError("unknown");
+    const sessionId = (receiptValue as { sessionId?: unknown }).sessionId;
+    if (typeof sessionId !== "string") throw new UnknownCliSessionError("unknown");
+    const live = this.require(sessionId);
+    const policy = live.cccNativeCliPolicy;
+    if (!policy) throw new UnknownCliSessionError(sessionId);
+    const receipt = validateCccNativeCliHeldClosureReceipt(receiptValue, { sessionId, policy });
+    if (!live.cccNativeCliHeldClosure?.receipt) {
+      throw new Error("CCC native CLI release requires an issued manager-held closure receipt");
+    }
+    if (live.cccNativeCliHeldClosure.receipt !== receipt) {
+      throw new Error("CCC native CLI release receipt does not match held closure");
+    }
+    const terminalScope = this.validateCccNativeCliReleaseTerminalScope(terminalScopeValue, policy);
+    const row = this.store.getSession(sessionId);
+    const posture = row?.autonomyPosture ?? {};
+    if (
+      !row
+      || row.agentState !== "dead"
+      || row.terminationReason === null
+      || posture.cccControllerGeneration !== policy.controllerToken
+      || posture.cccControllerFenced !== true
+      || posture.cccNativeCliClosureState !== "settled"
+      || terminalScope.state !== terminalScope.terminal?.state
+      || terminalScope.terminal.kind !== "reconciled"
+    ) {
+      throw new Error("CCC native CLI release requires terminal settled fenced durable row");
+    }
+    this.releaseLiveSlot(live);
+  }
+
+  private async closeCccNativeCliSessionLive(
+    live: LiveSession,
+    trigger: CccNativeCliHeldClosureTrigger,
+  ): Promise<CccNativeCliHeldClosureReceipt> {
+    const policy = live.cccNativeCliPolicy;
+    if (!policy) throw new UnknownCliSessionError(live.id);
+    if (!live.exitResult) {
+      try {
+        live.pty.kill("SIGTERM");
+        const waitTimeoutMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
+        await this.waitForRegisteredExit(live, waitTimeoutMs);
+      } catch (cause) {
+        await this.failCancellationWithoutClosure(
+          live,
+          cause instanceof Error && typeof (cause as { code?: unknown }).code === "string"
+            && (cause as { code?: unknown }).code === "CLI_CANCELLATION_TIMEOUT"
+            ? "CANCELLATION_UNCONFIRMED"
+            : "CANCELLATION_SIGNAL_FAILED",
+          cause instanceof Error ? cause : new CliCancellationSignalError(live.id, { cause }),
+        );
+      }
+    }
+    await this.disposeNativeMcpProxy(live);
+    await this.updateCccNativeCliHeldRow(live, policy);
+    await this.store.flush();
+    const exitCode = live.exitResult?.exitCode ?? -1;
+    const exitSignal = live.exitResult?.signal ?? 0;
+    return Object.freeze({
+      kind: CCC_NATIVE_CLI_HELD_CLOSURE_KIND,
+      version: CCC_NATIVE_CLI_HELD_CLOSURE_VERSION,
+      sessionId: live.id,
+      attemptKey: policy.attemptKey,
+      controllerToken: policy.controllerToken,
+      taskId: policy.taskId,
+      authorityBindingHash: policy.authorityBindingHash,
+      turnKey: policy.turnKey,
+      dispatchKey: policy.dispatchKey,
+      trigger,
+      exitCode,
+      exitSignal,
+      processGroupClosed: true,
+      proxyClosed: true,
+      durableFloorFlushed: true,
+      slotHeld: true,
+    }) satisfies CccNativeCliHeldClosureReceipt;
+  }
+
+  private async updateCccNativeCliHeldRow(live: LiveSession, policy: CccNativeCliSessionPolicy): Promise<void> {
+    const controllerStore = this.store as unknown as {
+      updateCccSessionForController?: (
+        id: string,
+        expectedGeneration: string,
+        patch: {
+          agentState: CliSession["agentState"];
+          terminationReason: CliTerminationReason | null;
+          controllerToken?: string;
+          controllerFenced?: boolean;
+          nativeCliClosureState?: "held-closed";
+        },
+      ) => Promise<CliSession | undefined>;
+      };
+    if (typeof controllerStore.updateCccSessionForController !== "function") {
+      throw new Error("CCC native CLI held close requires controller CAS storage method");
+    }
+    const updated = await controllerStore.updateCccSessionForController(live.id, policy.controllerToken, {
+      agentState: "needsAttention",
+      terminationReason: null,
+      controllerToken: policy.controllerToken,
+      controllerFenced: false,
+      nativeCliClosureState: "held-closed",
+    });
+    if (!updated) throw new Error("CCC native CLI held close lost controller generation");
+  }
+
+  private validateCccNativeCliReleaseTerminalScope(
+    value: unknown,
+    policy: CccNativeCliSessionPolicy,
+  ): CccProviderAttemptScope {
+    if (!value || typeof value !== "object") throw new Error("CCC native CLI terminal scope is missing");
+    const candidate = value as CccProviderAttemptScope;
+    if (!candidate.terminal || candidate.terminal.kind !== "reconciled") {
+      throw new Error("CCC native CLI terminal scope must be reconciled");
+    }
+    if (candidate.attemptKey !== policy.attemptKey) throw new Error("CCC native CLI terminal scope attemptKey mismatch");
+    if (candidate.controllerToken !== policy.controllerToken) throw new Error("CCC native CLI terminal scope controllerToken mismatch");
+    if (candidate.taskId !== policy.taskId) throw new Error("CCC native CLI terminal scope taskId mismatch");
+    if (candidate.turnKey !== policy.turnKey) throw new Error("CCC native CLI terminal scope turnKey mismatch");
+    if (candidate.dispatchKey !== policy.dispatchKey) throw new Error("CCC native CLI terminal scope dispatchKey mismatch");
+    if (!Object.isFrozen(candidate.binding)) throw new Error("CCC native CLI terminal scope binding must be frozen");
+    if (candidate.binding.bindingHash !== policy.authorityBindingHash) throw new Error("CCC native CLI terminal scope binding mismatch");
+    const observation = Object.freeze({
+      kind: "ccc-fusion.native-cli-observation",
+      version: 1,
+      outcome: candidate.terminal.state,
+      evidenceDigest: candidate.terminal.evidenceDigest,
+    });
+    if (candidate.terminal.observerId !== CCC_NATIVE_CLI_OBSERVER_ID) {
+      throw new Error("CCC native CLI terminal scope observer mismatch");
+    }
+    return validateCccNativeCliTerminalScope(value, {
+      permitScope: Object.freeze({
+        attemptKey: policy.attemptKey,
+        controllerToken: policy.controllerToken,
+        taskId: policy.taskId,
+        semanticTaskId: candidate.semanticTaskId,
+        campaignDeadlineAt: candidate.campaignDeadlineAt,
+        turnKey: policy.turnKey,
+        dispatchKey: policy.dispatchKey,
+        attemptOrdinal: candidate.attemptOrdinal,
+        requestCount: candidate.requestCount,
+        state: "dispatched_unknown",
+        binding: candidate.binding,
+      }),
+      observation,
+    });
+  }
+
+  private releaseLiveSlot(live: LiveSession): void {
+    this.clearCccNativeCliLifetimeTimer(live);
+    live.terminated = true;
+    for (const stream of live.streams) stream.close();
+    live.streams.clear();
+    for (const job of live.queue) {
+      if (job.kind === "injection") job.resolve();
+    }
+    live.queue = [];
+    if (this.sessions.get(live.id) === live) this.sessions.delete(live.id);
+  }
+
   /**
    * Terminate a single session: scoped SIGKILL of the PTY process tree, mark
    * the record, release the concurrency slot. NEVER touches anything but this
@@ -1234,7 +1519,7 @@ export class CliSessionManager {
     await this.persistConfirmedCancellation(live, reason);
   }
 
-  private async waitForRegisteredExit(live: LiveSession): Promise<void> {
+  private async waitForRegisteredExit(live: LiveSession, timeoutMs = this.cancellationTimeoutMs): Promise<void> {
     if (live.exitResult) return;
     await new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -1247,7 +1532,10 @@ export class CliSessionManager {
         callback();
       };
       const onExit = () => settle(resolve);
-      const timer = setTimeout(() => settle(() => reject(new CliCancellationTimeoutError(live.id, this.cancellationTimeoutMs))), this.cancellationTimeoutMs);
+      const timer = setTimeout(
+        () => settle(() => reject(new CliCancellationTimeoutError(live.id, timeoutMs))),
+        timeoutMs,
+      );
       timer.unref?.();
       live.exitWaiters.push(onExit);
     });
@@ -1360,7 +1648,11 @@ export class CliSessionManager {
    * dashboard / port 4040 / any unrelated process. Invoked on `process.exit`.
    */
   async killAll(): Promise<void> {
-    await Promise.all([...this.sessions.values()].map((live) => this.kill(live.id, "engineDeath")));
+    await Promise.all([...this.sessions.values()].map((live) => (
+      live.cccNativeCliPolicy
+        ? this.closeCccNativeCliSession(live.id, "cancel")
+        : this.kill(live.id, "engineDeath")
+    )));
   }
 
   /** Remove the process-exit hook and tear down all sessions. */
@@ -1384,5 +1676,24 @@ export class CliSessionManager {
     const live = this.sessions.get(sessionId);
     if (!live) throw new UnknownCliSessionError(sessionId);
     return live;
+  }
+
+  private armCccNativeCliLifetimeTimer(live: LiveSession): void {
+    const policy = live.cccNativeCliPolicy;
+    if (!policy) return;
+
+    const boundaryMs = policy.deadlineAtMs - policy.limits.termGraceMs - policy.limits.killClosureMs;
+    const delayMs = boundaryMs - Date.now();
+    const timer = setTimeout(() => {
+      void this.closeCccNativeCliSession(live.id, "lifetime").catch(() => undefined);
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    live.cccNativeCliLifetimeTimer = timer;
+  }
+
+  private clearCccNativeCliLifetimeTimer(live: LiveSession): void {
+    if (!live.cccNativeCliLifetimeTimer) return;
+    clearTimeout(live.cccNativeCliLifetimeTimer);
+    live.cccNativeCliLifetimeTimer = undefined;
   }
 }

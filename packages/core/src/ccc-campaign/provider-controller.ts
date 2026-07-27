@@ -1,5 +1,7 @@
 import {
   assertActiveClaimedCccCampaignApprovalWithinTransaction,
+  assertClaimedCccCampaignApprovalWithinTransaction,
+  assertConsumedCccCampaignApprovalWithinTransaction,
   type AssertActiveClaimedCccCampaignApprovalInput,
 } from "../async-approval-request-store.js";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
@@ -94,7 +96,6 @@ export async function atomicReserveCccCampaignProviderDispatch(
       approvalRequestId: input.approvalRequestId,
       claimToken: input.claimToken,
     };
-    await assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
     const reserved = await reserveCccProviderAttempt({
       layer: input.layer,
       rootDir: input.rootDir,
@@ -110,6 +111,18 @@ export async function atomicReserveCccCampaignProviderDispatch(
         transport: input.transport,
       },
     });
+    switch (reserved.state) {
+      case "reserved":
+        await assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
+        break;
+      case "dispatched_unknown":
+      case "proved_failed":
+        await assertClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
+        break;
+      case "committed":
+        await assertConsumedCccCampaignApprovalWithinTransaction(tx, approvalInput);
+        break;
+    }
     const begun = await beginCccProviderAttemptDispatch({
       layer: input.layer,
       rootDir: input.rootDir,

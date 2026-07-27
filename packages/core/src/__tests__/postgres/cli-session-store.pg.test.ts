@@ -11,6 +11,7 @@ import { importCccPrdBundle } from "../../index.js";
 import {
   claimCccCampaignApproval,
   getApprovalRequest,
+  getApprovalAuditHistory,
   issueCccCampaignApproval,
 } from "../../async-approval-request-store.js";
 import * as effectReceipts from "../../ccc-effect-receipts.js";
@@ -29,6 +30,8 @@ import {
   rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
 import type { CccPrdSemanticBundle } from "../../ccc-prd/types.js";
+import type { CccProviderAttemptReconciliation, CccProviderAttemptScope } from "../../ccc-campaign/types.js";
+import type { CliTerminationReason } from "../../cli-session-types.js";
 import type { ApprovalRequestActorSnapshot } from "../../types.js";
 import {
   createSharedPgTaskStoreTestHarness,
@@ -71,14 +74,14 @@ function campaignBundle(source: CccPrdSemanticBundle): CccPrdSemanticBundle {
   });
 }
 
-function campaignPolicy(source: CccPrdSemanticBundle) {
+function campaignPolicy(source: CccPrdSemanticBundle, transport: "pi" | "cli" = "pi") {
   return {
     schema: "ccc-campaign.execution-policy.v1" as const,
     routes: source.tasks.map((task) => ({
       taskId: task.id,
       providerId: "deterministic-fake",
       modelId: "fixture-v1",
-      transport: "pi" as const,
+      transport,
     })),
   };
 }
@@ -93,7 +96,11 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
   afterEach(h.afterEach);
   afterAll(h.afterAll);
 
-  async function claimedCampaignAuthority(suffix: string, claimToken = `claim-${suffix}`) {
+  async function claimedCampaignAuthority(
+    suffix: string,
+    claimToken = `claim-${suffix}`,
+    transport: "pi" | "cli" = "pi",
+  ) {
     const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), suffix));
     await importCccPrdBundle({
       bundle: source,
@@ -101,7 +108,7 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
-      executionPolicy: campaignPolicy(source),
+      executionPolicy: campaignPolicy(source, transport),
     });
     const taskId = `TASK-${suffix}`;
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
@@ -128,6 +135,323 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     });
     return { taskId, rootDir, issued, claimed, claimToken };
   }
+
+  type AtomicProviderAttemptSettlementStore = {
+    settleCccProviderAttemptAndFence(input: {
+      reconciliation: CccProviderAttemptReconciliation;
+      terminationReason: CliTerminationReason;
+      cancellationState?: string | null;
+    }): Promise<CccProviderAttemptScope>;
+  };
+
+  function atomicSettlement(store: CliSessionStore): AtomicProviderAttemptSettlementStore {
+    return store as unknown as AtomicProviderAttemptSettlementStore;
+  }
+
+  async function dispatchedCliProviderAttempt(suffix: string) {
+    const claimed = await claimedCampaignAuthority(`provider-settlement-${suffix}`, undefined, "cli");
+  const provider = await h.store().reserveCccProviderAttempt({
+      taskId: claimed.taskId,
+      actionId: campaignAction.actionId,
+      actionTarget: campaignAction.actionTarget,
+      turnKey: `provider-settlement-turn-${suffix}`,
+      dispatchKey: `provider-settlement-dispatch-${suffix}`,
+      providerId: "deterministic-fake",
+      modelId: "fixture-v1",
+      transport: "cli",
+    });
+    const dispatch = await h.store().beginCccProviderAttemptDispatch({
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+      controllerToken: provider.controllerToken,
+    });
+    expect(dispatch).toMatchObject({ kind: "dispatch-permit", scope: { state: "dispatched_unknown" } });
+    return { claimed, provider: dispatch.scope };
+  }
+
+  async function heldCliProviderSession(
+    suffix: string,
+    provider: CccProviderAttemptScope,
+    taskId: string,
+  ) {
+    const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: h.rootDir(),
+    });
+    const id = `cli-pg-provider-settlement-${suffix}`;
+    store.createSession({
+      id,
+      projectId: "__legacy_unscoped__",
+      adapterId: "codex",
+      purpose: "execute",
+      taskId,
+      agentState: "needsAttention",
+      terminationReason: null,
+      autonomyPosture: {
+        cccNativeCliOneShot: true,
+        cccProviderAttemptKey: provider.attemptKey,
+        cccProviderAttemptControllerToken: provider.controllerToken,
+        cccAuthorityBindingHash: provider.binding.bindingHash,
+        cccControllerGeneration: provider.controllerToken,
+        cccControllerFenced: false,
+        cccNativeCliClosureState: "held-closed",
+      },
+    });
+    await store.flush();
+    return { id, store };
+  }
+
+  it("atomically settles a dispatched CLI provider attempt and fences its held one-shot session", async () => {
+    const { claimed, provider } = await dispatchedCliProviderAttempt("committed");
+    const { id, store } = await heldCliProviderSession("committed", provider, claimed.taskId);
+    const reconciliation: CccProviderAttemptReconciliation = {
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+      controllerToken: provider.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "a".repeat(64),
+      observerId: "loopback-cli-provider-observer",
+    };
+
+    await expect(atomicSettlement(store).settleCccProviderAttemptAndFence({
+      reconciliation,
+      terminationReason: "completed",
+      cancellationState: "provider-settled",
+    })).resolves.toEqual({
+      ...provider,
+      state: "committed",
+      terminal: {
+        kind: "reconciled",
+        state: "committed",
+        evidenceDigest: reconciliation.evidenceDigest,
+        observerId: reconciliation.observerId,
+      },
+    });
+    await expect(h.store().inspectCccProviderAttempt({
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+    })).resolves.toEqual({
+      ...provider,
+      state: "committed",
+      terminal: {
+        kind: "reconciled",
+        state: "committed",
+        evidenceDigest: reconciliation.evidenceDigest,
+        observerId: reconciliation.observerId,
+      },
+    });
+    const rehydrated = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    expect(rehydrated.getSession(id)).toMatchObject({
+      agentState: "dead",
+      terminationReason: "completed",
+      autonomyPosture: {
+        cccControllerFenced: true,
+        cccCancellationState: "provider-settled",
+        cccNativeCliClosureState: "settled",
+      },
+    });
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toBeNull();
+  });
+
+  it("replays identical CLI provider settlement without changing its truthful terminal scope", async () => {
+    const { claimed, provider } = await dispatchedCliProviderAttempt("identical-replay");
+    const { id, store } = await heldCliProviderSession("identical-replay", provider, claimed.taskId);
+    const reconciliation: CccProviderAttemptReconciliation = {
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+      controllerToken: provider.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "1".repeat(64),
+      observerId: "loopback-cli-provider-observer",
+    };
+    const settlement = {
+      reconciliation,
+      terminationReason: "completed" as const,
+      cancellationState: "provider-settled",
+    };
+
+    const first = await atomicSettlement(store).settleCccProviderAttemptAndFence(settlement);
+    await expect(atomicSettlement(store).settleCccProviderAttemptAndFence(settlement)).resolves.toEqual(first);
+    await expect(h.store().inspectCccProviderAttempt({
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+    })).resolves.toEqual(first);
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "consumed" });
+    const auditAfterFirst = await getApprovalAuditHistory(h.layer().db, claimed.issued.id);
+    await atomicSettlement(store).settleCccProviderAttemptAndFence(settlement);
+    const auditAfterSecond = await getApprovalAuditHistory(h.layer().db, claimed.issued.id);
+    expect(auditAfterSecond).toEqual(auditAfterFirst);
+    const rehydrated = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    expect(rehydrated.getSession(id)).toMatchObject({
+      agentState: "dead",
+      terminationReason: "completed",
+      autonomyPosture: {
+        cccControllerFenced: true,
+        cccCancellationState: "provider-settled",
+        cccNativeCliClosureState: "settled",
+      },
+    });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toBeNull();
+  });
+
+  it("rolls back provider settlement when the held session generation is stale", async () => {
+    const { claimed, provider } = await dispatchedCliProviderAttempt("stale-generation");
+    const { id, store } = await heldCliProviderSession("stale-generation", provider, claimed.taskId);
+    await expect(store.updateCccSessionForController(id, provider.controllerToken, {
+      agentState: "needsAttention",
+      terminationReason: null,
+      controllerToken: "replacement-controller-generation",
+      controllerFenced: false,
+    })).resolves.toBeDefined();
+    const reconciliation: CccProviderAttemptReconciliation = {
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+      controllerToken: provider.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "b".repeat(64),
+      observerId: "loopback-cli-provider-observer",
+    };
+
+    await expect(atomicSettlement(store).settleCccProviderAttemptAndFence({
+      reconciliation,
+      terminationReason: "completed",
+    })).rejects.toThrow(/stale|generation|controller|fenc/i);
+    await expect(h.store().inspectCccProviderAttempt({
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+    })).resolves.toEqual(provider);
+    await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "claimed" });
+    await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toMatchObject({
+      lease: { claimToken: claimed.claimToken },
+    });
+    const rehydrated = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    expect(rehydrated.getSession(id)).toMatchObject({
+      agentState: "needsAttention",
+      terminationReason: null,
+      autonomyPosture: {
+        cccControllerGeneration: "replacement-controller-generation",
+        cccControllerFenced: false,
+      },
+    });
+  });
+
+  it("refuses provider settlement when the held one-shot session has no closure marker", async () => {
+    const { claimed, provider } = await dispatchedCliProviderAttempt("missing-closure");
+    const { id, store } = await heldCliProviderSession("missing-closure", provider, claimed.taskId);
+    const session = store.getSession(id);
+    if (!session?.autonomyPosture) throw new Error("missing held CLI posture");
+    const { cccNativeCliClosureState: _missingClosure, ...unclosedPosture } = session.autonomyPosture;
+    store.updateSession(id, { autonomyPosture: unclosedPosture });
+    await store.flush();
+    const reconciliation: CccProviderAttemptReconciliation = {
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+      controllerToken: provider.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "e".repeat(64),
+      observerId: "loopback-cli-provider-observer",
+    };
+
+    await expect(atomicSettlement(store).settleCccProviderAttemptAndFence({
+      reconciliation,
+      terminationReason: "completed",
+    })).rejects.toThrow(/closure|held|one-shot/i);
+    await expect(h.store().inspectCccProviderAttempt({
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+    })).resolves.toEqual(provider);
+    const rehydrated = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    expect(rehydrated.getSession(id)).toMatchObject({
+      agentState: "needsAttention",
+      terminationReason: null,
+      autonomyPosture: { cccControllerFenced: false },
+    });
+  });
+
+  it("refuses provider settlement when the closed one-shot session is still busy", async () => {
+    const { claimed, provider } = await dispatchedCliProviderAttempt("busy-closure");
+    const { id, store } = await heldCliProviderSession("busy-closure", provider, claimed.taskId);
+    store.updateSession(id, { agentState: "busy", terminationReason: null });
+    await store.flush();
+    const reconciliation: CccProviderAttemptReconciliation = {
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+      controllerToken: provider.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "f".repeat(64),
+      observerId: "loopback-cli-provider-observer",
+    };
+
+    await expect(atomicSettlement(store).settleCccProviderAttemptAndFence({
+      reconciliation,
+      terminationReason: "completed",
+    })).rejects.toThrow(/held|needsAttention|state|closed/i);
+    await expect(h.store().inspectCccProviderAttempt({
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+    })).resolves.toEqual(provider);
+    const rehydrated = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    expect(rehydrated.getSession(id)).toMatchObject({
+      agentState: "busy",
+      terminationReason: null,
+      autonomyPosture: {
+        cccNativeCliClosureState: "held-closed",
+        cccControllerFenced: false,
+      },
+    });
+  });
+
+  it("rejects conflicting provider terminal reconciliation without terminating the held CLI session", async () => {
+    const { claimed, provider } = await dispatchedCliProviderAttempt("terminal-conflict");
+    const { id, store } = await heldCliProviderSession("terminal-conflict", provider, claimed.taskId);
+    const existing: CccProviderAttemptReconciliation = {
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+      controllerToken: provider.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "c".repeat(64),
+      observerId: "first-cli-provider-observer",
+    };
+    const terminal = await h.store().reconcileCccProviderAttempt(existing);
+
+    await expect(atomicSettlement(store).settleCccProviderAttemptAndFence({
+      reconciliation: {
+        ...existing,
+        evidenceDigest: "d".repeat(64),
+        observerId: "conflicting-cli-provider-observer",
+      },
+      terminationReason: "completed",
+    })).rejects.toThrow(/collision|conflict|reconcil/i);
+    await expect(h.store().inspectCccProviderAttempt({
+      taskId: claimed.taskId,
+      attemptKey: provider.attemptKey,
+    })).resolves.toEqual(terminal);
+    const rehydrated = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
+      campaignAuthorityStore: h.store(),
+      rootDir: claimed.rootDir,
+    });
+    expect(rehydrated.getSession(id)).toMatchObject({
+      agentState: "needsAttention",
+      terminationReason: null,
+      autonomyPosture: { cccControllerFenced: false },
+    });
+  });
 
   it("refuses campaign receipt reservation before an authority reader is injected", async () => {
     const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), "effect-missing-authority"));
@@ -647,6 +971,55 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
         cccControllerFenced: false,
       },
     });
+  });
+
+  it("persists and removes the native CLI closure marker through the controller CAS lifecycle path", async () => {
+    const store = await CliSessionStore.create(h.layer(), "project-a");
+    const session = store.createSession({
+      id: "cli-pg-controller-closure-marker",
+      projectId: "project-a",
+      adapterId: "codex",
+      purpose: "execute",
+      taskId: "FN-CCC-CLOSURE",
+      agentState: "needsAttention",
+      terminationReason: null,
+      autonomyPosture: {
+        cccControllerGeneration: "controller-closure",
+        cccControllerFenced: false,
+      },
+    });
+    await store.flush();
+    const controller = store as unknown as {
+      updateCccSessionForController(
+        id: string,
+        expectedControllerToken: string,
+        input: {
+          agentState: "needsAttention";
+          terminationReason: null;
+          nativeCliClosureState?: string | null;
+        },
+      ): ReturnType<CliSessionStore["updateCccSessionForController"]>;
+    };
+
+    await expect(controller.updateCccSessionForController(session.id, "controller-closure", {
+      agentState: "needsAttention",
+      terminationReason: null,
+      nativeCliClosureState: "held-closed",
+    })).resolves.toMatchObject({
+      autonomyPosture: { cccNativeCliClosureState: "held-closed" },
+    });
+    expect((await CliSessionStore.create(h.layer(), "project-a")).getSession(session.id)).toMatchObject({
+      autonomyPosture: { cccNativeCliClosureState: "held-closed" },
+    });
+
+    const removed = await controller.updateCccSessionForController(session.id, "controller-closure", {
+      agentState: "needsAttention",
+      terminationReason: null,
+      nativeCliClosureState: null,
+    });
+    expect(removed?.autonomyPosture?.cccNativeCliClosureState).toBeUndefined();
+    expect((await CliSessionStore.create(h.layer(), "project-a")).getSession(session.id)?.autonomyPosture)
+      .not.toHaveProperty("cccNativeCliClosureState");
   });
 
   it("does not reissue a committed CCC effect after PostgreSQL store rehydration", async () => {

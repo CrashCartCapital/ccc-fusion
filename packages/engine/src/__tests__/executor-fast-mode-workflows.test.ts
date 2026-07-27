@@ -1317,6 +1317,211 @@ describe("fast mode workflow/runtime invariants", () => {
     expect(awaitInput).toHaveBeenCalledTimes(1);
   });
 
+  it("Task 4 RED: fenced CLI node without a host-native binding refuses before log or session effects", async () => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/cli-test",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    const resolveMcpServers = vi.fn(async () => []);
+    const resolveMcpServersSpy = vi.spyOn(executor as any, "resolveMcpServers").mockImplementation(resolveMcpServers);
+    const executionFence = Object.freeze({
+      workItemId: "wi-cli-binding-red",
+      attempt: 1,
+      runId: "FN-6226-run",
+    });
+    const execution = Object.freeze({
+      originTaskId: "FN-6226",
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic", executionMode: "fast" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({
+        nodeId: "cli-node",
+        materializedNodeId: "cli-node",
+      }),
+      executionFence,
+      providerAttemptTurnKey: "ccc-cli-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    const graphContext = Object.freeze({});
+    const sealedExecutionContext = Object.freeze({
+      task: nodeTask,
+      settings: undefined,
+      context: {},
+      execution,
+    });
+
+    let result: unknown;
+    let failure: unknown;
+    try {
+      result = await (executor as any).runGraphCustomNode(
+        {
+          id: "cli-native-node",
+          kind: "prompt",
+          config: {
+            executor: "cli-agent",
+            cliAdapterId: "test-cli-adapter",
+            cliSettings: { profile: "ccc-fusion" },
+            prompt: "test cli",
+          },
+        },
+        nodeTask,
+        {},
+        undefined,
+        graphContext,
+        sealedExecutionContext,
+      );
+    } catch (err) {
+      failure = err;
+    } finally {
+      resolveMcpServersSpy.mockRestore();
+    }
+
+    expect(failure).toMatchObject({ code: "CCC_NATIVE_CLI_BINDING_REFUSED" });
+    expect(result).toBeUndefined();
+
+    expect(store.logEntry).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(resolveMcpServers).not.toHaveBeenCalled();
+  });
+
+  it.each(["mutable", "extra-key"])("Task 4 RED: validates $case host-native CLI binding before preDispatch or effects", async (caseName) => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/cli-test",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const store = createMockStore();
+    store.getTask.mockImplementation(async (id: string) => ({ ...nodeTask, id }));
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      experimentalFeatures: { workflowGraphExecutor: true },
+    });
+    const runtimeStore = {
+      listByTask: vi.fn(async () => []),
+    };
+    const preDispatch = vi.fn();
+    const reconcile = vi.fn();
+    const observe = vi.fn();
+    const binding = {
+      kind: "ccc-fusion.native-cli-binding",
+      version: 1,
+      id: "fusion-native:ccc-cli-one-shot",
+      turnKey: "ccc-cli-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      dispatchKey: "cli-agent:1",
+      route: Object.freeze({
+        adapterId: "test-cli-adapter",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        transport: "cli",
+      }),
+      limits: Object.freeze({
+        maxRequests: 1,
+        lifetimeMs: 60000,
+        termGraceMs: 5000,
+        killClosureMs: 5000,
+      }),
+      followUp: false,
+      observer: Object.freeze({
+        id: "ccc-native-cli-observer.v1",
+        observe,
+      }),
+      controller: Object.freeze({
+        preDispatch,
+        reconcile,
+      }),
+    };
+    const resolveCccNativeCliBinding = vi.fn(async () => {
+      const candidate = { ...binding };
+      return caseName === "extra-key"
+        ? Object.freeze({ ...candidate, unexpected: "unexpected-key" })
+        : candidate;
+    });
+    const executor = new TaskExecutor(store, "/tmp/test", {
+      cliAgentRuntime: {
+        manager: {} as any,
+        hub: {} as any,
+        registry: {} as any,
+        store: runtimeStore,
+        projectId: "test",
+        hookEndpointUrl: "http://127.0.0.1:1/unused",
+        resolveCccNativeCliBinding,
+      } as any,
+    } as any);
+    const resolveMcpServers = vi.fn(async () => []);
+    const resolveMcpServersSpy = vi.spyOn(executor as any, "resolveMcpServers").mockImplementation(resolveMcpServers);
+
+    const executionFence = Object.freeze({
+      workItemId: "wi-cli-binding-red",
+      attempt: 1,
+      runId: "FN-6226-run",
+    });
+    const execution = Object.freeze({
+      originTaskId: "FN-6226",
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic", executionMode: "fast" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({
+        nodeId: "cli-node",
+        materializedNodeId: "cli-node",
+      }),
+      executionFence,
+      providerAttemptTurnKey: "ccc-cli-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    const graphContext = Object.freeze({});
+    const sealedExecutionContext = Object.freeze({
+      task: nodeTask,
+      settings: undefined,
+      context: {},
+      execution,
+    });
+
+    let result: unknown;
+    let failure: unknown;
+    try {
+      result = await (executor as any).runGraphCustomNode(
+        {
+          id: "cli-native-node",
+          kind: "prompt",
+          config: {
+            executor: "cli-agent",
+            cliAdapterId: "test-cli-adapter",
+            cliSettings: { profile: "ccc-fusion" },
+            prompt: "test cli",
+          },
+        },
+        nodeTask,
+        {},
+        undefined,
+        graphContext,
+        sealedExecutionContext,
+      );
+    } catch (err) {
+      failure = err;
+    } finally {
+      resolveMcpServersSpy.mockRestore();
+    }
+
+    expect(failure).toMatchObject({ code: "CCC_NATIVE_CLI_BINDING_REFUSED" });
+    expect(result).toBeUndefined();
+    expect(resolveCccNativeCliBinding).toHaveBeenCalledTimes(1);
+    if (caseName === "mutable") {
+      expect(String((failure as any)?.message ?? "")).toMatch(/frozen/i);
+    } else {
+      expect(String((failure as any)?.message ?? "")).toMatch(/exact|keys/i);
+    }
+
+    expect(preDispatch).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(runtimeStore.listByTask).not.toHaveBeenCalled();
+    expect(resolveMcpServers).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
+  });
+
   // U4 (KTD-2): the legacy `workflow-step` seam and `runWorkflowStep` primitive
   // were removed, so the two it.each blocks that drove them directly (fast-mode
   // skip + standard-mode run) are gone. Fast-mode skip of workflow gates is now

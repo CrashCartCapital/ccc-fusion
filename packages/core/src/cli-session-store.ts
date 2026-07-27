@@ -13,7 +13,12 @@ import { EventEmitter } from "node:events";
 import { realpath } from "node:fs/promises";
 import { and, desc, eq, sql } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
-import { recordRunAuditEventWithinTransaction, type AsyncDataLayer, type DbTransaction } from "./postgres/data-layer.js";
+import {
+  recordRunAuditEventWithinTransaction,
+  RunAuditEventCollisionError,
+  type AsyncDataLayer,
+  type DbTransaction,
+} from "./postgres/data-layer.js";
 import { fromJson } from "./db-helpers.js";
 import {
   isCliAgentState,
@@ -46,8 +51,13 @@ import {
   expireClaimedCccCampaignApprovalAfterProvedNoEffectWithinTransaction,
 } from "./async-approval-request-store.js";
 import { assertCccCampaignAuthorityBinding, createCccCampaignAuthorityBinding } from "./ccc-campaign/canonical.js";
+import { inspectCccProviderAttempt, reconcileCccProviderAttempt } from "./ccc-campaign/provider-attempt.js";
 import type { CccCampaignAuthorityStore } from "./ccc-campaign/store.js";
-import type { CccCampaignAuthorityBinding } from "./ccc-campaign/types.js";
+import type {
+  CccCampaignAuthorityBinding,
+  CccProviderAttemptReconciliation,
+  CccProviderAttemptScope,
+} from "./ccc-campaign/types.js";
 
 export interface CliSessionStoreEvents {
   "cli-session:created": [session: CliSession];
@@ -423,6 +433,7 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
       controllerToken?: string;
       controllerFenced?: boolean;
       cancellationState?: string | null;
+      nativeCliClosureState?: "held-closed" | "settled" | null;
     },
   ): Promise<CliSession | undefined> {
     this.assertAgentState(input.agentState);
@@ -451,6 +462,10 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
       };
       if (input.cancellationState === null) delete nextPosture.cccCancellationState;
       else if (input.cancellationState !== undefined) nextPosture.cccCancellationState = input.cancellationState;
+      if (input.nativeCliClosureState === null) delete nextPosture.cccNativeCliClosureState;
+      else if (input.nativeCliClosureState !== undefined) {
+        nextPosture.cccNativeCliClosureState = input.nativeCliClosureState;
+      }
       const next: CliSession = {
         ...current,
         agentState: input.agentState,
@@ -473,6 +488,201 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
     this.sessions.set(id, updated);
     this.emit("cli-session:updated", updated);
     return updated;
+  }
+
+  /**
+   * Settle a provider dispatch and fence its matching one-shot CLI session in
+   * the same durable transaction. Provider reconciliation must roll back if
+   * the held session no longer proves the same controller custody.
+   */
+  async settleCccProviderAttemptAndFence(input: {
+    reconciliation: CccProviderAttemptReconciliation;
+    terminationReason: CliTerminationReason;
+    cancellationState?: string | null;
+  }): Promise<CccProviderAttemptScope> {
+    this.assertTerminationReason(input.terminationReason);
+    await this.flush();
+    const rootDir = this.options.rootDir;
+    if (!rootDir) throw new Error("CCC provider attempt settlement requires a campaign rootDir");
+    const campaignAuthorityStore = this.options.campaignAuthorityStore;
+    const { terminal, session, changed } = await this.layer.transactionImmediate(async (tx) => {
+      let claimedApproval: {
+        action: Pick<CccCampaignAuthorityBinding, "actionId" | "actionTarget">;
+        claimToken: string;
+      } | undefined;
+      if (input.reconciliation.outcome === "committed") {
+        const initialAttempt = await inspectCccProviderAttempt({
+          layer: this.layer,
+          rootDir,
+          tx,
+          taskId: input.reconciliation.taskId,
+          attemptKey: input.reconciliation.attemptKey,
+        });
+        if (initialAttempt?.state === "dispatched_unknown") {
+          if (!campaignAuthorityStore) {
+            throw new Error("CCC committed provider settlement requires a campaign authority store");
+          }
+          const action = {
+            actionId: initialAttempt.binding.actionId,
+            actionTarget: initialAttempt.binding.actionTarget,
+          };
+          const lease = await campaignAuthorityStore.inspectCccCampaignActionLease(
+            initialAttempt.taskId,
+            action,
+            tx,
+          );
+          const lockedAttempt = await inspectCccProviderAttempt({
+            layer: this.layer,
+            rootDir,
+            tx,
+            taskId: input.reconciliation.taskId,
+            attemptKey: input.reconciliation.attemptKey,
+          });
+          if (lockedAttempt?.state === "dispatched_unknown") {
+            if (
+              !lease
+              || lease.binding.bindingHash !== lockedAttempt.binding.bindingHash
+              || lease.lease.bindingHash !== lockedAttempt.binding.bindingHash
+              || lease.lease.actionId !== lockedAttempt.binding.actionId
+              || lease.lease.actionTarget !== lockedAttempt.binding.actionTarget
+            ) {
+              throw new Error("CCC committed provider settlement has no exact persisted action lease");
+            }
+            await assertClaimedCccCampaignApprovalWithinTransaction(tx, {
+              authorityStore: campaignAuthorityStore,
+              rootDir,
+              taskId: lockedAttempt.taskId,
+              action: {
+                actionId: lockedAttempt.binding.actionId,
+                actionTarget: lockedAttempt.binding.actionTarget,
+              },
+              approvalRequestId: lease.lease.approvalRequestId,
+              claimToken: lease.lease.claimToken,
+            });
+            claimedApproval = {
+              action: {
+                actionId: lockedAttempt.binding.actionId,
+                actionTarget: lockedAttempt.binding.actionTarget,
+              },
+              claimToken: lease.lease.claimToken,
+            };
+          }
+        }
+      }
+      let terminal: CccProviderAttemptScope;
+      try {
+        terminal = await reconcileCccProviderAttempt({
+          layer: this.layer,
+          rootDir,
+          tx,
+          reconciliation: input.reconciliation,
+        });
+      } catch (error) {
+        if (error instanceof RunAuditEventCollisionError) {
+          throw new RunAuditEventCollisionError(`CCC provider attempt reconciliation collision: ${error.message}`);
+        }
+        throw error;
+      }
+      const rows = (await tx.execute(sql`
+        SELECT id, task_id AS "taskId", chat_session_id AS "chatSessionId", purpose,
+          owner_project_id AS "ownerProjectId", adapter_id AS "adapterId", agent_state AS "agentState",
+          termination_reason AS "terminationReason", native_session_id AS "nativeSessionId",
+          resume_attempts AS "resumeAttempts", autonomy_posture AS "autonomyPosture",
+          worktree_path AS "worktreePath", created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM project.cli_sessions
+        WHERE owner_project_id = ${this.projectId}
+          AND task_id = ${input.reconciliation.taskId}
+          AND autonomy_posture::jsonb->>'cccNativeCliOneShot' = 'true'
+          AND autonomy_posture::jsonb->>'cccProviderAttemptKey' = ${input.reconciliation.attemptKey}
+          AND autonomy_posture::jsonb->>'cccProviderAttemptControllerToken' = ${input.reconciliation.controllerToken}
+        FOR UPDATE
+      `)) as unknown as CliSessionRow[];
+      if (rows.length !== 1) {
+        throw new Error(`CCC provider attempt settlement requires exactly one held CLI session; found ${rows.length}`);
+      }
+      const current = rowToSession(rows[0]!);
+      const posture = current.autonomyPosture ?? {};
+      if (posture.cccAuthorityBindingHash !== terminal.binding.bindingHash) {
+        throw new Error("CCC provider attempt settlement authority binding does not match held CLI session");
+      }
+      if (posture.cccControllerGeneration !== input.reconciliation.controllerToken) {
+        throw new Error("CCC provider attempt settlement controller generation is stale");
+      }
+      const cancellationMatches = input.cancellationState === undefined
+        || (input.cancellationState === null
+          ? posture.cccCancellationState === undefined
+          : posture.cccCancellationState === input.cancellationState);
+      if (
+        current.agentState === "dead"
+        && current.terminationReason === input.terminationReason
+        && posture.cccControllerFenced === true
+        && posture.cccNativeCliClosureState === "settled"
+        && cancellationMatches
+      ) {
+        return { terminal, session: current, changed: false };
+      }
+      if (current.agentState !== "needsAttention" || current.terminationReason !== null) {
+        throw new Error("CCC provider attempt settlement requires a held needsAttention CLI session");
+      }
+      if (posture.cccNativeCliClosureState !== "held-closed" || posture.cccControllerFenced !== false) {
+        throw new Error("CCC provider attempt settlement requires an unfenced held-closed CLI session");
+      }
+      if (claimedApproval) {
+        if (!campaignAuthorityStore) {
+          throw new Error("CCC committed provider settlement requires a campaign authority store");
+        }
+        await consumeCccCampaignApprovalWithinTransaction(tx, {
+          authorityStore: campaignAuthorityStore,
+          rootDir,
+          taskId: terminal.taskId,
+          action: claimedApproval.action,
+          claimToken: claimedApproval.claimToken,
+          actor: Object.freeze({
+            actorId: "ccc-native-cli-provider",
+            actorType: "agent" as const,
+            actorName: "CCC native CLI provider settlement",
+          }),
+          runId: `ccc-cli-provider-settlement:${terminal.taskId}:${terminal.attemptKey}`,
+        });
+      }
+      const nextPosture: CliAutonomyPosture = {
+        ...posture,
+        cccControllerFenced: true,
+        cccNativeCliClosureState: "settled",
+      };
+      if (input.cancellationState === null) delete nextPosture.cccCancellationState;
+      else if (input.cancellationState !== undefined) nextPosture.cccCancellationState = input.cancellationState;
+      const updatedAt = new Date().toISOString();
+      const updatedRows = (await tx.execute(sql`
+        UPDATE project.cli_sessions
+        SET agent_state = 'dead', termination_reason = ${input.terminationReason},
+          autonomy_posture = ${JSON.stringify(nextPosture)}, updated_at = ${updatedAt}
+        WHERE owner_project_id = ${this.projectId}
+          AND id = ${current.id}
+          AND task_id = ${input.reconciliation.taskId}
+          AND agent_state = 'needsAttention'
+          AND termination_reason IS NULL
+          AND autonomy_posture::jsonb->>'cccNativeCliOneShot' = 'true'
+          AND autonomy_posture::jsonb->>'cccNativeCliClosureState' = 'held-closed'
+          AND autonomy_posture::jsonb->>'cccControllerFenced' = 'false'
+          AND autonomy_posture::jsonb->>'cccProviderAttemptKey' = ${input.reconciliation.attemptKey}
+          AND autonomy_posture::jsonb->>'cccProviderAttemptControllerToken' = ${input.reconciliation.controllerToken}
+          AND autonomy_posture::jsonb->>'cccAuthorityBindingHash' = ${terminal.binding.bindingHash}
+          AND autonomy_posture::jsonb->>'cccControllerGeneration' = ${input.reconciliation.controllerToken}
+        RETURNING id, task_id AS "taskId", chat_session_id AS "chatSessionId", purpose,
+          owner_project_id AS "ownerProjectId", adapter_id AS "adapterId", agent_state AS "agentState",
+          termination_reason AS "terminationReason", native_session_id AS "nativeSessionId",
+          resume_attempts AS "resumeAttempts", autonomy_posture AS "autonomyPosture",
+          worktree_path AS "worktreePath", created_at AS "createdAt", updated_at AS "updatedAt"
+      `)) as unknown as CliSessionRow[];
+      if (updatedRows.length !== 1) {
+        throw new Error(`CCC provider attempt settlement session fence compare-and-swap lost; updated ${updatedRows.length}`);
+      }
+      return { terminal, session: rowToSession(updatedRows[0]!), changed: true };
+    });
+    this.sessions.set(session.id, session);
+    if (changed) this.emit("cli-session:updated", session);
+    return terminal;
   }
 
   deleteSession(id: string): boolean {

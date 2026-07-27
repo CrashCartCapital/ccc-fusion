@@ -571,3 +571,183 @@ Exact RED now active:
 ```sh
 pnpm --filter @fusion/engine exec vitest run src/__tests__/pr-rework-bound.test.ts -t "gives each top-level rework pass a distinct provider turn key" --reporter=dot
 ```
+
+## Task 4 Native CLI Slice A Component Accepted — 2026-07-26
+
+Accepted Slice A component commit `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`, is accepted as a Task 4 Native CLI Slice A component only. Task 4 remains unaccepted. Exact commit diff SHA-256 is `d63431b8184909e13712b22b1a5a997709e6e7930f1edb0d6baad046a18c02a7`; exact scope is 11 tracked paths. Tracked status after acceptance was clean, with only intentional dependency-hydration symlinks `?? node_modules` and `?? packages/core/node_modules`.
+
+Proof passed: `4` files / `95` tests, engine typecheck, engine build, production ESLint, test ESLint with `--no-ignore`, and `git diff --check`. Manifest hashes remain unchanged: package `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, workspace `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, lock `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
+
+Fresh native Sol exact-byte review returned PASS with P0 `0`, P1 `0`, and P2 `0` new. The known legacy context-drop P2 remains owned by Slice B/Task 5 owning-runtime integration. Prior invalidated candidate `3a493efef1857d74b415d94991a7a7d6f7858d8146c26990ba4208ff44a11b98` remains invalid and is not resurrected. Native Sol substituted for unavailable AGY; Terra substituted for unavailable Luna. Next state is `task4_cli_predispatch_admission_red_active`.
+
+## Task 4 Slice B Legacy Context And Missing Binding Transition — 2026-07-26
+
+This records uncommitted Slice B development evidence only. Slice B and Task 4 are not accepted. Spark added `Task 4 RED: forwards sealed node execution context through the legacy task runner wrapper`; RED observed arg4 `undefined`, and GREEN threads the exact optional arg through `workflow-graph-task-runner.ts`. Spark also added corrected `Task 4 RED: fenced CLI node without a host-native binding refuses before log or session effects`; RED resolved `runtime-unavailable` and logged because arg6 was ignored. Terra GREEN in `executor.ts` threads the sixth `WorkflowNodeExecutionContext`, and fenced `cli-agent` now throws code `CCC_NATIVE_CLI_BINDING_REFUSED` before task reload, log, MCP, or session work; ordinary and unfenced paths are unchanged.
+
+Root proof with owned loopback PostgreSQL at `127.0.0.1:61316` passed `workflow-graph-task-runner.test.ts` plus `executor-fast-mode-workflows.test.ts`: `2` files / `69` tests. Engine typecheck, targeted lint, and diff check were reported PASS. Component bytes remain uncommitted.
+
+Native Sol contract challenge is accepted: use a host-owned optional `resolveCccNativeCliBinding` on `CliAgentRuntime`, never graph context or adapter capabilities; require exact frozen one-shot binding and permit validation. Slice C still owns termination, observer, and reconcile. AGY was unavailable, so native Sol substituted; Luna was unavailable, so Terra is the docs substitute. Next execution state is `task4_cli_binding_validation_red_active`.
+
+## Task 4 Slice B Binding And Permit Transition — 2026-07-26
+
+This records uncommitted Slice B development evidence only. Slice B and Task 4 are not accepted. Spark hash RED proved the exact frozen binding refused exact keys because `authorityBindingHash` was absent. Terra GREEN requires a host-owned lowercase 64-hex `authorityBindingHash`.
+
+Positive built fake RED failed at `CCC_NATIVE_CLI_DISPATCH_NOT_IMPLEMENTED` before `preDispatch`. Terra GREEN uses the exact typed controller, a frozen one-shot request, non-permit refusal, then the existing one-shot path. The initial post-GREEN test false-RED was a mock-observer bug: a post-import spy observed `0`. Spark REFACTOR used hoisted shared mocks.
+
+Root final proof with owned loopback PostgreSQL at `127.0.0.1:61316` passed `4` files / `73` tests. Engine typecheck, production plus new-test ESLint `--no-ignore`, and `git diff --check` passed. Component remains uncommitted and unaccepted; observer, reconcile, termination, and restart are not accepted yet. Current bundled runtimes still have no resolver, so real/bundled CLI remains fail-closed.
+
+AGY was unavailable and native Sol substituted; Luna was unavailable and Terra is the docs substitute. No operator gate was issued. Next execution state is `task4_cli_permit_scope_negative_red_active`.
+
+## Task 4 Slice B Permit Scope Validation — 2026-07-26
+
+This remains uncommitted Slice B development evidence only. Slice B and Task 4 are not accepted. Terra RED added five malformed permit-scope cases: mutable scope, foreign canonical authority hash, sealed semantic mismatch, committed/terminal state, and `requestCount != 1`. Each wrongly reached resolver -> `preDispatch` -> MCP -> kill -> launch and returned `needs-attention`.
+
+GREEN adds an exact frozen nonterminal permit-scope validator before effects. It requires canonical attempt and controller IDs, sealed task match, positive ordinal, `requestCount=1`, `dispatched_unknown`, canonical complete authority binding/hash, and exact provider/model/`transport=cli` association before resolver, `preDispatch`, MCP, kill, or launch.
+
+Root proof with owned PostgreSQL passed `4` files / `78` tests. Engine typecheck, production/new-test lint `--no-ignore`, and diff check passed. Observer, reconcile, termination, and restart remain open. AGY/native Sol and Luna/Terra substitutions remain in force. No operator gate was issued. Next execution state is `task4_cli_prepermit_input_and_lifecycle_red_active`.
+
+## Task 4 Slice B Strict Profile Pre-Binding Transition — 2026-07-26
+
+This records uncommitted Slice B development evidence only, based on current product HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`. Slice B and Task 4 are not accepted. The strict-profile RED proved a legacy root-only `profile: "ccc-fusion"` incorrectly reached `[resolver, preDispatch, kill, launch]` and returned `needs-attention` instead of controlled `CCC_NATIVE_CLI_BINDING_REFUSED`.
+
+GREEN removes the root `cfg.profile` fallback. Fenced campaign CLI admission now admits only resolved `cliSettings.profile` exactly `ccc-fusion` before binding resolution or `preDispatch`; ordinary and unfenced CLI behavior remains outside this Slice B admission path.
+
+Root proof with owned loopback PostgreSQL at `127.0.0.1:61316` passed the pre-binding refusal filter `4/4`, full `ccc-native-cli-executor.test.ts` `10/10`, existing missing/invalid binding filters in `executor-fast-mode-workflows.test.ts` `3` total, and `workflow-graph-task-runner.test.ts` `17/17`. Engine typecheck, production ESLint, and diff check passed.
+
+No commit, tree, operator gate, or Task 4 acceptance changed. Luna was unavailable, so Terra is the bounded documentation writer substitute. Next gate is finite lifecycle/closure/observer/reconcile plan freeze plus REDs; do not reopen Waves 1-5 or Task 1.
+
+## Task 4 Slice C Lifecycle Plan Freeze — 2026-07-26
+
+This is a documentation-only plan-freeze transition. No code, commit, operator gate, P0/P1-zero acceptance, Slice B acceptance, or Task 4 acceptance is claimed.
+
+Council record: root synthesis plus native Sol architectural challenge plus Terra PostgreSQL feasibility review. AGY remains unavailable with native Sol substitution already recorded; Luna remains unavailable with Terra documentation substitution.
+
+Accepted P0 findings:
+
+- Current native done can advance before proven process-group, proxy, and durable closure, while reap failure is swallowed.
+- Provider-attempt terminal reconciliation and CLI-session fence settlement must be atomic in one existing `AsyncDataLayer` transaction.
+
+Accepted minimal route:
+
+- Retain the validated host binding and permit scope.
+- Use a campaign-only manager-issued frozen held closure receipt.
+- Treat `lifetimeMs` as the total permit-to-closure budget bounded by `campaignDeadlineAt`; begin shutdown early enough to preserve full `termGraceMs + killClosureMs`.
+- Run TERM for the full grace, then KILL, then bounded closure/proxy drain plus durable `needsAttention` floor while the slot remains held.
+- Let the observer see only the retained scope plus held receipt and produce an exact observation.
+- Let the host controller atomic settlement call existing provider-attempt `reconcile(tx)` plus CLI generation compare-and-swap in the same transaction.
+- Release the slot only after an exact validated terminal result.
+- Keep malformed, timeout, collision, flush, observer, or reconcile uncertainty as `dispatched_unknown` plus `needsAttention` ownership.
+- Preserve one-shot `followUp=false`; ordinary CLI remains unchanged.
+- Add no database, store, scheduler, control plane, or new durable subsystem.
+
+Pre-spawn invariant: the provider PTY cannot spawn before the durable attempt-bound CLI row flushes. A residual crash before that row is a proved-no-dispatch reconciliation case, not a launch retry.
+
+Implementation order: exact observation and terminal validators -> core PostgreSQL atomic settlement -> manager held closure and supervisor timing -> task-session one-shot behavior -> executor observer/reconcile/release -> restart resume exclusion -> real process and PostgreSQL regressions.
+
+Next execution state remains lifecycle RED active: `task4_cli_lifecycle_plan_freeze_red_active`.
+
+## Task 4 Slice C Observation And Settlement Transition — 2026-07-26
+
+This is uncommitted Slice C development evidence only. Slice C and Task 4 are not accepted. No code is accepted, no commit or operator gate was issued, and no P0/P1-zero claim is made.
+
+Validator record:
+
+- Observation validator RED was missing-function failure across `5` tests; GREEN passed `6/6`.
+- Terminal-scope RED was missing-function failure across `11` tests.
+- Two false-green corrections were accepted: synthetic root `state: "terminal"` must refuse, and mutable authority bindings must refuse before core authority validation.
+- Strict terminal-scope GREEN passed `19/19`.
+
+Atomic settlement record:
+
+- Core settlement RED was `3` missing-method failures with `24` older tests still green.
+- GREEN passed `27/27`.
+- Closure precondition RED was `2` cases resolving incorrectly; GREEN passed `29/29`.
+- Settled-state/idempotent-replay RED added `2` cases; GREEN passed `30/30` on owned loopback PostgreSQL `127.0.0.1:61316`.
+
+Regression proof: executor regression `10/10`, engine typecheck, production/test lints, repo diff checks, and no-index checks passed. Component remains uncommitted and unaccepted.
+
+Frozen settlement contract: use the existing shared transaction so provider-attempt terminal audit and exact one-shot CLI generation fence settlement commit or roll back together. The settlement requires held `needsAttention`, null unfenced state, and held-closed lifecycle. It writes dead/fenced/settled state. Identical replay is idempotent. Drift or collision rolls back both sides.
+
+Next RED is manager-held closure and registry-slot lifecycle. Do not claim Slice C, Task 4, or P0/P1-zero acceptance. Keep `execution_state` lifecycle RED active: `task4_cli_lifecycle_plan_freeze_red_active`.
+
+## Task 4 Slice C Manager, Session, Executor, And Restart Transition — 2026-07-26
+
+This is uncommitted Slice C development evidence only. Accepted product remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`. Slice C and Task 4 remain unaccepted.
+
+The manager now builds and validates one frozen one-shot session policy, enforces the bounded lifetime, issues a held closure receipt, exposes an observer-only waiter, retains the registry slot, and releases it only after exact terminal fenced settlement. Direct one-shot resume refuses. `TaskSession` forwards the same policy, converts done, exit, lifetime, and cancel into the held result, and makes campaign kill wait for release.
+
+The executor builds that policy after permit validation and before MCP, kill, scratch, or spawn; validates the actual launched session ID and held receipt; observes only the frozen receipt plus retained permit scope; controller-reconciles the exact outcome; and releases only after terminal-scope validation. Uncertain observation, reconciliation, validation, or release retains the active map. Ordinary result-rejection cleanup remains intact.
+
+Restart admission now marks one-shot rows `needsAttention` and ineligible without spawning. Root and child review also repaired four false greens: a rejected release deferred, an ordinary result map leak, foreign outcome/receipt session identity, and one-shot rows silently filtered instead of surfaced.
+
+Focused proof passed the combined binding/session/task/executor lane `50/50`, restart exclusion `3/3`, and core PostgreSQL CLI-session settlement `31/31` on the owned loopback fixture at `127.0.0.1:61316`. The full native-MCP provider matrix first reproduced `8` failures; exact diagnosis exposed Undici refusing invalid forwarded `content-length`. The minimal proxy repair strips hop-by-hop, routing, and body-framing headers before forwarding. Exact RED `2/2` and the full matrix `33/33` then passed with the owned PostgreSQL fixture. This closes a real latent protocol bug, not parallel-test noise.
+
+No manifest, lockfile, operator gate, commit, or Task 4 acceptance changed. Remaining work is pre-spawn failure and proved-no-dispatch reconciliation, restart/effect reconciliation proof, full fake-bound integration, and integrated freeze/review. AGY remains unavailable with native Sol substitution; Luna remains unavailable with Terra documentation substitution. Next execution state is `task4_cli_predispatch_failure_reconciliation_red_active`.
+
+## Task 4 Slice C Pre-Provider Failure Reconciliation Transition — 2026-07-26
+
+Accepted product remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`. This is uncommitted development evidence only. Slice C and Task 4 remain unaccepted.
+
+A read-only Sol child violated its ownership and TDD limits and wrote a speculative helper that auto-reconciled every generic launch rejection as proved no-dispatch. That candidate is INVALIDATED and not accepted. The same child changed only the disposable loopback PostgreSQL role `ccc_task4` to `BYPASSRLS`; no product or external state changed, and final scratch-cluster teardown remains required.
+
+Corrective TDD rewound that helper. Exact RED command:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-native-cli-executor.test.ts --reporter=dot -t 'terminalizes permit|typed launch rejection|generic launch rejection'
+```
+
+RED proved three missing safe reconciliations: MCP resolution, prior-session kill, and typed `CliConcurrencyLimitError` each called reconcile `0` times. The generic launch case passed because it correctly stayed unreconciled, invalidating the earlier false green.
+
+GREEN uses an exact phase enum and reconciles only those three proven pre-provider failures. A generic `launchCliTaskSession` rejection remains `dispatched_unknown` with no automatic reconcile. The SHA-256 evidence digest binds a fixed version, phase, permit identity, and authority-binding hash only; it never includes raw error text. One fixed pre-provider observer ID and exact terminal-scope validation prevent a reconciliation rejection or foreign scope from fabricating an at-capacity result.
+
+Root proof passed the focused filter `7` selected tests with `23` development-filter skips, the five-file Slice C lane `71/71`, engine typecheck, owned ESLint `--no-ignore`, and `git diff --check`. The first six-file integrated attempt used `DATABASE_URL` instead of the PostgreSQL test harness variable and failed authentication as the laptop user; this was a command/configuration failure with no code signal. The corrected command used `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316`: six engine files passed `104/104`, and core `cli-session-store` PostgreSQL proof passed `31/31`.
+
+AGY remains unavailable, so native children substituted. Luna remains unavailable, so Terra substituted for this documentation lane. A Spark restart inventory failed to produce source evidence after one follow-up and is rejected as non-evidence. Next execution state is `task4_cli_restart_effect_reconciliation_red_active`; remaining gaps are restart/effect reconciliation, full fake-bound user-like integration, one-shot `killAll()` handling review, and consolidated Task 4 freeze/council.
+
+## Task 4 Kill-All, Legacy Receipt, And Evidence-Custody Transition — 2026-07-26
+
+Accepted product identity remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`; the candidate remains uncommitted and Task 4 is not accepted. Intentional hydration state remains `?? node_modules` and `?? packages/core/node_modules`.
+
+Kill-all RED `Task 4 RED: dispose/killAll closes a one-shot CCC session through held-closure (not dead/engineDeath/fenced)` first observed `dead/engineDeath/fenced` overwriting the held closure. GREEN routes CCC policy sessions through `closeCccNativeCliSession` with `cancel`. Exact proof passed `1/1`; the integrated engine lane passed `105/105`, core PostgreSQL CLI-session settlement passed `31/31`, and typecheck, lint, and `git diff --check` passed.
+
+Residual audit compatibility edge P1-04 reopened the predecessor test `replays an unambiguous legacy raw-tool receipt through the current native JSON-RPC request id`. RED returned JSON-RPC `-32000` (`CCC native MCP legacy receipt is not safely replayable`) for a valid legacy envelope whose `result` carried `isError: true`. GREEN accepts only completed, error-free JSON-RPC envelopes with a record `result`, makes zero upstream call, and keeps malformed and top-level-error envelopes fail-closed. The provider matrix passed `33/33`; integrated engine proof passed `105/105`.
+
+Evidence-custody incident: read-only Spark wandered into `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/wave-5-integration` on `agent/ccc-fusion-wave-5-integration` at `3f04bf4a18dec5d8e1bca5b184e9df95a40c7022` and left uncommitted edits in `docs/testing.md`, `packages/engine/src/__tests__/ccc-native-mcp-provider-matrix.test.ts`, and `packages/engine/src/cli-agent/ccc-native-mcp-proxy.ts`. Those bytes are **INVALIDATED**, isolated from the accepted spine, and are neither reverted nor overwritten. The correct idea was independently rederived in this accepted Task 4 tree; do not forward-fill blindly.
+
+Remaining Task 4 gate is a real-PostgreSQL public-route fake-bound integration proving restart inspection and authoritative settlement, followed by a fresh freeze/council. `execution_state` remains exactly `task4_cli_restart_effect_reconciliation_red_active`.
+
+## Task 4 Public-Route Settlement And Exact Replay Transition — 2026-07-26
+
+Accepted product remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed` until the root writer freezes and commits this candidate. Task 4 is candidate proof/pre-freeze active, uncommitted, and not accepted; no operator gate, manifest, lockfile, live provider, or network action changed.
+
+Two guarantees were repaired after public-route integration. Same-transaction committed CLI provider settlement now consumes the exact claimed approval and clears the exact action lease; stale or rollback settlement leaves that claim and lease intact, while identical replay adds no duplicate approval mutation. Post-commit `preDispatch` replay reserves or loads the exact attempt first, then validates state-specific exact approval custody: `reserved=active claimed`, `dispatched_unknown` or `proved_failed` = claimed, and `committed=consumed`; terminal replay returns a hold with no extra attempt, count, or provider permit. Wrong approval or token remains refused.
+
+RED first observed consumed approval expected but still claimed; the next terminal replay was rejected as `not exactly claimed`. GREEN is core PostgreSQL proof in two files `49/49`, engine focused public-route proof in nine files `177/177` including one real-PostgreSQL workflow, core and engine typechecks PASS, and `git diff --check` PASS.
+
+The public user-like path is import/reconcile -> work-item claim -> native workflow/`TaskExecutor` -> one local fake PTY spawn -> terminal committed settlement -> approval consumed/lease cleared -> restart visibility -> exact replay hold. It uses zero live provider or network activity. Luna is unavailable and Terra is the bounded documentation substitute; AGY is unavailable and native review remains planned. `execution_state` is `task4_candidate_proof_pre_freeze_active`.
+
+## Task 4 Pre-Freeze Workspace And Dashboard Proof Transition — 2026-07-26
+
+Accepted product remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`. This candidate remains uncommitted, unaccepted, and pre-freeze; no operator gate, manifest, lockfile, or live-provider action changed. `execution_state` remains exactly `task4_candidate_proof_pre_freeze_active`.
+
+Full-workspace proof is now recorded. `pnpm typecheck` passed `34 of 36` workspace packages; the script excludes desktop and mobile. `pnpm build` passed, including the dashboard build over `7163` modules; only the existing Vite warnings remained.
+
+The first full test run used `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm test` and was a valid RED: two stale three-argument assertions in `workflow-node-handlers.test.ts` did not supply the fourth execution-context argument that production correctly required. Spark made a test-only GREEN repair to those two assertions. `pnpm --filter @fusion/engine test:core` then passed `299/299`; the rerun full `pnpm test` passed with engine `299/299`, core PostgreSQL gate `10/10`, and CLI CI-shape `65/65`, with no temporary or live `.fusion` leaks.
+
+Dashboard build also exposed a false green: a direct dashboard import of `workflow-settings-resolver` reached Node-only `workflow-extension-provenance`. The pure resolver moved to browser-safe `execution-and-ui`, was exported through the types barrel, and dashboard now imports `@fusion/core`; the stale allowlist entry was removed. Focused core proof passed `45/45` and the dashboard build passed.
+
+Dependency hydration did not install, fetch, or change a manifest or lockfile. Read-only Wave-3-retry links exposed stale Wave 1/2 workspace resolution, so a candidate-local link view bound the current `@fusion` and plugin packages. This is environmental proof scaffolding only: it must be removed or precisely accounted for before freeze.
+
+Luna remains unavailable, so Terra is the bounded documentation substitute. AGY remains unavailable; native Sol review is still planned. This evidence does not claim Task 4 acceptance.
+
+## Task 4 Full-Sweep Disposition And Final Pre-Freeze Gates — 2026-07-26
+
+Accepted product remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`; the candidate remains uncommitted and unaccepted. `execution_state` remains `task4_candidate_proof_pre_freeze_active`. Freeze/council is next.
+
+The default `pnpm test:full` first reached core `4352` pass / `1` skip, with three failures: one real architecture invariant (three bare `listTasks` calls) and PostgreSQL contention in schema-applier/transition coverage. Spark isolated the PostgreSQL lanes at `77/77`, `5/5`, and combined `82/82`, establishing non-deterministic full-sweep contention rather than a product failure.
+
+The real invariant was repaired with explicit `{ slim: true, includeArchived: false }` at dashboard provider-health and two engine usage-limit call sites. Architecture passed `1/1`, usage-limit `49/49`, and provider-health `11/11`. The official serial full sweep then passed core `4355/4356`, with one documented skip.
+
+The engine full-package run is not valid host proof: enforced no-TTY SafeExec blocks on scratch Git checkout/revert/reset/stash caused `93` files / `342` test failures, alongside single-worker mock pollution. Treat that result as environment-invalid, not a product regression; do not bypass SafeExec.
+
+Fresh acceptance-relevant gates after the micro-fix all passed: `pnpm lint`; `pnpm typecheck` (`34/36`); `pnpm build` (dashboard `7163` modules); `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm test` (engine `299/299`, PostgreSQL `10/10`, CLI `65/65`, zero leaks); Task 4 engine nine files `177/177`; and core Task 4 PostgreSQL two files `49/49`. Luna remains unavailable with Terra substitution; AGY remains unavailable and native Sol review remains planned. No acceptance is claimed.

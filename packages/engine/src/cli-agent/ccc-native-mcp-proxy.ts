@@ -28,13 +28,13 @@ function routeToolKey(route: string, tool: string): string {
 
 /**
  * Committed v2 receipts hold the MCP result itself. Older receipts held the
- * whole JSON-RPC envelope; decode only a successful envelope and otherwise
- * fail closed rather than replaying a malformed/error result.
+ * whole JSON-RPC envelope; decode only a completed envelope with a record-valued
+ * result, including handled tool errors, and otherwise fail closed.
  */
 function decodeLegacyEnvelopeResult(candidate: unknown): unknown | undefined {
   if (!isRecord(candidate) || candidate.jsonrpc !== "2.0" || candidate.error !== undefined || !Object.prototype.hasOwnProperty.call(candidate, "result")) return undefined;
   const result = candidate.result;
-  return isRecord(result) && result.isError === true ? undefined : result;
+  return isRecord(result) ? result : undefined;
 }
 
 function decodeCommittedResult(candidate: unknown): unknown | undefined {
@@ -72,6 +72,18 @@ function copyHeaders(source: Headers): Record<string, string> {
   source.forEach((value, key) => {
     if (!/^(connection|keep-alive|transfer-encoding|content-length)$/i.test(key)) headers[key] = value;
   });
+  return headers;
+}
+
+function sanitizeForwardedHeaders(source: NodeJS.Dict<string | string[] | undefined>): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!value) continue;
+    if (/^(connection|keep-alive|te|trailers?|upgrade|proxy-connection|proxy-authenticate|proxy-authorization|host|content-length|transfer-encoding)$/i.test(key)) {
+      continue;
+    }
+    headers[key] = Array.isArray(value) ? value.join(", ") : String(value);
+  }
   return headers;
 }
 
@@ -132,7 +144,7 @@ export async function startCccNativeMcpProxy(options: {
   const forward = async (target: CccNativeMcpServerDefinition, request: IncomingMessage, body: Buffer, abort: AbortController): Promise<{ response: Response; bytes: Buffer }> => {
     const response = await fetch(target.url, {
       method: request.method,
-      headers: Object.fromEntries(Object.entries(request.headers).filter(([, value]) => typeof value === "string")) as Record<string, string>,
+      headers: sanitizeForwardedHeaders(request.headers),
       body: body.length > 0 ? new Uint8Array(body) : undefined,
       signal: abort.signal,
     });

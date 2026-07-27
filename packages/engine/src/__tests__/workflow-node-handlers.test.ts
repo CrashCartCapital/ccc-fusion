@@ -67,7 +67,7 @@ describe("workflow node handlers", () => {
     const customNode: WorkflowIrNode = { id: "spec-check", kind: "prompt", config: { prompt: "Check the spec" } };
     const result = await handlers.prompt(customNode, { task, settings: undefined, context: {} });
 
-    expect(runCustomNode).toHaveBeenCalledWith(customNode, task, {});
+    expect(runCustomNode).toHaveBeenCalledWith(customNode, task, {}, { task, settings: undefined, context: {} });
     expect(result.value).toBe("APPROVE");
     expect(seams.execute).not.toHaveBeenCalled();
     expect(seams.review).not.toHaveBeenCalled();
@@ -138,7 +138,7 @@ describe("workflow node handlers", () => {
     const askNode: WorkflowIrNode = { id: "ask", kind: "ask-user", config: { question: "Anything to refine?" } };
     const result = await handlers["ask-user"](askNode, { task, settings: undefined, context: {} });
 
-    expect(runCustomNode).toHaveBeenCalledWith(askNode, task, {});
+    expect(runCustomNode).toHaveBeenCalledWith(askNode, task, {}, { task, settings: undefined, context: {} });
     expect(result).toEqual({ outcome: "failure", value: "awaiting-user-input" });
   });
 

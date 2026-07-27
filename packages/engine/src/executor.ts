@@ -1,6 +1,6 @@
 // port-4040-allowlist: this file embeds the "never kill port 4040" rule in the executor prompt.
 import { exec, execFile, execSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { setImmediate as setImmediateCb } from "node:timers";
 
@@ -54,7 +54,7 @@ import {
   WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND,
   WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY,
 } from "./workflow-graph-executor.js";
-import type { WorkflowNodePreparationRequirement, WorkflowNodeResult } from "./workflow-graph-executor.js";
+import type { WorkflowNodeExecutionContext, WorkflowNodePreparationRequirement, WorkflowNodeResult } from "./workflow-graph-executor.js";
 import { workflowNodeRequiresWorktree } from "./workflow-node-execution-needs.js";
 import type {
   AuditPrimitiveInput,
@@ -152,17 +152,35 @@ import {
 } from "./active-session-registry.js";
 // CLI Agent Executor (U7): task ↔ CLI session orchestration seam.
 import {
-  CliTaskSession,
   launchCliTaskSession,
   killLiveTaskSessions,
   type CliTaskOutcome,
+  type CliTaskSession,
   type ResolvedCliExecutorConfig,
 } from "./cli-agent/task-session.js";
 import type { CliSessionManager } from "./cli-agent/session-manager.js";
 import { CliConcurrencyLimitError, DEFAULT_CLI_CANCELLATION_TIMEOUT_MS } from "./cli-agent/session-manager.js";
 import type { TelemetryHub } from "./cli-agent/telemetry-hub.js";
 import type { CliAdapterRegistry } from "./cli-agent/adapter.js";
-import type { CliSession, CliSessionStore } from "@fusion/core";
+import {
+  assertCanonicalCccNativeCliText,
+  assertCanonicalCccNativeCliTurnKey,
+  buildCccNativeCliSessionPolicy,
+  CCC_NATIVE_CLI_DISPATCH_KEY,
+  CCC_NATIVE_CLI_OBSERVER_ID,
+  CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID,
+  CCC_NATIVE_CLI_TRANSPORT,
+  CccNativeCliBindingRefusedError,
+  type CccNativeCliBindingResolver,
+  type CccNativeCliBinding,
+  type CccNativeCliRoute,
+  validateCccNativeCliBinding,
+  validateCccNativeCliHeldClosureReceipt,
+  validateCccNativeCliObservation,
+  validateCccNativeCliPermitScope,
+  validateCccNativeCliTerminalScope,
+} from "./cli-agent/ccc-native-cli-binding.js";
+import type { CccProviderAttemptScope, CliSession, CliSessionStore } from "@fusion/core";
 import {
   StaleWorktreeIndexLockError,
   classifyStaleLock,
@@ -170,6 +188,34 @@ import {
   tryRemoveStaleLock,
 } from "./worktree-stale-lock.js";
 import { parseStaleRegistrationPath, recoverStaleRegistration } from "./worktree-stale-registration.js";
+
+enum CccNativeCliPreProviderPhase {
+  McpResolution = "mcp-resolution",
+  PriorSessionKill = "prior-session-kill",
+  Launch = "launch",
+  PtyCapacity = "pty-capacity",
+}
+
+function createCccNativeCliPreProviderEvidenceDigest(
+  phase: CccNativeCliPreProviderPhase,
+  permitScope: CccProviderAttemptScope,
+  binding: CccNativeCliBinding,
+): string {
+  return createHash("sha256").update(JSON.stringify({
+    version: 1,
+    phase,
+    permit: {
+      attemptKey: permitScope.attemptKey,
+      controllerToken: permitScope.controllerToken,
+      taskId: permitScope.taskId,
+      turnKey: permitScope.turnKey,
+      dispatchKey: permitScope.dispatchKey,
+    },
+    binding: {
+      authorityBindingHash: binding.authorityBindingHash,
+    },
+  })).digest("hex");
+}
 import {
   BranchConflictError,
   BranchCrossContaminationError,
@@ -1668,6 +1714,8 @@ export interface CliAgentRuntime {
   hookEndpointUrl: string;
   /** Optional override for the hook scratch-dir root (tests). */
   hookDirRoot?: string;
+  /** Host-owned fenced campaign CLI binding resolver. */
+  resolveCccNativeCliBinding?: CccNativeCliBindingResolver;
 }
 
 /**
@@ -6196,8 +6244,8 @@ export class TaskExecutor {
       graphAbortController = new AbortController();
       this.activeWorkflowGraphAbortControllers.set(task.id, graphAbortController);
       const customNodeExecution = new WorkflowCustomNodeExecutionService({
-        execute: (node, nodeTask, nodeSettings, columnBinding, context) =>
-          this.runGraphCustomNode(node, nodeTask, nodeSettings, columnBinding, context),
+        execute: (node, nodeTask, nodeSettings, columnBinding, context, executionContext) =>
+          this.runGraphCustomNode(node, nodeTask, nodeSettings, columnBinding, context, executionContext),
         resolveColumnBinding: resolveBindingForNode,
       });
       const runner = new WorkflowGraphTaskRunner({
@@ -8998,8 +9046,21 @@ export class TaskExecutor {
     settings: Settings,
     columnBinding?: WorkflowColumnAgent,
     graphContext?: Record<string, unknown>,
+    executionContext?: WorkflowNodeExecutionContext,
   ): Promise<WorkflowNodeResult> {
     const cfg = node.config ?? {};
+    const executorKind = typeof cfg.executor === "string" ? cfg.executor : "model";
+
+    if (executorKind === "cli-agent" && executionContext?.execution?.executionFence) {
+      return this.runCliAgentNode(
+        node,
+        nodeTask,
+        cfg,
+        columnBinding,
+        executionContext,
+      );
+    }
+
     let live = await this.store.getTask(nodeTask.id);
 
     const staleInput = await this.resolveWorkflowInputMarkerForGraphNode(live, node.id);
@@ -9051,8 +9112,6 @@ export class TaskExecutor {
       await this.store.logEntry(live.id, `Workflow input received for step '${node.id}' — resuming`, undefined, this.getRunContextFor(live.id));
     }
 
-    const executorKind = typeof cfg.executor === "string" ? cfg.executor : "model";
-
     // CLI Agent Executor (U7): a `cli-agent` node drives an engine-owned CLI
     // session through the task-session orchestration — NOT through the
     // executeWorkflowStep / model machinery. It is write-capable (the agent edits
@@ -9063,6 +9122,7 @@ export class TaskExecutor {
         await this.store.getTask(live.id),
         cfg,
         columnBinding,
+        executionContext,
       );
     }
 
@@ -9472,7 +9532,106 @@ export class TaskExecutor {
     live: TaskDetail,
     cfg: Record<string, unknown>,
     columnBinding?: WorkflowColumnAgent,
+    executionContext?: WorkflowNodeExecutionContext,
   ): Promise<WorkflowNodeResult> {
+    let fencedCliConfig: ResolvedCliExecutorConfig | undefined;
+    let nativeCliBinding: CccNativeCliBinding | undefined;
+    let nativeCliPermitScope: CccProviderAttemptScope | undefined;
+    let nativeCliSessionPolicy: ReturnType<typeof buildCccNativeCliSessionPolicy> | undefined;
+    if (executionContext?.execution?.executionFence) {
+      const runtime = this.options.cliAgentRuntime;
+      if (!runtime?.resolveCccNativeCliBinding) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but no host-native CLI binding route exists yet`,
+        );
+      }
+      if (typeof live.worktree !== "string" || live.worktree.trim().length === 0) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but no task worktree exists`,
+        );
+      }
+      if (executionContext.signal?.aborted) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in an already aborted fenced campaign execution`,
+        );
+      }
+      const resolvedConfig = this.resolveCliExecutorConfig(cfg);
+      if (!resolvedConfig) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but no CLI executor config is available`,
+        );
+      }
+      if (resolvedConfig.settings?.profile !== CCC_FUSION_PROFILE) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but CLI profile is not ${CCC_FUSION_PROFILE}`,
+        );
+      }
+      fencedCliConfig = resolvedConfig;
+      const execution = executionContext.execution;
+      const executionFence = execution.executionFence;
+      if (!executionFence) {
+        throw new CccNativeCliBindingRefusedError("CCC native CLI executionFence is required");
+      }
+      const turnKey = assertCanonicalCccNativeCliTurnKey(execution.providerAttemptTurnKey, "providerAttemptTurnKey");
+      const adapterId = assertCanonicalCccNativeCliText(resolvedConfig.cliAdapterId, "adapterId");
+      const providerId = assertCanonicalCccNativeCliText(
+        typeof cfg.modelProvider === "string" ? cfg.modelProvider : live.modelProvider,
+        "providerId",
+      );
+      const modelId = assertCanonicalCccNativeCliText(
+        typeof cfg.modelId === "string" ? cfg.modelId : live.modelId,
+        "modelId",
+      );
+      if (!Object.isFrozen(executionFence)) {
+        throw new CccNativeCliBindingRefusedError("CCC native CLI executionFence must be frozen");
+      }
+      if (!Object.isFrozen(execution.visitIdentity)) {
+        throw new CccNativeCliBindingRefusedError("CCC native CLI visitIdentity must be frozen");
+      }
+      const expectedRoute: CccNativeCliRoute = Object.freeze({
+        adapterId,
+        providerId,
+        modelId,
+        transport: CCC_NATIVE_CLI_TRANSPORT,
+      });
+      const resolverInput = Object.freeze({
+        nodeId: node.id,
+        originTaskId: execution.originTaskId,
+        semanticTaskId: execution.semanticTaskId,
+        executionFence,
+        visitIdentity: execution.visitIdentity,
+        turnKey,
+        expectedRoute,
+        ...(executionContext.signal ? { signal: executionContext.signal } : {}),
+      });
+      const binding = validateCccNativeCliBinding(await runtime.resolveCccNativeCliBinding(resolverInput), {
+        turnKey,
+        dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
+        route: expectedRoute,
+      });
+      nativeCliBinding = binding;
+      const dispatchRequest = Object.freeze({
+        turnKey,
+        dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
+        providerId,
+        modelId,
+        transport: CCC_NATIVE_CLI_TRANSPORT,
+      });
+      const preDispatchDecision = await binding.controller.preDispatch(dispatchRequest);
+      if (preDispatchDecision.kind !== "dispatch-permit") {
+        throw new CccNativeCliBindingRefusedError(
+          `CCC native CLI binding controller refused dispatch with decision '${preDispatchDecision.kind}'`,
+        );
+      }
+      nativeCliPermitScope = validateCccNativeCliPermitScope(preDispatchDecision.scope, {
+        dispatchRequest,
+        semanticTaskId: execution.semanticTaskId,
+        authorityBindingHash: binding.authorityBindingHash,
+      });
+      const observedAtMs = Date.now();
+      nativeCliSessionPolicy = buildCccNativeCliSessionPolicy(binding, nativeCliPermitScope, observedAtMs);
+    }
+
     const runtime = this.options.cliAgentRuntime;
     if (!runtime) {
       await this.store.logEntry(
@@ -9492,7 +9651,7 @@ export class TaskExecutor {
       );
       return { outcome: "failure", value: "no-worktree-for-write-node" };
     }
-    const config = this.resolveCliExecutorConfig(cfg);
+    const config = fencedCliConfig ?? this.resolveCliExecutorConfig(cfg);
     if (!config) {
       await this.store.logEntry(
         live.id,
@@ -9534,16 +9693,49 @@ export class TaskExecutor {
     const effectiveAgentId = effectiveIdentity.source === "column-agent"
       ? effectiveIdentity.agentId
       : ownAgentId;
-    const mcpServers = config.settings?.profile === CCC_FUSION_PROFILE
-      ? await this.resolveMcpServers(effectiveAgentId)
-      : undefined;
+    let mcpServers: Awaited<ReturnType<TaskExecutor["resolveMcpServers"]>> | undefined;
+
+    const reconcileNativeCliPreProviderFailure = async (
+      phase: CccNativeCliPreProviderPhase.McpResolution
+        | CccNativeCliPreProviderPhase.PriorSessionKill
+        | CccNativeCliPreProviderPhase.PtyCapacity,
+    ): Promise<void> => {
+      if (!nativeCliBinding || !nativeCliPermitScope) return;
+      const evidenceDigest = createCccNativeCliPreProviderEvidenceDigest(phase, nativeCliPermitScope, nativeCliBinding);
+      const observation = Object.freeze({
+        kind: "ccc-fusion.native-cli-observation" as const,
+        version: 1 as const,
+        outcome: "proved_failed" as const,
+        evidenceDigest,
+      });
+      const terminalScope = await nativeCliBinding.controller.reconcile(Object.freeze({
+        taskId: nativeCliPermitScope.taskId,
+        attemptKey: nativeCliPermitScope.attemptKey,
+        controllerToken: nativeCliPermitScope.controllerToken,
+        outcome: "proved_failed" as const,
+        evidenceDigest,
+        observerId: CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID,
+        terminationReason: "crashed" as const,
+        cancellationState: null,
+      }));
+      validateCccNativeCliTerminalScope(terminalScope, {
+        permitScope: nativeCliPermitScope,
+        observation,
+        observerId: CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID,
+      });
+    };
 
     // Re-entry: kill any prior LIVE session for this task (RETHINK/replan context
     // reset) before launching fresh.
-    await killLiveTaskSessions(live.id, runtime.manager, runtime.store);
-
     let session: CliTaskSession;
+    let preProviderPhase = CccNativeCliPreProviderPhase.McpResolution;
     try {
+      mcpServers = config.settings?.profile === CCC_FUSION_PROFILE
+        ? await this.resolveMcpServers(effectiveAgentId)
+        : undefined;
+      preProviderPhase = CccNativeCliPreProviderPhase.PriorSessionKill;
+      await killLiveTaskSessions(live.id, runtime.manager, runtime.store);
+      preProviderPhase = CccNativeCliPreProviderPhase.Launch;
       session = await launchCliTaskSession({
         taskId: live.id,
         projectId: runtime.projectId,
@@ -9556,10 +9748,24 @@ export class TaskExecutor {
         registry: runtime.registry,
         hookEndpointUrl: runtime.hookEndpointUrl,
         hookDirRoot: runtime.hookDirRoot,
+        ...(nativeCliSessionPolicy
+          ? {
+              cccNativeCli: nativeCliSessionPolicy,
+            }
+          : {}),
         log: (msg) => executorLog.log(`[cli-agent] ${msg}`),
       });
     } catch (err) {
-      if (err instanceof CliConcurrencyLimitError) {
+      if (preProviderPhase === CccNativeCliPreProviderPhase.McpResolution) {
+        await reconcileNativeCliPreProviderFailure(CccNativeCliPreProviderPhase.McpResolution);
+        throw err;
+      }
+      if (preProviderPhase === CccNativeCliPreProviderPhase.PriorSessionKill) {
+        await reconcileNativeCliPreProviderFailure(CccNativeCliPreProviderPhase.PriorSessionKill);
+        throw err;
+      }
+      if (preProviderPhase === CccNativeCliPreProviderPhase.Launch && err instanceof CliConcurrencyLimitError) {
+        await reconcileNativeCliPreProviderFailure(CccNativeCliPreProviderPhase.PtyCapacity);
         await this.store.logEntry(
           live.id,
           `cli-agent session for node '${node.id}' rejected at PTY pool ceiling (${err.active}/${err.ceiling}) — queued`,
@@ -9577,15 +9783,60 @@ export class TaskExecutor {
     let outcome: CliTaskOutcome;
     try {
       outcome = await session.result();
-    } finally {
-      // Detach the live-session handle. Reaping (success) / killing (cancel) is
-      // handled per-outcome below or by the abort path.
+    } catch (err) {
+      if (!nativeCliSessionPolicy && this.activeCliTaskSessions.get(live.id) === session) {
+        this.activeCliTaskSessions.delete(live.id);
+      }
+      throw err;
+    }
+    if (!nativeCliSessionPolicy && outcome.kind !== "ccc-native-held-closed") {
+      // Ordinary CLI sessions retain their prior detach behavior. Native held
+      // closures and unexpected native failure outcomes remain owned until their
+      // campaign settlement path has resolved.
       if (this.activeCliTaskSessions.get(live.id) === session) {
         this.activeCliTaskSessions.delete(live.id);
       }
     }
 
     switch (outcome.kind) {
+      case "ccc-native-held-closed": {
+        if (!nativeCliBinding || !nativeCliPermitScope || !nativeCliSessionPolicy || !outcome.nativeCliHeldClosureReceipt) {
+          throw new CccNativeCliBindingRefusedError("CCC native CLI held close missing binding, permit, policy, or receipt");
+        }
+        if (outcome.sessionId !== session.sessionId) {
+          throw new CccNativeCliBindingRefusedError("CCC native CLI held close sessionId does not match launched session");
+        }
+        const receipt = validateCccNativeCliHeldClosureReceipt(outcome.nativeCliHeldClosureReceipt, {
+          sessionId: session.sessionId,
+          policy: nativeCliSessionPolicy,
+        });
+        const observation = validateCccNativeCliObservation(await nativeCliBinding.observer.observe(Object.freeze({
+          receipt,
+          permitScope: nativeCliPermitScope,
+        })));
+        const cancelled = observation.outcome === "proved_failed"
+          && (receipt.trigger === "cancel" || receipt.trigger === "lifetime");
+        const terminalScope = validateCccNativeCliTerminalScope(await nativeCliBinding.controller.reconcile(Object.freeze({
+          taskId: nativeCliPermitScope.taskId,
+          attemptKey: nativeCliPermitScope.attemptKey,
+          controllerToken: nativeCliPermitScope.controllerToken,
+          outcome: observation.outcome,
+          evidenceDigest: observation.evidenceDigest,
+          observerId: CCC_NATIVE_CLI_OBSERVER_ID,
+          terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
+          cancellationState: cancelled ? "CANCELLED" : null,
+        })), {
+          permitScope: nativeCliPermitScope,
+          observation,
+        });
+        await session.releaseCccNativeCli(receipt, terminalScope);
+        if (this.activeCliTaskSessions.get(live.id) === session) {
+          this.activeCliTaskSessions.delete(live.id);
+        }
+        return observation.outcome === "committed"
+          ? { outcome: "success", value: "cli-agent-done" }
+          : { outcome: "failure", value: "cli-agent-proved-failed" };
+      }
       case "success":
         // Reap the PTY at the execute→in-review handoff (autoMerge:false tasks
         // don't hold slots): graceful kill, record terminationReason "completed".

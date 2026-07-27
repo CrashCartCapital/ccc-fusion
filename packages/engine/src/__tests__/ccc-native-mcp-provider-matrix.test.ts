@@ -860,7 +860,7 @@ describe("ccc native MCP provider matrix", () => {
       });
       record.nativeSessionId = `${adapterId}-native-killed-wave2`;
       const coordinator = new CliResumeCoordinator({
-        store: store as any,
+        store: store as unknown as CliSessionStore,
         manager: runtime.manager,
         registry: runtime.registry,
         worktreeExists: () => true,
@@ -871,6 +871,50 @@ describe("ccc native MCP provider matrix", () => {
           disposition: "needsAttention-ineligible",
           reason: "killed",
         });
+        expect(runtime.captures).toEqual([]);
+      } finally {
+        await disposeManager(runtime.manager);
+      }
+    },
+  );
+
+  it.each(adapterCases)(
+    "$label coordinator marks one-shot native ccc rows needsAttention before spawn",
+    async ({ adapterId, model }) => {
+      const store = makeStore();
+      const runtime = makeManager(store);
+      const record = store.createSession({
+        adapterId,
+        projectId: "ccc-native-project",
+        purpose: "execute",
+        taskId: `task-oneshot-${adapterId}`,
+        chatSessionId: null,
+        worktreePath: "/tmp/ccc-native-resume-worktree",
+        autonomyPosture: {
+          cccFusionProfile: CCC_PROFILE,
+          cccFusionModel: model,
+          cccFusionMcpServers: [nativeMcpServer()],
+          cccNativeCliOneShot: true,
+        },
+        agentState: "ready",
+        terminationReason: null,
+      });
+      record.nativeSessionId = `${adapterId}-native-oneshot-wave2`;
+      const coordinator = new CliResumeCoordinator({
+        store: store as unknown as CliSessionStore,
+        manager: runtime.manager,
+        registry: runtime.registry,
+        worktreeExists: () => true,
+        isWorktreeDirty: async () => false,
+      });
+      try {
+        const results = await coordinator.recoverOnStart();
+        expect(results).toEqual([{
+          sessionId: record.id,
+          taskId: `task-oneshot-${adapterId}`,
+          disposition: "needsAttention-ineligible",
+          reason: "engineDeath",
+        }]);
         expect(runtime.captures).toEqual([]);
       } finally {
         await disposeManager(runtime.manager);
@@ -1280,6 +1324,53 @@ describe("ccc native MCP provider matrix", () => {
 });
 
 pgDescribe("ccc native MCP durable receipt proxy", () => {
+  it("does not manager-resume a persisted one-shot native ccc row", async () => {
+    const store = makeStore();
+    const projectId = "ccc-native-project";
+    const record = store.createSession({
+      adapterId: "claude-code",
+      projectId,
+      purpose: "execute",
+      taskId: "task-native-oneshot-direct-resume",
+      chatSessionId: null,
+      worktreePath: "/tmp/ccc-native-resume-worktree",
+      autonomyPosture: {
+        cccFusionProfile: CCC_PROFILE,
+        cccFusionModel: "claude-native-oneshot-direct",
+        cccFusionMcpServers: [{
+          name: SERVER_NAME,
+          transport: "streamable-http",
+          url: "http://127.0.0.1:1/oneshot",
+          enabled: true,
+        }],
+        cccNativeCliOneShot: true,
+      },
+      agentState: "dead",
+      terminationReason: "crashed",
+      nativeSessionId: "native-oneshot-direct-session",
+    });
+    const managerRuntime = makeManager(store as unknown as CliSessionStore);
+    try {
+      await expect(
+        managerRuntime.manager.spawn({
+          adapterId: "claude-code",
+          projectId,
+          purpose: "execute",
+          taskId: "task-native-oneshot-direct-resume",
+          worktreePath: "/tmp/ccc-native-resume-worktree",
+          settings: { subscriptionReady: true },
+          resume: {
+            sessionId: record.id,
+            nativeSessionId: "native-oneshot-direct-session",
+          },
+        }),
+      ).rejects.toThrow(/CLI resume admission rejected|needsAttention|one-shot/i);
+      expect(managerRuntime.captures).toEqual([]);
+    } finally {
+      await disposeManager(managerRuntime.manager);
+    }
+  });
+
   it("replays an unambiguous legacy raw-tool receipt through the current native JSON-RPC request id", async () => {
     const fixture = await startDurableEffectFixture();
     const harness = await createTaskStoreForTest({ prefix: "fusion_wave3_native_legacy_authority" });
@@ -1314,7 +1405,13 @@ pgDescribe("ccc native MCP durable receipt proxy", () => {
       await store.commitCccEffectReceipt(legacy, {
         jsonrpc: "2.0",
         id: "legacy-original-request",
-        result: { structuredContent: DURABLE_EFFECT_RESULT },
+        result: {
+          isError: true,
+          content: [{
+            type: "text",
+            text: JSON.stringify(DURABLE_EFFECT_RESULT),
+          }],
+        },
       });
       captureNativeSessionId(store as never, record.id, "native-legacy-authority");
       await store.flush();
@@ -1333,7 +1430,17 @@ pgDescribe("ccc native MCP durable receipt proxy", () => {
         method: "tools/call",
         params: { name: DURABLE_EFFECT_TOOL_NAME, arguments: { slot: "native-restart-slot" } },
       });
-      expect(replay).toEqual({ jsonrpc: "2.0", id: "legacy-current-request", result: { structuredContent: DURABLE_EFFECT_RESULT } });
+      expect(replay).toEqual({
+        jsonrpc: "2.0",
+        id: "legacy-current-request",
+        result: {
+          isError: true,
+          content: [{
+            type: "text",
+            text: JSON.stringify(DURABLE_EFFECT_RESULT),
+          }],
+        },
+      });
       expect(fixture.upstreamExecutions()).toBe(0);
       expect((await readNativeDurableRows(harness.layer, projectId, record.id)).receipts).toEqual([
         expect.objectContaining({ logical_key: `${turn.turn_key}:0`, tool_authority: DURABLE_EFFECT_TOOL_NAME, state: "committed" }),

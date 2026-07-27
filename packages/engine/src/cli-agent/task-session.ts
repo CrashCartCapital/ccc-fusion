@@ -46,6 +46,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
   CliAutonomyPosture,
+  CccProviderAttemptScope,
   ResolvedMcpServerDefinition,
   CliSession,
   CliTerminationReason,
@@ -66,6 +67,11 @@ import {
   type EffectivePosture,
 } from "./autonomy.js";
 import { applyCccNativeMcpPolicy } from "./ccc-native-mcp-policy.js";
+import {
+  type CccNativeCliHeldClosureReceipt,
+  type CccNativeCliHeldClosureTrigger,
+  type CccNativeCliSessionPolicy,
+} from "./ccc-native-cli-binding.js";
 
 // ── Outcome ──────────────────────────────────────────────────────────────────
 
@@ -87,6 +93,7 @@ import { applyCccNativeMcpPolicy } from "./ccc-native-mcp-policy.js";
  */
 export type CliTaskOutcomeKind =
   | "success"
+  | "ccc-native-held-closed"
   | "needs-attention"
   | "killed"
   | "user-exited"
@@ -98,6 +105,8 @@ export interface CliTaskOutcome {
   sessionId: string;
   /** Termination reason recorded on the session record, when the session ended. */
   terminationReason: CliTerminationReason | null;
+  /** Manager-issued one-shot CCC native CLI closure receipt, when this is a held close. */
+  nativeCliHeldClosureReceipt?: CccNativeCliHeldClosureReceipt;
 }
 
 // ── Resolved executor config (snapshotted at launch) ───────────────────────────
@@ -167,6 +176,8 @@ export interface LaunchCliTaskSessionOptions {
    * Optional logger for lifecycle breadcrumbs. Best-effort; never throws.
    */
   log?: (msg: string) => void;
+  /** Exact frozen CCC campaign one-shot policy, present only for fenced native CLI dispatch. */
+  cccNativeCli?: CccNativeCliSessionPolicy;
 }
 
 // ── CliTaskSession ─────────────────────────────────────────────────────────────
@@ -187,6 +198,9 @@ export class CliTaskSession {
   private readonly hookDir: string;
   private readonly hookEndpointUrl: string;
   private readonly log: (msg: string) => void;
+  private readonly cccNativeCli: LaunchCliTaskSessionOptions["cccNativeCli"];
+  private readonly cccNativeCliReleaseCompletion: Promise<void> | null;
+  private resolveCccNativeCliRelease: (() => void) | null = null;
 
   private settled = false;
   private resolveResult!: (outcome: CliTaskOutcome) => void;
@@ -203,6 +217,7 @@ export class CliTaskSession {
     hookDir: string;
     hookEndpointUrl: string;
     log: (msg: string) => void;
+    cccNativeCli: LaunchCliTaskSessionOptions["cccNativeCli"];
   }) {
     this.taskId = args.taskId;
     this.sessionId = args.sessionId;
@@ -213,6 +228,12 @@ export class CliTaskSession {
     this.hookDir = args.hookDir;
     this.hookEndpointUrl = args.hookEndpointUrl;
     this.log = args.log;
+    this.cccNativeCli = args.cccNativeCli;
+    this.cccNativeCliReleaseCompletion = this.cccNativeCli
+      ? new Promise<void>((resolve) => {
+          this.resolveCccNativeCliRelease = resolve;
+        })
+      : null;
     this.resultPromise = new Promise<CliTaskOutcome>((resolve) => {
       this.resolveResult = resolve;
     });
@@ -325,6 +346,7 @@ export class CliTaskSession {
           },
         },
         settings,
+        ...(opts.cccNativeCli ? { cccNativeCliPolicy: opts.cccNativeCli } : {}),
       });
     } catch (err) {
       // Clean up the scratch dir we created before re-throwing (ceiling / spawn).
@@ -351,11 +373,13 @@ export class CliTaskSession {
       hookDir,
       hookEndpointUrl: opts.hookEndpointUrl,
       log,
+      cccNativeCli: opts.cccNativeCli,
     });
 
     // 5. Subscribe to the authoritative state machine BEFORE injecting so a fast
     // done is never missed.
     session.subscribe();
+    if (opts.cccNativeCli) void session.waitForCccNativeCliHeldClosure();
 
     // 6. Inject the prompt after readiness (fire-and-forget; readiness gates it).
     void session.injectAfterReady(opts.prompt, adapter.capabilities.nativeDone);
@@ -398,6 +422,7 @@ export class CliTaskSession {
    * resume capability.
    */
   async followUp(prompt: string): Promise<boolean> {
+    if (this.cccNativeCli) return false;
     const adapter = this.registry.get(this.config.cliAdapterId);
     if (!adapter.capabilities.supportsResume) return false;
     if (!this.manager.isLive(this.sessionId)) return false;
@@ -448,6 +473,12 @@ export class CliTaskSession {
    * `killed`.
    */
   async kill(reason: CliTerminationReason = "killed"): Promise<void> {
+    if (this.cccNativeCli && reason === "killed") {
+      await this.manager.closeCccNativeCliSession(this.sessionId, "cancel");
+      await this.waitForCccNativeCliHeldClosure();
+      await this.cccNativeCliReleaseCompletion;
+      return;
+    }
     await this.manager.kill(this.sessionId, reason);
     await this.teardown();
     if (!this.settled) {
@@ -476,6 +507,10 @@ export class CliTaskSession {
     if (this.settled) return;
     switch (state) {
       case "done":
+        if (this.cccNativeCli) {
+          void this.closeCccNativeCli("done");
+          break;
+        }
         this.finish({ kind: "success", sessionId: this.sessionId, terminationReason: "completed" });
         break;
       case "needsAttention":
@@ -545,6 +580,43 @@ export class CliTaskSession {
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.resolveResult(outcome);
+  }
+
+  private async closeCccNativeCli(trigger: CccNativeCliHeldClosureTrigger): Promise<void> {
+    try {
+      await this.manager.closeCccNativeCliSession(this.sessionId, trigger);
+    } catch {
+      if (!this.settled) {
+        this.finish({ kind: "needs-attention", sessionId: this.sessionId, terminationReason: null });
+      }
+    }
+  }
+
+  /** Return the one manager-issued held outcome; this never initiates closure. */
+  async waitForCccNativeCliHeldClosure(): Promise<CliTaskOutcome> {
+    if (!this.cccNativeCli) return this.result();
+    try {
+      const receipt = await this.manager.waitForCccNativeCliHeldClosure(this.sessionId);
+      const outcome: CliTaskOutcome = {
+        kind: "ccc-native-held-closed",
+        sessionId: this.sessionId,
+        terminationReason: null,
+        nativeCliHeldClosureReceipt: receipt,
+      };
+      this.finish(outcome);
+      return outcome;
+    } catch {
+      const outcome: CliTaskOutcome = { kind: "needs-attention", sessionId: this.sessionId, terminationReason: null };
+      this.finish(outcome);
+      return outcome;
+    }
+  }
+
+  async releaseCccNativeCli(receipt: CccNativeCliHeldClosureReceipt, terminalScope: CccProviderAttemptScope): Promise<void> {
+    await this.manager.releaseCccNativeCliSession(receipt, terminalScope);
+    await this.teardown();
+    this.resolveCccNativeCliRelease?.();
+    this.log(`cli-task-session ${this.sessionId}: released CCC native CLI held slot`);
   }
 
   /** Re-open the result promise for a follow-up turn. */

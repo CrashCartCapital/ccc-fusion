@@ -93,7 +93,7 @@ export class UsageLimitPauser {
     if (!providerId) return 0;
 
     const pausedReason = `provider-rate-limit:${providerId}`;
-    const tasks = await this.store.listTasks();
+    const tasks = await this.store.listTasks({ slim: true, includeArchived: false });
     const recoverableTasks = tasks.filter((task) =>
       task.paused === true
       && task.userPaused !== true
@@ -166,7 +166,7 @@ export class UsageLimitPauser {
 
     const [settings, tasks] = await Promise.all([
       this.store.getSettings(),
-      this.store.listTasks(),
+      this.store.listTasks({ slim: true, includeArchived: false }),
     ]);
     const affectedTasks = tasks.filter((task) =>
       task.column !== "done"

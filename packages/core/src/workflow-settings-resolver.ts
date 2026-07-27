@@ -35,7 +35,8 @@ import {
 import { resolveEffectiveSettingValues, findOrphanedSettingValues } from "./workflow-settings.js";
 import { BUILTIN_WORKFLOW_SETTINGS, PLANNER_HEARTBEAT_PATROL_ENABLED_SETTING_ID } from "./builtin-workflow-settings.js";
 import type { WorkflowSettingDefinition, WorkflowIr, WorkflowOptionalGroupConfig } from "./workflow-ir-types.js";
-import { PLANNER_OVERSIGHT_LEVELS, DEFAULT_PLANNER_OVERSIGHT_LEVEL, type PlannerOversightLevel } from "./types.js";
+
+export { resolveEffectivePlannerOversightLevel } from "./types/execution-and-ui.js";
 
 export const PLAN_REVIEW_MAX_REVISIONS_SETTING_ID = "planReviewMaxRevisions";
 export const CODE_REVIEW_MAX_REVISIONS_SETTING_ID = "codeReviewMaxRevisions";
@@ -351,33 +352,6 @@ export async function resolveEffectiveSettingsDetailed(
     return effectiveFrom(store, ir, effectiveWorkflowId, "");
   }
   return resolveEffectiveSettingsDetailedById(store, effectiveWorkflowId, projectId, irCache);
-}
-
-function isPlannerOversightLevel(value: unknown): value is PlannerOversightLevel {
-  return typeof value === "string" && (PLANNER_OVERSIGHT_LEVELS as readonly string[]).includes(value);
-}
-
-/**
- * FNXC:PlannerOversight 2026-07-04-00:00:
- * Resolves the effective planner oversight level for a task: a per-task
- * `Task.plannerOversightLevel` override (FN-7509) always wins over the
- * workflow's effective `plannerOversightLevel` setting value (declared in
- * `BUILTIN_OVERSIGHT_SETTINGS`, resolved via {@link resolveEffectiveSettings}).
- * If neither is set, or either value is an unrecognized string (defensive
- * normalization — never trust arbitrary/legacy input), falls back to
- * `DEFAULT_PLANNER_OVERSIGHT_LEVEL` ("autonomous"). Pure and never throws.
- */
-export function resolveEffectivePlannerOversightLevel(
-  taskOverride: PlannerOversightLevel | string | null | undefined,
-  workflowEffective: PlannerOversightLevel | string | null | undefined,
-): PlannerOversightLevel {
-  if (isPlannerOversightLevel(taskOverride)) {
-    return taskOverride;
-  }
-  if (isPlannerOversightLevel(workflowEffective)) {
-    return workflowEffective;
-  }
-  return DEFAULT_PLANNER_OVERSIGHT_LEVEL;
 }
 
 /*

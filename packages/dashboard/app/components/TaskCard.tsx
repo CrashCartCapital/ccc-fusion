@@ -10,15 +10,14 @@ import {
   DEFAULT_TASK_PRIORITY,
   HIGH_FANOUT_BLOCKER_TODO_THRESHOLD,
   PLANNER_OVERSIGHT_LEVELS,
+  resolveEffectivePlannerOversightLevel,
   TASK_PRIORITIES,
   getErrorMessage,
 } from "@fusion/core";
 import { resolveEffectiveAutoMerge } from "../../../core/src/task-merge";
 // FNXC:PlannerOversight 2026-07-04-00:00: the dashboard's vite alias for "@fusion/core"
-// resolves only to ../core/src/types.ts (see packages/dashboard/vite.config.ts), so this
-// resolver — like resolveEffectiveAutoMerge above — must be imported from its source module
-// directly rather than the package barrel.
-import { resolveEffectivePlannerOversightLevel } from "../../../core/src/workflow-settings-resolver";
+// resolves only to ../core/src/types.ts (see packages/dashboard/vite.config.ts), so shared helpers
+// should be read from the package barrel to stay compatible with the browser-safe module map.
 import { addressPrFeedback, fetchTaskDetail, uploadAttachment, fetchMission, fetchAgent, rebuildTaskSpec, refreshPrStatus, fetchWorkflowSettingValues, type WorkflowFieldDefinition, type RevertTaskOptions, type RevertTaskResult } from "../api";
 import { GitHubBadge } from "./GitHubBadge";
 import { GitLabBadge } from "./GitLabBadge";
