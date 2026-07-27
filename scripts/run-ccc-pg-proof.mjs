@@ -687,6 +687,14 @@ const expectedWave6RealAcceptanceNames = [
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6 P1 RED: refuses a cross-wired same-task settlement before consuming its approval",
   "Task 6 real PostgreSQL: a user cancellation wins before a first-run CCC terminal result can publish work > keeps Todo/userPaused and no workflow task work across a fresh store restart",
 ];
+const expectedWave6ProtectedActionCanonicalNames = [
+  "ccc-prd protected-action canonical ordering > authors duplicate-free, canonically sorted task protected-action IDs from an unsorted proposal",
+  "ccc-prd protected-action canonical ordering > refuses a hand-edited sidecar whose task protected-action IDs are not canonically sorted",
+  "ccc-prd protected-action canonical ordering > refuses a hand-edited sidecar whose task protected-action IDs contain a duplicate",
+  "ccc-prd protected-action canonical ordering > accepts a sidecar whose task protected-action IDs are already canonical",
+  "ccc-prd protected-action canonical ordering > refuses a hand-edited sidecar whose task protected-action ID is not trimmed, even as an already-canonical single-entry list",
+  "ccc-prd protected-action canonical ordering > refuses authoring a proposal whose task protected-action ID is not trimmed, even as an already-canonical single-entry list",
+];
 
 function assertionName(assertion) {
   return [...(assertion.ancestorTitles ?? []), assertion.title].join(" > ");
@@ -1045,6 +1053,21 @@ const wave6Commands = [
     command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts", "src/__tests__/ccc-campaign-git-integration.real-pg.test.ts", "src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
     vitestArgs: ["--reporter=json"],
     expectedNames: expectedWave6RealAcceptanceNames,
+    machineResults: true,
+  },
+  /*
+  FNXC:CccWave9ProtectedActionCanonical 2026-07-27-00:00:
+  Task 9 fold-in of the accepted P2-C disposition: the canonical
+  protected-action-ID slice (authoring.ts/compiler.ts, committed at
+  346f42876) shipped without a Wave 6 mapping entry. Added additively as a
+  sixth command — the five existing Wave 6 commands and their frozen Task 6
+  name arrays above are untouched.
+  */
+  {
+    id: "ccc-prd-protected-action-canonical",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-prd-protected-action-canonical.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6ProtectedActionCanonicalNames,
     machineResults: true,
   },
 ];
