@@ -551,8 +551,10 @@ export {
   type ArchiveWorkspaceDisposalResult,
 } from "./archive-worktree-disposer.js";
 export {
+  beginTaskMoveDisposal,
   disposeTaskBeforeMove,
   getTaskMoveDisposer,
+  isTaskMoveDisposalActive,
   registerTaskMoveDisposer,
   type TaskMoveDisposer,
   type TaskMoveDisposalInput,

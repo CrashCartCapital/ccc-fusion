@@ -31,7 +31,7 @@ import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction} from "../task
 import {upsertArchivedTaskEntry} from "./async-archive-lineage.js";
 import {purgeTaskWorkflowSelectionRowsAsyncImpl} from "./workflow-definitions.js";
 import * as schema from "../postgres/schema/index.js";
-import {and, asc, eq, isNotNull, isNull, sql} from "drizzle-orm";
+import {and, asc, eq, inArray, isNotNull, isNull, sql} from "drizzle-orm";
 import {recoverExpiredMergeQueueLeases as recoverExpiredMergeQueueLeasesAsync} from "../task-store/async-merge-coordination.js";
 import {updateBranchGroup as updateBranchGroupAsync, updatePrEntity as updatePrEntityAsync} from "../task-store/async-branch-groups.js";
 import {recordCompletionHandoff as recordCompletionHandoffAsync, getCompletionHandoffMarker as getCompletionHandoffMarkerAsync} from "../task-store/async-workflow-workitems.js";
@@ -39,7 +39,7 @@ import { taskProjectScope } from "../postgres/data-layer.js";
 import {getActivityLog as getActivityLogAsync} from "../task-store/async-audit.js";
 import {insertArtifactRow as insertArtifactRowAsync} from "../task-store/async-comments-attachments.js";
 import type { ArtifactRow } from "./row-types.js";
-import type {MergeQueueRow, CompletionHandoffMarkerRow, ActivityLogRow} from "../task-store/row-types.js";
+import type {MergeQueueRow, CompletionHandoffMarkerRow, ActivityLogRow, WorkflowWorkItemRow} from "../task-store/row-types.js";
 import {appendConfigurationRevision, createConfigurationRevision, getConfigurationRevision, rollbackConfiguration} from "../async-configuration-revision-store.js";
 import {readProjectConfig, writeProjectConfig} from "./async-settings.js";
 import {publishSettingsUpdated} from "./settings-ops.js";
@@ -754,45 +754,91 @@ export async function rollbackConfigurationImpl(store: TaskStore, revisionId: st
   return rollback;
 }
 
-export async function cancelActiveWorkflowWorkItemsForTaskImpl(store: TaskStore, taskId: string, opts: { kinds?: WorkflowWorkItemKind[]; now?: string; lastError?: string | null; excludeIds?: string[] } = {}, tx?: import("../postgres/data-layer.js").DbTransaction): Promise<WorkflowWorkItem[]> {
+type CancelActiveWorkflowWorkItemsForTaskOptions = {
+  kinds?: WorkflowWorkItemKind[];
+  now?: string;
+  lastError?: string | null;
+  excludeIds?: string[];
+};
+
+export async function cancelActiveWorkflowWorkItemsForTaskBackendInTransaction(
+  store: TaskStore,
+  taskId: string,
+  opts: CancelActiveWorkflowWorkItemsForTaskOptions,
+  tx: import("../postgres/data-layer.js").DbTransaction,
+): Promise<WorkflowWorkItem[]> {
+  const table = schema.project.workflowWorkItems;
+  const activeStatePredicate = inArray(table.state, [
+    "runnable",
+    "running",
+    "held",
+    "retrying",
+    "manual-required",
+  ]);
+  const rows = await tx
+    .select()
+    .from(table)
+    .where(
+      opts.kinds?.length
+        ? and(eq(table.taskId, taskId), inArray(table.kind, opts.kinds), activeStatePredicate)
+        : and(eq(table.taskId, taskId), activeStatePredicate),
+    )
+    .orderBy(asc(table.createdAt), asc(table.id))
+    .for("update");
+  const excludeIds = new Set(opts.excludeIds ?? []);
+  const items = (rows as WorkflowWorkItemRow[])
+    .map((row) => store.rowToWorkflowWorkItem(row))
+    .filter((item) => store.isActiveWorkflowWorkItemState(item.state) && !excludeIds.has(item.id));
+  const results: WorkflowWorkItem[] = [];
+  for (const item of items) {
+    results.push(
+      await store.transitionWorkflowWorkItem(item.id, "cancelled", {
+        now: opts.now,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: opts.lastError ?? item.lastError ?? "cancelled-by-user-hard-cancel",
+      }, tx),
+    );
+  }
+  return results;
+}
+
+export function cancelActiveWorkflowWorkItemsForTaskSyncInCurrentTransaction(
+  store: TaskStore,
+  taskId: string,
+  opts: CancelActiveWorkflowWorkItemsForTaskOptions = {},
+): WorkflowWorkItem[] {
+  const excludeIds = new Set(opts.excludeIds ?? []);
+  const items = store.listWorkflowWorkItemsForTaskSync(taskId, opts).filter((item) =>
+    store.isActiveWorkflowWorkItemState(item.state) && !excludeIds.has(item.id)
+  );
+  return items.map((item) =>
+    store.transitionWorkflowWorkItemSync(item.id, "cancelled", {
+      now: opts.now,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: opts.lastError ?? item.lastError ?? "cancelled-by-user-hard-cancel",
+    }),
+  );
+}
+
+export async function cancelActiveWorkflowWorkItemsForTaskImpl(store: TaskStore, taskId: string, opts: CancelActiveWorkflowWorkItemsForTaskOptions = {}, tx?: import("../postgres/data-layer.js").DbTransaction): Promise<WorkflowWorkItem[]> {
     // FNXC:PostgresCutover 2026-06-27-10:20:
     // Accept an optional outer transaction so handoff-to-review can thread the
     // move tx through, ensuring cancel + upsert commit atomically with the move.
-    // No dedicated async helper; the composite is: list active items, then
-    // transition each to 'cancelled'. In backend mode, do this without a
-    // sync transactionImmediate (each transition is independently atomic).
+    // Selection, row locks, and terminal transitions share one transaction.
+    // When an outer move transaction is supplied, cancellation therefore
+    // commits or rolls back with the task column update.
     if (store.backendMode) {
-      const excludeIds = new Set(opts.excludeIds ?? []);
-      const items = (await store.listWorkflowWorkItemsForTask(taskId, opts)).filter((item) =>
-        store.isActiveWorkflowWorkItemState(item.state) && !excludeIds.has(item.id)
-      );
-      const results: WorkflowWorkItem[] = [];
-      for (const item of items) {
-        results.push(
-          await store.transitionWorkflowWorkItem(item.id, "cancelled", {
-            now: opts.now,
-            leaseOwner: null,
-            leaseExpiresAt: null,
-            lastError: opts.lastError ?? item.lastError ?? "cancelled-by-user-hard-cancel",
-          }, tx),
-        );
-      }
-      return results;
+      const layer = store.asyncLayer!;
+      return tx
+        ? cancelActiveWorkflowWorkItemsForTaskBackendInTransaction(store, taskId, opts, tx)
+        : layer.transactionImmediate((innerTx) =>
+            cancelActiveWorkflowWorkItemsForTaskBackendInTransaction(store, taskId, opts, innerTx)
+          );
     }
     return store.db.transactionImmediate(() => {
-      const excludeIds = new Set(opts.excludeIds ?? []);
-      // SQLite path: use the sync internal list to stay inside the transaction.
-      const items = store.listWorkflowWorkItemsForTaskSync(taskId, opts).filter((item) =>
-        store.isActiveWorkflowWorkItemState(item.state) && !excludeIds.has(item.id)
-      );
-      return items.map((item) =>
-        store.transitionWorkflowWorkItemSync(item.id, "cancelled", {
-          now: opts.now,
-          leaseOwner: null,
-          leaseExpiresAt: null,
-          lastError: opts.lastError ?? item.lastError ?? "cancelled-by-user-hard-cancel",
-        }),
-      );
+      return cancelActiveWorkflowWorkItemsForTaskSyncInCurrentTransaction(store, taskId, opts);
     });
   }
 

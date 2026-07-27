@@ -1,4 +1,4 @@
-import type { Settings, TaskDetail, WorkflowWorkItem, WorkflowWorkItemKind, WorkflowWorkItemState } from "@fusion/core";
+import { isTaskMoveDisposalActive, registerTaskMoveDisposer, type Settings, type TaskDetail, type TaskStore, type WorkflowWorkItem, type WorkflowWorkItemKind, type WorkflowWorkItemState } from "@fusion/core";
 import { claimDueWorkflowWorkItem, type ExactWorkflowWorkCandidate, type WorkflowWorkSchedulerStore } from "./workflow-work-scheduler.js";
 import { WorkflowTaskRuntime, type WorkflowTaskRuntimeResult } from "./workflow-task-runtime.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
@@ -44,6 +44,10 @@ class WorkflowCampaignTerminalTransitionError extends Error {
   }
 }
 
+type CampaignCompletion =
+  | { runtime: WorkflowTaskRuntimeResult }
+  | { error: unknown };
+
 export async function processDueWorkflowWorkItem(
   store: WorkflowWorkProcessorStore,
   runtime: WorkflowTaskRuntime,
@@ -71,6 +75,43 @@ export async function processDueWorkflowWorkItem(
 
   let runtimeResult: WorkflowTaskRuntimeResult;
   const abortController = new AbortController();
+  let resolveCampaignCompletion: ((completion: CampaignCompletion) => void) | undefined;
+  let campaignCompletion: Promise<CampaignCompletion> | undefined;
+  let unregisterTaskMoveDisposer: (() => void) | undefined;
+  let campaignCompletionError: unknown;
+  let userCancellationRequested = false;
+  const requestUserCancellation = () => {
+    userCancellationRequested = true;
+    if (!abortController.signal.aborted) abortController.abort(new Error("workflow-user-cancelled"));
+  };
+  const observeUserPausedTask = async () => {
+    const task = await awaitPreRuntimeRead(Promise.resolve(store.getTask?.(dispatch.taskId)), abortController.signal) as TaskDetail | undefined;
+    if (task?.userPaused === true) requestUserCancellation();
+  };
+  const registerCampaignTaskMoveDisposer = () => {
+    if (unregisterTaskMoveDisposer) return;
+    campaignCompletion = new Promise<CampaignCompletion>((resolve) => {
+      resolveCampaignCompletion = resolve;
+    });
+    /*
+    FNXC:CCCHardCancellation 2026-07-27-02:00: any claimed workflow item
+    may still be awaiting campaign classification when a user parks it.
+    Register on the exact TaskStore instance before that await so moveTask
+    cannot make the task look idle before this claim reaches a durable state.
+    */
+    unregisterTaskMoveDisposer = registerTaskMoveDisposer(store as TaskStore, async (task) => {
+      if (task.id !== dispatch.taskId) return;
+      requestUserCancellation();
+      const completion = await campaignCompletion!;
+      if ("error" in completion) throw completion.error;
+    });
+  };
+  // Classify every claimed item under an exact-task disposer so a user move that
+  // lands during an async read cannot escape into either runtime path.
+  registerCampaignTaskMoveDisposer();
+  if (isTaskMoveDisposalActive(store as TaskStore, dispatch.taskId)) {
+    requestUserCancellation();
+  }
   let workflowLeaseRenewInterval: ReturnType<typeof setInterval> | undefined;
   /*
   FNXC:MissionSymbolAdmission 2026-08-01-01:00:
@@ -92,19 +133,61 @@ export async function processDueWorkflowWorkItem(
   try {
     const importedCampaignWorkItem = isImportedCccCampaignWorkItem(dispatch.workItem);
     const campaignRequired = opts.campaignRequired === true || importedCampaignWorkItem;
+    if (userCancellationRequested) {
+      runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
+      return {
+        claimed: true,
+        workItemId: dispatch.workItem.id,
+        taskId: dispatch.taskId,
+        runtime: runtimeResult,
+      };
+    }
+    if (campaignRequired) {
+      await observeUserPausedTask();
+      if (userCancellationRequested) {
+        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
+        return {
+          claimed: true,
+          workItemId: dispatch.workItem.id,
+          taskId: dispatch.taskId,
+          runtime: runtimeResult,
+        };
+      }
+    }
     const getCampaignContext = store.getCccCampaignContextForTask;
     if (campaignRequired && typeof getCampaignContext !== "function") {
       throw new Error("workflow campaign custody lookup is unwired");
     }
     const campaignContext = typeof getCampaignContext === "function"
-      ? await getCampaignContext.call(store, dispatch.taskId)
+      ? await awaitPreRuntimeRead(Promise.resolve(getCampaignContext.call(store, dispatch.taskId)), abortController.signal)
       : null;
+    if (userCancellationRequested) {
+      runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
+      return {
+        claimed: true,
+        workItemId: dispatch.workItem.id,
+        taskId: dispatch.taskId,
+        runtime: runtimeResult,
+      };
+    }
     if (campaignRequired && !campaignContext) {
       throw new Error(importedCampaignWorkItem
         ? "workflow imported campaign custody is missing"
         : "workflow required campaign custody is missing");
     }
     if (campaignRequired || campaignContext) {
+      if (!campaignRequired) {
+        await observeUserPausedTask();
+        if (userCancellationRequested) {
+          runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
+          return {
+            claimed: true,
+            workItemId: dispatch.workItem.id,
+            taskId: dispatch.taskId,
+            runtime: runtimeResult,
+          };
+        }
+      }
       if (dispatch.workItem.attempt === 0) {
         dispatch.workItem = await store.transitionWorkflowWorkItem(dispatch.workItem.id, "running", {
           now: opts.now,
@@ -115,17 +198,47 @@ export async function processDueWorkflowWorkItem(
           leaseOwner: opts.leaseOwner,
         });
       }
+      registerCampaignTaskMoveDisposer();
+      if (abortController.signal.aborted) {
+        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(userCancellationRequested), abortController.signal);
+        return {
+          claimed: true,
+          workItemId: dispatch.workItem.id,
+          taskId: dispatch.taskId,
+          runtime: runtimeResult,
+        };
+      }
       if (typeof store.renewWorkflowWorkItemLease !== "function") {
         throw new Error("workflow campaign processor requires renewWorkflowWorkItemLease");
       }
       workflowLeaseRenewInterval = startWorkflowLeaseRenewal(store, dispatch.workItem, opts, abortController);
-      runtimeResult = await runCampaignWorkflowWorkItem(store, runtime, settings, opts, dispatch.workItem, abortController.signal);
+      runtimeResult = await runCampaignWorkflowWorkItem(store, runtime, settings, opts, dispatch.workItem, abortController.signal, () => userCancellationRequested);
     } else {
+      unregisterTaskMoveDisposer?.();
+      unregisterTaskMoveDisposer = undefined;
       runtimeResult = await runtime.runWorkItem(dispatch.workItem, settings);
     }
   } catch (err) {
     if (err instanceof WorkflowCampaignTerminalTransitionError) {
-      throw err.cause instanceof Error ? err.cause : err;
+      campaignCompletionError = err.cause instanceof Error ? err.cause : err;
+      throw campaignCompletionError;
+    }
+    if (userCancellationRequested) {
+      try {
+        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
+        return {
+          claimed: true,
+          workItemId: dispatch.workItem.id,
+          taskId: dispatch.taskId,
+          runtime: runtimeResult,
+        };
+      } catch (terminalPersistenceError) {
+        campaignCompletionError = new AggregateError(
+          [err, terminalPersistenceError],
+          "workflow work cancellation and terminal persistence both failed",
+        );
+        throw campaignCompletionError;
+      }
     }
     const reason = `workflow-work-item-runtime-error:${err instanceof Error ? err.message : String(err)}`;
     try {
@@ -146,10 +259,11 @@ export async function processDueWorkflowWorkItem(
       acknowledged claim: retaining both causes lets the owning caller surface
       the durable-state uncertainty instead of falsely reporting completion.
       */
-      throw new AggregateError(
+      campaignCompletionError = new AggregateError(
         [err, terminalPersistenceError],
         "workflow work runtime and terminal persistence both failed",
       );
+      throw campaignCompletionError;
     }
     runtimeResult = {
       disposition: "failed",
@@ -161,6 +275,10 @@ export async function processDueWorkflowWorkItem(
   } finally {
     if (renewInterval) clearInterval(renewInterval);
     if (workflowLeaseRenewInterval) clearInterval(workflowLeaseRenewInterval);
+    unregisterTaskMoveDisposer?.();
+    resolveCampaignCompletion?.(campaignCompletionError === undefined
+      ? { runtime: runtimeResult! }
+      : { error: campaignCompletionError });
   }
   return {
     claimed: true,
@@ -170,6 +288,27 @@ export async function processDueWorkflowWorkItem(
   };
 }
 
+function awaitPreRuntimeRead<T>(read: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const settle = (operation: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = () => {
+      settle(() => reject(signal.reason ?? new Error("workflow-pre-runtime-aborted")));
+    };
+    void read.then(
+      (value) => settle(() => resolve(value)),
+      (error) => settle(() => reject(error)),
+    );
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
 async function runCampaignWorkflowWorkItem(
   store: WorkflowWorkProcessorStore,
   runtime: WorkflowTaskRuntime,
@@ -177,36 +316,59 @@ async function runCampaignWorkflowWorkItem(
   opts: WorkflowWorkProcessorOptions,
   workItem: WorkflowWorkItem,
   signal: AbortSignal,
+  userCancellationRequested: () => boolean,
 ): Promise<WorkflowTaskRuntimeResult> {
   if (!store.getTask) {
     throw new Error("workflow campaign processor requires getTask");
   }
-  const task = await store.getTask(workItem.taskId) as TaskDetail | undefined;
+  const task = await awaitPreRuntimeRead(Promise.resolve(store.getTask(workItem.taskId)), signal) as TaskDetail | undefined;
   if (!task) {
     throw new Error(`workflow campaign task missing:${workItem.taskId}`);
   }
-  const runtimeResult = await runtime.run(task, settings, {
-    signal,
-    workItemFence: {
-      workItemId: workItem.id,
-      leaseOwner: opts.leaseOwner,
-      attempt: workItem.attempt,
-      runId: workItem.runId,
-      eventTimestamp: workItem.updatedAt,
-    },
-    deferCompletionSummary: true,
-  });
-  if (signal.aborted && runtimeResult.disposition === "completed") {
-    return await transitionCampaignTerminal(store, opts, workItem, {
-      disposition: "failed",
-      outcome: "failure",
-      visitedNodeIds: runtimeResult.visitedNodeIds,
-      context: runtimeResult.context,
-      reason: "workflow-aborted",
+  if (signal.aborted) {
+    return await transitionCampaignTerminal(
+      store,
+      opts,
+      workItem,
+      abortedCampaignRuntimeResult(userCancellationRequested()),
+      signal,
+    );
+  }
+  let runtimeResult: WorkflowTaskRuntimeResult;
+  try {
+    runtimeResult = await runtime.run(task, settings, {
+      signal,
+      workItemFence: {
+        workItemId: workItem.id,
+        leaseOwner: opts.leaseOwner,
+        attempt: workItem.attempt,
+        runId: workItem.runId,
+        eventTimestamp: workItem.updatedAt,
+      },
+      deferCompletionSummary: true,
     });
+  } catch (err) {
+    if (!signal.aborted) throw err;
+    return await transitionCampaignTerminal(store, opts, workItem, abortedCampaignRuntimeResult(userCancellationRequested()), signal);
+  }
+  if (signal.aborted) {
+    return await transitionCampaignTerminal(store, opts, workItem, abortedCampaignRuntimeResult(userCancellationRequested(), runtimeResult), signal);
   }
 
-  return await transitionCampaignTerminal(store, opts, workItem, runtimeResult);
+  return await transitionCampaignTerminal(store, opts, workItem, runtimeResult, signal);
+}
+
+function abortedCampaignRuntimeResult(
+  userCancellationRequested: boolean,
+  runtimeResult?: WorkflowTaskRuntimeResult,
+): WorkflowTaskRuntimeResult {
+  return {
+    disposition: userCancellationRequested ? "cancelled" : "failed",
+    outcome: "failure",
+    visitedNodeIds: runtimeResult?.visitedNodeIds ?? [],
+    context: runtimeResult?.context ?? {},
+    reason: userCancellationRequested ? "workflow-user-cancelled" : "workflow-aborted",
+  };
 }
 
 async function transitionCampaignTerminal(
@@ -214,6 +376,7 @@ async function transitionCampaignTerminal(
   opts: WorkflowWorkProcessorOptions,
   workItem: WorkflowWorkItem,
   runtimeResult: WorkflowTaskRuntimeResult,
+  signal: AbortSignal,
 ): Promise<WorkflowTaskRuntimeResult> {
   const terminalState: WorkflowWorkItemState = runtimeResult.disposition === "completed"
     ? "succeeded"
@@ -248,13 +411,19 @@ async function transitionCampaignTerminal(
   }
 
   if (terminalState === "succeeded" && store.getTask) {
-    const latestTask = await store.getTask(workItem.taskId) as TaskDetail | undefined;
+    const latestTask = await awaitPreRuntimeRead(
+      Promise.resolve(store.getTask(workItem.taskId)),
+      signal,
+    ).catch(() => undefined) as TaskDetail | undefined;
     if (latestTask) {
-      await ensureWorkflowCompletionSummary(store, latestTask, {
-        reason: "workflow-work-item:campaign",
-        workflowId: String(runtimeResult.context["workflow:id"] ?? "unknown"),
-        runId: workItem.runId,
-      }).catch(() => undefined);
+      await awaitPreRuntimeRead(
+        Promise.resolve(ensureWorkflowCompletionSummary(store, latestTask, {
+          reason: "workflow-work-item:campaign",
+          workflowId: String(runtimeResult.context["workflow:id"] ?? "unknown"),
+          runId: workItem.runId,
+        })),
+        signal,
+      ).catch(() => undefined);
     }
   }
   return runtimeResult;

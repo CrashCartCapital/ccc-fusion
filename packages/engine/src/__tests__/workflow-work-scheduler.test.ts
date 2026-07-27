@@ -73,6 +73,25 @@ describe("claimDueWorkflowWorkItem", () => {
     expect(acquireWorkflowWorkItemLease).toHaveBeenCalledOnce();
   });
 
+  it("Task 6 P1 RED: ordinary coarse fallback does not read tasks without mission admission capabilities", async () => {
+    const never = new Promise<never>(() => {});
+    const getTask = vi.fn(() => never);
+    const acquireWorkflowWorkItemLease = vi.fn(async () => item);
+
+    const claim = claimDueWorkflowWorkItem(store({
+      listDueWorkflowWorkItems: () => [item],
+      getTask,
+      acquireWorkflowWorkItemLease,
+    }), {
+      leaseOwner: "worker",
+      leaseDurationMs: 1000,
+    });
+
+    await vi.waitFor(() => expect(acquireWorkflowWorkItemLease).toHaveBeenCalledOnce());
+    await expect(claim).resolves.toMatchObject({ taskId: item.taskId, workItem: item });
+    expect(getTask).not.toHaveBeenCalled();
+  });
+
   it("Task 5 RED: claims the exact campaign candidate instead of an earlier ordinary due row", async () => {
     const ordinary = { ...item, id: "WW-ordinary", runId: "ordinary-run", attempt: 2 };
     const campaign = { ...item, id: "WW-campaign", runId: "ccc-prd:campaign-run", attempt: 7 };

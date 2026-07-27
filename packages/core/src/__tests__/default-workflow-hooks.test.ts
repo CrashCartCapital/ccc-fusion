@@ -7,7 +7,7 @@
 //   - a missing registration degrades to a no-op + audit warning (not a crash);
 //   - applyDefaultWorkflowMoveEffects mutates the task per the legacy contract.
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   __resetTraitRegistryForTests,
   getTraitRegistry,
@@ -83,6 +83,46 @@ describe("default-workflow-hooks registry wiring", () => {
     const engineCtx = makeCtx({ fromColumn: "in-progress", toColumn: "todo", moveSource: "engine" });
     applyDefaultWorkflowMoveEffects(engineCtx);
     expect(engineCtx.task.userPaused).toBeUndefined();
+  });
+
+  it("applies reopen resets and userPaused for an explicit custom-column hard cancel", () => {
+    registerDefaultWorkflowHooks();
+    const resetSteps = vi.fn();
+    const ctx = makeCtx({
+      fromColumn: "implementing",
+      toColumn: "todo",
+      moveSource: "user",
+      hardCancel: true,
+      resetSteps,
+    });
+    ctx.task.status = "failed";
+    ctx.task.error = "runtime failed";
+    ctx.task.executionStartedAt = "2026-07-27T00:00:00.000Z";
+    ctx.task.worktree = "/tmp/fusion-custom-hard-cancel";
+    ctx.task.steps = [{ id: "execute", name: "Execute", status: "completed" }] as Task["steps"];
+
+    applyDefaultWorkflowMoveEffects(ctx);
+
+    expect(ctx.task).toMatchObject({ userPaused: true });
+    expect(ctx.task.status).toBeUndefined();
+    expect(ctx.task.error).toBeUndefined();
+    expect(ctx.task.executionStartedAt).toBeUndefined();
+    expect(ctx.task.worktree).toBeUndefined();
+    expect(resetSteps).toHaveBeenCalledOnce();
+  });
+
+  it("preserves userPaused for a user reopen from done to todo", () => {
+    registerDefaultWorkflowHooks();
+    const ctx = makeCtx({
+      fromColumn: "done",
+      toColumn: "todo",
+      moveSource: "user",
+      hardCancel: false,
+    });
+
+    applyDefaultWorkflowMoveEffects(ctx);
+
+    expect(ctx.task.userPaused).toBe(true);
   });
 
   // FN-7851 pause-bounce regression: the executor's pause teardown re-queues a

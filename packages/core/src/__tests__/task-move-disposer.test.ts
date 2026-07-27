@@ -1,11 +1,80 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   __setTaskMoveDisposalTimeoutForTesting,
+  beginTaskMoveDisposal,
   disposeTaskBeforeMove,
+  isTaskMoveDisposalActive,
   registerTaskMoveDisposer,
 } from "../task-move-disposer.js";
 
 describe("task move disposer", () => {
+  it("Task 6 P1 RED: move intent is active before disposer snapshot and through explicit release", async () => {
+    const store = {} as never;
+    let settle!: () => void;
+    registerTaskMoveDisposer(store, () => new Promise<void>((resolve) => { settle = resolve; }));
+    const beginning = beginTaskMoveDisposal(store, {
+      task: { id: "FN-LINEARIZE" }, from: "in-progress", to: "todo", source: "user",
+    });
+    await Promise.resolve();
+    expect(isTaskMoveDisposalActive(store, "FN-LINEARIZE")).toBe(true);
+    settle();
+    const release = await beginning;
+    expect(isTaskMoveDisposalActive(store, "FN-LINEARIZE")).toBe(true);
+    release();
+    release();
+    expect(isTaskMoveDisposalActive(store, "FN-LINEARIZE")).toBe(false);
+  });
+
+  it("treats an explicit custom-column hard cancel as an active disposal intent", async () => {
+    const store = {} as never;
+    let settle = () => undefined;
+    const disposer = vi.fn(() => new Promise<void>((resolve) => { settle = resolve; }));
+    registerTaskMoveDisposer(store, disposer);
+    const input = {
+      task: { id: "FN-CUSTOM-LINEARIZE" } as never,
+      from: "implementing",
+      to: "todo",
+      source: "user",
+      hardCancel: true,
+    } satisfies Parameters<typeof beginTaskMoveDisposal>[1];
+
+    const beginning = beginTaskMoveDisposal(store, input);
+    await Promise.resolve();
+    expect(disposer).toHaveBeenCalledOnce();
+    expect(isTaskMoveDisposalActive(store, "FN-CUSTOM-LINEARIZE")).toBe(true);
+
+    settle();
+    const release = await beginning;
+    expect(isTaskMoveDisposalActive(store, "FN-CUSTOM-LINEARIZE")).toBe(true);
+    release();
+    expect(isTaskMoveDisposalActive(store, "FN-CUSTOM-LINEARIZE")).toBe(false);
+  });
+
+  it("does not let an explicit false suppress the legacy literal hard-cancel rule", async () => {
+    const store = {} as never;
+    const disposer = vi.fn().mockResolvedValue(undefined);
+    registerTaskMoveDisposer(store, disposer);
+
+    await disposeTaskBeforeMove(store, {
+      task: { id: "FN-LEGACY-HARD-CANCEL" } as never,
+      from: "in-progress",
+      to: "todo",
+      source: "user",
+      hardCancel: false,
+    });
+
+    expect(disposer).toHaveBeenCalledOnce();
+  });
+
+  it("Task 6 P1 RED: move intent clears when disposer preparation fails", async () => {
+    const store = {} as never;
+    registerTaskMoveDisposer(store, async () => { throw new Error("stop failed"); });
+    await expect(beginTaskMoveDisposal(store, {
+      task: { id: "FN-LINEARIZE-ERROR" }, from: "in-progress", to: "todo", source: "user",
+    })).rejects.toThrow("stop failed");
+    expect(isTaskMoveDisposalActive(store, "FN-LINEARIZE-ERROR")).toBe(false);
+  });
+
   it("does not complete a user in-progress to todo move until cancellation settles", async () => {
     const store = {} as never;
     let resolveCancellation: (() => void) | undefined;

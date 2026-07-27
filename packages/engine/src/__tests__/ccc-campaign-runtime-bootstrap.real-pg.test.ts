@@ -10,6 +10,7 @@ import {
   getWorkflowExtensionHostProvenanceBinding,
   importCccPrdBundle,
   queryRunAuditEvents,
+  registerTaskMoveDisposer,
   TaskStore as FreshTaskStore,
 } from "@fusion/core";
 import {
@@ -27,6 +28,8 @@ import { InProcessRuntime } from "../runtimes/in-process-runtime.js";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-campaign-proof-host.js";
 import { isImportedCccCampaignWorkItem } from "../ccc-campaign-routing.js";
 import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
+import { TaskExecutor } from "../executor.js";
+import { WorkflowGraphTaskRunner } from "../workflow-graph-task-runner.js";
 import { createCccCampaignProviderAttemptBinding } from "../ccc-campaign-provider-controller.js";
 import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
 import {
@@ -363,6 +366,186 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     });
   });
 
+  it("Task 6: public user cancellation durably parks a real campaign and restart cannot redispatch it", async () => {
+    const store = h.store();
+    const campaign = await importCampaignFixture(h, "task6-user-cancel");
+    await store.moveTask(campaign.taskId, "in-progress", { moveSource: "scheduler" });
+    const afterMove = await store.getWorkflowWorkItem(campaign.id);
+    if (!afterMove) throw new Error("campaign item vanished after scheduler move");
+    expect(afterMove).toMatchObject({ id: campaign.id, runId: campaign.runId, state: "runnable", attempt: campaign.attempt, retryAfter: null, leaseOwner: null, leaseExpiresAt: null });
+    let observedSignal: AbortSignal | undefined;
+    const runtime = {
+      run: vi.fn((_task: unknown, _settings: unknown, options: { signal: AbortSignal }) => new Promise<any>((resolve) => {
+        observedSignal = options.signal;
+        options.signal.addEventListener("abort", () => resolve({
+          disposition: "failed",
+          outcome: "failure",
+          visitedNodeIds: [],
+          context: {},
+          reason: "provider-observed-abort",
+        }), { once: true });
+      })),
+    } as unknown as WorkflowTaskRuntime;
+
+    const processing = processDueWorkflowWorkItem(store, runtime, await store.getSettings(), {
+      leaseOwner: "task6-user-cancel",
+      leaseDurationMs: 60_000,
+      kinds: ["task"],
+      campaignRequired: true,
+      exactCandidate: { id: afterMove.id, runId: afterMove.runId, attempt: afterMove.attempt },
+    });
+    await waitFor(async () => runtime.run.mock.calls.length, (count) => count === 1, "campaign runtime dispatch");
+
+    await store.moveTask(campaign.taskId, "todo", { moveSource: "user" });
+    expect(observedSignal?.aborted).toBe(true);
+    await expect(processing).resolves.toMatchObject({
+      runtime: { disposition: "cancelled", reason: "workflow-user-cancelled" },
+    });
+    await expect(store.getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({
+      state: "cancelled",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "workflow-user-cancelled",
+    });
+    await expect(store.getTask(campaign.taskId)).resolves.toMatchObject({
+      id: campaign.taskId,
+      column: "todo",
+      userPaused: true,
+    });
+
+    const restartedStore = new FreshTaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+    await restartedStore.init();
+    try {
+      const restartRuntime = { run: vi.fn() } as unknown as WorkflowTaskRuntime;
+      await expect(processDueWorkflowWorkItem(restartedStore, restartRuntime, await restartedStore.getSettings(), {
+        leaseOwner: "task6-user-cancel-restart",
+        leaseDurationMs: 60_000,
+        kinds: ["task"],
+        exactCandidate: { id: campaign.id, runId: campaign.runId, attempt: 1 },
+      })).resolves.toMatchObject({ claimed: false });
+      expect(restartRuntime.run).not.toHaveBeenCalled();
+      await expect(restartedStore.getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({
+        state: "cancelled",
+        attempt: 1,
+        leaseOwner: null,
+      });
+      await expect(restartedStore.getTask(campaign.taskId)).resolves.toMatchObject({
+        column: "todo",
+        userPaused: true,
+      });
+    } finally {
+      restartedStore.stopWatching();
+    }
+  });
+
+  it("Task 6 P1 RED: a claim that lands during a public move is cancelled and cannot redispatch after restart", async () => {
+    const store = h.store();
+    const campaign = await importCampaignFixture(h, "task6-late-claim");
+    await store.moveTask(campaign.taskId, "in-progress", { moveSource: "scheduler" });
+    const candidate = await store.getWorkflowWorkItem(campaign.id);
+    if (!candidate) throw new Error("late-claim campaign item vanished");
+
+    let releaseClaim!: () => void;
+    const claimHeld = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    let signalClaimEntered!: () => void;
+    const claimEntered = new Promise<void>((resolve) => { signalClaimEntered = resolve; });
+    const originalAcquire = store.acquireWorkflowWorkItemLease.bind(store);
+    const acquireSpy = vi.spyOn(store, "acquireWorkflowWorkItemLease").mockImplementation(async (id, leaseOwner, opts) => {
+      if (id === candidate.id && leaseOwner === "task6-late-claim-owner") {
+        signalClaimEntered();
+        await claimHeld;
+      }
+      return originalAcquire(id, leaseOwner, opts);
+    });
+
+    let releaseMoveDisposer!: () => void;
+    const moveDisposerHeld = new Promise<void>((resolve) => { releaseMoveDisposer = resolve; });
+    let signalMoveDisposerEntered!: () => void;
+    const moveDisposerEntered = new Promise<void>((resolve) => { signalMoveDisposerEntered = resolve; });
+    const unregisterMoveDisposer = registerTaskMoveDisposer(store, async (task) => {
+      if (task.id !== campaign.taskId) return;
+      signalMoveDisposerEntered();
+      await moveDisposerHeld;
+    });
+
+    let releaseTerminalCas!: () => void;
+    const terminalCasHeld = new Promise<void>((resolve) => { releaseTerminalCas = resolve; });
+    let signalTerminalCasEntered!: () => void;
+    const terminalCasEntered = new Promise<void>((resolve) => { signalTerminalCasEntered = resolve; });
+    const originalTransition = store.transitionWorkflowWorkItem.bind(store);
+    const transitionSpy = vi.spyOn(store, "transitionWorkflowWorkItem").mockImplementation(async (id, state, patch, tx) => {
+      if (
+        id === candidate.id
+        && state === "cancelled"
+        && patch.expectedLeaseOwner === "task6-late-claim-owner"
+      ) {
+        signalTerminalCasEntered();
+        await terminalCasHeld;
+      }
+      return originalTransition(id, state, patch, tx);
+    });
+
+    const runtime = { run: vi.fn() } as unknown as WorkflowTaskRuntime;
+    const processing = processDueWorkflowWorkItem(store, runtime, await store.getSettings(), {
+      leaseOwner: "task6-late-claim-owner",
+      leaseDurationMs: 60_000,
+      kinds: ["task"],
+      campaignRequired: true,
+      exactCandidate: { id: candidate.id, runId: candidate.runId, attempt: candidate.attempt },
+    });
+
+    let move: Promise<unknown> | undefined;
+    try {
+      await claimEntered;
+      move = store.moveTask(campaign.taskId, "todo", { moveSource: "user" });
+      await moveDisposerEntered;
+      releaseClaim();
+      await terminalCasEntered;
+      expect(runtime.run).not.toHaveBeenCalled();
+
+      releaseMoveDisposer();
+      await expect(move).resolves.toMatchObject({ column: "todo", userPaused: true });
+      await expect(store.getWorkflowWorkItem(candidate.id)).resolves.toMatchObject({
+        state: "cancelled",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      });
+      expect(runtime.run).not.toHaveBeenCalled();
+
+      releaseTerminalCas();
+      await expect(processing).resolves.toMatchObject({
+        runtime: { disposition: "cancelled" },
+      });
+
+      const terminal = await store.getWorkflowWorkItem(candidate.id);
+      if (!terminal) throw new Error("late-claim campaign terminal item vanished");
+      const restartedStore = new FreshTaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+      await restartedStore.init();
+      try {
+        const restartRuntime = { run: vi.fn() } as unknown as WorkflowTaskRuntime;
+        await expect(processDueWorkflowWorkItem(restartedStore, restartRuntime, await restartedStore.getSettings(), {
+          leaseOwner: "task6-late-claim-restart",
+          leaseDurationMs: 60_000,
+          kinds: ["task"],
+          exactCandidate: { id: terminal.id, runId: terminal.runId, attempt: terminal.attempt },
+        })).resolves.toMatchObject({ claimed: false });
+        expect(restartRuntime.run).not.toHaveBeenCalled();
+      } finally {
+        restartedStore.stopWatching();
+      }
+    } finally {
+      releaseClaim();
+      releaseMoveDisposer();
+      releaseTerminalCas();
+      unregisterMoveDisposer();
+      await move?.catch(() => undefined);
+      await processing.catch(() => undefined);
+      transitionSpy.mockRestore();
+      acquireSpy.mockRestore();
+    }
+  });
+
   it("does not clear a rival lease when fixed proof-host bootstrap fails after selection", async () => {
     const store = h.store();
     const campaign = await importCampaignFixture(h, "bootstrap-race");
@@ -640,5 +823,118 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       lease: { claimToken },
     });
     expect(await queryRunAuditEvents(h.layer().db, { taskId })).toHaveLength(auditsBefore.length);
+  });
+});
+
+pgTest("Task 6 real PostgreSQL: a user cancellation wins before a first-run CCC terminal result can publish work", () => {
+  const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
+    prefix: "fusion_ccc_terminal_race_realpg",
+  });
+
+  beforeAll(h.beforeAll);
+  beforeEach(h.beforeEach);
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
+
+  it("keeps Todo/userPaused and no workflow task work across a fresh store restart", async () => {
+    const store = h.store();
+    const task = await store.createTask({
+      title: "Terminal publication race",
+      description: "A user move must fence the late terminal publication.",
+      column: "in-progress",
+      customFields: { cccFusionProfile: "ccc-fusion" },
+    });
+    await store.writeTaskWorkflowSelection(task.id, "builtin:coding", []);
+
+    let resolveGraph!: (result: {
+      disposition: "failed";
+      outcome: "failure";
+      reason: string;
+      context: Record<string, unknown>;
+      visitedNodeIds: string[];
+    }) => void;
+    const delayedGraph = new Promise<Parameters<typeof resolveGraph>[0]>((resolve) => {
+      resolveGraph = resolve;
+    });
+    const runSpy = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockReturnValue(delayedGraph);
+    const withTaskLockSpy = vi.spyOn(store, "withTaskLock");
+    const upsertSpy = vi.spyOn(store, "upsertWorkflowWorkItem");
+    const executor = new TaskExecutor(store, h.rootDir());
+    let releaseMoveDisposer!: () => void;
+    const moveDisposerEntered = new Promise<void>((resolve) => {
+      releaseMoveDisposer = resolve;
+    });
+    let notifyMoveDisposerEntered!: () => void;
+    const moveDisposerHasEntered = new Promise<void>((resolve) => {
+      notifyMoveDisposerEntered = resolve;
+    });
+    const unregisterBlocker = registerTaskMoveDisposer(store, async (movingTask) => {
+      if (movingTask.id !== task.id) return;
+      notifyMoveDisposerEntered();
+      await moveDisposerEntered;
+    });
+    let execution: Promise<void> | undefined;
+    let userMove: Promise<unknown> | undefined;
+
+    try {
+      execution = executor.execute(task);
+      await vi.waitFor(() => expect(runSpy).toHaveBeenCalledOnce());
+
+      userMove = store.moveTask(task.id, "todo", { moveSource: "user" });
+      await moveDisposerHasEntered;
+      const withTaskLockBaseline = withTaskLockSpy.mock.calls.length;
+
+      resolveGraph({
+        disposition: "failed",
+        outcome: "failure",
+        reason: "ccc-branch-persistence-terminal-failed",
+        context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+        visitedNodeIds: ["start", "A", "fanout", "B"],
+      });
+
+      await waitFor(
+        async () => ({
+          publisherEntered: withTaskLockSpy.mock.calls.length > withTaskLockBaseline,
+          upserted: upsertSpy.mock.calls.length > 0,
+        }),
+        (state) => state.publisherEntered || state.upserted,
+        "terminal publisher lock attempt",
+      );
+      expect(upsertSpy).not.toHaveBeenCalled();
+      await expect(store.listWorkflowWorkItemsForTask(task.id, { kinds: ["task"] })).resolves.toEqual([]);
+
+      releaseMoveDisposer();
+      await userMove;
+      await execution;
+
+      await expect(store.getTask(task.id)).resolves.toMatchObject({
+        id: task.id,
+        column: "todo",
+        userPaused: true,
+      });
+      await expect(store.listWorkflowWorkItemsForTask(task.id, { kinds: ["task"] })).resolves.toEqual([]);
+
+      const restartedStore = new FreshTaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+      await restartedStore.init();
+      try {
+        await expect(restartedStore.listWorkflowWorkItemsForTask(task.id, { kinds: ["task"] })).resolves.toEqual([]);
+        await expect(restartedStore.listDueWorkflowWorkItems({
+          kinds: ["task"],
+          states: ["runnable", "retrying"],
+          limit: 20,
+        })).resolves.toEqual([]);
+      } finally {
+        restartedStore.stopWatching();
+      }
+    } finally {
+      releaseMoveDisposer();
+      await userMove?.catch(() => undefined);
+      await execution?.catch(() => undefined);
+      executor.disposeStoreLifecycleDisposers();
+      unregisterBlocker();
+      runSpy.mockRestore();
+      withTaskLockSpy.mockRestore();
+      upsertSpy.mockRestore();
+    }
   });
 });

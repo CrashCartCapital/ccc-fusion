@@ -77,29 +77,31 @@ export async function claimDueWorkflowWorkItem(
     });
 
   for (const candidate of due) {
-    const task = store.getTask ? await store.getTask(candidate.taskId) : undefined;
     let lockedSymbols: string[] | undefined;
-    if (!opts.bypassMissionSymbolAdmission && task && store.getMissionStore && store.acquireSymbolLocks) {
-      const settings = await store.getSettings?.();
-      const admission = await decideMissionSymbolAdmission(task, store.getMissionStore(), {
-        planApprovalRequired: settings?.planApprovalMode === "require-all",
-      });
-      if (admission.kind === "lineage-blocked") {
-        await store.logEntry?.(task.id, `workflow work not claimed — mission lineage blocked: ${admission.reason}`);
-        continue;
-      }
-      if (admission.kind === "symbol-lock") {
-        const result = await store.acquireSymbolLocks(
-          admission.symbols,
-          { ownerTaskId: task.id, missionId: task.missionId, featureId: admission.feature.id, agentId: opts.leaseOwner },
-          WORKFLOW_SYMBOL_LOCK_LEASE_MS,
-        );
-        if (!result.acquired) {
-          const conflict = result.conflicts[0];
-          await store.logEntry?.(task.id, `workflow work not claimed — symbol contention: symbol=${conflict?.symbolKey ?? "unknown"} holder=${conflict?.ownerTaskId ?? "unknown"}`);
+    if (!opts.bypassMissionSymbolAdmission && store.getTask && store.getMissionStore && store.acquireSymbolLocks) {
+      const task = await store.getTask(candidate.taskId);
+      if (task) {
+        const settings = await store.getSettings?.();
+        const admission = await decideMissionSymbolAdmission(task, store.getMissionStore(), {
+          planApprovalRequired: settings?.planApprovalMode === "require-all",
+        });
+        if (admission.kind === "lineage-blocked") {
+          await store.logEntry?.(task.id, `workflow work not claimed — mission lineage blocked: ${admission.reason}`);
           continue;
         }
-        lockedSymbols = admission.symbols;
+        if (admission.kind === "symbol-lock") {
+          const result = await store.acquireSymbolLocks(
+            admission.symbols,
+            { ownerTaskId: task.id, missionId: task.missionId, featureId: admission.feature.id, agentId: opts.leaseOwner },
+            WORKFLOW_SYMBOL_LOCK_LEASE_MS,
+          );
+          if (!result.acquired) {
+            const conflict = result.conflicts[0];
+            await store.logEntry?.(task.id, `workflow work not claimed — symbol contention: symbol=${conflict?.symbolKey ?? "unknown"} holder=${conflict?.ownerTaskId ?? "unknown"}`);
+            continue;
+          }
+          lockedSymbols = admission.symbols;
+        }
       }
     }
 

@@ -16,7 +16,7 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
 import { getUnmetSchedulingDependencies } from "./scheduler.js";
 import { CCC_EFFECT_RECEIPT_CONTRACT } from "@fusion/core";
-import { RetryStormError, serializeRetryStormError, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, resolveWorkflowIrForTask, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveReboundTarget, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AgentStore, resolveExecutorFallbackModel } from "@fusion/core";
+import { RetryStormError, TaskDeletedError, serializeRetryStormError, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, resolveWorkflowIrForTask, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveReboundTarget, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AgentStore, resolveExecutorFallbackModel } from "@fusion/core";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
 import { generateFeatureVideo, type GenerateFeatureVideoOptions } from "./review-artifacts/feature-video.js";
@@ -6451,21 +6451,91 @@ export class TaskExecutor {
         const terminalCccFailure = terminalCccBranchPersistenceFailure || terminalCccPermanentFailure || terminalCccTransientExhaustion;
         if (terminalCccFailure && !continuation) {
           /*
-          FNXC:CccBranchPersistence 2026-07-24-13:35:
-          A first-run checkpoint failure has no continuation to park yet. Create
-          the existing native task work item under the resolved stable run id so
-          the operator sees the same durable manual-required contract as resume.
+          FNXC:CCCFusionCancellation 2026-07-27-04:50:
+          A first-run terminal result races with user move cancellation because
+          there is no continuation row for the move disposer to cancel yet.
+          Serialize its entire publication with the move boundary, then refetch
+          through the non-locking reader so a committed Todo/user pause wins.
           */
-          continuation = await this.store.upsertWorkflowWorkItem({
-            runId: resolvedRunId ?? `${task.id}:${selection.workflowId}`,
-            taskId: task.id,
-            nodeId: terminalCccBranchPersistenceFailure ? "ccc-branch-persistence" : "ccc-retry-classification",
-            kind: "task",
-            state: "running",
-            attempt: terminalCccPermanentFailure || terminalCccTransientExhaustion
-              ? (terminalAttempt ?? 1)
-              : 1,
+          await this.store.withTaskLock(task.id, async () => {
+            let liveTask: Task;
+            try {
+              liveTask = await this.store.readTaskForMove(task.id);
+            } catch (error) {
+              const missingTask = error instanceof Error
+                && (
+                  error.message === `Task ${task.id} not found`
+                  || ("code" in error && error.code === "ENOENT")
+                );
+              if (error instanceof TaskDeletedError || missingTask) {
+                return;
+              }
+              throw error;
+            }
+            if (
+              liveTask.deletedAt
+              || liveTask.column === "todo"
+              || liveTask.paused
+              || liveTask.userPaused
+            ) {
+              return;
+            }
+
+            const terminalContinuation = await this.store.upsertWorkflowWorkItem({
+              runId: resolvedRunId ?? `${task.id}:${selection.workflowId}`,
+              taskId: task.id,
+              nodeId: terminalCccBranchPersistenceFailure ? "ccc-branch-persistence" : "ccc-retry-classification",
+              kind: "task",
+              state: "running",
+              attempt: terminalCccPermanentFailure || terminalCccTransientExhaustion
+                ? (terminalAttempt ?? 1)
+                : 1,
+            });
+            const terminalReason = terminalCccBranchPersistenceFailure
+              ? branchPersistenceFailure as string
+              : retryClassification as string;
+            const terminalState = terminalCccTransientExhaustion ? "exhausted" : "manual-required";
+            await this.store.transitionWorkflowWorkItem(terminalContinuation.id, terminalState, {
+              ...((terminalCccPermanentFailure || terminalCccTransientExhaustion) && terminalAttempt !== undefined
+                ? { attempt: terminalAttempt }
+                : {}),
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastError: terminalReason,
+              blockedReason: terminalReason,
+            });
+            if (terminalCccPermanentFailure) {
+              await this.store.recordRunAuditEvent({
+                taskId: task.id,
+                agentId: "task-executor",
+                runId: terminalContinuation.runId,
+                domain: "database",
+                mutationType: "workflow:work-item-transition",
+                target: terminalContinuation.id,
+                metadata: {
+                  state: "manual-required",
+                  attempt: terminalAttempt ?? terminalContinuation.attempt,
+                  classification: "ccc-permanent",
+                },
+              });
+            }
+            if (terminalCccTransientExhaustion) {
+              await this.store.recordRunAuditEvent({
+                taskId: task.id,
+                agentId: "task-executor",
+                runId: terminalContinuation.runId,
+                domain: "database",
+                mutationType: "workflow:work-item-transition",
+                target: terminalContinuation.id,
+                metadata: {
+                  state: "exhausted",
+                  attempt: terminalAttempt ?? terminalContinuation.attempt,
+                  classification: "ccc-transient-exhausted",
+                },
+              });
+            }
           });
+          return;
         }
         if (continuation) {
           /*

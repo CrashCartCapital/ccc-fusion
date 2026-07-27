@@ -9,6 +9,8 @@ export interface TaskMoveDisposalInput {
   from: ColumnId;
   to: ColumnId;
   source: TaskMoveSource;
+  /** Authoritative lifecycle classification supplied by the task store. */
+  hardCancel?: boolean;
 }
 
 /*
@@ -17,6 +19,7 @@ export interface TaskMoveDisposalInput {
  * owned by another store. A set preserves every live owner during overlap.
  */
 const disposers = new WeakMap<TaskStore, Set<TaskMoveDisposer>>();
+const activeMoveIntents = new WeakMap<TaskStore, Map<string, number>>();
 const TASK_MOVE_DISPOSAL_TIMEOUT_MS = 30_000;
 let taskMoveDisposalTimeoutMs = TASK_MOVE_DISPOSAL_TIMEOUT_MS;
 
@@ -45,16 +48,37 @@ export function getTaskMoveDisposer(store: TaskStore): TaskMoveDisposer | undefi
   };
 }
 
-/**
- * FNXC:WorkflowLifecycle 2026-07-18-14:32:
- * A user move from active execution back to Todo is a hard cancel. Await every
- * registered execution surface before publishing the new column so persisted
- * board state can never claim the task is idle while its agent still runs.
- */
-export async function disposeTaskBeforeMove(store: TaskStore, input: TaskMoveDisposalInput): Promise<void> {
-  if (input.source !== "user" || input.from !== "in-progress" || input.to !== "todo") return;
+export function isTaskMoveDisposalActive(store: TaskStore, taskId: string): boolean {
+  return (activeMoveIntents.get(store)?.get(taskId) ?? 0) > 0;
+}
+
+export async function beginTaskMoveDisposal(
+  store: TaskStore,
+  input: TaskMoveDisposalInput,
+): Promise<() => void> {
+  const hardCancel =
+    input.hardCancel === true ||
+    (input.source === "user" && input.from === "in-progress" && input.to === "todo");
+  if (!hardCancel) {
+    return () => undefined;
+  }
+
+  const taskIntents = activeMoveIntents.get(store) ?? new Map<string, number>();
+  taskIntents.set(input.task.id, (taskIntents.get(input.task.id) ?? 0) + 1);
+  activeMoveIntents.set(store, taskIntents);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    const current = activeMoveIntents.get(store);
+    const remaining = (current?.get(input.task.id) ?? 1) - 1;
+    if (remaining > 0) current?.set(input.task.id, remaining);
+    else current?.delete(input.task.id);
+    if (current?.size === 0) activeMoveIntents.delete(store);
+  };
+
   const disposer = getTaskMoveDisposer(store);
-  if (!disposer) return;
+  if (!disposer) return release;
 
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -67,7 +91,22 @@ export async function disposeTaskBeforeMove(store: TaskStore, input: TaskMoveDis
         timeout.unref?.();
       }),
     ]);
+    return release;
+  } catch (error) {
+    release();
+    throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
   }
+}
+
+/**
+ * FNXC:WorkflowLifecycle 2026-07-18-14:32:
+ * A user move from active execution back to Todo is a hard cancel. Await every
+ * registered execution surface before publishing the new column so persisted
+ * board state can never claim the task is idle while its agent still runs.
+ */
+export async function disposeTaskBeforeMove(store: TaskStore, input: TaskMoveDisposalInput): Promise<void> {
+  const release = await beginTaskMoveDisposal(store, input);
+  release();
 }

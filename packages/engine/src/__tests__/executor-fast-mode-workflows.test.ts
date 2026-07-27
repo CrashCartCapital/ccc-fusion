@@ -10,7 +10,7 @@ const { createCccCampaignProviderAttemptBindingMock } = vi.hoisted(() => ({
   createCccCampaignProviderAttemptBindingMock: vi.fn(),
 }));
 import "./executor-test-helpers.js";
-import { getBuiltinWorkflow } from "@fusion/core";
+import { disposeTaskBeforeMove, getBuiltinWorkflow } from "@fusion/core";
 import { TaskExecutor } from "../executor.js";
 import { WorkflowGraphTaskRunner } from "../workflow-graph-task-runner.js";
 import { FOREACH_ACTIVE_CONTEXT_KEY } from "../workflow-node-handlers.js";
@@ -54,7 +54,25 @@ function task(overrides: Record<string, unknown> = {}) {
 
 function makeExecutorForTask(liveTask = task()) {
   const store = createMockStore();
+  const taskLocks = new Map<string, Promise<void>>();
   store.getTask.mockImplementation(async (id: string) => ({ ...liveTask, id }));
+  store.withTaskLock = vi.fn((id: string, work: () => Promise<unknown>) => {
+    const previous = taskLocks.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    taskLocks.set(id, next);
+    return previous.then(async () => {
+      try {
+        return await work();
+      } finally {
+        if (taskLocks.get(id) === next) taskLocks.delete(id);
+        release();
+      }
+    });
+  });
+  store.readTaskForMove = vi.fn(async (id: string) => store.getTask(id));
   store.getSettings.mockResolvedValue({
     autoMerge: false,
     experimentalFeatures: { workflowGraphExecutor: true },
@@ -375,6 +393,100 @@ describe("fast mode workflow/runtime invariants", () => {
         blockedReason: "ccc-branch-persistence-terminal-failed",
         lastError: "ccc-branch-persistence-terminal-failed",
       }));
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 6 P1 RED: user hard-cancel fences a late first-run CCC terminal publication", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-task6-late-terminal", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-branch-persistence", kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    let resolveRun!: (result: {
+      disposition: "failed";
+      outcome: "failure";
+      reason: string;
+      context: Record<string, unknown>;
+      visitedNodeIds: string[];
+    }) => void;
+    const delayedRun = new Promise<Parameters<typeof resolveRun>[0]>((resolve) => {
+      resolveRun = resolve;
+    });
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockReturnValue(delayedRun);
+    const execution = executor.execute(liveTask);
+    let commitUserMove!: () => void;
+    const userMoveCanCommit = new Promise<void>((resolve) => {
+      commitUserMove = resolve;
+    });
+    let userMoveLockAcquired!: () => void;
+    const userMoveHasLock = new Promise<void>((resolve) => {
+      userMoveLockAcquired = resolve;
+    });
+
+    try {
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+      const userMove = store.withTaskLock(liveTask.id, async () => {
+        await disposeTaskBeforeMove(store, {
+          task: liveTask,
+          from: "in-progress",
+          to: "todo",
+          source: "user",
+        });
+        userMoveLockAcquired();
+        await userMoveCanCommit;
+        store._setRow(liveTask.id, { column: "todo", paused: true, userPaused: true });
+      });
+      await userMoveHasLock;
+      resolveRun({
+        disposition: "failed",
+        outcome: "failure",
+        reason: "ccc-branch-persistence-terminal-failed",
+        context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+        visitedNodeIds: ["start", "A", "fanout", "B"],
+      });
+
+      try {
+        await vi.waitFor(() => {
+          expect(
+            store.withTaskLock.mock.calls.length > 1
+            || store.upsertWorkflowWorkItem.mock.calls.length > 0,
+          ).toBe(true);
+        });
+        expect(store.upsertWorkflowWorkItem).not.toHaveBeenCalled();
+      } finally {
+        commitUserMove();
+        await userMove;
+        await execution;
+      }
+
+      expect(store.readTaskForMove).toHaveBeenCalledWith(liveTask.id);
+      expect(store.upsertWorkflowWorkItem).not.toHaveBeenCalled();
+      expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 6 P1 RED: first-run terminal publication propagates an authoritative reread failure", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.readTaskForMove = vi.fn().mockRejectedValue(new Error("authoritative-task-reread-failed"));
+    store.upsertWorkflowWorkItem = vi.fn();
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "ccc-branch-persistence-terminal-failed",
+      context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+      visitedNodeIds: ["start", "A", "fanout", "B"],
+    });
+
+    try {
+      await expect(executor.execute(liveTask)).rejects.toThrow("authoritative-task-reread-failed");
+      expect(store.upsertWorkflowWorkItem).not.toHaveBeenCalled();
     } finally {
       run.mockRestore();
     }
