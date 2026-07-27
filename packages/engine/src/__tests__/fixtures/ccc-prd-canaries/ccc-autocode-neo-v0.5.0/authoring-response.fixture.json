@@ -1,0 +1,417 @@
+{
+  "schema": "ccc-prd.authoring-proposal.v1",
+  "authorityRoles": [
+    {
+      "id": "AUTHORITY-ROOT",
+      "role": "root",
+      "sourcePaths": [
+        "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md"
+      ],
+      "accountableProducer": "ccc-autocode-neo product owner"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-WORKER-ISOLATION",
+      "statement": "No two workers may ever share a workspace, a branch, a slot config, or a write boundary; overlap is rejected at spec-compile time and again at gate and merge time.",
+      "acceptance": "The isolation proof passes only when every worker attempt observes a workspace, branch, slot config, and write boundary distinct from every other concurrent attempt.",
+      "accountableProducer": "worktree isolation owner",
+      "dependencies": [],
+      "proofIds": [
+        "PROOF-ISOLATION"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "Isolation before concurrency. No two workers ever share a workspace, a branch, a slot config, or a write boundary. Overlap is rejected at spec-compile time and caught again at gate and merge time."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "REQ-GATE-TRUTH",
+      "statement": "Every chunk verdict must come from an independent gate re-running a sealed proof in a clean copy; worker narration, a coordinator log line, or a checkbox is never proof.",
+      "acceptance": "The gate-truth proof passes only when the independent gate's own clean-room rerun, not worker narration, produced the recorded verdict.",
+      "accountableProducer": "proof-kernel transplant owner",
+      "dependencies": [
+        "REQ-WORKER-ISOLATION"
+      ],
+      "proofIds": [
+        "PROOF-GATE-TRUTH"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "Gate-owned truth, always. No worker narration, coordinator log line, or checkbox is ever proof. Every chunk verdict comes from an independent gate re-running a sealed proof in a clean copy, and every product verdict comes from the validation lane."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "REQ-LEDGER-TRUTH",
+      "statement": "If an event is not recorded in the hash-chained WorkLedger it did not happen, and the run is degraded and cannot ship if ledger replay cannot reproduce the derived state.",
+      "acceptance": "The ledger-replay proof passes only when replaying the WorkLedger from genesis reproduces the exact derived state recorded during the run.",
+      "accountableProducer": "WorkLedger owner",
+      "dependencies": [
+        "REQ-GATE-TRUTH"
+      ],
+      "proofIds": [
+        "PROOF-LEDGER-TRUTH"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "The ledger is the run. If an event is not in the WorkLedger, it did not happen; if replaying the ledger cannot reproduce the derived state, the run is degraded and cannot ship."
+        }
+      ],
+      "confidence": "high"
+    }
+  ],
+  "proofs": [
+    {
+      "id": "PROOF-ISOLATION",
+      "requirementIds": [
+        "REQ-WORKER-ISOLATION"
+      ],
+      "command": "task verify:m1 -- worktree-isolation",
+      "positiveOracle": "Every worker attempt observes a workspace, branch, slot config, and write boundary distinct from every other concurrent attempt.",
+      "negativeControls": [
+        "two workers sharing one workspace or branch is rejected at spec-compile time",
+        "two workers sharing one write boundary is rejected at gate or merge time"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "Isolation before concurrency. No two workers ever share a workspace, a branch, a slot config, or a write boundary. Overlap is rejected at spec-compile time and caught again at gate and merge time."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "PROOF-GATE-TRUTH",
+      "requirementIds": [
+        "REQ-GATE-TRUTH"
+      ],
+      "command": "task verify:m0 -- gate-truth",
+      "positiveOracle": "The clean-room gate reruns the sealed proof in a fresh copy and the recorded verdict comes only from that independent rerun.",
+      "negativeControls": [
+        "worker-reported success without a matching gate verdict is refused",
+        "a coordinator log line alone cannot substitute for a gate verdict"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "Gate-owned truth, always. No worker narration, coordinator log line, or checkbox is ever proof. Every chunk verdict comes from an independent gate re-running a sealed proof in a clean copy, and every product verdict comes from the validation lane."
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "PROOF-LEDGER-TRUTH",
+      "requirementIds": [
+        "REQ-LEDGER-TRUTH"
+      ],
+      "command": "task verify:m0 -- ledger-replay",
+      "positiveOracle": "Replaying the hash-chained WorkLedger from genesis reproduces the exact derived state recorded during the run.",
+      "negativeControls": [
+        "an event missing from the WorkLedger cannot be treated as having happened",
+        "a replay that cannot reproduce the derived state marks the run degraded and unshippable"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "The ledger is the run. If an event is not in the WorkLedger, it did not happen; if replaying the ledger cannot reproduce the derived state, the run is degraded and cannot ship."
+        }
+      ],
+      "confidence": "high"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-WORKER-ISOLATION",
+      "title": "Implement worker isolation boundaries",
+      "description": "Ensure no two workers ever share a workspace, branch, slot config, or write boundary, rejecting overlap at spec-compile time and again at gate/merge time.",
+      "accountableProducer": "worktree isolation owner",
+      "requirementIds": [
+        "REQ-WORKER-ISOLATION"
+      ],
+      "dependencyTaskIds": [],
+      "proofIds": [
+        "PROOF-ISOLATION"
+      ],
+      "workflowId": "WORKFLOW-TRUST-KERNEL",
+      "documentIds": [
+        "DOCUMENT-TRUST-PLAN"
+      ],
+      "artifactIds": [],
+      "protectedActionIds": [],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "Isolation before concurrency. No two workers ever share a workspace, a branch, a slot config, or a write boundary. Overlap is rejected at spec-compile time and caught again at gate and merge time."
+        }
+      ]
+    },
+    {
+      "id": "TASK-GATE-TRUTH",
+      "title": "Implement the independent clean-room gate",
+      "description": "Bind every chunk verdict to an independent gate rerunning a sealed proof in a clean copy of an isolated worker attempt.",
+      "accountableProducer": "proof-kernel transplant owner",
+      "requirementIds": [
+        "REQ-GATE-TRUTH"
+      ],
+      "dependencyTaskIds": [
+        "TASK-WORKER-ISOLATION"
+      ],
+      "proofIds": [
+        "PROOF-GATE-TRUTH"
+      ],
+      "workflowId": "WORKFLOW-TRUST-KERNEL",
+      "documentIds": [],
+      "artifactIds": [],
+      "protectedActionIds": [],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "Gate-owned truth, always. No worker narration, coordinator log line, or checkbox is ever proof. Every chunk verdict comes from an independent gate re-running a sealed proof in a clean copy, and every product verdict comes from the validation lane."
+        }
+      ]
+    },
+    {
+      "id": "TASK-LEDGER-TRUTH",
+      "title": "Implement WorkLedger replay and truth binding",
+      "description": "Bind gate truth into a hash-chained WorkLedger that must replay to reproduce the exact derived state before a run may ship.",
+      "accountableProducer": "WorkLedger owner",
+      "requirementIds": [
+        "REQ-LEDGER-TRUTH"
+      ],
+      "dependencyTaskIds": [
+        "TASK-GATE-TRUTH"
+      ],
+      "proofIds": [
+        "PROOF-LEDGER-TRUTH"
+      ],
+      "workflowId": "WORKFLOW-TRUST-KERNEL",
+      "documentIds": [],
+      "artifactIds": [
+        "ARTIFACT-TRUST-PROOF"
+      ],
+      "protectedActionIds": [
+        "ACTION-LIVE-SHIP",
+        "ACTION-CLEANUP-DELETE"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "The ledger is the run. If an event is not in the WorkLedger, it did not happen; if replaying the ledger cannot reproduce the derived state, the run is degraded and cannot ship."
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "EDGE-GATE-AFTER-ISOLATION",
+      "fromTaskId": "TASK-GATE-TRUTH",
+      "toTaskId": "TASK-WORKER-ISOLATION",
+      "kind": "depends_on"
+    },
+    {
+      "id": "EDGE-LEDGER-AFTER-GATE",
+      "fromTaskId": "TASK-LEDGER-TRUTH",
+      "toTaskId": "TASK-GATE-TRUTH",
+      "kind": "depends_on"
+    }
+  ],
+  "workflows": [
+    {
+      "id": "WORKFLOW-TRUST-KERNEL",
+      "title": "Proof-kernel trust chain: isolation, gate, ledger",
+      "taskIds": [
+        "TASK-WORKER-ISOLATION",
+        "TASK-GATE-TRUTH",
+        "TASK-LEDGER-TRUTH"
+      ],
+      "entryTaskIds": [
+        "TASK-WORKER-ISOLATION"
+      ],
+      "terminalTaskIds": [
+        "TASK-LEDGER-TRUTH"
+      ],
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "The ledger is the run. If an event is not in the WorkLedger, it did not happen; if replaying the ledger cannot reproduce the derived state, the run is degraded and cannot ship."
+        }
+      ]
+    }
+  ],
+  "documents": [
+    {
+      "id": "DOCUMENT-TRUST-PLAN",
+      "taskId": "TASK-WORKER-ISOLATION",
+      "key": "plan",
+      "title": "Trust-kernel implementation plan",
+      "content": "Implement worker isolation, then the independent clean-room gate rerun, then hash-chained WorkLedger replay, in dependency order.",
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "Isolation before concurrency. No two workers ever share a workspace, a branch, a slot config, or a write boundary. Overlap is rejected at spec-compile time and caught again at gate and merge time."
+        }
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "ARTIFACT-TRUST-PROOF",
+      "taskId": "TASK-LEDGER-TRUTH",
+      "type": "proof",
+      "title": "Trust-kernel proof inventory",
+      "mimeType": "application/json",
+      "content": "{\"proof_ids\":[\"PROOF-ISOLATION\",\"PROOF-GATE-TRUTH\",\"PROOF-LEDGER-TRUTH\"]}",
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "The ledger is the run. If an event is not in the WorkLedger, it did not happen; if replaying the ledger cannot reproduce the derived state, the run is degraded and cannot ship."
+        }
+      ]
+    }
+  ],
+  "importIntents": [
+    {
+      "id": "IMPORT-CAMPAIGN",
+      "entityType": "campaign",
+      "entityId": "CAMPAIGN-CCC-AUTOCODE-NEO-V0.5.0",
+      "operation": "create",
+      "target": "project.missions"
+    },
+    {
+      "id": "IMPORT-TASK-ISOLATION",
+      "entityType": "task",
+      "entityId": "TASK-WORKER-ISOLATION",
+      "operation": "create",
+      "target": "project.tasks"
+    },
+    {
+      "id": "IMPORT-TASK-GATE",
+      "entityType": "task",
+      "entityId": "TASK-GATE-TRUTH",
+      "operation": "create",
+      "target": "project.tasks"
+    },
+    {
+      "id": "IMPORT-TASK-LEDGER",
+      "entityType": "task",
+      "entityId": "TASK-LEDGER-TRUTH",
+      "operation": "create",
+      "target": "project.tasks"
+    },
+    {
+      "id": "IMPORT-EDGE-ISOLATION-GATE",
+      "entityType": "dependency_edge",
+      "entityId": "EDGE-GATE-AFTER-ISOLATION",
+      "operation": "create",
+      "target": "project.tasks.dependencies"
+    },
+    {
+      "id": "IMPORT-EDGE-GATE-LEDGER",
+      "entityType": "dependency_edge",
+      "entityId": "EDGE-LEDGER-AFTER-GATE",
+      "operation": "create",
+      "target": "project.tasks.dependencies"
+    },
+    {
+      "id": "IMPORT-WORKFLOW",
+      "entityType": "workflow",
+      "entityId": "WORKFLOW-TRUST-KERNEL",
+      "operation": "create",
+      "target": "project.workflow_work_items"
+    },
+    {
+      "id": "IMPORT-DOCUMENT",
+      "entityType": "document",
+      "entityId": "DOCUMENT-TRUST-PLAN",
+      "operation": "create",
+      "target": "project.task_documents"
+    },
+    {
+      "id": "IMPORT-ARTIFACT",
+      "entityType": "artifact",
+      "entityId": "ARTIFACT-TRUST-PROOF",
+      "operation": "create",
+      "target": "project.artifacts"
+    },
+    {
+      "id": "IMPORT-SOURCES",
+      "entityType": "source",
+      "entityId": "SOURCE-CUSTODY-CCC-AUTOCODE-NEO-V0.5.0",
+      "operation": "create",
+      "target": "project.ccc_prd_import_sources"
+    },
+    {
+      "id": "IMPORT-WORK-ITEMS",
+      "entityType": "work_item",
+      "entityId": "WORKFLOW-TRUST-KERNEL",
+      "operation": "create",
+      "target": "project.workflow_work_items"
+    },
+    {
+      "id": "IMPORT-AUDIT",
+      "entityType": "run_audit",
+      "entityId": "CAMPAIGN-CCC-AUTOCODE-NEO-V0.5.0",
+      "operation": "create",
+      "target": "project.run_audit_events"
+    }
+  ],
+  "protectedActions": [
+    {
+      "id": "ACTION-LIVE-SHIP",
+      "kind": "live_execution",
+      "target": "ccc-autocode-neo:live-ship-run",
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "release requires one live successful SHIP run and a separate controlled live truthful-failure run, with different run IDs and independently verified capsules."
+        }
+      ]
+    },
+    {
+      "id": "ACTION-CLEANUP-DELETE",
+      "kind": "deletion",
+      "target": "ccc-autocode-neo:cleanup.apply",
+      "sourceRefs": [
+        {
+          "path": "260712-ccc-autocode-neo-PRODPRD-v0.5.0.md",
+          "exactQuote": "`neo cleanup (RUN_ID|--all-eligible) --dry-run` writes `cleanup_plan.v1`; `neo cleanup --apply --plan-sha256 SHA` applies only that plan. There is no force flag."
+        }
+      ]
+    }
+  ],
+  "bounds": {
+    "maxRequests": 6,
+    "maxDurationMs": 120000,
+    "maxConcurrency": 2
+  },
+  "admittedWriteRoots": [
+    {
+      "path": "/Users/ryanpappal/03_CODE/ccc-autocode-neo/.fusion/tasks",
+      "purpose": "task and prompt projection"
+    },
+    {
+      "path": "/Users/ryanpappal/03_CODE/ccc-autocode-neo/.fusion/artifacts",
+      "purpose": "text artifact projection"
+    }
+  ],
+  "targetRepository": {
+    "path": "/Users/ryanpappal/03_CODE/ccc-autocode-neo",
+    "baseCommit": "094404115cea7e610c9841c79a9c6401fbd6176f"
+  },
+  "nonGoals": [
+    "No live provider or vendor call.",
+    "No credential, billing, publication, merge, push, release, or physical deletion.",
+    "This frozen local oracle covers a representative executable slice; the unchanged packet remains the full authority."
+  ],
+  "unresolvedDecisions": [],
+  "ambiguities": [],
+  "exceptions": [],
+  "confidence": "high"
+}

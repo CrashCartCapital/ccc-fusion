@@ -5,6 +5,7 @@
  */
 
 import type { AgentState } from "./agent-state.js";
+import type { CccCampaignAuthorityBinding } from "../ccc-campaign/types.js";
 
 export type AgentCapability = "triage" | "executor" | "reviewer" | "merger" | "scheduler" | "engineer" | "custom";
 
@@ -273,7 +274,16 @@ export interface AgentPermissionPolicy {
 }
 
 /** Approval request lifecycle statuses. */
-export const APPROVAL_REQUEST_STATUSES = ["pending", "approved", "denied", "completed"] as const;
+export const APPROVAL_REQUEST_STATUSES = [
+  "pending",
+  "approved",
+  "denied",
+  "completed",
+  "issued",
+  "claimed",
+  "consumed",
+  "expired",
+] as const;
 
 /** A single approval request lifecycle status. */
 export type ApprovalRequestStatus = (typeof APPROVAL_REQUEST_STATUSES)[number];
@@ -284,6 +294,10 @@ export const APPROVAL_REQUEST_AUDIT_EVENT_TYPES = [
   "approved",
   "denied",
   "completed",
+  "issued",
+  "claimed",
+  "consumed",
+  "expired",
 ] as const;
 
 /** A single append-only audit event type for approval requests. */
@@ -360,6 +374,20 @@ export interface ApprovalRequestAuditEvent {
   createdAt: string;
 }
 
+/**
+ * Complete immutable authority carried by a native CCC campaign approval.
+ *
+ * The nested binding is intentionally all-or-nothing: campaign callers never
+ * receive or supply a partial provenance tuple.
+ */
+export interface CccCampaignApprovalAuthority {
+  binding: CccCampaignAuthorityBinding;
+  notBeforeAt: string;
+  expiresAt: string;
+  claimToken?: string;
+  claimedAt?: string;
+}
+
 /** Durable approval request record used by engine and dashboard surfaces. */
 export interface ApprovalRequest {
   id: string;
@@ -373,6 +401,8 @@ export interface ApprovalRequest {
   completedAt?: string;
   createdAt: string;
   updatedAt: string;
+  /** Present only for a complete native CCC campaign approval authority. */
+  campaign?: CccCampaignApprovalAuthority;
 }
 
 /** Create input for a new pending approval request. */
@@ -420,6 +450,12 @@ export function isValidApprovalRequestTransition(
   }
   if (from === "approved") {
     return to === "completed";
+  }
+  if (from === "issued") {
+    return to === "claimed" || to === "denied" || to === "expired";
+  }
+  if (from === "claimed") {
+    return to === "consumed" || to === "expired";
   }
   return false;
 }
@@ -1125,4 +1161,3 @@ export interface AgentPerformanceSummary {
   /** ISO-8601 timestamp when summary was computed */
   computedAt: string;
 }
-

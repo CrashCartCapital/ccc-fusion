@@ -1,7 +1,7 @@
 import type { WorkflowIrEdge, WorkflowIrNode, WorkflowLoopConfig, WorkflowOptionalGroupConfig } from "@fusion/core";
 import { WorkflowIrError } from "@fusion/core";
 
-import type { WorkflowNodeOutcome, WorkflowNodeResult } from "./workflow-graph-executor.js";
+import type { WorkflowMaterializedVisitIdentity, WorkflowNodeOutcome, WorkflowNodeResult } from "./workflow-graph-executor.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const MAX_ITERATIONS_CAP = 50;
@@ -22,6 +22,7 @@ export interface LoopEnvironment {
     node: WorkflowIrNode,
     signal?: AbortSignal,
     contextOverride?: Record<string, unknown>,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ) => Promise<WorkflowNodeResult>;
   shouldTraverseEdge: (edge: WorkflowIrEdge, source: WorkflowNodeResult) => boolean;
   signal?: AbortSignal;
@@ -161,7 +162,13 @@ export async function runLoop(
 
       const materializedId = `${loopNode.id}#${iteration}:${current.id}`;
       visitedNodeIds.push(materializedId);
-      lastResult = await env.runTemplateNode(current, env.signal, iterationContext);
+      const visitIdentity = Object.freeze({
+        nodeId: current.id,
+        loopNodeId: loopNode.id,
+        iteration,
+        materializedNodeId: materializedId,
+      });
+      lastResult = await env.runTemplateNode(current, env.signal, iterationContext, visitIdentity);
       if (lastResult.contextPatch) Object.assign(iterationContext, lastResult.contextPatch);
       iterationContext[`node:${current.id}:outcome`] = lastResult.outcome;
       if (lastResult.value !== undefined) iterationContext[`node:${current.id}:value`] = lastResult.value;
@@ -220,6 +227,7 @@ export interface OptionalGroupEnvironment {
     node: WorkflowIrNode,
     signal?: AbortSignal,
     contextOverride?: Record<string, unknown>,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ) => Promise<WorkflowNodeResult>;
   shouldTraverseEdge: (edge: WorkflowIrEdge, source: WorkflowNodeResult) => boolean;
   signal?: AbortSignal;
@@ -279,7 +287,12 @@ export async function runOptionalGroup(
 
     const materializedId = `${groupNode.id}::${current.id}`;
     visitedNodeIds.push(materializedId);
-    lastResult = await env.runTemplateNode(current, env.signal, groupContext);
+    const visitIdentity = Object.freeze({
+      nodeId: current.id,
+      materializedNodeId: materializedId,
+      optionalGroupNodeId: groupNode.id,
+    });
+    lastResult = await env.runTemplateNode(current, env.signal, groupContext, visitIdentity);
     if (lastResult.contextPatch) Object.assign(groupContext, lastResult.contextPatch);
     groupContext[`node:${current.id}:outcome`] = lastResult.outcome;
     if (lastResult.value !== undefined) groupContext[`node:${current.id}:value`] = lastResult.value;

@@ -127,6 +127,8 @@ export interface ResolveEffectivePostureArgs {
   adapter: CliAgentAdapter;
   /** Per-adapter operator settings (from GlobalSettings.cliAgents). */
   settings?: CliAgentResolveSettings | null;
+  /** Complete adapter settings after profile-specific expansion and validation. */
+  launchSettings?: CliAdapterLaunchSettings | null;
   /** The cli-agent node config (carries the autonomy field). */
   nodeConfig?: CliAgentNodeConfig | null;
 }
@@ -201,7 +203,10 @@ export function resolveEffectivePosture(
   const nodeConfig = args.nodeConfig ?? null;
 
   const { posture } = resolveIntentPosture(settings, nodeConfig);
-  const launchSettings = buildLaunchSettings(settings);
+  const launchSettings = {
+    ...(args.launchSettings ?? {}),
+    ...buildLaunchSettings(settings),
+  };
 
   // Build the EXACT argv the child would receive (folds posture flags + extra
   // args + command override). A buildLaunch failure (e.g. generic with no
@@ -213,8 +218,10 @@ export function resolveEffectivePosture(
     resolvedArgv = spec.args;
     resolvedCommand = spec.command;
   } catch {
-    resolvedArgv = [...(settings?.extraArgs ?? [])];
-    resolvedCommand = settings?.commandOverride;
+    resolvedArgv = [...(launchSettings.extraArgs as readonly string[] | undefined ?? [])];
+    resolvedCommand = typeof launchSettings.command === "string"
+      ? launchSettings.command
+      : undefined;
   }
 
   const flags: CliElevationFlag[] = [];
@@ -227,7 +234,6 @@ export function resolveEffectivePosture(
   // Channel: command override to a non-default path is privileged.
   if (
     typeof resolvedCommand === "string" &&
-    settings?.commandOverride &&
     typeof adapter.defaultCommand === "string" &&
     resolvedCommand !== adapter.defaultCommand
   ) {

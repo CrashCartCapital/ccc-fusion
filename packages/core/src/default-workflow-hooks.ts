@@ -71,6 +71,8 @@ export interface DefaultWorkflowMoveContext {
   fromColumn: string;
   toColumn: string;
   moveSource: "user" | "engine" | "scheduler";
+  /** Authoritative trait-aware hard-cancel classification from the task store. */
+  hardCancel?: boolean;
   /** True when guards + abort-on-exit are bypassed (engine/recovery, KTD-9). */
   bypassGuards: boolean;
   movedAt: string;
@@ -131,8 +133,9 @@ export function applyCompletionTimingEffects(ctx: DefaultWorkflowMoveContext): v
 export function applyResetOnEntryEffects(ctx: DefaultWorkflowMoveContext): void {
   const { task, fromColumn, toColumn, moveSource, options } = ctx;
   const isReopenToTodoOrTriage =
-    (fromColumn === "in-progress" || fromColumn === "done" || fromColumn === "in-review") &&
-    (toColumn === "todo" || toColumn === "triage");
+    ctx.hardCancel === true ||
+    ((fromColumn === "in-progress" || fromColumn === "done" || fromColumn === "in-review") &&
+      (toColumn === "todo" || toColumn === "triage"));
   if (!isReopenToTodoOrTriage) return;
 
   /*

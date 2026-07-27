@@ -81,6 +81,49 @@ function recordingSeams(calls: string[], overrides: Partial<Record<string, Workf
 }
 
 describe("WorkflowGraphTaskRunner (CU-U2)", () => {
+  it("Task 4 RED: forwards sealed node execution context through the legacy task runner wrapper", async () => {
+    const executionArgs: [unknown, unknown, unknown, unknown][] = [];
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "single prompt",
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "prompt", kind: "prompt", config: { prompt: "Do the thing" } },
+        { id: "zend", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "prompt" },
+        { from: "prompt", to: "zend", condition: "success" },
+      ],
+    };
+
+    const runner = new WorkflowGraphTaskRunner({
+      store: storeWith(definition(ir), "WF-001"),
+      seams: recordingSeams([]),
+      runCustomNode: async (_node, _task, _context, execution) => {
+        executionArgs.push([_node, _task, _context, execution]);
+        return { outcome: "success" };
+      },
+    });
+
+    await runner.run(task, flagOn);
+
+    const [, , , executionContext] = executionArgs[0];
+    const execution = (executionContext as { execution?: { runId?: string } })?.execution;
+    expect(executionArgs).toHaveLength(1);
+    expect(execution).toBeDefined();
+    expect(executionContext).toBeDefined();
+    expect(Object.isFrozen(execution)).toBe(true);
+    expect((execution as { runId?: string }).runId).toBe(`${task.id}:WF-001`);
+    expect((execution as { originTaskId?: string }).originTaskId).toBe(task.id);
+    expect((execution as { semanticTaskId?: string }).semanticTaskId).toBe(task.id);
+    expect(Object.isFrozen((execution as { visitIdentity?: unknown }).visitIdentity)).toBe(true);
+    expect((execution as { visitIdentity?: { nodeId: string; materializedNodeId: string } }).visitIdentity).toMatchObject({
+      nodeId: "prompt",
+      materializedNodeId: "prompt",
+    });
+  });
+
   it("runs the full lifecycle in graph order: custom → execute → review → merge → custom", async () => {
     const calls: string[] = [];
     const runner = new WorkflowGraphTaskRunner({
@@ -153,7 +196,7 @@ describe("WorkflowGraphTaskRunner (CU-U2)", () => {
       getTask: (id: string) => Promise<TaskDetail>;
     };
     const sendNotification = vi.fn(async () => ({ success: true, providerId: "mock" }));
-    const service = new NotificationService(store as any);
+    const service = new NotificationService(store as unknown as ConstructorParameters<typeof NotificationService>[0]);
     service.registerProvider({ getProviderId: () => "mock", isEventSupported: () => true, sendNotification });
     await service.start();
 

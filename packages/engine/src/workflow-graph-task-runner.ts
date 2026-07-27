@@ -133,7 +133,12 @@ export interface WorkflowGraphTaskRunnerDeps {
   /** Enabled pre-merge optional-step REVISE remediation seam. Additive; absent preserves prior graph traversal. */
   requestPreMergeOptionalStepFix?: WorkflowGraphExecutorDeps["requestPreMergeOptionalStepFix"];
   /** Project node-published task metadata onto the task row for dispatcher/UI. */
-  publishTaskProjection?: (taskId: string, patch: WorkflowTaskProjection, source: { nodeId: string; nodeKind: string }) => void | Promise<void>;
+  publishTaskProjection?: (
+    taskId: string,
+    patch: WorkflowTaskProjection,
+    source: { nodeId: string; nodeKind: string },
+    signal?: AbortSignal,
+  ) => void | Promise<void>;
   /** @deprecated use publishTaskProjection. */
   publishTouchedFiles?: (taskId: string, files: string[], source: { nodeId: string; nodeKind: string }) => void | Promise<void>;
   /**
@@ -302,7 +307,7 @@ export class WorkflowGraphTaskRunner {
         ? { stepReview: (t, c, cfg) => ((sideEffectsRan = true), invoked.push("step-review"), seams.stepReview!(t, c, cfg)) }
         : {}),
     };
-    const wrappedRunCustomNode: WorkflowCustomNodeRunner = (node, t, c) => {
+    const wrappedRunCustomNode: WorkflowCustomNodeRunner = (node, t, c, executionContext) => {
       if (!this.deps.primitives && (t as { executionMode?: unknown }).executionMode === "fast") {
         /*
         FNXC:WorkflowFastMode 2026-07-01-00:00:
@@ -325,7 +330,7 @@ export class WorkflowGraphTaskRunner {
       }
       sideEffectsRan = true;
       invoked.push(node.id);
-      return this.deps.runCustomNode(node, t, c);
+      return this.deps.runCustomNode(node, t, c, executionContext);
     };
     const wrappedPrimitives = this.deps.primitives
       ? new Proxy(this.deps.primitives, {

@@ -134,7 +134,7 @@ export class ProviderHealthMonitor {
 
     await Promise.all(stores.map(async (store) => {
       try {
-        const tasks = await store.listTasks();
+        const tasks = await store.listTasks({ slim: true, includeArchived: false });
         for (const task of tasks) {
           if (task.paused !== true || task.userPaused === true) continue;
           const providerId = providerIdFromRateLimitReason(task.pausedReason);

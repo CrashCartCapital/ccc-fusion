@@ -87,6 +87,11 @@ import { DEFAULT_COMMIT_AUTHOR_EMAIL, DEFAULT_COMMIT_AUTHOR_NAME } from "./workt
 import { installWorktreeDependencies } from "./merge-dependency-sync.js";
 import { activeSessionRegistry } from "./active-session-registry.js";
 import { resolveMcpServersForStore } from "./mcp-resolution.js";
+import { resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
+import {
+  campaignGitLandingRequiredResult,
+  type CccCampaignGitLandingFault,
+} from "./ccc-campaign-git-landing.js";
 /*
 FNXC:Workspace 2026-06-22-14:10 (Phase D review G — cycle dissolved):
 `isRepoLanded` + `FUSION_TASK_ID_TRAILER_KEY` moved to the dependency-free `workspace-land-predicate`
@@ -401,6 +406,8 @@ interface AgentDeps {
   reviewAgent?: (cwd: string, prompt: string) => Promise<string>;
   /** Run the mutating stash-conflict resolver in `cwd` (local checkout sync). */
   stashResolveAgent?: (cwd: string, prompt: string) => Promise<void>;
+  /** Test-only interruption seam for campaign native Git landing. */
+  cccCampaignGitLandingFault?: CccCampaignGitLandingFault;
 }
 
 /** Factory for a mutating AI agent bound to a fixed system prompt. */
@@ -1082,6 +1089,16 @@ export async function runAiMerge(
   deps: AgentDeps = {},
 ): Promise<MergeResult> {
   const task = await store.getTask(taskId);
+  const campaignCustody = await resolveCccCampaignMergeCustody(store, task);
+  if (campaignCustody.kind === "campaign") {
+    return campaignGitLandingRequiredResult(
+      store,
+      projectRootDir,
+      task,
+      campaignCustody.context,
+      deps.cccCampaignGitLandingFault,
+    );
+  }
   // FNXC:MergerUnification 2026-06-21-19:05:
   // Chokepoint R7 guard. runAiMerge is the SOLE merge path (master-plan U0), so it
   // self-enforces the workspace merge-boundary here — immediately after the task read

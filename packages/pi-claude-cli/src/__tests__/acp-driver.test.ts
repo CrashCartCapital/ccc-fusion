@@ -245,6 +245,44 @@ describe("connection reuse (item 1) — gated by FUSION_CLAUDE_ACP_REUSE", () =>
     (vi.mocked(spawn).mock.results[0].value as EventEmitter).emit("close", 0);
   });
 
+  it("cold-starts when an ordinary cached child is followed by ccc-fusion with the same session id", async () => {
+    process.env.FUSION_CLAUDE_ACP_REUSE = "1";
+    const savedForward = process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH;
+    const savedToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH = "1";
+    process.env.ANTHROPIC_AUTH_TOKEN = "synthetic-auth-token";
+    const sessionId = "conv-profile-boundary";
+    const ordinary = { ...OPTS, sessionId };
+    const ccc = { ...OPTS, sessionId, profile: "ccc-fusion", subscriptionReady: true } as const;
+    const ctx1 = { messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }] } as never;
+    const ctx2 = { messages: [...(ctx1 as unknown as { messages: unknown[] }).messages, { role: "user", content: "again" }] } as never;
+
+    try {
+      scriptedUpdates = [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ordinary" } }];
+      streamViaAcp(MODEL, ctx1, ordinary);
+      await flush();
+      expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
+      expect((vi.mocked(spawn).mock.calls[0][2] as { env?: NodeJS.ProcessEnv }).env?.ANTHROPIC_AUTH_TOKEN)
+        .toBe("synthetic-auth-token");
+
+      scriptedUpdates = [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ccc" } }];
+      streamViaAcp(MODEL, ctx2, ccc);
+      await flush();
+
+      expect(vi.mocked(spawn)).toHaveBeenCalledTimes(2);
+      expect((vi.mocked(spawn).mock.calls[1][2] as { env?: NodeJS.ProcessEnv }).env?.ANTHROPIC_AUTH_TOKEN)
+        .toBeUndefined();
+    } finally {
+      if (savedForward === undefined) delete process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH;
+      else process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH = savedForward;
+      if (savedToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+      else process.env.ANTHROPIC_AUTH_TOKEN = savedToken;
+      for (const result of vi.mocked(spawn).mock.results) {
+        (result.value as EventEmitter).emit("close", 0);
+      }
+    }
+  });
+
   it("fails a reuse turn FAST when the warm child dies mid-prompt (P0: no 30min hang)", async () => {
     process.env.FUSION_CLAUDE_ACP_REUSE = "1";
     const reuseOpts = { ...OPTS, sessionId: "conv-death" };
@@ -419,5 +457,34 @@ describe("buildBridgeEnv — R17 auth opt-in (item 3)", () => {
     // A caller trying to inject a different token via the supplied env must be ignored.
     const env = buildBridgeEnv({ HOME: "/h", PATH: "/b", ANTHROPIC_API_KEY: "attacker" } as NodeJS.ProcessEnv);
     expect(env.ANTHROPIC_API_KEY).toBe("real-from-env");
+  });
+
+  it("denies auth forwarding for the ccc-fusion profile even when the old opt-in is set", async () => {
+    vi.mocked(spawn).mockClear();
+    process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH = "1";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "fake-oauth-token";
+    process.env.ANTHROPIC_AUTH_TOKEN = "fake-auth-token";
+    const stream = streamViaAcp(MODEL, CTX, { ...OPTS, profile: "ccc-fusion", subscriptionReady: true } as any);
+    await flush();
+    expect(stream).toBeDefined();
+    const [, , options] = vi.mocked(spawn).mock.calls.at(-1) as any;
+    expect(options.env).toMatchObject({ HOME: "/h", PATH: "/b" });
+    expect(options.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(options.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(options.env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it("blocks ccc-fusion before the actual ACP bridge spawn without a ready preflight", () => {
+    vi.mocked(spawn).mockClear();
+    expect(() => streamViaAcp(MODEL, CTX, { ...OPTS, profile: "ccc-fusion" } as any))
+      .toThrow("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("blocks ccc-fusion before the actual ACP bridge spawn when subscription readiness is false", () => {
+    vi.mocked(spawn).mockClear();
+    expect(() => streamViaAcp(MODEL, CTX, { ...OPTS, profile: "ccc-fusion", subscriptionReady: false } as any))
+      .toThrow("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

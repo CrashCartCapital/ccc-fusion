@@ -283,4 +283,50 @@ describe("executor workflow-step model resolution", () => {
       "Workflow step 'Model Step' using model: mock-provider/mock-model (thinking effort: high) (workflow step override)",
     ]);
   });
+
+  it("settles a prompt-mode workflow step promptly when its execution signal aborts", async () => {
+    const store = createMockStore();
+    const executor = makeExecutor(store);
+    const controller = new AbortController();
+    let markPromptEntered!: () => void;
+    const promptEntered = new Promise<void>((resolve) => {
+      markPromptEntered = resolve;
+    });
+    const session = {
+      state: {},
+      subscribe: vi.fn(() => vi.fn()),
+      prompt: vi.fn(() => {
+        markPromptEntered();
+        return new Promise<void>(() => {});
+      }),
+      abort: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(),
+    };
+    mockedCreateFnAgent.mockResolvedValue({ session } as never);
+
+    const executorInternals = executor as unknown as {
+      executeWorkflowStep: (...args: unknown[]) => Promise<unknown>;
+      activeWorkflowStepSessions: Map<string, unknown>;
+    };
+    const execution = executorInternals.executeWorkflowStep(
+      baseTask(),
+      workflowStep(),
+      "/tmp/wt",
+      { workflowStepTimeoutMs: 60_000 },
+      undefined,
+      { signal: controller.signal },
+    );
+    await promptEntered;
+    controller.abort();
+
+    const result = await Promise.race([
+      execution,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("workflow step did not settle after abort")), 250)),
+    ]);
+
+    expect(result).toEqual({ success: false, error: "workflow step cancelled" });
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.dispose).toHaveBeenCalledOnce();
+    expect(executorInternals.activeWorkflowStepSessions.has("FN-MODEL-1")).toBe(false);
+  });
 });

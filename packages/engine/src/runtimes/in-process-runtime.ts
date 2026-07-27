@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { fileURLToPath } from "node:url";
 import type {
   TaskStore,
   Task,
@@ -53,8 +54,13 @@ import { SelfHealingManager, VALIDATOR_RUN_STALE_MAX_AGE_MS } from "../self-heal
 import { RestartRecoveryCoordinator } from "../restart-recovery-coordinator.js";
 import { MeshLeaseManager } from "../mesh-lease-manager.js";
 import { PluginRunner } from "../plugin-runner.js";
+import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-campaign-proof-host.js";
+import { isImportedCccCampaignWorkItem } from "../ccc-campaign-routing.js";
 import { MissionAutopilot } from "../mission-autopilot.js";
 import { MissionExecutionLoop } from "../mission-execution-loop.js";
+import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
+import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
+import { claimDueWorkflowWorkItem } from "../workflow-work-scheduler.js";
 import { TriageProcessor } from "../triage.js";
 import { EphemeralWorkerManager } from "../ephemeral-worker-manager.js";
 import { validateProjectNodeMapping } from "../node-dispatch-validation.js";
@@ -64,6 +70,7 @@ import { setImmediate as setImmediateCb } from "node:timers";
 import { resolvePreReleasePlanReviewNode } from "../hold-release.js";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
+const ENGINE_BUILT_ARTIFACT_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
 export const CLI_AGENT_AWAITING_INPUT_EVENT = "cli-agent-awaiting-input" as const;
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
@@ -317,6 +324,9 @@ export class InProcessRuntime
   private triageProcessor?: TriageProcessor;
   private workflowContinuationTimer?: ReturnType<typeof setInterval>;
   private workflowContinuationDrainActive = false;
+  private cccCampaignProofBootstrapPromise?: Promise<void>;
+  private cccCampaignProofBootstrapError?: Error;
+  private cccCampaignWorkflowRuntime?: WorkflowTaskRuntime;
   private messageStore?: MessageStore;
   private chatStore?: ChatStore;
   private detachAgentLinkSync?: () => void;
@@ -756,6 +766,8 @@ export class InProcessRuntime
             fusionDir: this.taskStore.getFusionDir(),
             asyncLayer,
             projectId: this.config.projectId,
+            rootDir: this.config.workingDirectory,
+            campaignAuthorityStore: this.taskStore,
             hookEndpointUrl: this.resolveCliAgentHookEndpointUrl(),
             onNotification: (info) => {
               /*
@@ -902,6 +914,7 @@ export class InProcessRuntime
       if (this.mergeRequester) {
         this.executor.setMergeRequester(this.mergeRequester);
       }
+      await this.ensureCccCampaignWorkflowRuntime(settings);
 
       this.worktreePool.setInvariantViolationHandler((violation: PoolInvariantViolation) => {
         void (async () => {
@@ -1969,6 +1982,120 @@ export class InProcessRuntime
     });
   }
 
+  private async ensureCccCampaignProofHostBootstrapped(): Promise<Error | undefined> {
+    if (this.cccCampaignProofBootstrapError) return this.cccCampaignProofBootstrapError;
+    if (!this.cccCampaignProofBootstrapPromise) {
+      this.cccCampaignProofBootstrapPromise = bootstrapCccCampaignProofAdmissionHost({
+        builtRootPath: ENGINE_BUILT_ARTIFACT_ROOT,
+      })
+        .then(() => undefined)
+        .catch((error) => {
+          const err = error instanceof Error ? error : new Error(String(error));
+          this.cccCampaignProofBootstrapError = err;
+          runtimeLog.error(`CCC campaign proof host bootstrap failed:`, err.message);
+          return undefined;
+        });
+    }
+    await this.cccCampaignProofBootstrapPromise;
+    return this.cccCampaignProofBootstrapError;
+  }
+
+  private async ensureCccCampaignWorkflowRuntime(
+    settings: Awaited<ReturnType<TaskStore["getSettings"]>>,
+  ): Promise<WorkflowTaskRuntime | undefined> {
+    if (this.cccCampaignWorkflowRuntime) return this.cccCampaignWorkflowRuntime;
+    const bootstrapError = await this.ensureCccCampaignProofHostBootstrapped();
+    if (bootstrapError) return undefined;
+    this.cccCampaignWorkflowRuntime = new WorkflowTaskRuntime({
+      store: this.taskStore,
+      primitives: this.executor.createAuthoritativeWorkflowPrimitives(settings),
+      runCustomNode: this.executor.createAuthoritativeWorkflowCustomNodeRunner(settings),
+      resolveNodeProviderController: this.executor.createCccCampaignWorkflowNodeProviderControllerResolver(),
+      handlers: {},
+    });
+    return this.cccCampaignWorkflowRuntime;
+  }
+
+  private async classifyCampaignWorkflowCandidate(
+    item: WorkflowWorkItem,
+  ): Promise<"campaign" | "ordinary"> {
+    if (isImportedCccCampaignWorkItem(item)) return "campaign";
+    const getCampaignContext = (this.taskStore as TaskStore & {
+      getCccCampaignContextForTask?: (taskId: string) => Promise<unknown | null> | unknown | null;
+    }).getCccCampaignContextForTask;
+    if (typeof getCampaignContext !== "function") {
+      runtimeLog.warn(
+        `Workflow continuation ${item.id}: campaign custody lookup is unwired — routing fail-closed through campaign processor`,
+      );
+      return "campaign";
+    }
+    try {
+      const custody = await getCampaignContext.call(this.taskStore, item.taskId);
+      return custody == null ? "ordinary" : "campaign";
+    } catch (error) {
+      runtimeLog.warn(
+        `Workflow continuation ${item.id}: campaign custody lookup failed — routing fail-closed through campaign processor: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return "campaign";
+    }
+  }
+
+  private async failCampaignWorkflowCandidateClosed(item: WorkflowWorkItem, error: Error): Promise<void> {
+    const transitionWorkflowWorkItem = (this.taskStore as TaskStore & {
+      transitionWorkflowWorkItem?: (
+        id: string,
+        state: "failed",
+        patch?: {
+          lastError?: string | null;
+          leaseOwner?: string | null;
+          leaseExpiresAt?: string | null;
+          expectedState?: "running";
+          expectedLeaseOwner?: string;
+          expectedAttempt?: number;
+          attempt?: number;
+        },
+      ) => Promise<WorkflowWorkItem> | WorkflowWorkItem;
+    }).transitionWorkflowWorkItem;
+    if (typeof transitionWorkflowWorkItem !== "function") {
+      runtimeLog.warn(
+        `Workflow continuation ${item.id}: fixed proof host unavailable and transitionWorkflowWorkItem is unwired`,
+      );
+      return;
+    }
+    try {
+      const leaseOwner = `in-process-runtime:${this.config.projectId}:bootstrap-refusal`;
+      const claimed = await claimDueWorkflowWorkItem(this.taskStore, {
+        leaseOwner,
+        leaseDurationMs: 10 * 60_000,
+        kinds: [item.kind],
+        bypassMissionSymbolAdmission: true,
+        exactCandidate: {
+          id: item.id,
+          runId: item.runId,
+          attempt: item.attempt,
+        },
+      });
+      if (!claimed) return;
+      await transitionWorkflowWorkItem.call(this.taskStore, claimed.workItem.id, "failed", {
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: `ccc-campaign-proof-host-bootstrap-failed:${error.message}`,
+        expectedState: "running",
+        expectedLeaseOwner: leaseOwner,
+        expectedAttempt: claimed.workItem.attempt,
+        attempt: claimed.workItem.attempt,
+      });
+    } catch (transitionError) {
+      runtimeLog.warn(
+        `Workflow continuation ${item.id}: failed to persist fixed proof host refusal: ${
+          transitionError instanceof Error ? transitionError.message : String(transitionError)
+        }`,
+      );
+    }
+  }
+
   private async drainWorkflowContinuations(): Promise<void> {
     /*
     FNXC:WorkflowScheduling 2026-07-21-12:20:
@@ -2008,6 +2135,31 @@ export class InProcessRuntime
           continue;
         }
         if (resolved.kind !== "actionable") continue;
+        const campaignCandidate = await this.classifyCampaignWorkflowCandidate(resolved.item);
+        if (campaignCandidate === "campaign") {
+          const settings = await this.taskStore.getSettings();
+          const campaignRuntime = await this.ensureCccCampaignWorkflowRuntime(settings);
+          if (!campaignRuntime) {
+            const bootstrapError = this.cccCampaignProofBootstrapError
+              ?? new Error("fixed proof-admission host bootstrap failed");
+            await this.failCampaignWorkflowCandidateClosed(resolved.item, bootstrapError);
+            continue;
+          }
+          void processDueWorkflowWorkItem(this.taskStore, campaignRuntime, settings, {
+            leaseOwner: `in-process-runtime:${this.config.projectId}`,
+            leaseDurationMs: 10 * 60_000,
+            kinds: [resolved.item.kind],
+            campaignRequired: true,
+            exactCandidate: {
+              id: resolved.item.id,
+              runId: resolved.item.runId,
+              attempt: resolved.item.attempt,
+            },
+          }).catch((error) => {
+            runtimeLog.error(`Workflow continuation ${resolved.item.id} campaign processor failed:`, error);
+          });
+          continue;
+        }
         void this.executor.execute(resolved.task).catch((error) => {
           runtimeLog.error(`Workflow continuation ${resolved.item.id} failed:`, error);
         });

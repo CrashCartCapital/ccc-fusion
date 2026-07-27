@@ -47,7 +47,7 @@ import { AssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { Api, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { buildPrompt, buildResumePrompt, buildSystemPrompt, type PiContext } from "./prompt-builder.js";
 import { createEventBridge } from "./event-bridge.js";
-import { registerProcess, captureStderr } from "./process-manager.js";
+import { assertCccFusionSubscriptionReady, registerProcess, captureStderr } from "./process-manager.js";
 import { isPiKnownClaudeTool } from "./tool-mapping.js";
 import type { ClaudeApiEvent } from "./types.js";
 
@@ -68,6 +68,10 @@ export type StreamViaAcpOptions = SimpleStreamOptions & {
   mcpServers?: AcpMcpServerSpec[];
   /** Env keys to forward to the bridge — filtered to the allow-list below regardless. */
   bridgeEnv?: NodeJS.ProcessEnv;
+  /** ccc-fusion never forwards auth/token material to the bridge. */
+  profile?: string;
+  /** Caller-supplied, non-secret structural readiness outcome for ccc-fusion. */
+  subscriptionReady?: true;
 };
 
 const INITIALIZE_TIMEOUT_MS = 30_000;
@@ -136,7 +140,7 @@ const BRIDGE_ENV_ALLOWLIST = [
  */
 const BRIDGE_AUTH_ENV_KEYS = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
 
-export function buildBridgeEnv(supplied?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function buildBridgeEnv(supplied?: NodeJS.ProcessEnv, profile?: string): NodeJS.ProcessEnv {
   const source = supplied ?? process.env;
   const env: NodeJS.ProcessEnv = {};
   for (const key of BRIDGE_ENV_ALLOWLIST) {
@@ -145,7 +149,12 @@ export function buildBridgeEnv(supplied?: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
   }
   // Opt-in only: forward a single Claude auth token from the operator's launch
   // env (always process.env, never the caller-supplied object).
-  if (process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH === "1") {
+  /*
+  FNXC:CCCSubscriptionPolicy 2026-07-23-13:15:
+  The legacy ACP opt-in remains available to ordinary Fusion sessions, but the
+  explicit ccc-fusion profile must deny it even when that parent flag is set.
+  */
+  if (profile !== "ccc-fusion" && process.env.FUSION_CLAUDE_ACP_FORWARD_AUTH === "1") {
     for (const key of BRIDGE_AUTH_ENV_KEYS) {
       const v = process.env[key];
       // Treat a whitespace-only value as absent, so a blank higher-preference
@@ -220,6 +229,7 @@ interface CachedAcpConn {
   child: ChildProcess;
   acpSessionId: string;
   cwd: string;
+  profile: string | undefined;
   inUse: boolean;
   router: AcpRouter;
   idleTimer?: ReturnType<typeof setTimeout>;
@@ -257,6 +267,7 @@ export function streamViaAcp(
   context: PiContext,
   options: StreamViaAcpOptions,
 ): AssistantMessageEventStream {
+  assertCccFusionSubscriptionReady(options.profile, options.subscriptionReady);
   // @ts-expect-error — pi-ai exports AssistantMessageEventStream as a type; the
   // constructor exists at runtime (same workaround as streamViaCli).
   const stream = new AssistantMessageEventStream();
@@ -472,6 +483,13 @@ export function streamViaAcp(
       // holds the prior turns server-side (sending full history would duplicate
       // it). Gated by `reuseKey`, which is undefined unless reuse is enabled.
       let warm = reuseKey ? acpSessionCache.get(reuseKey) : undefined;
+      // A cached ordinary child may carry opt-in auth forwarded at spawn time.
+      // Never cross a profile boundary through reuse: evict the old process so
+      // ccc-fusion always cold-starts with its explicit safe environment.
+      if (warm && warm.profile !== options.profile && reuseKey) {
+        evictCachedAcpConn(reuseKey, warm);
+        warm = undefined;
+      }
       // Never reuse a busy connection or one bound to a different cwd.
       if (warm && (warm.inUse || warm.cwd !== cwd)) warm = undefined;
       // A reuse turn sends only the delta; if there's nothing new to send, an
@@ -511,7 +529,7 @@ export function streamViaAcp(
         failWith(`ACP bridge path invalid (must be an absolute, existing binary): ${options.bridgePath}`);
         return;
       }
-      child = spawn(options.bridgePath, [], { stdio: ["pipe", "pipe", "pipe"], cwd, env: buildBridgeEnv(options.bridgeEnv) });
+      child = spawn(options.bridgePath, [], { stdio: ["pipe", "pipe", "pipe"], cwd, env: buildBridgeEnv(options.bridgeEnv, options.profile) });
       registerProcess(child);
       getStderr = captureStderr(child);
       // Stable router indirection: the long-lived connection + child handlers
@@ -558,7 +576,16 @@ export function streamViaAcp(
       // it. Only when reuse is enabled (reuseKey set) and the child is live.
       if (reuseKey) {
         myTurn = ++acpTurnCounter;
-        cacheEntry = { conn, child, acpSessionId: opened.sessionId, cwd, inUse: true, router, activeTurn: myTurn };
+        cacheEntry = {
+          conn,
+          child,
+          acpSessionId: opened.sessionId,
+          cwd,
+          profile: options.profile,
+          inUse: true,
+          router,
+          activeTurn: myTurn,
+        };
         acpSessionCache.set(reuseKey, cacheEntry);
       }
 

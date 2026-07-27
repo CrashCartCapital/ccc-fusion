@@ -155,6 +155,9 @@ export {
   WorkflowGraphExecutor,
   type WorkflowGraphExecutorDeps,
   type WorkflowGraphExecutorResult,
+  type WorkflowMaterializedVisitIdentity,
+  type WorkflowNodeSealedExecution,
+  type WorkflowNodeProviderControllerResolverInput,
 } from "./workflow-graph-executor.js";
 export {
   runSplitJoin,
@@ -298,6 +301,28 @@ export {
   type WorkflowTaskRuntimeDisposition,
   type WorkflowTaskRuntimeResult,
 } from "./workflow-task-runtime.js";
+export {
+  CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+  CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID,
+  computeCccCampaignProofAdmissionInputSha256,
+  createCccCampaignProofAdmissionEvaluatorInput,
+  evaluateCccCampaignProofAdmission,
+} from "./ccc-campaign-proof-admission.js";
+export {
+  bootstrapCccCampaignProofAdmissionHost,
+  type BootstrapCccCampaignProofAdmissionHostInput,
+} from "./ccc-campaign-proof-host.js";
+export {
+  createCccCampaignProofNodeAdmission,
+  type CccCampaignProofNodeAdmission,
+  type CccCampaignProofWorkflowStore,
+  type CccCampaignProofWorkItemFence,
+  type CreateCccCampaignProofNodeAdmissionInput,
+  type CccCampaignProofAdmissionExecutionBinding,
+} from "./ccc-campaign-proof-workflow.js";
 export { collectTaskEvaluationEvidence } from "./evaluator-evidence.js";
 export { Scheduler, type SchedulerOptions } from "./scheduler.js";
 export {
@@ -1164,3 +1189,18 @@ export {
   type ResolvedCliExecutorConfig,
   type LaunchCliTaskSessionOptions,
 } from "./cli-agent/task-session.js";
+export * from "./ccc-campaign-admission.js";
+export {
+  CccCampaignLocalGitError,
+  inspectCccCampaignLocalGit,
+  recheckCccCampaignLocalGit,
+  type CccCampaignLocalGitSnapshot,
+  type InspectCccCampaignLocalGitInput,
+} from "./ccc-campaign-local-git.js";
+export {
+  preDispatchCccCampaignProviderFromEngine,
+} from "./ccc-campaign-provider-controller.js";
+export type {
+  CccCampaignEngineProviderControllerInput,
+} from "./ccc-campaign-provider-controller.js";
+export * from "./ccc-prd/index.js";

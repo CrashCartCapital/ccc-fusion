@@ -1,4 +1,4 @@
-import type { Settings, TaskDetail, WorkflowIr, WorkflowIrArtifact, WorkflowIrNode, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
+import type { CccCampaignTaskContext, RunAuditEventInput, Settings, TaskDetail, WorkflowIr, WorkflowIrArtifact, WorkflowIrNode, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
 import {
   getBuiltinWorkflow,
   isBuiltinWorkflowId,
@@ -8,6 +8,7 @@ import {
 
 import {
   WorkflowGraphExecutor,
+  type WorkflowNodeExecutionFence,
   type WorkflowGraphExecutorDeps,
   type WorkflowNodeHandler,
   type WorkflowNodeOutcome,
@@ -22,8 +23,28 @@ import {
 import type { WorkflowRuntimePrimitives } from "./runtime-primitives.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { requiresNonEmptyWorkflowArtifact } from "./required-workflow-artifacts.js";
+import { PermanentError, TransientError } from "./engine-errors.js";
+import {
+  createCccCampaignProofNodeAdmission,
+  type CccCampaignProofNodeAdmission,
+} from "./ccc-campaign-proof-workflow.js";
+import { isImportedCccCampaignTask, isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
 
-export type WorkflowTaskRuntimeDisposition = "completed" | "failed" | "manual-required";
+export type WorkflowTaskRuntimeDisposition = "completed" | "failed" | "manual-required" | "cancelled";
+
+export interface WorkflowWorkItemFence {
+  workItemId: string;
+  leaseOwner: string;
+  attempt: number;
+  runId: string;
+  eventTimestamp: string;
+}
+
+export interface WorkflowTaskRuntimeRunOptions {
+  signal?: AbortSignal;
+  workItemFence?: WorkflowWorkItemFence;
+  deferCompletionSummary?: boolean;
+}
 
 export interface WorkflowTaskRuntimeResult {
   disposition: WorkflowTaskRuntimeDisposition;
@@ -33,21 +54,73 @@ export interface WorkflowTaskRuntimeResult {
   reason?: string;
 }
 
-export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps, "seams" | "runCustomNode"> {
+export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps, "seams" | "runCustomNode" | "executionFence"> {
   store: WorkflowIrResolverStore & {
     getTask?: (taskId: string) => Promise<TaskDetail>;
     getTaskDocument?: (taskId: string, key: string) => Promise<unknown | null>;
     updateTask?: (taskId: string, updates: { summary: string }) => Promise<unknown> | unknown;
     logEntry?: (taskId: string, action: string, detail?: string) => Promise<unknown> | unknown;
+    getCccCampaignContextForTask?: (
+      taskId: string,
+    ) => CccCampaignTaskContext | null | Promise<CccCampaignTaskContext | null>;
+    assertCccCampaignWorkflowLeaseFence?: (input: {
+      workItemId: string;
+      originTaskId: string;
+      leaseOwner: string;
+      attempt: number;
+      runId: string;
+    }) => Promise<void> | void;
     transitionWorkflowWorkItem?: (
       id: string,
       state: WorkflowWorkItemState,
-      patch?: { now?: string; lastError?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
-    ) => WorkflowWorkItem;
+      patch?: { now?: string; expectedState?: WorkflowWorkItemState; expectedLeaseOwner?: string | null; expectedAttempt?: number; attempt?: number; lastError?: string | null; blockedReason?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
+    ) => WorkflowWorkItem | Promise<WorkflowWorkItem>;
+    recordRunAuditEvent?: (input: RunAuditEventInput) => Promise<unknown> | unknown;
+    recordFencedCccCampaignProofAudit?: (input: {
+      workItemId: string;
+      originTaskId: string;
+      leaseOwner: string;
+      attempt: number;
+      runId: string;
+      event: RunAuditEventInput;
+    }) => Promise<unknown> | unknown;
   };
   primitives: WorkflowRuntimePrimitives;
   runCustomNode: WorkflowCustomNodeRunner;
   onEvent?: (event: { type: "start" | "terminal"; taskId: string; detail: string }) => void;
+}
+
+type WorkflowTaskRuntimeRunOptionsSnapshot = Readonly<{
+  signal?: AbortSignal;
+  workItemFence?: WorkflowWorkItemFence;
+  deferCompletionSummary?: boolean;
+}>;
+
+function snapshotWorkItemFence(fence: WorkflowWorkItemFence | undefined): WorkflowWorkItemFence | undefined {
+  if (!fence) return undefined;
+  return Object.freeze({
+    workItemId: fence.workItemId,
+    leaseOwner: fence.leaseOwner,
+    attempt: fence.attempt,
+    runId: fence.runId,
+    eventTimestamp: fence.eventTimestamp,
+  });
+}
+
+function snapshotRunOptions(options: WorkflowTaskRuntimeRunOptions): WorkflowTaskRuntimeRunOptionsSnapshot {
+  return Object.freeze({
+    signal: options.signal,
+    workItemFence: snapshotWorkItemFence(options.workItemFence),
+    deferCompletionSummary: options.deferCompletionSummary,
+  });
+}
+
+function createGraphExecutionFence(fence: WorkflowWorkItemFence): WorkflowNodeExecutionFence {
+  return Object.freeze({
+    workItemId: fence.workItemId,
+    attempt: fence.attempt,
+    runId: fence.runId,
+  });
 }
 
 /**
@@ -73,7 +146,13 @@ export class WorkflowTaskRuntime {
   public async run(
     task: TaskDetail,
     settings: (Pick<Settings, "experimentalFeatures"> & Partial<Settings>) | undefined,
+    options: WorkflowTaskRuntimeRunOptions = {},
   ): Promise<WorkflowTaskRuntimeResult> {
+    const runOptions = snapshotRunOptions(options);
+    const campaignCustodyRefusal = await this.campaignCustodyRefusal(task, runOptions);
+    if (campaignCustodyRefusal) return campaignCustodyRefusal;
+    const campaignFenceRefusal = await this.campaignFenceRefusal(task, runOptions);
+    if (campaignFenceRefusal) return campaignFenceRefusal;
     this.emit("start", task.id, "resolve-workflow");
 
     let target: WorkflowRuntimeTarget;
@@ -91,15 +170,51 @@ export class WorkflowTaskRuntime {
       };
     }
 
+    const runtimeRunId = runOptions.workItemFence?.runId ?? this.deps.runId ?? `${task.id}:${target.workflowId}`;
     const invoked: string[] = [];
+    const campaignProofAdmission = this.campaignProofAdmission(task, runOptions);
+    const graphExecutionFence = runOptions.workItemFence
+      ? createGraphExecutionFence(runOptions.workItemFence)
+      : undefined;
+    const {
+      store: _store,
+      onEvent: _onEvent,
+      resolveNodeExecution: ordinaryResolveNodeExecution,
+      resolveNodeProviderController: ordinaryResolveNodeProviderController,
+      admitNodeExecution: ordinaryAdmitNodeExecution,
+      executionFence: _executionFence,
+      ...graphDeps
+    } = this.deps as WorkflowTaskRuntimeDeps & { executionFence?: unknown };
+    const fencedCampaignRun = runOptions.workItemFence !== undefined;
     const executor = new WorkflowGraphExecutor({
-      ...this.deps,
+      ...graphDeps,
       primitives: this.deps.primitives,
       handlers: this.recordingHandlers(invoked),
+      ...(fencedCampaignRun
+        ? {
+            resolveNodeExecution: this.campaignNodeExecutionResolver(task),
+            // Presence is the native campaign enforcement marker. A missing
+            // producer remains a closed capability, not an ordinary plugin run.
+            resolveNodeProviderController: async (input) =>
+              ordinaryResolveNodeProviderController?.(input),
+            admitNodeExecution: (node, semanticTask, signal, visitIdentity, execution) =>
+              campaignProofAdmission?.(node, signal, execution && visitIdentity
+                ? { semanticTask, visitIdentity, execution }
+                : undefined),
+            executionFence: graphExecutionFence,
+          }
+        : {
+            ...(ordinaryResolveNodeExecution ? { resolveNodeExecution: ordinaryResolveNodeExecution } : {}),
+            ...(ordinaryResolveNodeProviderController
+              ? { resolveNodeProviderController: ordinaryResolveNodeProviderController }
+              : {}),
+            ...(ordinaryAdmitNodeExecution ? { admitNodeExecution: ordinaryAdmitNodeExecution } : {}),
+          }),
       // WorkflowTaskRuntime is the execution engine, so internally the graph
       // executor is authoritative even before the old feature flag plumbing is
       // deleted from legacy entry points.
-      runId: this.deps.runId ?? `${task.id}:${target.workflowId}`,
+      runId: runtimeRunId,
+      signal: runOptions.signal,
     });
 
     const runtimeSettings = buildWorkflowRuntimeSettings(settings);
@@ -117,8 +232,30 @@ export class WorkflowTaskRuntime {
         reason,
       };
     }
+    if (runOptions.signal?.aborted && result.outcome === "success") {
+      const reason = "workflow-aborted";
+      this.emit("terminal", task.id, `failed:${reason}`);
+      return {
+        disposition: "failed",
+        outcome: "failure",
+        visitedNodeIds: result.visitedNodeIds,
+        context: result.context,
+        reason,
+      };
+    }
     if (result.outcome === "success") {
       const missingArtifactKeys = await this.findMissingRequiredArtifacts(task.id, target.ir);
+      if (runOptions.signal?.aborted) {
+        const reason = "workflow-aborted";
+        this.emit("terminal", task.id, `failed:${reason}`);
+        return {
+          disposition: "failed",
+          outcome: "failure",
+          visitedNodeIds: result.visitedNodeIds,
+          context: result.context,
+          reason,
+        };
+      }
       if (missingArtifactKeys.length > 0) {
         const reason = `workflow-required-artifacts-missing:${missingArtifactKeys.join(",")}`;
         const context = {
@@ -134,21 +271,162 @@ export class WorkflowTaskRuntime {
           reason,
         };
       }
-      const latestTask = await this.deps.store.getTask?.(task.id).catch(() => undefined);
-      await ensureWorkflowCompletionSummary(this.deps.store, latestTask ?? task, {
-        reason: "workflow-runtime-completed",
-        workflowId: target.workflowId,
-        runId: this.deps.runId ?? `${task.id}:${target.workflowId}`,
-      }).catch(() => undefined);
+      if (!runOptions.deferCompletionSummary) {
+        const latestTask = await this.deps.store.getTask?.(task.id).catch(() => undefined);
+        await ensureWorkflowCompletionSummary(this.deps.store, latestTask ?? task, {
+          reason: "workflow-runtime-completed",
+          workflowId: target.workflowId,
+          runId: runtimeRunId,
+        }).catch(() => undefined);
+      }
     }
 
     const disposition: WorkflowTaskRuntimeDisposition = result.outcome === "success" ? "completed" : "failed";
     this.emit("terminal", task.id, disposition);
+    const reason = result.outcome === "failure" && runOptions.signal?.aborted ? "workflow-aborted" : undefined;
     return {
       disposition,
       outcome: result.outcome,
       visitedNodeIds: result.visitedNodeIds,
       context: result.context,
+      ...(reason ? { reason } : {}),
+    };
+  }
+
+  private async campaignCustodyRefusal(
+    task: TaskDetail,
+    options: WorkflowTaskRuntimeRunOptions,
+  ): Promise<WorkflowTaskRuntimeResult | undefined> {
+    const importedTask = isImportedCccCampaignTask(task);
+    const fencedInvocation = options.workItemFence !== undefined;
+    const getContext = this.deps.store.getCccCampaignContextForTask;
+    if (typeof getContext !== "function") {
+      return importedTask || fencedInvocation
+        ? this.campaignCustodyFailure(task.id, "ccc-campaign-custody-lookup-unwired")
+        : undefined;
+    }
+    let context: CccCampaignTaskContext | null;
+    try {
+      context = await getContext.call(this.deps.store, task.id);
+    } catch {
+      return importedTask || fencedInvocation
+        ? this.campaignCustodyFailure(task.id, "ccc-campaign-custody-lookup-error")
+        : undefined;
+    }
+    if (context && !options.workItemFence) {
+      return this.campaignCustodyFailure(task.id, "ccc-campaign-work-item-fence-required");
+    }
+    return (importedTask || fencedInvocation) && !context
+      ? this.campaignCustodyFailure(task.id, "ccc-campaign-custody-missing")
+      : undefined;
+  }
+
+  private campaignCustodyFailure(taskId: string, reason: string): WorkflowTaskRuntimeResult {
+    this.emit("terminal", taskId, `failed:${reason}`);
+    return {
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: [],
+      context: {},
+      reason,
+    };
+  }
+
+  private async campaignFenceRefusal(
+    task: TaskDetail,
+    options: WorkflowTaskRuntimeRunOptions,
+  ): Promise<WorkflowTaskRuntimeResult | undefined> {
+    const fence = options.workItemFence;
+    if (!fence) return undefined;
+    const assertFence = this.deps.store.assertCccCampaignWorkflowLeaseFence;
+    if (typeof assertFence !== "function") {
+      return this.campaignCustodyFailure(task.id, "ccc-campaign-work-item-fence-validator-unwired");
+    }
+    try {
+      await assertFence.call(this.deps.store, {
+        workItemId: fence.workItemId,
+        originTaskId: task.id,
+        leaseOwner: fence.leaseOwner,
+        attempt: fence.attempt,
+        runId: fence.runId,
+      });
+      return undefined;
+    } catch {
+      return this.campaignCustodyFailure(task.id, "ccc-campaign-work-item-fence-refused");
+    }
+  }
+
+  private campaignProofAdmission(
+    task: TaskDetail,
+    options: WorkflowTaskRuntimeRunOptions,
+  ): CccCampaignProofNodeAdmission | undefined {
+    if (!options.workItemFence) return undefined;
+    const getContext = this.deps.store.getCccCampaignContextForTask;
+    const recordAudit = this.deps.store.recordFencedCccCampaignProofAudit;
+    if (typeof getContext !== "function" || typeof recordAudit !== "function") {
+      return async () => {
+        throw new PermanentError(
+          "CCC campaign proof admission store is unwired",
+          "CCC_PROOF_ADMISSION_REFUSED",
+        );
+      };
+    }
+    return createCccCampaignProofNodeAdmission({
+      store: {
+        getCccCampaignContextForTask: (taskId) =>
+          getContext.call(this.deps.store, taskId),
+        recordFencedCccCampaignProofAudit: (input) =>
+          recordAudit.call(this.deps.store, input),
+      },
+      originTaskId: task.id,
+      fence: options.workItemFence,
+      requireExecutionBinding: true,
+    });
+  }
+
+  private campaignNodeExecutionResolver(originTask: TaskDetail): NonNullable<WorkflowGraphExecutorDeps["resolveNodeExecution"]> {
+    return async ({ node }) => {
+      const semanticTaskId = node.config?.cccPrdTaskId;
+      // Structural graph nodes do not execute a campaign task or proof and retain
+      // the origin task as their sealed semantic identity.
+      if (semanticTaskId === undefined && (node.kind === "start" || node.kind === "end" || node.kind === "split" || node.kind === "join" || node.kind === "foreach" || node.kind === "loop" || node.kind === "optional-group")) {
+        return { semanticTask: originTask };
+      }
+      if (typeof semanticTaskId !== "string" || semanticTaskId.length === 0 || semanticTaskId !== semanticTaskId.trim()) {
+        throw new PermanentError(
+          `CCC campaign semantic task id for node ${node.id} is missing or invalid`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      const getTask = this.deps.store.getTask;
+      if (typeof getTask !== "function") {
+        throw new PermanentError(
+          "CCC campaign semantic task store is unwired",
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      let semanticTask: TaskDetail | undefined;
+      try {
+        semanticTask = await getTask.call(this.deps.store, semanticTaskId);
+      } catch {
+        throw new PermanentError(
+          `CCC campaign semantic task ${semanticTaskId} lookup failed`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      if (!semanticTask) {
+        throw new PermanentError(
+          `CCC campaign semantic task ${semanticTaskId} is missing`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      if (semanticTask.id !== semanticTaskId) {
+        throw new PermanentError(
+          `CCC campaign semantic task identity does not match ${semanticTaskId}`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      return { semanticTask };
     };
   }
 
@@ -156,6 +434,8 @@ export class WorkflowTaskRuntime {
     workItem: WorkflowWorkItem,
     settings: (Pick<Settings, "experimentalFeatures"> & Partial<Settings>) | undefined,
   ): Promise<WorkflowTaskRuntimeResult> {
+    const campaignCustodyRefusal = await this.campaignWorkItemCustodyRefusal(workItem);
+    if (campaignCustodyRefusal) return campaignCustodyRefusal;
     if (!this.deps.store.getTask || !this.deps.store.transitionWorkflowWorkItem) {
       const reason = "workflow-work-item-store-unwired";
       this.emit("terminal", workItem.taskId, `work-item:failed:${reason}`);
@@ -167,27 +447,60 @@ export class WorkflowTaskRuntime {
         reason,
       };
     }
-    if (workItem.state !== "running") {
-      return this.failWorkItem(workItem, `workflow-work-item-not-running:${workItem.state}`);
-    }
-
     let task: TaskDetail;
     try {
       task = await this.deps.store.getTask(workItem.taskId);
     } catch (err) {
-      return this.failWorkItem(workItem, `workflow-work-item-task-missing:${err instanceof Error ? err.message : String(err)}`);
+      return await this.failWorkItem(workItem, `workflow-work-item-task-missing:${err instanceof Error ? err.message : String(err)}`);
     }
 
     let target: WorkflowRuntimeTarget;
     try {
       target = await this.resolveRuntimeTarget(workItem.taskId);
     } catch (err) {
-      return this.failWorkItem(workItem, `workflow-resolution-error: ${err instanceof Error ? err.message : String(err)}`);
+      return await this.failWorkItem(workItem, `workflow-resolution-error: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     const node = target.ir.nodes.find((candidate) => candidate.id === workItem.nodeId);
     if (!node) {
-      return this.failWorkItem(workItem, `workflow-work-item-node-missing:${workItem.nodeId}`);
+      return await this.failWorkItem(workItem, `workflow-work-item-node-missing:${workItem.nodeId}`);
+    }
+
+    const configuredRetries = Number(node.config?.maxRetries);
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const maxAttempts = Number.isFinite(configuredRetries) && configuredRetries >= 1
+      ? Math.min(10, Math.floor(configuredRetries))
+      : 1;
+    const currentAttempt = Math.max(1, workItem.attempt);
+    const claimedCccTransient = cccFusionTask
+      && workItem.state === "running"
+      && workItem.lastError?.startsWith("ccc-transient:") === true;
+    if (claimedCccTransient && currentAttempt >= maxAttempts) {
+      const reason = "ccc-transient-retry-exhausted";
+      await this.deps.store.transitionWorkflowWorkItem(workItem.id, "exhausted", {
+        attempt: currentAttempt,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: reason,
+      });
+      await this.recordWorkItemTransition(workItem, "exhausted", currentAttempt, "ccc-transient-exhausted");
+      this.emit("terminal", workItem.taskId, "work-item:failed");
+      return { disposition: "failed", outcome: "failure", visitedNodeIds: [], context: {}, reason };
+    }
+    if (workItem.state !== "running") {
+      if (cccFusionTask && workItem.state === "retrying" && currentAttempt >= maxAttempts) {
+        const reason = "ccc-transient-retry-exhausted";
+        await this.deps.store.transitionWorkflowWorkItem(workItem.id, "exhausted", {
+          attempt: currentAttempt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastError: reason,
+        });
+        await this.recordWorkItemTransition(workItem, "exhausted", currentAttempt, "ccc-transient-exhausted");
+        this.emit("terminal", workItem.taskId, "work-item:failed");
+        return { disposition: "failed", outcome: "failure", visitedNodeIds: [], context: {}, reason };
+      }
+      return await this.failWorkItem(workItem, `workflow-work-item-not-running:${workItem.state}`);
     }
 
     if (workItem.kind === "merge" || workItem.kind === "manual-hold") {
@@ -201,7 +514,7 @@ export class WorkflowTaskRuntime {
     const invoked: string[] = [];
     const handler = this.recordingHandlers(invoked)[node.kind];
     if (!handler && node.kind !== "start" && node.kind !== "end") {
-      return this.failWorkItem(workItem, `workflow-work-item-node-unhandled:${node.kind}`);
+      return await this.failWorkItem(workItem, `workflow-work-item-node-unhandled:${node.kind}`);
     }
 
     const runtimeSettings = buildWorkflowRuntimeSettings(settings);
@@ -215,17 +528,62 @@ export class WorkflowTaskRuntime {
       "workflow:work-item-attempt": workItem.attempt,
     };
 
-    try {
-      const result = handler
-        ? await handler(node, { task, settings: runtimeSettings, context })
-        : { outcome: "success" as const };
-      outcome = result.outcome;
-      if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
-      context = { ...context, ...(result.contextPatch ?? {}) };
-      reason = result.outcome === "failure" ? result.value ?? "workflow-work-item-node-failed" : undefined;
-    } catch (err) {
-      outcome = "failure";
-      reason = `workflow-work-item-node-error:${err instanceof Error ? err.message : String(err)}`;
+    /*
+    FNXC:CCCWorkItemRetry 2026-07-24-11:52:
+    `maxRetries` is the total invocation cap, including the first attempt. Only
+    native TransientError failures consume another bounded attempt; a
+    PermanentError is classified once and durably parked for operator action.
+    */
+    let attempt = currentAttempt;
+    if (claimedCccTransient) {
+      attempt += 1;
+      await this.deps.store.transitionWorkflowWorkItem(workItem.id, "running", { attempt, lastError: null });
+      await this.recordWorkItemTransition(workItem, "running", attempt, "ccc-transient-resume");
+    }
+    for (;;) {
+      try {
+        const result = handler
+          ? await handler(node, { task, settings: runtimeSettings, context })
+          : { outcome: "success" as const };
+        outcome = result.outcome;
+        if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
+        context = { ...context, ...(result.contextPatch ?? {}) };
+        reason = result.outcome === "failure" ? result.value ?? "workflow-work-item-node-failed" : undefined;
+        break;
+      } catch (err) {
+        if (cccFusionTask && err instanceof PermanentError) {
+          const reason = `ccc-permanent:${err.code}`;
+          await this.deps.store.transitionWorkflowWorkItem(workItem.id, "manual-required", {
+            attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastError: reason,
+            blockedReason: reason,
+          });
+          await this.recordWorkItemTransition(workItem, "manual-required", attempt, "ccc-permanent");
+          this.emit("terminal", workItem.taskId, "work-item:manual-required");
+          return { disposition: "manual-required", outcome: "failure", visitedNodeIds: invoked, context, reason };
+        }
+        if (cccFusionTask && err instanceof TransientError && attempt < maxAttempts) {
+          await this.deps.store.transitionWorkflowWorkItem(workItem.id, "retrying", {
+            attempt,
+            lastError: `ccc-transient:${err.code}`,
+          });
+          await this.recordWorkItemTransition(workItem, "retrying", attempt, "ccc-transient-retry");
+          attempt += 1;
+          await this.deps.store.transitionWorkflowWorkItem(workItem.id, "running", {
+            attempt,
+            lastError: null,
+          });
+          await this.recordWorkItemTransition(workItem, "running", attempt, "ccc-transient-resume");
+          continue;
+        }
+        outcome = "failure";
+        reason = cccFusionTask && err instanceof TransientError
+          ? `ccc-transient-retry-exhausted:${err.code}`
+          : `workflow-work-item-node-error:${err instanceof Error ? err.message : String(err)}`;
+        break;
+      }
     }
 
     const disposition: WorkflowTaskRuntimeDisposition = outcome === "success"
@@ -233,16 +591,27 @@ export class WorkflowTaskRuntime {
       : reason === "manual-required"
         ? "manual-required"
         : "failed";
-    const terminalState: WorkflowWorkItemState = disposition === "completed"
+    const terminalState: WorkflowWorkItemState = cccFusionTask && reason?.startsWith("ccc-transient-retry-exhausted:")
+      ? "exhausted"
+      : disposition === "completed"
       ? "succeeded"
       : disposition === "manual-required"
         ? "manual-required"
         : "failed";
-    this.deps.store.transitionWorkflowWorkItem(workItem.id, terminalState, {
+    await this.deps.store.transitionWorkflowWorkItem(workItem.id, terminalState, {
+      attempt,
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: reason ?? null,
     });
+    if (cccFusionTask) {
+      const classification = terminalState === "exhausted"
+        ? "ccc-transient-exhausted"
+        : terminalState === "succeeded"
+          ? "ccc-transient-succeeded"
+          : "ccc-work-item-failed";
+      await this.recordWorkItemTransition(workItem, terminalState, attempt, classification);
+    }
     this.emit("terminal", workItem.taskId, `work-item:${disposition}`);
     return {
       disposition,
@@ -253,8 +622,30 @@ export class WorkflowTaskRuntime {
     };
   }
 
-  private failWorkItem(workItem: WorkflowWorkItem, reason: string): WorkflowTaskRuntimeResult {
-    this.deps.store.transitionWorkflowWorkItem!(workItem.id, "failed", {
+  private async campaignWorkItemCustodyRefusal(
+    workItem: WorkflowWorkItem,
+  ): Promise<WorkflowTaskRuntimeResult | undefined> {
+    const importedWorkItem = isImportedCccCampaignWorkItem(workItem);
+    const getContext = this.deps.store.getCccCampaignContextForTask;
+    if (typeof getContext !== "function") {
+      return importedWorkItem
+        ? this.campaignCustodyFailure(workItem.taskId, "ccc-campaign-full-graph-processor-required")
+        : undefined;
+    }
+    try {
+      const context = await getContext.call(this.deps.store, workItem.taskId);
+      return context || importedWorkItem
+        ? this.campaignCustodyFailure(workItem.taskId, "ccc-campaign-full-graph-processor-required")
+        : undefined;
+    } catch {
+      return importedWorkItem
+        ? this.campaignCustodyFailure(workItem.taskId, "ccc-campaign-full-graph-processor-required")
+        : undefined;
+    }
+  }
+
+  private async failWorkItem(workItem: WorkflowWorkItem, reason: string): Promise<WorkflowTaskRuntimeResult> {
+    await this.deps.store.transitionWorkflowWorkItem!(workItem.id, "failed", {
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: reason,
@@ -267,6 +658,23 @@ export class WorkflowTaskRuntime {
       context: {},
       reason,
     };
+  }
+
+  private async recordWorkItemTransition(
+    workItem: WorkflowWorkItem,
+    state: WorkflowWorkItemState,
+    attempt: number,
+    classification: string,
+  ): Promise<void> {
+    await this.deps.store.recordRunAuditEvent?.({
+      taskId: workItem.taskId,
+      agentId: "workflow-task-runtime",
+      runId: workItem.runId,
+      domain: "database",
+      mutationType: "workflow:work-item-transition",
+      target: workItem.id,
+      metadata: { state, attempt, classification },
+    });
   }
 
   /**

@@ -5,6 +5,7 @@ import type * as ReviewerModule from "../reviewer.js";
 
 // Mock external dependencies
 vi.mock("../pi.js", () => ({
+  CCC_AWAIT_OWNED_TRANSPORT_CLOSURE: Symbol("cccAwaitOwnedTransportClosure"),
   createFnAgent: vi.fn(),
   describeModel: vi.fn().mockReturnValue("mock-provider/mock-model"),
   formatModelMarkerDetails: vi.fn((model: string, thinking?: string | null, annotations: string[] = []) => {

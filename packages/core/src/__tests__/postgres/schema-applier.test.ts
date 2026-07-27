@@ -76,12 +76,13 @@ import {
   SQLITE_MIGRATION_RUNTIME_READ_VERSION,
   WORKFLOW_TASK_CONTINUATIONS_VERSION,
   LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+  TASK_WEDGE_NOTIFICATION_VERSION,
+  CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+  CCC_CAMPAIGN_GOVERNANCE_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
 
-const PG_ADMIN_URL =
-  process.env.FUSION_PG_TEST_ADMIN_URL ?? "postgresql://localhost:5432/postgres";
 const PG_TEST_URL_BASE =
   process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
 const PG_AVAILABLE =
@@ -217,6 +218,16 @@ describe("schema-applier: immutable migration identities", () => {
     expect(applierSource).toMatch(/applied\.includes\(\s*BIGINT_COUNTERS_VERSION\s*\)/);
   });
 
+  it("registers the complete campaign-governance migration at 0037", () => {
+    expect(CCC_CAMPAIGN_GOVERNANCE_VERSION).toBe("0037");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0037");
+    const applierSource = readFileSync(
+      fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(applierSource).toContain("0037_ccc_campaign_governance.sql");
+    expect(applierSource).toMatch(/cccCampaignGovernanceAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_GOVERNANCE_VERSION\s*,?\s*\)/);
+  });
 });
 
 /*
@@ -252,6 +263,7 @@ describe("schema-applier: migration wiring integrity", () => {
     const unwired = migrationFiles.filter((f) => !applierSource.includes(f));
     expect(unwired).toEqual([]);
   });
+
 });
 
 /**
@@ -640,7 +652,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 93 project tables, 18 central tables, 1 archive table", async () => {
+  it("creates all 100 project tables, 18 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -659,9 +671,10 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 1 import_translation_cache (FNXC:GitHubImportTranslate 2026-07-15-09:30)
     // + 1 configuration_revisions (FNXC:ConfigVersioning 2026-07-18-14:00)
     // + 2 ideation_sessions/ideation_candidates (FNXC:Ideation 2026-07-18-13:25 / FN-8295)
-    // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305).
+    // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
+    // + 1 ccc_effect_receipts table, its authority turn, and 3 CCC PRD custody tables.
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(95);
+    expect(bySchema.project).toBe(100);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -1491,7 +1504,56 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
         updated_at text NOT NULL
       );
       /* FNXC:GitHubImportTranslate 2026-07-16-23:30: Later durable-task migrations run after this historical 0000 fixture, so retain their required task table surface. */
-      CREATE TABLE project.tasks (id text PRIMARY KEY);
+      CREATE TABLE project.tasks (
+        id text PRIMARY KEY,
+        "column" text,
+        status text,
+        paused integer,
+        user_paused integer,
+        paused_reason text
+      );
+      /* FNXC:WorkflowTaskContinuations: 0031 alters and indexes this pre-existing durable work-item surface. */
+      CREATE TABLE project.workflow_work_items (
+        id text PRIMARY KEY,
+        task_id text NOT NULL,
+        kind text NOT NULL,
+        state text NOT NULL,
+        blocked_reason text,
+        lease_owner text,
+        lease_expires_at text,
+        updated_at text NOT NULL
+      );
+      CREATE TABLE project.run_audit_events (
+        id text PRIMARY KEY,
+        timestamp text NOT NULL,
+        task_id text,
+        agent_id text NOT NULL,
+        run_id text NOT NULL,
+        domain text NOT NULL,
+        mutation_type text NOT NULL,
+        target text NOT NULL,
+        metadata jsonb
+      );
+      CREATE TABLE project.approval_requests (
+        id text PRIMARY KEY,
+        status text NOT NULL,
+        requester_actor_id text NOT NULL,
+        requester_actor_type text NOT NULL,
+        requester_actor_name text NOT NULL,
+        target_action_category text NOT NULL,
+        target_action_operation text NOT NULL,
+        target_action_summary text NOT NULL,
+        target_resource_type text NOT NULL,
+        target_resource_id text NOT NULL,
+        target_context jsonb,
+        task_id text,
+        run_id text,
+        requested_at text NOT NULL,
+        decided_at text,
+        completed_at text,
+        created_at text NOT NULL,
+        updated_at text NOT NULL
+      );
       /*
       FNXC:Ideation 2026-07-18-13:25:
       FN-8295 migration 0022 FKs ideation rows to missions/mission_features on (project_id, id).
@@ -1594,6 +1656,9 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1652,6 +1717,9 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 
@@ -1843,6 +1911,9 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 
@@ -1915,6 +1986,9 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 
@@ -1987,6 +2061,9 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       SQLITE_MIGRATION_RUNTIME_READ_VERSION,
       WORKFLOW_TASK_CONTINUATIONS_VERSION,
       LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION,
+      TASK_WEDGE_NOTIFICATION_VERSION,
+      CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
+      CCC_CAMPAIGN_GOVERNANCE_VERSION,
     ]);
   });
 });
@@ -2423,6 +2500,160 @@ pgDescribe("schema-applier: VAL-SCHEMA-007 plugin-owned tables materialize via s
     `)) as unknown as Array<{ n: number }>;
     expect(ms[0].n).toBe(0);
     expect(feats[0].n).toBe(0);
+  });
+});
+
+/*
+FNXC:CCCEffectReceipts 2026-07-23-22:20:
+Fresh-baseline coverage cannot prove that an already-deployed 0033 database
+receives the new receipt table. Materialize that exact bookkeeping/table shape,
+then use the real applier to prove the forward migration restores both the
+database boundary and fresh-baseline parity.
+*/
+pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
+  let ctx: TestContext | null = null;
+  let freshCtx: TestContext | null = null;
+
+  afterEach(async () => {
+    await teardownDb(ctx);
+    await teardownDb(freshCtx);
+    ctx = null;
+    freshCtx = null;
+  });
+
+  it("upgrades a 0033 receipt-less database with constrained forced-RLS receipt parity", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    // Construct the durable state of the last released schema: all bookkeeping
+    // through 0033, but no v2 receipt table or 0034 marker.
+    await ctx.db.execute(sql.raw(`
+      DROP TABLE IF EXISTS project.ccc_effect_receipts;
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0034', '0037');
+    `));
+    expect(await getAppliedMigrations(ctx.db)).toContain("0033");
+    expect(await getAppliedMigrations(ctx.db)).not.toContain("0034");
+    expect(await getAppliedMigrations(ctx.db)).not.toContain("0037");
+    const before = (await ctx.db.execute(sql`
+      SELECT to_regclass('project.ccc_effect_receipts') AS receipt_table
+    `)) as unknown as Array<{ receipt_table: string | null }>;
+    expect(before).toEqual([{ receipt_table: null }]);
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    expect(await getAppliedMigrations(ctx.db)).toContain("0034");
+    expect(await getAppliedMigrations(ctx.db)).toContain("0037");
+
+    const catalog = (await ctx.db.execute(sql`
+      SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,
+        EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'project.ccc_effect_receipts'::regclass
+            AND conname = 'ccc_effect_receipts_state_check'
+        ) AS state_check,
+        EXISTS (
+          SELECT 1 FROM pg_policies
+          WHERE schemaname = 'project' AND tablename = 'ccc_effect_receipts'
+            AND policyname = 'fusion_project_isolation'
+        ) AS policy,
+        EXISTS (
+          SELECT 1 FROM pg_indexes
+          WHERE schemaname = 'project' AND tablename = 'ccc_effect_receipts'
+            AND indexname = 'idx_ccc_effect_receipts_scope_authority_digest'
+        ) AS lookup_index
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'project' AND c.relname = 'ccc_effect_receipts'
+    `)) as unknown as Array<{
+      rls: boolean;
+      forced: boolean;
+      state_check: boolean;
+      policy: boolean;
+      lookup_index: boolean;
+    }>;
+    expect(catalog).toEqual([{
+      rls: true,
+      forced: true,
+      state_check: true,
+      policy: true,
+      lookup_index: true,
+    }]);
+
+    await expectPgError(ctx.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT set_config('fusion.project_id', 'project-a', true)`);
+      await tx.execute(sql`SELECT set_config('fusion.project_bypass', 'on', true)`);
+      await tx.execute(sql`
+        INSERT INTO project.ccc_effect_receipts(
+          effect_scope_id, logical_key, turn_key, slot_ordinal, tool_authority, arguments_digest,
+          state, controller_token, created_at, updated_at
+        ) VALUES (
+          'scope-invalid', 'invalid-state', 'turn-invalid', 0, 'tool.write', 'digest-invalid',
+          'impossible', 'controller-a', '2026-07-23T22:20:00.000Z', '2026-07-23T22:20:00.000Z'
+        )
+      `);
+    }), /ccc_effect_receipts_state_check|check constraint/i);
+
+    const role = `fusion_receipt_isolation_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+    await ctx.db.execute(sql.raw(`
+      CREATE ROLE ${role} NOLOGIN;
+      GRANT USAGE ON SCHEMA project TO ${role};
+      GRANT SELECT, INSERT, UPDATE, DELETE ON project.ccc_effect_receipts TO ${role};
+    `));
+    try {
+      await ctx.db.transaction(async (tx) => {
+        await tx.execute(sql.raw(`SET LOCAL ROLE ${role}`));
+        await tx.execute(sql`SELECT set_config('fusion.project_id', 'project-a', true)`);
+        await tx.execute(sql`
+          INSERT INTO project.ccc_effect_receipts(
+            effect_scope_id, logical_key, turn_key, slot_ordinal, tool_authority, arguments_digest,
+            state, controller_token, created_at, updated_at
+          ) VALUES (
+            'scope-a', 'effect-a', 'turn-a', 0, 'tool.write', 'digest-a',
+            'reserved', 'controller-a', '2026-07-23T22:20:00.000Z', '2026-07-23T22:20:00.000Z'
+          )
+        `);
+      });
+      await ctx.db.transaction(async (tx) => {
+        await tx.execute(sql.raw(`SET LOCAL ROLE ${role}`));
+        await tx.execute(sql`SELECT set_config('fusion.project_id', 'project-b', true)`);
+        const visible = (await tx.execute(sql`
+          SELECT logical_key FROM project.ccc_effect_receipts
+          WHERE effect_scope_id = 'scope-a'
+        `)) as unknown as Array<{ logical_key: string }>;
+        expect(visible).toEqual([]);
+        const mutated = (await tx.execute(sql`
+          UPDATE project.ccc_effect_receipts
+          SET state = 'proved_failed'
+          WHERE effect_scope_id = 'scope-a' AND logical_key = 'effect-a'
+          RETURNING logical_key
+        `)) as unknown as Array<{ logical_key: string }>;
+        expect(mutated).toEqual([]);
+      });
+    } finally {
+      await ctx.db.execute(sql.raw(`DROP OWNED BY ${role}; DROP ROLE ${role};`));
+    }
+
+    const receiptShape = async (target: TestContext) => ({
+      columns: await target.db.execute(sql`
+        SELECT column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = 'project' AND table_name = 'ccc_effect_receipts'
+        ORDER BY ordinal_position
+      `),
+      constraints: await target.db.execute(sql`
+        SELECT conname, contype, pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint
+        WHERE conrelid = 'project.ccc_effect_receipts'::regclass
+        ORDER BY conname
+      `),
+      indexes: await target.db.execute(sql`
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'project' AND tablename = 'ccc_effect_receipts'
+        ORDER BY indexname
+      `),
+    });
+    freshCtx = await setupFreshDb();
+    await applySchemaBaseline(freshCtx.db, { pluginHooks: [] });
+    expect(await receiptShape(ctx)).toEqual(await receiptShape(freshCtx));
   });
 });
 

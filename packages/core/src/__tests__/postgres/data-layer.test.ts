@@ -28,11 +28,12 @@
  * gate stays green without a running server.
  */
 
-import { describe, it, expect, afterEach, beforeAll } from "vitest";
+import { describe, it, expect, afterAll, afterEach, beforeAll, beforeEach } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   createAsyncDataLayer,
   recordRunAuditEvent,
@@ -40,10 +41,30 @@ import {
   type AsyncDataLayer,
   type RunAuditEventInput,
 } from "../../postgres/data-layer.js";
+import { queryRunAuditEvents } from "../../task-store/async-audit.js";
 import { createConnectionSetFromUrl } from "../../postgres/connection.js";
 import type { ResolvedBackend } from "../../postgres/backend-resolver.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import * as schema from "../../postgres/schema/index.js";
+import { importCccPrdBundle } from "../../index.js";
+import {
+  createCccCampaignAuthorityBinding,
+} from "../../ccc-campaign/canonical.js";
+import { canonicalCccPrdJson } from "../../ccc-prd/contract.js";
+import type {
+  CccCampaignAuthorityBinding,
+  CccCampaignContext,
+} from "../../ccc-campaign/types.js";
+import {
+  createSharedPgTaskStoreTestHarness,
+  pgDescribe as sharedPgDescribe,
+  type SharedPgTaskStoreHarness,
+} from "../../__test-utils__/pg-test-harness.js";
+import {
+  createCccPrdImportTestBundle,
+  createCccPrdImportTestExecutionPolicy,
+  rehashCccPrdImportTestBundle,
+} from "../../__test-utils__/ccc-prd-import-fixture.js";
 
 const PG_ADMIN_URL =
   process.env.FUSION_PG_TEST_ADMIN_URL ?? "postgresql://localhost:5432/postgres";
@@ -541,5 +562,469 @@ pgDescribe("AsyncDataLayer: interface stability and connectivity", () => {
     expect(typeof ctx.layer.transactionImmediate).toBe("function");
     expect(typeof ctx.layer.ping).toBe("function");
     expect(typeof ctx.layer.close).toBe("function");
+  });
+});
+
+type CampaignContextStore = {
+  getCccCampaignContextForTask(taskId: string): Promise<CccCampaignContext | null>;
+};
+
+type CampaignProofAuditStore = CampaignContextStore & {
+  listWorkflowWorkItemsForTask(taskId: string): Promise<Array<{
+    id: string;
+    runId: string;
+  }>>;
+  transitionWorkflowWorkItem(
+    id: string,
+    state: "running" | "cancelled",
+    patch: Record<string, unknown>,
+  ): Promise<unknown>;
+  recordFencedCccCampaignProofAudit(input: {
+    workItemId: string;
+    originTaskId: string;
+    leaseOwner: string;
+    attempt: number;
+    runId: string;
+    event: RunAuditEventInput;
+  }): Promise<void>;
+};
+
+function campaignAuditInput(
+  binding: CccCampaignAuthorityBinding,
+  eventKey: string,
+  overrides: Partial<RunAuditEventInput> = {},
+): RunAuditEventInput & { campaign: { eventKey: string; binding: CccCampaignAuthorityBinding } } {
+  return {
+    timestamp: "2026-07-25T12:00:00.000Z",
+    taskId: binding.taskId,
+    agentId: "ccc-audit-agent",
+    runId: "ccc-audit-run",
+    domain: "database",
+    mutationType: "ccc-campaign:audit",
+    target: binding.actionTarget,
+    metadata: { result: "accepted", nested: { ordinal: 1 } },
+    ...overrides,
+    campaign: { eventKey, binding },
+  };
+}
+
+function forgedCampaignBinding(
+  binding: CccCampaignAuthorityBinding,
+): CccCampaignAuthorityBinding {
+  const { bindingHash: _originalBindingHash, ...baseFields } = binding;
+  const fields: Omit<CccCampaignAuthorityBinding, "bindingHash"> = {
+    ...baseFields,
+    actionId: "forged-audit-action",
+    actionTarget: "audit-target:forged-audit-action",
+    packetHash: createHash("sha256").update("forged-packet", "utf8").digest("hex"),
+    targetRepository: "/tmp/forged-campaign-target",
+    targetBase: "forged-base-commit",
+    providerId: "forged-provider",
+    modelId: "forged-model",
+  };
+  return {
+    ...fields,
+    bindingHash: createHash("sha256")
+      .update(canonicalCccPrdJson(fields), "utf8")
+      .digest("hex"),
+  };
+}
+
+function forgedUndeclaredActionBinding(
+  binding: CccCampaignAuthorityBinding,
+): CccCampaignAuthorityBinding {
+  const { bindingHash: _originalBindingHash, ...baseFields } = binding;
+  const fields: Omit<CccCampaignAuthorityBinding, "bindingHash"> = {
+    ...baseFields,
+    actionId: "undeclared-audit-action",
+    actionTarget: "audit-target:undeclared-audit-action",
+  };
+  return {
+    ...fields,
+    bindingHash: createHash("sha256")
+      .update(canonicalCccPrdJson(fields), "utf8")
+      .digest("hex"),
+  };
+}
+
+function forgedProofBinding(
+  binding: CccCampaignAuthorityBinding,
+  proofId: string,
+  inputSha256: string,
+): CccCampaignAuthorityBinding {
+  const { bindingHash: _originalBindingHash, ...baseFields } = binding;
+  const fields: Omit<CccCampaignAuthorityBinding, "bindingHash"> = {
+    ...baseFields,
+    actionId: `proof:${proofId}`,
+    actionTarget: inputSha256,
+  };
+  return {
+    ...fields,
+    bindingHash: createHash("sha256")
+      .update(canonicalCccPrdJson(fields), "utf8")
+      .digest("hex"),
+  };
+}
+
+function withProtectedCampaignAction(
+  source: ReturnType<typeof createCccPrdImportTestBundle>,
+  actionId: string,
+  actionTarget: string,
+): ReturnType<typeof createCccPrdImportTestBundle> {
+  return rehashCccPrdImportTestBundle({
+    ...source,
+    tasks: source.tasks.map((task, index) => index === 0
+      ? { ...task, protectedActionIds: [actionId] }
+      : task),
+    protectedActions: [{
+      id: actionId,
+      kind: "merge",
+      target: actionTarget,
+      operatorDecision: "approve_merge",
+      requiresOperatorDecision: true,
+      spans: [source.tasks[0]!.spans[0]!],
+    }],
+  });
+}
+
+const campaignPgDescribe = sharedPgDescribe;
+
+campaignPgDescribe("AsyncDataLayer: CCC campaign run-audit receipts", () => {
+  const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
+    prefix: "fusion_run_audit_campaign",
+  });
+  let custodyOrdinal = 0;
+
+  beforeAll(h.beforeAll);
+  beforeEach(h.beforeEach);
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
+
+  async function admittedBinding(actionId = "audit-action"): Promise<CccCampaignAuthorityBinding> {
+    const suffix = `run-audit-${custodyOrdinal++}`;
+    const actionTarget = `audit-target:${actionId}`;
+    const source = withProtectedCampaignAction(
+      createCccPrdImportTestBundle(h.rootDir(), suffix),
+      actionId,
+      actionTarget,
+    );
+    await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+      idempotencyKey: `run-audit-custody-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const context = await (h.store() as unknown as CampaignContextStore)
+      .getCccCampaignContextForTask(`TASK-${suffix}`);
+    expect(context).not.toBeNull();
+    return createCccCampaignAuthorityBinding(context!, {
+      actionId,
+      actionTarget,
+      requireProtected: true,
+    });
+  }
+
+  async function liveProofAuditFixture(label: string) {
+    const store = h.store() as unknown as CampaignProofAuditStore;
+    const binding = forgedProofBinding(
+      await admittedBinding(),
+      `PROOF-${label}`,
+      createHash("sha256").update(label, "utf8").digest("hex"),
+    );
+    const [workItem] = await store.listWorkflowWorkItemsForTask(binding.taskId);
+    expect(workItem).toBeDefined();
+    const leaseOwner = `proof-worker-${label}`;
+    const attempt = 2;
+    await store.transitionWorkflowWorkItem(workItem!.id, "running", {
+      attempt,
+      leaseOwner,
+      leaseExpiresAt: "2999-07-25T12:00:00.000Z",
+    });
+    const event = campaignAuditInput(
+      binding,
+      `campaign-proof-audit-${label}`,
+      {
+        agentId: leaseOwner,
+        runId: workItem!.runId,
+        mutationType: "ccc-campaign:proof-admission",
+      },
+    );
+    return {
+      store,
+      binding,
+      workItem: workItem!,
+      leaseOwner,
+      attempt,
+      event,
+      input: {
+        workItemId: workItem!.id,
+        originTaskId: binding.taskId,
+        leaseOwner,
+        attempt,
+        runId: workItem!.runId,
+        event,
+      },
+    };
+  }
+
+  it("replays an identical campaign event as one native row with the same identity", async () => {
+    const binding = await admittedBinding();
+    const input = campaignAuditInput(binding, "campaign-audit-event-1");
+
+    const first = await recordRunAuditEvent(h.layer(), input);
+    const second = await recordRunAuditEvent(h.layer(), input);
+    const rows = await queryRunAuditEvents(h.layer().db, { runId: input.runId });
+
+    expect(second).toEqual(first);
+    expect(second.id).toBe(first.id);
+    expect(rows).toEqual([first]);
+  });
+
+  it("refuses a reused campaign event key when action or binding changes", async () => {
+    const binding = await admittedBinding();
+    const first = campaignAuditInput(binding, "campaign-audit-event-collision");
+    await recordRunAuditEvent(h.layer(), first);
+
+    const changedBinding = await admittedBinding("audit-action-changed");
+    await expect(recordRunAuditEvent(
+      h.layer(),
+      campaignAuditInput(changedBinding, "campaign-audit-event-collision"),
+    )).rejects.toMatchObject({ code: "CCC_RUN_AUDIT_EVENT_COLLISION" });
+
+    expect(await queryRunAuditEvents(h.layer().db, { runId: first.runId })).toHaveLength(1);
+  });
+
+  it("refuses a reused campaign event key when payload or metadata changes", async () => {
+    const binding = await admittedBinding();
+    const first = campaignAuditInput(binding, "campaign-audit-event-payload");
+    await recordRunAuditEvent(h.layer(), first);
+
+    await expect(recordRunAuditEvent(
+      h.layer(),
+      campaignAuditInput(binding, "campaign-audit-event-payload", {
+        metadata: { nested: { ordinal: 2 }, result: "changed" },
+      }),
+    )).rejects.toMatchObject({ code: "CCC_RUN_AUDIT_EVENT_COLLISION" });
+
+    expect(await queryRunAuditEvents(h.layer().db, { runId: first.runId })).toHaveLength(1);
+  });
+
+  it("concurrently replays an identical campaign event as one native row", async () => {
+    const binding = await admittedBinding();
+    const input = campaignAuditInput(binding, "campaign-audit-event-concurrent");
+    const [left, right] = await Promise.all([
+      recordRunAuditEvent(h.layer(), input),
+      recordRunAuditEvent(h.layer(), input),
+    ]);
+
+    expect(left.id).toBe(right.id);
+    expect(await queryRunAuditEvents(h.layer().db, { runId: input.runId })).toHaveLength(1);
+  });
+
+  it("rolls a campaign event back with its caller transaction", async () => {
+    const binding = await admittedBinding();
+    const input = campaignAuditInput(binding, "campaign-audit-event-rollback");
+
+    await expect(h.layer().transactionImmediate(async (tx) => {
+      await recordRunAuditEventWithinTransaction(tx, input);
+      throw new Error("campaign audit rollback");
+    })).rejects.toThrow("campaign audit rollback");
+
+    expect(await queryRunAuditEvents(h.layer().db, { runId: input.runId })).toEqual([]);
+  });
+
+  it("refuses a caller-minted campaign binding that does not match persisted custody", async () => {
+    const binding = await admittedBinding();
+    const forged = forgedCampaignBinding(binding);
+    const input = campaignAuditInput(
+      forged,
+      "campaign-audit-event-forged-binding",
+      { runId: "ccc-audit-run-forged-binding" },
+    );
+
+    await expect(recordRunAuditEvent(h.layer(), input))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_CONTEXT_REFUSED" });
+    expect(await queryRunAuditEvents(h.layer().db, { runId: input.runId })).toEqual([]);
+  });
+
+  it("records and idempotently replays a non-protected proof action, then rejects changed payload", async () => {
+    const binding = await admittedBinding();
+    const proofBinding = forgedUndeclaredActionBinding(binding);
+    const input = campaignAuditInput(
+      proofBinding,
+      "campaign-audit-event-proof-action",
+      { runId: "ccc-audit-run-proof-action" },
+    );
+
+    const first = await recordRunAuditEvent(h.layer(), input);
+    await expect(recordRunAuditEvent(h.layer(), input)).resolves.toEqual(first);
+    await expect(recordRunAuditEvent(h.layer(), {
+      ...input,
+      metadata: { nested: { ordinal: 2 }, result: "changed" },
+    })).rejects.toMatchObject({ code: "CCC_RUN_AUDIT_EVENT_COLLISION" });
+    expect(await queryRunAuditEvents(h.layer().db, { runId: input.runId })).toEqual([first]);
+  });
+
+  it("preserves campaign custody through the public TaskStore audit seam", async () => {
+    const binding = forgedUndeclaredActionBinding(await admittedBinding());
+    const input = campaignAuditInput(
+      binding,
+      "campaign-audit-event-store-seam",
+      { runId: "ccc-audit-run-store-seam" },
+    );
+
+    const recorded = await h.store().recordRunAuditEvent(input);
+    const rows = await queryRunAuditEvents(h.layer().db, { runId: input.runId });
+
+    expect(recorded.campaign).toEqual(input.campaign);
+    expect(rows).toEqual([expect.objectContaining({ campaign: input.campaign })]);
+  });
+
+  it("refuses a proof pass receipt after the workflow lease owner changes", async () => {
+    const fixture = await liveProofAuditFixture("owner-race");
+    await fixture.store.transitionWorkflowWorkItem(fixture.workItem.id, "running", {
+      expectedState: "running",
+      expectedLeaseOwner: fixture.leaseOwner,
+      expectedAttempt: fixture.attempt,
+      attempt: fixture.attempt,
+      leaseOwner: "proof-worker-2",
+      leaseExpiresAt: "2999-07-25T12:00:00.000Z",
+    });
+
+    await expect(fixture.store.recordFencedCccCampaignProofAudit(fixture.input))
+      .rejects.toMatchObject({ code: "CCC_PROOF_AUDIT_LEASE_REFUSED" });
+    expect(await queryRunAuditEvents(h.layer().db, {
+      runId: fixture.workItem.runId,
+      mutationType: "ccc-campaign:proof-admission",
+    })).toEqual([]);
+  });
+
+  it("records and idempotently replays a proof receipt only behind the exact live lease", async () => {
+    const fixture = await liveProofAuditFixture("live");
+
+    await fixture.store.recordFencedCccCampaignProofAudit(fixture.input);
+    await fixture.store.recordFencedCccCampaignProofAudit(fixture.input);
+
+    const rows = await queryRunAuditEvents(h.layer().db, {
+      runId: fixture.workItem.runId,
+      mutationType: "ccc-campaign:proof-admission",
+    });
+    expect(rows).toEqual([
+      expect.objectContaining({
+        campaign: fixture.event.campaign,
+        target: fixture.binding.actionTarget,
+      }),
+    ]);
+  });
+
+  it("refuses a proof receipt after cancellation even when owner and attempt still match", async () => {
+    const fixture = await liveProofAuditFixture("cancelled");
+    await fixture.store.transitionWorkflowWorkItem(fixture.workItem.id, "cancelled", {
+      expectedState: "running",
+      expectedLeaseOwner: fixture.leaseOwner,
+      expectedAttempt: fixture.attempt,
+      attempt: fixture.attempt,
+      leaseOwner: fixture.leaseOwner,
+      leaseExpiresAt: "2999-07-25T12:00:00.000Z",
+    });
+
+    await expect(fixture.store.recordFencedCccCampaignProofAudit(fixture.input))
+      .rejects.toMatchObject({ code: "CCC_PROOF_AUDIT_LEASE_REFUSED" });
+    expect(await queryRunAuditEvents(h.layer().db, {
+      runId: fixture.workItem.runId,
+      mutationType: "ccc-campaign:proof-admission",
+    })).toEqual([]);
+  });
+
+  it("uses database time to refuse an expired proof-audit lease", async () => {
+    const fixture = await liveProofAuditFixture("expired");
+    await fixture.store.transitionWorkflowWorkItem(fixture.workItem.id, "running", {
+      expectedState: "running",
+      expectedLeaseOwner: fixture.leaseOwner,
+      expectedAttempt: fixture.attempt,
+      attempt: fixture.attempt,
+      leaseOwner: fixture.leaseOwner,
+      leaseExpiresAt: "2000-01-01T00:00:00.000Z",
+    });
+
+    await expect(fixture.store.recordFencedCccCampaignProofAudit(fixture.input))
+      .rejects.toMatchObject({ code: "CCC_PROOF_AUDIT_LEASE_REFUSED" });
+    expect(await queryRunAuditEvents(h.layer().db, {
+      runId: fixture.workItem.runId,
+      mutationType: "ccc-campaign:proof-admission",
+    })).toEqual([]);
+  });
+
+  it("keeps protected-action target and requireProtected enforcement intact", async () => {
+    const binding = await admittedBinding();
+    const proofBinding = forgedUndeclaredActionBinding(binding);
+    const context = await (h.store() as unknown as CampaignContextStore)
+      .getCccCampaignContextForTask(binding.taskId);
+    expect(context).not.toBeNull();
+
+    expect(() => createCccCampaignAuthorityBinding(context!, {
+      actionId: proofBinding.actionId,
+      actionTarget: proofBinding.actionTarget,
+      requireProtected: true,
+    })).toThrow(/not a declared protected action/i);
+    expect(() => createCccCampaignAuthorityBinding(context!, {
+      actionId: binding.actionId,
+      actionTarget: `${binding.actionTarget}:different`,
+    })).toThrow(/target must match exactly/i);
+  });
+
+  it("refuses campaign audit events whose top-level task or target contradicts the binding", async () => {
+    const taskBinding = await admittedBinding();
+    const taskInput = campaignAuditInput(
+      taskBinding,
+      "campaign-audit-event-task-mismatch",
+      { runId: "ccc-audit-run-task-mismatch", taskId: "TASK-other" },
+    );
+    await expect(recordRunAuditEvent(h.layer(), taskInput))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_CONTEXT_REFUSED" });
+    expect(await queryRunAuditEvents(h.layer().db, { runId: taskInput.runId })).toEqual([]);
+
+    const targetBinding = await admittedBinding();
+    const targetInput = campaignAuditInput(
+      targetBinding,
+      "campaign-audit-event-target-mismatch",
+      { runId: "ccc-audit-run-target-mismatch", target: "audit-target:other" },
+    );
+    await expect(recordRunAuditEvent(h.layer(), targetInput))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_CONTEXT_REFUSED" });
+    expect(await queryRunAuditEvents(h.layer().db, { runId: targetInput.runId })).toEqual([]);
+  });
+
+  it("keeps legacy audit rows random and compatible", async () => {
+    const input: RunAuditEventInput = {
+      agentId: "legacy-audit-agent",
+      runId: "legacy-audit-run",
+      domain: "database",
+      mutationType: "task:update",
+      target: "legacy-target",
+    };
+    const [left, right] = await Promise.all([
+      recordRunAuditEvent(h.layer(), input),
+      recordRunAuditEvent(h.layer(), input),
+    ]);
+
+    expect(left.id).not.toBe(right.id);
+    expect(Object.hasOwn(left, "campaign")).toBe(false);
+    expect(Object.hasOwn(right, "campaign")).toBe(false);
+    expect(await queryRunAuditEvents(h.layer().db, { runId: input.runId })).toHaveLength(2);
+  });
+
+  it("refuses a partial campaign input before writing", async () => {
+    const binding = await admittedBinding();
+    const partial = {
+      ...campaignAuditInput(binding, "campaign-audit-event-partial"),
+      campaign: { eventKey: "campaign-audit-event-partial" },
+    };
+
+    await expect(recordRunAuditEvent(h.layer(), partial as RunAuditEventInput))
+      .rejects.toThrow(/campaign/i);
+    expect(await queryRunAuditEvents(h.layer().db, { runId: partial.runId })).toEqual([]);
   });
 });

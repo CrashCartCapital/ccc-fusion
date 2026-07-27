@@ -1388,6 +1388,152 @@ CREATE TABLE IF NOT EXISTS project.cli_sessions (
   updated_at text NOT NULL
 );
 
+-- FNXC:CCCEffectReceipts 2026-07-23-21:42: fresh baselines need the same v2 receipt authority as upgrades.
+CREATE TABLE IF NOT EXISTS project.ccc_effect_receipts (
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  owner_project_id text,
+  effect_scope_id text NOT NULL,
+  logical_key text NOT NULL,
+  turn_key text NOT NULL,
+  slot_ordinal integer NOT NULL,
+  tool_authority text NOT NULL,
+  arguments_digest text NOT NULL,
+  repeat_of text,
+  state text NOT NULL,
+  controller_token text NOT NULL,
+  evidence_digest text,
+  result_json text,
+  created_at text NOT NULL,
+  updated_at text NOT NULL,
+  campaign_project_id text,
+  campaign_import_id text,
+  campaign_id text,
+  campaign_task_id text,
+  campaign_action_id text,
+  campaign_action_target text,
+  campaign_idempotency_key text,
+  campaign_packet_hash text,
+  campaign_sidecar_hash text,
+  campaign_bundle_hash text,
+  campaign_target_repository text,
+  campaign_target_base text,
+  campaign_provider_id text,
+  campaign_model_id text,
+  campaign_transport text,
+  campaign_manifest_hash text,
+  campaign_binding_hash text,
+  PRIMARY KEY (project_id, effect_scope_id, logical_key),
+  CONSTRAINT ccc_effect_receipts_state_check
+    CHECK (state IN ('reserved', 'dispatched_unknown', 'committed', 'proved_failed')),
+  CONSTRAINT ccc_effect_receipts_slot_ordinal_check CHECK (slot_ordinal >= 0),
+  CONSTRAINT ccc_effect_receipts_turn_slot_unique UNIQUE (project_id, effect_scope_id, turn_key, slot_ordinal),
+  CONSTRAINT ccc_effect_receipts_campaign_binding_check CHECK (
+    (campaign_project_id IS NULL AND campaign_import_id IS NULL AND campaign_id IS NULL AND campaign_task_id IS NULL AND campaign_action_id IS NULL AND campaign_action_target IS NULL AND campaign_idempotency_key IS NULL AND campaign_packet_hash IS NULL AND campaign_sidecar_hash IS NULL AND campaign_bundle_hash IS NULL AND campaign_target_repository IS NULL AND campaign_target_base IS NULL AND campaign_provider_id IS NULL AND campaign_model_id IS NULL AND campaign_transport IS NULL AND campaign_manifest_hash IS NULL AND campaign_binding_hash IS NULL)
+    OR (campaign_project_id IS NOT NULL AND campaign_import_id IS NOT NULL AND campaign_id IS NOT NULL AND campaign_task_id IS NOT NULL AND campaign_action_id IS NOT NULL AND campaign_action_target IS NOT NULL AND campaign_idempotency_key IS NOT NULL AND campaign_packet_hash IS NOT NULL AND campaign_sidecar_hash IS NOT NULL AND campaign_bundle_hash IS NOT NULL AND campaign_target_repository IS NOT NULL AND campaign_target_base IS NOT NULL AND campaign_provider_id IS NOT NULL AND campaign_model_id IS NOT NULL AND campaign_transport IS NOT NULL AND campaign_manifest_hash IS NOT NULL AND campaign_binding_hash IS NOT NULL AND campaign_project_id = project_id)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS project.ccc_effect_turns (
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  owner_project_id text,
+  effect_scope_id text NOT NULL,
+  turn_key text NOT NULL,
+  state text NOT NULL,
+  controller_token text NOT NULL,
+  created_at text NOT NULL,
+  updated_at text NOT NULL,
+  PRIMARY KEY (project_id, effect_scope_id, turn_key),
+  CONSTRAINT ccc_effect_turns_state_check CHECK (state IN ('open', 'closed'))
+);
+
+-- FNXC:CCCPrdImport 2026-07-24: fresh baselines need restart-safe PRD import ownership.
+CREATE TABLE IF NOT EXISTS project.ccc_prd_imports (
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  idempotency_key text NOT NULL,
+  import_id text NOT NULL,
+  identity_hash text NOT NULL,
+  bundle_hash text NOT NULL,
+  packet_hash text NOT NULL,
+  sidecar_hash text NOT NULL,
+  source_version text NOT NULL,
+  target_repository text NOT NULL,
+  target_base text NOT NULL,
+  root_dir text NOT NULL,
+  staging_relative_path text NOT NULL,
+  state text NOT NULL,
+  runnable integer NOT NULL DEFAULT 0,
+  canonical_bundle jsonb NOT NULL,
+  transaction_witness jsonb NOT NULL,
+  projection_digest text NOT NULL,
+  projection_owner text,
+  projection_lease_until text,
+  last_error text,
+  created_at text NOT NULL,
+  updated_at text NOT NULL,
+  activated_at text,
+  execution_policy jsonb NOT NULL,
+  campaign_manifest jsonb NOT NULL,
+  campaign_manifest_hash text NOT NULL,
+  campaign_started_at text NOT NULL,
+  campaign_deadline_at text NOT NULL,
+  request_count integer NOT NULL DEFAULT 0,
+  active_action_leases jsonb NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (project_id, idempotency_key),
+  CONSTRAINT ccc_prd_imports_project_import_unique UNIQUE (project_id, import_id),
+  CONSTRAINT ccc_prd_imports_state_check CHECK (state IN ('prepared', 'projecting', 'active')),
+  CONSTRAINT ccc_prd_imports_runnable_check CHECK (runnable IN (0, 1)),
+  CONSTRAINT ccc_prd_imports_request_count_check CHECK (request_count >= 0),
+  CONSTRAINT ccc_prd_imports_state_runnable_check
+    CHECK ((state = 'active' AND runnable = 1) OR (state <> 'active' AND runnable = 0))
+);
+
+CREATE TABLE IF NOT EXISTS project.ccc_prd_import_sources (
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  import_id text NOT NULL,
+  ordinal integer NOT NULL,
+  path text NOT NULL,
+  role text NOT NULL,
+  authoritative integer NOT NULL,
+  raw_sha256 text NOT NULL,
+  byte_length integer NOT NULL,
+  PRIMARY KEY (project_id, import_id, path),
+  CONSTRAINT ccc_prd_import_sources_import_fkey
+    FOREIGN KEY (project_id, import_id)
+    REFERENCES project.ccc_prd_imports(project_id, import_id)
+    ON DELETE CASCADE
+    DEFERRABLE INITIALLY IMMEDIATE,
+  CONSTRAINT ccc_prd_import_sources_authoritative_check CHECK (authoritative IN (0, 1)),
+  CONSTRAINT ccc_prd_import_sources_ordinal_check CHECK (ordinal >= 0),
+  CONSTRAINT ccc_prd_import_sources_byte_length_check CHECK (byte_length >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS project.ccc_prd_import_entities (
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  import_id text NOT NULL,
+  entity_type text NOT NULL,
+  entity_id text NOT NULL,
+  native_id text NOT NULL,
+  ordinal integer NOT NULL,
+  content_digest text NOT NULL,
+  PRIMARY KEY (project_id, import_id, entity_type, entity_id),
+  CONSTRAINT ccc_prd_import_entities_import_fkey
+    FOREIGN KEY (project_id, import_id)
+    REFERENCES project.ccc_prd_imports(project_id, import_id)
+    ON DELETE CASCADE
+    DEFERRABLE INITIALLY IMMEDIATE,
+  CONSTRAINT ccc_prd_import_entities_type_check
+    CHECK (entity_type IN ('campaign', 'task', 'dependency_edge', 'workflow', 'document', 'artifact', 'source', 'work_item', 'run_audit')),
+  CONSTRAINT ccc_prd_import_entities_ordinal_check CHECK (ordinal >= 0)
+);
+
+ALTER TABLE project.ccc_effect_receipts
+  ADD CONSTRAINT ccc_effect_receipts_campaign_import_fkey
+  FOREIGN KEY (project_id, campaign_import_id)
+  REFERENCES project.ccc_prd_imports(project_id, import_id)
+  ON DELETE NO ACTION
+  ON UPDATE NO ACTION
+  DEFERRABLE INITIALLY IMMEDIATE;
+
 CREATE TABLE IF NOT EXISTS project.chat_messages (
   id text PRIMARY KEY,
   session_id text NOT NULL,
@@ -1419,7 +1565,8 @@ CREATE TABLE IF NOT EXISTS project.chat_token_usage (
 );
 
 CREATE TABLE IF NOT EXISTS project.run_audit_events (
-  id text PRIMARY KEY,
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  id text NOT NULL,
   timestamp text NOT NULL,
   task_id text,
   agent_id text NOT NULL,
@@ -1427,7 +1574,36 @@ CREATE TABLE IF NOT EXISTS project.run_audit_events (
   domain text NOT NULL,
   mutation_type text NOT NULL,
   target text NOT NULL,
-  metadata jsonb
+  metadata jsonb,
+  campaign_project_id text,
+  campaign_import_id text,
+  campaign_id text,
+  campaign_task_id text,
+  campaign_action_id text,
+  campaign_action_target text,
+  campaign_idempotency_key text,
+  campaign_packet_hash text,
+  campaign_sidecar_hash text,
+  campaign_bundle_hash text,
+  campaign_target_repository text,
+  campaign_target_base text,
+  campaign_provider_id text,
+  campaign_model_id text,
+  campaign_transport text,
+  campaign_manifest_hash text,
+  campaign_binding_hash text,
+  campaign_event_key text,
+  PRIMARY KEY (project_id, id),
+  CONSTRAINT run_audit_events_campaign_binding_check CHECK (
+    (campaign_project_id IS NULL AND campaign_import_id IS NULL AND campaign_id IS NULL AND campaign_task_id IS NULL AND campaign_action_id IS NULL AND campaign_action_target IS NULL AND campaign_idempotency_key IS NULL AND campaign_packet_hash IS NULL AND campaign_sidecar_hash IS NULL AND campaign_bundle_hash IS NULL AND campaign_target_repository IS NULL AND campaign_target_base IS NULL AND campaign_provider_id IS NULL AND campaign_model_id IS NULL AND campaign_transport IS NULL AND campaign_manifest_hash IS NULL AND campaign_binding_hash IS NULL AND campaign_event_key IS NULL)
+    OR (campaign_project_id IS NOT NULL AND campaign_import_id IS NOT NULL AND campaign_id IS NOT NULL AND campaign_task_id IS NOT NULL AND campaign_action_id IS NOT NULL AND campaign_action_target IS NOT NULL AND campaign_idempotency_key IS NOT NULL AND campaign_packet_hash IS NOT NULL AND campaign_sidecar_hash IS NOT NULL AND campaign_bundle_hash IS NOT NULL AND campaign_target_repository IS NOT NULL AND campaign_target_base IS NOT NULL AND campaign_provider_id IS NOT NULL AND campaign_model_id IS NOT NULL AND campaign_transport IS NOT NULL AND campaign_manifest_hash IS NOT NULL AND campaign_binding_hash IS NOT NULL AND campaign_event_key IS NOT NULL AND campaign_project_id = project_id)
+  ),
+  CONSTRAINT run_audit_events_campaign_import_fkey
+    FOREIGN KEY (project_id, campaign_import_id)
+    REFERENCES project.ccc_prd_imports(project_id, import_id)
+    ON DELETE NO ACTION
+    ON UPDATE NO ACTION
+    DEFERRABLE INITIALLY IMMEDIATE
 );
 
 CREATE TABLE IF NOT EXISTS project.mission_contract_assertions (
@@ -1498,7 +1674,8 @@ CREATE TABLE IF NOT EXISTS project.verification_cache (
 );
 
 CREATE TABLE IF NOT EXISTS project.approval_requests (
-  id text PRIMARY KEY,
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  id text NOT NULL,
   status text NOT NULL,
   requester_actor_id text NOT NULL,
   requester_actor_type text NOT NULL,
@@ -1515,19 +1692,64 @@ CREATE TABLE IF NOT EXISTS project.approval_requests (
   decided_at text,
   completed_at text,
   created_at text NOT NULL,
-  updated_at text NOT NULL
+  updated_at text NOT NULL,
+  not_before_at text,
+  expires_at text,
+  claim_token text,
+  claimed_at text,
+  campaign_project_id text,
+  campaign_import_id text,
+  campaign_id text,
+  campaign_task_id text,
+  campaign_action_id text,
+  campaign_action_target text,
+  campaign_idempotency_key text,
+  campaign_packet_hash text,
+  campaign_sidecar_hash text,
+  campaign_bundle_hash text,
+  campaign_target_repository text,
+  campaign_target_base text,
+  campaign_provider_id text,
+  campaign_model_id text,
+  campaign_transport text,
+  campaign_manifest_hash text,
+  campaign_binding_hash text,
+  PRIMARY KEY (project_id, id),
+  CONSTRAINT approval_requests_status_check
+    CHECK (status IN ('pending', 'approved', 'denied', 'completed', 'issued', 'claimed', 'consumed', 'expired')),
+  CONSTRAINT approval_requests_campaign_binding_check CHECK (
+    (campaign_project_id IS NULL AND campaign_import_id IS NULL AND campaign_id IS NULL AND campaign_task_id IS NULL AND campaign_action_id IS NULL AND campaign_action_target IS NULL AND campaign_idempotency_key IS NULL AND campaign_packet_hash IS NULL AND campaign_sidecar_hash IS NULL AND campaign_bundle_hash IS NULL AND campaign_target_repository IS NULL AND campaign_target_base IS NULL AND campaign_provider_id IS NULL AND campaign_model_id IS NULL AND campaign_transport IS NULL AND campaign_manifest_hash IS NULL AND campaign_binding_hash IS NULL)
+    OR (campaign_project_id IS NOT NULL AND campaign_import_id IS NOT NULL AND campaign_id IS NOT NULL AND campaign_task_id IS NOT NULL AND campaign_action_id IS NOT NULL AND campaign_action_target IS NOT NULL AND campaign_idempotency_key IS NOT NULL AND campaign_packet_hash IS NOT NULL AND campaign_sidecar_hash IS NOT NULL AND campaign_bundle_hash IS NOT NULL AND campaign_target_repository IS NOT NULL AND campaign_target_base IS NOT NULL AND campaign_provider_id IS NOT NULL AND campaign_model_id IS NOT NULL AND campaign_transport IS NOT NULL AND campaign_manifest_hash IS NOT NULL AND campaign_binding_hash IS NOT NULL AND campaign_project_id = project_id)
+  ),
+  CONSTRAINT approval_requests_campaign_lifecycle_check CHECK (
+    (campaign_project_id IS NULL AND not_before_at IS NULL AND expires_at IS NULL AND claim_token IS NULL AND claimed_at IS NULL AND status IN ('pending', 'approved', 'denied', 'completed'))
+    OR (campaign_project_id IS NOT NULL AND not_before_at IS NOT NULL AND expires_at IS NOT NULL AND not_before_at <= expires_at AND (
+      (status = 'issued' AND claim_token IS NULL AND claimed_at IS NULL)
+      OR (status = 'claimed' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL)
+      OR (status = 'consumed' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL AND completed_at IS NOT NULL)
+      OR (status = 'denied' AND claim_token IS NULL AND claimed_at IS NULL AND decided_at IS NOT NULL)
+      OR (status = 'expired' AND decided_at IS NOT NULL AND ((claim_token IS NULL AND claimed_at IS NULL) OR (claim_token IS NOT NULL AND claimed_at IS NOT NULL)))
+    ))
+  ),
+  CONSTRAINT approval_requests_campaign_import_fkey
+    FOREIGN KEY (project_id, campaign_import_id)
+    REFERENCES project.ccc_prd_imports(project_id, import_id)
+    ON DELETE NO ACTION
+    ON UPDATE NO ACTION
+    DEFERRABLE INITIALLY IMMEDIATE
 );
 
 CREATE TABLE IF NOT EXISTS project.approval_request_audit_events (
-  project_id text NOT NULL DEFAULT '',
-  id text PRIMARY KEY,
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  id text NOT NULL,
   request_id text NOT NULL,
   event_type text NOT NULL,
   actor_id text NOT NULL,
   actor_type text NOT NULL,
   actor_name text NOT NULL,
   note text,
-  created_at text NOT NULL
+  created_at text NOT NULL,
+  PRIMARY KEY (project_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS project.chat_rooms (
@@ -1646,11 +1868,32 @@ CREATE INDEX IF NOT EXISTS "idxChatTokenUsageCreatedAt" ON project.chat_token_us
 CREATE INDEX IF NOT EXISTS "idx_cli_sessions_taskId" ON project.cli_sessions(task_id);
 CREATE INDEX IF NOT EXISTS "idx_cli_sessions_chatSessionId" ON project.cli_sessions(chat_session_id);
 CREATE INDEX IF NOT EXISTS "idx_cli_sessions_project_state" ON project.cli_sessions(project_id, agent_state);
+CREATE INDEX IF NOT EXISTS "idx_ccc_effect_receipts_scope_authority_digest"
+  ON project.ccc_effect_receipts(project_id, effect_scope_id, tool_authority, arguments_digest);
+CREATE INDEX IF NOT EXISTS "idx_ccc_effect_receipts_turn_slot"
+  ON project.ccc_effect_receipts(project_id, effect_scope_id, turn_key, slot_ordinal);
+CREATE INDEX IF NOT EXISTS "idx_ccc_effect_receipts_campaign_import"
+  ON project.ccc_effect_receipts(project_id, campaign_import_id);
+CREATE INDEX IF NOT EXISTS "idx_ccc_effect_turns_open"
+  ON project.ccc_effect_turns(project_id, effect_scope_id, state);
+CREATE INDEX IF NOT EXISTS "idx_ccc_prd_imports_state"
+  ON project.ccc_prd_imports(project_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS "idx_ccc_prd_imports_identity"
+  ON project.ccc_prd_imports(project_id, target_repository, target_base, identity_hash);
+CREATE INDEX IF NOT EXISTS "idx_ccc_prd_imports_campaign_manifest"
+  ON project.ccc_prd_imports(project_id, campaign_manifest_hash);
+CREATE INDEX IF NOT EXISTS "idx_ccc_prd_import_entities_native"
+  ON project.ccc_prd_import_entities(project_id, import_id, entity_type, native_id);
 
 -- run_audit_events
 CREATE INDEX IF NOT EXISTS "idxRunAuditEventsRunIdTimestamp" ON project.run_audit_events(run_id, timestamp);
 CREATE INDEX IF NOT EXISTS "idxRunAuditEventsTaskIdTimestamp" ON project.run_audit_events(task_id, timestamp);
 CREATE INDEX IF NOT EXISTS "idxRunAuditEventsTimestamp" ON project.run_audit_events(timestamp);
+CREATE INDEX IF NOT EXISTS "idx_run_audit_events_campaign_import"
+  ON project.run_audit_events(project_id, campaign_import_id);
+CREATE UNIQUE INDEX IF NOT EXISTS "ux_run_audit_events_campaign_event"
+  ON project.run_audit_events(project_id, campaign_event_key)
+  WHERE campaign_event_key IS NOT NULL;
 
 -- mission_contract_assertions
 CREATE INDEX IF NOT EXISTS "idxContractAssertionsMilestoneOrder"
@@ -1683,6 +1926,11 @@ CREATE INDEX IF NOT EXISTS "idxVerificationCacheRecordedAt" ON project.verificat
 CREATE INDEX IF NOT EXISTS "idxApprovalRequestsStatusCreatedAt" ON project.approval_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS "idxApprovalRequestsRequesterCreatedAt" ON project.approval_requests(requester_actor_id, created_at);
 CREATE INDEX IF NOT EXISTS "idxApprovalRequestsTaskCreatedAt" ON project.approval_requests(task_id, created_at);
+CREATE INDEX IF NOT EXISTS "idx_approval_requests_campaign_import"
+  ON project.approval_requests(project_id, campaign_import_id);
+CREATE UNIQUE INDEX IF NOT EXISTS "ux_approval_requests_campaign_action"
+  ON project.approval_requests(project_id, campaign_import_id, campaign_action_id)
+  WHERE campaign_project_id IS NOT NULL;
 
 -- approval_request_audit_events
 CREATE INDEX IF NOT EXISTS "idxApprovalRequestAuditRequestCreatedAt"

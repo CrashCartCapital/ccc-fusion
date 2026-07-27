@@ -1,0 +1,209 @@
+import {
+  CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
+  canonicalCccPrdJson,
+  type CccPrdAuthoringAdapter,
+  type CccPrdAuthoringProposal,
+  type CccPrdAuthoringRequest,
+} from "@fusion/core";
+import {
+  createFusionAuthStorage,
+  createFusionModelRegistry,
+  getHomeDir,
+} from "../auth-storage.js";
+import { registerCustomProviders } from "../custom-provider-registry.js";
+import { readCustomProviders } from "../custom-providers.js";
+
+export type CccPrdNativeAuthoringTransportRequest = {
+  provider: string;
+  model: string;
+  prompt: string;
+  maxDurationMs: number;
+  maxResponseBytes: number;
+  signal: AbortSignal;
+};
+
+export type CccPrdNativeAuthoringTransportResponse = {
+  text: string;
+  provider: string;
+  model: string;
+};
+
+export type CccPrdNativeAuthoringTransport = (
+  request: CccPrdNativeAuthoringTransportRequest,
+) => Promise<CccPrdNativeAuthoringTransportResponse>;
+
+export type CreateNativeCccPrdAuthoringAdapterOptions = {
+  provider: string;
+  model: string;
+  maxDurationMs: number;
+  maxPromptBytes: number;
+  maxResponseBytes: number;
+  transport?: CccPrdNativeAuthoringTransport;
+};
+
+function positiveInteger(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a finite positive integer`);
+  }
+}
+
+function buildPrompt(request: CccPrdAuthoringRequest): string {
+  if (!request.constraints) {
+    throw new Error("CCC PRD native authoring requires explicit target, bounds, and review constraints");
+  }
+  return [
+    "Generate exactly one JSON object and no Markdown or commentary.",
+    `The object schema must be ${CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION}.`,
+    "Preserve the source packet. Do not execute actions or invent source text.",
+    "Every requirement, proof, task, workflow, document, artifact, unresolved decision, ambiguity, exception, and protected action must cite one or more admitted sources using {path, exactQuote}; every exactQuote must occur exactly once in that source.",
+    "Return all required arrays and objects: schema, authorityRoles, requirements, proofs, tasks, edges, workflows, documents, artifacts, importIntents, protectedActions, bounds, admittedWriteRoots, targetRepository, nonGoals, unresolvedDecisions, ambiguities, exceptions, confidence.",
+    "Use stable IDs. Protected actions must name exact targets. Human review is limited to ambiguities, unresolved decisions, exceptions, and protected actions.",
+    canonicalCccPrdJson({
+      packetHash: request.packetHash,
+      sourceVersion: request.sourceVersion,
+      constraints: request.constraints,
+      orderedSources: request.sources,
+      ...(request.previousSidecar ? { previousSidecar: request.previousSidecar } : {}),
+    }),
+  ].join("\n");
+}
+
+export const fusionModelRuntimeAuthoringTransport: CccPrdNativeAuthoringTransport = async (
+  request,
+) => {
+  const home = getHomeDir();
+  const customProviders = readCustomProviders(home);
+  const authStorage = createFusionAuthStorage(home);
+  const registry = await createFusionModelRegistry(authStorage, home);
+  await registerCustomProviders(registry, customProviders, () => undefined);
+  const model = registry.find(request.provider, request.model);
+  if (!model) {
+    throw new Error(
+      `CCC PRD authoring model is not configured: ${request.provider}/${request.model}`,
+    );
+  }
+
+  const controller = new AbortController();
+  const abort = () => controller.abort(request.signal.reason);
+  if (request.signal.aborted) abort();
+  else request.signal.addEventListener("abort", abort, { once: true });
+  try {
+    const stream = registry.modelRuntime.streamSimple(
+      model,
+      {
+        messages: [{
+          role: "user",
+          content: request.prompt,
+          timestamp: Date.now(),
+        }],
+      },
+      {
+        signal: controller.signal,
+        temperature: 0,
+        maxTokens: Math.max(1, Math.min(model.maxTokens, request.maxResponseBytes)),
+        timeoutMs: request.maxDurationMs,
+        maxRetries: 0,
+      },
+    );
+    let streamedTextBytes = 0;
+    for await (const event of stream) {
+      if (event.type !== "text_delta") continue;
+      streamedTextBytes += Buffer.byteLength(event.delta, "utf8");
+      if (streamedTextBytes > request.maxResponseBytes) {
+        controller.abort();
+        throw new Error(
+          `CCC PRD authoring response exceeded ${request.maxResponseBytes} bytes`,
+        );
+      }
+    }
+    const response = await stream.result();
+    if (response.stopReason !== "stop") {
+      throw new Error(
+        `CCC PRD authoring transport ended with ${response.stopReason}: ${response.errorMessage ?? "incomplete response"}`,
+      );
+    }
+    const text = response.content
+      .filter((entry): entry is Extract<typeof entry, { type: "text" }> => entry.type === "text")
+      .map((entry) => entry.text)
+      .join("");
+    if (Buffer.byteLength(text, "utf8") > request.maxResponseBytes) {
+      throw new Error(
+        `CCC PRD authoring response exceeded ${request.maxResponseBytes} bytes`,
+      );
+    }
+    return {
+      text,
+      provider: response.provider,
+      model: response.responseModel ?? response.model,
+    };
+  } finally {
+    request.signal.removeEventListener("abort", abort);
+  }
+};
+
+export function createNativeCccPrdAuthoringAdapter(
+  options: CreateNativeCccPrdAuthoringAdapterOptions,
+): CccPrdAuthoringAdapter {
+  positiveInteger(options.maxDurationMs, "maxDurationMs");
+  positiveInteger(options.maxPromptBytes, "maxPromptBytes");
+  positiveInteger(options.maxResponseBytes, "maxResponseBytes");
+  if (!options.provider.trim() || !options.model.trim()) {
+    throw new Error("CCC PRD native authoring provider and model are required");
+  }
+  const transport = options.transport ?? fusionModelRuntimeAuthoringTransport;
+
+  return {
+    id: "fusion-native-model-runtime-v1",
+    model: `${options.provider}/${options.model}`,
+    async generateCandidate(request): Promise<CccPrdAuthoringProposal> {
+      const prompt = buildPrompt(request);
+      const promptBytes = Buffer.byteLength(prompt, "utf8");
+      if (promptBytes > options.maxPromptBytes) {
+        throw new Error(
+          `CCC PRD authoring prompt is ${promptBytes} bytes; maximum is ${options.maxPromptBytes}`,
+        );
+      }
+
+      const controller = new AbortController();
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        const response = await Promise.race([
+          transport({
+            provider: options.provider,
+            model: options.model,
+            prompt,
+            maxDurationMs: options.maxDurationMs,
+            maxResponseBytes: options.maxResponseBytes,
+            signal: controller.signal,
+          }),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              controller.abort();
+              reject(new Error(
+                `CCC PRD native authoring timed out after ${options.maxDurationMs}ms`,
+              ));
+            }, options.maxDurationMs);
+          }),
+        ]);
+        if (response.provider !== options.provider || response.model !== options.model) {
+          throw new Error(
+            `CCC PRD authoring transport identity drifted: expected ${options.provider}/${options.model}, received ${response.provider}/${response.model}`,
+          );
+        }
+        const responseBytes = Buffer.byteLength(response.text, "utf8");
+        if (responseBytes > options.maxResponseBytes) {
+          throw new Error(
+            `CCC PRD authoring response is ${responseBytes} bytes; maximum is ${options.maxResponseBytes}`,
+          );
+        }
+        const parsed = JSON.parse(response.text) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("CCC PRD authoring response is not one JSON object");
+        }
+        return parsed as CccPrdAuthoringProposal;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+  };
+}

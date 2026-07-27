@@ -31,11 +31,6 @@
       "verifiedAt": "2026-07-16"
     },
     {
-      "module": "workflow-settings-resolver",
-      "reason": "2026-07-16: Workflow setting resolution uses browser-safe workflow metadata helpers.",
-      "verifiedAt": "2026-07-16"
-    },
-    {
       "module": "settings-schema",
       "reason": "2026-07-16: Settings defaults and validation metadata are browser-safe.",
       "verifiedAt": "2026-07-16"

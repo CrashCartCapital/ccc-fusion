@@ -1322,6 +1322,84 @@ Subcommands: `search`, `install`.
 
 ---
 
+## PRD campaign (`fn prd`)
+
+Author, validate, and compile a CCC PRD campaign packet: a manifest-scoped set of admitted source files that is turned into a deterministic, hash-addressed workflow bundle before any task board write happens. `fn prd` never mutates the task board itself — it only produces or checks a sidecar/bundle on disk. Board import is a separate, programmatic step (see [Import](#import-programmatic-only) below).
+
+```bash
+fn prd author <root-dir> <manifest-path> <sidecar-output> \
+  --target <repository> --base <40-hex-commit> \
+  --provider <provider> --model <model> \
+  --max-requests <n> --max-duration-ms <n> --max-concurrency <n> \
+  --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+
+fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
+
+fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
+fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
+```
+
+### `fn prd author` — native bounded form
+
+```bash
+fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+```
+
+Calls a live provider/model through the native authoring adapter to generate a **candidate sidecar** — a traceable, versioned draft of the campaign (target repository, admitted manifest entries, workflow IR, review payload) written atomically to `<sidecar-output>`. The bounded flags are all required and enforced together:
+
+| Option | Description |
+|---|---|
+| `--target <repository>` | Repository path the candidate campaign targets. |
+| `--base <40-hex-commit>` | Exact 40-character hex commit the campaign is based on. |
+| `--provider <provider>` / `--model <model>` | Live provider and model identifiers for the native authoring adapter. |
+| `--max-requests <n>` | Maximum provider requests the authoring run may issue. |
+| `--max-duration-ms <n>` | Wall-clock ceiling for the authoring run. |
+| `--max-concurrency <n>` | Maximum concurrent provider requests. |
+| `--max-prompt-bytes <n>` / `--max-response-bytes <n>` | Per-request prompt/response byte ceilings. |
+| `--max-review-items <n>` | Maximum number of items the bounded review payload may carry (zero is allowed). |
+
+The candidate's `review` payload reports bounded **ambiguity**, **exception**, and **protected-decision** items the authoring run flagged for a human to resolve before the packet is trusted — `fn prd author` itself never resolves them. Re-running `author` against an existing sidecar output passes it back in as `previousSidecar` so incremental authoring runs can build on prior review state; the target must still be an admitted, non-protected path inside `<root-dir>`.
+
+### `fn prd author` — deterministic proposal-file form (compatibility)
+
+```bash
+fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
+```
+
+Same sidecar schema and output shape as the native form — and the same downstream `fn prd validate`/`fn prd compile` enforcement once a sidecar exists — but with zero live-provider calls: `<proposal-path>` is a pre-built JSON file already shaped like the authoring adapter's candidate output, and the CLI reads it in directly instead of dispatching a provider request. This is the deterministic path used by fixtures, canaries, and any workflow that needs a reproducible sidecar without a live model in the loop.
+
+This compatibility form does **not** get the native form's authoring-time constraint enforcement: it passes no target repository, no execution bounds, no `--max-review-items` ceiling, and no previous sidecar into authoring, so the target/bounds drift checks, the review-item ceiling check, and the previous-sidecar identity-drift check are all skipped at authoring time. A malformed or out-of-bounds proposal file is only caught later, by `fn prd validate`/`fn prd compile` against `<expected-target>`/`<expected-base>` and full sidecar structural validation — not by `fn prd author` itself on this route.
+
+### `fn prd validate`
+
+```bash
+fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
+```
+
+Runs the same admission and structural checks as `compile`, but only reports diagnostics — it never emits a bundle and never touches the board. Prints `{ "kind": "diagnostics", "valid": <bool>, "diagnostics": [...] }`. Use it to fail fast in scripts before attempting a real `compile`.
+
+### `fn prd compile`
+
+```bash
+fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
+```
+
+Re-derives and checks the sidecar against the manifest and expected target/base, then emits the deterministic semantic bundle (`{ "kind": "bundle", ... }`) that downstream import consumes. `compile` is pure with respect to the task board: it reads the manifest and sidecar from disk and writes nothing back to either.
+
+### Import (programmatic only)
+
+There is no `fn prd import` subcommand. Importing a compiled bundle onto the task board is a programmatic call — `importCccPrdBundle` from `@fusion/core` — invoked by the engine's campaign import path with a `TaskStore`, data layer, and idempotency key. This keeps the board-mutating step out of the CLI surface entirely; `fn prd` only ever produces or checks bundles on disk.
+
+### Exit-code contract
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Success — candidate authored, diagnostics report valid, or bundle compiled. |
+| `1` | Semantic refusal — admission, provider, review-bound, or validation/compile failure reported in the JSON payload (`kind: "refusal"` for author, `valid: false` for validate, `kind: "refusal"` for compile). |
+| `2` | Usage error — missing/malformed arguments; prints the `fn prd` usage string instead of JSON. |
+
+---
+
 ## Useful option flags by context
 
 | Option | Used by |

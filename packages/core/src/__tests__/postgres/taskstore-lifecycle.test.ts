@@ -23,8 +23,11 @@
 import { describe, it, expect, afterEach } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
-import { sql, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { execSync } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
 import { createConnectionSetFromUrl } from "../../postgres/connection.js";
 import type { ResolvedBackend } from "../../postgres/backend-resolver.js";
@@ -48,6 +51,8 @@ import {
 } from "../../task-store/async-merge-coordination.js";
 import { recordRunAuditEventWithinTransaction } from "../../postgres/data-layer.js";
 import type { MergeQueueRow } from "../../task-store/row-types.js";
+import { DatabaseSync } from "../../sqlite-adapter.js";
+import { TaskStore } from "../../store.js";
 
 const PG_TEST_URL_BASE =
   process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
@@ -59,6 +64,119 @@ const pgDescribe = PG_AVAILABLE ? describe : describe.skip;
 function uniqueDbName(): string {
   return `fusion_u13_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
 }
+
+function installRealSqliteLeaseSurface(store: TaskStore, dbPath: string): void {
+  const sqlite = new DatabaseSync(dbPath);
+  sqlite.exec(`
+    CREATE TABLE workflow_work_items (
+      id TEXT PRIMARY KEY,
+      runId TEXT NOT NULL,
+      taskId TEXT NOT NULL,
+      nodeId TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      state TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      retryAfter TEXT,
+      leaseOwner TEXT,
+      leaseExpiresAt TEXT,
+      lastError TEXT,
+      blockedReason TEXT,
+      stableWorkflowRunId TEXT,
+      continuationSequence INTEGER,
+      waitReason TEXT,
+      sourceColumn TEXT,
+      targetColumn TEXT,
+      irHash TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      UNIQUE(runId, taskId, nodeId, kind)
+    );
+    CREATE TABLE runAuditEvents (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      taskId TEXT,
+      agentId TEXT NOT NULL,
+      runId TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      mutationType TEXT NOT NULL,
+      target TEXT NOT NULL,
+      metadata TEXT
+    );
+  `);
+  /*
+   * VAL-REMOVAL-005 deleted the legacy Database class, but DatabaseSync remains
+   * as the real SQLite migration adapter. Inject its narrow transaction shape
+   * so this test executes TaskStore's retained SQLite lease branch without
+   * reviving or mocking the removed production runtime.
+   */
+  store._db = {
+    prepare: (sql: string) => sqlite.prepare(sql),
+    transactionImmediate: <T>(fn: () => T): T => {
+      sqlite.exec("BEGIN IMMEDIATE");
+      try {
+        const result = fn();
+        sqlite.exec("COMMIT");
+        return result;
+      } catch (error) {
+        sqlite.exec("ROLLBACK");
+        throw error;
+      }
+    },
+    close: () => sqlite.close(),
+  } as unknown as NonNullable<TaskStore["_db"]>;
+}
+
+describe("workflow work-item exact lease (SQLite)", () => {
+  let rootDir: string | undefined;
+  let store: TaskStore | undefined;
+
+  afterEach(async () => {
+    await store?.close();
+    store = undefined;
+    if (rootDir) await rm(rootDir, { recursive: true, force: true });
+    rootDir = undefined;
+  });
+
+  it("refuses stale run and attempt candidates while admitting the exact candidate", async () => {
+    rootDir = await mkdtemp(join(tmpdir(), "fusion-exact-work-lease-"));
+    store = new TaskStore(rootDir);
+    installRealSqliteLeaseSurface(store, join(rootDir, "lease.sqlite"));
+    const now = "2026-07-26T12:00:00.000Z";
+    const item = await store.upsertWorkflowWorkItem({
+      runId: "ccc-prd:sqlite-exact-run",
+      taskId: "KB-SQLITE-EXACT-LEASE",
+      nodeId: "lease-node",
+      kind: "execute",
+      state: "runnable",
+      attempt: 3,
+      now,
+    });
+
+    await expect(store.acquireWorkflowWorkItemLease(item.id, "stale-run", {
+      leaseDurationMs: 60_000,
+      now,
+      expectedRunId: "ccc-prd:sqlite-stale-run",
+      expectedAttempt: item.attempt,
+    })).resolves.toBeNull();
+    await expect(store.acquireWorkflowWorkItemLease(item.id, "stale-attempt", {
+      leaseDurationMs: 60_000,
+      now,
+      expectedRunId: item.runId,
+      expectedAttempt: item.attempt + 1,
+    })).resolves.toBeNull();
+    await expect(store.acquireWorkflowWorkItemLease(item.id, "exact", {
+      leaseDurationMs: 60_000,
+      now,
+      expectedRunId: item.runId,
+      expectedAttempt: item.attempt,
+    })).resolves.toMatchObject({
+      id: item.id,
+      runId: item.runId,
+      attempt: item.attempt,
+      leaseOwner: "exact",
+    });
+  });
+});
 
 /*
 FNXC:PgTestAuthFix 2026-07-14-00:00:
@@ -167,6 +285,68 @@ pgDescribe("U13 taskstore-lifecycle (PostgreSQL)", () => {
   afterEach(async () => {
     await teardownCtx(ctx);
     ctx = null;
+  });
+
+  it("Wave 4: concurrent workflow work-item claims admit one worker and never steal a live lease", async () => {
+    ctx = await setupCtx();
+    const now = "2026-07-24T18:30:00.000Z";
+    const store = new TaskStore(process.cwd(), undefined, { asyncLayer: ctx.layer });
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-WORK-LEASE"), { lineageId: null });
+    const item = await store.upsertWorkflowWorkItem({
+      runId: "run-work-lease",
+      taskId: "KB-WORK-LEASE",
+      nodeId: "lease-node",
+      kind: "execute",
+      state: "runnable",
+      now,
+    });
+
+    const claims = await Promise.all([
+      store.acquireWorkflowWorkItemLease(item.id, "worker-a", { leaseDurationMs: 60_000, now }),
+      store.acquireWorkflowWorkItemLease(item.id, "worker-b", { leaseDurationMs: 60_000, now }),
+    ]);
+    const winners = claims.filter((claim): claim is NonNullable<typeof claim> => claim !== null);
+
+    expect(winners).toHaveLength(1);
+    expect(["worker-a", "worker-b"]).toContain(winners[0]?.leaseOwner);
+    await expect(
+      store.acquireWorkflowWorkItemLease(item.id, "worker-c", { leaseDurationMs: 60_000, now }),
+    ).resolves.toBeNull();
+  });
+
+  it("Task 5 RED: stale run or attempt cannot acquire the same due workflow work-item lease", async () => {
+    ctx = await setupCtx();
+    const now = "2026-07-26T12:00:00.000Z";
+    const store = new TaskStore(process.cwd(), undefined, { asyncLayer: ctx.layer });
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-EXACT-LEASE"), { lineageId: null });
+    const item = await store.upsertWorkflowWorkItem({
+      runId: "ccc-prd:exact-run",
+      taskId: "KB-EXACT-LEASE",
+      nodeId: "lease-node",
+      kind: "execute",
+      state: "runnable",
+      attempt: 3,
+      now,
+    });
+
+    await expect(store.acquireWorkflowWorkItemLease(item.id, "stale-run", {
+      leaseDurationMs: 60_000,
+      now,
+      expectedRunId: "ccc-prd:stale-run",
+      expectedAttempt: item.attempt,
+    })).resolves.toBeNull();
+    await expect(store.acquireWorkflowWorkItemLease(item.id, "stale-attempt", {
+      leaseDurationMs: 60_000,
+      now,
+      expectedRunId: item.runId,
+      expectedAttempt: item.attempt + 1,
+    })).resolves.toBeNull();
+    await expect(store.acquireWorkflowWorkItemLease(item.id, "exact", {
+      leaseDurationMs: 60_000,
+      now,
+      expectedRunId: item.runId,
+      expectedAttempt: item.attempt,
+    })).resolves.toMatchObject({ id: item.id, leaseOwner: "exact" });
   });
 
   // ── VAL-DATA-010: Lineage-integrity gate blocks parent delete with live children ──

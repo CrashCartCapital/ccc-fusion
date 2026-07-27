@@ -210,6 +210,37 @@ pgDescribe("PostgreSQL satellite DB-injected stores (VAL-DATA-016)", () => {
     expect(history.length).toBeGreaterThanOrEqual(3); // created + approved + completed
   });
 
+  it("ApprovalRequestStore: legacy decision and completion use exact-state CAS", async () => {
+    ctx = await setupCtx();
+    const { createApprovalRequest, getApprovalRequest, decideApprovalRequest, markApprovalRequestCompleted } = await import("../../async-approval-request-store.js");
+    const create = (id: string) => createApprovalRequest(ctx!.layer, {
+      id,
+      requester: { actorId: "agent-cas", actorType: "agent", actorName: "CAS" },
+      targetAction: { category: "shell", action: "exec", summary: "run", resourceType: "host", resourceId: "local" },
+    });
+    const actor = { actorId: "operator-cas", actorType: "user" as const, actorName: "Operator" };
+    await create("apr-cas-decision");
+    const decisions = await Promise.allSettled([
+      decideApprovalRequest(ctx.layer, "apr-cas-decision", "approved", { actor }),
+      decideApprovalRequest(ctx.layer, "apr-cas-decision", "denied", { actor }),
+    ]);
+    expect(decisions.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(decisions.filter((result) => result.status === "rejected")).toHaveLength(1);
+
+    const decided = await getApprovalRequest(ctx.layer.db, "apr-cas-decision");
+    expect(["approved", "denied"]).toContain(decided?.status);
+
+    await create("apr-cas-complete");
+    await decideApprovalRequest(ctx.layer, "apr-cas-complete", "approved", { actor });
+    const completions = await Promise.allSettled([
+      markApprovalRequestCompleted(ctx.layer, "apr-cas-complete", { actor }),
+      markApprovalRequestCompleted(ctx.layer, "apr-cas-complete", { actor }),
+    ]);
+    expect(completions.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(completions.filter((result) => result.status === "rejected")).toHaveLength(1);
+    await expect(getApprovalRequest(ctx.layer.db, "apr-cas-complete")).resolves.toMatchObject({ status: "completed" });
+  });
+
   // ── EvalStore ──
 
   it("EvalStore: create run → upsert result → list → append event", async () => {

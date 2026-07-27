@@ -468,12 +468,12 @@ export async function createFusionModelRegistry(authStorage: FusionAuthStorage, 
   return Object.assign(new ModelRegistry(modelRuntime), { modelRuntime });
 }
 
-export function createFusionAuthStorage(): FusionAuthStorage {
-  const authPath = getFusionAuthPath();
+export function createFusionAuthStorage(home = getHomeDir()): FusionAuthStorage {
+  const authPath = getFusionAuthPath(home);
   const primary = new FusionFileAuthStorage(authPath);
-  let supplementalCredentials = readSupplementalCredentials();
+  let supplementalCredentials = readSupplementalCredentials(getSupplementalAuthPaths(home));
   // models.json provider API keys — final fallback after primary auth and supplemental auth.json files
-  let modelsJsonApiKeys = readModelsJsonApiKeys();
+  let modelsJsonApiKeys = readModelsJsonApiKeys(home);
   /*
   FNXC:ClaudeOAuth 2026-06-13-22:46:
   Dashboard auth-status polling can run while model execution also resolves credentials, so expired Claude credentials need one refresh attempt per provider at a time.
@@ -894,9 +894,9 @@ export function createFusionAuthStorage(): FusionAuthStorage {
       if (prop === "reload") {
         return () => {
           target.reload();
-          supplementalCredentials = readSupplementalCredentials();
+          supplementalCredentials = readSupplementalCredentials(getSupplementalAuthPaths(home));
           supplementalHydration = syncSupplementalOauthCredentials();
-          modelsJsonApiKeys = readModelsJsonApiKeys();
+          modelsJsonApiKeys = readModelsJsonApiKeys(home);
         };
       }
 

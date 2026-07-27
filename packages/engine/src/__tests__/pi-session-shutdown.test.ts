@@ -3,8 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { _wrapSessionDisposeForTest } from "../pi.js";
 
 describe("session shutdown dispose wrapper", () => {
-  const createSession = (options?: { hasHandlers?: boolean; emitReject?: boolean }) => {
-    const dispose = vi.fn();
+  const createSession = (options?: { hasHandlers?: boolean; emitReject?: boolean; disposeReject?: boolean }) => {
+    const dispose = options?.disposeReject
+      ? vi.fn().mockRejectedValue(new Error("dispose failed"))
+      : vi.fn();
     const hasHandlers = vi.fn(() => options?.hasHandlers ?? true);
     const emit = options?.emitReject
       ? vi.fn().mockRejectedValue(new Error("emit failed"))
@@ -46,6 +48,15 @@ describe("session shutdown dispose wrapper", () => {
     _wrapSessionDisposeForTest(session as any);
 
     await expect((session as any).dispose()).resolves.toBeUndefined();
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates an asynchronous disposal failure after shutdown", async () => {
+    const { session, dispose } = createSession({ disposeReject: true });
+
+    _wrapSessionDisposeForTest(session as any);
+
+    await expect((session as any).dispose()).rejects.toThrow("dispose failed");
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 

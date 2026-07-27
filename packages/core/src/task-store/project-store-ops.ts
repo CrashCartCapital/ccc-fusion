@@ -522,6 +522,7 @@ export async function recordRunAuditEventImpl(store: TaskStore, input: RunAuditE
         mutationType: input.mutationType,
         target: input.target,
         metadata: input.metadata,
+        campaign: input.campaign,
       });
       return {
         ...raw,

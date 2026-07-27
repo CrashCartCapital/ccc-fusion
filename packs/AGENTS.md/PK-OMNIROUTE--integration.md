@@ -1,0 +1,21 @@
+# OmniRoute integration
+
+Pack ID: `PK-OMNIROUTE`.
+
+Read this generated pack only after the compact root catalog identifies a strong trigger.
+
+**OmniRoute** is the local OpenAI-compatible transport gateway for provider/model fallback, quota, cost, cache, and compression visibility. Use it for API-compatible sidecars and route audits; do not treat it as a replacement for Claude/Codex native sessions, MCPJungle/MCPProxy tool brokerage, consultation bridges, or Dagu/Ralph execution.
+
+- Prefer local truth over upstream examples: in this vault stack, current SSOT/live probes own base URLs, model IDs, provider nodes, and route counts.
+- Keep oMLX and the Ollama-oMLX shim distinct from OmniRoute. oMLX, the shim, and OmniRoute have different ports, defaults, aliases, and health surfaces; verify live defaults before using model IDs.
+- For OmniRoute MCP control, use registered `omniroute` through `stack-core`. Codex uses brokered exact names; if discovery lags, verify the exact broker version's documented inventory (`/v0/tools` on the current live v0.33 broker, authenticated `/api/v1/tools` on the hardened candidate) or group inventory instead of inventing names.
+- Read first: health, model catalog, provider metrics, combos, quota, cost, cache stats, compression status, route explanation, and session snapshots.
+- Treat `route_request` calls, route requests, combo switches, routing-strategy/resilience/budget changes, compression configuration, cache flush, pricing sync, DB repair, and direct provider execution as write/execute actions requiring explicit task intent.
+- Never paste OmniRoute keys into notes, configs, shell history, or MCP JSON; use the AgentSecrets-backed MCP wrapper or approved secret-injection path.
+
+### Compute Selection
+
+- When you build or configure an app, sidecar, pipeline, or agent that draws LLM compute through OmniRoute (compute you provision — not the primary Claude/Codex session's own model), select by task archetype rather than a fixed model ID: frontier tier for complex architecture, hard debugging, deep synthesis, and adversarial review; medium tier for everyday coding, analysis, and routine planning; small tier for triage, extraction, latency-sensitive checks, and short confirmations. Apply capability, tool, privacy, live-routability, risk, and proof constraints first; then choose model family and per-call `reasoning.effort`/`thinking_level` together. Use the minimum measured effort that clears the task, do not assume effort improves monotonically, and account for whether a person is waiting.
+- Cost order is a hard rule: prefer subscription/coding-plan compute, then free tiers, then a non-metered or plan-covered cross-provider equivalent; use metered pay-per-token compute only as a genuine last resort, never as a default. Within the first eligible access tier, optimize for accepted-result cost — inference, retries, escalation, latency, human correction, and expected failure loss — rather than token price alone. Codex Spark stays forbidden on every surface, including any OmniRoute catalog listing.
+- Prefer the named combos already configured (discover with `omniroute_list_combos`) before designing a new one — they already encode this tiering and fallback order. When a new combo is genuinely needed, pick its strategy by intent: exhaust-first (`fill-first`/`priority`) for chains ordered by cost or quality — the common case, draining a preferred target before falling back; load-spreading (`round-robin`/`least-used`) to distribute across same-tier targets and dodge per-provider rate limits; `auto` (scored) when unsure. Combo creation is Dashboard/REST-only (no MCP tool creates one), and switching a combo or its strategy is a write/execute action under the boundary above — design and read-simulate, then propose the change for explicit operator approval rather than mutating routing yourself.
+- Model names, tiers, and combo rosters drift monthly — never name one from memory. Verify against [[30_DEVSTACK/instruction_system/REF-AI-OmniRouteModelSelectionAndCombos|OmniRoute Model Selection And Combos]] or a live `omniroute_list_models_catalog`/`omniroute_list_combos` probe before naming a model or combo in a plan or command.

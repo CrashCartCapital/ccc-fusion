@@ -5,8 +5,38 @@ import { and, eq, isNull, ne, sql } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
 import { type FSWatcher } from "node:fs";
 import type { Task, TaskDetail, TaskCreateInput, TaskAttachment, AgentLogEntry, BoardConfig, Column, ColumnId, CheckoutClaimPrecondition, MergeResult, Settings, GlobalSettings, ProjectSettings, ActivityLogEntry, ActivityEventType, TaskDocument, TaskDocumentRevision, TaskDocumentCreateInput, ArchivedTaskDocumentAdditionInput, ArchivedTaskDocumentAdditionResult, TaskDocumentWithTask, Artifact, ArtifactCreateInput, ArtifactType, ArtifactWithTask, InboxTask, TaskLogEntry, RunMutationContext, RunAuditEvent, RunAuditEventInput, RunAuditEventFilter, ArchivedTaskEntry, ArchiveAgentLogMode, TaskPriority, WorkflowStepTemplate, Agent, AutostashOrphanRecord, TaskCommitAssociation, CommitAssociationDiffBackfillReport, GithubIssueAction, MergeQueueEntry, MergeQueueEnqueueOptions, MergeQueueAcquireOptions, MergeQueueReleaseOutcome, HandoffToReviewOptions, GoalCitation, GoalCitationFilter, GoalCitationInput, GoalCitationSurface, BranchGroup, BranchGroupCreateInput, BranchGroupUpdate, TaskBranchAssignmentMode, MergeRequestRecord, MergeRequestState, MergeRequestWorkflowProjectionOptions, CompletionHandoffMarker, WorkflowWorkItem, WorkflowWorkItemDueFilter, WorkflowWorkItemKind, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput, PrEntity, PrEntityCreateInput, PrEntityUpdate, PrThreadState, PrThreadOutcome, PluginActivation, PluginActivationInput } from "./types.js";
-
-
+import {
+  claimCccCampaignActionLease,
+  inspectCccCampaignActionLease,
+  loadCccCampaignContextForTask,
+  settleCccCampaignActionLease,
+  type CccCampaignActionLeaseClaim,
+  type CccCampaignActionLeaseResult,
+} from "./ccc-campaign/store.js";
+import { createCccCampaignAuthorityBinding } from "./ccc-campaign/canonical.js";
+import { canonicalCccPrdJson } from "./ccc-prd/contract.js";
+import {
+  assertClaimedCccCampaignApprovalWithinTransaction,
+  consumeCccCampaignApprovalWithinTransaction,
+} from "./async-approval-request-store.js";
+import {
+  inspectCccProviderAttempt,
+  beginCccProviderAttemptDispatch,
+  markCccProviderAttemptDispatched,
+  proveCccProviderAttemptNotDispatched,
+  reconcileCccProviderAttempt,
+  reserveCccProviderAttempt,
+} from "./ccc-campaign/provider-attempt.js";
+import type {
+  CccCampaignActionLookup,
+  CccCampaignTaskContext,
+  CccProviderAttemptReconciliation,
+  CccProviderAttemptDispatchDecision,
+  CccProviderAttemptRequest,
+  CccProviderAttemptSettlementInput,
+  CccProviderAttemptScope,
+  CccProviderAttemptTransition,
+} from "./ccc-campaign/types.js";
 export type OverlapBlockerRepairReason =
   | "task-not-found"
   | "no-overlap-blocker"
@@ -118,7 +148,7 @@ import { acquireSymbolLocksAsync, inspectSymbolLockConflictsAsync, reconcileStal
 import type { AcquireSymbolLocksResult, ReconcileStaleSymbolLocksResult, ReleaseSymbolLocksResult, RenewSymbolLocksResult, SymbolLockConflict, SymbolLockOwner } from "./symbol-lock-types.js";
 import { queryRunAuditEvents } from "./task-store/async-audit.js";
 import { isValidMergeRequestTransitionImpl, enqueueMergeQueueSyncInternalImpl, releaseMergeQueueLeaseImpl, collectMergeDetailsImpl, applyPrMergedTransitionImpl } from "./task-store/merge-queue-ops-2.js";
-import { upsertWorkflowWorkItemImpl, replaceActiveTaskWorkflowContinuationImpl, transitionWorkflowWorkItemImpl, acquireWorkflowWorkItemLeaseImpl } from "./task-store/workflow-workitems-ops-2.js";
+import { upsertWorkflowWorkItemImpl, replaceActiveTaskWorkflowContinuationImpl, transitionWorkflowWorkItemImpl, acquireWorkflowWorkItemLeaseImpl, renewWorkflowWorkItemLeaseImpl, assertCccCampaignWorkflowLeaseFenceImpl, recordFencedCccCampaignProofAuditImpl, type CccCampaignWorkflowLeaseFenceInput, type FencedCccCampaignProofAuditInput } from "./task-store/workflow-workitems-ops-2.js";
 import { getSettingsImpl, getSettingsFastImpl, getSettingsByScopeImpl, getSettingsByScopeFastImpl } from "./task-store/settings-ops-2.js";
 import { runPluginColumnTransitionHooksImpl, logEntryImpl } from "./task-store/audit-ops.js";
 import { clearWorkflowRunBranchesImpl, projectMergeRequestToWorkflowWorkItemImpl, createCompletionHandoffWorkflowWorkImpl } from "./task-store/workflow-workitems-ops.js";
@@ -956,6 +986,197 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async getTask(id: string, options?: { activityLogLimit?: number; includeDeleted?: boolean }): Promise<TaskDetail> {
     return getTaskImpl(this, id, options);
   }
+  async getCccCampaignContextForTask(taskId: string): Promise<CccCampaignTaskContext | null> {
+    if (!this.asyncLayer) return null;
+    return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId);
+  }
+  async getCccCampaignContextForTaskWithinTransaction(
+    tx: DbTransaction,
+    taskId: string,
+  ): Promise<CccCampaignTaskContext | null> {
+    if (!this.asyncLayer) throw new Error("CCC campaign context requires a PostgreSQL-backed TaskStore");
+    return loadCccCampaignContextForTask(this.asyncLayer, this.rootDir, taskId, tx, true);
+  }
+  async reserveCccProviderAttempt(
+    input: CccProviderAttemptRequest,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return reserveCccProviderAttempt({ layer: this.asyncLayer, rootDir: this.rootDir, request: input });
+  }
+  async markCccProviderAttemptDispatched(
+    input: CccProviderAttemptTransition,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return markCccProviderAttemptDispatched({ layer: this.asyncLayer, rootDir: this.rootDir, transition: input });
+  }
+  async beginCccProviderAttemptDispatch(
+    input: CccProviderAttemptTransition,
+  ): Promise<CccProviderAttemptDispatchDecision> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return beginCccProviderAttemptDispatch({ layer: this.asyncLayer, rootDir: this.rootDir, transition: input });
+  }
+  async proveCccProviderAttemptNotDispatched(
+    input: CccProviderAttemptTransition,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return proveCccProviderAttemptNotDispatched({ layer: this.asyncLayer, rootDir: this.rootDir, transition: input });
+  }
+  async reconcileCccProviderAttempt(
+    input: CccProviderAttemptReconciliation,
+  ): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return reconcileCccProviderAttempt({ layer: this.asyncLayer, rootDir: this.rootDir, reconciliation: input });
+  }
+  /**
+   * Settle a non-CLI provider attempt and, only on its first committed terminal
+   * transition, consume the exact approval claim in the same PostgreSQL transaction.
+   * CLI attempts intentionally use CliSessionStore's held-session fence instead.
+   */
+  async settleCccProviderAttemptAndApproval(input: CccProviderAttemptSettlementInput): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return this.asyncLayer.transactionImmediate(async (tx) => {
+      const initial = await inspectCccProviderAttempt({
+        layer: this.asyncLayer!, rootDir: this.rootDir, tx,
+        taskId: input.taskId, attemptKey: input.attemptKey,
+      });
+      if (!initial) throw new Error("CCC provider attempt settlement requires an exact dispatched attempt");
+      const submittedIdentity = {
+        attemptKey: input.attemptKey,
+        controllerToken: input.controllerToken,
+        taskId: input.taskId,
+        semanticTaskId: input.semanticTaskId,
+        campaignDeadlineAt: input.campaignDeadlineAt,
+        turnKey: input.turnKey,
+        dispatchKey: input.dispatchKey,
+        attemptOrdinal: input.attemptOrdinal,
+        requestCount: input.requestCount,
+        binding: input.binding,
+      };
+      const persistedIdentity = {
+        attemptKey: initial.attemptKey,
+        controllerToken: initial.controllerToken,
+        taskId: initial.taskId,
+        semanticTaskId: initial.semanticTaskId,
+        campaignDeadlineAt: initial.campaignDeadlineAt,
+        turnKey: initial.turnKey,
+        dispatchKey: initial.dispatchKey,
+        attemptOrdinal: initial.attemptOrdinal,
+        requestCount: initial.requestCount,
+        binding: initial.binding,
+      };
+      if (canonicalCccPrdJson(submittedIdentity) !== canonicalCccPrdJson(persistedIdentity)) {
+        throw new Error("CCC provider attempt settlement immutable identity mismatch; persisted attempt was not mutated");
+      }
+      const context = await loadCccCampaignContextForTask(this.asyncLayer!, this.rootDir, input.taskId, tx, true);
+      if (!context || context.taskId !== initial.taskId || context.semanticTaskId !== initial.semanticTaskId) {
+        throw new Error("CCC provider attempt settlement requires matching persisted campaign context");
+      }
+      const transport = context.route.transport;
+      const expectedBinding = createCccCampaignAuthorityBinding(context, {
+        actionId: initial.binding.actionId,
+        actionTarget: initial.binding.actionTarget,
+      });
+      if (transport === "cli" || (transport !== "pi" && transport !== "workflow")) {
+        throw new Error("CCC TaskStore provider settlement only permits pi or workflow transport");
+      }
+      if (
+        initial.binding.bindingHash !== expectedBinding.bindingHash
+        || initial.binding.providerId !== context.route.providerId
+        || initial.binding.modelId !== context.route.modelId
+        || initial.binding.transport !== transport
+      ) {
+        throw new Error("CCC provider attempt binding does not match persisted campaign route and authority binding");
+      }
+      let claimedApproval: { action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">; claimToken: string } | undefined;
+      if (input.outcome === "committed" && initial.state === "dispatched_unknown") {
+        const action = { actionId: initial.binding.actionId, actionTarget: initial.binding.actionTarget };
+        const lease = await this.inspectCccCampaignActionLease(initial.taskId, action, tx);
+        if (
+          !lease
+          || lease.binding.bindingHash !== initial.binding.bindingHash
+          || lease.lease.bindingHash !== initial.binding.bindingHash
+          || lease.lease.actionId !== action.actionId
+          || lease.lease.actionTarget !== action.actionTarget
+        ) throw new Error("CCC committed provider settlement has no exact persisted action lease");
+        await assertClaimedCccCampaignApprovalWithinTransaction(tx, {
+          authorityStore: this,
+          rootDir: this.rootDir,
+          taskId: initial.taskId,
+          action,
+          approvalRequestId: lease.lease.approvalRequestId,
+          claimToken: lease.lease.claimToken,
+        });
+        claimedApproval = { action, claimToken: lease.lease.claimToken };
+      }
+      const terminal = await reconcileCccProviderAttempt({
+        layer: this.asyncLayer!, rootDir: this.rootDir, tx, reconciliation: input,
+      });
+      if (claimedApproval) {
+        await consumeCccCampaignApprovalWithinTransaction(tx, {
+          authorityStore: this,
+          rootDir: this.rootDir,
+          taskId: terminal.taskId,
+          action: claimedApproval.action,
+          claimToken: claimedApproval.claimToken,
+          actor: Object.freeze({ actorId: "ccc-provider", actorType: "agent" as const, actorName: "CCC provider settlement" }),
+          runId: `ccc-provider-settlement:${terminal.taskId}:${terminal.attemptKey}`,
+        });
+      }
+      return terminal;
+    });
+  }
+  async inspectCccProviderAttempt(
+    input: Pick<CccProviderAttemptTransition, "taskId" | "attemptKey">,
+  ): Promise<CccProviderAttemptScope | null> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return inspectCccProviderAttempt({ layer: this.asyncLayer, rootDir: this.rootDir, ...input });
+  }
+  async claimCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    claim: CccCampaignActionLeaseClaim,
+    tx?: DbTransaction,
+  ): Promise<CccCampaignActionLeaseResult> {
+    if (!this.asyncLayer) throw new Error("CCC campaign action leases require a PostgreSQL-backed TaskStore");
+    return claimCccCampaignActionLease({
+      layer: this.asyncLayer,
+      rootDir: this.rootDir,
+      taskId,
+      action,
+      claim,
+      tx,
+    });
+  }
+  async inspectCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    tx?: DbTransaction,
+  ): Promise<CccCampaignActionLeaseResult | null> {
+    if (!this.asyncLayer) throw new Error("CCC campaign action leases require a PostgreSQL-backed TaskStore");
+    return inspectCccCampaignActionLease({
+      layer: this.asyncLayer,
+      rootDir: this.rootDir,
+      taskId,
+      action,
+      tx,
+    });
+  }
+  async settleCccCampaignActionLease(
+    taskId: string,
+    action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">,
+    claimToken: string,
+    tx?: DbTransaction,
+  ): Promise<void> {
+    if (!this.asyncLayer) throw new Error("CCC campaign action leases require a PostgreSQL-backed TaskStore");
+    return settleCccCampaignActionLease({
+      layer: this.asyncLayer,
+      rootDir: this.rootDir,
+      taskId,
+      action,
+      claimToken,
+      tx,
+    });
+  }
 
   /**
    * FNXC:RuntimeWorkflowAsync 2026-06-24-16:20:
@@ -1567,8 +1788,21 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   async listDueWorkflowWorkItems(filter: WorkflowWorkItemDueFilter = {}): Promise<WorkflowWorkItem[]> {
     return listDueWorkflowWorkItemsImpl(this, filter);
   }
-  async acquireWorkflowWorkItemLease( id: string, leaseOwner: string, opts: { leaseDurationMs: number; now?: string }, ): Promise<WorkflowWorkItem | null> {
+  async acquireWorkflowWorkItemLease( id: string, leaseOwner: string, opts: { leaseDurationMs: number; now?: string; expectedRunId?: string; expectedAttempt?: number }, ): Promise<WorkflowWorkItem | null> {
     return acquireWorkflowWorkItemLeaseImpl(this, id, leaseOwner, opts);
+  }
+  async renewWorkflowWorkItemLease( id: string, leaseOwner: string, expectedAttempt: number, opts: { leaseDurationMs: number; now?: string }, ): Promise<WorkflowWorkItem | null> {
+    return renewWorkflowWorkItemLeaseImpl(this, id, leaseOwner, expectedAttempt, opts);
+  }
+  async assertCccCampaignWorkflowLeaseFence(
+    input: CccCampaignWorkflowLeaseFenceInput,
+  ): Promise<void> {
+    return assertCccCampaignWorkflowLeaseFenceImpl(this, input);
+  }
+  async recordFencedCccCampaignProofAudit(
+    input: FencedCccCampaignProofAuditInput,
+  ): Promise<void> {
+    return recordFencedCccCampaignProofAuditImpl(this, input);
   }
   async setCompletionHandoffAcceptedMarker( taskId: string, opts: { source: string; acceptedAt?: string }, ): Promise<CompletionHandoffMarker> {
     return setCompletionHandoffAcceptedMarkerImpl(this, taskId, opts);

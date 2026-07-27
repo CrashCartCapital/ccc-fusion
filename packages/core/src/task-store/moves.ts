@@ -34,8 +34,9 @@ import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
 import {getTaskMergeBlocker} from "../task-merge.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {readTaskRow as readTaskRowAsync, readTaskRowInTransaction, upsertTaskRowInTransaction} from "../task-store/async-persistence.js";
-import {disposeTaskBeforeMove} from "../task-move-disposer.js";
+import {beginTaskMoveDisposal} from "../task-move-disposer.js";
 import {resolveTaskSymbolsForTask} from "../task-symbol-resolution.js";
+import {cancelActiveWorkflowWorkItemsForTaskSyncInCurrentTransaction} from "./task-mutation-ops.js";
 
 /*
 FNXC:PostgresCutover 2026-07-05-19:50:
@@ -675,6 +676,14 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       }
     }
 
+    const lifecycleWorkflowIr = workflowIr ?? await resolveTaskWorkflowIrForMove(store, id);
+    const fromIsImplementation = resolveTransitionColumnFacts(lifecycleWorkflowIr, fromColumn).flags.countsTowardWip === true;
+    const toIsImplementation = resolveTransitionColumnFacts(lifecycleWorkflowIr, toColumn).flags.countsTowardWip === true;
+    const shouldHardCancelTaskWork =
+      toColumn === "todo" &&
+      moveSource === "user" &&
+      (fromColumn === "in-progress" || fromIsImplementation || fromColumn === "in-review");
+
     /*
     FNXC:TaskMovement 2026-07-18-14:32:
     A user in-progress -> todo move is a hard cancel. Run the engine-owned,
@@ -683,12 +692,14 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     Todo row until the agent, workflow, configured command, and CLI execution
     surfaces have stopped.
     */
-    await disposeTaskBeforeMove(store, {
+    const releaseTaskMoveDisposal = await beginTaskMoveDisposal(store, {
       task,
       from: fromColumn,
       to: toColumn,
       source: moveSource,
+      hardCancel: shouldHardCancelTaskWork,
     });
+    try {
 
     const movedAt = internal.now ?? new Date().toISOString();
     // FNXC:TaskTiming 2026-08-01-10:00: column dwell is wall-clock stage data,
@@ -712,6 +723,7 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         fromColumn,
         toColumn,
         moveSource,
+        hardCancel: shouldHardCancelTaskWork,
         bypassGuards,
         movedAt,
         settings: undefined,
@@ -725,8 +737,9 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         resetSteps: () => store.resetAllStepsToPending(task),
       };
       const isReopenToTodoOrTriage =
-        (fromColumn === "in-progress" || fromColumn === "done" || fromColumn === "in-review") &&
-        (toColumn === "todo" || toColumn === "triage");
+        shouldHardCancelTaskWork ||
+        ((fromColumn === "in-progress" || fromColumn === "done" || fromColumn === "in-review") &&
+          (toColumn === "todo" || toColumn === "triage"));
       const hasNonPendingStepProgress = task.steps.some((step) => step.status !== "pending");
       const preserveStepProgress =
         options?.preserveResumeState ||
@@ -778,8 +791,9 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       }
 
       const isReopenToTodoOrTriage =
-        (fromColumn === "in-progress" || fromColumn === "done" || fromColumn === "in-review")
-        && (toColumn === "todo" || toColumn === "triage");
+        shouldHardCancelTaskWork ||
+        ((fromColumn === "in-progress" || fromColumn === "done" || fromColumn === "in-review")
+          && (toColumn === "todo" || toColumn === "triage"));
 
       if (isReopenToTodoOrTriage) {
         // FNXC:WorkflowLifecycle 2026-07-12-09:05 (merge port from main): keep
@@ -911,6 +925,14 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
                 }),
             });
           }
+        }
+
+        if (shouldHardCancelTaskWork) {
+          await store.cancelActiveWorkflowWorkItemsForTask(id, {
+            kinds: ["task"],
+            now: movedAt,
+            lastError: "cancelled-by-user-hard-cancel",
+          }, tx);
         }
 
         // Upsert the task row (update column + all mutated fields).
@@ -1050,6 +1072,14 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         }
       }
 
+      if (shouldHardCancelTaskWork) {
+        cancelActiveWorkflowWorkItemsForTaskSyncInCurrentTransaction(store, id, {
+          kinds: ["task"],
+          now: movedAt,
+          lastError: "cancelled-by-user-hard-cancel",
+        });
+      }
+
       store.upsertTaskWithFtsRecovery(task);
       store.insertRunAuditEventRow({
         taskId: id,
@@ -1155,9 +1185,6 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     them only when leaving WIP. PostgreSQL owns durable locks; SQLite has no
     symbol-lock table and remains on coarse scheduling behavior.
     */
-    const lifecycleWorkflowIr = workflowIr ?? await resolveTaskWorkflowIrForMove(store, id);
-    const fromIsImplementation = resolveTransitionColumnFacts(lifecycleWorkflowIr, fromColumn).flags.countsTowardWip === true;
-    const toIsImplementation = resolveTransitionColumnFacts(lifecycleWorkflowIr, toColumn).flags.countsTowardWip === true;
     if (store.backendMode && fromIsImplementation && !toIsImplementation) {
       const symbols = resolveTaskSymbolsForTask(task);
       if (symbols.resolvable) {
@@ -1182,25 +1209,6 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         lastError: "cancelled-by-user-hard-cancel",
       });
       void store.clearCompletionHandoffAcceptedMarker(id);
-    }
-    if (toColumn === "todo" && moveSource === "user" && (fromIsImplementation || fromColumn === "in-review")) {
-      // FNXC:WorkflowTaskCancellation 2026-07-21-11:51:
-      // The task move is already committed here. Continuation cleanup is
-      // best-effort so a storage fault cannot suppress task:moved or strand
-      // transitionPending after a successful operator hard-cancel.
-      try {
-        await store.cancelActiveWorkflowWorkItemsForTask(id, {
-          kinds: ["task"],
-          now: movedAt,
-          lastError: "cancelled-by-user-hard-cancel",
-        });
-      } catch (err) {
-        storeLog.warn("Failed to cancel active task workflow continuation on user todo move (degraded)", {
-          phase: "moveTaskInternal:cancel-task-continuation",
-          taskId: id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
     }
     if (toColumn === "done") {
       // FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-16:00:
@@ -1263,4 +1271,7 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
       });
     }
     return task;
+    } finally {
+      releaseTaskMoveDisposal();
+    }
   }

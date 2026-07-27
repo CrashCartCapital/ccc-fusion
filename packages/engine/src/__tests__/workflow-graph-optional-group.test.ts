@@ -5,6 +5,7 @@ import type { TaskDetail, WorkflowIr } from "@fusion/core";
 import {
   PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE,
   WorkflowGraphExecutor,
+  type WorkflowGraphExecutorDeps,
   type WorkflowNodeHandler,
 } from "../workflow-graph-executor.js";
 
@@ -209,6 +210,89 @@ describe("WorkflowGraphExecutor optional-group", () => {
     expect(result.visitedNodeIds.filter((id) => id === "group::b")).toHaveLength(1);
     expect(result.context["node:group:outcome"]).toBe("success");
     expect(result.outcome).toBe("success");
+  });
+
+  it("Task 4 RED: enabled optional-group template nodes receive one frozen materialized optional-group visit identity across resolver, admit, prepare, and handler", async () => {
+    const resolveNodeExecution = vi.fn(async (input: { visitIdentity: unknown }) => {
+      resolveVisitIdentity = input.visitIdentity as unknown;
+      return {
+        semanticTask: {
+          ...taskWith(["group"]),
+          id: "FN-OG-SEMANTIC",
+        },
+      };
+    }) as unknown as WorkflowGraphExecutorDeps["resolveNodeExecution"];
+    const admitNodeExecution = vi.fn((_node, _task, _signal, visitIdentity?: unknown) => {
+      admitVisitIdentity = visitIdentity;
+    });
+    const prepareNodeExecution = vi.fn((_node, _task, _requirement, visitIdentity?: unknown) => {
+      prepareVisitIdentity = visitIdentity;
+    });
+    const handler = vi.fn(async (_node, context) => {
+      handlerVisitIdentity = context.visitIdentity;
+      return { outcome: "success" };
+    });
+    let resolveVisitIdentity: unknown;
+    let admitVisitIdentity: unknown;
+    let prepareVisitIdentity: unknown;
+    let handlerVisitIdentity: unknown;
+    const ir: WorkflowIr = {
+      version: "v2",
+      name: "optional-group-red-id-assertion",
+      columns: [{ id: "work", name: "Work", traits: [] }],
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "group",
+          kind: "optional-group",
+          config: {
+            name: "Browser verification",
+            defaultOn: false,
+            template: {
+              nodes: [{
+                id: "optstep",
+                kind: "prompt",
+                config: {
+                  prompt: "verify",
+                  toolMode: "coding",
+                  skillName: "compound-engineering:ce-plan",
+                },
+              }],
+              edges: [],
+            },
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "group" },
+        { from: "group", to: "end", condition: "success" },
+      ],
+    };
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        prompt: handler,
+      },
+      resolveNodeExecution,
+      admitNodeExecution: admitNodeExecution as unknown as WorkflowGraphExecutorDeps["admitNodeExecution"],
+      prepareNodeExecution: prepareNodeExecution as unknown as WorkflowGraphExecutorDeps["prepareNodeExecution"],
+    });
+
+    await executor.run(taskWith(["group"]), settingsOn(), ir);
+
+    expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
+    expect(admitNodeExecution).toHaveBeenCalledTimes(1);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(resolveVisitIdentity).toEqual({
+      nodeId: "optstep",
+      materializedNodeId: "group::optstep",
+      optionalGroupNodeId: "group",
+    });
+    expect(admitVisitIdentity).toBe(resolveVisitIdentity);
+    expect(prepareVisitIdentity).toBe(resolveVisitIdentity);
+    expect(handlerVisitIdentity).toBe(resolveVisitIdentity);
+    expect(Object.isFrozen(resolveVisitIdentity as { nodeId: string; materializedNodeId: string; optionalGroupNodeId: string })).toBe(true);
   });
 
   it("disabled group is inert: downstream outcome/context identical to the group not being there", async () => {

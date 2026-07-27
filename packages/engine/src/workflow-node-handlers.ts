@@ -1,7 +1,7 @@
 import { WorkflowIrError, instanceNodeId } from "@fusion/core";
 import type { TaskDetail, WorkflowIrNode } from "@fusion/core";
 
-import type { WorkflowNodeHandler, WorkflowNodeResult } from "./workflow-graph-executor.js";
+import type { WorkflowNodeExecutionContext, WorkflowNodeHandler, WorkflowNodeResult } from "./workflow-graph-executor.js";
 import { createPrNodeHandlers, createAutoMergeGateHandler, type PrNodeDeps } from "./pr-nodes.js";
 import {
   primitiveNodeContext,
@@ -223,6 +223,7 @@ export type WorkflowCustomNodeRunner = (
   node: WorkflowIrNode,
   task: TaskDetail,
   context: Record<string, unknown>,
+  executionContext?: WorkflowNodeExecutionContext,
 ) => Promise<WorkflowNodeResult>;
 
 /*
@@ -353,7 +354,7 @@ export function createPromptLikeHandler(
     if (!runCustomNode) {
       throw new WorkflowIrError(`No custom-node runner registered for node: ${node.id}`);
     }
-    return runCustomNode(node, context.task, context.context);
+    return runCustomNode(node, context.task, context.context, context);
   };
 }
 
@@ -463,7 +464,7 @@ export function createPrimitivePromptLikeHandler(
     if (!runCustomNode) {
       throw new WorkflowIrError(`No custom-node runner registered for node: ${node.id}`);
     }
-    return runCustomNode(node, context.task, context.context);
+    return runCustomNode(node, context.task, context.context, context);
   };
 }
 

@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { TaskDetail, WorkflowIrNode } from "@fusion/core";
 
-import { parseWorkflowStepOutput } from "../executor.js";
+import "./executor-test-helpers.js";
+import { parseWorkflowStepOutput, TaskExecutor } from "../executor.js";
 import { createDefaultNodeHandlers } from "../workflow-node-handlers.js";
 import { WorkflowGraphExecutor } from "../workflow-graph-executor.js";
+import { createMockStore } from "./executor-test-helpers.js";
 
 /*
 FNXC:WorkflowGates 2026-06-17-18:27:
@@ -114,5 +116,92 @@ describe("workflow malformed-verdict gate", () => {
 
     expect(result.outcome).toBe("failure");
     expect(result.visitedNodeIds).toEqual(["start", "gate"]);
+  });
+
+  it("fails closed for fenced blocking CCC semantic task nodes with malformed workflow-step output", async () => {
+    const liveTask = {
+      ...task,
+      id: "FN-CCC-GATE",
+      worktree: "/tmp/ccc-fenced-gate",
+    } as TaskDetail;
+    const store = createMockStore();
+    store.getTask.mockImplementation(async (id: string) => ({ ...liveTask, id }));
+    const executor = new TaskExecutor(store as any, "/tmp/ccc-fenced-gate");
+    const executeStep = vi
+      .spyOn(executor as any, "executeWorkflowStep")
+      .mockResolvedValue({ success: false, output: "lorem ipsum", malformed: true });
+    const executionFence = Object.freeze({
+      workItemId: "wi-ccc-fenced-gate",
+      attempt: 1,
+      runId: "run-ccc-fenced-gate",
+    });
+    const sealedExecutionContext = Object.freeze({
+      task: liveTask,
+      settings: undefined,
+      context: {},
+      execution: Object.freeze({
+        originTaskId: liveTask.id,
+        semanticTaskId: "CCC-SEMANTIC-GATE",
+        semanticTask: { ...liveTask, id: "CCC-SEMANTIC-GATE" },
+        runId: "run-ccc-fenced-gate",
+        visitIdentity: Object.freeze({
+          nodeId: "ccc-imported-gate",
+          materializedNodeId: "ccc-imported-gate",
+        }),
+        executionFence,
+        providerAttemptTurnKey: "ccc-gate-turn-key",
+      }),
+      signal: undefined,
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      {
+        id: "ccc-imported-gate",
+        kind: "prompt",
+        config: {
+          prompt: "Return APPROVE or REVISE",
+          gateMode: "gate",
+          cccPrdTaskId: "CCC-SEMANTIC-GATE",
+        },
+      },
+      liveTask,
+      {},
+      undefined,
+      {},
+      sealedExecutionContext,
+    );
+
+    expect(result).toMatchObject({ outcome: "failure", value: "failed" });
+    expect(executeStep).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps generic unfenced prompt gates lenient on malformed workflow-step output", async () => {
+    const liveTask = {
+      ...task,
+      id: "FN-GENERIC-GATE",
+      worktree: "/tmp/generic-unfenced-gate",
+    } as TaskDetail;
+    const store = createMockStore();
+    store.getTask.mockImplementation(async (id: string) => ({ ...liveTask, id }));
+    const executor = new TaskExecutor(store as any, "/tmp/generic-unfenced-gate");
+    vi
+      .spyOn(executor as any, "executeWorkflowStep")
+      .mockResolvedValue({ success: false, output: "lorem ipsum", malformed: true });
+
+    const result = await (executor as any).runGraphCustomNode(
+      {
+        id: "generic-prompt-gate",
+        kind: "prompt",
+        config: {
+          prompt: "Return APPROVE or REVISE",
+          gateMode: "gate",
+        },
+      },
+      liveTask,
+      {},
+      undefined,
+    );
+
+    expect(result).toMatchObject({ outcome: "success", value: "advisory_failure" });
   });
 });

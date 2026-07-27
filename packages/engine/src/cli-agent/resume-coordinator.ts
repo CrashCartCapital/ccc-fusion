@@ -39,8 +39,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { CliSession, CliSessionStore, CliTerminationReason } from "@fusion/core";
 import type { CliSessionManager } from "./session-manager.js";
-import { CliConcurrencyLimitError, CliResumeUnsupportedError } from "./session-manager.js";
+import { CliConcurrencyLimitError, CliResumeAdmissionError, CliResumeUnsupportedError } from "./session-manager.js";
 import type { CliAdapterRegistry } from "./adapter.js";
+import {
+  CCC_FUSION_POSTURE_PROFILE_KEY,
+  CCC_FUSION_PROFILE,
+} from "./ccc-subscription-policy.js";
 import { isResumeEligible } from "./state-machine.js";
 
 const execFileAsync = promisify(execFile);
@@ -52,6 +56,18 @@ const ORPHANED_LIVE_STATES = new Set<CliSession["agentState"]>([
   "busy",
   "waitingOnInput",
 ]);
+
+/** TaskExecutor owns PI receipt recovery when it persisted this exact authority marker. */
+function isTaskExecutorOwnedPiReceiptLedger(session: CliSession): boolean {
+  return session.adapterId === "pi"
+    && session.purpose === "execute"
+    && session.autonomyPosture?.cccExecutionAuthority != null;
+}
+
+/** One-shot native sessions are intentionally never resumed. */
+function isCccNativeCliOneShot(session: CliSession): boolean {
+  return session.autonomyPosture?.cccNativeCliOneShot === true;
+}
 
 /** Default resume attempt cap (KTD = 2). */
 export const DEFAULT_MAX_RESUME_ATTEMPTS = 2;
@@ -159,6 +175,8 @@ export class CliResumeCoordinator {
 
   /** Whether a recorded session is currently resume-eligible (for sweep skipping). */
   isRecordResumeEligible(session: CliSession): boolean {
+    if (isTaskExecutorOwnedPiReceiptLedger(session)) return false;
+    if (isCccNativeCliOneShot(session)) return false;
     if (session.resumeAttempts >= this.maxResumeAttempts) return false;
     // Found-live-on-restart → engineDeath (eligible).
     if (ORPHANED_LIVE_STATES.has(session.agentState)) return true;
@@ -184,6 +202,7 @@ export class CliResumeCoordinator {
     const candidates = this.store
       .listSessions()
       .filter((s) => ORPHANED_LIVE_STATES.has(s.agentState))
+      .filter((s) => !isTaskExecutorOwnedPiReceiptLedger(s))
       // Never reclaim a session the manager already owns (idempotent re-run).
       .filter((s) => !this.manager.isLive(s.id));
 
@@ -221,6 +240,10 @@ export class CliResumeCoordinator {
     const reason: CliTerminationReason = ORPHANED_LIVE_STATES.has(session.agentState)
       ? "engineDeath"
       : session.terminationReason ?? "engineDeath";
+    if (isCccNativeCliOneShot(session)) {
+      this.toNeedsAttention(session, reason, "ineligible because ccc native CLI one-shot session");
+      return { ...base, disposition: "needsAttention-ineligible", reason };
+    }
 
     // Eligibility predicate: only crashed / engineDeath ever resume.
     if (!isResumeEligible(reason)) {
@@ -272,18 +295,52 @@ export class CliResumeCoordinator {
       this.flagDirty(session);
     }
 
+    // The sweep snapshot can become terminal (or gain a live owner) while the
+    // coordinator is checking the worktree. Re-read immediately before the
+    // manager admission. Never use the stale snapshot to revive or overwrite a
+    // newer durable generation.
+    const current = this.store.getSession(session.id);
+    if (!current) {
+      return { ...base, disposition: "needsAttention-spawnError", reason: "session disappeared before admission" };
+    }
+    const currentReason: CliTerminationReason = ORPHANED_LIVE_STATES.has(current.agentState)
+      ? "engineDeath"
+      : current.terminationReason ?? "engineDeath";
+    if (isCccNativeCliOneShot(current)) {
+      this.toNeedsAttention(current, currentReason, "ineligible because ccc native CLI one-shot session");
+      return { ...base, disposition: "needsAttention-ineligible", reason: currentReason };
+    }
+    if (!isResumeEligible(currentReason) || current.agentState === "needsAttention") {
+      return { ...base, disposition: "needsAttention-ineligible", reason: currentReason };
+    }
+    if (!current.nativeSessionId) {
+      return { ...base, disposition: "needsAttention-spawnError", reason: "native session id disappeared before admission" };
+    }
+
     // Relaunch via the manager's resume path (adapter buildResume + native id),
     // reusing the existing record so no duplicate session row is created.
     try {
+      /*
+       * A persisted ccc posture proves that the original launch passed the
+       * structural readiness boundary. Recovery supplies a fresh in-memory
+       * marker to the same spawn gate without persisting readiness or reading
+       * credentials. The manager independently restores and revalidates the
+       * exact sanitized MCP posture before adapter argv or PTY creation.
+       */
+      const cccRecoverySettings =
+        current.autonomyPosture?.[CCC_FUSION_POSTURE_PROFILE_KEY] === CCC_FUSION_PROFILE
+          ? { subscriptionReady: true }
+          : undefined;
       await this.manager.spawn({
-        adapterId: session.adapterId,
-        projectId: session.projectId,
-        purpose: session.purpose,
-        taskId: session.taskId,
-        chatSessionId: session.chatSessionId,
+        adapterId: current.adapterId,
+        projectId: current.projectId,
+        purpose: current.purpose,
+        taskId: current.taskId,
+        chatSessionId: current.chatSessionId,
         worktreePath,
-        posture: session.autonomyPosture,
-        resume: { sessionId: session.id, nativeSessionId: session.nativeSessionId },
+        posture: current.autonomyPosture,
+        ...(cccRecoverySettings ? { settings: cccRecoverySettings } : {}),
+        resume: { sessionId: current.id, nativeSessionId: current.nativeSessionId },
       });
     } catch (err) {
       // Immediate spawn failure / unsupported resume / missing vendor store →
@@ -294,6 +351,17 @@ export class CliResumeCoordinator {
       const msg = err instanceof Error ? err.message : String(err);
       const isUnsupported = err instanceof CliResumeUnsupportedError;
       const isCeiling = err instanceof CliConcurrencyLimitError;
+      const isAdmission = err instanceof CliResumeAdmissionError;
+      if (isAdmission) {
+        // The manager re-read a newer live/terminal record. Its admission
+        // decision is authoritative; do not mutate it through this stale
+        // coordinator snapshot.
+        return {
+          ...base,
+          disposition: err.reason === "session is already live" ? "resumed" : "needsAttention-ineligible",
+          reason: err.reason,
+        };
+      }
       if (isCeiling) {
         // Capacity raced away — leave persisted-live for the next sweep, no attempt charge.
         this.store.updateSession(session.id, { resumeAttempts: session.resumeAttempts });

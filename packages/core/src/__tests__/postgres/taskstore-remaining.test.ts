@@ -23,9 +23,10 @@
 import { describe, it, expect, afterEach } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { execSync } from "node:child_process";
 import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
+import { TaskStore } from "../../store.js";
 import { createConnectionSetFromUrl } from "../../postgres/connection.js";
 import type { ResolvedBackend } from "../../postgres/backend-resolver.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
@@ -54,7 +55,6 @@ import {
   ensureBranchGroupForSource,
   ensurePrEntityForSource,
   updatePrEntity,
-  getPrEntity,
   listActivePrEntities,
   recordPrThreadOutcome,
   getPrThreadState,
@@ -62,7 +62,6 @@ import {
 import {
   upsertWorkflowWorkItem,
   transitionWorkflowWorkItem,
-  getWorkflowWorkItem,
   listDueWorkflowWorkItems,
   recordCompletionHandoff,
   getCompletionHandoffMarker,
@@ -778,9 +777,9 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     const running = await transitionWorkflowWorkItem(ctx.layer, item.id, "running");
     expect(running.state).toBe("running");
 
-    // Transition to 'completed' (terminal).
-    const completed = await transitionWorkflowWorkItem(ctx.layer, item.id, "completed");
-    expect(completed.state).toBe("completed");
+    // Transition to 'succeeded' (terminal).
+    const completed = await transitionWorkflowWorkItem(ctx.layer, item.id, "succeeded");
+    expect(completed.state).toBe("succeeded");
 
     // Terminal guard: cannot requeue a completed item.
     await expect(
@@ -833,6 +832,179 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
 
     const due = await listDueWorkflowWorkItems(ctx.layer.db, { limit: 10 });
     expect(due.some((i) => i.taskId === "KB-DUE")).toBe(true);
+  });
+
+  it("fences stale terminal transitions after another owner reacquires the lease", async () => {
+    ctx = await setupCtx();
+    const now = "2026-07-25T12:00:00.000Z";
+    const store = new TaskStore(process.cwd(), undefined, { asyncLayer: ctx.layer });
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-FENCE-OWNER"), { lineageId: null });
+    const item = await store.upsertWorkflowWorkItem({
+      runId: "run-fence-owner",
+      taskId: "KB-FENCE-OWNER",
+      nodeId: "node-fence-owner",
+      kind: "task",
+      state: "runnable",
+      now,
+    });
+    const ownerA = await store.acquireWorkflowWorkItemLease(item.id, "owner-a", {
+      leaseDurationMs: 1_000,
+      now,
+    });
+    expect(ownerA).not.toBeNull();
+    const ownerB = await store.acquireWorkflowWorkItemLease(item.id, "owner-b", {
+      leaseDurationMs: 60_000,
+      now: "2026-07-25T12:00:02.000Z",
+    });
+    expect(ownerB?.leaseOwner).toBe("owner-b");
+
+    const auditBefore = await queryRunAuditEvents(ctx.layer.db, {
+      taskId: "KB-FENCE-OWNER",
+      mutationType: "workflowWorkItem:transition",
+    });
+    await expect(
+      store.transitionWorkflowWorkItem(item.id, "succeeded", {
+        expectedState: "running",
+        expectedLeaseOwner: "owner-a",
+        expectedAttempt: 0,
+      }),
+    ).rejects.toThrow(/precondition|fence|transition/i);
+
+    const row = await ctx.layer.db
+      .select({ state: schema.project.workflowWorkItems.state, leaseOwner: schema.project.workflowWorkItems.leaseOwner, attempt: schema.project.workflowWorkItems.attempt })
+      .from(schema.project.workflowWorkItems)
+      .where(eq(schema.project.workflowWorkItems.id, item.id));
+    expect(row).toEqual([{ state: "running", leaseOwner: "owner-b", attempt: 0 }]);
+    const auditAfter = await queryRunAuditEvents(ctx.layer.db, {
+      taskId: "KB-FENCE-OWNER",
+      mutationType: "workflowWorkItem:transition",
+    });
+    expect(auditAfter).toHaveLength(auditBefore.length);
+  });
+
+  it("refuses attempt drift and late success after cancellation without mutating the row", async () => {
+    ctx = await setupCtx();
+    const store = new TaskStore(process.cwd(), undefined, { asyncLayer: ctx.layer });
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-FENCE-TERMINAL"), { lineageId: null });
+    const item = await store.upsertWorkflowWorkItem({
+      runId: "run-fence-terminal",
+      taskId: "KB-FENCE-TERMINAL",
+      nodeId: "node-fence-terminal",
+      kind: "task",
+      state: "running",
+      attempt: 2,
+      leaseOwner: "owner-a",
+      leaseExpiresAt: "2026-07-25T13:00:00.000Z",
+    });
+
+    await expect(
+      store.transitionWorkflowWorkItem(item.id, "succeeded", {
+        expectedState: "running",
+        expectedLeaseOwner: "owner-a",
+        expectedAttempt: 1,
+      }),
+    ).rejects.toThrow(/precondition|fence|transition/i);
+    expect((await store.getWorkflowWorkItem(item.id))?.state).toBe("running");
+
+    await store.transitionWorkflowWorkItem(item.id, "cancelled", {
+      expectedState: "running",
+      expectedLeaseOwner: "owner-a",
+      expectedAttempt: 2,
+    });
+    await expect(
+      store.transitionWorkflowWorkItem(item.id, "succeeded", {
+        expectedState: "running",
+        expectedLeaseOwner: "owner-a",
+        expectedAttempt: 2,
+      }),
+    ).rejects.toThrow(/terminal|precondition|fence|transition/i);
+    const row = await ctx.layer.db
+      .select({ state: schema.project.workflowWorkItems.state, leaseOwner: schema.project.workflowWorkItems.leaseOwner, attempt: schema.project.workflowWorkItems.attempt })
+      .from(schema.project.workflowWorkItems)
+      .where(eq(schema.project.workflowWorkItems.id, item.id));
+    expect(row).toEqual([{ state: "cancelled", leaseOwner: "owner-a", attempt: 2 }]);
+  });
+
+  it("keeps exhausted workflow work terminal when late success arrives", async () => {
+    ctx = await setupCtx();
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-FENCE-EXHAUSTED"), { lineageId: null });
+    const item = await upsertWorkflowWorkItem(ctx.layer, {
+      runId: "run-fence-exhausted",
+      taskId: "KB-FENCE-EXHAUSTED",
+      nodeId: "node-fence-exhausted",
+      kind: "task",
+      state: "exhausted",
+      attempt: 3,
+    });
+
+    const auditBefore = await queryRunAuditEvents(ctx.layer.db, {
+      taskId: "KB-FENCE-EXHAUSTED",
+      mutationType: "workflowWorkItem:transition",
+    });
+    await expect(
+      transitionWorkflowWorkItem(ctx.layer, item.id, "succeeded"),
+    ).rejects.toThrow(/terminal/);
+
+    const row = await ctx.layer.db
+      .select({
+        state: schema.project.workflowWorkItems.state,
+        attempt: schema.project.workflowWorkItems.attempt,
+      })
+      .from(schema.project.workflowWorkItems)
+      .where(eq(schema.project.workflowWorkItems.id, item.id));
+    expect(row).toEqual([{ state: "exhausted", attempt: 3 }]);
+    const auditAfter = await queryRunAuditEvents(ctx.layer.db, {
+      taskId: "KB-FENCE-EXHAUSTED",
+      mutationType: "workflowWorkItem:transition",
+    });
+    expect(auditAfter).toHaveLength(auditBefore.length);
+  });
+
+  it("renews only a live running lease held by the exact owner and attempt", async () => {
+    ctx = await setupCtx();
+    const now = "2026-07-25T12:00:00.000Z";
+    const store = new TaskStore(process.cwd(), undefined, { asyncLayer: ctx.layer });
+    await insertTaskRow(ctx.layer, makeMinimalTask("KB-WORK-RENEW"), { lineageId: null });
+    const item = await store.upsertWorkflowWorkItem({
+      runId: "run-work-renew",
+      taskId: "KB-WORK-RENEW",
+      nodeId: "node-work-renew",
+      kind: "task",
+      state: "running",
+      attempt: 4,
+      leaseOwner: "owner-a",
+      leaseExpiresAt: "2026-07-25T12:01:00.000Z",
+      now,
+    });
+
+    const renewed = await store.renewWorkflowWorkItemLease(item.id, "owner-a", 4, {
+      leaseDurationMs: 30_000,
+      now: "2026-07-25T12:00:30.000Z",
+    });
+    expect(renewed).toMatchObject({
+      id: item.id,
+      state: "running",
+      leaseOwner: "owner-a",
+      attempt: 4,
+      leaseExpiresAt: "2026-07-25T12:01:00.000Z",
+    });
+    await expect(store.renewWorkflowWorkItemLease(item.id, "owner-b", 4, {
+      leaseDurationMs: 30_000,
+      now: "2026-07-25T12:00:31.000Z",
+    })).resolves.toBeNull();
+    await expect(store.renewWorkflowWorkItemLease(item.id, "owner-a", 5, {
+      leaseDurationMs: 30_000,
+      now: "2026-07-25T12:00:31.000Z",
+    })).resolves.toBeNull();
+    await expect(store.renewWorkflowWorkItemLease(item.id, "owner-a", 4, {
+      leaseDurationMs: 30_000,
+      now: "2026-07-25T12:01:00.000Z",
+    })).resolves.toBeNull();
+    await store.transitionWorkflowWorkItem(item.id, "cancelled");
+    await expect(store.renewWorkflowWorkItemLease(item.id, "owner-a", 4, {
+      leaseDurationMs: 30_000,
+      now: "2026-07-25T12:00:40.000Z",
+    })).resolves.toBeNull();
   });
 
   // ── Goal citations / usage events / plugin activations ──

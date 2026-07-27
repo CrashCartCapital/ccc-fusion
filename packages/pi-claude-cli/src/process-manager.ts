@@ -11,9 +11,52 @@ import { writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+const CCC_FUSION_PROFILE = "ccc-fusion";
+const CCC_SAFE_ENV_KEYS = [
+  "HOME", "PATH", "SHELL", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
+  "TERM", "TERMINFO", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "COLORTERM",
+];
+
+export class CccSubscriptionReadyRequiredError extends Error {
+  readonly code = "CCC_SUBSCRIPTION_PREFLIGHT_REQUIRED";
+
+  constructor() {
+    super("CCC Fusion subscription readiness must be explicitly true before spawning a child.");
+    this.name = "CccSubscriptionReadyRequiredError";
+  }
+}
+
+/*
+FNXC:CCCSubscriptionReadiness 2026-07-23-14:38:
+ccc-fusion accepts only subscriptionReady === true, a caller-supplied
+structural outcome before a child boundary. This guard never reads auth,
+credential, or provider state.
+*/
+export function assertCccFusionSubscriptionReady(profile?: string, subscriptionReady?: true): void {
+  if (profile === CCC_FUSION_PROFILE && subscriptionReady !== true) {
+    throw new CccSubscriptionReadyRequiredError();
+  }
+}
+
 function debugLog(message: string): void {
   if (process.env.PI_CLAUDE_CLI_DEBUG !== "1") return;
   console.error(`[pi-claude-cli] ${message}`);
+}
+
+/*
+FNXC:CCCSubscriptionPolicy 2026-07-23-13:15:
+The ccc-fusion pi-Claude profile passes an explicit safe environment to the
+actual Claude child so billing/auth/base-route variables and
+the ACP auth-forwarding opt-in cannot leak through Node's default inheritance.
+*/
+export function buildClaudeChildEnv(profile?: string): NodeJS.ProcessEnv | undefined {
+  if (profile !== CCC_FUSION_PROFILE) return undefined;
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of CCC_SAFE_ENV_KEYS) {
+    const value = process.env[key];
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
 }
 
 /**
@@ -32,6 +75,7 @@ export function buildClaudeSpawnArgs(
     mcpConfigPath?: string;
     resumeSessionId?: string;
     newSessionId?: string;
+    profile?: string;
   },
 ): string[] {
   const args = [
@@ -86,8 +130,11 @@ export function spawnClaude(
     mcpConfigPath?: string;
     resumeSessionId?: string;
     newSessionId?: string;
+    profile?: string;
+    subscriptionReady?: true;
   },
 ): ChildProcess {
+  assertCccFusionSubscriptionReady(options?.profile, options?.subscriptionReady);
   const args = buildClaudeSpawnArgs(modelId, systemPrompt, {
     effort: options?.effort,
     mcpConfigPath: options?.mcpConfigPath,
@@ -98,6 +145,7 @@ export function spawnClaude(
   const proc = spawn("claude", args, {
     stdio: ["pipe", "pipe", "pipe"],
     cwd: options?.cwd ?? process.cwd(),
+    ...(options?.profile === CCC_FUSION_PROFILE ? { env: buildClaudeChildEnv(options.profile) } : {}),
   });
 
   debugLog(`spawnClaude: pid=${proc.pid} model=${modelId}`);

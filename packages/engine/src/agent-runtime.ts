@@ -15,7 +15,15 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
+import type {
+  CccCampaignProviderControllerDecision,
+  CccCampaignProviderDispatchInput,
+  CccEffectReceiptStore,
+  CccProviderAttemptScope,
+  CccProviderAttemptSettlementInput,
+  PermanentAgentGatingContext,
+  ResolvedMcpServerDefinition,
+} from "@fusion/core";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { FallbackModelUsedPayload } from "./pi.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
@@ -45,6 +53,39 @@ export interface AgentMcpServerConfig {
 }
 
 export type AgentRuntimeMcpServerConfig = ResolvedMcpServerDefinition | AgentMcpServerConfig;
+
+/** The final, safe projection of the tools actually offered to a CCC PI session. */
+export interface CccExecutionToolAuthority {
+  authority: string;
+  parametersSha256: string;
+}
+
+/** Durable receipt ownership selected only after PI has materialized its final tool boundary. */
+export interface CccEffectReceiptBinding {
+  store: CccEffectReceiptStore;
+  sessionId: string;
+  controllerToken: string;
+  keepTurnOpen: boolean;
+}
+
+/** Frozen, runtime-neutral admission/settlement binding for one CCC PI turn. */
+export type CccProviderAttemptController = Readonly<{
+  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
+  reconcile(input: CccProviderAttemptSettlementInput): Promise<CccProviderAttemptScope>;
+}>;
+
+export type CccProviderAttemptBinding = Readonly<{
+  turnKey: string;
+  controller: CccProviderAttemptController;
+}>;
+
+/**
+ * PI invokes this once per session construction after every tool filter and
+ * wrapper has completed. The executor receives no raw schemas or tool args.
+ */
+export type CccEffectReceiptBinder = (
+  authorities: readonly CccExecutionToolAuthority[],
+) => Promise<CccEffectReceiptBinding>;
 
 export function normalizeAgentRuntimeMcpServers(
   servers: AgentRuntimeMcpServerConfig[] | undefined,
@@ -161,6 +202,20 @@ export interface AgentRuntimeOptions {
   /** Optional task context for fallback notifications. */
   taskId?: string;
   taskTitle?: string;
+  /** Explicit ccc-fusion boundary; omitted profiles retain predecessor behavior. */
+  profile?: string;
+  /** Structural ccc subscription preflight propagated to the PI runtime. */
+  subscriptionReady?: true;
+  /** Durable receipt surface for real ccc custom-tool effects. */
+  cccEffectReceiptStore?: CccEffectReceiptStore;
+  /** Durable ccc session identity for tool-effect replay protection. */
+  cccEffectReceiptSessionId?: string;
+  /** Durable controller-generation fence for a ccc receipt turn. */
+  cccEffectReceiptControllerToken?: string;
+  /** Late-bound durable CCC receipt ownership for the final PI tool boundary. */
+  cccEffectReceiptBinder?: CccEffectReceiptBinder;
+  /** Frozen CCC provider-attempt controller passed only to the native PI runtime. */
+  cccProviderAttemptBinding?: CccProviderAttemptBinding;
   actionGateContext?: AgentActionGateContext;
   /** Permanent-agent action gating context for v1 category classification enforcement. */
   permanentAgentGating?: PermanentAgentGatingContext;

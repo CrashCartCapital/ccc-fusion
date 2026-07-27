@@ -55,6 +55,7 @@
  *     also tolerates the snake_case / camelCase variants in case a version drifts.
  */
 
+import type { ResolvedMcpServerDefinition } from "@fusion/core";
 import type {
   CliAdapterCapabilities,
   CliAdapterLaunchContext,
@@ -65,6 +66,8 @@ import type {
   CliReadinessDetector,
 } from "../adapter.js";
 import { stripAnsiControl, type TelemetryEvent } from "../telemetry-hub.js";
+import { cccFusionEnvAllowlist } from "../ccc-subscription-policy.js";
+import { resolveCccNativeMcpServers } from "../ccc-native-mcp-policy.js";
 
 // ── Capabilities ────────────────────────────────────────────────────────────
 
@@ -94,6 +97,8 @@ export interface CodexLaunchSettings {
   extraArgs?: readonly string[];
   /** Model override (`-c model=<id>`). */
   model?: string;
+  /** Resolved MCP servers forwarded through Codex's native MCP config. */
+  mcpServers?: readonly ResolvedMcpServerDefinition[];
   /**
    * Absolute path to the session-scoped notify program (from U17). When present
    * the adapter appends `-c notify=["<path>"]` so a turn-complete event is
@@ -132,6 +137,29 @@ export function buildNotifyOverrideArg(notifyProgram: string | undefined): strin
 }
 
 /**
+ * Build session-scoped Codex config overrides for resolved MCP servers.
+ *
+ * FNXC:CCCNativeMcp 2026-07-23-15:45:
+ * Keep MCP schemas, calls, and structured results on Codex's native MCP
+ * protocol seam. These argv assignments carry configuration only; tool traffic
+ * is never converted to prompt text or sent through the generic adapter.
+ */
+function buildNativeMcpOverrideArgs(
+  settings: CodexLaunchSettings,
+): string[] {
+  const args: string[] = [];
+  const servers = resolveCccNativeMcpServers(
+    settings as unknown as Record<string, unknown>,
+  );
+  for (const server of servers) {
+    const prefix = `mcp_servers.${JSON.stringify(server.name)}`;
+    args.push("-c", `${prefix}.url=${JSON.stringify(server.url)}`);
+    args.push("-c", `${prefix}.enabled=true`);
+  }
+  return args;
+}
+
+/**
  * Describe the layered session-scoped `CODEX_HOME` mechanism (the alternative to
  * `-c notify`). The caller materializes `dir` (copying/symlinking the user's
  * `auth.json` so the child stays authenticated) and writes a `config.toml` that
@@ -160,6 +188,7 @@ function buildBaseArgs(ctx: CliAdapterLaunchContext): { command: string; args: s
     args.push("-c", `model=${JSON.stringify(settings.model)}`);
   }
   args.push(...buildNotifyOverrideArg(settings.notifyProgram));
+  args.push(...buildNativeMcpOverrideArgs(settings));
   return { command, args };
 }
 
@@ -643,7 +672,7 @@ export const codexAdapter: CliAgentAdapter = {
       "OPENAI_BASE_URL",
     ];
     // When a layered CODEX_HOME scratch dir is configured the env carries it.
-    return settings.codexHome ? [...new Set([...base, "CODEX_HOME"])] : base;
+    return cccFusionEnvAllowlist(settings.codexHome ? [...new Set([...base, "CODEX_HOME"])] : base, ctx.settings);
   },
 
   createReadinessDetector(): CliReadinessDetector {
@@ -668,6 +697,7 @@ export const codexAdapter: CliAgentAdapter = {
       args.push("-c", `model=${JSON.stringify(settings.model)}`);
     }
     args.push(...buildNotifyOverrideArg(settings.notifyProgram));
+    args.push(...buildNativeMcpOverrideArgs(settings));
     appendPostureFlags(args, ctx);
     if (settings.extraArgs) args.push(...settings.extraArgs);
     return { command, args };

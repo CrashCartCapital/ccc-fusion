@@ -6,11 +6,20 @@
 // standard / undefined executionMode data states, and the executor tool
 // injection surface (fn_review_step is deleted in both modes) vs mandatory fn_task_done.
 import { describe, it, expect, vi, beforeEach } from "vitest";
+const { createCccCampaignProviderAttemptBindingMock } = vi.hoisted(() => ({
+  createCccCampaignProviderAttemptBindingMock: vi.fn(),
+}));
 import "./executor-test-helpers.js";
-import { getBuiltinWorkflow } from "@fusion/core";
+import { disposeTaskBeforeMove, getBuiltinWorkflow } from "@fusion/core";
 import { TaskExecutor } from "../executor.js";
 import { WorkflowGraphTaskRunner } from "../workflow-graph-task-runner.js";
 import { FOREACH_ACTIVE_CONTEXT_KEY } from "../workflow-node-handlers.js";
+import {
+  AgentSemaphore,
+  clearPreHeldExecutorSlotsForTests,
+  hasPreHeldExecutorSlot,
+  registerPreHeldExecutorSlot,
+} from "../concurrency.js";
 import {
   createMockStore,
   mockedCreateFnAgent,
@@ -19,6 +28,10 @@ import {
   mockedStatSync,
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
+
+vi.mock("../ccc-campaign-provider-controller.js", () => ({
+  createCccCampaignProviderAttemptBinding: createCccCampaignProviderAttemptBindingMock,
+}));
 
 const now = "2026-06-10T00:00:00.000Z";
 
@@ -41,7 +54,25 @@ function task(overrides: Record<string, unknown> = {}) {
 
 function makeExecutorForTask(liveTask = task()) {
   const store = createMockStore();
+  const taskLocks = new Map<string, Promise<void>>();
   store.getTask.mockImplementation(async (id: string) => ({ ...liveTask, id }));
+  store.withTaskLock = vi.fn((id: string, work: () => Promise<unknown>) => {
+    const previous = taskLocks.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    taskLocks.set(id, next);
+    return previous.then(async () => {
+      try {
+        return await work();
+      } finally {
+        if (taskLocks.get(id) === next) taskLocks.delete(id);
+        release();
+      }
+    });
+  });
+  store.readTaskForMove = vi.fn(async (id: string) => store.getTask(id));
   store.getSettings.mockResolvedValue({
     autoMerge: false,
     experimentalFeatures: { workflowGraphExecutor: true },
@@ -70,7 +101,108 @@ function workflowResult() {
 describe("fast mode workflow/runtime invariants", () => {
   beforeEach(() => {
     resetExecutorMocks();
+    clearPreHeldExecutorSlotsForTests();
     mockedExistsSync.mockReturnValue(true);
+    createCccCampaignProviderAttemptBindingMock.mockReset();
+  });
+
+  it.each(["persisted context", "imported marker"])("Task 3 RED: public execute refuses %s before dependency and ephemeral side effects", async (caseName) => {
+    const liveTask = task({
+      dependencies: ["FN-BLOCKER"],
+      ...(caseName === "imported marker"
+        ? { lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1" }
+        : {}),
+    });
+    const store = createMockStore();
+    store.getTask.mockResolvedValue(liveTask);
+    store.getSettings.mockResolvedValue({ ephemeralAgentsEnabled: false });
+    store.listTasks.mockResolvedValue([
+      liveTask,
+      task({ id: "FN-BLOCKER", column: "todo" }),
+    ]);
+    store.getCccCampaignContextForTask = vi.fn(async () => caseName === "persisted context"
+      ? { campaignId: "CAMPAIGN-1" }
+      : null);
+    const semaphore = new AgentSemaphore(1);
+    expect(semaphore.tryAcquire()).toBe(true);
+    registerPreHeldExecutorSlot(liveTask.id);
+    const executor = new TaskExecutor(store as any, "/tmp/test", { semaphore });
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await executor.execute(liveTask as any);
+
+      expect(store.listTasks).not.toHaveBeenCalled();
+      expect(store.getSettings).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(store.updateTask).not.toHaveBeenCalled();
+      expect(store.logEntry).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(mockedExec).not.toHaveBeenCalled();
+      expect(hasPreHeldExecutorSlot(liveTask.id)).toBe(false);
+      expect(semaphore.activeCount).toBe(0);
+      expect((executor as any).graphRouting.has(liveTask.id)).toBe(false);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: public execute releases custody refusal so a later ordinary redispatch can proceed", async () => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn()
+      .mockResolvedValueOnce({ campaignId: "CAMPAIGN-1" })
+      .mockResolvedValue(null);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "completed",
+      outcome: "success",
+      visitedNodeIds: ["start"],
+    });
+
+    try {
+      await executor.execute(liveTask as any);
+      expect(run).not.toHaveBeenCalled();
+      expect((executor as any).graphRouting.has(liveTask.id)).toBe(false);
+
+      await executor.execute(liveTask as any);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect((executor as any).graphRouting.has(liveTask.id)).toBe(false);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: a final custody recheck closes the continuation transition race", async () => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ campaignId: "CAMPAIGN-1" });
+    const continuation = {
+      id: "WORK-ORDINARY-1",
+      taskId: liveTask.id,
+      kind: "task",
+      state: "runnable",
+      attempt: 1,
+      runId: "ordinary-run",
+      stableWorkflowRunId: "ordinary-run",
+      irHash: "a".repeat(64),
+    };
+    store.listWorkflowWorkItemsForTask = vi.fn(async () => [continuation]);
+    store.transitionWorkflowWorkItem = vi.fn(async () => continuation);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await executor.execute(liveTask as any);
+
+      expect(store.getCccCampaignContextForTask).toHaveBeenCalledTimes(3);
+      expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
   });
 
   /*
@@ -113,6 +245,476 @@ describe("fast mode workflow/runtime invariants", () => {
     } finally {
       // Prototype spy: restore even on failure so it cannot leak into sibling runner tests.
       run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: the generic executor defers persisted CCC campaign custody before settings or graph effects", async () => {
+    const liveTask = task({ lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1" });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({ campaignId: "CAMPAIGN-1" }));
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask, { alreadyClaimed: true });
+
+      expect(store.getCccCampaignContextForTask).toHaveBeenCalledWith(liveTask.id);
+      expect(store.getSettings).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 3 RED: an imported campaign work item is left runnable for the native processor", async () => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn(async () => null);
+    const importedWorkItem = {
+      id: "WI-CCC-1",
+      taskId: liveTask.id,
+      kind: "task",
+      state: "runnable",
+      attempt: 1,
+      runId: "ccc-prd:import-1",
+      stableWorkflowRunId: "ccc-prd:import-1",
+      irHash: "a".repeat(64),
+    };
+    store.listWorkflowWorkItemsForTask = vi.fn(async () => [importedWorkItem]);
+    store.transitionWorkflowWorkItem = vi.fn(async () => importedWorkItem);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it.each([
+    ["unwired", undefined],
+    ["missing", async () => null],
+    ["error", async () => { throw new Error("custody unavailable"); }],
+  ])("Task 3: imported task %s custody defers generic execution", async (_case, getCccCampaignContextForTask) => {
+    const liveTask = task({ lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1" });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    if (getCccCampaignContextForTask) store.getCccCampaignContextForTask = vi.fn(getCccCampaignContextForTask);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run");
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.getSettings).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it.each([
+    ["missing", async () => null],
+    ["error", async () => { throw new Error("custody unavailable"); }],
+  ])("Task 3: ordinary task %s custody preserves generic execution", async (_case, getCccCampaignContextForTask) => {
+    const liveTask = task();
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.getCccCampaignContextForTask = vi.fn(getCccCampaignContextForTask);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "completed",
+      outcome: "success",
+      visitedNodeIds: ["start"],
+    });
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.getSettings).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Wave 4 verification: public TaskExecutor terminal CCC park bypasses generic in-review routing", async () => {
+    const liveTask = task({ status: "in-review", customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-terminal", taskId: liveTask.id, kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([workItem]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "ccc-branch-persistence-terminal-failed",
+      context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+      visitedNodeIds: ["start", "A", "split", "B"],
+    });
+
+    try {
+      await (executor as any).executeWorkflowGraph(liveTask);
+
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "manual-required", expect.objectContaining({
+        blockedReason: "ccc-branch-persistence-terminal-failed",
+        lastError: "ccc-branch-persistence-terminal-failed",
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      }));
+      expect(store.updateTask).toHaveBeenCalledTimes(1);
+      expect(store.updateTask).toHaveBeenLastCalledWith(liveTask.id, {
+        toolFailureDetectorLogCursor: 0,
+      }, undefined);
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Wave 4 RED: fresh CCC branch persistence failure creates and parks a native work item", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-fresh", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-branch-persistence", kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "ccc-branch-persistence-terminal-failed",
+      context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+      visitedNodeIds: ["start", "A", "fanout", "B"],
+    });
+
+    try {
+      await executor.execute(liveTask);
+
+      expect(store.upsertWorkflowWorkItem).toHaveBeenCalledWith(expect.objectContaining({
+        runId: `${liveTask.id}:builtin:coding`, taskId: liveTask.id, nodeId: "ccc-branch-persistence", kind: "task", state: "running",
+      }));
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "manual-required", expect.objectContaining({
+        blockedReason: "ccc-branch-persistence-terminal-failed",
+        lastError: "ccc-branch-persistence-terminal-failed",
+      }));
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 6 P1 RED: user hard-cancel fences a late first-run CCC terminal publication", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-task6-late-terminal", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-branch-persistence", kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    let resolveRun!: (result: {
+      disposition: "failed";
+      outcome: "failure";
+      reason: string;
+      context: Record<string, unknown>;
+      visitedNodeIds: string[];
+    }) => void;
+    const delayedRun = new Promise<Parameters<typeof resolveRun>[0]>((resolve) => {
+      resolveRun = resolve;
+    });
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockReturnValue(delayedRun);
+    const execution = executor.execute(liveTask);
+    let commitUserMove!: () => void;
+    const userMoveCanCommit = new Promise<void>((resolve) => {
+      commitUserMove = resolve;
+    });
+    let userMoveLockAcquired!: () => void;
+    const userMoveHasLock = new Promise<void>((resolve) => {
+      userMoveLockAcquired = resolve;
+    });
+
+    try {
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+      const userMove = store.withTaskLock(liveTask.id, async () => {
+        await disposeTaskBeforeMove(store, {
+          task: liveTask,
+          from: "in-progress",
+          to: "todo",
+          source: "user",
+        });
+        userMoveLockAcquired();
+        await userMoveCanCommit;
+        store._setRow(liveTask.id, { column: "todo", paused: true, userPaused: true });
+      });
+      await userMoveHasLock;
+      resolveRun({
+        disposition: "failed",
+        outcome: "failure",
+        reason: "ccc-branch-persistence-terminal-failed",
+        context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+        visitedNodeIds: ["start", "A", "fanout", "B"],
+      });
+
+      try {
+        await vi.waitFor(() => {
+          expect(
+            store.withTaskLock.mock.calls.length > 1
+            || store.upsertWorkflowWorkItem.mock.calls.length > 0,
+          ).toBe(true);
+        });
+        expect(store.upsertWorkflowWorkItem).not.toHaveBeenCalled();
+      } finally {
+        commitUserMove();
+        await userMove;
+        await execution;
+      }
+
+      expect(store.readTaskForMove).toHaveBeenCalledWith(liveTask.id);
+      expect(store.upsertWorkflowWorkItem).not.toHaveBeenCalled();
+      expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Task 6 P1 RED: first-run terminal publication propagates an authoritative reread failure", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.readTaskForMove = vi.fn().mockRejectedValue(new Error("authoritative-task-reread-failed"));
+    store.upsertWorkflowWorkItem = vi.fn();
+    const run = vi.spyOn(WorkflowGraphTaskRunner.prototype, "run").mockResolvedValue({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "ccc-branch-persistence-terminal-failed",
+      context: { "ccc:branch-persistence-failure": "ccc-branch-persistence-terminal-failed" },
+      visitedNodeIds: ["start", "A", "fanout", "B"],
+    });
+
+    try {
+      await expect(executor.execute(liveTask)).rejects.toThrow("authoritative-task-reread-failed");
+      expect(store.upsertWorkflowWorkItem).not.toHaveBeenCalled();
+    } finally {
+      run.mockRestore();
+    }
+  });
+
+  it("Wave 4 RED: public TaskExecutor parks a classified CCC permanent graph failure once", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-permanent", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-retry-classification", kind: "task", state: "running", attempt: 1 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    const selected = { workflowId: "wave4-actual-permanent", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 actual permanent",
+      ir: { version: "v2", name: "Wave 4 actual permanent", columns: [], nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: {} }, { id: "end", kind: "end" }], edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }] },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockRejectedValue(new (await import("../engine-errors.js")).PermanentError("operator action", "CCC_PERMANENT"));
+    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
+    try {
+      await executor.execute(liveTask);
+      expect(store.upsertWorkflowWorkItem).toHaveBeenCalledWith(expect.objectContaining({ nodeId: "ccc-retry-classification", state: "running" }));
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "manual-required", expect.objectContaining({
+        blockedReason: "ccc-permanent:CCC_PERMANENT", lastError: "ccc-permanent:CCC_PERMANENT",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition", metadata: expect.objectContaining({ classification: "ccc-permanent" }),
+      }));
+    } finally { customNode.mockRestore(); graphFailure.mockRestore(); }
+  });
+
+  it("Wave 4 RED: public TaskExecutor exhausts a classified CCC transient graph failure", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const workItem = { id: "WI-wave4-transient", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "ccc-retry-classification", kind: "task", state: "running", attempt: 3 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
+    store.upsertWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue(workItem);
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    const selected = { workflowId: "wave4-actual-transient", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 actual transient",
+      ir: { version: "v2", name: "Wave 4 actual transient", columns: [], nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: { maxRetries: 3 } }, { id: "end", kind: "end" }], edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }] },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockRejectedValue(new (await import("../engine-errors.js")).TransientError("retry", "CCC_TRANSIENT"));
+    const graphFailure = vi.spyOn(executor as any, "handleGraphFailure").mockResolvedValue(undefined);
+    try {
+      await executor.execute(liveTask);
+      expect(customNode).toHaveBeenCalledTimes(3);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(workItem.id, "exhausted", expect.objectContaining({
+        lastError: "ccc-transient-retry-exhausted:CCC_TRANSIENT",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition", metadata: expect.objectContaining({ classification: "ccc-transient-exhausted" }),
+      }));
+    } finally { customNode.mockRestore(); graphFailure.mockRestore(); }
+  });
+
+  it("Wave 4 verification: public TaskExecutor replaces a stale continuation attempt with the consumed cap", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const stale = { id: "WI-wave4-stale", taskId: liveTask.id, runId: `${liveTask.id}:builtin:coding`, nodeId: "A", kind: "task", state: "running", attempt: 9 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([stale]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue({ ...stale, state: "exhausted", attempt: 2 });
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    const selected = { workflowId: "wave4-two-attempt-transient", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 two attempts",
+      ir: { version: "v2", name: "Wave 4 two attempts", columns: [], nodes: [{ id: "start", kind: "start" }, { id: "A", kind: "prompt", config: { maxRetries: 2 } }, { id: "end", kind: "end" }], edges: [{ from: "start", to: "A" }, { from: "A", to: "end", condition: "success" }] },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockRejectedValue(new (await import("../engine-errors.js")).TransientError("retry", "CCC_TWO"));
+    try {
+      await executor.execute(liveTask);
+      expect(customNode).toHaveBeenCalledTimes(2);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(stale.id, "exhausted", expect.objectContaining({
+        attempt: 2,
+        lastError: "ccc-transient-retry-exhausted:CCC_TWO",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition",
+        metadata: expect.objectContaining({ classification: "ccc-transient-exhausted", attempt: 2 }),
+      }));
+    } finally { customNode.mockRestore(); }
+  });
+
+  it("Wave 4 RED: public TaskExecutor persists a branch terminal's consumed retry cap over a stale continuation", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const stale = { id: "WI-wave4-branch-stale", taskId: liveTask.id, runId: `${liveTask.id}:wave4-branch-retry`, nodeId: "split", kind: "task", state: "running", attempt: 9 };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([stale]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue({ ...stale, state: "exhausted", attempt: 2 });
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    store.saveWorkflowRunBranch = vi.fn().mockResolvedValue(undefined);
+    store.loadWorkflowRunBranches = vi.fn().mockResolvedValue([]);
+    store.clearWorkflowRunBranches = vi.fn().mockResolvedValue(undefined);
+    const selected = { workflowId: "wave4-branch-two-attempt-transient", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 branch two attempts",
+      ir: {
+        version: "v2",
+        name: "Wave 4 branch two attempts",
+        columns: [],
+        nodes: [
+          { id: "start", kind: "start" },
+          { id: "split", kind: "split" },
+          { id: "retrying-branch", kind: "prompt", config: { maxRetries: 2 } },
+          { id: "sibling", kind: "prompt", config: {} },
+          { id: "join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+          { id: "end", kind: "end" },
+        ],
+        edges: [
+          { from: "start", to: "split" },
+          { from: "split", to: "retrying-branch" },
+          { from: "split", to: "sibling" },
+          { from: "retrying-branch", to: "join", condition: "success" },
+          { from: "sibling", to: "join", condition: "success" },
+          { from: "join", to: "end", condition: "success" },
+        ],
+      },
+    });
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockImplementation(async (node: { id: string }) => {
+      if (node.id === "retrying-branch") {
+        throw new (await import("../engine-errors.js")).TransientError("retry", "CCC_BRANCH_TWO");
+      }
+      return { outcome: "success" };
+    });
+
+    try {
+      await executor.execute(liveTask);
+
+      expect(customNode).toHaveBeenCalledTimes(3);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(stale.id, "exhausted", expect.objectContaining({
+        attempt: 2,
+        lastError: "ccc-transient-retry-exhausted:CCC_BRANCH_TWO",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition",
+        metadata: expect.objectContaining({ classification: "ccc-transient-exhausted", attempt: 2 }),
+      }));
+    } finally {
+      customNode.mockRestore();
+    }
+  });
+
+  it("Wave 4 RED: public TaskExecutor persists one consumed attempt for a permanent nested branch", async () => {
+    const liveTask = task({ customFields: { cccFusionProfile: "ccc-fusion" } });
+    const { store, executor } = makeExecutorForTask(liveTask);
+    const stale = {
+      id: "WI-wave4-nested-permanent-stale",
+      taskId: liveTask.id,
+      runId: `${liveTask.id}:wave4-nested-permanent`,
+      nodeId: "outer-split",
+      kind: "task",
+      state: "running",
+      attempt: 9,
+    };
+    store.listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([stale]);
+    store.transitionWorkflowWorkItem = vi.fn().mockResolvedValue({ ...stale, state: "manual-required", attempt: 1 });
+    store.recordRunAuditEvent = vi.fn().mockResolvedValue({});
+    store.saveWorkflowRunBranch = vi.fn().mockResolvedValue(undefined);
+    store.loadWorkflowRunBranches = vi.fn().mockResolvedValue([]);
+    store.clearWorkflowRunBranches = vi.fn().mockResolvedValue(undefined);
+    const selected = { workflowId: "wave4-nested-permanent", stepIds: [] };
+    store.getTaskWorkflowSelectionAsync = vi.fn().mockResolvedValue(selected);
+    store.getWorkflowDefinition = vi.fn().mockResolvedValue({
+      id: selected.workflowId,
+      name: "Wave 4 nested permanent",
+      ir: {
+        version: "v2",
+        name: "Wave 4 nested permanent",
+        columns: [],
+        nodes: [
+          { id: "start", kind: "start" },
+          { id: "outer-split", kind: "split" },
+          { id: "inner-split", kind: "split" },
+          { id: "permanent-branch", kind: "prompt", config: { maxRetries: 4 } },
+          { id: "inner-sibling", kind: "prompt", config: {} },
+          { id: "inner-join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+          { id: "outer-sibling", kind: "prompt", config: {} },
+          { id: "outer-join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+          { id: "end", kind: "end" },
+        ],
+        edges: [
+          { from: "start", to: "outer-split" },
+          { from: "outer-split", to: "inner-split" },
+          { from: "outer-split", to: "outer-sibling" },
+          { from: "inner-split", to: "permanent-branch" },
+          { from: "inner-split", to: "inner-sibling" },
+          { from: "permanent-branch", to: "inner-join", condition: "success" },
+          { from: "inner-sibling", to: "inner-join", condition: "success" },
+          { from: "inner-join", to: "outer-join", condition: "success" },
+          { from: "outer-sibling", to: "outer-join", condition: "success" },
+          { from: "outer-join", to: "end", condition: "success" },
+        ],
+      },
+    });
+    let permanentCalls = 0;
+    const customNode = vi.spyOn(executor as any, "runGraphCustomNode").mockImplementation(async (node: { id: string }) => {
+      if (node.id === "permanent-branch") {
+        permanentCalls += 1;
+        throw new (await import("../engine-errors.js")).PermanentError("operator action", "CCC_NESTED_PERMANENT");
+      }
+      return { outcome: "success" };
+    });
+
+    try {
+      await executor.execute(liveTask);
+
+      expect(permanentCalls).toBe(1);
+      expect(store.transitionWorkflowWorkItem).toHaveBeenCalledWith(stale.id, "manual-required", expect.objectContaining({
+        attempt: 1,
+        lastError: "ccc-permanent:CCC_NESTED_PERMANENT",
+      }));
+      expect(store.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "workflow:work-item-transition",
+        metadata: expect.objectContaining({ classification: "ccc-permanent", attempt: 1 }),
+      }));
+    } finally {
+      customNode.mockRestore();
     }
   });
 
@@ -833,6 +1435,325 @@ describe("fast mode workflow/runtime invariants", () => {
 
     expect(result.value).toBe("awaiting-input");
     expect(awaitInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("Task 6 RED: fenced CCC graph model node refuses before native Pi session when provider binding cannot be created", async () => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/ccc-provider-binding",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    const failure = new Error("provider attempt is not admitted");
+    createCccCampaignProviderAttemptBindingMock.mockRejectedValueOnce(failure);
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence: Object.freeze({ workItemId: "wi-provider-binding", attempt: 1, runId: "FN-6226-run" }),
+      providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+
+    await expect((executor as any).executeWorkflowStep(
+      nodeTask,
+      {
+        id: "provider-model",
+        name: "Provider model",
+        mode: "prompt",
+        phase: "pre-merge",
+        gateMode: "advisory",
+        prompt: "Do the bounded work.",
+        toolMode: "readonly",
+        enabled: true,
+      },
+      "/tmp/ccc-provider-binding",
+      { executionProvider: "openai", executionModelId: "gpt-4o" },
+      undefined,
+      { execution },
+    )).rejects.toThrow("provider attempt is not admitted");
+
+    expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledTimes(1);
+    expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+  });
+
+  it("Task 6 RED: fenced CCC graph model node passes sealed provider attempt binding to native Pi with actual provider and model", async () => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/ccc-provider-binding",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    const signal = new AbortController().signal;
+    const turnKey = "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const binding = Object.freeze({
+      turnKey,
+      controller: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
+    });
+    createCccCampaignProviderAttemptBindingMock.mockResolvedValueOnce(binding);
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+      },
+    });
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence: Object.freeze({ workItemId: "wi-provider-binding", attempt: 1, runId: "FN-6226-run" }),
+      providerAttemptTurnKey: turnKey,
+    });
+
+    await (executor as any).executeWorkflowStep(
+      nodeTask,
+      {
+        id: "provider-model",
+        name: "Provider model",
+        mode: "prompt",
+        phase: "pre-merge",
+        gateMode: "advisory",
+        prompt: "Do the bounded work.",
+        toolMode: "readonly",
+        enabled: true,
+      },
+      "/tmp/ccc-provider-binding",
+      { executionProvider: "openai", executionModelId: "gpt-4o" },
+      undefined,
+      { execution, signal },
+    );
+
+    expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledWith(expect.objectContaining({
+      semanticTaskId: "FN-6226-semantic",
+      turnKey: execution.providerAttemptTurnKey,
+      signal,
+      expectedRoute: Object.freeze({ providerId: "openai", modelId: "gpt-4o", transport: "pi" }),
+    }));
+    expect(mockedCreateFnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      runtimeHint: "pi",
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+      cccProviderAttemptBinding: binding,
+    }));
+    const piOptions = mockedCreateFnAgent.mock.calls.find(([options]: any[]) => options?.cccProviderAttemptBinding === binding)?.[0] as any;
+    expect(piOptions.cccProviderAttemptBinding).toBe(binding);
+    expect(Object.isFrozen(binding)).toBe(true);
+    expect(Object.isFrozen(binding.controller)).toBe(true);
+    expect(binding.turnKey).toBe(execution.providerAttemptTurnKey);
+  });
+
+  it("Task 4 RED: fenced CLI node without a host-native binding refuses before log or session effects", async () => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/cli-test",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    const resolveMcpServers = vi.fn(async () => []);
+    const resolveMcpServersSpy = vi.spyOn(executor as any, "resolveMcpServers").mockImplementation(resolveMcpServers);
+    const executionFence = Object.freeze({
+      workItemId: "wi-cli-binding-red",
+      attempt: 1,
+      runId: "FN-6226-run",
+    });
+    const execution = Object.freeze({
+      originTaskId: "FN-6226",
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic", executionMode: "fast" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({
+        nodeId: "cli-node",
+        materializedNodeId: "cli-node",
+      }),
+      executionFence,
+      providerAttemptTurnKey: "ccc-cli-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    const graphContext = Object.freeze({});
+    const sealedExecutionContext = Object.freeze({
+      task: nodeTask,
+      settings: undefined,
+      context: {},
+      execution,
+    });
+
+    let result: unknown;
+    let failure: unknown;
+    try {
+      result = await (executor as any).runGraphCustomNode(
+        {
+          id: "cli-native-node",
+          kind: "prompt",
+          config: {
+            executor: "cli-agent",
+            cliAdapterId: "test-cli-adapter",
+            cliSettings: { profile: "ccc-fusion" },
+            prompt: "test cli",
+          },
+        },
+        nodeTask,
+        {},
+        undefined,
+        graphContext,
+        sealedExecutionContext,
+      );
+    } catch (err) {
+      failure = err;
+    } finally {
+      resolveMcpServersSpy.mockRestore();
+    }
+
+    expect(failure).toMatchObject({ code: "CCC_NATIVE_CLI_BINDING_REFUSED" });
+    expect(result).toBeUndefined();
+
+    expect(store.logEntry).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(resolveMcpServers).not.toHaveBeenCalled();
+  });
+
+  it.each(["mutable", "extra-key"])("Task 4 RED: validates $case host-native CLI binding before preDispatch or effects", async (caseName) => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/cli-test",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const store = createMockStore();
+    store.getTask.mockImplementation(async (id: string) => ({ ...nodeTask, id }));
+    store.getSettings.mockResolvedValue({
+      autoMerge: false,
+      experimentalFeatures: { workflowGraphExecutor: true },
+    });
+    const runtimeStore = {
+      listByTask: vi.fn(async () => []),
+    };
+    const preDispatch = vi.fn();
+    const reconcile = vi.fn();
+    const observe = vi.fn();
+    const binding = {
+      kind: "ccc-fusion.native-cli-binding",
+      version: 1,
+      id: "fusion-native:ccc-cli-one-shot",
+      turnKey: "ccc-cli-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      dispatchKey: "cli-agent:1",
+      route: Object.freeze({
+        adapterId: "test-cli-adapter",
+        providerId: "openai",
+        modelId: "gpt-4o",
+        transport: "cli",
+      }),
+      limits: Object.freeze({
+        maxRequests: 1,
+        lifetimeMs: 60000,
+        termGraceMs: 5000,
+        killClosureMs: 5000,
+      }),
+      followUp: false,
+      observer: Object.freeze({
+        id: "ccc-native-cli-observer.v1",
+        observe,
+      }),
+      controller: Object.freeze({
+        preDispatch,
+        reconcile,
+      }),
+    };
+    const resolveCccNativeCliBinding = vi.fn(async () => {
+      const candidate = { ...binding };
+      return caseName === "extra-key"
+        ? Object.freeze({ ...candidate, unexpected: "unexpected-key" })
+        : candidate;
+    });
+    const executor = new TaskExecutor(store, "/tmp/test", {
+      cliAgentRuntime: {
+        manager: {} as any,
+        hub: {} as any,
+        registry: {} as any,
+        store: runtimeStore,
+        projectId: "test",
+        hookEndpointUrl: "http://127.0.0.1:1/unused",
+        resolveCccNativeCliBinding,
+      } as any,
+    } as any);
+    const resolveMcpServers = vi.fn(async () => []);
+    const resolveMcpServersSpy = vi.spyOn(executor as any, "resolveMcpServers").mockImplementation(resolveMcpServers);
+
+    const executionFence = Object.freeze({
+      workItemId: "wi-cli-binding-red",
+      attempt: 1,
+      runId: "FN-6226-run",
+    });
+    const execution = Object.freeze({
+      originTaskId: "FN-6226",
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic", executionMode: "fast" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({
+        nodeId: "cli-node",
+        materializedNodeId: "cli-node",
+      }),
+      executionFence,
+      providerAttemptTurnKey: "ccc-cli-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    const graphContext = Object.freeze({});
+    const sealedExecutionContext = Object.freeze({
+      task: nodeTask,
+      settings: undefined,
+      context: {},
+      execution,
+    });
+
+    let result: unknown;
+    let failure: unknown;
+    try {
+      result = await (executor as any).runGraphCustomNode(
+        {
+          id: "cli-native-node",
+          kind: "prompt",
+          config: {
+            executor: "cli-agent",
+            cliAdapterId: "test-cli-adapter",
+            cliSettings: { profile: "ccc-fusion" },
+            prompt: "test cli",
+          },
+        },
+        nodeTask,
+        {},
+        undefined,
+        graphContext,
+        sealedExecutionContext,
+      );
+    } catch (err) {
+      failure = err;
+    } finally {
+      resolveMcpServersSpy.mockRestore();
+    }
+
+    expect(failure).toMatchObject({ code: "CCC_NATIVE_CLI_BINDING_REFUSED" });
+    expect(result).toBeUndefined();
+    expect(resolveCccNativeCliBinding).toHaveBeenCalledTimes(1);
+    if (caseName === "mutable") {
+      expect(String((failure as any)?.message ?? "")).toMatch(/frozen/i);
+    } else {
+      expect(String((failure as any)?.message ?? "")).toMatch(/exact|keys/i);
+    }
+
+    expect(preDispatch).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
+    expect(runtimeStore.listByTask).not.toHaveBeenCalled();
+    expect(resolveMcpServers).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
   });
 
   // U4 (KTD-2): the legacy `workflow-step` seam and `runWorkflowStep` primitive

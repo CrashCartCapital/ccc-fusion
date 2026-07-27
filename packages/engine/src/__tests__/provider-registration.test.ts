@@ -249,6 +249,48 @@ and that an opted-out (default) provider does NOT get it forced — no cache_con
 gateways that never asked for them (avoids provider 400s on backends like Together/Fireworks).
 */
 describe("registerCustomProviders anthropicPromptCaching opt-in (FN-7689)", () => {
+  it("preserves two deliberately dissimilar ccc provider identities, base URLs, and exact model IDs", () => {
+    /*
+    FNXC:CCCTransport 2026-07-23-15:45:
+    Wave 2 pins registry identity independently from transport behavior so the
+    ccc profile cannot silently normalize a configured model ID or base URL.
+    */
+    const modelRegistry = makeModelRegistry();
+    const providers = [
+      customProvider({
+        id: "ccc-provider-01-needle",
+        name: "CCC North Needle",
+        baseUrl: "http://127.0.0.1:41001/v1",
+        models: [{ id: "route/alpha-7b-exact", name: "Alpha Exact" }],
+      }),
+      customProvider({
+        id: "9f3d7a22-ccc-south-orbit",
+        name: "CCC South Orbit",
+        baseUrl: "http://127.0.0.1:41999/v1",
+        models: [{ id: "vendor.beta:model-Z9", name: "Beta Exact" }],
+      }),
+    ];
+
+    registerCustomProviders(modelRegistry, providers, vi.fn());
+
+    expect(modelRegistry.registerProvider).toHaveBeenNthCalledWith(
+      1,
+      "ccc-north-needle",
+      expect.objectContaining({
+        baseUrl: "http://127.0.0.1:41001/v1",
+        models: [expect.objectContaining({ id: "route/alpha-7b-exact" })],
+      }),
+    );
+    expect(modelRegistry.registerProvider).toHaveBeenNthCalledWith(
+      2,
+      "ccc-south-orbit",
+      expect.objectContaining({
+        baseUrl: "http://127.0.0.1:41999/v1",
+        models: [expect.objectContaining({ id: "vendor.beta:model-Z9" })],
+      }),
+    );
+  });
+
   it("sets compat.cacheControlFormat='anthropic' for an opted-in openai-compatible provider", () => {
     const modelRegistry = makeModelRegistry();
     const provider = customProvider({ anthropicPromptCaching: true });

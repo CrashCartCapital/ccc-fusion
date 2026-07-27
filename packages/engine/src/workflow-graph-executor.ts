@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   Settings,
   TaskDetail,
@@ -6,12 +7,16 @@ import type {
   WorkflowIrEdge,
   WorkflowIrNode,
   WorkflowIrNodeKind,
+  WorkflowExtensionDefinition,
   WorkflowNodeExtensionResult,
+  WorkflowNodeProviderController,
+  WorkflowNodeProviderDispatchInput,
   WorkflowStepResult,
 } from "@fusion/core";
-import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
+import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, canonicalCccPrdJson, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
 import { isNonPlanDefectPlanReviewFailure } from "./transient-error-detector.js";
 import { isRequiredArtifactReadFailedValue, parseRequiredArtifactMissingValue } from "./required-workflow-artifacts.js";
+import { PermanentError, TransientError } from "./engine-errors.js";
 
 import {
   createDefaultNodeHandlers,
@@ -54,6 +59,11 @@ type WorkflowNodeSettings = Pick<Settings, "experimentalFeatures"> & {
 
 /** A classified Plan Review provider outage terminates the graph without replan traversal. */
 export const PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE = "plan-review-provider-failure-hold";
+/** Node-ID-independent CCC terminal checkpoint classification for the outer executor. */
+export const CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY = "ccc:branch-persistence-failure";
+export const CCC_RETRY_CLASSIFICATION_CONTEXT_KEY = "ccc:retry-classification";
+/** Actual total handler calls consumed by a terminal CCC retry classification. */
+export const CCC_RETRY_ATTEMPT_CONTEXT_KEY = "ccc:retry-attempt";
 
 /*
 FNXC:PlanReviewLease 2026-07-18-23:45:
@@ -103,10 +113,73 @@ export interface WorkflowNodeExecutionContext {
   task: TaskDetail;
   settings: WorkflowNodeSettings | undefined;
   context: Record<string, unknown>;
+  visitIdentity?: WorkflowMaterializedVisitIdentity;
+  execution?: WorkflowNodeSealedExecution;
   /** Set during concurrent branch execution; fail-fast aborts via this signal.
    *  Undefined on the sequential path (zero behavior change for linear graphs). */
   signal?: AbortSignal;
 }
+
+export type WorkflowMaterializedVisitIdentity = Readonly<{
+  nodeId: string;
+  materializedNodeId: string;
+  foreachNodeId?: string;
+  stepIndex?: number;
+  instanceId?: string;
+  reworkPass?: number;
+  loopNodeId?: string;
+  iteration?: number;
+  optionalGroupNodeId?: string;
+  topLevelReworkHeadNodeId?: string;
+  topLevelReworkPass?: number;
+}>;
+
+export type WorkflowNodeExecutionFence = Readonly<{
+  workItemId: string;
+  attempt: number;
+  runId: string;
+}>;
+
+export type WorkflowNodeExecutionResolverInput = Readonly<{
+  node: WorkflowIrNode;
+  originTask: TaskDetail;
+  runId: string;
+  visitIdentity: WorkflowMaterializedVisitIdentity;
+  signal?: AbortSignal;
+}>;
+
+export type WorkflowNodeExecutionResolverOutput = Readonly<{
+  semanticTask: TaskDetail;
+}>;
+
+export type WorkflowNodeSealedExecution = Readonly<{
+  originTaskId: string;
+  semanticTaskId: string;
+  semanticTask: TaskDetail;
+  runId: string;
+  visitIdentity: WorkflowMaterializedVisitIdentity;
+  executionFence?: WorkflowNodeExecutionFence;
+  providerAttemptTurnKey?: string;
+}>;
+
+export type WorkflowNodeProviderControllerResolverInput = Readonly<{
+  node: WorkflowIrNode;
+  semanticTask: TaskDetail;
+  workflow: WorkflowIr;
+  extensionId: string;
+  execution: WorkflowNodeSealedExecution;
+  signal?: AbortSignal;
+}>;
+
+export type WorkflowNodeProviderControllerBinding = Readonly<{
+  providerController: WorkflowNodeProviderController;
+  providerRoute: Readonly<{
+    providerId: string;
+    modelId: string;
+    transport: "workflow";
+    workflowExtensionId: string;
+  }>;
+}>;
 
 export type WorkflowNodeHandler = (node: WorkflowIrNode, context: WorkflowNodeExecutionContext) => Promise<WorkflowNodeResult>;
 
@@ -117,6 +190,24 @@ export interface WorkflowNodePreparationRequirement {
 
 export interface WorkflowGraphExecutorDeps {
   handlers?: Partial<Record<WorkflowIrNode["kind"], WorkflowNodeHandler>>;
+  /** Resolves the task that owns node execution without accepting execution provenance. */
+  resolveNodeExecution?: (
+    input: WorkflowNodeExecutionResolverInput,
+  ) => WorkflowNodeExecutionResolverOutput | Promise<WorkflowNodeExecutionResolverOutput>;
+  /** Native campaign marker and capability resolver for provider-scoped plugin handlers. */
+  resolveNodeProviderController?: (
+    input: WorkflowNodeProviderControllerResolverInput,
+  ) => WorkflowNodeProviderControllerBinding | undefined | Promise<WorkflowNodeProviderControllerBinding | undefined>;
+  /** Fail-closed admission for executable nodes. Runs once before preparation,
+   * plugin dispatch, or a default handler. Orchestration-only nodes never enter
+   * this seam. */
+  admitNodeExecution?: (
+    node: WorkflowIrNode,
+    task: TaskDetail,
+    signal?: AbortSignal,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
+    execution?: WorkflowNodeSealedExecution,
+  ) => void | Promise<void>;
   /*
    * FNXC:WorkflowNodeRunners 2026-07-01-00:00:
    * Node runners are the new ownership boundary for workflow node behavior. During migration the graph accepts a registry and adapts it into handlers, while explicit handlers remain the highest-precedence test/plugin override so existing graph semantics do not drift.
@@ -136,6 +227,8 @@ export interface WorkflowGraphExecutorDeps {
     node: WorkflowIrNode,
     task: TaskDetail,
     requirement: WorkflowNodePreparationRequirement,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
+    execution?: WorkflowNodeSealedExecution,
   ) => void | Promise<void>;
   /** Step-inversion (U12, KTD-12): dependencies for the `parse-steps` node
    *  handler (artifact read, projection write, pin-protection probe, audit).
@@ -159,6 +252,8 @@ export interface WorkflowGraphExecutorDeps {
   onBranchProgress?: (progress: WorkflowBranchProgress) => void;
   /** Stable identifier for this run, used to key persisted branch state. */
   runId?: string;
+  /** Host-owned sealed workflow work-item fence for CCC provider turn identity. */
+  executionFence?: WorkflowNodeExecutionFence;
   /** Test seam for bounded loop timeout checks. Defaults to Date.now. */
   runLoopNowForTests?: () => number;
   /**
@@ -244,7 +339,12 @@ export interface WorkflowGraphExecutorDeps {
     maxRevisions?: unknown;
   }) => Promise<boolean> | boolean;
   /** Project node-published task metadata onto the task row for dispatcher/UI. */
-  publishTaskProjection?: (taskId: string, patch: WorkflowTaskProjection, source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] }) => void | Promise<void>;
+  publishTaskProjection?: (
+    taskId: string,
+    patch: WorkflowTaskProjection,
+    source: { nodeId: string; nodeKind: WorkflowIrNode["kind"]; execution?: WorkflowNodeSealedExecution },
+    signal?: AbortSignal,
+  ) => void | Promise<void>;
   /** @deprecated use publishTaskProjection. Kept for older callers. */
   publishTouchedFiles?: (taskId: string, files: string[], source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] }) => void | Promise<void>;
   /*
@@ -334,6 +434,77 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isCanonicalNonblankString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value === value.trim();
+}
+
+function requireWorkflowNodeExecutionFence(
+  fence: WorkflowNodeExecutionFence,
+  runId: string,
+): WorkflowNodeExecutionFence {
+  if (
+    !isPlainObject(fence)
+    || !Object.isFrozen(fence)
+    || Object.keys(fence).length !== 3
+    || !Object.hasOwn(fence, "workItemId")
+    || !Object.hasOwn(fence, "attempt")
+    || !Object.hasOwn(fence, "runId")
+    || !isCanonicalNonblankString(fence.workItemId)
+    || !Number.isSafeInteger(fence.attempt)
+    || fence.attempt <= 0
+    || !isCanonicalNonblankString(fence.runId)
+    || fence.runId !== runId
+  ) {
+    throw new PermanentError(
+      "Workflow graph execution fence is missing or malformed",
+      "WORKFLOW_EXECUTION_FENCE_REFUSED",
+    );
+  }
+  return fence;
+}
+
+function materializedVisitIdentityForTurnKey(
+  identity: WorkflowMaterializedVisitIdentity,
+): Record<string, string | number> {
+  const stable: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(identity)) {
+    if (typeof value === "string" || typeof value === "number") {
+      stable[key] = value;
+    }
+  }
+  return stable;
+}
+
+function createProviderAttemptTurnKey(input: {
+  originTaskId: string;
+  semanticTaskId: string;
+  executionFence: WorkflowNodeExecutionFence;
+  visitIdentity: WorkflowMaterializedVisitIdentity;
+}): string {
+  const identity = {
+    schema: "ccc-cli-provider-attempt-turn-key",
+    version: 1,
+    originTaskId: input.originTaskId,
+    semanticTaskId: input.semanticTaskId,
+    executionFence: {
+      workItemId: input.executionFence.workItemId,
+      attempt: input.executionFence.attempt,
+      runId: input.executionFence.runId,
+    },
+    visitIdentity: materializedVisitIdentityForTurnKey(input.visitIdentity),
+  };
+  const digest = createHash("sha256")
+    .update(`ccc-cli-turn/v1\0${canonicalCccPrdJson(identity)}`, "utf8")
+    .digest("hex");
+  return `ccc-cli-turn-${digest}`;
+}
+
 function finiteCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? Math.floor(value)
@@ -368,6 +539,213 @@ function extractTaskProjection(contextPatch: Record<string, unknown> | undefined
 
 function hasTaskProjection(patch: WorkflowTaskProjection): boolean {
   return Object.keys(patch).length > 0;
+}
+
+function cloneTaskWithLockedId(task: TaskDetail, id: string): TaskDetail {
+  const cloned = { ...task } as TaskDetail;
+  Object.defineProperty(cloned, "id", {
+    value: id,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+  return cloned;
+}
+
+function snapshotResolverInput<T extends object>(value: T, lockedId?: string): T {
+  const seen = new WeakMap<object, object>();
+  const cloneAndFreeze = (current: unknown, root = false): unknown => {
+    if (current === null || typeof current !== "object") return current;
+    const existing = seen.get(current);
+    if (existing) return existing;
+    if (Array.isArray(current)) {
+      const cloned: unknown[] = [];
+      seen.set(current, cloned);
+      for (let index = 0; index < current.length; index++) {
+        if (index in current) cloned[index] = cloneAndFreeze(current[index]);
+      }
+      cloned.length = current.length;
+      return Object.freeze(cloned);
+    }
+    const cloned: Record<string, unknown> = {};
+    seen.set(current, cloned);
+    for (const [key, entry] of Object.entries(current)) {
+      if (root && lockedId !== undefined && key === "id") continue;
+      cloned[key] = cloneAndFreeze(entry);
+    }
+    if (root && lockedId !== undefined) {
+      Object.defineProperty(cloned, "id", {
+        value: lockedId,
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      });
+    }
+    return Object.freeze(cloned);
+  };
+  return cloneAndFreeze(value, true) as T;
+}
+
+function requireSealedExecution(
+  execution: WorkflowNodeSealedExecution | undefined,
+  nodeId: string,
+): WorkflowNodeSealedExecution {
+  if (!execution || !Object.isFrozen(execution)) {
+    throw new PermanentError(
+      `Workflow node ${nodeId} provider controller requires sealed execution`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return execution;
+}
+
+function requireWorkflowNodeProviderController(
+  candidate: WorkflowNodeProviderController | undefined,
+  extensionId: string,
+): WorkflowNodeProviderController {
+  if (
+    !candidate
+    || typeof candidate !== "object"
+    || !Object.isFrozen(candidate)
+    || !Object.hasOwn(candidate, "preDispatch")
+    || !Object.hasOwn(candidate, "reconcile")
+    || Object.keys(candidate).length !== 2
+    || typeof candidate.preDispatch !== "function"
+    || typeof candidate.reconcile !== "function"
+  ) {
+    throw new PermanentError(
+      `Workflow node provider controller is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return candidate;
+}
+
+const CANONICAL_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+
+function requireCanonicalProviderIdentifier(value: unknown, label: string, extensionId: string): string {
+  if (typeof value !== "string" || !CANONICAL_IDENTIFIER_PATTERN.test(value)) {
+    throw new PermanentError(
+      `Workflow node provider ${label} is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return value;
+}
+
+function requireWorkflowNodeProviderControllerBinding(
+  candidate: WorkflowNodeProviderControllerBinding | undefined,
+  extensionId: string,
+): WorkflowNodeProviderControllerBinding {
+  if (
+    !candidate
+    || typeof candidate !== "object"
+    || !Object.isFrozen(candidate)
+    || Object.keys(candidate).length !== 2
+    || !Object.hasOwn(candidate, "providerController")
+    || !Object.hasOwn(candidate, "providerRoute")
+  ) {
+    throw new PermanentError(
+      `Workflow node provider binding is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  requireWorkflowNodeProviderController(candidate.providerController, extensionId);
+  const providerRoute = candidate.providerRoute;
+  if (
+    !providerRoute
+    || typeof providerRoute !== "object"
+    || !Object.isFrozen(providerRoute)
+    || Object.keys(providerRoute).length !== 4
+    || !Object.hasOwn(providerRoute, "providerId")
+    || !Object.hasOwn(providerRoute, "modelId")
+    || !Object.hasOwn(providerRoute, "transport")
+    || !Object.hasOwn(providerRoute, "workflowExtensionId")
+    || providerRoute.transport !== "workflow"
+    || providerRoute.workflowExtensionId !== extensionId
+  ) {
+    throw new PermanentError(
+      `Workflow node provider route is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  requireCanonicalProviderIdentifier(providerRoute.providerId, "provider ID", extensionId);
+  requireCanonicalProviderIdentifier(providerRoute.modelId, "model ID", extensionId);
+  requireCanonicalProviderIdentifier(providerRoute.workflowExtensionId, "workflow extension ID", extensionId);
+  return candidate;
+}
+
+function createWorkflowNodeProviderDispatch(
+  execution: WorkflowNodeSealedExecution | undefined,
+  nodeId: string,
+  extensionId: string,
+  binding: WorkflowNodeProviderControllerBinding,
+): WorkflowNodeProviderDispatchInput {
+  const sealedExecution = requireSealedExecution(execution, nodeId);
+  const turnKey = requireCanonicalProviderIdentifier(
+    sealedExecution.providerAttemptTurnKey,
+    "sealed turn key",
+    extensionId,
+  );
+  const canonicalNodeId = requireCanonicalProviderIdentifier(nodeId, "node ID", extensionId);
+  const canonicalExtensionId = requireCanonicalProviderIdentifier(extensionId, "extension ID", extensionId);
+  if (binding.providerRoute.workflowExtensionId !== canonicalExtensionId) {
+    throw new PermanentError(
+      `Workflow node provider route extension identity does not match extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  const dispatchKey = `ccc-workflow-node-dispatch-${createHash("sha256")
+    .update(canonicalCccPrdJson({
+      schema: "ccc-workflow-node-dispatch",
+      version: 1,
+      nodeId: canonicalNodeId,
+      extensionId: canonicalExtensionId,
+    }), "utf8")
+    .digest("hex")}`;
+  return Object.freeze({
+    turnKey,
+    dispatchKey,
+    providerId: binding.providerRoute.providerId,
+    modelId: binding.providerRoute.modelId,
+    transport: "workflow" as const,
+  });
+}
+
+function requireSealedWorkflowNodeProviderDispatch(
+  candidate: WorkflowNodeProviderDispatchInput,
+  sealedDispatch: WorkflowNodeProviderDispatchInput,
+  extensionId: string,
+): WorkflowNodeProviderDispatchInput {
+  if (
+    !isPlainObject(candidate)
+    || Object.keys(candidate).length !== 5
+    || candidate.turnKey !== sealedDispatch.turnKey
+    || candidate.dispatchKey !== sealedDispatch.dispatchKey
+    || candidate.providerId !== sealedDispatch.providerId
+    || candidate.modelId !== sealedDispatch.modelId
+    || candidate.transport !== sealedDispatch.transport
+  ) {
+    throw new PermanentError(
+      `Workflow node provider dispatch does not match sealed provider dispatch for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return sealedDispatch;
+}
+
+function createSealedWorkflowNodeProviderController(
+  controller: WorkflowNodeProviderController,
+  sealedDispatch: WorkflowNodeProviderDispatchInput,
+  extensionId: string,
+): WorkflowNodeProviderController {
+  return Object.freeze({
+    preDispatch: async (input) => {
+      requireSealedWorkflowNodeProviderDispatch(input, sealedDispatch, extensionId);
+      return await controller.preDispatch(sealedDispatch);
+    },
+    reconcile: async (input) => await controller.reconcile(input),
+  });
 }
 
 export class WorkflowGraphExecutor {
@@ -512,10 +890,28 @@ export class WorkflowGraphExecutor {
     }
     const isReworkSignal = (r: WorkflowNodeResult | ReworkSignal): r is ReworkSignal =>
       (r as ReworkSignal).__rework === true;
+    type TopLevelReworkVisit = Readonly<{ headNodeId: string; pass: number }>;
+    const visitIdentityWithTopLevelRework = (
+      node: WorkflowIrNode,
+      topLevelReworkVisit: TopLevelReworkVisit | undefined,
+      visitIdentity?: WorkflowMaterializedVisitIdentity,
+    ): WorkflowMaterializedVisitIdentity | undefined => {
+      if (!topLevelReworkVisit) return visitIdentity;
+      return Object.freeze({
+        ...(visitIdentity ?? {
+          nodeId: node.id,
+          materializedNodeId: node.id,
+          reworkPass: topLevelReworkVisit.pass,
+        }),
+        topLevelReworkHeadNodeId: topLevelReworkVisit.headNodeId,
+        topLevelReworkPass: topLevelReworkVisit.pass,
+      }) as WorkflowMaterializedVisitIdentity;
+    };
 
     // On resume, completed branch nodes (from a prior crashed run) are skipped
     // so their handlers do not re-fire (idempotency).
     let completedNodeIds: Set<string> | undefined;
+    let completedBranchIds: Set<string> | undefined;
     const persisted = await this.deps.branchPersistence?.loadBranchStates?.(task.id, runId);
     if (persisted && persisted.length > 0) {
       completedNodeIds = new Set(
@@ -523,7 +919,40 @@ export class WorkflowGraphExecutor {
           .filter((s: WorkflowBranchRunState) => s.status === "completed")
           .map((s) => s.currentNodeId),
       );
+      completedBranchIds = new Set(
+        persisted
+          .filter((s: WorkflowBranchRunState) => s.status === "completed")
+          .map((s) => s.branchId),
+      );
     }
+    /*
+    FNXC:CCCBranchPersistence 2026-07-24-11:48:
+    CCC’s stable run uses the existing branch rows as a durable frontier, not a
+    second continuation store. A completed sequential node is admitted only
+    after its checkpoint commits; recovery therefore never replays A before a
+    split, and a failed checkpoint routes failure before any successor effect.
+    */
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const checkpointCccFrontier = async (node: WorkflowIrNode): Promise<string | undefined> => {
+      if (!cccFusionTask || node.kind === "start" || node.kind === "end") return undefined;
+      if (typeof this.deps.branchPersistence?.saveBranchState !== "function") {
+        return "ccc-branch-persistence-progress-failed";
+      }
+      try {
+        await this.deps.branchPersistence.saveBranchState({
+          taskId: task.id,
+          runId,
+          branchId: `__ccc_frontier__:${node.id}`,
+          currentNodeId: node.id,
+          status: "completed",
+        });
+        completedNodeIds ??= new Set<string>();
+        completedNodeIds.add(node.id);
+        return undefined;
+      } catch {
+        return "ccc-branch-persistence-progress-failed";
+      }
+    };
 
     // Prune prior-run branch rows on run start (#1412). Done after the resume
     // load so this run's own (taskId, runId) rows survive while every stale run
@@ -536,27 +965,39 @@ export class WorkflowGraphExecutor {
     await this.pruneStaleInstances(task.id, runId);
 
     // Shared branch environment: built lazily so the sequential path pays nothing.
-    const branchEnv = (): BranchEnvironment => ({
+    const branchEnv = (topLevelReworkVisit?: TopLevelReworkVisit): BranchEnvironment => ({
       task,
       settings,
       runId,
+      signal: this.deps.signal,
       nodeMap,
       outgoingMap,
-      runBranchNode: (node, signal) => this.executeNodeWithRetries(node, task, settings, context, ir, signal),
+      runBranchNode: (node, signal) => this.executeNodeWithRetries(
+        node,
+        task,
+        settings,
+        context,
+        ir,
+        signal,
+        true,
+        visitIdentityWithTopLevelRework(node, topLevelReworkVisit),
+      ),
       shouldTraverseEdge: (edge, source) => this.shouldTraverseEdge(edge, source),
       persistence: this.deps.branchPersistence,
       semaphore: this.deps.branchSemaphore,
       onBranchProgress: this.deps.onBranchProgress,
       completedNodeIds,
+      completedBranchIds,
     });
 
     // Execute one node and traverse its outgoing edges. May return a ReworkSignal
     // (a rework back-edge fired); the caller frame propagates or consumes it.
     const runNodeAndTraverse = async (
       node: WorkflowIrNode,
+      topLevelReworkVisit?: TopLevelReworkVisit,
     ): Promise<WorkflowNodeResult | ReworkSignal> => {
         if (node.kind === "start") {
-          return await traverseChildren(node, { outcome: "success" });
+          return await traverseChildren(node, { outcome: "success" }, topLevelReworkVisit);
         }
         if (node.kind === "end") {
           // KTD-1: `end` is a graph terminal, not a column destination — the card
@@ -564,6 +1005,10 @@ export class WorkflowGraphExecutor {
           // in place (its current wip/merge column), which is exactly the
           // no-onNodeEntry behavior.
           return { outcome: "success" };
+        }
+
+        if (cccFusionTask && completedNodeIds?.has(node.id)) {
+          return await traverseChildren(node, { outcome: "success" }, topLevelReworkVisit);
         }
 
         // U1: cross the lifecycle column boundary on node entry (KTD-1/2/3). A
@@ -589,7 +1034,7 @@ export class WorkflowGraphExecutor {
           context[SPLIT_ACTIVE_CONTEXT_KEY] = true;
           let splitResult: Awaited<ReturnType<typeof runSplitJoin>>;
           try {
-            splitResult = await runSplitJoin(node, branchEnv());
+            splitResult = await runSplitJoin(node, branchEnv(topLevelReworkVisit));
           } finally {
             if (priorSplitActive === undefined) delete context[SPLIT_ACTIVE_CONTEXT_KEY];
             else context[SPLIT_ACTIVE_CONTEXT_KEY] = priorSplitActive;
@@ -598,10 +1043,22 @@ export class WorkflowGraphExecutor {
           context[`node:${node.id}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:branchOutcomes`] = splitResult.branchOutcomes;
+          if (splitResult.failureReason) {
+            if (splitResult.failureReason.startsWith("ccc-branch-persistence-")) {
+              context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = splitResult.failureReason;
+            } else {
+              context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY] = splitResult.failureReason;
+            }
+            if (typeof splitResult.terminalAttempt === "number") {
+              context[CCC_RETRY_ATTEMPT_CONTEXT_KEY] = splitResult.terminalAttempt;
+            }
+            return { outcome: "failure", value: splitResult.failureReason };
+          }
           if (!inStack.has(splitResult.joinNodeId)) visitedNodeIds.push(splitResult.joinNodeId);
           return await traverseChildren(
             nodeMap.get(splitResult.joinNodeId)!,
             { outcome: splitResult.outcome },
+            topLevelReworkVisit,
           );
         }
 
@@ -618,8 +1075,8 @@ export class WorkflowGraphExecutor {
             steps,
             getLiveSteps: () => this.resolveTaskSteps(task),
             context,
-            runTemplateNode: (tNode, sig, contextOverride) =>
-              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false),
+            runTemplateNode: (tNode, sig, contextOverride, visitIdentity) =>
+              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentityWithTopLevelRework(tNode, topLevelReworkVisit, visitIdentity)),
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             persistence: this.deps.stepInstancePersistence,
             onReworkReset: this.deps.onReworkReset,
@@ -640,14 +1097,14 @@ export class WorkflowGraphExecutor {
           };
           context[`node:${node.id}:outcome`] = result.outcome;
           if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
-          return await traverseChildren(node, result);
+          return await traverseChildren(node, result, topLevelReworkVisit);
         }
 
         if (node.kind === "loop") {
           const loopResult = await runLoop(node, {
             context,
-            runTemplateNode: (tNode, sig, contextOverride) =>
-              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false),
+            runTemplateNode: (tNode, sig, contextOverride, visitIdentity) =>
+              this.executeNodeWithRetries(tNode, task, settings, contextOverride ?? context, ir, sig, false, visitIdentityWithTopLevelRework(tNode, topLevelReworkVisit, visitIdentity)),
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             signal: this.deps.signal,
             now: this.deps.runLoopNowForTests,
@@ -659,7 +1116,7 @@ export class WorkflowGraphExecutor {
           };
           context[`node:${node.id}:outcome`] = result.outcome;
           if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
-          return await traverseChildren(node, result);
+          return await traverseChildren(node, result, topLevelReworkVisit);
         }
 
         if (node.kind === "optional-group") {
@@ -708,7 +1165,7 @@ export class WorkflowGraphExecutor {
             // could let an `outcome:*` edge preempt the success edge in
             // traverseChildren, breaking the "disabled == node absent" inertness
             // invariant. (Code review: CodeRabbit.)
-            return await traverseChildren(node, { outcome: "success" });
+            return await traverseChildren(node, { outcome: "success" }, topLevelReworkVisit);
           }
           /*
            * FNXC:WorkflowStepResults 2026-06-25-12:00:
@@ -738,7 +1195,7 @@ export class WorkflowGraphExecutor {
           ) {
             context[`node:${node.id}:outcome`] = "success";
             this.deps.logTaskEntry?.("[pre-merge] Workflow step already passed: Plan Review");
-            return await traverseChildren(node, { outcome: "success", value: "already-passed" });
+            return await traverseChildren(node, { outcome: "success", value: "already-passed" }, topLevelReworkVisit);
           }
           const repairedPlanReview = node.id === PLAN_REVIEW_GROUP_ID
             ? recoverPassedPlanReviewFromLatestLog(task)
@@ -747,7 +1204,7 @@ export class WorkflowGraphExecutor {
             await this.recordOptionalGroupStepResult(task.id, repairedPlanReview);
             context[`node:${node.id}:outcome`] = "success";
             this.deps.logTaskEntry?.("[pre-merge] Workflow step already passed: Plan Review");
-            return await traverseChildren(node, { outcome: "success", value: "already-passed" });
+            return await traverseChildren(node, { outcome: "success", value: "already-passed" }, topLevelReworkVisit);
           }
           /*
            * FNXC:PlanReviewLease 2026-07-18-23:50:
@@ -812,7 +1269,7 @@ export class WorkflowGraphExecutor {
 
           const groupResult = await runOptionalGroup(node, {
             context,
-            runTemplateNode: (tNode, sig, contextOverride) => {
+            runTemplateNode: (tNode, sig, contextOverride, visitIdentity) => {
               /*
               FNXC:FastOptionalSteps 2026-06-30-09:12:
               Optional-group template execution carries the parent group id in context so fast mode can skip only top-level review/validation gates. Once an operator explicitly enables an optional group, that selection is stronger than the fast default and its prompt/script/gate body must run.
@@ -821,7 +1278,7 @@ export class WorkflowGraphExecutor {
                 ...(contextOverride ?? context),
                 [WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY]: node.id,
               };
-              return this.executeNodeWithRetries(tNode, task, settings, optionalGroupContext, ir, sig, false);
+              return this.executeNodeWithRetries(tNode, task, settings, optionalGroupContext, ir, sig, false, visitIdentityWithTopLevelRework(tNode, topLevelReworkVisit, visitIdentity));
             },
             shouldTraverseEdge: (edge, src) => this.shouldTraverseEdge(edge, src),
             signal: this.deps.signal,
@@ -985,7 +1442,7 @@ export class WorkflowGraphExecutor {
               return action === "plan-replan" || action === "pre-merge-remediation";
             });
             if (explicitWorkflowRemediationRoute) {
-              return await traverseChildren(node, remediationRouteSource);
+              return await traverseChildren(node, remediationRouteSource, topLevelReworkVisit);
             }
             const fixScheduled = await this.deps.requestPreMergeOptionalStepFix?.(task.id, failureContext);
             if (fixScheduled) {
@@ -993,7 +1450,7 @@ export class WorkflowGraphExecutor {
               return { outcome: "success", value: "pre-merge-optional-step-fix-scheduled" };
             }
           }
-          return await traverseChildren(node, result);
+          return await traverseChildren(node, result, topLevelReworkVisit);
         }
 
         const workflowAction = node.config?.workflowAction;
@@ -1024,12 +1481,34 @@ export class WorkflowGraphExecutor {
           return { outcome: "success", value: "remediation-scheduled" };
         }
 
-        const result = await this.executeNodeWithRetries(node, task, settings, context, ir, this.deps.signal);
+        const result = await this.executeNodeWithRetries(
+          node,
+          task,
+          settings,
+          context,
+          ir,
+          this.deps.signal,
+          true,
+          visitIdentityWithTopLevelRework(node, topLevelReworkVisit),
+        );
         if (result.contextPatch) Object.assign(context, result.contextPatch);
         context[`node:${node.id}:outcome`] = result.outcome;
         if (result.value !== undefined) context[`node:${node.id}:value`] = result.value;
 
-        return await traverseChildren(node, result);
+        const cccClassification = context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY];
+        if (typeof cccClassification === "string" && cccClassification.startsWith("ccc-")) {
+          return { outcome: "failure", value: cccClassification };
+        }
+
+        if (result.outcome === "success") {
+          const checkpointFailure = await checkpointCccFrontier(node);
+          if (checkpointFailure) {
+            context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = checkpointFailure;
+            return { outcome: "failure", value: checkpointFailure };
+          }
+        }
+
+        return await traverseChildren(node, result, topLevelReworkVisit);
     };
 
     // Recursive walk into a node. A rework region head (target of a `kind:
@@ -1038,7 +1517,10 @@ export class WorkflowGraphExecutor {
     // re-runs; budget exhaustion re-routes the head with an
     // `outcome:rework-exhausted` source so its forward edge carries the flow out.
     // Every NON-rework back-edge still hits the cycle detector and throws.
-    const walk = async (nodeId: string): Promise<WorkflowNodeResult | ReworkSignal> => {
+    const walk = async (
+      nodeId: string,
+      topLevelReworkVisit?: TopLevelReworkVisit,
+    ): Promise<WorkflowNodeResult | ReworkSignal> => {
       const node = nodeMap.get(nodeId);
       if (!node) throw new WorkflowIrError(`Unknown workflow node: ${nodeId}`);
       if (inStack.has(nodeId)) throw new WorkflowIrError(`Cycle detected at node: ${nodeId}`);
@@ -1047,8 +1529,12 @@ export class WorkflowGraphExecutor {
 
       try {
         const isReworkHead = reworkHeads.has(nodeId);
+        let reworkPass = 0;
         for (;;) {
-          const outcome = await runNodeAndTraverse(node);
+          const activeTopLevelReworkVisit = isReworkHead
+            ? Object.freeze({ headNodeId: nodeId, pass: reworkPass })
+            : topLevelReworkVisit;
+          const outcome = await runNodeAndTraverse(node, activeTopLevelReworkVisit);
           if (!isReworkSignal(outcome)) return outcome;
           // A rework back-edge fired. It must target THIS head (the deepest
           // enclosing rework head); a signal for an outer head propagates up.
@@ -1056,6 +1542,7 @@ export class WorkflowGraphExecutor {
           const remaining = reworkBudgetFor(nodeId);
           if (remaining > 0) {
             reworkBudget.set(nodeId, remaining - 1);
+            reworkPass += 1;
             continue; // re-run the head node fresh (await-review re-evaluates)
           }
           // Budget exhausted: route the head's `outcome:rework-exhausted` forward
@@ -1065,7 +1552,11 @@ export class WorkflowGraphExecutor {
           // `condition:"success"` forward edge (which would re-enter the loop body
           // and never terminate). Never loops forever; never throws "Cycle
           // detected" for the legal rework edge.
-          const exhausted = await traverseChildren(node, { outcome: "failure", value: "rework-exhausted" });
+          const exhausted = await traverseChildren(
+            node,
+            { outcome: "failure", value: "rework-exhausted" },
+            activeTopLevelReworkVisit,
+          );
           // If no `outcome:rework-exhausted` edge exists the source bubbles back
           // (a failure outcome) — a finite, routable terminal, never an infinite loop.
           return exhausted;
@@ -1075,7 +1566,10 @@ export class WorkflowGraphExecutor {
       }
     };
 
-    const runLegacyMergeSeam = async (regionNode?: WorkflowIrNode): Promise<WorkflowNodeResult> => {
+    const runLegacyMergeSeam = async (
+      regionNode: WorkflowIrNode | undefined,
+      topLevelReworkVisit?: TopLevelReworkVisit,
+    ): Promise<WorkflowNodeResult> => {
       // The merge-policy primitive region is interpreter-owned policy. While the
       // legacy lifecycle remains authoritative, reaching any of its node kinds is
       // the terminal merge boundary: dispatch the same prompt/seam handler a
@@ -1094,6 +1588,8 @@ export class WorkflowGraphExecutor {
         context,
         ir,
         this.deps.signal,
+        true,
+        visitIdentityWithTopLevelRework(mergeNode, topLevelReworkVisit),
       );
       if (result.contextPatch) Object.assign(context, result.contextPatch);
       context[`node:${mergeNode.id}:outcome`] = result.outcome;
@@ -1104,6 +1600,7 @@ export class WorkflowGraphExecutor {
     const traverseChildren = async (
       node: WorkflowIrNode,
       sourceResult: WorkflowNodeResult,
+      topLevelReworkVisit?: TopLevelReworkVisit,
     ): Promise<WorkflowNodeResult | ReworkSignal> => {
       const edges = outgoingMap.get(node.id) ?? [];
       if (edges.length === 0) {
@@ -1135,7 +1632,7 @@ export class WorkflowGraphExecutor {
           continue;
         }
         if (target && isMergeRegionKind(target.kind)) {
-          aggregate = await runLegacyMergeSeam(target);
+          aggregate = await runLegacyMergeSeam(target, topLevelReworkVisit);
           if (aggregate.outcome === "failure") break;
           /*
            * FNXC:WorkflowPostMerge 2026-06-26-09:00:
@@ -1160,7 +1657,7 @@ export class WorkflowGraphExecutor {
              * not overwrite already-proven merge state.
              */
             try {
-              const postMerge = await walk(entryId);
+              const postMerge = await walk(entryId, topLevelReworkVisit);
               // A post-merge entry node is never an enclosing rework head, so a
               // ReworkSignal here would be malformed IR; ignore it rather than bubble a
               // rework loop out of the merge boundary.
@@ -1197,7 +1694,7 @@ export class WorkflowGraphExecutor {
           }
           continue;
         }
-        const child = await walk(edge.to);
+        const child = await walk(edge.to, topLevelReworkVisit);
         // A ReworkSignal propagated from deeper: bubble it further up unchanged.
         if (isReworkSignal(child)) return child;
         if (child.outcome === "failure") {
@@ -1377,12 +1874,80 @@ export class WorkflowGraphExecutor {
     };
   }
 
+  private async resolvePluginNodeProviderController(
+    node: WorkflowIrNode,
+    task: TaskDetail,
+    workflow: WorkflowIr,
+    extensionId: string,
+    definition: WorkflowExtensionDefinition,
+    signal: AbortSignal | undefined,
+    execution: WorkflowNodeSealedExecution | undefined,
+    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderControllerBinding>>,
+  ): Promise<WorkflowNodeProviderControllerBinding | undefined> {
+    if (definition.providerPosture === "opaque") {
+      throw new PermanentError(
+        `Workflow node ${node.id} refuses opaque provider posture for extension ${extensionId}`,
+        "WORKFLOW_NODE_PROVIDER_REFUSED",
+      );
+    }
+    if (definition.providerPosture !== "scoped-provider") return undefined;
+    if (!this.deps.resolveNodeProviderController) {
+      throw new PermanentError(
+        `Workflow node provider binding resolver is unavailable for extension ${extensionId}`,
+        "WORKFLOW_NODE_PROVIDER_REFUSED",
+      );
+    }
+
+    const cached = providerControllerPromises.get(extensionId) ?? Promise.resolve()
+      .then(() => this.deps.resolveNodeProviderController!({
+        node,
+        semanticTask: task,
+        workflow,
+        extensionId,
+        execution: requireSealedExecution(execution, node.id),
+        signal,
+      }))
+      .then((candidate) => requireWorkflowNodeProviderControllerBinding(candidate, extensionId));
+    providerControllerPromises.set(extensionId, cached);
+    return await cached;
+  }
+
+  private async preflightPluginNodeProviderControllers(
+    node: WorkflowIrNode,
+    task: TaskDetail,
+    workflow: WorkflowIr,
+    signal: AbortSignal | undefined,
+    execution: WorkflowNodeSealedExecution | undefined,
+    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderControllerBinding>>,
+  ): Promise<void> {
+    const registry = getWorkflowExtensionRegistry();
+    for (const extensionId of Object.keys(node.extensions ?? {})) {
+      const definition = registry.get(extensionId);
+      const extension = definition?.extension;
+      if (!definition || definition.degraded || extension?.kind !== "node-handler" || !extension.handle) continue;
+      if (extension.nodeKind && extension.nodeKind !== node.kind) continue;
+      const binding = await this.resolvePluginNodeProviderController(
+        node,
+        task,
+        workflow,
+        extensionId,
+        definition,
+        signal,
+        execution,
+        providerControllerPromises,
+      );
+      if (binding) createWorkflowNodeProviderDispatch(execution, node.id, extensionId, binding);
+    }
+  }
+
   private async executePluginNodeHandler(
     node: WorkflowIrNode,
     task: TaskDetail,
     workflow: WorkflowIr,
     context: Record<string, unknown>,
     signal?: AbortSignal,
+    execution?: WorkflowNodeSealedExecution,
+    providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderControllerBinding>>(),
   ): Promise<WorkflowNodeResult | undefined> {
     const extensionIds = Object.keys(node.extensions ?? {});
     if (extensionIds.length === 0) return undefined;
@@ -1393,16 +1958,47 @@ export class WorkflowGraphExecutor {
       const extension = definition?.extension;
       if (!definition || definition.degraded || extension?.kind !== "node-handler" || !extension.handle) continue;
       if (extension.nodeKind && extension.nodeKind !== node.kind) continue;
+      const providerBinding = await this.resolvePluginNodeProviderController(
+        node,
+        task,
+        workflow,
+        extensionId,
+        definition,
+        signal,
+        execution,
+        providerControllerPromises,
+      );
       try {
+        const providerDispatch = providerBinding
+          ? createWorkflowNodeProviderDispatch(execution, node.id, extensionId, providerBinding)
+          : undefined;
         const result = await extension.handle({
           task,
           workflow,
           node,
           context,
           signal,
+          ...(providerBinding ? {
+            providerController: createSealedWorkflowNodeProviderController(
+              providerBinding.providerController,
+              providerDispatch!,
+              extensionId,
+            ),
+            providerDispatch,
+          } : {}),
         });
         return this.normalizePluginNodeResult(result);
       } catch (error) {
+        if (definition.providerPosture === "scoped-provider") {
+          return {
+            outcome: "failure",
+            value: "plugin-node-handler-error",
+            contextPatch: {
+              [`node:${node.id}:error`]: error instanceof Error ? error.message : String(error),
+              [`node:${node.id}:extensionId`]: extensionId,
+            },
+          };
+        }
         if (extension.fallback === "degradeToDefault") {
           try {
             registry.degrade(
@@ -1438,8 +2034,54 @@ export class WorkflowGraphExecutor {
     workflow: WorkflowIr,
     signal?: AbortSignal,
     recordProgress = true,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
   ): Promise<WorkflowNodeResult> {
     const handler = this.handlers[node.kind];
+    if (signal?.aborted) {
+      return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
+    }
+    const originTaskId = task.id;
+    const effectiveVisitIdentity = Object.freeze({
+      ...(visitIdentity ?? { nodeId: node.id, materializedNodeId: node.id }),
+    }) as WorkflowMaterializedVisitIdentity;
+    const runId = this.deps.runId ?? `${originTaskId}:run`;
+    const executionFence = this.deps.executionFence !== undefined
+      ? requireWorkflowNodeExecutionFence(this.deps.executionFence as WorkflowNodeExecutionFence, runId)
+      : undefined;
+    const resolvedExecution = this.deps.resolveNodeExecution
+      ? await this.deps.resolveNodeExecution({
+        node: snapshotResolverInput(node),
+        originTask: snapshotResolverInput(task, originTaskId),
+        runId,
+        visitIdentity: effectiveVisitIdentity,
+        signal,
+      })
+      : undefined;
+    let semanticTask = this.deps.resolveNodeExecution ? resolvedExecution?.semanticTask : task;
+    if (typeof semanticTask?.id !== "string" || semanticTask.id.length === 0 || semanticTask.id !== semanticTask.id.trim()) {
+      throw new WorkflowIrError(`Workflow node ${node.id} resolved a semantic task without a canonical id`);
+    }
+    const semanticTaskId = semanticTask.id;
+    if (this.deps.resolveNodeExecution) {
+      semanticTask = cloneTaskWithLockedId(semanticTask, semanticTaskId);
+    }
+    const providerAttemptTurnKey = executionFence
+      ? createProviderAttemptTurnKey({
+          originTaskId,
+          semanticTaskId,
+          executionFence,
+          visitIdentity: effectiveVisitIdentity,
+        })
+      : undefined;
+    const execution = Object.freeze({
+      originTaskId,
+      semanticTaskId,
+      semanticTask,
+      runId,
+      visitIdentity: effectiveVisitIdentity,
+      ...(executionFence ? { executionFence } : {}),
+      ...(providerAttemptTurnKey ? { providerAttemptTurnKey } : {}),
+    }) as WorkflowNodeSealedExecution;
 
     // Per-node override: config.maxRetries beats the executor-wide default.
     const configured = Number(node.config?.maxRetries);
@@ -1448,44 +2090,101 @@ export class WorkflowGraphExecutor {
       : this.maxRetriesPerNode;
 
     let lastError: unknown;
+    let admissionCompleted = false;
+    const providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderControllerBinding>>();
+    /*
+    FNXC:CccWave4Retry 2026-07-24-19:15:
+    Permanent CCC failures stop after their first real invocation even when the
+    configured cap is larger. Persist the loop index actually consumed, while
+    exhausted transient failures naturally retain their final retry index.
+    */
+    let attemptsConsumed = 0;
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // Fail-fast cancellation: a branch or top-level graph abort mid-retry stops re-trying.
       if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
+      attemptsConsumed = attempt + 1;
       try {
-        await this.prepareNodeExecution(node, task, context, settings);
+        if (!admissionCompleted) {
+          await this.deps.admitNodeExecution?.(node, semanticTask, signal, effectiveVisitIdentity, execution);
+          admissionCompleted = true;
+        }
+        await this.preflightPluginNodeProviderControllers(
+          node,
+          semanticTask,
+          workflow,
+          signal,
+          execution,
+          providerControllerPromises,
+        );
+        await this.prepareNodeExecution(node, semanticTask, context, settings, effectiveVisitIdentity, execution);
         const progressRecord = recordProgress && this.shouldRecordNodeProgress(node)
-          ? await this.recordNodeProgressStart(task.id, node)
+          ? await this.recordNodeProgressStart(semanticTaskId, node)
           : null;
-        const pluginResult = await this.executePluginNodeHandler(node, task, workflow, context, signal);
+        const pluginResult = await this.executePluginNodeHandler(
+          node,
+          semanticTask,
+          workflow,
+          context,
+          signal,
+          execution,
+          providerControllerPromises,
+        );
         if (pluginResult) {
-          const projected = await this.publishTaskProjectionFromResult(task.id, node, pluginResult);
-          if (signal?.aborted || this.isAbortNodeResult(projected)) {
+          /*
+          FNXC:CccWave4Projection 2026-07-24-18:25:
+          A fail-closed branch abort is authoritative once a delayed handler
+          settles. Check it before projecting either plugin or normal handler
+          metadata so a losing sibling cannot publish stale task state.
+          */
+          if (signal?.aborted || this.isAbortNodeResult(pluginResult)) {
+            return this.withEnginePauseAbortContext(node, pluginResult);
+          }
+          const projected = await this.publishTaskProjectionFromResult(semanticTaskId, node, pluginResult, signal, this.deps.resolveNodeExecution ? execution : undefined);
+          if (this.isAbortNodeResult(projected)) {
             return this.withEnginePauseAbortContext(node, projected);
           }
           if (progressRecord) {
-            await this.recordNodeProgressFinish(task.id, node, progressRecord, projected);
+            await this.recordNodeProgressFinish(semanticTaskId, node, progressRecord, projected);
           }
           return projected;
         }
         if (!handler) {
           throw new WorkflowIrError(`No handler registered for node kind: ${node.kind}`);
         }
-        const result = await handler(node, { task, settings, context, signal });
-        const projected = await this.publishTaskProjectionFromResult(task.id, node, result);
-        if (signal?.aborted || this.isAbortNodeResult(projected)) {
+        const result = await handler(node, { task: semanticTask, settings, context, signal, visitIdentity: effectiveVisitIdentity, execution });
+        if (signal?.aborted || this.isAbortNodeResult(result)) {
+          return this.withEnginePauseAbortContext(node, result);
+        }
+        const projected = await this.publishTaskProjectionFromResult(semanticTaskId, node, result, signal, this.deps.resolveNodeExecution ? execution : undefined);
+        if (this.isAbortNodeResult(projected)) {
           return this.withEnginePauseAbortContext(node, projected);
         }
         if (progressRecord) {
-          await this.recordNodeProgressFinish(task.id, node, progressRecord, projected);
+          await this.recordNodeProgressFinish(semanticTaskId, node, progressRecord, projected);
         }
         return projected;
       } catch (error) {
-        if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
         lastError = error;
+        const cccTerminalFailure = cccFusionTask && (
+          error instanceof PermanentError
+          || (error instanceof TransientError && attempt + 1 >= maxAttempts)
+        );
+        /*
+        FNXC:CccWave4Retry 2026-07-24-15:32: preserve a permanent or
+        exhausted transient CCC handler classification even when a competing
+        branch aborted the shared signal while that handler was settling.
+        */
+        if (cccTerminalFailure) break;
+        if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
+        if (cccFusionTask && error instanceof PermanentError) break;
       }
     }
 
-    if (signal?.aborted) {
+    const cccTerminalAfterAbort = cccFusionTask && (
+      lastError instanceof PermanentError || lastError instanceof TransientError
+    );
+    if (signal?.aborted && !cccTerminalAfterAbort) {
       return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
     }
 
@@ -1500,7 +2199,12 @@ export class WorkflowGraphExecutor {
      * — the deterministic `ensureWorkflowCompletionSummary` fallback still fills
      * `task.summary` — so the graph always advances past it.
      */
-    if (isCompletionSummaryNode(node)) {
+    const cccClassification = cccFusionTask && lastError instanceof PermanentError
+      ? `ccc-permanent:${lastError.code}`
+      : cccFusionTask && lastError instanceof TransientError
+        ? `ccc-transient-retry-exhausted:${lastError.code}`
+        : undefined;
+    if (isCompletionSummaryNode(node) && !cccClassification) {
       const degraded: WorkflowNodeResult = {
         outcome: "success",
         value: "summary-unavailable",
@@ -1509,19 +2213,21 @@ export class WorkflowGraphExecutor {
         },
       };
       if (recordProgress && this.shouldRecordNodeProgress(node)) {
-        await this.recordNodeProgressFinish(task.id, node, null, degraded);
+        await this.recordNodeProgressFinish(semanticTaskId, node, null, degraded);
       }
       return degraded;
     }
     const failureResult: WorkflowNodeResult = {
       outcome: "failure",
-      value: "exception",
+      value: cccClassification ?? "exception",
       contextPatch: {
+        ...(cccClassification ? { [CCC_RETRY_CLASSIFICATION_CONTEXT_KEY]: cccClassification } : {}),
+        ...(cccClassification ? { [CCC_RETRY_ATTEMPT_CONTEXT_KEY]: attemptsConsumed } : {}),
         [`node:${node.id}:error`]: lastError instanceof Error ? lastError.message : String(lastError),
       },
     };
     if (recordProgress && this.shouldRecordNodeProgress(node)) {
-      await this.recordNodeProgressFinish(task.id, node, null, failureResult);
+      await this.recordNodeProgressFinish(semanticTaskId, node, null, failureResult);
     }
     return failureResult;
   }
@@ -1597,10 +2303,12 @@ export class WorkflowGraphExecutor {
     task: TaskDetail,
     context: Record<string, unknown>,
     settings: WorkflowNodeSettings | undefined,
+    visitIdentity?: WorkflowMaterializedVisitIdentity,
+    execution?: WorkflowNodeSealedExecution,
   ): Promise<void> {
     const requirement = this.classifyNodePreparation(node, context, settings);
     if (!requirement.requiresWorktree) return;
-    await this.deps.prepareNodeExecution?.(node, task, requirement);
+    await this.deps.prepareNodeExecution?.(node, task, requirement, visitIdentity, execution);
   }
 
   private classifyNodePreparation(
@@ -1654,12 +2362,16 @@ export class WorkflowGraphExecutor {
     taskId: string,
     node: WorkflowIrNode,
     result: WorkflowNodeResult,
+    signal?: AbortSignal,
+    execution?: WorkflowNodeSealedExecution,
   ): Promise<WorkflowNodeResult> {
     const patch = extractTaskProjection(result.contextPatch);
     if (!hasTaskProjection(patch)) return result;
-    const source = { nodeId: node.id, nodeKind: node.kind };
+    const legacySource = { nodeId: node.id, nodeKind: node.kind };
+    const source = { ...legacySource, ...(execution ? { execution } : {}) };
     try {
-      await this.deps.publishTaskProjection?.(taskId, patch, source);
+      if (signal) await this.deps.publishTaskProjection?.(taskId, patch, source, signal);
+      else await this.deps.publishTaskProjection?.(taskId, patch, source);
     } catch (error) {
       /*
        * FNXC:WorkflowCompletion 2026-07-01-16:24:
@@ -1689,9 +2401,10 @@ export class WorkflowGraphExecutor {
         },
       };
     }
+    if (signal?.aborted) return { ...result, outcome: "failure", value: "aborted" };
     if (patch.modifiedFiles && patch.modifiedFiles.length > 0) {
       try {
-        await this.deps.publishTouchedFiles?.(taskId, patch.modifiedFiles, source);
+        await this.deps.publishTouchedFiles?.(taskId, patch.modifiedFiles, legacySource);
       } catch {
         // Deprecated compatibility hook; primary projection persistence owns node outcome.
       }

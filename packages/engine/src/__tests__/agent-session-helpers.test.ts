@@ -621,6 +621,113 @@ describe("createResolvedAgentSession", () => {
     resolveRuntimeMock.mockReset();
   });
 
+  it("Task 6 RED: a provider binding rejects an explicit non-pi runtime before runtime resolution", async () => {
+    const binding = Object.freeze({
+      turnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      controller: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
+    });
+    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+
+    await expect(createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      runtimeHint: "grok",
+      cccProviderAttemptBinding: binding as any,
+    })).rejects.toThrow("cccProviderAttemptBinding requires the native pi runtime");
+
+    expect(resolveRuntimeMock).not.toHaveBeenCalled();
+    expect(Object.isFrozen(binding)).toBe(true);
+    expect(Object.isFrozen(binding.controller)).toBe(true);
+  });
+
+  it("Task 6 RED: a provider binding forces native pi instead of mock or test runtime", async () => {
+    const createSessionMock = vi.fn().mockResolvedValue({
+      session: { prompt: vi.fn() },
+    });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "pi",
+        name: "Default PI Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: vi.fn(),
+        describeModel: vi.fn(() => "openai/gpt-4o"),
+      },
+      runtimeId: "pi",
+      wasConfigured: false,
+    });
+    const binding = Object.freeze({
+      turnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      controller: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
+    });
+    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+
+    const result = await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      defaultProvider: "mock",
+      defaultModelId: "scripted",
+      settings: { testMode: true } as any,
+      cccProviderAttemptBinding: binding as any,
+    });
+
+    expect(result.runtimeId).toBe("pi");
+    expect(resolveRuntimeMock).toHaveBeenCalledWith(expect.objectContaining({ runtimeHint: "pi" }));
+    expect(createSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      cccProviderAttemptBinding: binding,
+    }));
+    expect(Object.isFrozen(binding)).toBe(true);
+    expect(Object.isFrozen(binding.controller)).toBe(true);
+  });
+
+  it.each([
+    ["grok-cli", "grok-cli/grok-4.5"],
+    ["omp-cli", "omp-cli/MiniMax-M2.5"],
+  ])(
+    "Task 6 repair RED: a bound %s model bypasses plugin auto-routing and reaches native pi unchanged",
+    async (defaultProvider, defaultModelId) => {
+      vi.stubEnv("GROK_API_KEY", "");
+      const createSessionMock = vi.fn().mockResolvedValue({ session: { prompt: vi.fn() } });
+      resolveRuntimeMock.mockResolvedValue({
+        runtime: {
+          id: "pi",
+          name: "Default PI Runtime",
+          createSession: createSessionMock,
+          promptWithFallback: vi.fn(),
+          describeModel: vi.fn(() => `${defaultProvider}/${defaultModelId}`),
+        },
+        runtimeId: "pi",
+        wasConfigured: false,
+      });
+      const pluginRunner = { getRuntimeById: vi.fn(() => ({ id: "plugin-runtime" })) };
+      const binding = Object.freeze({
+        turnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        controller: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
+      });
+      const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+
+      await createResolvedAgentSession({
+        sessionPurpose: "executor",
+        cwd: "/tmp/project",
+        systemPrompt: "system",
+        defaultProvider,
+        defaultModelId,
+        pluginRunner: pluginRunner as any,
+        cccProviderAttemptBinding: binding as any,
+      });
+
+      expect(pluginRunner.getRuntimeById).not.toHaveBeenCalled();
+      expect(resolveRuntimeMock).toHaveBeenCalledWith(expect.objectContaining({ runtimeHint: "pi" }));
+      expect(createSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+        defaultProvider,
+        defaultModelId,
+        cccProviderAttemptBinding: binding,
+      }));
+      vi.unstubAllEnvs();
+    },
+  );
+
   it("forwards taskEnv unchanged to runtime session factory", async () => {
     const mockSession = { prompt: vi.fn() } as any;
     const createSessionMock = vi.fn().mockResolvedValue({

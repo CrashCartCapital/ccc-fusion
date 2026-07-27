@@ -40,6 +40,33 @@ export const PLANNER_OVERSIGHT_LEVELS = ["off", "observe", "steer", "autonomous"
 export type PlannerOversightLevel = (typeof PLANNER_OVERSIGHT_LEVELS)[number];
 export const DEFAULT_PLANNER_OVERSIGHT_LEVEL: PlannerOversightLevel = "autonomous";
 
+function isPlannerOversightLevel(value: unknown): value is PlannerOversightLevel {
+  return typeof value === "string" && (PLANNER_OVERSIGHT_LEVELS as readonly string[]).includes(value);
+}
+
+/**
+ * FNXC:PlannerOversight 2026-07-04-00:00:
+ * Resolves the effective planner oversight level for a task: a per-task
+ * `Task.plannerOversightLevel` override (FN-7509) always wins over the
+ * workflow's effective `plannerOversightLevel` setting value (declared in
+ * `BUILTIN_OVERSIGHT_SETTINGS`, resolved via `resolveEffectiveSettings`).
+ * If neither is set, or either value is an unrecognized string (defensive
+ * normalization — never trust arbitrary/legacy input), falls back to
+ * `DEFAULT_PLANNER_OVERSIGHT_LEVEL` ("autonomous"). Pure and never throws.
+ */
+export function resolveEffectivePlannerOversightLevel(
+  taskOverride: PlannerOversightLevel | string | null | undefined,
+  workflowEffective: PlannerOversightLevel | string | null | undefined,
+): PlannerOversightLevel {
+  if (isPlannerOversightLevel(taskOverride)) {
+    return taskOverride;
+  }
+  if (isPlannerOversightLevel(workflowEffective)) {
+    return workflowEffective;
+  }
+  return DEFAULT_PLANNER_OVERSIGHT_LEVEL;
+}
+
 /** Controls whether triage should require completion documentation artifacts in task specs. */
 export const COMPLETION_DOCUMENTATION_MODES = ["off", "changeset", "changelog"] as const;
 export type CompletionDocumentationMode = (typeof COMPLETION_DOCUMENTATION_MODES)[number];

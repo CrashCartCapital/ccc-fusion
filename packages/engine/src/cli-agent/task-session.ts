@@ -46,6 +46,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
   CliAutonomyPosture,
+  CccProviderAttemptScope,
+  ResolvedMcpServerDefinition,
   CliSession,
   CliTerminationReason,
 } from "@fusion/core";
@@ -64,6 +66,12 @@ import {
   type CliAgentResolveSettings,
   type EffectivePosture,
 } from "./autonomy.js";
+import { applyCccNativeMcpPolicy } from "./ccc-native-mcp-policy.js";
+import {
+  type CccNativeCliHeldClosureReceipt,
+  type CccNativeCliHeldClosureTrigger,
+  type CccNativeCliSessionPolicy,
+} from "./ccc-native-cli-binding.js";
 
 // ── Outcome ──────────────────────────────────────────────────────────────────
 
@@ -85,6 +93,7 @@ import {
  */
 export type CliTaskOutcomeKind =
   | "success"
+  | "ccc-native-held-closed"
   | "needs-attention"
   | "killed"
   | "user-exited"
@@ -96,6 +105,8 @@ export interface CliTaskOutcome {
   sessionId: string;
   /** Termination reason recorded on the session record, when the session ended. */
   terminationReason: CliTerminationReason | null;
+  /** Manager-issued one-shot CCC native CLI closure receipt, when this is a held close. */
+  nativeCliHeldClosureReceipt?: CccNativeCliHeldClosureReceipt;
 }
 
 // ── Resolved executor config (snapshotted at launch) ───────────────────────────
@@ -135,6 +146,8 @@ export interface LaunchCliTaskSessionOptions {
   prompt: string;
   /** Resolved (snapshotted) executor config. */
   config: ResolvedCliExecutorConfig;
+  /** Production-resolved MCP definitions for the effective ccc agent identity. */
+  mcpServers?: readonly ResolvedMcpServerDefinition[];
   /** Engine-owned PTY session manager (U2). */
   manager: CliSessionManager;
   /** In-process telemetry hub (U3) — mints the hook token + owns the state machine. */
@@ -163,6 +176,8 @@ export interface LaunchCliTaskSessionOptions {
    * Optional logger for lifecycle breadcrumbs. Best-effort; never throws.
    */
   log?: (msg: string) => void;
+  /** Exact frozen CCC campaign one-shot policy, present only for fenced native CLI dispatch. */
+  cccNativeCli?: CccNativeCliSessionPolicy;
 }
 
 // ── CliTaskSession ─────────────────────────────────────────────────────────────
@@ -183,6 +198,9 @@ export class CliTaskSession {
   private readonly hookDir: string;
   private readonly hookEndpointUrl: string;
   private readonly log: (msg: string) => void;
+  private readonly cccNativeCli: LaunchCliTaskSessionOptions["cccNativeCli"];
+  private readonly cccNativeCliReleaseCompletion: Promise<void> | null;
+  private resolveCccNativeCliRelease: (() => void) | null = null;
 
   private settled = false;
   private resolveResult!: (outcome: CliTaskOutcome) => void;
@@ -199,6 +217,7 @@ export class CliTaskSession {
     hookDir: string;
     hookEndpointUrl: string;
     log: (msg: string) => void;
+    cccNativeCli: LaunchCliTaskSessionOptions["cccNativeCli"];
   }) {
     this.taskId = args.taskId;
     this.sessionId = args.sessionId;
@@ -209,6 +228,12 @@ export class CliTaskSession {
     this.hookDir = args.hookDir;
     this.hookEndpointUrl = args.hookEndpointUrl;
     this.log = args.log;
+    this.cccNativeCli = args.cccNativeCli;
+    this.cccNativeCliReleaseCompletion = this.cccNativeCli
+      ? new Promise<void>((resolve) => {
+          this.resolveCccNativeCliRelease = resolve;
+        })
+      : null;
     this.resultPromise = new Promise<CliTaskOutcome>((resolve) => {
       this.resolveResult = resolve;
     });
@@ -224,20 +249,46 @@ export class CliTaskSession {
     const log = opts.log ?? (() => {});
     const adapter = opts.registry.get(opts.config.cliAdapterId);
 
-    // 0. Autonomy approval gate (U15). Resolve the EFFECTIVE posture from the
-    // fully resolved argv + env (NOT the autonomy field alone) and enforce the
-    // per-project approval for any elevation. A missing lookup fails closed.
-    // Runs BEFORE any side effects (scratch dir / spawn) so an unapproved
-    // elevation never reserves a concurrency slot or leaves a scratch dir.
+    // 0. Assemble and validate the complete launch settings before posture
+    // evaluation or any scratch/session/PTY side effect. The production-resolved
+    // MCP set is authoritative when supplied by the executor. Non-ccc profiles
+    // retain their pre-Wave behavior and do not receive native MCP settings.
+    const cliAgentSettings = opts.config.cliAgentSettings ?? null;
+    const operatorEnvAdditions = (cliAgentSettings?.envAdditions ?? []).filter(
+      (key) => !/^FUSION_/i.test(key),
+    );
+    const priorAllowlist = Array.isArray(
+      (opts.config.settings as Record<string, unknown> | undefined)?.envAllowlist,
+    )
+      ? ((opts.config.settings as Record<string, unknown>).envAllowlist as string[])
+      : [];
+    const expandedSettings = applyCccNativeMcpPolicy({
+      ...(opts.config.settings ?? {}),
+      ...(opts.mcpServers !== undefined
+        ? { mcpServers: [...opts.mcpServers] }
+        : {}),
+      ...(cliAgentSettings?.commandOverride
+        ? { command: cliAgentSettings.commandOverride }
+        : {}),
+      ...(cliAgentSettings?.extraArgs && cliAgentSettings.extraArgs.length > 0
+        ? { extraArgs: [...cliAgentSettings.extraArgs] }
+        : {}),
+      envAllowlist: [...new Set([...priorAllowlist, ...operatorEnvAdditions])],
+    });
+
+    // 1. Autonomy approval gate (U15). Resolve the EFFECTIVE posture from the
+    // exact validated launch settings + env additions and enforce the per-project
+    // approval for any elevation. A missing lookup fails closed.
     const effectivePosture: EffectivePosture = await assertAutonomyApproved({
       adapter,
       settings: opts.config.cliAgentSettings ?? null,
+      launchSettings: expandedSettings,
       nodeConfig: { cliAutonomy: opts.config.cliAutonomy ?? null },
       projectId: opts.projectId,
       isApproved: opts.isAutonomyApproved ?? (() => false),
     });
 
-    // 1. Scratch dir for the session-scoped hook scripts + settings.
+    // 2. Scratch dir for the session-scoped hook scripts + settings.
     const root = opts.hookDirRoot ?? tmpdir();
     const hookDir = await mkdtemp(join(root, "fusion-cli-hooks-"));
 
@@ -251,33 +302,11 @@ export class CliTaskSession {
     const hookScriptPath = join(hookDir, HOOK_SCRIPT_NAMES.hook);
     const settingsPath = join(hookDir, "settings.json");
 
-    // Fold the per-adapter operator settings (U15) into the launch settings bag
-    // so they actually reach the child: command override → `command`, extra args
-    // → `extraArgs`, env additions → `envAllowlist`. Service credentials are
-    // ALWAYS excluded from the env allowlist regardless of what the operator
-    // added (a user must never widen the allowlist to leak FUSION_* creds).
-    const cliAgentSettings = opts.config.cliAgentSettings ?? null;
-    const operatorEnvAdditions = (cliAgentSettings?.envAdditions ?? []).filter(
-      (k) => !/^FUSION_/i.test(k),
-    );
-    const priorAllowlist = Array.isArray(
-      (opts.config.settings as Record<string, unknown> | undefined)?.envAllowlist,
-    )
-      ? ((opts.config.settings as Record<string, unknown>).envAllowlist as string[])
-      : [];
-
     // Build adapter launch settings carrying the hook-script refs. Claude's
     // settings flow reads `hookScripts` + `settingsPath` off ctx.settings; other
     // adapters ignore unknown keys.
     const settings: Record<string, unknown> = {
-      ...(opts.config.settings ?? {}),
-      ...(cliAgentSettings?.commandOverride
-        ? { command: cliAgentSettings.commandOverride }
-        : {}),
-      ...(cliAgentSettings?.extraArgs && cliAgentSettings.extraArgs.length > 0
-        ? { extraArgs: [...cliAgentSettings.extraArgs] }
-        : {}),
-      envAllowlist: [...new Set([...priorAllowlist, ...operatorEnvAdditions])],
+      ...expandedSettings,
       hookScripts: {
         stopScript: hookScriptPath,
         notificationScript: hookScriptPath,
@@ -288,7 +317,7 @@ export class CliTaskSession {
       settingsPath,
     };
 
-    // 2. Spawn (reserves the concurrency slot; throws CliConcurrencyLimitError at
+    // 3. Spawn (reserves the concurrency slot; throws CliConcurrencyLimitError at
     // the ceiling). The record is created with state "starting".
     let record: CliSession;
     try {
@@ -317,6 +346,7 @@ export class CliTaskSession {
           },
         },
         settings,
+        ...(opts.cccNativeCli ? { cccNativeCliPolicy: opts.cccNativeCli } : {}),
       });
     } catch (err) {
       // Clean up the scratch dir we created before re-throwing (ceiling / spawn).
@@ -324,7 +354,7 @@ export class CliTaskSession {
       throw err;
     }
 
-    // 3. Mint the per-session hook token + write the hook scripts.
+    // 4. Mint the per-session hook token + write the hook scripts.
     const token = opts.hub.issueToken(record.id);
     await writeSessionHookScripts({
       sessionId: record.id,
@@ -343,13 +373,15 @@ export class CliTaskSession {
       hookDir,
       hookEndpointUrl: opts.hookEndpointUrl,
       log,
+      cccNativeCli: opts.cccNativeCli,
     });
 
-    // 4. Subscribe to the authoritative state machine BEFORE injecting so a fast
+    // 5. Subscribe to the authoritative state machine BEFORE injecting so a fast
     // done is never missed.
     session.subscribe();
+    if (opts.cccNativeCli) void session.waitForCccNativeCliHeldClosure();
 
-    // 5. Inject the prompt after readiness (fire-and-forget; readiness gates it).
+    // 6. Inject the prompt after readiness (fire-and-forget; readiness gates it).
     void session.injectAfterReady(opts.prompt, adapter.capabilities.nativeDone);
 
     log(`cli-task-session ${record.id}: launched for task ${opts.taskId} (adapter ${opts.config.cliAdapterId})`);
@@ -390,9 +422,14 @@ export class CliTaskSession {
    * resume capability.
    */
   async followUp(prompt: string): Promise<boolean> {
+    if (this.cccNativeCli) return false;
     const adapter = this.registry.get(this.config.cliAdapterId);
     if (!adapter.capabilities.supportsResume) return false;
     if (!this.manager.isLive(this.sessionId)) return false;
+    // The native-MCP proxy owns durable effect turns. Advance it before changing
+    // task state or injecting so a failed close/open cannot leak a follow-up
+    // prompt onto the prior turn.
+    await this.manager.beginFollowUpTurn(this.sessionId);
     // Live + resumable: a follow-up is just another injection on the live PTY.
     // Re-arm the result promise so the next done resolves it again.
     if (this.settled) this.rearm();
@@ -425,7 +462,7 @@ export class CliTaskSession {
    * done). Cleans up the hook dir + invalidates the token.
    */
   async reap(): Promise<void> {
-    this.manager.kill(this.sessionId, "completed");
+    await this.manager.kill(this.sessionId, "completed");
     await this.teardown();
     this.log(`cli-task-session ${this.sessionId}: reaped at handoff`);
   }
@@ -436,7 +473,13 @@ export class CliTaskSession {
    * `killed`.
    */
   async kill(reason: CliTerminationReason = "killed"): Promise<void> {
-    this.manager.kill(this.sessionId, reason);
+    if (this.cccNativeCli && reason === "killed") {
+      await this.manager.closeCccNativeCliSession(this.sessionId, "cancel");
+      await this.waitForCccNativeCliHeldClosure();
+      await this.cccNativeCliReleaseCompletion;
+      return;
+    }
+    await this.manager.kill(this.sessionId, reason);
     await this.teardown();
     if (!this.settled) {
       this.finish({ kind: "killed", sessionId: this.sessionId, terminationReason: reason });
@@ -464,6 +507,10 @@ export class CliTaskSession {
     if (this.settled) return;
     switch (state) {
       case "done":
+        if (this.cccNativeCli) {
+          void this.closeCccNativeCli("done");
+          break;
+        }
         this.finish({ kind: "success", sessionId: this.sessionId, terminationReason: "completed" });
         break;
       case "needsAttention":
@@ -535,6 +582,43 @@ export class CliTaskSession {
     this.resolveResult(outcome);
   }
 
+  private async closeCccNativeCli(trigger: CccNativeCliHeldClosureTrigger): Promise<void> {
+    try {
+      await this.manager.closeCccNativeCliSession(this.sessionId, trigger);
+    } catch {
+      if (!this.settled) {
+        this.finish({ kind: "needs-attention", sessionId: this.sessionId, terminationReason: null });
+      }
+    }
+  }
+
+  /** Return the one manager-issued held outcome; this never initiates closure. */
+  async waitForCccNativeCliHeldClosure(): Promise<CliTaskOutcome> {
+    if (!this.cccNativeCli) return this.result();
+    try {
+      const receipt = await this.manager.waitForCccNativeCliHeldClosure(this.sessionId);
+      const outcome: CliTaskOutcome = {
+        kind: "ccc-native-held-closed",
+        sessionId: this.sessionId,
+        terminationReason: null,
+        nativeCliHeldClosureReceipt: receipt,
+      };
+      this.finish(outcome);
+      return outcome;
+    } catch {
+      const outcome: CliTaskOutcome = { kind: "needs-attention", sessionId: this.sessionId, terminationReason: null };
+      this.finish(outcome);
+      return outcome;
+    }
+  }
+
+  async releaseCccNativeCli(receipt: CccNativeCliHeldClosureReceipt, terminalScope: CccProviderAttemptScope): Promise<void> {
+    await this.manager.releaseCccNativeCliSession(receipt, terminalScope);
+    await this.teardown();
+    this.resolveCccNativeCliRelease?.();
+    this.log(`cli-task-session ${this.sessionId}: released CCC native CLI held slot`);
+  }
+
   /** Re-open the result promise for a follow-up turn. */
   private rearm(): void {
     this.settled = false;
@@ -572,15 +656,15 @@ export function launchCliTaskSession(
  * eligible). Best-effort: a dead/missing session is a no-op. Returns the count
  * of sessions killed.
  */
-export function killLiveTaskSessions(
+export async function killLiveTaskSessions(
   taskId: string,
   manager: CliSessionManager,
   store: { listByTask(taskId: string): CliSession[] },
-): number {
+): Promise<number> {
   let killed = 0;
   for (const record of store.listByTask(taskId)) {
     if (manager.isLive(record.id)) {
-      manager.kill(record.id, "killed");
+      await manager.kill(record.id, "killed");
       killed += 1;
     }
   }

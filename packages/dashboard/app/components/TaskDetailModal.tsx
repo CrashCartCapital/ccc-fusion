@@ -17,9 +17,9 @@ import {
   REPO_OVERRIDE_RE,
   TASK_PRIORITIES,
   PLANNER_OVERSIGHT_LEVELS,
+  resolveEffectivePlannerOversightLevel,
   getErrorMessage,
 } from "@fusion/core";
-import { resolveEffectivePlannerOversightLevel } from "../../../core/src/workflow-settings-resolver";
 import { resolveTaskSessionAdvisorEnabled } from "../../../core/src/session-advisor";
 import { isNearDuplicateCanonicalInactive } from "../../../core/src/near-duplicate-canonical";
 import { getRevertOfId, findOpenUndoTaskForSource } from "../utils/taskRevert";

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { describeModel, formatModelMarkerDetails, compactSessionContext, COMPACTION_FALLBACK_INSTRUCTIONS, createFnAgent, getProjectRootFromWorktree, isModelAuthTierIncompatibilityError, isRetryableModelSelectionError, promptWithFallback, type AgentOptions } from "../pi.js";
 import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { piLog } from "../logger.js";
+import { connectMcpSessionTools } from "../mcp-session-tools.js";
 
 // Mock skill resolver functions - define inside factory to avoid hoisting issues
 vi.mock("../skill-resolver.js", () => {
@@ -907,6 +908,856 @@ describe("session failure diagnostics", () => {
 
     expect(createAgentSessionMock.mock.calls[0]?.[0]).not.toHaveProperty("mcpServers");
     expect(session.prompt).toHaveBeenCalledWith("Use docs", expect.objectContaining({ mcpServers }));
+  });
+
+  it("forwards ccc-fusion profile and subscription readiness through createFnAgent to the actual MCP connection seam", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const session = {
+      model: { provider: "anthropic", id: "primary-model" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const mcpServers = [
+      { name: "docs", transport: "stdio" as const, command: "fake-mcp", args: [], env: { SAFE_SERVER_VALUE: "safe-value" } },
+    ];
+
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce({
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: vi.fn(() => ({})),
+      complete: vi.fn(async () => ({ role: "assistant", content: [] })),
+      streamSimple: vi.fn(() => ({})),
+    } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc MCP forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      mcpServers,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    } as AgentOptions & { profile: "ccc-fusion"; subscriptionReady: true });
+
+    expect(connectMcpSessionTools).toHaveBeenCalledWith(
+      mcpServers,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["false", false],
+    ["non-boolean", "ready"],
+  ])("blocks %s ccc-fusion readiness with no MCP servers before model or session setup", async (_label, subscriptionReady) => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+
+    createAgentSessionMock.mockReset();
+    vi.mocked(ModelRuntime.create).mockClear();
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await expect(createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc readiness boundary",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      profile: "ccc-fusion",
+      ...(subscriptionReady === undefined ? {} : { subscriptionReady }),
+    } as any)).rejects.toMatchObject({ code: "CCC_SUBSCRIPTION_PREFLIGHT_REQUIRED" });
+
+    expect(ModelRuntime.create).not.toHaveBeenCalled();
+    expect(connectMcpSessionTools).not.toHaveBeenCalled();
+    expect(createAgentSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("forwards ccc-fusion profile and readiness through ModelRuntime stream paths without MCP servers", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const providerStream = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
+    const providerStreamSimple = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
+    const modelRuntime = {
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: providerStream,
+      streamSimple: providerStreamSimple,
+      complete(model: any, context: any, options: any) {
+        return this.stream(model, context, options);
+      },
+      completeSimple(model: any, context: any, options: any) {
+        return this.streamSimple(model, context, options);
+      },
+    };
+    const session = {
+      model: { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce(modelRuntime as any);
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc no-MCP runtime forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+
+    const createdOptions = createAgentSessionMock.mock.calls[0]?.[0] as { modelRuntime: typeof modelRuntime };
+    const model = { provider: "pi-claude-cli", id: "claude-sonnet-4-6" } as any;
+    const context = { messages: [] } as any;
+    createdOptions.modelRuntime.stream(model, context, { headers: { "x-test": "stream" } } as any);
+    createdOptions.modelRuntime.streamSimple(model, context, { headers: { "x-test": "simple" } } as any);
+    await createdOptions.modelRuntime.complete(model, context, { headers: { "x-test": "complete" } } as any);
+    await createdOptions.modelRuntime.completeSimple(model, context, { headers: { "x-test": "complete-simple" } } as any);
+
+    const expectedProbe = expect.objectContaining({
+      provider: "pi-claude-cli",
+      id: "__fusion_ccc_response_probe__claude-sonnet-4-6",
+    });
+    expect(providerStream).toHaveBeenCalledTimes(2);
+    expect(providerStream).toHaveBeenNthCalledWith(
+      1,
+      expectedProbe,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStream).toHaveBeenNthCalledWith(
+      2,
+      expectedProbe,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStreamSimple).toHaveBeenCalledTimes(2);
+    expect(providerStreamSimple).toHaveBeenNthCalledWith(
+      1,
+      expectedProbe,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStreamSimple).toHaveBeenNthCalledWith(
+      2,
+      expectedProbe,
+      context,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    const firstStreamOptions = providerStream.mock.calls[0]?.[2] as { onPayload: (payload: unknown) => Promise<unknown> };
+    await expect(firstStreamOptions.onPayload({ messages: [] })).resolves.toMatchObject({
+      model: "claude-sonnet-4-6",
+    });
+    expect(connectMcpSessionTools).not.toHaveBeenCalled();
+  });
+
+  it("leaves non-ccc ModelRuntime stream and complete options unchanged", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const providerStream = vi.fn(() => ({}));
+    const providerComplete = vi.fn(async () => ({ role: "assistant", content: [] }));
+    const modelRuntime = {
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: providerStream,
+      complete: providerComplete,
+      streamSimple: vi.fn(() => ({})),
+      completeSimple: vi.fn(async () => ({ role: "assistant", content: [] })),
+    };
+    const session = {
+      model: { provider: "anthropic", id: "primary-model" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const streamOptions = { headers: { "x-test": "stream" } };
+    const completeOptions = { headers: { "x-test": "complete" } };
+
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce(modelRuntime as any);
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ordinary runtime forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+    });
+
+    const createdOptions = createAgentSessionMock.mock.calls[0]?.[0] as { modelRuntime: typeof modelRuntime };
+    const model = { provider: "anthropic", id: "primary-model" } as any;
+    const context = { messages: [] } as any;
+    createdOptions.modelRuntime.stream(model, context, streamOptions as any);
+    await createdOptions.modelRuntime.complete(model, context, completeOptions as any);
+
+    expect(providerStream).toHaveBeenCalledWith(model, context, streamOptions);
+    expect(providerComplete).toHaveBeenCalledWith(model, context, completeOptions);
+    expect(connectMcpSessionTools).not.toHaveBeenCalled();
+  });
+
+  it("forwards ccc-fusion profile and readiness through createFnAgent to both pi provider and MCP connection options", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const providerStream = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
+    const providerStreamSimple = vi.fn(() => ({ result: vi.fn(async () => ({})) }));
+    const modelRuntime = {
+      getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+      stream: providerStream,
+      complete: vi.fn(async () => ({ role: "assistant", content: [] })),
+      streamSimple: providerStreamSimple,
+    };
+    const session = {
+      model: { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    const mcpServers = [
+      { name: "docs", transport: "stdio" as const, command: "fake-mcp", args: [], env: { SAFE_SERVER_VALUE: "safe-value" } },
+    ];
+
+    vi.mocked(ModelRuntime.create).mockResolvedValueOnce(modelRuntime as any);
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+    vi.mocked(connectMcpSessionTools).mockClear();
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test ccc dual forwarding",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      mcpServers,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+
+    const createdOptions = createAgentSessionMock.mock.calls[0]?.[0] as { modelRuntime: typeof modelRuntime };
+    await createdOptions.modelRuntime.stream(
+      { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      { messages: [] },
+      { reasoning: "low" },
+    );
+    await createdOptions.modelRuntime.streamSimple(
+      { provider: "pi-claude-cli", id: "claude-sonnet-4-6" },
+      { messages: [] },
+      { reasoning: "low" },
+    );
+
+    expect(providerStream).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(providerStreamSimple).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+    expect(connectMcpSessionTools).toHaveBeenCalledWith(
+      mcpServers,
+      expect.objectContaining({ profile: "ccc-fusion", subscriptionReady: true }),
+    );
+  });
+
+
+  describe("createFnAgent cccProviderAttemptBinding controller seam", () => {
+    const providerModel = { provider: "pi-claude-cli", id: "claude-sonnet-4-6" } as any;
+    const providerContext = { messages: [] } as any;
+    const dispatchKeyForAttempt = (attemptKey: string) => `pi-stream:${attemptKey.replace(/^attempt-/, "")}`;
+    const authorityBinding = Object.freeze({
+      projectId: "project-pi",
+      importId: "import-pi",
+      campaignId: "campaign-pi",
+      taskId: "TASK-PI-1",
+      actionId: "ACTION-LIVE-EXECUTION",
+      actionTarget: "ccc-lab-super:pre-live-provider-gate",
+      idempotencyKey: "idempotency-pi",
+      packetHash: "a".repeat(64),
+      sidecarHash: "b".repeat(64),
+      bundleHash: "c".repeat(64),
+      targetRepository: "/test/project",
+      targetBase: "d".repeat(40),
+      providerId: "pi-claude-cli",
+      modelId: "claude-sonnet-4-6",
+      transport: "pi",
+      manifestHash: "e".repeat(64),
+      bindingHash: "f".repeat(64),
+    });
+    const scope = (attemptKey: string, state = "dispatched_unknown", overrides: Record<string, unknown> = {}) => ({
+      attemptKey,
+      controllerToken: `token-${attemptKey}`,
+      taskId: "TASK-PI-1",
+      semanticTaskId: "SEMANTIC-TASK-PI-1",
+      campaignDeadlineAt: "2026-07-26T21:00:00.000Z",
+      turnKey: "turn-stable-01", dispatchKey: dispatchKeyForAttempt(attemptKey), state,
+      attemptOrdinal: Number(attemptKey.replace(/^attempt-/, "")),
+      requestCount: 1,
+      binding: authorityBinding,
+      ...overrides,
+    } as any);
+    const committedScope = (input: any, overrides: Record<string, unknown> = {}) => ({
+      ...scope(input.attemptKey, "committed"),
+      taskId: input.taskId,
+      controllerToken: input.controllerToken,
+      turnKey: input.turnKey,
+      dispatchKey: input.dispatchKey,
+      terminal: {
+        kind: "reconciled",
+        state: "committed",
+        evidenceDigest: input.evidenceDigest,
+        observerId: input.observerId,
+      },
+      ...overrides,
+    } as any);
+    const scopeFromDispatchInput = (input: any, overrides: Record<string, unknown> = {}) => scope(
+      input.dispatchKey.replace(/^pi-stream:/, "attempt-"),
+      "dispatched_unknown",
+      {
+        turnKey: input.turnKey,
+        dispatchKey: input.dispatchKey,
+        binding: {
+          ...authorityBinding,
+          taskId: "TASK-PI-1",
+          providerId: input.providerId,
+          modelId: input.modelId,
+          transport: input.transport,
+        },
+        ...overrides,
+      },
+    );
+    const message = { role: "assistant", content: [{ type: "text", text: "provider message" }] } as any;
+    const successfulAsyncStream = () => {
+      const source = {
+        result: vi.fn(async () => message),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "done", reason: "stop", message };
+        },
+      };
+      return source;
+    };
+
+    async function createBoundAgent(input: {
+      controller: { preDispatch: ReturnType<typeof vi.fn>; reconcile: ReturnType<typeof vi.fn> };
+      providerStream?: ReturnType<typeof vi.fn>;
+      providerStreamSimple?: ReturnType<typeof vi.fn>;
+    }) {
+      const createAgentSessionMock = vi.mocked(createAgentSession);
+      const providerStream = input.providerStream ?? vi.fn(successfulAsyncStream);
+      const providerStreamSimple = input.providerStreamSimple ?? vi.fn(successfulAsyncStream);
+      const modelRuntime = {
+        getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
+        stream: providerStream,
+        streamSimple: providerStreamSimple,
+        complete: vi.fn(async () => ({ role: "assistant", content: [] })),
+        completeSimple: vi.fn(async () => ({ role: "assistant", content: [] })),
+      };
+      const session = {
+        model: providerModel,
+        prompt: vi.fn(),
+        subscribe: vi.fn(),
+        dispose: vi.fn(),
+        sessionFile: undefined,
+      } as unknown as AgentSession;
+      vi.mocked(ModelRuntime.create).mockResolvedValueOnce(modelRuntime as any);
+      createAgentSessionMock.mockReset();
+      createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+
+      await createFnAgent({
+        cwd: "/test/project",
+        systemPrompt: "Test PI provider admission controller seam",
+        defaultProvider: "pi-claude-cli",
+        defaultModelId: "claude-sonnet-4-6",
+        profile: "ccc-fusion",
+        subscriptionReady: true,
+        cccProviderAttemptBinding: Object.freeze({
+          turnKey: "turn-stable-01",
+          controller: Object.freeze(input.controller),
+        }),
+      } as any);
+
+      return {
+        providerStream,
+        providerStreamSimple,
+        modelRuntime: createAgentSessionMock.mock.calls[0]?.[0]?.modelRuntime as typeof modelRuntime,
+      };
+    }
+
+    it("awaits async preDispatch before the original PI stream", async () => {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const controller = {
+        preDispatch: vi.fn(async () => {
+          await gate;
+          return { kind: "dispatch-permit", scope: scope("attempt-1") };
+        }),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      await Promise.resolve();
+      expect(controller.preDispatch).toHaveBeenCalledWith({
+        turnKey: "turn-stable-01",
+        dispatchKey: "pi-stream:1",
+        providerId: "pi-claude-cli",
+        modelId: "claude-sonnet-4-6",
+        transport: "pi",
+      });
+      expect(created.providerStream).not.toHaveBeenCalled();
+
+      release();
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).resolves.toBe(message);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+      expect(events).toContainEqual({ type: "done", reason: "stop", message });
+      expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining(scope("attempt-1")));
+    });
+
+    it("uses stable turn keys and sequential PI dispatch keys for successful stream paths", async () => {
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({ kind: "dispatch-permit", scope: scopeFromDispatchInput(input) })),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await created.modelRuntime.stream(providerModel, providerContext, {}).result();
+      await created.modelRuntime.streamSimple(providerModel, providerContext, {}).result();
+      await created.modelRuntime.stream(providerModel, providerContext, {}).result();
+
+      expect(controller.preDispatch.mock.calls.map(([input]) => input)).toEqual([
+        expect.objectContaining({ turnKey: "turn-stable-01", dispatchKey: "pi-stream:1" }),
+        expect.objectContaining({ turnKey: "turn-stable-01", dispatchKey: "pi-stream:2" }),
+        expect.objectContaining({ turnKey: "turn-stable-01", dispatchKey: "pi-stream:3" }),
+      ]);
+      expect(created.providerStream).toHaveBeenCalledTimes(2);
+      expect(created.providerStreamSimple).toHaveBeenCalledTimes(1);
+      expect(controller.reconcile).toHaveBeenCalledTimes(3);
+      for (const [index, [reconciliation]] of controller.reconcile.mock.calls.entries()) {
+        expect(reconciliation).toMatchObject({ ...scope(`attempt-${index + 1}`), outcome: "committed" });
+        expect(reconciliation.evidenceDigest).toMatch(/^[a-f0-9]{64}$/);
+      }
+    });
+
+    it("serializes same-tick stream calls so one slot cannot physically dispatch twice", async () => {
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const providerStream = vi.fn()
+        .mockImplementationOnce(() => ({
+          result: vi.fn(async () => {
+            await firstGate;
+            return message;
+          }),
+          async *[Symbol.asyncIterator]() {
+            await firstGate;
+            yield { type: "done", reason: "stop", message };
+          },
+        }))
+        .mockImplementation(successfulAsyncStream);
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({ kind: "dispatch-permit", scope: scopeFromDispatchInput(input) })),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller, providerStream });
+
+      const first = created.modelRuntime.stream(providerModel, providerContext, {});
+      const second = created.modelRuntime.stream(providerModel, providerContext, {});
+      await Promise.resolve();
+
+      expect(controller.preDispatch).toHaveBeenCalledTimes(1);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+
+      releaseFirst();
+      await first.result();
+      await second.result();
+
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual([
+        "pi-stream:1", "pi-stream:2",
+      ]);
+      expect(created.providerStream).toHaveBeenCalledTimes(2);
+    });
+
+    it("passes the actual provider and model to a rejected route without dispatching", async () => {
+      const controller = {
+        preDispatch: vi.fn(async () => { throw new Error("model-not-admitted"); }),
+        reconcile: vi.fn(),
+      };
+      const created = await createBoundAgent({ controller });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      await expect(handle.result()).rejects.toThrow(/model-not-admitted|route/i);
+      expect(controller.preDispatch).toHaveBeenCalledWith(expect.objectContaining({
+        providerId: "pi-claude-cli",
+        modelId: "claude-sonnet-4-6",
+      }));
+      expect(created.providerStream).not.toHaveBeenCalled();
+    });
+
+    it("refuses dispatch-permit scope with stale turn or dispatch key before provider dispatch", async () => {
+      const controller = {
+        preDispatch: vi.fn()
+          .mockImplementationOnce(async (input) => ({
+            kind: "dispatch-permit",
+            scope: scopeFromDispatchInput(input, { dispatchKey: "pi-stream:99" }),
+          }))
+          .mockImplementationOnce(async (input) => ({
+            kind: "dispatch-permit",
+            scope: scopeFromDispatchInput(input),
+          })),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatch-permit.*scope/i);
+      await created.modelRuntime.stream(providerModel, providerContext, {}).result();
+
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1", "pi-stream:1"]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not advance attempt slot when a terminal hold has proven_failed state but foreign dispatch key", async () => {
+      let preDispatchCalls = 0;
+      const controller = {
+        preDispatch: vi.fn(async (input) => {
+          preDispatchCalls += 1;
+          return preDispatchCalls === 1
+            ? { kind: "hold", reason: "terminal", scope: scope("attempt-1", "proved_failed", {
+              dispatchKey: "pi-stream:99",
+              terminal: {
+                kind: "not-dispatched",
+                state: "proved_failed",
+              },
+            }) }
+            : { kind: "dispatch-permit", scope: scopeFromDispatchInput(input) };
+        }),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result())
+        .rejects.toThrow(/hold.*scope|controller.*scope|scope.*mismatch/i);
+      expect(created.providerStream).not.toHaveBeenCalled();
+      expect(controller.reconcile).not.toHaveBeenCalled();
+
+      await created.modelRuntime.stream(providerModel, providerContext, {}).result();
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual([
+        "pi-stream:1",
+        "pi-stream:1",
+      ]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      [
+        "rejects matching proved_failed hold with missing terminal",
+        { terminal: undefined },
+      ],
+      [
+        "rejects matching proved_failed hold with invalid terminal state",
+        { terminal: { kind: "not-dispatched", state: "committed" } as any },
+      ],
+      [
+        "rejects matching proved_failed hold with malformed terminal evidence",
+        {
+          terminal: {
+            kind: "reconciled",
+            state: "proved_failed",
+            evidenceDigest: "bad-digest",
+            observerId: "pi",
+          },
+        },
+      ],
+      [
+        "rejects matching proved_failed hold with malformed observer",
+        {
+          terminal: {
+            kind: "reconciled",
+            state: "proved_failed",
+            evidenceDigest: "a".repeat(64),
+            observerId: " pi ",
+          },
+        },
+      ],
+      [
+        "rejects matching proved_failed hold with non-string observer",
+        {
+          terminal: {
+            kind: "reconciled",
+            state: "proved_failed",
+            evidenceDigest: "a".repeat(64),
+            observerId: 123 as any,
+          },
+        },
+      ],
+      [
+        "rejects matching proved_failed hold with non-string evidence",
+        {
+          terminal: {
+            kind: "reconciled",
+            state: "proved_failed",
+            evidenceDigest: {
+              toString: () => "a".repeat(64),
+            } as any,
+            observerId: "pi",
+          },
+        },
+      ],
+    ])("%s, then retries same slot", async (_name, overrides) => {
+      let preDispatchCalls = 0;
+      const controller = {
+        preDispatch: vi.fn(async (input) => {
+          preDispatchCalls += 1;
+          return preDispatchCalls === 1
+            ? { kind: "hold", reason: "terminal", scope: scope("attempt-1", "proved_failed", {
+              dispatchKey: "pi-stream:1",
+              ...overrides,
+            }) }
+            : { kind: "dispatch-permit", scope: scopeFromDispatchInput(input) };
+        }),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result())
+        .rejects.toThrow(/hold.*scope|controller.*scope|scope.*mismatch/i);
+      expect(created.providerStream).not.toHaveBeenCalled();
+      expect(controller.reconcile).not.toHaveBeenCalled();
+
+      await created.modelRuntime.stream(providerModel, providerContext, {}).result();
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual([
+        "pi-stream:1",
+        "pi-stream:1",
+      ]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses dispatch-permit scope with provider binding drift before provider dispatch", async () => {
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({
+          kind: "dispatch-permit",
+          scope: scopeFromDispatchInput(input, {
+            binding: { ...authorityBinding, providerId: "foreign-provider" },
+          }),
+        })),
+        reconcile: vi.fn(),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatch-permit.*scope/i);
+
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1"]);
+      expect(created.providerStream).not.toHaveBeenCalled();
+      expect(controller.reconcile).not.toHaveBeenCalled();
+    });
+
+    it("holds terminal slots but internally advances proved_failed to the next slot", async () => {
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "hold", reason: "terminal", scope: scope("attempt-1", "committed") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "dispatched-unknown", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({
+            kind: "hold",
+            reason: "terminal",
+            scope: scope("attempt-1", "proved_failed", {
+              terminal: {
+                kind: "not-dispatched",
+                state: "proved_failed",
+              },
+            }),
+          })
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-2") }),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/committed/);
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatched_unknown/);
+      await created.modelRuntime.stream(providerModel, providerContext, {}).result();
+
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual([
+        "pi-stream:1", "pi-stream:1", "pi-stream:1", "pi-stream:2",
+      ]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a post-dispatch error unknown and holds its same slot on reentry", async () => {
+      const error = new Error("provider transport error");
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => { throw error; }),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "error", reason: "error", error };
+        },
+      }));
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "dispatched-unknown", scope: scope("attempt-1") }),
+        reconcile: vi.fn(),
+      };
+      const created = await createBoundAgent({ controller, providerStream });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).rejects.toThrow("provider transport error");
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatched_unknown/);
+
+      expect(controller.reconcile).not.toHaveBeenCalled();
+      expect(events).toContainEqual({ type: "error", reason: "error", error });
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1", "pi-stream:1"]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not commit when a real PI error event has a resolved error result", async () => {
+      const errorMessage = { role: "assistant", content: [], errorMessage: "provider event error" };
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => errorMessage),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "error", reason: "error", error: errorMessage };
+        },
+      }));
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "dispatched-unknown", scope: scope("attempt-1") }),
+        reconcile: vi.fn(),
+      };
+      const created = await createBoundAgent({ controller, providerStream });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).rejects.toThrow("provider event error");
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatched_unknown/);
+
+      expect(events).toContainEqual({ type: "error", reason: "error", error: errorMessage });
+      expect(controller.reconcile).not.toHaveBeenCalled();
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1", "pi-stream:1"]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not deliver or advance when committed reconciliation loses its response", async () => {
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "terminal", scope: scope("attempt-1", "committed") }),
+        reconcile: vi.fn(async () => { throw new Error("lost reconcile response"); }),
+      };
+      const created = await createBoundAgent({ controller });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).rejects.toThrow("lost reconcile response");
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/committed/);
+
+      expect(events).not.toContainEqual({ type: "done", reason: "stop", message });
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1", "pi-stream:1"]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects inconsistent committed reconciliation and keeps the same slot", async () => {
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "dispatched-unknown", scope: scope("attempt-1") }),
+        reconcile: vi.fn(async (input) => committedScope(input, { semanticTaskId: "SEMANTIC-DRIFT" })),
+      };
+      const created = await createBoundAgent({ controller });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).rejects.toThrow(/reconciliation.*identity|committed/i);
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatched_unknown/);
+
+      expect(events).not.toContainEqual({ type: "done", reason: "stop", message });
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1", "pi-stream:1"]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects semantic binding drift in committed reconciliation and keeps the same slot", async () => {
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "dispatched-unknown", scope: scope("attempt-1") }),
+        reconcile: vi.fn(async (input) => committedScope(input, {
+          binding: { ...authorityBinding, bindingHash: "0".repeat(64) },
+        })),
+      };
+      const created = await createBoundAgent({ controller });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).rejects.toThrow(/reconciliation.*identity|terminal/i);
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatched_unknown/);
+
+      expect(events).not.toContainEqual({ type: "done", reason: "stop", message });
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1", "pi-stream:1"]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects terminal evidence drift in committed reconciliation and keeps the same slot", async () => {
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "dispatched-unknown", scope: scope("attempt-1") }),
+        reconcile: vi.fn(async (input) => committedScope(input, {
+          terminal: {
+            kind: "reconciled",
+            state: "committed",
+            evidenceDigest: "0".repeat(64),
+            observerId: input.observerId,
+          },
+        })),
+      };
+      const created = await createBoundAgent({ controller });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).rejects.toThrow(/reconciliation.*identity|terminal/i);
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatched_unknown/);
+
+      expect(events).not.toContainEqual({ type: "done", reason: "stop", message });
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
+      expect(controller.preDispatch.mock.calls.map(([input]) => input.dispatchKey)).toEqual(["pi-stream:1", "pi-stream:1"]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses an attempt binding outside the ccc-fusion profile before runtime setup", async () => {
+      const controller = Object.freeze({
+        preDispatch: vi.fn(),
+        reconcile: vi.fn(),
+      });
+      vi.mocked(ModelRuntime.create).mockClear();
+
+      await expect(createFnAgent({
+        cwd: "/test/project",
+        systemPrompt: "Test PI provider admission profile guard",
+        defaultProvider: "pi-claude-cli",
+        defaultModelId: "claude-sonnet-4-6",
+        cccProviderAttemptBinding: Object.freeze({
+          turnKey: "turn-stable-01",
+          controller,
+        }),
+      } as any)).rejects.toThrow(/ccc-fusion profile/);
+
+      expect(ModelRuntime.create).not.toHaveBeenCalled();
+      expect(controller.preDispatch).not.toHaveBeenCalled();
+    });
   });
 
   it("skips MCP forwarding for unsupported mock provider and emits a content-free skip log", async () => {

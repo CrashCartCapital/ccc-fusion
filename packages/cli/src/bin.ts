@@ -153,6 +153,7 @@ async function loadCommandHandlers() {
   const { runSkillsSearch, runSkillsInstall } = await import("./commands/skills.js");
   const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = await import("./commands/research.js");
   const { runExperimentFinalize } = await import("./commands/experiment-finalize.js");
+  const { runPrdCommand } = await import("./commands/prd.js");
   const { dispatchUpdateCliArgs } = await import("./commands/update.js");
 
   return {
@@ -289,6 +290,7 @@ async function loadCommandHandlers() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    runPrdCommand,
     dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
@@ -300,6 +302,14 @@ fn — AI-orchestrated task board
 
 Usage:
   fn                                  Launch the dashboard (same as fn dashboard)
+  fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+                                      Generate a traceable candidate sidecar from an admitted packet through native bounded authoring
+  fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
+                                      Compatibility fixture authoring path for deterministic tests
+  fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
+                                      Validate custody and semantics; emit diagnostics only
+  fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
+                                      Compile a validated sidecar into the complete deterministic semantic bundle
   fn init [opts]                      Initialize a new fn project (--name, --path, --git)
   fn onboard [--force] [--skip-onboarding]
                                       Run onboarding on demand; auto-launch runs before interactive commands when central DB is missing,
@@ -816,6 +826,7 @@ async function main() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    runPrdCommand,
     dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
@@ -823,6 +834,10 @@ async function main() {
 
   try {
     switch (command) {
+      case "prd": {
+        process.exitCode = await runPrdCommand(args.slice(1));
+        break;
+      }
       case "init": {
         // Parse init options
         const nameIdx = args.indexOf("--name");

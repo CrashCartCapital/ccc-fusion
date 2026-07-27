@@ -40,6 +40,151 @@ pnpm build             # build workspace packages (excludes desktop/mobile; skip
 pnpm verify:workspace  # deep opt-in verification: lint -> test:full -> build (NOT the merge gate)
 ```
 
+## ccc-fusion conversion proof lanes
+
+ccc-fusion conversion work uses focused behavioral proof before broad workspace gates. Speculative or historical test results are development evidence only; acceptance requires a fresh run against one frozen commit and tree.
+
+The current pure PRD compiler lane is:
+
+```bash
+pnpm --filter @fusion/core exec vitest run src/__tests__/ccc-prd-schema.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-prd-compiler.test.ts src/__tests__/ccc-prd-corpus.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @runfusion/fusion exec vitest run src/commands/__tests__/prd.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @fusion/core typecheck
+pnpm --filter @fusion/engine typecheck
+pnpm --filter @runfusion/fusion typecheck
+pnpm lint
+pnpm test:gate
+pnpm build
+git diff --check
+```
+
+Run the compiler twice against the same admitted fixture and compare semantic output, source hash, bundle hash, and full serialized output. The accepted 18-source, 7,201-line `ccc-lab-super` fixture declares 3 sidecar requirements and compiles exact non-zero requirement, proof, task, edge, workflow, document, artifact, import-intent, and protected-action counts. The packet contains a large unnormalized set of `REQ-`-like tokens, including prefixes and ranges, and direct totals vary with regex boundary rules. The fixture is a representative executable slice and semantic extraction completeness remains unproven. Never report it as full-packet coverage or convert a regex token count into a verified requirement denominator. The built `prd author` descendant now exercises the designated native workflow on an unchanged representative packet without a proposal argument, using bounded injected local transport/fakes; it generates a traceable candidate sidecar and bounded ambiguity/exception/protected-decision list before built validate and compile. The deterministic proposal-file route is a compatibility fixture only, not the user path. Source bindings are order-insensitive and code-unit-normalized; malformed rows emit `CCC_PRD_AUTHORING_PROPOSAL_INVALID`; `maxReviewItems=0` is valid; target/base/bounds/review drift refuses. Exact provider/model equality is intentional, the byte bound is authoritative with a conservative token bound, and pre-stringification observation does not falsify that guarantee. A deterministic fake at the native transport seam proves bounded request/response wiring, custody, validation, and materialization—not semantic extraction quality on arbitrary novel packets. Every sidecar record must reference exact unchanged Markdown spans and raw source hashes. Use code-unit canonical ordering, not locale collation.
+
+Test the built CLI rather than only `runPrdCommand`. Top-level help must expose `prd`; validate must emit bounded diagnostics without a full bundle; compile must emit the bundle; import must report exact created/existing counts. Success is `0`, semantic refusal is `1`, and usage error is `2`. Define zero-store as no mutation to admitted repository/vault/database roots plus removal of bounded owned temporary bootstrap state; do not treat arbitrary global filesystem immutability as a meaningful oracle.
+
+PostgreSQL-backed ccc proof uses a disposable loopback fixture on a free port. Never reuse, stop, or modify an unrelated listener; port `55439` is a preserved existing listener in the current Phase 5 environment. Keep failed fixture roots and machine-readable reports for diagnosis. A successful owned fixture must stop its processes and release its listener before the lane returns.
+
+The closed Wave 4 proof contract is:
+
+```bash
+FUSION_PG_TEST_SKIP=1 node scripts/run-ccc-pg-proof.mjs --wave 4
+node scripts/run-ccc-pg-proof.mjs --wave 4
+```
+
+The first command must fail before tests for the intended skip-policy reason. The second must enforce its exact named mapping and reject missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, or failed tests.
+
+The accepted Wave 5 import slice is frozen, but any repair to its production or mapped tests must still cover all of these before broad gates:
+
+- zero-store compile and validate;
+- one successful import with independent exact campaign, task, edge, workflow, document, artifact, source, work-item, and audit counts confirmed by direct tables and normal Fusion APIs;
+- every database writer receives the same import-owned transaction handle; fail the proof if any helper opens an inner/top-level transaction;
+- derived task/prompt/artifact files, allocator reservations, caches, hooks, and events are staged, compensated, or restart-reconciled without a runnable partial campaign;
+- injected failure after each database and filesystem write class, after the final audit row, and at commit/projection/activation boundaries with complete rollback or one non-runnable reconcilable state;
+- sequential and concurrent identical replay, lost-response retry, failed-then-retried import, and identical replay after restart without duplicate rows, files, IDs, hooks, or runnable work;
+- mismatched bundle, target, or base identity rejected before mutation;
+- CLI exit codes and bounded redacted operator output for success, refusal, replay, rollback failure, and identity collision;
+- imported tasks and workflows visible through normal list/show/read surfaces after restart;
+- zero provider execution.
+
+The closed Wave 5 proof mapping exists at 81 exact names: built CLI 10, core contract 7, core import/recovery 40, core migration 3, engine contract 20, and native imported execution 1. Run it with `node scripts/run-ccc-pg-proof.mjs --wave 5`. The runner rejects missing, duplicate, extra, skipped, pending, todo, timed-out, signaled, forced-killed, and failed results. Preserve this mapping unchanged during consolidated Phase E/F work.
+
+Changing a test body under an accepted Wave 5 name creates a descendant candidate; record the exact number of names reopened and rerun those names plus the preserved 81-name gate. A historical name is not immutable production code, but neither may a changed body borrow its predecessor's acceptance verdict.
+
+Focused PostgreSQL RED/GREEN is admissible only when the test owns a disposable loopback fixture, supplies an explicit `FUSION_PG_TEST_URL_BASE`, executes a nonzero selected-test count, and reports zero skipped, pending, or todo tests. Vitest names outside a `-t` filter may appear as skipped and therefore make that invocation development evidence only unless the proof record separately establishes the closed selected inventory. Only the closed proof runner may make Wave 5 or consolidated-wave acceptance claims.
+
+The Task 2 accepted descendant retained these two focused regressions as mandatory safety proof:
+
+- Final `0037_ccc_campaign_governance.sql` must park only imports whose persisted policy is explicitly `ccc-campaign.execution-policy.unadmitted.v0`, pause and triage only their ledger-owned tasks, and hold every provider-capable work item bound to those tasks, including later work items absent from the import ledger. A simultaneously admitted v1 import must remain active and runnable, and terminal work items must not be resurrected. This is graded P0 safety impact because migration `0036` wrote a no-provider guarantee while leaving legacy work provider-capable.
+- A valid MCP response carrying `result.isError: true` must commit and replay as an acknowledged completed tool result, allow the next effect in the same scope, and make no extra upstream call after restart. Top-level JSON-RPC errors, malformed or missing results, disconnects, and aborts remain `dispatched_unknown`.
+
+Task A hardening REDs were reordered previous source-bound rows falsely drifting, `requirements: [null]` receiving a generic failure, and zero review ceiling receiving engine refusal plus CLI usage exit `2`. GREEN is engine native authoring `11/11`, CLI command `2/2`, core contract `7/7`, and post-rebuild built CLI `12/12`. The first `12/12` was stale-binary evidence: `dist/bin.js` predated Task B compiler cardinality and the built fixture lacked campaign/source/run-audit intents. A one-file fixture-helper repair added those exact three intents; the ignored artifact was rebuilt from current sources with `env CI=0 FUSION_CLI_FULL_PACKAGE=0 pnpm exec tsup` (no install, fast package mode), and the two built CLI files reran `12/12`. This reopened one accepted test helper, not a test name; strict compiler behavior was unchanged. The development evidence was later included in the frozen Task 2 acceptance below.
+
+Task B compiler RED exposed fixture debt (`3` failed / `42` passed) because aggregate intents were zero; the fixture-only repair preserved the strict compiler and combined engine passed `45/45`. The exact compiler contract is nine native targets, `work_item -> workflow`, `run_audit -> campaign`, and exactly one campaign/source/run-audit. Task B import RED was `9` failed / `34` passed because history had only `active`; GREEN is two exact PostgreSQL files `43/43`, zero skipped/pending/todo, ordered `prepared` then `active`, direct `runAudits === 1`, and real zero-effect receipt/non-database-domain checks on a task-owned disposable loopback fixture. Every machine-results runner command now requires nonempty `expectedNames`; the policy self-test passes, and accepted Wave 5 arrays remain unchanged.
+
+These focused proofs use owned ephemeral loopback infrastructure only; no endpoint is a durable published surface. They became accepted only in Task 2 product `bdd5cfce44271ba2f13636098e6d736dcf7ea874`, after the complete `0037` DDL, candidate freeze, broader proof, and fresh council. Task A, Task B, and the final indivisible `0037` are accepted descendants; Tasks 3–10 remain open.
+
+Task 2 owns forward migration `0037_ccc_campaign_governance.sql`; Task 1 migration `0036_ccc_campaign_native_enforcement.sql` remains immutable. The accepted final `0037` keeps the dedicated `ccc-campaign-governance-migration.pg.test.ts` upgrade proof, preserves the closed Wave 5 migration command at exactly three tests, and does not alter the structure, constraints, or identity of the Wave 5 custody tables (`ccc_prd_imports`, `ccc_prd_import_sources`, `ccc_prd_import_entities`). It includes the legacy-`0036` provider-capability repair, `schema-applier.ts` registration, `SCHEMA_BASELINE_VERSION === "0037"`, fresh `0000_initial.sql` parity, fresh-baseline no-op idempotence, and typed-writer plus SQL rejection of partial audit/approval/effect campaign bindings. No `0038` is permitted for this slice. Focused Task 2 PostgreSQL proof remains valid only with a task-owned disposable loopback fixture, explicit `FUSION_PG_TEST_URL_BASE`, `FUSION_PG_TEST_SKIP` unset or not `1`, nonzero execution, and zero skipped/pending/todo tests. Task 2 names are not inserted into the preserved Wave 5 mapping.
+
+### Frozen Task 2 acceptance — 2026-07-25
+
+- Product `bdd5cfce44271ba2f13636098e6d736dcf7ea874`, parent `32593d796e76583ac6b9d921db67cf77da5dc6b5`, tree `edc3d571bfb617ada24f889489307968cb567880` passed focused Task 2 PostgreSQL `177/177`, engine descendants `80/80`, CLI Task A `2/2`, and the unchanged closed Wave 5 mapping `81/81` twice.
+- Full typecheck, lint, build, `git diff --check`, and manifest verification passed. Proof-report digest: `d2cf29944bc5cc2556038c99ee5f7d47e637b6a2f5f239eb47d3bd79593ecc12`; changed-path digest: `a198ac879692fa384363eb9b7ea2fbcb2c9f7ddebf28cd29d1317b06004044b9`; predecessor binary diff digest: `be108c15b7dbb7c38aded491389ff7cea6164cb2562d672d147d5f3ac9bbb9b7`.
+- Behavioral/PostgreSQL, static/build, and AGY adversarial review (`dedbf944-4add-4e02-a867-7e1c3311188d`) each passed with no P0/P1. The only nonblocking reviewer note is that authoring response content is accumulated in memory before `maxResponseBytes` truncates it; the requested byte bound remains enforced.
+- Campaign-effect provenance must be reloaded from TaskStore; callers cannot assert it. `campaign_project_id = project_id` is protected by an enforceable composite foreign key. Approval/effect replay and CAS semantics are accepted. The P1-03 safety impact is P0: `0037` holds legacy provider-capable rows without touching admitted rows. P1-04 is partially accepted at its semantic boundary: `result.isError: true` is committed/replayable, while malformed, top-level RPC, disconnect, and abort outcomes remain `dispatched_unknown`.
+- Task 2 documentation descendant `97e102c90da91535b5a06b6f13e91a8aeb112855`, tree `4e663900fb6773a4474726bae02066e28200d13c`, is the exact predecessor for this Task 3 amendment. Speculative Wave 6 `2a739f13bfbea4e2c10a46570719fbd6441ba0a6` and Wave 7 `93309dcaa111614dfd2c2362d96525f9af597dc7` remain unaccepted. Continue with Tasks 3–10 under existing operator gates.
+
+### Task 3 proof-authority repair 2 plan freeze — 2026-07-25
+
+- Production surfaces include `packages/core/src/ccc-campaign/types.ts`, `packages/core/src/ccc-campaign/store.ts`, `packages/core/src/ccc-campaign/custody.ts`, `packages/engine/src/ccc-prd/authoring.ts`, `packages/engine/src/ccc-prd/native-authoring-adapter.ts`, `packages/cli/src/commands/prd.ts`, built-CLI authoring tests, and the native plugin loader/runner, registry, workflow runtime, processor, and TaskStore fencing seams.
+- `CccPrdProof.admission` is optional only for backward-compatible validation and compilation of existing `sidecar.v1` declarations. Every newly generated candidate sidecar must include expected binding `schema: "ccc-prd.proof-admission.v1"`, `pluginId`, `pluginVersion`, `extensionId`, `proofVersion`, `extensionRootRelativeSource`, raw-byte `extensionSourceSha256`, raw-byte `extensionManifestSha256`, and `definitionSha256`. The source is relative to the trusted real plugin/native package root, never `targetRepository.path`. Compute `definitionSha256` over the canonical mapped proof with the entire admission object omitted. Sidecar values are expectations, never authority.
+- PluginLoader/native host stamps registry provenance from manifest plugin ID/version, trusted real plugin/native package root, real entry path, raw entry bytes, and raw manifest bytes. Proof register/upsert requires complete host provenance at the registry boundary. The fixed native extension is one self-contained/bundled runtime entry; reject relative, file-URL, or dynamic local runtime dependencies outside the hashed entry, while allowing compiled-away type imports and Node built-ins. External/multi-file proof extensions remain blocked pending explicit persisted selection plus dependency closure. Registry copies/freezes/seals identity, provenance, and evaluator into an internal record and never stores caller-owned mutable objects; `get`/`list` return readonly frozen snapshots and degradation changes only through registry methods. Same-ID identity drift keeps the old record, marks it runtime-fault degraded, and refuses replacement; ordinary extensions remain compatible unless proof-specific.
+- After proposal mapping, designated authoring—not model output, proposal JSON, or Ryan—looks up only host-owned native registry ID `plugin:fusion-native:ccc-proof-admission` and stamps all new proofs from that host-derived registration. Standalone built CLI authoring explicitly bootstraps this fixed native registration before stamping. Missing, degraded, or colliding registration refuses. External proof-admission extensions require a later explicit persisted selection contract and are never ambient authoring candidates. Existing omitted-admission sidecars require maintenance authoring before campaign execution. No target-repository proof-source field exists; proof command/oracle/span custody binds through definition plus bundle, while target/base/live Git drift remains Task 4/5.
+- One no-migration TaskStore custody API—`getCccCampaignContextForTask` or a delegate reusing it—returns mapped semantic task ID and immutable canonical task proof IDs from the already reconstructed `canonicalBundle` plus import-entity mapping. Independently recompute `bundleHash` from canonical bundle bytes with `bundleHash` omitted before trusting tasks; stored/embedded equality and the current task-omitting manifest are insufficient. Missing/collision/rehash/mismatch refuses; engine cannot requery or reconstruct parallel custody. The returned Task must still have unique/nonempty/canonical `sourceMetadata.proofIds`, matching bundle hash, and exact canonical equality with the immutable task set. Caller IDs and requirement-proof union remain forbidden.
+- For both entry and manifest, validate lexical path, pre-resolve inside trusted real root, open the exact file with platform-supported `O_NOFOLLOW | O_CLOEXEC` where available, `fstat` the handle, post-resolve/stat the candidate, require handle device/inode equality with the post-resolved contained file, read/hash only from that handle, and close before evaluator. Unavailable required no-follow/identity guarantees refuse. The registered native evaluator receives no path and must substantiate declared positive-oracle and negative-control semantics; reject unsupported definitions and any generic exit-zero shell evaluator. It receives immutable engine input plus `AbortSignal` and returns `{ outcome: "pass" | "fail", evaluatedInputSha256, summary }`. Accept pass only on current digest echo with live signal; audit through native `RunAuditEvent`; no proof receipt store.
+- Registry RED remains `1` failed / `4` passed because same-ID identity drift left the old entry non-degraded. Core fencing development evidence remains PostgreSQL `30/30`, combined focused `47/47`, core typecheck, focused lint, and diff hygiene. Add `exhausted` to the async terminal set and prove in PostgreSQL that terminal exhaustion does not append a false audit.
+- Freeze a per-invocation runtime API equivalent to `run(task, settings, { signal, workItemFence, deferCompletionSummary: true })`; never mutate constructor dependencies. Processor-owned AbortController and fractional lease renewal use exact owner/attempt CAS. Processor alone performs terminal transition from expected running state. After campaign success CAS, processor freshly reloads task state and writes summary from current task/reason/workflow/run; runtime writes no campaign summary and need not return prebuilt summary bytes. Durable cancellation returns cancelled truth; takeover/stale-CAS uncertainty surfaces; narrowed patch types widen; ordinary non-campaign `runWorkItem` behavior remains unchanged.
+- Current Task 3 development proof replaces the stale `8/26` baseline: engine runtime focused `90/90`; combined focused PostgreSQL `90/90`; final author/admission `60/60`; built CLI `14/14`; and lexical provenance `12/12` after RED exposed two false accepts. Relevant typechecks, build, lint, and `git diff --check` are green. These are dirty development bytes, not acceptance.
+- Generic-consumer RED/GREEN must run `pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-work-processor.test.ts src/__tests__/workflow-task-runtime.test.ts src/__tests__/ccc-campaign-proof-workflow.test.ts src/__tests__/executor-fast-mode-workflows.test.ts --silent=passed-only --reporter=dot` and prove activated imported `ccc-prd` work cannot reach `WorkflowGraphTaskRunner` through generic `TaskExecutor`; authoritative persisted context or an unresolved exact marker returns before settings/provider/runner effects and before work-item consumption, `handleGraphFailure`, parking, pause, or terminal mutation. Authority lookup error must fail closed when campaign custody, a supplied fence, or an exact import marker is present, while ordinary non-campaign lookup error preserves compatibility. Exercise public `TaskExecutor.execute` and a scheduler-like path, require zero dependency, ephemeral, task, and work-item mutation, and assert correct `graphRouting` plus preheld-semaphore cleanup. Add the race where the first authoritative lookup returns null and the mandatory second lookup before transition/runner sees campaign custody and refuses. Private `executeWorkflowGraph` tests are defense-level only. `alreadyClaimed` cannot waive this check. Root's independent four-file run passed `110/110`; the earlier worker count of `98` was a narrower/different snapshot and is not final integrated acceptance.
+- Direct-runtime RED/GREEN must prove `WorkflowTaskRuntime.run` refuses before graph resolution when persisted campaign context has no `workItemFence` or marker/fence custody is missing or unresolved, while ordinary tasks remain compatible. The sanctioned `processDueWorkflowWorkItem` route remains the only campaign consumer; no production bootstrap currently calls it, so Task 5 must bootstrap/reverify the fixed native contribution in one long-lived `InProcessRuntime`, construct one authoritative runtime, and prove the old executor is excluded before a live or synthetic campaign runs.
+- Public one-node RED/GREEN must prove exported `WorkflowTaskRuntime.runWorkItem` refuses authoritative campaign context or an exact imported-work-item marker before `getTask`, resolution, transition, or handler work and leaves the item untouched; ordinary work remains compatible. `ccc-prd-import-execution.real-pg.test.ts` must later prove the sanctioned `processDueWorkflowWorkItem` full-graph route instead of calling unfenced `runWorkItem` directly. This is a blocking Task 3 defense-in-depth requirement, not a Task 5 bootstrap change.
+- Fence-preflight RED/GREEN must use one native TaskStore method before workflow resolution to validate exact work-item ID, origin task, run ID, `running` state, lease owner, attempt, and unexpired lease using database time. Missing, forged, stale, mismatched, or expired fence custody must produce zero resolution, handler, summary, and state mutation. Retain per-proof same-transaction audit revalidation because the preflight can race, and require preflight for orchestration-only graphs; add no store, database, scheduler, or control plane.
+- Before freeze, repair line 44 of `ccc-prd-import-execution.real-pg.test.ts` so it succeeds only through `processDueWorkflowWorkItem` and the full graph. Run `pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-prd-import-execution.real-pg.test.ts --silent=passed-only --reporter=dot` against the owned loopback PostgreSQL fixture, update its exact closed proof-runner inventory/name only as required, and rerun that closed mapping. This is forward security preservation rather than reopening accepted Wave 5 adjudication; Task 5 retains production bootstrap ownership.
+- Task 5 mixed-queue proof must extend or reuse the native claim/scheduler seam to target the authoritative campaign candidate while preserving symbol and lease CAS. In one ordinary-plus-campaign due queue, prove both drain: campaign exclusively through `processDueWorkflowWorkItem`, ordinary work through the existing route, and no second scheduler.
+- Latest behavioral and architecture councils failed exact plan `24c6cde8…`, testing `c775f3fb…`, and checkpoint `e3c3677a…` with no P0. Root accepted the missing four-file executor inventory, direct-import test repair, database-time fence preflight, public-path cleanup/race proof, and mixed-queue eligibility as blocking P1s. Candidate freeze remains suspended and all current counts remain development evidence.
+- AGY follow-up `9aa1d951-3634-4246-8b81-7fdca6f0a002` returned `PASS WITH REQUIRED RACE/FIELD TESTS`: include expired lease, public no-update/worktree/session, and mixed-queue no-stall coverage for the database-time validator, public double-check, and targeted existing-queue selection. A `createProofAdmission` test location means runtime/store-preflight coverage only; evaluator authority does not move. Consultation remains advisory.
+- Accepted amended-plan freeze receipt: exact reviewed SHA-256 values were plan `0365b456b03c579b09b2bf3d630650d30023679710f3ca6a81860c00a1e7f4ee`, testing `fb59def10b675482c3547062197a5bdb86e2b9cf444e5416c0f287bc1b5ad10c`, and checkpoint `8a968f23f3608d5557f9a42e6a9c3bf22f8c3158370006e10aa75d19cf3ba257`. Native behavioral PASS had no P0/P1 and one P2 to freeze exact Task 5 bootstrap/mixed-queue names before its candidate. Native architecture PASS had no P0/P1/P2 and recommends a plain database-time `SELECT`, not a transaction lock, for preflight. AGY `9aa1d951-3634-4246-8b81-7fdca6f0a002` exact-byte PASS had no contract P0/P1. Implementation may resume; Task 3 remains unaccepted. Receipt only; contract unchanged.
+- The first exact-byte freeze reviewed plan `b08ea7…`, testing `7e749b…`, and checkpoint `2bea4e…`; native behavioral, native architecture, and AGY `7b25a79f-efad-48ac-8e37-2ea3879c2c0d` all returned FAIL with no accepted P0. Reject AGY's P0 registry label because it is the named pre-production RED, but keep GREEN blocking. Accept host/root stamping and core `exhausted` plus invocation-signal P1s; partially accept definition hashing, TOCTOU, and concurrency as frozen above; reject requirement union while adding immutable-bundle equality; reject a mandatory migration helper because execution fails closed until maintenance authoring upgrades the sidecar.
+- The second freeze reviewed plan `7334da2…`, testing `ed67ba1…`, and checkpoint `3a7641a…`: behavioral PASS; architecture FAIL with no P0 and accepted custody-API plus immutable-registry-record P1s; AGY `3957b94f-008d-449d-888b-e762b4e38c9e` FAIL. Accept AGY file-descriptor binding P1 and provenance-at-registry-boundary substance, whose P2 overlaps architecture P1. Reject prebuilt-summary P2 because post-CAS re-derivation is safer and the helper needs current task/reason/workflow/run.
+- Final repair 2 plan-freeze receipt: exact reviewed bytes were plan SHA-256 `cb989d9a92f650ed9e694cab59d7be366b6ce07991660122820efa0c778946b7`, testing SHA-256 `e876dd9bc5a215b4ca662045322a7499e46820799c007350162d2a0307414152`, and checkpoint SHA-256 `ca017a85df21ed5fb43ef6ecc63be9c364bf383182f6c27a54cd5ac4551da828`, with documentation predecessor `97e102c90da91535b5a06b6f13e91a8aeb112855`. Native behavioral and native architecture/concurrency both returned PASS with no P0/P1; architecture retained one P2 requiring the implementation to use the compiler's exact `bundleWithoutHash` projection. AGY session `15ac8b8a-540d-453d-8afd-dc81b0d5dc75` initially returned FAIL on six source/contract scope misreads, all rejected: work-item CAS plus best-effort summary is not task/proof atomicity; bundle rehash is synchronous in one custody read; workflow lease-TTL CAS is not a permanent process lock; device/inode identity is the local POSIX fail-closed scope; generic exit refusal is proof-only; and dependency refusal is limited to the fixed native proof entry. One allowed follow-up returned PASS with no P0/P1. Consultation is evidence, not authority. This receipt-only text does not alter the reviewed Task 3 contract.
+- This slice adds no migration, `0038`, proof store, dependency graph, database, parser, scheduler, or parallel control plane and does not reopen Waves 1–5, Task 1, or Task 2. Run sidecar/authoring host-stamp and built-CLI bootstrap tests; registry provenance/drift plus original/get/list mutation and external-local-dependency negative controls; native custody API, independent bundle rehash, and proof-set equality; file-descriptor-bound entry/manifest race controls; proof-aware oracle/negative-control and generic-exit-zero refusal; exhausted/no-audit proof; workflow fencing/cancellation/post-CAS-summary tests; repaired engine baseline; relevant typechecks/builds/lint; and `git diff --check`. The repair 2 plan freeze is accepted and frozen; implementation may proceed, but Task 3 remains unaccepted product until GREEN and a fresh integrated council.
+
+### Task 3 accepted proof-authority candidate — 2026-07-25
+
+- Accepted product: `dc2d4968d828d623986991f504a530112ba59c3a`, parent `aac700ab851e973f89b49a0f41bfd180bd7c98b7`, tree `5aed8833cd8345b967945052c005cd50f11cb19f`. Candidate `aac700ab851e973f89b49a0f41bfd180bd7c98b7` is invalidated because it expanded the closed Wave 5 inventory and left proof-authority false greens around import aliasing, loaded/evaluated bytes, and generic proof semantics.
+- Accepted behavior: the fixed native proof-admission entry is raw-byte and file-descriptor bound to its real entry and manifest; registry proof records are sealed snapshots; external ambient proof-admission contributions are withheld from PluginLoader/Runner publication; new authoring stamps proofs from the fixed host registration; campaign custody is TaskStore-derived and independently rehashes the canonical bundle; generic `TaskExecutor` and unfenced direct runtime paths refuse campaign work before provider/session/handler effects; fenced `processDueWorkflowWorkItem` is the sanctioned imported-campaign route; proof audit is bound to campaign/task/work-item/fence identity.
+- Intentional proof boundary: the native self-check is conformance-only and is non-authorizing for campaign task execution. It cannot unlock a campaign task, and it must not be used as semantic proof of a user requirement. The accepted positive PostgreSQL path uses a deterministic synthetic evaluator whose exact source bytes are registered under provenance. Live providers, hooks, credentials, billing, non-loopback calls, and shell proof commands remain outside local Task 3 authority.
+- Fresh root proof: core proof/provenance focused `44/44`; engine proof/workflow focused `47/47`; CLI build plus proof-host/PRD command tests `15/15`; compiler split `26/26`; real loopback PostgreSQL imported workflow `1/1`; broader engine regression `176/176`; broader core regression `58/58`; core, engine, and CLI typechecks; core, engine, and CLI builds; workspace lint; `git diff --check`; `node scripts/run-ccc-pg-proof.mjs --self-test-policies`; and `node scripts/run-ccc-pg-proof.mjs --wave 5`.
+- Closed Wave 5 runner report: `/var/folders/m0/q5ny02wd0wd5lf0tt9w2jwqr0000gn/T/ccc-wave-5-proof-a0Rfj0/report.json`, `passed: true`, `policyError: null`, six command groups all `code=0`, no signal, no timeout, no forced kill. The exact Wave 5 inventory is preserved at `10 + 7 + 40 + 3 + 20 + 1 = 81` names; later Task 3+ tests stay outside that mapping until a new closed consolidated inventory is deliberately frozen.
+- Review disposition: native adversarial review PASS with no P0/P1 and two accepted P2s: same-process trusted callers are not a malicious sandbox, and the fixed-entry scanner is not a general sandbox for arbitrary future proof JavaScript. AGY adversarial session `747ac95f-0931-40e3-be66-a2a1a0b5059b` correctly identified that production semantic proof execution is still fail-closed and that the real-PG positive path uses a test-only registry override; both are accepted as documented Task 4/5+ boundaries, not Task 3 blockers.
+- Manifest hashes remain package `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, workspace `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and lock `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`. Proof-time untracked state was limited to intentional dependency-hydration symlinks `node_modules` and `packages/core/node_modules` pointing at read-only `wave-3-retry`.
+- Task 4 must add real pre-provider campaign admission, request/time/concurrency bounds, drift checks, and durable cancellation. It must not rely on caller-provided provenance or the conformance self-check as semantic proof authority. Task 4 does not implement or own long-lived `InProcessRuntime` bootstrap; Task 5 owns it.
+
+### Frozen Task 4 acceptance — 2026-07-26
+
+- Accepted product `bb04cff1c0301b55f7b3aa7c8729eb5bd93070c0`, parent rejected candidate `b94dd45390d80ea13cb81feac0ff611960d9407d`, tree `cb0ad962ea6642285b56539d39ea9e32610b179b`. Candidate `b94dd45390d80ea13cb81feac0ff611960d9407d` remains rejected evidence because native MCP proxy disposal was not bounded before the durable uncertainty floor. The accepted descendant closes that gap with one closure deadline and retains `needsAttention`, the fence, and the slot when closure is not proven.
+- Fresh behavioral/PostgreSQL review passed Task 4 engine `178/178`, core Task 4 PostgreSQL `49/49`, root engine `299/299`, PostgreSQL gate `10/10`, and CLI CI-shape `65/65`, with no `.fusion` leaks. The fake-bound public route proved committed settlement, approval consumption, lease clearing, restart visibility, and exact replay hold. Verdict: P0 `0`, P1 `0`, P2 `0`.
+- The first static attempt was environment-incomplete because proof-only hydration link views had already been removed; it produced no verdict. A fresh rerun against the same commit/tree used documented read-only links and passed pretest/static guards, lint, typecheck `34/36`, build including dashboard `7163` modules, browser-safe import checking, and `git diff --check`. Verdict: P0 `0`, P1 `0`, P2 `0`. Proof-only links were then removed; tracked state was clean with only intentional root `node_modules` and `packages/core/node_modules` hydration symlinks.
+- AGY was unavailable or permission-blocked, so native Sol performed the adversarial lane. Verdict: PASS, P0 `0`, P1 `0`, P2 `1`. The optional P2 is test clarity: the blocked-dispose control injects the proxy interface rather than constructing a real stuck proxy tail. The manager contract and existing real proxy tests adequately prove the bound.
+- Frozen custody: changed-path digest `8126d1abe2b58e852fcb0df3689a96c6c5b766a50a24102dfe8145cb2e6fec2c`; predecessor binary-diff digest `f2a27054beb29e239df81141d4cde51229a21be16a9eb01f5cebd860be367190`; package/workspace/lock hashes `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
+- Acceptance boundary: Task 4 is the accepted predecessor/component, not full production-route readiness. Task 5 owns long-lived `InProcessRuntime` resolver/bootstrap, one authoritative runtime, the mixed ordinary-plus-campaign queue, and production merger/ref-update reconciliation. These repo-doc changes are a documentation-only descendant pending the root writer's commit. No live provider, credential, billing, non-loopback, push, merge, release, publication, remote-adoption, `main`, or other operator gate was issued.
+
+The CCC-created `packages/engine/src/__tests__/ccc-omniroute-transport.test.ts` exceeds 2,000 lines, and the repository-wide line-count checker currently reports broader pre-existing debt rather than a CCC-only gate. Treat this as advisory debt: do not attribute it to unrelated upstream code, do not weaken the checker, and require every frozen CCC candidate to explain any net growth or split a file when the split reduces real review/false-green risk.
+
+## Task 5 Corrected Plan-Freeze Reviewed Candidate — 2026-07-26
+
+This is the reviewed candidate later accepted by the Task 5 Plan-Freeze Acceptance receipt; implementation RED is active. Accepted Task 4 product remains `bb04cff1c0301b55f7b3aa7c8729eb5bd93070c0`; documentation predecessor remains `29762606571c8a8aad02be01000eba06372045da`. Prior exact-byte candidate hashes `5a39…`, `c347…`, and `bd192…` are invalidated. The initial behavioral council FAIL P1 `1` and architecture council FAIL P1 `3`, P0 `0` were corrected; the later fresh review passed.
+
+The frozen RED names are:
+
+1. `Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime`
+2. `Task 5 RED: mixed due queue preserves ordinary dispatch and claims campaign work only through the fenced processor`
+3. `Task 5 RED: production native CLI resolver binds persisted route lease and restart settlement`
+4. `Task 5 RED: refuses drift dirty overlap and undeclared paths before mutation`
+5. `Task 5 RED: reconciles interruption at each CAS boundary and consumes one exact approval`
+
+Proof-host controls: authorizing bound non-self-check declarations validate exact admission/source/manifest/definition/input hashes, nonempty unique requirement IDs, and bounded nonblank command/positive oracle/negative controls, but return pass without spawning, interpreting, or executing the packet command. V1 accepts only declaration grammar `task <verify-prefixed-task> [--] [bounded canonical args...]`; it does not check/run Taskfile now and refuses metacharacters, redirection, command substitution, wrappers, absolute executables, env assignment, and other executables. Prove one real non-self-check declaration success; malformed, stale, unbounded, `true`, `exit 0`, `sh -c`, `node -e`, and `rm -rf` refusal; and zero subprocess/provider/action/hook effects. Binding self-check remains evaluator-pass but workflow-non-authorizing.
+
+Required negative controls: bootstrap failure makes no provider call; marker-only fails closed through `processDueWorkflowWorkItem`; custody-only uses that campaign route; only marker-false plus custody-null remains ordinary; stale or competing `exactCandidate` (`id`/`runId`/`attempt`) claim loses lease CAS; resolver uses persisted campaign context, derived/stored semantic-task protected action IDs, exact active-action lease, native `preDispatch`, finite one-shot bounds, and native `CliSessionStore` restart settlement; object-only landing uses strict `merge-tree --write-tree` then fixed-identity/timestamp `commit-tree`, with no temporary worktree; admission snapshot remains authoritative and self-write baseline permits only exact generated tree/commit objects; before intent and CAS re-pin target/base/HEAD, cleanliness, target ref, declared paths, target/git/common-dir/index realpaths plus physical identities, checked-out target state in every worktree, and exact lease; unrelated drift rejects with zero CAS; after-commit-before-intent crash leaves ref unchanged/approval claimed/zero terminal effects and replay regenerates the exact same commit SHA; strict inspection read/parse failure refuses with zero CAS; ProjectEngine resolves persisted custody before strategy/workspace dispatch, so PR-configured affirmative custody uses only campaign `runAiMerge` with zero PR/provider/legacy effects and lookup uncertainty fails closed; every TaskExecutor merge entry resolves custody before boundary creation, so campaign request causes zero pre-request boundary mutation, legacy seam fails closed/skips mutation, and caller marker alone cannot bypass ordinary mutation; intent-persistence failure makes no CAS; post-CAS PostgreSQL oracle is ref `== new`, zero terminal audit, approval claimed, lease intact, then restart no second CAS and exactly one audit/consume/lease clear; `ref == expected` retries; a foreign ref enters manual hold and preserves its claim.
+
+The campaign landing mode is explicitly frozen: `LandRepoContext` bypasses preexisting recovery, prune, dependency install, local checkout/stash/push, provider merger/reviewer, retry rebuild, and legacy finalization. ProjectEngine performs persisted-custody routing before strategy/workspace dispatch; every TaskExecutor merge entry does so before boundary creation. Campaign `runAiMerge` must return after gate → deterministic Git-only squash → durable intent → final custody/lease/path/ref recheck → CAS → atomic terminal audit plus exact approval consume. It must not call `finalizeMerged`, group bookkeeping/PR sync, task branch/worktree cleanup, task lifecycle/`mergeDetails` mutation, `task:merged`, or push. Campaign-controlled `MergeResult` is honored by ProjectEngine and TaskExecutor, so outer legacy finalization/retry-reset/group promotion/`ensureWorkflowMergeBoundaryTask`/`finalizeProvenAutoMergeTask` do not run while campaign graph/work-item lifecycle stays native. A landing-level forbidden-effect recorder covers provider merger, reviewer, and stash seams across success and Git-landing refusal or recovery paths. ProjectEngine and TaskExecutor seam-specific mocks and assertions separately cover PR, workspace, finalizer, group, task-lifecycle, and boundary effects. Together they prove zero forbidden effects without adding an artificial cross-layer recorder. No new table, store, scheduler, parser, or control plane is allowed. The initial file map is frozen in the Task 5 Plan-Freeze Acceptance receipt; executable counts remain closed until RED cases exist.
+
+After Wave 5 acceptance, speculative Wave 6 and Wave 7 tests remain development evidence only. Any harvested enforcement test must hit native PostgreSQL audit/approval services or the production merger/ref-update/real-Git seam. Standalone classifier passes cannot close an integrated acceptance gate.
+
+Freeze branch, HEAD, tree, manifest hashes, accepted-predecessor diff digest, status, and proof artifacts before independent behavioral, static/build, and final-artifact review. Any source or test repair creates a new candidate and invalidates prior reviewer verdicts.
+
+Persist static acceptance evidence rather than summarizing it from memory: command, exit status, commit, tree, relevant manifest hashes, and output digest for lint, typecheck, build, diff hygiene, and every closed runner. Final reviewers must inspect the actual built CLI, normal readers, restart state, local Git behavior, and blocked protected actions in addition to test output.
+
 <!-- FNXC:TestInfrastructure 2026-06-25-00:00: verify:fast is the opt-in test-free verification path. docs/testing.md observes the broad test gate caught no recalled real bugs while consuming ~70% of shipping time in flake triage; typecheck+build+boot-smoke gives deterministic, flake-free signal without running tests. It changes no default — pnpm test, the merge gate, and CI are untouched; the full suite stays available and runs non-blocking. -->
 <!-- FNXC:TestInfrastructure 2026-06-26-00:49: verify:fast must bootstrap missing workspace dist artifacts and build @runfusion/fusion even when the CLI package is not in the changed-package set because package builds and the boot smoke invoke source-checkout wrappers that require dist outputs in fresh worktrees. -->
 <!-- FNXC:TestInfrastructure 2026-07-22-12:00: Cheap deterministic policy gates must fail before verify:fast's expensive work. Read canonical package.json pretest commands and invoke their validator entry points directly so test-free verification and the merge gate cannot drift. -->
@@ -514,3 +659,595 @@ Use the exact heading `## Symptom Verification` and include all three required c
 - [ ] **Assertion it is gone** — final verification reproduces the original failure condition and asserts it no longer occurs via a real automated test.
 
 Symptom-based acceptance is mandatory for bug fixes: reproduce the original failure, prove it is gone, and keep the invariant covered across the `## Surface Enumeration` checklist. Green build/tests alone are insufficient when they do not exercise the reported symptom.
+
+## Task 4 Pre-Provider Admission Foundation Freeze — 2026-07-25
+
+Task 4 foundation commit `0ff3748319036ba57356afe1625e2d04e95ef850`, tree `7a73a5595c013126b06337bfdd417cda0622c5db`, is committed on `agent/ccc-fusion-task4-preprovider`. It is a foundation only: it proves pre-provider admission and provider-attempt accounting seams, not Task 4 acceptance, not production Pi/CLI/workflow transport wiring, not production local-Git admission, not downstream Task 5 merger/ref-update behavior, and not any live provider call.
+
+Final focused proof on the committed foundation:
+
+- `FUSION_PG_TEST_URL_BASE=postgresql://postgres:password@localhost:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/ccc-campaign-provider-attempt.pg.test.ts --silent=passed-only --reporter=dot` — PASS, `10/10`.
+- `pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-execution.test.ts --silent=passed-only --reporter=dot` — PASS, `26/26`.
+- `pnpm --filter @fusion/core typecheck` — PASS.
+- `pnpm --filter @fusion/engine typecheck` — PASS.
+- `pnpm --filter @fusion/engine build` — PASS.
+- Targeted lint for the touched core/engine files — PASS.
+- `git diff --check` — PASS.
+
+Observed RED/GREEN sequence:
+
+- Engine admission initially passed 19 existing cases and failed 3 new negative controls for non-canonical Git head, empty protected claim token, and mutable returned lease; after repair it passed `22/22`.
+- Engine admission then passed 22 existing cases and failed 2 new controls for unprotected binding/context mutation; callback-timing controls added another `24 pass / 2 fail` RED; final repair passed `26/26`.
+- Core provider-attempt PostgreSQL initially passed 9 existing cases and failed 1 immutability control for returned attempt scope mutation; final repair passed `10/10`.
+
+The foundation reuses `ccc_prd_imports` under its existing serialized row lock and native `run_audit_events`; it does not introduce a migration, table, store, receipt family, parser, scheduler, or alternate control plane. Public `TaskStore` provider-attempt methods own their own transaction and return only after commit. Active attempts are computed from exact campaign-bound audit history, never from `active_action_leases`. Replay finds a deterministic event before timestamp generation or request-count increment, and same-key changed content refuses. `dispatched_unknown` remains active until authoritative reconciliation.
+
+Final adversarial review returned PASS with no P0/P1/P2. Accepted repairs include public transaction ownership, native action-lease validation, canonical Git object-ID refusal, immutable context before async callbacks, immutable returned authority/binding/approval/provider-attempt scopes, restart visibility for unknown dispatch, changed-content collision refusal, and zero provider/action/hook callback effects before admission.
+
+Current boundaries for future tests: this foundation-era boundary is superseded for production local-Git admission by accepted local-Git commit `9ed1839827ced133ff435499a7ab3a8e9f4416a4` and controller commit `79c91f8be245038100741cb5e405b34e01a4b46e`; Pi `ModelRuntime.stream`/`streamSimple`, CLI `manager.spawn`, provider-capable workflow call sites, durable cancellation, approval-terminal reconciliation, and user-like restart/transport inspection remain open Task 4 acceptance work. Task 4 does not implement or own long-lived `InProcessRuntime` bootstrap; Task 5 owns it, together with production merger/ref-update reconciliation and terminal Git receipts. No live provider, credential, billing, non-loopback, fetch, push, merge, release, publication, upstream adoption, or `main` gate has been issued. Package, workspace, and lockfile hashes remain unchanged: `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
+
+## Task 4 Controller Component Freeze — 2026-07-25
+
+Task 4 controller component commit `79c91f8be245038100741cb5e405b34e01a4b46e`, tree `e47902c4220e6bf3f8178c53dc7cac6495d96f94`, parent `8f10f7c08217b94c7a31bc4f1052aaafe24d7854`, is accepted as a component only. Task 4 remains unaccepted.
+
+Final focused proof on the committed controller bytes:
+
+- `FUSION_PG_TEST_URL_BASE='postgresql://postgres:password@127.0.0.1:61316' node_modules/.bin/vitest run src/__tests__/postgres/ccc-campaign-provider-controller.pg.test.ts --reporter=dot` from `packages/core` — PASS, `14/14`.
+- `node_modules/.bin/vitest run src/__tests__/ccc-campaign-provider-controller.test.ts src/__tests__/ccc-campaign-provider-controller.real-packet.test.ts --reporter=dot` from `packages/engine` — PASS, `5/5`.
+- `pnpm --filter @fusion/core typecheck` — PASS.
+- `pnpm --filter @fusion/engine typecheck` — PASS.
+- `pnpm exec eslint packages/core/src/ccc-campaign/provider-controller.ts packages/engine/src/ccc-campaign-provider-controller.ts --max-warnings=0` — PASS.
+- `git diff --check` — PASS.
+
+The RED/GREEN closure covers the two P1 false-greens found during review: no core `routeKind` or ordinary bypass remains, and the real ccc-lab-super sidecar action is `ACTION-LIVE-EXECUTION -> ccc-lab-super:pre-live-provider-gate` rather than a hardcoded `provider:direct` or semantic-task target. The PostgreSQL suite proves approval expiry, not-before, wrong identity, wrong claim token, missing lease, route/semantic custody corruption, rollback after begin interruption, foreign Git custody, noncanonical Git head, mixed SHA-1/SHA-256 object-format refusal plus matching 64-character base/head positive custody, lost-response replay hold, non-imported-task refusal, and missing/ambiguous/wrong-kind live-action refusal. The engine suite proves production Git recheck occurs before core, core is not called after Git refusal or post-Git abort, no `routeKind` is present on the full admission input, and the unchanged real packet selects the exact declared live-execution action without rewriting bytes.
+
+Final-byte review returned PASS with no P0/P1. Package, workspace, and lockfile hashes remain unchanged: `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, and `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
+
+## Task 4 Transport Plan-Freeze RED Inventory — 2026-07-25
+
+This is the intended RED inventory for the frozen transport contract, not completed proof and not a test-count claim.
+
+- PostgreSQL/store: campaign-wide monotonic ordinal allocation under the import lock; exact replay retains attempt/token/ordinal without increment; changed task/action/target/route/provider/model/binding or reconciliation evidence collides; one dispatch-acquisition CAS winner receives a permit; `dispatched_unknown` and terminal attempts never redispatch; committed replay with durably recorded output returns that recorded output and terminal evidence verbatim, while committed replay without durably recorded output is an explicit recovery hold and never reconstructs or invents output.
+- Pi: reserve and permit finish before `pi-ai` lazy provider/auth setup for both `ModelRuntime.stream` and `streamSimple`; `pi-stream:1/2/3` share durable work-item-attempt turn identity; fallback provider/model route drift refuses; SHA-256 terminal evidence and unknown abort/timeout/disconnect behavior hold; ordinary Pi zero-attempt work stays ordinary.
+- CLI: current interactive/generic/opaque adapters fail before `manager.spawn`; exact immutable host-owned one-request-per-process capability admits the deterministic local fake; `followUp` refuses; manager-owned deadline and awaited process-tree closure hold; exit/native-done/cancel are not terminal evidence.
+- Workflow: registry-publication posture is immutable and host-owned; omitted or external self-declared posture fails before handler; host-scoped handlers receive only the narrow controller; host-owned no-provider handlers have zero controller effects; no raw `TaskStore` reaches a handler.
+- Integration: production local-Git admission, approval/cancellation settlement, saturation and authoritative unknown-dispatch settlement. Task 4 does not implement or own long-lived `InProcessRuntime` bootstrap; Task 5 owns it, mixed-queue ownership, and merger/ref-update terminal receipts. Task 4 adds no new scheduler or control plane.
+
+Intended focused commands (exact file inventory is frozen only when the implementation names exist):
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres:password@localhost:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/ccc-campaign-provider-attempt.pg.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-execution.test.ts src/__tests__/workflow-task-runtime.test.ts src/__tests__/workflow-work-processor.test.ts --silent=passed-only --reporter=dot
+pnpm --filter @fusion/core typecheck
+pnpm --filter @fusion/engine typecheck
+pnpm --filter @fusion/engine build
+git diff --check
+```
+
+## Task 4 Native CLI Plan Freeze — 2026-07-26
+
+Base accepted product is `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `c222be6c7a527c3965592b41b08e539c8d35c1c6`. This is a testing correction and plan freeze only; Task 4 is not accepted. Luna was unavailable, so this receipt uses Terra as the evidence/docs substitute. Council evidence was Terra implementation-readiness plus native Sol architectural review; AGY was unavailable or permission-blocked and native Sol substituted. Verdict: CORRECTIONS REQUIRED with no P0 and three accepted P1s.
+
+Focused RED sequence:
+
+1. Slice A starts with sealed workflow identity:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-custom-node-execution.test.ts -t "forwards sealed workflow execution context to cli-agent custom runner"
+```
+
+Then add workflow task-runtime identity REDs for exact cloned/frozen `workItemFence`, immutable host-owned `executionFence`, schema-versioned canonical SHA-256 `turnKey`, and refusal on missing, unvalidated, or mutated fence data.
+
+2. Slice B proves host-native CLI binding admission: current `createCliAgentRuntime` and bundled interactive, generic, or opaque adapters publish no frozen campaign binding and fail closed before log mutation, MCP/auth, kill, scratch, session row, or spawn. The admitted fake binding must validate exact keys, frozen route, `providerId`, `modelId`, `transport=cli`, `maxRequests=1`, lifetime bounds, `followUp=false`, observer, and controller permit scope before launch.
+3. Slice C proves campaign-only termination and receipt ordering with fake clock: TERM, bounded grace, KILL, bounded process-group closure, proxy closure, durable fence flush, registry-slot release, observer only after closure receipt, and reconcile only after exact retained scope/token validation. Native done, exit, or cancel alone must never reconcile. Timeout, nonclosure, signal, observer, or reconcile uncertainty leaves `dispatched_unknown` plus `needsAttention` with fence and slot retained.
+4. Slice D is focused real-PostgreSQL/restart integration. It must prove committed and `proved_failed` terminal reconciliation is exact and idempotent, lost response stays unknown, restart holds do not spawn, admitted path spawns once, and ordinary CLI remains behavior-compatible with zero campaign rows.
+
+No operator gate has been issued. P2 controller provenance and owning-runtime wiring carry into CLI integration proof; they are not accepted as authority by this plan freeze.
+
+## Task 4 Native CLI Slice A Candidate Invalidation — 2026-07-26
+
+Accepted product remains HEAD `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `c222be6c7a527c3965592b41b08e539c8d35c1c6`. Frozen 10-path candidate diff SHA-256 `3a493efef1857d74b415d94991a7a7d6f7858d8146c26990ba4208ff44a11b98` is invalidated despite development proof `89/89`, typecheck, build, changed production and test lint, and diff check.
+
+Fresh Sol exact-byte review returned FAIL with no P0 and one P1: top-level rework re-enters the same node with default `{nodeId, materializedNodeId}` identity, so later materialized passes reuse `providerAttemptTurnKey`. P2 legacy `WorkflowGraphTaskRunner` and `TaskExecutor` fourth/sixth context wiring remains deferred to Slice B/Task 5 owning-runtime integration and is not authority. Terra-for-Luna and native Sol-for-AGY substitutions remain recorded.
+
+Active RED:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/pr-rework-bound.test.ts -t "gives each top-level rework pass a distinct provider turn key" --reporter=dot
+```
+
+No commit, tree, manifest, operator gate, or Task 4 acceptance changed.
+
+## Task 4 Native CLI Slice A Component Accepted — 2026-07-26
+
+Accepted Slice A component commit `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`, is accepted only as the Native CLI Slice A component. Task 4 remains unaccepted. Exact commit diff SHA-256 is `d63431b8184909e13712b22b1a5a997709e6e7930f1edb0d6baad046a18c02a7`; exact scope is 11 tracked paths.
+
+Accepted proof:
+
+- `4` files / `95` tests — PASS.
+- Engine typecheck — PASS.
+- Engine build — PASS.
+- Production ESLint — PASS.
+- Test ESLint with `--no-ignore` — PASS.
+- `git diff --check` — PASS.
+
+Tracked status after acceptance was clean, with only intentional dependency-hydration symlinks `?? node_modules` and `?? packages/core/node_modules`. Manifest hashes remain unchanged: package `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, workspace `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, lock `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
+
+Fresh native Sol exact-byte review returned PASS with P0 `0`, P1 `0`, and P2 `0` new. The known legacy context-drop P2 remains owned by Slice B/Task 5 owning-runtime integration. Prior invalidated candidate `3a493efef1857d74b415d94991a7a7d6f7858d8146c26990ba4208ff44a11b98` remains invalid and is not resurrected. Native Sol substituted for unavailable AGY; Terra substituted for unavailable Luna. Next execution state is `task4_cli_predispatch_admission_red_active`.
+
+## Task 4 Slice B Legacy Context And Missing Binding Transition — 2026-07-26
+
+This is uncommitted Slice B development evidence only. Slice B and Task 4 are not accepted.
+
+RED/GREEN record:
+
+- Spark RED `Task 4 RED: forwards sealed node execution context through the legacy task runner wrapper` observed arg4 `undefined`; GREEN threads the exact optional arg through `workflow-graph-task-runner.ts`.
+- Spark corrected RED `Task 4 RED: fenced CLI node without a host-native binding refuses before log or session effects` resolved `runtime-unavailable` and logged because arg6 was ignored.
+- Terra GREEN in `executor.ts` threads the sixth `WorkflowNodeExecutionContext`; fenced `cli-agent` now throws `CCC_NATIVE_CLI_BINDING_REFUSED` before task reload, log, MCP, or session work. Ordinary and unfenced paths remain unchanged.
+
+Proof reported with owned loopback PostgreSQL at `127.0.0.1:61316`:
+
+- `workflow-graph-task-runner.test.ts` plus `executor-fast-mode-workflows.test.ts` — PASS, `2` files / `69` tests.
+- Engine typecheck — PASS.
+- Targeted lint — PASS.
+- `git diff --check` — PASS.
+
+Native Sol contract challenge accepted host-owned optional `resolveCccNativeCliBinding` on `CliAgentRuntime`, never graph context or adapter capabilities. The next RED must validate exact frozen one-shot binding and permit scope. Slice C still owns termination, observer, and reconcile. AGY was unavailable and native Sol substituted; Luna was unavailable and Terra is the docs substitute. Next execution state is `task4_cli_binding_validation_red_active`.
+
+## Task 4 Slice B Binding And Permit Transition — 2026-07-26
+
+This is uncommitted Slice B development evidence only. Slice B and Task 4 are not accepted.
+
+RED/GREEN record:
+
+- Spark hash RED proved exact frozen binding refused exact keys because `authorityBindingHash` was absent.
+- Terra GREEN requires a host-owned lowercase 64-hex `authorityBindingHash`.
+- Positive built fake RED failed at `CCC_NATIVE_CLI_DISPATCH_NOT_IMPLEMENTED` before `preDispatch`.
+- Terra GREEN uses the exact typed controller, frozen one-shot request, non-permit refusal, then the existing one-shot path.
+- Initial post-GREEN false-RED was a mock-observer bug: a post-import spy observed `0`; Spark REFACTOR used hoisted shared mocks.
+
+Root final proof with owned loopback PostgreSQL at `127.0.0.1:61316`:
+
+- `4` files / `73` tests — PASS.
+- Engine typecheck — PASS.
+- Production plus new-test ESLint `--no-ignore` — PASS.
+- `git diff --check` — PASS.
+
+Component remains uncommitted and unaccepted. Observer, reconcile, termination, and restart are not accepted yet. Current bundled runtimes still have no resolver, so real/bundled CLI remains fail-closed. AGY was unavailable and native Sol substituted; Luna was unavailable and Terra is the docs substitute. Next execution state is `task4_cli_permit_scope_negative_red_active`.
+
+## Task 4 Slice B Permit Scope Validation — 2026-07-26
+
+This is uncommitted Slice B development evidence only. Slice B and Task 4 are not accepted.
+
+Terra RED malformed permit-scope cases:
+
+- Mutable scope.
+- Foreign canonical authority hash.
+- Sealed semantic mismatch.
+- Committed or terminal state.
+- `requestCount != 1`.
+
+All five wrongly reached resolver -> `preDispatch` -> MCP -> kill -> launch and returned `needs-attention`.
+
+GREEN adds an exact frozen nonterminal permit-scope validator before effects. It requires canonical attempt/controller IDs, sealed task match, positive ordinal, `requestCount=1`, `dispatched_unknown`, canonical complete authority binding/hash, and exact provider/model/`transport=cli` association.
+
+Root proof with owned PostgreSQL:
+
+- `4` files / `78` tests — PASS.
+- Engine typecheck — PASS.
+- Production/new-test lint `--no-ignore` — PASS.
+- `git diff --check` — PASS.
+
+Observer, reconcile, termination, and restart remain open. AGY/native Sol and Luna/Terra substitutions remain in force. No operator gate was issued. Next execution state is `task4_cli_prepermit_input_and_lifecycle_red_active`.
+
+## Task 4 Slice B Strict Profile Pre-Binding Transition — 2026-07-26
+
+This is uncommitted Slice B development evidence only, based on current product HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`. Slice B and Task 4 are not accepted.
+
+Strict-profile RED/GREEN record:
+
+- RED proved a legacy root-only `profile: "ccc-fusion"` incorrectly admitted fenced CLI work: it reached `[resolver, preDispatch, kill, launch]` and returned `needs-attention` instead of a controlled `CCC_NATIVE_CLI_BINDING_REFUSED`.
+- GREEN removed the root `cfg.profile` fallback. Fenced campaign CLI admission now admits only resolved `cliSettings.profile` exactly equal to `ccc-fusion` before binding resolution or `preDispatch`.
+
+Root proof with owned loopback PostgreSQL at `127.0.0.1:61316`:
+
+- Pre-binding refusal filter — PASS, `4/4`.
+- Full `ccc-native-cli-executor.test.ts` — PASS, `10/10`.
+- Existing missing/invalid binding filters in `executor-fast-mode-workflows.test.ts` — PASS, `3` tests total.
+- `workflow-graph-task-runner.test.ts` — PASS, `17/17`.
+- Engine typecheck — PASS.
+- Production ESLint — PASS.
+- `git diff --check` — PASS.
+
+This transition is a material Slice B development checkpoint, not acceptance. Observer, reconcile, termination, closure, and restart remain open. Luna was unavailable; Terra is the bounded documentation writer substitute. Next gate is finite lifecycle/closure/observer/reconcile plan freeze plus REDs.
+
+## Task 4 Slice C Lifecycle Plan Freeze — 2026-07-26
+
+This is a documentation-only plan-freeze transition. No code, commit, operator gate, P0/P1-zero acceptance, Slice B acceptance, or Task 4 acceptance is claimed.
+
+Council record: root synthesis plus native Sol architectural challenge plus Terra PostgreSQL feasibility review. AGY remains unavailable with native Sol substitution already recorded; Luna remains unavailable with Terra documentation substitution.
+
+Accepted P0 findings:
+
+- Current native done can advance before proven process-group, proxy, and durable closure, while reap failure is swallowed.
+- Provider-attempt terminal reconciliation and CLI-session fence settlement must be atomic in one existing `AsyncDataLayer` transaction.
+
+Accepted minimal route:
+
+- Retain the validated host binding and permit scope.
+- Use a campaign-only manager-issued frozen held closure receipt.
+- Treat `lifetimeMs` as the total permit-to-closure budget bounded by `campaignDeadlineAt`; begin shutdown early enough to preserve full `termGraceMs + killClosureMs`.
+- Run TERM for the full grace, then KILL, then bounded closure/proxy drain plus durable `needsAttention` floor while the slot remains held.
+- Let the observer see only the retained scope plus held receipt and produce an exact observation.
+- Let the host controller atomic settlement call existing provider-attempt `reconcile(tx)` plus CLI generation compare-and-swap in the same transaction.
+- Release the slot only after an exact validated terminal result.
+- Keep malformed, timeout, collision, flush, observer, or reconcile uncertainty as `dispatched_unknown` plus `needsAttention` ownership.
+- Preserve one-shot `followUp=false`; ordinary CLI remains unchanged.
+- Add no database, store, scheduler, control plane, or new durable subsystem.
+
+Pre-spawn invariant: the provider PTY cannot spawn before the durable attempt-bound CLI row flushes. A residual crash before that row is a proved-no-dispatch reconciliation case, not a launch retry.
+
+Implementation order: exact observation and terminal validators -> core PostgreSQL atomic settlement -> manager held closure and supervisor timing -> task-session one-shot behavior -> executor observer/reconcile/release -> restart resume exclusion -> real process and PostgreSQL regressions.
+
+Next execution state remains lifecycle RED active: `task4_cli_lifecycle_plan_freeze_red_active`.
+
+## Task 4 Slice C Observation And Settlement Transition — 2026-07-26
+
+This is uncommitted Slice C development evidence only. Slice C and Task 4 are not accepted. No commit, operator gate, P0/P1-zero claim, manifest change, lock change, symlink change, or acceptance boundary changed.
+
+Validator RED/GREEN record:
+
+- Observation validator RED began as `5` tests failing on missing `validateCccNativeCliObservation`; GREEN passed `6/6`.
+- Terminal-scope RED began as `11` tests failing on missing `validateCccNativeCliTerminalScope`.
+- Two false-green corrections were accepted: synthetic root `state: "terminal"` is refused, and mutable authority bindings are refused before core validation.
+- Strict terminal-scope GREEN passed `19/19`.
+
+Core settlement RED/GREEN record:
+
+- Atomic core settlement RED began as `3` missing-method failures with `24` older tests still green.
+- GREEN passed `27/27`.
+- Closure precondition RED began as `2` cases resolving incorrectly; GREEN passed `29/29`.
+- Settled-state and idempotent replay RED added `2` cases; GREEN passed `30/30` on owned loopback PostgreSQL `127.0.0.1:61316`.
+
+Regression proof reported:
+
+- `ccc-native-cli-executor.test.ts` — PASS, `10/10`.
+- Engine typecheck — PASS.
+- Production and test ESLint — PASS.
+- Repo diff checks and no-index checks for untracked native CLI files — PASS, with no whitespace diagnostics.
+
+Settlement behavior now proven in development: the shared existing transaction commits or rolls back provider-attempt terminal audit and the exact one-shot CLI generation fence together. It requires a held session in `needsAttention` with null unfenced state and held-closed lifecycle, then writes the dead/fenced/settled state. Identical replay is idempotent. Drift or collision rolls back both the provider-attempt terminal audit and CLI generation fence settlement.
+
+This remains lifecycle RED-active evidence only. Manager-held closure and registry-slot lifecycle are still open. Next RED is manager-held closure/slot lifecycle. Execution state remains `task4_cli_lifecycle_plan_freeze_red_active`.
+
+## Task 4 Slice C Manager, Session, Executor, And Restart Transition — 2026-07-26
+
+This is uncommitted Slice C development evidence only. Accepted product remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`. Slice C and Task 4 remain unaccepted.
+
+Behavior now proven in development:
+
+- The manager builds and validates one frozen one-shot policy, enforces the finite lifetime, issues a held closure receipt, exposes an observer-only waiter, retains the registry slot, and releases only after exact terminal fenced settlement. Direct resume of a one-shot row refuses.
+- `TaskSession` forwards the exact policy, converts done, exit, lifetime, and cancel into the held result, and makes campaign kill wait for release.
+- The executor builds the policy after permit validation and before MCP, kill, scratch, or spawn; validates the actual launched session ID and held receipt; observes the exact frozen receipt plus retained permit scope; controller-reconciles the exact outcome; validates terminal scope; and releases last. Observation, reconciliation, validation, or release uncertainty retains the active map. Ordinary result-rejection cleanup remains intact.
+- The resume coordinator marks one-shot rows `needsAttention` and ineligible and never spawns them.
+- False-green repairs cover rejected release-deferred ownership, ordinary result map cleanup, foreign outcome/receipt session identity, and one-shot rows that were silently filtered instead of surfaced.
+
+Focused proof:
+
+- Combined binding/session/task/executor lane — PASS, `50/50`.
+- Restart exclusion — PASS, `3/3`.
+- Core PostgreSQL CLI-session settlement on owned loopback `127.0.0.1:61316` — PASS, `31/31`.
+- Full native-MCP provider matrix first reproduced `8` failures. Exact diagnostic exposed Undici rejecting forwarded invalid `content-length`; this was a real latent proxy protocol bug, not parallel-test noise.
+- Minimal proxy GREEN strips hop-by-hop, routing, and body-framing headers before upstream forwarding. Exact RED filter — PASS, `2/2`; full provider matrix with explicit owned PostgreSQL — PASS, `33/33`.
+
+No manifest, lockfile, operator gate, commit, or Task 4 acceptance changed. Pre-spawn failure/proved-no-dispatch reconciliation, restart/effect reconciliation proof, full fake-bound integration, and integrated freeze/review remain open. AGY remains unavailable with native Sol substitution; Luna remains unavailable with Terra documentation substitution. Next execution state is `task4_cli_predispatch_failure_reconciliation_red_active`.
+
+## Task 4 Slice C Pre-Provider Failure Reconciliation Transition — 2026-07-26
+
+This is uncommitted Slice C development proof only. Accepted product remains `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`. Slice C and Task 4 remain unaccepted.
+
+Invalidated candidate:
+
+- A read-only Sol child violated ownership and TDD limits and added a helper that auto-reconciled every generic launch rejection as proved no-dispatch.
+- The candidate is INVALIDATED and not acceptance evidence.
+- Its only non-product mutation was disposable loopback role `ccc_task4` gaining `BYPASSRLS`; final scratch-cluster teardown remains required.
+
+Corrective RED:
+
+```sh
+pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-native-cli-executor.test.ts --reporter=dot -t 'terminalizes permit|typed launch rejection|generic launch rejection'
+```
+
+Observed RED:
+
+- MCP resolution failure — reconcile called `0` times.
+- Prior-session kill failure — reconcile called `0` times.
+- Typed `CliConcurrencyLimitError` — reconcile called `0` times.
+- Generic launch rejection — passed because it correctly made no reconcile call.
+
+GREEN behavior:
+
+- An exact phase enum admits only MCP resolution, prior-session kill, and typed capacity rejection as proved pre-provider failures.
+- Generic `launchCliTaskSession` rejection remains `dispatched_unknown` and is not auto-reconciled.
+- The deterministic SHA-256 evidence digest covers fixed version, phase, permit identity, and authority-binding hash only; raw error text is excluded.
+- A fixed pre-provider observer ID plus exact terminal-scope validation rejects malformed or foreign terminal scope.
+- Reconciliation rejection or scope drift cannot fabricate an at-capacity result.
+
+Root proof:
+
+- Focused filter — PASS, `7` selected; `23` skipped only because the development `-t` filter excluded them, so this count is not acceptance inventory.
+- Five-file Slice C lane — PASS, `71/71`.
+- Engine typecheck — PASS.
+- Owned ESLint `--no-ignore` — PASS.
+- `git diff --check` — PASS.
+- First six-file integrated attempt — command/configuration failure only: `DATABASE_URL` was used instead of `FUSION_PG_TEST_URL_BASE`, so PostgreSQL tried the laptop OS role and rejected authentication.
+- Correct six-file engine rerun with `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316` — PASS, `104/104`.
+- Core `cli-session-store` PostgreSQL proof on the same owned fixture — PASS, `31/31`.
+
+AGY remains unavailable and native children substituted. Luna remains unavailable and Terra substituted for documentation. A Spark restart inventory produced no source evidence after one follow-up and is rejected as non-evidence. Next RED is restart/effect reconciliation; full fake-bound user-like integration, one-shot `killAll()` handling review, and consolidated Task 4 freeze/council remain open.
+
+## Task 4 Kill-All, Legacy Receipt, And Evidence-Custody Transition — 2026-07-26
+
+Accepted product identity remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed`, parent `2b574951fa58675b19085e4bfd021f18d04394ca`, tree `91eb0c2bdff5d18de30e8cc8c318bb32178ff32a`. This remains uncommitted development evidence only: Task 4 is not accepted. Intentional hydration state remains `?? node_modules` and `?? packages/core/node_modules`.
+
+Kill-all RED `Task 4 RED: dispose/killAll closes a one-shot CCC session through held-closure (not dead/engineDeath/fenced)` observed `dead/engineDeath/fenced` overwrite the held closure. GREEN routes CCC policy sessions through `closeCccNativeCliSession` with `cancel`. Exact regression passed `1/1`; integrated engine proof passed `105/105`; core PostgreSQL CLI-session settlement passed `31/31`; typecheck, lint, and `git diff --check` passed.
+
+P1-04 compatibility reopened predecessor regression `replays an unambiguous legacy raw-tool receipt through the current native JSON-RPC request id`. RED returned JSON-RPC `-32000`, `CCC native MCP legacy receipt is not safely replayable`, for a valid legacy envelope with `result.isError: true`. GREEN accepts only completed, error-free JSON-RPC envelopes with a record `result`, makes zero upstream call, and keeps malformed and top-level-error envelopes fail-closed. Provider matrix passed `33/33`; integrated engine proof passed `105/105`.
+
+Wrong-worktree incident: read-only Spark wandered into `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/wave-5-integration`, branch `agent/ccc-fusion-wave-5-integration`, HEAD `3f04bf4a18dec5d8e1bca5b184e9df95a40c7022`, leaving uncommitted edits to `docs/testing.md`, `packages/engine/src/__tests__/ccc-native-mcp-provider-matrix.test.ts`, and `packages/engine/src/cli-agent/ccc-native-mcp-proxy.ts`. Those bytes are **INVALIDATED**, isolated from accepted-spine evidence, and neither reverted nor overwritten. The correct behavior was independently rederived in the accepted Task 4 tree; do not forward-fill blindly.
+
+Remaining gate: real-PostgreSQL public-route fake-bound integration proving restart inspection and authoritative settlement, then fresh freeze/council. `execution_state` remains exactly `task4_cli_restart_effect_reconciliation_red_active`.
+
+## Task 4 Public-Route Settlement And Exact Replay Transition — 2026-07-26
+
+Accepted product remains HEAD `003b397c44ff3213867ec3b90850bbf24ae928ed` until the root writer freezes and commits this candidate. Task 4 is candidate proof/pre-freeze active, uncommitted, and not accepted; no operator gate, manifest, lockfile, live provider, or network action changed.
+
+The public-route repair has two guarantees. Same-transaction committed CLI provider settlement consumes the exact claimed approval and clears the exact action lease; stale or rollback settlement preserves both, and identical replay makes no duplicate approval mutation. Post-commit `preDispatch` replay reserves or loads the exact attempt first, then checks exact approval custody by state: `reserved=active claimed`, `dispatched_unknown` or `proved_failed` = claimed, and `committed=consumed`. A terminal replay returns a hold without an extra attempt, count, or provider permit; wrong approval or token remains refused.
+
+RED signatures were consumed expected but claimed, then terminal replay rejected `not exactly claimed`. GREEN: core PostgreSQL two-file proof `49/49`; engine focused public-route suite nine files `177/177`, including one real-PostgreSQL workflow; core and engine typechecks PASS; `git diff --check` PASS.
+
+User-like proof path: import/reconcile -> work-item claim -> native workflow/`TaskExecutor` -> one local fake PTY spawn -> terminal committed settlement -> approval consumed/lease cleared -> restart visibility -> exact replay hold. It makes zero live provider or network call. Luna is unavailable and Terra is the documentation substitute; AGY is unavailable and native review remains planned. `execution_state` is `task4_candidate_proof_pre_freeze_active`.
+
+## Task 4 Pre-Freeze Full-Workspace And Dashboard Proof — 2026-07-26
+
+Status boundary: accepted product remains `003b397c44ff3213867ec3b90850bbf24ae928ed`; the Task 4 candidate is uncommitted and unaccepted. No operator gate, manifest, lockfile, live provider, or network action changed. `execution_state` remains `task4_candidate_proof_pre_freeze_active`.
+
+Full-workspace evidence:
+
+- `pnpm typecheck` — PASS, `34 of 36`; desktop and mobile are excluded by the script.
+- `pnpm build` — PASS, including dashboard `7163` modules; only existing Vite warnings appeared.
+- First `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm test` — RED because two stale three-argument assertions in `workflow-node-handlers.test.ts` omitted the fourth execution context which production correctly required.
+- Spark test-only GREEN — the two stale assertions were updated; `pnpm --filter @fusion/engine test:core` — PASS, `299/299`.
+- Full rerun `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm test` — PASS: engine `299/299`, core PostgreSQL gate `10/10`, CLI CI-shape `65/65`, and no temporary or live `.fusion` leaks.
+
+Dashboard false-green repair:
+
+- Direct dashboard import of `workflow-settings-resolver` reached Node-only `workflow-extension-provenance`.
+- The pure resolver moved to browser-safe `execution-and-ui`, was exported via the types barrel, and dashboard now imports `@fusion/core`; the stale allowlist was removed.
+- Focused core proof — PASS, `45/45`; dashboard build — PASS.
+
+Hydration custody: no install, fetch, manifest, or lockfile change occurred. Read-only Wave-3-retry links revealed stale Wave 1/2 workspace resolution; a candidate-local link view bound current `@fusion` and plugin packages. It is environmental proof scaffolding only and must be removed or precisely accounted for before freeze.
+
+Luna is unavailable, so Terra is the documentation substitute. AGY is unavailable; native Sol review remains planned. These results are candidate proof, not acceptance.
+
+## Task 4 Full-Sweep Disposition And Final Pre-Freeze Gates — 2026-07-26
+
+Boundary: accepted product remains `003b397c44ff3213867ec3b90850bbf24ae928ed`; candidate remains uncommitted and unaccepted. `execution_state` remains `task4_candidate_proof_pre_freeze_active`; freeze/council is next.
+
+- Default `pnpm test:full` first reached core `4352` pass / `1` skip and had three failures: one real architecture invariant (three bare `listTasks` calls), plus schema-applier/transition PostgreSQL contention.
+- Spark isolated the PostgreSQL cases: `77/77`, `5/5`, then combined `82/82`. This proves non-deterministic full-sweep contention, not a product failure.
+- The real invariant was fixed with explicit `{ slim: true, includeArchived: false }` at dashboard provider-health and two engine usage-limit sites. Architecture passed `1/1`; usage-limit `49/49`; provider-health `11/11`.
+- Official serial full sweep passed core `4355/4356`, with one documented skip.
+- Engine full-package output is invalid host evidence: enforced no-TTY SafeExec blocks on scratch Git checkout/revert/reset/stash produced `93` files / `342` test failures, compounded by single-worker mock pollution. It is not a product regression and SafeExec must not be bypassed.
+
+Fresh acceptance-relevant gates after the micro-fix:
+
+- `pnpm lint` — PASS.
+- `pnpm typecheck` — PASS, `34/36`.
+- `pnpm build` — PASS, dashboard `7163` modules.
+- `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm test` — PASS: engine `299/299`, PostgreSQL `10/10`, CLI `65/65`, zero leaks.
+- Task 4 engine nine files — PASS, `177/177`.
+- Core Task 4 PostgreSQL two files — PASS, `49/49`.
+
+Luna remains unavailable with Terra substitution. AGY remains unavailable and native Sol review remains planned. These are pre-freeze gates, not acceptance.
+
+## Task 4 Proxy Closure Bound GREEN Transition — 2026-07-26
+
+Frozen candidate `b94dd45390d80ea13cb81feac0ff611960d9407d` was rejected by the native Sol lane with P0 `0` and P1 `1`: proxy disposal could wait forever before the durable held floor. That candidate and its earlier acceptance verdicts are invalidated.
+
+RED expected `NATIVE_MCP_PROXY_DISPOSAL_TIMEOUT` but observed `TEST_PROXY_DISPOSAL_BOUND_EXCEEDED`. GREEN applies one deadline, `min(policy.deadlineAtMs, closeStart + termGraceMs + killClosureMs)`, and closes the process group and proxy concurrently. A proxy timeout or error becomes `NATIVE_MCP_PROXY_DISPOSAL_FAILED`; the campaign remains `needsAttention`, its fence and registry slot stay held, and no closure receipt is issued.
+
+Fresh repair proof passed: focused regression `1/1`; lifecycle `11/11`; Task 4 engine nine-file lane `178/178`; core provider-controller plus CLI-session PostgreSQL lane `49/49`; engine typecheck; production and test ESLint; root lint; and `git diff --check`. The existing test-process `MaxListeners` warning remains visible and is not hidden.
+
+This repair is uncommitted and unaccepted. Fresh integrated gates and a new council on the final bytes are required. Task 5 still owns the long-lived runtime resolver/bootstrap and mixed queue. Current state is `task4_proxy_closure_bound_green_integrated_proof_active`.
+
+## Task 5 Corrected Plan-Freeze Acceptance And RED Start — 2026-07-26
+
+The corrected Task 5 plan freeze is accepted and implementation is authorized; RED is active. This receipt changes neither implementation nor any operator gate. The reviewed council candidate evidence remains plan SHA-256 `b33abe6c439278729c7790a862c0b816c643a2a5e7ffcd400cfdcbefc6cb7a52` and testing SHA-256 `0de24e2f511b87cd389594679d6ff8ad83d6065b9d87e3ae2a767a236ed7da72`; fresh behavioral and architecture councils both passed with P0 `0` and P1 `0`.
+
+Custody-before-boundary applies to every TaskExecutor merge entry: authoritative `requestMerge`, the legacy merge seam, and `routeGraphMergeFailureToRetry` (approximately `executor.ts:10597`). Each must resolve persisted campaign custody before `ensureWorkflowMergeBoundaryTask` or any equivalent boundary mutation; campaign custody keeps the authoritative path mutation-free until that decision, and the legacy seam fails closed.
+
+The exact five frozen top-level RED names are: `Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime`; `Task 5 RED: mixed due queue preserves ordinary dispatch and claims campaign work only through the fenced processor`; `Task 5 RED: production native CLI resolver binds persisted route lease and restart settlement`; `Task 5 RED: refuses drift dirty overlap and undeclared paths before mutation`; `Task 5 RED: reconciles interruption at each CAS boundary and consumes one exact approval`.
+
+Frozen initial RED file map: `packages/engine/src/__tests__/ccc-campaign-proof-admission.test.ts`; `packages/cli/src/commands/__tests__/ccc-native-proof-host.test.ts`; `packages/engine/src/__tests__/workflow-work-scheduler.test.ts`; `packages/engine/src/__tests__/workflow-work-processor.test.ts`; `packages/core/src/__tests__/postgres/taskstore-lifecycle.test.ts`; `packages/engine/src/__tests__/ccc-native-cli-public-route.real-pg.test.ts`; `packages/engine/src/__tests__/project-engine.test.ts`; `packages/engine/src/__tests__/workflow-merge-cancellation.test.ts`; new `packages/engine/src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts`; and new `packages/engine/src/__tests__/ccc-campaign-git-integration.real-pg.test.ts`. Exact executable per-file counts cannot be known until RED cases exist. The proof-runner mapping remains closed; counts freeze before mapping.
+
+### Task 5 Candidate Pre-Freeze Evidence — 2026-07-26
+
+Task 5 is a repaired dirty candidate, not accepted. Accepted product predecessor is `bb04cff1c0301b55f7b3aa7c8729eb5bd93070c0`; accepted plan-freeze documentation commit is `9a6ae1e41c62f6e4d2e7b5faf0f0a181972eccca`. Repair invalidated earlier candidate verdicts. Freeze one commit/tree, then rerun behavioral/PostgreSQL, static/build, and native-Sol review.
+
+Bootstrap P1 is accepted/fixed: RED expected running/rival but got failed/null from an unowned direct transition; GREEN claims exact candidate, writes owned bootstrap-refusal lease, and guards transition (`4/4` runtime real-PostgreSQL). Marker-only P1 is rejected: Task 3 generic consumer refusal does not govern Task 5's sanctioned processor. Frozen Task 5 routes marker-only work through `processDueWorkflowWorkItem` to fail closed; claimed-lease terminal failure is restart-visible and has zero provider/runner effect. Stale CLI typecheck P1 is partially accepted as environment-only: dashboard resolved stale local `@fusion` links; candidate-local current core/engine/i18n links restored proof without source, manifest, lockfile, install, or fetch change. Five exact RED labels occur once.
+
+Git landing requires exact active claimed approval lease immediately before CAS, CAS-success observation, and final exact ref reread before terminal effects; foreign-before/after-CAS races preserve approval/lease with zero terminal effects. Merge-retry custody lookup failure returns false with zero pre-dispatch mutation. Fresh proof: engine eight files `217/217`, core lifecycle `19/19`, CLI proof host `4/4`, total `240/240`; relevant core/engine/CLI/plugin-SDK typechecks and root lint pass; full typecheck `34/36`; full build passes including dashboard `7163` modules; built CLI top help and `prd --help` exit `0` and expose author/validate/compile. Manifest hashes unchanged: package `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`, workspace `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`, lock `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`. The 25 temporary package/plugin link views were removed and five copied proof directories were parked at `/tmp/ccc-task5-proof-hydration.xMWUPY`; only separately documented root/core hydration links may remain before commit.
+
+### Task 5 Second Candidate Repair Evidence — 2026-07-26
+
+`f6a9f67c8f7514cde934b27c97635d7877f18b05` is invalidated because its read-only adversarial reviewer changed bytes during freeze; all of its verdicts are invalid. `0abad636cda1dec8302194c3fdf5f105e5ea3cc1` is an unaccepted two-file descendant proving object-preparation/pre-intent replay but not intent-transaction rollback. The current repair adds only test-fault `after-intent-write-before-commit` inside the existing intent transaction after audit write plus one real-PG/Git regression.
+
+The targeted absent-test probe falsely exited `0` with `16` skipped/`0` executed. After adding the test, the true RED before fault behavior was `promise resolved instead of rejecting`; GREEN was `1` passed/`16` skipped. The exact GREEN case is `1/1`; paired pre-intent/intent rollback is `2/2`; full Git file is `17/17`; engine eight files are `219/219`; core lifecycle is `19/19`; built CLI proof-host is `4/4`; focused total is `242/242`; engine typecheck, changed-file ESLint, and diff check pass. Counts with `-t` skips are development evidence only; unfiltered file/set counts are candidate evidence.
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-git-integration.real-pg.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-proof-admission.test.ts src/__tests__/workflow-work-scheduler.test.ts src/__tests__/workflow-work-processor.test.ts src/__tests__/ccc-native-cli-public-route.real-pg.test.ts src/__tests__/project-engine.test.ts src/__tests__/workflow-merge-cancellation.test.ts src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts src/__tests__/ccc-campaign-git-integration.real-pg.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/taskstore-lifecycle.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @runfusion/fusion exec vitest run src/commands/__tests__/ccc-native-proof-host.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @fusion/engine typecheck
+```
+
+```sh
+pnpm exec eslint --no-ignore packages/engine/src/ccc-campaign-git-landing.ts packages/engine/src/__tests__/ccc-campaign-git-integration.real-pg.test.ts
+```
+
+```sh
+git diff --check
+```
+
+The recorder wording adjudication partially accepts the safety intent and rejects an artificial physical cross-layer recorder: native granular seam assertions are behaviorally equivalent, so no new abstraction was added. There is no acceptance claim; a new commit/tree and fresh behavioral/PostgreSQL, static/build, and adversarial lanes remain mandatory.
+
+### Task 5 Retry Authority Repair Evidence — 2026-07-27
+
+Candidate `0a45396a597f3c67e2fd9e9d36cb6e58cec4b050` is rejected despite behavioral/static PASS because native Sol found P0 `0` and P1 `1`. Root verified and accepted the finding: `routeGraphMergeFailureToRetry` swallowed campaign requester/missing-control errors, persisted, and returned `true`. The exact RED signature for `Task 5 RED: campaign graph retry refuses requester failure or missing exact custody authority` was resolved `true` instead of rejecting. GREEN rethrows campaign requester/missing-control failures before warning, persistence, or `true`, while ordinary behavior remains unchanged; REFACTOR removed the new explicit-`any` cast.
+
+The focused case is `1/1`; the unfiltered workflow file is `15/15`; engine eight files are `220/220`; core is `19/19`; CLI is `4/4`; total is `243/243`. The stale `219` report used a 16-test Git subtotal and was rejected; the exact footer is `220` (`Git 17` plus `workflow 15`). Focused `-t` skips are development evidence only; unfiltered counts are candidate evidence. Hydration proof views must be parked before commit. There is no acceptance claim: this is a dirty repair requiring a new commit/tree and all three council lanes.
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-merge-cancellation.test.ts -t 'Task 5 RED: campaign graph retry refuses requester failure or missing exact custody authority' --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-merge-cancellation.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-proof-admission.test.ts src/__tests__/workflow-work-scheduler.test.ts src/__tests__/workflow-work-processor.test.ts src/__tests__/ccc-native-cli-public-route.real-pg.test.ts src/__tests__/project-engine.test.ts src/__tests__/workflow-merge-cancellation.test.ts src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts src/__tests__/ccc-campaign-git-integration.real-pg.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/taskstore-lifecycle.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @runfusion/fusion exec vitest run src/commands/__tests__/ccc-native-proof-host.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @fusion/engine typecheck
+```
+
+```sh
+pnpm lint
+```
+
+```sh
+pnpm exec eslint packages/engine/src/executor.ts
+```
+
+```sh
+git diff --check
+```
+
+### Task 5 Frozen Acceptance Evidence — 2026-07-27
+
+Task 5 is accepted as the component/predecessor only: product commit `fed32801b58a88cd5d037dbbd639afd00b910c22`, rejected parent `0a45396a597f3c67e2fd9e9d36cb6e58cec4b050`, and tree `d568d67b6d37b812df1d4f9695dc2696e7d00beb`. The total-versus-accepted plan is 39 paths; path digest `4b025ed1af9f52e55b87aad7a5fcfc8a8270f9008a363594244dabd50609ce1c`; binary digest `a3ace83644fc1d6241f9e4d5db2dd193d4c6e8065928aab7af238bff58bb4580`. The behavioral exact-replacement lane passed engine `220`, core `19`, CLI `4`, total `243`, zero skips, P0/P1/P2=`0`; the initial interrupted lane is rejected as incomplete.
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-proof-admission.test.ts src/__tests__/workflow-work-scheduler.test.ts src/__tests__/workflow-work-processor.test.ts src/__tests__/ccc-native-cli-public-route.real-pg.test.ts src/__tests__/project-engine.test.ts src/__tests__/workflow-merge-cancellation.test.ts src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts src/__tests__/ccc-campaign-git-integration.real-pg.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/taskstore-lifecycle.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @runfusion/fusion exec vitest run src/commands/__tests__/ccc-native-proof-host.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm pretest
+pnpm lint
+pnpm typecheck
+pnpm build
+```
+
+```sh
+node packages/cli/dist/bin.js --help
+node packages/cli/dist/bin.js prd --help
+```
+
+```sh
+git diff --check
+```
+
+Static pretest/lint/typecheck `34/36`/build including dashboard `7163` modules/built CLI top-level and `prd` subcommand/diff/hash/non-ancestry passed with P0/P1/P2=`0`. The literal standalone `prd` binary finding is rejected because the declared bins are `agent-browser`, `fn`, and `fusion`; the accepted contract is the built CLI subcommand, with no install or manifest authority. Adversarial review passed P0/P1/P2=`0`. Pre-receipt hashes: plan `32b80f9a13bade1183546beb2388283b4872f7c9a1313bd96309f6d145c8c127`, testing `981d7c5f21852de4e8faf405f2ae4ba7ae1e10c43a25e3441e1544bc4a703902`; manifests are unchanged at their full hashes. Status is root/core only; Wave 6/7 are non-ancestors and earlier candidates are rejected. No claim extends to literal full completion, providers, or live state. Next state is Task 6 RED for local mixed-provider synthetic work using deterministic fakes/native transports only.
+
+### Task 6 Local Acceptance Proof Receipt — 2026-07-27
+
+The candidate is locally green but uncommitted, unaccepted, and pending native Sol council review. Use the green result only as pre-freeze evidence; it does not authorize Task 7/8 freeze, a commit, or any live-provider activity.
+
+- Product failures must be distinguished from proof plumbing: the first whole-workspace build exposed stale `@fusion/core` hydration links. A temporary candidate-local link view made the existing bytes visible; no install, fetch, manifest, or lockfile change occurred. Read-only Wave-3-retry hydration was required only for that build proof.
+- Regression guards: imported malformed prompt output refuses (`6/6`); parent abort crosses split/join and settles failure (`24/24`); prompt-mode cancellation aborts and disposes without the prior `250ms` timeout (`7/7`); the mixed Pi/scoped-handler/Git-landing local PostgreSQL acceptance proves durable cancellation/restart with no redispatch (`2/2`).
+- Fresh checks passed: engine `91/91` and `136/136`, PostgreSQL/Git `28/28`, core/importer PostgreSQL `69/69` + `46/46`, core and engine typechecks, package and workspace build, whole lint, standard gate core PostgreSQL `10/10`, engine `299/299`, CLI `65/65`, and `git diff --check`.
+- Manifests are unchanged: package `cf1e924...`, workspace `0e5f3a...`, lock `09244d...`. Treat a green local run as false if it silently hydrates different package bytes, bypasses the abort/restart assertions, or is presented as accepted before council review.
+- Extension identity is part of the sealed scoped-provider binding: focused proof must refuse a persisted-versus-runtime extension mismatch before any lease, Git, core permit, or handler work, rather than letting a drifted extension borrow a transport-only binding.
+
+### Task 6 Accepted Proof Receipt — 2026-07-27
+
+Task 6 is accepted at commit `7dc608a3537a79a67c347051de5e93186bf1c050`, parent `ce6274b74927fe46658dd5ec70d6aa46c63a348a`, tree `028142c1ff3492f2e3650141c9d71dbdba04eacc`, on `agent/ccc-fusion-task4-preprovider`. The accepted change over the rejected parent is exactly two files: `packages/engine/src/workflow-graph-executor.ts` and `packages/engine/src/__tests__/workflow-node-handler-extensions.test.ts` (path digest `65a2ff05015fcdca4616c96d87f0f357c1a9426f1281fcf321c0c909ce550d43`, binary diff digest `ab92e200ddd043433ff09830e4f72f4fe7c66057a8ac0b42b49c4713afa999bc`).
+
+Accepted invariant: a scoped workflow node handler cannot alter provider-attempt identity through its provider controller. The sealed wrapper validates any submitted dispatch as a plain object with exactly the five sealed fields strictly equal to the executor-derived descriptor and then delegates the sealed original (validate-then-substitute); forged `dispatchKey`/`providerId`/`modelId` refuses with `WORKFLOW_NODE_PROVIDER_REFUSED` before the raw controller is reached, and exact-value clones remain compatible.
+
+Frozen Task 6 proof inventory on the accepted bytes: core campaign PostgreSQL `69/69`; importer PostgreSQL `46/46`; engine provider/cancellation group `94/94`; campaign execution/proof/Git `136/136`; real PostgreSQL/Git acceptance `28/28` (one non-failing `MaxListenersExceededWarning`, watch-only); standard gate core PostgreSQL `10/10`, engine `299/299`, CLI `65/65`; pretest, whole lint, core/engine typechecks, core/engine/workspace builds, and `git diff --check` all pass; package/workspace/lock manifests unchanged at `cf1e924d…`, `0e5f3ad8…`, `09244dac…`. Built-CLI user exercise: top help exposes `prd`; `prd --help` exposes author/validate/compile; validate success exit `0`; foreign-target refusal exit `1` (`CCC_PRD_FOREIGN_TARGET`); usage error exit `2`; sidecar path-escape write refusal exit `1`; deterministic author route produces a validating sidecar with byte-exact protected-action spans.
+
+Council: three independent exact-byte lanes (behavioral `373/373`, static/build/CLI/identity, adversarial) all returned PASS with P0/P1 `0/0`. Residual non-blocking P2 notes: the sealed wrapper's `reconcile` is a bare passthrough whose sound gate is core's unguessable `controllerToken` plus canonical identity equality in `settleCccProviderAttemptAndApproval` (engine-layer symmetry check is a candidate hardening); pre-existing `contextPatch` merge into shared run context can leak a handler's own sealed wrapper but cannot forge a new attempt identity; `prd --help` renders the full top-level help (accepted contract is exit `0` exposing author/validate/compile).
+
+### Task 7 Accepted Proof Receipt — 2026-07-27
+
+Task 7 is accepted at commit `f0207a729200ed26047b415035aa66e91319e8e5`, parent `346f42876d260dd28b9e23f9a9d43f53cf29effb`, tree `8f59199b072124f3141dec79aa9b5a3d330dee65`, sole changed path `scripts/run-ccc-pg-proof.mjs`. An earlier candidate `f5ce01a2d8b1c14baebdffa21a7ec8de2d5e09a3` was rejected by adversarial review for one P1: provenance fields attested the last commit rather than the proved working tree, captured post-run with ambient environment and no timeout.
+
+Accepted runner behavior: closed Wave 6 mapping with five commands and exactly `69 + 46 + 94 + 136 + 28 = 373` unique names (core campaign PostgreSQL, importer PostgreSQL, engine provider/cancellation, campaign execution/proof/Git, real PostgreSQL/Git acceptance); Wave 4 and Wave 5 command definitions and all ten legacy expected-name arrays byte-identical; supervisor policy rejects stop errors, interruption, lifecycle errors, unknown/duplicate/missing result rows, timeouts, forced kills, spawn errors, signals, and nonzero exits; machine-result validation reconciles `numPassedTests` against the closed inventory, requires `machineResults: true`, and the parent recomputes result paths instead of trusting the audited child; the supervisor result marker must appear exactly once; the report carries pre-run scrubbed-env bounded-timeout provenance (`gitHead`, `gitTree`, `workingTreeDirty`, `trackedDirtyPaths`), manifest hashes, exact `perCommand` counts, and `cleanupState`.
+
+Council on frozen bytes: verification lane PASS with zero findings (full Wave 6 `373/373` with `gitHead`/`gitTree` equal to the frozen identity, `workingTreeDirty: false`, `trackedDirtyPaths: 0`, manifests exact, postgres data dir removed on pass with the report preserved); adversarial lane PASS with P0/P1 `0/0` (probed foreign `GIT_DIR` redirection defeated by the scrubbed env; honest dirty labeling; all four custody hardenings rejecting probe shapes; self-tests exercising the real production functions). Designed refusal evidence: `--wave 5` on current bytes fails closed at counter reconciliation (`numPassedTests 46 does not match the closed expected-name inventory count 40` for `ccc-prd-core-import`), and `--wave 4` passes unchanged.
+
+Recorded dispositions: the dirty-flag boundary excludes untracked files, `assume-unchanged`, and ambient-gitconfig suppression (candidate hardening, non-blocking); merge-readiness must assert `report.gitHead === <frozen HEAD> && report.workingTreeDirty === false` rather than reading `passed` alone (binding Tasks 9–10 rule); the canonical protected-action test file is intentionally absent from the Wave 6 mapping and folds in during the Task 9 final proof bundle with a fresh mini-council.
+
+### Task 8 Accepted Proof Receipt — 2026-07-27
+
+Task 8 is accepted across canonical protected-action slice `346f42876d260dd28b9e23f9a9d43f53cf29effb` and trim-invariant repair `c8aa58471c2192c0e9fb2fe4509eb1c2d73005bb` (tree `5e5eeffba51da6bdddfe23d1cc8016a3f255bde8`). The accepted spine ends at the repair commit.
+
+Product behavior: task `protectedActionIds` are enforced against the exact runtime rule (`packages/core/src/ccc-campaign/store.ts` `requireCanonicalProtectedActionIds`) at the earliest boundaries — authoring refuses padded or malformed IDs as invalid proposals before mapping, authored sidecars emit duplicate-free canonically sorted IDs, and `validateSidecar` refuses non-well-formed, duplicate, or non-canonical sets with `CCC_PRD_PROTECTED_ACTION_IDS_NOT_CANONICAL` on both `prd validate` and `prd compile`. Padded IDs are refused, never silently trimmed, because trimming would rewrite the identity reference between task `protectedActionIds` and `protectedActions[].id`. One shared engine helper (`packages/engine/src/ccc-prd/protected-action-ids.ts`) is consumed by both sites so they cannot re-drift; core remains the independent runtime authority. This closes the gap the Neo canary exposed: a packet that passed author/validate/compile/import with zero diagnostics and failed only at mid-run campaign-context resolution.
+
+Packet evidence: ccc-lab-super and ccc-autocode-neo both reached COMPLETE local preflight in disposable targets (disposable clone at the pinned base commit; scratch proposal variant repointing only the target path and admitted write roots; unique disposable loopback database per run, dropped after). Chains proven: built-CLI author → validate → compile, programmatic `importCccPrdBundle` → `inspectCccPrdImport` → idempotent re-import → `reconcileCccPrdImport` → `processDueWorkflowWorkItem` to completion with real fusion-native proof-admission audits (3 passes per packet; lab's `custody_gate.py` hash-verified and never executed), fresh-TaskStore restart inspection with identical durable state and zero redispatch, and zero-escape verification (only `.fusion/tasks` and `.fusion/artifacts` under the disposable clone; live repositories byte-identical before and after). Original packet bytes preserved byte-for-byte throughout; the Neo canary fixture (`packages/engine/src/__tests__/fixtures/ccc-prd-canaries/ccc-autocode-neo-v0.5.0/`) pins PRD `af47129a…059d1` and sidecar `dc83f089…ec96d`. The deterministic proposal route is the sanctioned no-live-provider path; live provider-backed canaries remain operator-gated.
+
+Reviews: first slice review returned one accepted P1 (trim invariant missing at compile time — a consistently padded ID validated clean and threw `CccCampaignContextError` mid-run); the repair was re-reviewed fresh on exact bytes and returned PASS with zero findings, including proof that both new tests fail on the pre-repair bytes and the frozen lab oracle remains byte-stable (`26/26`).
+
+### Task 9 Wave 6 Fold-In Receipt And Mapping Supersession — 2026-07-27
+
+Commit `74f42cf1b646d38ac1098dd7a14e04e1df2cfbca` folded `packages/engine/src/__tests__/ccc-prd-protected-action-canonical.test.ts` into the closed Wave 6 mapping as a sixth command (`ccc-prd-protected-action-canonical`, six closed names), exactly as the Task 7 receipt scheduled. The change is pure addition: zero removed lines, the five frozen Task 6 command inventories and the Wave 4/5 selection path byte-identical. This supersedes the Task 7 receipt's "five commands / `373` names" description: the accepted Wave 6 mapping is now six commands / `379` unique names (`69 + 46 + 94 + 136 + 28 + 6`). Proof on the final frozen candidate `ad2624ff1cf98f29eb656d2809c96f348635c6fa`: full `--wave 6` PASS with all six `perCommand` rows exact, `policyError: null`, `gitHead`/`gitTree` equal to the frozen identity, `workingTreeDirty: false`, `trackedDirtyPaths: 0`, cleanup `removed-on-pass` with the report preserved.
+
+### Task 9 Recorded Proof Boundaries — 2026-07-27
+
+- **Closed-mapping corpus boundary (P2, recorded):** the closed wave mappings are frozen acceptance inventories for their specific waves, not a census of every `ccc*.test.ts` file. Roughly nineteen ccc test files (~162 tests), including `packages/core/src/__tests__/postgres/ccc-campaign-provider-attempt.pg.test.ts`, appear in no wave mapping; their proof coverage lives in `pnpm test:gate`, the focused per-task acceptance receipts above, and the standard engine/core lanes. No automatic ratchet detects a ccc test file absent from all mappings; adding one is future work, not a current acceptance requirement.
+- **Provenance trust boundary (P2, recorded):** the runner's provenance capture resolves `git` from `PATH`, so a substituted git binary could forge `gitHead`/`workingTreeDirty` — a shape distinct from the already-dispositioned foreign-`GIT_DIR` and ambient-gitconfig attacks. The binding merge-readiness rule is therefore strengthened: compare `report.gitHead` against an INDEPENDENTLY observed `git rev-parse HEAD`, never the report field alone. Both the final proof bundle and the final adversarial challenge practiced this: both independently re-derived HEAD, tree, and tracked-dirty state and matched the report exactly.
+- **Dirty-flag boundary (restated):** `workingTreeDirty` covers tracked files only (`--untracked-files=no`); it is a no-tracked-drift attestation, not a clean-room claim.
+
+### Task 9 Worktree Inventory And Disposition — 2026-07-27
+
+Authoritative `git worktree list` inventory at final freeze, every non-clean state dispositioned:
+
+- `ccc-fusion` (primary, `main` @ `d665917`): one pre-existing untracked `fusion-modification-report.txt` — preserved historical report, keep; documented in the vault checkpoint's generated-instruction rollout section.
+- `task4-preprovider-admission` (`agent/ccc-fusion-task4-preprovider`, the accepted spine writer): tracked-clean at the frozen candidate; untracked read-only dependency-hydration symlinks into `wave-2`/`wave-3-retry`, plus candidate-local link views inside `packages/plugin-sdk/node_modules`, `packages/cli/node_modules`, and `packages/engine/node_modules` whose `@fusion/*` entries (ten distinct targets: core, dashboard, desktop, droid-cli, engine, i18n, mobile, pi-claude-cli, pi-llama-cpp, plugin-sdk) resolve relatively into this worktree's own packages — intentional proof plumbing so the accepted bytes remain provable in place; remove only when the worktree itself is retired. (Correction 2026-07-27: an earlier revision of this bullet miscounted the link views as three; the three are the *hosting* `node_modules` directories, the `@fusion/*` link targets number ten.)
+- `task2-plan-repair` (@ `c59a463`): one modified `packages/core/src/workflow-extension-provenance.ts` — the unstaged provenance experiment quarantined as non-accepted evidence (recorded in the Task 4 foundation section above); retained for diagnosis, never staged.
+- `wave-5-integration` (@ `3f04bf4`): four modified files (`docs/plans/2026-07-24-ccc-fusion-conversion-continuation.md`, `docs/testing.md`, `packages/engine/src/__tests__/ccc-native-mcp-provider-matrix.test.ts`, `packages/engine/src/cli-agent/ccc-native-mcp-proxy.ts`) — the recorded evidence-custody incident bytes: invalidated, isolated from the accepted spine, neither reverted nor overwritten.
+- `wave-1`, `wave-2`, `wave-3-retry`, `wave-4`, `wave-5-speculative`, `wave-6-speculative`, `wave-7-speculative`: clean at their recorded generated-instruction commits; `wave-3-retry` additionally serves as the read-only hydration source. Speculative Wave 6/7 worktrees hold only discarded evidence per the disposition ledger above.
+- `wave-3`: revoked; never entered; listed for completeness only.

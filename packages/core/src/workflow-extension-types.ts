@@ -1,5 +1,8 @@
 import type { Task, TaskDetail } from "./types.js";
 import type { WorkflowIr, WorkflowIrNode } from "./workflow-ir-types.js";
+import type { CccPrdProof } from "./ccc-prd/types.js";
+import type { CccCampaignProviderControllerDecision, CccCampaignProviderDispatchInput } from "./ccc-campaign/provider-controller.js";
+import type { CccProviderAttemptScope, CccProviderAttemptSettlementInput } from "./ccc-campaign/types.js";
 
 export const WORKFLOW_EXTENSION_SCHEMA_VERSION = 1 as const;
 
@@ -11,7 +14,8 @@ export type WorkflowExtensionKind =
   | "work-engine"
   | "node-handler"
   | "verdict-provider"
-  | "merge-fact-provider";
+  | "merge-fact-provider"
+  | "proof-admission";
 
 export interface WorkflowExtensionBaseContribution {
   extensionId: string;
@@ -91,12 +95,22 @@ export type WorkflowNodeExtensionResult =
   | { outcome: "success" | "failure"; value?: string; contextPatch?: Record<string, unknown> }
   | { outcome: `outcome:${string}`; value?: string; contextPatch?: Record<string, unknown> };
 
+/** The actual provider route, not caller-asserted extension metadata. */
+export type WorkflowNodeProviderDispatchInput = CccCampaignProviderDispatchInput;
+
+export type WorkflowNodeProviderController = Readonly<{
+  preDispatch(input: WorkflowNodeProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
+  reconcile(input: CccProviderAttemptSettlementInput): Promise<CccProviderAttemptScope>;
+}>;
+
 export interface WorkflowNodeHandlerInput {
   task: TaskDetail;
   workflow: WorkflowIr;
   node: WorkflowIrNode;
   context: Record<string, unknown>;
   signal?: AbortSignal;
+  providerController?: WorkflowNodeProviderController;
+  providerDispatch?: WorkflowNodeProviderDispatchInput;
 }
 
 export type WorkflowNodeExtensionHandler =
@@ -158,13 +172,48 @@ export interface AutoMergeFactProviderExtensionContribution extends WorkflowExte
   configSchema?: WorkflowExtensionConfigSchema;
 }
 
+export type WorkflowProofAdmissionEvaluatorInput = Readonly<{
+  campaignId: string;
+  importId: string;
+  bundleHash: string;
+  manifestHash: string;
+  taskId: string;
+  nodeId: string;
+  workItemId: string;
+  owner: string;
+  attempt: number;
+  proofDefinitionSha256: string;
+  inputSha256: string;
+  proof: Readonly<CccPrdProof>;
+  signal: AbortSignal;
+}>;
+
+export type WorkflowProofAdmissionEvaluatorResult = Readonly<{
+  outcome: "pass" | "fail";
+  evaluatedInputSha256: string;
+  summary: string;
+}>;
+
+export type WorkflowProofAdmissionEvaluator = (
+  input: WorkflowProofAdmissionEvaluatorInput,
+) => Promise<WorkflowProofAdmissionEvaluatorResult>;
+
+export interface WorkflowProofAdmissionExtensionContribution extends WorkflowExtensionBaseContribution {
+  kind: "proof-admission";
+  fallback: "failClosed";
+  proofVersion: string;
+  evaluate: WorkflowProofAdmissionEvaluator;
+  configSchema?: never;
+}
+
 export type WorkflowExtensionContribution =
   | WorkflowColumnMetadataExtensionContribution
   | WorkflowMovePolicyExtensionContribution
   | WorkflowWorkEngineExtensionContribution
   | WorkflowNodeHandlerExtensionContribution
   | TaskVerdictProviderExtensionContribution
-  | AutoMergeFactProviderExtensionContribution;
+  | AutoMergeFactProviderExtensionContribution
+  | WorkflowProofAdmissionExtensionContribution;
 
 export interface WorkflowExtensionMetadata {
   extensionId: string;

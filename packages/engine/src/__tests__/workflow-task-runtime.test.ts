@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Settings, TaskDetail, WorkflowIr, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
+import type {
+  CccCampaignTaskContext,
+  Settings,
+  TaskDetail,
+  WorkflowIr,
+  WorkflowWorkItem,
+  WorkflowWorkItemState,
+} from "@fusion/core";
 
 import { WorkflowTaskRuntime, type WorkflowTaskRuntimeDeps } from "../workflow-task-runtime.js";
 import type { WorkflowNodeResult } from "../workflow-graph-executor.js";
@@ -33,6 +40,37 @@ function selectedIr(): WorkflowIr {
       { from: "execute", to: "zend", condition: "failure" },
     ],
   };
+}
+
+function selectedSemanticIr(): WorkflowIr {
+  return {
+    version: "v1",
+    name: "selected-semantic",
+    nodes: [
+      { id: "start", kind: "start" },
+      { id: "semantic", kind: "prompt", config: { cccPrdTaskId: "TASK-SEMANTIC" } },
+      { id: "end", kind: "end" },
+    ],
+    edges: [
+      { from: "start", to: "semantic", condition: "success" },
+      { from: "semantic", to: "end", condition: "success" },
+      { from: "semantic", to: "end", condition: "failure" },
+    ],
+  };
+}
+
+function campaignProofContext(taskId: string): CccCampaignTaskContext {
+  return {
+    schema: "ccc-campaign.context.v1" as CccCampaignTaskContext["schema"],
+    taskId,
+    semanticTaskId: taskId,
+    proofIds: [],
+    proofs: [],
+    admittedWriteRoots: [],
+    protectedActions: [],
+    requestCount: 0,
+    activeActionLeases: {},
+  } as unknown as CccCampaignTaskContext;
 }
 
 function recordingPrimitives(
@@ -135,7 +173,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       runCustomNode: async () => ({ outcome: "success" }),
     };
@@ -178,6 +216,620 @@ describe("WorkflowTaskRuntime", () => {
     expect(result.context.preparedKey).toBe("from-prepare");
     expect(result.context.executeKey).toBe("from-execute");
     expect(workflowSelectionReads).toBe(1);
+  });
+
+  it("Task 3 RED: direct persisted campaign execution requires a work-item fence before workflow resolution", async () => {
+    const resolve = vi.fn(() => ({ workflowId: "WF-001", stepIds: [] }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: resolve,
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        getCccCampaignContextForTask: async () => ({ campaignId: "CAMPAIGN-1" }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const result = await runtime.run(task, flagOff);
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: [],
+      reason: "ccc-campaign-work-item-fence-required",
+    });
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unwired", undefined, "ccc-campaign-custody-lookup-unwired"],
+    ["missing", async () => null, "ccc-campaign-custody-missing"],
+    ["error", async () => { throw new Error("custody unavailable"); }, "ccc-campaign-custody-lookup-error"],
+  ])("Task 3 RED: fenced runtime %s custody refuses before workflow resolution", async (_case, getCccCampaignContextForTask, reason) => {
+    const resolve = vi.fn(() => ({ workflowId: "WF-001", stepIds: [] }));
+    const handler = vi.fn(async () => ({ outcome: "success" as const }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: resolve,
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        ...(getCccCampaignContextForTask ? { getCccCampaignContextForTask } : {}),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: { prompt: handler },
+    });
+
+    const result = await runtime.run(task, flagOff, {
+      workItemFence: {
+        workItemId: "WORK-UNMARKED-1",
+        leaseOwner: "worker-1",
+        attempt: 1,
+        runId: "ccc-prd:import-1",
+        eventTimestamp: "2026-07-25T12:00:00.000Z",
+      },
+    });
+
+    expect(result).toMatchObject({ disposition: "failed", outcome: "failure", visitedNodeIds: [], reason });
+    expect(resolve).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["wrong owner", "wrong-owner"],
+    ["wrong attempt", "wrong-attempt"],
+    ["wrong run", "wrong-run"],
+    ["expired", "expired"],
+    ["validator error", "validator-error"],
+  ])("Task 3 RED: campaign fence preflight refuses %s before orchestration-only workflow resolution", async (_case, refusal) => {
+    const resolve = vi.fn(() => ({ workflowId: "WF-orchestration", stepIds: [] }));
+    const handler = vi.fn(async () => ({ outcome: "success" as const }));
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => {
+      throw new Error(refusal);
+    });
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: resolve,
+        getWorkflowDefinition: async () => ({
+          ir: {
+            version: "v1",
+            name: "orchestration-only",
+            nodes: [{ id: "start", kind: "start" }, { id: "end", kind: "end" }],
+            edges: [{ from: "start", to: "end", condition: "success" }],
+          },
+        }),
+        getCccCampaignContextForTask: async () => ({ campaignId: "CAMPAIGN-1" }),
+        assertCccCampaignWorkflowLeaseFence,
+      } as WorkflowTaskRuntimeDeps["store"],
+      primitives: recordingPrimitives([]),
+      runCustomNode: handler,
+    });
+
+    const result = await runtime.run(task, flagOff, {
+      workItemFence: {
+        workItemId: "WORK-1",
+        leaseOwner: "worker-1",
+        attempt: 2,
+        runId: "ccc-prd:import-1",
+        eventTimestamp: "2026-07-25T12:00:00.000Z",
+      },
+    });
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: [],
+      reason: "ccc-campaign-work-item-fence-refused",
+    });
+    expect(resolve).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("Task 3 RED: campaign fence preflight refuses an unwired validator before workflow resolution", async () => {
+    const resolve = vi.fn(() => ({ workflowId: "WF-orchestration", stepIds: [] }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: resolve,
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        getCccCampaignContextForTask: async () => ({ campaignId: "CAMPAIGN-1" }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const result = await runtime.run(task, flagOff, {
+      workItemFence: {
+        workItemId: "WORK-1",
+        leaseOwner: "worker-1",
+        attempt: 2,
+        runId: "ccc-prd:import-1",
+        eventTimestamp: "2026-07-25T12:00:00.000Z",
+      },
+    });
+
+    expect(result.reason).toBe("ccc-campaign-work-item-fence-validator-unwired");
+    expect(result.visitedNodeIds).toEqual([]);
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("Task 3 RED: a valid campaign fence preflight admits an orchestration-only workflow", async () => {
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-orchestration", stepIds: [] }),
+        getWorkflowDefinition: async () => ({
+          ir: {
+            version: "v1",
+            name: "orchestration-only",
+            nodes: [{ id: "start", kind: "start" }, { id: "end", kind: "end" }],
+            edges: [{ from: "start", to: "end", condition: "success" }],
+          },
+        }),
+        getCccCampaignContextForTask: async () => ({ campaignId: "CAMPAIGN-1" }),
+        assertCccCampaignWorkflowLeaseFence,
+      } as WorkflowTaskRuntimeDeps["store"],
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+    const fence = {
+      workItemId: "WORK-1",
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const result = await runtime.run(task, flagOff, { workItemFence: fence });
+
+    expect(result.disposition).toBe("completed");
+    expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledWith({
+      workItemId: fence.workItemId,
+      originTaskId: task.id,
+      leaseOwner: fence.leaseOwner,
+      attempt: fence.attempt,
+      runId: fence.runId,
+    });
+  });
+
+  it("Task 4 RED: fenced campaign run identity comes from the persisted work-item fence", async () => {
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
+    const getCccCampaignContextForTask = vi.fn(async () =>
+      ({ campaignId: "CAMPAIGN-1" } as CccCampaignTaskContext),
+    );
+    const runtime = new WorkflowTaskRuntime({
+      runId: "ambient-deps-run-id",
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-orchestration", stepIds: [] }),
+        getWorkflowDefinition: async () => ({
+          ir: {
+            version: "v1",
+            name: "orchestration-only",
+            nodes: [{ id: "start", kind: "start" }, { id: "end", kind: "end" }],
+            edges: [{ from: "start", to: "end", condition: "success" }],
+          },
+        }),
+        getCccCampaignContextForTask,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const fence = {
+      workItemId: "WORK-FENCE-1",
+      leaseOwner: "worker-1",
+      attempt: 1,
+      runId: "ccc-prd:import-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const result = await runtime.run(task, flagOff, { workItemFence: fence });
+
+    expect(result.context["workflow:run-id"]).toBe(fence.runId);
+    expect(getCccCampaignContextForTask).toHaveBeenCalledTimes(1);
+    expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledWith({
+      workItemId: fence.workItemId,
+      originTaskId: task.id,
+      leaseOwner: fence.leaseOwner,
+      attempt: fence.attempt,
+      runId: fence.runId,
+    });
+  });
+
+
+  it("Task 4 RED: freezes the work-item fence before the first await", async () => {
+    let releaseLookup!: () => void;
+    let lookupEntered = false;
+    let capturedFenceInput: {
+      workItemId: string;
+      originTaskId: string;
+      leaseOwner: string;
+      attempt: number;
+      runId: string;
+    } | undefined;
+
+    const getCccCampaignContextForTask = vi.fn(async () => {
+      lookupEntered = true;
+      await new Promise<void>((resolve) => {
+        releaseLookup = resolve;
+      });
+      return { campaignId: "CAMPAIGN-1" } as CccCampaignTaskContext;
+    });
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async (input) => {
+      capturedFenceInput = input;
+    });
+
+    const resolve = vi.fn(() => ({ workflowId: "WF-orchestration", stepIds: [] }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: resolve,
+        getWorkflowDefinition: async () => ({
+          ir: {
+            version: "v1",
+            name: "orchestration-only",
+            nodes: [{ id: "start", kind: "start" }, { id: "end", kind: "end" }],
+            edges: [{ from: "start", to: "end", condition: "success" }],
+          },
+        }),
+        getCccCampaignContextForTask,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const fence = {
+      workItemId: "WORK-1",
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const processing = runtime.run(task, flagOff, { workItemFence: fence });
+
+    await vi.waitFor(() => expect(lookupEntered).toBe(true));
+    fence.workItemId = "WORK-MUTATED";
+    fence.leaseOwner = "worker-2";
+    fence.attempt = 9;
+    fence.runId = "ccc-prd:import-mutated";
+    fence.eventTimestamp = "2026-07-25T13:00:00.000Z";
+    releaseLookup();
+
+    const result = await processing;
+
+    expect(result.disposition).toBe("completed");
+    expect(capturedFenceInput).toEqual({
+      workItemId: "WORK-1",
+      originTaskId: task.id,
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-1",
+    });
+    expect(getCccCampaignContextForTask).toHaveBeenCalledTimes(1);
+    expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledTimes(1);
+  });
+
+  it("Task 4 RED: resolves semantic task via store.getTask before proof admission", async () => {
+    const getTask = vi.fn(async () => ({ id: "TASK-SEMANTIC" } as TaskDetail));
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
+    const recordFencedCccCampaignProofAudit = vi.fn();
+    const handler = vi.fn(async () => ({ outcome: "success" as const }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-SEM", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedSemanticIr() }),
+        getTask,
+        getCccCampaignContextForTask: async (taskId: string) => campaignProofContext(taskId),
+        recordFencedCccCampaignProofAudit,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: handler,
+    });
+    const fence = {
+      workItemId: "WORK-SEM-1",
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-semantic-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const result = await runtime.run(task, flagOff, {
+      workItemFence: fence,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.disposition).toBe("failed");
+    expect(result.outcome).toBe("failure");
+    expect(getTask).toHaveBeenCalledTimes(1);
+    expect(getTask).toHaveBeenCalledWith("TASK-SEMANTIC");
+    expect(handler).not.toHaveBeenCalled();
+    expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledTimes(1);
+    expect(recordFencedCccCampaignProofAudit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unwired", undefined, /CCC campaign semantic task|lookup|semantic/i],
+    ["missing", async () => undefined, /CCC campaign semantic task TASK-SEMANTIC is missing/i],
+    ["throws", async () => { throw new Error("resolver failed"); }, /CCC campaign semantic task TASK-SEMANTIC lookup failed/i],
+    ["mismatched-id", async () => ({ id: "TASK-OTHER" } as TaskDetail), /CCC campaign semantic task identity does not match TASK-SEMANTIC/i],
+  ])("Task 4 RED: semantic resolver refuses before proof/evaluator when getTask is %s", async (_case, getTaskResult, token) => {
+    const signal = new AbortController().signal;
+    const getTask = getTaskResult
+      ? vi.fn(async (_taskId: string) => getTaskResult())
+      : undefined;
+    const handler = vi.fn(async () => ({ outcome: "success" as const }));
+    const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
+    const recordFencedCccCampaignProofAudit = vi.fn();
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-SEM", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedSemanticIr() }),
+        ...(getTask ? { getTask } : {}),
+        getCccCampaignContextForTask: async (taskId: string) => campaignProofContext(taskId),
+        recordFencedCccCampaignProofAudit,
+        assertCccCampaignWorkflowLeaseFence,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: handler,
+    });
+    const fence = {
+      workItemId: "WORK-SEM-1",
+      leaseOwner: "worker-1",
+      attempt: 2,
+      runId: "ccc-prd:import-semantic-1",
+      eventTimestamp: "2026-07-25T12:00:00.000Z",
+    };
+
+    const result = await runtime.run(task, flagOff, { workItemFence: fence, signal });
+
+    expect(result.disposition).toBe("failed");
+    expect(result.outcome).toBe("failure");
+    if (getTask) {
+      expect(getTask).toHaveBeenCalledTimes(1);
+      expect(getTask).toHaveBeenCalledWith("TASK-SEMANTIC");
+    }
+    expect(handler).not.toHaveBeenCalled();
+    expect(recordFencedCccCampaignProofAudit).not.toHaveBeenCalled();
+    expect(result.context["node:semantic:error"] ?? result.reason ?? "").toMatch(token);
+  });
+
+  it("Task 4 RED: ordinary unfenced workflow does not perform semantic task substitution", async () => {
+    const getTask = vi.fn(async () => ({ id: "TASK-SEMANTIC" } as TaskDetail));
+    const calls: string[] = [];
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-SEM", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedSemanticIr() }),
+        getTask,
+      },
+      primitives: recordingPrimitives(calls),
+      runCustomNode: async (node) => {
+        calls.push(`custom:${node.id}`);
+        return { outcome: "success" };
+      },
+    });
+
+    const result = await runtime.run(task, flagOff, { deferCompletionSummary: true });
+
+    expect(result.disposition).toBe("completed");
+    expect(result.outcome).toBe("success");
+    expect(calls).toContain("custom:semantic");
+    expect(calls).not.toContain("custom:prepare");
+    expect(calls).not.toContain("custom:workflow-step");
+    expect(getTask).not.toHaveBeenCalled();
+  });
+
+  it("Task 3 RED: imported campaign lineage fails closed when custody lookup is missing", async () => {
+    const resolve = vi.fn(() => ({ workflowId: "WF-001", stepIds: [] }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: resolve,
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+    const importedTask = {
+      ...task,
+      lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1",
+    } as TaskDetail;
+
+    const result = await runtime.run(importedTask, flagOff, {
+      workItemFence: {
+        workItemId: "WORK-1",
+        leaseOwner: "worker-1",
+        attempt: 1,
+        runId: "ccc-prd:import-1",
+        eventTimestamp: "2026-07-25T12:00:00.000Z",
+      },
+    });
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: [],
+      reason: "ccc-campaign-custody-lookup-unwired",
+    });
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("Task 3 RED: direct imported work-item execution is reserved for the full campaign processor", async () => {
+    const getTask = vi.fn();
+    const transitionWorkflowWorkItem = vi.fn();
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTask,
+        transitionWorkflowWorkItem,
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-001", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        getCccCampaignContextForTask: async () => ({ campaignId: "CAMPAIGN-1" }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+    const workItem = {
+      id: "WORK-CCC-1",
+      taskId: "TASK-ORIGIN",
+      kind: "task",
+      state: "running",
+      attempt: 1,
+      runId: "ccc-prd:import-1",
+      stableWorkflowRunId: "ccc-prd:import-1",
+      irHash: "a".repeat(64),
+    } as WorkflowWorkItem;
+
+    const result = await runtime.runWorkItem(workItem, flagOff);
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      visitedNodeIds: [],
+      reason: "ccc-campaign-full-graph-processor-required",
+    });
+    expect(getTask).not.toHaveBeenCalled();
+    expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unwired", undefined],
+    ["missing", async () => null],
+    ["error", async () => { throw new Error("custody unavailable"); }],
+  ])("Task 3: imported work-item %s custody refuses without mutation", async (_case, getCccCampaignContextForTask) => {
+    const getTask = vi.fn();
+    const transitionWorkflowWorkItem = vi.fn();
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTask,
+        transitionWorkflowWorkItem,
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-001", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        ...(getCccCampaignContextForTask ? { getCccCampaignContextForTask } : {}),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+    const workItem = {
+      id: "WORK-CCC-2",
+      taskId: "TASK-ORIGIN",
+      kind: "task",
+      state: "runnable",
+      attempt: 1,
+      runId: "ccc-prd:import-2",
+      stableWorkflowRunId: "ccc-prd:import-2",
+      irHash: "b".repeat(64),
+    } as WorkflowWorkItem;
+
+    const result = await runtime.runWorkItem(workItem, flagOff);
+
+    expect(result.reason).toBe("ccc-campaign-full-graph-processor-required");
+    expect(getTask).not.toHaveBeenCalled();
+    expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
+  });
+
+  it("Task 3 RED: a fenced campaign graph refuses a node without semantic proof custody before its handler", async () => {
+    const promptHandler = vi.fn(async () => ({ outcome: "success" as const }));
+    const getCccCampaignContextForTask = vi.fn();
+    const campaignTask = {
+      id: "TASK-ORIGIN",
+      customFields: { cccFusionProfile: "ccc-fusion" },
+    } as TaskDetail;
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-001", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        getCccCampaignContextForTask,
+        recordRunAuditEvent: vi.fn(),
+        recordFencedCccCampaignProofAudit: vi.fn(),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: { prompt: promptHandler },
+    });
+
+    const result = await runtime.run(campaignTask, flagOff, {
+      signal: new AbortController().signal,
+      workItemFence: {
+        workItemId: "WORK-1",
+        leaseOwner: "worker-1",
+        attempt: 1,
+        runId: "run-1",
+        eventTimestamp: "2026-07-25T12:00:00.000Z",
+      },
+    });
+
+    expect(result.disposition).toBe("failed");
+    expect(result.outcome).toBe("failure");
+    expect(promptHandler).not.toHaveBeenCalled();
+    expect(getCccCampaignContextForTask).toHaveBeenCalledWith("TASK-ORIGIN");
+  });
+
+  it("Task 3 RED: external cancellation reaches a long sequential node and prevents late success", async () => {
+    const controller = new AbortController();
+    const updateTask = vi.fn();
+    let observedSignal: AbortSignal | undefined;
+    let releaseHandler!: () => void;
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-001", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedIr() }),
+        updateTask,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: {
+        prompt: async (_node, context) => {
+          observedSignal = context.signal;
+          await new Promise<void>((resolve) => { releaseHandler = resolve; });
+          return { outcome: "success", value: "late-success" };
+        },
+      },
+    });
+
+    const processing = runtime.run(task, flagOff, { signal: controller.signal });
+    await vi.waitFor(() => expect(observedSignal).toBe(controller.signal));
+    controller.abort();
+    releaseHandler();
+    const result = await processing;
+
+    expect(result.disposition).toBe("failed");
+    expect(result.outcome).toBe("failure");
+    expect(result.reason).toContain("workflow-aborted");
+    expect(updateTask).not.toHaveBeenCalled();
+  });
+
+  it("Task 3 RED: abort during required artifact custody prevents terminal success summary", async () => {
+    const controller = new AbortController();
+    const updateTask = vi.fn();
+    let releaseArtifactRead!: () => void;
+    const irWithRequiredArtifact: WorkflowIr = {
+      ...selectedIr(),
+      artifacts: [{ key: "PROMPT.md", title: "Plan", producedBy: "prepare", role: "step-source" }],
+    };
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-001", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: irWithRequiredArtifact }),
+        getTaskDocument: async (_taskId, key) => {
+          if (key !== "PROMPT.md") return null;
+          await new Promise<void>((resolve) => { releaseArtifactRead = resolve; });
+          return { key, content: promptWithOneStep };
+        },
+        updateTask,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const processing = runtime.run(task, flagOff, { signal: controller.signal });
+    await vi.waitFor(() => expect(releaseArtifactRead).toBeTypeOf("function"));
+    controller.abort();
+    releaseArtifactRead();
+    const result = await processing;
+
+    expect(result.disposition).toBe("failed");
+    expect(result.reason).toBe("workflow-aborted");
+    expect(updateTask).not.toHaveBeenCalled();
   });
 
   it("records a completion summary when a workflow run completes without fn_task_done", async () => {
@@ -304,7 +956,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives(calls, undefined, observed),
       runCustomNode: async (node) => {
@@ -330,7 +982,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives([], undefined, observed),
       runCustomNode: async () => ({ outcome: "success" }),
@@ -374,7 +1026,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives(calls),
       runCustomNode: async (node) => {
@@ -408,7 +1060,7 @@ describe("WorkflowTaskRuntime", () => {
       store: {
         getTaskWorkflowSelection: () => undefined,
         getWorkflowDefinition: async () => undefined,
-        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key } : null,
+        getTaskDocument: async (_taskId, key) => key === "PROMPT.md" ? { key, content: promptWithOneStep } : null,
       },
       primitives: recordingPrimitives(calls),
       runCustomNode: async (node) => {
@@ -571,7 +1223,7 @@ describe("WorkflowTaskRuntime", () => {
       {
         id: "work-1",
         state: "succeeded",
-        patch: { leaseOwner: null, leaseExpiresAt: null, lastError: null },
+        patch: { attempt: 1, leaseOwner: null, leaseExpiresAt: null, lastError: null },
       },
     ]);
   });
@@ -616,7 +1268,7 @@ describe("WorkflowTaskRuntime", () => {
       {
         id: "work-2",
         state: "failed",
-        patch: { leaseOwner: null, leaseExpiresAt: null, lastError: "implementation-incomplete" },
+        patch: { attempt: 1, leaseOwner: null, leaseExpiresAt: null, lastError: "implementation-incomplete" },
       },
     ]);
   });
@@ -661,7 +1313,7 @@ describe("WorkflowTaskRuntime", () => {
       {
         id: "work-merge-gate",
         state: "succeeded",
-        patch: { leaseOwner: null, leaseExpiresAt: null, lastError: null },
+        patch: { attempt: 1, leaseOwner: null, leaseExpiresAt: null, lastError: null },
       },
     ]);
   });
@@ -706,7 +1358,7 @@ describe("WorkflowTaskRuntime", () => {
       {
         id: "work-manual-hold",
         state: "manual-required",
-        patch: { leaseOwner: null, leaseExpiresAt: null, lastError: "manual-required" },
+        patch: { attempt: 1, leaseOwner: null, leaseExpiresAt: null, lastError: "manual-required" },
       },
     ]);
   });

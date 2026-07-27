@@ -3,10 +3,10 @@ import { count, eq, desc, and } from "drizzle-orm";
 import type { Database } from "./db.js";
 import { fromJson, toJsonNullable } from "./db.js";
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
+import type { CccCampaignAuthorityStore } from "./ccc-campaign/store.js";
 import * as asyncApprovalRequestStore from "./async-approval-request-store.js";
 import * as schema from "./postgres/schema/index.js";
 import {
-  isValidApprovalRequestTransition,
   normalizeApprovalRequestActionCategory,
   type ApprovalRequest,
   type ApprovalRequestActorSnapshot,
@@ -58,12 +58,20 @@ export class ApprovalRequestStore {
    * access delegates to the async helpers. The sync db is unused in this mode.
    */
   private readonly asyncLayer: AsyncDataLayer | null;
+  private readonly campaignAuthorityStore: CccCampaignAuthorityStore | null;
+  private readonly campaignRootDir: string | null;
 
   constructor(
     private db: Database | null,
-    options?: { asyncLayer?: AsyncDataLayer | null },
+    options?: {
+      asyncLayer?: AsyncDataLayer | null;
+      campaignAuthorityStore?: CccCampaignAuthorityStore | null;
+      rootDir?: string | null;
+    },
   ) {
     this.asyncLayer = options?.asyncLayer ?? null;
+    this.campaignAuthorityStore = options?.campaignAuthorityStore ?? null;
+    this.campaignRootDir = options?.rootDir ?? null;
   }
 
   /** True when the store is backed by PostgreSQL (AsyncDataLayer present). */
@@ -82,6 +90,25 @@ export class ApprovalRequestStore {
       throw new Error("ApprovalRequestStore: sync Database is null (backend mode requires asyncLayer)");
     }
     return this.db;
+  }
+
+  /**
+   * Native campaign approvals require both the PostgreSQL layer and the
+   * persisted TaskStore custody reader. The SQLite surface intentionally fails
+   * closed rather than synthesizing a second campaign state machine.
+   */
+  private campaignAuthority(): { layer: AsyncDataLayer; authorityStore: CccCampaignAuthorityStore; rootDir: string } {
+    if (!this.asyncLayer) {
+      throw new Error("CCC campaign approvals require a PostgreSQL-backed ApprovalRequestStore");
+    }
+    if (!this.campaignAuthorityStore || !this.campaignRootDir) {
+      throw new Error("CCC campaign approvals require persisted TaskStore authority and rootDir");
+    }
+    return {
+      layer: this.asyncLayer,
+      authorityStore: this.campaignAuthorityStore,
+      rootDir: this.campaignRootDir,
+    };
   }
 
   private rowToRequest(row: ApprovalRequestRow): ApprovalRequest {
@@ -338,21 +365,16 @@ export class ApprovalRequestStore {
     if (this.backendMode) {
       return asyncApprovalRequestStore.decideApprovalRequest(this.asyncLayer!, requestId, status, input);
     }
-    const existing = await this.get(requestId);
-    if (!existing) {
-      throw new Error(`Approval request ${requestId} not found`);
-    }
-    if (!isValidApprovalRequestTransition(existing.status, status)) {
-      throw new Error(`Invalid approval request transition: ${existing.status} -> ${status}`);
-    }
-
     const now = new Date().toISOString();
     this.syncDb().transaction(() => {
-      this.syncDb().prepare(`
+      const updated = this.syncDb().prepare(`
         UPDATE approval_requests
         SET status = ?, decidedAt = ?, updatedAt = ?
-        WHERE id = ?
+        WHERE id = ? AND status = 'pending'
       `).run(status, now, now, requestId);
+      if (updated.changes !== 1) {
+        throw new Error(`Approval request ${requestId} was not pending for ${status}`);
+      }
       this.appendAuditEvent(requestId, status, input.actor, now, input.note);
     });
 
@@ -368,21 +390,16 @@ export class ApprovalRequestStore {
     if (this.backendMode) {
       return asyncApprovalRequestStore.markApprovalRequestCompleted(this.asyncLayer!, requestId, input);
     }
-    const existing = await this.get(requestId);
-    if (!existing) {
-      throw new Error(`Approval request ${requestId} not found`);
-    }
-    if (!isValidApprovalRequestTransition(existing.status, "completed")) {
-      throw new Error(`Invalid approval request transition: ${existing.status} -> completed`);
-    }
-
     const now = new Date().toISOString();
     this.syncDb().transaction(() => {
-      this.syncDb().prepare(`
+      const updated = this.syncDb().prepare(`
         UPDATE approval_requests
         SET status = 'completed', completedAt = ?, updatedAt = ?
-        WHERE id = ?
+        WHERE id = ? AND status = 'approved'
       `).run(now, now, requestId);
+      if (updated.changes !== 1) {
+        throw new Error(`Approval request ${requestId} was not approved for completion`);
+      }
       this.appendAuditEvent(requestId, "completed", input.actor, now, input.note);
     });
 
@@ -392,6 +409,73 @@ export class ApprovalRequestStore {
       throw new Error(`Approval request ${requestId} not found after completion`);
     }
     return updated;
+  }
+
+  async issueCccCampaignApproval(
+    input: Omit<asyncApprovalRequestStore.IssueCccCampaignApprovalInput, "authorityStore" | "rootDir">,
+  ): Promise<ApprovalRequest> {
+    const authority = this.campaignAuthority();
+    return asyncApprovalRequestStore.issueCccCampaignApproval(authority.layer, {
+      ...input,
+      authorityStore: authority.authorityStore,
+      rootDir: authority.rootDir,
+    });
+  }
+
+  async claimCccCampaignApproval(
+    input: Omit<asyncApprovalRequestStore.ClaimCccCampaignApprovalInput, "authorityStore" | "rootDir">,
+  ): Promise<ApprovalRequest> {
+    const authority = this.campaignAuthority();
+    return asyncApprovalRequestStore.claimCccCampaignApproval(authority.layer, {
+      ...input,
+      authorityStore: authority.authorityStore,
+      rootDir: authority.rootDir,
+    });
+  }
+
+  async denyCccCampaignApproval(
+    input: Omit<asyncApprovalRequestStore.DecideCccCampaignApprovalInput, "authorityStore" | "rootDir">,
+  ): Promise<ApprovalRequest> {
+    const authority = this.campaignAuthority();
+    return asyncApprovalRequestStore.denyCccCampaignApproval(authority.layer, {
+      ...input,
+      authorityStore: authority.authorityStore,
+      rootDir: authority.rootDir,
+    });
+  }
+
+  async expireCccCampaignApproval(
+    input: Omit<asyncApprovalRequestStore.DecideCccCampaignApprovalInput, "authorityStore" | "rootDir">,
+  ): Promise<ApprovalRequest> {
+    const authority = this.campaignAuthority();
+    return asyncApprovalRequestStore.expireCccCampaignApproval(authority.layer, {
+      ...input,
+      authorityStore: authority.authorityStore,
+      rootDir: authority.rootDir,
+    });
+  }
+
+  async consumeCccCampaignApproval(
+    input: Omit<asyncApprovalRequestStore.ConsumeCccCampaignApprovalInput, "authorityStore" | "rootDir">,
+  ): Promise<ApprovalRequest> {
+    const authority = this.campaignAuthority();
+    return asyncApprovalRequestStore.consumeCccCampaignApproval(authority.layer, {
+      ...input,
+      authorityStore: authority.authorityStore,
+      rootDir: authority.rootDir,
+    });
+  }
+
+  async assertActiveClaimedCccCampaignApproval(
+    input: Omit<asyncApprovalRequestStore.AssertActiveClaimedCccCampaignApprovalInput, "authorityStore" | "rootDir">,
+  ): Promise<asyncApprovalRequestStore.ClaimedCccCampaignApproval> {
+    const authority = this.campaignAuthority();
+    return authority.layer.transactionImmediate((tx) =>
+      asyncApprovalRequestStore.assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, {
+        ...input,
+        authorityStore: authority.authorityStore,
+        rootDir: authority.rootDir,
+      }));
   }
 
   async getAuditHistory(requestId: string): Promise<ApprovalRequestAuditEvent[]> {

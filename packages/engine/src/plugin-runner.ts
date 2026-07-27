@@ -23,6 +23,7 @@ import type {
   PluginMcpServerContribution,
   PluginWorkflowStepContribution,
   WorkflowExtensionContribution,
+  WorkflowExtensionHostProvenance,
   PluginTraitContribution,
   WorkflowIr,
   PluginPromptContribution,
@@ -65,6 +66,7 @@ import {
   degradePluginWorkflowExtensions,
   registerPluginWorkflowExtensions,
   unregisterPluginWorkflowExtensions,
+  type PluginWorkflowExtensionRegistration,
 } from "./plugin-workflow-extension-adapter.js";
 
 // Type for the task store's event data
@@ -135,7 +137,11 @@ interface CachedWorkflowSteps {
 }
 
 interface CachedWorkflowExtensions {
-  extensions: Array<{ pluginId: string; extension: WorkflowExtensionContribution }>;
+  extensions: Array<{
+    pluginId: string;
+    extension: WorkflowExtensionContribution;
+    hostProvenance?: WorkflowExtensionHostProvenance;
+  }>;
   version: number;
 }
 
@@ -433,7 +439,11 @@ export class PluginRunner {
     return this.cachedWorkflowSteps.steps;
   }
 
-  getPluginWorkflowExtensions(): Array<{ pluginId: string; extension: WorkflowExtensionContribution }> {
+  getPluginWorkflowExtensions(): Array<{
+    pluginId: string;
+    extension: WorkflowExtensionContribution;
+    hostProvenance?: WorkflowExtensionHostProvenance;
+  }> {
     if (!this.cachedWorkflowExtensions || this.cachedWorkflowExtensions.version !== this.workflowExtensionsCacheVersion) {
       this.cachedWorkflowExtensions = {
         extensions: this.options.pluginLoader.getPluginWorkflowExtensions(),
@@ -530,10 +540,14 @@ export class PluginRunner {
     const registry = getWorkflowExtensionRegistry();
     const current = this.getPluginWorkflowExtensions();
 
-    const byPlugin = new Map<string, WorkflowExtensionContribution[]>();
-    for (const { pluginId, extension } of current) {
+    const byPlugin = new Map<string, PluginWorkflowExtensionRegistration[]>();
+    for (const { pluginId, extension, hostProvenance } of current) {
+      if (extension.kind === "proof-admission") continue;
       const list = byPlugin.get(pluginId) ?? [];
-      list.push(extension);
+      list.push({
+        extension,
+        ...(hostProvenance ? { hostProvenance } : {}),
+      });
       byPlugin.set(pluginId, list);
     }
 
@@ -545,6 +559,17 @@ export class PluginRunner {
     }
 
     for (const [pluginId, contributions] of byPlugin) {
+      const currentIds = new Set(contributions.map(({ extension }) =>
+        workflowExtensionRegistryId(pluginId, extension.extensionId)));
+      const previouslyRegistered = this.registeredPluginWorkflowExtensionIds.get(pluginId) ?? [];
+      const staleIds = previouslyRegistered.filter((id) => !currentIds.has(id));
+      if (staleIds.length > 0) {
+        unregisterPluginWorkflowExtensions(registry, staleIds);
+        this.registeredPluginWorkflowExtensionIds.set(
+          pluginId,
+          previouslyRegistered.filter((id) => currentIds.has(id)),
+        );
+      }
       try {
         const ids = registerPluginWorkflowExtensions({ registry, pluginId, contributions });
         this.registeredPluginWorkflowExtensionIds.set(pluginId, ids);
@@ -593,6 +618,7 @@ export class PluginRunner {
     if (tracked && tracked.length > 0) return tracked;
     return this.getPluginWorkflowExtensions()
       .filter((entry) => entry.pluginId === pluginId)
+      .filter((entry) => entry.extension.kind !== "proof-admission")
       .map((entry) => workflowExtensionRegistryId(pluginId, entry.extension.extensionId));
   }
 
@@ -945,22 +971,27 @@ export class PluginRunner {
    */
   async reloadPlugin(pluginId: string): Promise<void> {
     executorLog.log(`Reloading plugin: ${pluginId}`);
-    await this.options.pluginLoader.reloadPlugin(pluginId);
-    this.invalidateToolsCache();
-    this.invalidateRoutesCache();
-    this.invalidateUiSlotsCache();
-    this.invalidateUiContributionsCache();
-    this.invalidateRuntimesCache();
-    this.invalidateCliProviderContributionsCache();
-    this.invalidateSkillsCache();
-    this.invalidateMcpServersCache();
-    this.invalidateWorkflowStepsCache();
-    this.invalidateWorkflowExtensionsCache();
-    this.invalidateWorkflowStepTemplatesCache();
-    this.invalidateTraitsCache();
-    this.invalidatePromptContributionsCache();
-    this.invalidateSetupCache();
-    executorLog.log(`Plugin ${pluginId} reloaded`);
+    try {
+      await this.options.pluginLoader.reloadPlugin(pluginId);
+      this.invalidateToolsCache();
+      this.invalidateRoutesCache();
+      this.invalidateUiSlotsCache();
+      this.invalidateUiContributionsCache();
+      this.invalidateRuntimesCache();
+      this.invalidateCliProviderContributionsCache();
+      this.invalidateSkillsCache();
+      this.invalidateMcpServersCache();
+      this.invalidateWorkflowStepsCache();
+      this.invalidateWorkflowStepTemplatesCache();
+      this.invalidateTraitsCache();
+      this.invalidatePromptContributionsCache();
+      this.invalidateSetupCache();
+      executorLog.log(`Plugin ${pluginId} reloaded`);
+    } finally {
+      // Reload can succeed, roll back, or remove the plugin entirely. Always
+      // reconcile the proof registry with the loader's final authoritative view.
+      this.invalidateWorkflowExtensionsCache();
+    }
   }
 
   // ── Event Handlers for Hot-Load/Unload ─────────────────────────

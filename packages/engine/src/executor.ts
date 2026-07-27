@@ -1,5 +1,6 @@
 // port-4040-allowlist: this file embeds the "never kill port 4040" rule in the executor prompt.
 import { exec, execFile, execSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { setImmediate as setImmediateCb } from "node:timers";
 
@@ -14,19 +15,22 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
 import { getUnmetSchedulingDependencies } from "./scheduler.js";
-import { RetryStormError, serializeRetryStormError, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, resolveWorkflowIrForTask, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveReboundTarget, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AgentStore, resolveExecutorFallbackModel } from "@fusion/core";
+import { CCC_EFFECT_RECEIPT_CONTRACT } from "@fusion/core";
+import { RetryStormError, TaskDeletedError, serializeRetryStormError, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, resolveWorkflowIrForTask, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveReboundTarget, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AgentStore, resolveExecutorFallbackModel } from "@fusion/core";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
 import { generateFeatureVideo, type GenerateFeatureVideoOptions } from "./review-artifacts/feature-video.js";
 import { moveTaskToReplanColumn, resolveReplanTargetColumn } from "./replan-target.js";
 import type { TaskStep, WorkflowIr, WorkflowFieldDefinition, WorkflowColumnAgent, EffectiveAgentInput, WorkflowWorkEngineDispatchResult, WorkflowWorkItem } from "@fusion/core";
 import { WorkflowGraphTaskRunner, type WorkflowGraphTaskRunResult, type WorkflowColumnBoundaryHooks } from "./workflow-graph-task-runner.js";
+import { isImportedCccCampaignTask, isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
+import { matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflow-column-boundary.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { createCodeNodeRunner } from "./code-node-runner.js";
 import { getTaskReviewCheckoutPath, resolveReviewCheckoutCwd } from "./review-checkout.js";
 import { getActiveNotificationService } from "./notifier.js";
-import type { ParseStepsHandlerDeps, CodeNodeRunner } from "./workflow-node-handlers.js";
+import type { ParseStepsHandlerDeps, CodeNodeRunner, WorkflowCustomNodeRunner } from "./workflow-node-handlers.js";
 import type { WorkflowBranchPersistence, WorkflowBranchRunState } from "./workflow-graph-branches.js";
 import type {
   WorkflowStepInstancePersistence,
@@ -43,12 +47,15 @@ import {
 } from "./workflow-node-handlers.js";
 import {
   MERGE_REGION_KINDS,
+  CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY,
+  CCC_RETRY_ATTEMPT_CONTEXT_KEY,
+  CCC_RETRY_CLASSIFICATION_CONTEXT_KEY,
   PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE,
   WORKFLOW_DRIFT_PARK_CONTEXT_KEY,
   WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND,
   WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY,
 } from "./workflow-graph-executor.js";
-import type { WorkflowNodePreparationRequirement, WorkflowNodeResult } from "./workflow-graph-executor.js";
+import type { WorkflowNodeExecutionContext, WorkflowNodePreparationRequirement, WorkflowNodeResult } from "./workflow-graph-executor.js";
 import { workflowNodeRequiresWorktree } from "./workflow-node-execution-needs.js";
 import type {
   AuditPrimitiveInput,
@@ -60,6 +67,8 @@ import { createWorkflowRuntimePrimitiveProvider } from "./workflow-runtime-primi
 import { WorkflowCustomNodeExecutionService } from "./workflow-custom-node-execution.js";
 import { WorkflowReviewService } from "./workflow-review-service.js";
 import { WorkflowPlanningService } from "./workflow-planning-service.js";
+import { createCccCampaignProviderAttemptBinding } from "./ccc-campaign-provider-controller.js";
+import type { WorkflowNodeProviderControllerResolverInput } from "./workflow-graph-executor.js";
 import {
   buildPlanVerifiedMessage,
   buildReviewUnavailableMessage,
@@ -94,7 +103,13 @@ import {
 import { canonicalFusionBranchName, canonicalStepInstanceBranchName, generateWorktreeName, resolveTaskWorkingBranch } from "./worktree-names.js";
 import { resolveTaskWorktreePath, resolveWorktreesDir } from "./worktree-paths.js";
 import { Type, type Static } from "@earendil-works/pi-ai";
-import { describeModel, formatModelMarkerDetails, promptWithFallback, compactSessionContext } from "./pi.js";
+import {
+  CCC_AWAIT_OWNED_TRANSPORT_CLOSURE,
+  describeModel,
+  formatModelMarkerDetails,
+  promptWithFallback,
+  compactSessionContext,
+} from "./pi.js";
 import { buildAgentGatedActionSummary } from "./permanent-agent-gating.js";
 import { accumulateSessionTokenUsage, captureSessionTokenBaseline, mergeTokenUsagePerModel, resetSessionTokenBaseline } from "./session-token-usage.js";
 import { finalizePlanningSegment, startPlanningSegment } from "@fusion/core";
@@ -110,6 +125,7 @@ import {
 } from "./agent-session-helpers.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { resolveMcpServersForStore } from "./mcp-resolution.js";
+import { CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
 import { proseSignalsClearApproval, extractJsonObjectCandidates, type ReviewVerdict, type ReviewResult } from "./reviewer.js";
 import { buildUserCommentsPromptSection, selectUserCommentsForAgentContext } from "./agent-user-comments.js";
 import { resolveSandboxBackend } from "./sandbox/index.js";
@@ -139,17 +155,35 @@ import {
 } from "./active-session-registry.js";
 // CLI Agent Executor (U7): task ↔ CLI session orchestration seam.
 import {
-  CliTaskSession,
   launchCliTaskSession,
   killLiveTaskSessions,
   type CliTaskOutcome,
+  type CliTaskSession,
   type ResolvedCliExecutorConfig,
 } from "./cli-agent/task-session.js";
 import type { CliSessionManager } from "./cli-agent/session-manager.js";
-import { CliConcurrencyLimitError } from "./cli-agent/session-manager.js";
+import { CliConcurrencyLimitError, DEFAULT_CLI_CANCELLATION_TIMEOUT_MS } from "./cli-agent/session-manager.js";
 import type { TelemetryHub } from "./cli-agent/telemetry-hub.js";
 import type { CliAdapterRegistry } from "./cli-agent/adapter.js";
-import type { CliSessionStore } from "@fusion/core";
+import {
+  assertCanonicalCccNativeCliText,
+  assertCanonicalCccNativeCliTurnKey,
+  buildCccNativeCliSessionPolicy,
+  CCC_NATIVE_CLI_DISPATCH_KEY,
+  CCC_NATIVE_CLI_OBSERVER_ID,
+  CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID,
+  CCC_NATIVE_CLI_TRANSPORT,
+  CccNativeCliBindingRefusedError,
+  type CccNativeCliBindingResolver,
+  type CccNativeCliBinding,
+  type CccNativeCliRoute,
+  validateCccNativeCliBinding,
+  validateCccNativeCliHeldClosureReceipt,
+  validateCccNativeCliObservation,
+  validateCccNativeCliPermitScope,
+  validateCccNativeCliTerminalScope,
+} from "./cli-agent/ccc-native-cli-binding.js";
+import type { CccProviderAttemptScope, CliSession, CliSessionStore } from "@fusion/core";
 import {
   StaleWorktreeIndexLockError,
   classifyStaleLock,
@@ -157,6 +191,34 @@ import {
   tryRemoveStaleLock,
 } from "./worktree-stale-lock.js";
 import { parseStaleRegistrationPath, recoverStaleRegistration } from "./worktree-stale-registration.js";
+
+enum CccNativeCliPreProviderPhase {
+  McpResolution = "mcp-resolution",
+  PriorSessionKill = "prior-session-kill",
+  Launch = "launch",
+  PtyCapacity = "pty-capacity",
+}
+
+function createCccNativeCliPreProviderEvidenceDigest(
+  phase: CccNativeCliPreProviderPhase,
+  permitScope: CccProviderAttemptScope,
+  binding: CccNativeCliBinding,
+): string {
+  return createHash("sha256").update(JSON.stringify({
+    version: 1,
+    phase,
+    permit: {
+      attemptKey: permitScope.attemptKey,
+      controllerToken: permitScope.controllerToken,
+      taskId: permitScope.taskId,
+      turnKey: permitScope.turnKey,
+      dispatchKey: permitScope.dispatchKey,
+    },
+    binding: {
+      authorityBindingHash: binding.authorityBindingHash,
+    },
+  })).digest("hex");
+}
 import {
   BranchConflictError,
   BranchCrossContaminationError,
@@ -1632,6 +1694,8 @@ export interface TaskExecutorOptions {
    * PTY manager + telemetry hub + adapter registry + hook endpoint together.
    */
   cliAgentRuntime?: CliAgentRuntime;
+  /** Bound for a real AgentSession abort plus its owned CCC transport closure. */
+  cancellationTimeoutMs?: number;
 }
 
 /** Bundled CLI Agent Executor runtime dependencies (U7). */
@@ -1653,11 +1717,105 @@ export interface CliAgentRuntime {
   hookEndpointUrl: string;
   /** Optional override for the hook scratch-dir root (tests). */
   hookDirRoot?: string;
+  /** Host-owned fenced campaign CLI binding resolver. */
+  resolveCccNativeCliBinding?: CccNativeCliBindingResolver;
+}
+
+/**
+ * A CCC executor receipt ledger is reusable only for the exact task execution
+ * contract. Keeping this check at the production controller seam prevents a
+ * restarted controller from borrowing a different model, provider, worktree,
+ * or profile's effects merely because that task once had a CLI row.
+ */
+function matchesCccExecutorReceiptLedger(
+  session: CliSession,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
+  authority: unknown,
+): boolean {
+  return matchesCccExecutorReceiptLedgerPosture(session, taskId, provider, modelId, worktreePath)
+    && canonicalCccExecutionAuthorityJson(session.autonomyPosture?.cccExecutionAuthority ?? null) === canonicalCccExecutionAuthorityJson(authority);
+}
+
+function matchesCccExecutorReceiptLedgerPosture(
+  session: CliSession,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
+): boolean {
+  const posture = session.autonomyPosture;
+  return session.taskId === taskId
+    && session.adapterId === "pi"
+    && session.purpose === "execute"
+    && session.worktreePath === worktreePath
+    && posture?.cccFusionProfile === CCC_FUSION_PROFILE
+    && posture?.cccFusionProvider === provider
+    && posture?.cccFusionModel === modelId
+    && posture?.cccEffectReceiptContract === CCC_EFFECT_RECEIPT_CONTRACT;
+}
+
+function canonicalCccExecutionAuthorityJson(value: unknown, seen = new Set<object>()): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("CCC execution authority must be JSON-serializable");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalCccExecutionAuthorityJson(entry, seen)).join(",")}]`;
+  if (typeof value === "object") {
+    if (seen.has(value)) throw new Error("CCC execution authority must not be circular");
+    seen.add(value);
+    const serialized = `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalCccExecutionAuthorityJson(entry, seen)}`)
+      .join(",")}}`;
+    seen.delete(value);
+    return serialized;
+  }
+  throw new Error("CCC execution authority must be JSON-serializable");
+}
+
+function selectCccExecutorReceiptLedger(
+  store: Pick<CliSessionStore, "listByTask">,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
+  authority: unknown,
+): CliSession | undefined {
+  const matching = store.listByTask(taskId)
+    .filter((session) => matchesCccExecutorReceiptLedger(session, taskId, provider, modelId, worktreePath, authority))
+    .filter((session) => session.terminationReason === null && session.agentState !== "dead" && session.agentState !== "done")
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return matching[0];
+}
+
+function selectCccFencedEngineDeathLedger(
+  store: Pick<CliSessionStore, "listByTask">,
+  taskId: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  worktreePath: string,
+  authority: unknown,
+): CliSession | undefined {
+  return store.listByTask(taskId)
+    .filter((session) => matchesCccExecutorReceiptLedger(session, taskId, provider, modelId, worktreePath, authority))
+    .filter((session) => session.agentState === "dead" && session.terminationReason === "engineDeath")
+    .filter((session) => session.autonomyPosture?.cccControllerFenced === true)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
 }
 
 interface ActiveExecutorSessionState {
   session: AgentSession;
   seenSteeringIds: Set<string>;
+  /** One owned async disposal per execution generation. */
+  disposeCompletion?: Promise<void>;
+  /** Durable CCC record retained until abort, stream closure, and flush all confirm. */
+  cccDurableSession?: { store: CliSessionStore; sessionId: string; controllerToken: string };
   lastResolvedModelProvider?: string;
   lastResolvedModelId?: string;
   lastTaskModelProvider?: string | null;
@@ -1708,6 +1866,19 @@ docs/plans/2026-07-19-002-u5e-remaining-deletions-handoff.md.
 */
 export type GraphCompletionCallback = (info: { modifiedFiles: string[] }) => void;
 
+/** A cancellation did not confirm that the task-owned execution surface closed. */
+export class TaskCancellationAbortError extends Error {
+  constructor(
+    public readonly taskId: string,
+    public readonly surface: "agent-session" | "cli-agent-session",
+    public readonly code: "TASK_CANCELLATION_ABORT_FAILED" | "TASK_CANCELLATION_DISPOSE_FAILED" | "TASK_CANCELLATION_PERSISTENCE_FAILED" | "TASK_CANCELLATION_TIMEOUT",
+    options?: { cause?: unknown },
+  ) {
+    super(`Task cancellation could not close ${surface}: ${taskId}`, options);
+    this.name = "TaskCancellationAbortError";
+  }
+}
+
 export class TaskExecutor {
   /*
   FNXC:Workspace 2026-06-21-12:00:
@@ -1734,6 +1905,8 @@ export class TaskExecutor {
   private executing = new Set<string>();
   /** Tasks currently being prepared for unpause resume, before execute() has registered them. */
   private resumingUnpaused = new Set<string>();
+  /** Startup-only dispatch marker; enables fenced engine-death receipt recovery. */
+  private resumingOrphaned = new Set<string>();
   /** Tasks whose active session was intentionally suspended by an action gate. */
   private approvalSuspended = new Set<string>();
   /** Approval decisions received while the old execute() lifecycle is still unwinding. */
@@ -1770,6 +1943,16 @@ export class TaskExecutor {
   private unregisterArchiveWorkspaceWorktreeDisposer: (() => void) | undefined;
   /** Active agent sessions per task, used to terminate on pause and inject steering. */
   private activeSessions = new Map<string, ActiveExecutorSessionState>();
+  /*
+  FNXC:CCCFusionCancellation 2026-07-23-17:34:
+  A custom-provider stream retains its active-session and worktree ownership until
+  abort and dispose have settled. This promise map claims the cancellation without
+  clearing the visible owner, so concurrent hard-cancel callers await one teardown
+  instead of double-aborting or admitting a replacement session too early.
+  */
+  private activeSessionAbortCompletions = new Map<string, Promise<void>>();
+  /** CLI sessions share the same ownership rule but use their task-session kill seam. */
+  private activeCliSessionAbortCompletions = new Map<string, Promise<void>>();
   /** Active step-session executors per task (mutually exclusive with activeSessions). */
   private activeStepExecutors = new Map<string, StepSessionExecutor>();
   /** Steering comments already observed for active step-session executor runs. */
@@ -1981,6 +2164,9 @@ export class TaskExecutor {
   }
 
   private setActiveSession(taskId: string, sessionState: ActiveExecutorSessionState, worktreePath: string): void {
+    // A new registered session is a new execution generation. A prior timed-out
+    // cancellation stays idempotently failed only for its original generation.
+    this.activeSessionAbortCompletions.delete(taskId);
     this.activeSessions.set(taskId, sessionState);
     activeSessionRegistry.registerPath(this.sessionRegistryPath(taskId, worktreePath), { taskId, kind: "executor", ownerKey: taskId });
   }
@@ -2725,11 +2911,17 @@ export class TaskExecutor {
     // abort. Without this, two concurrent disposal calls for the same task
     // (e.g., task:moved-away followed immediately by task:deleted) both pass
     // the `has(taskId)` guards and double-call abort/dispose.
-    const claimedSession = this.activeSessions.get(taskId);
-    if (claimedSession) {
+    let waitForClaimedSessionAbort: Promise<void> | undefined;
+    const activeSession = this.activeSessions.get(taskId);
+    if (activeSession) {
       hadActiveSurface = true;
-      abortedSurfaces.push("agent-session");
-      this.deleteActiveSession(taskId);
+      const existingAbort = this.activeSessionAbortCompletions.get(taskId);
+      if (existingAbort) {
+        waitForClaimedSessionAbort = existingAbort;
+      } else {
+        waitForClaimedSessionAbort = this.startAgentSessionCancellation(taskId, activeSession, options.userCanceled === true);
+        abortedSurfaces.push("agent-session");
+      }
     }
     const claimedStepExecutor = this.activeStepExecutors.get(taskId);
     if (claimedStepExecutor) {
@@ -2770,27 +2962,15 @@ export class TaskExecutor {
     // `killed` (never resume-eligible) — the same dispose/abort contract API
     // sessions honor. moveTask(in-progress→todo) routes here (AGENTS.md hard
     // cancel), so this is what guarantees the PTY tree is reaped on column exit.
+    let waitForClaimedCliSessionAbort: Promise<void> | undefined;
     const claimedCliSession = this.activeCliTaskSessions.get(taskId);
     if (claimedCliSession) {
       hadActiveSurface = true;
       abortedSurfaces.push("cli-agent-session");
-      this.activeCliTaskSessions.delete(taskId);
+      waitForClaimedCliSessionAbort = this.startCliSessionCancellation(taskId, claimedCliSession);
     }
 
-    if (claimedSession) {
-      const { session } = claimedSession;
-      const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
-      if (typeof sessionWithAbort.abort === "function") {
-        await sessionWithAbort.abort().catch((err) => {
-          executorLog.warn(`Failed to abort agent session for ${taskId}: ${err}`);
-        });
-      }
-      try {
-        session.dispose();
-      } catch (err) {
-        executorLog.warn(`Failed to dispose agent session for ${taskId}: ${err}`);
-      }
-    }
+    if (waitForClaimedSessionAbort) await waitForClaimedSessionAbort;
 
     if (claimedStepExecutor) {
       const stepExecutorWithAbort = claimedStepExecutor as StepSessionExecutor & { abortAllSessionBash?: () => void };
@@ -2820,10 +3000,17 @@ export class TaskExecutor {
       }
     }
 
-    if (claimedCliSession) {
-      await claimedCliSession.kill("killed").catch((err) => {
-        executorLog.warn(`Failed to kill CLI agent session for ${taskId}: ${err}`);
-      });
+    if (waitForClaimedCliSessionAbort) await waitForClaimedCliSessionAbort;
+
+    /*
+    FNXC:CCCFusionCancellation 2026-07-23-19:34:
+    A user cancellation acknowledges only after its task-owned resources have
+    closed and any CCC durable cancellation record has flushed. Release the
+    task worktree lease at that same proven boundary; an abort/flush failure
+    throws above and intentionally leaves the lease owned for attention.
+    */
+    if (options.userCanceled) {
+      this.activeWorktrees.delete(taskId);
     }
 
     this.loopRecoveryState.delete(taskId);
@@ -2836,6 +3023,252 @@ export class TaskExecutor {
         `Pause abort cleanup completed: reason=${reason}; surfaces=${abortedSurfaces.join(", ") || "none"}`,
       );
     }
+  }
+
+  private startAgentSessionCancellation(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    releaseWorktreeAfterConfirmedClose: boolean,
+  ): Promise<void> {
+    const completion = this.abortAndReleaseAgentSession(taskId, state, releaseWorktreeAfterConfirmedClose);
+    this.activeSessionAbortCompletions.set(taskId, completion);
+    void completion.then(() => {
+      if (this.activeSessionAbortCompletions.get(taskId) === completion) {
+        this.activeSessionAbortCompletions.delete(taskId);
+      }
+    }, () => {
+      // Keep a rejected completion as the single-flight result. Repeated cancel
+      // calls must return the same typed failure without releasing ownership.
+    });
+    return completion;
+  }
+
+  private async abortAndReleaseAgentSession(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    releaseWorktreeAfterConfirmedClose: boolean,
+  ): Promise<void> {
+    const { session } = state;
+    const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
+    try {
+      await this.awaitAgentSessionClosure(taskId, state, sessionWithAbort, releaseWorktreeAfterConfirmedClose);
+    } catch (cause) {
+      await this.persistCccCancellationAttention(state).catch((persistenceCause) => {
+        throw new TaskCancellationAbortError(
+          taskId,
+          "agent-session",
+          "TASK_CANCELLATION_PERSISTENCE_FAILED",
+          { cause: persistenceCause },
+        );
+      });
+      if (cause instanceof TaskCancellationAbortError) throw cause;
+      throw new TaskCancellationAbortError(taskId, "agent-session", "TASK_CANCELLATION_ABORT_FAILED", { cause });
+    }
+
+    try {
+      await this.persistCccCancellationConfirmed(state);
+    } catch (cause) {
+      await this.persistCccCancellationAttention(state).catch(() => undefined);
+      throw new TaskCancellationAbortError(
+        taskId,
+        "agent-session",
+        "TASK_CANCELLATION_PERSISTENCE_FAILED",
+        { cause },
+      );
+    }
+
+    try {
+      await this.disposeAgentSessionOnce(state);
+    } catch (cause) {
+      await this.persistCccCancellationAttention(state).catch(() => undefined);
+      throw new TaskCancellationAbortError(taskId, "agent-session", "TASK_CANCELLATION_DISPOSE_FAILED", { cause });
+    }
+
+    if (this.activeSessions.get(taskId)?.session === session) {
+      this.deleteActiveSession(taskId);
+    }
+  }
+
+  /**
+   * AgentSession declares a synchronous disposer, but PI custom-provider
+   * sessions own async transports. Memoize that close per generation so every
+   * cancellation/retry path observes one result before it releases ownership.
+   */
+  private disposeAgentSessionOnce(state: ActiveExecutorSessionState): Promise<void> {
+    if (!state.disposeCompletion) {
+      state.disposeCompletion = Promise.resolve().then(() => state.session.dispose());
+    }
+    return state.disposeCompletion;
+  }
+
+  private async awaitAgentSessionClosure(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    sessionWithAbort: AgentSession & { abort?: () => Promise<void> },
+    releaseWorktreeAfterConfirmedClose: boolean,
+  ): Promise<void> {
+    const close = async () => {
+      if (typeof sessionWithAbort.abort !== "function") {
+        // Pre-CCC mock/legacy sessions did not expose an abort acknowledgement;
+        // preserve their predecessor dispose path while enforcing closure proof on
+        // the real custom-provider transport.
+        if (state.lastResolvedModelProvider === "custom-provider-pi") {
+          throw new Error("custom-provider session has no abort acknowledgement");
+        }
+        return;
+      }
+      await sessionWithAbort.abort();
+      const awaitTransport = (state.session as AgentSession & {
+        [CCC_AWAIT_OWNED_TRANSPORT_CLOSURE]?: () => Promise<void>;
+      })[CCC_AWAIT_OWNED_TRANSPORT_CLOSURE];
+      if (awaitTransport) await awaitTransport();
+    };
+    const timeoutMs = this.options.cancellationTimeoutMs ?? DEFAULT_CLI_CANCELLATION_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const closePromise = close();
+    try {
+      await Promise.race([
+        closePromise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new TaskCancellationAbortError(
+            taskId,
+            "agent-session",
+            "TASK_CANCELLATION_TIMEOUT",
+          )), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (cause) {
+      if (cause instanceof TaskCancellationAbortError && cause.code === "TASK_CANCELLATION_TIMEOUT") {
+        /*
+        FNXC:CCCFusionCancellation 2026-07-23-20:36:
+        A timeout is an honest failure acknowledgement, not proof that the
+        custom-provider transport will never close. Observe that original
+        close promise without calling abort twice; if it later proves closed,
+        finalize only the same execution generation after a durable flush.
+        */
+        void closePromise.then(
+          () => this.finalizeLateAgentSessionCancellation(taskId, state, releaseWorktreeAfterConfirmedClose),
+          () => undefined,
+        );
+      }
+      throw cause;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Complete a late proven close without allowing it to touch a replacement session generation. */
+  private async finalizeLateAgentSessionCancellation(
+    taskId: string,
+    state: ActiveExecutorSessionState,
+    releaseWorktreeAfterConfirmedClose: boolean,
+  ): Promise<void> {
+    const { session } = state;
+    if (this.activeSessions.get(taskId)?.session !== session) return;
+    try {
+      await this.persistCccCancellationConfirmed(state);
+      if (this.activeSessions.get(taskId)?.session !== session) return;
+      await this.disposeAgentSessionOnce(state);
+      if (this.activeSessions.get(taskId)?.session === session) {
+        this.deleteActiveSession(taskId);
+        if (releaseWorktreeAfterConfirmedClose) this.activeWorktrees.delete(taskId);
+      }
+    } catch {
+      await this.persistCccCancellationAttention(state).catch(() => undefined);
+      // The original caller already received the typed failure. Keep ownership
+      // visible when a late durable finalization cannot be proven.
+    }
+  }
+
+  /**
+   * The AgentSession abort acknowledgement plus the owned custom-provider
+   * stream-close barrier must resolve before a CCC receipt session becomes
+   * terminal; a failed close remains visible and owns its worktree.
+   */
+  private async persistCccCancellationConfirmed(state: ActiveExecutorSessionState): Promise<void> {
+    const durable = state.cccDurableSession;
+    if (!durable) return;
+    const guardedStore = durable.store as CliSessionStore & {
+      updateCccSessionForController?: CliSessionStore["updateCccSessionForController"];
+    };
+    const updated = typeof guardedStore.updateCccSessionForController === "function"
+      ? await guardedStore.updateCccSessionForController(durable.sessionId, durable.controllerToken, {
+          agentState: "dead",
+          terminationReason: "killed",
+          controllerFenced: true,
+          cancellationState: "CANCELLED",
+        })
+      : (() => {
+          const current = durable.store.getSession(durable.sessionId);
+          if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
+          return durable.store.updateSession(durable.sessionId, {
+            agentState: "dead",
+            terminationReason: "killed",
+            autonomyPosture: {
+              ...(current.autonomyPosture ?? {}),
+              cccControllerFenced: true,
+              cccCancellationState: "CANCELLED",
+            },
+          });
+        })();
+    // A replacement controller owns this durable row now. Late finalizers may
+    // still dispose their own transport, but must not mutate that replacement.
+    if (updated) await durable.store.flush();
+  }
+
+  /** Keep a truthfully non-terminal record when abort or persistence is unconfirmed. */
+  private async persistCccCancellationAttention(state: ActiveExecutorSessionState): Promise<void> {
+    const durable = state.cccDurableSession;
+    if (!durable) return;
+    const guardedStore = durable.store as CliSessionStore & {
+      updateCccSessionForController?: CliSessionStore["updateCccSessionForController"];
+    };
+    const updated = typeof guardedStore.updateCccSessionForController === "function"
+      ? await guardedStore.updateCccSessionForController(durable.sessionId, durable.controllerToken, {
+          agentState: "needsAttention",
+          terminationReason: null,
+          controllerFenced: false,
+          cancellationState: "CANCELLATION_UNCONFIRMED",
+        })
+      : (() => {
+          const current = durable.store.getSession(durable.sessionId);
+          if (!current) throw new Error(`CCC durable session missing: ${durable.sessionId}`);
+          return durable.store.updateSession(durable.sessionId, {
+            agentState: "needsAttention",
+            terminationReason: null,
+            autonomyPosture: {
+              ...(current.autonomyPosture ?? {}),
+              cccControllerFenced: false,
+              cccCancellationState: "CANCELLATION_UNCONFIRMED",
+            },
+          });
+        })();
+    if (updated) await durable.store.flush();
+  }
+
+  private startCliSessionCancellation(taskId: string, session: CliTaskSession): Promise<void> {
+    const existing = this.activeCliSessionAbortCompletions.get(taskId);
+    if (existing) return existing;
+    const completion = (async () => {
+      try {
+        await session.kill("killed");
+      } catch (cause) {
+        throw new TaskCancellationAbortError(taskId, "cli-agent-session", "TASK_CANCELLATION_ABORT_FAILED", { cause });
+      }
+      if (this.activeCliTaskSessions.get(taskId) === session) {
+        this.activeCliTaskSessions.delete(taskId);
+      }
+    })();
+    this.activeCliSessionAbortCompletions.set(taskId, completion);
+    void completion.then(() => {
+      if (this.activeCliSessionAbortCompletions.get(taskId) === completion) {
+        this.activeCliSessionAbortCompletions.delete(taskId);
+      }
+    }, () => {
+      // Retain the failed single-flight cancellation and the live CLI owner.
+    });
+    return completion;
   }
 
   async abortAllInFlight(reason: string): Promise<void> {
@@ -5411,9 +5844,10 @@ export class TaskExecutor {
         executorLog.error(`Failed to write resume log for ${task.id}:`, err);
       }
       scheduleResume(() => {
-        this.execute(task).catch((err) =>
-          executorLog.error(`Failed to resume ${task.id}:`, err),
-        );
+        this.resumingOrphaned.add(task.id);
+        this.execute(task)
+          .catch((err) => executorLog.error(`Failed to resume ${task.id}:`, err))
+          .finally(() => this.resumingOrphaned.delete(task.id));
       });
     }
   }
@@ -5597,6 +6031,37 @@ export class TaskExecutor {
    * Returns true when the graph owned the task to a terminal disposition
    * (completed or failed); false when the legacy pipeline should run.
    */
+  private async shouldDeferGenericCccCampaignExecution(task: Task): Promise<boolean> {
+    const importedCampaignTask = isImportedCccCampaignTask(task);
+    const getCampaignContext = this.store.getCccCampaignContextForTask;
+    if (typeof getCampaignContext !== "function") {
+      if (importedCampaignTask) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign task: custody lookup is unwired`);
+        return true;
+      }
+      return false;
+    }
+    try {
+      const campaignContext = await getCampaignContext.call(this.store, task.id);
+      if (campaignContext) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring CCC campaign task to native workflow work processor`);
+        return true;
+      }
+      if (importedCampaignTask) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign task: custody is missing`);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      if (importedCampaignTask) {
+        executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign task: custody lookup failed (${err instanceof Error ? err.message : String(err)})`);
+        return true;
+      }
+      executorLog.warn(`[workflow-graph] ${task.id} preserving ordinary graph dispatch after CCC custody lookup failed (${err instanceof Error ? err.message : String(err)})`);
+      return false;
+    }
+  }
+
   private async executeWorkflowGraph(task: Task, opts?: { alreadyClaimed?: boolean }): Promise<void> {
     // Claim synchronously before any await so concurrent execute() calls for
     // the same task cannot both enter graph routing (mirrors executingTaskLock).
@@ -5614,6 +6079,7 @@ export class TaskExecutor {
       this.outerConcurrencyClaims.add(task.id);
     }
     try {
+      if (await this.shouldDeferGenericCccCampaignExecution(task)) return;
       let settings: Settings;
       try {
         settings = await this.store.getSettings();
@@ -5781,8 +6247,8 @@ export class TaskExecutor {
       graphAbortController = new AbortController();
       this.activeWorkflowGraphAbortControllers.set(task.id, graphAbortController);
       const customNodeExecution = new WorkflowCustomNodeExecutionService({
-        execute: (node, nodeTask, nodeSettings, columnBinding, context) =>
-          this.runGraphCustomNode(node, nodeTask, nodeSettings, columnBinding, context),
+        execute: (node, nodeTask, nodeSettings, columnBinding, context, executionContext) =>
+          this.runGraphCustomNode(node, nodeTask, nodeSettings, columnBinding, context, executionContext),
         resolveColumnBinding: resolveBindingForNode,
       });
       const runner = new WorkflowGraphTaskRunner({
@@ -5805,8 +6271,15 @@ export class TaskExecutor {
         prepareNodeExecution: (node, nodeTask, requirement) =>
           this.prepareGraphNodeExecution(node, nodeTask, settings, requirement),
         runCustomNode: customNodeExecution.runner(settings),
-        publishTaskProjection: async (taskId, patch) => {
+        publishTaskProjection: async (taskId, patch, _source, signal) => {
           await this.store.updateTaskAtomic(taskId, (liveTask) => {
+            /*
+            FNXC:CccWave4Projection 2026-07-24-19:10:
+            The branch may abort after projection persistence starts but before
+            the atomic updater owns the task lock. Recheck at that commit
+            boundary so a losing normal or plugin node produces no task patch.
+            */
+            if (signal?.aborted) return undefined;
             const update: Parameters<TaskStore["updateTask"]>[1] = {};
             if (patch.modifiedFiles) {
               const merged = [...new Set([...(liveTask.modifiedFiles ?? []), ...patch.modifiedFiles])].sort();
@@ -5915,6 +6388,11 @@ export class TaskExecutor {
             break;
           }
         }
+        if (continuation && isImportedCccCampaignWorkItem(continuation)) {
+          executorLog.warn(`[workflow-graph] ${task.id} deferring imported CCC campaign work item ${continuation.id} to native workflow work processor`);
+          return;
+        }
+        if (await this.shouldDeferGenericCccCampaignExecution(task)) return;
         if (continuation && continuation.state !== "running") {
           continuation = await this.store.transitionWorkflowWorkItem(continuation.id, "running", {
             leaseOwner: `executor:${task.id}`,
@@ -5956,12 +6434,175 @@ export class TaskExecutor {
         return;
       }
       if (result.disposition === "failed") {
+        const branchPersistenceFailure = result.context?.[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY];
+        const retryClassification = result.context?.[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY];
+        const terminalAttempt = typeof result.context?.[CCC_RETRY_ATTEMPT_CONTEXT_KEY] === "number"
+          ? result.context[CCC_RETRY_ATTEMPT_CONTEXT_KEY] as number
+          : undefined;
+        const terminalCccBranchPersistenceFailure = task.customFields?.cccFusionProfile === "ccc-fusion"
+          && typeof branchPersistenceFailure === "string"
+          && branchPersistenceFailure.startsWith("ccc-branch-persistence-");
+        const terminalCccPermanentFailure = task.customFields?.cccFusionProfile === "ccc-fusion"
+          && typeof retryClassification === "string"
+          && retryClassification.startsWith("ccc-permanent:");
+        const terminalCccTransientExhaustion = task.customFields?.cccFusionProfile === "ccc-fusion"
+          && typeof retryClassification === "string"
+          && retryClassification.startsWith("ccc-transient-retry-exhausted:");
+        const terminalCccFailure = terminalCccBranchPersistenceFailure || terminalCccPermanentFailure || terminalCccTransientExhaustion;
+        if (terminalCccFailure && !continuation) {
+          /*
+          FNXC:CCCFusionCancellation 2026-07-27-04:50:
+          A first-run terminal result races with user move cancellation because
+          there is no continuation row for the move disposer to cancel yet.
+          Serialize its entire publication with the move boundary, then refetch
+          through the non-locking reader so a committed Todo/user pause wins.
+          */
+          await this.store.withTaskLock(task.id, async () => {
+            let liveTask: Task;
+            try {
+              liveTask = await this.store.readTaskForMove(task.id);
+            } catch (error) {
+              const missingTask = error instanceof Error
+                && (
+                  error.message === `Task ${task.id} not found`
+                  || ("code" in error && error.code === "ENOENT")
+                );
+              if (error instanceof TaskDeletedError || missingTask) {
+                return;
+              }
+              throw error;
+            }
+            if (
+              liveTask.deletedAt
+              || liveTask.column === "todo"
+              || liveTask.paused
+              || liveTask.userPaused
+            ) {
+              return;
+            }
+
+            const terminalContinuation = await this.store.upsertWorkflowWorkItem({
+              runId: resolvedRunId ?? `${task.id}:${selection.workflowId}`,
+              taskId: task.id,
+              nodeId: terminalCccBranchPersistenceFailure ? "ccc-branch-persistence" : "ccc-retry-classification",
+              kind: "task",
+              state: "running",
+              attempt: terminalCccPermanentFailure || terminalCccTransientExhaustion
+                ? (terminalAttempt ?? 1)
+                : 1,
+            });
+            const terminalReason = terminalCccBranchPersistenceFailure
+              ? branchPersistenceFailure as string
+              : retryClassification as string;
+            const terminalState = terminalCccTransientExhaustion ? "exhausted" : "manual-required";
+            await this.store.transitionWorkflowWorkItem(terminalContinuation.id, terminalState, {
+              ...((terminalCccPermanentFailure || terminalCccTransientExhaustion) && terminalAttempt !== undefined
+                ? { attempt: terminalAttempt }
+                : {}),
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastError: terminalReason,
+              blockedReason: terminalReason,
+            });
+            if (terminalCccPermanentFailure) {
+              await this.store.recordRunAuditEvent({
+                taskId: task.id,
+                agentId: "task-executor",
+                runId: terminalContinuation.runId,
+                domain: "database",
+                mutationType: "workflow:work-item-transition",
+                target: terminalContinuation.id,
+                metadata: {
+                  state: "manual-required",
+                  attempt: terminalAttempt ?? terminalContinuation.attempt,
+                  classification: "ccc-permanent",
+                },
+              });
+            }
+            if (terminalCccTransientExhaustion) {
+              await this.store.recordRunAuditEvent({
+                taskId: task.id,
+                agentId: "task-executor",
+                runId: terminalContinuation.runId,
+                domain: "database",
+                mutationType: "workflow:work-item-transition",
+                target: terminalContinuation.id,
+                metadata: {
+                  state: "exhausted",
+                  attempt: terminalAttempt ?? terminalContinuation.attempt,
+                  classification: "ccc-transient-exhausted",
+                },
+              });
+            }
+          });
+          return;
+        }
         if (continuation) {
-          await this.store.transitionWorkflowWorkItem(continuation.id, "failed", {
+          /*
+          FNXC:CccBranchPersistence 2026-07-24-12:07:
+          A CCC branch whose terminal checkpoint was not durably recorded must
+          not look like an ordinary retryable graph failure. The existing native
+          work item is the operator-facing recovery contract, so park it
+          manual-required with the stable persistence reason before graph
+          teardown can schedule anything else.
+          */
+          const terminalReason = terminalCccBranchPersistenceFailure
+            ? branchPersistenceFailure as string
+            : terminalCccFailure
+              ? retryClassification as string
+              : undefined;
+          const terminalState = terminalCccTransientExhaustion ? "exhausted" : terminalCccFailure ? "manual-required" : "failed";
+          /*
+          FNXC:CccWave4Retry 2026-07-24-19:15:
+          The graph's terminal count is authoritative for both one-shot
+          permanent failures and exhausted transient failures. Replace any
+          stale continuation count in the durable transition and audit.
+          */
+          await this.store.transitionWorkflowWorkItem(continuation.id, terminalState, {
+            ...((terminalCccPermanentFailure || terminalCccTransientExhaustion) && terminalAttempt !== undefined
+              ? { attempt: terminalAttempt }
+              : {}),
             leaseOwner: null,
             leaseExpiresAt: null,
-            lastError: "workflow-continuation-failed",
+            lastError: terminalCccFailure
+              ? terminalReason
+              : "workflow-continuation-failed",
+            ...(terminalCccFailure ? { blockedReason: terminalReason } : {}),
           });
+          if (terminalCccPermanentFailure) {
+            await this.store.recordRunAuditEvent({
+              taskId: task.id,
+              agentId: "task-executor",
+              runId: continuation.runId,
+              domain: "database",
+              mutationType: "workflow:work-item-transition",
+              target: continuation.id,
+              metadata: {
+                state: "manual-required",
+                attempt: terminalAttempt ?? continuation.attempt,
+                classification: "ccc-permanent",
+              },
+            });
+          }
+          if (terminalCccTransientExhaustion) {
+            await this.store.recordRunAuditEvent({
+              taskId: task.id,
+              agentId: "task-executor",
+              runId: continuation.runId,
+              domain: "database",
+              mutationType: "workflow:work-item-transition",
+              target: continuation.id,
+              metadata: { state: "exhausted", attempt: terminalAttempt ?? continuation.attempt, classification: "ccc-transient-exhausted" },
+            });
+          }
+          if (terminalCccFailure) {
+            /*
+            FNXC:CccWave4TerminalPark 2026-07-24-16:00: once the native work
+            item is durably parked, never enter generic graph-failure routing;
+            that router may rehome executable review work for ordinary retries.
+            */
+            return;
+          }
         }
         await this.handleGraphFailure(task, result);
       } else if (result.disposition === "completed") {
@@ -7020,6 +7661,59 @@ export class TaskExecutor {
     ).create(settings);
   }
 
+  /** Public custom-node runner seam for authoritative workflow runtimes. */
+  public createAuthoritativeWorkflowCustomNodeRunner(settings: Settings): WorkflowCustomNodeRunner {
+    return (node, task, context, executionContext) =>
+      this.runGraphCustomNode(node, task, settings, undefined, context, executionContext);
+  }
+
+  /** The sole production scoped-provider resolver for fenced campaign graph nodes. */
+  public createCccCampaignWorkflowNodeProviderControllerResolver() {
+    return async (input: WorkflowNodeProviderControllerResolverInput) => {
+      const turnKey = input.execution.providerAttemptTurnKey;
+      if (!turnKey) throw new Error("CCC workflow provider controller requires sealed provider attempt turn identity");
+      const layer = this.store.getAsyncLayer();
+      if (!layer) throw new Error("CCC workflow provider controller requires PostgreSQL TaskStore");
+      const binding = await createCccCampaignProviderAttemptBinding({
+        layer,
+        rootDir: this.rootDir,
+        authorityStore: this.store,
+        semanticTaskId: input.execution.semanticTaskId,
+        turnKey,
+        expectedRoute: Object.freeze({
+          transport: "workflow" as const,
+          workflowExtensionId: input.extensionId,
+        }),
+        workflowProviderBinding: true,
+        signal: input.signal,
+      });
+      return binding;
+    };
+  }
+
+  private async createCccProviderAttemptBindingForWorkflowStep(input: {
+    execution: NonNullable<WorkflowNodeExecutionContext["execution"]>;
+    provider: string | undefined;
+    modelId: string | undefined;
+    signal?: AbortSignal;
+  }) {
+    const turnKey = input.execution.providerAttemptTurnKey;
+    if (!turnKey || !input.provider || !input.modelId) {
+      throw new Error("CCC workflow model node requires sealed turn identity and resolved provider/model before PI session creation");
+    }
+    const layer = this.store.getAsyncLayer();
+    if (!layer) throw new Error("CCC workflow model node requires PostgreSQL TaskStore");
+    return createCccCampaignProviderAttemptBinding({
+      layer,
+      rootDir: this.rootDir,
+      authorityStore: this.store,
+      semanticTaskId: input.execution.semanticTaskId,
+      turnKey,
+      expectedRoute: Object.freeze({ providerId: input.provider, modelId: input.modelId, transport: "pi" as const }),
+      signal: input.signal,
+    });
+  }
+
   private createAuthoritativeWorkflowPrimitivesFromExecutor(settings: Settings): WorkflowRuntimePrimitives {
     const logAudit = async (taskId: string | undefined, input: AuditPrimitiveInput): Promise<void> => {
       if (!taskId) return;
@@ -7242,6 +7936,12 @@ export class TaskExecutor {
         return { outcome: "success", value: input.reason };
       },
       requestMerge: async (ctx, task) => {
+        let campaignCustody;
+        try {
+          campaignCustody = await resolveCccCampaignMergeCustody(this.store, task);
+        } catch (error) {
+          return { outcome: "failure", value: error instanceof Error ? error.message : "ccc-campaign-custody-refused" };
+        }
         if (!this.mergeRequester) {
           return { outcome: "failure", value: "merge-unavailable", data: { status: "failed", reason: "merge-unavailable" } };
         }
@@ -7252,12 +7952,14 @@ export class TaskExecutor {
         if (ctx.signal?.aborted) {
           return { outcome: "failure", value: "merge-cancelled" };
         }
-        const mergeTask = await this.ensureWorkflowMergeBoundaryTask(task, {
-          reason: "workflow-merge-boundary",
-          nodeId: ctx.node.node.id,
-          workflowId: ctx.run.workflowId,
-          runId: ctx.run.runId,
-        });
+        const mergeTask = campaignCustody.kind === "campaign"
+          ? task
+          : await this.ensureWorkflowMergeBoundaryTask(task, {
+              reason: "workflow-merge-boundary",
+              nodeId: ctx.node.node.id,
+              workflowId: ctx.run.workflowId,
+              runId: ctx.run.runId,
+            });
         /*
         FNXC:WorkflowMerge 2026-06-29-23:18:
         FN-7261 reached the merge node in fast mode with every legacy implementation step still pending, producing a no-op merge proof for work that never ran. A graph-native workflow may project its checklist at the merge boundary only when node workflow results prove implementation completed; otherwise incomplete legacy steps are authoritative and merge must fail before the merger can create stale no-op proof.
@@ -7323,11 +8025,24 @@ export class TaskExecutor {
             executorLog.warn(`${mergeTask.id}: workflow merge primitive timed out after ${GRAPH_MERGE_TIMEOUT_MS}ms`);
             return { outcome: "failure", value: "merge-timeout", data: { status: "timeout" } };
           }
+          if (
+            campaignCustody.kind === "campaign"
+            && !matchesCccCampaignMergeControl(result.campaignControlled, campaignCustody.context)
+          ) {
+            return { outcome: "failure", value: "ccc-campaign-merge-authority-mismatch", data: { status: "failed", reason: "ccc-campaign-merge-authority-mismatch" } };
+          }
           if (result.merged || result.noOp) {
             /*
             FNXC:WorkflowMerge 2026-06-29-09:24:
             The workflow merge primitive owns the normal lifecycle transition after a graph merge node succeeds. Finalize the proven landed task here so `mergeConfirmed` cannot strand a card in `in-progress`; executor preflight recovery is only a fallback for rows already stranded by older runs.
             */
+            if (campaignCustody.kind === "campaign") {
+              return {
+                outcome: "success",
+                value: result.noOp ? "merge-noop" : "merged",
+                data: { status: "merged", noOp: result.noOp },
+              };
+            }
             const finalization = await finalizeProvenAutoMergeTask({
               store: this.store,
               taskId: mergeTask.id,
@@ -7630,6 +8345,18 @@ export class TaskExecutor {
         return { outcome: "success", value: "in-review" };
       },
       merge: async (seamTask, _context, signal) => {
+        let campaignCustody;
+        try {
+          campaignCustody = await resolveCccCampaignMergeCustody(this.store, seamTask);
+        } catch (error) {
+          return { outcome: "failure", value: error instanceof Error ? error.message : "ccc-campaign-custody-refused" };
+        }
+        if (campaignCustody.kind === "campaign") {
+          return {
+            outcome: "failure",
+            value: "ccc-campaign-authoritative-merge-required",
+          };
+        }
         if (!this.mergeRequester) {
           return { outcome: "failure", value: "merge-unavailable" };
         }
@@ -8478,8 +9205,21 @@ export class TaskExecutor {
     settings: Settings,
     columnBinding?: WorkflowColumnAgent,
     graphContext?: Record<string, unknown>,
+    executionContext?: WorkflowNodeExecutionContext,
   ): Promise<WorkflowNodeResult> {
     const cfg = node.config ?? {};
+    const executorKind = typeof cfg.executor === "string" ? cfg.executor : "model";
+
+    if (executorKind === "cli-agent" && executionContext?.execution?.executionFence) {
+      return this.runCliAgentNode(
+        node,
+        nodeTask,
+        cfg,
+        columnBinding,
+        executionContext,
+      );
+    }
+
     let live = await this.store.getTask(nodeTask.id);
 
     const staleInput = await this.resolveWorkflowInputMarkerForGraphNode(live, node.id);
@@ -8531,14 +9271,18 @@ export class TaskExecutor {
       await this.store.logEntry(live.id, `Workflow input received for step '${node.id}' — resuming`, undefined, this.getRunContextFor(live.id));
     }
 
-    const executorKind = typeof cfg.executor === "string" ? cfg.executor : "model";
-
     // CLI Agent Executor (U7): a `cli-agent` node drives an engine-owned CLI
     // session through the task-session orchestration — NOT through the
     // executeWorkflowStep / model machinery. It is write-capable (the agent edits
     // the worktree), so it requires a task worktree like any coding node.
     if (executorKind === "cli-agent") {
-      return this.runCliAgentNode(node, await this.store.getTask(live.id), cfg);
+      return this.runCliAgentNode(
+        node,
+        await this.store.getTask(live.id),
+        cfg,
+        columnBinding,
+        executionContext,
+      );
     }
 
     // Fast mode bypasses pre-merge automated review/validation gates. Custom
@@ -8829,7 +9573,7 @@ export class TaskExecutor {
 
     const outcome = mode === "script"
       ? await this.executeScriptWorkflowStep(live, step, worktreePath, settings, nodeEnv)
-      : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, { unattended });
+      : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, { unattended, execution: executionContext?.execution, signal: executionContext?.signal });
 
     // Skill-emitted await-input (U6): if the skill asked the user a blocking
     // question via the ===FUSION_AWAIT_INPUT=== sentinel, park the task
@@ -8886,13 +9630,21 @@ export class TaskExecutor {
      * one; `advisory_failure` preserves visibility without inventing feedback.
      */
     const malformed = (outcome as { malformed?: boolean }).malformed === true;
-    const advisoryFailureValue = malformed ? "advisory_failure" : "failed";
+    const cccPrdTaskId = typeof cfg.cccPrdTaskId === "string" ? cfg.cccPrdTaskId.trim() : "";
+    const fencedBlockingCccSemanticGate = malformed
+      && blocking
+      && cfg.gateMode === "gate"
+      && cccPrdTaskId.length > 0
+      && cfg.cccPrdTaskId === cccPrdTaskId
+      && Boolean(executionContext?.execution?.executionFence)
+      && Object.isFrozen(executionContext?.execution?.executionFence);
+    const advisoryFailureValue = malformed && !fencedBlockingCccSemanticGate ? "advisory_failure" : "failed";
     /*
-    FNXC:ReviewLeniency 2026-07-02-00:30:
-    Malformed review output (no parseable verdict, even after the fallback-model retry in executeWorkflowStep) is treated as a NON-BLOCKING advisory rather than a hard gate failure. Operators asked that an unparseable reviewer response not block a task in review — a genuine REVISE (parsed verdict) still blocks, and the advisory_failure value keeps the malformed result visible on the Workflow tab. Only `malformed` relaxes a gate; every parsed non-pass verdict continues to block exactly as before.
-    */
+     * FNXC:ReviewLeniency 2026-07-02-00:30:
+     * Generic malformed review output (no parseable verdict, even after the fallback-model retry in executeWorkflowStep) remains a NON-BLOCKING advisory rather than a hard gate failure. Sealed imported CCC semantic task gates are the narrow exception: when they carry a canonical `cccPrdTaskId`, `gateMode: "gate"`, and a frozen execution fence, malformed output fails closed as `failed`. A genuine REVISE (parsed verdict) still blocks, and `advisory_failure` keeps generic malformed results visible on the Workflow tab.
+     */
     return {
-      outcome: outcome.success || !blocking || malformed ? "success" : "failure",
+      outcome: outcome.success || !blocking || (malformed && !fencedBlockingCccSemanticGate) ? "success" : "failure",
       value: (outcome as WorkflowStepOutcome).failureValue ?? verdict ?? (outcome.success ? "passed" : advisoryFailureValue),
       ...(Object.keys(contextPatch).length > 0 ? { contextPatch } : {}),
     };
@@ -8946,7 +9698,107 @@ export class TaskExecutor {
     node: WorkflowIrNode,
     live: TaskDetail,
     cfg: Record<string, unknown>,
+    columnBinding?: WorkflowColumnAgent,
+    executionContext?: WorkflowNodeExecutionContext,
   ): Promise<WorkflowNodeResult> {
+    let fencedCliConfig: ResolvedCliExecutorConfig | undefined;
+    let nativeCliBinding: CccNativeCliBinding | undefined;
+    let nativeCliPermitScope: CccProviderAttemptScope | undefined;
+    let nativeCliSessionPolicy: ReturnType<typeof buildCccNativeCliSessionPolicy> | undefined;
+    if (executionContext?.execution?.executionFence) {
+      const runtime = this.options.cliAgentRuntime;
+      if (!runtime?.resolveCccNativeCliBinding) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but no host-native CLI binding route exists yet`,
+        );
+      }
+      if (typeof live.worktree !== "string" || live.worktree.trim().length === 0) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but no task worktree exists`,
+        );
+      }
+      if (executionContext.signal?.aborted) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in an already aborted fenced campaign execution`,
+        );
+      }
+      const resolvedConfig = this.resolveCliExecutorConfig(cfg);
+      if (!resolvedConfig) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but no CLI executor config is available`,
+        );
+      }
+      if (resolvedConfig.settings?.profile !== CCC_FUSION_PROFILE) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but CLI profile is not ${CCC_FUSION_PROFILE}`,
+        );
+      }
+      fencedCliConfig = resolvedConfig;
+      const execution = executionContext.execution;
+      const executionFence = execution.executionFence;
+      if (!executionFence) {
+        throw new CccNativeCliBindingRefusedError("CCC native CLI executionFence is required");
+      }
+      const turnKey = assertCanonicalCccNativeCliTurnKey(execution.providerAttemptTurnKey, "providerAttemptTurnKey");
+      const adapterId = assertCanonicalCccNativeCliText(resolvedConfig.cliAdapterId, "adapterId");
+      const providerId = assertCanonicalCccNativeCliText(
+        typeof cfg.modelProvider === "string" ? cfg.modelProvider : live.modelProvider,
+        "providerId",
+      );
+      const modelId = assertCanonicalCccNativeCliText(
+        typeof cfg.modelId === "string" ? cfg.modelId : live.modelId,
+        "modelId",
+      );
+      if (!Object.isFrozen(executionFence)) {
+        throw new CccNativeCliBindingRefusedError("CCC native CLI executionFence must be frozen");
+      }
+      if (!Object.isFrozen(execution.visitIdentity)) {
+        throw new CccNativeCliBindingRefusedError("CCC native CLI visitIdentity must be frozen");
+      }
+      const expectedRoute: CccNativeCliRoute = Object.freeze({
+        adapterId,
+        providerId,
+        modelId,
+        transport: CCC_NATIVE_CLI_TRANSPORT,
+      });
+      const resolverInput = Object.freeze({
+        nodeId: node.id,
+        originTaskId: execution.originTaskId,
+        semanticTaskId: execution.semanticTaskId,
+        executionFence,
+        visitIdentity: execution.visitIdentity,
+        turnKey,
+        expectedRoute,
+        ...(executionContext.signal ? { signal: executionContext.signal } : {}),
+      });
+      const binding = validateCccNativeCliBinding(await runtime.resolveCccNativeCliBinding(resolverInput), {
+        turnKey,
+        dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
+        route: expectedRoute,
+      });
+      nativeCliBinding = binding;
+      const dispatchRequest = Object.freeze({
+        turnKey,
+        dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
+        providerId,
+        modelId,
+        transport: CCC_NATIVE_CLI_TRANSPORT,
+      });
+      const preDispatchDecision = await binding.controller.preDispatch(dispatchRequest);
+      if (preDispatchDecision.kind !== "dispatch-permit") {
+        throw new CccNativeCliBindingRefusedError(
+          `CCC native CLI binding controller refused dispatch with decision '${preDispatchDecision.kind}'`,
+        );
+      }
+      nativeCliPermitScope = validateCccNativeCliPermitScope(preDispatchDecision.scope, {
+        dispatchRequest,
+        semanticTaskId: execution.semanticTaskId,
+        authorityBindingHash: binding.authorityBindingHash,
+      });
+      const observedAtMs = Date.now();
+      nativeCliSessionPolicy = buildCccNativeCliSessionPolicy(binding, nativeCliPermitScope, observedAtMs);
+    }
+
     const runtime = this.options.cliAgentRuntime;
     if (!runtime) {
       await this.store.logEntry(
@@ -8966,7 +9818,7 @@ export class TaskExecutor {
       );
       return { outcome: "failure", value: "no-worktree-for-write-node" };
     }
-    const config = this.resolveCliExecutorConfig(cfg);
+    const config = fencedCliConfig ?? this.resolveCliExecutorConfig(cfg);
     if (!config) {
       await this.store.logEntry(
         live.id,
@@ -8978,28 +9830,109 @@ export class TaskExecutor {
     }
 
     const prompt = typeof cfg.prompt === "string" ? cfg.prompt : (live.prompt ?? "");
+    /*
+    FNXC:CCCNativeMcp 2026-07-23-16:10:
+    Native CLI MCP resolution uses the same effective-agent precedence as model
+    nodes. Resolve only for the ccc profile, immediately before task-session
+    construction, so ordinary profiles neither materialize nor forward MCP data.
+    */
+    const ownAgentId = typeof cfg.agentId === "string" && cfg.agentId.trim()
+      ? cfg.agentId.trim()
+      : typeof live.assignedAgentId === "string" && live.assignedAgentId.trim()
+        ? live.assignedAgentId.trim()
+        : undefined;
+    const cfgModelComplete = Boolean(
+      typeof cfg.modelProvider === "string"
+      && cfg.modelProvider.trim()
+      && typeof cfg.modelId === "string"
+      && cfg.modelId.trim(),
+    );
+    const effectiveIdentity = resolveEffectiveAgent({
+      binding: columnBinding,
+      ownAgentId,
+      ownModelProvider: cfgModelComplete
+        ? (cfg.modelProvider as string).trim()
+        : live.modelProvider ?? undefined,
+      ownModelId: cfgModelComplete
+        ? (cfg.modelId as string).trim()
+        : live.modelId ?? undefined,
+    });
+    const effectiveAgentId = effectiveIdentity.source === "column-agent"
+      ? effectiveIdentity.agentId
+      : ownAgentId;
+    let mcpServers: Awaited<ReturnType<TaskExecutor["resolveMcpServers"]>> | undefined;
+
+    const reconcileNativeCliPreProviderFailure = async (
+      phase: CccNativeCliPreProviderPhase.McpResolution
+        | CccNativeCliPreProviderPhase.PriorSessionKill
+        | CccNativeCliPreProviderPhase.PtyCapacity,
+    ): Promise<void> => {
+      if (!nativeCliBinding || !nativeCliPermitScope) return;
+      const evidenceDigest = createCccNativeCliPreProviderEvidenceDigest(phase, nativeCliPermitScope, nativeCliBinding);
+      const observation = Object.freeze({
+        kind: "ccc-fusion.native-cli-observation" as const,
+        version: 1 as const,
+        outcome: "proved_failed" as const,
+        evidenceDigest,
+      });
+      const terminalScope = await nativeCliBinding.controller.reconcile(Object.freeze({
+        taskId: nativeCliPermitScope.taskId,
+        attemptKey: nativeCliPermitScope.attemptKey,
+        controllerToken: nativeCliPermitScope.controllerToken,
+        outcome: "proved_failed" as const,
+        evidenceDigest,
+        observerId: CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID,
+        terminationReason: "crashed" as const,
+        cancellationState: null,
+      }));
+      validateCccNativeCliTerminalScope(terminalScope, {
+        permitScope: nativeCliPermitScope,
+        observation,
+        observerId: CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID,
+      });
+    };
 
     // Re-entry: kill any prior LIVE session for this task (RETHINK/replan context
     // reset) before launching fresh.
-    killLiveTaskSessions(live.id, runtime.manager, runtime.store);
-
     let session: CliTaskSession;
+    let preProviderPhase = CccNativeCliPreProviderPhase.McpResolution;
     try {
+      mcpServers = config.settings?.profile === CCC_FUSION_PROFILE
+        ? await this.resolveMcpServers(effectiveAgentId)
+        : undefined;
+      preProviderPhase = CccNativeCliPreProviderPhase.PriorSessionKill;
+      await killLiveTaskSessions(live.id, runtime.manager, runtime.store);
+      preProviderPhase = CccNativeCliPreProviderPhase.Launch;
       session = await launchCliTaskSession({
         taskId: live.id,
         projectId: runtime.projectId,
         worktreePath: live.worktree,
         prompt,
         config,
+        ...(mcpServers ? { mcpServers } : {}),
         manager: runtime.manager,
         hub: runtime.hub,
         registry: runtime.registry,
         hookEndpointUrl: runtime.hookEndpointUrl,
         hookDirRoot: runtime.hookDirRoot,
+        ...(nativeCliSessionPolicy
+          ? {
+              cccNativeCli: nativeCliSessionPolicy,
+            }
+          : {}),
         log: (msg) => executorLog.log(`[cli-agent] ${msg}`),
       });
     } catch (err) {
-      if (err instanceof CliConcurrencyLimitError) {
+      if (preProviderPhase === CccNativeCliPreProviderPhase.McpResolution) {
+        await reconcileNativeCliPreProviderFailure(CccNativeCliPreProviderPhase.McpResolution);
+        throw err;
+      }
+      if (preProviderPhase === CccNativeCliPreProviderPhase.PriorSessionKill) {
+        await reconcileNativeCliPreProviderFailure(CccNativeCliPreProviderPhase.PriorSessionKill);
+        throw err;
+      }
+      if (preProviderPhase === CccNativeCliPreProviderPhase.Launch && err instanceof CliConcurrencyLimitError) {
+        await reconcileNativeCliPreProviderFailure(CccNativeCliPreProviderPhase.PtyCapacity);
         await this.store.logEntry(
           live.id,
           `cli-agent session for node '${node.id}' rejected at PTY pool ceiling (${err.active}/${err.ceiling}) — queued`,
@@ -9017,15 +9950,60 @@ export class TaskExecutor {
     let outcome: CliTaskOutcome;
     try {
       outcome = await session.result();
-    } finally {
-      // Detach the live-session handle. Reaping (success) / killing (cancel) is
-      // handled per-outcome below or by the abort path.
+    } catch (err) {
+      if (!nativeCliSessionPolicy && this.activeCliTaskSessions.get(live.id) === session) {
+        this.activeCliTaskSessions.delete(live.id);
+      }
+      throw err;
+    }
+    if (!nativeCliSessionPolicy && outcome.kind !== "ccc-native-held-closed") {
+      // Ordinary CLI sessions retain their prior detach behavior. Native held
+      // closures and unexpected native failure outcomes remain owned until their
+      // campaign settlement path has resolved.
       if (this.activeCliTaskSessions.get(live.id) === session) {
         this.activeCliTaskSessions.delete(live.id);
       }
     }
 
     switch (outcome.kind) {
+      case "ccc-native-held-closed": {
+        if (!nativeCliBinding || !nativeCliPermitScope || !nativeCliSessionPolicy || !outcome.nativeCliHeldClosureReceipt) {
+          throw new CccNativeCliBindingRefusedError("CCC native CLI held close missing binding, permit, policy, or receipt");
+        }
+        if (outcome.sessionId !== session.sessionId) {
+          throw new CccNativeCliBindingRefusedError("CCC native CLI held close sessionId does not match launched session");
+        }
+        const receipt = validateCccNativeCliHeldClosureReceipt(outcome.nativeCliHeldClosureReceipt, {
+          sessionId: session.sessionId,
+          policy: nativeCliSessionPolicy,
+        });
+        const observation = validateCccNativeCliObservation(await nativeCliBinding.observer.observe(Object.freeze({
+          receipt,
+          permitScope: nativeCliPermitScope,
+        })));
+        const cancelled = observation.outcome === "proved_failed"
+          && (receipt.trigger === "cancel" || receipt.trigger === "lifetime");
+        const terminalScope = validateCccNativeCliTerminalScope(await nativeCliBinding.controller.reconcile(Object.freeze({
+          taskId: nativeCliPermitScope.taskId,
+          attemptKey: nativeCliPermitScope.attemptKey,
+          controllerToken: nativeCliPermitScope.controllerToken,
+          outcome: observation.outcome,
+          evidenceDigest: observation.evidenceDigest,
+          observerId: CCC_NATIVE_CLI_OBSERVER_ID,
+          terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
+          cancellationState: cancelled ? "CANCELLED" : null,
+        })), {
+          permitScope: nativeCliPermitScope,
+          observation,
+        });
+        await session.releaseCccNativeCli(receipt, terminalScope);
+        if (this.activeCliTaskSessions.get(live.id) === session) {
+          this.activeCliTaskSessions.delete(live.id);
+        }
+        return observation.outcome === "committed"
+          ? { outcome: "success", value: "cli-agent-done" }
+          : { outcome: "failure", value: "cli-agent-proved-failed" };
+      }
       case "success":
         // Reap the PTY at the execute→in-review handoff (autoMerge:false tasks
         // don't hold slots): graceful kill, record terminationReason "completed".
@@ -9775,22 +10753,39 @@ export class TaskExecutor {
     result: WorkflowGraphTaskRunResult,
     abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
   ): Promise<boolean> {
-    if (!this.mergeRequester) return false;
     /* FNXC:WorkflowMerge 2026-07-12-17:38: FN-1165 defense in depth — implementation-incomplete merge graph failures must never reach the merge requester, because a no-branch task can otherwise be finalized as an intentional no-op. */
     if (this.graphFailureValue(result) === "implementation-incomplete") return false;
     const failedNode = result.visitedNodeIds[result.visitedNodeIds.length - 1] ?? "unknown";
-    const message = `Workflow graph merge failure at node '${failedNode}' routed to bounded auto-merge retry${abortProvenance === "merge-seam" ? " after merge-seam abort" : abortProvenance === "hard-cancel" || abortProvenance === undefined ? " after benign pause/resume abort" : ""}`;
-    executorLog.warn(`${live.id}: ${message}`);
-    await this.store.logEntry(live.id, message, undefined, this.getRunContextFor(live.id));
+    let campaignCustody;
     try {
-      const mergeTask = await this.ensureWorkflowMergeBoundaryTask(live, {
-        reason: "workflow-merge-retry-boundary",
-        nodeId: failedNode,
-        workflowId: result.context?.["workflow:id"] as string | undefined ?? "workflow-graph",
-        runId: this.getRunContextFor(live.id)?.runId ?? "graph-merge-retry",
-      });
-      await this.mergeRequester(mergeTask.id);
+      campaignCustody = await resolveCccCampaignMergeCustody(this.store, live);
+    } catch {
+      return false;
+    }
+    if (!this.mergeRequester) return false;
+    const message = `Workflow graph merge failure at node '${failedNode}' routed to bounded auto-merge retry${abortProvenance === "merge-seam" ? " after merge-seam abort" : abortProvenance === "hard-cancel" || abortProvenance === undefined ? " after benign pause/resume abort" : ""}`;
+    if (campaignCustody.kind !== "campaign") {
+      executorLog.warn(`${live.id}: ${message}`);
+      await this.store.logEntry(live.id, message, undefined, this.getRunContextFor(live.id));
+    }
+    try {
+      const mergeTask = campaignCustody.kind === "campaign"
+        ? live
+        : await this.ensureWorkflowMergeBoundaryTask(live, {
+            reason: "workflow-merge-retry-boundary",
+            nodeId: failedNode,
+            workflowId: result.context?.["workflow:id"] as string | undefined ?? "workflow-graph",
+            runId: this.getRunContextFor(live.id)?.runId ?? "graph-merge-retry",
+          });
+      const mergeResult = await this.mergeRequester(mergeTask.id);
+      if (
+        campaignCustody.kind === "campaign"
+        && !matchesCccCampaignMergeControl(mergeResult.campaignControlled, campaignCustody.context)
+      ) {
+        throw new Error("CCC campaign retry merge result is missing an exact persisted custody authority");
+      }
     } catch (error) {
+      if (campaignCustody.kind === "campaign") throw error;
       executorLog.warn(`${live.id}: bounded auto-merge retry request failed after graph merge failure: ${error instanceof Error ? error.message : String(error)}`);
     }
     await this.persistTokenUsage(live.id);
@@ -11025,6 +12020,7 @@ export class TaskExecutor {
   invocation to exclude and the gates are unconditional.
   */
   private async executeCore(task: Task): Promise<void> {
+    if (await this.shouldDeferGenericCccCampaignExecution(task)) return;
     this.completionFinalizedTaskIds.delete(task.id);
     /*
     FNXC:ExecutorSoftDelete 2026-07-20-23:30:
@@ -12618,6 +13614,136 @@ export class TaskExecutor {
         // sessionFile must be let because it's assigned before downstream retry-session reassignment.
         let session: AgentSession;
         let sessionFile: string | null | undefined;
+        const cccFusionExecutor = settings.profile === CCC_FUSION_PROFILE;
+        const cccRuntime = this.options.cliAgentRuntime;
+        if (cccFusionExecutor && !cccRuntime) {
+          throw new Error("CCC Fusion executor requires the CLI session runtime for durable effect receipts");
+        }
+        /*
+        FNXC:CCCDurableEffects 2026-07-23-19:20:
+        The generic PI/custom-provider executor owns the actual synthetic tool
+        boundary. Give that live AgentSession a durable CliSessionStore record
+        before it can execute any tool so a process restart can suppress a
+        receipt that was committed before its acknowledgement returned.
+        */
+        let cccDurableSession: CliSession | undefined;
+        let cccEffectReceiptControllerToken: string | undefined;
+        let cccReceiptBindingPromise: Promise<{
+          store: CliSessionStore;
+          sessionId: string;
+          controllerToken: string;
+          keepTurnOpen: boolean;
+        }> | undefined;
+        const cccEffectReceiptBinder = cccFusionExecutor && cccRuntime
+          ? async (toolScope: readonly { authority: string; parametersSha256: string }[]) => {
+              if (!cccReceiptBindingPromise) {
+                cccReceiptBindingPromise = (async () => {
+                  const cccExecutionAuthority = {
+                    actorId: identityAgent?.id ?? `executor-${task.id}`,
+                    permissionPolicy: resolveEffectiveAgentPermissionPolicy(
+                      identityAgent?.permissionPolicy,
+                      settings.defaultAgentPermissionPolicy,
+                    ),
+                    effectTurnMode: "keep-open" as const,
+                    toolScope,
+                  };
+                  const unfencedEngineDeath = this.resumingOrphaned.has(task.id)
+                    && cccRuntime.store.listByTask(task.id).some((session) => (
+                      matchesCccExecutorReceiptLedgerPosture(
+                        session,
+                        task.id,
+                        executorProvider,
+                        executorModelId,
+                        worktreePath,
+                      )
+                      && session.agentState === "dead"
+                      && session.terminationReason === "engineDeath"
+                      && session.autonomyPosture?.cccControllerFenced !== true
+                    ));
+                  if (unfencedEngineDeath) {
+                    throw new Error("CCC engine-death receipt recovery requires a durable controller fence");
+                  }
+                  const existingLedger = selectCccExecutorReceiptLedger(
+                    cccRuntime.store,
+                    task.id,
+                    executorProvider,
+                    executorModelId,
+                    worktreePath,
+                    cccExecutionAuthority,
+                  );
+                  if (existingLedger) {
+                    const token = existingLedger.autonomyPosture?.cccControllerGeneration;
+                    if (typeof token !== "string") throw new Error("CCC reusable receipt ledger is missing its controller generation");
+                    cccDurableSession = await cccRuntime.store.updateCccSessionForController(existingLedger.id, token, {
+                      agentState: "starting",
+                      terminationReason: null,
+                      controllerFenced: false,
+                    });
+                    if (!cccDurableSession) throw new Error("CCC durable receipt ledger changed before exact-authority reuse");
+                    cccEffectReceiptControllerToken = token;
+                  } else {
+                    const recoveryLedger = this.resumingOrphaned.has(task.id)
+                      ? selectCccFencedEngineDeathLedger(
+                          cccRuntime.store,
+                          task.id,
+                          executorProvider,
+                          executorModelId,
+                          worktreePath,
+                          cccExecutionAuthority,
+                        )
+                      : undefined;
+                    if (recoveryLedger) {
+                      const oldToken = recoveryLedger.autonomyPosture?.cccControllerGeneration;
+                      if (typeof oldToken !== "string") throw new Error("CCC fenced engine-death ledger is missing its controller generation");
+                      const freshToken = randomUUID();
+                      // The durable turn takeover validates the old dead/fenced owner before this
+                      // controller can make the session row live under a new generation.
+                      await cccRuntime.store.openCccEffectTurn(recoveryLedger.id, freshToken);
+                      cccDurableSession = await cccRuntime.store.updateCccSessionForController(recoveryLedger.id, oldToken, {
+                        agentState: "starting",
+                        terminationReason: null,
+                        controllerToken: freshToken,
+                        controllerFenced: false,
+                        cancellationState: null,
+                      });
+                      if (!cccDurableSession) throw new Error("CCC fenced engine-death ledger changed before recovery admission");
+                      cccEffectReceiptControllerToken = freshToken;
+                    } else {
+                      cccEffectReceiptControllerToken = randomUUID();
+                      cccDurableSession = cccRuntime.store.createSession({
+                        projectId: cccRuntime.projectId,
+                        adapterId: "pi",
+                        purpose: "execute",
+                        taskId: task.id,
+                        worktreePath,
+                        autonomyPosture: {
+                          cccFusionProfile: CCC_FUSION_PROFILE,
+                          cccFusionProvider: executorProvider,
+                          cccFusionModel: executorModelId,
+                          cccEffectReceiptContract: CCC_EFFECT_RECEIPT_CONTRACT,
+                          cccExecutionAuthority,
+                          cccControllerGeneration: cccEffectReceiptControllerToken,
+                          cccControllerFenced: false,
+                        },
+                        agentState: "starting",
+                      });
+                      await cccRuntime.store.flush();
+                    }
+                  }
+                  if (!cccDurableSession || !cccEffectReceiptControllerToken) {
+                    throw new Error("CCC durable receipt admission did not produce a session generation");
+                  }
+                  return {
+                    store: cccRuntime.store,
+                    sessionId: cccDurableSession.id,
+                    controllerToken: cccEffectReceiptControllerToken,
+                    keepTurnOpen: true,
+                  };
+                })();
+              }
+              return cccReceiptBindingPromise;
+            }
+          : undefined;
         try {
           const createdSession = await createResolvedAgentSession({
             sessionPurpose: "executor",
@@ -12656,6 +13782,11 @@ export class TaskExecutor {
             permanentAgentGating: this.buildPermanentAgentGatingContext(task.id, identityAgent, settings.defaultAgentPermissionPolicy),
             taskId: task.id,
             taskTitle: detail.title,
+            ...(cccEffectReceiptBinder ? {
+              profile: CCC_FUSION_PROFILE,
+              subscriptionReady: true as const,
+              cccEffectReceiptBinder,
+            } : {}),
             onFallbackModelUsed: createFallbackModelObserver({
               agent: "executor",
               label: "executor",
@@ -12666,6 +13797,15 @@ export class TaskExecutor {
           });
           session = createdSession.session;
           sessionFile = createdSession.sessionFile;
+          if (cccDurableSession && cccEffectReceiptControllerToken) {
+            const updated = await cccRuntime!.store.updateCccSessionForController(cccDurableSession.id, cccEffectReceiptControllerToken, {
+              agentState: "busy",
+              terminationReason: null,
+              ...(sessionFile ? { nativeSessionId: sessionFile } : {}),
+            });
+            if (!updated) throw new Error(`CCC durable session disappeared: ${cccDurableSession.id}`);
+            await cccRuntime!.store.flush();
+          }
         } catch (sessionStartError) {
           if (await this.recoverMissingWorktreeSessionStartFailure(task, worktreePath, sessionStartError, audit)) {
             return;
@@ -12707,6 +13847,13 @@ export class TaskExecutor {
           lastResolvedModelId: executorModelId,
           lastTaskModelProvider: detail.modelProvider,
           lastTaskModelId: detail.modelId,
+          ...(cccDurableSession && cccEffectReceiptControllerToken ? {
+            cccDurableSession: {
+              store: cccRuntime!.store,
+              sessionId: cccDurableSession.id,
+              controllerToken: cccEffectReceiptControllerToken,
+            },
+          } : {}),
           lastAssignedAgentId: detail.assignedAgentId ?? null,
           // U5 (R7): the effective column-agent governing this session (null when no
           // binding governs — legacy path). The watcher re-resolves this for graph-
@@ -13086,6 +14233,11 @@ export class TaskExecutor {
                   // X-Session-Id/X-Session-Affinity as the primary session, keeping the
                   // task's LLM requests grouped under one stable routing/observability id.
                   taskId: task.id,
+                  ...(cccEffectReceiptBinder ? {
+                    profile: CCC_FUSION_PROFILE,
+                    subscriptionReady: true as const,
+                    cccEffectReceiptBinder,
+                  } : {}),
                 });
                 retrySession = createdRetrySession.session;
                 await this.captureExecutorTokenUsageBaseline(task.id, retrySession);
@@ -13106,6 +14258,13 @@ export class TaskExecutor {
                   lastResolvedModelId: executorModelId,
                   lastTaskModelProvider: detail.modelProvider,
                   lastTaskModelId: detail.modelId,
+                  ...(cccDurableSession && cccEffectReceiptControllerToken ? {
+                    cccDurableSession: {
+                      store: cccRuntime!.store,
+                      sessionId: cccDurableSession.id,
+                      controllerToken: cccEffectReceiptControllerToken,
+                    },
+                  } : {}),
                   lastAssignedAgentId: detail.assignedAgentId ?? null,
                   // U5 (R7): preserve the effective column-agent across the retry.
                   lastEffectiveColumnAgentId: columnAgentSeam?.agent.id ?? null,
@@ -15093,7 +16252,8 @@ export class TaskExecutor {
     settings: Settings,
     audit?: RunAuditor,
   ): Promise<{ blocked: false } | { blocked: true; message: string }> {
-    if (task.scopeOverride === true) {
+    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    if (task.scopeOverride === true && !cccFusionTask) {
       executorLog.log(`${task.id}: scope-leak guard bypassed (scopeOverride=true)`);
       await this.store.logEntry(task.id, "[scope-leak] scope guard bypassed via task.scopeOverride", undefined, this.getRunContextFor(task.id));
       return { blocked: false };
@@ -15101,12 +16261,20 @@ export class TaskExecutor {
 
     const declaredScope = await this.store.parseFileScopeFromPrompt(task.id).catch(() => [] as string[]);
     if (declaredScope.length === 0) {
+      if (cccFusionTask) {
+        const message = "CCC Fusion scope verification requires a declared File Scope before fn_task_done.";
+        executorLog.warn(`${task.id}: [scope-leak] ${message}`);
+        await this.store.logEntry(task.id, `[scope-leak] ${message}`, undefined, this.getRunContextFor(task.id));
+        return { blocked: true, message };
+      }
       return { blocked: false };
     }
 
     const reviewLevel = parseReviewLevelFromPrompt(promptContent);
     const configuredMode = settings.planOnlyScopeLeakEnforcement ?? "warn";
-    const enforcementMode: "off" | "warn" | "block" = reviewLevel === 1
+    const enforcementMode: "off" | "warn" | "block" = cccFusionTask
+      ? "block"
+      : reviewLevel === 1
       ? configuredMode
       : "warn";
 
@@ -15586,8 +16754,20 @@ export class TaskExecutor {
         // workflow values. Behavior-inert by default.
         const settings = await mergeEffectiveSettings(store, task, await store.getSettings());
         const scopeLeakCheck = await this.evaluateTaskDoneScopeLeak(task, worktreePath, promptContent, settings, audit)
-          .catch((error: unknown) => {
+          .catch(async (error: unknown) => {
             const errorMessage = error instanceof Error ? error.message : String(error);
+            if (task.customFields?.cccFusionProfile === "ccc-fusion") {
+              /*
+              FNXC:CCCScopeVerification 2026-07-23-13:15:
+              Wave 1 makes only the explicit ccc-fusion task profile fail closed
+              when scope verification throws. Existing Fusion tasks keep their
+              compatibility fail-open behavior until their own policy changes.
+              */
+              const message = "CCC Fusion scope verification unavailable — fn_task_done blocked to preserve ccc-fusion scope safety.";
+              executorLog.warn(`${taskId}: [scope-leak] ${message}`);
+              await store.logEntry(taskId, `[scope-leak] ${message}`, undefined, this.getRunContextFor(task.id));
+              return { blocked: true, message } as const;
+            }
             executorLog.warn(`${taskId}: scope-leak guard failed open: ${errorMessage}`);
             return { blocked: false } as const;
           });
@@ -16705,7 +17885,7 @@ ${scopeGuard}
     worktreePath: string,
     settings: Settings,
     taskEnv?: NodeJS.ProcessEnv,
-    stepOptions?: { unattended?: boolean },
+    stepOptions?: { unattended?: boolean; execution?: WorkflowNodeExecutionContext["execution"]; signal?: AbortSignal },
   ): Promise<WorkflowStepOutcome> {
     let toolMode: "coding" | "readonly" = workflowStep.toolMode || "readonly";
     // (U3) Genuinely-unattended run — set FUSION_HEADLESS=1 below so skills record
@@ -17138,9 +18318,18 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ? resolveExecutorFallbackThinkingLevel(workflowStepThinkingSource, settings)
         : resolveExecutorThinkingLevel(workflowStepThinkingSource, settings);
       const workflowStepFallbackThinkingLevel = resolveExecutorFallbackThinkingLevel(workflowStepThinkingSource, settings);
+      const sealedExecution = stepOptions?.execution;
+      const cccProviderAttemptBinding = sealedExecution?.executionFence
+        ? await this.createCccProviderAttemptBindingForWorkflowStep({
+            execution: sealedExecution,
+            provider,
+            modelId,
+            signal: stepOptions?.signal,
+          })
+        : undefined;
       const { session } = await createResolvedAgentSession({
         sessionPurpose: "executor",
-        runtimeHint: workflowRuntimeHint,
+        runtimeHint: cccProviderAttemptBinding ? "pi" : workflowRuntimeHint,
         pluginRunner: this.options.pluginRunner,
         cwd: worktreePath,
         systemPrompt: stepSystemPrompt,
@@ -17164,6 +18353,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ...(effectiveSkillSelection ? { skillSelection: effectiveSkillSelection } : {}),
         ...(additionalSkillPaths ? { additionalSkillPaths } : {}),
         ...(readonlyCustomTools.allowed.length > 0 ? { customTools: readonlyCustomTools.allowed } : {}),
+        ...(cccProviderAttemptBinding ? { profile: CCC_FUSION_PROFILE, subscriptionReady: true as const, cccProviderAttemptBinding } : {}),
       });
 
       const workflowModelDetails = formatModelMarkerDetails(
@@ -17243,6 +18433,31 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           resolveTimeout("timeout");
         }, timeoutMs);
       });
+      let removeAbortListener: (() => void) | undefined;
+      const cancellationPromise = new Promise<"cancelled">((resolveCancelled) => {
+        const signal = stepOptions?.signal;
+        if (!signal) return;
+        const onAbort = () => {
+          const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> | void };
+          if (typeof sessionWithAbort.abort === "function") {
+            try {
+              void Promise.resolve(sessionWithAbort.abort()).catch((error) => {
+                executorLog.warn(`${task.id}: failed to abort workflow step session: ${error}`);
+              });
+            } catch (error) {
+              executorLog.warn(`${task.id}: failed to abort workflow step session: ${error}`);
+            }
+          }
+          try { session.dispose(); } catch { /* best-effort */ }
+          resolveCancelled("cancelled");
+        };
+        if (signal.aborted) {
+          onAbort();
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+          removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+        }
+      });
 
       try {
         const promptPromise = promptWithFallback(
@@ -17255,7 +18470,13 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           promptPromise.then(() => "completed" as const),
           timeoutPromise,
           questionPromise,
+          cancellationPromise,
         ]);
+
+        if (outcome === "cancelled") {
+          await agentLogger.flush();
+          return { success: false, error: "workflow step cancelled" };
+        }
 
         if (outcome === "await-input" && detectedQuestion) {
           try { session.dispose(); } catch { /* best-effort */ }
@@ -17356,6 +18577,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         return { success: false, error: errorMessage };
       } finally {
         if (timeoutHandle) clearTimeout(timeoutHandle);
+        removeAbortListener?.();
         if (ownsPlanningSegment) {
           try {
             const livePlanningTask = await this.store.getTask(task.id);

@@ -1,18 +1,36 @@
 import {
   type WorkflowExtensionContribution,
+  type WorkflowExtensionHostProvenance,
   type WorkflowExtensionRegistry,
   workflowExtensionRegistryId,
 } from "@fusion/core";
 
+export interface PluginWorkflowExtensionRegistration {
+  extension: WorkflowExtensionContribution;
+  hostProvenance?: WorkflowExtensionHostProvenance;
+}
+
 export function registerPluginWorkflowExtensions(params: {
   registry: WorkflowExtensionRegistry;
   pluginId: string;
-  contributions: WorkflowExtensionContribution[];
+  contributions: PluginWorkflowExtensionRegistration[];
 }): string[] {
+  const ordinaryContributions = params.contributions.filter(
+    ({ extension }) => extension.kind !== "proof-admission",
+  );
+
   const registered: string[] = [];
-  for (const contribution of params.contributions) {
-    const id = workflowExtensionRegistryId(params.pluginId, contribution.extensionId);
-    params.registry.upsert(params.pluginId, contribution);
+  // This adapter bridges ambient external plugins only. Proof admission is
+  // bootstrapped separately from the fixed native entry after its persisted
+  // selection/dependency closure is established.
+  for (const { extension } of ordinaryContributions) {
+    const id = workflowExtensionRegistryId(params.pluginId, extension.extensionId);
+    params.registry.upsert(
+      params.pluginId,
+      extension,
+      undefined,
+      { providerPosture: "opaque" },
+    );
     registered.push(id);
   }
   return registered;

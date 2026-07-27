@@ -71,6 +71,9 @@ const qualityPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-qual
 const linearImportPluginSrc = join(__dirname, "..", "..", "plugins", "fusion-plugin-linear-import");
 const linearImportPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin-linear-import");
 const pluginSdkCoreRuntimeShim = join(__dirname, "src", "plugin-sdk-core-runtime-shim.mjs");
+const cccCampaignProofAdmissionManifestSrc = join(__dirname, "..", "engine", "src", "ccc-campaign-proof-admission.manifest.json");
+const cccCampaignProofAdmissionManifestDest = join(__dirname, "dist", "plugins", "fusion-native-proof-admission");
+const cccProofAdmissionCoreRuntimeShim = join(__dirname, "src", "ccc-proof-admission-core-runtime-shim.mjs");
 const dashboardClientStub = `<!doctype html>
 <html lang="en">
   <head>
@@ -659,6 +662,40 @@ const cliBuildConfig = {
   },
 };
 
+const cccProofAdmissionBuildConfig = {
+  /*
+   * FNXC:CccProofAdmission 2026-07-25-14:45:
+   * Keep the fixed proof evaluator in a dedicated self-contained ESM artifact.
+   * The CLI imports its custodied bytes through a data URL, so this artifact
+   * deliberately omits the general CLI createRequire(import.meta.url) banner.
+   */
+  entry: {
+    "ccc-campaign-proof-admission": "../engine/src/ccc-campaign-proof-admission.ts",
+  },
+  format: ["esm"],
+  platform: "node",
+  target: "node22",
+  esbuildOptions(options: { conditions?: string[]; alias?: Record<string, string> }) {
+    options.conditions = [...(options.conditions || []), "source"];
+    options.alias = {
+      ...(options.alias || {}),
+      "@fusion/core": cccProofAdmissionCoreRuntimeShim,
+    };
+  },
+  noExternal: [/^@fusion\//],
+  splitting: false,
+  clean: false,
+  removeNodeProtocol: false,
+  outDir: "dist",
+  onSuccess: async () => {
+    mkdirSync(cccCampaignProofAdmissionManifestDest, { recursive: true });
+    cpSync(
+      cccCampaignProofAdmissionManifestSrc,
+      join(cccCampaignProofAdmissionManifestDest, "manifest.json"),
+    );
+  },
+};
+
 const pluginSdkBuildConfig = {
   entry: { "plugin-sdk/index": pluginSdkEntry },
   format: ["esm"],
@@ -697,4 +734,8 @@ const pluginSdkBuildConfig = {
   outDir: "dist",
 };
 
-export default defineConfig([cliBuildConfig, pluginSdkBuildConfig]);
+export default defineConfig([
+  cliBuildConfig,
+  cccProofAdmissionBuildConfig,
+  pluginSdkBuildConfig,
+]);

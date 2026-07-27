@@ -18,6 +18,8 @@ import { TaskExecutor } from "../executor.js";
 import { primitiveNodeContext } from "../runtime-primitives.js";
 import { classifyMergePrimitiveResult } from "../workflow-merge-nodes.js";
 import { createMergeAttemptHandler } from "../workflow-node-runners/merge-runner.js";
+import { createCccCampaignMergeControl, matchesCccCampaignMergeControl } from "../ccc-campaign-merge-control.js";
+import { executorLog } from "../logger.js";
 import { createMockStore, mockedExistsSync, resetExecutorMocks } from "./executor-test-helpers.js";
 
 const now = "2026-07-15T00:00:00.000Z";
@@ -80,7 +82,59 @@ describe("workflow merge cancellation", () => {
     mockedExistsSync.mockReturnValue(true);
   });
 
+  it("rejects campaign merge authority objects carrying hidden extra keys", () => {
+    const context = {
+      taskId: "FN-CAMPAIGN-AUTHORITY",
+      projectId: "project-1",
+      importId: "import-1",
+      campaignId: "campaign-1",
+      bundleHash: "bundle-1",
+      manifestHash: "manifest-1",
+      targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+    };
+    const authority = {
+      ...createCccCampaignMergeControl(context as any),
+      [Symbol("caller-authority")]: true,
+    };
+
+    expect(matchesCccCampaignMergeControl(authority, context as any)).toBe(false);
+  });
+
   describe("requestMerge primitive", () => {
+    it("uses persisted campaign custody without a workflow boundary or legacy finalization", async () => {
+      const liveTask = mergeReadyTask({
+        id: "FN-CAMPAIGN",
+        lineageId: "ccc-prd:0123456789abcdef01234567:merge",
+      });
+      const { store, executor } = executorFor(liveTask);
+      const context = {
+        taskId: liveTask.id,
+        projectId: "project-1",
+        importId: "import-1",
+        campaignId: "campaign-1",
+        bundleHash: "bundle-1",
+        manifestHash: "manifest-1",
+        targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+      };
+      store.getCccCampaignContextForTask = vi.fn(async () => context);
+      const requester = vi.fn(async () => ({
+        task: liveTask,
+        merged: true,
+        worktreeRemoved: false,
+        branchDeleted: false,
+        campaignControlled: createCccCampaignMergeControl(context as any),
+      }));
+      executor.setMergeRequester(requester);
+
+      const result = await executor
+        .createAuthoritativeWorkflowPrimitives({ autoMerge: true })
+        .requestMerge(mergeCtx(undefined), liveTask);
+
+      expect(result).toMatchObject({ outcome: "success", value: "merged" });
+      expect(requester).toHaveBeenCalledWith("FN-CAMPAIGN", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+      expect(store.moveTask).not.toHaveBeenCalled();
+    });
+
     it("collapses immediately when the graph aborts mid-merge instead of waiting for the 30-minute timeout", async () => {
       const liveTask = mergeReadyTask();
       const { executor } = executorFor(liveTask);
@@ -138,6 +192,37 @@ describe("workflow merge cancellation", () => {
   });
 
   describe("legacy merge seam", () => {
+    it("refuses persisted campaign custody before boundary mutation or requester dispatch", async () => {
+      const liveTask = mergeReadyTask({
+        id: "FN-CAMPAIGN-LEGACY",
+        lineageId: "ccc-prd:0123456789abcdef01234567:legacy",
+      });
+      const { store, executor } = executorFor(liveTask);
+      store.getCccCampaignContextForTask = vi.fn(async () => ({
+        taskId: liveTask.id,
+        projectId: "project-1",
+        importId: "import-1",
+        campaignId: "campaign-1",
+        bundleHash: "bundle-1",
+        manifestHash: "manifest-1",
+        targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+      }));
+      const requester = vi.fn();
+      executor.setMergeRequester(requester);
+
+      const result = await executor
+        .createAuthoritativeWorkflowSeams({ autoMerge: true })
+        .merge(liveTask, {}, undefined);
+
+      expect(result).toEqual({
+        outcome: "failure",
+        value: "ccc-campaign-authoritative-merge-required",
+      });
+      expect(requester).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(store.logEntry).not.toHaveBeenCalled();
+    });
+
     it("collapses immediately when the graph aborts mid-merge", async () => {
       const liveTask = mergeReadyTask();
       const { executor } = executorFor(liveTask);
@@ -171,6 +256,145 @@ describe("workflow merge cancellation", () => {
       expect(result).toMatchObject({ outcome: "failure", value: "merge-cancelled" });
       expect(requester).not.toHaveBeenCalled();
       expect(store.moveTask).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("graph merge retry custody", () => {
+    it("classifies custody before logs, boundary mutation, or requester dispatch", async () => {
+      const liveTask = mergeReadyTask({ id: "FN-CUSTODY-LOOKUP-ERROR" });
+      const { store, executor } = executorFor(liveTask);
+      store.getCccCampaignContextForTask = vi.fn(async () => {
+        throw new Error("custody store unavailable");
+      });
+      const requester = vi.fn();
+      executor.setMergeRequester(requester);
+      const warnSpy = vi.spyOn(executorLog, "warn").mockImplementation(() => undefined);
+
+      const routed = await executor.routeGraphMergeFailureToRetry(
+        liveTask,
+        {
+          disposition: "failed",
+          outcome: "failure",
+          visitedNodeIds: ["requestMerge"],
+          context: {},
+        },
+        "merge-seam",
+      );
+
+      expect(routed).toBe(false);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(store.logEntry).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(requester).not.toHaveBeenCalled();
+    });
+
+    it("Task 5 RED: campaign graph retry refuses requester failure or missing exact custody authority", async () => {
+      const cases = [
+        {
+          name: "requester failure",
+          requester: vi.fn(async () => {
+            throw new Error("campaign requester rejected retry");
+          }),
+          error: "campaign requester rejected retry",
+        },
+        {
+          name: "missing exact custody authority",
+          requester: vi.fn(async () => ({})),
+          error: "CCC campaign retry merge result is missing an exact persisted custody authority",
+        },
+      ];
+
+      for (const testCase of cases) {
+        const liveTask = mergeReadyTask({
+          id: `FN-CAMPAIGN-RETRY-${testCase.name}`,
+          lineageId: "ccc-prd:0123456789abcdef01234567:retry",
+        });
+        const { store, executor } = executorFor(liveTask);
+        store.getCccCampaignContextForTask = vi.fn(async () => ({
+          taskId: liveTask.id,
+          projectId: "project-1",
+          importId: "import-1",
+          campaignId: "campaign-1",
+          bundleHash: "bundle-1",
+          manifestHash: "manifest-1",
+          targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+        }));
+        const warnSpy = vi.spyOn(executorLog, "warn").mockImplementation(() => undefined);
+        const persistSpy = vi.spyOn(executor as unknown as { persistTokenUsage(taskId: string): Promise<void> }, "persistTokenUsage").mockImplementation(async () => undefined);
+        executor.setMergeRequester(testCase.requester);
+
+        await expect(executor.routeGraphMergeFailureToRetry(
+          liveTask,
+          { disposition: "failed", outcome: "failure", visitedNodeIds: ["requestMerge"], context: {} },
+          "merge-seam",
+        )).rejects.toThrow(testCase.error);
+
+        expect(testCase.requester).toHaveBeenCalledTimes(1);
+        expect(testCase.requester).toHaveBeenCalledWith(liveTask.id);
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(store.logEntry).not.toHaveBeenCalled();
+        expect(store.moveTask).not.toHaveBeenCalled();
+        expect(persistSpy).not.toHaveBeenCalled();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("dispatches campaign retry with exact custody before mutable bookkeeping", async () => {
+      const liveTask = mergeReadyTask({
+        id: "FN-CAMPAIGN-RETRY",
+        lineageId: "ccc-prd:0123456789abcdef01234567:retry",
+      });
+      const { store, executor } = executorFor(liveTask);
+      const context = {
+        taskId: liveTask.id,
+        projectId: "project-1",
+        importId: "import-1",
+        campaignId: "campaign-1",
+        bundleHash: "bundle-1",
+        manifestHash: "manifest-1",
+        targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+      };
+      const events: string[] = [];
+      store.getCccCampaignContextForTask = vi.fn(async () => context);
+      store.logEntry.mockImplementation(async () => {
+        events.push("log");
+      });
+      store.moveTask.mockImplementation(async () => {
+        events.push("boundary");
+        return liveTask;
+      });
+      const warnSpy = vi.spyOn(executorLog, "warn").mockImplementation(() => {
+        events.push("warn");
+      });
+      const persistSpy = vi.spyOn(executor as any, "persistTokenUsage").mockImplementation(async () => {
+        events.push("persist");
+      });
+      const requester = vi.fn(async (taskId: string) => {
+        expect(taskId).toBe(liveTask.id);
+        expect(events).toEqual([]);
+        return { campaignControlled: createCccCampaignMergeControl(context as any) };
+      });
+      executor.setMergeRequester(requester);
+
+      const routed = await executor.routeGraphMergeFailureToRetry(
+        liveTask,
+        {
+          disposition: "failed",
+          outcome: "failure",
+          visitedNodeIds: ["requestMerge"],
+          context: {},
+        },
+        "merge-seam",
+      );
+
+      expect(routed).toBe(true);
+      expect(requester).toHaveBeenCalledTimes(1);
+      expect(requester).toHaveBeenCalledWith(liveTask.id);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(store.logEntry).not.toHaveBeenCalled();
+      expect(store.moveTask).not.toHaveBeenCalled();
+      expect(persistSpy).toHaveBeenCalledWith(liveTask.id);
+      expect(events).toEqual(["persist"]);
     });
   });
 

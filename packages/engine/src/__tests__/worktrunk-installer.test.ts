@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { WorktrunkSettings } from "@fusion/core";
+import type { ApprovalRequestStore, WorktrunkSettings } from "@fusion/core";
 import type { AgentActionGateContext } from "../agent-action-gate.js";
 import type { RunAuditor } from "../run-audit.js";
 
@@ -132,6 +132,19 @@ describe("worktrunk-installer", () => {
       status: "pending",
     });
     expect(approvalStore.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the persisted deduped approval status without narrowing newer lifecycle states", async () => {
+    const approvalStore = {
+      findLatestByDedupeKey: vi.fn().mockResolvedValue({ id: "apr-expired", status: "expired" }),
+      create: vi.fn(),
+    } as unknown as ApprovalRequestStore;
+
+    await expect(requestWorktrunkInstallApproval({ approvalStore, actor })).resolves.toEqual({
+      approvalRequestId: "apr-expired",
+      status: "expired",
+    });
+    expect(approvalStore.create).not.toHaveBeenCalled();
   });
 
   it("executeApprovedWorktrunkInstall throws when request is not approved", async () => {

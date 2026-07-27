@@ -499,10 +499,12 @@ describe("embedded-lifecycle: macOS dylib compatibility links", () => {
       // requests the ABI-specific uc name rather than the unversioned link.
       writeFileSync(join(libDir, "libicui18n.68.2.dylib"), "");
       writeFileSync(join(libDir, "libicuuc.68.2.dylib"), "");
+      writeFileSync(join(libDir, "libicudata.68.2.dylib"), "");
 
       const created = normalizeMacosEmbeddedPostgresDylibSymlinks(nativeRoot);
 
       expect(created.map((link) => link.expected).sort()).toEqual([
+        "libicudata.68.dylib",
         "libicui18n.dylib",
         "libicuuc.68.dylib",
         "liblz4.1.dylib",
@@ -1135,12 +1137,11 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
     let releaseStart!: () => void;
     const delayedStart = new Promise<void>((resolve) => { releaseStart = resolve; });
-    let resolveLateStop!: () => void;
-    const lateStop = new Promise<void>((resolve) => { resolveLateStop = resolve; });
     const running = { value: false };
+    let stopCalls = 0;
     const stop = vi.fn(async () => {
+      stopCalls += 1;
       running.value = false;
-      if (stop.mock.calls.length === 2) resolveLateStop();
     });
 
     class DelayedEmbeddedPostgres {
@@ -1148,6 +1149,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
       async start() {
         await delayedStart;
         running.value = true;
+        writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n0\n55493\n`);
       }
       stop = stop;
       createDatabase = vi.fn(async () => {});
@@ -1164,7 +1166,7 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     const beforeExitListeners = process.listenerCount("beforeExit");
     const lifecycle = new EmbeddedPostgresLifecycle({
       ...baseOptions(dataDir),
-      port: 55439,
+      port: 55493,
       startTimeoutMs: 25,
     });
 
@@ -1172,16 +1174,58 @@ describe("embedded-lifecycle: startup timeout (P1 #24)", () => {
     const timeoutRejection = expect(start).rejects.toBeInstanceOf(EmbeddedStartTimeoutError);
     await vi.advanceTimersByTimeAsync(25);
     await timeoutRejection;
+    const stopCallsAtTimeout = stop.mock.calls.length;
     expect(running.value).toBe(false);
 
     releaseStart();
-    await lateStop;
+    await vi.advanceTimersByTimeAsync(0);
+    const stopCallsAfterLateStart = stop.mock.calls.length;
+    rmSync(dataDir, { recursive: true, force: true });
 
-    expect(stop).toHaveBeenCalledTimes(2);
+    expect(stopCallsAtTimeout).toBe(1);
+    expect(stopCallsAfterLateStart).toBe(2);
     expect(running.value).toBe(false);
     expect(lifecycle.isRunning()).toBe(false);
     expect(process.listenerCount("beforeExit")).toBe(beforeExitListeners);
-    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("Wave 4 RED: an actual owned start clears its stale PID after confirmed stop", async () => {
+    const dataDir = makeDataDir();
+    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    const stop = vi.fn(async () => {});
+    class OwnedEmbeddedPostgres {
+      initialise = vi.fn(async () => {});
+      async start() {
+        writeFileSync(join(dataDir, "postmaster.pid"), `43210\n${dataDir}\n0\n55494\n`);
+      }
+      stop = stop;
+    }
+
+    __setEmbeddedPostgresCtorForTests(OwnedEmbeddedPostgres as never);
+    const ensureDatabase = vi.spyOn(EmbeddedPostgresLifecycle.prototype, "ensureDatabase").mockResolvedValue(undefined);
+    const lifecycle = new EmbeddedPostgresLifecycle({
+      ...baseOptions(dataDir),
+      port: 55494,
+      installShutdownHooks: false,
+    });
+    const realKill = process.kill;
+    const kill = vi.fn();
+    try {
+      await lifecycle.start();
+      expect(lifecycle.getOwnsProcess()).toBe(true);
+
+      await lifecycle.stop();
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(lifecycle.getOwnsProcess()).toBe(false);
+
+      (process as unknown as { kill: typeof process.kill }).kill = kill as typeof process.kill;
+      await lifecycle.terminateOwnedPostmaster();
+      expect(kill).not.toHaveBeenCalled();
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+      ensureDatabase.mockRestore();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1189,6 +1233,7 @@ describe("embedded-lifecycle: Windows fatal recovery", () => {
   it("restarts an owned cluster on its resolved port when no port was configured", async () => {
     const dataDir = makeDataDir();
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    writeFileSync(join(dataDir, "postmaster.pid"), `${process.pid}\n${dataDir}\n0\n55491\n`);
     const records: Record<string, unknown>[] = [];
     const logs: string[] = [];
     class RecordingEmbeddedPostgres {
@@ -1656,6 +1701,7 @@ describe("embedded-lifecycle: signal re-raise (P1 #23)", () => {
     // started a real cluster). The boundShutdown handler checks this.running.
     // We set it true to exercise the stop path, then stub stop to flip it.
     (lifecycle as unknown as { running: boolean }).running = true;
+    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
     const killCalls: string[] = [];
     const realKill = process.kill;
     const realExit = process.exit;
@@ -1686,5 +1732,50 @@ describe("embedded-lifecycle: signal re-raise (P1 #23)", () => {
       (process as unknown as { kill: typeof realKill }).kill = realKill;
       (process as unknown as { exit: typeof realExit }).exit = realExit;
     }
+  });
+});
+
+describe("embedded-lifecycle: proof-supervisor shutdown ownership", () => {
+  it("Wave 4 verification: owned postmaster liveness rejects EPERM instead of treating it as exit", async () => {
+    const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions("/tmp/wave4-owned-eperm") });
+    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
+    (lifecycle as unknown as { ownedPostmasterPid: number | null }).ownedPostmasterPid = 424242;
+    const realKill = process.kill;
+    const kill = vi.fn((pid: number, signal?: string | number) => {
+      expect(pid).toBe(424242);
+      if (signal === 0) {
+        const error = Object.assign(new Error("permission denied"), { code: "EPERM" });
+        throw error;
+      }
+    });
+    try {
+      (process as unknown as { kill: typeof process.kill }).kill = kill as typeof process.kill;
+      await expect(lifecycle.terminateOwnedPostmaster()).rejects.toMatchObject({ code: "EPERM" });
+      expect(kill).toHaveBeenCalledWith(424242, "SIGTERM");
+      expect(kill).toHaveBeenCalledWith(424242, 0);
+      expect(kill).not.toHaveBeenCalledWith(424242, "SIGKILL");
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+    }
+  });
+
+  it("Wave 4 RED: proof opt-in exposes a reported stop failure without installing lifecycle signal hooks", async () => {
+    const onError = vi.fn();
+    const lifecycle = new EmbeddedPostgresLifecycle({
+      ...baseOptions("/tmp/wave4-stop-failure"),
+      installShutdownHooks: false,
+      throwOnStopError: true,
+      onError,
+    });
+    const failure = new Error("synthetic stop failure");
+    (lifecycle as unknown as { pg: { stop: () => Promise<void> }; running: boolean }).pg = {
+      stop: async () => { throw failure; },
+    };
+    (lifecycle as unknown as { running: boolean }).running = true;
+    (lifecycle as unknown as { ownsProcess: boolean }).ownsProcess = true;
+
+    await expect(lifecycle.stop()).rejects.toBe(failure);
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("synthetic stop failure"));
+    expect((lifecycle as unknown as { shutdownHookInstalled: boolean }).shutdownHookInstalled).toBe(false);
   });
 });

@@ -70,8 +70,10 @@ export interface TelemetryEvent {
   payload?: Record<string, unknown> & {
     /** Raw text chunk (output / transcript) — stripped + redacted on ingest. */
     text?: string;
-    /** Native session id reported by the CLI (e.g. Claude `session_id`). */
-    nativeSessionId?: string;
+  /** Native session id reported by the CLI (e.g. Claude `session_id`). */
+  nativeSessionId?: string;
+  /** Stable identity of a provider effect/tool commit; never replay it. */
+  effectIdentity?: string;
     /** Notification context for a waitingOnInput event (permission/question). */
     notification?: Record<string, unknown>;
   };
@@ -83,6 +85,7 @@ export interface SanitizedTelemetryEvent {
   /** Sanitized text (ANSI/control stripped, secret-redacted, size-capped). */
   text?: string;
   nativeSessionId?: string;
+  effectIdentity?: string;
   notification?: Record<string, unknown>;
   /** True when the event text was truncated by the size cap. */
   truncated?: boolean;
@@ -334,6 +337,9 @@ export class TelemetryHub {
     if (typeof payload.nativeSessionId === "string") {
       out.nativeSessionId = payload.nativeSessionId.slice(0, 256);
     }
+    if (typeof payload.effectIdentity === "string") {
+      out.effectIdentity = payload.effectIdentity.slice(0, 256);
+    }
     if (payload.notification && typeof payload.notification === "object") {
       out.notification = payload.notification as Record<string, unknown>;
     }
@@ -374,8 +380,18 @@ export class TelemetryHub {
     if (event.nativeSessionId) {
       const current = this.store.getSession(entry.machine.sessionId);
       if (current && current.nativeSessionId !== event.nativeSessionId) {
+        const contract = current.autonomyPosture?.cccResumeContract;
         this.store.updateSession(entry.machine.sessionId, {
           nativeSessionId: event.nativeSessionId,
+          autonomyPosture: contract && typeof contract === "object"
+            ? {
+              ...(current.autonomyPosture ?? {}),
+              cccResumeContract: {
+                ...(contract as Record<string, unknown>),
+                nativeSessionId: event.nativeSessionId,
+              },
+            }
+            : current.autonomyPosture,
         });
       }
     }

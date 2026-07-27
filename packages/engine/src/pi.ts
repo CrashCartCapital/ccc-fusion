@@ -11,6 +11,8 @@ import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative, isAbsolute, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { lazyStream } from "@earendil-works/pi-ai/api/lazy";
 
 const execAsync = promisify(exec);
 import {
@@ -38,6 +40,8 @@ import {
 import {
   customProviderRegistryKey,
   getEnabledPiExtensionPaths,
+  canonicalCccPrdJson,
+  compareCccPrdCodeUnits,
   getFusionAgentDir,
   getLegacyPiAgentDir,
   getProjectRootFromWorktree,
@@ -50,18 +54,26 @@ import {
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
   resolvePiExtensionProjectRoot,
+  prepareCccEffectReceipt,
+  reserveCccEffectReceipt,
 } from "@fusion/core";
 import type {
   AgentPermissionPolicyActionCategory,
+  CccCampaignProviderControllerDecision,
+  CccCampaignProviderDispatchInput,
   PermanentAgentActionCategory,
   PermanentAgentGatingContext,
   ResolvedMcpServerDefinition,
+  CccEffectReceiptStore,
+  CccProviderAttemptScope,
+  CccProviderAttemptSettlementInput,
 } from "@fusion/core";
 import {
   resolveSessionSkills,
   createSkillsOverrideFromSelection,
   type SkillSelectionContext,
 } from "./skill-resolver.js";
+import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { applyClaudeAcpEnable } from "./claude-acp-enable.js";
 import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
@@ -77,12 +89,49 @@ import {
 } from "./agent-action-gate.js";
 import { resolvePermanentAgentToolDecision } from "./permanent-agent-gating.js";
 import type { SystemPromptLayers } from "./prompt-layers.js";
+import type {
+  CccEffectReceiptBinder,
+  CccEffectReceiptBinding,
+  CccExecutionToolAuthority,
+} from "./agent-runtime.js";
 import { READONLY_ALLOWLIST, filterCustomToolsForReadonly, isReadonlyAllowed } from "./workflow-step-tool-policy.js";
 import { createStreamingDeltaNormalizer } from "./streaming-delta.js";
 import { isModelAuthTierIncompatibilityError, isProviderModelNotFoundError, isUnsupportedMessageRoleError } from "./transient-error-detector.js";
 import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp-runtime-support.js";
 import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp-session-tools.js";
+import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
+import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
+
+/**
+ * A receipt is durable after its flush, but two concurrently-created agent
+ * sessions can reach the pre-commit read together. Claims are deliberately
+ * scoped to the shared durable store so they span wrappers/controllers while
+ * remaining local to that runtime's receipt ledger.
+ */
+const cccEffectReceiptInFlightClaims = new WeakMap<object, Map<string, Promise<unknown>>>();
 export { isModelAuthTierIncompatibilityError } from "./transient-error-detector.js";
+
+function canonicalCccToolSchemaJson(value: unknown, seen = new Set<object>()): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("CCC tool schema must be JSON-serializable");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalCccToolSchemaJson(entry, seen)).join(",")}]`;
+  if (typeof value === "object") {
+    if (seen.has(value)) throw new Error("CCC tool schema must not be circular");
+    seen.add(value);
+    const serialized = `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalCccToolSchemaJson(entry, seen)}`)
+      .join(",")}}`;
+    seen.delete(value);
+    return serialized;
+  }
+  throw new Error("CCC tool schema must be JSON-serializable");
+}
 
 const RTK_ACCEPTED_REWRITE_EXIT_CODES = new Set([0, 3]);
 const RTK_EXPECTED_PASSTHROUGH_EXIT_CODES = new Set([1, 2]);
@@ -284,6 +333,7 @@ function wrapSessionDisposeWithShutdown(session: AgentSession): void {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       piLog.warn(`Session dispose failed after session_shutdown emit: ${message}`);
+      throw error;
     }
   };
 
@@ -318,6 +368,455 @@ function clearSessionStateError(session: AgentSession): void {
       }
     }
   }
+}
+
+const CCC_EXPECTED_RESPONSE_MODEL = "__fusionCccExpectedResponseModel";
+
+/**
+ * An owned CCC transport is not considered closed when AbortController merely
+ * fires. The provider stream must first reach its terminal result and one full
+ * close-callback turn must run before executor ownership can be released.
+ */
+export const CCC_AWAIT_OWNED_TRANSPORT_CLOSURE = Symbol("cccAwaitOwnedTransportClosure");
+
+type CccTransportClosureSession = AgentSession & {
+  [CCC_AWAIT_OWNED_TRANSPORT_CLOSURE]?: () => Promise<void>;
+};
+
+function awaitNodeTransportCloseCallbacks(): Promise<void> {
+  return new Promise((resolve) => {
+    // Node runs socket close callbacks after check. Two turns make the
+    // completion observable to the owner without a timing delay or polling.
+    setImmediate(() => setImmediate(resolve));
+  });
+}
+
+type CccResponseIdentitySession = AgentSession & {
+  [CCC_EXPECTED_RESPONSE_MODEL]?: {
+    provider: string;
+    modelId: string;
+  };
+};
+
+class CccCustomProviderEgressPolicyViolationError extends Error {
+  readonly code = "CCC_CUSTOM_PROVIDER_EGRESS_POLICY_VIOLATION";
+
+  constructor(public readonly selection: "primary" | "fallback") {
+    super(`ccc-fusion ${selection} custom-provider base URL rejected by loopback policy`);
+    this.name = "CccCustomProviderEgressPolicyViolationError";
+  }
+}
+
+function assertCccCustomProviderEgress(
+  options: AgentOptions,
+  providers: ReturnType<typeof readCustomProviders>,
+): void {
+  if (options.profile !== CCC_FUSION_PROFILE) return;
+  const selections = [
+    ["primary", options.defaultProvider],
+    ["fallback", options.fallbackProvider],
+  ] as const;
+  for (const [selection, providerKey] of selections) {
+    if (!providerKey) continue;
+    const provider = providers.find(
+      (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
+    );
+    if (!provider) continue;
+    if (!validateCccLoopbackHttpUrl(provider.baseUrl).ok) {
+      throw new CccCustomProviderEgressPolicyViolationError(selection);
+    }
+  }
+}
+
+function assertCccResponseModelIdentity(session: AgentSession): void {
+  const expected = (session as CccResponseIdentitySession)[CCC_EXPECTED_RESPONSE_MODEL];
+  if (!expected) return;
+  const messages = (session as { messages?: unknown }).messages;
+  const assistant = Array.isArray(messages) ? [...messages].reverse().find(
+    (message): message is Record<string, unknown> =>
+      Boolean(message) && typeof message === "object" && (message as Record<string, unknown>).role === "assistant",
+  ) : undefined;
+  const responseModel = assistant?.responseModel;
+  if (typeof responseModel !== "string" || responseModel.trim().length === 0) {
+    throw new Error(
+      `ccc-fusion response model identity missing: configured ${expected.provider}/${expected.modelId}`,
+    );
+  }
+  if (responseModel === expected.modelId) {
+    return;
+  }
+  throw new Error(
+    `ccc-fusion response model mismatch: configured ${expected.provider}/${expected.modelId}, provider reported ${responseModel}`,
+  );
+}
+
+function restoreCccStreamRequestModel<TStream extends AsyncIterable<any> & {
+  result: () => Promise<any>;
+}>(source: TStream, expectedModelId: string): TStream {
+  const restore = (message: unknown): void => {
+    if (message && typeof message === "object") {
+      (message as { model?: string }).model = expectedModelId;
+    }
+  };
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const event of source) {
+        if (event && typeof event === "object") {
+          restore((event as { partial?: unknown }).partial);
+          restore((event as { message?: unknown }).message);
+        }
+        yield event;
+      }
+    },
+    async result() {
+      const result = await source.result();
+      restore(result);
+      return result;
+    },
+  } as unknown as TStream;
+}
+
+function cccProviderAttemptEvidenceDigest(value: unknown): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(value), "utf8")
+    .digest("hex");
+}
+
+function exactObjectKeys(value: Record<string, unknown>, expected: string[], label: string): void {
+  const keys = Object.keys(value).sort(compareCccPrdCodeUnits);
+  const expectedKeys = [...expected].sort(compareCccPrdCodeUnits);
+  if (canonicalCccPrdJson(keys) !== canonicalCccPrdJson(expectedKeys)) {
+    throw new Error(`${label} must expose exactly ${expectedKeys.join(", ")}`);
+  }
+}
+
+function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBinding | undefined {
+  if (input === undefined) return undefined;
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("cccProviderAttemptBinding must be a frozen object");
+  }
+  if (!Object.isFrozen(input)) {
+    throw new Error("cccProviderAttemptBinding must be frozen");
+  }
+  exactObjectKeys(input as Record<string, unknown>, ["controller", "turnKey"], "cccProviderAttemptBinding");
+  const binding = input as Record<string, unknown>;
+  if (typeof binding.turnKey !== "string" || binding.turnKey.trim().length === 0) {
+    throw new Error("cccProviderAttemptBinding.turnKey must be a non-empty string");
+  }
+  const controller = binding.controller;
+  if (!controller || typeof controller !== "object" || Array.isArray(controller)) {
+    throw new Error("cccProviderAttemptBinding.controller must be a frozen object");
+  }
+  if (!Object.isFrozen(controller)) {
+    throw new Error("cccProviderAttemptBinding.controller must be frozen");
+  }
+  exactObjectKeys(controller as Record<string, unknown>, ["preDispatch", "reconcile"], "cccProviderAttemptBinding.controller");
+  const controllerRecord = controller as Record<string, unknown>;
+  if (typeof controllerRecord.preDispatch !== "function" || typeof controllerRecord.reconcile !== "function") {
+    throw new Error("cccProviderAttemptBinding.controller methods must be functions");
+  }
+  return input as CccProviderAttemptBinding;
+}
+
+type CccProviderAttemptSubmittedReconciliation = CccProviderAttemptSettlementInput;
+
+type CccProviderAttemptSessionState = {
+  nextSlot: number;
+  tail?: Promise<void>;
+};
+
+function createCccProviderAttemptSessionState(): CccProviderAttemptSessionState {
+  return { nextSlot: 1 };
+}
+
+function cccProviderAttemptHoldError(decision: Extract<CccCampaignProviderControllerDecision, { kind: "hold" }>, dispatchKey: string): Error {
+  if (decision.reason === "terminal") {
+    return new Error(`ccc-fusion provider attempt ${dispatchKey} is already ${decision.scope.state ?? "terminal"}`);
+  }
+  return new Error(`ccc-fusion provider attempt ${dispatchKey} is still dispatched_unknown`);
+}
+
+function assertCccProviderAttemptDoneMatchesResult(event: unknown, result: unknown): void {
+  const message = event && typeof event === "object" ? (event as { message?: unknown }).message : undefined;
+  if (canonicalCccPrdJson(message) !== canonicalCccPrdJson(result)) {
+    throw new Error("ccc-fusion provider attempt terminal done event did not match stream result");
+  }
+}
+
+function cccProviderAttemptStreamFailure(error: unknown): Error {
+  if (error instanceof Error) return error;
+  if (error && typeof error === "object") {
+    const message = (error as { errorMessage?: unknown; message?: unknown }).errorMessage
+      ?? (error as { errorMessage?: unknown; message?: unknown }).message;
+    if (typeof message === "string" && message.trim().length > 0) {
+      return new Error(message);
+    }
+  }
+  return new Error("ccc-fusion provider attempt stream failed");
+}
+
+function assertCccProviderAttemptReconciledScope(
+  requested: CccProviderAttemptSubmittedReconciliation,
+  observed: CccProviderAttemptScope,
+): void {
+  const requestedIdentity = {
+    attemptKey: requested.attemptKey,
+    controllerToken: requested.controllerToken,
+    taskId: requested.taskId,
+    semanticTaskId: requested.semanticTaskId,
+    campaignDeadlineAt: requested.campaignDeadlineAt,
+    turnKey: requested.turnKey,
+    dispatchKey: requested.dispatchKey,
+    attemptOrdinal: requested.attemptOrdinal,
+    requestCount: requested.requestCount,
+    binding: requested.binding,
+  };
+  const observedIdentity = {
+    attemptKey: observed.attemptKey,
+    controllerToken: observed.controllerToken,
+    taskId: observed.taskId,
+    semanticTaskId: observed.semanticTaskId,
+    campaignDeadlineAt: observed.campaignDeadlineAt,
+    turnKey: observed.turnKey,
+    dispatchKey: observed.dispatchKey,
+    attemptOrdinal: observed.attemptOrdinal,
+    requestCount: observed.requestCount,
+    binding: observed.binding,
+  };
+  if (canonicalCccPrdJson(observedIdentity) !== canonicalCccPrdJson(requestedIdentity)) {
+    throw new Error("ccc-fusion provider attempt reconciliation identity mismatch");
+  }
+  if (observed.state !== "committed") {
+    throw new Error(`ccc-fusion provider attempt reconciliation did not return committed state: ${observed.state}`);
+  }
+  const expectedTerminal = {
+    kind: "reconciled",
+    state: "committed",
+    evidenceDigest: requested.evidenceDigest,
+    observerId: requested.observerId,
+  };
+  if (canonicalCccPrdJson(observed.terminal) !== canonicalCccPrdJson(expectedTerminal)) {
+    throw new Error("ccc-fusion provider attempt reconciliation terminal evidence mismatch");
+  }
+}
+
+function assertCccProviderAttemptScopeAssociation(
+  request: CccCampaignProviderDispatchInput,
+  scope: CccProviderAttemptScope,
+  label: string,
+): void {
+  if (scope.turnKey !== request.turnKey) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: turnKey`);
+  }
+  if (scope.dispatchKey !== request.dispatchKey) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: dispatchKey`);
+  }
+  if (scope.binding.taskId !== scope.taskId) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.taskId`);
+  }
+  if (scope.binding.providerId !== request.providerId) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.providerId`);
+  }
+  if (scope.binding.modelId !== request.modelId) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.modelId`);
+  }
+  if (scope.binding.transport !== request.transport) {
+    throw new Error(`ccc-fusion ${label} scope mismatch: binding.transport`);
+  }
+}
+
+function assertCccProviderAttemptPermitScope(
+  request: CccCampaignProviderDispatchInput,
+  scope: CccProviderAttemptScope,
+): void {
+  assertCccProviderAttemptScopeAssociation(request, scope, "dispatch-permit");
+  if (scope.state !== "dispatched_unknown") {
+    throw new Error(`ccc-fusion dispatch-permit scope must be dispatched_unknown, got ${scope.state}`);
+  }
+  if (scope.terminal !== undefined) {
+    throw new Error("ccc-fusion dispatch-permit scope must not include terminal evidence");
+  }
+}
+
+function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAttemptScope): void {
+  const terminal = scope.terminal;
+  if (!terminal || typeof terminal !== "object" || Array.isArray(terminal)) {
+    throw new Error("ccc-fusion terminal hold scope must include proved_failed terminal evidence");
+  }
+  if (terminal.kind === "not-dispatched") {
+    exactObjectKeys(terminal as unknown as Record<string, unknown>, ["kind", "state"], "ccc-fusion proved_failed terminal evidence");
+    const rawTerminal = terminal as unknown as Record<string, unknown>;
+    if (rawTerminal.state !== "proved_failed") {
+      throw new Error(`ccc-fusion terminal hold scope proved_failed evidence has wrong state: ${String(rawTerminal.state)}`);
+    }
+    return;
+  }
+  if (terminal.kind === "reconciled") {
+    exactObjectKeys(
+      terminal as unknown as Record<string, unknown>,
+      ["evidenceDigest", "kind", "observerId", "state"],
+      "ccc-fusion proved_failed terminal evidence",
+    );
+    if (terminal.state !== "proved_failed") {
+      throw new Error(`ccc-fusion terminal hold scope proved_failed evidence has wrong state: ${terminal.state}`);
+    }
+    if (typeof terminal.evidenceDigest !== "string" || !/^[a-f0-9]{64}$/.test(terminal.evidenceDigest)) {
+      throw new Error("ccc-fusion terminal hold scope proved_failed evidence has invalid evidenceDigest");
+    }
+    if (typeof terminal.observerId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(terminal.observerId)) {
+      throw new Error("ccc-fusion terminal hold scope proved_failed evidence has invalid observerId");
+    }
+    return;
+  }
+  throw new Error("ccc-fusion terminal hold scope has invalid proved_failed terminal evidence");
+}
+
+function createCccProviderAttemptControlledStream(input: {
+  binding: CccProviderAttemptBinding;
+  state: CccProviderAttemptSessionState;
+  dispatch: (...args: any[]) => AsyncIterable<any> & { result: () => Promise<any> };
+  model: any;
+  dispatchModel: any;
+  context: any;
+  requestOptions: any;
+}) {
+  let failure: unknown;
+  const outer = lazyStream(input.model, async () => {
+    const priorTail = input.state.tail;
+    let release!: () => void;
+    input.state.tail = new Promise<void>((resolve) => { release = resolve; });
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      release();
+    };
+    try {
+      if (priorTail) {
+        await priorTail.catch(() => undefined);
+      }
+      let source!: AsyncIterable<any> & { result: () => Promise<any> };
+      let scope!: CccProviderAttemptScope;
+      while (true) {
+        const dispatchKey = `pi-stream:${input.state.nextSlot}`;
+        const request = {
+          turnKey: input.binding.turnKey,
+          dispatchKey,
+          providerId: String(input.model.provider),
+          modelId: String(input.model.id),
+          transport: "pi",
+        } as const;
+        const decision = await input.binding.controller.preDispatch(request);
+        if (decision.kind === "dispatch-permit") {
+          assertCccProviderAttemptPermitScope(request, decision.scope);
+          scope = decision.scope;
+          source = input.dispatch(input.dispatchModel, input.context, input.requestOptions);
+          break;
+        }
+        assertCccProviderAttemptScopeAssociation(request, decision.scope, `${decision.reason} hold`);
+        if (decision.reason === "terminal" && decision.scope.state === "proved_failed") {
+          assertCccProviderAttemptProvedFailedTerminalScope(decision.scope);
+          input.state.nextSlot += 1;
+          continue;
+        }
+        throw cccProviderAttemptHoldError(decision, dispatchKey);
+      }
+
+      let terminalDoneEvent: unknown;
+      let finalResultPromise: Promise<any> | undefined;
+      let reconciled = false;
+      let deliveredTerminal = false;
+      const advanceAfterTerminalDelivery = () => {
+        if (!reconciled || deliveredTerminal) return;
+        deliveredTerminal = true;
+        input.state.nextSlot += 1;
+        releaseOnce();
+      };
+      const finalResult = async () => {
+        if (!finalResultPromise) {
+          finalResultPromise = Promise.resolve(source.result())
+            .then(async (result) => {
+              if (terminalDoneEvent === undefined) {
+                throw failure instanceof Error
+                  ? failure
+                  : new Error("ccc-fusion provider attempt did not observe a terminal done event");
+              }
+              assertCccProviderAttemptDoneMatchesResult(terminalDoneEvent, result);
+              const reconciliation: CccProviderAttemptSubmittedReconciliation = {
+                ...scope,
+                outcome: "committed" as const,
+                evidenceDigest: cccProviderAttemptEvidenceDigest({
+                  transport: "pi",
+                  turnKey: input.binding.turnKey,
+                  dispatchKey: `pi-stream:${input.state.nextSlot}`,
+                  message: result,
+                }),
+                observerId: "pi",
+              };
+              const reconciledScope = await input.binding.controller.reconcile(reconciliation);
+              assertCccProviderAttemptReconciledScope(reconciliation, reconciledScope);
+              reconciled = true;
+              return result;
+            });
+        }
+        return finalResultPromise;
+      };
+
+      return {
+        async *[Symbol.asyncIterator]() {
+          try {
+            for await (const event of source) {
+              if (event && typeof event === "object" && (event as { type?: unknown }).type === "done") {
+                terminalDoneEvent = event;
+                await finalResult();
+                yield event;
+                advanceAfterTerminalDelivery();
+                continue;
+              }
+              if (event && typeof event === "object" && (event as { type?: unknown }).type === "error") {
+                failure = cccProviderAttemptStreamFailure((event as { error?: unknown }).error);
+                yield event;
+                return;
+              }
+              yield event;
+            }
+          } catch (error) {
+            failure = error;
+            throw error;
+          } finally {
+            if (!deliveredTerminal) releaseOnce();
+          }
+        },
+        async result() {
+          try {
+            return await finalResult();
+          } catch (error) {
+            failure = error;
+            releaseOnce();
+            throw error;
+          }
+        },
+      };
+    } catch (error) {
+      failure = error;
+      releaseOnce();
+      throw error;
+    }
+  });
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const event of outer) {
+        yield event;
+      }
+    },
+    async result() {
+      const result = await outer.result();
+      if (failure) {
+        throw failure;
+      }
+      return result;
+    },
+  };
 }
 
 function isThinkingReasoningConflictError(message: string): boolean {
@@ -430,6 +929,7 @@ export async function promptSessionAndCheck(session: AgentSession, prompt: strin
     }
     throw new Error(stateError);
   }
+  assertCccResponseModelIdentity(session);
 }
 
 // Re-entry guard for the top-level dispatcher below. When `session.promptWithFallback`
@@ -1102,6 +1602,22 @@ export interface AgentOptions {
   mcpClientFactory?: McpClientFactory;
   /** Test seam for MCP retry timing. */
   mcpBootstrapRetryDelayMs?: number;
+  /** Explicit ccc-fusion child profile; all other profiles preserve existing MCP behavior. */
+  profile?: string;
+  /** Caller-supplied structural readiness outcome for ccc-fusion child boundaries. */
+  subscriptionReady?: true;
+  /** Durable receipt store for actual ccc custom-tool effects. */
+  cccEffectReceiptStore?: CccEffectReceiptStore;
+  /** Stable durable session identity used by the effect receipt contract. */
+  cccEffectReceiptSessionId?: string;
+  /** Durable controller-generation fence supplied by the owning runtime. */
+  cccEffectReceiptControllerToken?: string;
+  /** Optional ccc-fusion provider-attempt admission controller supplied by the owning runtime. */
+  cccProviderAttemptBinding?: CccProviderAttemptBinding;
+  /** Late-bound durable ownership selected from PI's final offered-tool boundary. */
+  cccEffectReceiptBinder?: CccEffectReceiptBinder;
+  /** Task retries share one incomplete durable turn until their owner settles it. */
+  cccEffectReceiptKeepTurnOpen?: boolean;
   /** Optional task-scoped env injected into this session's subprocess tools only. */
   taskEnv?: NodeJS.ProcessEnv;
   /** Last-chance abort hook fired immediately before `createAgentSession`.
@@ -1146,6 +1662,7 @@ function resolveConfiguredModel(
   kind: "primary" | "fallback",
   provider?: string,
   modelId?: string,
+  profile?: string,
 ) {
   if (!provider || !modelId) {
     return undefined;
@@ -1156,12 +1673,16 @@ function resolveConfiguredModel(
     return model;
   }
 
-  // Fall back to constructing a model on-the-fly if the provider is known.
-  // This mirrors the pi CLI's buildFallbackModel behaviour, which accepts any
-  // model ID for a configured provider (e.g. any OpenRouter model string) even
-  // when it isn't in the built-in or custom model list.
+  /*
+  FNXC:CCCTransport 2026-07-23-15:45:
+  The ccc-fusion profile is a frozen custom-provider route: its configured
+  provider/model pair is the wire identity. Never synthesize an alias from the
+  provider's first model, because that silently changes the requested route
+  while retaining an unrelated base model. Other profiles keep the pi CLI's
+  permissive unknown-model behavior for providers such as OpenRouter.
+  */
   const providerModels = modelRegistry.getAll().filter((m) => m.provider === provider);
-  if (providerModels.length > 0) {
+  if (profile !== CCC_FUSION_PROFILE && providerModels.length > 0) {
     const baseModel = providerModels[0]!;
     piLog.warn(`${kind} model ${provider}/${modelId} not in registry; using provider base model as template`);
     return { ...baseModel, id: modelId, name: modelId };
@@ -1873,6 +2394,88 @@ export function wrapToolsWithBoundary(
   });
 }
 
+/*
+FNXC:CCCEffectReceipts 2026-07-23-20:38:
+This is the committed effect boundary: the ToolDefinition execute closure passed
+to createAgentSession. Fusion owns the logical envelope; provider call IDs are
+only fencing evidence. The database state reaches dispatched_unknown before the
+handler and committed before its result returns upstream.
+*/
+export function wrapCccToolsWithDurableEffectReceipts(
+  tools: ToolDefinition[],
+  store: CccEffectReceiptStore,
+  sessionId: string,
+  turnContext: { controllerToken: string; current: () => { turnKey: string; nextSlot: number } },
+): ToolDefinition[] {
+  /*
+  FNXC:CCCEffectReceiptSingleFlight 2026-07-23-20:06:
+  A durable receipt is visible only after its flush, so concurrent controllers
+  can both observe an absent receipt. Scope a transient claim to the durable
+  store (not an individual wrapper/controller), keyed by the canonical receipt
+  identity. The leader's committed result is shared with followers; a failure
+  clears only the local claim while the durable unknown receipt remains a
+  replay barrier until reconciliation.
+  */
+  const turnTails = new Map<string, Promise<void>>();
+  return tools.map((tool) => {
+    const originalExecute = tool.execute as (...args: any[]) => Promise<any>;
+    return {
+      ...tool,
+      execute: async (...args: any[]) => {
+        const turn = turnContext.current();
+        const slotOrdinal = turn.nextSlot++;
+        const input = {
+          sessionId,
+          toolCallId: String(args[0] ?? ""),
+          toolName: tool.name,
+          arguments: args[1] ?? {},
+          controllerToken: turnContext.controllerToken,
+          turnKey: turn.turnKey,
+          slotOrdinal,
+        };
+        const storeScope = store as object;
+        let claims = cccEffectReceiptInFlightClaims.get(storeScope);
+        if (!claims) {
+          claims = new Map<string, Promise<any>>();
+          cccEffectReceiptInFlightClaims.set(storeScope, claims);
+        }
+        const prepared = prepareCccEffectReceipt(input);
+        const identity = `${prepared.effectScopeId}\0${prepared.turnKey}\0${prepared.slotOrdinal}`;
+        const existing = claims.get(identity);
+        if (existing) return existing;
+
+        const prior = turnTails.get(turn.turnKey) ?? Promise.resolve();
+        const claimed = prior.then(async () => {
+          const reservation = await reserveCccEffectReceipt(store, input);
+          if (reservation.state === "committed") {
+            if (reservation.result === undefined) {
+              throw new Error("CCC committed effect replay lacks a durable structured result");
+            }
+            return reservation.result;
+          }
+          await store.markCccEffectReceiptDispatched(reservation);
+          // Do not clear a dispatched_unknown receipt when the handler throws:
+          // the downstream effect may have occurred and replay must reconcile.
+          const result = await originalExecute(args[0], reservation.forwardedArguments, ...args.slice(2));
+          await store.commitCccEffectReceipt(reservation, result);
+          return result;
+        });
+        turnTails.set(turn.turnKey, claimed.then(() => undefined, () => undefined));
+        claims.set(identity, claimed);
+        void claimed.then(
+          () => {
+            if (claims!.get(identity) === claimed) claims!.delete(identity);
+          },
+          () => {
+            if (claims!.get(identity) === claimed) claims!.delete(identity);
+          },
+        );
+        return claimed;
+      },
+    };
+  });
+}
+
 export function wrapToolsWithRtkRewrite(
   tools: ToolDefinition[],
   options: RtkRewriteOptions = resolveRtkRewriteOptions(),
@@ -2176,6 +2779,20 @@ function withMcpPromptOptions(promptOptions: unknown, mcpServers: ResolvedMcpSer
 }
 
 export async function createFnAgent(options: AgentOptions): Promise<AgentResult> {
+  /*
+   * FNXC:CCCSubscriptionPolicy 2026-07-23-14:19:
+   * createFnAgent is the public engine entrypoint before either pi provider
+   * dispatch or stdio MCP connection. Fail closed here for ccc-fusion unless
+   * the caller supplies subscriptionReady === true; this structural check
+   * neither probes auth nor reads credentials.
+   */
+  assertCccFusionSubscriptionReady(options);
+  const cccProviderAttemptBinding = validateCccProviderAttemptBinding(options.cccProviderAttemptBinding);
+  if (cccProviderAttemptBinding && options.profile !== CCC_FUSION_PROFILE) {
+    throw new Error("cccProviderAttemptBinding is only allowed for the ccc-fusion profile");
+  }
+  const customProviders = readCustomProviders();
+  assertCccCustomProviderEgress(options, customProviders);
   piLog.log(`createFnAgent called (tools=${options.tools}, provider=${options.defaultProvider}, model=${options.defaultModelId})`);
   // FNXC:McpConfig 2026-06-25-22:02:
   // The pi session is the final shared forwarding seam for direct createFnAgent lanes. Forward the resolved MCP set only to MCP-capable provider/runtime combinations and keep unsupported lanes content-free by logging just provider/runtime/count metadata.
@@ -2187,6 +2804,79 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const authStorage = createFusionAuthStorage();
   const modelRegistry = await createFusionModelRegistry(authStorage);
   const modelRuntime = modelRegistry.modelRuntime;
+  const cccTransportClosures = new Set<Promise<void>>();
+
+  if (options.profile === CCC_FUSION_PROFILE) {
+    const cccProviderAttemptState = createCccProviderAttemptSessionState();
+    /*
+     * FNXC:CCCSubscriptionPolicy 2026-07-23-14:38:
+     * createAgentSession dispatches provider traffic through this per-session
+     * ModelRuntime rather than an engine-level provider option. Carry only the
+     * explicit ccc-fusion marker and positive structural readiness result to
+     * direct stream seams; ModelRuntime completion methods delegate through
+     * those streams. The provider then fails closed before its child spawn
+     * when the caller omits readiness. This never reads auth state or forwards
+     * credentials.
+     */
+    const dispatchCccFusionStream = (
+      dispatch: (...args: any[]) => any,
+      model: any,
+      context: any,
+      requestOptions: any,
+    ) => {
+      const expectedModelId = model.id as string;
+      const optionsWithBoundary = {
+        ...(requestOptions ?? {}),
+        profile: CCC_FUSION_PROFILE,
+        subscriptionReady: true,
+      };
+      const priorOnPayload = optionsWithBoundary.onPayload as
+        | ((payload: unknown, model: unknown) => unknown | Promise<unknown>)
+        | undefined;
+      optionsWithBoundary.onPayload = async (payload: unknown) => {
+        const prior = priorOnPayload ? await priorOnPayload(payload, model) : undefined;
+        const resolved = prior === undefined ? payload : prior;
+        if (!resolved || typeof resolved !== "object" || Array.isArray(resolved)) {
+          throw new Error("ccc-fusion provider payload did not expose a structured model identity");
+        }
+        return {
+          ...(resolved as Record<string, unknown>),
+          model: expectedModelId,
+        };
+      };
+      /*
+       * pi-ai records responseModel only when the provider-reported model differs
+       * from model.id. Use a private in-process probe id while forcing the exact
+       * configured id onto the outbound payload, then restore the public request
+       * model on every event/result. A missing provider model stays missing, an
+       * alias stays visible, and an exact echo becomes independently observable.
+       */
+      const dispatchModel = { ...model, id: `__fusion_ccc_response_probe__${expectedModelId}` };
+      const source = cccProviderAttemptBinding
+        ? createCccProviderAttemptControlledStream({
+          binding: cccProviderAttemptBinding,
+          state: cccProviderAttemptState,
+          dispatch,
+          model,
+          dispatchModel,
+          context,
+          requestOptions: optionsWithBoundary,
+        })
+        : dispatch(dispatchModel, context, optionsWithBoundary);
+      const closed = Promise.resolve(source.result())
+        .catch(() => undefined)
+        .then(() => awaitNodeTransportCloseCallbacks());
+      cccTransportClosures.add(closed);
+      void closed.then(() => cccTransportClosures.delete(closed));
+      return restoreCccStreamRequestModel(source, expectedModelId);
+    };
+    const stream = modelRuntime.stream.bind(modelRuntime);
+    modelRuntime.stream = ((model, context, streamOptions) =>
+      dispatchCccFusionStream(stream, model, context, streamOptions)) as typeof modelRuntime.stream;
+    const streamSimple = modelRuntime.streamSimple.bind(modelRuntime);
+    modelRuntime.streamSimple = ((model, context, streamOptions) =>
+      dispatchCccFusionStream(streamSimple, model, context, streamOptions)) as typeof modelRuntime.streamSimple;
+  }
 
   // Resolve the project root early so extension providers, skill discovery,
   // and resource loading all use the correct root when cwd is a worktree,
@@ -2194,7 +2884,6 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const resolvedProjectRoot = getProjectRootFromWorktree(options.cwd) ?? resolvePiExtensionProjectRoot(options.cwd);
   await registerExtensionProviders(resolvedProjectRoot, modelRegistry);
 
-  const customProviders = readCustomProviders();
   for (const provider of customProviders) {
     try {
       const registryKey = customProviderRegistryKey(provider, customProviders);
@@ -2303,6 +2992,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       "primary",
       options.defaultProvider,
       options.defaultModelId,
+      options.profile,
     );
   } catch (primaryResolutionError) {
     if (!options.fallbackProvider || !options.fallbackModelId) {
@@ -2313,6 +3003,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       "fallback",
       options.fallbackProvider,
       options.fallbackModelId,
+      options.profile,
     );
     selectedModel = fallbackModel;
   }
@@ -2323,6 +3014,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       "fallback",
       options.fallbackProvider,
       options.fallbackModelId,
+      options.profile,
     );
   }
 
@@ -2424,6 +3116,65 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     attachSessionRoutingHeaders(modelRuntime, sessionRoutingId);
   }
 
+  let cccReceiptBinding: CccEffectReceiptBinding | undefined;
+  let cccReceiptBindingPromise: Promise<CccEffectReceiptBinding> | undefined;
+  let cccControllerToken = options.cccEffectReceiptControllerToken ?? randomUUID();
+  const resolveCccReceiptBinding = async (boundaryTools: readonly ToolDefinition[]): Promise<CccEffectReceiptBinding | undefined> => {
+    if (options.profile !== CCC_FUSION_PROFILE) return undefined;
+    if (!options.cccEffectReceiptBinder) {
+      if (!options.cccEffectReceiptStore || !options.cccEffectReceiptSessionId) return undefined;
+      return {
+        store: options.cccEffectReceiptStore,
+        sessionId: options.cccEffectReceiptSessionId,
+        controllerToken: cccControllerToken,
+        keepTurnOpen: options.cccEffectReceiptKeepTurnOpen === true,
+      };
+    }
+    if (!cccReceiptBindingPromise) {
+      const authorities: CccExecutionToolAuthority[] = boundaryTools
+        .map((tool) => ({
+          authority: tool.name,
+          parametersSha256: createHash("sha256")
+            .update(canonicalCccToolSchemaJson(tool.parameters))
+            .digest("hex"),
+        }))
+        .sort((left, right) => left.authority.localeCompare(right.authority)
+          || left.parametersSha256.localeCompare(right.parametersSha256));
+      cccReceiptBindingPromise = options.cccEffectReceiptBinder(authorities).then((binding) => {
+        cccReceiptBinding = binding;
+        cccControllerToken = binding.controllerToken;
+        return binding;
+      });
+    }
+    return cccReceiptBindingPromise;
+  };
+  const cccReceiptStore = (): CccEffectReceiptStore | undefined => cccReceiptBinding?.store ?? options.cccEffectReceiptStore;
+  const cccReceiptSessionId = (): string | undefined => cccReceiptBinding?.sessionId ?? options.cccEffectReceiptSessionId;
+  const cccKeepTurnOpen = (): boolean => cccReceiptBinding?.keepTurnOpen ?? options.cccEffectReceiptKeepTurnOpen === true;
+  let cccOpenTurn: { turnKey: string; nextSlot: number } | undefined;
+  const openCccTurnForPrompt = async (): Promise<void> => {
+    const store = cccReceiptStore();
+    const sessionId = cccReceiptSessionId();
+    if (options.profile !== CCC_FUSION_PROFILE || !store || !sessionId) return;
+    const turn = await store.openCccEffectTurn(
+      sessionId,
+      cccControllerToken,
+    );
+    cccOpenTurn = { turnKey: turn.turnKey, nextSlot: 0 };
+  };
+  const closeCccTurnAfterPrompt = async (): Promise<void> => {
+    const store = cccReceiptStore();
+    const sessionId = cccReceiptSessionId();
+    if (cccKeepTurnOpen()) return;
+    if (!cccOpenTurn || !store || !sessionId) return;
+    await store.closeCccEffectTurn(
+      sessionId,
+      cccOpenTurn.turnKey,
+      cccControllerToken,
+    );
+    cccOpenTurn = undefined;
+  };
+
   const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
     // Tool instances. We need boundary-wrapped versions of the built-ins, so we
@@ -2445,6 +3196,19 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         clientFactory: options.mcpClientFactory,
         logger: piLog,
         retryDelayMs: options.mcpBootstrapRetryDelayMs,
+        /*
+         * FNXC:CCCSubscriptionPolicy 2026-07-23-13:58:
+         * This is the real engine-to-stdio-MCP child seam. Forward only the
+         * exact positive ccc-fusion profile and its structural readiness bit,
+         * so absent or false readiness still reaches the fail-closed MCP guard
+         * without exposing credentials, auth state, or other profile values.
+         */
+        ...(options.profile === CCC_FUSION_PROFILE
+          ? {
+              profile: CCC_FUSION_PROFILE,
+              ...(options.subscriptionReady === true ? { subscriptionReady: true } : {}),
+            }
+          : {}),
       });
       /*
        * FNXC:McpConfig 2026-07-18-19:41:
@@ -2502,12 +3266,28 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       toolsWithPermanentGating,
       options.actionGateContext,
     );
-    const customToolList: ToolDefinition[] = wrapToolsWithBoundary(
+    const boundaryTools: ToolDefinition[] = wrapToolsWithBoundary(
       toolsWithActionGate,
       boundaryContext.worktreePath,
       boundaryContext.worktreeProjectRoot,
       normalizedAdditionalSkillPaths,
     );
+    const cccBinding = await resolveCccReceiptBinding(boundaryTools);
+    const customToolList: ToolDefinition[] = options.profile === CCC_FUSION_PROFILE
+      && cccBinding
+      ? wrapCccToolsWithDurableEffectReceipts(
+          boundaryTools,
+          cccBinding.store,
+          cccBinding.sessionId,
+          {
+            controllerToken: cccControllerToken,
+            current: () => {
+              if (!cccOpenTurn) throw new Error("CCC effectful tool call occurred without an open Fusion turn");
+              return cccOpenTurn;
+            },
+          },
+        )
+      : boundaryTools;
     // Sort tools alphabetically by name for deterministic ordering.
     // Prompt caching requires the tool list to be byte-identical across
     // sessions — reordering breaks cache prefix matching.
@@ -2597,6 +3377,19 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
        */
       if (modelOverride && !(result.session as AgentSession & { model?: unknown }).model) {
         (result.session as AgentSession & { model?: typeof modelOverride }).model = modelOverride;
+      }
+      /*
+      FNXC:CCCTransport 2026-07-23-15:45:
+      pi-ai records an OpenAI-compatible response model that differs from the
+      request as `responseModel`. Pin the exact ccc provider/model identity on
+      every primary, fallback, or recovery session so the shared prompt seam can
+      refuse a provider-side alias before the turn is accepted.
+      */
+      if (options.profile === CCC_FUSION_PROFILE && modelOverride) {
+        (result.session as CccResponseIdentitySession)[CCC_EXPECTED_RESPONSE_MODEL] = {
+          provider: modelOverride.provider,
+          modelId: modelOverride.id,
+        };
       }
       return result;
     } catch (error) {
@@ -2704,6 +3497,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   (activeSession as any).__fusionMemoryAppendAvailable = options.customTools?.some((tool) => tool.name === FN_MEMORY_APPEND_TOOL_NAME) === true;
   const promptableSession = activeSession as PromptableSession;
 
+  if (options.profile === CCC_FUSION_PROFILE) {
+    (promptableSession as CccTransportClosureSession)[CCC_AWAIT_OWNED_TRANSPORT_CLOSURE] = async () => {
+      await Promise.all([...cccTransportClosures]);
+    };
+  }
+
   let thinkingCompatibilityDisabled = false;
   const applyThinkingLevelIfSupported = (targetSession: AgentSession, sourceModel: string): void => {
     /*
@@ -2764,7 +3563,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     }
     wrapSessionDisposeWithShutdown(activeSession);
     try {
-      activeSession.dispose();
+      await Promise.resolve(activeSession.dispose());
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       piLog.warn(`Failed to dispose session during swap: ${msg}`);
@@ -2782,8 +3581,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
 
   promptableSession.promptWithFallback = async (prompt: string, promptOptions?: unknown) => {
     const effectivePromptOptions = withMcpPromptOptions(promptOptions, forwardedMcpServers);
+    await openCccTurnForPrompt();
     try {
       await promptSessionAndCheck(activeSession, prompt, effectivePromptOptions);
+      await closeCccTurnAfterPrompt();
       return;
     } catch (err: any) {
       const errorMessage = err?.message || "";
@@ -2791,6 +3592,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         // Context limit error — attempt auto-compaction and retry once
         const promptMemoryRetry = await retryWithCompactedPromptMemory(activeSession, prompt, effectivePromptOptions);
         if (promptMemoryRetry.recovered) {
+          await closeCccTurnAfterPrompt();
           return;
         }
         if (promptMemoryRetry.error) {
@@ -2802,6 +3604,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
 
         const promptSectionRetry = await retryWithCompactedPromptSections(activeSession, prompt, effectivePromptOptions);
         if (promptSectionRetry.recovered) {
+          await closeCccTurnAfterPrompt();
           return;
         }
         if (promptSectionRetry.error) {
@@ -2818,6 +3621,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           piLog.log(`promptWithFallback: compaction succeeded (${compactResult.tokensBefore} tokens) — retrying prompt`);
           try {
             await promptSessionAndCheck(activeSession, prompt, effectivePromptOptions);
+            await closeCccTurnAfterPrompt();
             return;
           } catch (retryErr: any) {
             const retryErrorMessage = retryErr?.message || "";
@@ -2836,6 +3640,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         piLog.warn(`Prompt failed with thinking/reasoning conflict; retrying without explicit thinking level: ${errorMessage}`);
         const recoveredSession = await swapPromptSession(selectedModel);
         await promptSessionAndCheck(recoveredSession, prompt, effectivePromptOptions);
+        await closeCccTurnAfterPrompt();
         return;
       }
 
@@ -2853,6 +3658,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       // Retry with fallback model, also with auto-compaction support
       try {
         await promptSessionAndCheck(fallbackSession, prompt, effectivePromptOptions);
+        await closeCccTurnAfterPrompt();
         return;
       } catch (_fallbackErr: unknown) {
         /*
@@ -2865,6 +3671,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         try {
           const primaryRetrySession = await swapPromptSession(selectedModel);
           await promptSessionAndCheck(primaryRetrySession, prompt, effectivePromptOptions);
+          await closeCccTurnAfterPrompt();
           return;
         } catch (primaryRetryErr: unknown) {
           throw makeFallbackExhaustedError("prompt-time", 3, primaryRetryErr);
