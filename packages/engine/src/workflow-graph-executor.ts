@@ -10,6 +10,7 @@ import type {
   WorkflowExtensionDefinition,
   WorkflowNodeExtensionResult,
   WorkflowNodeProviderController,
+  WorkflowNodeProviderDispatchInput,
   WorkflowStepResult,
 } from "@fusion/core";
 import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, canonicalCccPrdJson, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
@@ -170,6 +171,16 @@ export type WorkflowNodeProviderControllerResolverInput = Readonly<{
   signal?: AbortSignal;
 }>;
 
+export type WorkflowNodeProviderControllerBinding = Readonly<{
+  providerController: WorkflowNodeProviderController;
+  providerRoute: Readonly<{
+    providerId: string;
+    modelId: string;
+    transport: "workflow";
+    workflowExtensionId: string;
+  }>;
+}>;
+
 export type WorkflowNodeHandler = (node: WorkflowIrNode, context: WorkflowNodeExecutionContext) => Promise<WorkflowNodeResult>;
 
 export interface WorkflowNodePreparationRequirement {
@@ -186,7 +197,7 @@ export interface WorkflowGraphExecutorDeps {
   /** Native campaign marker and capability resolver for provider-scoped plugin handlers. */
   resolveNodeProviderController?: (
     input: WorkflowNodeProviderControllerResolverInput,
-  ) => WorkflowNodeProviderController | undefined | Promise<WorkflowNodeProviderController | undefined>;
+  ) => WorkflowNodeProviderControllerBinding | undefined | Promise<WorkflowNodeProviderControllerBinding | undefined>;
   /** Fail-closed admission for executable nodes. Runs once before preparation,
    * plugin dispatch, or a default handler. Orchestration-only nodes never enter
    * this seam. */
@@ -610,6 +621,97 @@ function requireWorkflowNodeProviderController(
   return candidate;
 }
 
+const CANONICAL_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+
+function requireCanonicalProviderIdentifier(value: unknown, label: string, extensionId: string): string {
+  if (typeof value !== "string" || !CANONICAL_IDENTIFIER_PATTERN.test(value)) {
+    throw new PermanentError(
+      `Workflow node provider ${label} is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return value;
+}
+
+function requireWorkflowNodeProviderControllerBinding(
+  candidate: WorkflowNodeProviderControllerBinding | undefined,
+  extensionId: string,
+): WorkflowNodeProviderControllerBinding {
+  if (
+    !candidate
+    || typeof candidate !== "object"
+    || !Object.isFrozen(candidate)
+    || Object.keys(candidate).length !== 2
+    || !Object.hasOwn(candidate, "providerController")
+    || !Object.hasOwn(candidate, "providerRoute")
+  ) {
+    throw new PermanentError(
+      `Workflow node provider binding is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  requireWorkflowNodeProviderController(candidate.providerController, extensionId);
+  const providerRoute = candidate.providerRoute;
+  if (
+    !providerRoute
+    || typeof providerRoute !== "object"
+    || !Object.isFrozen(providerRoute)
+    || Object.keys(providerRoute).length !== 4
+    || !Object.hasOwn(providerRoute, "providerId")
+    || !Object.hasOwn(providerRoute, "modelId")
+    || !Object.hasOwn(providerRoute, "transport")
+    || !Object.hasOwn(providerRoute, "workflowExtensionId")
+    || providerRoute.transport !== "workflow"
+    || providerRoute.workflowExtensionId !== extensionId
+  ) {
+    throw new PermanentError(
+      `Workflow node provider route is unavailable or malformed for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  requireCanonicalProviderIdentifier(providerRoute.providerId, "provider ID", extensionId);
+  requireCanonicalProviderIdentifier(providerRoute.modelId, "model ID", extensionId);
+  requireCanonicalProviderIdentifier(providerRoute.workflowExtensionId, "workflow extension ID", extensionId);
+  return candidate;
+}
+
+function createWorkflowNodeProviderDispatch(
+  execution: WorkflowNodeSealedExecution | undefined,
+  nodeId: string,
+  extensionId: string,
+  binding: WorkflowNodeProviderControllerBinding,
+): WorkflowNodeProviderDispatchInput {
+  const sealedExecution = requireSealedExecution(execution, nodeId);
+  const turnKey = requireCanonicalProviderIdentifier(
+    sealedExecution.providerAttemptTurnKey,
+    "sealed turn key",
+    extensionId,
+  );
+  const canonicalNodeId = requireCanonicalProviderIdentifier(nodeId, "node ID", extensionId);
+  const canonicalExtensionId = requireCanonicalProviderIdentifier(extensionId, "extension ID", extensionId);
+  if (binding.providerRoute.workflowExtensionId !== canonicalExtensionId) {
+    throw new PermanentError(
+      `Workflow node provider route extension identity does not match extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  const dispatchKey = `ccc-workflow-node-dispatch-${createHash("sha256")
+    .update(canonicalCccPrdJson({
+      schema: "ccc-workflow-node-dispatch",
+      version: 1,
+      nodeId: canonicalNodeId,
+      extensionId: canonicalExtensionId,
+    }), "utf8")
+    .digest("hex")}`;
+  return Object.freeze({
+    turnKey,
+    dispatchKey,
+    providerId: binding.providerRoute.providerId,
+    modelId: binding.providerRoute.modelId,
+    transport: "workflow" as const,
+  });
+}
+
 export class WorkflowGraphExecutor {
   private readonly maxRetriesPerNode: number;
 
@@ -831,6 +933,7 @@ export class WorkflowGraphExecutor {
       task,
       settings,
       runId,
+      signal: this.deps.signal,
       nodeMap,
       outgoingMap,
       runBranchNode: (node, signal) => this.executeNodeWithRetries(
@@ -1743,9 +1846,8 @@ export class WorkflowGraphExecutor {
     definition: WorkflowExtensionDefinition,
     signal: AbortSignal | undefined,
     execution: WorkflowNodeSealedExecution | undefined,
-    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderController>>,
-  ): Promise<WorkflowNodeProviderController | undefined> {
-    if (!this.deps.resolveNodeProviderController) return undefined;
+    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderControllerBinding>>,
+  ): Promise<WorkflowNodeProviderControllerBinding | undefined> {
     if (definition.providerPosture === "opaque") {
       throw new PermanentError(
         `Workflow node ${node.id} refuses opaque provider posture for extension ${extensionId}`,
@@ -1753,6 +1855,12 @@ export class WorkflowGraphExecutor {
       );
     }
     if (definition.providerPosture !== "scoped-provider") return undefined;
+    if (!this.deps.resolveNodeProviderController) {
+      throw new PermanentError(
+        `Workflow node provider binding resolver is unavailable for extension ${extensionId}`,
+        "WORKFLOW_NODE_PROVIDER_REFUSED",
+      );
+    }
 
     const cached = providerControllerPromises.get(extensionId) ?? Promise.resolve()
       .then(() => this.deps.resolveNodeProviderController!({
@@ -1763,7 +1871,7 @@ export class WorkflowGraphExecutor {
         execution: requireSealedExecution(execution, node.id),
         signal,
       }))
-      .then((candidate) => requireWorkflowNodeProviderController(candidate, extensionId));
+      .then((candidate) => requireWorkflowNodeProviderControllerBinding(candidate, extensionId));
     providerControllerPromises.set(extensionId, cached);
     return await cached;
   }
@@ -1774,7 +1882,7 @@ export class WorkflowGraphExecutor {
     workflow: WorkflowIr,
     signal: AbortSignal | undefined,
     execution: WorkflowNodeSealedExecution | undefined,
-    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderController>>,
+    providerControllerPromises: Map<string, Promise<WorkflowNodeProviderControllerBinding>>,
   ): Promise<void> {
     const registry = getWorkflowExtensionRegistry();
     for (const extensionId of Object.keys(node.extensions ?? {})) {
@@ -1782,7 +1890,7 @@ export class WorkflowGraphExecutor {
       const extension = definition?.extension;
       if (!definition || definition.degraded || extension?.kind !== "node-handler" || !extension.handle) continue;
       if (extension.nodeKind && extension.nodeKind !== node.kind) continue;
-      await this.resolvePluginNodeProviderController(
+      const binding = await this.resolvePluginNodeProviderController(
         node,
         task,
         workflow,
@@ -1792,6 +1900,7 @@ export class WorkflowGraphExecutor {
         execution,
         providerControllerPromises,
       );
+      if (binding) createWorkflowNodeProviderDispatch(execution, node.id, extensionId, binding);
     }
   }
 
@@ -1802,7 +1911,7 @@ export class WorkflowGraphExecutor {
     context: Record<string, unknown>,
     signal?: AbortSignal,
     execution?: WorkflowNodeSealedExecution,
-    providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderController>>(),
+    providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderControllerBinding>>(),
   ): Promise<WorkflowNodeResult | undefined> {
     const extensionIds = Object.keys(node.extensions ?? {});
     if (extensionIds.length === 0) return undefined;
@@ -1813,7 +1922,7 @@ export class WorkflowGraphExecutor {
       const extension = definition?.extension;
       if (!definition || definition.degraded || extension?.kind !== "node-handler" || !extension.handle) continue;
       if (extension.nodeKind && extension.nodeKind !== node.kind) continue;
-      const providerController = await this.resolvePluginNodeProviderController(
+      const providerBinding = await this.resolvePluginNodeProviderController(
         node,
         task,
         workflow,
@@ -1830,10 +1939,23 @@ export class WorkflowGraphExecutor {
           node,
           context,
           signal,
-          ...(providerController ? { providerController } : {}),
+          ...(providerBinding ? {
+            providerController: providerBinding.providerController,
+            providerDispatch: createWorkflowNodeProviderDispatch(execution, node.id, extensionId, providerBinding),
+          } : {}),
         });
         return this.normalizePluginNodeResult(result);
       } catch (error) {
+        if (definition.providerPosture === "scoped-provider") {
+          return {
+            outcome: "failure",
+            value: "plugin-node-handler-error",
+            contextPatch: {
+              [`node:${node.id}:error`]: error instanceof Error ? error.message : String(error),
+              [`node:${node.id}:extensionId`]: extensionId,
+            },
+          };
+        }
         if (extension.fallback === "degradeToDefault") {
           try {
             registry.degrade(
@@ -1926,7 +2048,7 @@ export class WorkflowGraphExecutor {
 
     let lastError: unknown;
     let admissionCompleted = false;
-    const providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderController>>();
+    const providerControllerPromises = new Map<string, Promise<WorkflowNodeProviderControllerBinding>>();
     /*
     FNXC:CccWave4Retry 2026-07-24-19:15:
     Permanent CCC failures stop after their first real invocation even when the

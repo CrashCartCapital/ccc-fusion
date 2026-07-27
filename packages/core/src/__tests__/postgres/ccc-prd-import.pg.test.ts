@@ -27,6 +27,11 @@ import {
 import type { AsyncDataLayer, DbTransaction } from "../../postgres/data-layer.js";
 import type { CccPrdImportEntityType } from "../../ccc-prd/types.js";
 import {
+  __resetWorkflowExtensionRegistryForTests,
+  getWorkflowExtensionRegistry,
+} from "../../workflow-extension-registry.js";
+import { WORKFLOW_EXTENSION_SCHEMA_VERSION } from "../../workflow-extension-types.js";
+import {
   CCC_PRD_TEST_BASE as BASE,
   createCccPrdImportTestExecutionPolicy as executionPolicy,
   createCccPrdImportTestBundle as bundle,
@@ -121,7 +126,20 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   beforeAll(h.beforeAll);
   beforeEach(h.beforeEach);
   afterEach(h.afterEach);
+  afterEach(__resetWorkflowExtensionRegistryForTests);
   afterAll(h.afterAll);
+
+  function registerWorkflowProviderExtension(extensionId: string): void {
+    __resetWorkflowExtensionRegistryForTests();
+    getWorkflowExtensionRegistry().register("ccc-campaign", {
+      extensionId: extensionId.replace("plugin:ccc-campaign:", ""),
+      name: "CCC campaign provider dispatch",
+      kind: "node-handler",
+      nodeKind: "prompt",
+      schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
+      fallback: "failClosed",
+    });
+  }
 
   function request(suffix = "base", key = "idem-base", checkpoint?: FailureCheckpoint) {
     const semanticBundle = bundle(h.rootDir(), suffix);
@@ -489,6 +507,255 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(ir.edges).toContainEqual({ from: join!.id, to: taskNodeId(taskD!.id), condition: "success" });
     expect(ir.edges).not.toContainEqual({ from: taskNodeId(taskB.id), to: taskNodeId(taskD!.id), condition: "success" });
     expect(ir.edges).not.toContainEqual({ from: taskNodeId(taskC.id), to: taskNodeId(taskD!.id), condition: "success" });
+  });
+
+  it("Task 6 RED: attaches each workflow transport route extension to its semantic prompt node", async () => {
+    const suffix = "task6-workflow-extension";
+    const key = "idem-task6-workflow-extension";
+    const semanticBundle = bundle(h.rootDir(), suffix);
+    const workflowExtensionId = "plugin:ccc-campaign:provider-dispatch";
+    registerWorkflowProviderExtension(workflowExtensionId);
+    const imported = await importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: semanticBundle,
+      executionPolicy: {
+        ...executionPolicy(semanticBundle),
+        routes: executionPolicy(semanticBundle).routes.map((route, index) => index === 0
+          ? { ...route, transport: "workflow" as const, workflowExtensionId }
+          : route),
+      },
+    });
+    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--WF-${suffix}`);
+    const prompt = (stored?.ir as { nodes: Array<{
+      kind: string;
+      config?: Record<string, unknown>;
+      extensions?: Record<string, Record<string, unknown>>;
+    }> }).nodes.find((node) => node.config?.cccPrdTaskId === `TASK-${suffix}`);
+
+    expect(prompt).toMatchObject({
+      kind: "prompt",
+      extensions: { [workflowExtensionId]: {} },
+    });
+  });
+
+  it("Task 6 RED: refuses an unregistered workflow transport extension without persisted import state", async () => {
+    const suffix = "task6-unregistered-workflow-extension";
+    const key = "idem-task6-unregistered-workflow-extension";
+    const semanticBundle = bundle(h.rootDir(), suffix);
+    const workflowExtensionId = "plugin:ccc-campaign:unregistered-provider";
+    __resetWorkflowExtensionRegistryForTests();
+
+    await expect(importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: semanticBundle,
+      executionPolicy: {
+        ...executionPolicy(semanticBundle),
+        routes: executionPolicy(semanticBundle).routes.map((route, index) => index === 0
+          ? { ...route, transport: "workflow" as const, workflowExtensionId }
+          : route),
+      },
+    })).rejects.toThrow(
+      `Workflow node 'ccc-task-${createHash("sha256").update(`TASK-${suffix}`).digest("hex").slice(0, 24)}' extension key '${workflowExtensionId}' is not registered`,
+    );
+    await expect(inspectCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toBeNull();
+    const expectedImportId = `ccc-prd-${createHash("sha256")
+      .update(`__legacy_unscoped__\0${key}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+    expect((await h.store().listWorkflowDefinitions()).map(({ id }) => id))
+      .not.toContain(`${expectedImportId}--WF-${suffix}`);
+  });
+
+  it("Task 6 RED: refuses a dangling terminal protected-action reference before emitting workflow IR", async () => {
+    const suffix = "task6-dangling-terminal-action";
+    const key = "idem-task6-dangling-terminal-action";
+    const initial = bundle(h.rootDir(), suffix);
+    const landingTask = initial.tasks[1]!;
+    const danglingActionId = `ACTION-missing-${suffix}`;
+    const danglingBundle = rehashBundle({
+      ...initial,
+      tasks: initial.tasks.map((task) => task.id === landingTask.id
+        ? { ...task, protectedActionIds: [danglingActionId] }
+        : task),
+      protectedActions: [],
+    });
+
+    await expect(importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: danglingBundle,
+      executionPolicy: executionPolicy(danglingBundle),
+    })).rejects.toMatchObject({
+      code: "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      message: `CCC PRD workflow WF-${suffix} terminal task ${landingTask.id} references unknown protected action ${danglingActionId}`,
+    });
+    await expect(inspectCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toBeNull();
+    const expectedImportId = `ccc-prd-${createHash("sha256")
+      .update(`__legacy_unscoped__\0${key}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+    expect((await h.store().listWorkflowDefinitions()).map(({ id }) => id))
+      .not.toContain(`${expectedImportId}--WF-${suffix}`);
+  });
+
+  it("Task 6 RED: emits one merge seam after one exact terminal merge action and refuses ambiguous landings", async () => {
+    const suffix = "task6-merge-seam";
+    const key = "idem-task6-merge-seam";
+    const initial = bundle(h.rootDir(), suffix);
+    const landingTask = initial.tasks[1]!;
+    const mergeAction = {
+      id: `ACTION-merge-${suffix}`,
+      kind: "merge" as const,
+      target: "refs/heads/main",
+      operatorDecision: "approve_merge" as const,
+      requiresOperatorDecision: true as const,
+      spans: [landingTask.spans[0]!],
+    };
+    const mergeBundle = rehashBundle({
+      ...initial,
+      tasks: initial.tasks.map((task) => task.id === landingTask.id
+        ? { ...task, protectedActionIds: [mergeAction.id] }
+        : task),
+      protectedActions: [mergeAction],
+    });
+    const extraTerminal = {
+      ...landingTask,
+      id: `TASK-extra-terminal-${suffix}`,
+      title: "Extra terminal",
+      dependencyTaskIds: [],
+      documentIds: [],
+      artifactIds: [],
+      protectedActionIds: [],
+    };
+    const ambiguousLanding = rehashBundle({
+      ...mergeBundle,
+      tasks: [...mergeBundle.tasks, extraTerminal],
+      workflows: mergeBundle.workflows.map((workflow) => ({
+        ...workflow,
+        taskIds: [...workflow.taskIds, extraTerminal.id],
+        terminalTaskIds: [...workflow.terminalTaskIds, extraTerminal.id],
+      })),
+      importIntents: [
+        ...mergeBundle.importIntents.map((intent) => intent.entityType === "campaign"
+          ? {
+            ...intent,
+            id: `${intent.id}-ambiguous`,
+            entityId: `${intent.entityId}-ambiguous`,
+          }
+          : intent),
+        { id: extraTerminal.id, entityType: "task" as const, entityId: extraTerminal.id, operation: "create" as const, target: h.rootDir() },
+      ],
+    });
+    await expect(importCccPrdBundle({
+      ...request(`${suffix}-ambiguous`, `${key}-ambiguous`),
+      bundle: ambiguousLanding,
+      executionPolicy: executionPolicy(ambiguousLanding),
+    })).rejects.toMatchObject({
+      code: "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      message: "CCC PRD workflow WF-task6-merge-seam has multiple terminal landing tasks for merge ACTION-merge-task6-merge-seam",
+    });
+
+    const secondMergeAction = { ...mergeAction, id: `${mergeAction.id}-second` };
+    const ambiguousAction = rehashBundle({
+      ...mergeBundle,
+      tasks: mergeBundle.tasks.map((task) => task.id === landingTask.id
+        ? { ...task, protectedActionIds: [mergeAction.id, secondMergeAction.id] }
+        : task),
+      protectedActions: [mergeAction, secondMergeAction],
+    });
+    await expect(importCccPrdBundle({
+      ...request(`${suffix}-ambiguous-action`, `${key}-ambiguous-action`),
+      bundle: ambiguousAction,
+      executionPolicy: executionPolicy(ambiguousAction),
+    })).rejects.toMatchObject({
+      code: "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      message: "CCC PRD workflow WF-task6-merge-seam terminal landing TASK-terminal-task6-merge-seam must reference exactly one declared merge protected action",
+    });
+
+    const imported = await importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: mergeBundle,
+      executionPolicy: executionPolicy(mergeBundle),
+    });
+    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--WF-${suffix}`);
+    const ir = stored?.ir as {
+      nodes: Array<{ id: string; kind: string; config?: Record<string, unknown> }>;
+      edges: Array<{ from: string; to: string; condition: string }>;
+    };
+    const terminalNodeId = `ccc-task-${createHash("sha256").update(landingTask.id).digest("hex").slice(0, 24)}`;
+    const mergeNode = ir.nodes.find((node) => node.config?.seam === "merge");
+    expect(mergeNode).toMatchObject({
+      kind: "prompt",
+      config: { seam: "merge", cccPrdTaskId: landingTask.id },
+    });
+    expect(ir.edges).toContainEqual({ from: terminalNodeId, to: mergeNode!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: mergeNode!.id, to: "end", condition: "success" });
+    expect(ir.edges).not.toContainEqual({ from: terminalNodeId, to: "end", condition: "success" });
+  });
+
+  it("Task 6 RED: preserves no-merge-action workflow IR bytes", async () => {
+    const suffix = "task6-no-merge";
+    const key = "idem-task6-no-merge";
+    const semanticBundle = bundle(h.rootDir(), suffix);
+    const imported = await importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: semanticBundle,
+      executionPolicy: executionPolicy(semanticBundle),
+    });
+    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--WF-${suffix}`);
+    expect(stored?.ir).toEqual({
+      version: "v2",
+      name: "Import workflow",
+      columns: [],
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: `ccc-task-${createHash("sha256").update(`TASK-${suffix}`).digest("hex").slice(0, 24)}`,
+          kind: "prompt",
+          config: {
+            name: "Import-owned task",
+            prompt: "A task projected only after commit.",
+            cccPrdTaskId: `TASK-${suffix}`,
+            gateMode: "gate",
+          },
+        },
+        {
+          id: `ccc-task-${createHash("sha256").update(`TASK-terminal-${suffix}`).digest("hex").slice(0, 24)}`,
+          kind: "prompt",
+          config: {
+            name: "Terminal import-owned task",
+            prompt: "Dependent terminal task.",
+            cccPrdTaskId: `TASK-terminal-${suffix}`,
+            gateMode: "gate",
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        {
+          from: "start",
+          to: `ccc-task-${createHash("sha256").update(`TASK-${suffix}`).digest("hex").slice(0, 24)}`,
+          condition: "success",
+        },
+        {
+          from: `ccc-task-${createHash("sha256").update(`TASK-${suffix}`).digest("hex").slice(0, 24)}`,
+          to: `ccc-task-${createHash("sha256").update(`TASK-terminal-${suffix}`).digest("hex").slice(0, 24)}`,
+          condition: "success",
+        },
+        {
+          from: `ccc-task-${createHash("sha256").update(`TASK-terminal-${suffix}`).digest("hex").slice(0, 24)}`,
+          to: "end",
+          condition: "success",
+        },
+      ],
+    });
   });
 
   it("commits exact semantic counts, projects task/document/artifact readers, and remains visible after restart", async () => {

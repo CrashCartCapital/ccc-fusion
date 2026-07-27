@@ -282,6 +282,27 @@ function parseCccCampaignActionLeases(
   return leases;
 }
 
+function parseCccCampaignActionLeaseBuckets(
+  value: unknown,
+  campaignDeadlineAt: string,
+): Record<string, Record<string, CccCampaignActionLease>> {
+  if (!isRecord(value)) {
+    throw new CccCampaignContextError("CCC campaign action leases must be an object");
+  }
+  const buckets: Record<string, Record<string, CccCampaignActionLease>> = {};
+  for (const taskId of Object.keys(value).sort(compareCccPrdCodeUnits)) {
+    requireLeaseText(taskId, "CCC campaign action lease task key");
+    const bucket = value[taskId];
+    if (isRecord(bucket) && typeof bucket.actionId === "string") {
+      throw new CccCampaignContextError(
+        "CCC campaign action leases must be keyed by task ID; legacy flat lease rows are unsupported",
+      );
+    }
+    buckets[taskId] = parseCccCampaignActionLeases(bucket, campaignDeadlineAt);
+  }
+  return buckets;
+}
+
 export async function loadCccCampaignContextForTask(
   layer: AsyncDataLayer,
   rootDir: string,
@@ -422,10 +443,11 @@ export async function loadCccCampaignContextForTask(
       `Task ${taskId} campaign request count is invalid`,
     );
   }
-  const activeActionLeases = parseCccCampaignActionLeases(
+  const actionLeaseBuckets = parseCccCampaignActionLeaseBuckets(
     row.activeActionLeases,
     row.campaignDeadlineAt,
   );
+  const activeActionLeases = actionLeaseBuckets[taskId] ?? {};
 
   const context: CccCampaignTaskContext = {
     schema: CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
@@ -580,7 +602,7 @@ function createActionLease(
 async function lockActionLeases(
   tx: DbTransaction,
   context: CccCampaignContext,
-): Promise<Record<string, CccCampaignActionLease>> {
+): Promise<Record<string, Record<string, CccCampaignActionLease>>> {
   const rows = await tx
     .select({
       projectId: schema.project.cccPrdImports.projectId,
@@ -612,18 +634,18 @@ async function lockActionLeases(
       `Task ${context.taskId} CCC campaign action lease context drifted before lock`,
     );
   }
-  return parseCccCampaignActionLeases(row.activeActionLeases, row.campaignDeadlineAt);
+  return parseCccCampaignActionLeaseBuckets(row.activeActionLeases, row.campaignDeadlineAt);
 }
 
 async function writeActionLeases(
   tx: DbTransaction,
   context: CccCampaignContext,
-  leases: Record<string, CccCampaignActionLease>,
+  actionLeaseBuckets: Record<string, Record<string, CccCampaignActionLease>>,
 ): Promise<void> {
   const updated = await tx
     .update(schema.project.cccPrdImports)
     .set({
-      activeActionLeases: leases,
+      activeActionLeases: actionLeaseBuckets,
       updatedAt: new Date().toISOString(),
     })
     .where(and(
@@ -683,7 +705,8 @@ async function claimCccCampaignActionLeaseWithinTransaction(
   );
   const binding = createProtectedLeaseBinding(context, input.action);
   const requested = createActionLease(binding, input.claim, context.campaignDeadlineAt);
-  const leases = await lockActionLeases(tx, context);
+  const actionLeaseBuckets = await lockActionLeases(tx, context);
+  const leases = actionLeaseBuckets[context.taskId] ?? {};
   const existing = leases[requested.actionId];
   if (existing) {
     assertLeaseMatchesBinding(existing, binding);
@@ -693,7 +716,7 @@ async function claimCccCampaignActionLeaseWithinTransaction(
     throw new CccCampaignContextError(collisionMessage(existing, requested));
   }
   const next = { ...leases, [requested.actionId]: requested };
-  await writeActionLeases(tx, context, next);
+  await writeActionLeases(tx, context, { ...actionLeaseBuckets, [context.taskId]: next });
   return { lease: requested, binding };
 }
 
@@ -738,7 +761,8 @@ async function settleCccCampaignActionLeaseWithinTransaction(
     input.claimToken,
     `CCC campaign action lease ${binding.actionId} claimToken`,
   );
-  const leases = await lockActionLeases(tx, context);
+  const actionLeaseBuckets = await lockActionLeases(tx, context);
+  const leases = actionLeaseBuckets[context.taskId] ?? {};
   const lease = leases[binding.actionId];
   if (!lease) {
     throw new CccCampaignContextError(`CCC campaign action lease ${binding.actionId} is missing`);
@@ -750,7 +774,7 @@ async function settleCccCampaignActionLeaseWithinTransaction(
   }
   assertLeaseMatchesBinding(lease, binding);
   const { [binding.actionId]: _settled, ...remaining } = leases;
-  await writeActionLeases(tx, context, remaining);
+  await writeActionLeases(tx, context, { ...actionLeaseBuckets, [context.taskId]: remaining });
 }
 
 export async function settleCccCampaignActionLease(

@@ -234,6 +234,90 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
     });
   });
 
+  it("keeps active action leases scoped to each sibling task when they reuse an action ID", async () => {
+    const suffix = "sibling-action-leases";
+    const fixture = bundle(h.rootDir(), suffix);
+    const sharedAction = { actionId: "actionId", actionTarget: action.actionTarget };
+    const source = rehashCccPrdImportTestBundle({
+      ...withCampaignAction(fixture, {
+        ...mergeProtectedAction,
+        id: sharedAction.actionId,
+        target: sharedAction.actionTarget,
+      }),
+      tasks: fixture.tasks.map((task) => ({
+        ...task,
+        protectedActionIds: [sharedAction.actionId],
+      })),
+    });
+    await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: `approval-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy: policyFor(source),
+    });
+    const taskIds = [`TASK-${suffix}`, `TASK-terminal-${suffix}`];
+    const campaigns = await Promise.all(taskIds.map(async (taskId) => {
+      const campaign = await h.store().getCccCampaignContextForTask(taskId);
+      if (!campaign) throw new Error(`missing campaign context for ${taskId}`);
+      return campaign;
+    }));
+
+    await Promise.all(campaigns.map((campaign, index) => h.store().claimCccCampaignActionLease(
+      taskIds[index]!,
+      sharedAction,
+      {
+        approvalRequestId: `approval-${index}`,
+        claimToken: `claim-${index}`,
+        claimedAt: campaign.campaignStartedAt,
+        expiresAt: campaign.campaignDeadlineAt,
+      },
+    )));
+
+    const persistedContexts = await Promise.all(taskIds.map((taskId) =>
+      h.store().getCccCampaignContextForTask(taskId)));
+    expect(persistedContexts).toEqual([
+      expect.objectContaining({
+        taskId: taskIds[0],
+        activeActionLeases: expect.objectContaining({
+          [sharedAction.actionId]: expect.objectContaining({ claimToken: "claim-0" }),
+        }),
+      }),
+      expect.objectContaining({
+        taskId: taskIds[1],
+        activeActionLeases: expect.objectContaining({
+          [sharedAction.actionId]: expect.objectContaining({ claimToken: "claim-1" }),
+        }),
+      }),
+    ]);
+    await expect(Promise.all(taskIds.map((taskId) =>
+      h.store().inspectCccCampaignActionLease(taskId, sharedAction)))).resolves.toEqual([
+      expect.objectContaining({ lease: expect.objectContaining({ claimToken: "claim-0" }) }),
+      expect.objectContaining({ lease: expect.objectContaining({ claimToken: "claim-1" }) }),
+    ]);
+  });
+
+  it("refuses a nonempty legacy flat action-lease row", async () => {
+    const { campaign, taskId } = await context("legacy-flat-action-lease");
+    const claimed = await h.store().claimCccCampaignActionLease(taskId, action, {
+      approvalRequestId: "approval-legacy-flat",
+      claimToken: "claim-legacy-flat",
+      claimedAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET active_action_leases = ${JSON.stringify({ [action.actionId]: claimed.lease })}::jsonb
+      WHERE project_id = ${campaign.projectId}
+        AND import_id = ${campaign.importId}
+    `);
+
+    await expect(h.store().getCccCampaignContextForTask(taskId)).rejects.toThrow(
+      /legacy flat lease rows are unsupported/,
+    );
+  });
+
   it("asserts exact consumed custody and refuses wrong request, token, or a remaining action lease", async () => {
     const { campaign, taskId } = await context("consumed-custody");
     const issued = await issueCccCampaignApproval(h.layer(), issueInput(taskId, campaign));
@@ -448,7 +532,7 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
       UPDATE project.ccc_prd_imports
       SET active_action_leases = jsonb_set(
         active_action_leases,
-        ARRAY[${action.actionId}, 'claimedAt'],
+        ARRAY[${taskId}, ${action.actionId}, 'claimedAt'],
         to_jsonb(${driftedClaimedAt}::text),
         true
       )
@@ -479,7 +563,7 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
       UPDATE project.ccc_prd_imports
       SET active_action_leases = jsonb_set(
         active_action_leases,
-        ARRAY[${action.actionId}, 'expiresAt'],
+        ARRAY[${taskId}, ${action.actionId}, 'expiresAt'],
         to_jsonb(${driftedExpiresAt}::text),
         true
       )
@@ -563,7 +647,7 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
       UPDATE project.ccc_prd_imports
       SET active_action_leases = jsonb_set(
         active_action_leases,
-        ARRAY[${action.actionId}, 'expiresAt'],
+        ARRAY[${taskId}, ${action.actionId}, 'expiresAt'],
         to_jsonb(${new Date(Date.now() - 1_000).toISOString()}::text),
         true
       )
@@ -577,7 +661,7 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
       UPDATE project.ccc_prd_imports
       SET active_action_leases = jsonb_set(
         active_action_leases,
-        ARRAY[${action.actionId}, 'bindingHash'],
+        ARRAY[${taskId}, ${action.actionId}, 'bindingHash'],
         to_jsonb('drifted'::text),
         true
       )

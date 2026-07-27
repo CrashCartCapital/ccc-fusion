@@ -108,6 +108,8 @@ export interface BranchEnvironment {
   task: TaskDetail;
   settings: Pick<Settings, "experimentalFeatures"> | undefined;
   runId: string;
+  /** Top-level executor cancellation, bridged into the split's branch controller. */
+  signal?: AbortSignal;
   nodeMap: Map<string, WorkflowIrNode>;
   outgoingMap: Map<string, WorkflowIrEdge[]>;
   /** Reuses the executor's executeNodeWithRetries (+ context bookkeeping). */
@@ -247,6 +249,14 @@ export async function runSplitJoin(
     settle("failure");
   };
 
+  const abortForParentSignal = (): void => {
+    controller.abort();
+    settle("failure");
+  };
+  const parentSignal = env.signal;
+  if (parentSignal?.aborted) abortForParentSignal();
+  else parentSignal?.addEventListener("abort", abortForParentSignal, { once: true });
+
   // Re-evaluate the join after each branch settles. `lastWasFailure` only
   // affects fail-fast (one failure cancels siblings immediately).
   const evaluateJoin = (lastWasFailure: boolean, terminalCccFailure = false): void => {
@@ -309,10 +319,14 @@ export async function runSplitJoin(
 
   // Wait for the join to resolve, then let in-flight branches settle so collect
   // semantics (and persistence writes) complete before we return.
-  const outcome = await joinReached;
-  await Promise.allSettled(branchPromises);
+  try {
+    const outcome = await joinReached;
+    await Promise.allSettled(branchPromises);
 
-  return { joinNodeId: join, outcome, branchOutcomes, visitedNodeIds, failureReason, terminalAttempt };
+    return { joinNodeId: join, outcome, branchOutcomes, visitedNodeIds, failureReason, terminalAttempt };
+  } finally {
+    parentSignal?.removeEventListener("abort", abortForParentSignal);
+  }
 }
 
 interface BranchWalkResult {

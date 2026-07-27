@@ -16,6 +16,18 @@ import { inspectCccCampaignLocalGit } from "./ccc-campaign-local-git.js";
 import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { recheckCccCampaignLocalGit, type CccCampaignLocalGitSnapshot } from "./ccc-campaign-local-git.js";
 
+const CANONICAL_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+
+export type CccCampaignWorkflowProviderBinding = Readonly<{
+  providerController: CccProviderAttemptBinding["controller"];
+  providerRoute: Readonly<{
+    providerId: string;
+    modelId: string;
+    transport: "workflow";
+    workflowExtensionId: string;
+  }>;
+}>;
+
 export type CccCampaignEngineProviderControllerInput = Readonly<{
   initialGitSnapshot: CccCampaignLocalGitSnapshot;
   signal?: AbortSignal;
@@ -42,16 +54,29 @@ export async function preDispatchCccCampaignProviderFromEngine(
  * closure re-derives persisted campaign custody and never accepts route or
  * approval provenance from its caller.
  */
-export async function createCccCampaignProviderAttemptBinding(input: Readonly<{
+type CccCampaignProviderAttemptBindingInput = Readonly<{
   layer: AsyncDataLayer;
   rootDir: string;
   authorityStore: CccCampaignAuthorityStore;
   semanticTaskId: string;
   turnKey: string;
-  /** PI binds exact resolved route; scoped workflow binds its native transport. */
-  expectedRoute: Readonly<{ transport: "workflow" }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>;
+  /** PI binds exact resolved route; scoped workflow binds its native transport and extension identity. */
+  expectedRoute: Readonly<{ transport: "workflow"; workflowExtensionId: string }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>;
   signal?: AbortSignal;
-}>): Promise<CccProviderAttemptBinding> {
+}>;
+
+export function createCccCampaignProviderAttemptBinding(
+  input: CccCampaignProviderAttemptBindingInput & Readonly<{
+    expectedRoute: Readonly<{ transport: "workflow"; workflowExtensionId: string }>;
+    workflowProviderBinding: true;
+  }>,
+): Promise<CccCampaignWorkflowProviderBinding>;
+export function createCccCampaignProviderAttemptBinding(
+  input: CccCampaignProviderAttemptBindingInput & Readonly<{ workflowProviderBinding?: false | undefined }>,
+): Promise<CccProviderAttemptBinding>;
+export async function createCccCampaignProviderAttemptBinding(
+  input: CccCampaignProviderAttemptBindingInput & Readonly<{ workflowProviderBinding?: boolean }>,
+): Promise<CccProviderAttemptBinding | CccCampaignWorkflowProviderBinding> {
   const rootDir = await realpath(input.rootDir);
   const context = await input.layer.transaction((tx) =>
     input.authorityStore.getCccCampaignContextForTaskWithinTransaction(tx, input.semanticTaskId));
@@ -63,6 +88,9 @@ export async function createCccCampaignProviderAttemptBinding(input: Readonly<{
   }
   if (input.expectedRoute.transport === "workflow") {
     if (context.route.transport !== "workflow") throw new Error("CCC workflow binding route does not match persisted campaign route");
+    if (context.route.workflowExtensionId !== input.expectedRoute.workflowExtensionId) {
+      throw new Error("CCC workflow extension binding does not match persisted campaign route");
+    }
   } else if (
     context.route.transport !== "pi"
     || context.route.providerId !== input.expectedRoute.providerId
@@ -126,5 +154,27 @@ export async function createCccCampaignProviderAttemptBinding(input: Readonly<{
       return store.settleCccProviderAttemptAndApproval(reconciliation) as ReturnType<CccProviderAttemptBinding["controller"]["reconcile"]>;
     },
   });
+  if (input.workflowProviderBinding) {
+    if (
+      input.expectedRoute.transport !== "workflow"
+      || typeof context.route.providerId !== "string"
+      || !CANONICAL_IDENTIFIER_PATTERN.test(context.route.providerId)
+      || typeof context.route.modelId !== "string"
+      || !CANONICAL_IDENTIFIER_PATTERN.test(context.route.modelId)
+      || typeof context.route.workflowExtensionId !== "string"
+      || !CANONICAL_IDENTIFIER_PATTERN.test(context.route.workflowExtensionId)
+    ) {
+      throw new Error("CCC workflow binding requires a persisted canonical provider route");
+    }
+    return Object.freeze({
+      providerController: controller,
+      providerRoute: Object.freeze({
+        providerId: context.route.providerId,
+        modelId: context.route.modelId,
+        transport: "workflow" as const,
+        workflowExtensionId: context.route.workflowExtensionId,
+      }),
+    });
+  }
   return Object.freeze({ turnKey: input.turnKey, controller });
 }

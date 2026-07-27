@@ -110,6 +110,7 @@ export interface WorkflowNodeHandlerInput {
   context: Record<string, unknown>;
   signal?: AbortSignal;
   providerController?: WorkflowNodeProviderController;
+  providerDispatch?: WorkflowNodeProviderDispatchInput;
 }
 
 export type WorkflowNodeExtensionHandler =

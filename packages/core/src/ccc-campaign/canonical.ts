@@ -17,6 +17,7 @@ import {
 } from "./types.js";
 
 const ROUTE_KEYS = ["modelId", "providerId", "taskId", "transport"] as const;
+const WORKFLOW_ROUTE_KEYS = [...ROUTE_KEYS, "workflowExtensionId"] as const;
 const POLICY_KEYS = ["routes", "schema"] as const;
 const AUTHORITY_BINDING_KEYS = [
   "actionId",
@@ -39,6 +40,7 @@ const AUTHORITY_BINDING_KEYS = [
 ] as const;
 const TRANSPORTS = new Set<CccCampaignTransport>(["pi", "cli", "workflow"]);
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const WORKFLOW_EXTENSION_REGISTRY_ID_PATTERN = /^plugin:[a-z0-9]([a-z0-9-]*[a-z0-9])?:[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 
 export class CccCampaignExecutionPolicyError extends Error {
   public readonly code = "CCC_PRD_EXECUTION_ROUTE_REFUSED";
@@ -83,7 +85,6 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
     );
   }
   const route = value as Record<string, unknown>;
-  exactKeys(route, ROUTE_KEYS, `CCC campaign execution route ${index}`);
   const transport = exactIdentifier(
     route.transport,
     `CCC campaign execution route ${index} transport`,
@@ -93,6 +94,21 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
       `CCC campaign execution route ${index} has unsupported transport ${JSON.stringify(transport)}`,
     );
   }
+  const isWorkflowTransport = transport === "workflow";
+  if (!isWorkflowTransport && Object.prototype.hasOwnProperty.call(route, "workflowExtensionId")) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} workflowExtensionId is forbidden for ${transport} transport`,
+    );
+  }
+  if (isWorkflowTransport) {
+    exactWorkflowExtensionRegistryId(route.workflowExtensionId, index);
+  }
+  exactKeys(
+    route,
+    isWorkflowTransport ? WORKFLOW_ROUTE_KEYS : ROUTE_KEYS,
+    `CCC campaign execution route ${index}`,
+  );
+  const workflowExtensionId = isWorkflowTransport ? route.workflowExtensionId as string : undefined;
   return {
     taskId: exactIdentifier(route.taskId, `CCC campaign execution route ${index} taskId`),
     providerId: exactIdentifier(
@@ -101,7 +117,17 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
     ),
     modelId: exactIdentifier(route.modelId, `CCC campaign execution route ${index} modelId`),
     transport: transport as CccCampaignTransport,
+    ...(workflowExtensionId ? { workflowExtensionId } : {}),
   };
+}
+
+function exactWorkflowExtensionRegistryId(value: unknown, index: number): string {
+  if (typeof value !== "string" || value !== value.trim() || !WORKFLOW_EXTENSION_REGISTRY_ID_PATTERN.test(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} workflowExtensionId must be a non-empty canonical registry ID`,
+    );
+  }
+  return value;
 }
 
 export function parseCccCampaignExecutionPolicy(

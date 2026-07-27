@@ -44,7 +44,7 @@ const lease = Object.freeze({
   binding: authority,
   lease: Object.freeze({ bindingHash: authority.bindingHash, actionId: action.actionId, actionTarget: action.actionTarget, approvalRequestId: "approval-1", claimToken: "claim-1" }),
 });
-const contextFor = (route: Readonly<{ transport: "pi" | "workflow" | "cli"; providerId: string; modelId: string }>) => Object.freeze({
+const contextFor = (route: Readonly<{ transport: "pi" | "workflow" | "cli"; providerId: string; modelId: string; workflowExtensionId?: string }>) => Object.freeze({
   taskId: "TASK-1",
   semanticTaskId: "TASK-1",
   targetRepository: Object.freeze({ path: "/tmp/target", baseCommit: "a".repeat(40) }),
@@ -54,7 +54,7 @@ const contextFor = (route: Readonly<{ transport: "pi" | "workflow" | "cli"; prov
 });
 const dispatch = Object.freeze({ turnKey: "turn-1", dispatchKey: "dispatch-1", providerId: "provider-1", modelId: "model-1", transport: "pi" as const });
 
-function bindingInput(route: Readonly<{ transport: "pi" | "workflow" | "cli"; providerId: string; modelId: string }>, expectedRoute: Readonly<{ transport: "workflow" }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>) {
+function bindingInput(route: Readonly<{ transport: "pi" | "workflow" | "cli"; providerId: string; modelId: string; workflowExtensionId?: string }>, expectedRoute: Readonly<{ transport: "workflow" }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>) {
   const authorityStore = {
     getCccCampaignContextForTaskWithinTransaction: vi.fn(async () => contextFor(route)),
     inspectCccCampaignActionLease: vi.fn(async () => lease),
@@ -139,6 +139,32 @@ describe("CCC campaign provider controller", () => {
       await expect(createCccCampaignProviderAttemptBinding(input)).rejects.toThrow(/workflow binding route/i);
       expect(authorityStore.inspectCccCampaignActionLease).not.toHaveBeenCalled();
     }
+    expect(effects.action).not.toHaveBeenCalled();
+    expect(effects.inspectGit).not.toHaveBeenCalled();
+    expect(effects.core).not.toHaveBeenCalled();
+  });
+
+  it("Task 6 P1 RED: refuses a persisted workflow extension mismatch before lease, Git, or provider permit work", async () => {
+    const { input, authorityStore } = bindingInput(
+      {
+        transport: "workflow",
+        providerId: "provider-1",
+        modelId: "model-1",
+        workflowExtensionId: "plugin:ccc-campaign:persisted-extension",
+      },
+      { transport: "workflow" },
+    );
+
+    await expect(createCccCampaignProviderAttemptBinding({
+      ...input,
+      expectedRoute: Object.freeze({
+        transport: "workflow" as const,
+        workflowExtensionId: "plugin:ccc-campaign:runtime-extension",
+      }),
+      workflowProviderBinding: true,
+    })).rejects.toThrow(/workflow extension/i);
+
+    expect(authorityStore.inspectCccCampaignActionLease).not.toHaveBeenCalled();
     expect(effects.action).not.toHaveBeenCalled();
     expect(effects.inspectGit).not.toHaveBeenCalled();
     expect(effects.core).not.toHaveBeenCalled();

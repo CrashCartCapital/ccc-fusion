@@ -197,7 +197,7 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
           schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
           fallback: "failClosed",
           handle: async ({ signal }) => lateResult(signal),
-        });
+        }, undefined, { providerPosture: "no-provider" });
       }
 
       const executor = new WorkflowGraphExecutor({
@@ -302,6 +302,36 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
 
     expect(result.outcome).toBe("success");
     expect(aborted).toBe(true);
+  });
+
+  it("parent abort reaches a split branch and settles the join as failure", async () => {
+    const parent = new AbortController();
+    const branchEntered = deferred<void>();
+    let branchAborted = false;
+    const prompt: WorkflowNodeHandler = async (node, ctx) => {
+      if (node.id !== "branchA") return { outcome: "success" as const };
+      branchEntered.resolve();
+      await new Promise<void>((resolve) => {
+        ctx.signal?.addEventListener("abort", () => {
+          branchAborted = true;
+          resolve();
+        }, { once: true });
+      });
+      return { outcome: "failure" as const, value: "aborted" };
+    };
+    const executor = new WorkflowGraphExecutor({ handlers: { prompt }, signal: parent.signal });
+    const run = executor.run(task, settingsOn(), twoBranchIr({ mode: "all", onBranchFailure: "collect" }));
+
+    await branchEntered.promise;
+    parent.abort();
+    const settled = await Promise.race([
+      run.then((result) => ({ kind: "settled" as const, result })),
+      new Promise<{ kind: "timed-out" }>((resolve) => setTimeout(() => resolve({ kind: "timed-out" }), 100)),
+    ]);
+
+    expect(settled.kind).toBe("settled");
+    expect(branchAborted).toBe(true);
+    if (settled.kind === "settled") expect(settled.result.outcome).toBe("failure");
   });
 
   it("quorum(2) of 3 — join fires on the second completion", async () => {

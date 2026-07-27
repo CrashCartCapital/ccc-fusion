@@ -7680,10 +7680,14 @@ export class TaskExecutor {
         authorityStore: this.store,
         semanticTaskId: input.execution.semanticTaskId,
         turnKey,
-        expectedRoute: Object.freeze({ transport: "workflow" as const }),
+        expectedRoute: Object.freeze({
+          transport: "workflow" as const,
+          workflowExtensionId: input.extensionId,
+        }),
+        workflowProviderBinding: true,
         signal: input.signal,
       });
-      return binding.controller;
+      return binding;
     };
   }
 
@@ -9626,13 +9630,21 @@ export class TaskExecutor {
      * one; `advisory_failure` preserves visibility without inventing feedback.
      */
     const malformed = (outcome as { malformed?: boolean }).malformed === true;
-    const advisoryFailureValue = malformed ? "advisory_failure" : "failed";
+    const cccPrdTaskId = typeof cfg.cccPrdTaskId === "string" ? cfg.cccPrdTaskId.trim() : "";
+    const fencedBlockingCccSemanticGate = malformed
+      && blocking
+      && cfg.gateMode === "gate"
+      && cccPrdTaskId.length > 0
+      && cfg.cccPrdTaskId === cccPrdTaskId
+      && Boolean(executionContext?.execution?.executionFence)
+      && Object.isFrozen(executionContext?.execution?.executionFence);
+    const advisoryFailureValue = malformed && !fencedBlockingCccSemanticGate ? "advisory_failure" : "failed";
     /*
-    FNXC:ReviewLeniency 2026-07-02-00:30:
-    Malformed review output (no parseable verdict, even after the fallback-model retry in executeWorkflowStep) is treated as a NON-BLOCKING advisory rather than a hard gate failure. Operators asked that an unparseable reviewer response not block a task in review — a genuine REVISE (parsed verdict) still blocks, and the advisory_failure value keeps the malformed result visible on the Workflow tab. Only `malformed` relaxes a gate; every parsed non-pass verdict continues to block exactly as before.
-    */
+     * FNXC:ReviewLeniency 2026-07-02-00:30:
+     * Generic malformed review output (no parseable verdict, even after the fallback-model retry in executeWorkflowStep) remains a NON-BLOCKING advisory rather than a hard gate failure. Sealed imported CCC semantic task gates are the narrow exception: when they carry a canonical `cccPrdTaskId`, `gateMode: "gate"`, and a frozen execution fence, malformed output fails closed as `failed`. A genuine REVISE (parsed verdict) still blocks, and `advisory_failure` keeps generic malformed results visible on the Workflow tab.
+     */
     return {
-      outcome: outcome.success || !blocking || malformed ? "success" : "failure",
+      outcome: outcome.success || !blocking || (malformed && !fencedBlockingCccSemanticGate) ? "success" : "failure",
       value: (outcome as WorkflowStepOutcome).failureValue ?? verdict ?? (outcome.success ? "passed" : advisoryFailureValue),
       ...(Object.keys(contextPatch).length > 0 ? { contextPatch } : {}),
     };
@@ -18421,6 +18433,31 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           resolveTimeout("timeout");
         }, timeoutMs);
       });
+      let removeAbortListener: (() => void) | undefined;
+      const cancellationPromise = new Promise<"cancelled">((resolveCancelled) => {
+        const signal = stepOptions?.signal;
+        if (!signal) return;
+        const onAbort = () => {
+          const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> | void };
+          if (typeof sessionWithAbort.abort === "function") {
+            try {
+              void Promise.resolve(sessionWithAbort.abort()).catch((error) => {
+                executorLog.warn(`${task.id}: failed to abort workflow step session: ${error}`);
+              });
+            } catch (error) {
+              executorLog.warn(`${task.id}: failed to abort workflow step session: ${error}`);
+            }
+          }
+          try { session.dispose(); } catch { /* best-effort */ }
+          resolveCancelled("cancelled");
+        };
+        if (signal.aborted) {
+          onAbort();
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+          removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+        }
+      });
 
       try {
         const promptPromise = promptWithFallback(
@@ -18433,7 +18470,13 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           promptPromise.then(() => "completed" as const),
           timeoutPromise,
           questionPromise,
+          cancellationPromise,
         ]);
+
+        if (outcome === "cancelled") {
+          await agentLogger.flush();
+          return { success: false, error: "workflow step cancelled" };
+        }
 
         if (outcome === "await-input" && detectedQuestion) {
           try { session.dispose(); } catch { /* best-effort */ }
@@ -18534,6 +18577,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         return { success: false, error: errorMessage };
       } finally {
         if (timeoutHandle) clearTimeout(timeoutHandle);
+        removeAbortListener?.();
         if (ownsPlanningSegment) {
           try {
             const livePlanningTask = await this.store.getTask(task.id);

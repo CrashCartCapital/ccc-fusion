@@ -125,6 +125,7 @@ export type CccCampaignExecutionRoute = {
   providerId: string;
   modelId: string;
   transport: CccCampaignTransport;
+  workflowExtensionId?: string;
 };
 
 export type CccCampaignActionLookup = {

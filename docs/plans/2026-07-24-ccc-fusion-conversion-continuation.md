@@ -331,19 +331,20 @@ This records the reviewed corrected plan-freeze that the later Task 5 Plan-Freez
 
 ### Task 6 — Joined Local Mixed-Provider Synthetic Campaign
 
-Task 6 cannot honestly remain test/fixture-only. The frozen local plan has three production-contract blockers, all P1 locally and no P0: `nativeWorkflowIr` emits a prompt-only DAG without explicit split/join topology; production Pi/scoped-workflow campaign-controller wiring is absent, so Pi may dispatch without a controller while scoped-provider execution refuses; and public task cancellation does not reach the private `AbortController` created inside `processDueWorkflowWorkItem`. The provider-wiring gap becomes P0 before any live-provider authority, but remains P1 while Task 6 is restricted to deterministic local fakes and native transports. The `extensionId`-only controller-cache finding is rejected: `providerControllerPromises` is allocated inside `WorkflowGraphExecutor.executeNodeWithRetries` after one fixed node, semantic task, visit, and execution fence are resolved; each other node invocation receives a new map, while reuse within that node's preflight, handler, and retries is intentional.
+Accepted product remains commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`. A two-file uncommitted acceptance candidate is rejected: test SHA-256 `bc5c2f88e68b421735693a3afd0046a5f5ad8debbc7332195c1d3edef3b1e48e`; fixture SHA-256 `50a281eff6bd4201ad3f8972be6a6fb5bc1f518b7bc2d62ea274333556afc987`; path digest `d17d1b5161dcffd85ee288fb064038ff1402e9192deab747486c74fa53ee47e1`; aggregate path-plus-bytes digest `e7fd50b75287305cdcc4241b215089d3bb9a829a87a350a8e813b2d22154714c`. Its `2/2` pass is invalid acceptance evidence: council result is P0 `0`, P1 `4`, P2 `1`.
 
-- Surfaces: core importer/topology work in `packages/core/src/ccc-prd/importer.ts` with focused proof in `packages/core/src/__tests__/postgres/ccc-prd-import.pg.test.ts`; engine provider/cancellation work only in existing native seams including `packages/engine/src/workflow-task-runtime.ts`, `packages/engine/src/workflow-work-processor.ts`, `packages/engine/src/executor.ts`, `packages/engine/src/pi.ts`, and `packages/engine/src/runtimes/in-process-runtime.ts`; acceptance proof in new `packages/engine/src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts`, focused existing workflow/cancellation tests, and deterministic fixtures under `packages/engine/src/__tests__/fixtures/ccc-campaign/`.
+- Exact false greens: the fixture mocks the whole `runGraphCustomNode` and calls its controller manually out of graph order; it approves only `C` while its action is assigned `A/B/C/D`; it has no production Git landing/merge node; cancellation uses a fake runtime; and P2 public readers/network observer are incomplete. Do not repair this by mutating persisted IR in the fixture, using `providerId` as extension identity, hardcoding a test provider handler in product, adding a second merger/control plane, or manually calling a controller/`runAiMerge` after the graph.
+- Frozen provider-route contract: execution policy gains optional-in-TypeScript `workflowExtensionId`; whenever `transport=workflow`, parser validation requires exactly the canonical registry ID and manifest identity binds it. The field is forbidden for Pi/CLI. The importer attaches that exact extension to the semantic prompt node. `providerId` and extension identity are distinct.
+- Frozen native dispatch contract: `WorkflowNodeHandlerInput` gains a sealed `providerDispatch` descriptor for scoped-provider nodes: graph-derived `turnKey`, deterministic per-node/extension `dispatchKey`, persisted semantic-task provider/model, and transport `workflow`. The registered extension handler owns `preDispatch -> deterministic effect -> reconcile`; missing or malformed controller fails closed. The acceptance test registers its deterministic scoped-provider extension through the native registry only.
+- Frozen merge contract: importer emits one native merge seam after the joined terminal only if exactly one workflow terminal task explicitly references exactly one declared merge protected action. No merge action preserves prior IR. Ambiguous merge action or multi-terminal landing refuses with a deterministic diagnostic. The merge node binds `cccPrdTaskId` to that landing task and reaches the existing `TaskExecutor.requestMerge` -> injected `runAiMerge` path; no second merger.
 - Frozen RED order:
-  1. Import explicit split/join topology and prove the terminal node waits for the join rather than merely following prompt-node edges.
-  2. Prove missing production Pi or scoped-workflow campaign binding produces zero dispatch and that an admitted action uses the exact route/controller bound to its campaign and semantic task.
-  3. Prove native public cancellation aborts the exact in-flight action owned by `processDueWorkflowWorkItem`, settles or holds its durable state truthfully, and restart performs no duplicate dispatch.
-  4. Only after the first three contracts are green, run the full importer → due-work claim → graph → deterministic local Git landing → public-reader acceptance path.
-- Ownership freeze: one core importer/topology writer owns RED 1 and freezes the emitted graph contract first; one engine provider/cancellation writer owns REDs 2–3 against that frozen topology; the acceptance fixture/test writer starts RED 4 only after both production contracts are frozen. Do not overlap writers on shared interfaces.
-- GREEN: add only the smallest repairs to the existing native production seams needed to emit explicit split/join topology, bind Pi and scoped-provider dispatch to the exact campaign/semantic-task route, and register the due-work abort surface with public cancellation. Then import one deterministic multi-node fixture through the real importer, claim it only through `processDueWorkflowWorkItem`, run it through `WorkflowTaskRuntime` and the native executor using deterministic local provider identities/native transports, prove join timing and exact cancellation/restart behavior, reconcile Git and durable effects, and inspect tasks, workflow items, documents, artifacts, audit history, approvals, effects, and terminal receipts through normal public readers.
-- REFACTOR: small repairs to existing native production seams are allowed; no new store, scheduler, parser, provider framework, cancellation framework, or control plane. Fixtures may inject deterministic behavior and interruption checkpoints but may not assert provenance, bypass admission, call production functions out of order, contact a socket, or substitute an in-memory campaign store.
-- Verification: focused importer proof; focused provider-controller and public-cancellation proofs; `pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts --silent=passed-only --reporter=dot`; zero non-loopback socket/provider observer; disposable repository and loopback PostgreSQL cleanup proof; core/engine typecheck, scoped lint, build, and `git diff --check`.
-- Done when: all four ordered REDs are green on one fresh candidate; one user-like local campaign proves the full joined route with exact provider/model and semantic-task/controller identity; public cancellation and restart prove no duplicate dispatch; deterministic Git and public readers agree; and no live provider, credential, billing, external-network, install, release, or deployment authority was used.
+  1. Core policy/parser/importer extension attachment, including manifest identity validation and Pi/CLI refusal.
+  2. Engine delivery of sealed `providerDispatch` to the native registered extension handler.
+  3. Importer conditional native merge seam and deterministic refusal cases.
+  4. Only then repair the two acceptance files against the frozen product contracts. Production files have not yet changed.
+- Acceptance contract: use real `WorkflowTaskRuntime`, real `processDueWorkflowWorkItem`, real Pi wrapper over a deterministic bottom `ModelRuntime` fake, real scoped extension/controller, approvals for every semantic live action plus the exact merge action, blocked-branch join, real local `runAiMerge`/ref CAS, public readers, real cancellation/provider terminal settlement/fresh restart/no redispatch, and a zero non-loopback observer.
+- REFACTOR and authority boundary: retain existing native seams only; no new store, scheduler, parser, provider framework, cancellation framework, merger, or control plane. No live provider, credential, billing, external-network, operator, merge, release, or deployment action is authorized.
+- Done when: the four REDs are green on fresh identical bytes; the local user-like route proves native graph order, exact registry extension identity, exact approval custody, joined conditional merge through the existing merger, durable cancellation/restart settlement, public-reader agreement, and zero non-loopback activity.
 
 ### Task 7 — Freeze Consolidated E/F Acceptance
 
@@ -844,3 +845,109 @@ Task 6 is frozen against documentation descendant `0ef8eb84530b3c87a00be897ebb3e
 The provider-controller wiring gap is P1 for the local deterministic lane but becomes P0 before any live-provider authority. Task 6 therefore cannot honestly be implemented as test/fixture-only work: narrowly scoped repairs to existing importer, provider, and cancellation seams are allowed, while a new store, scheduler, parser, provider framework, cancellation framework, or control plane remains forbidden. Ownership and order are frozen as core importer/topology writer, then engine provider/cancellation writer, then acceptance fixture/test writer after both production contracts freeze.
 
 The canonical Plan Path is `docs/plans/2026-07-24-ccc-fusion-conversion-continuation.md`. After compaction or handoff, reread the accepted Task 5 receipt and amended Task 6 section before executing; keep Task 6 progress and any contract amendment in this plan rather than a parallel scratch plan. The next lane is Task 6 RED 1: explicit imported split/join topology with terminal-waits proof.
+
+### Task 6 Resolver-Binding Refinement — 2026-07-27
+
+Accepted product remains commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`. Read-only source inspection proved the current engine resolver returns only a bare controller, so the graph cannot derive persisted provider/model truth.
+
+Freeze the smallest repair: the resolver returns one sealed binding `{ providerController, providerRoute: { providerId, modelId, transport: "workflow" } }` sourced from persisted CCC campaign context. Do not widen the existing exact two-method controller. The graph combines that sealed route with its sealed `turnKey` and a deterministic canonical-hash node/extension `dispatchKey` to derive `providerDispatch`, then passes the descriptor only to scoped-provider handlers. Opaque and no-provider handlers never receive it; a missing or malformed binding fails closed.
+
+Spark scouting remained quota-blocked, so low-cost Terra substituted. No product file has changed for this refinement; the core RED writer remains active. Overall progress remains approximately `89%`, and `execution_state` remains `task6_workflow_route_and_merge_contract_frozen_red_active`.
+
+### Task 6 Core Route, Importer, And Merge GREEN Transition — 2026-07-27
+
+Accepted product remains commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`. The core route/importer/merge slice is GREEN but uncommitted and unaccepted across exactly `packages/core/src/ccc-campaign/types.ts`, `packages/core/src/ccc-campaign/canonical.ts`, `packages/core/src/ccc-prd/importer.ts`, `packages/core/src/__tests__/postgres/ccc-campaign-native.pg.test.ts`, and `packages/core/src/__tests__/postgres/ccc-prd-import.pg.test.ts`.
+
+RED was native `30` pass / `1` fail for legacy exact fields versus missing `workflowExtensionId`, and import `42` pass / `2` fail for legacy-field refusal plus the absent merge seam. GREEN enforces the canonical manifest-bound workflow extension ID, forbids the field for Pi/CLI, attaches the exact extension during import, emits the conditional sole-terminal exact-merge seam, refuses ambiguity, and preserves prior IR when no merge action exists. Root independently reran the exact combined loopback-PostgreSQL proof at `75/75`; core typecheck, scoped production ESLint, and `git diff --check` passed.
+
+No commit or acceptance follows from this GREEN. The engine slice remains active: root identified a likely P1 where a scoped-provider handler failure could degrade to the default handler, so the engine writer must first capture and repair a fail-closed RED before candidate freeze. Overall progress is approximately `90%`; `execution_state` advances to `task6_engine_scoped_failure_red_active`.
+
+### Task 6 Engine Scoped Provider-Dispatch GREEN Transition — 2026-07-27
+
+The engine slice is GREEN but uncommitted and unaccepted atop accepted commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`. Exact scope is `packages/core/src/workflow-extension-types.ts`, `packages/engine/src/workflow-graph-executor.ts`, only the public resolver in `packages/engine/src/executor.ts`, `packages/engine/src/ccc-campaign-provider-controller.ts`, and `packages/engine/src/__tests__/workflow-node-handler-extensions.test.ts`.
+
+Initial RED was `1` fail / `8` pass because a bare controller could not satisfy the sealed binding. Root adversarial review then found the scoped handler could honor `degradeToDefault`; the second RED was `1` fail / `9` pass because failure incorrectly resolved as success. GREEN supplies the sealed persisted `{ providerController, providerRoute }`, freezes `providerDispatch` with graph `turnKey` and the canonical node-plus-extension hash `dispatchKey`, gives it only to scoped-provider handlers, leaves it absent for opaque/no-provider handlers, refuses malformed bindings before handler entry, and makes scoped-handler errors terminal-fail with zero later/default execution. Root independently reran focused proof `10/10`; core and engine typechecks, scoped production ESLint, and `git diff --check` passed.
+
+No commit or acceptance occurred. Core adversarial review remains active. The acceptance test/fixture repair RED may begin only after that review returns no P1. Overall progress remains approximately `90%`; the handoff `execution_state` is `task6_full_local_acceptance_repair_red_active`.
+
+### Task 6 Core Adversarial Review Failure And Adjudication — 2026-07-27
+
+Core adversarial review failed with P0 `0`, P1 `1`, P2 `1`; the prior core GREEN verdict is invalidated pending repair and full reproof. Accepted product remains commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`. The engine dispatch GREEN remains uncommitted and unaccepted, with engine adversarial review active.
+
+Root live-source adjudication accepts the P1: `mergeLandingFor` drops dangling terminal `protectedActionIds` and can silently select no-merge. The same core writer now owns an exact terminal dangling-ID RED and fail-closed repair. The P2 is partially accepted: canonical unregistered workflow extension identity already fails closed through the deterministic shared `parseWorkflowIr` registry diagnostic, so add negative proof with a no-state assertion. Do not add a duplicate importer registry parser or change the error type without a demonstrated contract.
+
+No commit or acceptance occurred. Overall progress is approximately `89.5%`; `execution_state` is `task6_core_dangling_action_red_active`.
+
+### Task 6 Engine Adversarial Review Failure And Adjudication — 2026-07-27
+
+Engine adversarial review failed with P0 `0`, P1 `1`, P2 `0`; the prior engine GREEN verdict is invalidated pending repair and reproof. Accepted product remains commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`. The core dangling-action repair remains active.
+
+Root accepts the P1: an absent resolver can take the early-return path and allow a scoped-provider handler to run without its controller or `providerDispatch`. The same engine writer owns a RED proving zero handler, default-handler, and preparation execution when the resolver seam is absent, followed by the smallest posture-first fail-closed repair.
+
+No commit or acceptance occurred. Overall progress is approximately `89%`; `execution_state` is `task6_engine_missing_resolver_red_active`.
+
+### Task 6 Core And Engine Repair Reproof Transition — 2026-07-27
+
+Both repaired slices remain uncommitted and unaccepted atop accepted commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`.
+
+Core RED was `45` pass / `1` fail because a dangling terminal protected action still imported as active. GREEN now refuses that bundle deterministically and proves an unregistered workflow extension fails through the shared parser with no state. Root reran the exact combined PostgreSQL lane at `77/77`; typecheck, scoped lint, and diff check passed. Fresh core adversarial review passed with P0 `0`, P1 `0`, P2 `0`.
+
+Engine RED was `1` fail / `10` pass because resolver absence returned success. The posture-first GREEN passed `11/11` and proves zero scoped-handler, default-handler, or preparation execution; typecheck, scoped lint, and diff check passed. Fresh engine adversarial review passed with P0 `0`, P1 `0`, P2 `0`.
+
+No commit or acceptance occurred. Full local acceptance test/fixture repair may now begin. Overall progress is approximately `90%`; `execution_state` is `task6_full_local_acceptance_repair_red_active`.
+
+### Task 6 Full Local Acceptance Repair RED Transition — 2026-07-27
+
+Exact RED command:
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts --silent=passed-only --reporter=dot
+```
+
+Both tests failed at `canonical.ts:126` with `CCC campaign execution route 2 workflowExtensionId must be a non-empty canonical registry ID`. This truthfully proves the rejected fixture does not satisfy the frozen route contract; it does not establish a new production gap.
+
+The acceptance writer owns only untracked `packages/engine/src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts` and `packages/engine/src/__tests__/fixtures/ccc-campaign/joined-local-campaign.ts`. Repaired fixture declarations use the exact per-suffix registered C extension ID, distinct A/B/C/D identities, a live action for every task, D-only merge against `refs/heads/main`, and bounds of `4` requests with concurrency `2`. The full test rewrite is active. No commit or acceptance occurred; overall progress remains approximately `90%`, and `execution_state` advances to `task6_full_local_acceptance_repair_green_active`.
+
+### Task 7 Proof-Runner Inventory Transition — 2026-07-27
+
+Spark scouting was quota-blocked until `2026-08-01 17:59`; low-reasoning Terra substituted and changed no files. `scripts/run-ccc-pg-proof.mjs` currently accepts only Wave 4 or Wave 5, whose mappings remain byte-stable. Closed result validation already rejects missing, duplicate, extra, and non-passed test results; supervisor validation already rejects missing output, timeout, spawn failure, signal, nonzero exit, stop, and interruption.
+
+Material Task 7 gaps remain: no Wave 6 mapping; `forcedKill` is not rejected; `lifecycleErrors` are ignored; one-result-per-command and unexpected duplicate command rows are not checked explicitly; and the final report lacks Task 7 evidence fields. Freeze no Task 6 test names until its bytes are accepted. No commit occurred; Task 6 remains approximately `90%` complete with `execution_state` `task6_full_local_acceptance_repair_green_active`.
+
+### Task 6 Action-Lease Scoping P1 RED Transition — 2026-07-27
+
+The mandated RED command remains `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts --silent=passed-only --reporter=dot`. It exposed a production P1: after claiming A, reading B context fails at `packages/core/src/ccc-campaign/store.ts:457-466` with `CCC campaign action lease ACTION-...-A-LIVE binding does not match persisted campaign context`. Root live-source verification found `active_action_leases` is import-global while each binding hash is task/route-specific, and the loader validates every active lease against the current sibling context. Unique action IDs do not repair the mismatch.
+
+Acceptance hardening otherwise uses native seams, proves C committed before B releases, preserves exact provider/model identity, fails before any non-loopback activity, and leaves `main` unchanged. One Terra-medium core writer owns only `packages/core/src/ccc-campaign/store.ts` plus one focused PostgreSQL regression. Add no migration, table, or control plane. No commit or acceptance occurred; overall progress is approximately `89%`, and `execution_state` is `task6_action_lease_scoping_red_active`.
+
+### Task 8 Read-Only Real-Packet Inventory Transition — 2026-07-27
+
+Spark scouting was quota-blocked, Terra substituted, and the scout wrote no files. The accepted Task A/Task 2 authoring product is not reopened: it already provides native provider authoring plus the deterministic proposal-fixture route. The active real packets still lack admitted sidecars/proposals for local preflight without a live provider.
+
+- Lab: active manifest `6319` bytes, SHA-256 `7fa461…316b5`; bundle `5007` bytes, `bfedc4…f2d5b`; repository-frozen sidecar `16837` bytes, `644624…39ed8`.
+- Neo: PRD `297837` bytes, `af4712…059d1`; handoff candidate `6476` bytes, `22bb76…d470e`, and it is not a sidecar.
+- SRU: allowed third-packet PRD `94356` bytes, `4ba9b2…7252`, currently unprepared.
+
+Task 8—not Task 7—owns creating and freezing deterministic fixture proposals/sidecars from unchanged source bytes, then built-CLI validate/compile and PostgreSQL import/inspect/restart. Do not require Ryan to translate packets manually or use a live provider. The first milestone remains one packet. Task 7 owns only the proof harness. Task 6 state remains `task6_action_lease_scoping_red_active`.
+
+### Task 6 Full Local Acceptance GREEN, Pre-Freeze Review Pending — 2026-07-27
+
+Accepted predecessor remains commit `720e543f43e0010881f060331abdcbedef5c35cb`, tree `7c9c70443a20311765e89f8a329e1e844cf94a20`. The full Task 6 candidate is uncommitted and not accepted; native Sol council review is still pending. Overall progress is approximately `90%`, not `97%`.
+
+The action-lease P1 is repaired: import-global leases are now task-scoped persisted buckets (`69/69` core PostgreSQL). `MasterKeyManager` receives store `globalDir`; imported task nodes set `gateMode: "gate"` (`46/46` importer PostgreSQL). Imported malformed prompt output fails closed (`6/6`), a parent abort now bridges split/join and settles failure (`24/24` fanout), and prompt-mode dispatch now cancels/disposes quickly rather than timing out (`7/7` focused). The full user-like PostgreSQL acceptance is `2/2`: mixed Pi plus scoped handler plus Git landing, with durable cancellation/restart and no redispatch.
+
+Fresh proof also passed engine `91/91`, `136/136`, PostgreSQL/Git `28/28`, core/importer `69/69` + `46/46`, core and engine typechecks, package and whole-workspace build, whole lint, and standard gate tests: core PostgreSQL `10/10`, engine `299/299`, CLI `65/65`. The first whole-build failure was hydration plumbing from stale `@fusion/core` links; a temporary candidate-local link view repaired that proof environment without install, fetch, or product-byte change. The whole build required read-only Wave-3-retry hydration only. `git diff --check` passed; package, workspace, and lock manifests remain unchanged at `cf1e924...`, `0e5f3a...`, and `09244d...`.
+
+Task 7 and Task 8 inventories remain pending exactly as recorded. Spark remains quota-blocked until `2026-08-01`; Terra is the substitute. AGY is unavailable. `execution_state` is exactly `task6_full_local_acceptance_green_prefreeze_review_pending`.
+
+### Task 6 Extension-Identity Binding P1 RED Transition — 2026-07-27
+
+Prefreeze review of staged candidate tree `e4929f599fe0e7337fea1fd77e0ef6bf332de0ee` returned P0 `0`, P1 `1`, P2 `0`; root live-source inspection accepts the P1. The candidate tree and digests are rejected: path digest `705b98f46ba32beeb4f73710e1538c3686371228d9f1dfcfbdd476fb78d11e8c`, binary digest `e283b23123ded162b0729aa606bc36148f9d45d2ac32e6fc4fbf18fc79fdcc00`.
+
+Persisted workflow routing carries the exact `workflowExtensionId`, but the executor resolver drops `input.extensionId`, the controller checks transport only, and returned `providerRoute` omits extension identity. A drifted scoped extension can therefore borrow the binding. One Terra-medium writer owns only the engine resolver/controller/graph and focused tests; RED is active, no commit occurred. Overall progress is approximately `89.5%`; `execution_state` is `task6_extension_identity_binding_red_active`.
+
+### Task 6 Extension-Identity Binding GREEN; Static Reproof Active — 2026-07-27
+
+The prior `e4929f...` candidate remains rejected. New bytes are uncommitted and broader static reproof plus council review remain pending; no commit or Task 6 acceptance occurred. Overall progress remains approximately `89.5%`.
+
+RED proved a persisted `plugin:ccc-campaign:persisted-extension` binding resolved for runtime `plugin:ccc-campaign:runtime-extension` rather than refusing, with no lease, Git, or core permit reached. GREEN threads resolver `input.extensionId`, requires exact persisted `workflowExtensionId`, seals that identity in `providerRoute`, and makes the graph compare it before handler entry. Root focused proof passed `21/21`; engine regression is `92/92`, real PostgreSQL/Git `28/28`, engine typecheck, scoped lint, and `git diff --check` passed. `execution_state` is `task6_extension_identity_binding_green_static_reproof_active`.

@@ -1190,3 +1190,13 @@ git diff --check
 ```
 
 Static pretest/lint/typecheck `34/36`/build including dashboard `7163` modules/built CLI top-level and `prd` subcommand/diff/hash/non-ancestry passed with P0/P1/P2=`0`. The literal standalone `prd` binary finding is rejected because the declared bins are `agent-browser`, `fn`, and `fusion`; the accepted contract is the built CLI subcommand, with no install or manifest authority. Adversarial review passed P0/P1/P2=`0`. Pre-receipt hashes: plan `32b80f9a13bade1183546beb2388283b4872f7c9a1313bd96309f6d145c8c127`, testing `981d7c5f21852de4e8faf405f2ae4ba7ae1e10c43a25e3441e1544bc4a703902`; manifests are unchanged at their full hashes. Status is root/core only; Wave 6/7 are non-ancestors and earlier candidates are rejected. No claim extends to literal full completion, providers, or live state. Next state is Task 6 RED for local mixed-provider synthetic work using deterministic fakes/native transports only.
+
+### Task 6 Local Acceptance Proof Receipt — 2026-07-27
+
+The candidate is locally green but uncommitted, unaccepted, and pending native Sol council review. Use the green result only as pre-freeze evidence; it does not authorize Task 7/8 freeze, a commit, or any live-provider activity.
+
+- Product failures must be distinguished from proof plumbing: the first whole-workspace build exposed stale `@fusion/core` hydration links. A temporary candidate-local link view made the existing bytes visible; no install, fetch, manifest, or lockfile change occurred. Read-only Wave-3-retry hydration was required only for that build proof.
+- Regression guards: imported malformed prompt output refuses (`6/6`); parent abort crosses split/join and settles failure (`24/24`); prompt-mode cancellation aborts and disposes without the prior `250ms` timeout (`7/7`); the mixed Pi/scoped-handler/Git-landing local PostgreSQL acceptance proves durable cancellation/restart with no redispatch (`2/2`).
+- Fresh checks passed: engine `91/91` and `136/136`, PostgreSQL/Git `28/28`, core/importer PostgreSQL `69/69` + `46/46`, core and engine typechecks, package and workspace build, whole lint, standard gate core PostgreSQL `10/10`, engine `299/299`, CLI `65/65`, and `git diff --check`.
+- Manifests are unchanged: package `cf1e924...`, workspace `0e5f3a...`, lock `09244d...`. Treat a green local run as false if it silently hydrates different package bytes, bypasses the abort/restart assertions, or is presented as accepted before council review.
+- Extension identity is part of the sealed scoped-provider binding: focused proof must refuse a persisted-versus-runtime extension mismatch before any lease, Git, core permit, or handler work, rather than letting a drifted extension borrow a transport-only binding.

@@ -433,6 +433,7 @@ async function writeWorkflows(
   tx: DbTransaction,
   recorder: ImportTransactionWitnessRecorder,
   bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignExecutionPolicy,
   projectId: string,
   importId: string,
   now: string,
@@ -452,7 +453,7 @@ async function writeWorkflows(
       id: nativeWorkflowId,
       name: workflow.title,
       description: `Generated from CCC PRD ${bundle.sourceVersion}`,
-      ir: nativeWorkflowIr(bundle, workflow),
+      ir: nativeWorkflowIr(bundle, workflow, executionPolicy),
       layout: {},
       kind: "workflow",
       createdAt: now,
@@ -498,17 +499,31 @@ function nativeWorkflowJoinNodeId(taskId: string): string {
   return `ccc-join-${sha256(taskId).slice(0, 24)}`;
 }
 
+function nativeWorkflowMergeNodeId(workflowId: string, taskId: string): string {
+  return `ccc-merge-${sha256(`${workflowId}\0${taskId}`).slice(0, 24)}`;
+}
+
 function nativeWorkflowIr(
   bundle: CccPrdSemanticBundle,
   workflow: CccPrdWorkflow,
+  executionPolicy: CccCampaignExecutionPolicy,
 ): WorkflowIr {
   const taskById = new Map(bundle.tasks.map((task) => [task.id, task]));
+  const routeByTaskId = new Map(executionPolicy.routes.map((route) => [route.taskId, route]));
+  const mergeLanding = mergeLandingFor(bundle, workflow, taskById);
   const taskNodes: WorkflowIrNode[] = workflow.taskIds.map((taskId) => {
     const task = taskById.get(taskId);
     if (!task) {
       throw new CccPrdImportError(
         "CCC_PRD_IMPORT_INVALID_BUNDLE",
         `CCC PRD workflow ${workflow.id} references unknown task ${taskId}`,
+      );
+    }
+    const route = routeByTaskId.get(task.id);
+    if (!route) {
+      throw new CccPrdImportError(
+        "CCC_PRD_EXECUTION_ROUTE_REFUSED",
+        `CCC campaign execution route disappeared for workflow task ${task.id}`,
       );
     }
     return {
@@ -518,7 +533,11 @@ function nativeWorkflowIr(
         name: task.title,
         prompt: task.description,
         cccPrdTaskId: task.id,
+        gateMode: "gate",
       },
+      ...(route.transport === "workflow"
+        ? { extensions: { [route.workflowExtensionId!]: {} } }
+        : {}),
     };
   });
   const dependencyEdges: WorkflowIrEdge[] = bundle.edges
@@ -572,6 +591,11 @@ function nativeWorkflowIr(
         kind: "join" as const,
         config: { mode: "all", cccPrdTaskId: taskId },
       })),
+      ...(mergeLanding ? [{
+        id: nativeWorkflowMergeNodeId(workflow.id, mergeLanding.taskId),
+        kind: "prompt" as const,
+        config: { seam: "merge", cccPrdTaskId: mergeLanding.taskId },
+      }] : []),
       { id: "end", kind: "end" },
     ],
     edges: [
@@ -583,12 +607,56 @@ function nativeWorkflowIr(
       ...topologyEdges,
       ...workflow.terminalTaskIds.map((taskId) => ({
         from: nativeWorkflowTaskNodeId(taskId),
-        to: "end",
+        to: mergeLanding?.taskId === taskId
+          ? nativeWorkflowMergeNodeId(workflow.id, taskId)
+          : "end",
         condition: "success" as const,
       })),
+      ...(mergeLanding ? [{
+        from: nativeWorkflowMergeNodeId(workflow.id, mergeLanding.taskId),
+        to: "end",
+        condition: "success" as const,
+      }] : []),
     ],
   };
   return parseWorkflowIr(ir);
+}
+
+function mergeLandingFor(
+  bundle: CccPrdSemanticBundle,
+  workflow: CccPrdWorkflow,
+  taskById: ReadonlyMap<string, CccPrdSemanticBundle["tasks"][number]>,
+): { taskId: string } | undefined {
+  const protectedActionsById = new Map(bundle.protectedActions.map((action) => [action.id, action]));
+  const mergeReferences = workflow.terminalTaskIds.flatMap((taskId) => {
+    const task = taskById.get(taskId);
+    if (!task) return [];
+    return task.protectedActionIds.flatMap((actionId) => {
+      const action = protectedActionsById.get(actionId);
+      if (!action) {
+        throw new CccPrdImportError(
+          "CCC_PRD_IMPORT_INVALID_BUNDLE",
+          `CCC PRD workflow ${workflow.id} terminal task ${taskId} references unknown protected action ${actionId}`,
+        );
+      }
+      return action.kind === "merge" ? [{ taskId, actionId }] : [];
+    });
+  });
+  if (mergeReferences.length === 0) return undefined;
+  if (workflow.terminalTaskIds.length !== 1) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      `CCC PRD workflow ${workflow.id} has multiple terminal landing tasks for merge ${mergeReferences.map(({ actionId }) => actionId).sort().join(",")}`,
+    );
+  }
+  const [landingTaskId] = workflow.terminalTaskIds;
+  if (mergeReferences.length !== 1 || mergeReferences[0]!.taskId !== landingTaskId) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      `CCC PRD workflow ${workflow.id} terminal landing ${landingTaskId} must reference exactly one declared merge protected action`,
+    );
+  }
+  return { taskId: landingTaskId! };
 }
 
 async function writeDocuments(
@@ -992,7 +1060,7 @@ async function prepareDatabaseImport(
         await inject(failureInjection, "task");
         await writeDependencyEdges(tx, recorder, bundle, projectId, importId);
         await inject(failureInjection, "dependency_edge");
-        await writeWorkflows(tx, recorder, bundle, projectId, importId, now);
+        await writeWorkflows(tx, recorder, bundle, executionPolicy, projectId, importId, now);
         await inject(failureInjection, "workflow");
         await writeDocuments(tx, recorder, bundle, projectId, importId, now);
         await inject(failureInjection, "document");

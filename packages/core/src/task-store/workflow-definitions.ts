@@ -826,7 +826,7 @@ export async function getSecretsStoreImpl(store: TaskStore): Promise<SecretsStor
       return store.secretsStore;
     }
 
-    const masterKeyManager = new MasterKeyManager();
+    const masterKeyManager = new MasterKeyManager({ globalDir: store.getGlobalSettingsDir() });
     const masterKeyProvider = () => masterKeyManager.getOrCreateKey();
 
     // FNXC:SecretsStore 2026-06-24-21:10:

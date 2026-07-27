@@ -33,6 +33,7 @@ type ExecutionRoute = Readonly<{
   providerId: string;
   modelId: string;
   transport: "pi" | "cli" | "workflow";
+  workflowExtensionId?: string;
 }>;
 
 type ExecutionPolicy = Readonly<{
@@ -171,6 +172,62 @@ function withProtectedActions(
 describe("CCC campaign native public surface", () => {
   it("reserves the TaskStore campaign-context reader", () => {
     expect(typeof (TaskStore.prototype as unknown as Partial<CampaignContextStore>).getCccCampaignContextForTask).toBe("function");
+  });
+
+  it("Task 6 RED: canonical workflow routes require an extension identity and bind it into manifest identity", () => {
+    const source = bundle("/tmp/ccc-campaign-workflow-route", "workflow-route");
+    const workflowExtensionId = "plugin:ccc-campaign:provider-dispatch";
+    const workflowRoute = {
+      ...routesFor(source)[0]!,
+      transport: "workflow" as const,
+      workflowExtensionId,
+    };
+    const workflowPolicy = policyFor(source, [
+      workflowRoute,
+      ...routesFor(source).slice(1),
+    ]);
+
+    expect(() => campaignCanonical.parseCccCampaignExecutionPolicy(
+      policyFor(source, [
+        { ...workflowRoute, workflowExtensionId: undefined },
+        ...routesFor(source).slice(1),
+      ]),
+      source,
+    )).toThrow("CCC campaign execution route 0 workflowExtensionId must be a non-empty canonical registry ID");
+
+    expect(campaignCanonical.parseCccCampaignExecutionPolicy(workflowPolicy, source).routes)
+      .toContainEqual(expect.objectContaining({ workflowExtensionId }));
+
+    for (const transport of ["pi", "cli"] as const) {
+      expect(() => campaignCanonical.parseCccCampaignExecutionPolicy(
+        policyFor(source, [
+          { ...workflowRoute, transport },
+          ...routesFor(source).slice(1),
+        ]),
+        source,
+      )).toThrow(`CCC campaign execution route 0 workflowExtensionId is forbidden for ${transport} transport`);
+    }
+
+    const manifest = (extensionId: string) => campaignCanonical.hashCccCampaignManifest(
+      campaignCanonical.createCccCampaignManifest({
+        projectId: "project-workflow-route",
+        importId: "import-workflow-route",
+        idempotencyKey: "idem-workflow-route",
+        campaignId: "campaign-workflow-route",
+        bundle: source,
+        executionPolicy: campaignCanonical.parseCccCampaignExecutionPolicy(
+          policyFor(source, [
+            { ...workflowRoute, workflowExtensionId: extensionId },
+            ...routesFor(source).slice(1),
+          ]),
+          source,
+        ),
+        targetRepositoryPath: source.targetRepository.path,
+        campaignStartedAt: "2026-07-27T00:00:00.000Z",
+      }),
+    );
+
+    expect(manifest(workflowExtensionId)).not.toBe(manifest("plugin:ccc-campaign:alternate-dispatch"));
   });
 });
 
@@ -612,9 +669,11 @@ pgTest("CCC campaign native persistence", () => {
     await h.layer().db.execute(sql`
       UPDATE project.ccc_prd_imports
       SET active_action_leases = ${JSON.stringify({
-        [action.actionId]: {
-          ...lease.lease,
-          bindingHash: "0".repeat(64),
+        [context.taskId]: {
+          [action.actionId]: {
+            ...lease.lease,
+            bindingHash: "0".repeat(64),
+          },
         },
       })}::jsonb
       WHERE idempotency_key = ${context.idempotencyKey}
