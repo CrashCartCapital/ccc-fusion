@@ -1,7 +1,8 @@
 import type { Task, TaskDetail } from "./types.js";
 import type { WorkflowIr, WorkflowIrNode } from "./workflow-ir-types.js";
 import type { CccPrdProof } from "./ccc-prd/types.js";
-import type { CccCampaignProviderControllerDecision } from "./ccc-campaign/provider-controller.js";
+import type { CccCampaignProviderControllerDecision, CccCampaignProviderDispatchInput } from "./ccc-campaign/provider-controller.js";
+import type { CccProviderAttemptScope, CccProviderAttemptSettlementInput } from "./ccc-campaign/types.js";
 
 export const WORKFLOW_EXTENSION_SCHEMA_VERSION = 1 as const;
 
@@ -94,13 +95,12 @@ export type WorkflowNodeExtensionResult =
   | { outcome: "success" | "failure"; value?: string; contextPatch?: Record<string, unknown> }
   | { outcome: `outcome:${string}`; value?: string; contextPatch?: Record<string, unknown> };
 
-export type WorkflowNodeProviderDispatchInput = Readonly<{
-  turnKey: string;
-  dispatchKey: string;
-}>;
+/** The actual provider route, not caller-asserted extension metadata. */
+export type WorkflowNodeProviderDispatchInput = CccCampaignProviderDispatchInput;
 
 export type WorkflowNodeProviderController = Readonly<{
   preDispatch(input: WorkflowNodeProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
+  reconcile(input: CccProviderAttemptSettlementInput): Promise<CccProviderAttemptScope>;
 }>;
 
 export interface WorkflowNodeHandlerInput {

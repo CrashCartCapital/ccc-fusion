@@ -882,7 +882,7 @@ export async function createResolvedAgentSession(
 
   const testModeActive = settings ? isTestModeActive(settings) : false;
   const mockProviderActive = isMockProviderId(runtimeOptions.defaultProvider);
-  const useMockRuntime = mockProviderActive || testModeActive;
+  const useMockRuntime = !runtimeOptions.cccProviderAttemptBinding && (mockProviderActive || testModeActive);
   const effectiveRuntimeOptions = useMockRuntime
     ? {
       ...runtimeOptions,
@@ -911,13 +911,24 @@ export async function createResolvedAgentSession(
   FNXC:GrokCliRouting 2026-07-09-23:05:
   FN-7761 closes the packaged serve/daemon/dashboard gap: if grok-cli is selected and no Fusion-visible key exists, this seam must never silently fall through to the key-requiring pi/openai-completions runtime when the Grok plugin was not pre-installed. The hosts eagerly install/load the bundled runtime; if that genuinely fails, throw an operator-actionable error naming the two supported remediations.
   */
-  const autoGrokRuntimeHint = !useMockRuntime && !runtimeHint
+  const autoGrokRuntimeHint = !runtimeOptions.cccProviderAttemptBinding && !useMockRuntime && !runtimeHint
     ? deriveGrokRuntimeHintForNoVisibleKey(runtimeOptions, pluginRunner)
     : undefined;
-  const autoOmpRuntimeHint = !useMockRuntime && !runtimeHint
+  const autoOmpRuntimeHint = !runtimeOptions.cccProviderAttemptBinding && !useMockRuntime && !runtimeHint
     ? deriveOmpRuntimeHint(runtimeOptions, pluginRunner)
     : undefined;
-  const effectiveRuntimeHint = autoGrokRuntimeHint ?? autoOmpRuntimeHint ?? runtimeHint;
+  if (
+    runtimeOptions.cccProviderAttemptBinding
+    && runtimeHint !== undefined
+    && runtimeHint !== "pi"
+  ) {
+    throw new Error("cccProviderAttemptBinding requires the native pi runtime");
+  }
+  // A provider-attempt binding is enforced inside createFnAgent/PI. Never
+  // route it through a plugin runtime that could ignore AgentRuntimeOptions.
+  const effectiveRuntimeHint = runtimeOptions.cccProviderAttemptBinding
+    ? "pi"
+    : autoGrokRuntimeHint ?? autoOmpRuntimeHint ?? runtimeHint;
   const usesOmpRuntime = effectiveRuntimeHint === "omp" && isOmpCliSelection(runtimeOptions);
   if (usesOmpRuntime) {
     // resolveRuntime intentionally falls back to pi for an unavailable hint; OMP
@@ -930,7 +941,7 @@ export async function createResolvedAgentSession(
   hinted onto the Grok runtime), withhold the pair from the primary runtime and arm a
   prompt-time swap to the Grok CLI runtime instead of preempting the configured primary.
   */
-  const grokFallbackDeferral = !useMockRuntime && !autoGrokRuntimeHint && effectiveRuntimeHint !== "grok"
+  const grokFallbackDeferral = !runtimeOptions.cccProviderAttemptBinding && !useMockRuntime && !autoGrokRuntimeHint && effectiveRuntimeHint !== "grok"
     ? deferGrokCliFallbackForNoVisibleKey(effectiveRuntimeOptions, pluginRunner)
     : { options: effectiveRuntimeOptions, dropped: false as const };
   const effectiveRuntimeOptionsWithModel: AgentRuntimeOptions = autoGrokRuntimeHint

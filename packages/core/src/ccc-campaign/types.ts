@@ -71,6 +71,12 @@ export type CccProviderAttemptScope = Readonly<{
   binding: Readonly<CccCampaignAuthorityBinding>;
 }>;
 
+/** Full immutable persisted identity required to settle a native provider attempt. */
+export type CccProviderAttemptSettlementInput = CccProviderAttemptReconciliation & Pick<
+  CccProviderAttemptScope,
+  "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "binding"
+>;
+
 export type CccProviderAttemptDispatchDecision =
   | Readonly<{ kind: "dispatch-permit"; scope: CccProviderAttemptScope }>
   | Readonly<{ kind: "dispatched-unknown" | "terminal"; scope: CccProviderAttemptScope }>;

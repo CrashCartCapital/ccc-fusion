@@ -406,6 +406,16 @@ export type AssertConsumedCccCampaignApprovalInput =
   AssertClaimedCccCampaignApprovalInput;
 
 /**
+ * Read-only exact terminal custody for a committed provider-attempt replay.
+ * The caller supplies only the task/action selected from persisted campaign
+ * context; the native approval identity and claim token are re-derived here.
+ */
+export type ReadConsumedCccCampaignApprovalCustodyInput = Pick<
+  CccCampaignApprovalBaseInput,
+  "authorityStore" | "rootDir" | "taskId" | "action"
+>;
+
+/**
  * Exact approval identity required before a new provider dispatch. Unlike the
  * after-effect assertion, this also proves the approval and action lease are
  * still inside their database-clock windows.
@@ -429,6 +439,11 @@ export type ClaimedCccCampaignApproval = {
 
 export type ConsumedCccCampaignApproval = ClaimedCccCampaignApproval;
 export type ExpiredCccCampaignApproval = ClaimedCccCampaignApproval;
+export type ConsumedCccCampaignApprovalCustody = Readonly<{
+  approvalRequestId: string;
+  claimToken: string;
+  binding: CccCampaignAuthorityBinding;
+}>;
 
 function requireCanonicalTimestamp(value: string, label: string): number {
   const instant = Date.parse(value);
@@ -1037,6 +1052,39 @@ export async function assertConsumedCccCampaignApprovalWithinTransaction(
   input: AssertConsumedCccCampaignApprovalInput,
 ): Promise<ConsumedCccCampaignApproval> {
   return assertTerminalCccCampaignApprovalWithinTransaction(tx, input, "consumed");
+}
+
+/**
+ * Re-derive the only approval identity that can replay a committed provider
+ * attempt. Unlike the assertion above, this exposes no caller-provided
+ * approval ID or token, so an engine restart cannot forge terminal custody.
+ */
+export async function readConsumedCccCampaignApprovalCustodyWithinTransaction(
+  tx: DbTransaction,
+  input: ReadConsumedCccCampaignApprovalCustodyInput,
+): Promise<ConsumedCccCampaignApprovalCustody> {
+  const { binding } = await lockedCampaignAuthority(tx, input);
+  const approval = await lockedCampaignApproval(tx, binding);
+  if (
+    !approval?.campaign
+    || approval.status !== "consumed"
+    || canonicalCccPrdJson(approval.campaign.binding) !== canonicalCccPrdJson(binding)
+  ) {
+    throw new Error(`CCC campaign approval ${binding.actionId} is not exactly consumed by persisted campaign custody`);
+  }
+  const claimToken = requireCanonicalText(
+    approval.campaign.claimToken ?? "",
+    `CCC campaign approval ${binding.actionId} consumed claim token`,
+  );
+  const persistedLease = await input.authorityStore.inspectCccCampaignActionLease(
+    input.taskId,
+    input.action,
+    tx,
+  );
+  if (persistedLease !== null) {
+    throw new Error(`CCC campaign approval ${binding.actionId} consumed custody still has a persisted action lease`);
+  }
+  return Object.freeze({ approvalRequestId: approval.id, claimToken, binding });
 }
 
 export async function assertExpiredCccCampaignApprovalWithinTransaction(

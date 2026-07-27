@@ -36,6 +36,7 @@ export type {
   CccProviderAttemptReconciliation,
   CccProviderAttemptDispatchDecision,
   CccProviderAttemptRequest,
+  CccProviderAttemptSettlementInput,
   CccProviderAttemptScope,
   CccProviderAttemptState,
   CccProviderAttemptTerminalEvidence,

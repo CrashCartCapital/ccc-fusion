@@ -4,9 +4,15 @@
  * The production surface is intentionally cast locally so this suite reaches
  * the real PostgreSQL store and fails on absent runtime methods, not imports.
  */
+import { createHash } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { importCccPrdBundle } from "../../index.js";
+import {
+  claimCccCampaignApproval,
+  getApprovalRequest,
+  issueCccCampaignApproval,
+} from "../../async-approval-request-store.js";
 import { TaskStore } from "../../store.js";
 import {
   createSharedPgTaskStoreTestHarness,
@@ -18,6 +24,14 @@ import {
   createCccPrdImportTestExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
+import { canonicalCccPrdJson } from "../../ccc-prd/contract.js";
+import type { ApprovalRequestActorSnapshot } from "../../types.js";
+
+const providerWorker: ApprovalRequestActorSnapshot = {
+  actorId: "provider-settlement-worker",
+  actorType: "agent",
+  actorName: "Provider settlement worker",
+};
 
 type ProviderAttemptRequest = Readonly<{
   taskId: string;
@@ -78,6 +92,11 @@ type ProviderAttemptStore = {
     observerId: string;
   }): Promise<ProviderAttemptScope>;
   inspectCccProviderAttempt(input: Pick<ProviderAttemptTransition, "taskId" | "attemptKey">): Promise<ProviderAttemptScope | null>;
+  settleCccProviderAttemptAndApproval(input: ProviderAttemptTransition & {
+    outcome: "committed" | "proved_failed";
+    evidenceDigest: string;
+    observerId: string;
+  }): Promise<ProviderAttemptScope>;
 };
 
 const api = (store: TaskStore): ProviderAttemptStore => store as unknown as ProviderAttemptStore;
@@ -95,6 +114,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     bounds: Readonly<{ maxRequests: number; maxDurationMs: number; maxConcurrency: number }> = {
       maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1,
     },
+    transport: "pi" | "cli" | "workflow" = "pi",
   ) {
     const source = rehashCccPrdImportTestBundle({
       ...bundle(h.rootDir(), suffix),
@@ -106,7 +126,14 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
-      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+      executionPolicy: transport === "pi"
+        ? createCccPrdImportTestExecutionPolicy(source)
+        : {
+            ...createCccPrdImportTestExecutionPolicy(source),
+            routes: source.tasks.map(({ id }) => ({
+              taskId: id, providerId: "deterministic-fake", modelId: "fixture-v1", transport,
+            })),
+          },
     });
     const taskId = `TASK-${suffix}`;
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
@@ -114,15 +141,61 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     return { taskId, campaign, source };
   }
 
+  async function protectedContext(suffix: string) {
+    const initial = bundle(h.rootDir(), suffix);
+    const action = {
+      actionId: "ACTION-LIVE-EXECUTION",
+      actionTarget: "ccc-lab-super:pre-live-provider-gate",
+      requireProtected: true,
+    };
+    const source = rehashCccPrdImportTestBundle({
+      ...initial,
+      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      tasks: initial.tasks.map((task, index) => index === 0
+        ? { ...task, protectedActionIds: [action.actionId] }
+        : task),
+      protectedActions: [{
+        id: action.actionId,
+        kind: "live_execution",
+        target: action.actionTarget,
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_live_execution",
+        spans: [initial.tasks[0]!.spans[0]!],
+      }],
+    });
+    await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: `provider-attempt-protected-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+    });
+    const taskId = `TASK-${suffix}`;
+    const campaign = await h.store().getCccCampaignContextForTask(taskId);
+    if (!campaign) throw new Error(`missing protected campaign context for ${taskId}`);
+    const issued = await issueCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      requester: providerWorker, runId: `issue-provider-settlement-${suffix}`,
+      notBeforeAt: campaign.campaignStartedAt, expiresAt: campaign.campaignDeadlineAt,
+    });
+    const claimToken = `claim-provider-settlement-${suffix}`;
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
+      claimant: providerWorker, runId: `claim-provider-settlement-${suffix}`, claimToken,
+    });
+    return { taskId, action, issued, claimToken };
+  }
+
   function request(
     taskId: string,
     actionTarget: string,
     turnKey: string,
-    route: Partial<Pick<ProviderAttemptRequest, "providerId" | "modelId" | "transport">> = {},
+    route: Partial<Pick<ProviderAttemptRequest, "actionId" | "providerId" | "modelId" | "transport">> = {},
   ): ProviderAttemptRequest {
     return {
       taskId,
-      actionId: taskId,
+      actionId: route.actionId ?? taskId,
       actionTarget,
       turnKey,
       dispatchKey: `dispatch-${turnKey}`,
@@ -526,5 +599,125 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       code: "CCC_PROVIDER_ATTEMPT_STATE_REFUSED",
     });
     expect(await auditRows()).toHaveLength(1);
+  });
+
+  it("Task 6 RED: transport-neutral settlement refuses CLI attempts before reconciliation", async () => {
+    const { taskId } = await context("task6-cli-refusal", undefined, "cli");
+    const store = api(h.store());
+    const attempt = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-task6-cli", { transport: "cli" }));
+    const transition = { taskId, attemptKey: attempt.attemptKey, controllerToken: attempt.controllerToken };
+    await dispatch(store, transition);
+
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...attempt,
+      outcome: "proved_failed",
+      evidenceDigest: "d".repeat(64),
+      observerId: "task6-cli-refusal",
+    })).rejects.toThrow(/pi or workflow transport/i);
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: attempt.attemptKey }))
+      .resolves.toMatchObject({ state: "dispatched_unknown" });
+  });
+
+  it("Task 6 RED: committed pi settlement consumes the exact claimed approval without a CLI session", async () => {
+    const { taskId, action, issued } = await protectedContext("task6-pi-committed-consumes");
+    const store = api(h.store());
+    const attempt = await store.reserveCccProviderAttempt(request(taskId, action.actionTarget, "turn-task6-pi-committed", {
+      actionId: action.actionId, transport: "pi",
+    }));
+    const transition = { taskId, attemptKey: attempt.attemptKey, controllerToken: attempt.controllerToken };
+    await dispatch(store, transition);
+
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...attempt, outcome: "committed", evidenceDigest: "c".repeat(64), observerId: "task6-pi-committed",
+    })).resolves.toMatchObject({ state: "committed", terminal: { kind: "reconciled", state: "committed" } });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(h.store().inspectCccCampaignActionLease(taskId, action)).resolves.toBeNull();
+    const cliRows = await h.layer().db.execute(sql`
+      SELECT id FROM project.cli_sessions WHERE task_id = ${taskId}
+    `);
+    expect(cliRows).toHaveLength(0);
+  });
+
+  it("Task 6 P1 RED: TaskStore rejects a drifted immutable turn before terminal settlement or approval consumption", async () => {
+    const { taskId, action, issued, claimToken } = await protectedContext("task6-native-identity-drift");
+    const store = api(h.store());
+    const attempt = await store.reserveCccProviderAttempt(request(taskId, action.actionTarget, "turn-task6-native-identity", {
+      actionId: action.actionId, transport: "pi",
+    }));
+    await dispatch(store, { taskId, attemptKey: attempt.attemptKey, controllerToken: attempt.controllerToken });
+    const auditsBefore = await auditRows();
+
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...attempt,
+      turnKey: "turn-task6-native-identity-drift",
+      outcome: "committed",
+      evidenceDigest: "b".repeat(64),
+      observerId: "task6-native-identity-drift",
+    })).rejects.toThrow(/settlement immutable identity mismatch/i);
+
+    const persisted = await store.inspectCccProviderAttempt({ taskId, attemptKey: attempt.attemptKey });
+    expect(persisted).toMatchObject({ state: "dispatched_unknown" });
+    expect(persisted?.terminal).toBeUndefined();
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({
+      status: "claimed",
+      campaign: { claimToken },
+    });
+    await expect(h.store().inspectCccCampaignActionLease(taskId, action)).resolves.toMatchObject({
+      lease: { approvalRequestId: issued.id, claimToken },
+    });
+    expect(await auditRows()).toHaveLength(auditsBefore.length);
+  });
+
+  it("Task 6 RED: proved-failed pi settlement preserves the exact claimed approval for retry", async () => {
+    const { taskId, action, issued, claimToken } = await protectedContext("task6-pi-proved-failed-retry");
+    const store = api(h.store());
+    const attempt = await store.reserveCccProviderAttempt(request(taskId, action.actionTarget, "turn-task6-pi-proved-failed", {
+      actionId: action.actionId, transport: "pi",
+    }));
+    const transition = { taskId, attemptKey: attempt.attemptKey, controllerToken: attempt.controllerToken };
+    await dispatch(store, transition);
+
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...attempt, outcome: "proved_failed", evidenceDigest: "f".repeat(64), observerId: "task6-pi-proved-failed",
+    })).resolves.toMatchObject({ state: "proved_failed", terminal: { kind: "reconciled", state: "proved_failed" } });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({ status: "claimed" });
+    await expect(h.store().inspectCccCampaignActionLease(taskId, action)).resolves.toMatchObject({
+      lease: { approvalRequestId: issued.id, claimToken, actionId: action.actionId, actionTarget: action.actionTarget },
+    });
+  });
+
+  it("Task 6 RED: settlement refuses a self-consistent provider-attempt binding that drifted from the persisted campaign route", async () => {
+    const { taskId, action } = await protectedContext("task6-settlement-binding-drift");
+    const store = api(h.store());
+    const attempt = await store.reserveCccProviderAttempt(request(taskId, action.actionTarget, "turn-task6-settlement-binding-drift", {
+      actionId: action.actionId, transport: "pi",
+    }));
+    const transition = { taskId, attemptKey: attempt.attemptKey, controllerToken: attempt.controllerToken };
+    await dispatch(store, transition);
+    const { bindingHash: _bindingHash, ...driftedFields } = attempt.binding;
+    const driftedBinding = {
+      ...driftedFields,
+      providerId: "deterministic-fake-drift",
+      modelId: "fixture-v2",
+      transport: "workflow" as const,
+    };
+    const driftedBindingHash = createHash("sha256")
+      .update(canonicalCccPrdJson(driftedBinding), "utf8")
+      .digest("hex");
+    await h.layer().db.execute(sql`
+      UPDATE project.run_audit_events
+      SET campaign_provider_id = ${driftedBinding.providerId},
+        campaign_model_id = ${driftedBinding.modelId},
+        campaign_transport = ${driftedBinding.transport},
+        campaign_binding_hash = ${driftedBindingHash},
+        metadata = jsonb_set(metadata, '{bindingHash}', to_jsonb(${driftedBindingHash}::text))
+      WHERE campaign_event_key LIKE ${`${attempt.attemptKey}:%`}
+    `);
+
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...attempt, outcome: "proved_failed", evidenceDigest: "e".repeat(64), observerId: "task6-settlement-binding-drift",
+    })).rejects.toThrow(/settlement immutable identity mismatch/i);
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: attempt.attemptKey }))
+      .resolves.toMatchObject({ state: "dispatched_unknown" });
   });
 });

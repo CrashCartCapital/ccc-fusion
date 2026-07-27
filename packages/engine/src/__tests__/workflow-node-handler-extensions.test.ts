@@ -7,6 +7,8 @@ import {
   getWorkflowExtensionRegistry,
   workflowExtensionRegistryId,
   type CccCampaignProviderControllerDecision,
+  type CccProviderAttemptReconciliation,
+  type CccProviderAttemptScope,
   type TaskDetail,
   type WorkflowIr,
   type WorkflowNodeHandlerInput,
@@ -19,6 +21,9 @@ const settingsOn = { experimentalFeatures: { workflowGraphExecutor: true } };
 function providerController(): WorkflowNodeProviderController {
   return Object.freeze({
     preDispatch: vi.fn(async (): Promise<CccCampaignProviderControllerDecision> => {
+      throw new Error("Provider controller must not run in graph posture tests");
+    }),
+    reconcile: vi.fn(async (_input: CccProviderAttemptReconciliation): Promise<CccProviderAttemptScope> => {
       throw new Error("Provider controller must not run in graph posture tests");
     }),
   });
@@ -443,7 +448,7 @@ describe("workflow node-handler extensions", () => {
 
   it("fails closed when scoped-provider resolver returns malformed controller", async () => {
     const extensionKey = workflowExtensionRegistryId("node-plugin", "decision");
-    const resolveNodeProviderController = vi.fn(async () => ({ preDispatch: true }));
+    const resolveNodeProviderController = vi.fn(async () => Object.freeze({ preDispatch: vi.fn() }));
     const handle = vi.fn(async () => ({ outcome: "success" as const }));
     const prompt = vi.fn(async () => ({ outcome: "success" as const }));
     const prepareNodeExecution = vi.fn();

@@ -13,6 +13,12 @@ import {
   type CccCampaignActionLeaseClaim,
   type CccCampaignActionLeaseResult,
 } from "./ccc-campaign/store.js";
+import { createCccCampaignAuthorityBinding } from "./ccc-campaign/canonical.js";
+import { canonicalCccPrdJson } from "./ccc-prd/contract.js";
+import {
+  assertClaimedCccCampaignApprovalWithinTransaction,
+  consumeCccCampaignApprovalWithinTransaction,
+} from "./async-approval-request-store.js";
 import {
   inspectCccProviderAttempt,
   beginCccProviderAttemptDispatch,
@@ -27,6 +33,7 @@ import type {
   CccProviderAttemptReconciliation,
   CccProviderAttemptDispatchDecision,
   CccProviderAttemptRequest,
+  CccProviderAttemptSettlementInput,
   CccProviderAttemptScope,
   CccProviderAttemptTransition,
 } from "./ccc-campaign/types.js";
@@ -1019,6 +1026,104 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   ): Promise<CccProviderAttemptScope> {
     if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
     return reconcileCccProviderAttempt({ layer: this.asyncLayer, rootDir: this.rootDir, reconciliation: input });
+  }
+  /**
+   * Settle a non-CLI provider attempt and, only on its first committed terminal
+   * transition, consume the exact approval claim in the same PostgreSQL transaction.
+   * CLI attempts intentionally use CliSessionStore's held-session fence instead.
+   */
+  async settleCccProviderAttemptAndApproval(input: CccProviderAttemptSettlementInput): Promise<CccProviderAttemptScope> {
+    if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
+    return this.asyncLayer.transactionImmediate(async (tx) => {
+      const initial = await inspectCccProviderAttempt({
+        layer: this.asyncLayer!, rootDir: this.rootDir, tx,
+        taskId: input.taskId, attemptKey: input.attemptKey,
+      });
+      if (!initial) throw new Error("CCC provider attempt settlement requires an exact dispatched attempt");
+      const submittedIdentity = {
+        attemptKey: input.attemptKey,
+        controllerToken: input.controllerToken,
+        taskId: input.taskId,
+        semanticTaskId: input.semanticTaskId,
+        campaignDeadlineAt: input.campaignDeadlineAt,
+        turnKey: input.turnKey,
+        dispatchKey: input.dispatchKey,
+        attemptOrdinal: input.attemptOrdinal,
+        requestCount: input.requestCount,
+        binding: input.binding,
+      };
+      const persistedIdentity = {
+        attemptKey: initial.attemptKey,
+        controllerToken: initial.controllerToken,
+        taskId: initial.taskId,
+        semanticTaskId: initial.semanticTaskId,
+        campaignDeadlineAt: initial.campaignDeadlineAt,
+        turnKey: initial.turnKey,
+        dispatchKey: initial.dispatchKey,
+        attemptOrdinal: initial.attemptOrdinal,
+        requestCount: initial.requestCount,
+        binding: initial.binding,
+      };
+      if (canonicalCccPrdJson(submittedIdentity) !== canonicalCccPrdJson(persistedIdentity)) {
+        throw new Error("CCC provider attempt settlement immutable identity mismatch; persisted attempt was not mutated");
+      }
+      const context = await loadCccCampaignContextForTask(this.asyncLayer!, this.rootDir, input.taskId, tx, true);
+      if (!context || context.taskId !== initial.taskId || context.semanticTaskId !== initial.semanticTaskId) {
+        throw new Error("CCC provider attempt settlement requires matching persisted campaign context");
+      }
+      const transport = context.route.transport;
+      const expectedBinding = createCccCampaignAuthorityBinding(context, {
+        actionId: initial.binding.actionId,
+        actionTarget: initial.binding.actionTarget,
+      });
+      if (transport === "cli" || (transport !== "pi" && transport !== "workflow")) {
+        throw new Error("CCC TaskStore provider settlement only permits pi or workflow transport");
+      }
+      if (
+        initial.binding.bindingHash !== expectedBinding.bindingHash
+        || initial.binding.providerId !== context.route.providerId
+        || initial.binding.modelId !== context.route.modelId
+        || initial.binding.transport !== transport
+      ) {
+        throw new Error("CCC provider attempt binding does not match persisted campaign route and authority binding");
+      }
+      let claimedApproval: { action: Pick<CccCampaignActionLookup, "actionId" | "actionTarget">; claimToken: string } | undefined;
+      if (input.outcome === "committed" && initial.state === "dispatched_unknown") {
+        const action = { actionId: initial.binding.actionId, actionTarget: initial.binding.actionTarget };
+        const lease = await this.inspectCccCampaignActionLease(initial.taskId, action, tx);
+        if (
+          !lease
+          || lease.binding.bindingHash !== initial.binding.bindingHash
+          || lease.lease.bindingHash !== initial.binding.bindingHash
+          || lease.lease.actionId !== action.actionId
+          || lease.lease.actionTarget !== action.actionTarget
+        ) throw new Error("CCC committed provider settlement has no exact persisted action lease");
+        await assertClaimedCccCampaignApprovalWithinTransaction(tx, {
+          authorityStore: this,
+          rootDir: this.rootDir,
+          taskId: initial.taskId,
+          action,
+          approvalRequestId: lease.lease.approvalRequestId,
+          claimToken: lease.lease.claimToken,
+        });
+        claimedApproval = { action, claimToken: lease.lease.claimToken };
+      }
+      const terminal = await reconcileCccProviderAttempt({
+        layer: this.asyncLayer!, rootDir: this.rootDir, tx, reconciliation: input,
+      });
+      if (claimedApproval) {
+        await consumeCccCampaignApprovalWithinTransaction(tx, {
+          authorityStore: this,
+          rootDir: this.rootDir,
+          taskId: terminal.taskId,
+          action: claimedApproval.action,
+          claimToken: claimedApproval.claimToken,
+          actor: Object.freeze({ actorId: "ccc-provider", actorType: "agent" as const, actorName: "CCC provider settlement" }),
+          runId: `ccc-provider-settlement:${terminal.taskId}:${terminal.attemptKey}`,
+        });
+      }
+      return terminal;
+    });
   }
   async inspectCccProviderAttempt(
     input: Pick<CccProviderAttemptTransition, "taskId" | "attemptKey">,

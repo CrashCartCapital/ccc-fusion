@@ -597,8 +597,10 @@ function requireWorkflowNodeProviderController(
     || typeof candidate !== "object"
     || !Object.isFrozen(candidate)
     || !Object.hasOwn(candidate, "preDispatch")
-    || Object.keys(candidate).length !== 1
+    || !Object.hasOwn(candidate, "reconcile")
+    || Object.keys(candidate).length !== 2
     || typeof candidate.preDispatch !== "function"
+    || typeof candidate.reconcile !== "function"
   ) {
     throw new PermanentError(
       `Workflow node provider controller is unavailable or malformed for extension ${extensionId}`,

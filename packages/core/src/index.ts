@@ -2647,6 +2647,11 @@ export {
   assertActiveClaimedCccCampaignApprovalWithinTransaction,
   assertClaimedCccCampaignApprovalWithinTransaction,
   consumeCccCampaignApprovalWithinTransaction,
+  readConsumedCccCampaignApprovalCustodyWithinTransaction,
+} from "./async-approval-request-store.js";
+export type {
+  ConsumedCccCampaignApprovalCustody,
+  ReadConsumedCccCampaignApprovalCustodyInput,
 } from "./async-approval-request-store.js";
 /*
 FNXC:GitHubImportTranslate 2026-07-15-09:30:

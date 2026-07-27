@@ -65,14 +65,15 @@ import type {
   PermanentAgentGatingContext,
   ResolvedMcpServerDefinition,
   CccEffectReceiptStore,
-  CccProviderAttemptReconciliation,
   CccProviderAttemptScope,
+  CccProviderAttemptSettlementInput,
 } from "@fusion/core";
 import {
   resolveSessionSkills,
   createSkillsOverrideFromSelection,
   type SkillSelectionContext,
 } from "./skill-resolver.js";
+import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { applyClaudeAcpEnable } from "./claude-acp-enable.js";
 import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
@@ -517,11 +518,7 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
   return input as CccProviderAttemptBinding;
 }
 
-type CccProviderAttemptSubmittedReconciliation = CccProviderAttemptReconciliation
-  & Pick<
-    CccProviderAttemptScope,
-    "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "binding"
-  >;
+type CccProviderAttemptSubmittedReconciliation = CccProviderAttemptSettlementInput;
 
 type CccProviderAttemptSessionState = {
   nextSlot: number;
@@ -1527,16 +1524,6 @@ export class ModelFallbackExhaustedError extends Error {
 }
 
 export type BuiltinWebToolName = "WebSearch" | "WebFetch";
-
-type CccProviderAttemptController = Readonly<{
-  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
-  reconcile(input: CccProviderAttemptReconciliation): Promise<CccProviderAttemptScope>;
-}>;
-
-type CccProviderAttemptBinding = Readonly<{
-  turnKey: string;
-  controller: CccProviderAttemptController;
-}>;
 
 export interface AgentOptions {
   cwd: string;

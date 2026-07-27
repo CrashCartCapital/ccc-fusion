@@ -67,6 +67,8 @@ import { createWorkflowRuntimePrimitiveProvider } from "./workflow-runtime-primi
 import { WorkflowCustomNodeExecutionService } from "./workflow-custom-node-execution.js";
 import { WorkflowReviewService } from "./workflow-review-service.js";
 import { WorkflowPlanningService } from "./workflow-planning-service.js";
+import { createCccCampaignProviderAttemptBinding } from "./ccc-campaign-provider-controller.js";
+import type { WorkflowNodeProviderControllerResolverInput } from "./workflow-graph-executor.js";
 import {
   buildPlanVerifiedMessage,
   buildReviewUnavailableMessage,
@@ -7595,6 +7597,49 @@ export class TaskExecutor {
       this.runGraphCustomNode(node, task, settings, undefined, context, executionContext);
   }
 
+  /** The sole production scoped-provider resolver for fenced campaign graph nodes. */
+  public createCccCampaignWorkflowNodeProviderControllerResolver() {
+    return async (input: WorkflowNodeProviderControllerResolverInput) => {
+      const turnKey = input.execution.providerAttemptTurnKey;
+      if (!turnKey) throw new Error("CCC workflow provider controller requires sealed provider attempt turn identity");
+      const layer = this.store.getAsyncLayer();
+      if (!layer) throw new Error("CCC workflow provider controller requires PostgreSQL TaskStore");
+      const binding = await createCccCampaignProviderAttemptBinding({
+        layer,
+        rootDir: this.rootDir,
+        authorityStore: this.store,
+        semanticTaskId: input.execution.semanticTaskId,
+        turnKey,
+        expectedRoute: Object.freeze({ transport: "workflow" as const }),
+        signal: input.signal,
+      });
+      return binding.controller;
+    };
+  }
+
+  private async createCccProviderAttemptBindingForWorkflowStep(input: {
+    execution: NonNullable<WorkflowNodeExecutionContext["execution"]>;
+    provider: string | undefined;
+    modelId: string | undefined;
+    signal?: AbortSignal;
+  }) {
+    const turnKey = input.execution.providerAttemptTurnKey;
+    if (!turnKey || !input.provider || !input.modelId) {
+      throw new Error("CCC workflow model node requires sealed turn identity and resolved provider/model before PI session creation");
+    }
+    const layer = this.store.getAsyncLayer();
+    if (!layer) throw new Error("CCC workflow model node requires PostgreSQL TaskStore");
+    return createCccCampaignProviderAttemptBinding({
+      layer,
+      rootDir: this.rootDir,
+      authorityStore: this.store,
+      semanticTaskId: input.execution.semanticTaskId,
+      turnKey,
+      expectedRoute: Object.freeze({ providerId: input.provider, modelId: input.modelId, transport: "pi" as const }),
+      signal: input.signal,
+    });
+  }
+
   private createAuthoritativeWorkflowPrimitivesFromExecutor(settings: Settings): WorkflowRuntimePrimitives {
     const logAudit = async (taskId: string | undefined, input: AuditPrimitiveInput): Promise<void> => {
       if (!taskId) return;
@@ -9454,7 +9499,7 @@ export class TaskExecutor {
 
     const outcome = mode === "script"
       ? await this.executeScriptWorkflowStep(live, step, worktreePath, settings, nodeEnv)
-      : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, { unattended });
+      : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, { unattended, execution: executionContext?.execution, signal: executionContext?.signal });
 
     // Skill-emitted await-input (U6): if the skill asked the user a blocking
     // question via the ===FUSION_AWAIT_INPUT=== sentinel, park the task
@@ -17758,7 +17803,7 @@ ${scopeGuard}
     worktreePath: string,
     settings: Settings,
     taskEnv?: NodeJS.ProcessEnv,
-    stepOptions?: { unattended?: boolean },
+    stepOptions?: { unattended?: boolean; execution?: WorkflowNodeExecutionContext["execution"]; signal?: AbortSignal },
   ): Promise<WorkflowStepOutcome> {
     let toolMode: "coding" | "readonly" = workflowStep.toolMode || "readonly";
     // (U3) Genuinely-unattended run — set FUSION_HEADLESS=1 below so skills record
@@ -18191,9 +18236,18 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ? resolveExecutorFallbackThinkingLevel(workflowStepThinkingSource, settings)
         : resolveExecutorThinkingLevel(workflowStepThinkingSource, settings);
       const workflowStepFallbackThinkingLevel = resolveExecutorFallbackThinkingLevel(workflowStepThinkingSource, settings);
+      const sealedExecution = stepOptions?.execution;
+      const cccProviderAttemptBinding = sealedExecution?.executionFence
+        ? await this.createCccProviderAttemptBindingForWorkflowStep({
+            execution: sealedExecution,
+            provider,
+            modelId,
+            signal: stepOptions?.signal,
+          })
+        : undefined;
       const { session } = await createResolvedAgentSession({
         sessionPurpose: "executor",
-        runtimeHint: workflowRuntimeHint,
+        runtimeHint: cccProviderAttemptBinding ? "pi" : workflowRuntimeHint,
         pluginRunner: this.options.pluginRunner,
         cwd: worktreePath,
         systemPrompt: stepSystemPrompt,
@@ -18217,6 +18271,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ...(effectiveSkillSelection ? { skillSelection: effectiveSkillSelection } : {}),
         ...(additionalSkillPaths ? { additionalSkillPaths } : {}),
         ...(readonlyCustomTools.allowed.length > 0 ? { customTools: readonlyCustomTools.allowed } : {}),
+        ...(cccProviderAttemptBinding ? { profile: CCC_FUSION_PROFILE, subscriptionReady: true as const, cccProviderAttemptBinding } : {}),
       });
 
       const workflowModelDetails = formatModelMarkerDetails(

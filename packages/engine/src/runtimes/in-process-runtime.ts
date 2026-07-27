@@ -2010,6 +2010,7 @@ export class InProcessRuntime
       store: this.taskStore,
       primitives: this.executor.createAuthoritativeWorkflowPrimitives(settings),
       runCustomNode: this.executor.createAuthoritativeWorkflowCustomNodeRunner(settings),
+      resolveNodeProviderController: this.executor.createCccCampaignWorkflowNodeProviderControllerResolver(),
       handlers: {},
     });
     return this.cccCampaignWorkflowRuntime;

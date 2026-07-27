@@ -15,7 +15,15 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { CccEffectReceiptStore, PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
+import type {
+  CccCampaignProviderControllerDecision,
+  CccCampaignProviderDispatchInput,
+  CccEffectReceiptStore,
+  CccProviderAttemptScope,
+  CccProviderAttemptSettlementInput,
+  PermanentAgentGatingContext,
+  ResolvedMcpServerDefinition,
+} from "@fusion/core";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { FallbackModelUsedPayload } from "./pi.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
@@ -59,6 +67,17 @@ export interface CccEffectReceiptBinding {
   controllerToken: string;
   keepTurnOpen: boolean;
 }
+
+/** Frozen, runtime-neutral admission/settlement binding for one CCC PI turn. */
+export type CccProviderAttemptController = Readonly<{
+  preDispatch(input: CccCampaignProviderDispatchInput): Promise<CccCampaignProviderControllerDecision>;
+  reconcile(input: CccProviderAttemptSettlementInput): Promise<CccProviderAttemptScope>;
+}>;
+
+export type CccProviderAttemptBinding = Readonly<{
+  turnKey: string;
+  controller: CccProviderAttemptController;
+}>;
 
 /**
  * PI invokes this once per session construction after every tool filter and
@@ -195,6 +214,8 @@ export interface AgentRuntimeOptions {
   cccEffectReceiptControllerToken?: string;
   /** Late-bound durable CCC receipt ownership for the final PI tool boundary. */
   cccEffectReceiptBinder?: CccEffectReceiptBinder;
+  /** Frozen CCC provider-attempt controller passed only to the native PI runtime. */
+  cccProviderAttemptBinding?: CccProviderAttemptBinding;
   actionGateContext?: AgentActionGateContext;
   /** Permanent-agent action gating context for v1 category classification enforcement. */
   permanentAgentGating?: PermanentAgentGatingContext;

@@ -1,5 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { execFile as execFileCallback } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import type { TaskStore, WorkflowWorkItem } from "@fusion/core";
 import {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
@@ -7,8 +9,14 @@ import {
   deriveWorkflowExtensionHostProvenance,
   getWorkflowExtensionHostProvenanceBinding,
   importCccPrdBundle,
+  queryRunAuditEvents,
   TaskStore as FreshTaskStore,
 } from "@fusion/core";
+import {
+  claimCccCampaignApproval,
+  getApprovalRequest,
+  issueCccCampaignApproval,
+} from "../../../core/src/async-approval-request-store.js";
 import {
   createCccPrdImportTestBundle,
   createCccPrdImportTestExecutionPolicy,
@@ -19,6 +27,7 @@ import { InProcessRuntime } from "../runtimes/in-process-runtime.js";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-campaign-proof-host.js";
 import { isImportedCccCampaignWorkItem } from "../ccc-campaign-routing.js";
 import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
+import { createCccCampaignProviderAttemptBinding } from "../ccc-campaign-provider-controller.js";
 import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
 import {
   CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
@@ -34,6 +43,7 @@ type RuntimeHarness = InProcessRuntime & {
     execute: ReturnType<typeof vi.fn>;
     createAuthoritativeWorkflowPrimitives: ReturnType<typeof vi.fn>;
     createAuthoritativeWorkflowCustomNodeRunner: ReturnType<typeof vi.fn>;
+    createCccCampaignWorkflowNodeProviderControllerResolver: ReturnType<typeof vi.fn>;
   };
   cccCampaignProofBootstrapPromise?: Promise<void>;
   cccCampaignProofBootstrapError?: Error;
@@ -41,6 +51,24 @@ type RuntimeHarness = InProcessRuntime & {
 };
 
 const ENGINE_DIST_ROOT = fileURLToPath(new URL("../../dist/", import.meta.url));
+const execFile = promisify(execFileCallback);
+const providerWorker = Object.freeze({
+  actorId: "runtime-provider-worker",
+  actorType: "agent" as const,
+  actorName: "Runtime provider worker",
+});
+
+async function initializeGitRoot(rootDir: string): Promise<string> {
+  await execFile("git", ["init", "--initial-branch=main", rootDir]);
+  await commitGitRoot(rootDir, "fixture");
+  const { stdout } = await execFile("git", ["-C", rootDir, "rev-parse", "HEAD"]);
+  return stdout.trim();
+}
+
+async function commitGitRoot(rootDir: string, message: string): Promise<void> {
+  await execFile("git", ["-C", rootDir, "add", "--all"]);
+  await execFile("git", ["-C", rootDir, "-c", "user.name=Fusion Test", "-c", "user.email=fusion-test@example.invalid", "commit", "--allow-empty", "-m", message]);
+}
 
 const pgTest = pgDescribe;
 
@@ -61,6 +89,7 @@ function runtimeWithStore(store: TaskStore, rootDir: string): RuntimeHarness {
       outcome: "success" as const,
       value: "mocked-provider-effect",
     }))),
+    createCccCampaignWorkflowNodeProviderControllerResolver: vi.fn(() => undefined),
   };
   runtime.cccCampaignProofBootstrapPromise = bootstrapCccCampaignProofAdmissionHost({
     builtRootPath: ENGINE_DIST_ROOT,
@@ -393,5 +422,223 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     });
     expect(runtime.executor.execute).not.toHaveBeenCalled();
     expect(runtime.executor.createAuthoritativeWorkflowCustomNodeRunner).not.toHaveBeenCalled();
+  });
+
+  it("Task 6 RED: recreates a real committed provider binding and holds its exact replay without another provider effect", async () => {
+    const store = h.store();
+    const rootDir = h.rootDir();
+    const baseCommit = await initializeGitRoot(rootDir);
+    const initial = createCccPrdImportTestBundle(rootDir, "task6-committed-replay");
+    const action = Object.freeze({
+      actionId: "ACTION-LIVE-EXECUTION",
+      actionTarget: "ccc-lab-super:pre-live-provider-gate",
+      requireProtected: true as const,
+    });
+    const source = rehashCccPrdImportTestBundle({
+      ...initial,
+      targetRepository: { ...initial.targetRepository, baseCommit },
+      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      tasks: initial.tasks.map((task, index) => index === 0
+        ? { ...task, protectedActionIds: [action.actionId] }
+        : task),
+      protectedActions: [{
+        id: action.actionId,
+        kind: "live_execution",
+        target: action.actionTarget,
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_live_execution",
+        spans: [initial.tasks[0]!.spans[0]!],
+      }],
+    });
+    await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: "runtime-real-pg-task6-committed-replay",
+      store,
+      layer: h.layer(),
+      rootDir,
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+    });
+    await commitGitRoot(rootDir, "campaign import");
+    const taskId = "TASK-task6-committed-replay";
+    const campaign = await store.getCccCampaignContextForTask(taskId);
+    if (!campaign) throw new Error("missing Task 6 campaign context");
+    const issued = await issueCccCampaignApproval(h.layer(), {
+      authorityStore: store,
+      rootDir,
+      taskId,
+      action,
+      requester: providerWorker,
+      runId: "issue-task6-committed-replay",
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    const claimToken = "claim-task6-committed-replay";
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: store,
+      rootDir,
+      taskId,
+      action,
+      claimant: providerWorker,
+      runId: "claim-task6-committed-replay",
+      claimToken,
+    });
+    const dispatch = Object.freeze({
+      turnKey: "turn-task6-committed-replay",
+      dispatchKey: "dispatch-task6-committed-replay",
+      providerId: campaign.route.providerId,
+      modelId: campaign.route.modelId,
+      transport: campaign.route.transport,
+    });
+    const reserved = await store.reserveCccProviderAttempt({
+      taskId,
+      actionId: action.actionId,
+      actionTarget: action.actionTarget,
+      ...dispatch,
+    });
+    await expect(store.beginCccProviderAttemptDispatch({
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    })).resolves.toMatchObject({ kind: "dispatch-permit" });
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...reserved,
+      outcome: "committed",
+      evidenceDigest: "d".repeat(64),
+      observerId: "task6-committed-replay",
+    })).resolves.toMatchObject({ state: "committed" });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({
+      status: "consumed",
+      campaign: { claimToken },
+    });
+    await expect(store.inspectCccCampaignActionLease(taskId, action)).resolves.toBeNull();
+
+    const attemptsBeforeReplay = await queryRunAuditEvents(h.layer().db, { taskId });
+    const binding = await createCccCampaignProviderAttemptBinding({
+      layer: h.layer(),
+      rootDir,
+      authorityStore: store,
+      semanticTaskId: taskId,
+      turnKey: dispatch.turnKey,
+      expectedRoute: {
+        transport: "pi",
+        providerId: campaign.route.providerId,
+        modelId: campaign.route.modelId,
+      },
+    });
+    await expect(binding.controller.preDispatch(dispatch)).resolves.toMatchObject({
+      kind: "hold",
+      reason: "terminal",
+      scope: { attemptKey: reserved.attemptKey, state: "committed" },
+    });
+    await expect(store.getCccCampaignContextForTask(taskId)).resolves.toMatchObject({ requestCount: 1 });
+    const attemptsAfterReplay = await queryRunAuditEvents(h.layer().db, { taskId });
+    expect(attemptsAfterReplay).toHaveLength(attemptsBeforeReplay.length);
+  });
+
+  it("Task 6 P1 RED: refuses a cross-wired same-task settlement before consuming its approval", async () => {
+    const store = h.store();
+    const rootDir = h.rootDir();
+    const baseCommit = await initializeGitRoot(rootDir);
+    const initial = createCccPrdImportTestBundle(rootDir, "task6-provider-identity");
+    const action = Object.freeze({
+      actionId: "ACTION-LIVE-EXECUTION",
+      actionTarget: "ccc-lab-super:pre-live-provider-gate",
+      requireProtected: true as const,
+    });
+    const source = rehashCccPrdImportTestBundle({
+      ...initial,
+      targetRepository: { ...initial.targetRepository, baseCommit },
+      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      tasks: initial.tasks.map((task, index) => index === 0
+        ? { ...task, protectedActionIds: [action.actionId] }
+        : task),
+      protectedActions: [{
+        id: action.actionId,
+        kind: "live_execution",
+        target: action.actionTarget,
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_live_execution",
+        spans: [initial.tasks[0]!.spans[0]!],
+      }],
+    });
+    await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: "runtime-real-pg-task6-provider-identity",
+      store,
+      layer: h.layer(),
+      rootDir,
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+    });
+    await commitGitRoot(rootDir, "campaign import");
+    const taskId = "TASK-task6-provider-identity";
+    const campaign = await store.getCccCampaignContextForTask(taskId);
+    if (!campaign) throw new Error("missing Task 6 provider-identity campaign context");
+    const issued = await issueCccCampaignApproval(h.layer(), {
+      authorityStore: store,
+      rootDir,
+      taskId,
+      action,
+      requester: providerWorker,
+      runId: "issue-task6-provider-identity",
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    const claimToken = "claim-task6-provider-identity";
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: store,
+      rootDir,
+      taskId,
+      action,
+      claimant: providerWorker,
+      runId: "claim-task6-provider-identity",
+      claimToken,
+    });
+    const dispatchA = Object.freeze({
+      turnKey: "turn-task6-provider-identity-A",
+      dispatchKey: "dispatch-task6-provider-identity-A",
+      providerId: campaign.route.providerId,
+      modelId: campaign.route.modelId,
+      transport: campaign.route.transport,
+    });
+    const dispatchB = Object.freeze({
+      turnKey: "turn-task6-provider-identity-B",
+      dispatchKey: "dispatch-task6-provider-identity-B",
+      providerId: campaign.route.providerId,
+      modelId: campaign.route.modelId,
+      transport: campaign.route.transport,
+    });
+    const bindingA = await createCccCampaignProviderAttemptBinding({
+      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId: taskId, turnKey: dispatchA.turnKey,
+      expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
+    });
+    const bindingB = await createCccCampaignProviderAttemptBinding({
+      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId: taskId, turnKey: dispatchB.turnKey,
+      expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
+    });
+    const permitB = await bindingB.controller.preDispatch(dispatchB);
+    if (permitB.kind !== "dispatch-permit") throw new Error("expected Task 6 B dispatch permit");
+    const auditsBefore = await queryRunAuditEvents(h.layer().db, { taskId });
+
+    await expect(bindingA.controller.reconcile({
+      ...permitB.scope,
+      turnKey: dispatchA.turnKey,
+      dispatchKey: dispatchA.dispatchKey,
+      outcome: "committed",
+      evidenceDigest: "e".repeat(64),
+      observerId: "task6-provider-identity",
+    })).rejects.toThrow(/identity|turn/i);
+
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: permitB.scope.attemptKey })).resolves.toMatchObject({
+      state: "dispatched_unknown",
+      controllerToken: permitB.scope.controllerToken,
+    });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({
+      status: "claimed",
+      campaign: { claimToken },
+    });
+    await expect(store.inspectCccCampaignActionLease(taskId, action)).resolves.toMatchObject({
+      lease: { claimToken },
+    });
+    expect(await queryRunAuditEvents(h.layer().db, { taskId })).toHaveLength(auditsBefore.length);
   });
 });

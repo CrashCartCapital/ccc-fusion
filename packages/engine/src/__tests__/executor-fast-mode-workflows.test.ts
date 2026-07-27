@@ -6,6 +6,9 @@
 // standard / undefined executionMode data states, and the executor tool
 // injection surface (fn_review_step is deleted in both modes) vs mandatory fn_task_done.
 import { describe, it, expect, vi, beforeEach } from "vitest";
+const { createCccCampaignProviderAttemptBindingMock } = vi.hoisted(() => ({
+  createCccCampaignProviderAttemptBindingMock: vi.fn(),
+}));
 import "./executor-test-helpers.js";
 import { getBuiltinWorkflow } from "@fusion/core";
 import { TaskExecutor } from "../executor.js";
@@ -25,6 +28,10 @@ import {
   mockedStatSync,
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
+
+vi.mock("../ccc-campaign-provider-controller.js", () => ({
+  createCccCampaignProviderAttemptBinding: createCccCampaignProviderAttemptBindingMock,
+}));
 
 const now = "2026-06-10T00:00:00.000Z";
 
@@ -78,6 +85,7 @@ describe("fast mode workflow/runtime invariants", () => {
     resetExecutorMocks();
     clearPreHeldExecutorSlotsForTests();
     mockedExistsSync.mockReturnValue(true);
+    createCccCampaignProviderAttemptBindingMock.mockReset();
   });
 
   it.each(["persisted context", "imported marker"])("Task 3 RED: public execute refuses %s before dependency and ephemeral side effects", async (caseName) => {
@@ -1315,6 +1323,120 @@ describe("fast mode workflow/runtime invariants", () => {
 
     expect(result.value).toBe("awaiting-input");
     expect(awaitInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("Task 6 RED: fenced CCC graph model node refuses before native Pi session when provider binding cannot be created", async () => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/ccc-provider-binding",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    const failure = new Error("provider attempt is not admitted");
+    createCccCampaignProviderAttemptBindingMock.mockRejectedValueOnce(failure);
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence: Object.freeze({ workItemId: "wi-provider-binding", attempt: 1, runId: "FN-6226-run" }),
+      providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+
+    await expect((executor as any).executeWorkflowStep(
+      nodeTask,
+      {
+        id: "provider-model",
+        name: "Provider model",
+        mode: "prompt",
+        phase: "pre-merge",
+        gateMode: "advisory",
+        prompt: "Do the bounded work.",
+        toolMode: "readonly",
+        enabled: true,
+      },
+      "/tmp/ccc-provider-binding",
+      { executionProvider: "openai", executionModelId: "gpt-4o" },
+      undefined,
+      { execution },
+    )).rejects.toThrow("provider attempt is not admitted");
+
+    expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledTimes(1);
+    expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+    expect(store.logEntry).not.toHaveBeenCalled();
+  });
+
+  it("Task 6 RED: fenced CCC graph model node passes sealed provider attempt binding to native Pi with actual provider and model", async () => {
+    const nodeTask = task({
+      executionMode: "fast",
+      worktree: "/tmp/ccc-provider-binding",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    const signal = new AbortController().signal;
+    const turnKey = "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const binding = Object.freeze({
+      turnKey,
+      controller: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
+    });
+    createCccCampaignProviderAttemptBindingMock.mockResolvedValueOnce(binding);
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+      },
+    });
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "FN-6226-semantic",
+      semanticTask: task({ id: "FN-6226-semantic" }),
+      runId: "FN-6226-run",
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence: Object.freeze({ workItemId: "wi-provider-binding", attempt: 1, runId: "FN-6226-run" }),
+      providerAttemptTurnKey: turnKey,
+    });
+
+    await (executor as any).executeWorkflowStep(
+      nodeTask,
+      {
+        id: "provider-model",
+        name: "Provider model",
+        mode: "prompt",
+        phase: "pre-merge",
+        gateMode: "advisory",
+        prompt: "Do the bounded work.",
+        toolMode: "readonly",
+        enabled: true,
+      },
+      "/tmp/ccc-provider-binding",
+      { executionProvider: "openai", executionModelId: "gpt-4o" },
+      undefined,
+      { execution, signal },
+    );
+
+    expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledWith(expect.objectContaining({
+      semanticTaskId: "FN-6226-semantic",
+      turnKey: execution.providerAttemptTurnKey,
+      signal,
+      expectedRoute: Object.freeze({ providerId: "openai", modelId: "gpt-4o", transport: "pi" }),
+    }));
+    expect(mockedCreateFnAgent).toHaveBeenCalledWith(expect.objectContaining({
+      runtimeHint: "pi",
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+      cccProviderAttemptBinding: binding,
+    }));
+    const piOptions = mockedCreateFnAgent.mock.calls.find(([options]: any[]) => options?.cccProviderAttemptBinding === binding)?.[0] as any;
+    expect(piOptions.cccProviderAttemptBinding).toBe(binding);
+    expect(Object.isFrozen(binding)).toBe(true);
+    expect(Object.isFrozen(binding.controller)).toBe(true);
+    expect(binding.turnKey).toBe(execution.providerAttemptTurnKey);
   });
 
   it("Task 4 RED: fenced CLI node without a host-native binding refuses before log or session effects", async () => {
