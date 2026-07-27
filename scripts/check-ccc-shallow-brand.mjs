@@ -5,12 +5,13 @@ ccc-fusion is a shallow-branded fork (CF-018 / CF-DIV-008): the operator-facing
 name is "ccc-fusion", but internal package/bin identifiers stay upstream
 (@fusion/*, @runfusion/fusion, fn/fusion bins) so upstream diffs stay
 mergeable. This verifier enforces that boundary from BOTH directions — no
-upstream identifier may be renamed away, and no "ccc-" identifier may leak
-into the internal package graph or the CLI bin block — plus that the operator
-alias (scripts/ccc-fusion) exists, is executable, and README.md actually
-names ccc-fusion for discoverability. Checks are pure functions over already-
-read file contents so --self-test can drive them with synthetic fixtures
-without touching any tracked file.
+upstream identifier may be renamed away, and no "ccc" identifier may leak
+into the internal package graph (as a bare name, scope, or scoped basename)
+or claim a CLI-reserved bin name outside the two legitimate CLI-entry
+packages — plus that the operator alias (scripts/ccc-fusion) exists, is
+executable, and README.md actually names ccc-fusion for discoverability.
+Checks are pure functions over already-read file contents so --self-test can
+drive them with synthetic fixtures without touching any tracked file.
 */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -19,9 +20,14 @@ import { fileURLToPath } from "node:url";
 export const EXPECTED_CLI_PACKAGE_NAME = "@runfusion/fusion";
 export const EXPECTED_ROOT_PACKAGE_NAME = "fusion-workspace";
 export const EXPECTED_CLI_BIN_KEYS = ["agent-browser", "fn", "fusion"];
-export const FORBIDDEN_NAME_PREFIX = "ccc-";
+export const FORBIDDEN_NAME_PREFIX = "ccc";
 export const WRAPPER_RELATIVE_PATH = "scripts/ccc-fusion";
 export const README_MARKER = "ccc-fusion";
+export const RIVAL_BIN_NAMES = ["fn", "fusion", "agent-browser", "ccc-fusion"];
+// The only two packages allowed to publish a CLI entrypoint under these bin
+// names: the real CLI, and its thin npm-alias forwarder (packages/cli-alias
+// depends on @runfusion/fusion and re-execs into it — same brand, not a rival).
+export const RIVAL_BIN_ALLOWED_PACKAGE_DIRS = ["packages/cli", "packages/cli-alias"];
 
 /** (a) packages/cli/package.json must keep the exact upstream name and bin block. */
 export function checkCliPackageJson(cliPackageJson) {
@@ -60,16 +66,64 @@ export function checkRootPackageJson(rootPackageJson) {
 }
 
 /**
- * (c) No package under packages/* or plugins/* may declare a "ccc-" prefixed
- * name — internal identifiers stay upstream; ccc-fusion is operator-facing
- * naming only.
+ * Split a package name into its scope (without "@", or null when unscoped)
+ * and basename. For an unscoped name the "basename" is the whole name.
+ * @param {string} name
+ */
+function splitPackageName(name) {
+  const match = /^@([^/]+)\/(.+)$/.exec(name);
+  if (!match) return { scope: null, basename: name };
+  return { scope: match[1], basename: match[2] };
+}
+
+/**
+ * (c) No package under packages/* or plugins/* may declare a "ccc"-prefixed
+ * identifier — internal identifiers stay upstream; ccc-fusion is
+ * operator-facing naming only. This is a brand-takeover guard from BOTH the
+ * scope and the basename: an unscoped name like "ccc-core", a scoped
+ * basename like "@fusion/ccc-thing", and a scope itself like
+ * "@ccc-fusion/x" or "@ccc/x" are all rejected, so renaming into a "ccc"
+ * scope cannot dodge the older unscoped-only check.
  * @param {Array<{path: string, name: unknown}>} entries
  */
 export function checkNoCccPrefixedPackageNames(entries) {
   const violations = [];
   for (const entry of entries) {
-    if (typeof entry.name === "string" && entry.name.startsWith(FORBIDDEN_NAME_PREFIX)) {
-      violations.push(`${entry.path}: package name "${entry.name}" starts with "${FORBIDDEN_NAME_PREFIX}" (shallow-brand violation)`);
+    if (typeof entry.name !== "string") continue;
+    const { scope, basename } = splitPackageName(entry.name);
+    if (scope !== null && scope.startsWith(FORBIDDEN_NAME_PREFIX)) {
+      violations.push(
+        `${entry.path}: package name "${entry.name}" has scope "@${scope}" starting with "${FORBIDDEN_NAME_PREFIX}" (shallow-brand takeover)`,
+      );
+      continue;
+    }
+    if (basename.startsWith(FORBIDDEN_NAME_PREFIX)) {
+      violations.push(
+        `${entry.path}: package name "${entry.name}" starts with "${FORBIDDEN_NAME_PREFIX}" (shallow-brand takeover)`,
+      );
+    }
+  }
+  return violations;
+}
+
+/**
+ * (f) No package under packages/* or plugins/* other than the two
+ * legitimate CLI-entry packages (RIVAL_BIN_ALLOWED_PACKAGE_DIRS) may declare
+ * a bin named fn, fusion, agent-browser, or ccc-fusion — a rival package
+ * could otherwise shadow the real CLI's commands on a user's PATH.
+ * @param {Array<{path: string, bin: unknown}>} entries
+ */
+export function checkNoRivalBinDeclarations(entries) {
+  const violations = [];
+  for (const entry of entries) {
+    const packageDir = entry.path.replace(/\/package\.json$/, "");
+    if (RIVAL_BIN_ALLOWED_PACKAGE_DIRS.includes(packageDir)) continue;
+    if (!entry.bin || typeof entry.bin !== "object") continue;
+    const rivalKeys = Object.keys(entry.bin).filter((key) => RIVAL_BIN_NAMES.includes(key));
+    if (rivalKeys.length > 0) {
+      violations.push(
+        `${entry.path}: declares rival bin name(s) ${rivalKeys.join(", ")} — reserved for ${RIVAL_BIN_ALLOWED_PACKAGE_DIRS.join(" and ")} (rival-bin guard)`,
+      );
     }
   }
   return violations;
@@ -114,6 +168,7 @@ export function runShallowBrandChecks({
     ...checkRootPackageJson(rootPackageJson),
     ...checkCliPackageJson(cliPackageJson),
     ...checkNoCccPrefixedPackageNames(packageNameEntries),
+    ...checkNoRivalBinDeclarations(packageNameEntries),
     ...checkWrapperExecutable(wrapperStatus),
     ...checkReadmeMentionsCccFusion(readmeContent),
   ];
@@ -130,7 +185,7 @@ function readJsonIfExists(path) {
   }
 }
 
-/** Collect {path, name} for every packages/*\/package.json and plugins/*\/package.json. */
+/** Collect {path, name, bin} for every packages/*\/package.json and plugins/*\/package.json. */
 function collectPackageNameEntries(repoRoot) {
   const entries = [];
   for (const group of ["packages", "plugins"]) {
@@ -147,7 +202,7 @@ function collectPackageNameEntries(repoRoot) {
       const relativePath = `${group}/${child.name}/package.json`;
       const manifest = readJsonIfExists(join(groupDir, child.name, "package.json"));
       if (manifest === undefined) continue;
-      entries.push({ path: relativePath, name: manifest.name });
+      entries.push({ path: relativePath, name: manifest.name, bin: manifest.bin });
     }
   }
   return entries;
@@ -271,14 +326,75 @@ export function selfTest() {
     "cli-package-json:bin-extra",
   );
 
-  // (c) A workspace package leaks a "ccc-" prefixed internal name.
+  // (c) A workspace package leaks a "ccc" prefixed internal name — unscoped.
   assertViolationContains(
     checkNoCccPrefixedPackageNames([
       { path: "packages/core/package.json", name: "@fusion/core" },
       { path: "packages/ccc-thing/package.json", name: "ccc-thing" },
     ]),
-    'package name "ccc-thing" starts with "ccc-"',
-    "no-ccc-prefixed-names:leak",
+    'package name "ccc-thing" starts with "ccc"',
+    "no-ccc-prefixed-names:leak-unscoped",
+  );
+
+  // (c) Unscoped basename exactly matching the reviewer's example, "ccc-core".
+  assertViolationContains(
+    checkNoCccPrefixedPackageNames([{ path: "packages/ccc-core/package.json", name: "ccc-core" }]),
+    'package name "ccc-core" starts with "ccc"',
+    "no-ccc-prefixed-names:ccc-core",
+  );
+
+  // (c) A scoped rename can no longer dodge the check via scope: "@ccc-fusion/x".
+  assertViolationContains(
+    checkNoCccPrefixedPackageNames([{ path: "packages/core/package.json", name: "@ccc-fusion/x" }]),
+    'has scope "@ccc-fusion" starting with "ccc"',
+    "no-ccc-prefixed-names:scope-ccc-fusion",
+  );
+
+  // (c) Bare "@ccc/x" scope is also a brand takeover.
+  assertViolationContains(
+    checkNoCccPrefixedPackageNames([{ path: "packages/core/package.json", name: "@ccc/x" }]),
+    'has scope "@ccc" starting with "ccc"',
+    "no-ccc-prefixed-names:scope-ccc-bare",
+  );
+
+  // (c) Accept: current real upstream-scoped names pass clean.
+  assertNoViolations(
+    checkNoCccPrefixedPackageNames([
+      { path: "packages/cli/package.json", name: "@runfusion/fusion" },
+      { path: "packages/core/package.json", name: "@fusion/core" },
+      { path: "plugins/fusion-plugin-reports/package.json", name: "@fusion-plugin-examples/reports" },
+      { path: "packages/cli-alias/package.json", name: "runfusion.ai" },
+    ]),
+    "no-ccc-prefixed-names:accept-current-shapes",
+  );
+
+  // (f) rival-bin guard: a plugin declaring the reserved "fn" bin is rejected.
+  assertViolationContains(
+    checkNoRivalBinDeclarations([
+      { path: "plugins/fusion-plugin-rogue/package.json", bin: { fn: "./index.js" } },
+    ]),
+    "plugins/fusion-plugin-rogue/package.json: declares rival bin name(s) fn",
+    "no-rival-bin:leak",
+  );
+
+  // (f) rival-bin guard: a package claiming the "ccc-fusion" bin name is rejected too.
+  assertViolationContains(
+    checkNoRivalBinDeclarations([
+      { path: "packages/impostor/package.json", bin: { "ccc-fusion": "./index.js" } },
+    ]),
+    "packages/impostor/package.json: declares rival bin name(s) ccc-fusion",
+    "no-rival-bin:ccc-fusion-bin",
+  );
+
+  // (f) rival-bin guard: accept the two legitimate CLI-entry packages, and
+  // packages with no bin block at all.
+  assertNoViolations(
+    checkNoRivalBinDeclarations([
+      { path: "packages/cli/package.json", bin: { "agent-browser": "x", fn: "x", fusion: "x" } },
+      { path: "packages/cli-alias/package.json", bin: { "runfusion.ai": "x", runfusion: "x", fn: "x", fusion: "x" } },
+      { path: "packages/core/package.json", bin: undefined },
+    ]),
+    "no-rival-bin:accept-current-shapes",
   );
 
   // (d) Wrapper missing, and wrapper present but not executable.
@@ -308,7 +424,7 @@ export function selfTest() {
     wrapperStatus: { exists: true, executable: true },
     readmeContent: "see ccc-fusion",
   });
-  assertViolationContains(mixedViolations, 'package name "ccc-runtime" starts with "ccc-"', "runShallowBrandChecks:mixed");
+  assertViolationContains(mixedViolations, 'package name "ccc-runtime" starts with "ccc"', "runShallowBrandChecks:mixed");
 
   console.log("check-ccc-shallow-brand self-test passed");
   return 0;

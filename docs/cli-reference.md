@@ -1366,7 +1366,9 @@ The candidate's `review` payload reports bounded **ambiguity**, **exception**, a
 fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
 ```
 
-Same candidate-sidecar contract as the native form, but with zero live-provider calls: `<proposal-path>` is a pre-built JSON file already shaped like the authoring adapter's candidate output, and the CLI reads it in directly instead of dispatching a provider request. This is the deterministic path used by fixtures, canaries, and any workflow that needs a reproducible sidecar without a live model in the loop.
+Same sidecar schema and output shape as the native form — and the same downstream `fn prd validate`/`fn prd compile` enforcement once a sidecar exists — but with zero live-provider calls: `<proposal-path>` is a pre-built JSON file already shaped like the authoring adapter's candidate output, and the CLI reads it in directly instead of dispatching a provider request. This is the deterministic path used by fixtures, canaries, and any workflow that needs a reproducible sidecar without a live model in the loop.
+
+This compatibility form does **not** get the native form's authoring-time constraint enforcement: it passes no target repository, no execution bounds, no `--max-review-items` ceiling, and no previous sidecar into authoring, so the target/bounds drift checks, the review-item ceiling check, and the previous-sidecar identity-drift check are all skipped at authoring time. A malformed or out-of-bounds proposal file is only caught later, by `fn prd validate`/`fn prd compile` against `<expected-target>`/`<expected-base>` and full sidecar structural validation — not by `fn prd author` itself on this route.
 
 ### `fn prd validate`
 
