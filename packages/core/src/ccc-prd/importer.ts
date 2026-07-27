@@ -29,6 +29,8 @@ import {
 import { CccPrdImportError } from "./import-error.js";
 import { buildCccPrdProjection, CCC_PRD_IMPORT_PREPARED_STATUS, nativeCccPrdScopedId, preparedCccPrdTask, type PreparedCccPrdProjection } from "./projection.js";
 import type { CccPrdImportEntityType, CccPrdImportIntent, CccPrdSemanticBundle, CccPrdWorkflow } from "./types.js";
+import { parseWorkflowIr } from "../workflow-ir.js";
+import type { WorkflowIr, WorkflowIrEdge, WorkflowIrNode } from "../workflow-ir-types.js";
 
 const STAGING_PREFIX = join(".fusion", "ccc-prd-import-staging");
 const RETRYABLE_SQLSTATES = new Set(["40001", "40P01"]);
@@ -488,17 +490,20 @@ function nativeWorkflowTaskNodeId(taskId: string): string {
   return `ccc-task-${sha256(taskId).slice(0, 24)}`;
 }
 
+function nativeWorkflowSplitNodeId(taskId: string): string {
+  return `ccc-split-${sha256(taskId).slice(0, 24)}`;
+}
+
+function nativeWorkflowJoinNodeId(taskId: string): string {
+  return `ccc-join-${sha256(taskId).slice(0, 24)}`;
+}
+
 function nativeWorkflowIr(
   bundle: CccPrdSemanticBundle,
   workflow: CccPrdWorkflow,
-): {
-  version: "v1";
-  name: string;
-  nodes: Array<Record<string, unknown>>;
-  edges: Array<{ from: string; to: string; condition?: "success" }>;
-} {
+): WorkflowIr {
   const taskById = new Map(bundle.tasks.map((task) => [task.id, task]));
-  const taskNodes = workflow.taskIds.map((taskId) => {
+  const taskNodes: WorkflowIrNode[] = workflow.taskIds.map((taskId) => {
     const task = taskById.get(taskId);
     if (!task) {
       throw new CccPrdImportError(
@@ -516,7 +521,7 @@ function nativeWorkflowIr(
       },
     };
   });
-  const dependencyEdges = bundle.edges
+  const dependencyEdges: WorkflowIrEdge[] = bundle.edges
     .filter((edge) =>
       workflow.taskIds.includes(edge.fromTaskId)
       && workflow.taskIds.includes(edge.toTaskId))
@@ -525,12 +530,48 @@ function nativeWorkflowIr(
       to: nativeWorkflowTaskNodeId(edge.fromTaskId),
       condition: "success" as const,
     }));
-  return {
-    version: "v1",
+  const outgoing = new Map<string, WorkflowIrEdge[]>();
+  const incoming = new Map<string, WorkflowIrEdge[]>();
+  for (const edge of dependencyEdges) {
+    const from = outgoing.get(edge.from) ?? [];
+    from.push(edge);
+    outgoing.set(edge.from, from);
+    const to = incoming.get(edge.to) ?? [];
+    to.push(edge);
+    incoming.set(edge.to, to);
+  }
+  const splitTaskIds = workflow.taskIds.filter((taskId) => (outgoing.get(nativeWorkflowTaskNodeId(taskId))?.length ?? 0) > 1);
+  const joinTaskIds = workflow.taskIds.filter((taskId) => (incoming.get(nativeWorkflowTaskNodeId(taskId))?.length ?? 0) > 1);
+  const splitByTaskNodeId = new Map(splitTaskIds.map((taskId) => [nativeWorkflowTaskNodeId(taskId), nativeWorkflowSplitNodeId(taskId)]));
+  const joinByTaskNodeId = new Map(joinTaskIds.map((taskId) => [nativeWorkflowTaskNodeId(taskId), nativeWorkflowJoinNodeId(taskId)]));
+  const topologyEdges: WorkflowIrEdge[] = dependencyEdges.map((edge) => ({
+    ...edge,
+    from: splitByTaskNodeId.get(edge.from) ?? edge.from,
+    to: joinByTaskNodeId.get(edge.to) ?? edge.to,
+  }));
+  for (const [taskNodeId, splitNodeId] of splitByTaskNodeId) {
+    topologyEdges.push({ from: taskNodeId, to: splitNodeId, condition: "success" });
+  }
+  for (const [taskNodeId, joinNodeId] of joinByTaskNodeId) {
+    topologyEdges.push({ from: joinNodeId, to: taskNodeId, condition: "success" });
+  }
+  const ir: WorkflowIr = {
+    version: "v2",
     name: workflow.title,
+    columns: [],
     nodes: [
       { id: "start", kind: "start" },
       ...taskNodes,
+      ...splitTaskIds.map((taskId) => ({
+        id: nativeWorkflowSplitNodeId(taskId),
+        kind: "split" as const,
+        config: { cccPrdTaskId: taskId },
+      })),
+      ...joinTaskIds.map((taskId) => ({
+        id: nativeWorkflowJoinNodeId(taskId),
+        kind: "join" as const,
+        config: { mode: "all", cccPrdTaskId: taskId },
+      })),
       { id: "end", kind: "end" },
     ],
     edges: [
@@ -539,7 +580,7 @@ function nativeWorkflowIr(
         to: nativeWorkflowTaskNodeId(taskId),
         condition: "success" as const,
       })),
-      ...dependencyEdges,
+      ...topologyEdges,
       ...workflow.terminalTaskIds.map((taskId) => ({
         from: nativeWorkflowTaskNodeId(taskId),
         to: "end",
@@ -547,6 +588,7 @@ function nativeWorkflowIr(
       })),
     ],
   };
+  return parseWorkflowIr(ir);
 }
 
 async function writeDocuments(

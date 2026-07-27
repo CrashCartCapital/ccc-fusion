@@ -397,6 +397,100 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect((await h.store().listWorkflowDefinitions()).map(({ id }) => id)).toContain(expectedNativeWorkflowId);
   });
 
+  it("Task 6 RED: imports explicit split join topology for a dependency diamond", async () => {
+    const suffix = "task6-diamond";
+    const key = "idem-task6-diamond";
+    const base = bundle(h.rootDir(), suffix);
+    const [taskA, taskD] = base.tasks;
+    expect(taskA).toBeDefined();
+    expect(taskD).toBeDefined();
+    const workflow = base.workflows[0]!;
+    const taskB = {
+      ...taskD!,
+      id: `TASK-${suffix}-B`,
+      title: "Diamond branch B",
+      description: "First parallel branch.",
+      dependencyTaskIds: [taskA!.id],
+      documentIds: [],
+      artifactIds: [],
+    };
+    const taskC = {
+      ...taskD!,
+      id: `TASK-${suffix}-C`,
+      title: "Diamond branch C",
+      description: "Second parallel branch.",
+      dependencyTaskIds: [taskA!.id],
+      documentIds: [],
+      artifactIds: [],
+    };
+    const diamond = rehashBundle({
+      ...base,
+      tasks: [
+        { ...taskA!, dependencyTaskIds: [] },
+        { ...taskB, workflowId: workflow.id },
+        { ...taskC, workflowId: workflow.id },
+        { ...taskD!, dependencyTaskIds: [taskB.id, taskC.id] },
+      ],
+      edges: [
+        { id: `EDGE-${suffix}-B-A`, fromTaskId: taskB.id, toTaskId: taskA!.id, kind: "depends_on" },
+        { id: `EDGE-${suffix}-C-A`, fromTaskId: taskC.id, toTaskId: taskA!.id, kind: "depends_on" },
+        { id: `EDGE-${suffix}-D-B`, fromTaskId: taskD!.id, toTaskId: taskB.id, kind: "depends_on" },
+        { id: `EDGE-${suffix}-D-C`, fromTaskId: taskD!.id, toTaskId: taskC.id, kind: "depends_on" },
+      ],
+      workflows: [{
+        ...workflow,
+        taskIds: [taskA!.id, taskB.id, taskC.id, taskD!.id],
+        entryTaskIds: [taskA!.id],
+        terminalTaskIds: [taskD!.id],
+      }],
+      importIntents: [
+        ...base.importIntents.filter((intent) => intent.entityType !== "task" && intent.entityType !== "dependency_edge"),
+        ...[taskA!.id, taskB.id, taskC.id, taskD!.id].map((entityId) => ({
+          id: entityId,
+          entityType: "task" as const,
+          entityId,
+          operation: "create" as const,
+          target: h.rootDir(),
+        })),
+        ...[`EDGE-${suffix}-B-A`, `EDGE-${suffix}-C-A`, `EDGE-${suffix}-D-B`, `EDGE-${suffix}-D-C`].map((entityId) => ({
+          id: entityId,
+          entityType: "dependency_edge" as const,
+          entityId,
+          operation: "create" as const,
+          target: h.rootDir(),
+        })),
+      ],
+    });
+
+    const imported = await importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: diamond,
+      executionPolicy: executionPolicy(diamond),
+    });
+    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--${workflow.id}`);
+    const ir = stored?.ir as {
+      version: string;
+      columns: unknown[];
+      nodes: Array<{ id: string; kind: string; config?: Record<string, unknown> }>;
+      edges: Array<{ from: string; to: string }>;
+    };
+    const split = ir.nodes.find((node) => node.kind === "split");
+    const join = ir.nodes.find((node) => node.kind === "join");
+    const taskNodeId = (taskId: string) => `ccc-task-${createHash("sha256").update(taskId).digest("hex").slice(0, 24)}`;
+    expect(ir.version).toBe("v2");
+    expect(ir.columns).toEqual([]);
+    expect(split).toBeDefined();
+    expect(join).toBeDefined();
+    expect(ir.edges).toContainEqual({ from: taskNodeId(taskA!.id), to: split!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(taskB.id), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(taskC.id), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(taskB.id), to: join!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(taskC.id), to: join!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: join!.id, to: taskNodeId(taskD!.id), condition: "success" });
+    expect(ir.edges).not.toContainEqual({ from: taskNodeId(taskB.id), to: taskNodeId(taskD!.id), condition: "success" });
+    expect(ir.edges).not.toContainEqual({ from: taskNodeId(taskC.id), to: taskNodeId(taskD!.id), condition: "success" });
+  });
+
   it("commits exact semantic counts, projects task/document/artifact readers, and remains visible after restart", async () => {
     const key = "idem-success";
     const imported = await importCccPrdBundle(request("success", key));
