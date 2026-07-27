@@ -533,4 +533,84 @@ describe("CCC native CLI campaign-held lifecycle", () => {
       expect(settledCalls.at(-1)).toEqual(["rejected", expect.objectContaining({ code: "CLI_CANCELLATION_TIMEOUT" })]);
     },
   );
+
+  it("Task 4 RED: held close is bounded when native MCP proxy disposal blocks", async () => {
+    const timeoutMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
+
+    vi.useFakeTimers();
+
+    const { manager, pty, spawn, store } = createHarness();
+    const lifecycleManager = manager as unknown as CccLifecycleManager;
+    const session = await spawn();
+    pty.pty.kill.mockImplementation(() => queueMicrotask(() => pty.exit(-1, 15)));
+
+    const privateManager = manager as unknown as {
+      sessions: Map<string, { nativeMcpProxy?: { dispose: () => Promise<void> } }>;
+    };
+    const live = privateManager.sessions.get(session.id);
+    expect(live).toBeDefined();
+    const originalProxy = live!.nativeMcpProxy;
+
+    let releaseDispose: (() => void) | undefined;
+    const blockedDispose = new Promise<void>((resolve) => {
+      releaseDispose = resolve;
+    }).then(async () => originalProxy?.dispose());
+    live!.nativeMcpProxy = {
+      dispose: vi.fn(() => blockedDispose),
+    };
+
+    const settled = vi.fn();
+    try {
+      const close = lifecycleManager.closeCccNativeCliSession(session.id, "cancel");
+      close.then(
+        (receipt) => {
+          settled("resolved", receipt);
+        },
+        (error) => {
+          settled("rejected", error);
+        },
+      );
+
+      const timeout = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error("TEST_PROXY_DISPOSAL_BOUND_EXCEEDED"));
+        }, timeoutMs + 1);
+      });
+      const bounded = Promise.race([close, timeout]);
+      const boundedAssertion = expect(bounded).rejects.toMatchObject({
+        code: "NATIVE_MCP_PROXY_DISPOSAL_TIMEOUT",
+        message: expect.stringContaining("total closure budget"),
+      });
+      await vi.advanceTimersByTimeAsync(timeoutMs);
+      await boundedAssertion;
+      expect(settled).toHaveBeenCalledWith(
+        "rejected",
+        expect.objectContaining({
+          code: "NATIVE_MCP_PROXY_DISPOSAL_TIMEOUT",
+          message: expect.stringContaining("total closure budget"),
+        }),
+      );
+      expect((store.getSession(session.id) as StoredSession | undefined)).toEqual(
+        expect.objectContaining({
+          agentState: "needsAttention",
+          terminationReason: null,
+          autonomyPosture: expect.objectContaining({
+            cccControllerFenced: false,
+            cccCancellationState: "NATIVE_MCP_PROXY_DISPOSAL_FAILED",
+          }),
+        }),
+      );
+      expect(manager.activeCount()).toBe(1);
+      expect(pty.pty.kill).toHaveBeenCalledWith("SIGTERM");
+
+      const rowClosureState = (store.getSession(session.id) as StoredSession | undefined)?.autonomyPosture?.cccNativeCliClosureState;
+      expect(rowClosureState).not.toBe("held-closed");
+    } finally {
+      expect(typeof releaseDispose).toBe("function");
+      releaseDispose?.();
+      await blockedDispose;
+      await (manager as unknown as CccLifecycleManager).closeCccNativeCliSession(session.id, "cancel").catch(() => undefined);
+      expect(manager.activeCount()).toBe(1);
+    }
+  });
 });

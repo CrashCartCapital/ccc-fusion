@@ -147,6 +147,16 @@ export class CliCancellationTimeoutError extends Error {
   }
 }
 
+/** The owned native MCP proxy did not close inside the campaign's total closure budget. */
+export class NativeMcpProxyDisposalTimeoutError extends Error {
+  readonly code = "NATIVE_MCP_PROXY_DISPOSAL_TIMEOUT";
+
+  constructor(public readonly sessionId: string, public readonly timeoutMs: number) {
+    super(`Native MCP proxy disposal exceeded the total closure budget after ${timeoutMs}ms: ${sessionId}`);
+    this.name = "NativeMcpProxyDisposalTimeoutError";
+  }
+}
+
 /** The manager could not durably record an honest cancellation-attention state. */
 export class CliCancellationPersistenceError extends Error {
   readonly code = "CLI_CANCELLATION_PERSISTENCE_FAILED";
@@ -1360,23 +1370,64 @@ export class CliSessionManager {
   ): Promise<CccNativeCliHeldClosureReceipt> {
     const policy = live.cccNativeCliPolicy;
     if (!policy) throw new UnknownCliSessionError(live.id);
+    const closeStartedAtMs = Date.now();
+    const totalClosureBudgetMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
+    const absoluteClosureDeadlineMs = Math.min(
+      policy.deadlineAtMs,
+      closeStartedAtMs + totalClosureBudgetMs,
+    );
+
+    let processClosure: Promise<void> = Promise.resolve();
     if (!live.exitResult) {
       try {
         live.pty.kill("SIGTERM");
-        const waitTimeoutMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
-        await this.waitForRegisteredExit(live, waitTimeoutMs);
       } catch (cause) {
         await this.failCancellationWithoutClosure(
           live,
-          cause instanceof Error && typeof (cause as { code?: unknown }).code === "string"
-            && (cause as { code?: unknown }).code === "CLI_CANCELLATION_TIMEOUT"
-            ? "CANCELLATION_UNCONFIRMED"
-            : "CANCELLATION_SIGNAL_FAILED",
+          "CANCELLATION_SIGNAL_FAILED",
           cause instanceof Error ? cause : new CliCancellationSignalError(live.id, { cause }),
         );
       }
+      const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
+      processClosure = this.waitForRegisteredExit(live, remainingClosureBudgetMs);
     }
-    await this.disposeNativeMcpProxy(live);
+
+    const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
+    const proxyClosure = this.disposeNativeMcpProxy(live).then(
+      () => ({ closed: true as const }),
+      (cause: unknown) => ({ closed: false as const, cause }),
+    );
+    let proxyTimeout: ReturnType<typeof setTimeout> | undefined;
+    const proxyClosureWithinBudget = Promise.race([
+      proxyClosure,
+      new Promise<never>((_, reject) => {
+        proxyTimeout = setTimeout(
+          () => reject(new NativeMcpProxyDisposalTimeoutError(live.id, remainingClosureBudgetMs)),
+          remainingClosureBudgetMs,
+        );
+        proxyTimeout.unref?.();
+      }),
+    ]);
+
+    let proxyOutcome: Awaited<typeof proxyClosure>;
+    try {
+      [, proxyOutcome] = await Promise.all([processClosure, proxyClosureWithinBudget]);
+    } catch (cause) {
+      if (proxyTimeout) clearTimeout(proxyTimeout);
+      return this.failCancellationWithoutClosure(
+        live,
+        cause instanceof NativeMcpProxyDisposalTimeoutError
+          ? "NATIVE_MCP_PROXY_DISPOSAL_FAILED"
+          : "CANCELLATION_UNCONFIRMED",
+        cause,
+      );
+    } finally {
+      if (proxyTimeout) clearTimeout(proxyTimeout);
+    }
+    if ("cause" in proxyOutcome) {
+      await this.failCancellationWithoutClosure(live, "NATIVE_MCP_PROXY_DISPOSAL_FAILED", proxyOutcome.cause);
+    }
+
     await this.updateCccNativeCliHeldRow(live, policy);
     await this.store.flush();
     const exitCode = live.exitResult?.exitCode ?? -1;

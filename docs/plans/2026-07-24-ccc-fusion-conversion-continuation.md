@@ -751,3 +751,13 @@ The real invariant was repaired with explicit `{ slim: true, includeArchived: fa
 The engine full-package run is not valid host proof: enforced no-TTY SafeExec blocks on scratch Git checkout/revert/reset/stash caused `93` files / `342` test failures, alongside single-worker mock pollution. Treat that result as environment-invalid, not a product regression; do not bypass SafeExec.
 
 Fresh acceptance-relevant gates after the micro-fix all passed: `pnpm lint`; `pnpm typecheck` (`34/36`); `pnpm build` (dashboard `7163` modules); `FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm test` (engine `299/299`, PostgreSQL `10/10`, CLI `65/65`, zero leaks); Task 4 engine nine files `177/177`; and core Task 4 PostgreSQL two files `49/49`. Luna remains unavailable with Terra substitution; AGY remains unavailable and native Sol review remains planned. No acceptance is claimed.
+
+## Task 4 Proxy Closure Bound GREEN Transition — 2026-07-26
+
+Frozen candidate `b94dd45390d80ea13cb81feac0ff611960d9407d` was rejected by native Sol with P0 `0` and P1 `1`: proxy disposal could wait forever before the durable held floor. The candidate and its prior acceptance verdicts are invalidated.
+
+RED expected `NATIVE_MCP_PROXY_DISPOSAL_TIMEOUT` but observed `TEST_PROXY_DISPOSAL_BOUND_EXCEEDED`. GREEN uses one deadline, `min(policy.deadlineAtMs, closeStart + termGraceMs + killClosureMs)`, while process-group and proxy closure run concurrently. Proxy timeout or error maps to `NATIVE_MCP_PROXY_DISPOSAL_FAILED`; state stays `needsAttention`, the fence and registry slot remain held, and no closure receipt is emitted.
+
+Focused proof passed `1/1`; lifecycle passed `11/11`; the Task 4 engine nine-file lane passed `178/178`; core provider-controller plus CLI-session PostgreSQL passed `49/49`; engine typecheck, production/test ESLint, root lint, and `git diff --check` passed. The existing test-process `MaxListeners` warning remains visible.
+
+The repair is uncommitted and unaccepted. Fresh integrated gates and a new final-byte council are mandatory. Task 5 ownership of the long-lived runtime resolver/bootstrap and mixed queue is unchanged. Current state is `task4_proxy_closure_bound_green_integrated_proof_active`.

@@ -1023,3 +1023,13 @@ Fresh acceptance-relevant gates after the micro-fix:
 - Core Task 4 PostgreSQL two files — PASS, `49/49`.
 
 Luna remains unavailable with Terra substitution. AGY remains unavailable and native Sol review remains planned. These are pre-freeze gates, not acceptance.
+
+## Task 4 Proxy Closure Bound GREEN Transition — 2026-07-26
+
+Frozen candidate `b94dd45390d80ea13cb81feac0ff611960d9407d` was rejected by the native Sol lane with P0 `0` and P1 `1`: proxy disposal could wait forever before the durable held floor. That candidate and its earlier acceptance verdicts are invalidated.
+
+RED expected `NATIVE_MCP_PROXY_DISPOSAL_TIMEOUT` but observed `TEST_PROXY_DISPOSAL_BOUND_EXCEEDED`. GREEN applies one deadline, `min(policy.deadlineAtMs, closeStart + termGraceMs + killClosureMs)`, and closes the process group and proxy concurrently. A proxy timeout or error becomes `NATIVE_MCP_PROXY_DISPOSAL_FAILED`; the campaign remains `needsAttention`, its fence and registry slot stay held, and no closure receipt is issued.
+
+Fresh repair proof passed: focused regression `1/1`; lifecycle `11/11`; Task 4 engine nine-file lane `178/178`; core provider-controller plus CLI-session PostgreSQL lane `49/49`; engine typecheck; production and test ESLint; root lint; and `git diff --check`. The existing test-process `MaxListeners` warning remains visible and is not hidden.
+
+This repair is uncommitted and unaccepted. Fresh integrated gates and a new council on the final bytes are required. Task 5 still owns the long-lived runtime resolver/bootstrap and mixed queue. Current state is `task4_proxy_closure_bound_green_integrated_proof_active`.
