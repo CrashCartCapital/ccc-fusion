@@ -84,6 +84,7 @@ import {
   extractFailingTestFiles,
 } from "./verification-followup-dedup.js";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
+import { CccCampaignMergeControlError, matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
 import { isTransientError } from "./transient-error-detector.js";
 import { classifyTransientMergeError } from "./transient-merge-error-classifier.js";
 import { TunnelProcessManager } from "./remote-access/tunnel-process-manager.js";
@@ -3663,6 +3664,12 @@ export class ProjectEngine {
             continue;
           }
 
+          const mergeCandidate = await store.getTask(taskId).catch(() => null);
+          if (!mergeCandidate) {
+            throw new Error(`Merge task ${taskId} could not be read before dispatch`);
+          }
+          const campaignCustody = await resolveCccCampaignMergeCustody(store, mergeCandidate);
+          const routeWorkspaceDirect = isWorkspaceTask(mergeCandidate);
           const mergeStrategy = this.options.getMergeStrategy?.(settings) ?? "direct";
           const promotionSettings = {
             autoMerge: settings.autoMerge,
@@ -3740,9 +3747,6 @@ export class ProjectEngine {
           // isWorkspaceTask(mergeTask) routing already calls landWorkspaceTask
           // correctly, regardless of the configured mergeStrategy — until true
           // per-repo PR merge for workspace tasks (master-plan U6) ships.
-          const mergeCandidate = await store.getTask(taskId).catch(() => null);
-          const routeWorkspaceDirect = !!mergeCandidate && isWorkspaceTask(mergeCandidate);
-
           // FNXC:MergeQueue 2026-07-15-10:05: Wait for any orphan body from a prior abort race before claiming the next generation.
           await this.awaitPriorMergeBodySettle();
 
@@ -3792,7 +3796,7 @@ export class ProjectEngine {
             return value;
           };
 
-          if (mergeStrategy === "pull-request" && this.options.processPullRequestMerge && !routeWorkspaceDirect) {
+          if (mergeStrategy === "pull-request" && this.options.processPullRequestMerge && !routeWorkspaceDirect && campaignCustody.kind !== "campaign") {
             /*
             FNXC:MergeQueue 2026-07-15-10:05:
             PR merge dispatch shares the single-flight pump. Race the PR body with abort so pause/reclaim unblocks drainMergeQueue even when processPullRequestMerge ignores cooperative abort.
@@ -3896,7 +3900,8 @@ export class ProjectEngine {
               // routing falls through to runAiMerge, whose chokepoint guard re-reads
               // the task and is the authoritative workspace enforcement.
               const mergeTask = await store.getTask(taskId).catch(() => null);
-              const isWorkspaceMerge = !!mergeTask && isWorkspaceTask(mergeTask);
+              const isWorkspaceMerge =
+                campaignCustody.kind !== "campaign" && !!mergeTask && isWorkspaceTask(mergeTask);
               if (isWorkspaceMerge) {
                 // FNXC:Workspace 2026-06-22-00:30 (Phase C U2, KTD3):
                 // Land each acquired sub-repo on its own local integration ref;
@@ -3981,6 +3986,15 @@ export class ProjectEngine {
             }
 
             this.activeMergeSession = null;
+            if (
+              campaignCustody.kind === "campaign"
+              && !matchesCccCampaignMergeControl(result.campaignControlled, campaignCustody.context)
+            ) {
+              throw new CccCampaignMergeControlError(
+                "ccc-campaign-merge-authority-mismatch",
+                `CCC campaign merge result for ${taskId} is missing an exact persisted custody authority`,
+              );
+            }
             runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge merged: ${taskId}`);
 
             if (hasManualResolver) {
@@ -3989,19 +4003,31 @@ export class ProjectEngine {
 
             // Reset retries on success
             const latestTask = await store.getTask(taskId).catch(() => null);
-            if (latestTask?.mergeRetries && latestTask.mergeRetries > 0) {
+            if (campaignCustody.kind !== "campaign" && latestTask?.mergeRetries && latestTask.mergeRetries > 0) {
               await store.updateTask(taskId, { mergeRetries: 0 });
             }
             // FNXC:Workspace 2026-06-22-05:10 (Phase C review B4): clear the in-memory busy
             // re-enqueue counter once the merge succeeds so a later unrelated contention starts fresh.
             this.workspaceBusyReenqueues.delete(taskId);
 
-            await attemptBranchGroupPromotion(latestTask);
+            if (campaignCustody.kind !== "campaign") {
+              await attemptBranchGroupPromotion(latestTask);
+            }
           }
         } catch (err: unknown) {
           this.activeMergeSession = null;
           const errorMsg = err instanceof Error ? err.message : String(err);
           const mergeWasAborted = err instanceof Error && err.name === "MergeAbortedError";
+
+          if (err instanceof CccCampaignMergeControlError) {
+            runtimeLog.error(`${hasManualResolver ? "Manual" : "Auto"}-merge refused for ${taskId}: ${errorMsg}`);
+            if (hasManualResolver) {
+              this.rejectMergeResolvers(taskId, err);
+            } else {
+              await store.updateTask(taskId, { status: "failed", error: errorMsg }).catch(() => undefined);
+            }
+            continue;
+          }
 
           if (mergeWasAborted) {
             runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge aborted for ${taskId}: ${errorMsg}`);

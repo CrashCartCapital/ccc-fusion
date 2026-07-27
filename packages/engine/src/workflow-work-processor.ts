@@ -1,5 +1,5 @@
 import type { Settings, TaskDetail, WorkflowWorkItem, WorkflowWorkItemKind, WorkflowWorkItemState } from "@fusion/core";
-import { claimDueWorkflowWorkItem, type WorkflowWorkSchedulerStore } from "./workflow-work-scheduler.js";
+import { claimDueWorkflowWorkItem, type ExactWorkflowWorkCandidate, type WorkflowWorkSchedulerStore } from "./workflow-work-scheduler.js";
 import { WorkflowTaskRuntime, type WorkflowTaskRuntimeResult } from "./workflow-task-runtime.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
@@ -9,6 +9,8 @@ export interface WorkflowWorkProcessorOptions {
   leaseDurationMs: number;
   now?: string;
   kinds?: WorkflowWorkItemKind[];
+  exactCandidate?: ExactWorkflowWorkCandidate;
+  campaignRequired?: boolean;
 }
 
 export interface WorkflowWorkProcessorResult {
@@ -62,6 +64,8 @@ export async function processDueWorkflowWorkItem(
     leaseOwner: opts.leaseOwner,
     leaseDurationMs: opts.leaseDurationMs,
     kinds: opts.kinds,
+    exactCandidate: opts.exactCandidate,
+    bypassMissionSymbolAdmission: opts.campaignRequired === true,
   });
   if (!dispatch) return { claimed: false };
 
@@ -87,17 +91,20 @@ export async function processDueWorkflowWorkItem(
     : undefined;
   try {
     const importedCampaignWorkItem = isImportedCccCampaignWorkItem(dispatch.workItem);
+    const campaignRequired = opts.campaignRequired === true || importedCampaignWorkItem;
     const getCampaignContext = store.getCccCampaignContextForTask;
-    if (importedCampaignWorkItem && typeof getCampaignContext !== "function") {
+    if (campaignRequired && typeof getCampaignContext !== "function") {
       throw new Error("workflow campaign custody lookup is unwired");
     }
     const campaignContext = typeof getCampaignContext === "function"
       ? await getCampaignContext.call(store, dispatch.taskId)
       : null;
-    if (importedCampaignWorkItem && !campaignContext) {
-      throw new Error("workflow imported campaign custody is missing");
+    if (campaignRequired && !campaignContext) {
+      throw new Error(importedCampaignWorkItem
+        ? "workflow imported campaign custody is missing"
+        : "workflow required campaign custody is missing");
     }
-    if (campaignContext) {
+    if (campaignRequired || campaignContext) {
       if (dispatch.workItem.attempt === 0) {
         dispatch.workItem = await store.transitionWorkflowWorkItem(dispatch.workItem.id, "running", {
           now: opts.now,

@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
 
+type ProcessorStore = Parameters<typeof processDueWorkflowWorkItem>[0];
+type ProcessorRuntime = Parameters<typeof processDueWorkflowWorkItem>[1];
+
 const item = {
   id: "WW-renew",
   taskId: "FN-renew",
@@ -30,6 +33,31 @@ function campaignContext(taskId = "FN-renew"): any {
 afterEach(() => vi.useRealTimers());
 
 describe("processDueWorkflowWorkItem symbol lock renewal", () => {
+  it("Task 5 RED: passes an exact campaign candidate through to the lease claim", async () => {
+    const exactCandidate = { id: item.id, runId: item.runId, attempt: item.attempt };
+    const acquireWorkflowWorkItemLease = vi.fn(async () => item);
+    const store = {
+      getWorkflowWorkItem: async () => item,
+      listDueWorkflowWorkItems: async () => [item],
+      acquireWorkflowWorkItemLease,
+      transitionWorkflowWorkItem: async () => item,
+    } as unknown as ProcessorStore;
+    const runtime = {
+      runWorkItem: async () => ({ disposition: "completed" as const, outcome: "success" as const, visitedNodeIds: [], context: {} }),
+    } as unknown as ProcessorRuntime;
+    const result = await processDueWorkflowWorkItem(store, runtime, undefined, {
+      leaseOwner: "worker",
+      leaseDurationMs: 1_000,
+      exactCandidate,
+    });
+
+    expect(result.claimed).toBe(true);
+    expect(acquireWorkflowWorkItemLease).toHaveBeenCalledWith(item.id, "worker", expect.objectContaining({
+      expectedRunId: exactCandidate.runId,
+      expectedAttempt: exactCandidate.attempt,
+    }));
+  });
+
   it("renews a claimed mission symbol before its short admission lease can expire", async () => {
     vi.useFakeTimers();
     let finish!: () => void;
@@ -87,6 +115,51 @@ describe("processDueWorkflowWorkItem symbol lock renewal", () => {
 
     finish();
     await processing;
+  });
+
+  it("Task 5 RED: campaign-required custody classification never falls through when recheck is missing", async () => {
+    const run = vi.fn(async () => ({ disposition: "completed", outcome: "success", visitedNodeIds: ["start"], context: {} }));
+    const runWorkItem = vi.fn(async () => ({ disposition: "completed", outcome: "success", visitedNodeIds: [item.nodeId], context: {} }));
+    const transitionWorkflowWorkItem = vi.fn(async () => ({ ...item, state: "failed" }));
+    const acquireWorkflowWorkItemLease = vi.fn(async () => item);
+    const logEntry = vi.fn(async () => undefined);
+    const store = {
+      listDueWorkflowWorkItems: async () => [item],
+      acquireWorkflowWorkItemLease,
+      transitionWorkflowWorkItem,
+      renewWorkflowWorkItemLease: vi.fn(async () => item),
+      getCccCampaignContextForTask: vi.fn(async () => null),
+      getTask: vi.fn(async () => ({ id: item.taskId, title: "Campaign task" })),
+      getMissionStore: vi.fn(() => ({
+        getFeatureByTaskId: vi.fn(async () => undefined),
+        getSlice: vi.fn(async () => undefined),
+        getMilestone: vi.fn(async () => undefined),
+        getMission: vi.fn(async () => undefined),
+      })),
+      acquireSymbolLocks: vi.fn(),
+      logEntry,
+    };
+
+    const result = await processDueWorkflowWorkItem(store as unknown as ProcessorStore, { run, runWorkItem } as unknown as ProcessorRuntime, undefined, {
+      leaseOwner: "worker",
+      leaseDurationMs: 1_000,
+      campaignRequired: true,
+    });
+
+    expect(result.runtime).toEqual(expect.objectContaining({
+      disposition: "failed",
+      outcome: "failure",
+      reason: expect.stringContaining("campaign custody is missing"),
+    }));
+    expect(run).not.toHaveBeenCalled();
+    expect(runWorkItem).not.toHaveBeenCalled();
+    expect(acquireWorkflowWorkItemLease).toHaveBeenCalledOnce();
+    expect(logEntry).not.toHaveBeenCalledWith(item.taskId, expect.stringContaining("mission lineage blocked"));
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(item.id, "failed", expect.objectContaining({
+      expectedState: "running",
+      expectedLeaseOwner: "worker",
+      expectedAttempt: item.attempt,
+    }));
   });
 
   it("Task 3 RED: an imported campaign work item fails closed when campaign custody lookup is unwired", async () => {

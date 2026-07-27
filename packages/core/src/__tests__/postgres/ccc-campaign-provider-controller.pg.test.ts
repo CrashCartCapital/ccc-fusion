@@ -29,7 +29,6 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     options: Readonly<{ protectedActions?: TestBundle["protectedActions"]; taskProtectedActionIds?: readonly string[]; issueApproval?: boolean; baseCommit?: string }> = {},
   ) {
     const initial = createCccPrdImportTestBundle(h.rootDir(), suffix);
-    const semanticTaskId = initial.tasks[0]!.id;
     const protectedActions = options.protectedActions ?? [{ id: "ACTION-LIVE-EXECUTION", kind: "live_execution", target: "ccc-lab-super:pre-live-provider-gate", requiresOperatorDecision: true, operatorDecision: "approve_live_execution", spans: [initial.tasks[0]!.spans[0]!] }];
     const source = rehashCccPrdImportTestBundle({
       ...initial,
@@ -79,12 +78,29 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
   async function counts() {
     const attempts = await h.layer().db.execute(sql`SELECT mutation_type FROM project.run_audit_events WHERE mutation_type LIKE 'ccc-campaign:provider-attempt:%'`);
     const imports = await h.layer().db.execute(sql`SELECT request_count::int AS request_count FROM project.ccc_prd_imports` ) as unknown as Array<{ request_count: number }>;
-    return { attempts: attempts.length, requestCount: imports[0]?.request_count ?? 0 };
+    return { attempts: attempts.length, requestCount: imports.reduce((sum, row) => sum + row.request_count, 0) };
   }
 
   it("requires one exact active claimed approval and lease before atomic reservation", async () => {
     const f = await fixture("exact");
     await expect(atomicReserveCccCampaignProviderDispatch(input(f, "exact"))).resolves.toMatchObject({ kind: "dispatch-permit", scope: { semanticTaskId: f.campaign.semanticTaskId, binding: { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate" } } });
+    expect(await counts()).toEqual({ attempts: 2, requestCount: 1 });
+  });
+
+  it("selects the one live-execution action assigned to this task, not another task's action", async () => {
+    const initial = createCccPrdImportTestBundle(h.rootDir(), "task-owned-live-action-template");
+    const spans = [initial.tasks[0]!.spans[0]!];
+    const f = await fixture("task-owned-live-action", {
+      protectedActions: [
+        { id: "ACTION-LIVE-EXECUTION", kind: "live_execution", target: "ccc-lab-super:pre-live-provider-gate", requiresOperatorDecision: true, operatorDecision: "approve_live_execution", spans },
+        { id: "ACTION-OTHER-TASK-LIVE-EXECUTION", kind: "live_execution", target: "ccc-lab-super:other-task-provider-gate", requiresOperatorDecision: true, operatorDecision: "approve_live_execution", spans },
+      ],
+      taskProtectedActionIds: ["ACTION-LIVE-EXECUTION"],
+    });
+    await expect(atomicReserveCccCampaignProviderDispatch(input(f, "task-owned-live-action"))).resolves.toMatchObject({
+      kind: "dispatch-permit",
+      scope: { binding: { actionId: "ACTION-LIVE-EXECUTION" } },
+    });
     expect(await counts()).toEqual({ attempts: 2, requestCount: 1 });
   });
 
@@ -145,7 +161,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     ["actual transport", { transport: "cli" }],
   ])("refuses wrong %s route before any provider-attempt audit or request-count increment", async (_kind, mismatch) => {
     const f = await fixture(`actual-${_kind.replace(" ", "-")}`);
-    await expect(atomicReserveCccCampaignProviderDispatch({ ...input(f, "actual"), ...(mismatch as any) })).rejects.toThrow(/route|provider|model|transport|campaign|custody/i);
+    await expect(atomicReserveCccCampaignProviderDispatch({ ...input(f, "actual"), ...(mismatch as Partial<ReturnType<typeof input>>) })).rejects.toThrow(/route|provider|model|transport|campaign|custody/i);
     expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
   });
 
@@ -276,7 +292,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
   });
 
-  it("refuses missing, ambiguous, and wrong-kind live-execution declarations before campaign writes", async () => {
+  it("refuses missing, ambiguous, and wrong-kind live-execution declarations before provider-attempt writes", async () => {
     const missing = await fixture("missing-action", { protectedActions: [], taskProtectedActionIds: [], issueApproval: false });
     await expect(atomicReserveCccCampaignProviderDispatch(input(missing, "missing-action"))).rejects.toThrow(/exactly one declared live-execution/i);
     expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
@@ -298,6 +314,49 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
       protectedActions: [{ id: "ACTION-LIVE-EXECUTION", kind: "merge", target: "ccc-lab-super:pre-live-provider-gate", requiresOperatorDecision: true, operatorDecision: "approve_merge", spans }],
     });
     await expect(atomicReserveCccCampaignProviderDispatch(input(wrongKind, "wrong-kind-action"))).rejects.toThrow(/exactly one declared live-execution/i);
+    expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
+  });
+
+  it("refuses missing, foreign, or duplicate task protected-action IDs before provider-attempt writes", async () => {
+    async function importInvalidTaskActionIds(suffix: string, protectedActionIds: readonly string[]) {
+      const initial = createCccPrdImportTestBundle(h.rootDir(), suffix);
+      const source = rehashCccPrdImportTestBundle({
+        ...initial,
+        bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+        tasks: initial.tasks.map((task, index) => index === 0 ? { ...task, protectedActionIds: [...protectedActionIds] } : task),
+        protectedActions: [{
+          id: "ACTION-LIVE-EXECUTION",
+          kind: "live_execution",
+          target: "ccc-lab-super:pre-live-provider-gate",
+          requiresOperatorDecision: true,
+          operatorDecision: "approve_live_execution",
+          spans: [initial.tasks[0]!.spans[0]!],
+        }],
+      });
+      await importCccPrdBundle({
+        bundle: source,
+        idempotencyKey: `invalid-task-action-${suffix}`,
+        store: h.store(),
+        layer: h.layer(),
+        rootDir: h.rootDir(),
+        executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+      });
+      return `TASK-${suffix}`;
+    }
+
+    const missing = await fixture("missing-task-action-id", {
+      taskProtectedActionIds: [],
+      issueApproval: false,
+    });
+    await expect(atomicReserveCccCampaignProviderDispatch(input(missing, "missing-task-action-id"))).rejects.toThrow(/exactly one declared live-execution/i);
+    expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
+
+    const foreignTaskId = await importInvalidTaskActionIds("foreign-task-action-id", ["ACTION-NOT-DECLARED"]);
+    await expect(h.store().getCccCampaignContextForTask(foreignTaskId)).rejects.toThrow(/protected-action IDs are not declared bundle actions/i);
+    expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
+
+    const duplicateTaskId = await importInvalidTaskActionIds("duplicate-task-action-id", ["ACTION-LIVE-EXECUTION", "ACTION-LIVE-EXECUTION"]);
+    await expect(h.store().getCccCampaignContextForTask(duplicateTaskId)).rejects.toThrow(/protected-action IDs must be unique and sorted canonically/i);
     expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
   });
 });

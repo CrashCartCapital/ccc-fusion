@@ -758,6 +758,7 @@ pgTest("CCC campaign native persistence", () => {
       taskId: "TASK-context",
       semanticTaskId: "TASK-context",
       proofIds: ["PROOF-context"],
+      protectedActionIds: source.tasks[0]!.protectedActionIds,
       packetHash: source.sourceHash,
       sidecarHash: source.sidecarHash,
       bundleHash: source.bundleHash,

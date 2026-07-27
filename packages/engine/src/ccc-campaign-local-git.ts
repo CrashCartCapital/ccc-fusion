@@ -34,11 +34,25 @@ const PROCESS_EXIT_POLL_MS = 10;
 const LOCAL_GIT_INSPECTION_TIMEOUT_MS = 30_000;
 const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const KNOWN_GIT_BUILTINS = new Set([
+  "cat-file",
   "config",
+  "commit-tree",
+  "diff-tree",
   "ls-files",
   "ls-tree",
   "merge-base",
+  "merge-tree",
   "rev-parse",
+  "update-ref",
+  "worktree",
+]);
+const CONTROLLED_GIT_CALLER_ENV_KEYS = new Set([
+  "GIT_AUTHOR_DATE",
+  "GIT_AUTHOR_EMAIL",
+  "GIT_AUTHOR_NAME",
+  "GIT_COMMITTER_DATE",
+  "GIT_COMMITTER_EMAIL",
+  "GIT_COMMITTER_NAME",
 ]);
 
 type CccCampaignStatIdentity = Readonly<{
@@ -90,6 +104,7 @@ export class CccCampaignLocalGitError extends Error {
 function controlledGitEnvironment(
   gitBinary: string,
   targetRoot: string,
+  extraEnv: Readonly<NodeJS.ProcessEnv> = {},
 ): Readonly<NodeJS.ProcessEnv> {
   const supportPath = process.platform === "win32"
     ? [
@@ -114,6 +129,7 @@ function controlledGitEnvironment(
     GIT_TERMINAL_PROMPT: "0",
     LANG: "C",
     LC_ALL: "C",
+    ...controlledGitCallerEnvironment(extraEnv),
   };
   for (const key of [
     "SystemRoot",
@@ -126,6 +142,27 @@ function controlledGitEnvironment(
   ] as const) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
+  }
+  return Object.freeze(env);
+}
+
+function controlledGitCallerEnvironment(
+  extraEnv: Readonly<NodeJS.ProcessEnv>,
+): Readonly<NodeJS.ProcessEnv> {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(extraEnv)) {
+    if (value === undefined) continue;
+    if (!CONTROLLED_GIT_CALLER_ENV_KEYS.has(key)) {
+      throw new CccCampaignLocalGitError(
+        "CCC campaign refused unsupported Git environment override",
+      );
+    }
+    if (value.length === 0 || value.length > 512 || /[\0\r\n]/u.test(value)) {
+      throw new CccCampaignLocalGitError(
+        "CCC campaign refused unsafe Git identity environment value",
+      );
+    }
+    env[key] = value;
   }
   return Object.freeze(env);
 }
@@ -203,6 +240,7 @@ function runGitRaw(
   args: readonly string[],
   environment: Readonly<NodeJS.ProcessEnv>,
   signal?: AbortSignal,
+  stdin?: string | Buffer,
 ): Promise<Buffer> {
   signal?.throwIfAborted();
   requireKnownGitBuiltin(args);
@@ -221,7 +259,7 @@ function runGitRaw(
         killGraceMs: GIT_TERMINATION_GRACE_MS,
         maxLifetimeMs:
           GIT_TIMEOUT_MS + GIT_TERMINATION_GRACE_MS + GIT_CLOSE_CONFIRM_MS,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         windowsHide: true,
       },
     );
@@ -295,6 +333,9 @@ function runGitRaw(
     if (signal?.aborted) onAbort();
     child.stdout?.on("data", appendStdout);
     child.stderr?.on("data", observeStderr);
+    if (stdin !== undefined) {
+      child.stdin?.end(stdin);
+    }
     child.once("error", (error) => {
       terminateAndReject(new CccCampaignLocalGitError(
         `Git ${gitCommandLabel(args)} could not be started: ${
@@ -341,6 +382,25 @@ async function runGit(
     environment,
     signal,
   )).toString("utf8").trim();
+}
+
+export async function runControlledCccCampaignGit(
+  snapshot: Pick<CccCampaignLocalGitSnapshot, "gitBinary" | "targetRoot">,
+  args: readonly string[],
+  options: Readonly<{
+    env?: Readonly<NodeJS.ProcessEnv>;
+    signal?: AbortSignal;
+    stdin?: string | Buffer;
+  }> = {},
+): Promise<Buffer> {
+  return runGitRaw(
+    snapshot.gitBinary,
+    snapshot.targetRoot,
+    args,
+    controlledGitEnvironment(snapshot.gitBinary, snapshot.targetRoot, options.env),
+    options.signal,
+    options.stdin,
+  );
 }
 
 function requireCanonicalObjectId(value: string, label: string): string {

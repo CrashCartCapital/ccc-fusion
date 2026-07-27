@@ -312,6 +312,10 @@ export {
   evaluateCccCampaignProofAdmission,
 } from "./ccc-campaign-proof-admission.js";
 export {
+  bootstrapCccCampaignProofAdmissionHost,
+  type BootstrapCccCampaignProofAdmissionHostInput,
+} from "./ccc-campaign-proof-host.js";
+export {
   createCccCampaignProofNodeAdmission,
   type CccCampaignProofNodeAdmission,
   type CccCampaignProofWorkflowStore,

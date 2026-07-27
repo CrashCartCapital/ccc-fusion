@@ -62,6 +62,24 @@ function evaluatorInput(proof = admittedProof(), signal = new AbortController().
 }
 
 describe("CCC native campaign proof admission", () => {
+  it("accepts the exact CCC lab kernel transaction declaration without executing it", async () => {
+    const input = evaluatorInput(admittedProof({
+      command: "task verify:phase0 -- kernel-transaction",
+      positiveOracle: "Every declared legal transition and crash boundary passes with one recoverable authoritative state.",
+      negativeControls: [
+        "illegal transition is refused before mutation",
+        "duplicate idempotency key cannot create a second publish",
+        "crash between boundaries cannot expose a half-published batch",
+      ],
+    }));
+
+    await expect(evaluateCccCampaignProofAdmission(input)).resolves.toEqual({
+      outcome: "pass",
+      evaluatedInputSha256: input.inputSha256,
+      summary: "proof declaration is admissible; command not executed",
+    });
+  });
+
   it("verifies the exact immutable binding self-check without executing a command", async () => {
     const input = evaluatorInput();
 
@@ -69,6 +87,22 @@ describe("CCC native campaign proof admission", () => {
       outcome: "pass",
       evaluatedInputSha256: input.inputSha256,
       summary: "proof binding semantics verified; command not executed",
+    });
+  });
+
+  it.each([
+    ["blank positive oracle", { command: "task verify:phase0 -- kernel-transaction", positiveOracle: "   ", negativeControls: ["negative control"] }],
+    ["oversized positive oracle", { command: "task verify:phase0 -- kernel-transaction", positiveOracle: "o".repeat(513), negativeControls: ["negative control"] }],
+    ["empty negative controls", { command: "task verify:phase0 -- kernel-transaction", positiveOracle: "positive oracle", negativeControls: [] }],
+    ["duplicate negative controls", { command: "task verify:phase0 -- kernel-transaction", positiveOracle: "positive oracle", negativeControls: ["same", "same"] }],
+    ["blank negative control", { command: "task verify:phase0 -- kernel-transaction", positiveOracle: "positive oracle", negativeControls: [" "] }],
+    ["oversized negative control", { command: "task verify:phase0 -- kernel-transaction", positiveOracle: "positive oracle", negativeControls: ["n".repeat(513)] }],
+  ] as const)("refuses non-self-check declaration with %s", async (_label, overrides) => {
+    const input = evaluatorInput(admittedProof(overrides));
+
+    await expect(evaluateCccCampaignProofAdmission(input)).resolves.toMatchObject({
+      outcome: "fail",
+      summary: expect.stringContaining("command not executed"),
     });
   });
 
@@ -125,9 +159,34 @@ describe("CCC native campaign proof admission", () => {
     ["bash-wrapped true command", { command: "bash -c \"true\"" }],
     ["absolute true command", { command: "/usr/bin/true" }],
     ["node explicit zero-exit command", { command: "node -e 'process.exit(0)'" }],
+    ["shell substitution", { command: "task verify:phase0 -- $(whoami)" }],
+    ["output redirection", { command: "task verify:phase0 -- proof > result" }],
+    ["environment assignment", { command: "TOKEN=value task verify:phase0" }],
+    ["shell wrapper", { command: "sh -c task verify:phase0" }],
+    ["extra executable", { command: "task verify:phase0 -- node -e" }],
+    ["recursive removal", { command: "task verify:phase0 -- rm -rf" }],
+    ["curl executable", { command: "task verify:phase0 -- curl" }],
+    ["python executable", { command: "task verify:phase0 -- python" }],
+    ["python3 executable", { command: "task verify:phase0 -- python3" }],
+    ["git executable", { command: "task verify:phase0 -- git status" }],
+    ["gh executable", { command: "task verify:phase0 -- gh" }],
+    ["pnpm executable", { command: "task verify:phase0 -- pnpm" }],
+    ["npm executable", { command: "task verify:phase0 -- npm" }],
+    ["npx executable", { command: "task verify:phase0 -- npx" }],
+    ["bun executable", { command: "task verify:phase0 -- bun" }],
+    ["deno executable", { command: "task verify:phase0 -- deno" }],
+    ["ruby executable", { command: "task verify:phase0 -- ruby" }],
+    ["perl executable", { command: "task verify:phase0 -- perl" }],
+    ["java executable", { command: "task verify:phase0 -- java" }],
+    ["go executable", { command: "task verify:phase0 -- go" }],
+    ["cargo executable", { command: "task verify:phase0 -- cargo" }],
+    ["make executable", { command: "task verify:phase0 -- make" }],
+    ["oversized declaration", { command: `task verify:phase0 -- ${"a".repeat(513)}` }],
     ["generic positive oracle", { positiveOracle: "exit 0" }],
     ["generic negative control", { negativeControls: ["false"] }],
     ["duplicate requirement ids", { requirementIds: ["REQ-ADMISSION-1", "REQ-ADMISSION-1"] }],
+    ["too many requirement ids", { requirementIds: Array.from({ length: 65 }, (_, index) => `REQ-${index}`) }],
+    ["oversized requirement id", { requirementIds: ["R".repeat(129)] }],
     ["duplicate negative controls", {
       negativeControls: [
         "a stale definition hash is refused before any command can run",

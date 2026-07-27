@@ -44,8 +44,14 @@ const CANONICAL_GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 export function selectCccCampaignDeclaredLiveExecutionAction(
   protectedActions: readonly CccPrdProtectedActionIntent[],
+  protectedActionIds?: readonly string[],
 ): CccCampaignLiveExecutionAction {
+  const assignedActionIds = protectedActionIds === undefined
+    ? null
+    : new Set(protectedActionIds);
   const actions = protectedActions.filter((candidate) =>
+    (assignedActionIds === null || assignedActionIds.has(candidate.id))
+    &&
     candidate.kind === "live_execution"
     && candidate.operatorDecision === "approve_live_execution"
     && candidate.requiresOperatorDecision === true
@@ -87,7 +93,10 @@ export async function atomicReserveCccCampaignProviderDispatch(
     ) {
       throw new Error("CCC campaign local Git snapshot does not match locked campaign custody");
     }
-    const action = selectCccCampaignDeclaredLiveExecutionAction(context.protectedActions);
+    const action = selectCccCampaignDeclaredLiveExecutionAction(
+      context.protectedActions,
+      context.protectedActionIds,
+    );
     const approvalInput: AssertActiveClaimedCccCampaignApprovalInput = {
       authorityStore: input.authorityStore,
       rootDir: input.rootDir,

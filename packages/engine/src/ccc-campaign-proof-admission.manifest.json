@@ -1,9 +1,9 @@
 {
-  "schema": "ccc-fusion.native-proof-admission-manifest.v1",
-  "pluginId": "fusion-native",
-  "pluginVersion": "1.0.0",
-  "extensionId": "ccc-proof-admission",
-  "proofVersion": "ccc-proof-admission.v1",
-  "registryId": "plugin:fusion-native:ccc-proof-admission",
-  "entry": "ccc-campaign-proof-admission.js"
+    "schema": "ccc-fusion.native-proof-admission-manifest.v1",
+    "pluginId": "fusion-native",
+    "pluginVersion": "1.0.0",
+    "extensionId": "ccc-proof-admission",
+    "proofVersion": "ccc-proof-admission.v1",
+    "registryId": "plugin:fusion-native:ccc-proof-admission",
+    "entry": "ccc-campaign-proof-admission.js"
 }

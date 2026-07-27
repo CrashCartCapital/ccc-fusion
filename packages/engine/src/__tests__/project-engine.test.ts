@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Task } from "@fusion/core";
 import { ProjectEngine, __resetDeterministicMergerModeDeprecationWarned } from "../project-engine.js";
+import { createCccCampaignMergeControl } from "../ccc-campaign-merge-control.js";
 import { AgentSemaphore } from "../concurrency.js";
 // Resolves to the vi.mock factory above (the mocked merger-ai exports the real-shaped
 // workspace land error classes so the dispatch's `instanceof` matching is exercised).
@@ -2461,6 +2462,180 @@ describe("ProjectEngine paused in-review auto-merge behavior", () => {
     });
 
     expect(semaphore.activeCount).toBe(0);
+    await engine.stop();
+  });
+
+  it("routes persisted imported CCC campaign custody directly to runAiMerge before PR strategy dispatch", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    const campaignTask = {
+      id: "FN-campaign-merge",
+      lineageId: "ccc-prd:0123456789abcdef01234567:merge",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-campaign-merge",
+    };
+    mockStore.store.getTask.mockResolvedValue(campaignTask);
+    const campaignContext = {
+      taskId: campaignTask.id,
+      projectId: "project-1",
+      campaignId: "campaign-1",
+      importId: "import-1",
+      bundleHash: "bundle-1",
+      manifestHash: "manifest-1",
+      targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+    };
+    (mockStore.store as any).getCccCampaignContextForTask = vi.fn(async () => campaignContext);
+    mocks.currentStore = mockStore.store;
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    mocks.runAiMerge.mockResolvedValue({
+      task: campaignTask,
+      branch: campaignTask.branch,
+      merged: true,
+      worktreeRemoved: false,
+      branchDeleted: false,
+      campaignControlled: createCccCampaignMergeControl(campaignContext as any),
+    });
+    const engine = createEngine({ processPullRequestMerge, getMergeStrategy: () => "pull-request" });
+    await engine.start();
+    engine.enqueueMerge(campaignTask.id);
+
+    await vi.waitFor(() => expect(mocks.runAiMerge).toHaveBeenCalledWith(
+      mockStore.store,
+      "/tmp/proj_test",
+      campaignTask.id,
+      expect.any(Object),
+    ));
+    expect(processPullRequestMerge).not.toHaveBeenCalled();
+    await engine.stop();
+  });
+
+  it("routes workspace-shaped persisted campaign custody through runAiMerge without legacy landing or lifecycle effects", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    const campaignTask = {
+      id: "FN-campaign-workspace-merge",
+      lineageId: "ccc-prd:0123456789abcdef01234567:workspace-merge",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-campaign-workspace-merge",
+      workspaceWorktrees: {
+        "repo-a": { worktreePath: "/tmp/campaign-a", branch: "fusion/fn-campaign-workspace-merge-a" },
+      },
+    };
+    const campaignContext = {
+      taskId: campaignTask.id,
+      projectId: "project-1",
+      campaignId: "campaign-1",
+      importId: "import-1",
+      bundleHash: "bundle-1",
+      manifestHash: "manifest-1",
+      targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+    };
+    mockStore.store.getTask.mockResolvedValue(campaignTask);
+    (mockStore.store as any).getCccCampaignContextForTask = vi.fn(async () => campaignContext);
+    mocks.currentStore = mockStore.store;
+    mocks.landWorkspaceTask.mockResolvedValue({
+      allLanded: true,
+      repos: [{ repo: "repo-a", status: "landed", landedSha: "aaaa1111", integrationBranch: "main" }],
+    } as any);
+    mocks.runAiMerge.mockResolvedValue({
+      task: campaignTask,
+      branch: campaignTask.branch,
+      merged: true,
+      worktreeRemoved: false,
+      branchDeleted: false,
+      campaignControlled: createCccCampaignMergeControl(campaignContext as any),
+    });
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    const engine = createEngine({ processPullRequestMerge, getMergeStrategy: () => "pull-request" });
+    await engine.start();
+    mockStore.store.updateTask.mockClear();
+    mockStore.store.moveTask.mockClear();
+    mockStore.store.emit.mockClear();
+    mockStore.store.getBranchGroup.mockClear();
+
+    const result = await engine.onMerge(campaignTask.id);
+
+    expect(result).toMatchObject({ merged: true });
+    expect(mocks.runAiMerge).toHaveBeenCalledWith(
+      mockStore.store,
+      "/tmp/proj_test",
+      campaignTask.id,
+      expect.any(Object),
+    );
+    expect(mocks.landWorkspaceTask).not.toHaveBeenCalled();
+    expect(processPullRequestMerge).not.toHaveBeenCalled();
+    expect(mockStore.store.updateTask).not.toHaveBeenCalled();
+    expect(mockStore.store.moveTask).not.toHaveBeenCalled();
+    expect(mockStore.store.emit).not.toHaveBeenCalled();
+    expect(mockStore.store.getBranchGroup).not.toHaveBeenCalled();
+    await engine.stop();
+  });
+
+  it("fails closed on unmarked custody lookup uncertainty before strategy, PR, workspace, or retry effects", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    const ordinaryShapedTask = {
+      id: "FN-custody-lookup-error",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-custody-lookup-error",
+    };
+    mockStore.store.getTask.mockResolvedValue(ordinaryShapedTask);
+    (mockStore.store as any).getCccCampaignContextForTask = vi.fn(async () => {
+      throw new Error("custody store unavailable");
+    });
+    mocks.currentStore = mockStore.store;
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    const getMergeStrategy = vi.fn(() => "pull-request" as const);
+    const engine = createEngine({ processPullRequestMerge, getMergeStrategy });
+    await engine.start();
+    engine.enqueueMerge(ordinaryShapedTask.id);
+
+    await vi.waitFor(() => expect(mockStore.store.updateTask).toHaveBeenCalledWith(
+      ordinaryShapedTask.id,
+      expect.objectContaining({ status: "failed" }),
+    ));
+    expect(getMergeStrategy).not.toHaveBeenCalled();
+    expect(processPullRequestMerge).not.toHaveBeenCalled();
+    expect(mocks.landWorkspaceTask).not.toHaveBeenCalled();
+    expect(mocks.runAiMerge).not.toHaveBeenCalled();
+    expect(mockStore.store.updateTask).not.toHaveBeenCalledWith(
+      ordinaryShapedTask.id,
+      expect.objectContaining({ mergeRetries: expect.any(Number) }),
+    );
+    await engine.stop();
+  });
+
+  it("preserves ordinary PR routing when custody lookup returns null", async () => {
+    const mockStore = createMockStore({ ...baseSettings, autoMerge: true });
+    const ordinaryTask = {
+      id: "FN-ordinary-null-custody",
+      column: "in-review",
+      paused: false,
+      mergeRetries: 0,
+      status: null,
+      branch: "fusion/fn-ordinary-null-custody",
+    };
+    mockStore.store.getTask.mockResolvedValue(ordinaryTask);
+    (mockStore.store as any).getCccCampaignContextForTask = vi.fn(async () => null);
+    mocks.currentStore = mockStore.store;
+    const processPullRequestMerge = vi.fn(async () => "merged" as const);
+    const engine = createEngine({ processPullRequestMerge, getMergeStrategy: () => "pull-request" });
+    await engine.start();
+    engine.enqueueMerge(ordinaryTask.id);
+
+    await vi.waitFor(() => expect(processPullRequestMerge).toHaveBeenCalledWith(
+      mockStore.store,
+      "/tmp/proj_test",
+      ordinaryTask.id,
+      undefined,
+    ));
+    expect(mocks.runAiMerge).not.toHaveBeenCalled();
     await engine.stop();
   });
 

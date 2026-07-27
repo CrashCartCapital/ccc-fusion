@@ -203,4 +203,6 @@ export type CccCampaignContext = Omit<CccCampaignManifest, "schema"> & {
 export type CccCampaignTaskContext = CccCampaignContext & {
   semanticTaskId: string;
   proofIds: readonly string[];
+  /** Exact protected actions declared by this semantic task; may be empty. */
+  protectedActionIds: readonly string[];
 };

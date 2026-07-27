@@ -99,6 +99,56 @@ function taskProofIds(
   );
 }
 
+function requireCanonicalProtectedActionIds(value: unknown, label: string): readonly string[] {
+  if (!Array.isArray(value)) {
+    throw new CccCampaignContextError(`${label} must be a canonical protected-action ID set`);
+  }
+  const actionIds = value.map((entry, index) => {
+    if (typeof entry !== "string" || entry.length === 0 || entry !== entry.trim()) {
+      throw new CccCampaignContextError(`${label}[${index}] must be a non-empty canonical string`);
+    }
+    return entry;
+  });
+  const canonical = [...actionIds].sort(compareCccPrdCodeUnits);
+  if (
+    new Set(actionIds).size !== actionIds.length
+    || canonicalCccPrdJson(actionIds) !== canonicalCccPrdJson(canonical)
+  ) {
+    throw new CccCampaignContextError(`${label} must be unique and sorted canonically`);
+  }
+  return Object.freeze([...actionIds]);
+}
+
+function taskProtectedActionIds(
+  bundleTasks: readonly CccPrdTask[],
+  semanticTaskId: string,
+  taskId: string,
+): readonly string[] {
+  const matches = bundleTasks.filter(({ id }) => id === semanticTaskId);
+  if (matches.length !== 1) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} has no exact semantic campaign task authority`,
+    );
+  }
+  return requireCanonicalProtectedActionIds(
+    matches[0]!.protectedActionIds,
+    `Task ${taskId} semantic campaign protected-action IDs`,
+  );
+}
+
+function assertProtectedActionIdsExist(
+  actionIds: readonly string[],
+  bundleActionIds: readonly string[],
+  taskId: string,
+): void {
+  const bundleActionSet = new Set(bundleActionIds);
+  if (!actionIds.every((actionId) => bundleActionSet.has(actionId))) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} campaign protected-action IDs are not declared bundle actions`,
+    );
+  }
+}
+
 function assertProofIdsExist(
   proofIds: readonly string[],
   bundleProofIds: readonly string[],
@@ -354,6 +404,12 @@ export async function loadCccCampaignContextForTask(
     bundle.bundleHash,
   );
   assertExactProofIds(metadataProofIds, proofIds, taskId);
+  const protectedActionIds = taskProtectedActionIds(bundle.tasks, row.semanticTaskId, taskId);
+  assertProtectedActionIdsExist(
+    protectedActionIds,
+    bundle.protectedActions.map(({ id }) => id),
+    taskId,
+  );
   const startedAt = requireIsoTimestamp(row.campaignStartedAt, "campaignStartedAt");
   const deadlineAt = requireIsoTimestamp(row.campaignDeadlineAt, "campaignDeadlineAt");
   if (deadlineAt !== startedAt + bundle.bounds.maxDurationMs) {
@@ -380,6 +436,7 @@ export async function loadCccCampaignContextForTask(
     taskId,
     semanticTaskId: row.semanticTaskId,
     proofIds,
+    protectedActionIds,
     packetHash: manifest.packetHash,
     sidecarHash: manifest.sidecarHash,
     bundleHash: manifest.bundleHash,

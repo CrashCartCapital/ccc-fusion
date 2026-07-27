@@ -25,13 +25,14 @@
  */
 
 import { CliSessionStore } from "@fusion/core";
-import type { AsyncDataLayer } from "@fusion/core";
+import type { AsyncDataLayer, CccCampaignAuthorityStore } from "@fusion/core";
 import { CliAdapterRegistry } from "./adapter.js";
 import { BUNDLED_CLI_ADAPTERS } from "./adapters/index.js";
 import { CliSessionManager, type CliSessionManagerOptions } from "./session-manager.js";
 import { TelemetryHub, type TelemetryHubOptions } from "./telemetry-hub.js";
 import { CliResumeCoordinator } from "./resume-coordinator.js";
 import { writeSessionHookScripts } from "./hook-scripts.js";
+import { createCccNativeCliProductionResolver } from "./ccc-native-cli-production-resolver.js";
 import type { CliAgentRuntime } from "../executor.js";
 
 /** Options for {@link createCliAgentRuntime}. */
@@ -47,6 +48,10 @@ export interface CreateCliAgentRuntimeOptions {
    * scripts POST to (e.g. `http://127.0.0.1:4040/api/cli-agent/hooks`).
    */
   hookEndpointUrl: string;
+  /** Campaign target root. Native CCC routing requires this with authority. */
+  rootDir?: string;
+  /** Existing TaskStore authority seam; never a second campaign store. */
+  campaignAuthorityStore?: CccCampaignAuthorityStore;
   /** Optional override for the hook scratch-dir root (tests). */
   hookDirRoot?: string;
   /** Optional notification dispatch forwarded to the TelemetryHub. */
@@ -94,11 +99,23 @@ export async function createCliAgentRuntime(
   options: CreateCliAgentRuntimeOptions,
 ): Promise<BootstrappedCliAgentRuntime> {
   const { asyncLayer, projectId, hookEndpointUrl } = options;
+  const hasRoot = options.rootDir !== undefined;
+  const hasAuthority = options.campaignAuthorityStore !== undefined;
+  if (hasRoot !== hasAuthority) {
+    throw new Error("CLI Agent native CCC routing requires both rootDir and campaignAuthorityStore");
+  }
 
   // FNXC:CliAgentPostgres 2026-07-14-12:00:
   // Hydrate the project-scoped cache before state machines or recovery inspect
   // it; mutations remain ordered through the shared PostgreSQL data layer.
-  const store = await CliSessionStore.create(asyncLayer, projectId);
+  const store = await CliSessionStore.create(
+    asyncLayer,
+    projectId,
+    hasRoot ? {
+      rootDir: options.rootDir!,
+      campaignAuthorityStore: options.campaignAuthorityStore!,
+    } : undefined,
+  );
 
   // 2. A per-runtime registry with every bundled adapter (not the process-wide
   //    singleton — avoids duplicate-registration across multi-project boots).
@@ -146,6 +163,14 @@ export async function createCliAgentRuntime(
     projectId,
     hookEndpointUrl,
     hookDirRoot: options.hookDirRoot,
+    ...(hasRoot ? {
+      resolveCccNativeCliBinding: createCccNativeCliProductionResolver({
+        layer: asyncLayer,
+        rootDir: options.rootDir!,
+        campaignAuthorityStore: options.campaignAuthorityStore!,
+        cliSessionStore: store,
+      }),
+    } : {}),
   };
 
   return {

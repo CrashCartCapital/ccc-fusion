@@ -109,6 +109,23 @@ export type AutostashOutcome =
     }
   | { status: "failed"; stashSha?: string; errorMessage: string };
 
+/**
+ * A persisted CCC campaign custody binding returned by the campaign-controlled
+ * merge path. This is authority evidence, never a caller-supplied routing flag.
+ */
+export interface CccCampaignControlledMergeAuthority {
+  kind: "ccc-campaign-controlled";
+  version: 1;
+  projectId: string;
+  importId: string;
+  campaignId: string;
+  taskId: string;
+  bundleHash: string;
+  manifestHash: string;
+  targetRepository: string;
+  targetBase: string;
+}
+
 export interface MergeResult extends MergeDetails {
   task: Task;
   branch: string;
@@ -128,6 +145,8 @@ export interface MergeResult extends MergeDetails {
   autostash?: AutostashOutcome;
   /** Internal flag to track if a build retry has been attempted. Not persisted. */
   _buildRetried?: boolean;
+  /** Present only when the merger used persisted CCC campaign custody. */
+  campaignControlled?: CccCampaignControlledMergeAuthority;
 }
 
 export type TaskCommitAssociationMatchSource =
@@ -203,4 +222,3 @@ export const VALID_TRANSITIONS: Record<Column, Column[]> = {
   done: ["todo", "triage", "archived"],
   archived: ["done"],
 };
-

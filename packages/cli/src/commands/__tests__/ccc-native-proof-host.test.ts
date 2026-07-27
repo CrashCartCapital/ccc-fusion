@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   WorkflowExtensionRegistry,
@@ -215,5 +216,85 @@ describe("CCC native proof host bootstrap", () => {
       ...input, proof: bizarre, proofDefinitionSha256: computeCccPrdProofDefinitionSha256(bizarre),
     });
     await expect(registered.extension.evaluate(bizarreInput)).resolves.toMatchObject({ outcome: "fail" });
+  });
+
+  it("boots from the actual engine tsc output with its emitted canonical manifest", async () => {
+    const builtRootPath = join(repoRoot, "packages", "engine", "dist");
+    const sourceBytes = readFileSync(join(builtRootPath, ENTRY_FILE));
+    const manifestBytes = readFileSync(join(
+      builtRootPath,
+      "ccc-campaign-proof-admission.manifest.json",
+    ));
+
+    expect(sha256(manifestBytes)).toBe(sha256(readFileSync(join(
+      repoRoot,
+      "packages",
+      "engine",
+      "src",
+      "ccc-campaign-proof-admission.manifest.json",
+    ))));
+    const { bootstrapCccCampaignProofAdmissionHost: bootstrapBuiltEngineHost } = await import(
+      pathToFileURL(join(builtRootPath, "ccc-campaign-proof-host.js")).href,
+    );
+    const registry = await bootstrapBuiltEngineHost({
+      builtRootPath,
+      registry: new WorkflowExtensionRegistry(),
+    });
+    const registered = registry.get(REGISTRY_ID);
+    expect(registered?.hostProvenance).toMatchObject({
+      extensionSourceSha256: sha256(sourceBytes),
+      extensionManifestSha256: sha256(manifestBytes),
+    });
+    if (registered?.extension.kind !== "proof-admission" || !registered.hostProvenance) {
+      throw new Error("engine tsc proof-admission extension was not registered");
+    }
+    const definition = {
+      id: "PROOF-ENGINE-DIST",
+      requirementIds: ["REQ-ENGINE-DIST"],
+      command: "task verify:phase0 -- kernel-transaction",
+      positiveOracle: "Every declared legal transition and crash boundary passes with one recoverable authoritative state.",
+      negativeControls: [
+        "illegal transition is refused before mutation",
+        "duplicate idempotency key cannot create a second publish",
+        "crash between boundaries cannot expose a half-published batch",
+      ],
+      spans: [],
+      confidence: "high" as const,
+    };
+    const proof = {
+      ...definition,
+      admission: {
+        schema: CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+        pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+        pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+        extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+        proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+        extensionRootRelativeSource: registered.hostProvenance.extensionRootRelativeSource,
+        extensionSourceSha256: registered.hostProvenance.extensionSourceSha256,
+        extensionManifestSha256: registered.hostProvenance.extensionManifestSha256,
+        definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+      },
+    };
+    const input = createCccCampaignProofAdmissionEvaluatorInput({
+      campaignId: "campaign", importId: "import", bundleHash: "c".repeat(64), manifestHash: "d".repeat(64),
+      taskId: "task", nodeId: "node", workItemId: "work", owner: "owner", attempt: 1,
+      proofDefinitionSha256: computeCccPrdProofDefinitionSha256(proof), proof,
+      signal: new AbortController().signal,
+    });
+    await expect(registered.extension.evaluate(input)).resolves.toMatchObject({ outcome: "pass" });
+    const forbiddenDefinition = { ...definition, command: "task verify:phase0 -- curl" };
+    const forbiddenProof = {
+      ...forbiddenDefinition,
+      admission: {
+        ...proof.admission,
+        definitionSha256: computeCccPrdProofDefinitionSha256(forbiddenDefinition),
+      },
+    };
+    const forbiddenInput = createCccCampaignProofAdmissionEvaluatorInput({
+      ...input,
+      proof: forbiddenProof,
+      proofDefinitionSha256: computeCccPrdProofDefinitionSha256(forbiddenProof),
+    });
+    await expect(registered.extension.evaluate(forbiddenInput)).resolves.toMatchObject({ outcome: "fail" });
   });
 });

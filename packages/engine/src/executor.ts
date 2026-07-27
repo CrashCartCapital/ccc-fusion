@@ -24,12 +24,13 @@ import { moveTaskToReplanColumn, resolveReplanTargetColumn } from "./replan-targ
 import type { TaskStep, WorkflowIr, WorkflowFieldDefinition, WorkflowColumnAgent, EffectiveAgentInput, WorkflowWorkEngineDispatchResult, WorkflowWorkItem } from "@fusion/core";
 import { WorkflowGraphTaskRunner, type WorkflowGraphTaskRunResult, type WorkflowColumnBoundaryHooks } from "./workflow-graph-task-runner.js";
 import { isImportedCccCampaignTask, isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
+import { matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflow-column-boundary.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { createCodeNodeRunner } from "./code-node-runner.js";
 import { getTaskReviewCheckoutPath, resolveReviewCheckoutCwd } from "./review-checkout.js";
 import { getActiveNotificationService } from "./notifier.js";
-import type { ParseStepsHandlerDeps, CodeNodeRunner } from "./workflow-node-handlers.js";
+import type { ParseStepsHandlerDeps, CodeNodeRunner, WorkflowCustomNodeRunner } from "./workflow-node-handlers.js";
 import type { WorkflowBranchPersistence, WorkflowBranchRunState } from "./workflow-graph-branches.js";
 import type {
   WorkflowStepInstancePersistence,
@@ -7588,6 +7589,12 @@ export class TaskExecutor {
     ).create(settings);
   }
 
+  /** Public custom-node runner seam for authoritative workflow runtimes. */
+  public createAuthoritativeWorkflowCustomNodeRunner(settings: Settings): WorkflowCustomNodeRunner {
+    return (node, task, context, executionContext) =>
+      this.runGraphCustomNode(node, task, settings, undefined, context, executionContext);
+  }
+
   private createAuthoritativeWorkflowPrimitivesFromExecutor(settings: Settings): WorkflowRuntimePrimitives {
     const logAudit = async (taskId: string | undefined, input: AuditPrimitiveInput): Promise<void> => {
       if (!taskId) return;
@@ -7810,6 +7817,12 @@ export class TaskExecutor {
         return { outcome: "success", value: input.reason };
       },
       requestMerge: async (ctx, task) => {
+        let campaignCustody;
+        try {
+          campaignCustody = await resolveCccCampaignMergeCustody(this.store, task);
+        } catch (error) {
+          return { outcome: "failure", value: error instanceof Error ? error.message : "ccc-campaign-custody-refused" };
+        }
         if (!this.mergeRequester) {
           return { outcome: "failure", value: "merge-unavailable", data: { status: "failed", reason: "merge-unavailable" } };
         }
@@ -7820,12 +7833,14 @@ export class TaskExecutor {
         if (ctx.signal?.aborted) {
           return { outcome: "failure", value: "merge-cancelled" };
         }
-        const mergeTask = await this.ensureWorkflowMergeBoundaryTask(task, {
-          reason: "workflow-merge-boundary",
-          nodeId: ctx.node.node.id,
-          workflowId: ctx.run.workflowId,
-          runId: ctx.run.runId,
-        });
+        const mergeTask = campaignCustody.kind === "campaign"
+          ? task
+          : await this.ensureWorkflowMergeBoundaryTask(task, {
+              reason: "workflow-merge-boundary",
+              nodeId: ctx.node.node.id,
+              workflowId: ctx.run.workflowId,
+              runId: ctx.run.runId,
+            });
         /*
         FNXC:WorkflowMerge 2026-06-29-23:18:
         FN-7261 reached the merge node in fast mode with every legacy implementation step still pending, producing a no-op merge proof for work that never ran. A graph-native workflow may project its checklist at the merge boundary only when node workflow results prove implementation completed; otherwise incomplete legacy steps are authoritative and merge must fail before the merger can create stale no-op proof.
@@ -7891,11 +7906,24 @@ export class TaskExecutor {
             executorLog.warn(`${mergeTask.id}: workflow merge primitive timed out after ${GRAPH_MERGE_TIMEOUT_MS}ms`);
             return { outcome: "failure", value: "merge-timeout", data: { status: "timeout" } };
           }
+          if (
+            campaignCustody.kind === "campaign"
+            && !matchesCccCampaignMergeControl(result.campaignControlled, campaignCustody.context)
+          ) {
+            return { outcome: "failure", value: "ccc-campaign-merge-authority-mismatch", data: { status: "failed", reason: "ccc-campaign-merge-authority-mismatch" } };
+          }
           if (result.merged || result.noOp) {
             /*
             FNXC:WorkflowMerge 2026-06-29-09:24:
             The workflow merge primitive owns the normal lifecycle transition after a graph merge node succeeds. Finalize the proven landed task here so `mergeConfirmed` cannot strand a card in `in-progress`; executor preflight recovery is only a fallback for rows already stranded by older runs.
             */
+            if (campaignCustody.kind === "campaign") {
+              return {
+                outcome: "success",
+                value: result.noOp ? "merge-noop" : "merged",
+                data: { status: "merged", noOp: result.noOp },
+              };
+            }
             const finalization = await finalizeProvenAutoMergeTask({
               store: this.store,
               taskId: mergeTask.id,
@@ -8198,6 +8226,18 @@ export class TaskExecutor {
         return { outcome: "success", value: "in-review" };
       },
       merge: async (seamTask, _context, signal) => {
+        let campaignCustody;
+        try {
+          campaignCustody = await resolveCccCampaignMergeCustody(this.store, seamTask);
+        } catch (error) {
+          return { outcome: "failure", value: error instanceof Error ? error.message : "ccc-campaign-custody-refused" };
+        }
+        if (campaignCustody.kind === "campaign") {
+          return {
+            outcome: "failure",
+            value: "ccc-campaign-authoritative-merge-required",
+          };
+        }
         if (!this.mergeRequester) {
           return { outcome: "failure", value: "merge-unavailable" };
         }
@@ -10586,21 +10626,37 @@ export class TaskExecutor {
     result: WorkflowGraphTaskRunResult,
     abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
   ): Promise<boolean> {
-    if (!this.mergeRequester) return false;
     /* FNXC:WorkflowMerge 2026-07-12-17:38: FN-1165 defense in depth — implementation-incomplete merge graph failures must never reach the merge requester, because a no-branch task can otherwise be finalized as an intentional no-op. */
     if (this.graphFailureValue(result) === "implementation-incomplete") return false;
     const failedNode = result.visitedNodeIds[result.visitedNodeIds.length - 1] ?? "unknown";
-    const message = `Workflow graph merge failure at node '${failedNode}' routed to bounded auto-merge retry${abortProvenance === "merge-seam" ? " after merge-seam abort" : abortProvenance === "hard-cancel" || abortProvenance === undefined ? " after benign pause/resume abort" : ""}`;
-    executorLog.warn(`${live.id}: ${message}`);
-    await this.store.logEntry(live.id, message, undefined, this.getRunContextFor(live.id));
+    let campaignCustody;
     try {
-      const mergeTask = await this.ensureWorkflowMergeBoundaryTask(live, {
-        reason: "workflow-merge-retry-boundary",
-        nodeId: failedNode,
-        workflowId: result.context?.["workflow:id"] as string | undefined ?? "workflow-graph",
-        runId: this.getRunContextFor(live.id)?.runId ?? "graph-merge-retry",
-      });
-      await this.mergeRequester(mergeTask.id);
+      campaignCustody = await resolveCccCampaignMergeCustody(this.store, live);
+    } catch {
+      return false;
+    }
+    if (!this.mergeRequester) return false;
+    const message = `Workflow graph merge failure at node '${failedNode}' routed to bounded auto-merge retry${abortProvenance === "merge-seam" ? " after merge-seam abort" : abortProvenance === "hard-cancel" || abortProvenance === undefined ? " after benign pause/resume abort" : ""}`;
+    if (campaignCustody.kind !== "campaign") {
+      executorLog.warn(`${live.id}: ${message}`);
+      await this.store.logEntry(live.id, message, undefined, this.getRunContextFor(live.id));
+    }
+    try {
+      const mergeTask = campaignCustody.kind === "campaign"
+        ? live
+        : await this.ensureWorkflowMergeBoundaryTask(live, {
+            reason: "workflow-merge-retry-boundary",
+            nodeId: failedNode,
+            workflowId: result.context?.["workflow:id"] as string | undefined ?? "workflow-graph",
+            runId: this.getRunContextFor(live.id)?.runId ?? "graph-merge-retry",
+          });
+      const mergeResult = await this.mergeRequester(mergeTask.id);
+      if (
+        campaignCustody.kind === "campaign"
+        && !matchesCccCampaignMergeControl(mergeResult.campaignControlled, campaignCustody.context)
+      ) {
+        throw new Error("CCC campaign retry merge result is missing an exact persisted custody authority");
+      }
     } catch (error) {
       executorLog.warn(`${live.id}: bounded auto-merge retry request failed after graph merge failure: ${error instanceof Error ? error.message : String(error)}`);
     }

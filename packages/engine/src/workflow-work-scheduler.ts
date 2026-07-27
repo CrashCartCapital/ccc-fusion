@@ -3,12 +3,20 @@ import { decideMissionSymbolAdmission } from "./mission-symbol-admission.js";
 
 const WORKFLOW_SYMBOL_LOCK_LEASE_MS = 10 * 60_000;
 
+export class WorkflowWorkSchedulerExactCandidateInvariantError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkflowWorkSchedulerExactCandidateInvariantError";
+  }
+}
+
 export interface WorkflowWorkSchedulerStore {
   listDueWorkflowWorkItems(filter?: WorkflowWorkItemDueFilter): WorkflowWorkItem[] | Promise<WorkflowWorkItem[]>;
+  getWorkflowWorkItem?(id: string): WorkflowWorkItem | null | Promise<WorkflowWorkItem | null>;
   acquireWorkflowWorkItemLease(
     id: string,
     leaseOwner: string,
-    opts: { leaseDurationMs: number; now?: string },
+    opts: { leaseDurationMs: number; now?: string; expectedRunId?: string; expectedAttempt?: number },
   ): WorkflowWorkItem | null | Promise<WorkflowWorkItem | null>;
   /** TaskStore supplies these optional scheduler-admission capabilities. */
   getTask?(id: string): Promise<Task | undefined>;
@@ -39,6 +47,14 @@ export interface ClaimWorkflowWorkOptions {
   leaseOwner: string;
   leaseDurationMs: number;
   kinds?: WorkflowWorkItemKind[];
+  exactCandidate?: ExactWorkflowWorkCandidate;
+  bypassMissionSymbolAdmission?: boolean;
+}
+
+export interface ExactWorkflowWorkCandidate {
+  id: string;
+  runId: string;
+  attempt: number;
 }
 
 /**
@@ -52,16 +68,18 @@ export async function claimDueWorkflowWorkItem(
   store: WorkflowWorkSchedulerStore,
   opts: ClaimWorkflowWorkOptions,
 ): Promise<WorkflowWorkDispatch | null> {
-  const due = await store.listDueWorkflowWorkItems({
-    now: opts.now,
-    limit: opts.limit ?? 25,
-    kinds: opts.kinds,
-  });
+  const due = opts.exactCandidate
+    ? await resolveExactCandidate(store, opts.exactCandidate, opts)
+    : await store.listDueWorkflowWorkItems({
+      now: opts.now,
+      limit: opts.limit ?? 25,
+      kinds: opts.kinds,
+    });
 
   for (const candidate of due) {
     const task = store.getTask ? await store.getTask(candidate.taskId) : undefined;
     let lockedSymbols: string[] | undefined;
-    if (task && store.getMissionStore && store.acquireSymbolLocks) {
+    if (!opts.bypassMissionSymbolAdmission && task && store.getMissionStore && store.acquireSymbolLocks) {
       const settings = await store.getSettings?.();
       const admission = await decideMissionSymbolAdmission(task, store.getMissionStore(), {
         planApprovalRequired: settings?.planApprovalMode === "require-all",
@@ -88,10 +106,20 @@ export async function claimDueWorkflowWorkItem(
     const workItem = await store.acquireWorkflowWorkItemLease(candidate.id, opts.leaseOwner, {
       now: opts.now,
       leaseDurationMs: opts.leaseDurationMs,
+      expectedRunId: opts.exactCandidate?.runId,
+      expectedAttempt: opts.exactCandidate?.attempt,
     });
     if (!workItem) {
       if (lockedSymbols) await store.releaseSymbolLocks?.(lockedSymbols, candidate.taskId);
       continue;
+    }
+    if (opts.exactCandidate && (
+      workItem.id !== opts.exactCandidate.id
+      || workItem.runId !== opts.exactCandidate.runId
+      || workItem.attempt !== opts.exactCandidate.attempt
+    )) {
+      if (lockedSymbols) await store.releaseSymbolLocks?.(lockedSymbols, candidate.taskId);
+      throw new WorkflowWorkSchedulerExactCandidateInvariantError(`exact candidate invariant violated: leased work item ${workItem.id} ${workItem.runId} attempt ${workItem.attempt} did not match requested ${opts.exactCandidate.id} ${opts.exactCandidate.runId} attempt ${opts.exactCandidate.attempt}`);
     }
     return {
       workItem,
@@ -103,4 +131,32 @@ export async function claimDueWorkflowWorkItem(
   }
 
   return null;
+}
+
+async function resolveExactCandidate(
+  store: WorkflowWorkSchedulerStore,
+  exactCandidate: ExactWorkflowWorkCandidate,
+  opts: ClaimWorkflowWorkOptions,
+): Promise<WorkflowWorkItem[]> {
+  if (store.getWorkflowWorkItem) {
+    const candidate = await store.getWorkflowWorkItem(exactCandidate.id);
+    return candidate
+      && candidate.id === exactCandidate.id
+      && candidate.runId === exactCandidate.runId
+      && candidate.attempt === exactCandidate.attempt
+      && (!opts.kinds?.length || opts.kinds.includes(candidate.kind))
+      ? [candidate]
+      : [];
+  }
+  const due = await store.listDueWorkflowWorkItems({
+    now: opts.now,
+    limit: opts.limit ?? 25,
+    kinds: opts.kinds,
+  });
+  return due.filter((candidate) => (
+    candidate.id === exactCandidate.id
+    && candidate.runId === exactCandidate.runId
+    && candidate.attempt === exactCandidate.attempt
+    && (!opts.kinds?.length || opts.kinds.includes(candidate.kind))
+  ));
 }

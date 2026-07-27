@@ -224,7 +224,7 @@ export async function transitionWorkflowWorkItemImpl(store: TaskStore, id: strin
     return store.transitionWorkflowWorkItemSync(id, state, patch);
   }
 
-export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: string, leaseOwner: string, opts: { leaseDurationMs: number; now?: string },): Promise<WorkflowWorkItem | null> {
+export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: string, leaseOwner: string, opts: { leaseDurationMs: number; now?: string; expectedRunId?: string; expectedAttempt?: number },): Promise<WorkflowWorkItem | null> {
     if (!Number.isFinite(opts.leaseDurationMs) || opts.leaseDurationMs <= 0) {
       throw new Error(`workflow work item leaseDurationMs must be > 0 (received ${opts.leaseDurationMs})`);
     }
@@ -250,6 +250,8 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
         .where(
           and(
             eq(schema.project.workflowWorkItems.id, id),
+            ...(opts.expectedRunId === undefined ? [] : [eq(schema.project.workflowWorkItems.runId, opts.expectedRunId)]),
+            ...(opts.expectedAttempt === undefined ? [] : [eq(schema.project.workflowWorkItems.attempt, opts.expectedAttempt)]),
             inArray(schema.project.workflowWorkItems.state, ["runnable", "retrying", "running"]),
             or(
               isNull(schema.project.workflowWorkItems.retryAfter),
@@ -290,10 +292,23 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
                   updatedAt = ?
             WHERE id = ?
               AND state IN ('runnable', 'retrying', 'running')
+              AND (? IS NULL OR runId = ?)
+              AND (? IS NULL OR attempt = ?)
               AND (retryAfter IS NULL OR retryAfter <= ?)
               AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= ?)`,
         )
-        .run(leaseOwner, leaseExpiresAt, now, id, now, now);
+        .run(
+          leaseOwner,
+          leaseExpiresAt,
+          now,
+          id,
+          opts.expectedRunId ?? null,
+          opts.expectedRunId ?? null,
+          opts.expectedAttempt ?? null,
+          opts.expectedAttempt ?? null,
+          now,
+          now,
+        );
       if (result.changes === 0) return null;
 
       const row = store.db.prepare("SELECT * FROM workflow_work_items WHERE id = ?").get(id) as WorkflowWorkItemRow | undefined;
