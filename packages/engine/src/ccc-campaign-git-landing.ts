@@ -37,6 +37,7 @@ type ApprovalTransaction = Parameters<typeof assertActiveClaimedCccCampaignAppro
 
 export type CccCampaignGitLandingFault =
   | "after-objects-before-intent"
+  | "after-intent-write-before-commit"
   | "after-intent"
   | "after-cas"
   | "foreign-before-cas"
@@ -362,6 +363,9 @@ export async function campaignGitLandingRequiredResult(
       metadata: intent,
       campaign: { eventKey: eventKey(context, action, "intent"), binding },
     });
+    if (fault === "after-intent-write-before-commit") {
+      throw new Error("CCC campaign Git landing test fault after intent write before commit");
+    }
   });
   if (fault === "after-intent") {
     throw new Error("CCC campaign Git landing test fault after durable intent");

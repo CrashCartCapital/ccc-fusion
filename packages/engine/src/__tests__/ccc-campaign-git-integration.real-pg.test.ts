@@ -402,11 +402,42 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     })).rejects.toThrow(/after deterministic objects before durable intent/);
 
     expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(fixture.claimed.campaign!.binding.targetBase);
-    await expect(getApprovalRequest(h.layer().db, fixture.issued.id)).resolves.toMatchObject({ status: "claimed" });
+    await expectClaimedApprovalAndLease(fixture);
     await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
     expectNoForbiddenEffects(forbidden);
 
     const expectedCommit = await expectedPreparedCommit(fixture);
+    const replay = createForbiddenEffectRecorder();
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, replay.deps)).resolves.toMatchObject({
+      merged: true,
+      noOp: false,
+      worktreeRemoved: false,
+      branchDeleted: false,
+    });
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(expectedCommit);
+    await expect(getApprovalRequest(h.layer().db, fixture.issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:intent",
+      "ccc-campaign-git-landing:terminal",
+    ]);
+    expectNoForbiddenEffects(replay);
+  });
+
+  it("Task 5 RED: rolls back intent persistence failure before ref mutation and replays exact commit identity", async () => {
+    const fixture = await importedMergeFixture("after-intent-write-before-commit");
+    const forbidden = createForbiddenEffectRecorder();
+    const expectedCommit = await expectedPreparedCommit(fixture);
+
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
+      ...forbidden.deps,
+      cccCampaignGitLandingFault: "after-intent-write-before-commit",
+    })).rejects.toThrow(/intent write before commit/);
+
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(fixture.claimed.campaign!.binding.targetBase);
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
+    expectNoForbiddenEffects(forbidden);
+
     const replay = createForbiddenEffectRecorder();
     await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, replay.deps)).resolves.toMatchObject({
       merged: true,
