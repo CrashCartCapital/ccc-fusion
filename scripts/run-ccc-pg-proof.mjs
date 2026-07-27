@@ -2,17 +2,18 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { setImmediate } from "node:timers";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 const stopPolicySelfTest = process.argv.length === 3 && process.argv[2] === "--self-test-stop-settlement";
 const runnerPolicySelfTest = process.argv.length === 3 && process.argv[2] === "--self-test-policies";
 const selectedWave = process.argv.length === 4 && process.argv[2] === "--wave"
   ? Number(process.argv[3])
   : null;
-if (!stopPolicySelfTest && !runnerPolicySelfTest && selectedWave !== 4 && selectedWave !== 5) {
-  throw new Error("usage: node scripts/run-ccc-pg-proof.mjs --wave <4|5>");
+if (!stopPolicySelfTest && !runnerPolicySelfTest && selectedWave !== 4 && selectedWave !== 5 && selectedWave !== 6) {
+  throw new Error("usage: node scripts/run-ccc-pg-proof.mjs --wave <4|5|6>");
 }
 if (!stopPolicySelfTest && !runnerPolicySelfTest && process.env.FUSION_PG_TEST_SKIP === "1") {
   throw new Error(`FUSION_PG_TEST_SKIP=1 disables the required Wave ${selectedWave} PostgreSQL proof before test execution`);
@@ -303,6 +304,390 @@ const expectedWave5EngineImportNames = [
   "CCC PRD imported workflow execution > claims the imported runnable item through the fenced full-graph processor",
 ];
 
+const expectedWave6CampaignPgNames = [
+  "CCC campaign approval lifecycle (PostgreSQL) > exposes the lifecycle through the native store and fails closed without PostgreSQL authority",
+  "CCC campaign approval lifecycle (PostgreSQL) > issues, claims, consumes, and survives a normal PostgreSQL reader restart",
+  "CCC campaign approval lifecycle (PostgreSQL) > keeps active action leases scoped to each sibling task when they reuse an action ID",
+  "CCC campaign approval lifecycle (PostgreSQL) > refuses a nonempty legacy flat action-lease row",
+  "CCC campaign approval lifecycle (PostgreSQL) > asserts exact consumed custody and refuses wrong request, token, or a remaining action lease",
+  "CCC campaign approval lifecycle (PostgreSQL) > maps each protected-action kind to the matching approval policy category",
+  "CCC campaign approval lifecycle (PostgreSQL) > denies issued approval and refuses claim before not-before time",
+  "CCC campaign approval lifecycle (PostgreSQL) > rolls a denied transition back when its immutable campaign audit receipt collides",
+  "CCC campaign approval lifecycle (PostgreSQL) > expires an issued approval, rejects claimed expiry without effect evidence, and refuses a wrong consume token",
+  "CCC campaign approval lifecycle (PostgreSQL) > reconciles a claimed approval after nominal expiry, but refuses a same-token replay without its persisted lease",
+  "CCC campaign approval lifecycle (PostgreSQL) > admits one exact active claimed approval before a new provider dispatch without writing lifecycle or audit state",
+  "CCC campaign approval lifecycle (PostgreSQL) > refuses provider dispatch when only the persisted action lease claim time drifts",
+  "CCC campaign approval lifecycle (PostgreSQL) > refuses provider dispatch when only the persisted action lease expiry drifts but remains active",
+  "CCC campaign approval lifecycle (PostgreSQL) > refuses provider dispatch when only the claimed approval not-before moves into the future",
+  "CCC campaign approval lifecycle (PostgreSQL) > refuses a past database-clock approval window before dispatch while preserving after-effect consume",
+  "CCC campaign approval lifecycle (PostgreSQL) > refuses a wrong token, elapsed, missing, or drifted lease, and gives a restarted PostgreSQL reader the same active result",
+  "CCC campaign approval lifecycle (PostgreSQL) > expires a claimed approval only after exact native proved-failed receipt evidence and no unknown dispatch",
+  "CCC campaign approval lifecycle (PostgreSQL) > admits exactly one distinct concurrent claim and rejects issue drift",
+  "CCC campaign native public surface > reserves the TaskStore campaign-context reader",
+  "CCC campaign native public surface > Task 6 RED: canonical workflow routes require an extension identity and bind it into manifest identity",
+  "CCC campaign native persistence > Task 3 RED: read-only workflow lease preflight validates every fence field with database time",
+  "CCC campaign native persistence > uses a supplied transaction for a campaign-context reload",
+  "CCC campaign native persistence > locks the campaign import for a transaction-scoped authority read",
+  "CCC campaign native persistence > derives a full authority binding and canonical hash from persisted campaign context",
+  "CCC campaign native persistence > refuses protected action target drift",
+  "CCC campaign native persistence > refuses an undeclared action when protected authority is required",
+  "CCC campaign native persistence > allows one action-lease winner under two concurrent claims",
+  "CCC campaign native persistence > replays an identical action lease without changing its owner",
+  "CCC campaign native persistence > refuses an action lease collision with a changed winning token",
+  "CCC campaign native persistence > settles only the exact winning action lease",
+  "CCC campaign native persistence > keeps an action lease visible after a TaskStore restart",
+  "CCC campaign native persistence > refuses a persisted action lease whose protected binding has drifted",
+  "CCC campaign native persistence > refuses missing exact per-task execution routes",
+  "CCC campaign native persistence > refuses extra exact per-task execution routes",
+  "CCC campaign native persistence > refuses duplicate exact per-task execution routes",
+  "CCC campaign native persistence > refuses an idempotency replay whose provider, model, or transport binding changed",
+  "CCC campaign native persistence > returns one immutable context across a sequential identical replay",
+  "CCC campaign native persistence > returns one immutable context across two concurrent identical imports",
+  "CCC campaign native persistence > reloads the same immutable context after a post-commit lost response",
+  "CCC campaign native persistence > persists and reloads an immutable policy-complete campaign binding from custody rows after restart",
+  "CCC campaign native persistence > does not accept caller task metadata as campaign context",
+  "CCC campaign native persistence > refuses a canonical bundle task proof-id mutation that is not rehashed",
+  "CCC campaign native persistence > refuses native task source metadata drift in proof IDs",
+  "CCC campaign native persistence > refuses native task source metadata drift in bundle hash",
+  "CCC campaign native persistence > fails closed with a typed refusal when persisted campaign custody is malformed",
+  "CCC campaign native persistence > refuses restart custody after an admitted symlink target is retargeted",
+  "CCC campaign native persistence > refuses a shifted persisted campaign window even when its duration is preserved",
+  "CCC campaign native persistence > releases its projection claim when the physical root drifts immediately after claim",
+  "CCC campaign native persistence > refuses reconciliation of an explicitly unadmitted legacy campaign row",
+  "CCC campaign provider controller (PostgreSQL) > requires one exact active claimed approval and lease before atomic reservation",
+  "CCC campaign provider controller (PostgreSQL) > selects the one live-execution action assigned to this task, not another task's action",
+  "CCC campaign provider controller (PostgreSQL) > accepts a canonical 64-character local Git head observation",
+  "CCC campaign provider controller (PostgreSQL) > refuses expired approval before any request-count or audit mutation",
+  "CCC campaign provider controller (PostgreSQL) > refuses future not-before, wrong approval identity, and wrong claim token without writes",
+  "CCC campaign provider controller (PostgreSQL) > refuses a missing persisted action lease without campaign writes",
+  "CCC campaign provider controller (PostgreSQL) > refuses corrupted persisted route and semantic task custody without campaign writes",
+  "CCC campaign provider controller (PostgreSQL) > refuses wrong actual provider route before any provider-attempt audit or request-count increment",
+  "CCC campaign provider controller (PostgreSQL) > refuses wrong actual model route before any provider-attempt audit or request-count increment",
+  "CCC campaign provider controller (PostgreSQL) > refuses wrong actual transport route before any provider-attempt audit or request-count increment",
+  "CCC campaign provider controller (PostgreSQL) > rolls back reservation and count when begin is interrupted",
+  "CCC campaign provider controller (PostgreSQL) > refuses a foreign Git target before campaign attempt writes",
+  "CCC campaign provider controller (PostgreSQL) > refuses a foreign Git expected base before campaign attempt writes",
+  "CCC campaign provider controller (PostgreSQL) > refuses a noncanonical Git head before campaign attempt writes",
+  "CCC campaign provider controller (PostgreSQL) > refuses mixed Git object formats before campaign attempt writes",
+  "CCC campaign provider controller (PostgreSQL) > holds identical lost-response replay without extra audit rows or provider permit",
+  "CCC campaign provider controller (PostgreSQL) > holds terminal replay after attempted provider consumption without extra permit",
+  "CCC campaign provider controller (PostgreSQL) > refuses a task without imported campaign custody instead of treating it as ordinary",
+  "CCC campaign provider controller (PostgreSQL) > refuses missing, ambiguous, and wrong-kind live-execution declarations before provider-attempt writes",
+  "CCC campaign provider controller (PostgreSQL) > refuses missing, foreign, or duplicate task protected-action IDs before provider-attempt writes",
+];
+const expectedWave6PrdImportPgNames = [
+  "CCC PRD import public surface > exports the import, inspection, and reconciliation entry points",
+  "CCC PRD import public surface > uses canonical semantic content, not a fixed fixture literal, for bundle identity",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: campaign",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: task",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: dependency_edge",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: workflow",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: document",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: artifact",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: source",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: work_item",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rolls back every database entity/final-audit boundary without effects: run_audit",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: after_prepared_db_commit",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: task_directory",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: task_json",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: prompt",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: artifact_bytes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: canonical_projection_move",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > leaves only a prepared, non-runnable state across projection boundary: before_activation",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > recovers a lost response after the activation commit without runnable filesystem drift",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > observes every preparation writer on one actual DbTransaction with no nested or top-level writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > invalidates native workflow caches only after the prepared database transaction commits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: imports explicit split join topology for a dependency diamond",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: attaches each workflow transport route extension to its semantic prompt node",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: refuses an unregistered workflow transport extension without persisted import state",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: refuses a dangling terminal protected-action reference before emitting workflow IR",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: emits one merge seam after one exact terminal merge action and refuses ambiguous landings",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: preserves no-merge-action workflow IR bytes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > commits exact semantic counts, projects task/document/artifact readers, and remains visible after restart",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > rebuilds missing canonical prepared files for an active import after restart",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > serializes two concurrent active repairs over one staging prefix",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds active-repair lock waiting by the admitted reconciliation budget",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds same-key preparation admission while the creator transaction is uncommitted",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > is sequentially and concurrently idempotent, including a lost response after commit",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps a live projection claim beyond lease expiry while an identical import waits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps renewing through the activation handoff while an identical import waits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds an identical wait by the admitted bundle duration plus reconciliation overhead",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > retries one transient PostgreSQL lease-renewal failure without losing ownership",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > surfaces projection lease ownership loss as a deterministic reconciliation conflict",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > namespaces global workflow and artifact IDs so independent imports cannot collide",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > includes all three import custody tables in the shared PostgreSQL reset",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > allows failed-then-retry but refuses idempotency-key collisions on bundle, target, or base",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a symlink escape through the owned .fusion/tasks root without external writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a symlink escape through the owned .fusion/artifacts root without external writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a symlink escape through the owned .fusion/ccc-prd-import-staging root without external writes",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a dangling symlink at an existing canonical artifact path",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a byte-identical symlink at an existing canonical task directory",
+];
+const expectedWave6EngineDefaultNames = [
+  "CCC campaign provider controller real-packet authority > selects the exact declared live-execution action without rewriting the unchanged sidecar",
+  "CCC campaign provider controller > rechecks the immutable Git snapshot before asking core for a permit",
+  "CCC campaign provider controller > does not call core when the Git recheck refuses",
+  "CCC campaign provider controller > has no routeKind admission label on the engine pre-dispatch input",
+  "CCC campaign provider controller > refuses an abort observed after Git recheck before core reservation",
+  "CCC campaign provider controller > refuses persisted pi or cli routes for a workflow binding before lease or Git work",
+  "CCC campaign provider controller > Task 6 P1 RED: refuses a persisted workflow extension mismatch before lease, Git, or provider permit work",
+  "CCC campaign provider controller > refuses persisted Pi provider or model drift before lease or Git work",
+  "CCC campaign provider controller > creates a frozen exact workflow binding and refuses a wrong dispatch turn or transport before core",
+  "CCC campaign provider controller > preserves the actual matching Pi route into core",
+  "CCC campaign provider controller > Task 6 P1 RED: refuses a reconciliation whose submitted turn is not the binding's sealed turn",
+  "executor workflow-step model resolution > uses the project execution lane instead of the global default when the step has no override",
+  "executor workflow-step model resolution > keeps step and task overrides ahead of execution-lane settings",
+  "executor workflow-step model resolution > falls through the execution hierarchy without mixing partial pairs",
+  "executor workflow-step model resolution > forces mock/scripted for workflow steps when test mode is active",
+  "executor workflow-step model resolution > resolves workflow-step thinking level before task and settings defaults",
+  "executor workflow-step model resolution > logs workflow-step model rows with thinking effort before override annotations",
+  "executor workflow-step model resolution > settles a prompt-mode workflow step promptly when its execution signal aborts",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: CCC frontier checkpoint failure does not traverse an authored failure effect",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: CCC permanent node failure is classified once without authored failure traversal",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: CCC transient node failure consumes the configured total attempt cap",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: CCC transient terminal context carries a non-three consumed cap",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: an aborted sibling cannot commit an async task projection from the normal handler path",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: an aborted sibling cannot commit an async task projection from the plugin handler path",
+  "WorkflowGraphExecutor fan-out/join (U13) > mode:all — both branches complete in any order, join fires once, advances to tail",
+  "WorkflowGraphExecutor fan-out/join (U13) > mode:any with collect — first completion fires join; slower branch finishes without re-firing",
+  "WorkflowGraphExecutor fan-out/join (U13) > mode:any with fail-fast — slower branch is aborted via signal",
+  "WorkflowGraphExecutor fan-out/join (U13) > parent abort reaches a split branch and settles the join as failure",
+  "WorkflowGraphExecutor fan-out/join (U13) > quorum(2) of 3 — join fires on the second completion",
+  "WorkflowGraphExecutor fan-out/join (U13) > branch failure fail-fast — siblings aborted, join routes the failure edge",
+  "WorkflowGraphExecutor fan-out/join (U13) > branch failure collect — all branches finish; join evaluates combined outcomes",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: CCC persistence failure aborts a collect join before the next sibling effect",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: CCC branches enter the split concurrently",
+  "WorkflowGraphExecutor fan-out/join (U13) > crash mid-branch resume — completed branches' nodes are NOT re-run",
+  "WorkflowGraphExecutor fan-out/join (U13) > card-position invariant — no column move occurs during the parallel window",
+  "WorkflowGraphExecutor fan-out/join (U13) > semaphore bound — branches queue, never exceeding the limit (fake semaphore)",
+  "WorkflowGraphExecutor fan-out/join (U13) > nested split resolves recursively",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: nested CCC checkpoint failure bypasses inner and outer failure edges",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: CCC permanent branch failure cannot be masked by a collect join",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: exhausted CCC transient branch failure cannot be masked by a collect join",
+  "WorkflowGraphExecutor fan-out/join (U13) > Wave 4 RED: a late CCC terminal checkpoint survives an ordinary fail-fast abort",
+  "WorkflowGraphExecutor fan-out/join (U13) > reports live per-branch progress for the dashboard",
+  "workflow malformed-verdict gate > parses structured, fenced, prose, and malformed verdict shapes at the imperative seam",
+  "workflow malformed-verdict gate > keeps a blocking graph gate with a genuine REVISE verdict from passing",
+  "workflow malformed-verdict gate > allows advisory malformed gates to record advisory_failure without blocking the graph",
+  "workflow malformed-verdict gate > terminates a graph run as failed when a blocking gate returns REVISE",
+  "workflow malformed-verdict gate > fails closed for fenced blocking CCC semantic task nodes with malformed workflow-step output",
+  "workflow malformed-verdict gate > keeps generic unfenced prompt gates lenient on malformed workflow-step output",
+  "workflow node-handler extensions > executes an extension-marked node and routes custom outcomes",
+  "workflow node-handler extensions > preserves plugin-provided values for custom outcomes",
+  "workflow node-handler extensions > degrades faulty node handlers before falling through to default handler",
+  "workflow node-handler extensions > Task 4 maps resolver output to semantic task before plugin handling",
+  "workflow node-handler extensions > rejects opaque host posture before plugin/default handler when provider resolution is available",
+  "workflow node-handler extensions > passes through no-provider posture without provider capability and without provider-binding resolution",
+  "workflow node-handler extensions > passes each scoped extension a sealed provider dispatch rooted in one resolver binding",
+  "workflow node-handler extensions > refuses forged scoped-provider dispatch before raw provider preDispatch",
+  "workflow node-handler extensions > delegates exact scoped-provider dispatch clones with the sealed descriptor",
+  "workflow node-handler extensions > fails closed when a scoped-provider handler throws, without later scoped or default dispatch",
+  "workflow node-handler extensions > fails closed before scoped or default dispatch when the provider-binding resolver seam is absent",
+  "workflow node-handler extensions > fails closed when scoped-provider resolver returns undefined",
+  "workflow node-handler extensions > fails closed when scoped-provider resolver returns a malformed binding",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1 RED: late processor registration observes an active hard-move intent and cancels before runtime",
+  "processDueWorkflowWorkItem symbol lock renewal > late processor registration observes an explicit custom-column hard-cancel intent",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1 RED: fresh user pause returns before custody starts and cannot leak a delayed rejection",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1 RED: an already-aborted custody read consumes its delayed rejection",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P2 RED: user cancellation aborts a hung best-effort summary after succeeded CAS",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1-A RED: user cancellation races a hung runtime task read and persists cancelled",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1 RED: cancellation after task-read fulfillment prevents runtime dispatch",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1-B RED: context-only campaign cancellation registers during classification and never runs either runtime",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1-A: user cancellation races a hung custody read and persists cancelled",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1-B RED: ordinary classification unregisters its provisional disposer before runWorkItem",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 P1 RED: null-custody ordinary work does not wait on campaign task reads",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 RED: required campaign cancellation registers before async custody, waits for cancelled CAS, and never dispatches",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6 RED: a mismatched task move cannot abort an active campaign",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6: a user cancellation during custody failure still persists cancelled",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6: a user cancellation wins when lease loss aborted the controller first",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 6: a user pause observed after campaign claim prevents runtime dispatch",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 5 RED: passes an exact campaign candidate through to the lease claim",
+  "processDueWorkflowWorkItem symbol lock renewal > renews a claimed mission symbol before its short admission lease can expire",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: ordinary non-campaign work items do not renew workflow work-item leases",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 5 RED: campaign-required custody classification never falls through when recheck is missing",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: an imported campaign work item fails closed when campaign custody lookup is unwired",
+  "processDueWorkflowWorkItem symbol lock renewal > Wave 4 RED: rejects the public processor call when runtime and fallback terminal persistence both fail",
+  "processDueWorkflowWorkItem symbol lock renewal > Wave 4 RED: rejects before claiming when native fallback terminal persistence is unavailable",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: campaign processor enters the full graph instead of the addressed work-item node",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: a first imported campaign claim promotes attempt zero before building its fence",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3: attempt-zero promotion CAS failure never enters runtime or publishes success",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: exact workflow lease renewal loss aborts the campaign run",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: campaign work persists fenced failure before runtime when native work-item lease renewal is absent",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: renewal loss after graph return refuses terminal success CAS",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: work-item lease renewal is single-flight while runtime is active",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: stale owner or attempt cannot publish campaign success",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: campaign summary is written only after terminal CAS using a freshly reloaded task",
+  "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: durable cancellation after runtime success is reported truthfully",
+];
+const expectedWave6CampaignExecProofGitNames = [
+  "CCC campaign coarse pre-provider admission > refuses a task without an explicit imported-marker snapshot instead of treating absent custody as ordinary",
+  "CCC campaign coarse pre-provider admission > permits an explicitly ordinary task without proof, approval, reservation, or provider effects",
+  "CCC campaign coarse pre-provider admission > fails closed when an imported marker has no persisted campaign custody",
+  "CCC campaign coarse pre-provider admission > fails closed when imported campaign custody lookup errors",
+  "CCC campaign coarse pre-provider admission > keeps native and semantic task identities distinct and observes exact clean Git state before proof",
+  "CCC campaign coarse pre-provider admission > fails closed after Git inspection for 'resolved target root mismatch' and before all later effects",
+  "CCC campaign coarse pre-provider admission > fails closed after Git inspection for 'expected-base object mismatch' and before all later effects",
+  "CCC campaign coarse pre-provider admission > fails closed after Git inspection for 'foreign HEAD outside the expected-bas…' and before all later effects",
+  "CCC campaign coarse pre-provider admission > fails closed after Git inspection for 'empty noncanonical HEAD despite a cal…' and before all later effects",
+  "CCC campaign coarse pre-provider admission > fails closed after Git inspection for 'noncanonical HEAD despite a caller-as…' and before all later effects",
+  "CCC campaign coarse pre-provider admission > fails closed after Git inspection for 'dirty target repository' and before all later effects",
+  "CCC campaign coarse pre-provider admission > fails closed after Git inspection for 'missing clean-state observation' and before all later effects",
+  "CCC campaign coarse pre-provider admission > wraps a live-Git inspection failure as an admission refusal before proof, claim, reservation, or provider dispatch",
+  "CCC campaign coarse pre-provider admission > wraps a null live-Git inspection result as an admission refusal before all later effects",
+  "CCC campaign coarse pre-provider admission > uses context.route as the authority and refuses provider, model, or transport drift before all effects",
+  "CCC campaign coarse pre-provider admission > derives protectedness only from the declared action and preserves the store's exact binding and lease",
+  "CCC campaign coarse pre-provider admission > wraps a declared protected action target mismatch as action-drift before approval or transport effects",
+  "CCC campaign coarse pre-provider admission > revalidates a protected claim's returned binding provenance before transport effects",
+  "CCC campaign coarse pre-provider admission > refuses a protected claim with an empty noncanonical claim token",
+  "CCC campaign coarse pre-provider admission > returns frozen protected authority snapshots that do not alias the claim fake's lease",
+  "CCC campaign coarse pre-provider admission > admits proof before a protected claim and leaves reservation and provider dispatch to the transport boundary",
+  "CCC campaign coarse pre-provider admission > returns a frozen unprotected authority binding whose canonical bytes cannot be mutated",
+  "CCC campaign coarse pre-provider admission > returns a detached recursively frozen campaign context snapshot",
+  "CCC campaign coarse pre-provider admission > passes a detached recursively frozen campaign context snapshot to proof callbacks",
+  "CCC campaign coarse pre-provider admission > prevents callback-time source context mutation from changing admitted protected authority",
+  "CCC campaign coarse pre-provider admission > honors abort during asynchronous proof before claim, reservation, or provider dispatch",
+  "CCC campaign local Git observation > returns a frozen physical snapshot for a clean descendant checkout",
+  "CCC campaign local Git observation > hashes tracked worktree blobs using the repository SHA-256 object format",
+  "CCC campaign local Git observation > rejects noncanonical and missing expected base objects",
+  "CCC campaign local Git observation > rejects a clean HEAD that does not descend from the expected base",
+  "CCC campaign local Git observation > rejects foreign ancestry spoofed by an inherited Git graft file",
+  "CCC campaign local Git observation > rejects a staged worktree",
+  "CCC campaign local Git observation > rejects a unstaged worktree",
+  "CCC campaign local Git observation > rejects a untracked worktree",
+  "CCC campaign local Git observation > never admits dirty bytes through an ambient PATH Git that spoofs index and HEAD",
+  "CCC campaign local Git observation > rejects staged index drift from modify even when worktree matches the index",
+  "CCC campaign local Git observation > rejects staged index drift from add even when worktree matches the index",
+  "CCC campaign local Git observation > rejects staged index drift from delete even when worktree matches the index",
+  "CCC campaign local Git observation > rejects same-length tracked byte drift hidden by Git stat settings",
+  "CCC campaign local Git observation > rejects a tracked FIFO without blocking for a writer",
+  "CCC campaign local Git observation > rejects owner-execute drift hidden by a group-execute bit",
+  "CCC campaign local Git observation > rejects a tracked regular file reached through an ignored intermediate symlink",
+  "CCC campaign local Git observation > rejects an indexed symlink reached through an ignored intermediate symlink",
+  "CCC campaign local Git observation > refuses tracked drift without executing a repository clean filter",
+  "CCC campaign local Git observation > refuses a tracked submodule entry in the exact HEAD tree",
+  "CCC campaign local Git observation > refuses hidden tracked changes under assume-unchanged",
+  "CCC campaign local Git observation > refuses hidden tracked changes under skip-worktree",
+  "CCC campaign local Git observation > refuses hidden tracked changes under both hidden flags",
+  "CCC campaign local Git observation > binds linked worktrees to their exact physical root and git directory",
+  "CCC campaign local Git observation > rejects a bare repository",
+  "CCC campaign local Git observation > canonicalizes a symlink alias to the physical target root",
+  "CCC campaign local Git observation > accepts a clean detached HEAD at the expected base",
+  "CCC campaign local Git observation > scrubs inherited repository and config redirection",
+  "CCC campaign local Git observation > ignores an invalid global Git config from ambient HOME",
+  "CCC campaign local Git observation > fails closed when the trusted catalog has no absolute executable file",
+  "CCC campaign local Git observation > controls the environment of the first Git process selected from the trusted catalog",
+  "CCC campaign local Git observation > recheck uses the originally pinned physical Git binary after PATH changes",
+  "CCC campaign local Git observation > bounds timeout and reaps a SIGTERM-ignoring selected executable tree",
+  "CCC campaign local Git observation > rechecks the exact observed HEAD and refuses later descendant or dirty state",
+  "CCC campaign local Git observation > recheck refuses a same-path whole-checkout replacement with identical clean Git bytes",
+  "CCC campaign local Git observation > recheck refuses a same-path Git control-directory replacement",
+  "CCC campaign local Git observation > honors an already-aborted signal",
+  "CCC campaign local Git observation > refuses a missing promisor object without lazy-fetching or mutating the object store",
+  "CCC native campaign proof admission > accepts the exact CCC lab kernel transaction declaration without executing it",
+  "CCC native campaign proof admission > verifies the exact immutable binding self-check without executing a command",
+  "CCC native campaign proof admission > refuses non-self-check declaration with blank positive oracle",
+  "CCC native campaign proof admission > refuses non-self-check declaration with oversized positive oracle",
+  "CCC native campaign proof admission > refuses non-self-check declaration with empty negative controls",
+  "CCC native campaign proof admission > refuses non-self-check declaration with duplicate negative controls",
+  "CCC native campaign proof admission > refuses non-self-check declaration with blank negative control",
+  "CCC native campaign proof admission > refuses non-self-check declaration with oversized negative control",
+  "CCC native campaign proof admission > deep-clones and freezes the proof payload while preserving the live abort signal",
+  "CCC native campaign proof admission > refuses constant true command without executing a command",
+  "CCC native campaign proof admission > refuses explicit exit-zero command without executing a command",
+  "CCC native campaign proof admission > refuses echo-ok command without executing a command",
+  "CCC native campaign proof admission > refuses shell-wrapped exit-zero command without executing a command",
+  "CCC native campaign proof admission > refuses bash-wrapped true command without executing a command",
+  "CCC native campaign proof admission > refuses absolute true command without executing a command",
+  "CCC native campaign proof admission > refuses node explicit zero-exit command without executing a command",
+  "CCC native campaign proof admission > refuses shell substitution without executing a command",
+  "CCC native campaign proof admission > refuses output redirection without executing a command",
+  "CCC native campaign proof admission > refuses environment assignment without executing a command",
+  "CCC native campaign proof admission > refuses shell wrapper without executing a command",
+  "CCC native campaign proof admission > refuses extra executable without executing a command",
+  "CCC native campaign proof admission > refuses recursive removal without executing a command",
+  "CCC native campaign proof admission > refuses curl executable without executing a command",
+  "CCC native campaign proof admission > refuses python executable without executing a command",
+  "CCC native campaign proof admission > refuses python3 executable without executing a command",
+  "CCC native campaign proof admission > refuses git executable without executing a command",
+  "CCC native campaign proof admission > refuses gh executable without executing a command",
+  "CCC native campaign proof admission > refuses pnpm executable without executing a command",
+  "CCC native campaign proof admission > refuses npm executable without executing a command",
+  "CCC native campaign proof admission > refuses npx executable without executing a command",
+  "CCC native campaign proof admission > refuses bun executable without executing a command",
+  "CCC native campaign proof admission > refuses deno executable without executing a command",
+  "CCC native campaign proof admission > refuses ruby executable without executing a command",
+  "CCC native campaign proof admission > refuses perl executable without executing a command",
+  "CCC native campaign proof admission > refuses java executable without executing a command",
+  "CCC native campaign proof admission > refuses go executable without executing a command",
+  "CCC native campaign proof admission > refuses cargo executable without executing a command",
+  "CCC native campaign proof admission > refuses make executable without executing a command",
+  "CCC native campaign proof admission > refuses oversized declaration without executing a command",
+  "CCC native campaign proof admission > refuses generic positive oracle without executing a command",
+  "CCC native campaign proof admission > refuses generic negative control without executing a command",
+  "CCC native campaign proof admission > refuses duplicate requirement ids without executing a command",
+  "CCC native campaign proof admission > refuses too many requirement ids without executing a command",
+  "CCC native campaign proof admission > refuses oversized requirement id without executing a command",
+  "CCC native campaign proof admission > refuses duplicate negative controls without executing a command",
+  "CCC native campaign proof admission > refuses positive oracle repeated as a negative control without executing a command",
+  "CCC native campaign proof admission > refuses stale proof-definition and admission-definition hashes",
+  "CCC native campaign proof admission > refuses a stale evaluator input digest and echoes the current digest",
+  "CCC native campaign proof admission > refuses a proof admission bound to a different fixed identity",
+  "CCC native campaign proof admission > refuses arbitrary shell and prose declarations without executing them",
+  "CCC native campaign proof admission > stops before evaluation when the invocation is already aborted",
+  "CCC campaign proof workflow admission > exposes the native pre-node admission factory",
+  "CCC campaign proof workflow admission > admits an exact node proof through the sealed native registry and writes a campaign receipt",
+  "CCC campaign proof workflow admission > admits a fixture with exact admission binding and sealed execution provenance",
+  "CCC campaign proof workflow admission > refuses before evaluator dispatch when execution origin differs from factory origin",
+  "CCC campaign proof workflow admission > refuses before evaluator dispatch when execution semantic id differs from node config",
+  "CCC campaign proof workflow admission > refuses before evaluator dispatch when semantic task id differs from execution semantic task",
+  "CCC campaign proof workflow admission > refuses before evaluator dispatch when execution run id differs from fenced run id",
+  "CCC campaign proof workflow admission > refuses before evaluator dispatch when visit identity nodeId differs from node id",
+  "CCC campaign proof workflow admission > refuses before evaluator dispatch when execution visit identity is not the exact same visit identity",
+  "CCC campaign proof workflow admission > refuses before evaluator dispatch when materialized visit identity drifts",
+  "CCC campaign proof workflow admission > refuses missing runtime-safe admission binding before evaluator dispatch",
+  "CCC campaign proof workflow admission > refuses a missing semantic task binding before loading campaign custody",
+  "CCC campaign proof workflow admission > refuses duplicate task proof ids before evaluator dispatch",
+  "CCC campaign proof workflow admission > audits and refuses a stale proof definition before evaluator dispatch",
+  "CCC campaign proof workflow admission > audits and refuses host source drift before evaluator dispatch",
+  "CCC campaign proof workflow admission > audits and refuses 'a failed outcome'",
+  "CCC campaign proof workflow admission > audits and refuses 'a changed input digest'",
+  "CCC campaign proof workflow admission > audits and refuses 'an incomplete result'",
+  "CCC campaign proof workflow admission > audits and refuses an evaluator aborted while running",
+  "CCC campaign proof workflow admission > blocks a passing evaluator when its native audit receipt cannot persist",
+  "CCC campaign proof workflow admission > audits and refuses the native binding self-check before any task execution can follow",
+  "CCC campaign proof workflow admission > does not require proofs for orchestration-only nodes",
+];
+const expectedWave6RealAcceptanceNames = [
+  "Task 5 native CCC campaign Git landing > branches from merger-ai before legacy landing and binds the structured campaign marker",
+  "Task 5 native CCC campaign Git landing > leaves ordinary merger behavior on the legacy branch",
+  "Task 5 native CCC campaign Git landing > fails closed for imported campaign markers without persisted custody",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses after deterministic objects before durable intent with ref unchanged and replayable commit identity",
+  "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: rolls back intent persistence failure before ref mutation and replays exact commit identity",
+  "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: reconciles interruption at each CAS boundary and consumes one exact approval",
+  "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: refuses a foreign target ref race before CAS without terminal audit or approval consume",
+  "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: refuses a foreign target ref race before terminal audit or approval consume",
+  "CCC campaign deterministic Git object primitives > prepares deterministic object-only squash output and replays the same commit",
+  "CCC campaign deterministic Git object primitives > Task 5 RED: refuses drift dirty overlap and undeclared paths before mutation",
+  "CCC campaign deterministic Git object primitives > refuses undeclared paths, bad admitted roots, symlinks, and gitlinks",
+  "CCC campaign deterministic Git object primitives > refuses unsafe controlled Git environment overrides",
+  "CCC campaign deterministic Git object primitives > rejects noncanonical identity and message fields before writing objects",
+  "CCC campaign deterministic Git object primitives > refuses unrelated object drift before recheck or CAS",
+  "CCC campaign deterministic Git object primitives > refuses packed unrelated object drift before recheck or CAS",
+  "CCC campaign deterministic Git object primitives > performs exact update-ref CAS once, refuses stale CAS, and prepare accepts exact-new restart state",
+  "CCC campaign deterministic Git object primitives > detects target checked out by a sibling worktree",
+  "Task 6 local CCC campaign acceptance (real PostgreSQL) > completes an imported mixed-provider split/join campaign through real Pi admission, a scoped handler, and native Git landing",
+  "Task 6 local CCC campaign acceptance (real PostgreSQL) > durably cancels an admitted scoped-provider branch through the real graph signal and never redispatches it after restart",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 5 RED: mixed due queue preserves ordinary dispatch and claims campaign work only through the fenced processor",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > keeps campaignRequired fail-closed after a real PostgreSQL claim when custody is absent",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6: public user cancellation durably parks a real campaign and restart cannot redispatch it",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6 P1 RED: a claim that lands during a public move is cancelled and cannot redispatch after restart",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > does not clear a rival lease when fixed proof-host bootstrap fails after selection",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > fails a still-unclaimed campaign item only after taking its exact bootstrap-refusal lease",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6 RED: recreates a real committed provider binding and holds its exact replay without another provider effect",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6 P1 RED: refuses a cross-wired same-task settlement before consuming its approval",
+  "Task 6 real PostgreSQL: a user cancellation wins before a first-run CCC terminal result can publish work > keeps Todo/userPaused and no workflow task work across a fresh store restart",
+];
+
 function assertionName(assertion) {
   return [...(assertion.ancestorTitles ?? []), assertion.title].join(" > ");
 }
@@ -388,10 +773,24 @@ selfTestClosedNamePolicy();
 function assertSupervisorResult(result, commands) {
   if (result.stopError) throw new Error(`embedded PostgreSQL stop failed: ${result.stopError}`);
   if (result.interrupted) throw new Error(`supervisor interrupted by ${result.interrupted}`);
+  if (Array.isArray(result.lifecycleErrors) && result.lifecycleErrors.length > 0) {
+    throw new Error(`embedded PostgreSQL lifecycle reported errors: ${result.lifecycleErrors.join(" | ")}`);
+  }
+  const commandIds = new Set(commands.map((command) => command.id));
+  const counts = new Map();
+  for (const entry of result.results) {
+    if (!commandIds.has(entry.id)) throw new Error(`unexpected command result: ${entry.id}`);
+    counts.set(entry.id, (counts.get(entry.id) ?? 0) + 1);
+  }
+  for (const command of commands) {
+    const count = counts.get(command.id) ?? 0;
+    if (count === 0) throw new Error(`missing command result: ${command.id}`);
+    if (count > 1) throw new Error(`duplicate command result: ${command.id}`);
+  }
   for (const command of commands) {
     const outcome = result.results.find((entry) => entry.id === command.id);
-    if (!outcome) throw new Error(`missing command result: ${command.id}`);
     if (outcome.timedOut) throw new Error(`${command.id} exceeded its bounded timeout`);
+    if (outcome.forcedKill) throw new Error(`${command.id} required a forced SIGKILL after graceful termination failed`);
     if (outcome.spawnError) throw new Error(`${command.id} spawn rejected: ${outcome.spawnError}`);
     if (outcome.signal) throw new Error(`${command.id} terminated by ${outcome.signal}`);
     if (outcome.code !== 0) throw new Error(`${command.id} exited ${outcome.code}`);
@@ -400,18 +799,23 @@ function assertSupervisorResult(result, commands) {
 
 function selfTestSupervisorFailurePolicy() {
   const commands = [{ id: "required" }];
-  const passed = { results: [{ id: "required", code: 0, timedOut: false }], stopError: null, interrupted: null };
+  const passed = { results: [{ id: "required", code: 0, timedOut: false, forcedKill: false }], stopError: null, interrupted: null, lifecycleErrors: [] };
   assertSupervisorResult(passed, commands);
-  for (const result of [
-    { ...passed, results: [{ id: "required", code: 1, timedOut: true }] },
-    { ...passed, results: [{ id: "required", code: 1, spawnError: "injected rejection" }] },
-    { ...passed, results: [{ id: "required", code: 0, timedOut: false, signal: "SIGTERM" }] },
-    { ...passed, stopError: "injected stop failure" },
-    { ...passed, interrupted: "SIGTERM" },
+  for (const [label, result] of [
+    ["timedOut", { ...passed, results: [{ id: "required", code: 1, timedOut: true }] }],
+    ["spawnError", { ...passed, results: [{ id: "required", code: 1, spawnError: "injected rejection" }] }],
+    ["signal", { ...passed, results: [{ id: "required", code: 0, timedOut: false, signal: "SIGTERM" }] }],
+    ["stopError", { ...passed, stopError: "injected stop failure" }],
+    ["interrupted", { ...passed, interrupted: "SIGTERM" }],
+    ["forcedKill", { ...passed, results: [{ id: "required", code: 0, timedOut: false, forcedKill: true }] }],
+    ["lifecycleErrors", { ...passed, lifecycleErrors: ["injected lifecycle error"] }],
+    ["duplicate result rows", { ...passed, results: [...passed.results, { id: "required", code: 0, timedOut: false, forcedKill: false }] }],
+    ["unknown result row", { ...passed, results: [...passed.results, { id: "unknown-command", code: 0, timedOut: false, forcedKill: false }] }],
+    ["missing result row", { ...passed, results: [] }],
   ]) {
     let rejected = false;
     try { assertSupervisorResult(result, commands); } catch { rejected = true; }
-    if (!rejected) throw new Error("policy-self-test: supervisor failure was accepted");
+    if (!rejected) throw new Error(`policy-self-test:${label}: supervisor failure was accepted`);
   }
 }
 selfTestSupervisorFailurePolicy();
@@ -503,7 +907,60 @@ const wave5Commands = [
     machineResults: true,
   },
 ];
-const commands = selectedWave === 5 ? wave5Commands : wave4Commands;
+/*
+FNXC:CccWave6Proof 2026-07-27-00:00:
+Wave 6 is the consolidated Task 6 closed mapping: campaign approval/native/
+provider-controller PostgreSQL persistence, the PRD importer's PostgreSQL/
+filesystem unit of work, the engine-default workflow/provider-controller
+contract group, campaign execution/proof/local-git, and the real-PostgreSQL/
+real-Git acceptance suites. The core campaign PG group (3 files) and the PRD
+importer PG file both omit --config vitest.pg.config.ts, mirroring the
+already-accepted Wave 5 ccc-prd-core-import entry: probed directly against the
+supervisor's embedded-PostgreSQL connection base, the plain form selects and
+passes every test (69/69 core campaign PG, twice; 46/46 importer PG). The
+core campaign PG group is only 3 files, so vitest's fork fan-out is bounded by
+file count regardless of the CPU-derived worker cap and cannot reproduce the
+DDL-oversubscription failure documented in vitest.pg.config.ts (which guards a
+23-file, 6-fork scenario against one shared PostgreSQL).
+*/
+const wave6Commands = [
+  {
+    id: "ccc-campaign-pg",
+    command: ["pnpm", "--filter", "@fusion/core", "exec", "vitest", "run", "src/__tests__/postgres/ccc-campaign-approval.pg.test.ts", "src/__tests__/postgres/ccc-campaign-native.pg.test.ts", "src/__tests__/postgres/ccc-campaign-provider-controller.pg.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6CampaignPgNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-prd-import-pg",
+    command: ["pnpm", "--filter", "@fusion/core", "exec", "vitest", "run", "src/__tests__/postgres/ccc-prd-import.pg.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6PrdImportPgNames,
+    machineResults: true,
+  },
+  {
+    id: "engine-workflow-provider-controller",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/workflow-node-handler-extensions.test.ts", "src/__tests__/workflow-malformed-verdict-gate.test.ts", "src/__tests__/executor-workflow-step-model.test.ts", "src/__tests__/workflow-graph-fanout.test.ts", "src/__tests__/workflow-work-processor.test.ts", "src/__tests__/ccc-campaign-provider-controller.test.ts", "src/__tests__/ccc-campaign-provider-controller.real-packet.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6EngineDefaultNames,
+    machineResults: true,
+  },
+  {
+    id: "campaign-exec-proof-git",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-execution.test.ts", "src/__tests__/ccc-campaign-proof-admission.test.ts", "src/__tests__/ccc-campaign-proof-workflow.test.ts", "src/__tests__/ccc-campaign-local-git.real-git.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6CampaignExecProofGitNames,
+    machineResults: true,
+  },
+  {
+    id: "campaign-real-pg-git-acceptance",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts", "src/__tests__/ccc-campaign-git-integration.real-pg.test.ts", "src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6RealAcceptanceNames,
+    machineResults: true,
+  },
+];
+const commands = selectedWave === 6 ? wave6Commands : selectedWave === 5 ? wave5Commands : wave4Commands;
 for (const command of commands) assertMachineResultInventory(command);
 
 function positiveBudget(name, fallback) {
@@ -512,8 +969,18 @@ function positiveBudget(name, fallback) {
   return Math.floor(value);
 }
 
-const budgetPrefix = selectedWave === 5 ? "CCC_W5" : "CCC_W4";
-const childTimeoutMs = positiveBudget(`${budgetPrefix}_CHILD_TIMEOUT_MS`, 120_000);
+/*
+FNXC:CccWave6ChildTimeout 2026-07-27-00:00:
+Wave 6's real-PostgreSQL/real-Git acceptance group boots an embedded
+PostgreSQL cold inside the child alongside real Git object work; the Wave 4/5
+120s default has headroom on this box (group 5 alone measured well under a
+minute against the disposable proof service) but embedded-PG cold boot under
+contention can run slower, so the W6 default is raised to 240s. This does not
+loosen the Wave 4/5 defaults or budgets.
+*/
+const budgetPrefix = selectedWave === 6 ? "CCC_W6" : selectedWave === 5 ? "CCC_W5" : "CCC_W4";
+const childTimeoutMsDefault = selectedWave === 6 ? 240_000 : 120_000;
+const childTimeoutMs = positiveBudget(`${budgetPrefix}_CHILD_TIMEOUT_MS`, childTimeoutMsDefault);
 const childTerminateGraceMs = positiveBudget(`${budgetPrefix}_CHILD_TERMINATE_GRACE_MS`, 2_000);
 const postgresStopBudgetMs = positiveBudget(`${budgetPrefix}_PG_STOP_TIMEOUT_MS`, 10_000);
 const parentShutdownMarginMs = positiveBudget(`${budgetPrefix}_PARENT_SHUTDOWN_MARGIN_MS`, 3_000);
@@ -645,6 +1112,7 @@ if (parentNormalTimeout) clearTimeout(parentNormalTimeout);
 const supervisorLine = stdout.split("\n").find((line) => line.startsWith("CCC_PROOF_SUPERVISOR_RESULT="));
 let supervisorResult = { results: [], database: proofDatabase };
 let policyError;
+const perCommandResults = [];
 try {
   if (supervisorSpawnError) throw new Error(`supervisor spawn rejected: ${supervisorSpawnError}`);
   if (!supervisorLine) throw new Error("supervisor did not emit machine result");
@@ -660,12 +1128,44 @@ try {
       throw new Error(`${command.id}: failed, skipped, pending, todo, or empty machine result`);
     }
     assertClosedNamedResults(command.expectedNames, assertions, command.id);
+    perCommandResults.push({ id: command.id, passed: json.numPassedTests, expected: command.expectedNames.length });
   }
 } catch (error) {
   policyError = redact(error instanceof Error ? error.message : String(error));
 }
 
 const passed = exitCode === 0 && policyError === undefined;
+
+/*
+FNXC:CccWave7ProofEvidence 2026-07-27-00:00:
+Task 7 hardening: bind the report to the exact source state it proved
+(gitHead/gitTree) and the exact dependency manifests in effect
+(manifestHashes), without adding a dependency — node:crypto and a plain `git
+rev-parse` cover both. Both are best-effort: a git or hash failure must not
+mask a real policyError, so failures here are recorded as null rather than
+thrown.
+*/
+function gitRevision(ref) {
+  try {
+    return execFileSync("git", ["rev-parse", ref], { cwd: repoRoot, encoding: "utf8" }).trim();
+  } catch {
+    return null;
+  }
+}
+async function hashManifest(relativePath) {
+  try {
+    const bytes = await readFile(join(repoRoot, relativePath));
+    return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  } catch {
+    return null;
+  }
+}
+const manifestHashes = {
+  "package.json": await hashManifest("package.json"),
+  "pnpm-workspace.yaml": await hashManifest("pnpm-workspace.yaml"),
+  "pnpm-lock.yaml": await hashManifest("pnpm-lock.yaml"),
+};
+
 const report = {
   wave: selectedWave,
   passed,
@@ -673,6 +1173,11 @@ const report = {
     Object.entries(result).map(([key, value]) => [key, typeof value === "string" ? redact(value) : value]),
   )),
   policyError: policyError ?? null,
+  gitHead: gitRevision("HEAD"),
+  gitTree: gitRevision("HEAD^{tree}"),
+  manifestHashes,
+  perCommand: perCommandResults,
+  cleanupState: { state: passed ? "removed-on-pass" : "preserved-on-failure", proofRoot },
 };
 await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 await writeFile(manifestPath, `${JSON.stringify({ wave: selectedWave, passed, reportPath, database: supervisorResult.database }, null, 2)}\n`);
