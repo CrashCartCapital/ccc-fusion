@@ -444,8 +444,10 @@ describe("workflow node-handler extensions", () => {
     expect(firstHandle).toHaveBeenCalledTimes(1);
     expect(secondHandle).toHaveBeenCalledTimes(1);
     expect(inputs).toHaveLength(2);
-    expect(inputs[0]?.providerController).toBe(controller);
-    expect(inputs[1]?.providerController).toBe(controller);
+    expect(inputs[0]?.providerController).not.toBe(controller);
+    expect(inputs[1]?.providerController).not.toBe(controller);
+    expect(Object.isFrozen(inputs[0]?.providerController)).toBe(true);
+    expect(Object.isFrozen(inputs[1]?.providerController)).toBe(true);
     expect(Object.isFrozen(inputs[0]?.providerDispatch)).toBe(true);
     expect(Object.isFrozen(inputs[1]?.providerDispatch)).toBe(true);
     expect(inputs[0]?.providerDispatch).toMatchObject({
@@ -466,6 +468,153 @@ describe("workflow node-handler extensions", () => {
         }), "utf8")
         .digest("hex")}`,
     );
+    expect(prompt).toHaveBeenCalledTimes(0);
+  });
+
+  it("refuses forged scoped-provider dispatch before raw provider preDispatch", async () => {
+    const extensionKey = workflowExtensionRegistryId("node-plugin", "decision");
+    const rawPreDispatch = vi.fn(async (_input): Promise<CccCampaignProviderControllerDecision> => {
+      throw new Error("raw provider preDispatch invoked");
+    });
+    const controller = Object.freeze({
+      preDispatch: rawPreDispatch,
+      reconcile: vi.fn(async (_input: CccProviderAttemptReconciliation): Promise<CccProviderAttemptScope> => {
+        throw new Error("raw provider reconcile invoked");
+      }),
+    });
+    const resolveNodeProviderController = vi.fn(async (input) => providerBinding(controller, input.extensionId));
+    const handle = vi.fn(async (input: WorkflowNodeHandlerInput) => {
+      expect(Object.isFrozen(input.providerDispatch)).toBe(true);
+      expect(() => Object.assign(input.providerDispatch!, { dispatchKey: "ccc-forged-dispatch" })).toThrow();
+      await input.providerController!.preDispatch({
+        ...input.providerDispatch!,
+        dispatchKey: "ccc-forged-dispatch",
+      });
+      return { outcome: "success" as const };
+    });
+    const prompt = vi.fn(async () => ({ outcome: "success" as const }));
+
+    getWorkflowExtensionRegistry().register("node-plugin", {
+      extensionId: "decision",
+      name: "Decision",
+      kind: "node-handler",
+      nodeKind: "prompt",
+      schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
+      fallback: "degradeToDefault",
+      handle,
+    }, undefined, { providerPosture: "scoped-provider" });
+
+    const workflow: WorkflowIr = {
+      version: "v2",
+      name: "node-extension-scoped-provider-forged-dispatch",
+      columns: [{ id: "work", name: "Work", traits: [] }],
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "decide",
+          kind: "prompt",
+          column: "work",
+          extensions: { [extensionKey]: {} },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "decide" },
+        { from: "decide", to: "end" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      handlers: { prompt },
+      resolveNodeProviderController,
+      runId: "run-provider-dispatch-forgery",
+      executionFence: Object.freeze({
+        workItemId: "work-item-provider-dispatch-forgery",
+        attempt: 1,
+        runId: "run-provider-dispatch-forgery",
+      }),
+    });
+
+    const result = await executor.run({ id: "FN-NODE" } as TaskDetail, settingsOn, workflow);
+
+    expect(result.outcome).toBe("failure");
+    expect(result.context).toMatchObject({
+      "node:decide:error": expect.stringContaining("does not match sealed provider dispatch"),
+      "node:decide:extensionId": extensionKey,
+    });
+    expect(rawPreDispatch).toHaveBeenCalledTimes(0);
+    expect(handle).toHaveBeenCalledTimes(1);
+    expect(prompt).toHaveBeenCalledTimes(0);
+  });
+
+  it("delegates exact scoped-provider dispatch clones with the sealed descriptor", async () => {
+    const extensionKey = workflowExtensionRegistryId("node-plugin", "decision");
+    let sealedDispatchFromHandler: WorkflowNodeHandlerInput["providerDispatch"];
+    const rawPreDispatch = vi.fn(async (_input): Promise<CccCampaignProviderControllerDecision> => Object.freeze({
+      kind: "dispatch-permit",
+      scope: Object.freeze({ state: "dispatched_unknown" }) as unknown as CccProviderAttemptScope,
+    }));
+    const controller = Object.freeze({
+      preDispatch: rawPreDispatch,
+      reconcile: vi.fn(async (_input: CccProviderAttemptReconciliation): Promise<CccProviderAttemptScope> => {
+        throw new Error("raw provider reconcile invoked");
+      }),
+    });
+    const resolveNodeProviderController = vi.fn(async (input) => providerBinding(controller, input.extensionId));
+    const handle = vi.fn(async (input: WorkflowNodeHandlerInput) => {
+      sealedDispatchFromHandler = input.providerDispatch;
+      await input.providerController!.preDispatch({ ...input.providerDispatch! });
+      return { outcome: "success" as const };
+    });
+    const prompt = vi.fn(async () => ({ outcome: "success" as const }));
+
+    getWorkflowExtensionRegistry().register("node-plugin", {
+      extensionId: "decision",
+      name: "Decision",
+      kind: "node-handler",
+      nodeKind: "prompt",
+      schemaVersion: WORKFLOW_EXTENSION_SCHEMA_VERSION,
+      fallback: "degradeToDefault",
+      handle,
+    }, undefined, { providerPosture: "scoped-provider" });
+
+    const workflow: WorkflowIr = {
+      version: "v2",
+      name: "node-extension-scoped-provider-cloned-dispatch",
+      columns: [{ id: "work", name: "Work", traits: [] }],
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "decide",
+          kind: "prompt",
+          column: "work",
+          extensions: { [extensionKey]: {} },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "decide" },
+        { from: "decide", to: "end" },
+      ],
+    };
+
+    const executor = new WorkflowGraphExecutor({
+      handlers: { prompt },
+      resolveNodeProviderController,
+      runId: "run-provider-dispatch-clone",
+      executionFence: Object.freeze({
+        workItemId: "work-item-provider-dispatch-clone",
+        attempt: 1,
+        runId: "run-provider-dispatch-clone",
+      }),
+    });
+
+    const result = await executor.run({ id: "FN-NODE" } as TaskDetail, settingsOn, workflow);
+
+    expect(result.outcome).toBe("success");
+    expect(rawPreDispatch).toHaveBeenCalledTimes(1);
+    expect(rawPreDispatch.mock.calls[0]?.[0]).toBe(sealedDispatchFromHandler);
+    expect(handle).toHaveBeenCalledTimes(1);
     expect(prompt).toHaveBeenCalledTimes(0);
   });
 

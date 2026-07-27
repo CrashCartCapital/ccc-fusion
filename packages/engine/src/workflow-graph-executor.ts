@@ -712,6 +712,42 @@ function createWorkflowNodeProviderDispatch(
   });
 }
 
+function requireSealedWorkflowNodeProviderDispatch(
+  candidate: WorkflowNodeProviderDispatchInput,
+  sealedDispatch: WorkflowNodeProviderDispatchInput,
+  extensionId: string,
+): WorkflowNodeProviderDispatchInput {
+  if (
+    !isPlainObject(candidate)
+    || Object.keys(candidate).length !== 5
+    || candidate.turnKey !== sealedDispatch.turnKey
+    || candidate.dispatchKey !== sealedDispatch.dispatchKey
+    || candidate.providerId !== sealedDispatch.providerId
+    || candidate.modelId !== sealedDispatch.modelId
+    || candidate.transport !== sealedDispatch.transport
+  ) {
+    throw new PermanentError(
+      `Workflow node provider dispatch does not match sealed provider dispatch for extension ${extensionId}`,
+      "WORKFLOW_NODE_PROVIDER_REFUSED",
+    );
+  }
+  return sealedDispatch;
+}
+
+function createSealedWorkflowNodeProviderController(
+  controller: WorkflowNodeProviderController,
+  sealedDispatch: WorkflowNodeProviderDispatchInput,
+  extensionId: string,
+): WorkflowNodeProviderController {
+  return Object.freeze({
+    preDispatch: async (input) => {
+      requireSealedWorkflowNodeProviderDispatch(input, sealedDispatch, extensionId);
+      return await controller.preDispatch(sealedDispatch);
+    },
+    reconcile: async (input) => await controller.reconcile(input),
+  });
+}
+
 export class WorkflowGraphExecutor {
   private readonly maxRetriesPerNode: number;
 
@@ -1933,6 +1969,9 @@ export class WorkflowGraphExecutor {
         providerControllerPromises,
       );
       try {
+        const providerDispatch = providerBinding
+          ? createWorkflowNodeProviderDispatch(execution, node.id, extensionId, providerBinding)
+          : undefined;
         const result = await extension.handle({
           task,
           workflow,
@@ -1940,8 +1979,12 @@ export class WorkflowGraphExecutor {
           context,
           signal,
           ...(providerBinding ? {
-            providerController: providerBinding.providerController,
-            providerDispatch: createWorkflowNodeProviderDispatch(execution, node.id, extensionId, providerBinding),
+            providerController: createSealedWorkflowNodeProviderController(
+              providerBinding.providerController,
+              providerDispatch!,
+              extensionId,
+            ),
+            providerDispatch,
           } : {}),
         });
         return this.normalizePluginNodeResult(result);
