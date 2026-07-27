@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+/*
+FNXC:CccShallowBrand 2026-07-27-00:00:
+Operator-facing `ccc-fusion` alias (CF-018 / CF-DIV-008). This wrapper does not
+duplicate or rename anything under packages/cli — it resolves the same built
+CLI entrypoint the declared `fn`/`fusion` bins use (packages/cli/bin.mjs,
+which in turn resolves packages/cli/dist/bin.js) and execs it with the same
+args/stdio/exit-code contract. Internal identifiers stay upstream on purpose;
+only this alias says ccc-fusion.
+*/
+import { spawnSync } from "node:child_process";
+import { accessSync, constants } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const cliBin = resolve(scriptDir, "..", "packages", "cli", "bin.mjs");
+
+try {
+  accessSync(cliBin, constants.F_OK);
+} catch {
+  process.stderr.write(`ccc-fusion: Fusion CLI entrypoint not found at ${cliBin}\n`);
+  process.exit(1);
+}
+
+const result = spawnSync(process.execPath, [cliBin, ...process.argv.slice(2)], {
+  stdio: "inherit",
+});
+
+if (result.error) {
+  process.stderr.write(`ccc-fusion: failed to launch CLI: ${result.error.message}\n`);
+  process.exit(1);
+}
+
+process.exit(result.status ?? (result.signal ? 1 : 0));

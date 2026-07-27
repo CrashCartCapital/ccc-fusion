@@ -656,6 +656,17 @@ fn skills install firebase/agent-skills               # Install agent skills
 
 ---
 
+## ccc-fusion
+
+This repository is **ccc-fusion**, CrashCartCapital's acceptance-hardening fork of [Runfusion/Fusion](https://github.com/Runfusion/Fusion). It adds a PRD campaign system (deterministic packet compiler, transactional PostgreSQL import, fail-closed proof admission, sealed provider dispatch), on top of upstream Fusion.
+
+The fork is intentionally **shallow-branded**: internal package/env/bin identifiers (`@fusion/*`, `@runfusion/fusion`, `FUSION_*`, the `fn`/`fusion` bins) keep their upstream names on purpose (CF-018) so upstream diffs stay mergeable. Only the operator-facing surface says `ccc-fusion` — an alias CLI at [`scripts/ccc-fusion`](./scripts/ccc-fusion) that execs the same built CLI entrypoint as `fn`/`fusion`.
+
+- CLI reference: [`fn prd` (PRD campaign)](./docs/cli-reference.md#prd-campaign-fn-prd)
+- What diverges from upstream and why: [`docs/divergence-ledger.md`](./docs/divergence-ledger.md)
+
+---
+
 ## Development
 
 ```bash
