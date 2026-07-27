@@ -36,6 +36,7 @@ type LandingAuditEvent = Awaited<ReturnType<typeof queryRunAuditEvents>>[number]
 type ApprovalTransaction = Parameters<typeof assertActiveClaimedCccCampaignApprovalWithinTransaction>[0];
 
 export type CccCampaignGitLandingFault =
+  | "after-objects-before-intent"
   | "after-intent"
   | "after-cas"
   | "foreign-before-cas"
@@ -342,6 +343,10 @@ export async function campaignGitLandingRequiredResult(
     approvalRequestId: lease.approvalRequestId,
     claimToken: lease.claimToken,
   };
+
+  if (!intentMetadata && fault === "after-objects-before-intent") {
+    throw new Error("CCC campaign Git landing test fault after deterministic objects before durable intent");
+  }
 
   if (!intentMetadata) await layer.transactionImmediate(async (tx) => {
     await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);

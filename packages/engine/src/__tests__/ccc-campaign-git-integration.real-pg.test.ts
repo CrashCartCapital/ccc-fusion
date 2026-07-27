@@ -130,6 +130,31 @@ const worker: ApprovalRequestActorSnapshot = {
   actorName: "Worker",
 };
 
+function createForbiddenEffectRecorder() {
+  const effects: string[] = [];
+  return {
+    effects,
+    deps: {
+      mergeAgent: async () => {
+        effects.push("provider:mergeAgent");
+        throw new Error("provider merger must not run");
+      },
+      reviewAgent: async () => {
+        effects.push("provider:reviewAgent");
+        throw new Error("provider reviewer must not run");
+      },
+      stashResolveAgent: async () => {
+        effects.push("legacy:stashResolveAgent");
+        throw new Error("legacy stash resolver must not run");
+      },
+    },
+  };
+}
+
+function expectNoForbiddenEffects(recorder: ReturnType<typeof createForbiddenEffectRecorder>): void {
+  expect(recorder.effects).toEqual([]);
+}
+
 function cleanupObjectTestRepos(): void {
   for (const dir of Array.from(trackedTmpDirs)) {
     rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
@@ -332,15 +357,6 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     return { root, taskId, action, issued, claimed, claimToken: `claim-${suffix}` };
   }
 
-  const providerForbidden = {
-    mergeAgent: async () => {
-      throw new Error("provider merger must not run");
-    },
-    reviewAgent: async () => {
-      throw new Error("provider reviewer must not run");
-    },
-  };
-
   const landingMutationTypes = async (taskId: string) => (await queryRunAuditEvents(h.layer().db, {
     taskId,
     domain: "git",
@@ -358,11 +374,61 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     });
   }
 
-  it("Task 5 RED: reconciles interruption at each CAS boundary and consumes one exact approval", async () => {
-    const fixture = await importedMergeFixture("git-landing-success");
+  async function expectedPreparedCommit(fixture: Awaited<ReturnType<typeof importedMergeFixture>>): Promise<string> {
+    const branch = resolveTaskWorkingBranch(await h.store().getTask(fixture.taskId));
+    const prepared = await prepareCccCampaignGitObjects({
+      targetRoot: fixture.root,
+      expectedBaseObject: fixture.claimed.campaign!.binding.targetBase,
+      sourceRef: `refs/heads/${branch}`,
+      targetRef: fixture.action.actionTarget,
+      admittedWriteRoots: [join(fixture.root, "src")],
+      identity: {
+        name: "CCC Campaign",
+        email: "ccc-campaign@example.com",
+        timestamp: "2026-07-26T00:00:00Z",
+      },
+      message: `CCC campaign native Git landing ${fixture.taskId}`,
+    });
+    return prepared.commitObject;
+  }
+
+  it("refuses after deterministic objects before durable intent with ref unchanged and replayable commit identity", async () => {
+    const fixture = await importedMergeFixture("after-objects-before-intent");
+    const forbidden = createForbiddenEffectRecorder();
 
     await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
-      ...providerForbidden,
+      ...forbidden.deps,
+      cccCampaignGitLandingFault: "after-objects-before-intent",
+    })).rejects.toThrow(/after deterministic objects before durable intent/);
+
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(fixture.claimed.campaign!.binding.targetBase);
+    await expect(getApprovalRequest(h.layer().db, fixture.issued.id)).resolves.toMatchObject({ status: "claimed" });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
+    expectNoForbiddenEffects(forbidden);
+
+    const expectedCommit = await expectedPreparedCommit(fixture);
+    const replay = createForbiddenEffectRecorder();
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, replay.deps)).resolves.toMatchObject({
+      merged: true,
+      noOp: false,
+      worktreeRemoved: false,
+      branchDeleted: false,
+    });
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(expectedCommit);
+    await expect(getApprovalRequest(h.layer().db, fixture.issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:intent",
+      "ccc-campaign-git-landing:terminal",
+    ]);
+    expectNoForbiddenEffects(replay);
+  });
+
+  it("Task 5 RED: reconciles interruption at each CAS boundary and consumes one exact approval", async () => {
+    const fixture = await importedMergeFixture("git-landing-success");
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
+      ...forbidden.deps,
       cccCampaignGitLandingFault: "after-intent",
     })).rejects.toThrow(/test fault after durable intent/);
     expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(fixture.claimed.campaign!.binding.targetBase);
@@ -370,7 +436,7 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual(["ccc-campaign-git-landing:intent"]);
 
     await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
-      ...providerForbidden,
+      ...forbidden.deps,
       cccCampaignGitLandingFault: "after-cas",
     })).rejects.toThrow(/test fault after CAS/);
     expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).not.toBe(fixture.claimed.campaign!.binding.targetBase);
@@ -378,7 +444,7 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual(["ccc-campaign-git-landing:intent"]);
 
     const result = await runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
-      ...providerForbidden,
+      ...forbidden.deps,
     });
 
     expect(result).toMatchObject({
@@ -392,7 +458,7 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     expect(approval?.status).toBe("consumed");
 
     const replay = await runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
-      ...providerForbidden,
+      ...forbidden.deps,
     });
     expect(replay).toMatchObject({
       merged: true,
@@ -405,36 +471,41 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
       "ccc-campaign-git-landing:intent",
       "ccc-campaign-git-landing:terminal",
     ]);
+    expectNoForbiddenEffects(forbidden);
   });
 
   it("Task 5 RED: refuses a foreign target ref race before CAS without terminal audit or approval consume", async () => {
     const fixture = await importedMergeFixture("foreign-before-cas");
     const branch = resolveTaskWorkingBranch(await h.store().getTask(fixture.taskId));
     const foreign = git(fixture.root, ["rev-parse", `refs/heads/${branch}`]);
+    const forbidden = createForbiddenEffectRecorder();
 
     await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
-      ...providerForbidden,
+      ...forbidden.deps,
       cccCampaignGitLandingFault: "foreign-before-cas",
     })).rejects.toThrow(/target ref drifted|CAS|stale/i);
 
     expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(foreign);
     await expectClaimedApprovalAndLease(fixture);
     await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual(["ccc-campaign-git-landing:intent"]);
+    expectNoForbiddenEffects(forbidden);
   });
 
   it("Task 5 RED: refuses a foreign target ref race before terminal audit or approval consume", async () => {
     const fixture = await importedMergeFixture("foreign-after-cas");
     const branch = resolveTaskWorkingBranch(await h.store().getTask(fixture.taskId));
     const foreign = git(fixture.root, ["rev-parse", `refs/heads/${branch}`]);
+    const forbidden = createForbiddenEffectRecorder();
 
     await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
-      ...providerForbidden,
+      ...forbidden.deps,
       cccCampaignGitLandingFault: "foreign-after-cas",
     })).rejects.toThrow(/terminal|target ref/i);
 
     expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(foreign);
     await expectClaimedApprovalAndLease(fixture);
     await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual(["ccc-campaign-git-landing:intent"]);
+    expectNoForbiddenEffects(forbidden);
   });
 });
 
