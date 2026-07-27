@@ -189,6 +189,14 @@ function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+// Semantic campaign-context resolution (packages/core/src/ccc-campaign/store.ts) fails closed on
+// any task whose protectedActionIds is not duplicate-free and canonically code-unit sorted.
+// Normalize here, at the point the task's protectedActionIds list is built, so a proposal
+// authored (or hand-edited) in any order always yields a canonical sidecar.
+function canonicalProtectedActionIds(ids: readonly string[]): string[] {
+  return [...new Set(ids)].sort(compareCodeUnits);
+}
+
 function compareSourceSpans(left: CccPrdSourceSpan, right: CccPrdSourceSpan): number {
   return compareCodeUnits(left.path, right.path)
     || left.byteStart - right.byteStart
@@ -303,7 +311,13 @@ function mapProposal(
   return {
     requirements: sortCccPrdById(proposal.requirements.map((value) => withoutSourceRefs(value, sourceBytes))),
     proofs: sortCccPrdById(proposal.proofs.map((value) => withoutSourceRefs(value, sourceBytes))),
-    tasks: sortCccPrdById(proposal.tasks.map((value) => withoutSourceRefs(value, sourceBytes))),
+    tasks: sortCccPrdById(proposal.tasks.map((value) => {
+      const mappedTask = withoutSourceRefs(value, sourceBytes);
+      return {
+        ...mappedTask,
+        protectedActionIds: canonicalProtectedActionIds(mappedTask.protectedActionIds),
+      };
+    })),
     workflows: sortCccPrdById(proposal.workflows.map((value) => withoutSourceRefs(value, sourceBytes))),
     documents: sortCccPrdById(proposal.documents.map((value) => withoutSourceRefs(value, sourceBytes))),
     artifacts: sortCccPrdById(proposal.artifacts.map((value) => withoutSourceRefs(value, sourceBytes))),

@@ -756,6 +756,25 @@ function validateSidecar(
       collections.protectedActions,
       diagnostics,
     );
+    // Mirrors packages/core/src/ccc-campaign/store.ts requireCanonicalProtectedActionIds: campaign
+    // context resolution fails closed on a non-canonical set at runtime, so refuse it here too,
+    // before a hand-edited sidecar can validate/compile clean and only fail mid workflow-run.
+    if (
+      Array.isArray(task.protectedActionIds)
+      && task.protectedActionIds.every((id): id is string => isNonEmptyString(id))
+    ) {
+      const protectedActionIds = task.protectedActionIds as string[];
+      const canonicalOrder = [...protectedActionIds].sort(compareCccPrdCodeUnits);
+      if (
+        new Set(protectedActionIds).size !== protectedActionIds.length
+        || canonicalCccPrdJson(protectedActionIds) !== canonicalCccPrdJson(canonicalOrder)
+      ) {
+        diagnostics.push(diagnostic(
+          "CCC_PRD_PROTECTED_ACTION_IDS_NOT_CANONICAL",
+          `task ${String(task.id)} protected-action IDs must be unique and sorted canonically`,
+        ));
+      }
+    }
     if (!isNonEmptyString(task.workflowId) || !collections.workflows.has(task.workflowId)) {
       diagnostics.push(diagnostic("CCC_PRD_REFERENCE_FOREIGN", `task ${String(task.id)} workflow is unknown`));
     }
