@@ -709,8 +709,22 @@ function assertClosedNamedResults(expectedNames, assertions, label) {
   }
 }
 
+function assertMachineResultJson(json, command) {
+  if (json.numFailedTests !== 0 || json.numPendingTests !== 0 || json.numTodoTests !== 0 || json.numPassedTests === 0) {
+    throw new Error(`${command.id}: failed, skipped, pending, todo, or empty machine result`);
+  }
+  if (json.numPassedTests !== command.expectedNames.length) {
+    throw new Error(`${command.id}: numPassedTests ${json.numPassedTests} does not match the closed expected-name inventory count ${command.expectedNames.length}`);
+  }
+  const assertions = json.testResults.flatMap((testResult) => testResult.assertionResults ?? []);
+  assertClosedNamedResults(command.expectedNames, assertions, command.id);
+  return assertions;
+}
+
 function assertMachineResultInventory(command) {
-  if (!command.machineResults) return;
+  if (command.machineResults !== true) {
+    throw new Error(`${command.id ?? "command"}: machineResults is mandatory and must be true`);
+  }
   if (!Array.isArray(command.expectedNames) || command.expectedNames.length === 0) {
     throw new Error(`${command.id ?? "machine-result command"}: machine results require a non-empty expected-name inventory`);
   }
@@ -750,6 +764,18 @@ function selfTestClosedNamePolicy() {
     }
     if (!rejected) throw new Error("policy-self-test: machine result without a closed expected-name inventory was accepted");
   }
+  for (const [label, command] of [
+    ["machineResults:false", { machineResults: false, expectedNames: expected }],
+    ["machineResults missing", { expectedNames: expected }],
+  ]) {
+    let rejected = false;
+    try {
+      assertMachineResultInventory(command);
+    } catch {
+      rejected = true;
+    }
+    if (!rejected) throw new Error(`policy-self-test:${label}: non-machine-result command was accepted`);
+  }
   for (const [label, assertions] of [
     ["missing", []],
     ["extra", [...good, { ancestorTitles: ["suite"], title: "extra", status: "passed" }]],
@@ -769,6 +795,40 @@ function selfTestClosedNamePolicy() {
   }
 }
 selfTestClosedNamePolicy();
+
+/*
+FNXC:CccWave7MachineResultJson 2026-07-27-01:00:
+The main flow's per-command machine-result validation is itself a correctness
+boundary: a lying numPassedTests (miscounted or empty assertionResults while
+claiming passes) must fail closed even when the closed-name checker alone
+would not catch it, because assertClosedNamedResults only inspects the
+assertions it is given — it cannot see whether the reporter's own summary
+count agrees with them.
+*/
+function selfTestMachineResultJsonPolicy() {
+  const command = { id: "policy-self-test", expectedNames: ["suite > required"] };
+  const goodJson = {
+    numFailedTests: 0,
+    numPendingTests: 0,
+    numTodoTests: 0,
+    numPassedTests: 1,
+    testResults: [{ assertionResults: [{ ancestorTitles: ["suite"], title: "required", status: "passed" }] }],
+  };
+  assertMachineResultJson(goodJson, command);
+  for (const [label, json] of [
+    ["counter mismatch", { ...goodJson, numPassedTests: 2 }],
+    ["vacuous assertionResults", { ...goodJson, testResults: [{ assertionResults: [] }] }],
+    ["missing names", { ...goodJson, testResults: [{ assertionResults: [{ ancestorTitles: ["suite"], title: "other", status: "passed" }] }] }],
+    ["failed tests present", { ...goodJson, numFailedTests: 1 }],
+    ["pending tests present", { ...goodJson, numPendingTests: 1 }],
+    ["todo tests present", { ...goodJson, numTodoTests: 1 }],
+  ]) {
+    let rejected = false;
+    try { assertMachineResultJson(json, command); } catch { rejected = true; }
+    if (!rejected) throw new Error(`policy-self-test:${label}: machine result json was accepted`);
+  }
+}
+selfTestMachineResultJsonPolicy();
 
 function assertSupervisorResult(result, commands) {
   if (result.stopError) throw new Error(`embedded PostgreSQL stop failed: ${result.stopError}`);
@@ -802,6 +862,7 @@ function selfTestSupervisorFailurePolicy() {
   const passed = { results: [{ id: "required", code: 0, timedOut: false, forcedKill: false }], stopError: null, interrupted: null, lifecycleErrors: [] };
   assertSupervisorResult(passed, commands);
   for (const [label, result] of [
+    ["nonzero exit", { ...passed, results: [{ id: "required", code: 1, timedOut: false, forcedKill: false }] }],
     ["timedOut", { ...passed, results: [{ id: "required", code: 1, timedOut: true }] }],
     ["spawnError", { ...passed, results: [{ id: "required", code: 1, spawnError: "injected rejection" }] }],
     ["signal", { ...passed, results: [{ id: "required", code: 0, timedOut: false, signal: "SIGTERM" }] }],
@@ -819,6 +880,33 @@ function selfTestSupervisorFailurePolicy() {
   }
 }
 selfTestSupervisorFailurePolicy();
+
+const supervisorResultMarker = "CCC_PROOF_SUPERVISOR_RESULT=";
+function extractSupervisorResultLine(rawStdout) {
+  const lines = rawStdout.split("\n").filter((line) => line.startsWith(supervisorResultMarker));
+  if (lines.length === 0) throw new Error("supervisor did not emit machine result");
+  if (lines.length > 1) throw new Error(`supervisor emitted the machine-result marker ${lines.length} times; expected exactly once`);
+  return lines[0];
+}
+
+/*
+FNXC:CccWave7SupervisorMarker 2026-07-27-01:00:
+The parent trusts the FIRST line starting with the machine-result marker.
+A supervisor that (by bug or injected output) writes the marker more than
+once must not silently let the parent pick the first one and move on —
+exactly one marker line is the contract; more than one is a policy error.
+*/
+function selfTestSupervisorMarkerPolicy() {
+  const line = extractSupervisorResultLine(`noise\n${supervisorResultMarker}{}\ntrailer`);
+  if (line !== `${supervisorResultMarker}{}`) throw new Error("policy-self-test: marker extraction did not return the expected line");
+  let rejected = false;
+  try { extractSupervisorResultLine("no marker here"); } catch { rejected = true; }
+  if (!rejected) throw new Error("policy-self-test:missing marker: supervisor marker policy was accepted");
+  rejected = false;
+  try { extractSupervisorResultLine(`${supervisorResultMarker}{}\n${supervisorResultMarker}{}`); } catch { rejected = true; }
+  if (!rejected) throw new Error("policy-self-test:duplicate marker: supervisor marker policy was accepted");
+}
+selfTestSupervisorMarkerPolicy();
 
 if (runnerPolicySelfTest) {
   await selfTestStopSettlementPolicy();
@@ -1064,6 +1152,43 @@ function redact(text) {
     .replace(/password=[^\s&]+/gi, "password=[redacted]");
 }
 
+/*
+FNXC:CccWave7GitProvenance 2026-07-27-01:30:
+Provenance must attest the exact bytes the supervisor is about to test, not
+whatever HEAD happens to be after the run finishes — capturing it post-hoc
+with the ambient environment let a dirty-tree run silently report as if it
+proved the frozen committed tree. Capture gitHead/gitTree and working-tree
+cleanliness BEFORE spawning the supervisor child, using a scrubbed
+PATH/HOME-only env (no inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE) and a
+bounded timeout so a hung git cannot block the runner. Capture failures and a
+dirty tree are both recorded as explicit, honest report fields rather than
+causing the proof to fail closed — developers legitimately run waves on dirty
+trees; the report must just tell the truth about which tree was proved.
+*/
+const gitProvenanceEnv = { PATH: process.env.PATH, HOME: process.env.HOME };
+function runGitProvenance(args) {
+  return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", env: gitProvenanceEnv, timeout: 10_000 }).trim();
+}
+function captureGitRevision(ref) {
+  try {
+    return runGitProvenance(["rev-parse", ref]);
+  } catch {
+    return null;
+  }
+}
+function captureWorkingTreeStatus() {
+  try {
+    const output = runGitProvenance(["status", "--porcelain", "--untracked-files=no"]);
+    const dirtyPaths = output.length === 0 ? [] : output.split("\n").filter((line) => line.length > 0);
+    return { workingTreeDirty: dirtyPaths.length > 0, trackedDirtyPaths: dirtyPaths.length };
+  } catch {
+    return { workingTreeDirty: null, trackedDirtyPaths: null };
+  }
+}
+const preRunGitHead = captureGitRevision("HEAD");
+const preRunGitTree = captureGitRevision("HEAD^{tree}");
+const preRunWorkingTreeStatus = captureWorkingTreeStatus();
+
 const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", supervisor], {
   cwd: repoRoot,
   env: {
@@ -1109,25 +1234,21 @@ process.removeListener("SIGINT", forwardSigInt);
 process.removeListener("SIGTERM", forwardSigTerm);
 if (parentForceKillTimer) clearTimeout(parentForceKillTimer);
 if (parentNormalTimeout) clearTimeout(parentNormalTimeout);
-const supervisorLine = stdout.split("\n").find((line) => line.startsWith("CCC_PROOF_SUPERVISOR_RESULT="));
 let supervisorResult = { results: [], database: proofDatabase };
 let policyError;
 const perCommandResults = [];
 try {
   if (supervisorSpawnError) throw new Error(`supervisor spawn rejected: ${supervisorSpawnError}`);
-  if (!supervisorLine) throw new Error("supervisor did not emit machine result");
-  supervisorResult = JSON.parse(supervisorLine.slice("CCC_PROOF_SUPERVISOR_RESULT=".length));
+  const supervisorLine = extractSupervisorResultLine(stdout);
+  supervisorResult = JSON.parse(supervisorLine.slice(supervisorResultMarker.length));
   if (forwardedSignal) throw new Error(`proof runner interrupted by ${forwardedSignal}`);
   assertSupervisorResult(supervisorResult, commands);
   for (const command of commands) {
-    const result = supervisorResult.results.find((entry) => entry.id === command.id);
-    if (!command.machineResults) continue;
-    const json = JSON.parse(await readFile(result.outputFile, "utf8"));
-    const assertions = json.testResults.flatMap((testResult) => testResult.assertionResults ?? []);
-    if (json.numFailedTests !== 0 || json.numPendingTests !== 0 || json.numTodoTests !== 0 || json.numPassedTests === 0) {
-      throw new Error(`${command.id}: failed, skipped, pending, todo, or empty machine result`);
-    }
-    assertClosedNamedResults(command.expectedNames, assertions, command.id);
+    // Recompute the machine-result path from the trusted resultRoot/command.id
+    // instead of trusting result.outputFile from the supervisor's own JSON.
+    const outputFile = join(resultRoot, `${command.id}.json`);
+    const json = JSON.parse(await readFile(outputFile, "utf8"));
+    assertMachineResultJson(json, command);
     perCommandResults.push({ id: command.id, passed: json.numPassedTests, expected: command.expectedNames.length });
   }
 } catch (error) {
@@ -1139,19 +1260,12 @@ const passed = exitCode === 0 && policyError === undefined;
 /*
 FNXC:CccWave7ProofEvidence 2026-07-27-00:00:
 Task 7 hardening: bind the report to the exact source state it proved
-(gitHead/gitTree) and the exact dependency manifests in effect
-(manifestHashes), without adding a dependency — node:crypto and a plain `git
-rev-parse` cover both. Both are best-effort: a git or hash failure must not
-mask a real policyError, so failures here are recorded as null rather than
-thrown.
+(gitHead/gitTree/workingTreeDirty, captured pre-run — see
+FNXC:CccWave7GitProvenance) and the exact dependency manifests in effect
+(manifestHashes), without adding a dependency — node:crypto covers the
+latter. Manifest hashing is best-effort: a hash failure must not mask a real
+policyError, so failures here are recorded as null rather than thrown.
 */
-function gitRevision(ref) {
-  try {
-    return execFileSync("git", ["rev-parse", ref], { cwd: repoRoot, encoding: "utf8" }).trim();
-  } catch {
-    return null;
-  }
-}
 async function hashManifest(relativePath) {
   try {
     const bytes = await readFile(join(repoRoot, relativePath));
@@ -1173,8 +1287,10 @@ const report = {
     Object.entries(result).map(([key, value]) => [key, typeof value === "string" ? redact(value) : value]),
   )),
   policyError: policyError ?? null,
-  gitHead: gitRevision("HEAD"),
-  gitTree: gitRevision("HEAD^{tree}"),
+  gitHead: preRunGitHead,
+  gitTree: preRunGitTree,
+  workingTreeDirty: preRunWorkingTreeStatus.workingTreeDirty,
+  trackedDirtyPaths: preRunWorkingTreeStatus.trackedDirtyPaths,
   manifestHashes,
   perCommand: perCommandResults,
   cleanupState: { state: passed ? "removed-on-pass" : "preserved-on-failure", proofRoot },
