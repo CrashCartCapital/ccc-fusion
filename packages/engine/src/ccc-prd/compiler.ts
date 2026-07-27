@@ -26,6 +26,10 @@ import {
   resolveCccPrdAdmittedFile,
   sortCccPrdById,
 } from "./custody.js";
+import {
+  isCanonicalProtectedActionIdSet,
+  isWellFormedProtectedActionId,
+} from "./protected-action-ids.js";
 
 export type CompileCccPrdInput = {
   rootDir: string;
@@ -757,21 +761,16 @@ function validateSidecar(
       diagnostics,
     );
     // Mirrors packages/core/src/ccc-campaign/store.ts requireCanonicalProtectedActionIds: campaign
-    // context resolution fails closed on a non-canonical set at runtime, so refuse it here too,
-    // before a hand-edited sidecar can validate/compile clean and only fail mid workflow-run.
-    if (
-      Array.isArray(task.protectedActionIds)
-      && task.protectedActionIds.every((id): id is string => isNonEmptyString(id))
-    ) {
-      const protectedActionIds = task.protectedActionIds as string[];
-      const canonicalOrder = [...protectedActionIds].sort(compareCccPrdCodeUnits);
-      if (
-        new Set(protectedActionIds).size !== protectedActionIds.length
-        || canonicalCccPrdJson(protectedActionIds) !== canonicalCccPrdJson(canonicalOrder)
-      ) {
+    // context resolution fails closed at runtime unless the set is well-formed (non-empty, already
+    // trimmed strings), duplicate-free, and sorted canonically. Refuse it here too, before a
+    // hand-edited sidecar can validate/compile clean and only fail mid workflow-run.
+    if (Array.isArray(task.protectedActionIds)) {
+      const protectedActionIds = task.protectedActionIds as unknown[];
+      const wellFormed = protectedActionIds.every((id) => isWellFormedProtectedActionId(id));
+      if (!wellFormed || !isCanonicalProtectedActionIdSet(protectedActionIds as string[])) {
         diagnostics.push(diagnostic(
           "CCC_PRD_PROTECTED_ACTION_IDS_NOT_CANONICAL",
-          `task ${String(task.id)} protected-action IDs must be unique and sorted canonically`,
+          `task ${String(task.id)} protected-action IDs must be non-empty, trimmed, unique, and sorted canonically`,
         ));
       }
     }

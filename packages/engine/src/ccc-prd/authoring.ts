@@ -39,6 +39,10 @@ import {
   readCccPrdPacketCustody,
   sortCccPrdById,
 } from "./custody.js";
+import {
+  canonicalizeProtectedActionIds,
+  isWellFormedProtectedActionId,
+} from "./protected-action-ids.js";
 
 export type AuthorCccPrdInput = {
   rootDir: string;
@@ -189,12 +193,15 @@ function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-// Semantic campaign-context resolution (packages/core/src/ccc-campaign/store.ts) fails closed on
-// any task whose protectedActionIds is not duplicate-free and canonically code-unit sorted.
-// Normalize here, at the point the task's protectedActionIds list is built, so a proposal
-// authored (or hand-edited) in any order always yields a canonical sidecar.
-function canonicalProtectedActionIds(ids: readonly string[]): string[] {
-  return [...new Set(ids)].sort(compareCodeUnits);
+// Padded protected-action IDs are malformed proposal input, not reorderable input: normalizing
+// them here would silently rewrite the identity reference between a task's protectedActionIds and
+// the matching protectedActions[].id, so they are refused at the proposal-validation layer instead
+// (see hasWellFormedProtectedActionIds below). This only dedupes and sorts already well-formed IDs.
+function hasWellFormedProtectedActionIds(proposal: CccPrdAuthoringProposal): boolean {
+  return proposal.tasks.every((task) => (
+    Array.isArray(task.protectedActionIds)
+    && task.protectedActionIds.every((id) => isWellFormedProtectedActionId(id))
+  ));
 }
 
 function compareSourceSpans(left: CccPrdSourceSpan, right: CccPrdSourceSpan): number {
@@ -315,7 +322,7 @@ function mapProposal(
       const mappedTask = withoutSourceRefs(value, sourceBytes);
       return {
         ...mappedTask,
-        protectedActionIds: canonicalProtectedActionIds(mappedTask.protectedActionIds),
+        protectedActionIds: canonicalizeProtectedActionIds(mappedTask.protectedActionIds),
       };
     })),
     workflows: sortCccPrdById(proposal.workflows.map((value) => withoutSourceRefs(value, sourceBytes))),
@@ -361,6 +368,9 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
     });
     if (!validateProposalShape(proposalValue)) {
       return malformed(`authoring adapter ${input.adapter.id} returned the wrong proposal schema or shape`);
+    }
+    if (!hasWellFormedProtectedActionIds(proposalValue)) {
+      return malformed(`authoring adapter ${input.adapter.id} returned a task protected-action ID that is empty or not trimmed`);
     }
     if (input.constraints) {
       if (

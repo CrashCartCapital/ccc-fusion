@@ -258,6 +258,13 @@ function refusalCode(result: Record<string, unknown>): string | undefined {
   return (result.diagnostics as Array<{ code?: string }> | undefined)?.[0]?.code;
 }
 
+// stableDiagnostics resorts by code, not push order, so a test that hand-edits a sidecar to
+// trigger two independent diagnostics (e.g. an unresolvable reference alongside a canonical-order
+// violation) cannot rely on diagnostics[0]. Check membership instead.
+function diagnosticCodes(result: Record<string, unknown>): string[] {
+  return (result.diagnostics as Array<{ code?: string }> | undefined)?.map((entry) => entry.code ?? "") ?? [];
+}
+
 function taskById(sidecar: Record<string, unknown>, id: string): { id: string; protectedActionIds: string[] } {
   const task = (sidecar.tasks as Array<{ id: string; protectedActionIds: string[] }>).find((entry) => entry.id === id);
   if (!task) throw new Error(`fixture task not found: ${id}`);
@@ -321,5 +328,45 @@ describe("ccc-prd protected-action canonical ordering", () => {
       expectedBase: base,
     });
     expect(validation).toEqual({ kind: "validation", valid: true, diagnostics: [] });
+  });
+
+  // packages/core/src/ccc-campaign/store.ts:107 rejects any protected-action ID where
+  // `entry !== entry.trim()`. isNonEmptyString(" a") is true, so a whitespace-padded but
+  // otherwise duplicate-free, already-sorted single-entry list dodges a check that only
+  // inspects set membership and order. This is that exact dodge shape.
+  it("refuses a hand-edited sidecar whose task protected-action ID is not trimmed, even as an already-canonical single-entry list", async () => {
+    const input = packet();
+    const authored = await author(input);
+    const sidecar = structuredClone(authored.sidecar) as Record<string, unknown>;
+    taskById(sidecar, "TASK-2").protectedActionIds = [" ACTION-ALPHA"];
+    writeFileSync(authored.sidecarPath, JSON.stringify(sidecar));
+    const compileInput = {
+      ...input,
+      sidecarPath: authored.sidecarPath,
+      expectedTarget: target,
+      expectedBase: base,
+    };
+    const validation = ccc.validateCccPrdPacket(compileInput);
+    expect(diagnosticCodes(validation)).toContain("CCC_PRD_PROTECTED_ACTION_IDS_NOT_CANONICAL");
+    const compiled = ccc.compileCccPrdPacket(compileInput);
+    expect(diagnosticCodes(compiled)).toContain("CCC_PRD_PROTECTED_ACTION_IDS_NOT_CANONICAL");
+  });
+
+  it("refuses authoring a proposal whose task protected-action ID is not trimmed, even as an already-canonical single-entry list", async () => {
+    const input = packet();
+    const paddedProposal = proposal();
+    const task2 = paddedProposal.tasks.find((task) => task.id === "TASK-2")!;
+    task2.protectedActionIds = [" ACTION-ALPHA"];
+    const result = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      adapter: {
+        id: "local-deterministic-fixture",
+        model: "fixture-v1",
+        generateCandidate: async () => paddedProposal,
+      },
+    });
+    expect(result.kind).toBe("refusal");
+    expect(refusalCode(result as unknown as Record<string, unknown>)).toBe("CCC_PRD_AUTHORING_PROPOSAL_INVALID");
   });
 });
