@@ -35,9 +35,10 @@ This is the code-local continuation packet. The vault remains authoritative for 
 | Accepted Task 3 descendant | Fail-closed native proof-admission binding, sealed provenance registry, fenced workflow ownership, built-CLI proof host bootstrap, generic-executor refusal, and preserved Wave 5 81-name proof mapping | `dc2d4968d828d623986991f504a530112ba59c3a` |
 | Task 4 foundation | Committed pre-provider admission foundation only: coarse campaign/action admission and native provider-attempt accounting, not transport wiring or Task 4 acceptance | `0ff3748319036ba57356afe1625e2d04e95ef850` |
 | Accepted Task 4 controller component | Atomic provider-dispatch controller plus production local-Git recheck wrapper; component-only acceptance, not Task 4 acceptance | `79c91f8be245038100741cb5e405b34e01a4b46e` |
+| Accepted Task 4 | Native pre-provider admission, bounded one-shot CLI lifecycle, exact settlement/replay, restart inspection, and local fake-bound public-route proof; accepted predecessor/component, not full production runtime readiness | `bb04cff1c0301b55f7b3aa7c8729eb5bd93070c0` |
 | Accepted Phase A/B contract | Generated sidecar, structural compiler, validate, and built CLI | `90c585766b37605aae4be5a9ad6880455e1b7afa` |
 | Accepted Phase C import | PostgreSQL/filesystem unit of work, recovery, and idempotency | `d0debd4ee1b50276b149741e23bbe69c18360ba2` |
-| Task 3 acceptance branch | Accepted product plus this documentation descendant for Task 4 | `agent/ccc-fusion-task2-plan-repair` |
+| Active Task 4 branch | Accepted Task 4 product plus the pending documentation-only descendant for Task 5 handoff | `agent/ccc-fusion-task4-preprovider` |
 | Wave 6 and Wave 7 | Speculative evidence only; unchanged replay rejected | Isolated worktrees, not ancestors of integration |
 | Primary checkout | Not a product writing target | `main` has a generated-instruction descendant and one preserved pre-existing untracked report |
 
@@ -761,3 +762,17 @@ RED expected `NATIVE_MCP_PROXY_DISPOSAL_TIMEOUT` but observed `TEST_PROXY_DISPOS
 Focused proof passed `1/1`; lifecycle passed `11/11`; the Task 4 engine nine-file lane passed `178/178`; core provider-controller plus CLI-session PostgreSQL passed `49/49`; engine typecheck, production/test ESLint, root lint, and `git diff --check` passed. The existing test-process `MaxListeners` warning remains visible.
 
 The repair is uncommitted and unaccepted. Fresh integrated gates and a new final-byte council are mandatory. Task 5 ownership of the long-lived runtime resolver/bootstrap and mixed queue is unchanged. Current state is `task4_proxy_closure_bound_green_integrated_proof_active`.
+
+## Task 4 Frozen Acceptance — 2026-07-26
+
+Task 4 is accepted at product commit `bb04cff1c0301b55f7b3aa7c8729eb5bd93070c0`, parent rejected candidate `b94dd45390d80ea13cb81feac0ff611960d9407d`, tree `cb0ad962ea6642285b56539d39ea9e32610b179b`. Candidate `b94dd45390d80ea13cb81feac0ff611960d9407d` remains immutable rejected evidence because its native MCP proxy disposal could wait forever before the durable uncertainty floor. The accepted repair uses one bounded closure deadline and preserves `needsAttention`, the fence, and the registry slot when proxy closure is not proven.
+
+Fresh behavioral/PostgreSQL review passed the exact accepted bytes: Task 4 engine `178/178`; core Task 4 PostgreSQL `49/49`; root engine `299/299`, PostgreSQL gate `10/10`, and CLI CI-shape `65/65`; no `.fusion` leaks; and the public fake-bound route showed committed settlement, approval consumption, lease clearing, restart visibility, and exact replay hold. Reviewer severity was P0 `0`, P1 `0`, P2 `0`.
+
+The first static attempt was environment-incomplete because candidate-local dependency link views had already been removed; it did not produce an acceptance verdict. A fresh same-byte rerun used documented read-only hydration links and passed pretest/static guards, lint, typecheck `34/36`, build including dashboard `7163` modules, browser-safe import checking, and `git diff --check`, with P0 `0`, P1 `0`, P2 `0`. Proof-only link views were then removed. Final tracked status was clean; only intentional root `node_modules` and `packages/core/node_modules` hydration symlinks remained.
+
+AGY was unavailable or permission-blocked, so native Sol performed the final adversarial review. Verdict: PASS, P0 `0`, P1 `0`, P2 `1`. The P2 is optional test clarity: the blocked-dispose negative control injects the proxy interface rather than constructing a real stalled proxy tail. The manager contract plus existing real proxy coverage adequately proves the accepted bound; a future focused real-tail test may improve readability but is not required for Task 4 acceptance.
+
+Frozen custody: changed-path digest `8126d1abe2b58e852fcb0df3689a96c6c5b766a50a24102dfe8145cb2e6fec2c`; predecessor binary-diff digest `f2a27054beb29e239df81141d4cde51229a21be16a9eb01f5cebd860be367190`; package manifest `cf1e924da8b13c1d6a4ed23b7e5cfb033b9e265a4676b8329050b2a9c6ba1755`; workspace manifest `0e5f3ad808110908c6864d6fa02d05fe4a55d35eee75bf71815361f4c35118d1`; lockfile `09244dac5fdbc33029b5a44a9f7aca19c09de57ecb5c8547ca202eae6d34a7ab`.
+
+This accepts Task 4 as the next accepted predecessor and native component, not as a claim that the full user-facing production campaign route is ready. Task 5 owns the long-lived `InProcessRuntime` resolver/bootstrap, one authoritative runtime, the mixed ordinary-plus-campaign queue, and production merger/ref-update reconciliation. The accepted product remains `bb04cff1c0301b55f7b3aa7c8729eb5bd93070c0`; the documentation-only descendant identity is pending the root writer's commit. No live provider, credential, billing, non-loopback, push, merge, release, publication, remote-adoption, `main`, or other operator gate was issued.
