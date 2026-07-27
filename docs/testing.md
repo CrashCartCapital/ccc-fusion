@@ -1156,3 +1156,37 @@ pnpm exec eslint packages/engine/src/executor.ts
 ```sh
 git diff --check
 ```
+
+### Task 5 Frozen Acceptance Evidence — 2026-07-27
+
+Task 5 is accepted as the component/predecessor only: product commit `fed32801b58a88cd5d037dbbd639afd00b910c22`, rejected parent `0a45396a597f3c67e2fd9e9d36cb6e58cec4b050`, and tree `d568d67b6d37b812df1d4f9695dc2696e7d00beb`. The total-versus-accepted plan is 39 paths; path digest `4b025ed1af9f52e55b87aad7a5fcfc8a8270f9008a363594244dabd50609ce1c`; binary digest `a3ace83644fc1d6241f9e4d5db2dd193d4c6e8065928aab7af238bff58bb4580`. The behavioral exact-replacement lane passed engine `220`, core `19`, CLI `4`, total `243`, zero skips, P0/P1/P2=`0`; the initial interrupted lane is rejected as incomplete.
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-proof-admission.test.ts src/__tests__/workflow-work-scheduler.test.ts src/__tests__/workflow-work-processor.test.ts src/__tests__/ccc-native-cli-public-route.real-pg.test.ts src/__tests__/project-engine.test.ts src/__tests__/workflow-merge-cancellation.test.ts src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts src/__tests__/ccc-campaign-git-integration.real-pg.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/taskstore-lifecycle.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @runfusion/fusion exec vitest run src/commands/__tests__/ccc-native-proof-host.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm pretest
+pnpm lint
+pnpm typecheck
+pnpm build
+```
+
+```sh
+node packages/cli/dist/bin.js --help
+node packages/cli/dist/bin.js prd --help
+```
+
+```sh
+git diff --check
+```
+
+Static pretest/lint/typecheck `34/36`/build including dashboard `7163` modules/built CLI top-level and `prd` subcommand/diff/hash/non-ancestry passed with P0/P1/P2=`0`. The literal standalone `prd` binary finding is rejected because the declared bins are `agent-browser`, `fn`, and `fusion`; the accepted contract is the built CLI subcommand, with no install or manifest authority. Adversarial review passed P0/P1/P2=`0`. Pre-receipt hashes: plan `32b80f9a13bade1183546beb2388283b4872f7c9a1313bd96309f6d145c8c127`, testing `981d7c5f21852de4e8faf405f2ae4ba7ae1e10c43a25e3441e1544bc4a703902`; manifests are unchanged at their full hashes. Status is root/core only; Wave 6/7 are non-ancestors and earlier candidates are rejected. No claim extends to literal full completion, providers, or live state. Next state is Task 6 RED for local mixed-provider synthetic work using deterministic fakes/native transports only.
