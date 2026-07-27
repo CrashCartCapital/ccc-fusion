@@ -10658,6 +10658,7 @@ export class TaskExecutor {
         throw new Error("CCC campaign retry merge result is missing an exact persisted custody authority");
       }
     } catch (error) {
+      if (campaignCustody.kind === "campaign") throw error;
       executorLog.warn(`${live.id}: bounded auto-merge retry request failed after graph merge failure: ${error instanceof Error ? error.message : String(error)}`);
     }
     await this.persistTokenUsage(live.id);

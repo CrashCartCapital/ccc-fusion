@@ -1114,3 +1114,45 @@ git diff --check
 ```
 
 The recorder wording adjudication partially accepts the safety intent and rejects an artificial physical cross-layer recorder: native granular seam assertions are behaviorally equivalent, so no new abstraction was added. There is no acceptance claim; a new commit/tree and fresh behavioral/PostgreSQL, static/build, and adversarial lanes remain mandatory.
+
+### Task 5 Retry Authority Repair Evidence — 2026-07-27
+
+Candidate `0a45396a597f3c67e2fd9e9d36cb6e58cec4b050` is rejected despite behavioral/static PASS because native Sol found P0 `0` and P1 `1`. Root verified and accepted the finding: `routeGraphMergeFailureToRetry` swallowed campaign requester/missing-control errors, persisted, and returned `true`. The exact RED signature for `Task 5 RED: campaign graph retry refuses requester failure or missing exact custody authority` was resolved `true` instead of rejecting. GREEN rethrows campaign requester/missing-control failures before warning, persistence, or `true`, while ordinary behavior remains unchanged; REFACTOR removed the new explicit-`any` cast.
+
+The focused case is `1/1`; the unfiltered workflow file is `15/15`; engine eight files are `220/220`; core is `19/19`; CLI is `4/4`; total is `243/243`. The stale `219` report used a 16-test Git subtotal and was rejected; the exact footer is `220` (`Git 17` plus `workflow 15`). Focused `-t` skips are development evidence only; unfiltered counts are candidate evidence. Hydration proof views must be parked before commit. There is no acceptance claim: this is a dirty repair requiring a new commit/tree and all three council lanes.
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-merge-cancellation.test.ts -t 'Task 5 RED: campaign graph retry refuses requester failure or missing exact custody authority' --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/workflow-merge-cancellation.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/engine exec vitest run src/__tests__/ccc-campaign-proof-admission.test.ts src/__tests__/workflow-work-scheduler.test.ts src/__tests__/workflow-work-processor.test.ts src/__tests__/ccc-native-cli-public-route.real-pg.test.ts src/__tests__/project-engine.test.ts src/__tests__/workflow-merge-cancellation.test.ts src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts src/__tests__/ccc-campaign-git-integration.real-pg.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+FUSION_PG_TEST_URL_BASE=postgresql://postgres@127.0.0.1:61316 pnpm --filter @fusion/core exec vitest run src/__tests__/postgres/taskstore-lifecycle.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @runfusion/fusion exec vitest run src/commands/__tests__/ccc-native-proof-host.test.ts --silent=passed-only --reporter=dot
+```
+
+```sh
+pnpm --filter @fusion/engine typecheck
+```
+
+```sh
+pnpm lint
+```
+
+```sh
+pnpm exec eslint packages/engine/src/executor.ts
+```
+
+```sh
+git diff --check
+```

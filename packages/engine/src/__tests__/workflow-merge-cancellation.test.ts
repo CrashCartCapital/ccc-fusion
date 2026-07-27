@@ -288,6 +288,57 @@ describe("workflow merge cancellation", () => {
       expect(requester).not.toHaveBeenCalled();
     });
 
+    it("Task 5 RED: campaign graph retry refuses requester failure or missing exact custody authority", async () => {
+      const cases = [
+        {
+          name: "requester failure",
+          requester: vi.fn(async () => {
+            throw new Error("campaign requester rejected retry");
+          }),
+          error: "campaign requester rejected retry",
+        },
+        {
+          name: "missing exact custody authority",
+          requester: vi.fn(async () => ({})),
+          error: "CCC campaign retry merge result is missing an exact persisted custody authority",
+        },
+      ];
+
+      for (const testCase of cases) {
+        const liveTask = mergeReadyTask({
+          id: `FN-CAMPAIGN-RETRY-${testCase.name}`,
+          lineageId: "ccc-prd:0123456789abcdef01234567:retry",
+        });
+        const { store, executor } = executorFor(liveTask);
+        store.getCccCampaignContextForTask = vi.fn(async () => ({
+          taskId: liveTask.id,
+          projectId: "project-1",
+          importId: "import-1",
+          campaignId: "campaign-1",
+          bundleHash: "bundle-1",
+          manifestHash: "manifest-1",
+          targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+        }));
+        const warnSpy = vi.spyOn(executorLog, "warn").mockImplementation(() => undefined);
+        const persistSpy = vi.spyOn(executor as unknown as { persistTokenUsage(taskId: string): Promise<void> }, "persistTokenUsage").mockImplementation(async () => undefined);
+        executor.setMergeRequester(testCase.requester);
+
+        await expect(executor.routeGraphMergeFailureToRetry(
+          liveTask,
+          { disposition: "failed", outcome: "failure", visitedNodeIds: ["requestMerge"], context: {} },
+          "merge-seam",
+        )).rejects.toThrow(testCase.error);
+
+        expect(testCase.requester).toHaveBeenCalledTimes(1);
+        expect(testCase.requester).toHaveBeenCalledWith(liveTask.id);
+        expect(warnSpy).not.toHaveBeenCalled();
+        expect(store.logEntry).not.toHaveBeenCalled();
+        expect(store.moveTask).not.toHaveBeenCalled();
+        expect(persistSpy).not.toHaveBeenCalled();
+        warnSpy.mockRestore();
+      }
+    });
+
     it("dispatches campaign retry with exact custody before mutable bookkeeping", async () => {
       const liveTask = mergeReadyTask({
         id: "FN-CAMPAIGN-RETRY",
