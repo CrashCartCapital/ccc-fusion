@@ -51,9 +51,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
-      PGPASSWORD: "postgres"
     # Backstop for a wedged shard. The per-invocation watchdog (L2,
     # scripts/lib/run-vitest-watchdog.mjs) kills any single hung invocation at
     # its budget ceiling (<=30min), so this job budget only fires if L2 itself
@@ -118,6 +115,9 @@ jobs:
 
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4
+        env:
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
+          PGPASSWORD: "postgres"
 
       # Each shard emits per-file vitest JSON timing reporter output under
       # .timings/. Upload as an artifact so the timing snapshot can be
@@ -230,9 +230,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
-      PGPASSWORD: "postgres"
     # Real-git slow suites; same backstop rationale as test-shards. Sits above
     # the L2 per-invocation ceiling so the watchdog fires first on a single hang.
     timeout-minutes: 60
@@ -247,3 +244,6 @@ jobs:
 
       - name: Run engine-slow with non-empty-execution assertion
         run: node scripts/assert-engine-slow-nonempty.mjs
+        env:
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
+          PGPASSWORD: "postgres"

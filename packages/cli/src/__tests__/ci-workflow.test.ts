@@ -199,7 +199,10 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
 
   it("keeps the PostgreSQL service off the laptop's fixed 5432 tunnel", () => {
     expect(workflow.jobs?.gate?.services?.postgres?.ports).toEqual(["5432/tcp"]);
-    expect(workflow.jobs?.gate?.env?.FUSION_PG_TEST_URL_BASE).toContain(
+    const gateTestStep = (workflow.jobs?.gate?.steps ?? []).find(
+      (step: any) => step.name === "Gate tests (curated engine-core + CI-shape)",
+    );
+    expect(gateTestStep?.env?.FUSION_PG_TEST_URL_BASE).toContain(
       "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
     );
   });
@@ -363,10 +366,14 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
   });
 
   it("gives each PostgreSQL-backed job a random host port", () => {
-    for (const jobName of ["test-shards", "test-slow"]) {
+    for (const [jobName, stepName] of [
+      ["test-shards", "Test (deterministic shard)"],
+      ["test-slow", "Run engine-slow with non-empty-execution assertion"],
+    ]) {
       const job = workflow.jobs?.[jobName];
       expect(job?.services?.postgres?.ports).toEqual(["5432/tcp"]);
-      expect(job?.env?.FUSION_PG_TEST_URL_BASE).toContain(
+      const postgresStep = (job?.steps ?? []).find((step: any) => step.name === stepName);
+      expect(postgresStep?.env?.FUSION_PG_TEST_URL_BASE).toContain(
         "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
       );
     }

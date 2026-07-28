@@ -108,11 +108,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      # The runner itself is a Docker container. Reach the sibling PostgreSQL
-      # service through Docker Desktop's host bridge and its random host port.
-      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
-      PGPASSWORD: "postgres"
     # The gate's value is speed; without a job timeout a hung build or
     # deadlocked vitest worker blocks every PR for GitHub's default 6 hours.
     # Expected runtime is ~3-5 min.
@@ -160,6 +155,11 @@ jobs:
 
       - name: Gate tests (curated engine-core + CI-shape)
         run: pnpm test:gate
+        env:
+          # The runner itself is a Docker container. Reach the sibling
+          # PostgreSQL service through its random Docker Desktop host port.
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
+          PGPASSWORD: "postgres"
 
   # Advisory desktop-packaging validation lives in its OWN workflow (desktop-packaging.yml) so this
   # thin gate stays exactly [Lint, Typecheck, Build, Gate] — the job set here maps 1:1 to the
