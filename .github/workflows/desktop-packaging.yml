@@ -35,7 +35,7 @@ env:
 jobs:
   desktop-pack:
     name: Desktop packaging
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
     timeout-minutes: 25
     steps:
       - name: Checkout

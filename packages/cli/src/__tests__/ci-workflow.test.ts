@@ -160,6 +160,18 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(Object.keys(workflow.jobs ?? {}).sort()).toEqual(["build", "gate", "lint", "typecheck"]);
   });
 
+  it("routes every blocking job to the dedicated local Fusion runners", () => {
+    for (const jobName of ["lint", "typecheck", "build", "gate"]) {
+      expect(workflow.jobs?.[jobName]?.["runs-on"]).toEqual([
+        "self-hosted",
+        "linux",
+        "ARM64",
+        "ccc-fusion",
+      ]);
+    }
+    expect(content).not.toContain("ubuntu-latest");
+  });
+
   it("contains no shard matrix or full-suite invocation (demoted to full-suite.yml)", () => {
     expect(workflow.jobs?.["test-shards"]).toBeUndefined();
     expect(workflow.jobs?.["test-slow"]).toBeUndefined();
@@ -183,6 +195,13 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
         (step: any) => typeof step.run === "string" && step.run.includes("pnpm test:gate"),
       ),
     ).toBe(true);
+  });
+
+  it("keeps the PostgreSQL service off the laptop's fixed 5432 tunnel", () => {
+    expect(workflow.jobs?.gate?.services?.postgres?.ports).toEqual(["5432/tcp"]);
+    expect(workflow.jobs?.gate?.env?.FUSION_PG_TEST_URL_BASE).toContain(
+      "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
+    );
   });
 
   /*
@@ -324,11 +343,33 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(workflow.on?.pull_request).toBeUndefined();
   });
 
+  it("routes every post-merge job to the dedicated local Fusion runners", () => {
+    for (const job of Object.values(workflow.jobs ?? {}) as any[]) {
+      expect(job?.["runs-on"]).toEqual([
+        "self-hosted",
+        "linux",
+        "ARM64",
+        "ccc-fusion",
+      ]);
+    }
+    expect(content).not.toContain("ubuntu-latest");
+  });
+
   it("carries the demoted tier: 4-way shards, engine slow, inventory guard", () => {
     expect(workflow.jobs?.["test-shards"]?.strategy?.matrix?.shard).toEqual([1, 2, 3, 4]);
     expect(content).toContain("pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4");
     expect(workflow.jobs?.["test-slow"]).toBeDefined();
     expect(workflow.jobs?.["test-inventory-guard"]).toBeDefined();
+  });
+
+  it("gives each PostgreSQL-backed job a random host port", () => {
+    for (const jobName of ["test-shards", "test-slow"]) {
+      const job = workflow.jobs?.[jobName];
+      expect(job?.services?.postgres?.ports).toEqual(["5432/tcp"]);
+      expect(job?.env?.FUSION_PG_TEST_URL_BASE).toContain(
+        "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
+      );
+    }
   });
 
   it("keeps full clones where real-git tests need history", () => {
@@ -352,6 +393,20 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
         (step: any) => step.name === "Build" || (typeof step.run === "string" && step.run.includes("pnpm build")),
       ),
     ).toBe(false);
+  });
+});
+
+describe("Desktop packaging workflow (.github/workflows/desktop-packaging.yml)", () => {
+  it("uses the dedicated local Fusion runners", () => {
+    const { content, parsed } = loadWorkflow("desktop-packaging.yml");
+
+    expect(parsed.jobs?.["desktop-pack"]?.["runs-on"]).toEqual([
+      "self-hosted",
+      "linux",
+      "ARM64",
+      "ccc-fusion",
+    ]);
+    expect(content).not.toContain("ubuntu-latest");
   });
 });
 
