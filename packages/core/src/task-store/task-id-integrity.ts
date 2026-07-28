@@ -849,30 +849,32 @@ export async function buildActiveTaskDependencyLookupImpl(store: TaskStore, over
     return lookup;
 }
 
-export function recordDependencyCycleRejectedAuditImpl(store: TaskStore,
+export async function recordDependencyCycleRejectedAuditImpl(store: TaskStore,
     taskId: string,
     cyclePath: readonly string[],
     source: "createTask" | "createTaskWithReservedId" | "updateTask" | "replication",
-  ): void {
+  ): Promise<void> {
     /*
      * FNXC:SqliteFinalRemoval 2026-06-26:
      * In backend mode, delegate to async recordRunAuditEvent via the async layer
-     * instead of the synchronous SQLite store.db path. This prevents "SQLite Database
-     * is not available" errors when dependency cycles are detected in PG mode.
+     * instead of the synchronous SQLite store.db path. Await the write so the
+     * rejected mutation has no database work left running when it returns.
      */
     if (store.backendMode && store.asyncLayer) {
       const mutationType = source === "replication" ? "task:dependency-cycle-rejected-replication" : "task:dependency-cycle-rejected";
-      void recordRunAuditEventAsync(store.asyncLayer, {
-        taskId,
-        agentId: "store",
-        runId: `store:${mutationType}:${taskId}`,
-        domain: "database",
-        mutationType,
-        target: taskId,
-        metadata: { taskId, cyclePath, source } as Record<string, unknown>,
-      }).catch((err) => {
+      try {
+        await recordRunAuditEventAsync(store.asyncLayer, {
+          taskId,
+          agentId: "store",
+          runId: `store:${mutationType}:${taskId}`,
+          domain: "database",
+          mutationType,
+          target: taskId,
+          metadata: { taskId, cyclePath, source } as Record<string, unknown>,
+        });
+      } catch (err) {
         storeLog.warn(`[dependency-cycle-rejected-audit-failed] ${taskId}`, { error: getErrorMessage(err) });
-      });
+      }
       return;
     }
     store.insertRunAuditEventRow({
@@ -894,7 +896,7 @@ export async function assertNoDependencyCycleImpl(store: TaskStore,
     const lookup = await store.buildActiveTaskDependencyLookup(overrides);
     const cyclePath = detectDependencyCycle(taskId, dependencies, (candidateId) => lookup.get(candidateId));
     if (!cyclePath) return;
-    store.recordDependencyCycleRejectedAudit(taskId, cyclePath, source);
+    await store.recordDependencyCycleRejectedAudit(taskId, cyclePath, source);
     if (source === "replication") {
       storeLog.warn("Skipping replicated task create due to dependency cycle", { taskId, cyclePath });
       return;
