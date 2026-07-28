@@ -5,15 +5,57 @@
  * schema, and tears down cleanly.
  */
 
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect, afterEach } from "vitest";
 import {
   createTaskStoreForTest,
+  hasPsqlClient,
   PG_AVAILABLE,
+  probePsqlReady,
   type PgTestHarness,
 } from "../../__test-utils__/pg-test-harness.js";
 import { insertTaskRow } from "../../task-store/async-persistence.js";
 
 const testDescribe = PG_AVAILABLE ? describe : describe.skip;
+
+describe("PostgreSQL test availability", () => {
+  it("requires an executable psql client on PATH", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-psql-client-"));
+    const executableName = process.platform === "win32" ? "psql.exe" : "psql";
+    const executablePath = join(root, executableName);
+
+    try {
+      await writeFile(executablePath, "");
+      if (process.platform !== "win32") {
+        await chmod(executablePath, 0o755);
+      }
+
+      expect(hasPsqlClient(root)).toBe(true);
+      expect(hasPsqlClient(join(root, "missing"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  const readinessIt = process.platform === "win32" ? it.skip : it;
+  readinessIt("requires psql to reach a usable test database", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-psql-ready-"));
+    const executablePath = join(root, "psql");
+
+    try {
+      await writeFile(executablePath, "#!/bin/sh\nexit 0\n");
+      await chmod(executablePath, 0o755);
+      expect(probePsqlReady("postgresql://localhost:5432", root)).toBe(true);
+
+      await writeFile(executablePath, "#!/bin/sh\nexit 1\n");
+      expect(probePsqlReady("postgresql://localhost:5432", root)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 testDescribe("createTaskStoreForTest (PG fixture helper)", () => {
   let harness: PgTestHarness | null = null;

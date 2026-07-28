@@ -88,10 +88,10 @@ jobs:
     runs-on: ubuntu-latest
     # FNXC:FixPgTestsAndCi 2026-06-26-09:10:
     # Provision a PostgreSQL service container so the postgres/*.pg.test.ts
-    # suites (pgDescribe) run in the merge gate. The pg-test-harness probe
-    # detects reachability via a TCP probe on localhost:5432 and skips when
-    # unavailable, so this service is what makes the 57 PG twin tests actually
-    # execute instead of being silently skipped.
+    # suites (pgDescribe) run in the merge gate. The pg-test-harness requires
+    # an executable psql client, TCP reachability on localhost:5432, and a
+    # successful read-only psql connection, so this service is what makes the
+    # 57 PG twin tests actually execute instead of being silently skipped.
     services:
       postgres:
         image: postgres:15

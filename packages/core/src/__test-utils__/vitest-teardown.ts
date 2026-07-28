@@ -9,6 +9,7 @@
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { isPgTestAvailable } from "./pg-test-availability.js";
 
 export const WORKER_ROOT_OWNER_FILE = ".fusion-test-worker-root-owner";
 const FUSION_TEST_RUN_TOKEN_ENV = "FUSION_TEST_RUN_TOKEN";
@@ -83,6 +84,16 @@ export function removeWorkerRootWithRetry(workerRoot: string, retries = 8, delay
 
 export default function setup(): () => Promise<void> {
   removeLegacyTopLevelHomeRoots();
+  /*
+  FNXC:PgTestGuard 2026-07-28:
+  Decide PostgreSQL availability once in Vitest's main process, before workers
+  start. Older PG suites still honor FUSION_PG_TEST_SKIP directly; publishing
+  the canonical result here prevents those suites from bypassing the shared
+  harness when localhost:5432 is an unusable SSH tunnel.
+  */
+  if (!isPgTestAvailable()) {
+    process.env.FUSION_PG_TEST_SKIP = "1";
+  }
   // Use a fresh root for each Vitest invocation. A static shared root makes the
   // setup-time redirect sweep proportional to stale directories left by every
   // prior interrupted run.
