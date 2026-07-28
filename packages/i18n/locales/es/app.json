@@ -5964,7 +5964,8 @@
       "reportDiscussionCategoryHelp": "Obligatoria al enviar a Discusiones de GitHub. Las categorías se cargan desde el repositorio configurado.",
       "reportDiscussionCategorySelect": "Selecciona una categoría de discusión",
       "reportDiscussionCategoryUnavailable": "Las categorías de discusión no están disponibles para el repositorio configurado.",
-      "reportDiscussionCategoryEmpty": "No hay categorías de discusión disponibles para el repositorio configurado."
+      "reportDiscussionCategoryEmpty": "No hay categorías de discusión disponibles para el repositorio configurado.",
+      "reportTargetByActionHelp": ""
     },
     "globalGeneral": {
       "andShowsUpdateNoticesInTheCLIAnd": "",
@@ -6010,7 +6011,11 @@
       "skipConfirmationDialogs": "",
       "skipConfirmationDialogsHint": "",
       "enableProactiveTaskChat": "",
-      "enableProactiveTaskChatHint": ""
+      "enableProactiveTaskChatHint": "",
+      "releaseChannel": "",
+      "releaseChannelHelp": "",
+      "channelStable": "",
+      "channelBeta": ""
     },
     "globalModels": {
       "allow": "",
@@ -7820,7 +7825,12 @@
       "createdVia": "Creado mediante",
       "parentTaskOf": "",
       "createdToUndo": "",
-      "undoTask": ""
+      "undoTask": "",
+      "creatingAgent": "",
+      "importedFrom": "",
+      "nearDuplicateOf": "",
+      "parentTask": "",
+      "title": ""
     },
     "recoveryState": "Estado de recuperación",
     "refine": {
