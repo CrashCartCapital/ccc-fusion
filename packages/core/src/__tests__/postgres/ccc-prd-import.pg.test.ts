@@ -1379,8 +1379,8 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     `))) as unknown as Array<{ table_name: string; row_count: number }>;
     expect(counts).toEqual([
       { table_name: "ccc_prd_import_entities", row_count: 0 },
-      { table_name: "ccc_prd_import_sources", row_count: 0 },
       { table_name: "ccc_prd_imports", row_count: 0 },
+      { table_name: "ccc_prd_import_sources", row_count: 0 },
     ]);
   });
 
