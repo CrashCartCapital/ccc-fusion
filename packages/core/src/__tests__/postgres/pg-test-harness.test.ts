@@ -100,15 +100,22 @@ describe("PostgreSQL test availability", () => {
     async () => {
       const root = await mkdtemp(join(tmpdir(), "fusion-psql-canonical-"));
       const executablePath = join(root, "psql");
+      const originalSkip = process.env.FUSION_PG_TEST_SKIP;
 
       try {
         await writeFile(executablePath, "#!/bin/sh\nexit 0\n");
         await chmod(executablePath, 0o755);
+        delete process.env.FUSION_PG_TEST_SKIP;
 
         expect(
           isPgTestAvailable("postgresql://127.0.0.1:1", root),
         ).toBe(true);
       } finally {
+        if (originalSkip === undefined) {
+          delete process.env.FUSION_PG_TEST_SKIP;
+        } else {
+          process.env.FUSION_PG_TEST_SKIP = originalSkip;
+        }
         await rm(root, { recursive: true, force: true });
       }
     },
