@@ -393,13 +393,89 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(content).toContain("test-timings-shard-${{ matrix.shard }}");
   });
 
-  it("does not spend action minutes on a pre-test workspace build", () => {
-    const testSteps = workflow.jobs?.["test-shards"]?.steps ?? [];
+  it("builds all required dist artifacts once before fanning out test consumers", () => {
+    const requiredDistPaths = [
+      "packages/core/dist",
+      "packages/dashboard/dist",
+      "packages/engine/dist",
+      "packages/cli/dist",
+      "packages/plugin-sdk/dist",
+      "plugins/fusion-plugin-dependency-graph/dist",
+      "plugins/fusion-plugin-hermes-runtime/dist",
+      "plugins/fusion-plugin-openclaw-runtime/dist",
+      "plugins/fusion-plugin-paperclip-runtime/dist",
+      "plugins/fusion-plugin-compound-engineering/dist",
+    ];
+    const prepareJob = workflow.jobs?.["prepare-test-artifacts"];
+    expect(prepareJob).toBeDefined();
+
+    const allSteps = Object.values(workflow.jobs ?? {}).flatMap(
+      (job: any) => job?.steps ?? [],
+    ) as any[];
     expect(
-      testSteps.some(
-        (step: any) => step.name === "Build" || (typeof step.run === "string" && step.run.includes("pnpm build")),
+      allSteps.filter(
+        (step: any) => step.run === "node scripts/ensure-test-artifacts.mjs",
       ),
-    ).toBe(false);
+    ).toHaveLength(1);
+
+    const prepareRestore = (prepareJob.steps ?? []).find(
+      (step: any) => step.uses === "actions/cache/restore@v4",
+    );
+    const prepareSave = (prepareJob.steps ?? []).find(
+      (step: any) => step.uses === "actions/cache/save@v4",
+    );
+    for (const cacheStep of [prepareRestore, prepareSave]) {
+      expect(cacheStep).toBeDefined();
+      expect(cacheStep.with?.path.trim().split("\n")).toEqual(requiredDistPaths);
+      expect(cacheStep.with?.key).toContain("fusion-dist-v2-");
+      expect(cacheStep.with?.["restore-keys"]).toBeUndefined();
+      expect(cacheStep.with?.path).not.toContain("node_modules");
+    }
+    expect(prepareSave.with?.key).toBe(prepareRestore.with?.key);
+
+    for (const jobName of ["test-shards", "test-inventory-guard"]) {
+      const job = workflow.jobs?.[jobName];
+      const needs = Array.isArray(job?.needs) ? job.needs : [job?.needs];
+      expect(needs).toContain("prepare-test-artifacts");
+
+      const steps = job?.steps ?? [];
+      const restore = steps.find(
+        (step: any) => step.uses === "actions/cache/restore@v4",
+      );
+      expect(restore?.with?.path.trim().split("\n")).toEqual(requiredDistPaths);
+      expect(restore?.with?.key).toBe(prepareRestore.with?.key);
+      expect(restore?.with?.["fail-on-cache-miss"]).toBe(true);
+
+      const assertIndex = steps.findIndex(
+        (step: any) =>
+          step.run ===
+          "node scripts/ensure-test-artifacts.mjs --assert-artifacts-present",
+      );
+      const seedIndex = steps.findIndex(
+        (step: any) =>
+          step.run ===
+          "node scripts/ensure-test-artifacts.mjs --seed-artifact-cache",
+      );
+      const consumeIndex = steps.findIndex(
+        (step: any) =>
+          typeof step.run === "string" &&
+          (step.run.includes("pnpm test:ci:shard") ||
+            step.run.includes("check-test-inventory.mjs")),
+      );
+      expect(assertIndex).toBeGreaterThan(-1);
+      expect(seedIndex).toBeGreaterThan(assertIndex);
+      expect(consumeIndex).toBeGreaterThan(seedIndex);
+      expect(
+        steps.some(
+          (step: any) =>
+            step.name === "Build" ||
+            step.run === "node scripts/ensure-test-artifacts.mjs",
+        ),
+      ).toBe(false);
+    }
+
+    expect(workflow.jobs?.["test-slow"]?.needs).toBeUndefined();
+    expect(workflow.jobs?.["line-count-audit"]?.needs).toBeUndefined();
   });
 
   it("runs the line-count audit without installing or remotely caching the workspace", () => {

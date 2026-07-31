@@ -317,6 +317,26 @@ export function detectMissingOrStaleArtifacts(
   });
 }
 
+/**
+ * Return every required repo-relative dist artifact that is absent.
+ *
+ * This deliberately derives from REQUIRED_BUILD_PACKAGES so CI cache
+ * validation cannot drift from the bootstrap registry.
+ *
+ * @param {string} rootDir
+ * @param {(p: string) => boolean} [existsFn]
+ * @returns {string[]}
+ */
+export function findMissingRequiredArtifacts(
+  rootDir = process.cwd(),
+  existsFn = existsSync,
+) {
+  const resolvedRootDir = resolveWorkspaceRoot(rootDir);
+  return REQUIRED_BUILD_PACKAGES.flatMap((pkg) => pkg.requiredArtifacts).filter(
+    (artifactPath) => !existsFn(path.join(resolvedRootDir, artifactPath)),
+  );
+}
+
 function classifyArtifactIssues(pkgEntry, rootDir, existsFn, statFn, readdirFn) {
   const missingPaths = pkgEntry.requiredArtifacts.filter((artifactPath) => !existsFn(path.join(rootDir, artifactPath)));
   if (missingPaths.length > 0) {
@@ -505,6 +525,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   } else if (argv.includes("--seed-artifact-cache")) {
     const seeded = seedArtifactCache();
     process.stderr.write(`[test-bootstrap] seeded artifact hash-cache for: ${seeded.join(", ") || "(none)"}\n`);
+  } else if (argv.includes("--assert-artifacts-present")) {
+    const missing = findMissingRequiredArtifacts();
+    if (missing.length > 0) {
+      process.stderr.write("[test-bootstrap] required dist artifacts are missing:\n");
+      for (const artifactPath of missing) {
+        process.stderr.write(`[test-bootstrap] missing: ${artifactPath}\n`);
+      }
+      process.exitCode = 1;
+    } else {
+      process.stderr.write("[test-bootstrap] all required dist artifacts are present\n");
+    }
   } else {
     ensureTestArtifacts();
   }

@@ -7,6 +7,7 @@ import {
   computeCombinedSourceHash,
   detectMissingOrStaleArtifacts,
   ensureTestArtifacts,
+  findMissingRequiredArtifacts,
   isStale,
   packageSourceInputs,
   REQUIRED_BUILD_PACKAGES,
@@ -33,6 +34,22 @@ test("detectMissingArtifacts returns missing package list", () => {
   const missing = detectMissingOrStaleArtifacts("/repo", () => false);
   assert.equal(missing.length, REQUIRED_BUILD_PACKAGES.length);
   assert.equal(missing[0].name, "@fusion/core");
+});
+
+test("findMissingRequiredArtifacts reports exact missing paths from the package registry", () => {
+  assert.deepEqual(findMissingRequiredArtifacts("/repo", () => true), []);
+
+  const expectedMissing = [
+    "packages/cli/dist/extension.js",
+    "plugins/fusion-plugin-compound-engineering/dist/session/orchestrator.js",
+  ];
+  const missing = findMissingRequiredArtifacts(
+    "/repo",
+    (candidatePath) =>
+      !expectedMissing.some((artifactPath) => candidatePath.endsWith(artifactPath)),
+  );
+
+  assert.deepEqual(missing, expectedMissing);
 });
 
 test("ensureTestArtifacts skips build when nothing is missing", () => {
@@ -587,7 +604,7 @@ test("seedArtifactCache: records hashes for staleable packages when all artifact
     // All artifacts present.
     const seeded = seedArtifactCache(root, () => true, fakeGitForAllSources());
     // recordArtifactBuild only writes entries for packages with source globs
-    // (engine + the 4 plugins); the mtime-immune core/dashboard/plugin-sdk are
+    // (engine + CLI + the 5 plugins); the mtime-immune core/dashboard/plugin-sdk are
     // returned as "present" but contribute no cache entry.
     assert.ok(seeded.includes("@fusion/engine"));
     assert.ok(seeded.includes("@fusion-plugin-examples/hermes-runtime"));
