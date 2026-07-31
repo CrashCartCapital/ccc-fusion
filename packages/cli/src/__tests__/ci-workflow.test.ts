@@ -417,6 +417,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     const setupNodeStep = lineCountSteps.find((step: any) => step.uses === "actions/setup-node@v5");
     expect(setupNodeStep?.with?.["node-version"]).toBe("24");
     expect(setupNodeStep?.with?.cache).toBeUndefined();
+    expect(setupNodeStep?.with?.["package-manager-cache"]).toBe(false);
 
     const auditStep = lineCountSteps.find((step: any) => step.name === "Run line-count audit");
     expect(auditStep?.run).toBe("node scripts/check-file-line-count.mjs");
