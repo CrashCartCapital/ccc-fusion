@@ -9,6 +9,7 @@ import {
   getApprovalRequest,
   getWorkflowExtensionHostProvenanceBinding,
   importCccPrdBundle,
+  inspectCccPrdProductStatus,
   type CccPrdSemanticBundle,
 } from "@fusion/core";
 import {
@@ -136,7 +137,22 @@ pgTest("CCC campaign product merge approval", () => {
       layer: h.layer(),
       rootDir,
     });
-    const taskId = bundle.workflows[0]!.terminalTaskIds[0]!;
+    const semanticTaskId = bundle.workflows[0]!.terminalTaskIds[0]!;
+    const productStatus = await inspectCccPrdProductStatus({
+      idempotencyKey: suffix,
+      layer: h.layer(),
+      rootDir,
+    });
+    if (!productStatus) {
+      throw new Error(`missing product status for ${suffix}`);
+    }
+    expect(productStatus.import.importId).toBe(imported.importId);
+    const taskStatuses = productStatus.tasks.filter(
+      (status) => status.semanticTaskId === semanticTaskId,
+    );
+    expect(taskStatuses).toHaveLength(1);
+    const taskId = taskStatuses[0]!.nativeTaskId;
+    expect(taskId).not.toBe(semanticTaskId);
     return { rootDir, baseCommit, bundle, imported, taskId };
   }
 

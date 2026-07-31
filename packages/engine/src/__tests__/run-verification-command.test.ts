@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -20,27 +22,40 @@ import {
   detectMarathonVerification,
   normalizeVerificationCommand,
   runVerificationCommand,
+  __testOnlyBuildVerificationSandboxLaunch,
+  __testOnlyDetectTrustedVerifierBwrap,
   __testOnlyReapVerificationProcessGroup,
   type RunVerificationOptions,
 } from "../run-verification-tool.js";
 
 // Some tests use platform-appropriate shell syntax. On Windows, sh-style
-// quoting and pipes through `printf` are different — these tests are skipped
-// when running on win32. The implementation itself is portable via
-// `shell: true` (Node picks cmd.exe on Windows, /bin/sh on POSIX).
+// quoting and pipes through `printf` are different. Real command execution is
+// also limited to hosts with an enforced verifier sandbox; unsupported hosts
+// exercise the pure launch/refusal contract and fail closed at runtime.
 const onPosix = process.platform !== "win32";
 const itPosix = onPosix ? it : it.skip;
-const onDarwin = process.platform === "darwin";
-const itDarwin = onDarwin ? it : it.skip;
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+function canExecuteVerifierSandbox(): boolean {
+  if (process.platform === "darwin") return existsSync("/usr/bin/sandbox-exec");
+  if (process.platform !== "linux") return false;
+  const detected = __testOnlyDetectTrustedVerifierBwrap();
+  if (!detected.available || !detected.path) return false;
+  const probe = spawnSync(detected.path, [
+    "--die-with-parent",
+    "--unshare-net",
+    "--ro-bind",
+    "/",
+    "/",
+    "--",
+    "/bin/true",
+  ], { stdio: "ignore", timeout: 5_000 });
+  return probe.status === 0;
 }
+
+const verifierSandboxAvailable = canExecuteVerifierSandbox();
+const describeVerifierHost = verifierSandboxAvailable ? describe : describe.skip;
+const itVerifierHost = verifierSandboxAvailable ? it : it.skip;
+const itUnsupportedLinux = process.platform === "linux" && !verifierSandboxAvailable ? it : it.skip;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -148,7 +163,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("tool verification budgets and marathon caps", () => {
+  describeVerifierHost("tool verification budgets and marathon caps", () => {
     it("uses the project verification timeout default when provided", async () => {
       const onVerificationStart = vi.fn();
       const tool = createRunVerificationTool({
@@ -284,7 +299,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("tool verification lifecycle callbacks", () => {
+  describeVerifierHost("tool verification lifecycle callbacks", () => {
     it("brackets a successful verification run with start and end callbacks", async () => {
       const onVerificationStart = vi.fn();
       const onVerificationEnd = vi.fn();
@@ -351,7 +366,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       })).rejects.toThrow(/canonical worktree/i);
     });
 
-    itDarwin("allows a canonical existing package directory inside the worktree", async () => {
+    itVerifierHost("allows a canonical existing package directory inside the worktree", async () => {
       const packageDir = join(tempDir, "package-cwd");
       mkdirSync(packageDir, { recursive: true });
 
@@ -368,7 +383,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("basic command execution", () => {
+  describeVerifierHost("basic command execution", () => {
     it("executes a simple echo command and captures output", async () => {
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
@@ -420,7 +435,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("environment hygiene", () => {
+  describeVerifierHost("environment hygiene", () => {
     itPosix("passes only the deterministic local verification environment", async () => {
       const plantedEnv = {
         LANG: "C",
@@ -543,7 +558,132 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
   });
 
   describe("verifier confinement", () => {
-    itDarwin("denies writes outside the verifier cwd while allowing normal cwd writes", async () => {
+    it("never trusts a PATH-prepended verifier sandbox executable", () => {
+      const fakeBin = mkdtempSync(join(tempDir, "fusion-verifier-fake-bwrap-"));
+      const fakeBwrap = join(fakeBin, "bwrap");
+      const originalPath = process.env.PATH;
+      writeFileSync(fakeBwrap, "#!/bin/sh\necho 'bubblewrap 99.0.0'\n", "utf8");
+      chmodSync(fakeBwrap, 0o755);
+      process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
+
+      try {
+        const detected = __testOnlyDetectTrustedVerifierBwrap();
+        expect(detected.path).not.toBe(fakeBwrap);
+        if (detected.available) {
+          expect(["/usr/bin/bwrap", "/bin/bwrap"]).toContain(detected.path);
+        }
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+        rmSync(fakeBin, { recursive: true, force: true });
+      }
+    });
+
+    it("builds a fail-closed Linux bubblewrap launch without a host shell wrapper", async () => {
+      const repoRoot = mkdtempSync(join(tempDir, "fusion-verifier-linux-launch-"));
+      const cwd = join(repoRoot, "packages", "target");
+      const protectedDir = join(repoRoot, "nested", "_secrets");
+      const skippedTreeProtectedDir = join(repoRoot, "dist", "_secrets");
+      const dependencyProtectedDir = join(repoRoot, "node_modules", "example", "_secrets");
+      mkdirSync(join(repoRoot, ".git"), { recursive: true });
+      mkdirSync(cwd, { recursive: true });
+      mkdirSync(protectedDir, { recursive: true });
+      mkdirSync(skippedTreeProtectedDir, { recursive: true });
+      mkdirSync(dependencyProtectedDir, { recursive: true });
+
+      const launch = await __testOnlyBuildVerificationSandboxLaunch(
+        {
+          command: "printf 'sandboxed\\n'",
+          cwd,
+          childEnv: {
+            PATH: process.env.PATH,
+            HOME: "/planted/host-home",
+            CI: "1",
+          },
+        },
+        {
+          platform: "linux",
+          bubblewrap: { available: true, path: "/usr/bin/bwrap", version: "0.9.0" },
+        },
+      );
+
+      try {
+        expect("error" in launch).toBe(false);
+        if ("error" in launch) return;
+        expect(launch.command).toBe("/usr/bin/bwrap");
+        expect(launch.args).toEqual(expect.arrayContaining([
+          "--clearenv",
+          "--unshare-net",
+          "--chdir",
+          realpathSync(cwd),
+        ]));
+        expect(launch.args.slice(-4)).toEqual([
+          "--",
+          "/bin/sh",
+          "-c",
+          "printf 'sandboxed\\n'",
+        ]);
+        expect(launch.env.HOME).not.toBe("/planted/host-home");
+        expect(launch.shell).toBe(false);
+        expect(launch.args).toContain(realpathSync(protectedDir));
+        expect(launch.args).toContain(realpathSync(skippedTreeProtectedDir));
+        expect(launch.args).toContain(realpathSync(dependencyProtectedDir));
+        const readRootMount = launch.args.findIndex((arg, index) =>
+          arg === "--ro-bind" && launch.args[index + 1] === realpathSync(repoRoot));
+        const writableCwdMounts = launch.args
+          .map((arg, index) => arg === "--bind" && launch.args[index + 1] === realpathSync(cwd) ? index : -1)
+          .filter((index) => index >= 0);
+        expect(readRootMount).toBeGreaterThanOrEqual(0);
+        expect(Math.max(...writableCwdMounts)).toBeGreaterThan(readRootMount);
+      } finally {
+        if (!("error" in launch)) launch.cleanup();
+        rmSync(repoRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses Linux verification when bubblewrap is unavailable", async () => {
+      const launch = await __testOnlyBuildVerificationSandboxLaunch(
+        {
+          command: "exit 0",
+          cwd: tempDir,
+          childEnv: { PATH: process.env.PATH },
+        },
+        {
+          platform: "linux",
+          bubblewrap: { available: false, reason: "not-installed" },
+        },
+      );
+
+      expect(launch).toEqual({
+        error: expect.stringMatching(/bubblewrap.*not-installed.*refusing to run verification natively/i),
+      });
+    });
+
+    itUnsupportedLinux("fails closed without executing the verifier when Linux confinement is unavailable", async () => {
+      const cwd = mkdtempSync(join(tempDir, "fusion-verifier-unsupported-linux-"));
+      const marker = join(cwd, "must-not-exist.txt");
+
+      try {
+        const result = await runVerificationCommand({
+          command: `printf unsafe > ${JSON.stringify(marker)}`,
+          cwd,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+          bypassVerificationSlot: true,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.exitCode).not.toBe(0);
+        expect(existsSync(marker)).toBe(false);
+        expect([result.stderr, ...result.warnings].join("\n")).toMatch(
+          /bubblewrap|bwrap|sandbox|namespace/i,
+        );
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    itVerifierHost("denies writes outside the verifier cwd while allowing normal cwd writes", async () => {
       const cwd = mkdtempSync(join(tempDir, "fusion-verifier-cwd-"));
       const outside = mkdtempSync(join(tempDir, "fusion-verifier-outside-"));
       const allowedPath = join(cwd, "allowed.txt");
@@ -576,7 +716,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       }
     });
 
-    itDarwin("isolates HOME and denies protected host-home reads", async () => {
+    itVerifierHost("isolates HOME and denies protected host-home reads", async () => {
       const cwd = mkdtempSync(join(tempDir, "fusion-verifier-home-cwd-"));
       const protectedHome = mkdtempSync(join(tempDir, "fusion-verifier-home-"));
       const protectedFile = join(protectedHome, "protected-token.txt");
@@ -615,7 +755,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       }
     });
 
-    itDarwin("denies nested protected-directory reads when the verifier cwd is inside HOME", async () => {
+    itVerifierHost("denies nested protected-directory reads when the verifier cwd is inside HOME", async () => {
       const protectedHome = mkdtempSync(join(tempDir, "fusion-verifier-nested-home-"));
       const cwd = join(protectedHome, "workspace", "package");
       const nestedProtectedDir = join(protectedHome, "workspace", "other", "_secrets");
@@ -654,7 +794,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       }
     });
 
-    itDarwin("denies verifier network connections", async () => {
+    itVerifierHost("denies verifier network connections", async () => {
       const cwd = mkdtempSync(join(tempDir, "fusion-verifier-network-cwd-"));
       const server = createServer((socket) => {
         socket.on("error", () => {
@@ -698,7 +838,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("timeouts", () => {
+  describeVerifierHost("timeouts", () => {
     itPosix("times out and kills a quiet long-running process group", async () => {
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
@@ -720,29 +860,36 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
        * FNXC:Verification 2026-06-21-10:00:
        * A clean shell exit is not enough evidence that verification is fully done; background children must be gone too or later task completion can stall behind leaked test workers.
        */
-      const childScript = "setInterval(() => {}, 1000)";
+      const cwd = mkdtempSync(join(tempDir, "fusion-verifier-reap-"));
+      const leakedEffect = join(cwd, "leaked-effect.txt");
+      const childScript = [
+        "const fs = require('node:fs');",
+        `setTimeout(() => fs.writeFileSync(${JSON.stringify(leakedEffect)}, 'leaked'), 750);`,
+        "setInterval(() => {}, 1000);",
+      ].join(" ");
       const parentScript = [
         "const { spawn } = require('node:child_process');",
         `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}], { stdio: 'ignore' });`,
-        "console.log(child.pid);",
+        "console.log('spawned-background-child');",
         "child.unref();",
       ].join(" ");
-      const result = await runVerificationCommand({
-        command: `${process.execPath} -e ${JSON.stringify(parentScript)}`,
-        cwd: tempDir,
-        timeoutMs: 30_000,
-        onHeartbeat: vi.fn(),
-      });
 
-      expect(result.success).toBe(true);
-      const leakedPid = Number.parseInt(result.stdout.trim(), 10);
-      expect(Number.isFinite(leakedPid)).toBe(true);
-      expect(result.timedOut).toBe(false);
+      try {
+        const result = await runVerificationCommand({
+          command: `${process.execPath} -e ${JSON.stringify(parentScript)}`,
+          cwd,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+        });
 
-      for (let i = 0; i < 15 && isProcessAlive(leakedPid); i++) {
-        await sleep(100);
+        expect(result.success).toBe(true);
+        expect(result.stdout).toContain("spawned-background-child");
+        expect(result.timedOut).toBe(false);
+        await sleep(1_250);
+        expect(existsSync(leakedEffect)).toBe(false);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
       }
-      expect(isProcessAlive(leakedPid)).toBe(false);
     });
 
     it("escalates non-timeout process-group reaping with fake timers", () => {
@@ -771,7 +918,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("output capture", () => {
+  describeVerifierHost("output capture", () => {
     itPosix("captures multi-line stdout (POSIX shell)", async () => {
       // POSIX uses `;` as a command separator; cmd.exe uses `&`. Skip on Windows.
       const onHeartbeat = vi.fn();
@@ -806,7 +953,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("heartbeat callbacks", () => {
+  describeVerifierHost("heartbeat callbacks", () => {
     itPosix("fires onHeartbeat for each output line (POSIX shell)", async () => {
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
@@ -841,7 +988,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("error handling", () => {
+  describeVerifierHost("error handling", () => {
     itPosix("handles missing commands gracefully (POSIX sh reports exit 127)", async () => {
       // The implementation runs commands via the platform shell. POSIX sh
       // returns exit 127 for "command not found"; cmd.exe returns 1 (or
@@ -902,7 +1049,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
-  describe("complex shell commands", () => {
+  describeVerifierHost("complex shell commands", () => {
     itPosix("handles piped commands (POSIX shell)", async () => {
       // The implementation runs commands through the platform shell. POSIX
       // pipes + printf differ from Windows cmd.exe syntax, so this test is

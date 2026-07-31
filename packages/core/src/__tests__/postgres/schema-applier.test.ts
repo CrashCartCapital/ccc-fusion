@@ -1655,6 +1655,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
+      CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1716,6 +1717,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
+      CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
     ]);
   });
 
@@ -1910,6 +1912,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
+      CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
     ]);
   });
 
@@ -1985,6 +1988,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
+      CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
     ]);
   });
 
@@ -2060,6 +2064,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
+      CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
     ]);
   });
 });

@@ -633,8 +633,9 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
           `${JSON.stringify(sidecar)}\n`,
         );
 
-        const databaseSnapshot = async () => (
-          await h.layer().db.execute(sql.raw(`
+        const databaseSnapshot = async () => {
+          const rows = (
+            await h.layer().db.execute(sql.raw(`
             SELECT 'ccc_prd_import_entities' AS table_name, count(*)::int AS row_count
               FROM project.ccc_prd_import_entities
             UNION ALL SELECT 'ccc_prd_import_sources', count(*)::int
@@ -648,9 +649,15 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
             UNION ALL SELECT 'workflow_work_items', count(*)::int
               FROM project.workflow_work_items
             UNION ALL SELECT 'workflows', count(*)::int FROM project.workflows
-            ORDER BY table_name
           `))
-        ) as unknown as Array<{ table_name: string; row_count: number }>;
+          ) as unknown as Array<{ table_name: string; row_count: number }>;
+          return [...rows].sort((left, right) =>
+            left.table_name < right.table_name
+              ? -1
+              : left.table_name > right.table_name
+                ? 1
+                : 0);
+        };
         const databaseBefore = await databaseSnapshot();
         expect(databaseBefore).toEqual([
           { table_name: "ccc_prd_import_entities", row_count: 0 },

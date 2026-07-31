@@ -904,7 +904,7 @@ describe("WorkflowGraphExecutor traversal", () => {
     } as unknown as WorkflowGraphExecutorDeps);
 
     await expect(executor.run(originTask, settingsOn(), ir)).rejects.toThrowError(
-      "resolved a semantic task without a canonical id",
+      "resolved a task without a canonical native id",
     );
     expect(resolveNodeExecution).toHaveBeenCalledTimes(1);
     expect(admitNodeExecution).toHaveBeenCalledTimes(0);

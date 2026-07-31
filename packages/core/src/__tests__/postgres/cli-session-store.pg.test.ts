@@ -7,7 +7,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vite
 import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { CliSessionStore } from "../../cli-session-store.js";
-import { importCccPrdBundle } from "../../index.js";
+import {
+  importCccPrdBundle,
+  inspectCccPrdProductStatus,
+} from "../../index.js";
 import {
   claimCccCampaignApproval,
   getApprovalRequest,
@@ -96,23 +99,50 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
   afterEach(h.afterEach);
   afterAll(h.afterAll);
 
+  async function importedNativeTaskId(
+    idempotencyKey: string,
+    semanticTaskId: string,
+  ): Promise<string> {
+    const productStatus = await inspectCccPrdProductStatus({
+      idempotencyKey,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const importedTasks = productStatus?.tasks.filter(
+      (task) => task.semanticTaskId === semanticTaskId,
+    ) ?? [];
+    expect(importedTasks).toEqual([
+      expect.objectContaining({
+        semanticTaskId,
+        nativeTaskId: expect.any(String),
+        present: true,
+      }),
+    ]);
+    const taskId = importedTasks[0]!.nativeTaskId;
+    expect(taskId).not.toBe(semanticTaskId);
+    return taskId;
+  }
+
   async function claimedCampaignAuthority(
     suffix: string,
     claimToken = `claim-${suffix}`,
     transport: "pi" | "cli" = "pi",
   ) {
     const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), suffix));
+    const idempotencyKey = `effect-${suffix}`;
     await importCccPrdBundle({
       bundle: source,
-      idempotencyKey: `effect-${suffix}`,
+      idempotencyKey,
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
       executionPolicy: campaignPolicy(source, transport),
     });
-    const taskId = `TASK-${suffix}`;
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await importedNativeTaskId(idempotencyKey, semanticTaskId);
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error(`missing campaign context for ${taskId}`);
+    expect(campaign).toMatchObject({ taskId, semanticTaskId, idempotencyKey });
     const rootDir = campaign.targetRepository.path;
     const issued = await issueCccCampaignApproval(h.layer(), {
       authorityStore: h.store(),
@@ -455,21 +485,26 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
 
   it("refuses campaign receipt reservation before an authority reader is injected", async () => {
     const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), "effect-missing-authority"));
+    const idempotencyKey = "effect-missing-authority";
     await importCccPrdBundle({
       bundle: source,
-      idempotencyKey: "effect-missing-authority",
+      idempotencyKey,
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
       executionPolicy: campaignPolicy(source),
     });
+    const taskId = await importedNativeTaskId(
+      idempotencyKey,
+      "TASK-effect-missing-authority",
+    );
     const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__");
     store.createSession({
       id: "cli-pg-campaign-missing-authority",
       projectId: "__legacy_unscoped__",
       adapterId: "pi",
       purpose: "execute",
-      taskId: "TASK-effect-missing-authority",
+      taskId,
     });
     await store.flush();
 

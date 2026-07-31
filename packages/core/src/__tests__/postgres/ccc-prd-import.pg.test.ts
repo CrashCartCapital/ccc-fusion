@@ -1927,9 +1927,14 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       SELECT 'ccc_prd_import_sources', count(*)::int FROM project.ccc_prd_import_sources
       UNION ALL
       SELECT 'ccc_prd_import_entities', count(*)::int FROM project.ccc_prd_import_entities
-      ORDER BY table_name
     `))) as unknown as Array<{ table_name: string; row_count: number }>;
-    expect(counts).toEqual([
+    const normalizedCounts = [...counts].sort((left, right) =>
+      left.table_name < right.table_name
+        ? -1
+        : left.table_name > right.table_name
+          ? 1
+          : 0);
+    expect(normalizedCounts).toEqual([
       { table_name: "ccc_prd_import_entities", row_count: 0 },
       { table_name: "ccc_prd_import_sources", row_count: 0 },
       { table_name: "ccc_prd_imports", row_count: 0 },

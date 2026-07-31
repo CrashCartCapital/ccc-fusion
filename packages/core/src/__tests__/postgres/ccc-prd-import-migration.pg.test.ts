@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
-import { importCccPrdBundle, reconcileCccPrdImport } from "../../index.js";
+import {
+  importCccPrdBundle,
+  inspectCccPrdProductStatus,
+  reconcileCccPrdImport,
+} from "../../index.js";
 import { TaskStore } from "../../store.js";
 import {
   createTaskStoreForTest,
@@ -54,6 +58,7 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       copyFromGolden: true,
     });
     await upgraded.adminDb.execute(sql.raw(`
+      DROP TABLE project.ccc_campaign_proof_attempts;
       ALTER TABLE project.run_audit_events
         DROP CONSTRAINT run_audit_events_campaign_import_fkey;
       ALTER TABLE project.approval_requests
@@ -63,18 +68,20 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       DROP TABLE project.ccc_prd_import_sources;
       DROP TABLE project.ccc_prd_import_entities;
       DROP TABLE project.ccc_prd_imports;
-      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037');
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037', '0038');
     `));
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0034");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0035");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0036");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0037");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0038");
 
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0035");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0036");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0037");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0038");
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] })).toEqual({
       applied: false,
       pluginHooksRun: 0,
@@ -250,7 +257,7 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
     });
     const harness = populated;
     const suffix = "populated-0035";
-    const taskId = `TASK-${suffix}`;
+    const semanticTaskId = `TASK-${suffix}`;
     const idempotencyKey = "test-test-test-0035";
     const bundle = createCccPrdImportTestBundle(harness.rootDir, suffix);
     await expect(importCccPrdBundle({
@@ -264,10 +271,28 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
       state: "active",
       runnable: true,
     });
+    const productStatus = await inspectCccPrdProductStatus({
+      idempotencyKey,
+      layer: harness.layer,
+      rootDir: harness.rootDir,
+    });
+    const importedTasks = productStatus?.tasks.filter(
+      (task) => task.semanticTaskId === semanticTaskId,
+    ) ?? [];
+    expect(importedTasks).toEqual([
+      expect.objectContaining({
+        semanticTaskId,
+        nativeTaskId: expect.any(String),
+        present: true,
+      }),
+    ]);
+    const taskId = importedTasks[0]!.nativeTaskId;
+    expect(taskId).not.toBe(semanticTaskId);
     await expect(harness.store.getCccCampaignContextForTask(taskId))
-      .resolves.toMatchObject({ taskId, idempotencyKey });
+      .resolves.toMatchObject({ taskId, semanticTaskId, idempotencyKey });
 
     await harness.adminDb.execute(sql.raw(`
+      DROP TABLE project.ccc_campaign_proof_attempts;
       ALTER TABLE project.ccc_prd_imports
         DROP COLUMN execution_policy,
         DROP COLUMN campaign_manifest,
@@ -276,13 +301,18 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
         DROP COLUMN campaign_deadline_at,
         DROP COLUMN request_count,
         DROP COLUMN active_action_leases;
-      DELETE FROM public.fusion_schema_migrations WHERE version = '0036';
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0036', '0037', '0038');
     `));
     expect(await getAppliedMigrations(harness.adminDb)).toContain("0035");
     expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0036");
+    expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0037");
+    expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0038");
 
     expect(await applySchemaBaseline(harness.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
+    expect(await getAppliedMigrations(harness.adminDb)).toContain("0036");
+    expect(await getAppliedMigrations(harness.adminDb)).toContain("0037");
+    expect(await getAppliedMigrations(harness.adminDb)).toContain("0038");
     const readCampaignState = () => harness.adminDb.execute(sql`
       SELECT
         state,
@@ -299,8 +329,8 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
     `);
     const migratedRows = await readCampaignState();
     expect(migratedRows).toEqual([{
-      state: "active",
-      runnable: 1,
+      state: "prepared",
+      runnable: 0,
       execution_policy: {
         schema: "ccc-campaign.execution-policy.unadmitted.v0",
         routes: [],
@@ -310,7 +340,7 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
       }),
       projection_owner: null,
       projection_lease_until: null,
-      activated_at: expect.any(String),
+      activated_at: null,
       request_count: 0,
       active_action_leases: {},
     }]);
