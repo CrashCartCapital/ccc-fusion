@@ -5,9 +5,24 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as engine from "@fusion/engine";
 
 const ccc = engine as typeof engine & {
-  compileCccPrdPacket(input: { rootDir: string; manifestPath: string; sidecarPath: string }): {
+  compileCccPrdPacket(input: {
+    rootDir: string;
+    manifestPath: string;
+    sidecarPath: string;
+    requireMaterialCoverage?: boolean;
+  }): {
     kind: string;
     diagnostics?: Array<{ code: string; message: string }>;
+  };
+  validateCccPrdPacket(input: {
+    rootDir: string;
+    manifestPath: string;
+    sidecarPath: string;
+    requireMaterialCoverage?: boolean;
+  }): {
+    kind: string;
+    valid: boolean;
+    diagnostics: Array<{ code: string; message: string }>;
   };
 };
 
@@ -18,7 +33,12 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function packet(mutator: (sidecar: { importIntents: Array<Record<string, string>> }) => void): {
+type MutableSidecar = {
+  importIntents: Array<Record<string, string>>;
+  workflows: Array<Record<string, unknown> & { id: string }>;
+};
+
+function packet(mutator: (sidecar: MutableSidecar) => void): {
   rootDir: string;
   manifestPath: string;
   sidecarPath: string;
@@ -27,7 +47,7 @@ function packet(mutator: (sidecar: { importIntents: Array<Record<string, string>
   roots.push(rootDir);
   cpSync(fixture, rootDir, { recursive: true });
   const sidecarPath = join(rootDir, "candidate.sidecar.v1.json");
-  const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as { importIntents: Array<Record<string, string>> };
+  const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as MutableSidecar;
   mutator(sidecar);
   writeFileSync(sidecarPath, `${JSON.stringify(sidecar)}\n`);
   return { rootDir, manifestPath: join(rootDir, "manifest.json"), sidecarPath };
@@ -37,6 +57,23 @@ function refusal(input: ReturnType<typeof packet>): Array<{ code: string; messag
   const result = ccc.compileCccPrdPacket(input);
   expect(result.kind).toBe("refusal");
   return result.diagnostics ?? [];
+}
+
+function expectValidationAndCompileRefusal(
+  input: ReturnType<typeof packet>,
+  expectedCode: string,
+  options: { requireMaterialCoverage?: boolean } = {},
+): void {
+  const validation = ccc.validateCccPrdPacket({ ...input, ...options });
+  const compiled = ccc.compileCccPrdPacket({ ...input, ...options });
+  expect(validation.valid).toBe(false);
+  expect(validation.diagnostics).toContainEqual(
+    expect.objectContaining({ code: expectedCode }),
+  );
+  expect(compiled.kind).toBe("refusal");
+  expect(compiled.diagnostics).toContainEqual(
+    expect.objectContaining({ code: expectedCode }),
+  );
 }
 
 describe("ccc-prd import intent descendants", () => {
@@ -77,14 +114,73 @@ describe("ccc-prd import intent descendants", () => {
     }
   });
 
-  it.each(["campaign", "source", "run_audit"])("requires exactly one %s intent", (entityType) => {
+  it.each([
+    "campaign",
+    "source",
+    "run_audit",
+    "workflow",
+    "work_item",
+  ])("requires exactly one %s intent", (entityType) => {
     for (const count of [0, 2]) {
-      const diagnostics = refusal(packet((sidecar) => {
+      const input = packet((sidecar) => {
         const index = sidecar.importIntents.findIndex((value) => value.entityType === entityType);
         if (count === 0) sidecar.importIntents.splice(index, 1);
         else sidecar.importIntents.push({ ...sidecar.importIntents[index], id: `DUPLICATE-${entityType}` });
-      }));
-      expect(diagnostics).toContainEqual(expect.objectContaining({ code: "CCC_PRD_IMPORT_INTENT_CARDINALITY" }));
+      });
+      expectValidationAndCompileRefusal(
+        input,
+        "CCC_PRD_IMPORT_INTENT_CARDINALITY",
+      );
+    }
+  });
+
+  it("binds the sole work item intent to the sole imported workflow", () => {
+    const input = packet((sidecar) => {
+      const importedWorkflow = sidecar.importIntents.find(
+        ({ entityType }) => entityType === "workflow",
+      )!;
+      const workItem = sidecar.importIntents.find(
+        ({ entityType }) => entityType === "work_item",
+      )!;
+      const declaredWorkflow = sidecar.workflows.find(
+        ({ id }) => id === importedWorkflow.entityId,
+      )!;
+      const foreignWorkflowId = "WORKFLOW-FOREIGN";
+      sidecar.workflows.push({
+        ...declaredWorkflow,
+        id: foreignWorkflowId,
+      });
+      workItem.entityId = foreignWorkflowId;
+    });
+
+    expectValidationAndCompileRefusal(
+      input,
+      "CCC_PRD_IMPORT_INTENT_INVALID",
+    );
+  });
+
+  it("refuses a multi-task graph on the current supported product path", () => {
+    const input = packet(() => undefined);
+    for (const result of [
+      ccc.validateCccPrdPacket({
+        ...input,
+        requireMaterialCoverage: true,
+      }),
+      ccc.compileCccPrdPacket({
+        ...input,
+        requireMaterialCoverage: true,
+      }),
+    ]) {
+      expect(result).toMatchObject({
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED",
+            message: expect.stringContaining(
+              "multi-task campaign integration is not yet supported",
+            ),
+          }),
+        ]),
+      });
     }
   });
 });

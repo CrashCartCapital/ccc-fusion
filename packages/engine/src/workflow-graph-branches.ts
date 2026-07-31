@@ -3,6 +3,7 @@ import { WorkflowIrError } from "@fusion/core";
 
 import type { WorkflowNodeOutcome, WorkflowNodeResult } from "./workflow-graph-executor.js";
 import { schedulerLog } from "./logger.js";
+import { isCccCampaignTask } from "./ccc-campaign-routing.js";
 
 /**
  * Concurrent fan-out/join branch execution (U13, KTD-11, R21).
@@ -64,10 +65,6 @@ class CccBranchPersistenceError extends Error {
     super(reason);
     this.name = "CccBranchPersistenceError";
   }
-}
-
-function isCccFusionTask(task: TaskDetail): boolean {
-  return task.customFields?.cccFusionProfile === "ccc-fusion";
 }
 
 async function persistBranchState(
@@ -194,7 +191,7 @@ export async function runSplitJoin(
   const join = findMatchingJoin(branchEdges[0].to, env);
   if (!join) throw new WorkflowIrError(`split '${split.id}' has no reachable matching join`);
   const joinConfig = resolveJoinConfig(env.nodeMap.get(join)!);
-  const failClosed = isCccFusionTask(env.task);
+  const failClosed = isCccCampaignTask(env.task);
 
   if (failClosed) {
     try {
@@ -342,7 +339,7 @@ function cccTerminalBranchFailure(
   task: TaskDetail,
   result: WorkflowNodeResult,
 ): { reason: string; attempt?: number } | undefined {
-  if (!isCccFusionTask(task) || result.outcome !== "failure") return undefined;
+  if (!isCccCampaignTask(task) || result.outcome !== "failure") return undefined;
   const value = result.contextPatch?.["ccc:retry-classification"];
   if (typeof value !== "string") return undefined;
   if (!value.startsWith("ccc-permanent:") && !value.startsWith("ccc-transient-retry-exhausted:")) {
@@ -415,7 +412,7 @@ async function walkBranch(
         branchId: startNodeId,
         currentNodeId: currentId,
         status: lastResult.outcome === "success" ? "running" : "failed",
-      }, "progress", isCccFusionTask(env.task));
+      }, "progress", isCccCampaignTask(env.task));
       env.onBranchProgress?.({
         branchId: startNodeId,
         nodeId: currentId,
@@ -430,7 +427,7 @@ async function walkBranch(
         branchId: startNodeId,
         currentNodeId: currentId,
         status: "failed",
-      }, "progress", isCccFusionTask(env.task));
+      }, "progress", isCccCampaignTask(env.task));
       /*
       FNXC:CccWave4Retry 2026-07-24-18:20:
       A split's terminal result crosses an asynchronous branch boundary before
@@ -460,7 +457,7 @@ async function walkBranch(
         branchId: startNodeId,
         currentNodeId: currentId,
         status: "completed",
-      }, "terminal", isCccFusionTask(env.task));
+      }, "terminal", isCccCampaignTask(env.task));
       env.onBranchProgress?.({ branchId: startNodeId, nodeId: currentId, status: "completed" });
       return { outcome: lastResult.outcome, lastNodeId: currentId };
     }

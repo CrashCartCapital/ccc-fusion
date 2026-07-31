@@ -11,6 +11,7 @@ import {
   getWorkflowExtensionHostProvenanceBinding,
   getWorkflowExtensionRegistry,
   importCccPrdBundle,
+  inspectCccPrdProductStatus,
   reconcileCccPrdImport,
   type CccNativeCliRoute,
   type CccPrdProof,
@@ -56,7 +57,15 @@ function fakePty() {
     write: vi.fn(),
     resize: vi.fn(), pause: vi.fn(), resume: vi.fn(), kill: vi.fn(() => { if (!exited) { exited = true; queueMicrotask(() => onExit?.({ exitCode: 0, signal: 0 })); } }),
   };
-  return { pty, ready: () => data?.("READY") };
+  return {
+    pty,
+    ready: () => data?.("READY"),
+    exit: (exitCode: number, signal = 0) => {
+      if (exited) return;
+      exited = true;
+      queueMicrotask(() => onExit?.({ exitCode, signal }));
+    },
+  };
 }
 
 async function admittedBundle(source: ReturnType<typeof createCccPrdImportTestBundle>, proofRoot: string) {
@@ -113,17 +122,34 @@ pgDescribe("CCC native CLI public workflow route (real PostgreSQL)", () => {
         tasks: initial.tasks.map((task, index) => index === 0 ? { ...task, protectedActionIds: [action.actionId] } : task),
       }), proofRoot);
       const policy = { schema: "ccc-campaign.execution-policy.v1" as const, routes: bundle.tasks.map((task) => ({ taskId: task.id, providerId: "test-provider", modelId: "test-model", transport: "cli" as const })) };
-      await importCccPrdBundle({ bundle, idempotencyKey: `public-cli-${suffix}`, store: harness.store, layer: harness.layer, rootDir: repository.root, executionPolicy: policy });
-      await reconcileCccPrdImport({ idempotencyKey: `public-cli-${suffix}`, store: harness.store, layer: harness.layer, rootDir: repository.root });
-      const importedTask = await harness.store.getTask(semanticTaskId);
+      const idempotencyKey = `public-cli-${suffix}`;
+      const imported = await importCccPrdBundle({ bundle, idempotencyKey, store: harness.store, layer: harness.layer, rootDir: repository.root, executionPolicy: policy });
+      await reconcileCccPrdImport({ idempotencyKey, store: harness.store, layer: harness.layer, rootDir: repository.root });
+      const productStatus = await inspectCccPrdProductStatus({
+        idempotencyKey,
+        layer: harness.layer,
+        rootDir: repository.root,
+      });
+      if (!productStatus) throw new Error("missing public CLI product status");
+      expect(productStatus.import.importId).toBe(imported.importId);
+      const taskStatuses = productStatus.tasks.filter(
+        (task) => task.semanticTaskId === semanticTaskId,
+      );
+      expect(taskStatuses).toHaveLength(1);
+      const nativeTaskId = taskStatuses[0]!.nativeTaskId;
+      expect(nativeTaskId).not.toBe(semanticTaskId);
+      const workItemId = `${imported.importId}--WORK-${suffix}`;
+      const importedTask = await harness.store.getTask(nativeTaskId);
       if (!importedTask) throw new Error("missing imported semantic task");
-      await harness.store.updateTask(semanticTaskId, { worktree: repository.root } as any);
-      const campaign = await harness.store.getCccCampaignContextForTask(semanticTaskId);
+      expect(importedTask.sourceMetadata).toMatchObject({ semanticTaskId });
+      await harness.store.updateTask(nativeTaskId, { worktree: repository.root } as any);
+      const campaign = await harness.store.getCccCampaignContextForTask(nativeTaskId);
       if (!campaign) throw new Error("missing imported campaign context");
+      expect(campaign).toMatchObject({ taskId: nativeTaskId, semanticTaskId });
       const actor = { actorId: "public-cli-worker", actorType: "agent" as const, actorName: "Public CLI test" };
-      const issued = await issueCccCampaignApproval(harness.layer, { authorityStore: harness.store, rootDir: repository.root, taskId: semanticTaskId, action, requester: actor, runId: `issue-${suffix}`, notBeforeAt: campaign.campaignStartedAt, expiresAt: campaign.campaignDeadlineAt });
+      const issued = await issueCccCampaignApproval(harness.layer, { authorityStore: harness.store, rootDir: repository.root, taskId: nativeTaskId, action, requester: actor, runId: `issue-${suffix}`, notBeforeAt: campaign.campaignStartedAt, expiresAt: campaign.campaignDeadlineAt });
       const claimToken = `claim-${suffix}`;
-      await claimCccCampaignApproval(harness.layer, { authorityStore: harness.store, rootDir: repository.root, taskId: semanticTaskId, action, claimant: actor, runId: `claim-${suffix}`, claimToken });
+      await claimCccCampaignApproval(harness.layer, { authorityStore: harness.store, rootDir: repository.root, taskId: nativeTaskId, action, claimant: actor, runId: `claim-${suffix}`, claimToken });
 
       const route: CccNativeCliRoute = Object.freeze({ adapterId: "public-route-cli", providerId: "test-provider", modelId: "test-model", transport: "cli" });
       const adapter: CliAgentAdapter = { id: route.adapterId, name: "public route fake", capabilities: { nativeDone: true, nativeWaiting: false, transcriptSource: "none", supportsResume: false }, buildLaunch: () => ({ command: "local-fake", args: [] }), buildEnvAllowlist: () => [], createReadinessDetector: () => ({ observe: (value: string) => value === "READY" }), formatInjection: (text) => ({ payload: text }) };
@@ -153,12 +179,19 @@ pgDescribe("CCC native CLI public workflow route (real PostgreSQL)", () => {
         if (semanticNodeCalls++ > 0) return { outcome: "success" as const };
         return (executor as any).runGraphCustomNode({ ...node, config: { ...(node.config ?? {}), executor: "cli-agent", cliAdapterId: route.adapterId, cliSettings: { profile: "ccc-fusion", subscriptionReady: true, model: route.modelId, providerId: route.providerId }, prompt: "local only" } }, task, {}, undefined, context, execution);
       };
-      const runtime = new WorkflowTaskRuntime({ store: harness.store, primitives: {} as never, handlers: {}, runCustomNode: dispatcher });
+      const runtime = new WorkflowTaskRuntime({
+        store: harness.store,
+        primitives: {} as never,
+        handlers: {},
+        runCustomNode: dispatcher,
+        branchPersistence:
+          executor.createAuthoritativeWorkflowBranchPersistence(),
+      });
       const processorStore = Object.assign(Object.create(harness.store), { getMissionStore: undefined, acquireSymbolLocks: undefined });
       const processedPromise = processDueWorkflowWorkItem(processorStore, runtime, {}, { leaseOwner: "public-cli-processor", leaseDurationMs: 60_000, kinds: ["task"] });
       let sessionId: string | undefined;
       for (let attempt = 0; attempt < 2_000 && !sessionId; attempt += 1) {
-        sessionId = cliStore.listByTask(semanticTaskId)[0]?.id ?? cliStore.listSessions()[0]?.id;
+        sessionId = cliStore.listByTask(nativeTaskId)[0]?.id ?? cliStore.listSessions()[0]?.id;
         if (!sessionId) await new Promise((resolve) => setTimeout(resolve, 5));
       }
       if (!sessionId) throw new Error("fake PTY was not admitted before native done");
@@ -169,15 +202,15 @@ pgDescribe("CCC native CLI public workflow route (real PostgreSQL)", () => {
       boot.bundle.hub.ingest(sessionId, { kind: "done" });
       const processed = await processedPromise;
       await cliStore.flush();
-      const durable = await harness.store.getWorkflowWorkItem(`WORK-${suffix}`);
-      const sessions = cliStore.listByTask(semanticTaskId);
+      const durable = await harness.store.getWorkflowWorkItem(workItemId);
+      const sessions = cliStore.listByTask(nativeTaskId);
       const restarted = await CliSessionStore.create(harness.layer, campaign.projectId, { rootDir: repository.root, campaignAuthorityStore: harness.store });
       if (!firstBinding) throw new Error(`native CLI binding was not resolved: ${JSON.stringify({ processed, semanticNodeCalls })}`);
       const replay = await firstBinding.controller.preDispatch({ turnKey: firstBinding.turnKey, dispatchKey: firstBinding.dispatchKey, providerId: route.providerId, modelId: route.modelId, transport: route.transport });
       const replayAttempt = replay.kind === "hold" ? replay.scope : undefined;
 
       if (processed.runtime?.outcome !== "success") throw new Error(`public workflow failed: ${JSON.stringify(processed.runtime)}`);
-      expect(processed).toMatchObject({ claimed: true, workItemId: `WORK-${suffix}`, runtime: { disposition: "completed", outcome: "success" } });
+      expect(processed).toMatchObject({ claimed: true, workItemId, taskId: nativeTaskId, runtime: { disposition: "completed", outcome: "success" } });
       expect(spawn).toHaveBeenCalledTimes(1);
       expect(bindingCalls).toHaveLength(1);
       expect(pty.pty.write).toHaveBeenCalledOnce();
@@ -188,7 +221,7 @@ pgDescribe("CCC native CLI public workflow route (real PostgreSQL)", () => {
       expect(boot.bundle.manager.activeCount()).toBe(0);
       expect(replay).toMatchObject({ kind: "hold" });
       await expect(getApprovalRequest(harness.layer.db, issued.id)).resolves.toMatchObject({ status: "consumed" });
-      await expect(harness.store.inspectCccCampaignActionLease(semanticTaskId, action)).resolves.toBeNull();
+      await expect(harness.store.inspectCccCampaignActionLease(nativeTaskId, action)).resolves.toBeNull();
       if (!replayAttempt) {
         throw new Error(`replay did not include an attempt scope: ${JSON.stringify(replay)}`);
       }
@@ -210,4 +243,495 @@ pgDescribe("CCC native CLI public workflow route (real PostgreSQL)", () => {
       await harness.teardown();
     }
   });
+
+  it.each([
+    {
+      observedOutcome: "committed" as const,
+      terminalWorkItemState: "succeeded",
+      terminationReason: "completed",
+    },
+    {
+      observedOutcome: "proved_failed" as const,
+      terminalWorkItemState: "failed",
+      terminationReason: "crashed",
+    },
+  ])(
+    "P1 real-PG crash cut: $observedOutcome held closure rehydrates without provider redispatch",
+    async ({
+      observedOutcome,
+      terminalWorkItemState,
+      terminationReason,
+    }) => {
+      const suffix = `restart-${observedOutcome.replace("_", "-")}`;
+      const harness = await createTaskStoreForTest({
+        prefix: `fusion_ccc_public_cli_${suffix}`,
+        copyFromGolden: true,
+      });
+      const repository = createCleanGitRepository(harness.rootDir);
+      const proofRoot = await mkdtemp(join(tmpdir(), "ccc-public-cli-restart-proof-"));
+      let firstBoot: Awaited<ReturnType<typeof createCliAgentRuntime>> | undefined;
+      let restartedBoot: Awaited<ReturnType<typeof createCliAgentRuntime>> | undefined;
+      let releaseFirstObserver: (() => void) | undefined;
+      let firstProcessor:
+        | ReturnType<typeof processDueWorkflowWorkItem>
+        | undefined;
+      try {
+        const initial = createCccPrdImportTestBundle(repository.root, suffix);
+        const semanticTaskId = `TASK-${suffix}`;
+        const action = {
+          actionId: "ACTION-PROVIDER",
+          actionTarget: `ccc:test-public-cli-${suffix}`,
+          requireProtected: true,
+        };
+        const bundle = await admittedBundle(rehashCccPrdImportTestBundle({
+          ...initial,
+          targetRepository: {
+            path: repository.root,
+            baseCommit: repository.base,
+          },
+          bounds: {
+            maxRequests: 1,
+            maxDurationMs: 180_000,
+            maxConcurrency: 1,
+          },
+          protectedActions: [{
+            id: action.actionId,
+            kind: "live_execution",
+            target: action.actionTarget,
+            requiresOperatorDecision: true,
+            operatorDecision: "approve_live_execution",
+            spans: [initial.tasks[0]!.spans[0]!],
+          }],
+          tasks: initial.tasks.map((task, index) => index === 0
+            ? { ...task, protectedActionIds: [action.actionId] }
+            : task),
+        }), proofRoot);
+        const policy = {
+          schema: "ccc-campaign.execution-policy.v1" as const,
+          routes: bundle.tasks.map((task) => ({
+            taskId: task.id,
+            providerId: "test-provider",
+            modelId: "test-model",
+            transport: "cli" as const,
+          })),
+        };
+        const idempotencyKey = `public-cli-${suffix}`;
+        const imported = await importCccPrdBundle({
+          bundle,
+          idempotencyKey,
+          store: harness.store,
+          layer: harness.layer,
+          rootDir: repository.root,
+          executionPolicy: policy,
+        });
+        await reconcileCccPrdImport({
+          idempotencyKey,
+          store: harness.store,
+          layer: harness.layer,
+          rootDir: repository.root,
+        });
+        const status = await inspectCccPrdProductStatus({
+          idempotencyKey,
+          layer: harness.layer,
+          rootDir: repository.root,
+        });
+        if (!status) throw new Error("missing native CLI restart status");
+        const matchingTasks = status.tasks.filter(
+          (task) => task.semanticTaskId === semanticTaskId,
+        );
+        expect(matchingTasks).toHaveLength(1);
+        const nativeTaskId = matchingTasks[0]!.nativeTaskId;
+        const workItemId = `${imported.importId}--WORK-${suffix}`;
+        await harness.store.updateTask(nativeTaskId, {
+          worktree: repository.root,
+        } as any);
+        const campaign =
+          await harness.store.getCccCampaignContextForTask(nativeTaskId);
+        if (!campaign) throw new Error("missing native CLI restart campaign");
+
+        const actor = {
+          actorId: `public-cli-${suffix}`,
+          actorType: "agent" as const,
+          actorName: "Public CLI restart test",
+        };
+        await issueCccCampaignApproval(harness.layer, {
+          authorityStore: harness.store,
+          rootDir: repository.root,
+          taskId: nativeTaskId,
+          action,
+          requester: actor,
+          runId: `issue-${suffix}`,
+          notBeforeAt: campaign.campaignStartedAt,
+          expiresAt: campaign.campaignDeadlineAt,
+        });
+        await claimCccCampaignApproval(harness.layer, {
+          authorityStore: harness.store,
+          rootDir: repository.root,
+          taskId: nativeTaskId,
+          action,
+          claimant: actor,
+          runId: `claim-${suffix}`,
+          claimToken: `claim-${suffix}`,
+        });
+
+        const route: CccNativeCliRoute = Object.freeze({
+          adapterId: `public-route-cli-${suffix}`,
+          providerId: "test-provider",
+          modelId: "test-model",
+          transport: "cli",
+        });
+        const adapter: CliAgentAdapter = {
+          id: route.adapterId,
+          name: `public route fake ${suffix}`,
+          capabilities: {
+            nativeDone: true,
+            nativeWaiting: false,
+            transcriptSource: "none",
+            supportsResume: false,
+          },
+          buildLaunch: () => ({ command: "local-fake", args: [] }),
+          buildEnvAllowlist: () => [],
+          createReadinessDetector: () => ({
+            observe: (value: string) => value === "READY",
+          }),
+          formatInjection: (text) => ({ payload: text }),
+        };
+        const firstPty = fakePty();
+        const firstSpawn = vi.fn(() => {
+          queueMicrotask(firstPty.ready);
+          return firstPty.pty;
+        });
+        firstBoot = await createCliAgentRuntime({
+          fusionDir: harness.store.getFusionDir(),
+          asyncLayer: harness.layer,
+          projectId: campaign.projectId,
+          rootDir: repository.root,
+          campaignAuthorityStore: harness.store,
+          hookEndpointUrl: "http://127.0.0.1:1/unused",
+          managerOptions: {
+            concurrencyCeiling: 1,
+            loadPty: async () => ({ spawn: firstSpawn }) as never,
+          },
+        });
+        firstBoot.bundle.registry.register(adapter);
+        const productionResolver = firstBoot.bundle.resolveCccNativeCliBinding;
+        if (!productionResolver) {
+          throw new Error("first native CLI runtime omitted production resolver");
+        }
+        let observerEnteredResolve: (() => void) | undefined;
+        const observerEntered = new Promise<void>((resolve) => {
+          observerEnteredResolve = resolve;
+        });
+        const observerRelease = new Promise<void>((resolve) => {
+          releaseFirstObserver = resolve;
+        });
+        firstBoot.bundle.resolveCccNativeCliBinding = async (input) => {
+          const binding =
+            await productionResolver(input) as CccNativeCliBinding;
+          return Object.freeze({
+            ...binding,
+            observer: Object.freeze({
+              id: binding.observer.id,
+              observe: async (value: unknown) => {
+                observerEnteredResolve?.();
+                await observerRelease;
+                return binding.observer.observe(value);
+              },
+            }),
+          }) satisfies CccNativeCliBinding;
+        };
+
+        const firstExecutor = new TaskExecutor(
+          harness.store as any,
+          repository.root,
+          { cliAgentRuntime: firstBoot.bundle },
+        );
+        vi.spyOn(firstExecutor as any, "resolveMcpServers")
+          .mockResolvedValue([]);
+        let firstSemanticNodeCalls = 0;
+        const firstRuntime = new WorkflowTaskRuntime({
+          store: harness.store,
+          primitives: {} as never,
+          handlers: {},
+          runCustomNode: (node, task, context, execution) => {
+            if (firstSemanticNodeCalls++ > 0) {
+              return Promise.resolve({ outcome: "success" as const });
+            }
+            return (firstExecutor as any).runGraphCustomNode({
+              ...node,
+              config: {
+                ...(node.config ?? {}),
+                executor: "cli-agent",
+                cliAdapterId: route.adapterId,
+                cliSettings: {
+                  profile: "ccc-fusion",
+                  subscriptionReady: true,
+                  model: route.modelId,
+                  providerId: route.providerId,
+                },
+                prompt: "local only",
+              },
+            }, task, {}, undefined, context, execution);
+          },
+          branchPersistence:
+            firstExecutor.createAuthoritativeWorkflowBranchPersistence(),
+        });
+        const firstProcessorStore = Object.assign(
+          Object.create(harness.store),
+          {
+            getMissionStore: undefined,
+            acquireSymbolLocks: undefined,
+            renewWorkflowWorkItemLease: vi.fn(
+              async (id: string) => harness.store.getWorkflowWorkItem(id),
+            ),
+          },
+        );
+        firstProcessor = processDueWorkflowWorkItem(
+          firstProcessorStore,
+          firstRuntime,
+          {},
+          {
+            leaseOwner: `public-cli-first-${suffix}`,
+            leaseDurationMs: 150,
+            kinds: ["task"],
+          },
+        );
+
+        let firstSessionId: string | undefined;
+        for (
+          let attempt = 0;
+          attempt < 2_000 && !firstSessionId;
+          attempt += 1
+        ) {
+          firstSessionId =
+            firstBoot.bundle.store.listByTask(nativeTaskId)[0]?.id;
+          if (!firstSessionId) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+        }
+        if (!firstSessionId) {
+          throw new Error("first runtime never persisted the native CLI session");
+        }
+        await vi.waitFor(() => {
+          expect(firstPty.pty.write).toHaveBeenCalledOnce();
+          expect(
+            firstBoot?.bundle.hub
+              .getStateMachine(firstSessionId!)
+              ?.getState(),
+          ).toBe("busy");
+        }, { timeout: 10_000, interval: 5 });
+        if (observedOutcome === "committed") {
+          firstBoot.bundle.hub.ingest(firstSessionId, { kind: "done" });
+        } else {
+          firstPty.exit(1);
+        }
+        await observerEntered;
+        await firstBoot.bundle.store.flush();
+        expect(
+          firstBoot.bundle.store.getSession(firstSessionId),
+        ).toMatchObject({
+          agentState: "needsAttention",
+          terminationReason: null,
+          autonomyPosture: expect.objectContaining({
+            cccNativeCliClosureState: "held-closed",
+            cccControllerFenced: false,
+            cccNativeCliHeldClosureEvidence: expect.objectContaining({
+              kind: "ccc-fusion.native-cli-held-closure-evidence",
+              trigger: observedOutcome === "committed" ? "done" : "exit",
+            }),
+          }),
+        });
+        const crashedWorkItem =
+          await harness.store.getWorkflowWorkItem(workItemId);
+        expect(crashedWorkItem).toMatchObject({
+          state: "running",
+          attempt: 1,
+          leaseOwner: `public-cli-first-${suffix}`,
+        });
+        const attemptKey = firstBoot.bundle.store
+          .getSession(firstSessionId)
+          ?.autonomyPosture?.cccProviderAttemptKey;
+        expect(attemptKey).toEqual(
+          expect.stringMatching(/^ccc-provider-attempt-[a-f0-9]{64}$/u),
+        );
+
+        await firstBoot.dispose();
+        firstBoot = undefined;
+        const leaseDelay = Math.max(
+          0,
+          Date.parse(crashedWorkItem!.leaseExpiresAt!) - Date.now() + 20,
+        );
+        await new Promise((resolve) => setTimeout(resolve, leaseDelay));
+
+        const restartedSpawn = vi.fn();
+        restartedBoot = await createCliAgentRuntime({
+          fusionDir: harness.store.getFusionDir(),
+          asyncLayer: harness.layer,
+          projectId: campaign.projectId,
+          rootDir: repository.root,
+          campaignAuthorityStore: harness.store,
+          hookEndpointUrl: "http://127.0.0.1:1/unused",
+          managerOptions: {
+            concurrencyCeiling: 1,
+            loadPty: async () => ({ spawn: restartedSpawn }) as never,
+          },
+        });
+        restartedBoot.bundle.registry.register(adapter);
+        expect(
+          restartedBoot.bundle.store.getSession(firstSessionId),
+        ).toMatchObject({
+          agentState: "needsAttention",
+          terminationReason: null,
+          autonomyPosture: expect.objectContaining({
+            cccNativeCliClosureState: "held-closed",
+            cccControllerFenced: false,
+          }),
+        });
+        const restartedExecutor = new TaskExecutor(
+          harness.store as any,
+          repository.root,
+          { cliAgentRuntime: restartedBoot.bundle },
+        );
+        const resolveMcpServers = vi.spyOn(
+          restartedExecutor as any,
+          "resolveMcpServers",
+        ).mockResolvedValue([]);
+        let restartedSemanticNodeCalls = 0;
+        const restartedRuntime = new WorkflowTaskRuntime({
+          store: harness.store,
+          primitives: {} as never,
+          handlers: {},
+          runCustomNode: (node, task, context, execution) => {
+            if (restartedSemanticNodeCalls++ > 0) {
+              return Promise.resolve({ outcome: "success" as const });
+            }
+            return (restartedExecutor as any).runGraphCustomNode({
+              ...node,
+              config: {
+                ...(node.config ?? {}),
+                executor: "cli-agent",
+                cliAdapterId: route.adapterId,
+                cliSettings: {
+                  profile: "ccc-fusion",
+                  subscriptionReady: true,
+                  model: route.modelId,
+                  providerId: route.providerId,
+                },
+                prompt: "local only",
+              },
+            }, task, {}, undefined, context, execution);
+          },
+          branchPersistence:
+            restartedExecutor.createAuthoritativeWorkflowBranchPersistence(),
+        });
+        const restartedProcessorStore = Object.assign(
+          Object.create(harness.store),
+          {
+            getMissionStore: undefined,
+            acquireSymbolLocks: undefined,
+          },
+        );
+        const exactCandidate = {
+          id: crashedWorkItem!.id,
+          runId: crashedWorkItem!.runId,
+          attempt: crashedWorkItem!.attempt,
+        };
+        const restarted = await processDueWorkflowWorkItem(
+          restartedProcessorStore,
+          restartedRuntime,
+          {},
+          {
+            leaseOwner: `public-cli-restarted-${suffix}`,
+            leaseDurationMs: 60_000,
+            kinds: ["task"],
+            exactCandidate,
+          },
+        );
+        expect(restarted).toMatchObject({
+          claimed: true,
+          workItemId,
+          taskId: nativeTaskId,
+          runtime: {
+            disposition: observedOutcome === "committed"
+              ? "completed"
+              : "failed",
+            outcome: observedOutcome === "committed"
+              ? "success"
+              : "failure",
+          },
+        });
+        expect(restartedSpawn).not.toHaveBeenCalled();
+        expect(resolveMcpServers).not.toHaveBeenCalled();
+        expect(
+          await harness.store.getWorkflowWorkItem(workItemId),
+        ).toMatchObject({
+          state: terminalWorkItemState,
+          attempt: 1,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        });
+        expect(
+          restartedBoot.bundle.store.getSession(firstSessionId),
+        ).toMatchObject({
+          agentState: "dead",
+          terminationReason,
+          autonomyPosture: expect.objectContaining({
+            cccNativeCliClosureState: "settled",
+            cccControllerFenced: true,
+          }),
+        });
+        await expect(harness.store.inspectCccProviderAttempt({
+          taskId: nativeTaskId,
+          attemptKey: attemptKey!,
+        })).resolves.toMatchObject({
+          state: observedOutcome,
+          terminal: {
+            kind: "reconciled",
+            state: observedOutcome,
+            observerId: "ccc-native-cli-observer.v1",
+          },
+        });
+        await expect(
+          harness.store.getCccCampaignContextForTask(nativeTaskId),
+        ).resolves.toMatchObject({ requestCount: 1 });
+
+        await expect(processDueWorkflowWorkItem(
+          restartedProcessorStore,
+          restartedRuntime,
+          {},
+          {
+            leaseOwner: `public-cli-second-restart-${suffix}`,
+            leaseDurationMs: 60_000,
+            kinds: ["task"],
+            exactCandidate,
+          },
+        )).resolves.toEqual({ claimed: false });
+        expect(restartedSpawn).not.toHaveBeenCalled();
+
+        releaseFirstObserver?.();
+        releaseFirstObserver = undefined;
+        await expect(firstProcessor).rejects.toThrow(
+          /transition precondition|workflow work item/i,
+        );
+        firstProcessor = undefined;
+        expect(firstSpawn).toHaveBeenCalledTimes(1);
+        expect(
+          await harness.store.getWorkflowWorkItem(workItemId),
+        ).toMatchObject({
+          state: terminalWorkItemState,
+          attempt: 1,
+          leaseOwner: null,
+        });
+      } finally {
+        releaseFirstObserver?.();
+        await firstProcessor?.catch(() => undefined);
+        await restartedBoot?.dispose();
+        await firstBoot?.dispose();
+        __resetWorkflowExtensionRegistryForTests();
+        await rm(proofRoot, { recursive: true, force: true });
+        await harness.teardown();
+      }
+    },
+    60_000,
+  );
 });

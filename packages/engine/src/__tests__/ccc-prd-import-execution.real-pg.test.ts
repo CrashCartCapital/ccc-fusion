@@ -12,6 +12,7 @@ import {
   getWorkflowExtensionHostProvenanceBinding,
   getWorkflowExtensionRegistry,
   importCccPrdBundle,
+  inspectCccPrdProductStatus,
   reconcileCccPrdImport,
   type CccPrdProof,
   type WorkflowProofAdmissionEvaluator,
@@ -44,22 +45,49 @@ pgDescribe("CCC PRD imported workflow execution", () => {
     try {
       const suffix = "engine-execution";
       const semanticBundle = await admittedBundle(harness.rootDir, suffix, proofRoot);
-      await importCccPrdBundle({
+      const idempotencyKey = "idem-engine-execution";
+      const imported = await importCccPrdBundle({
         bundle: semanticBundle,
         executionPolicy: createCccPrdImportTestExecutionPolicy(semanticBundle),
-        idempotencyKey: "idem-engine-execution",
+        idempotencyKey,
         store: harness.store,
         layer: harness.layer,
         rootDir: harness.rootDir,
       });
       await reconcileCccPrdImport({
-        idempotencyKey: "idem-engine-execution",
+        idempotencyKey,
         store: harness.store,
         layer: harness.layer,
         rootDir: harness.rootDir,
       });
+      const productStatus = await inspectCccPrdProductStatus({
+        idempotencyKey,
+        layer: harness.layer,
+        rootDir: harness.rootDir,
+      });
+      if (!productStatus) throw new Error("missing imported product status");
+      expect(productStatus.import.importId).toBe(imported.importId);
+      const nativeBySemantic = new Map(
+        productStatus.tasks.map(({ semanticTaskId, nativeTaskId }) => [
+          semanticTaskId,
+          nativeTaskId,
+        ]),
+      );
+      const semanticTaskId = `TASK-${suffix}`;
+      const terminalSemanticTaskId = `TASK-terminal-${suffix}`;
+      const nativeTaskId = nativeBySemantic.get(semanticTaskId);
+      const terminalNativeTaskId = nativeBySemantic.get(terminalSemanticTaskId);
+      expect(nativeTaskId).toEqual(expect.any(String));
+      expect(terminalNativeTaskId).toEqual(expect.any(String));
+      expect(nativeTaskId).not.toBe(semanticTaskId);
+      expect(terminalNativeTaskId).not.toBe(terminalSemanticTaskId);
+      const workItemId = `${imported.importId}--WORK-${suffix}`;
       expect(await harness.store.listDueWorkflowWorkItems({ kinds: ["task"] })).toEqual([
-        expect.objectContaining({ id: `WORK-${suffix}`, state: "runnable" }),
+        expect.objectContaining({
+          id: workItemId,
+          taskId: nativeTaskId,
+          state: "runnable",
+        }),
       ]);
       const handler = vi.fn(async (node: { id: string }) => ({
         outcome: "success" as const,
@@ -70,6 +98,14 @@ pgDescribe("CCC PRD imported workflow execution", () => {
         primitives: {} as never,
         runCustomNode: async () => ({ outcome: "success" }),
         handlers: { prompt: handler },
+        branchPersistence: {
+          saveBranchState: (state) =>
+            harness.store.saveWorkflowRunBranch(state),
+          loadBranchStates: (taskId, runId) =>
+            harness.store.loadWorkflowRunBranches(taskId, runId),
+          clearStaleBranchStates: (taskId, keepRunId) =>
+            harness.store.clearWorkflowRunBranches(taskId, keepRunId),
+        },
       });
       const directRunWorkItem = vi.spyOn(runtime, "runWorkItem");
       // The imported fixture has no separately admitted Mission lineage. Keep
@@ -84,7 +120,7 @@ pgDescribe("CCC PRD imported workflow execution", () => {
         leaseDurationMs: 60_000,
         kinds: ["task"],
       });
-      const durable = await harness.store.getWorkflowWorkItem(`WORK-${suffix}`);
+      const durable = await harness.store.getWorkflowWorkItem(workItemId);
       const audits = await harness.store.getRunAuditEventsAsync({
         mutationType: "ccc-campaign:proof-admission",
         limit: 20,
@@ -93,8 +129,8 @@ pgDescribe("CCC PRD imported workflow execution", () => {
       expect(processed.runtime?.reason).toBeUndefined();
       expect(processed).toMatchObject({
         claimed: true,
-        workItemId: `WORK-${suffix}`,
-        taskId: `TASK-${suffix}`,
+        workItemId,
+        taskId: nativeTaskId,
         runtime: {
           disposition: "completed",
           outcome: "success",
@@ -112,12 +148,12 @@ pgDescribe("CCC PRD imported workflow execution", () => {
       ]);
       expect(durable).toMatchObject({
         state: "succeeded",
-        taskId: `TASK-${suffix}`,
+        taskId: nativeTaskId,
       });
       expect(audits).toHaveLength(2);
       expect(audits.map((event) => event.campaign?.binding.taskId)).toEqual([
-        `TASK-${suffix}`,
-        `TASK-terminal-${suffix}`,
+        nativeTaskId,
+        terminalNativeTaskId,
       ]);
     } finally {
       __resetWorkflowExtensionRegistryForTests();

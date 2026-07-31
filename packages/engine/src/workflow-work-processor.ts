@@ -24,7 +24,7 @@ type WorkflowWorkProcessorStore = WorkflowWorkSchedulerStore & {
   transitionWorkflowWorkItem?: (
     id: string,
     state: WorkflowWorkItemState,
-    patch?: { now?: string; expectedState?: WorkflowWorkItemState; expectedLeaseOwner?: string | null; expectedAttempt?: number; attempt?: number; lastError?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
+    patch?: { now?: string; expectedState?: WorkflowWorkItemState; expectedLeaseOwner?: string | null; expectedAttempt?: number; attempt?: number; lastError?: string | null; blockedReason?: string | null; leaseOwner?: string | null; leaseExpiresAt?: string | null },
   ) => WorkflowWorkItem | Promise<WorkflowWorkItem>;
   renewWorkflowWorkItemLease?: (
     id: string,
@@ -344,6 +344,7 @@ async function runCampaignWorkflowWorkItem(
         attempt: workItem.attempt,
         runId: workItem.runId,
         eventTimestamp: workItem.updatedAt,
+        irHash: workItem.irHash ?? undefined,
       },
       deferCompletionSummary: true,
     });
@@ -395,6 +396,9 @@ async function transitionCampaignTerminal(
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: runtimeResult.reason ?? null,
+      blockedReason: terminalState === "manual-required"
+        ? runtimeResult.reason ?? "manual-required"
+        : null,
     });
   } catch (err) {
     const cancelled = await cancelledWorkItemAfterCasFailure(store, workItem.id);

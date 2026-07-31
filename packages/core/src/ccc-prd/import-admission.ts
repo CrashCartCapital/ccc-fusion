@@ -122,7 +122,13 @@ export function assertCccPrdImportBundle(
     ]),
   ];
   for (const [label, id] of allIds) assertSafeEntityId(id, label);
+  const optionalEmptyWriterClasses = new Set<CccPrdImportEntityType>([
+    ...(bundle.edges.length === 0 ? ["dependency_edge" as const] : []),
+    ...(bundle.documents.length === 0 ? ["document" as const] : []),
+    ...(bundle.artifacts.length === 0 ? ["artifact" as const] : []),
+  ]);
   for (const type of CCC_PRD_IMPORT_WRITER_CLASSES) {
+    if (optionalEmptyWriterClasses.has(type)) continue;
     if (!bundle.importIntents.some((intent) => intent.entityType === type)) {
       throw new CccPrdImportError(
         "CCC_PRD_IMPORT_INVALID_BUNDLE",

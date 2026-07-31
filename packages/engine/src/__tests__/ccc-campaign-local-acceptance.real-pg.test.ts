@@ -8,6 +8,7 @@ import {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   computeCccPrdProofDefinitionSha256,
   deriveWorkflowExtensionHostProvenance,
+  drizzleSql as sql,
   getWorkflowExtensionHostProvenanceBinding,
   getWorkflowExtensionRegistry,
   importCccPrdBundle,
@@ -256,6 +257,34 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
   afterEach(h.afterEach);
   afterAll(h.afterAll);
 
+  async function nativeTaskIdsForImport(
+    importId: string,
+    semanticTaskIds: ReturnType<typeof createJoinedLocalCampaignScenario>["taskIds"],
+  ) {
+    const rows = await h.layer().db.execute(sql`
+      SELECT entity_id, native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${importId}
+        AND entity_type = 'task'
+      ORDER BY ordinal
+    `) as unknown as Array<{ entity_id: string; native_id: string }>;
+    const nativeBySemantic = new Map(rows.map(({ entity_id, native_id }) => [entity_id, native_id]));
+    const nativeTaskIds = {
+      a: nativeBySemantic.get(semanticTaskIds.a),
+      b: nativeBySemantic.get(semanticTaskIds.b),
+      c: nativeBySemantic.get(semanticTaskIds.c),
+      d: nativeBySemantic.get(semanticTaskIds.d),
+    };
+    expect(nativeTaskIds).toEqual({
+      a: expect.any(String),
+      b: expect.any(String),
+      c: expect.any(String),
+      d: expect.any(String),
+    });
+    expect(Object.values(nativeTaskIds).every((nativeTaskId) => nativeTaskId && !Object.values(semanticTaskIds).includes(nativeTaskId))).toBe(true);
+    return nativeTaskIds as { a: string; b: string; c: string; d: string };
+  }
+
   async function importCampaign(
     suffix: string,
     registerScoped?: (scenario: ReturnType<typeof createJoinedLocalCampaignScenario>) => unknown,
@@ -273,10 +302,13 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
       rootDir,
       executionPolicy: { schema: "ccc-campaign.execution-policy.v1", routes: scenario.routes },
     });
+    const nativeTaskIds = await nativeTaskIdsForImport(imported.importId, scenario.taskIds);
     const workflow = await h.store().getWorkflowDefinition(`${imported.importId}--WF-${suffix}`);
-    const campaign = await h.store().getWorkflowWorkItem(`WORK-${suffix}`);
+    const campaign = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-${suffix}`,
+    );
     if (!workflow || !campaign) throw new Error("imported local campaign is incomplete");
-    const taskD = await h.store().getTask(scenario.taskIds.d);
+    const taskD = await h.store().getTask(nativeTaskIds.d);
     const branchD = resolveTaskWorkingBranch(taskD);
     mkdirSync(join(rootDir, "src"), { recursive: true });
     git(rootDir, ["update-ref", `refs/heads/${branchD}`, "main"]);
@@ -289,17 +321,21 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
     rmSync(join(rootDir, "src"), { recursive: true, force: true });
     git(rootDir, ["update-ref", "--no-deref", "HEAD", mainAtStart]);
     expect(git(rootDir, ["status", "--porcelain"])).toBe("");
-    return { rootDir, mainAtStart, scenario, imported, workflow, campaign, branchD, scoped };
+    return { rootDir, mainAtStart, scenario, nativeTaskIds, imported, workflow, campaign, branchD, scoped };
   }
 
-  async function issueAndClaimAll(scenario: ReturnType<typeof createJoinedLocalCampaignScenario>, suffix: string) {
+  async function issueAndClaimAll(
+    scenario: ReturnType<typeof createJoinedLocalCampaignScenario>,
+    nativeTaskIds: { a: string; b: string; c: string; d: string },
+    suffix: string,
+  ) {
     const actor = { actorId: `local-${suffix}-worker`, actorType: "agent" as const, actorName: "Local acceptance worker" };
     const bindings = [
-      [scenario.taskIds.a, scenario.actions.liveExecution.a],
-      [scenario.taskIds.b, scenario.actions.liveExecution.b],
-      [scenario.taskIds.c, scenario.actions.liveExecution.c],
-      [scenario.taskIds.d, scenario.actions.liveExecution.d],
-      [scenario.taskIds.d, scenario.actions.merge],
+      [nativeTaskIds.a, scenario.actions.liveExecution.a],
+      [nativeTaskIds.b, scenario.actions.liveExecution.b],
+      [nativeTaskIds.c, scenario.actions.liveExecution.c],
+      [nativeTaskIds.d, scenario.actions.liveExecution.d],
+      [nativeTaskIds.d, scenario.actions.merge],
     ] as const;
     const approvals = new Map<string, { id: string; taskId: string; actionId: string }>();
     const issuedBindings: Array<{ taskId: string; action: (typeof bindings)[number][1]; key: string }> = [];
@@ -331,7 +367,8 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
     const settledPromise = new Promise<void>((resolve) => { settled = resolve; });
     const scopes: Array<Record<string, unknown>> = [];
     const handler = vi.fn(async (input: WorkflowNodeHandlerInput) => {
-      expect(input.task.id).toBe(scenario.taskIds.c);
+      expect(input.task.id).not.toBe(scenario.taskIds.c);
+      expect(input.task.sourceMetadata).toMatchObject({ semanticTaskId: scenario.taskIds.c });
       expect(input.providerController).toBeDefined();
       expect(input.providerDispatch).toMatchObject({
         providerId: "local-scoped-c",
@@ -379,7 +416,18 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
     } };
   }
 
-  it("completes an imported mixed-provider split/join campaign through real Pi admission, a scoped handler, and native Git landing", async () => {
+  function storeBackedBranchPersistence() {
+    return {
+      saveBranchState: (state: { taskId: string; runId: string; branchId: string; currentNodeId: string; status: string }) =>
+        h.store().saveWorkflowRunBranch(state),
+      loadBranchStates: (taskId: string, runId: string) =>
+        h.store().loadWorkflowRunBranches(taskId, runId),
+      clearStaleBranchStates: (taskId: string, keepRunId: string) =>
+        h.store().clearWorkflowRunBranches(taskId, keepRunId),
+    };
+  }
+
+  it("runs legacy v1 mixed-provider work but fails closed before Git landing without executed proof receipts", async () => {
     const fixture = await importCampaign("local-acceptance", (scenario) => installScopedProvider(scenario, "complete"));
     const { scenario, workflow, campaign, rootDir } = fixture;
     expect(workflow.ir.nodes).toEqual(expect.arrayContaining([
@@ -387,14 +435,14 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
       expect.objectContaining({ kind: "join" }),
       expect.objectContaining({ extensions: expect.objectContaining({ [scenario.scopedExtension.registryId]: {} }) }),
     ]));
-    const approvals = await issueAndClaimAll(scenario, "local-acceptance");
+    const approvals = await issueAndClaimAll(scenario, fixture.nativeTaskIds, "local-acceptance");
     const scoped = fixture.scoped as ReturnType<typeof installScopedProvider>;
     const pi = configurePiBottomRuntime({ blockModelId: "pi-fixture-b" });
     const network = installLoopbackOnlyNetworkGuard();
     const forbidden = createForbiddenEffectRecorder();
     const executor = new TaskExecutor(h.store(), rootDir);
     executor.setMergeRequester(async (taskId, { signal } = {}) => {
-      expect(taskId).toBe(scenario.taskIds.d);
+      expect(taskId).toBe(fixture.nativeTaskIds.d);
       expect(signal).toBeInstanceOf(AbortSignal);
       return runAiMerge(h.store(), rootDir, taskId, { signal }, forbidden.deps);
     });
@@ -404,11 +452,11 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
       primitives: executor.createAuthoritativeWorkflowPrimitives(settings),
       runCustomNode: executor.createAuthoritativeWorkflowCustomNodeRunner(settings),
       resolveNodeProviderController: executor.createCccCampaignWorkflowNodeProviderControllerResolver(),
+      branchPersistence: storeBackedBranchPersistence(),
     });
     const sourceRefD = `refs/heads/${fixture.branchD}`;
     const sourceCommitBeforeProcessing = git(rootDir, ["rev-parse", sourceRefD]);
-    const expectedBaseObjectBeforeProcessing = git(rootDir, ["rev-parse", "refs/heads/main"]);
-    expect(expectedBaseObjectBeforeProcessing).toBe(fixture.mainAtStart);
+    expect(git(rootDir, ["rev-parse", "refs/heads/main"])).toBe(fixture.mainAtStart);
     const processing = processDueWorkflowWorkItem(h.store(), runtime, settings, {
       leaseOwner: "local-acceptance-processor", leaseDurationMs: 60_000, kinds: ["task"], campaignRequired: true,
       exactCandidate: { id: campaign.id, runId: campaign.runId, attempt: campaign.attempt },
@@ -444,46 +492,39 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
     expect(pi.modelCalls.some(({ id }) => id === "pi-fixture-d")).toBe(false);
     expect(git(rootDir, ["rev-parse", "refs/heads/main"])).toBe(fixture.mainAtStart);
     pi.releaseBlocked();
-    await expect(processing).resolves.toMatchObject({ runtime: { disposition: "completed", outcome: "success" } });
+    const processed = await processing;
+    expect(processed).toMatchObject({
+      runtime: {
+        disposition: "manual-required",
+        outcome: "failure",
+        reason: expect.stringMatching(/^ccc-permanent:/u),
+      },
+    });
     expect(pi.modelCalls).toEqual(expect.arrayContaining([{ provider: "local-pi-d", id: "pi-fixture-d" }]));
     expect(scoped.handler).toHaveBeenCalledTimes(1);
     expect(scoped.scopes).toHaveLength(1);
-    await expect(h.store().inspectCccProviderAttempt({ taskId: scenario.taskIds.c, attemptKey: scoped.scopes[0].attemptKey as string }))
+    await expect(h.store().inspectCccProviderAttempt({ taskId: fixture.nativeTaskIds.c, attemptKey: scoped.scopes[0].attemptKey as string }))
       .resolves.toMatchObject({ state: "committed", terminal: { state: "committed" }, binding: expect.objectContaining({ providerId: "local-scoped-c", modelId: "workflow-fixture-c", transport: "workflow" }) });
-    await expect(h.store().getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({ state: "succeeded", attempt: 1 });
-    const mainAfter = git(rootDir, ["rev-parse", "refs/heads/main"]);
-    expect(mainAfter).not.toBe(fixture.mainAtStart);
+    await expect(h.store().getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({ state: "manual-required", attempt: 1 });
+    expect(git(rootDir, ["rev-parse", "refs/heads/main"])).toBe(fixture.mainAtStart);
     expect(git(rootDir, ["rev-parse", sourceRefD])).toBe(sourceCommitBeforeProcessing);
     expect(forbidden.effects).toEqual([]);
-    for (const approval of approvals.values()) await expect(getApprovalRequest(h.layer().db, approval.id)).resolves.toMatchObject({ status: "consumed" });
-    const landingEvents = (await queryRunAuditEvents(h.layer().db, { taskId: scenario.taskIds.d, domain: "git" }))
+    const mergeApproval = approvals.get(`${fixture.nativeTaskIds.d}:${scenario.actions.merge.actionId}`);
+    if (!mergeApproval) throw new Error("missing claimed legacy merge approval");
+    await expect(getApprovalRequest(h.layer().db, mergeApproval.id)).resolves.toMatchObject({ status: "claimed" });
+    const landingEvents = (await queryRunAuditEvents(h.layer().db, { taskId: fixture.nativeTaskIds.d, domain: "git" }))
       .filter((event) => event.mutationType === "ccc-campaign-git-landing:intent" || event.mutationType === "ccc-campaign-git-landing:terminal")
       .sort((left, right) => left.mutationType.localeCompare(right.mutationType));
-    expect(landingEvents.map((event) => event.mutationType)).toEqual(["ccc-campaign-git-landing:intent", "ccc-campaign-git-landing:terminal"]);
-    const [intentEvent, terminalEvent] = landingEvents;
-    if (!intentEvent || !terminalEvent) throw new Error("missing Git landing intent or terminal receipt");
-    expect(intentEvent.metadata).toEqual(terminalEvent.metadata);
-    expect(intentEvent).toMatchObject({
-      target: scenario.actions.merge.actionTarget,
-      campaign: { binding: expect.objectContaining({ actionId: scenario.actions.merge.actionId, actionTarget: scenario.actions.merge.actionTarget }) },
-      metadata: expect.objectContaining({
-        schema: "ccc-campaign.git-landing.intent.v1",
-        sourceRef: sourceRefD,
-        targetRef: "refs/heads/main",
-        expectedBaseObject: expectedBaseObjectBeforeProcessing,
-        sourceCommit: sourceCommitBeforeProcessing,
-        commitObject: mainAfter,
-      }),
-    });
-    const campaignContext = await h.store().getCccCampaignContextForTask(scenario.taskIds.d);
+    expect(landingEvents).toEqual([]);
+    const campaignContext = await h.store().getCccCampaignContextForTask(fixture.nativeTaskIds.d);
     expect(campaignContext).toMatchObject({
-      taskId: scenario.taskIds.d,
+      taskId: fixture.nativeTaskIds.d,
       semanticTaskId: scenario.taskIds.d,
       protectedActionIds: expect.arrayContaining([scenario.actions.merge.actionId]),
     });
-    expect(await h.store().getTaskDocument(scenario.taskIds.a, "PROMPT.md")).toMatchObject({ content: expect.any(String) });
-    expect((await h.store().listArtifacts()).some((artifact) => artifact.taskId === scenario.taskIds.a)).toBe(true);
-    const taskAProviderAttemptMutations = (await queryRunAuditEvents(h.layer().db, { taskId: scenario.taskIds.a }))
+    expect(await h.store().getTaskDocument(fixture.nativeTaskIds.a, "PROMPT.md")).toMatchObject({ content: expect.any(String) });
+    expect((await h.store().listArtifacts()).some((artifact) => artifact.taskId === fixture.nativeTaskIds.a)).toBe(true);
+    const taskAProviderAttemptMutations = (await queryRunAuditEvents(h.layer().db, { taskId: fixture.nativeTaskIds.a }))
       .map((event) => event.mutationType)
       .filter((mutationType) => mutationType.startsWith("ccc-campaign:provider-attempt:"))
       .sort();
@@ -507,11 +548,11 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
   it("durably cancels an admitted scoped-provider branch through the real graph signal and never redispatches it after restart", async () => {
     const fixture = await importCampaign("local-cancel", (scenario) => installScopedProvider(scenario, "cancel"));
     const { scenario, campaign, rootDir } = fixture;
-    const approvals = await issueAndClaimAll(scenario, "local-cancel");
+    const approvals = await issueAndClaimAll(scenario, fixture.nativeTaskIds, "local-cancel");
     const scoped = fixture.scoped as ReturnType<typeof installScopedProvider>;
     const pi = configurePiBottomRuntime({});
     const network = installLoopbackOnlyNetworkGuard();
-    await h.store().moveTask(scenario.taskIds.a, "in-progress", { moveSource: "scheduler" });
+    await h.store().moveTask(fixture.nativeTaskIds.a, "in-progress", { moveSource: "scheduler" });
     const executor = new TaskExecutor(h.store(), rootDir);
     const settings = await h.store().getSettings();
     const runtime = new WorkflowTaskRuntime({
@@ -519,6 +560,7 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
       primitives: executor.createAuthoritativeWorkflowPrimitives(settings),
       runCustomNode: executor.createAuthoritativeWorkflowCustomNodeRunner(settings),
       resolveNodeProviderController: executor.createCccCampaignWorkflowNodeProviderControllerResolver(),
+      branchPersistence: storeBackedBranchPersistence(),
     });
     const processing = processDueWorkflowWorkItem(h.store(), runtime, settings, {
       leaseOwner: "local-cancel-processor", leaseDurationMs: 60_000, kinds: ["task"], campaignRequired: true,
@@ -539,7 +581,7 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
     expect(pi.modelCalls).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "pi-fixture-a" }),
     ]));
-    const userCancellationMove = h.store().moveTask(scenario.taskIds.a, "todo", { moveSource: "user" });
+    const userCancellationMove = h.store().moveTask(fixture.nativeTaskIds.a, "todo", { moveSource: "user" });
     const cancellation = await Promise.race([
       processing.then((result) => ({ kind: "completed" as const, result })),
       new Promise<{ kind: "timed-out" }>((resolve) => setTimeout(() => resolve({ kind: "timed-out" }), 5_000)),
@@ -547,15 +589,15 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
     if (cancellation.kind === "timed-out") {
       throw new Error(`campaign cancellation timed out: ${JSON.stringify({
         workItem: await h.store().getWorkflowWorkItem(campaign.id),
-        taskA: await h.store().getTask(scenario.taskIds.a),
-        taskC: await h.store().getTask(scenario.taskIds.c),
+        taskA: await h.store().getTask(fixture.nativeTaskIds.a),
+        taskC: await h.store().getTask(fixture.nativeTaskIds.c),
         scopes: scoped.scopes,
       })}`);
     }
     expect(cancellation.result).toMatchObject({ claimed: true, runtime: { disposition: "cancelled", reason: "workflow-user-cancelled" } });
     await expect(userCancellationMove).resolves.toMatchObject({ column: "todo", userPaused: true });
     await expect(h.store().getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({ state: "cancelled", attempt: 1, leaseOwner: null, leaseExpiresAt: null, lastError: "workflow-user-cancelled" });
-    await expect(h.store().getTask(scenario.taskIds.a)).resolves.toMatchObject({ column: "todo", userPaused: true });
+    await expect(h.store().getTask(fixture.nativeTaskIds.a)).resolves.toMatchObject({ column: "todo", userPaused: true });
     expect(pi.modelCalls.some(({ id }) => id === "pi-fixture-d")).toBe(false);
     expect(network.fetchSpy).not.toHaveBeenCalled();
     const cancellationNonLoopbackSockets = network.socketSpy.mock.calls.filter((args) => {
@@ -568,9 +610,9 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
     expect(cancellationNonLoopbackSockets).toEqual([]);
     expect(git(rootDir, ["rev-parse", "refs/heads/main"])).toBe(fixture.mainAtStart);
     expect(scoped.scopes).toHaveLength(1);
-    await expect(h.store().inspectCccProviderAttempt({ taskId: scenario.taskIds.c, attemptKey: scoped.scopes[0].attemptKey as string }))
+    await expect(h.store().inspectCccProviderAttempt({ taskId: fixture.nativeTaskIds.c, attemptKey: scoped.scopes[0].attemptKey as string }))
       .resolves.toMatchObject({ state: "proved_failed", terminal: { state: "proved_failed" } });
-    const scopedApproval = approvals.get(`${scenario.taskIds.c}:${scenario.actions.liveExecution.c.actionId}`);
+    const scopedApproval = approvals.get(`${fixture.nativeTaskIds.c}:${scenario.actions.liveExecution.c.actionId}`);
     if (!scopedApproval) throw new Error("missing C approval");
     await expect(getApprovalRequest(h.layer().db, scopedApproval.id)).resolves.toMatchObject({ status: "claimed" });
     const { TaskStore: FreshTaskStore } = await import("@fusion/core");

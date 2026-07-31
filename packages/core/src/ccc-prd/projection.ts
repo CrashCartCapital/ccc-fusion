@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import type { CccCampaignExecutionPolicy, CccCampaignExecutionRoute } from "../ccc-campaign/types.js";
 import type { Task } from "../types.js";
 import { canonicalCccPrdJson } from "./contract.js";
 import type { CccPrdSemanticBundle, CccPrdTask } from "./types.js";
 
 export const CCC_PRD_IMPORT_PREPARED_STATUS = "ccc-prd-import-prepared";
+export const CCC_PRD_EXECUTION_PROMPT_SCHEMA = "ccc-prd.execution-prompt.v1" as const;
 
 export type PreparedCccPrdProjection = {
   schema: "ccc-prd.import-projection.v1";
@@ -28,6 +30,15 @@ export function nativeCccPrdScopedId(importId: string, semanticId: string): stri
   return `${importId}--${semanticId}`;
 }
 
+export type CccPrdNativeTaskIds = ReadonlyMap<string, string>;
+
+export function nativeCccPrdTaskId(
+  semanticTaskId: string,
+  nativeTaskIds?: CccPrdNativeTaskIds,
+): string {
+  return nativeTaskIds?.get(semanticTaskId) ?? semanticTaskId;
+}
+
 export function preparedCccPrdTask(
   source: CccPrdTask,
   missionId: string,
@@ -36,16 +47,19 @@ export function preparedCccPrdTask(
   targetBase: string,
   route: CccCampaignExecutionRoute,
   now: string,
+  nativeTaskIds?: CccPrdNativeTaskIds,
 ): Task & { state: "prepared"; runnable: false } {
+  const nativeTaskId = nativeCccPrdTaskId(source.id, nativeTaskIds);
   return {
-    id: source.id,
+    id: nativeTaskId,
     lineageId: `ccc-prd:${identityHash.slice(0, 24)}:${source.id}`,
     title: source.title,
     description: source.description,
     priority: "normal",
     column: "triage",
     status: CCC_PRD_IMPORT_PREPARED_STATUS,
-    dependencies: [...source.dependencyTaskIds],
+    dependencies: source.dependencyTaskIds.map((taskId) =>
+      nativeCccPrdTaskId(taskId, nativeTaskIds)),
     steps: [],
     currentStep: 0,
     log: [{ timestamp: now, action: "CCC PRD import prepared" }],
@@ -56,9 +70,19 @@ export function preparedCccPrdTask(
     sourceType: "api",
     sourceMetadata: {
       bundleHash,
+      semanticTaskId: source.id,
       requirementIds: source.requirementIds,
       proofIds: source.proofIds,
       accountableProducer: source.accountableProducer,
+      ...(route.executor
+        ? {
+          cccCampaignExecution: {
+            ...route,
+            ownedPaths: [...(route.ownedPaths ?? [])],
+            allowedWriteRoots: [...(route.allowedWriteRoots ?? [])],
+          },
+        }
+        : {}),
     },
     baseCommitSha: targetBase,
     modelProvider: route.providerId,
@@ -71,11 +95,182 @@ export function preparedCccPrdTask(
   };
 }
 
-function promptForTask(bundle: CccPrdSemanticBundle, task: CccPrdTask): string {
+function legacyPromptForTask(bundle: CccPrdSemanticBundle, task: CccPrdTask): string {
   const prompt = bundle.documents.find((document) =>
     document.taskId === task.id && document.key.toLowerCase() === "prompt.md");
   if (prompt) return prompt.content;
   return `# ${task.title}\n\n${task.description}\n`;
+}
+
+function linkedById<T extends { id: string }>(
+  values: readonly T[],
+  ids: readonly string[],
+  label: string,
+): T[] {
+  const byId = new Map(values.map((value) => [value.id, value]));
+  return ids.map((id) => {
+    const value = byId.get(id);
+    if (!value) {
+      throw new Error(`CCC PRD execution prompt references unknown ${label} ${id}`);
+    }
+    return value;
+  });
+}
+
+function bulletList(values: readonly string[]): string[] {
+  return values.length > 0
+    ? values.map((value) => `- ${value}`)
+    : ["- None declared."];
+}
+
+/**
+ * Build the exact coding prompt persisted in the workflow IR and projected to
+ * PROMPT.md. It deliberately derives only from the frozen semantic bundle and
+ * admitted route, so runtime dispatch cannot silently drop or invent product
+ * meaning after review.
+ */
+export function buildCccPrdTaskExecutionPrompt(
+  bundle: CccPrdSemanticBundle,
+  task: CccPrdTask,
+  route: CccCampaignExecutionRoute,
+): {
+  schema: typeof CCC_PRD_EXECUTION_PROMPT_SCHEMA;
+  content: string;
+  sha256: string;
+} {
+  const requirements = linkedById(
+    bundle.requirements,
+    task.requirementIds,
+    "requirement",
+  );
+  const proofs = linkedById(bundle.proofs, task.proofIds, "proof");
+  const documents = linkedById(bundle.documents, task.documentIds, "document");
+  const artifacts = linkedById(bundle.artifacts, task.artifactIds, "artifact");
+  const protectedActions = linkedById(
+    bundle.protectedActions,
+    task.protectedActionIds,
+    "protected action",
+  );
+  const lines: string[] = [
+    "# CCC Fusion sealed execution task",
+    "",
+    `Execution prompt schema: ${CCC_PRD_EXECUTION_PROMPT_SCHEMA}`,
+    `Frozen bundle SHA-256: ${bundle.bundleHash}`,
+    `Semantic task: ${task.id}`,
+    `Accountable producer: ${task.accountableProducer}`,
+    "",
+    "## Task",
+    "",
+    `### ${task.title}`,
+    "",
+    task.description,
+    "",
+    "## Repository and write custody",
+    "",
+    `- Target repository: ${bundle.targetRepository.path}`,
+    `- Frozen base commit: ${bundle.targetRepository.baseCommit}`,
+    `- Executor: ${route.executor ?? "legacy"}`,
+    `- Transport: ${route.transport}`,
+    `- Worktree mode: ${route.worktreeMode ?? "unspecified"}`,
+    `- Commit policy: ${route.commitPolicy ?? "unspecified"}`,
+    "- Owned paths:",
+    ...bulletList(route.ownedPaths ?? []),
+    "- Allowed write roots:",
+    ...bulletList(route.allowedWriteRoots ?? []),
+    "",
+    "Modify no path outside the allowed write roots. Work only in the isolated task worktree. Do not run git add, git commit, or mutate Git refs: the campaign controller validates the final source bytes and creates the task-branch commit. Do not perform landing, publication, credential, billing, deletion, upstream-write, or other protected actions. The campaign controller owns commit creation, proof execution, and human approval gates.",
+    "",
+    "## Requirements and acceptance",
+    "",
+  ];
+  for (const requirement of requirements) {
+    lines.push(
+      `### ${requirement.id}`,
+      "",
+      `Statement: ${requirement.statement}`,
+      "",
+      `Acceptance: ${requirement.acceptance}`,
+      "",
+      `Accountable producer: ${requirement.accountableProducer}`,
+      "",
+      "Requirement dependencies:",
+      ...bulletList(requirement.dependencies),
+      "",
+    );
+  }
+  lines.push("## Expected proof", "");
+  for (const proof of proofs) {
+    lines.push(
+      `### ${proof.id}`,
+      "",
+      `Command: ${proof.command}`,
+      "",
+      `Positive oracle: ${proof.positiveOracle}`,
+      "",
+      "Negative controls:",
+      ...bulletList(proof.negativeControls),
+      "",
+    );
+  }
+  lines.push("## Task documents", "");
+  if (documents.length === 0) {
+    lines.push("None declared.", "");
+  } else {
+    for (const document of documents) {
+      lines.push(
+        `### ${document.title} (${document.key})`,
+        "",
+        document.content,
+        "",
+      );
+    }
+  }
+  lines.push("## Expected artifacts", "");
+  if (artifacts.length === 0) {
+    lines.push("None declared.", "");
+  } else {
+    for (const artifact of artifacts) {
+      lines.push(
+        `### ${artifact.title} (${artifact.id})`,
+        "",
+        `Type: ${artifact.type}`,
+        `MIME type: ${artifact.mimeType}`,
+        "",
+        artifact.content,
+        "",
+      );
+    }
+  }
+  lines.push(
+    "## Non-goals",
+    "",
+    ...bulletList(bundle.nonGoals),
+    "",
+    "## Protected actions",
+    "",
+  );
+  if (protectedActions.length === 0) {
+    lines.push("None declared.", "");
+  } else {
+    for (const action of protectedActions) {
+      lines.push(
+        `- ${action.id}: ${action.kind} on ${action.target}; requires human decision ${action.operatorDecision}.`,
+      );
+    }
+    lines.push("");
+  }
+  lines.push(
+    "## Completion handoff",
+    "",
+    "Implement the admitted change, leave only admitted source edits in the worktree, and stop before Git commit. The campaign controller will validate those bytes, create the task-branch commit, and run the commit-bound verifier. Stop before every protected action. Report changed paths, tests you ran, and any blocker without claiming final proof or landing.",
+    "",
+  );
+  const content = lines.join("\n");
+  return {
+    schema: CCC_PRD_EXECUTION_PROMPT_SCHEMA,
+    content,
+    sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+  };
 }
 
 export function buildCccPrdProjection(input: {
@@ -85,6 +280,7 @@ export function buildCccPrdProjection(input: {
   identityHash: string;
   campaignId: string;
   now: string;
+  nativeTaskIds?: CccPrdNativeTaskIds;
 }): PreparedCccPrdProjection {
   const routes = new Map(input.executionPolicy.routes.map((route) => [route.taskId, route]));
   const taskFiles = input.bundle.tasks.map((source) => {
@@ -92,7 +288,10 @@ export function buildCccPrdProjection(input: {
     if (!route) {
       throw new Error(`CCC campaign execution route disappeared for ${source.id}`);
     }
-    const prepared = preparedCccPrdTask(
+    const executionPrompt = input.executionPolicy.schema === "ccc-campaign.execution-policy.v2"
+      ? buildCccPrdTaskExecutionPrompt(input.bundle, source, route)
+      : undefined;
+    const basePrepared = preparedCccPrdTask(
       source,
       input.campaignId,
       input.identityHash,
@@ -100,11 +299,24 @@ export function buildCccPrdProjection(input: {
       input.bundle.targetRepository.baseCommit,
       route,
       input.now,
+      input.nativeTaskIds,
     );
+    const prepared = executionPrompt
+      ? {
+          ...basePrepared,
+          sourceMetadata: {
+            ...basePrepared.sourceMetadata,
+            cccExecutionPrompt: {
+              schema: executionPrompt.schema,
+              sha256: executionPrompt.sha256,
+            },
+          },
+        }
+      : basePrepared;
     return {
-      id: source.id,
+      id: prepared.id,
       taskJson: `${canonicalCccPrdJson(prepared)}\n`,
-      prompt: promptForTask(input.bundle, source),
+      prompt: executionPrompt?.content ?? legacyPromptForTask(input.bundle, source),
     };
   });
   const artifactFiles = input.bundle.tasks.flatMap((task) =>
@@ -113,7 +325,7 @@ export function buildCccPrdProjection(input: {
       .map((artifact) => ({
         id: nativeCccPrdScopedId(input.importId, artifact.id),
         content: artifact.content,
-        taskId: task.id,
+        taskId: nativeCccPrdTaskId(task.id, input.nativeTaskIds),
       })));
   return {
     schema: "ccc-prd.import-projection.v1",

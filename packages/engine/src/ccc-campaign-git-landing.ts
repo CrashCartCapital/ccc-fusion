@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
+import { resolve } from "node:path";
 import type {
   CccCampaignTaskContext,
   MergeResult,
@@ -9,7 +11,11 @@ import {
   assertActiveClaimedCccCampaignApprovalWithinTransaction,
   assertClaimedCccCampaignApprovalWithinTransaction,
   consumeCccCampaignApprovalWithinTransaction,
+  computeCccPrdProofDefinitionSha256,
   createCccCampaignAuthorityBinding,
+  drizzleSql,
+  listCccCampaignProofAttemptsForCommit,
+  postgresSchema,
   queryRunAuditEvents,
   recordRunAuditEventWithinTransaction,
   type CccCampaignAuthorityBinding,
@@ -17,8 +23,14 @@ import {
 import { createCccCampaignMergeControl } from "./ccc-campaign-merge-control.js";
 import {
   casCccCampaignGitRef,
+  inspectCccCampaignGitLandingState,
+  materializeCccCampaignGitCheckout,
   prepareCccCampaignGitObjects,
   recheckCccCampaignGitObjects,
+  restoreCccCampaignGitObjects,
+  type CccCampaignGitCommitIdentity,
+  type CccCampaignGitCustodyIdentity,
+  type CccCampaignTargetCheckout,
   type PreparedCccCampaignGitObjects,
 } from "./ccc-campaign-git-objects.js";
 import {
@@ -31,6 +43,7 @@ const LANDING_AGENT_ID = "ccc-campaign-native-git-landing";
 const LANDING_DOMAIN = "git";
 const LANDING_TIMESTAMP = "2026-07-26T00:00:00.000Z";
 const COMMIT_TIMESTAMP = "2026-07-26T00:00:00Z";
+const MERGE_APPROVAL_REQUIRED = "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
 
 type LandingAuditEvent = Awaited<ReturnType<typeof queryRunAuditEvents>>[number];
 type ApprovalTransaction = Parameters<typeof assertActiveClaimedCccCampaignApprovalWithinTransaction>[0];
@@ -39,6 +52,8 @@ export type CccCampaignGitLandingFault =
   | "after-objects-before-intent"
   | "after-intent-write-before-commit"
   | "after-intent"
+  | "after-checkout-materialization"
+  | "after-checkout-receipt"
   | "after-cas"
   | "foreign-before-cas"
   | "foreign-after-cas";
@@ -65,7 +80,7 @@ type ApprovalInput = Readonly<{
 }>;
 
 type IntentMetadata = Readonly<{
-  schema: "ccc-campaign.git-landing.intent.v1";
+  schema: "ccc-campaign.git-landing.intent.v2";
   expectedBaseObject: string;
   sourceRef: string;
   targetRef: string;
@@ -76,6 +91,10 @@ type IntentMetadata = Readonly<{
   admittedWriteRoots: readonly string[];
   objectBaselineBefore: readonly string[];
   expectedGeneratedObjectIds: readonly string[];
+  targetCheckout: CccCampaignTargetCheckout;
+  custodyIdentity: CccCampaignGitCustodyIdentity;
+  identity: CccCampaignGitCommitIdentity;
+  message: string;
 }>;
 
 function requireMergeAction(context: CccCampaignTaskContext): MergeAction {
@@ -95,17 +114,35 @@ function requireMergeAction(context: CccCampaignTaskContext): MergeAction {
   });
 }
 
+function sourceWriteRoots(
+  context: CccCampaignTaskContext,
+  targetRoot: string,
+): readonly string[] {
+  if (context.executionPolicy.schema !== "ccc-campaign.execution-policy.v2") {
+    throw new Error("CCC campaign Git landing requires product execution policy v2");
+  }
+  const roots = context.executionPolicy.routes
+    .flatMap((route) => route.allowedWriteRoots ?? [])
+    .map((root) => resolve(targetRoot, root));
+  if (roots.length === 0) {
+    throw new Error("CCC campaign Git landing requires route-scoped source write roots");
+  }
+  return Object.freeze([...new Set(roots)].sort());
+}
+
 function runId(context: CccCampaignTaskContext, action: MergeAction): string {
   return `ccc-git-landing:${context.taskId}:${action.actionId}`;
 }
 
-function eventKey(context: CccCampaignTaskContext, action: MergeAction, phase: "intent" | "terminal"): string {
+type LandingPhase = "intent" | "checkout-materialized" | "terminal";
+
+function eventKey(context: CccCampaignTaskContext, action: MergeAction, phase: LandingPhase): string {
   return `ccc-git-landing/${context.projectId}/${context.importId}/${context.taskId}/${action.actionId}/${phase}`;
 }
 
 function metadataFromPrepared(prepared: PreparedCccCampaignGitObjects): IntentMetadata {
   return Object.freeze({
-    schema: "ccc-campaign.git-landing.intent.v1",
+    schema: "ccc-campaign.git-landing.intent.v2",
     expectedBaseObject: prepared.expectedTarget,
     sourceRef: prepared.sourceRef,
     targetRef: prepared.targetRef,
@@ -116,6 +153,10 @@ function metadataFromPrepared(prepared: PreparedCccCampaignGitObjects): IntentMe
     admittedWriteRoots: prepared.admittedWriteRoots,
     objectBaselineBefore: prepared.objectBaselineBefore,
     expectedGeneratedObjectIds: prepared.expectedGeneratedObjectIds,
+    targetCheckout: prepared.targetCheckout,
+    custodyIdentity: prepared.custodyIdentity,
+    identity: prepared.identity,
+    message: prepared.message,
   });
 }
 
@@ -130,6 +171,10 @@ function preparedFromIntent(
     || prepared.sourceCommit !== intent.sourceCommit
     || prepared.treeObject !== intent.treeObject
     || prepared.commitObject !== intent.commitObject
+    || JSON.stringify(prepared.targetCheckout) !== JSON.stringify(intent.targetCheckout)
+    || JSON.stringify(prepared.custodyIdentity) !== JSON.stringify(intent.custodyIdentity)
+    || JSON.stringify(prepared.identity) !== JSON.stringify(intent.identity)
+    || prepared.message !== intent.message
   ) {
     throw new Error("CCC campaign Git landing intent drifted from deterministic object preparation");
   }
@@ -139,12 +184,16 @@ function preparedFromIntent(
     admittedWriteRoots: intent.admittedWriteRoots,
     objectBaselineBefore: intent.objectBaselineBefore,
     expectedGeneratedObjectIds: intent.expectedGeneratedObjectIds,
+    targetCheckout: intent.targetCheckout,
+    custodyIdentity: intent.custodyIdentity,
+    identity: intent.identity,
+    message: intent.message,
   });
 }
 
 function readIntentMetadata(event: LandingAuditEvent | undefined): IntentMetadata | null {
   const metadata = event?.metadata as Partial<IntentMetadata> | null | undefined;
-  if (!metadata || metadata.schema !== "ccc-campaign.git-landing.intent.v1") return null;
+  if (!metadata || metadata.schema !== "ccc-campaign.git-landing.intent.v2") return null;
   if (
     !isObjectId(metadata.expectedBaseObject)
     || !isGitRef(metadata.sourceRef)
@@ -156,6 +205,11 @@ function readIntentMetadata(event: LandingAuditEvent | undefined): IntentMetadat
     || !isStringArray(metadata.admittedWriteRoots)
     || !isStringArray(metadata.objectBaselineBefore, isObjectId)
     || !isStringArray(metadata.expectedGeneratedObjectIds, isObjectId)
+    || !isTargetCheckout(metadata.targetCheckout)
+    || !isCustodyIdentity(metadata.custodyIdentity)
+    || !isCommitIdentity(metadata.identity)
+    || typeof metadata.message !== "string"
+    || metadata.message.length === 0
   ) {
     throw new Error("CCC campaign Git landing audit metadata is malformed");
   }
@@ -167,7 +221,7 @@ async function findLandingEvent(
   context: CccCampaignTaskContext,
   action: MergeAction,
   binding: CccCampaignAuthorityBinding,
-  phase: "intent" | "terminal",
+  phase: LandingPhase,
 ): Promise<LandingAuditEvent | undefined> {
   const layer = store.getAsyncLayer();
   if (!layer) throw new Error("CCC campaign Git landing requires TaskStore AsyncDataLayer");
@@ -217,11 +271,211 @@ function isGitRef(value: unknown): value is string {
   return typeof value === "string" && /^refs\/[A-Za-z0-9._/-]+$/u.test(value) && !value.includes("..");
 }
 
+function isTargetCheckout(value: unknown): value is CccCampaignTargetCheckout {
+  if (!value || typeof value !== "object") return false;
+  const checkout = value as Partial<CccCampaignTargetCheckout>;
+  return checkout.mode === "target-root"
+    ? typeof checkout.path === "string" && checkout.path.length > 0
+    : checkout.mode === "not-checked-out"
+      && (
+        checkout.rootBranch === null
+        || (typeof checkout.rootBranch === "string" && isGitRef(checkout.rootBranch))
+      );
+}
+
+function isCustodyStat(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const stat = value as Record<string, unknown>;
+  return typeof stat.path === "string"
+    && stat.path.length > 0
+    && ["dev", "ino", "mode", "birthtimeNs"].every((key) =>
+      typeof stat[key] === "string" && /^(?:0|[1-9]\d*)$/u.test(stat[key] as string));
+}
+
+function isCustodyIdentity(value: unknown): value is CccCampaignGitCustodyIdentity {
+  if (!value || typeof value !== "object") return false;
+  const custody = value as Partial<CccCampaignGitCustodyIdentity>;
+  return isCustodyStat(custody.targetRoot)
+    && isCustodyStat(custody.gitControlPath)
+    && isCustodyStat(custody.gitDir)
+    && isCustodyStat(custody.gitCommonDir)
+    && isCustodyStat(custody.gitBinary)
+    && typeof custody.indexPath === "string"
+    && custody.indexPath.length > 0;
+}
+
+function isCommitIdentity(value: unknown): value is CccCampaignGitCommitIdentity {
+  if (!value || typeof value !== "object") return false;
+  const identity = value as Partial<CccCampaignGitCommitIdentity>;
+  return typeof identity.name === "string"
+    && identity.name.length > 0
+    && typeof identity.email === "string"
+    && identity.email.length > 0
+    && typeof identity.timestamp === "string"
+    && identity.timestamp.length > 0;
+}
+
 function isStringArray(
   value: unknown,
   itemGuard: (item: unknown) => item is string = (item): item is string => typeof item === "string",
 ): value is readonly string[] {
   return Array.isArray(value) && value.every((item) => itemGuard(item) && item.length > 0);
+}
+
+function sha256CanonicalStrings(values: readonly string[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify([...values].sort()), "utf8")
+    .digest("hex");
+}
+
+type ImportedWorkflowWorkItemFence = Readonly<{
+  id: string;
+  runId: string;
+  attempt: number;
+}>;
+
+async function requireImportedWorkflowWorkItemFence(
+  store: TaskStore,
+  context: CccCampaignTaskContext,
+  tx: ApprovalTransaction | undefined,
+  allowSucceeded: boolean,
+): Promise<ImportedWorkflowWorkItemFence> {
+  const layer = store.getAsyncLayer();
+  if (!layer) throw new Error("CCC campaign Git landing work-item fence check requires PostgreSQL");
+  const query = tx ?? layer.db;
+  const entities = postgresSchema.project.cccPrdImportEntities;
+  const workItems = postgresSchema.project.workflowWorkItems;
+  const selection = query
+    .select({
+      id: workItems.id,
+      runId: workItems.runId,
+      kind: workItems.kind,
+      state: workItems.state,
+      attempt: workItems.attempt,
+      leaseOwner: workItems.leaseOwner,
+      leaseExpiresAt: workItems.leaseExpiresAt,
+      lastError: workItems.lastError,
+      blockedReason: workItems.blockedReason,
+      stableWorkflowRunId: workItems.stableWorkflowRunId,
+    })
+    .from(entities)
+    .innerJoin(
+      workItems,
+      drizzleSql`${workItems.projectId} = ${entities.projectId}
+        AND ${workItems.id} = ${entities.nativeId}`,
+    )
+    .where(drizzleSql`${entities.projectId} = ${context.projectId}
+      AND ${entities.importId} = ${context.importId}
+      AND ${entities.entityType} = 'work_item'`)
+    .limit(2);
+  const rows = tx ? await selection.for("update") : await selection;
+  if (rows.length !== 1) {
+    throw new Error("CCC campaign Git landing requires one exact imported workflow work item");
+  }
+  const workItem = rows[0]!;
+  const expectedRunId = `ccc-prd:${context.importId}`;
+  const hasNoLiveLease = workItem.leaseOwner === null && workItem.leaseExpiresAt === null;
+  const isParkedForMergeApproval = workItem.state === "manual-required"
+    && workItem.lastError === MERGE_APPROVAL_REQUIRED
+    && workItem.blockedReason === MERGE_APPROVAL_REQUIRED;
+  const isPostLandingSuccess = allowSucceeded && workItem.state === "succeeded";
+  if (
+    workItem.kind !== "task"
+    || workItem.runId !== expectedRunId
+    || workItem.stableWorkflowRunId !== expectedRunId
+    || !Number.isSafeInteger(workItem.attempt)
+    || workItem.attempt < 1
+    || !hasNoLiveLease
+    || (!isParkedForMergeApproval && !isPostLandingSuccess)
+  ) {
+    throw new Error(
+      "CCC campaign Git landing requires the exact imported workflow work item parked for merge approval",
+    );
+  }
+  return Object.freeze({
+    id: workItem.id,
+    runId: workItem.runId,
+    attempt: workItem.attempt,
+  });
+}
+
+async function assertExactCommittedProofReceipts(
+  store: TaskStore,
+  context: CccCampaignTaskContext,
+  source: Readonly<{
+    sourceCommit: string;
+    sourceTree: string;
+    mutationPaths: readonly string[];
+  }>,
+  tx?: ApprovalTransaction,
+  allowSucceededWorkItem = false,
+): Promise<void> {
+  const layer = store.getAsyncLayer();
+  if (!layer) throw new Error("CCC campaign Git landing proof receipt check requires PostgreSQL");
+  if (!Array.isArray(context.proofs) || context.proofs.length === 0) {
+    throw new Error("CCC campaign Git landing requires at least one executed proof receipt");
+  }
+  const workItemFence = await requireImportedWorkflowWorkItemFence(
+    store,
+    context,
+    tx,
+    allowSucceededWorkItem,
+  );
+  const receipts = await listCccCampaignProofAttemptsForCommit({
+    layer,
+    importId: context.importId,
+    campaignId: context.campaignId,
+    taskId: context.taskId,
+    sourceCommit: source.sourceCommit,
+    ...(tx ? { tx } : {}),
+  });
+  const expectedProofIds = context.proofs.map(({ id }) => id).sort();
+  const observedProofIds = receipts.map(({ proofId }) => proofId).sort();
+  if (
+    new Set(expectedProofIds).size !== expectedProofIds.length
+    || JSON.stringify(observedProofIds) !== JSON.stringify(expectedProofIds)
+  ) {
+    throw new Error("CCC campaign Git landing requires one exact passing receipt for every campaign proof");
+  }
+  const changedPathsSha256 = sha256CanonicalStrings(source.mutationPaths);
+  for (const receipt of receipts) {
+    const proof = context.proofs.find(({ id }) => id === receipt.proofId);
+    if (!proof) {
+      throw new Error(`CCC campaign Git landing proof receipt ${receipt.proofId} is not declared`);
+    }
+    const binding = createCccCampaignAuthorityBinding(context, {
+      actionId: `proof:${proof.id}`,
+      actionTarget: source.sourceCommit,
+    });
+    if (
+      receipt.state !== "committed"
+      || receipt.result?.success !== true
+      || receipt.importId !== context.importId
+      || receipt.campaignId !== context.campaignId
+      || receipt.taskId !== context.taskId
+      || receipt.semanticTaskId !== context.semanticTaskId
+      || receipt.packetHash !== context.packetHash
+      || receipt.sidecarHash !== context.sidecarHash
+      || receipt.bundleHash !== context.bundleHash
+      || receipt.manifestHash !== context.manifestHash
+      || receipt.campaignBindingHash !== binding.bindingHash
+      || receipt.targetRepository !== context.targetRepository.path
+      || receipt.targetBase !== context.targetRepository.baseCommit
+      || receipt.sourceCommit !== source.sourceCommit
+      || receipt.sourceTree !== source.sourceTree
+      || receipt.definitionSha256 !== computeCccPrdProofDefinitionSha256(proof)
+      || receipt.command !== proof.command
+      || receipt.commandSha256 !== createHash("sha256").update(proof.command, "utf8").digest("hex")
+      || receipt.result.changedPathsSha256 !== changedPathsSha256
+      || receipt.workItemId !== workItemFence.id
+      || receipt.runId !== workItemFence.runId
+      || receipt.workItemAttempt !== workItemFence.attempt
+    ) {
+      throw new Error(
+        `CCC campaign Git landing proof receipt ${proof.id} is failed, stale, incomplete, or bound to different source`,
+      );
+    }
+  }
 }
 
 async function moveTargetToForeignCommit(prepared: PreparedCccCampaignGitObjects): Promise<void> {
@@ -261,6 +515,9 @@ export async function campaignGitLandingRequiredResult(
 ): Promise<MergeResult> {
   const layer = store.getAsyncLayer();
   if (!layer) throw new Error("CCC campaign Git landing requires TaskStore AsyncDataLayer");
+  if (context.executionPolicy.schema !== "ccc-campaign.execution-policy.v2") {
+    throw new Error("CCC campaign Git landing requires product-v2 proof execution");
+  }
   const authorityStore = store as CampaignAuthorityStore;
   if (typeof authorityStore.getCccCampaignContextForTaskWithinTransaction !== "function") {
     throw new Error("CCC campaign Git landing requires transaction-scoped campaign custody");
@@ -282,12 +539,35 @@ export async function campaignGitLandingRequiredResult(
   const targetRef = action.actionTarget;
   const existingIntent = await findLandingEvent(store, context, action, binding, "intent");
   const intentMetadata = readIntentMetadata(existingIntent);
+  const checkoutMaterialized = await findLandingEvent(
+    store,
+    context,
+    action,
+    binding,
+    "checkout-materialized",
+  );
+  const checkoutMaterializedMetadata = readIntentMetadata(checkoutMaterialized);
   const terminal = await findLandingEvent(store, context, action, binding, "terminal");
   const terminalMetadata = readIntentMetadata(terminal);
+  if (
+    checkoutMaterialized
+    && (
+      !checkoutMaterializedMetadata
+      || !intentMetadata
+      || JSON.stringify(checkoutMaterializedMetadata) !== JSON.stringify(intentMetadata)
+    )
+  ) {
+    throw new Error("CCC campaign Git landing materialization metadata does not match durable intent");
+  }
   if (terminalMetadata) {
     if (!intentMetadata || JSON.stringify(terminalMetadata) !== JSON.stringify(intentMetadata)) {
       throw new Error("CCC campaign Git landing terminal metadata does not match durable intent");
     }
+    await assertExactCommittedProofReceipts(store, context, {
+      sourceCommit: terminalMetadata.sourceCommit,
+      sourceTree: terminalMetadata.treeObject,
+      mutationPaths: terminalMetadata.mutationPaths,
+    }, undefined, true);
     const snapshot = await inspectCccCampaignLocalGit({
       targetRoot,
       expectedBaseObject: terminalMetadata.expectedBaseObject,
@@ -305,7 +585,13 @@ export async function campaignGitLandingRequiredResult(
   const lease = context.activeActionLeases[action.actionId];
   if (!lease) throw new Error("CCC campaign Git landing requires a claimed approval lease");
   const sourceRef = `refs/heads/${branch}`;
-  const admittedWriteRoots = context.admittedWriteRoots.map(({ path }) => path);
+  const admittedWriteRoots = sourceWriteRoots(context, targetRoot);
+  const identity: CccCampaignGitCommitIdentity = Object.freeze({
+    name: "CCC Campaign",
+    email: "ccc-campaign@example.com",
+    timestamp: COMMIT_TIMESTAMP,
+  });
+  const message = `CCC campaign native Git landing ${context.taskId}`;
   if (!intentMetadata) {
     const snapshot = await inspectCccCampaignLocalGit({
       targetRoot,
@@ -319,19 +605,33 @@ export async function campaignGitLandingRequiredResult(
       throw new Error("CCC campaign Git landing target ref drifted before durable intent");
     }
   }
-  const preparedBase = await prepareCccCampaignGitObjects({
-    targetRoot,
-    expectedBaseObject: context.targetRepository.baseCommit,
-    sourceRef,
-    targetRef,
-    admittedWriteRoots,
-    identity: {
-      name: "CCC Campaign",
-      email: "ccc-campaign@example.com",
-      timestamp: COMMIT_TIMESTAMP,
-    },
-    message: `CCC campaign native Git landing ${context.taskId}`,
-  });
+  const preparedBase = intentMetadata
+    ? await restoreCccCampaignGitObjects({
+      targetRoot,
+      expectedTarget: intentMetadata.expectedBaseObject,
+      sourceRef: intentMetadata.sourceRef,
+      targetRef: intentMetadata.targetRef,
+      sourceCommit: intentMetadata.sourceCommit,
+      treeObject: intentMetadata.treeObject,
+      commitObject: intentMetadata.commitObject,
+      mutationPaths: intentMetadata.mutationPaths,
+      admittedWriteRoots: intentMetadata.admittedWriteRoots,
+      identity: intentMetadata.identity,
+      message: intentMetadata.message,
+      objectBaselineBefore: intentMetadata.objectBaselineBefore,
+      expectedGeneratedObjectIds: intentMetadata.expectedGeneratedObjectIds,
+      targetCheckout: intentMetadata.targetCheckout,
+      custodyIdentity: intentMetadata.custodyIdentity,
+    })
+    : await prepareCccCampaignGitObjects({
+      targetRoot,
+      expectedBaseObject: context.targetRepository.baseCommit,
+      sourceRef,
+      targetRef,
+      admittedWriteRoots,
+      identity,
+      message,
+    });
   const prepared = intentMetadata
     ? preparedFromIntent(preparedBase, intentMetadata)
     : preparedBase;
@@ -350,6 +650,11 @@ export async function campaignGitLandingRequiredResult(
   }
 
   if (!intentMetadata) await layer.transactionImmediate(async (tx) => {
+    await assertExactCommittedProofReceipts(store, context, {
+      sourceCommit: prepared.sourceCommit,
+      sourceTree: prepared.treeObject,
+      mutationPaths: prepared.mutationPaths,
+    }, tx);
     await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
     await recheckCccCampaignGitObjects(prepared);
     await recordRunAuditEventWithinTransaction(tx, {
@@ -371,15 +676,90 @@ export async function campaignGitLandingRequiredResult(
     throw new Error("CCC campaign Git landing test fault after durable intent");
   }
 
-  await recheckCccCampaignGitObjects(prepared);
+  if (intentMetadata) {
+    await inspectCccCampaignGitLandingState(prepared);
+  } else {
+    await recheckCccCampaignGitObjects(prepared);
+  }
   const observedBeforeCas = await currentTargetCommit(prepared);
   if (observedBeforeCas === prepared.expectedTarget) {
     await layer.transactionImmediate(async (tx) => {
+      await assertExactCommittedProofReceipts(store, context, {
+        sourceCommit: prepared.sourceCommit,
+        sourceTree: prepared.treeObject,
+        mutationPaths: prepared.mutationPaths,
+      }, tx);
       await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
     });
     if (fault === "foreign-before-cas") {
       await moveTargetToForeignCommit(prepared);
     }
+    const stateBeforeMaterialization = await inspectCccCampaignGitLandingState(prepared);
+    if (
+      prepared.targetCheckout.mode === "target-root"
+      && checkoutMaterializedMetadata
+      && stateBeforeMaterialization === "base-clean"
+    ) {
+      throw new Error(
+        "CCC campaign checkout materialization receipt exists but its filesystem effect is absent; manual recovery is required",
+      );
+    }
+    const materializedState = await materializeCccCampaignGitCheckout(prepared);
+    if (
+      prepared.targetCheckout.mode === "target-root"
+      && materializedState !== "checkout-materialized"
+      && materializedState !== "landed-clean"
+    ) {
+      throw new Error("CCC campaign checked-out target did not reach exact materialized state");
+    }
+    if (
+      prepared.targetCheckout.mode === "target-root"
+      && fault === "after-checkout-materialization"
+    ) {
+      throw new Error("CCC campaign Git landing test fault after checkout materialization");
+    }
+    if (prepared.targetCheckout.mode === "target-root" && !checkoutMaterializedMetadata) {
+      await layer.transactionImmediate(async (tx) => {
+        await assertExactCommittedProofReceipts(store, context, {
+          sourceCommit: prepared.sourceCommit,
+          sourceTree: prepared.treeObject,
+          mutationPaths: prepared.mutationPaths,
+        }, tx);
+        await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
+        const state = await inspectCccCampaignGitLandingState(prepared);
+        if (state !== "checkout-materialized" && state !== "landed-clean") {
+          throw new Error("CCC campaign checkout materialization state drifted before its durable receipt");
+        }
+        await recordRunAuditEventWithinTransaction(tx, {
+          timestamp: LANDING_TIMESTAMP,
+          taskId: context.taskId,
+          agentId: LANDING_AGENT_ID,
+          runId: runId(context, action),
+          domain: LANDING_DOMAIN,
+          mutationType: "ccc-campaign-git-landing:checkout-materialized",
+          target: binding.actionTarget,
+          metadata: intent,
+          campaign: {
+            eventKey: eventKey(context, action, "checkout-materialized"),
+            binding,
+          },
+        });
+      });
+    }
+    if (
+      prepared.targetCheckout.mode === "target-root"
+      && fault === "after-checkout-receipt"
+    ) {
+      throw new Error("CCC campaign Git landing test fault after checkout materialization receipt");
+    }
+    await layer.transactionImmediate(async (tx) => {
+      await assertExactCommittedProofReceipts(store, context, {
+        sourceCommit: prepared.sourceCommit,
+        sourceTree: prepared.treeObject,
+        mutationPaths: prepared.mutationPaths,
+      }, tx);
+      await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
+    });
     const cas = await casCccCampaignGitRef(prepared);
     if (!cas.advanced && cas.observed !== prepared.commitObject) {
       throw new Error("CCC campaign Git landing target ref drifted during CAS");
@@ -400,6 +780,11 @@ export async function campaignGitLandingRequiredResult(
   }
 
   await layer.transactionImmediate(async (tx) => {
+    await assertExactCommittedProofReceipts(store, context, {
+      sourceCommit: prepared.sourceCommit,
+      sourceTree: prepared.treeObject,
+      mutationPaths: prepared.mutationPaths,
+    }, tx);
     await assertClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
     await recordRunAuditEventWithinTransaction(tx, {
       timestamp: LANDING_TIMESTAMP,

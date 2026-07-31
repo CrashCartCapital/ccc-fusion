@@ -363,6 +363,92 @@ function formatDistributedTaskId(prefix: string, sequence: number): string {
   return `${normalizedPrefix}-${String(sequence).padStart(3, "0")}`;
 }
 
+export type AllocateCommittedTaskIdsInTransactionInput = Readonly<{
+  projectId?: string;
+  nodeId: string;
+  count: number;
+  now?: string;
+}>;
+
+/**
+ * Allocate and commit a bounded batch of native task IDs inside a caller-owned
+ * PostgreSQL transaction.
+ *
+ * Composite importers cannot use the public reserve/commit allocator because
+ * each public operation opens its own transaction. This variant keeps the
+ * allocator state, committed reservation receipts, imported task rows, and
+ * their semantic-to-native ledger in one atomic unit.
+ */
+export async function allocateCommittedTaskIdsInTransaction(
+  tx: DbTransaction,
+  input: AllocateCommittedTaskIdsInTransactionInput,
+): Promise<string[]> {
+  if (!Number.isSafeInteger(input.count) || input.count < 0) {
+    throw new TypeError("task ID allocation count must be a non-negative safe integer");
+  }
+  if (input.count === 0) return [];
+  const nodeId = input.nodeId.trim();
+  if (!nodeId) throw new TypeError("task ID allocation nodeId is required");
+  const nowIso = input.now ?? new Date().toISOString();
+  if (!Number.isFinite(Date.parse(nowIso)) || new Date(nowIso).toISOString() !== nowIso) {
+    throw new TypeError("task ID allocation timestamp must be canonical ISO-8601");
+  }
+
+  await expireReservations(tx, nowIso);
+  const configured = await getConfiguredPrefixAndLegacyNextId(tx, input.projectId);
+  const prefix = configured.prefix.trim().toUpperCase();
+  if (!prefix) throw new Error("task ID allocation prefix is required");
+  const floor = await computeNextSequenceFloor(tx, prefix, input.projectId);
+  await ensureStateRow(tx, prefix, floor, nowIso);
+  const stateRows = await tx
+    .select({
+      nextSequence: schema.project.distributedTaskIdState.nextSequence,
+    })
+    .from(schema.project.distributedTaskIdState)
+    .where(eq(schema.project.distributedTaskIdState.prefix, prefix))
+    .limit(1)
+    .for("update");
+  const state = stateRows[0];
+  if (!state) {
+    throw new Error(`distributed_task_id_state row missing for prefix ${prefix}`);
+  }
+
+  let sequence = Math.max(state.nextSequence, floor);
+  const taskIds: string[] = [];
+  const expiresAt = new Date(Date.parse(nowIso) + DEFAULT_RESERVATION_TTL_MS).toISOString();
+  while (taskIds.length < input.count) {
+    while (await taskIdExists(tx, prefix, sequence)) sequence += 1;
+    const taskId = formatDistributedTaskId(prefix, sequence);
+    await tx.insert(schema.project.distributedTaskIdReservations).values({
+      reservationId: randomUUID(),
+      prefix,
+      nodeId,
+      sequence,
+      taskId,
+      status: "committed",
+      reason: null,
+      expiresAt,
+      committedAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    taskIds.push(taskId);
+    sequence += 1;
+  }
+
+  await tx
+    .update(schema.project.distributedTaskIdState)
+    .set({
+      nextSequence: sequence,
+      committedClusterTaskCount:
+        sql`${schema.project.distributedTaskIdState.committedClusterTaskCount} + ${taskIds.length}`,
+      lastCommittedTaskId: taskIds.at(-1)!,
+      updatedAt: nowIso,
+    })
+    .where(eq(schema.project.distributedTaskIdState.prefix, prefix));
+  return taskIds;
+}
+
 /**
  * FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-12:35:
  * Check whether a task ID already exists in the tasks or archived_tasks table.

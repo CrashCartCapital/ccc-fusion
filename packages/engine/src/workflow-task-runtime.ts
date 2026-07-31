@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import type { CccCampaignTaskContext, RunAuditEventInput, Settings, TaskDetail, WorkflowIr, WorkflowIrArtifact, WorkflowIrNode, WorkflowWorkItem, WorkflowWorkItemState } from "@fusion/core";
 import {
+  canonicalCccPrdJson,
   getBuiltinWorkflow,
   isBuiltinWorkflowId,
   parseWorkflowIr,
@@ -7,6 +9,7 @@ import {
 } from "@fusion/core";
 
 import {
+  CCC_RETRY_CLASSIFICATION_CONTEXT_KEY,
   WorkflowGraphExecutor,
   type WorkflowNodeExecutionFence,
   type WorkflowGraphExecutorDeps,
@@ -28,7 +31,11 @@ import {
   createCccCampaignProofNodeAdmission,
   type CccCampaignProofNodeAdmission,
 } from "./ccc-campaign-proof-workflow.js";
-import { isImportedCccCampaignTask, isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
+import {
+  isCccCampaignTask,
+  isImportedCccCampaignTask,
+  isImportedCccCampaignWorkItem,
+} from "./ccc-campaign-routing.js";
 
 export type WorkflowTaskRuntimeDisposition = "completed" | "failed" | "manual-required" | "cancelled";
 
@@ -38,6 +45,8 @@ export interface WorkflowWorkItemFence {
   attempt: number;
   runId: string;
   eventTimestamp: string;
+  /** Exact canonical native workflow IR admitted by the importer. */
+  irHash?: string;
 }
 
 export interface WorkflowTaskRuntimeRunOptions {
@@ -52,6 +61,68 @@ export interface WorkflowTaskRuntimeResult {
   visitedNodeIds: string[];
   context: Record<string, unknown>;
   reason?: string;
+}
+
+function graphFailureReason(result: {
+  visitedNodeIds: readonly string[];
+  context: Readonly<Record<string, unknown>>;
+}): string {
+  for (const nodeId of [...result.visitedNodeIds].reverse()) {
+    const error = result.context[`node:${nodeId}:error`];
+    if (typeof error === "string" && error.trim().length > 0) {
+      return `workflow-node-error:${nodeId}:${error.trim()}`;
+    }
+    const value = result.context[`node:${nodeId}:value`];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return `workflow-node-failed:${nodeId}:${value.trim()}`;
+    }
+  }
+  return "workflow-graph-failed";
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function canonicalDigest(value: unknown): string {
+  return sha256Text(canonicalCccPrdJson(value));
+}
+
+function importedProductRouteFromNode(node: WorkflowIrNode): Record<string, unknown> | null {
+  const config = node.config;
+  if (
+    !config
+    || typeof config.cccPrdTaskId !== "string"
+    || typeof config.cccExecutionProviderId !== "string"
+    || typeof config.cccExecutionModelId !== "string"
+    || (config.cccExecutionTransport !== "pi" && config.cccExecutionTransport !== "cli")
+    || (config.executor !== "model" && config.executor !== "cli-agent")
+    || config.toolMode !== "coding"
+    || config.worktreeMode !== "isolated"
+    || !Array.isArray(config.ownedPaths)
+    || config.ownedPaths.some((path) => typeof path !== "string")
+    || !Array.isArray(config.allowedWriteRoots)
+    || config.allowedWriteRoots.some((path) => typeof path !== "string")
+    || config.commitPolicy !== "required"
+    || (config.cliAdapterId !== undefined && typeof config.cliAdapterId !== "string")
+  ) {
+    return null;
+  }
+  return {
+    taskId: config.cccPrdTaskId,
+    providerId: config.cccExecutionProviderId,
+    modelId: config.cccExecutionModelId,
+    transport: config.cccExecutionTransport,
+    executor: config.executor,
+    toolMode: config.toolMode,
+    worktreeMode: config.worktreeMode,
+    ownedPaths: [...config.ownedPaths],
+    allowedWriteRoots: [...config.allowedWriteRoots],
+    commitPolicy: config.commitPolicy,
+    ...(config.cliAdapterId !== undefined
+      ? { cliAdapterId: config.cliAdapterId }
+      : {}),
+  };
 }
 
 export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps, "seams" | "runCustomNode" | "executionFence"> {
@@ -87,6 +158,8 @@ export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps,
   };
   primitives: WorkflowRuntimePrimitives;
   runCustomNode: WorkflowCustomNodeRunner;
+  /** Campaign-only executor for the final PRD proof-suite gate. */
+  runCccProofSuite?: WorkflowNodeHandler;
   onEvent?: (event: { type: "start" | "terminal"; taskId: string; detail: string }) => void;
 }
 
@@ -104,6 +177,7 @@ function snapshotWorkItemFence(fence: WorkflowWorkItemFence | undefined): Workfl
     attempt: fence.attempt,
     runId: fence.runId,
     eventTimestamp: fence.eventTimestamp,
+    irHash: fence.irHash,
   });
 }
 
@@ -118,6 +192,7 @@ function snapshotRunOptions(options: WorkflowTaskRuntimeRunOptions): WorkflowTas
 function createGraphExecutionFence(fence: WorkflowWorkItemFence): WorkflowNodeExecutionFence {
   return Object.freeze({
     workItemId: fence.workItemId,
+    leaseOwner: fence.leaseOwner,
     attempt: fence.attempt,
     runId: fence.runId,
   });
@@ -149,8 +224,8 @@ export class WorkflowTaskRuntime {
     options: WorkflowTaskRuntimeRunOptions = {},
   ): Promise<WorkflowTaskRuntimeResult> {
     const runOptions = snapshotRunOptions(options);
-    const campaignCustodyRefusal = await this.campaignCustodyRefusal(task, runOptions);
-    if (campaignCustodyRefusal) return campaignCustodyRefusal;
+    const campaignCustody = await this.campaignCustodyAdmission(task, runOptions);
+    if (campaignCustody.refusal) return campaignCustody.refusal;
     const campaignFenceRefusal = await this.campaignFenceRefusal(task, runOptions);
     if (campaignFenceRefusal) return campaignFenceRefusal;
     this.emit("start", task.id, "resolve-workflow");
@@ -169,6 +244,14 @@ export class WorkflowTaskRuntime {
         reason,
       };
     }
+
+    const importedExecutionRefusal = this.importedCampaignExecutionRefusal(
+      task,
+      runOptions,
+      target,
+      campaignCustody.context,
+    );
+    if (importedExecutionRefusal) return importedExecutionRefusal;
 
     const runtimeRunId = runOptions.workItemFence?.runId ?? this.deps.runId ?? `${task.id}:${target.workflowId}`;
     const invoked: string[] = [];
@@ -281,9 +364,25 @@ export class WorkflowTaskRuntime {
       }
     }
 
-    const disposition: WorkflowTaskRuntimeDisposition = result.outcome === "success" ? "completed" : "failed";
+    const retryClassification = result.context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY];
+    const permanentCampaignReason =
+      result.outcome === "failure"
+      && typeof retryClassification === "string"
+      && retryClassification.startsWith("ccc-permanent:")
+        ? retryClassification
+        : undefined;
+    const disposition: WorkflowTaskRuntimeDisposition = result.outcome === "success"
+      ? "completed"
+      : permanentCampaignReason
+        ? "manual-required"
+        : "failed";
     this.emit("terminal", task.id, disposition);
-    const reason = result.outcome === "failure" && runOptions.signal?.aborted ? "workflow-aborted" : undefined;
+    const reason = permanentCampaignReason
+      ?? (result.outcome === "failure" && runOptions.signal?.aborted
+        ? "workflow-aborted"
+        : result.outcome === "failure"
+          ? graphFailureReason(result)
+          : undefined);
     return {
       disposition,
       outcome: result.outcome,
@@ -293,32 +392,47 @@ export class WorkflowTaskRuntime {
     };
   }
 
-  private async campaignCustodyRefusal(
+  private async campaignCustodyAdmission(
     task: TaskDetail,
     options: WorkflowTaskRuntimeRunOptions,
-  ): Promise<WorkflowTaskRuntimeResult | undefined> {
+  ): Promise<{
+    context: CccCampaignTaskContext | null;
+    refusal?: WorkflowTaskRuntimeResult;
+  }> {
     const importedTask = isImportedCccCampaignTask(task);
     const fencedInvocation = options.workItemFence !== undefined;
     const getContext = this.deps.store.getCccCampaignContextForTask;
     if (typeof getContext !== "function") {
-      return importedTask || fencedInvocation
-        ? this.campaignCustodyFailure(task.id, "ccc-campaign-custody-lookup-unwired")
-        : undefined;
+      return {
+        context: null,
+        ...(importedTask || fencedInvocation
+          ? { refusal: this.campaignCustodyFailure(task.id, "ccc-campaign-custody-lookup-unwired") }
+          : {}),
+      };
     }
     let context: CccCampaignTaskContext | null;
     try {
       context = await getContext.call(this.deps.store, task.id);
     } catch {
-      return importedTask || fencedInvocation
-        ? this.campaignCustodyFailure(task.id, "ccc-campaign-custody-lookup-error")
-        : undefined;
+      return {
+        context: null,
+        ...(importedTask || fencedInvocation
+          ? { refusal: this.campaignCustodyFailure(task.id, "ccc-campaign-custody-lookup-error") }
+          : {}),
+      };
     }
     if (context && !options.workItemFence) {
-      return this.campaignCustodyFailure(task.id, "ccc-campaign-work-item-fence-required");
+      return {
+        context,
+        refusal: this.campaignCustodyFailure(task.id, "ccc-campaign-work-item-fence-required"),
+      };
     }
-    return (importedTask || fencedInvocation) && !context
-      ? this.campaignCustodyFailure(task.id, "ccc-campaign-custody-missing")
-      : undefined;
+    return {
+      context,
+      ...((importedTask || fencedInvocation) && !context
+        ? { refusal: this.campaignCustodyFailure(task.id, "ccc-campaign-custody-missing") }
+        : {}),
+    };
   }
 
   private campaignCustodyFailure(taskId: string, reason: string): WorkflowTaskRuntimeResult {
@@ -330,6 +444,78 @@ export class WorkflowTaskRuntime {
       context: {},
       reason,
     };
+  }
+
+  private campaignManualRequired(taskId: string, reason: string): WorkflowTaskRuntimeResult {
+    this.emit("terminal", taskId, `manual-required:${reason}`);
+    return {
+      disposition: "manual-required",
+      outcome: "failure",
+      visitedNodeIds: [],
+      context: {
+        [CCC_RETRY_CLASSIFICATION_CONTEXT_KEY]: reason,
+      },
+      reason,
+    };
+  }
+
+  private importedCampaignExecutionRefusal(
+    task: TaskDetail,
+    options: WorkflowTaskRuntimeRunOptions,
+    target: WorkflowRuntimeTarget,
+    context: CccCampaignTaskContext | null,
+  ): WorkflowTaskRuntimeResult | undefined {
+    if (!isImportedCccCampaignTask(task)) return undefined;
+    const admittedIrHash = options.workItemFence?.irHash;
+    if (
+      typeof admittedIrHash !== "string"
+      || !/^[0-9a-f]{64}$/u.test(admittedIrHash)
+      || canonicalDigest(target.ir) !== admittedIrHash
+    ) {
+      return this.campaignManualRequired(
+        task.id,
+        "ccc-permanent:CCC_CAMPAIGN_NATIVE_IR_DRIFT",
+      );
+    }
+    if (context?.executionPolicy.schema !== "ccc-campaign.execution-policy.v2") {
+      return undefined;
+    }
+    const custody = context.executionCustody;
+    if (!custody || canonicalDigest(context.route) !== custody.routeSha256) {
+      return this.campaignManualRequired(
+        task.id,
+        "ccc-permanent:CCC_CAMPAIGN_EXECUTION_CUSTODY_DRIFT",
+      );
+    }
+    const matchingNodes = target.ir.nodes.filter((node) =>
+      node.kind === "prompt"
+      && node.config?.cccPrdTaskId === context.semanticTaskId
+      && node.config?.cccNativeTaskId === context.taskId
+      && typeof node.config?.cccExecutionPromptSha256 === "string");
+    if (matchingNodes.length !== 1) {
+      return this.campaignManualRequired(
+        task.id,
+        "ccc-permanent:CCC_CAMPAIGN_EXECUTION_CUSTODY_DRIFT",
+      );
+    }
+    const node = matchingNodes[0]!;
+    const prompt = node.config?.prompt;
+    const route = importedProductRouteFromNode(node);
+    if (
+      typeof prompt !== "string"
+      || node.config?.cccExecutionPromptSchema !== custody.promptSchema
+      || node.config?.cccExecutionPromptSha256 !== custody.promptSha256
+      || sha256Text(prompt) !== custody.promptSha256
+      || node.config?.cccExecutionRouteSha256 !== custody.routeSha256
+      || !route
+      || canonicalDigest(route) !== custody.routeSha256
+    ) {
+      return this.campaignManualRequired(
+        task.id,
+        "ccc-permanent:CCC_CAMPAIGN_EXECUTION_CUSTODY_DRIFT",
+      );
+    }
+    return undefined;
   }
 
   private async campaignFenceRefusal(
@@ -398,6 +584,17 @@ export class WorkflowTaskRuntime {
           "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
         );
       }
+      const nativeTaskId = node.config?.cccNativeTaskId ?? semanticTaskId;
+      if (
+        typeof nativeTaskId !== "string"
+        || nativeTaskId.length === 0
+        || nativeTaskId !== nativeTaskId.trim()
+      ) {
+        throw new PermanentError(
+          `CCC campaign native task id for node ${node.id} is missing or invalid`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
       const getTask = this.deps.store.getTask;
       if (typeof getTask !== "function") {
         throw new PermanentError(
@@ -407,26 +604,37 @@ export class WorkflowTaskRuntime {
       }
       let semanticTask: TaskDetail | undefined;
       try {
-        semanticTask = await getTask.call(this.deps.store, semanticTaskId);
+        semanticTask = await getTask.call(this.deps.store, nativeTaskId);
       } catch {
         throw new PermanentError(
-          `CCC campaign semantic task ${semanticTaskId} lookup failed`,
+          `CCC campaign native task ${nativeTaskId} lookup failed for semantic task ${semanticTaskId}`,
           "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
         );
       }
       if (!semanticTask) {
         throw new PermanentError(
-          `CCC campaign semantic task ${semanticTaskId} is missing`,
+          `CCC campaign native task ${nativeTaskId} is missing for semantic task ${semanticTaskId}`,
           "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
         );
       }
-      if (semanticTask.id !== semanticTaskId) {
+      if (semanticTask.id !== nativeTaskId) {
         throw new PermanentError(
-          `CCC campaign semantic task identity does not match ${semanticTaskId}`,
+          `CCC campaign native task identity does not match ${nativeTaskId}`,
           "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
         );
       }
-      return { semanticTask };
+      const context = await this.deps.store.getCccCampaignContextForTask?.(nativeTaskId);
+      if (
+        !context
+        || context.taskId !== nativeTaskId
+        || context.semanticTaskId !== semanticTaskId
+      ) {
+        throw new PermanentError(
+          `CCC campaign task mapping ${semanticTaskId} -> ${nativeTaskId} does not match persisted custody`,
+          "CCC_CAMPAIGN_SEMANTIC_TASK_REFUSED",
+        );
+      }
+      return { semanticTask, semanticTaskId, nativeTaskId };
     };
   }
 
@@ -467,7 +675,7 @@ export class WorkflowTaskRuntime {
     }
 
     const configuredRetries = Number(node.config?.maxRetries);
-    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const cccFusionTask = isCccCampaignTask(task);
     const maxAttempts = Number.isFinite(configuredRetries) && configuredRetries >= 1
       ? Math.min(10, Math.floor(configuredRetries))
       : 1;
@@ -735,6 +943,19 @@ export class WorkflowTaskRuntime {
       prNodes: this.deps.prNodes,
     });
     const handlers = { ...defaultHandlers, ...(this.deps.handlers ?? {}) };
+    const ordinaryGate = handlers.gate;
+    handlers.gate = (node, context) => {
+      if (node.config?.cccProofSuite !== true) {
+        return ordinaryGate(node, context);
+      }
+      if (!this.deps.runCccProofSuite) {
+        return Promise.resolve({
+          outcome: "failure" as const,
+          value: "ccc-proof-suite-execution-unwired",
+        });
+      }
+      return this.deps.runCccProofSuite(node, context);
+    };
     const wrapped: Partial<Record<WorkflowIrNode["kind"], WorkflowNodeHandler>> = {};
     for (const [kind, handler] of Object.entries(handlers) as Array<[WorkflowIrNode["kind"], WorkflowNodeHandler]>) {
       wrapped[kind] = async (node, context) => {

@@ -40,7 +40,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe as vitestDescribe } from "vitest";
@@ -950,6 +950,20 @@ export function createSharedPgTaskStoreTestHarness(options?: {
       if (!harness || !store) throw new Error("SharedPgTaskStoreHarness: beforeAll not called yet");
       // Wipe all application data and reset sequences in one statement.
       await harness.adminDb.execute(sql.raw(TRUNCATE_ALL_SQL));
+      // FNXC:PgTestHarness 2026-07-31:
+      // The shared database reset must have a matching filesystem reset. Native
+      // task allocation can reuse KB-001 after TRUNCATE, so stale canonical
+      // projections would otherwise trigger the importer's intentional
+      // byte-conflict refusal in the next test.
+      const sharedFilesystemRoots = [
+        join(harness.rootDir, ".fusion", "tasks"),
+        join(harness.rootDir, ".fusion", "artifacts"),
+        join(harness.rootDir, ".fusion", "ccc-prd-import-staging"),
+      ];
+      await Promise.all(sharedFilesystemRoots.map((path) =>
+        rm(path, { recursive: true, force: true })));
+      await Promise.all(sharedFilesystemRoots.map((path) =>
+        mkdir(path, { recursive: true })));
       // Re-seed the singleton config row with default project settings so the
       // store sees a clean project on every test.
       const defaults = await ensureDefaults();

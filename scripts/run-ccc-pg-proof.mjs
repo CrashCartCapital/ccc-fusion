@@ -260,6 +260,7 @@ const expectedWave5CoreImportNames = [
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds same-key preparation admission while the creator transaction is uncommitted",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > is sequentially and concurrently idempotent, including a lost response after commit",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps a live projection claim beyond lease expiry while an identical import waits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > lets an in-flight heartbeat renew before reclaiming its just-expired projection lease",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps renewing through the activation handoff while an identical import waits",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds an identical wait by the admitted bundle duration plus reconciliation overhead",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > retries one transient PostgreSQL lease-renewal failure without losing ownership",
@@ -399,17 +400,25 @@ const expectedWave6PrdImportPgNames = [
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > invalidates native workflow caches only after the prepared database transaction commits",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: imports explicit split join topology for a dependency diamond",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: attaches each workflow transport route extension to its semantic prompt node",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 allocates durable native task ids without rewriting semantic custody",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 rolls native task allocation back with the importer transaction",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 RED: projects coding custody and a final proof barrier before human landing",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 CLI route projects stable adapter settings without persisted subscription readiness",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 activation schedules planning continuations through import and reconcile",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 refuses proof execution without one explicit integration terminal",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: refuses an unregistered workflow transport extension without persisted import state",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: refuses a dangling terminal protected-action reference before emitting workflow IR",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: emits one merge seam after one exact terminal merge action and refuses ambiguous landings",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: preserves no-merge-action workflow IR bytes",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > commits exact semantic counts, projects task/document/artifact readers, and remains visible after restart",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > admits a new reviewed campaign from the same PRD with distinct native campaign and work-item identities",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > rebuilds missing canonical prepared files for an active import after restart",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > serializes two concurrent active repairs over one staging prefix",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds active-repair lock waiting by the admitted reconciliation budget",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds same-key preparation admission while the creator transaction is uncommitted",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > is sequentially and concurrently idempotent, including a lost response after commit",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps a live projection claim beyond lease expiry while an identical import waits",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > lets an in-flight heartbeat renew before reclaiming its just-expired projection lease",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > keeps renewing through the activation handoff while an identical import waits",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > bounds an identical wait by the admitted bundle duration plus reconciliation overhead",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > retries one transient PostgreSQL lease-renewal failure without losing ownership",
@@ -501,6 +510,7 @@ const expectedWave6EngineDefaultNames = [
   "processDueWorkflowWorkItem symbol lock renewal > Task 6: a user cancellation during custody failure still persists cancelled",
   "processDueWorkflowWorkItem symbol lock renewal > Task 6: a user cancellation wins when lease loss aborted the controller first",
   "processDueWorkflowWorkItem symbol lock renewal > Task 6: a user pause observed after campaign claim prevents runtime dispatch",
+  "processDueWorkflowWorkItem symbol lock renewal > persists the exact campaign blocker when full-graph execution requires a human decision",
   "processDueWorkflowWorkItem symbol lock renewal > Task 5 RED: passes an exact campaign candidate through to the lease claim",
   "processDueWorkflowWorkItem symbol lock renewal > renews a claimed mission symbol before its short admission lease can expire",
   "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: ordinary non-campaign work items do not renew workflow work-item leases",
@@ -636,7 +646,10 @@ const expectedWave6CampaignExecProofGitNames = [
   "CCC native campaign proof admission > stops before evaluation when the invocation is already aborted",
   "CCC campaign proof workflow admission > exposes the native pre-node admission factory",
   "CCC campaign proof workflow admission > admits an exact node proof through the sealed native registry and writes a campaign receipt",
+  "CCC campaign proof workflow admission > uses a distinct audit identity when the same proof is re-admitted after a later durable work-item transition",
+  "CCC campaign proof workflow admission > admits every globally declared proof for the final proof-suite node",
   "CCC campaign proof workflow admission > admits a fixture with exact admission binding and sealed execution provenance",
+  "CCC campaign proof workflow admission > admits distinct semantic and allocator-native task identities",
   "CCC campaign proof workflow admission > refuses before evaluator dispatch when execution origin differs from factory origin",
   "CCC campaign proof workflow admission > refuses before evaluator dispatch when execution semantic id differs from node config",
   "CCC campaign proof workflow admission > refuses before evaluator dispatch when semantic task id differs from execution semantic task",
@@ -661,9 +674,31 @@ const expectedWave6RealAcceptanceNames = [
   "Task 5 native CCC campaign Git landing > branches from merger-ai before legacy landing and binds the structured campaign marker",
   "Task 5 native CCC campaign Git landing > leaves ordinary merger behavior on the legacy branch",
   "Task 5 native CCC campaign Git landing > fails closed for imported campaign markers without persisted custody",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses landing without exact passing proof receipts and preserves human approval",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses a bundle-admitted source change outside every product route write root",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses failed proof receipts before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses dispatched-unknown proof receipts before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses wrong-commit proof receipts before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses wrong-tree proof receipts before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses wrong-paths proof receipts before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses otherwise-valid proof receipts with fake receipt work-item fence before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses otherwise-valid proof receipts with stale receipt run fence before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses otherwise-valid proof receipts with stale receipt attempt fence before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses otherwise-valid proof receipts with incomplete imported workflow work item before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses otherwise-valid proof receipts with failed imported workflow work item before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses otherwise-valid proof receipts with premature succeeded imported workflow work item before intent and leaves approval reusable",
+  "Task 5 native CCC campaign Git landing real PG/Git > keeps v1 landing fail-closed even with otherwise-valid synthetic proof receipts",
   "Task 5 native CCC campaign Git landing real PG/Git > refuses after deterministic objects before durable intent with ref unchanged and replayable commit identity",
   "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: rolls back intent persistence failure before ref mutation and replays exact commit identity",
   "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: reconciles interruption at each CAS boundary and consumes one exact approval",
+  "Task 5 native CCC campaign Git landing real PG/Git > lands onto the exact clean target branch checked out at the canonical target root",
+  "Task 5 native CCC campaign Git landing real PG/Git > recovers exact checked-out landing materialization without replaying an uncertain filesystem effect",
+  "Task 5 native CCC campaign Git landing real PG/Git > requires manual recovery when a durable checkout receipt exists without its filesystem effect",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses tracked dirty checked-out restart state without overwriting operator bytes",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses untracked checked-out restart state without overwriting operator bytes",
+  "Task 5 native CCC campaign Git landing real PG/Git > refuses mixed index/worktree checked-out restart state without overwriting operator bytes",
+  "Task 5 native CCC campaign Git landing real PG/Git > recovers a checked-out target after CAS without repeating landing or approval",
+  "Task 5 native CCC campaign Git landing real PG/Git > accepts a succeeded imported workflow work item only on durable terminal replay",
   "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: refuses a foreign target ref race before CAS without terminal audit or approval consume",
   "Task 5 native CCC campaign Git landing real PG/Git > Task 5 RED: refuses a foreign target ref race before terminal audit or approval consume",
   "CCC campaign deterministic Git object primitives > prepares deterministic object-only squash output and replays the same commit",
@@ -674,10 +709,14 @@ const expectedWave6RealAcceptanceNames = [
   "CCC campaign deterministic Git object primitives > refuses unrelated object drift before recheck or CAS",
   "CCC campaign deterministic Git object primitives > refuses packed unrelated object drift before recheck or CAS",
   "CCC campaign deterministic Git object primitives > performs exact update-ref CAS once, refuses stale CAS, and prepare accepts exact-new restart state",
+  "CCC campaign deterministic Git object primitives > never executes repository hooks during checked-out prepare, materialization, or CAS",
   "CCC campaign deterministic Git object primitives > detects target checked out by a sibling worktree",
-  "Task 6 local CCC campaign acceptance (real PostgreSQL) > completes an imported mixed-provider split/join campaign through real Pi admission, a scoped handler, and native Git landing",
+  "CCC campaign deterministic Git object primitives > refuses a target branch checked out by more than one sibling worktree",
+  "Task 6 local CCC campaign acceptance (real PostgreSQL) > runs legacy v1 mixed-provider work but fails closed before Git landing without executed proof receipts",
   "Task 6 local CCC campaign acceptance (real PostgreSQL) > durably cancels an admitted scoped-provider branch through the real graph signal and never redispatches it after restart",
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 5 RED: mixed due queue preserves ordinary dispatch and claims campaign work only through the fenced processor",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > product v2 RED: the in-process campaign runtime prepares coding nodes before provider dispatch",
+  "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > product v2 RED: a restarted claim parks mutated imported IR before any graph or provider effect",
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > keeps campaignRequired fail-closed after a real PostgreSQL claim when custody is absent",
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6: public user cancellation durably parks a real campaign and restart cannot redispatch it",
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6 P1 RED: a claim that lands during a public move is cancelled and cannot redispatch after restart",
@@ -1100,6 +1139,7 @@ const proofDatabase = `ccc_wave${selectedWave}_proof`;
 const supervisor = `
   import { EmbeddedPostgresLifecycle } from ${JSON.stringify(join(repoRoot, "packages/core/src/postgres/embedded-lifecycle.ts"))};
   import { spawn } from "node:child_process";
+  import { writeSync } from "node:fs";
   import { mkdir } from "node:fs/promises";
   import { join } from "node:path";
   const lifecycleErrors = [];
@@ -1165,8 +1205,14 @@ const supervisor = `
     process.removeListener("SIGTERM", onSigTerm);
     try { await stopWithinBudget(); } catch (error) { stopError = stopFailureText(error); }
   }
-  process.stdout.write("CCC_PROOF_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: process.env.CCC_PROOF_DATABASE, stopError, lifecycleErrors, interrupted }) + "\\n");
-  if (stopError || interrupted || results.some((result) => result.code !== 0) || results.length !== commands.length) process.exitCode = 1;
+  const supervisorExitCode = stopError || interrupted || results.some((result) => result.code !== 0) || results.length !== commands.length ? 1 : 0;
+  writeSync(1, "CCC_PROOF_SUPERVISOR_RESULT=" + JSON.stringify({ results, database: process.env.CCC_PROOF_DATABASE, stopError, lifecycleErrors, interrupted }) + "\\n");
+  // embedded-postgres@15 registers a natural-beforeExit hook that can invoke
+  // its async callback without a callable done under Node 24 after an
+  // already-completed explicit stop. Exit explicitly only after the durable
+  // supervisor result is synchronously written; PostgreSQL ownership has
+  // already been settled in the finally block above.
+  process.exit(supervisorExitCode);
 `;
 
 function redact(text) {

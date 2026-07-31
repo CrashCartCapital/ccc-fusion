@@ -142,9 +142,24 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
   afterEach(h.afterEach);
   afterAll(h.afterAll);
 
+  async function nativeTaskIdForImport(
+    importId: string,
+    semanticTaskId: string,
+  ): Promise<string> {
+    const rows = await h.layer().db.execute(sql`
+      SELECT native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${importId}
+        AND entity_type = 'task'
+        AND entity_id = ${semanticTaskId}
+    `) as unknown as Array<{ native_id: string }>;
+    expect(rows).toHaveLength(1);
+    return rows[0]!.native_id;
+  }
+
   async function context(suffix: string, protectedAction: ProtectedActionFixture = mergeProtectedAction) {
     const source = withCampaignAction(bundle(h.rootDir(), suffix), protectedAction);
-    await importCccPrdBundle({
+    const imported = await importCccPrdBundle({
       bundle: source,
       idempotencyKey: `approval-${suffix}`,
       store: h.store(),
@@ -152,12 +167,15 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
       rootDir: h.rootDir(),
       executionPolicy: policyFor(source),
     });
-    const taskId = `TASK-${suffix}`;
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error(`missing campaign context for ${taskId}`);
+    expect(campaign).toMatchObject({ taskId, semanticTaskId });
     return {
       campaign,
       taskId,
+      semanticTaskId,
       action: { actionId: protectedAction.id, actionTarget: protectedAction.target },
     };
   }
@@ -249,7 +267,7 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
         protectedActionIds: [sharedAction.actionId],
       })),
     });
-    await importCccPrdBundle({
+    const imported = await importCccPrdBundle({
       bundle: source,
       idempotencyKey: `approval-${suffix}`,
       store: h.store(),
@@ -257,10 +275,16 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
       rootDir: h.rootDir(),
       executionPolicy: policyFor(source),
     });
-    const taskIds = [`TASK-${suffix}`, `TASK-terminal-${suffix}`];
-    const campaigns = await Promise.all(taskIds.map(async (taskId) => {
+    const semanticTaskIds = [`TASK-${suffix}`, `TASK-terminal-${suffix}`];
+    const taskIds = await Promise.all(semanticTaskIds.map((semanticTaskId) =>
+      nativeTaskIdForImport(imported.importId, semanticTaskId)));
+    const campaigns = await Promise.all(taskIds.map(async (taskId, index) => {
       const campaign = await h.store().getCccCampaignContextForTask(taskId);
       if (!campaign) throw new Error(`missing campaign context for ${taskId}`);
+      expect(campaign).toMatchObject({
+        taskId,
+        semanticTaskId: semanticTaskIds[index],
+      });
       return campaign;
     }));
 
@@ -280,12 +304,14 @@ pgDescribe("CCC campaign approval lifecycle (PostgreSQL)", () => {
     expect(persistedContexts).toEqual([
       expect.objectContaining({
         taskId: taskIds[0],
+        semanticTaskId: semanticTaskIds[0],
         activeActionLeases: expect.objectContaining({
           [sharedAction.actionId]: expect.objectContaining({ claimToken: "claim-0" }),
         }),
       }),
       expect.objectContaining({
         taskId: taskIds[1],
+        semanticTaskId: semanticTaskIds[1],
         activeActionLeases: expect.objectContaining({
           [sharedAction.actionId]: expect.objectContaining({ claimToken: "claim-1" }),
         }),

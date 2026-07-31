@@ -205,6 +205,7 @@ function proposal() {
       { id: "IMPORT-2", entityType: "task", entityId: "TASK-2", operation: "create", target: "project.tasks" },
       { id: "IMPORT-3", entityType: "dependency_edge", entityId: "EDGE-1", operation: "create", target: "project.tasks.dependencies" },
       { id: "IMPORT-4", entityType: "workflow", entityId: "WORKFLOW-1", operation: "create", target: "project.workflow_work_items" },
+      { id: "IMPORT-10", entityType: "work_item", entityId: "WORKFLOW-1", operation: "create", target: "project.workflow_work_items" },
       { id: "IMPORT-5", entityType: "document", entityId: "DOCUMENT-1", operation: "create", target: "project.task_documents" },
       { id: "IMPORT-6", entityType: "artifact", entityId: "ARTIFACT-1", operation: "create", target: "project.artifacts" },
       { id: "IMPORT-7", entityType: "campaign", entityId: "CAMPAIGN-1", operation: "create", target: "project.missions" },

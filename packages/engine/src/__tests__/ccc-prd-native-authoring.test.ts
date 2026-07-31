@@ -123,6 +123,9 @@ describe("CCC PRD native authoring adapter", () => {
     expect(generate.mock.calls[0]![0].prompt).toContain(
       "\"targetRepository\"",
     );
+    expect(generate.mock.calls[0]![0].prompt).toContain(
+      "collectively disposition every Markdown heading block and requirement-like row",
+    );
     expect(result).toMatchObject({
       kind: "candidate",
       sidecar: {

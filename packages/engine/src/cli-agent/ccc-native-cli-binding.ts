@@ -25,6 +25,8 @@ export const CCC_NATIVE_CLI_SESSION_POLICY_KIND = "ccc-fusion.native-cli-session
 export const CCC_NATIVE_CLI_SESSION_POLICY_VERSION = 1 as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_KIND = "ccc-fusion.native-cli-held-closure" as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_VERSION = 1 as const;
+export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND = "ccc-fusion.native-cli-held-closure-evidence" as const;
+export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION = 1 as const;
 export const CCC_NATIVE_CLI_TRANSPORT = "cli" as const;
 export const CCC_NATIVE_CLI_BINDING_REFUSED_CODE = "CCC_NATIVE_CLI_BINDING_REFUSED" as const;
 
@@ -91,6 +93,19 @@ export type CccNativeCliHeldClosureReceipt = Readonly<{
   slotHeld: true;
 }>;
 
+export type CccNativeCliHeldClosureEvidence = Readonly<{
+  kind: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND;
+  version: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION;
+  sessionId: string;
+  trigger: CccNativeCliHeldClosureTrigger;
+  exitCode: number;
+  exitSignal: number;
+  processGroupClosed: true;
+  proxyClosed: true;
+  durableFloorFlushed: true;
+  slotHeld: true;
+}>;
+
 export type CccNativeCliController = Readonly<{
   preDispatch: (input: CccCampaignProviderDispatchInput) => Promise<CccCampaignProviderControllerDecision>;
   reconcile: (input: CccNativeCliControllerReconciliation) => Promise<CccProviderAttemptScope>;
@@ -119,6 +134,7 @@ export type CccNativeCliBindingResolverInput = Readonly<{
   nodeId: string;
   originTaskId: string;
   semanticTaskId: string;
+  nativeTaskId: string;
   executionFence: WorkflowNodeExecutionFence;
   visitIdentity: WorkflowMaterializedVisitIdentity;
   turnKey: string;
@@ -145,6 +161,7 @@ export interface CccNativeCliBindingValidationExpectation {
 export interface CccNativeCliPermitScopeValidationExpectation {
   dispatchRequest: CccCampaignProviderDispatchInput;
   semanticTaskId: string;
+  nativeTaskId: string;
   authorityBindingHash: string;
 }
 
@@ -169,6 +186,7 @@ const TERMINAL_SCOPE_KEYS = ["attemptKey", "controllerToken", "taskId", "semanti
 const OBSERVATION_KEYS = ["kind", "version", "outcome", "evidenceDigest"] as const;
 const TERMINAL_KEYS = ["kind", "state", "evidenceDigest", "observerId"] as const;
 const HELD_CLOSURE_RECEIPT_KEYS = ["kind", "version", "sessionId", "attemptKey", "controllerToken", "taskId", "authorityBindingHash", "turnKey", "dispatchKey", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
+const HELD_CLOSURE_EVIDENCE_KEYS = ["kind", "version", "sessionId", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
 const ROUTE_KEYS = ["adapterId", "providerId", "modelId", "transport"] as const;
 const LIMIT_KEYS = ["maxRequests", "lifetimeMs", "termGraceMs", "killClosureMs"] as const;
 const OBSERVER_KEYS = ["id", "observe"] as const;
@@ -225,7 +243,7 @@ export function validateCccNativeCliPermitScope(
   const taskId = assertCanonicalCccNativeCliText(scope.taskId, "permit scope taskId");
   const semanticTaskId = assertCanonicalCccNativeCliText(scope.semanticTaskId, "permit scope semanticTaskId");
   assertCanonicalCccNativeCliText(scope.campaignDeadlineAt, "permit scope campaignDeadlineAt");
-  if (taskId !== expected.semanticTaskId) throw refused("permit scope taskId must match sealed semanticTaskId");
+  if (taskId !== expected.nativeTaskId) throw refused("permit scope taskId must match sealed nativeTaskId");
   if (semanticTaskId !== expected.semanticTaskId) throw refused("permit scope semanticTaskId must match sealed semanticTaskId");
   if (scope.turnKey !== expected.dispatchRequest.turnKey) throw refused("permit scope turnKey mismatch");
   if (scope.dispatchKey !== expected.dispatchRequest.dispatchKey) throw refused("permit scope dispatchKey mismatch");
@@ -252,6 +270,56 @@ export function validateCccNativeCliPermitScope(
   if (authorityBinding.transport !== expected.dispatchRequest.transport) throw refused("permit scope authority binding transport mismatch");
 
   return value as CccProviderAttemptScope;
+}
+
+export function validateCccNativeCliHoldScope(
+  value: unknown,
+  expected: CccNativeCliPermitScopeValidationExpectation,
+): CccProviderAttemptScope {
+  const candidate = value as Record<string, unknown>;
+  if (candidate?.state === "dispatched_unknown") {
+    return validateCccNativeCliPermitScope(value, expected);
+  }
+  if (candidate?.state !== "committed" && candidate?.state !== "proved_failed") {
+    throw refused("hold scope state must be dispatched_unknown, committed, or proved_failed");
+  }
+  const scope = requirePlainFrozenExactObject(value, TERMINAL_SCOPE_KEYS, "hold terminal scope") as Record<string, unknown>;
+  const terminal = requirePlainFrozenExactObject(
+    scope.terminal,
+    TERMINAL_KEYS,
+    "hold terminal scope terminal",
+  ) as Record<string, unknown>;
+  if (
+    terminal.observerId !== CCC_NATIVE_CLI_OBSERVER_ID
+    && terminal.observerId !== CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID
+  ) {
+    throw refused("hold terminal scope observer is not a native CLI observer");
+  }
+  const observation = validateCccNativeCliObservation(Object.freeze({
+    kind: CCC_NATIVE_CLI_OBSERVATION_KIND,
+    version: CCC_NATIVE_CLI_OBSERVATION_VERSION,
+    outcome: candidate.state,
+    evidenceDigest: terminal.evidenceDigest,
+  }));
+  const permitScope = Object.freeze({
+    attemptKey: scope.attemptKey,
+    controllerToken: scope.controllerToken,
+    taskId: scope.taskId,
+    semanticTaskId: scope.semanticTaskId,
+    campaignDeadlineAt: scope.campaignDeadlineAt,
+    turnKey: scope.turnKey,
+    dispatchKey: scope.dispatchKey,
+    attemptOrdinal: scope.attemptOrdinal,
+    requestCount: scope.requestCount,
+    state: "dispatched_unknown" as const,
+    binding: scope.binding,
+  });
+  const validatedPermit = validateCccNativeCliPermitScope(permitScope, expected);
+  return validateCccNativeCliTerminalScope(value, {
+    permitScope: validatedPermit,
+    observation,
+    observerId: terminal.observerId,
+  });
 }
 
 export function validateCccNativeCliSessionPolicy(
@@ -397,6 +465,101 @@ export function validateCccNativeCliHeldClosureReceipt(
   if (receipt.durableFloorFlushed !== true) throw refused("held closure receipt durableFloorFlushed must be true");
   if (receipt.slotHeld !== true) throw refused("held closure receipt slotHeld must be true");
   return receipt as unknown as CccNativeCliHeldClosureReceipt;
+}
+
+export function buildCccNativeCliHeldClosureEvidence(
+  input: Readonly<{
+    sessionId: string;
+    trigger: CccNativeCliHeldClosureTrigger;
+    exitCode: number;
+    exitSignal: number;
+  }>,
+): CccNativeCliHeldClosureEvidence {
+  return validateCccNativeCliHeldClosureEvidence(Object.freeze({
+    kind: CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND,
+    version: CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION,
+    sessionId: input.sessionId,
+    trigger: input.trigger,
+    exitCode: input.exitCode,
+    exitSignal: input.exitSignal,
+    processGroupClosed: true,
+    proxyClosed: true,
+    durableFloorFlushed: true,
+    slotHeld: true,
+  }), input.sessionId);
+}
+
+export function restoreCccNativeCliHeldClosureReceipt(
+  value: unknown,
+  expected: Readonly<{
+    sessionId: string;
+    attemptKey: string;
+    controllerToken: string;
+    taskId: string;
+    authorityBindingHash: string;
+    turnKey: string;
+    dispatchKey: typeof CCC_NATIVE_CLI_DISPATCH_KEY;
+  }>,
+): CccNativeCliHeldClosureReceipt {
+  const evidence = validateCccNativeCliHeldClosureEvidence(value, expected.sessionId);
+  return Object.freeze({
+    kind: CCC_NATIVE_CLI_HELD_CLOSURE_KIND,
+    version: CCC_NATIVE_CLI_HELD_CLOSURE_VERSION,
+    sessionId: evidence.sessionId,
+    attemptKey: expected.attemptKey,
+    controllerToken: expected.controllerToken,
+    taskId: expected.taskId,
+    authorityBindingHash: expected.authorityBindingHash,
+    turnKey: expected.turnKey,
+    dispatchKey: expected.dispatchKey,
+    trigger: evidence.trigger,
+    exitCode: evidence.exitCode,
+    exitSignal: evidence.exitSignal,
+    processGroupClosed: true,
+    proxyClosed: true,
+    durableFloorFlushed: true,
+    slotHeld: true,
+  });
+}
+
+function validateCccNativeCliHeldClosureEvidence(
+  value: unknown,
+  expectedSessionId: string,
+): CccNativeCliHeldClosureEvidence {
+  if (!isPlainObject(value)) throw refused("held closure evidence must be a plain object");
+  const actualKeys = Object.keys(value);
+  if (
+    actualKeys.length !== HELD_CLOSURE_EVIDENCE_KEYS.length
+    || HELD_CLOSURE_EVIDENCE_KEYS.some((key) => !Object.hasOwn(value, key))
+  ) {
+    throw refused(`held closure evidence must have exact keys: ${HELD_CLOSURE_EVIDENCE_KEYS.join(", ")}`);
+  }
+  if (value.kind !== CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND) throw refused("held closure evidence.kind mismatch");
+  if (value.version !== CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION) throw refused("held closure evidence.version mismatch");
+  if (value.sessionId !== expectedSessionId) throw refused("held closure evidence sessionId mismatch");
+  if (!isHeldClosureTrigger(value.trigger)) throw refused("held closure evidence trigger mismatch");
+  if (typeof value.exitCode !== "number" || !Number.isSafeInteger(value.exitCode)) {
+    throw refused("held closure evidence exitCode must be a safe integer");
+  }
+  if (typeof value.exitSignal !== "number" || !Number.isSafeInteger(value.exitSignal)) {
+    throw refused("held closure evidence exitSignal must be a safe integer");
+  }
+  if (value.processGroupClosed !== true) throw refused("held closure evidence processGroupClosed must be true");
+  if (value.proxyClosed !== true) throw refused("held closure evidence proxyClosed must be true");
+  if (value.durableFloorFlushed !== true) throw refused("held closure evidence durableFloorFlushed must be true");
+  if (value.slotHeld !== true) throw refused("held closure evidence slotHeld must be true");
+  return Object.freeze({
+    kind: value.kind,
+    version: value.version,
+    sessionId: value.sessionId,
+    trigger: value.trigger,
+    exitCode: value.exitCode,
+    exitSignal: value.exitSignal,
+    processGroupClosed: true,
+    proxyClosed: true,
+    durableFloorFlushed: true,
+    slotHeld: true,
+  });
 }
 
 function validateRoute(value: unknown, expected: CccNativeCliRoute): void {

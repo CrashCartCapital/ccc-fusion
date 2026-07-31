@@ -5,6 +5,7 @@ export {
   createCccCampaignManifest,
   hashCccCampaignManifest,
   parseCccCampaignExecutionPolicy,
+  parseCccCampaignProductExecutionPolicy,
 } from "./canonical.js";
 export {
   assertCccCampaignActionLease,
@@ -16,8 +17,14 @@ export type { CccCampaignAuthorityStore } from "./store.js";
 export {
   CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
+  CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION,
+  CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
   CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
+  CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
   CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION,
+  CccCampaignProofAttemptCollisionError,
+  CccCampaignProofAttemptIdentityError,
+  CccCampaignProofAttemptStateError,
   CccProviderAttemptCollisionError,
   CccProviderAttemptIdentityError,
   CccProviderAttemptLimitError,
@@ -30,7 +37,16 @@ export type {
   CccCampaignContext,
   CccCampaignExecutionPolicy,
   CccCampaignExecutionRoute,
+  CccCampaignProductExecutionPolicy,
+  CccCampaignProductExecutionRoute,
   CccCampaignManifest,
+  CccCampaignProofAttempt,
+  CccCampaignProofAttemptDispatchDecision,
+  CccCampaignProofAttemptScope,
+  CccCampaignProofAttemptState,
+  CccCampaignProofExecutionResult,
+  CccCampaignProofExecutionResultInput,
+  CccCampaignProofWorkItemFence,
   CccCampaignTaskContext,
   CccCampaignTransport,
   CccProviderAttemptReconciliation,
@@ -43,6 +59,20 @@ export type {
   CccProviderAttemptTransition,
 } from "./types.js";
 export {
+  beginCccCampaignProofAttemptDispatch,
+  inspectCccCampaignProofAttempt,
+  listCccCampaignProofAttemptsForCommit,
+  reserveCccCampaignProofAttempt,
+  settleCccCampaignProofAttempt,
+} from "./proof-attempt.js";
+export type {
+  InspectCccCampaignProofAttemptInput,
+  ListCccCampaignProofAttemptsForCommitInput,
+  ReserveCccCampaignProofAttemptInput,
+  SettleCccCampaignProofAttemptInput,
+  TransitionCccCampaignProofAttemptInput,
+} from "./proof-attempt.js";
+export {
   atomicReserveCccCampaignProviderDispatch,
   selectCccCampaignDeclaredLiveExecutionAction,
 } from "./provider-controller.js";
@@ -53,3 +83,9 @@ export type {
   CccCampaignProviderDispatchInput,
   AtomicCccCampaignProviderDispatchInput,
 } from "./provider-controller.js";
+export {
+  listCccProviderAttemptsForCampaign,
+} from "./provider-attempt.js";
+export type {
+  ListCccProviderAttemptsForCampaignInput,
+} from "./provider-attempt.js";

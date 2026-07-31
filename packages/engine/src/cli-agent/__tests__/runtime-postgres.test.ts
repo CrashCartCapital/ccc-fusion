@@ -9,7 +9,11 @@ import { CliSessionStore, type AsyncDataLayer } from "@fusion/core";
 import type { IPty } from "node-pty";
 import { CliAdapterRegistry, type CliAgentAdapter } from "../adapter.js";
 import { createCliAgentRuntime } from "../runtime.js";
-import { CliSessionManager } from "../session-manager.js";
+import {
+  CCC_NATIVE_CLI_PTY_PREFLIGHT_FAILED_CODE,
+  CliPtyPreflightError,
+  CliSessionManager,
+} from "../session-manager.js";
 
 describe("createCliAgentRuntime PostgreSQL wiring", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -105,6 +109,36 @@ describe("createCliAgentRuntime PostgreSQL wiring", () => {
         agentState: "dead",
         terminationReason: "crashed",
       });
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("preflights the PTY dependency without creating durable session residue", async () => {
+    const loadError = new Error("node-pty native module missing");
+    const fakeStore = Object.assign(new EventEmitter(), {
+      flush: vi.fn(async () => {}),
+      createSession: vi.fn(),
+      updateSession: vi.fn(),
+      getSession: vi.fn(),
+    }) as unknown as CliSessionStore;
+    const manager = new CliSessionManager({
+      registry: new CliAdapterRegistry(),
+      store: fakeStore,
+      loadPty: vi.fn(async () => {
+        throw loadError;
+      }),
+    });
+
+    try {
+      await expect(manager.preflightPtyRuntime()).rejects.toMatchObject({
+        name: CliPtyPreflightError.name,
+        code: CCC_NATIVE_CLI_PTY_PREFLIGHT_FAILED_CODE,
+        message: expect.stringContaining(loadError.message),
+      });
+      expect(fakeStore.createSession).not.toHaveBeenCalled();
+      expect(fakeStore.updateSession).not.toHaveBeenCalled();
+      expect(fakeStore.flush).not.toHaveBeenCalled();
     } finally {
       await manager.dispose();
     }

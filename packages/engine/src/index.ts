@@ -372,6 +372,36 @@ export {
 // FNXC:MergerUnification 2026-06-21-19:05: runAiMerge is the sole merge path
 // (master-plan U0); exported for the CLI callers (fn task merge + UI-only merge).
 export { runAiMerge } from "./merger-ai.js";
+export {
+  CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_CODE,
+  CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON,
+  CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_CODE,
+  CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON,
+  approveCccCampaignLiveExecution,
+  approveCccCampaignMerge,
+  computeCccCampaignLiveExecutionApprovalConfirmation,
+  computeCccCampaignMergeApprovalConfirmation,
+  issueCccCampaignLiveExecutionApproval,
+  issueCccCampaignMergeApproval,
+  requireCccCampaignLiveExecutionApproval,
+  requireCccCampaignMergeApproval,
+  type ApproveCccCampaignLiveExecutionInput,
+  type ApproveCccCampaignMergeInput,
+  type IssueCccCampaignLiveExecutionApprovalInput,
+  type IssueCccCampaignMergeApprovalInput,
+} from "./ccc-campaign-product-control.js";
+export {
+  CCC_CAMPAIGN_OPERATOR_PAUSED_REASON,
+  CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX,
+  CccCampaignOperatorControlError,
+  applyCccCampaignOperatorControl,
+  computeCccCampaignOperatorControlConfirmation,
+  describeCccCampaignOperatorControls,
+  type ApplyCccCampaignOperatorControlInput,
+  type CccCampaignOperatorControlAction,
+  type CccCampaignOperatorControlDescriptor,
+  type CccCampaignOperatorControlResult,
+} from "./ccc-campaign-operator-control.js";
 // FNXC:Workspace 2026-06-22-14:10 (Phase D review G): canonical landed predicate now lives in its
 // own dependency-free module (self-healing ↔ merger-ai cycle dissolved). Public export preserved.
 export { isRepoLanded } from "./workspace-land-predicate.js";
@@ -1204,3 +1234,23 @@ export type {
   CccCampaignEngineProviderControllerInput,
 } from "./ccc-campaign-provider-controller.js";
 export * from "./ccc-prd/index.js";
+export {
+  CccPrdIntakeError,
+  discoverCccPrdCandidates,
+  freezeCccPrdPacket,
+  type CccPrdDiscoveryCandidate,
+  type CccPrdDiscoveryCandidateScore,
+  type CccPrdDiscoveryResult,
+  type CccPrdFreezeReceiptEntry,
+  type CccPrdFreezeResult,
+  type CccPrdFreezeUnresolvedReference,
+  type CccPrdProjectDiscovery,
+} from "./ccc-prd/intake.js";
+export {
+  CCC_PRD_INTAKE_CONTRACT_SCHEMA_VERSION,
+  lintCccPrdIntakeMarkdown,
+  renderCccPrdIntakeTemplate,
+  type CccPrdIntakeContractFinding,
+  type CccPrdIntakeLintResult,
+  type LintCccPrdIntakeMarkdownInput,
+} from "./ccc-prd/intake-contract.js";

@@ -708,7 +708,7 @@ campaignPgDescribe("AsyncDataLayer: CCC campaign run-audit receipts", () => {
       actionId,
       actionTarget,
     );
-    await importCccPrdBundle({
+    const imported = await importCccPrdBundle({
       bundle: source,
       executionPolicy: createCccPrdImportTestExecutionPolicy(source),
       idempotencyKey: `run-audit-custody-${suffix}`,
@@ -716,8 +716,16 @@ campaignPgDescribe("AsyncDataLayer: CCC campaign run-audit receipts", () => {
       layer: h.layer(),
       rootDir: h.rootDir(),
     });
+    const [taskEntity] = await h.layer().db.execute(sql`
+      SELECT native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${imported.importId}
+        AND entity_type = 'task'
+        AND entity_id = ${`TASK-${suffix}`}
+    `) as unknown as Array<{ native_id: string }>;
+    expect(taskEntity).toBeDefined();
     const context = await (h.store() as unknown as CampaignContextStore)
-      .getCccCampaignContextForTask(`TASK-${suffix}`);
+      .getCccCampaignContextForTask(taskEntity!.native_id);
     expect(context).not.toBeNull();
     return createCccCampaignAuthorityBinding(context!, {
       actionId,

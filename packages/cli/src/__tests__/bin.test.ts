@@ -130,6 +130,7 @@ const commandMocks = vi.hoisted(() => ({
   runResearchExport: vi.fn(),
   runResearchCancel: vi.fn(),
   runResearchRetry: vi.fn(),
+  runPrdCommand: vi.fn(),
 }));
 
 const onboardEnv = vi.hoisted(() => ({
@@ -318,6 +319,10 @@ vi.mock("../commands/research.js", () => ({
   runResearchExport: commandMocks.runResearchExport,
   runResearchCancel: commandMocks.runResearchCancel,
   runResearchRetry: commandMocks.runResearchRetry,
+}));
+
+vi.mock("../commands/prd.js", () => ({
+  runPrdCommand: commandMocks.runPrdCommand,
 }));
 
 const originalArgv = process.argv;
@@ -652,6 +657,19 @@ describe("bin command routing and fallbacks", () => {
 
     expect(commandMocks.runTaskList).toHaveBeenCalledWith("alpha");
     expect(commandMocks.runSettingsShow).toHaveBeenCalledWith("alpha");
+  });
+
+  it("passes extracted --project into the stateful PRD command context", async () => {
+    commandMocks.runPrdCommand.mockResolvedValue(0);
+
+    await runBin(["prd", "inspect", "operator-key", "--project", "alpha"]);
+
+    expect(commandMocks.runPrdCommand).toHaveBeenCalledWith(
+      ["inspect", "operator-key"],
+      undefined,
+      undefined,
+      { projectName: "alpha" },
+    );
   });
 
   it("routes mission create with multi-word description and project flag", async () => {

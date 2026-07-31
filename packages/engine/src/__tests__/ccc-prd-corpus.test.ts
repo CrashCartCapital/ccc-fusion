@@ -28,6 +28,7 @@ const ccc = engine as typeof engine & {
     rootDir: string;
     manifestPath: string;
     sidecarPath: string;
+    requireMaterialCoverage?: boolean;
   }): CccPrdSemanticBundle | { kind: "refusal"; diagnostics: unknown[] };
 };
 
@@ -82,8 +83,10 @@ describe("ccc-prd admitted ccc-lab-super oracle", () => {
       ],
     });
     const legacyProjection = structuredClone(authored.sidecar) as {
+      materialCoverage?: unknown;
       proofs: Array<{ admission?: unknown }>;
     };
+    delete legacyProjection.materialCoverage;
     expect(legacyProjection.proofs).toHaveLength(3);
     for (const proof of legacyProjection.proofs) {
       expect(proof.admission).toMatchObject({
@@ -100,39 +103,20 @@ describe("ccc-prd admitted ccc-lab-super oracle", () => {
     );
   });
 
-  it("compiles exact non-zero entity counts and stable real-packet identities", () => {
+  it("refuses the historical three-requirement projection as implausibly shallow", () => {
     const result = ccc.compileCccPrdPacket({
       rootDir: fixture.pathname,
       manifestPath,
       sidecarPath,
+      requireMaterialCoverage: true,
     });
-    expect(result.kind).toBe("bundle");
-    const bundle = result as CccPrdSemanticBundle;
-    expect({
-      sources: bundle.orderedSources.length,
-      requirements: bundle.requirements.length,
-      proofs: bundle.proofs.length,
-      tasks: bundle.tasks.length,
-      edges: bundle.edges.length,
-      workflows: bundle.workflows.length,
-      documents: bundle.documents.length,
-      artifacts: bundle.artifacts.length,
-      importIntents: bundle.importIntents.length,
-      protectedActions: bundle.protectedActions.length,
-    }).toEqual({
-      sources: 18,
-      requirements: 3,
-      proofs: 3,
-      tasks: 3,
-      edges: 2,
-      workflows: 1,
-      documents: 1,
-      artifacts: 1,
-      importIntents: 12,
-      protectedActions: 2,
+    expect(result.kind).toBe("refusal");
+    expect(result).toMatchObject({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "CCC_PRD_EXTRACTION_IMPLAUSIBLY_SHALLOW" }),
+        expect.objectContaining({ code: "CCC_PRD_MATERIAL_SECTION_UNDISPOSITIONED" }),
+        expect.objectContaining({ code: "CCC_PRD_SOURCE_REQUIREMENT_UNDISPOSITIONED" }),
+      ]),
     });
-    expect(bundle.sourceHash).toBe("6dec9877961c1055ae8210daabbf707a2893248f353220d0f9801958b3a47b39");
-    expect(bundle.sidecarHash).toBe("644624afede709b457a075094df0c4b69072ca1823422e94fa2429449b039ed8");
-    expect(bundle.bundleHash).toBe("3efeb73b93826a24098a34919222c27a4235c29635b3bfa37b945e9e6dbe629e");
   });
 });

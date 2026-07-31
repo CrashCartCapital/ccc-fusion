@@ -9,6 +9,19 @@ export function isImportedCccCampaignTask(task: Pick<Task, "lineageId">): boolea
     && /^ccc-prd:[0-9a-f]{24}:.+$/u.test(task.lineageId);
 }
 
+/**
+ * Unified task-profile detection for campaign safety boundaries.
+ *
+ * Imported product tasks are identified by compiler-owned lineage. The custom
+ * field remains supported for pre-product campaign tasks and focused fixtures.
+ */
+export function isCccCampaignTask(
+  task: Pick<Task, "customFields" | "lineageId">,
+): boolean {
+  return task.customFields?.cccFusionProfile === "ccc-fusion"
+    || isImportedCccCampaignTask(task);
+}
+
 /** The imported workflow-item shape is the native processor admission marker. */
 export function isImportedCccCampaignWorkItem(workItem: WorkflowWorkItem): boolean {
   return workItem.kind === "task"

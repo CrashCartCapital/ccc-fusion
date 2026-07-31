@@ -517,13 +517,14 @@ async function assertCampaignBindingMatchesPersistedCustody(
       `Task ${binding.taskId} has no exact persisted campaign execution route`,
     );
   }
-  const context: CccCampaignContext = {
+  const context: CccCampaignContext & { semanticTaskId: string } = {
     schema: CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
     projectId: manifest.projectId,
     importId: manifest.importId,
     idempotencyKey: manifest.idempotencyKey,
     campaignId: manifest.campaignId,
     taskId: binding.taskId,
+    semanticTaskId: row.semanticTaskId,
     packetHash: manifest.packetHash,
     sidecarHash: manifest.sidecarHash,
     bundleHash: manifest.bundleHash,

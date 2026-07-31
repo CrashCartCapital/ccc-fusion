@@ -109,6 +109,21 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
   afterEach(h.afterEach);
   afterAll(h.afterAll);
 
+  async function nativeTaskIdForImport(
+    importId: string,
+    semanticTaskId: string,
+  ): Promise<string> {
+    const rows = await h.layer().db.execute(sql`
+      SELECT native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${importId}
+        AND entity_type = 'task'
+        AND entity_id = ${semanticTaskId}
+    `) as unknown as Array<{ native_id: string }>;
+    expect(rows).toHaveLength(1);
+    return rows[0]!.native_id;
+  }
+
   async function context(
     suffix: string,
     bounds: Readonly<{ maxRequests: number; maxDurationMs: number; maxConcurrency: number }> = {
@@ -120,7 +135,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       ...bundle(h.rootDir(), suffix),
       bounds,
     });
-    await importCccPrdBundle({
+    const imported = await importCccPrdBundle({
       bundle: source,
       idempotencyKey: `provider-attempt-${suffix}`,
       store: h.store(),
@@ -135,10 +150,12 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
             })),
           },
     });
-    const taskId = `TASK-${suffix}`;
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error(`missing campaign context for ${taskId}`);
-    return { taskId, campaign, source };
+    expect(campaign).toMatchObject({ taskId, semanticTaskId });
+    return { taskId, semanticTaskId, campaign, source };
   }
 
   async function protectedContext(suffix: string) {
@@ -163,7 +180,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
         spans: [initial.tasks[0]!.spans[0]!],
       }],
     });
-    await importCccPrdBundle({
+    const imported = await importCccPrdBundle({
       bundle: source,
       idempotencyKey: `provider-attempt-protected-${suffix}`,
       store: h.store(),
@@ -171,9 +188,11 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       rootDir: h.rootDir(),
       executionPolicy: createCccPrdImportTestExecutionPolicy(source),
     });
-    const taskId = `TASK-${suffix}`;
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error(`missing protected campaign context for ${taskId}`);
+    expect(campaign).toMatchObject({ taskId, semanticTaskId });
     const issued = await issueCccCampaignApproval(h.layer(), {
       authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
       requester: providerWorker, runId: `issue-provider-settlement-${suffix}`,
@@ -184,7 +203,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       authorityStore: h.store(), rootDir: h.rootDir(), taskId, action,
       claimant: providerWorker, runId: `claim-provider-settlement-${suffix}`, claimToken,
     });
-    return { taskId, action, issued, claimToken };
+    return { taskId, semanticTaskId, action, issued, claimToken };
   }
 
   function request(

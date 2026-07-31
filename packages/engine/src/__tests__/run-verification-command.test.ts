@@ -1,5 +1,16 @@
 import { describe, it, expect, vi } from "vitest";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BOUNDED_VERIFICATION_GUIDANCE,
@@ -19,6 +30,8 @@ import {
 // `shell: true` (Node picks cmd.exe on Windows, /bin/sh on POSIX).
 const onPosix = process.platform !== "win32";
 const itPosix = onPosix ? it : it.skip;
+const onDarwin = process.platform === "darwin";
+const itDarwin = onDarwin ? it : it.skip;
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -46,7 +59,7 @@ function sleep(ms: number): Promise<void> {
 // $TMPDIR (e.g. /var/folders/.../T on macOS). On Windows /tmp does not exist
 // so we fall back to os.tmpdir() which is always C:\Users\…\Temp there.
 describe("runVerificationCommand", { timeout: 30000 }, () => {
-  const tempDir = onPosix ? "/tmp" : tmpdir();
+  const tempDir = onPosix ? mkdtempSync(join("/tmp", "fusion-verifier-test-")) : tmpdir();
   const workspaceRoot = fileURLToPath(new URL("../../../../", import.meta.url));
 
   describe("command normalization", () => {
@@ -314,6 +327,47 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
   });
 
+  describe("tool cwd custody", () => {
+    function tool() {
+      return createRunVerificationTool({
+        worktreePath: tempDir,
+        rootDir: workspaceRoot,
+        taskId: "FN-CWD-CUSTODY",
+        recordActivity: vi.fn(),
+        onVerificationStart: vi.fn(),
+        onVerificationEnd: vi.fn(),
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      });
+    }
+
+    it.each([
+      ["relative parent escape", ".."],
+      ["absolute outside path", tmpdir()],
+    ])("refuses %s before granting a writable sandbox root", async (_label, cwd) => {
+      await expect(tool().execute("call-cwd-refusal", {
+        command: "exit 0",
+        scope: "package",
+        cwd,
+      })).rejects.toThrow(/canonical worktree/i);
+    });
+
+    itDarwin("allows a canonical existing package directory inside the worktree", async () => {
+      const packageDir = join(tempDir, "package-cwd");
+      mkdirSync(packageDir, { recursive: true });
+
+      const result = await tool().execute("call-cwd-admitted", {
+        command: "pwd",
+        scope: "package",
+        cwd: "package-cwd",
+      });
+
+      expect(result.details).toEqual(expect.objectContaining({
+        success: true,
+        cwd: realpathSync(packageDir),
+      }));
+    });
+  });
+
   describe("basic command execution", () => {
     it("executes a simple echo command and captures output", async () => {
       const onHeartbeat = vi.fn();
@@ -363,6 +417,284 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
 
       expect(result.success).toBe(true);
       expect(result.exitCode).toBe(3);
+    });
+  });
+
+  describe("environment hygiene", () => {
+    itPosix("passes only the deterministic local verification environment", async () => {
+      const plantedEnv = {
+        LANG: "C",
+        LC_ALL: "C",
+        DATABASE_URL: "postgresql://fusion:planted-password@127.0.0.1/fusion",
+        OPENAI_API_KEY: "planted-openai-key-7db561e55b65",
+        MCPJUNGLE_TOKEN: "planted-broker-token-7db561e55b65",
+        AWS_SECRET_ACCESS_KEY: "planted-provider-secret-7db561e55b65",
+        NODE_OPTIONS: "--no-warnings",
+        BASH_ENV: "/tmp/fusion-verifier-unsafe-bash-env",
+        ENV: "/tmp/fusion-verifier-unsafe-shell-env",
+        GIT_CONFIG_COUNT: "0",
+        NPM_CONFIG_USERCONFIG: "/tmp/fusion-verifier-unsafe-npmrc",
+      } as const;
+      const originalEnv = Object.fromEntries(
+        Object.keys(plantedEnv).map((key) => [key, process.env[key]]),
+      );
+      Object.assign(process.env, plantedEnv);
+
+      try {
+        const observedKeys = [
+          "PATH",
+          "LANG",
+          "LC_ALL",
+          "CI",
+          "COREPACK_ENABLE_DOWNLOAD_PROMPT",
+          "GIT_TERMINAL_PROMPT",
+          "GCM_INTERACTIVE",
+          "DATABASE_URL",
+          "OPENAI_API_KEY",
+          "MCPJUNGLE_TOKEN",
+          "AWS_SECRET_ACCESS_KEY",
+          "NODE_OPTIONS",
+          "BASH_ENV",
+          "ENV",
+          "GIT_CONFIG_COUNT",
+          "NPM_CONFIG_USERCONFIG",
+        ];
+        const script = [
+          `const keys = ${JSON.stringify(observedKeys)};`,
+          "process.stdout.write(JSON.stringify(Object.fromEntries(keys.map((key) => [key, process.env[key]]))));",
+        ].join(" ");
+        const result = await runVerificationCommand({
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          cwd: tempDir,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+        });
+        const childEnv = JSON.parse(result.stdout) as Record<string, string>;
+
+        expect(result.success).toBe(true);
+        expect(childEnv.PATH).toBe(process.env.PATH);
+        expect(childEnv.LANG).toBe("C");
+        expect(childEnv.LC_ALL).toBe("C");
+        expect(childEnv.CI).toBe("1");
+        expect(childEnv.COREPACK_ENABLE_DOWNLOAD_PROMPT).toBe("0");
+        expect(childEnv.GIT_TERMINAL_PROMPT).toBe("0");
+        expect(childEnv.GCM_INTERACTIVE).toBe("never");
+        expect(childEnv).not.toHaveProperty("DATABASE_URL");
+        expect(childEnv).not.toHaveProperty("OPENAI_API_KEY");
+        expect(childEnv).not.toHaveProperty("MCPJUNGLE_TOKEN");
+        expect(childEnv).not.toHaveProperty("AWS_SECRET_ACCESS_KEY");
+        expect(childEnv).not.toHaveProperty("NODE_OPTIONS");
+        expect(childEnv).not.toHaveProperty("BASH_ENV");
+        expect(childEnv).not.toHaveProperty("ENV");
+        expect(childEnv).not.toHaveProperty("GIT_CONFIG_COUNT");
+        expect(childEnv).not.toHaveProperty("NPM_CONFIG_USERCONFIG");
+      } finally {
+        for (const [key, value] of Object.entries(originalEnv)) {
+          if (value === undefined) {
+            delete process.env[key];
+          } else {
+            process.env[key] = value;
+          }
+        }
+      }
+    });
+
+    itPosix("redacts known excluded values from captured output and line callbacks", async () => {
+      const envKey = "FUSION_PROVIDER_TOKEN";
+      const sensitiveValue = "planted-verifier-token-94eb2f87f7f8";
+      const proofDigest = "a".repeat(64);
+      const originalValue = process.env[envKey];
+      process.env[envKey] = sensitiveValue;
+
+      try {
+        const encodedValue = Buffer.from(sensitiveValue, "utf8").toString("base64");
+        const script = [
+          `const value = Buffer.from(${JSON.stringify(encodedValue)}, "base64").toString("utf8");`,
+          `const digest = ${JSON.stringify(proofDigest)};`,
+          'process.stdout.write("stdout:" + value + "\\ndigest:" + digest + "\\n");',
+          'process.stderr.write("stderr:" + value + "\\n");',
+        ].join(" ");
+        const onLine = vi.fn();
+        const result = await runVerificationCommand({
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          cwd: tempDir,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+          onLine,
+        });
+        const callbackText = onLine.mock.calls.flat().join("");
+
+        expect(result.success).toBe(true);
+        expect(result.stdout).toContain("stdout:[REDACTED]");
+        expect(result.stderr).toContain("stderr:[REDACTED]");
+        expect(callbackText).toContain("[REDACTED]");
+        expect(result.stdout).toContain(`digest:${proofDigest}`);
+        expect(result.stdout).not.toContain(sensitiveValue);
+        expect(result.stderr).not.toContain(sensitiveValue);
+        expect(callbackText).not.toContain(sensitiveValue);
+      } finally {
+        if (originalValue === undefined) {
+          delete process.env[envKey];
+        } else {
+          process.env[envKey] = originalValue;
+        }
+      }
+    });
+  });
+
+  describe("verifier confinement", () => {
+    itDarwin("denies writes outside the verifier cwd while allowing normal cwd writes", async () => {
+      const cwd = mkdtempSync(join(tempDir, "fusion-verifier-cwd-"));
+      const outside = mkdtempSync(join(tempDir, "fusion-verifier-outside-"));
+      const allowedPath = join(cwd, "allowed.txt");
+      const outsidePath = join(outside, "outside.txt");
+      const script = [
+        `const fs = require("node:fs");`,
+        `fs.writeFileSync(${JSON.stringify(allowedPath)}, "allowed");`,
+        `try { fs.writeFileSync(${JSON.stringify(outsidePath)}, "outside"); }`,
+        `catch (error) { console.error(String(error && error.code || error)); process.exit(13); }`,
+        `process.stdout.write("outside-write-succeeded");`,
+      ].join(" ");
+
+      try {
+        const result = await runVerificationCommand({
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          cwd,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+          bypassVerificationSlot: true,
+        });
+
+        expect(readFileSync(allowedPath, "utf8")).toBe("allowed");
+        expect(result.success).toBe(false);
+        expect(result.exitCode).toBe(13);
+        expect(result.stdout).not.toContain("outside-write-succeeded");
+        expect(existsSync(outsidePath)).toBe(false);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(outside, { recursive: true, force: true });
+      }
+    });
+
+    itDarwin("isolates HOME and denies protected host-home reads", async () => {
+      const cwd = mkdtempSync(join(tempDir, "fusion-verifier-home-cwd-"));
+      const protectedHome = mkdtempSync(join(tempDir, "fusion-verifier-home-"));
+      const protectedFile = join(protectedHome, "protected-token.txt");
+      const secret = "planted-verifier-home-secret-42dd5f5d";
+      const originalHome = process.env.HOME;
+      writeFileSync(protectedFile, secret);
+      process.env.HOME = protectedHome;
+      const script = [
+        `const fs = require("node:fs");`,
+        `process.stdout.write("HOME=" + process.env.HOME + "\\n");`,
+        `try { process.stdout.write(fs.readFileSync(${JSON.stringify(protectedFile)}, "utf8")); }`,
+        `catch (error) { console.error(String(error && error.code || error)); process.exit(14); }`,
+      ].join(" ");
+
+      try {
+        const result = await runVerificationCommand({
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          cwd,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+          bypassVerificationSlot: true,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.exitCode).toBe(14);
+        expect(result.stdout).not.toContain(protectedHome);
+        expect(result.stdout).not.toContain(secret);
+      } finally {
+        if (originalHome === undefined) {
+          delete process.env.HOME;
+        } else {
+          process.env.HOME = originalHome;
+        }
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(protectedHome, { recursive: true, force: true });
+      }
+    });
+
+    itDarwin("denies nested protected-directory reads when the verifier cwd is inside HOME", async () => {
+      const protectedHome = mkdtempSync(join(tempDir, "fusion-verifier-nested-home-"));
+      const cwd = join(protectedHome, "workspace", "package");
+      const nestedProtectedDir = join(protectedHome, "workspace", "other", "_secrets");
+      const protectedFile = join(nestedProtectedDir, "token.txt");
+      const secret = "planted-verifier-nested-secret-46c4f75e";
+      const originalHome = process.env.HOME;
+      mkdirSync(cwd, { recursive: true });
+      mkdirSync(nestedProtectedDir, { recursive: true });
+      writeFileSync(protectedFile, secret);
+      process.env.HOME = protectedHome;
+      const script = [
+        `const fs = require("node:fs");`,
+        `try { process.stdout.write(fs.readFileSync(${JSON.stringify(protectedFile)}, "utf8")); }`,
+        `catch (error) { console.error(String(error && error.code || error)); process.exit(16); }`,
+      ].join(" ");
+
+      try {
+        const result = await runVerificationCommand({
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          cwd,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+          bypassVerificationSlot: true,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.exitCode).toBe(16);
+        expect(result.stdout).not.toContain(secret);
+      } finally {
+        if (originalHome === undefined) {
+          delete process.env.HOME;
+        } else {
+          process.env.HOME = originalHome;
+        }
+        rmSync(protectedHome, { recursive: true, force: true });
+      }
+    });
+
+    itDarwin("denies verifier network connections", async () => {
+      const cwd = mkdtempSync(join(tempDir, "fusion-verifier-network-cwd-"));
+      const server = createServer((socket) => {
+        socket.on("error", () => {
+          // The denied client path may reset while the server is closing.
+        });
+        socket.end("connected");
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => resolve());
+      });
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("expected TCP listener address");
+      }
+      const script = [
+        `const net = require("node:net");`,
+        `const socket = net.connect({ host: "127.0.0.1", port: ${address.port} });`,
+        `socket.setTimeout(1500);`,
+        `socket.on("connect", () => { process.stdout.write("network-connected"); socket.end(); process.exit(0); });`,
+        `socket.on("timeout", () => { console.error("network-timeout"); socket.destroy(); process.exit(15); });`,
+        `socket.on("error", (error) => { console.error(String(error && error.code || error)); process.exit(15); });`,
+      ].join(" ");
+
+      try {
+        const result = await runVerificationCommand({
+          command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+          cwd,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+          bypassVerificationSlot: true,
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.exitCode).toBe(15);
+        expect(result.stdout).not.toContain("network-connected");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        rmSync(cwd, { recursive: true, force: true });
+      }
     });
   });
 
@@ -589,8 +921,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       expect(result.stdout).toContain("test1");
     });
 
-    itPosix("executes commands with environment variables (POSIX shell)", async () => {
-      // POSIX shell expansion ($USER) differs from Windows (%USERNAME%).
+    itPosix("executes commands with shell-local environment variables (POSIX shell)", async () => {
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
         command: "FUSION_TEST_ENV=fusion-test; export FUSION_TEST_ENV; printf '%s\\n' \"$FUSION_TEST_ENV\"",
@@ -603,6 +934,19 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
 
       expect(result.success).toBe(true);
       expect(result.stdout.trim()).toBe("fusion-test");
+    });
+
+    itPosix("executes commands with allowlisted locale variables (POSIX shell)", async () => {
+      const result = await runVerificationCommand({
+        command: "echo $LANG",
+        cwd: tempDir,
+        timeoutMs: 30000,
+        onHeartbeat: vi.fn(),
+      });
+
+      expect(result.success).toBe(true);
+      // Should have output (LANG is part of the deterministic allowlist).
+      expect(result.stdout.trim().length).toBeGreaterThan(0);
     });
   });
 });

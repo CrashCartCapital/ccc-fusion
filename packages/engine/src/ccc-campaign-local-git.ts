@@ -42,6 +42,7 @@ const KNOWN_GIT_BUILTINS = new Set([
   "ls-tree",
   "merge-base",
   "merge-tree",
+  "read-tree",
   "rev-parse",
   "update-ref",
   "worktree",
@@ -78,6 +79,8 @@ type CccCampaignPhysicalIdentity = Readonly<{
 export type InspectCccCampaignLocalGitInput = Readonly<{
   targetRoot: string;
   expectedBaseObject: string;
+  expectedHeadObject?: string;
+  expectedCheckoutObject?: string;
 }>;
 
 export type CccCampaignLocalGitSnapshot = Readonly<{
@@ -245,7 +248,12 @@ function runGitRaw(
   signal?.throwIfAborted();
   requireKnownGitBuiltin(args);
   return new Promise((resolveOutput, reject) => {
-    const gitArgs = ["-c", "core.fsmonitor=false"];
+    const gitArgs = [
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      `core.hooksPath=${devNull}`,
+    ];
     if (args[0] === "ls-files" && args.includes("--others")) {
       gitArgs.push("-c", "core.untrackedCache=false");
     }
@@ -1071,6 +1079,12 @@ async function inspectCccCampaignLocalGitWithAuthority(
     input.expectedBaseObject,
     "expected base object",
   );
+  const expectedHeadObject = input.expectedHeadObject === undefined
+    ? undefined
+    : requireCanonicalObjectId(input.expectedHeadObject, "expected HEAD object");
+  const expectedCheckoutObject = input.expectedCheckoutObject === undefined
+    ? undefined
+    : requireCanonicalObjectId(input.expectedCheckoutObject, "expected checkout object");
   const targetRoot = await resolvePhysicalPath(input.targetRoot, "target root");
   const gitControlPath = join(targetRoot, ".git");
   const initialTargetRootIdentity = await captureStatIdentity(
@@ -1220,6 +1234,11 @@ async function inspectCccCampaignLocalGitWithAuthority(
     ),
     "HEAD",
   );
+  if (expectedHeadObject !== undefined && head !== expectedHeadObject) {
+    throw new CccCampaignLocalGitError(
+      "CCC campaign HEAD does not match the exact expected HEAD object",
+    );
+  }
   try {
     await runGit(
       gitBinary,
@@ -1240,7 +1259,7 @@ async function inspectCccCampaignLocalGitWithAuthority(
   await assertCleanGitSample(
     gitBinary,
     targetRoot,
-    head,
+    expectedCheckoutObject ?? head,
     environment,
     signal,
   );
@@ -1263,7 +1282,7 @@ async function inspectCccCampaignLocalGitWithAuthority(
   await assertCleanGitSample(
     gitBinary,
     targetRoot,
-    head,
+    expectedCheckoutObject ?? head,
     environment,
     signal,
   );

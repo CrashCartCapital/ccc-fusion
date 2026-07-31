@@ -24,6 +24,21 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     await h.afterEach();
   }); afterAll(h.afterAll);
 
+  async function nativeTaskIdForImport(
+    importId: string,
+    semanticTaskId: string,
+  ): Promise<string> {
+    const rows = await h.layer().db.execute(sql`
+      SELECT native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${importId}
+        AND entity_type = 'task'
+        AND entity_id = ${semanticTaskId}
+    `) as unknown as Array<{ native_id: string }>;
+    expect(rows).toHaveLength(1);
+    return rows[0]!.native_id;
+  }
+
   async function fixture(
     suffix: string,
     options: Readonly<{ protectedActions?: TestBundle["protectedActions"]; taskProtectedActionIds?: readonly string[]; issueApproval?: boolean; baseCommit?: string }> = {},
@@ -37,10 +52,12 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
       tasks: initial.tasks.map((task, index) => index === 0 ? { ...task, protectedActionIds: [...(options.taskProtectedActionIds ?? ["ACTION-LIVE-EXECUTION"])] } : task),
       protectedActions,
     });
-    await importCccPrdBundle({ bundle: source, idempotencyKey: `controller-${suffix}`, store: h.store(), layer: h.layer(), rootDir: h.rootDir(), executionPolicy: createCccPrdImportTestExecutionPolicy(source) });
-    const taskId = `TASK-${suffix}`;
+    const imported = await importCccPrdBundle({ bundle: source, idempotencyKey: `controller-${suffix}`, store: h.store(), layer: h.layer(), rootDir: h.rootDir(), executionPolicy: createCccPrdImportTestExecutionPolicy(source) });
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error("missing campaign");
+    expect(campaign).toMatchObject({ taskId, semanticTaskId });
     const action = { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate", requireProtected: true };
     const issued = options.issueApproval === false
       ? ({ id: `approval-${suffix}` } as Awaited<ReturnType<typeof issueCccCampaignApproval>>)
@@ -49,7 +66,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     if (options.issueApproval !== false) {
       await claimCccCampaignApproval(h.layer(), { authorityStore: h.store(), rootDir: h.rootDir(), taskId, action, claimant: worker, runId: `claim-${suffix}`, claimToken });
     }
-    return { taskId, campaign, issued, claimToken };
+    return { taskId, semanticTaskId, campaign, issued, claimToken };
   }
 
   function input(f: Awaited<ReturnType<typeof fixture>>, suffix: string) {
@@ -333,7 +350,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
           spans: [initial.tasks[0]!.spans[0]!],
         }],
       });
-      await importCccPrdBundle({
+      const imported = await importCccPrdBundle({
         bundle: source,
         idempotencyKey: `invalid-task-action-${suffix}`,
         store: h.store(),
@@ -341,7 +358,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
         rootDir: h.rootDir(),
         executionPolicy: createCccPrdImportTestExecutionPolicy(source),
       });
-      return `TASK-${suffix}`;
+      return nativeTaskIdForImport(imported.importId, `TASK-${suffix}`);
     }
 
     const missing = await fixture("missing-task-action-id", {

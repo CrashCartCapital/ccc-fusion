@@ -79,6 +79,7 @@ import {
   TASK_WEDGE_NOTIFICATION_VERSION,
   CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
   CCC_CAMPAIGN_GOVERNANCE_VERSION,
+  CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -218,15 +219,18 @@ describe("schema-applier: immutable migration identities", () => {
     expect(applierSource).toMatch(/applied\.includes\(\s*BIGINT_COUNTERS_VERSION\s*\)/);
   });
 
-  it("registers the complete campaign-governance migration at 0037", () => {
+  it("registers campaign governance at 0037 and proof attempts at 0038", () => {
     expect(CCC_CAMPAIGN_GOVERNANCE_VERSION).toBe("0037");
-    expect(SCHEMA_BASELINE_VERSION).toBe("0037");
+    expect(CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION).toBe("0038");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0038");
     const applierSource = readFileSync(
       fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
       "utf8",
     );
     expect(applierSource).toContain("0037_ccc_campaign_governance.sql");
+    expect(applierSource).toContain("0038_ccc_campaign_proof_attempts.sql");
     expect(applierSource).toMatch(/cccCampaignGovernanceAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_GOVERNANCE_VERSION\s*,?\s*\)/);
+    expect(applierSource).toMatch(/cccCampaignProofAttemptsAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION\s*,?\s*\)/);
   });
 });
 
@@ -652,7 +656,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 100 project tables, 18 central tables, 1 archive table", async () => {
+  it("creates all 101 project tables, 18 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -672,9 +676,9 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 1 configuration_revisions (FNXC:ConfigVersioning 2026-07-18-14:00)
     // + 2 ideation_sessions/ideation_candidates (FNXC:Ideation 2026-07-18-13:25 / FN-8295)
     // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
-    // + 1 ccc_effect_receipts table, its authority turn, and 3 CCC PRD custody tables.
+    // + 1 ccc_effect_receipts table, its authority turn, 3 CCC PRD custody tables, and 1 exact-commit proof-attempt table.
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(100);
+    expect(bySchema.project).toBe(101);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -2520,11 +2524,12 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
     // through 0033, but no v2 receipt table or 0034 marker.
     await ctx.db.execute(sql.raw(`
       DROP TABLE IF EXISTS project.ccc_effect_receipts;
-      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0034', '0037');
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0034', '0037', '0038');
     `));
     expect(await getAppliedMigrations(ctx.db)).toContain("0033");
     expect(await getAppliedMigrations(ctx.db)).not.toContain("0034");
     expect(await getAppliedMigrations(ctx.db)).not.toContain("0037");
+    expect(await getAppliedMigrations(ctx.db)).not.toContain("0038");
     const before = (await ctx.db.execute(sql`
       SELECT to_regclass('project.ccc_effect_receipts') AS receipt_table
     `)) as unknown as Array<{ receipt_table: string | null }>;
@@ -2533,6 +2538,7 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
     expect(await getAppliedMigrations(ctx.db)).toContain("0034");
     expect(await getAppliedMigrations(ctx.db)).toContain("0037");
+    expect(await getAppliedMigrations(ctx.db)).toContain("0038");
 
     const catalog = (await ctx.db.execute(sql`
       SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,
@@ -2646,6 +2652,79 @@ pgDescribe("schema-applier: CCC effect-receipt 0033 to 0034 upgrade", () => {
     freshCtx = await setupFreshDb();
     await applySchemaBaseline(freshCtx.db, { pluginHooks: [] });
     expect(await receiptShape(ctx)).toEqual(await receiptShape(freshCtx));
+  });
+});
+
+/*
+FNXC:CCCCampaignProofAttempts 2026-07-30-20:15:
+The fresh baseline cannot prove an existing 0037 campaign database receives
+the crash-safe proof process receipt. Reconstruct that exact upgrade boundary
+and require the real applier to install the constrained, project-scoped table.
+*/
+pgDescribe("schema-applier: CCC proof-attempt 0037 to 0038 upgrade", () => {
+  let ctx: TestContext | null = null;
+
+  afterEach(async () => {
+    await teardownDb(ctx);
+    ctx = null;
+  });
+
+  it("upgrades a 0037 database with forced-RLS exact-commit proof receipts", async () => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db, { pluginHooks: [] });
+    await ctx.db.execute(sql.raw(`
+      DROP TABLE IF EXISTS project.ccc_campaign_proof_attempts;
+      DELETE FROM public.fusion_schema_migrations WHERE version = '0038';
+    `));
+    expect(await getAppliedMigrations(ctx.db)).toContain("0037");
+    expect(await getAppliedMigrations(ctx.db)).not.toContain("0038");
+
+    expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(true);
+    expect(await getAppliedMigrations(ctx.db)).toContain("0038");
+
+    const catalog = (await ctx.db.execute(sql`
+      SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,
+        EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'project.ccc_campaign_proof_attempts'::regclass
+            AND conname = 'ccc_campaign_proof_attempts_state_check'
+        ) AS state_check,
+        EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'project.ccc_campaign_proof_attempts'::regclass
+            AND conname = 'ccc_campaign_proof_attempts_result_shape_check'
+        ) AS result_shape_check,
+        EXISTS (
+          SELECT 1 FROM pg_policies
+          WHERE schemaname = 'project'
+            AND tablename = 'ccc_campaign_proof_attempts'
+            AND policyname = 'fusion_project_isolation'
+        ) AS policy,
+        EXISTS (
+          SELECT 1 FROM pg_indexes
+          WHERE schemaname = 'project'
+            AND tablename = 'ccc_campaign_proof_attempts'
+            AND indexname = 'idx_ccc_campaign_proof_attempts_campaign_commit'
+        ) AS lookup_index
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'project' AND c.relname = 'ccc_campaign_proof_attempts'
+    `)) as unknown as Array<{
+      rls: boolean;
+      forced: boolean;
+      state_check: boolean;
+      result_shape_check: boolean;
+      policy: boolean;
+      lookup_index: boolean;
+    }>;
+    expect(catalog).toEqual([{
+      rls: true,
+      forced: true,
+      state_check: true,
+      result_shape_check: true,
+      policy: true,
+      lookup_index: true,
+    }]);
   });
 });
 

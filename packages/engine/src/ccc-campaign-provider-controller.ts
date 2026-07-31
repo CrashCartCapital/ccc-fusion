@@ -59,6 +59,7 @@ type CccCampaignProviderAttemptBindingInput = Readonly<{
   rootDir: string;
   authorityStore: CccCampaignAuthorityStore;
   semanticTaskId: string;
+  nativeTaskId?: string;
   turnKey: string;
   /** PI binds exact resolved route; scoped workflow binds its native transport and extension identity. */
   expectedRoute: Readonly<{ transport: "workflow"; workflowExtensionId: string }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>;
@@ -78,9 +79,15 @@ export async function createCccCampaignProviderAttemptBinding(
   input: CccCampaignProviderAttemptBindingInput & Readonly<{ workflowProviderBinding?: boolean }>,
 ): Promise<CccProviderAttemptBinding | CccCampaignWorkflowProviderBinding> {
   const rootDir = await realpath(input.rootDir);
+  const nativeTaskId = input.nativeTaskId ?? input.semanticTaskId;
   const context = await input.layer.transaction((tx) =>
-    input.authorityStore.getCccCampaignContextForTaskWithinTransaction(tx, input.semanticTaskId));
-  if (!context || context.taskId !== input.semanticTaskId || context.semanticTaskId !== input.semanticTaskId) {
+    input.authorityStore.getCccCampaignContextForTaskWithinTransaction(tx, nativeTaskId));
+  if (
+    !context
+    || context.taskId !== nativeTaskId
+    || context.semanticTaskId !== input.semanticTaskId
+    || context.route.taskId !== input.semanticTaskId
+  ) {
     throw new Error("CCC PI binding requires persisted matching task context");
   }
   if (context.targetRepository.path !== rootDir) {

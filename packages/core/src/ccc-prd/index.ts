@@ -18,8 +18,13 @@ export {
   reconcileCccPrdImport,
 } from "./importer.js";
 export {
+  CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION,
+  inspectCccPrdProductStatus,
+} from "./product-status.js";
+export {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
+  CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
   CCC_PRD_PACKET_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_SCHEMA_VERSION,
@@ -42,8 +47,12 @@ export type {
   CccPrdExecutionBounds,
   CccPrdImportEntityType,
   CccPrdImportIntent,
+  CccPrdImplementationFactBinding,
+  CccPrdImplementationFactProvenance,
   CccPrdManifestEntry,
   CccPrdManifestPacket,
+  CccPrdMaterialCoverageDisposition,
+  CccPrdMaterialCoverageItem,
   CccPrdOperatorDecision,
   CccPrdProof,
   CccPrdProofAdmission,
@@ -86,3 +95,18 @@ export type {
   InspectCccPrdImportInput,
   ReconcileCccPrdImportInput,
 } from "./importer.js";
+export type {
+  CccPrdProductApprovalStatus,
+  CccPrdProductLandingAudit,
+  CccPrdProductLandingMetadata,
+  CccPrdProductNextActionKind,
+  CccPrdProductProviderAttemptStatus,
+  CccPrdProductProofAttemptResult,
+  CccPrdProductProofAttemptStatus,
+  CccPrdProductProofStatus,
+  CccPrdProductStatus,
+  CccPrdProductTaskRoute,
+  CccPrdProductTaskStatus,
+  CccPrdProductWorkItemStatus,
+  InspectCccPrdProductStatusInput,
+} from "./product-status.js";

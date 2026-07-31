@@ -38,6 +38,7 @@ import {
   type CccProviderAttemptScope,
 } from "@fusion/core";
 import { randomUUID } from "node:crypto";
+import { PermanentError } from "../engine-errors.js";
 import { loadPtyModule } from "../pty-native.js";
 import type { IPty } from "node-pty";
 import type { CliAdapterRegistry, CliAgentAdapter, CliLaunchSpec, CliReadinessDetector } from "./adapter.js";
@@ -57,10 +58,11 @@ import {
 import { isResumeEligible } from "./state-machine.js";
 import { startCccNativeMcpProxy, type CccNativeMcpProxy } from "./ccc-native-mcp-proxy.js";
 import {
-  CCC_NATIVE_CLI_HELD_CLOSURE_KIND,
-  CCC_NATIVE_CLI_HELD_CLOSURE_VERSION,
   CCC_NATIVE_CLI_OBSERVER_ID,
+  buildCccNativeCliHeldClosureEvidence,
+  restoreCccNativeCliHeldClosureReceipt,
   type CccNativeCliHeldClosureReceipt,
+  type CccNativeCliHeldClosureEvidence,
   type CccNativeCliHeldClosureTrigger,
   type CccNativeCliSessionPolicy,
   validateCccNativeCliHeldClosureReceipt,
@@ -88,6 +90,24 @@ const PASTE_END = "\x1b[201~";
 const textEncoder = new TextEncoder();
 
 // ── Errors ───────────────────────────────────────────────────────────────
+
+export const CCC_NATIVE_CLI_PTY_PREFLIGHT_FAILED_CODE =
+  "CCC_NATIVE_CLI_PTY_PREFLIGHT_FAILED";
+
+/** The fenced native CLI cannot start because its local PTY dependency is unavailable. */
+export class CliPtyPreflightError extends PermanentError {
+  constructor(cause: unknown) {
+    const normalizedCause =
+      cause instanceof Error ? cause : new Error(String(cause));
+    super(
+      `CCC native CLI PTY runtime is unavailable: ${normalizedCause.message}`,
+      CCC_NATIVE_CLI_PTY_PREFLIGHT_FAILED_CODE,
+      undefined,
+      normalizedCause,
+    );
+    this.name = "CliPtyPreflightError";
+  }
+}
 
 /** Thrown when spawning would exceed the configured PTY concurrency ceiling. */
 export class CliConcurrencyLimitError extends Error {
@@ -729,6 +749,22 @@ export class CliSessionManager {
   /** Whether a session id is currently live. */
   isLive(sessionId: string): boolean {
     return this.sessions.has(sessionId);
+  }
+
+  /**
+   * Prove the local PTY dependency can load before fenced campaign dispatch
+   * creates a provider attempt, durable session row, or external effect.
+   */
+  async preflightPtyRuntime(): Promise<void> {
+    try {
+      const pty = await this.loadPty();
+      if (typeof pty?.spawn !== "function") {
+        throw new Error("loaded node-pty module does not expose spawn()");
+      }
+    } catch (error) {
+      if (error instanceof CliPtyPreflightError) throw error;
+      throw new CliPtyPreflightError(error);
+    }
   }
 
   // ── Spawn ──────────────────────────────────────────────────────────────
@@ -1485,13 +1521,17 @@ export class CliSessionManager {
       await this.failCancellationWithoutClosure(live, "NATIVE_MCP_PROXY_DISPOSAL_FAILED", proxyOutcome.cause);
     }
 
-    await this.updateCccNativeCliHeldRow(live, policy);
-    await this.store.flush();
     const exitCode = live.exitResult?.exitCode ?? -1;
     const exitSignal = live.exitResult?.signal ?? 0;
-    return Object.freeze({
-      kind: CCC_NATIVE_CLI_HELD_CLOSURE_KIND,
-      version: CCC_NATIVE_CLI_HELD_CLOSURE_VERSION,
+    const heldClosureEvidence = buildCccNativeCliHeldClosureEvidence({
+      sessionId: live.id,
+      trigger,
+      exitCode,
+      exitSignal,
+    });
+    await this.updateCccNativeCliHeldRow(live, policy, heldClosureEvidence);
+    await this.store.flush();
+    return restoreCccNativeCliHeldClosureReceipt(heldClosureEvidence, {
       sessionId: live.id,
       attemptKey: policy.attemptKey,
       controllerToken: policy.controllerToken,
@@ -1499,17 +1539,14 @@ export class CliSessionManager {
       authorityBindingHash: policy.authorityBindingHash,
       turnKey: policy.turnKey,
       dispatchKey: policy.dispatchKey,
-      trigger,
-      exitCode,
-      exitSignal,
-      processGroupClosed: true,
-      proxyClosed: true,
-      durableFloorFlushed: true,
-      slotHeld: true,
-    }) satisfies CccNativeCliHeldClosureReceipt;
+    });
   }
 
-  private async updateCccNativeCliHeldRow(live: LiveSession, policy: CccNativeCliSessionPolicy): Promise<void> {
+  private async updateCccNativeCliHeldRow(
+    live: LiveSession,
+    policy: CccNativeCliSessionPolicy,
+    heldClosureEvidence: CccNativeCliHeldClosureEvidence,
+  ): Promise<void> {
     const controllerStore = this.store as unknown as {
       updateCccSessionForController?: (
         id: string,
@@ -1520,6 +1557,7 @@ export class CliSessionManager {
           controllerToken?: string;
           controllerFenced?: boolean;
           nativeCliClosureState?: "held-closed";
+          nativeCliHeldClosureEvidence?: CccNativeCliHeldClosureEvidence;
         },
       ) => Promise<CliSession | undefined>;
       };
@@ -1532,6 +1570,7 @@ export class CliSessionManager {
       controllerToken: policy.controllerToken,
       controllerFenced: false,
       nativeCliClosureState: "held-closed",
+      nativeCliHeldClosureEvidence: heldClosureEvidence,
     });
     if (!updated) throw new Error("CCC native CLI held close lost controller generation");
   }

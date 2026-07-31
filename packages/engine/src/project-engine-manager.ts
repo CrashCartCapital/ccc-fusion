@@ -63,6 +63,8 @@ export interface EngineManagerOptions {
   externalTaskStore?: ProjectEngineOptions["externalTaskStore"];
   /** Forward first-boot SQLite migration progress to a fixed-port holding server. */
   onMigrationProgress?: (event: MigrationProgressEvent) => void;
+  /** Exact loopback endpoint used by native CLI completion hooks. */
+  cliAgentHookEndpointUrl?: ProjectRuntimeConfig["cliAgentHookEndpointUrl"];
 }
 
 /** Default interval for background reconciliation (30 seconds). */
@@ -557,6 +559,7 @@ export class ProjectEngineManager {
       // Shared global semaphore — all engines share one concurrency pool
       globalSemaphore: this.globalSemaphore,
       onMigrationProgress: this.options.onMigrationProgress,
+      cliAgentHookEndpointUrl: this.options.cliAgentHookEndpointUrl,
     };
   }
 
@@ -573,9 +576,21 @@ export class ProjectEngineManager {
     (Greptile: path.resolve alone double-boots symlink aliases).
     */
     const sharedStore = this.options.externalTaskStore;
+    /*
+    FNXC:ProjectPartitionIdentity 2026-07-30-23:30:
+    A fresh rootDir-only backend boot binds its store to a deterministic
+    `local-*` fallback partition before `fn serve` auto-registers the cwd as a
+    `proj_*` project. Path equality alone must not reuse that stale binding for
+    the registered engine: later CLI processes resolve `proj_*`, and the
+    fallback-bound engine would remain healthy but see none of their rows.
+    Refuse the shared store unless both root and PostgreSQL project identity
+    match; InProcessRuntime will reopen the same root with the explicit project
+    id, which also promotes any fallback rows through the startup factory.
+    */
     const shareForThisProject = Boolean(
       sharedStore
-      && sameProjectRoot(sharedStore.getRootDir(), workingDirectory),
+      && sameProjectRoot(sharedStore.getRootDir(), workingDirectory)
+      && sharedStore.getAsyncLayer()?.projectId === project.id,
     );
     return {
       projectId: project.id,

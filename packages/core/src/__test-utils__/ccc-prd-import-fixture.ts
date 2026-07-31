@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import type { CccCampaignExecutionPolicy } from "../ccc-campaign/types.js";
+import type {
+  CccCampaignExecutionPolicy,
+  CccCampaignProductExecutionPolicy,
+} from "../ccc-campaign/types.js";
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
 import type { CccPrdSemanticBundle } from "../ccc-prd/types.js";
 
@@ -48,6 +51,26 @@ export function createCccPrdImportTestExecutionPolicy(
       providerId: "deterministic-fake",
       modelId: "fixture-v1",
       transport: "pi",
+    })),
+  };
+}
+
+export function createCccPrdImportTestProductExecutionPolicy(
+  bundle: Pick<CccPrdSemanticBundle, "tasks">,
+): CccCampaignProductExecutionPolicy {
+  return {
+    schema: "ccc-campaign.execution-policy.v2",
+    routes: bundle.tasks.map(({ id }, index) => ({
+      taskId: id,
+      providerId: "deterministic-fake",
+      modelId: "fixture-v2",
+      transport: "pi",
+      executor: "model",
+      toolMode: "coding",
+      worktreeMode: "isolated",
+      ownedPaths: [`src/task-${index}`],
+      allowedWriteRoots: [`src/task-${index}`],
+      commitPolicy: "required",
     })),
   };
 }
