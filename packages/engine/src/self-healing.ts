@@ -1329,6 +1329,49 @@ export class SelfHealingManager {
     log.log(`[${stage}] ${task.id}: false-positive requeue suppressed (${reason})`);
   }
 
+  private async deferSelfOwnedBranchReclaimForLiveOwner(
+    task: Task,
+    additionalPaths: Array<string | null | undefined> = [],
+  ): Promise<boolean> {
+    const executingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
+    const livePaths = [...new Set([
+      ...activeSessionRegistry.pathsForTask(task.id),
+      task.worktree,
+      ...additionalPaths,
+    ].filter((path): path is string => typeof path === "string" && path.length > 0))]
+      .filter((path) => activeSessionRegistry.isPathActive(path));
+    const metadata = {
+      taskId: task.id,
+      branch: task.branch ?? null,
+      worktree: task.worktree ?? null,
+      liveSessionPaths: livePaths,
+    };
+
+    let signal: { reason: string; metadata: Record<string, unknown> } | null = null;
+    if (executingTaskLock.has(task.id) || executingIds.has(task.id) || this.options.isTaskActive?.(task.id) === true) {
+      signal = { reason: "executor-active", metadata };
+    } else if (livePaths.length > 0) {
+      signal = { reason: "active-session", metadata };
+    } else {
+      signal = this.getFalsePositiveRequeueSignal(task, {
+        executingIds,
+        graceMs: STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS,
+        includeLiveWorktreeBoundBranch: false,
+        includeCheckedOutLease: true,
+      });
+    }
+
+    if (!signal) return false;
+    await this.emitFalsePositiveRequeueNoAction(
+      task,
+      "reclaim-self-owned-branch-conflict",
+      "task:reclaim-self-owned-branch-conflict-no-action",
+      signal.reason,
+      signal.metadata,
+    );
+    return true;
+  }
+
   // ── Lifecycle ───────────────────────────────────────────────────────
 
   start(): void {
@@ -3758,6 +3801,11 @@ export class SelfHealingManager {
             integrationRef: integrationBranch,
           });
 
+          const inspectedLivePath = "livePath" in inspection ? inspection.livePath : undefined;
+          if (await this.deferSelfOwnedBranchReclaimForLiveOwner(task, [inspectedLivePath])) {
+            continue;
+          }
+
           if (inspection.kind === "stale") {
             continue;
           }
@@ -3800,6 +3848,9 @@ export class SelfHealingManager {
                 reason: ownership.rejectionReason === "foreign-task" ? "foreign-task-tip" : "foreign-lineage-tip",
                 phase: "tip-already-merged",
               });
+              continue;
+            }
+            if (await this.deferSelfOwnedBranchReclaimForLiveOwner(task, [inspection.livePath])) {
               continue;
             }
             let reclaimedCleanly = false;
@@ -3910,6 +3961,9 @@ export class SelfHealingManager {
               !ownedByOtherInProgressTask;
 
             if (canAutoReclaimLiveZero) {
+              if (await this.deferSelfOwnedBranchReclaimForLiveOwner(task, [inspection.livePath])) {
+                continue;
+              }
               let reclaimedCleanly = false;
               try {
                 await removeWorktree({
@@ -4024,6 +4078,9 @@ export class SelfHealingManager {
             continue;
           }
           const reclaimedWorktreePath = placement.path;
+          if (await this.deferSelfOwnedBranchReclaimForLiveOwner(task, [reclaimedWorktreePath])) {
+            continue;
+          }
           if (placement.relocated) {
             await this.store.logEntry(
               task.id,
