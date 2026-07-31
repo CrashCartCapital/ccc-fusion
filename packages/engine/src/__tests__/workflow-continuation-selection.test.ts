@@ -125,6 +125,168 @@ describe("InProcessRuntime campaign continuation dispatch", () => {
     executingTaskLock._clearForTest();
   });
 
+  it("waits for startup recovery before selecting workflow continuations", async () => {
+    let releaseStartupRecovery!: () => void;
+    const startupRecovery = new Promise<void>((resolve) => {
+      releaseStartupRecovery = resolve;
+    });
+    const store = {
+      listDueWorkflowWorkItems: vi.fn(async () => []),
+    } as unknown as TaskStore;
+    const runtime = new InProcessRuntime({
+      projectId: "startup-recovery-fence",
+      workingDirectory: "/tmp/startup-recovery-fence",
+      isolationMode: "in-process",
+      maxConcurrent: 1,
+      maxWorktrees: 1,
+    } as never, {} as never) as InProcessRuntime & {
+      status: "active";
+      taskStore: TaskStore;
+      startupRecoveryPromise: Promise<void> | undefined;
+      drainWorkflowContinuations: () => Promise<void>;
+    };
+    runtime.status = "active";
+    runtime.taskStore = store;
+    runtime.startupRecoveryPromise = startupRecovery;
+
+    const drain = runtime.drainWorkflowContinuations();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(store.listDueWorkflowWorkItems).not.toHaveBeenCalled();
+
+    releaseStartupRecovery();
+    await drain;
+
+    expect(store.listDueWorkflowWorkItems).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the startup recovery sequence pending until self-healing settles", async () => {
+    let releaseSelfHealing!: () => void;
+    const selfHealing = new Promise<void>((resolve) => {
+      releaseSelfHealing = resolve;
+    });
+    const runtime = new InProcessRuntime({
+      projectId: "startup-recovery-sequence",
+      workingDirectory: "/tmp/startup-recovery-sequence",
+      isolationMode: "in-process",
+      maxConcurrent: 1,
+      maxWorktrees: 1,
+    } as never, {} as never) as InProcessRuntime & {
+      restartRecoveryCoordinator: { recoverInterruptedRuns: ReturnType<typeof vi.fn> };
+      selfHealingManager: { runStartupRecovery: ReturnType<typeof vi.fn> };
+      resumeStartupRecoverySequence: () => Promise<void>;
+    };
+    runtime.restartRecoveryCoordinator = {
+      recoverInterruptedRuns: vi.fn(async () => undefined),
+    };
+    runtime.selfHealingManager = {
+      runStartupRecovery: vi.fn(async () => selfHealing),
+    };
+
+    let settled = false;
+    const recovery = runtime.resumeStartupRecoverySequence().then(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => {
+      expect(runtime.selfHealingManager.runStartupRecovery).toHaveBeenCalledTimes(1);
+    });
+
+    expect(settled).toBe(false);
+
+    releaseSelfHealing();
+    await recovery;
+    expect(settled).toBe(true);
+  });
+
+  it("keeps workflow dispatch blocked after startup recovery fails until a retry succeeds", async () => {
+    const startupFailure = new Error("restart recovery unavailable");
+    const store = {
+      listDueWorkflowWorkItems: vi.fn(async () => []),
+    } as unknown as TaskStore;
+    const runtime = new InProcessRuntime({
+      projectId: "startup-recovery-failure",
+      workingDirectory: "/tmp/startup-recovery-failure",
+      isolationMode: "in-process",
+      maxConcurrent: 1,
+      maxWorktrees: 1,
+    } as never, {} as never) as InProcessRuntime & {
+      status: "active";
+      taskStore: TaskStore;
+      restartRecoveryCoordinator: { recoverInterruptedRuns: ReturnType<typeof vi.fn> };
+      selfHealingManager: { runStartupRecovery: ReturnType<typeof vi.fn> };
+      beginStartupRecoverySequence: () => Promise<void>;
+      drainWorkflowContinuations: () => Promise<void>;
+    };
+    runtime.status = "active";
+    runtime.taskStore = store;
+    runtime.restartRecoveryCoordinator = {
+      recoverInterruptedRuns: vi.fn()
+        .mockRejectedValueOnce(startupFailure)
+        .mockResolvedValueOnce(undefined),
+    };
+    runtime.selfHealingManager = {
+      runStartupRecovery: vi.fn(async () => undefined),
+    };
+
+    await expect(runtime.beginStartupRecoverySequence()).rejects.toBe(startupFailure);
+    await runtime.drainWorkflowContinuations();
+    await runtime.drainWorkflowContinuations();
+
+    expect(store.listDueWorkflowWorkItems).not.toHaveBeenCalled();
+
+    await runtime.beginStartupRecoverySequence();
+    await runtime.drainWorkflowContinuations();
+
+    expect(runtime.restartRecoveryCoordinator.recoverInterruptedRuns).toHaveBeenCalledTimes(2);
+    expect(runtime.selfHealingManager.runStartupRecovery).toHaveBeenCalledTimes(1);
+    expect(store.listDueWorkflowWorkItems).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps workflow dispatch blocked after self-healing startup recovery fails until a retry succeeds", async () => {
+    const selfHealingFailure = new Error("self-healing recovery unavailable");
+    const store = {
+      listDueWorkflowWorkItems: vi.fn(async () => []),
+    } as unknown as TaskStore;
+    const runtime = new InProcessRuntime({
+      projectId: "self-healing-recovery-failure",
+      workingDirectory: "/tmp/self-healing-recovery-failure",
+      isolationMode: "in-process",
+      maxConcurrent: 1,
+      maxWorktrees: 1,
+    } as never, {} as never) as InProcessRuntime & {
+      status: "active";
+      taskStore: TaskStore;
+      restartRecoveryCoordinator: { recoverInterruptedRuns: ReturnType<typeof vi.fn> };
+      selfHealingManager: { runStartupRecovery: ReturnType<typeof vi.fn> };
+      beginStartupRecoverySequence: () => Promise<void>;
+      drainWorkflowContinuations: () => Promise<void>;
+    };
+    runtime.status = "active";
+    runtime.taskStore = store;
+    runtime.restartRecoveryCoordinator = {
+      recoverInterruptedRuns: vi.fn(async () => undefined),
+    };
+    runtime.selfHealingManager = {
+      runStartupRecovery: vi.fn()
+        .mockRejectedValueOnce(selfHealingFailure)
+        .mockResolvedValueOnce(undefined),
+    };
+
+    await expect(runtime.beginStartupRecoverySequence()).rejects.toBe(selfHealingFailure);
+    await runtime.drainWorkflowContinuations();
+    await runtime.drainWorkflowContinuations();
+
+    expect(store.listDueWorkflowWorkItems).not.toHaveBeenCalled();
+
+    await runtime.beginStartupRecoverySequence();
+    await runtime.drainWorkflowContinuations();
+
+    expect(runtime.restartRecoveryCoordinator.recoverInterruptedRuns).toHaveBeenCalledTimes(2);
+    expect(runtime.selfHealingManager.runStartupRecovery).toHaveBeenCalledTimes(2);
+    expect(store.listDueWorkflowWorkItems).toHaveBeenCalledTimes(1);
+  });
+
   it("does not dispatch the same exact candidate while its first claim is in flight", async () => {
     const item = workItem("campaign-in-flight", "planning", {
       runId: "run-campaign-in-flight",

@@ -360,6 +360,14 @@ export class InProcessRuntime
   private mergePendingProvider?: (taskId: string) => boolean;
   /** Tracks whether startup recovery was intentionally deferred due to pause state. */
   private startupRecoveryDeferred = false;
+  /**
+   * Startup recovery stays off the boot critical path, but no durable workflow
+   * continuation may start until that recovery pass has settled. Otherwise a
+   * recovery sweep can reclaim a worktree after the continuation has acquired it.
+  */
+  private startupRecoveryPromise?: Promise<void>;
+  /** A failed recovery remains a dispatch blocker until an explicit retry succeeds. */
+  private startupRecoveryError?: Error;
   /** Prevent duplicate unpause recovery dispatches from racing each other. */
   private resumeAfterUnpauseRunning = false;
   private restartRecoveryCoordinator?: RestartRecoveryCoordinator;
@@ -1303,7 +1311,7 @@ export class InProcessRuntime
         // both of which can block the event loop for several seconds.
         // Running it in the background lets the HTTP server become
         // responsive sooner while still performing the recovery work.
-        void this.resumeStartupRecoverySequence().catch((err) => {
+        void this.beginStartupRecoverySequence().catch((err) => {
           runtimeLog.error("Deferred startup recovery sequence failed:", err);
         });
       }
@@ -1731,8 +1739,8 @@ export class InProcessRuntime
         return;
       }
 
-      if (this.startupRecoveryDeferred) {
-        await this.resumeStartupRecoverySequence();
+      if (this.startupRecoveryDeferred || this.startupRecoveryError) {
+        await this.beginStartupRecoverySequence();
         this.startupRecoveryDeferred = false;
         return;
       }
@@ -1741,6 +1749,30 @@ export class InProcessRuntime
     } finally {
       this.resumeAfterUnpauseRunning = false;
     }
+  }
+
+  private beginStartupRecoverySequence(): Promise<void> {
+    if (this.startupRecoveryPromise) {
+      return this.startupRecoveryPromise;
+    }
+    this.startupRecoveryError = undefined;
+    const recovery = this.resumeStartupRecoverySequence();
+    this.startupRecoveryPromise = recovery;
+    void recovery.then(
+      () => {
+        if (this.startupRecoveryPromise === recovery) {
+          this.startupRecoveryPromise = undefined;
+          this.startupRecoveryError = undefined;
+        }
+      },
+      (error: unknown) => {
+        if (this.startupRecoveryPromise === recovery) {
+          this.startupRecoveryPromise = undefined;
+          this.startupRecoveryError = error instanceof Error ? error : new Error(String(error));
+        }
+      },
+    );
+    return recovery;
   }
 
   private async resumeStartupRecoverySequence(): Promise<void> {
@@ -1752,9 +1784,7 @@ export class InProcessRuntime
     // they no longer have a tracked session/worktree, so the stuck detector
     // cannot recover them. Delegate the startup recovery pass to
     // SelfHealingManager so the policy lives in one place.
-    void this.selfHealingManager!.runStartupRecovery().catch((err) => {
-      runtimeLog.error("Self-healing startup recovery failed:", err);
-    });
+    await this.selfHealingManager!.runStartupRecovery();
   }
 
   /**
@@ -2135,6 +2165,16 @@ export class InProcessRuntime
     if (this.workflowContinuationDrainActive || this.status !== "active") return;
     this.workflowContinuationDrainActive = true;
     try {
+      if (this.startupRecoveryError) return;
+      const startupRecovery = this.startupRecoveryPromise;
+      if (startupRecovery) {
+        try {
+          await startupRecovery;
+        } catch {
+          return;
+        }
+      }
+      if (this.startupRecoveryError || this.status !== "active") return;
       const items = await this.taskStore.listDueWorkflowWorkItems({
         kinds: ["task"],
         states: ["runnable", "retrying"],

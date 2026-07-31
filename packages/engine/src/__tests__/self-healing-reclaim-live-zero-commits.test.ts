@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskStore } from "@fusion/core";
 
 const execMock = vi.fn();
@@ -55,6 +55,7 @@ vi.mock("../worktree-pool.js", () => ({
 }));
 
 import { SelfHealingManager } from "../self-healing.js";
+import { executingTaskLock } from "../active-session-registry.js";
 import * as branchConflicts from "../branch-conflicts.js";
 import { isUsableTaskWorktree, removeWorktree, relocateReclaimableWorktreeIntoRoot } from "../worktree-pool.js";
 
@@ -75,6 +76,7 @@ describe("self-healing reclaim live zero commits", () => {
   let manager: SelfHealingManager;
 
   beforeEach(() => {
+    executingTaskLock._clearForTest();
     store = createStore();
     manager = new SelfHealingManager(store, { rootDir: "/tmp/test" });
     vi.mocked(isUsableTaskWorktree).mockResolvedValue(true);
@@ -88,6 +90,45 @@ describe("self-healing reclaim live zero commits", () => {
     vi.spyOn(manager as any, "evaluateBackwardMoveTripleProof").mockResolvedValue({ ok: true });
     execMock.mockReset();
     execMock.mockResolvedValue("");
+  });
+
+  afterEach(() => {
+    executingTaskLock._clearForTest();
+  });
+
+  it("defers fully-subsumed reclaim when the same task starts executing after the liveness snapshot", async () => {
+    manager = new SelfHealingManager(store, {
+      rootDir: "/tmp/test",
+      getExecutingTaskIds: () => new Set<string>(),
+    });
+    (store.listTasks as any)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        { id: "FN-9001", column: "in-progress", checkedOutBy: null, branch: "fusion/fn-9001", worktree: "/tmp/stale", paused: false, status: null },
+      ])
+      .mockResolvedValueOnce([]);
+    vi.spyOn(branchConflicts, "inspectBranchConflict").mockImplementationOnce(async () => {
+      expect(executingTaskLock.tryClaim("FN-9001")).toBe(true);
+      return {
+        kind: "fully-subsumed",
+        livePath: "/tmp/live",
+        tipSha: "1234567890abcdef",
+      } as any;
+    });
+
+    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
+
+    expect(recovered).toBe(0);
+    expect(removeWorktree).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalledWith(
+      "FN-9001",
+      expect.objectContaining({ worktree: null, branch: null }),
+    );
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+      mutationType: "task:reclaim-self-owned-branch-conflict-no-action",
+      metadata: expect.objectContaining({ reason: "executor-active" }),
+    }));
   });
 
   it("auto-reclaims self-owned fully-subsumed live branch by deleting worktree+branch", async () => {
