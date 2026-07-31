@@ -412,6 +412,7 @@ describe("Task 4 RED task-session native CLI seam harness", () => {
     const session = await launchCliTaskSession(opts);
     const machine = hub.getStateMachine((session as { sessionId: string }).sessionId);
 
+    await vi.waitFor(() => expect(machine.getState()).toBe("busy"));
     const outcomePromise = session.result();
     machine.signalDone();
 
@@ -420,6 +421,27 @@ describe("Task 4 RED task-session native CLI seam harness", () => {
     expect(outcome.kind).toBe("ccc-native-held-closed");
     expect(outcome.nativeCliHeldClosureReceipt?.trigger).toBe("done");
     expect(manager.closeCccNativeCliSession).toHaveBeenCalledWith(expect.any(String), "done");
+  });
+
+  it("arms the authoritative machine as busy before prompt bytes can trigger native done", async () => {
+    const { opts, hub, manager } = setupHarness();
+    let stateObservedDuringInjection: ReturnType<ReturnType<typeof createMachine>["getState"]> | undefined;
+
+    manager.inject.mockImplementationOnce(async (sessionId: string) => {
+      const machine = hub.getStateMachine(sessionId);
+      stateObservedDuringInjection = machine.getState();
+      if (stateObservedDuringInjection === "busy") machine.signalDone();
+    });
+
+    const session = await launchCliTaskSession(opts);
+    await vi.waitFor(
+      () => expect(stateObservedDuringInjection).toBe("busy"),
+      { timeout: 500, interval: 10 },
+    );
+
+    const outcome = await session.result();
+    expect(outcome.kind).toBe("ccc-native-held-closed");
+    expect(outcome.nativeCliHeldClosureReceipt?.trigger).toBe("done");
   });
 
   it("Task 4 RED: natural exit path should be modeled as close(..., 'exit') and still return held outcome", async () => {

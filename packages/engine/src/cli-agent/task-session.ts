@@ -553,24 +553,28 @@ export class CliTaskSession {
       return;
     }
     if (this.settled) return;
+    // Arm the authoritative machine before exposing prompt bytes to the child.
+    // A fast native adapter can emit `done` from inside manager.inject(); if the
+    // machine is still `starting` or `ready`, that valid completion is rejected
+    // as an invalid transition and the campaign waits until its deadline.
+    const machine = this.hub.getStateMachine(this.sessionId);
+    if (machine) {
+      try {
+        if (machine.getState() === "starting") machine.markReady();
+        if (machine.getState() === "ready") machine.injectPrompt();
+      } catch {
+        // best-effort transition
+      }
+    }
     try {
       await this.manager.inject(this.sessionId, prompt);
       // HTD: "ready → busy: prompt injected". The task-session is the component
       // that injects, so it drives the ready→busy transition on the authoritative
       // machine. The manager's PTY-output readiness is the fallback readiness
       // signal (per the adapter contract); when the native SessionStart hook has
-      // not yet landed the machine may still be `starting`, so mark it ready
-      // first. Native adapters that also emit `busy` telemetry are idempotent
-      // here (signalBusy from busy re-arms the watchdog).
-      const machine = this.hub.getStateMachine(this.sessionId);
-      if (machine) {
-        try {
-          if (machine.getState() === "starting") machine.markReady();
-          if (machine.getState() === "ready") machine.injectPrompt();
-        } catch {
-          // best-effort transition
-        }
-      }
+      // not yet landed the machine may still be `starting`, so the transition is
+      // pre-armed above. Native adapters that also emit `busy` telemetry are
+      // idempotent here (signalBusy from busy re-arms the watchdog).
       this.log(`cli-task-session ${this.sessionId}: prompt injected after readiness`);
     } catch {
       // Inject can fail if the session died mid-readiness — the terminal handler
