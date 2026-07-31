@@ -123,6 +123,90 @@ function captureNativeSessionId(
 afterEach(() => vi.unstubAllEnvs());
 
 describe("ccc-fusion subscription child environment policy", () => {
+  it("forces the ccc Codex child into the ccc_fusion permission profile with no network or approval escalation", () => {
+    const fresh = codexAdapter.buildLaunch({
+      posture: null,
+      settings: {
+        profile: CCC_PROFILE,
+        subscriptionReady: true,
+        model: "gpt-5.6-sol",
+      },
+    });
+    expect(fresh).toMatchObject({ command: "codex" });
+    expect(fresh.args).toEqual(expect.arrayContaining([
+      "-c",
+      'default_permissions="ccc_fusion"',
+      "--ask-for-approval",
+      "never",
+    ]));
+    expect(fresh.args).toContain(
+      'permissions.ccc_fusion.filesystem={":minimal"="read",":workspace_roots"={"."="write","**/_secrets/**"="deny","**/_KELSEY/**"="deny","**/.agentsecrets/**"="deny","**/.env"="deny","**/.env.*"="deny"}}',
+    );
+    expect(fresh.args).toContain("permissions.ccc_fusion.network.enabled=false");
+    expect(fresh.args).not.toContain("--sandbox");
+    expect(fresh.args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+
+    const resumed = codexAdapter.buildResume!({
+      posture: null,
+      nativeSessionId: "codex-native-session",
+      settings: {
+        profile: CCC_PROFILE,
+        subscriptionReady: true,
+        model: "gpt-5.6-sol",
+      },
+    });
+    expect(resumed.args).toEqual(expect.arrayContaining([
+      "resume",
+      "codex-native-session",
+      "-c",
+      'default_permissions="ccc_fusion"',
+      "--ask-for-approval",
+      "never",
+    ]));
+    expect(resumed.args).not.toContain("--sandbox");
+    expect(resumed.args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+  });
+
+  it.each([
+    {
+      label: "dangerous autonomy posture",
+      settings: { profile: CCC_PROFILE, subscriptionReady: true },
+      posture: { autoApprove: true },
+    },
+    {
+      label: "command replacement",
+      settings: { profile: CCC_PROFILE, subscriptionReady: true, command: "custom-codex-wrapper" },
+      posture: null,
+    },
+    {
+      label: "argument replacement",
+      settings: {
+        profile: CCC_PROFILE,
+        subscriptionReady: true,
+        extraArgs: ["--sandbox", "danger-full-access"],
+      },
+      posture: null,
+    },
+  ])("refuses ccc Codex $label before launch", ({ settings, posture }) => {
+    expect(() => codexAdapter.buildLaunch({
+      posture,
+      settings,
+    })).toThrow(/CCC Fusion Codex sandbox policy refused/u);
+  });
+
+  it("does not impose the ccc Codex sandbox contract on ordinary Fusion profiles", () => {
+    const launch = codexAdapter.buildLaunch({
+      posture: { autoApprove: true },
+      settings: {
+        model: "gpt-5.6-sol",
+        extraArgs: ["--search"],
+      },
+    });
+    expect(launch.args).toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(launch.args).toContain("--search");
+    expect(launch.args).not.toContain("workspace-write");
+  });
+
   it("blocks ccc-fusion without subscription readiness before the real PTY boundary", async () => {
     const store = makeStore();
     const { manager, captures } = makeManager(store);

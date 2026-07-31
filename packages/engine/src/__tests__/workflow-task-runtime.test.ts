@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { canonicalCccPrdJson } from "@fusion/core";
 import type {
   CccCampaignTaskContext,
   Settings,
@@ -11,8 +13,10 @@ import type {
 import { WorkflowTaskRuntime, type WorkflowTaskRuntimeDeps } from "../workflow-task-runtime.js";
 import type { WorkflowNodeResult } from "../workflow-graph-executor.js";
 import type { PreparedWorktree, WorkflowRuntimePrimitives } from "../runtime-primitives.js";
+import { PermanentError } from "../engine-errors.js";
 
 const task = { id: "FN-9002" } as TaskDetail;
+const nativeSemanticTaskId = "FN-9003";
 const flagOff = { experimentalFeatures: {} } as unknown as Pick<Settings, "experimentalFeatures">;
 const promptWithOneStep = "# Task: FN-9002 - Runtime default\n\n## Steps\n\n### Step 1: Implement runtime default\n- Exercise the default workflow.\n";
 
@@ -48,7 +52,14 @@ function selectedSemanticIr(): WorkflowIr {
     name: "selected-semantic",
     nodes: [
       { id: "start", kind: "start" },
-      { id: "semantic", kind: "prompt", config: { cccPrdTaskId: "TASK-SEMANTIC" } },
+      {
+        id: "semantic",
+        kind: "prompt",
+        config: {
+          cccPrdTaskId: "TASK-SEMANTIC",
+          cccNativeTaskId: nativeSemanticTaskId,
+        },
+      },
       { id: "end", kind: "end" },
     ],
     edges: [
@@ -59,11 +70,45 @@ function selectedSemanticIr(): WorkflowIr {
   };
 }
 
-function campaignProofContext(taskId: string): CccCampaignTaskContext {
+function workflowIrSha256(ir: WorkflowIr): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(ir), "utf8")
+    .digest("hex");
+}
+
+function selectedProofSuiteIr(): WorkflowIr {
+  return {
+    version: "v1",
+    name: "selected-proof-suite",
+    nodes: [
+      { id: "start", kind: "start" },
+      {
+        id: "proof-suite",
+        kind: "gate",
+        config: {
+          cccProofSuite: true,
+          cccProofIds: ["PROOF-1"],
+          cccPrdTaskIds: [task.id],
+          cccPrdTaskId: task.id,
+        },
+      },
+      { id: "end", kind: "end" },
+    ],
+    edges: [
+      { from: "start", to: "proof-suite", condition: "success" },
+      { from: "proof-suite", to: "end", condition: "success" },
+    ],
+  };
+}
+
+function campaignProofContext(
+  taskId: string,
+  semanticTaskId = taskId === nativeSemanticTaskId ? "TASK-SEMANTIC" : taskId,
+): CccCampaignTaskContext {
   return {
     schema: "ccc-campaign.context.v1" as CccCampaignTaskContext["schema"],
     taskId,
-    semanticTaskId: taskId,
+    semanticTaskId,
     proofIds: [],
     proofs: [],
     admittedWriteRoots: [],
@@ -178,6 +223,61 @@ describe("WorkflowTaskRuntime", () => {
       runCustomNode: async () => ({ outcome: "success" }),
     };
     expect(missingPrimitives).toBeDefined();
+  });
+
+  it("refuses a CCC proof-suite gate when its execution handler is unwired", async () => {
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedProofSuiteIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+    });
+
+    const result = await runtime.run(task, flagOff, { deferCompletionSummary: true });
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      context: {
+        "node:proof-suite:value": "ccc-proof-suite-execution-unwired",
+      },
+    });
+  });
+
+  it("parks an uncertain CCC proof-suite dispatch for manual reconciliation", async () => {
+    const campaignTask = {
+      ...task,
+      customFields: { cccFusionProfile: "ccc-fusion" },
+    } as TaskDetail;
+    const runCccProofSuite = vi.fn(async () => {
+      throw new PermanentError(
+        "A previously dispatched proof command has no terminal receipt.",
+        "CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+      );
+    });
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedProofSuiteIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      runCccProofSuite,
+    });
+
+    const result = await runtime.run(campaignTask, flagOff, { deferCompletionSummary: true });
+
+    expect(runCccProofSuite).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      disposition: "manual-required",
+      outcome: "failure",
+      reason: "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+      context: {
+        "ccc:retry-classification": "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+      },
+    });
   });
 
   it("runs a selected workflow through the graph engine", async () => {
@@ -390,6 +490,109 @@ describe("WorkflowTaskRuntime", () => {
     });
   });
 
+  it("product v2 RED: imported route custody drift refuses before any graph effect even when the mutable IR hash is rewritten", async () => {
+    const semanticTaskId = "TASK-SEALED";
+    const nativeTaskId = "FN-SEALED";
+    const expectedRoute = {
+      taskId: semanticTaskId,
+      providerId: "provider-approved",
+      modelId: "model-approved",
+      transport: "pi" as const,
+      executor: "model" as const,
+      toolMode: "coding" as const,
+      worktreeMode: "isolated" as const,
+      ownedPaths: ["src/owned.ts"],
+      allowedWriteRoots: ["src"],
+      commitPolicy: "required" as const,
+    };
+    const expectedRouteSha256 = createHash("sha256")
+      .update(canonicalCccPrdJson(expectedRoute), "utf8")
+      .digest("hex");
+    const expectedPromptSha256 = createHash("sha256")
+      .update("sealed prompt", "utf8")
+      .digest("hex");
+    const driftedIr: WorkflowIr = {
+      version: "v1",
+      name: "drifted-imported-workflow",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "execute",
+          kind: "prompt",
+          config: {
+            prompt: "sealed prompt",
+            cccPrdTaskId: semanticTaskId,
+            cccNativeTaskId: nativeTaskId,
+            cccExecutionPromptSchema: "ccc-prd.execution-prompt.v1",
+            cccExecutionPromptSha256: expectedPromptSha256,
+            cccExecutionTransport: "pi",
+            cccExecutionProviderId: "provider-tampered",
+            cccExecutionModelId: expectedRoute.modelId,
+            cccExecutionRouteSha256: expectedRouteSha256,
+            executor: expectedRoute.executor,
+            toolMode: expectedRoute.toolMode,
+            worktreeMode: expectedRoute.worktreeMode,
+            ownedPaths: expectedRoute.ownedPaths,
+            allowedWriteRoots: expectedRoute.allowedWriteRoots,
+            commitPolicy: expectedRoute.commitPolicy,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "execute", condition: "success" },
+        { from: "execute", to: "end", condition: "success" },
+      ],
+    };
+    const promptEffect = vi.fn(async () => ({ outcome: "success" as const }));
+    const importedTask = {
+      id: nativeTaskId,
+      lineageId: "ccc-prd:0123456789abcdef01234567:TASK-SEALED",
+    } as TaskDetail;
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-SEALED", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: driftedIr }),
+        getCccCampaignContextForTask: async () => ({
+          ...campaignProofContext(nativeTaskId, semanticTaskId),
+          executionPolicy: {
+            schema: "ccc-campaign.execution-policy.v2",
+            routes: [expectedRoute],
+          },
+          route: expectedRoute,
+          executionCustody: {
+            promptSchema: "ccc-prd.execution-prompt.v1",
+            promptSha256: expectedPromptSha256,
+            routeSha256: expectedRouteSha256,
+          },
+        } as CccCampaignTaskContext),
+        assertCccCampaignWorkflowLeaseFence: async () => undefined,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: promptEffect,
+      handlers: { prompt: promptEffect },
+    });
+
+    const result = await runtime.run(importedTask, flagOff, {
+      workItemFence: {
+        workItemId: "WORK-SEALED",
+        leaseOwner: "worker-1",
+        attempt: 1,
+        runId: "ccc-prd:import-sealed",
+        eventTimestamp: "2026-07-25T12:00:00.000Z",
+        irHash: workflowIrSha256(driftedIr),
+      },
+    });
+
+    expect(result).toMatchObject({
+      disposition: "manual-required",
+      outcome: "failure",
+      visitedNodeIds: [],
+      reason: "ccc-permanent:CCC_CAMPAIGN_EXECUTION_CUSTODY_DRIFT",
+    });
+    expect(promptEffect).not.toHaveBeenCalled();
+  });
+
   it("Task 4 RED: fenced campaign run identity comes from the persisted work-item fence", async () => {
     const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
     const getCccCampaignContextForTask = vi.fn(async () =>
@@ -510,7 +713,7 @@ describe("WorkflowTaskRuntime", () => {
   });
 
   it("Task 4 RED: resolves semantic task via store.getTask before proof admission", async () => {
-    const getTask = vi.fn(async () => ({ id: "TASK-SEMANTIC" } as TaskDetail));
+    const getTask = vi.fn(async () => ({ id: nativeSemanticTaskId } as TaskDetail));
     const assertCccCampaignWorkflowLeaseFence = vi.fn(async () => undefined);
     const recordFencedCccCampaignProofAudit = vi.fn();
     const handler = vi.fn(async () => ({ outcome: "success" as const }));
@@ -542,7 +745,7 @@ describe("WorkflowTaskRuntime", () => {
     expect(result.disposition).toBe("failed");
     expect(result.outcome).toBe("failure");
     expect(getTask).toHaveBeenCalledTimes(1);
-    expect(getTask).toHaveBeenCalledWith("TASK-SEMANTIC");
+    expect(getTask).toHaveBeenCalledWith(nativeSemanticTaskId);
     expect(handler).not.toHaveBeenCalled();
     expect(assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledTimes(1);
     expect(recordFencedCccCampaignProofAudit).not.toHaveBeenCalled();
@@ -550,9 +753,9 @@ describe("WorkflowTaskRuntime", () => {
 
   it.each([
     ["unwired", undefined, /CCC campaign semantic task|lookup|semantic/i],
-    ["missing", async () => undefined, /CCC campaign semantic task TASK-SEMANTIC is missing/i],
-    ["throws", async () => { throw new Error("resolver failed"); }, /CCC campaign semantic task TASK-SEMANTIC lookup failed/i],
-    ["mismatched-id", async () => ({ id: "TASK-OTHER" } as TaskDetail), /CCC campaign semantic task identity does not match TASK-SEMANTIC/i],
+    ["missing", async () => undefined, /CCC campaign native task FN-9003 is missing for semantic task TASK-SEMANTIC/i],
+    ["throws", async () => { throw new Error("resolver failed"); }, /CCC campaign native task FN-9003 lookup failed for semantic task TASK-SEMANTIC/i],
+    ["mismatched-id", async () => ({ id: "TASK-OTHER" } as TaskDetail), /CCC campaign native task identity does not match FN-9003/i],
   ])("Task 4 RED: semantic resolver refuses before proof/evaluator when getTask is %s", async (_case, getTaskResult, token) => {
     const signal = new AbortController().signal;
     const getTask = getTaskResult
@@ -587,7 +790,7 @@ describe("WorkflowTaskRuntime", () => {
     expect(result.outcome).toBe("failure");
     if (getTask) {
       expect(getTask).toHaveBeenCalledTimes(1);
-      expect(getTask).toHaveBeenCalledWith("TASK-SEMANTIC");
+      expect(getTask).toHaveBeenCalledWith(nativeSemanticTaskId);
     }
     expect(handler).not.toHaveBeenCalled();
     expect(recordFencedCccCampaignProofAudit).not.toHaveBeenCalled();
@@ -1537,6 +1740,9 @@ describe("WorkflowTaskRuntime", () => {
 
     expect(result.disposition).toBe("failed");
     expect(result.outcome).toBe("failure");
+    expect(result.reason).toBe(
+      "workflow-node-failed:execute:implementation-incomplete",
+    );
     expect(calls).toEqual(["custom:prepare", "prepare-worktree", "execute"]);
   });
 

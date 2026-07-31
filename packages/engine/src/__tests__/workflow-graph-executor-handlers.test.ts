@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { BUILTIN_CODING_WORKFLOW_IR } from "@fusion/core";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
-import { TransientError } from "../engine-errors.js";
+import { PermanentError, TransientError } from "../engine-errors.js";
 
 import { WorkflowGraphExecutor, type WorkflowGraphExecutorDeps } from "../workflow-graph-executor.js";
 
@@ -12,6 +12,45 @@ function settingsOn() {
 }
 
 describe("WorkflowGraphExecutor traversal", () => {
+  it("classifies an imported PRD task's permanent failure", async () => {
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "imported-prd-permanent-failure",
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "execute", kind: "script" },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "execute" },
+        { from: "execute", to: "end", condition: "success" },
+      ],
+    };
+    const executor = new WorkflowGraphExecutor({
+      handlers: {
+        script: async () => {
+          throw new PermanentError(
+            "Live execution requires explicit approval.",
+            "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+          );
+        },
+      },
+    });
+
+    const result = await executor.run({
+      id: "FN-IMPORTED",
+      lineageId: "ccc-prd:0123456789abcdef01234567:TASK-1",
+    } as TaskDetail, settingsOn(), ir);
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      context: {
+        "ccc:retry-classification":
+          "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      },
+    });
+  });
+
   it("runs pre-node admission before preparation and the handler, excluding start/end", async () => {
     const ir: WorkflowIr = {
       version: "v1",

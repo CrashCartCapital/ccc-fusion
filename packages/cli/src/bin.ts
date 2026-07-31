@@ -306,10 +306,40 @@ Usage:
                                       Generate a traceable candidate sidecar from an admitted packet through native bounded authoring
   fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
                                       Compatibility fixture authoring path for deterministic tests
+  fn prd discover <active-projects-root>
+                                      Select the current PRD inside each project using project-local lineage
+  fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>
+                                      Freeze the selected PRD and recursive support packet outside its source tree
+  fn prd template                     Print the optional future-PRD intake template
+  fn prd lint <prd-path>              Report missing implementation facts without rewriting the PRD
   fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Validate custody and semantics; emit diagnostics only
   fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Compile a validated sidecar into the complete deterministic semantic bundle
+  fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]
+                                      Show the exact hash-bound product import, coding routes, paths, proof, and approval contract
+  fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]
+                                      Recheck the preview identity and transactionally admit the campaign
+  fn prd inspect <idempotency-key> [--project <id|name>]
+                                      Inspect durable PRD import and recovery state
+  fn prd reconcile <idempotency-key> [--project <id|name>]
+                                      Resume an incomplete transactional projection without replaying uncertain effects
+  fn prd status <idempotency-key> [--project <id|name>]
+                                      Show tasks, routes, worktrees, proofs, approvals, recovery state, and fresh operator confirmations
+  fn prd pause <idempotency-key> --confirm <status-digest> [--project <id|name>]
+                                      Park an unleased campaign at its current safe boundary
+  fn prd resume <idempotency-key> --confirm <status-digest> [--project <id|name>]
+                                      Resume a campaign held by the exact operator pause receipt
+  fn prd stop <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]
+                                      Terminally stop a campaign while preserving worktrees, receipts, and uncertain-effect evidence
+  fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]
+                                      Settle an uncertain verifier from reviewed external evidence without rerunning it
+  fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]
+                                      Settle an uncertain PI/workflow provider effect; native CLI attempts retain their held-session fence
+  fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]
+                                      Claim the exact campaign-bound live-execution approval
+  fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]
+                                      Land only the exact proof-bound campaign commit after human approval
   fn init [opts]                      Initialize a new fn project (--name, --path, --git)
   fn onboard [--force] [--skip-onboarding]
                                       Run onboarding on demand; auto-launch runs before interactive commands when central DB is missing,
@@ -835,7 +865,12 @@ async function main() {
   try {
     switch (command) {
       case "prd": {
-        process.exitCode = await runPrdCommand(args.slice(1));
+        process.exitCode = await runPrdCommand(
+          args.slice(1),
+          undefined,
+          undefined,
+          { projectName },
+        );
         break;
       }
       case "init": {
@@ -2073,7 +2108,11 @@ async function main() {
               console.error("Usage: fn message inbox [--user <cli|dashboard>]");
               process.exit(1);
             }
-            await runMessageInbox(projectName, inboxUser);
+            if (inboxUser === undefined) {
+              await runMessageInbox(projectName);
+            } else {
+              await runMessageInbox(projectName, inboxUser);
+            }
             break;
           }
           case "outbox": {

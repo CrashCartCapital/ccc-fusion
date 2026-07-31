@@ -23,8 +23,17 @@ import { generateFeatureVideo, type GenerateFeatureVideoOptions } from "./review
 import { moveTaskToReplanColumn, resolveReplanTargetColumn } from "./replan-target.js";
 import type { TaskStep, WorkflowIr, WorkflowFieldDefinition, WorkflowColumnAgent, EffectiveAgentInput, WorkflowWorkEngineDispatchResult, WorkflowWorkItem } from "@fusion/core";
 import { WorkflowGraphTaskRunner, type WorkflowGraphTaskRunResult, type WorkflowColumnBoundaryHooks } from "./workflow-graph-task-runner.js";
-import { isImportedCccCampaignTask, isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
+import {
+  isCccCampaignTask,
+  isImportedCccCampaignTask,
+  isImportedCccCampaignWorkItem,
+} from "./ccc-campaign-routing.js";
 import { matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
+import {
+  requireCccCampaignLiveExecutionApproval,
+  requireCccCampaignMergeApproval,
+} from "./ccc-campaign-product-control.js";
+import { enforceCccCampaignRequiredCommitAfterNode } from "./ccc-campaign-required-commit.js";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflow-column-boundary.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { createCodeNodeRunner } from "./code-node-runner.js";
@@ -55,7 +64,12 @@ import {
   WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND,
   WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY,
 } from "./workflow-graph-executor.js";
-import type { WorkflowNodeExecutionContext, WorkflowNodePreparationRequirement, WorkflowNodeResult } from "./workflow-graph-executor.js";
+import type {
+  WorkflowGraphExecutorDeps,
+  WorkflowNodeExecutionContext,
+  WorkflowNodePreparationRequirement,
+  WorkflowNodeResult,
+} from "./workflow-graph-executor.js";
 import { workflowNodeRequiresWorktree } from "./workflow-node-execution-needs.js";
 import type {
   AuditPrimitiveInput,
@@ -178,10 +192,12 @@ import {
   type CccNativeCliBinding,
   type CccNativeCliRoute,
   validateCccNativeCliBinding,
+  validateCccNativeCliHoldScope,
   validateCccNativeCliHeldClosureReceipt,
   validateCccNativeCliObservation,
   validateCccNativeCliPermitScope,
   validateCccNativeCliTerminalScope,
+  restoreCccNativeCliHeldClosureReceipt,
 } from "./cli-agent/ccc-native-cli-binding.js";
 import type { CccProviderAttemptScope, CliSession, CliSessionStore } from "@fusion/core";
 import {
@@ -218,6 +234,51 @@ function createCccNativeCliPreProviderEvidenceDigest(
       authorityBindingHash: binding.authorityBindingHash,
     },
   })).digest("hex");
+}
+
+function selectCccNativeCliHeldClosureReceipt(
+  store: Pick<CliSessionStore, "listByTask">,
+  scope: CccProviderAttemptScope,
+  binding: CccNativeCliBinding,
+  adapterId: string,
+  worktreePath: string,
+) {
+  const matches = store.listByTask(scope.taskId).filter((session) => {
+    const posture = session.autonomyPosture;
+    return session.taskId === scope.taskId
+      && session.purpose === "execute"
+      && session.adapterId === adapterId
+      && session.worktreePath === worktreePath
+      && session.agentState === "needsAttention"
+      && session.terminationReason === null
+      && posture?.cccNativeCliOneShot === true
+      && posture.cccProviderAttemptKey === scope.attemptKey
+      && posture.cccProviderAttemptControllerToken === scope.controllerToken
+      && posture.cccControllerGeneration === scope.controllerToken
+      && posture.cccControllerFenced === false
+      && posture.cccAuthorityBindingHash === binding.authorityBindingHash
+      && posture.cccNativeCliTurnKey === scope.turnKey
+      && posture.cccNativeCliDispatchKey === scope.dispatchKey
+      && posture.cccNativeCliClosureState === "held-closed";
+  });
+  if (matches.length !== 1) {
+    throw new CccNativeCliBindingRefusedError(
+      `CCC native CLI dispatched-unknown restart requires exactly one durable held-closed session receipt; found ${matches.length}. The provider request was not replayed; inspect campaign status and explicitly settle or stop the campaign.`,
+    );
+  }
+  const session = matches[0]!;
+  return restoreCccNativeCliHeldClosureReceipt(
+    session.autonomyPosture?.cccNativeCliHeldClosureEvidence,
+    {
+      sessionId: session.id,
+      attemptKey: scope.attemptKey,
+      controllerToken: scope.controllerToken,
+      taskId: scope.taskId,
+      authorityBindingHash: binding.authorityBindingHash,
+      turnKey: scope.turnKey,
+      dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
+    },
+  );
 }
 import {
   BranchConflictError,
@@ -6256,7 +6317,14 @@ export class TaskExecutor {
       this.activeWorkflowGraphAbortControllers.set(task.id, graphAbortController);
       const customNodeExecution = new WorkflowCustomNodeExecutionService({
         execute: (node, nodeTask, nodeSettings, columnBinding, context, executionContext) =>
-          this.runGraphCustomNode(node, nodeTask, nodeSettings, columnBinding, context, executionContext),
+          this.runGraphCustomNodeWithRequiredCommitFence(
+            node,
+            nodeTask,
+            nodeSettings,
+            columnBinding,
+            context,
+            executionContext,
+          ),
         resolveColumnBinding: resolveBindingForNode,
       });
       const runner = new WorkflowGraphTaskRunner({
@@ -6447,13 +6515,13 @@ export class TaskExecutor {
         const terminalAttempt = typeof result.context?.[CCC_RETRY_ATTEMPT_CONTEXT_KEY] === "number"
           ? result.context[CCC_RETRY_ATTEMPT_CONTEXT_KEY] as number
           : undefined;
-        const terminalCccBranchPersistenceFailure = task.customFields?.cccFusionProfile === "ccc-fusion"
+        const terminalCccBranchPersistenceFailure = isCccCampaignTask(task)
           && typeof branchPersistenceFailure === "string"
           && branchPersistenceFailure.startsWith("ccc-branch-persistence-");
-        const terminalCccPermanentFailure = task.customFields?.cccFusionProfile === "ccc-fusion"
+        const terminalCccPermanentFailure = isCccCampaignTask(task)
           && typeof retryClassification === "string"
           && retryClassification.startsWith("ccc-permanent:");
-        const terminalCccTransientExhaustion = task.customFields?.cccFusionProfile === "ccc-fusion"
+        const terminalCccTransientExhaustion = isCccCampaignTask(task)
           && typeof retryClassification === "string"
           && retryClassification.startsWith("ccc-transient-retry-exhausted:");
         const terminalCccFailure = terminalCccBranchPersistenceFailure || terminalCccPermanentFailure || terminalCccTransientExhaustion;
@@ -7672,7 +7740,27 @@ export class TaskExecutor {
   /** Public custom-node runner seam for authoritative workflow runtimes. */
   public createAuthoritativeWorkflowCustomNodeRunner(settings: Settings): WorkflowCustomNodeRunner {
     return (node, task, context, executionContext) =>
-      this.runGraphCustomNode(node, task, settings, undefined, context, executionContext);
+      this.runGraphCustomNodeWithRequiredCommitFence(
+        node,
+        task,
+        settings,
+        undefined,
+        context,
+        executionContext,
+      );
+  }
+
+  /** Public node-preparation seam for authoritative workflow runtimes. */
+  public createAuthoritativeWorkflowNodePreparation(
+    settings: Settings,
+  ): NonNullable<WorkflowGraphExecutorDeps["prepareNodeExecution"]> {
+    return (node, task, requirement) =>
+      this.prepareGraphNodeExecution(node, task, settings, requirement);
+  }
+
+  /** Public store-backed branch frontier used by the native campaign runtime. */
+  public createAuthoritativeWorkflowBranchPersistence(): WorkflowBranchPersistence | undefined {
+    return this.buildBranchPersistence();
   }
 
   /** The sole production scoped-provider resolver for fenced campaign graph nodes. */
@@ -7687,6 +7775,7 @@ export class TaskExecutor {
         rootDir: this.rootDir,
         authorityStore: this.store,
         semanticTaskId: input.execution.semanticTaskId,
+        nativeTaskId: input.execution.nativeTaskId,
         turnKey,
         expectedRoute: Object.freeze({
           transport: "workflow" as const,
@@ -7716,6 +7805,7 @@ export class TaskExecutor {
       rootDir: this.rootDir,
       authorityStore: this.store,
       semanticTaskId: input.execution.semanticTaskId,
+      nativeTaskId: input.execution.nativeTaskId,
       turnKey,
       expectedRoute: Object.freeze({ providerId: input.provider, modelId: input.modelId, transport: "pi" as const }),
       signal: input.signal,
@@ -7950,7 +8040,7 @@ export class TaskExecutor {
         } catch (error) {
           return { outcome: "failure", value: error instanceof Error ? error.message : "ccc-campaign-custody-refused" };
         }
-        if (!this.mergeRequester) {
+        if (!this.mergeRequester && campaignCustody.kind !== "campaign") {
           return { outcome: "failure", value: "merge-unavailable", data: { status: "failed", reason: "merge-unavailable" } };
         }
         /*
@@ -8001,6 +8091,17 @@ export class TaskExecutor {
             value: "implementation-incomplete",
             data: { status: "failed", reason: "implementation-incomplete" },
           };
+        }
+        if (campaignCustody.kind === "campaign") {
+          await requireCccCampaignMergeApproval({
+            store: this.store,
+            rootDir: this.rootDir,
+            taskId: mergeTask.id,
+            runId: ctx.run.runId,
+          });
+        }
+        if (!this.mergeRequester) {
+          return { outcome: "failure", value: "merge-unavailable", data: { status: "failed", reason: "merge-unavailable" } };
         }
         /*
         FNXC:WorkflowCancellation 2026-07-15-10:42:
@@ -9200,6 +9301,48 @@ export class TaskExecutor {
     return true;
   }
 
+  private async runGraphCustomNodeWithRequiredCommitFence(
+    node: WorkflowIrNode,
+    nodeTask: TaskDetail,
+    settings: Settings,
+    columnBinding?: WorkflowColumnAgent,
+    graphContext?: Record<string, unknown>,
+    executionContext?: WorkflowNodeExecutionContext,
+  ): Promise<WorkflowNodeResult> {
+    const semanticTaskId = executionContext?.execution?.semanticTaskId;
+    const executorKind = node.config?.executor;
+    if (
+      executionContext?.execution?.executionFence
+      && typeof semanticTaskId === "string"
+      && node.config?.cccPrdTaskId === semanticTaskId
+      && node.config?.toolMode === "coding"
+      && (executorKind === "model" || executorKind === "cli-agent")
+    ) {
+      await requireCccCampaignLiveExecutionApproval({
+        store: this.store,
+        rootDir: this.rootDir,
+        taskId: executionContext.execution.nativeTaskId,
+        runId: executionContext.execution.runId,
+      });
+    }
+    const result = await this.runGraphCustomNode(
+      node,
+      nodeTask,
+      settings,
+      columnBinding,
+      graphContext,
+      executionContext,
+    );
+    await enforceCccCampaignRequiredCommitAfterNode({
+      rootDir: this.rootDir,
+      store: this.store,
+      taskId: nodeTask.id,
+      result,
+      executionContext,
+    });
+    return result;
+  }
+
   /** Run a custom (non-seam) graph node on the proven WorkflowStep machinery.
    *
    *  `columnBinding` (plan U3) is the agent binding governing this node's
@@ -9736,12 +9879,12 @@ export class TaskExecutor {
           `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but no CLI executor config is available`,
         );
       }
-      if (resolvedConfig.settings?.profile !== CCC_FUSION_PROFILE) {
+      const stableCliSettings = Object.freeze({ ...(resolvedConfig.settings ?? {}) });
+      if (stableCliSettings.profile !== CCC_FUSION_PROFILE) {
         throw new CccNativeCliBindingRefusedError(
           `Workflow node '${node.id}' uses the cli-agent executor in a fenced campaign execution, but CLI profile is not ${CCC_FUSION_PROFILE}`,
         );
       }
-      fencedCliConfig = resolvedConfig;
       const execution = executionContext.execution;
       const executionFence = execution.executionFence;
       if (!executionFence) {
@@ -9757,6 +9900,16 @@ export class TaskExecutor {
         typeof cfg.modelId === "string" ? cfg.modelId : live.modelId,
         "modelId",
       );
+      if (stableCliSettings.providerId !== providerId) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' CLI settings providerId '${String(stableCliSettings.providerId)}' does not match execution route providerId '${providerId}'`,
+        );
+      }
+      if (stableCliSettings.model !== modelId) {
+        throw new CccNativeCliBindingRefusedError(
+          `Workflow node '${node.id}' CLI settings model '${String(stableCliSettings.model)}' does not match execution route modelId '${modelId}'`,
+        );
+      }
       if (!Object.isFrozen(executionFence)) {
         throw new CccNativeCliBindingRefusedError("CCC native CLI executionFence must be frozen");
       }
@@ -9769,10 +9922,12 @@ export class TaskExecutor {
         modelId,
         transport: CCC_NATIVE_CLI_TRANSPORT,
       });
+      await runtime.manager.preflightPtyRuntime();
       const resolverInput = Object.freeze({
         nodeId: node.id,
         originTaskId: execution.originTaskId,
         semanticTaskId: execution.semanticTaskId,
+        nativeTaskId: execution.nativeTaskId,
         executionFence,
         visitIdentity: execution.visitIdentity,
         turnKey,
@@ -9793,15 +9948,70 @@ export class TaskExecutor {
         transport: CCC_NATIVE_CLI_TRANSPORT,
       });
       const preDispatchDecision = await binding.controller.preDispatch(dispatchRequest);
-      if (preDispatchDecision.kind !== "dispatch-permit") {
-        throw new CccNativeCliBindingRefusedError(
-          `CCC native CLI binding controller refused dispatch with decision '${preDispatchDecision.kind}'`,
+      if (preDispatchDecision.kind === "hold") {
+        const heldScope = validateCccNativeCliHoldScope(preDispatchDecision.scope, {
+          dispatchRequest,
+          semanticTaskId: execution.semanticTaskId,
+          nativeTaskId: execution.nativeTaskId,
+          authorityBindingHash: binding.authorityBindingHash,
+        });
+        if (preDispatchDecision.reason === "terminal") {
+          if (heldScope.state !== "committed" && heldScope.state !== "proved_failed") {
+            throw new CccNativeCliBindingRefusedError(
+              "CCC native CLI terminal hold did not contain an exact terminal provider attempt",
+            );
+          }
+          return heldScope.state === "committed"
+            ? { outcome: "success", value: "cli-agent-done" }
+            : { outcome: "failure", value: "cli-agent-proved-failed" };
+        }
+        if (heldScope.state !== "dispatched_unknown") {
+          throw new CccNativeCliBindingRefusedError(
+            "CCC native CLI dispatched-unknown hold contained a terminal provider attempt",
+          );
+        }
+        const receipt = selectCccNativeCliHeldClosureReceipt(
+          runtime.store,
+          heldScope,
+          binding,
+          adapterId,
+          live.worktree,
         );
+        const observation = validateCccNativeCliObservation(await binding.observer.observe(Object.freeze({
+          receipt,
+          permitScope: heldScope,
+        })));
+        const cancelled = observation.outcome === "proved_failed"
+          && (receipt.trigger === "cancel" || receipt.trigger === "lifetime");
+        validateCccNativeCliTerminalScope(await binding.controller.reconcile(Object.freeze({
+          taskId: heldScope.taskId,
+          attemptKey: heldScope.attemptKey,
+          controllerToken: heldScope.controllerToken,
+          outcome: observation.outcome,
+          evidenceDigest: observation.evidenceDigest,
+          observerId: CCC_NATIVE_CLI_OBSERVER_ID,
+          terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
+          cancellationState: cancelled ? "CANCELLED" : null,
+        })), {
+          permitScope: heldScope,
+          observation,
+        });
+        return observation.outcome === "committed"
+          ? { outcome: "success", value: "cli-agent-done" }
+          : { outcome: "failure", value: "cli-agent-proved-failed" };
       }
       nativeCliPermitScope = validateCccNativeCliPermitScope(preDispatchDecision.scope, {
         dispatchRequest,
         semanticTaskId: execution.semanticTaskId,
+        nativeTaskId: execution.nativeTaskId,
         authorityBindingHash: binding.authorityBindingHash,
+      });
+      fencedCliConfig = Object.freeze({
+        ...resolvedConfig,
+        settings: Object.freeze({
+          ...stableCliSettings,
+          subscriptionReady: true as const,
+        }),
       });
       const observedAtMs = Date.now();
       nativeCliSessionPolicy = buildCccNativeCliSessionPolicy(binding, nativeCliPermitScope, observedAtMs);
@@ -16260,7 +16470,7 @@ export class TaskExecutor {
     settings: Settings,
     audit?: RunAuditor,
   ): Promise<{ blocked: false } | { blocked: true; message: string }> {
-    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const cccFusionTask = isCccCampaignTask(task);
     if (task.scopeOverride === true && !cccFusionTask) {
       executorLog.log(`${task.id}: scope-leak guard bypassed (scopeOverride=true)`);
       await this.store.logEntry(task.id, "[scope-leak] scope guard bypassed via task.scopeOverride", undefined, this.getRunContextFor(task.id));
@@ -16764,7 +16974,7 @@ export class TaskExecutor {
         const scopeLeakCheck = await this.evaluateTaskDoneScopeLeak(task, worktreePath, promptContent, settings, audit)
           .catch(async (error: unknown) => {
             const errorMessage = error instanceof Error ? error.message : String(error);
-            if (task.customFields?.cccFusionProfile === "ccc-fusion") {
+            if (isCccCampaignTask(task)) {
               /*
               FNXC:CCCScopeVerification 2026-07-23-13:15:
               Wave 1 makes only the explicit ccc-fusion task profile fail closed

@@ -359,6 +359,21 @@ afterEach(() => {
 });
 
 describe("Task 4 RED task-session native CLI seam harness", () => {
+  it("passes the generated notify shim to native adapters before spawn", async () => {
+    const { opts, manager, hookDirRoot } = setupHarness();
+
+    await launchCliTaskSession(opts);
+
+    const launch = manager.spawn.mock.calls[0]?.[0] as {
+      settings?: Record<string, unknown>;
+    };
+    expect(launch.settings?.notifyProgram).toEqual(expect.stringMatching(
+      new RegExp(
+        `^${hookDirRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/fusion-cli-hooks-[^/]+/fusion-notify\\.sh$`,
+      ),
+    ));
+  });
+
   it("Task 4 RED: launch passes exact frozen ccc policy to manager.spawn and pre-caps deadline by permit lifetime", async () => {
     const { opts, manager, hookDirRoot, spawnPolicy, policy: expectedPolicy } = setupHarness();
 

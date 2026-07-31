@@ -125,6 +125,9 @@ function createStore() {
         ...(patch.controllerToken === undefined ? {} : { cccControllerGeneration: patch.controllerToken }),
         ...(patch.controllerFenced === undefined ? {} : { cccControllerFenced: patch.controllerFenced }),
         ...(patch.nativeCliClosureState === undefined ? {} : { cccNativeCliClosureState: patch.nativeCliClosureState }),
+        ...(patch.nativeCliHeldClosureEvidence === undefined
+          ? {}
+          : { cccNativeCliHeldClosureEvidence: patch.nativeCliHeldClosureEvidence }),
       },
     });
     return row;
@@ -281,6 +284,18 @@ describe("CCC native CLI campaign-held lifecycle", () => {
     expect(pty.pty.kill).toHaveBeenCalledWith("SIGTERM");
     expect(store.getSession(session.id)).toEqual(expect.objectContaining({ agentState: "needsAttention", terminationReason: null }));
     expect((store.getSession(session.id) as StoredSession).autonomyPosture.cccNativeCliClosureState).toBe("held-closed");
+    expect((store.getSession(session.id) as StoredSession).autonomyPosture.cccNativeCliHeldClosureEvidence).toEqual({
+      kind: "ccc-fusion.native-cli-held-closure-evidence",
+      version: 1,
+      sessionId: session.id,
+      trigger: "cancel",
+      exitCode: -1,
+      exitSignal: 15,
+      processGroupClosed: true,
+      proxyClosed: true,
+      durableFloorFlushed: true,
+      slotHeld: true,
+    });
     expect(store.flush).toHaveBeenCalled();
     expect(receipt).toEqual(expectedReceipt(session.id, "cancel"));
     expect(Object.isFrozen(receipt)).toBe(true);

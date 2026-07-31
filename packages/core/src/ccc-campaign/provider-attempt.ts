@@ -87,6 +87,10 @@ type ReconciliationInput = ProviderAttemptStoreInput & Readonly<{
   reconciliation: CccProviderAttemptReconciliation;
 }>;
 
+export type ListCccProviderAttemptsForCampaignInput = ProviderAttemptStoreInput & Readonly<{
+  taskId: string;
+}>;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null
     && typeof value === "object"
@@ -965,4 +969,20 @@ export async function inspectCccProviderAttempt(
   };
   if (input.tx) return inspect(input.tx);
   return input.layer.transaction(inspect);
+}
+
+export async function listCccProviderAttemptsForCampaign(
+  input: ListCccProviderAttemptsForCampaignInput,
+): Promise<readonly CccProviderAttemptScope[]> {
+  const taskId = requireCanonicalText(input.taskId, "task ID");
+  const list = async (tx: DbTransaction): Promise<readonly CccProviderAttemptScope[]> => {
+    const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, taskId, tx);
+    if (!context) return Object.freeze([]);
+    const history = await loadHistory(tx, context);
+    return Object.freeze([...history.attempts.values()]
+      .map((attempt) => attempt.scope)
+      .sort((left, right) => left.requestCount - right.requestCount || left.attemptKey.localeCompare(right.attemptKey)));
+  };
+  if (input.tx) return list(input.tx);
+  return input.layer.transaction(list);
 }

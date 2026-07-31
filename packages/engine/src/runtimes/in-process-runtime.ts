@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { fileURLToPath } from "node:url";
 import type {
   TaskStore,
   Task,
@@ -55,6 +54,7 @@ import { RestartRecoveryCoordinator } from "../restart-recovery-coordinator.js";
 import { MeshLeaseManager } from "../mesh-lease-manager.js";
 import { PluginRunner } from "../plugin-runner.js";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-campaign-proof-host.js";
+import { createCccCampaignProofSuiteHandler } from "../ccc-campaign-proof-execution.js";
 import { isImportedCccCampaignWorkItem } from "../ccc-campaign-routing.js";
 import { MissionAutopilot } from "../mission-autopilot.js";
 import { MissionExecutionLoop } from "../mission-execution-loop.js";
@@ -70,7 +70,6 @@ import { setImmediate as setImmediateCb } from "node:timers";
 import { resolvePreReleasePlanReviewNode } from "../hold-release.js";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
-const ENGINE_BUILT_ARTIFACT_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
 export const CLI_AGENT_AWAITING_INPUT_EVENT = "cli-agent-awaiting-input" as const;
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
@@ -1985,9 +1984,7 @@ export class InProcessRuntime
   private async ensureCccCampaignProofHostBootstrapped(): Promise<Error | undefined> {
     if (this.cccCampaignProofBootstrapError) return this.cccCampaignProofBootstrapError;
     if (!this.cccCampaignProofBootstrapPromise) {
-      this.cccCampaignProofBootstrapPromise = bootstrapCccCampaignProofAdmissionHost({
-        builtRootPath: ENGINE_BUILT_ARTIFACT_ROOT,
-      })
+      this.cccCampaignProofBootstrapPromise = bootstrapCccCampaignProofAdmissionHost()
         .then(() => undefined)
         .catch((error) => {
           const err = error instanceof Error ? error : new Error(String(error));
@@ -2010,7 +2007,13 @@ export class InProcessRuntime
       store: this.taskStore,
       primitives: this.executor.createAuthoritativeWorkflowPrimitives(settings),
       runCustomNode: this.executor.createAuthoritativeWorkflowCustomNodeRunner(settings),
+      prepareNodeExecution: this.executor.createAuthoritativeWorkflowNodePreparation(settings),
+      branchPersistence: this.executor.createAuthoritativeWorkflowBranchPersistence(),
       resolveNodeProviderController: this.executor.createCccCampaignWorkflowNodeProviderControllerResolver(),
+      runCccProofSuite: createCccCampaignProofSuiteHandler({
+        rootDir: this.config.workingDirectory,
+        store: this.taskStore,
+      }),
       handlers: {},
     });
     return this.cccCampaignWorkflowRuntime;

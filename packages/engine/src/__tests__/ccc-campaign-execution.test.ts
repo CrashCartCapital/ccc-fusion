@@ -117,6 +117,16 @@ describe("CCC campaign coarse pre-provider admission", () => {
         context: {
           taskId: "TASK-native-1",
           semanticTaskId: "REQ-semantic-7",
+          route: {
+            taskId: "REQ-semantic-7",
+          },
+          executionPolicy: {
+            routes: [
+              {
+                taskId: "REQ-semantic-7",
+              },
+            ],
+          },
         },
         binding: effects.binding,
         approval: effects.lease,
@@ -753,10 +763,10 @@ function context(overrides: Partial<CccCampaignTaskContext> = {}): CccCampaignTa
     protectedActions: [],
     executionPolicy: {
       schema: CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
-      routes: [{ taskId: "TASK-native-1", transport: "pi", providerId: "openai", modelId: "gpt-5.6-sol" }],
+      routes: [{ taskId: "REQ-semantic-7", transport: "pi", providerId: "openai", modelId: "gpt-5.6-sol" }],
     },
     taskId: "TASK-native-1",
-    route: { taskId: "TASK-native-1", transport: "pi", providerId: "openai", modelId: "gpt-5.6-sol" },
+    route: { taskId: "REQ-semantic-7", transport: "pi", providerId: "openai", modelId: "gpt-5.6-sol" },
     manifestHash: "4".repeat(64),
     requestCount: 0,
     activeActionLeases: {},

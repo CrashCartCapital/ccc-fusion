@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { and, eq } from "drizzle-orm";
 import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "../ccc-prd/contract.js";
+import { buildCccPrdTaskExecutionPrompt } from "../ccc-prd/projection.js";
 import type { CccPrdTask } from "../ccc-prd/types.js";
 import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
@@ -413,6 +415,24 @@ export async function loadCccCampaignContextForTask(
       `Task ${taskId} has no exact persisted campaign execution route`,
     );
   }
+  const semanticTasks = bundle.tasks.filter(({ id }) => id === row.semanticTaskId);
+  if (semanticTasks.length !== 1) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} has no exact semantic campaign task authority`,
+    );
+  }
+  const executionCustody = executionPolicy.schema === "ccc-campaign.execution-policy.v2"
+    ? (() => {
+      const prompt = buildCccPrdTaskExecutionPrompt(bundle, semanticTasks[0]!, route);
+      return {
+        promptSchema: prompt.schema,
+        promptSha256: prompt.sha256,
+        routeSha256: createHash("sha256")
+          .update(canonicalCccPrdJson(route), "utf8")
+          .digest("hex"),
+      } as const;
+    })()
+    : undefined;
   const proofIds = taskProofIds(bundle.tasks, row.semanticTaskId, taskId);
   assertProofIdsExist(
     proofIds,
@@ -471,6 +491,7 @@ export async function loadCccCampaignContextForTask(
     protectedActions: manifest.protectedActions,
     executionPolicy: manifest.executionPolicy,
     route: { ...route },
+    ...(executionCustody ? { executionCustody } : {}),
     campaignStartedAt: manifest.campaignStartedAt,
     campaignDeadlineAt: manifest.campaignDeadlineAt,
     requestCount: row.requestCount,

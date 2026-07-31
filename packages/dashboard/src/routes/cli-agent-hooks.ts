@@ -106,11 +106,53 @@ function normalizeHookEvent(eventName: string | undefined, body: Record<string, 
       return { kind: "done" as const, payload: basePayload };
     case "notification":
     case "permissionrequest":
-    case "notify":
       return {
         kind: "waitingOnInput" as const,
         payload: { ...basePayload, notification: body },
       };
+    case "notify": {
+      if (body.type === "agent-turn-complete") {
+        const codexNativeSessionId =
+          typeof body["thread-id"] === "string"
+            ? body["thread-id"]
+            : typeof body.thread_id === "string"
+              ? body.thread_id
+              : typeof body.threadId === "string"
+                ? body.threadId
+                : undefined;
+        const turnId =
+          typeof body["turn-id"] === "string"
+            ? body["turn-id"]
+            : typeof body.turn_id === "string"
+              ? body.turn_id
+              : typeof body.turnId === "string"
+                ? body.turnId
+                : undefined;
+        const lastAssistantMessage =
+          typeof body["last-assistant-message"] === "string"
+            ? body["last-assistant-message"]
+            : typeof body.last_assistant_message === "string"
+              ? body.last_assistant_message
+              : typeof body.lastAssistantMessage === "string"
+                ? body.lastAssistantMessage
+                : undefined;
+        return {
+          kind: "done" as const,
+          payload: {
+            ...(codexNativeSessionId
+              ? { nativeSessionId: codexNativeSessionId }
+              : {}),
+            ...(turnId ? { turnId } : {}),
+            ...(typeof body.cwd === "string" ? { cwd: body.cwd } : {}),
+            ...(lastAssistantMessage ? { lastAssistantMessage } : {}),
+          },
+        };
+      }
+      return {
+        kind: "waitingOnInput" as const,
+        payload: { ...basePayload, notification: body },
+      };
+    }
     case "pretooluse":
     case "posttooluse":
       return { kind: "toolActivity" as const, payload: basePayload };

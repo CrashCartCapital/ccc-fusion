@@ -1,12 +1,26 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
+  beginCccCampaignProofAttemptDispatch,
   importCccPrdBundle,
+  inspectCccPrdProductStatus,
   queryRunAuditEvents,
+  reserveCccCampaignProofAttempt,
+  settleCccCampaignProofAttempt,
   type ApprovalRequestActorSnapshot,
   type CccCampaignTaskContext,
   type Settings,
@@ -21,6 +35,7 @@ import {
 import {
   createCccPrdImportTestBundle,
   createCccPrdImportTestExecutionPolicy,
+  createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import {
@@ -29,6 +44,7 @@ import {
 } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import {
   casCccCampaignGitRef,
+  materializeCccCampaignGitCheckout,
   prepareCccCampaignGitObjects,
   recheckCccCampaignGitObjects,
   type PrepareCccCampaignGitObjectsInput,
@@ -279,13 +295,24 @@ describe("Task 5 native CCC campaign Git landing", () => {
 
 pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
   const h = createSharedPgTaskStoreTestHarness({ prefix: "fusion_ccc_campaign_git_landing" });
+  const mergeApprovalRequired = "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
 
   beforeAll(h.beforeAll);
   beforeEach(h.beforeEach);
   afterEach(h.afterEach);
   afterAll(h.afterAll);
 
-  async function importedMergeFixture(suffix: string) {
+  async function importedMergeFixture(
+    suffix: string,
+    options: {
+      proofReceipt?: "passing" | "missing" | "failed" | "dispatched-unknown" | "wrong-commit" | "wrong-tree" | "wrong-paths";
+      proofFence?: "exact" | "fake-work-item" | "stale-run" | "stale-attempt";
+      workItemState?: "manual-required" | "running" | "failed" | "succeeded";
+      executionPolicy?: "v1" | "v2";
+      sourcePath?: string;
+      targetCheckout?: "detached" | "checked-out";
+    } = {},
+  ) {
     const root = h.rootDir();
     rmSync(root, { recursive: true, force: true });
     await mkdir(root, { recursive: true });
@@ -315,26 +342,124 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
         spans: [initial.tasks[0]!.spans[0]!],
       }],
     });
-    await importCccPrdBundle({
+    const idempotencyKey = `git-landing-${suffix}`;
+    const imported = await importCccPrdBundle({
       bundle: source,
-      idempotencyKey: `git-landing-${suffix}`,
+      idempotencyKey,
       store: h.store(),
       layer: h.layer(),
       rootDir: root,
-      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+      executionPolicy: options.executionPolicy === "v1"
+        ? createCccPrdImportTestExecutionPolicy(source)
+        : createCccPrdImportTestProductExecutionPolicy(source),
     });
-    const taskId = `TASK-${suffix}`;
+    const semanticTaskId = `TASK-${suffix}`;
+    const productStatus = await inspectCccPrdProductStatus({
+      idempotencyKey,
+      layer: h.layer(),
+      rootDir: root,
+    });
+    if (!productStatus) throw new Error(`missing product status for ${idempotencyKey}`);
+    expect(productStatus.import.importId).toBe(imported.importId);
+    const taskStatuses = productStatus.tasks.filter(
+      (status) => status.semanticTaskId === semanticTaskId,
+    );
+    expect(taskStatuses).toHaveLength(1);
+    const taskId = taskStatuses[0]!.nativeTaskId;
+    const workItemIntent = source.importIntents.find(({ entityType }) => entityType === "work_item");
+    if (!workItemIntent) throw new Error("missing imported workflow work-item intent");
+    const nativeWorkItemId = `${imported.importId}--${workItemIntent.id}`;
+    const importedWorkItem = await h.store().getWorkflowWorkItem(nativeWorkItemId);
+    if (!importedWorkItem) throw new Error(`missing imported workflow work item ${nativeWorkItemId}`);
+    const workItemState = options.workItemState ?? "manual-required";
+    const parkedWorkItem = await h.store().transitionWorkflowWorkItem(
+      importedWorkItem.id,
+      workItemState,
+      {
+        attempt: 1,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: workItemState === "manual-required" ? mergeApprovalRequired : null,
+        blockedReason: workItemState === "manual-required" ? mergeApprovalRequired : null,
+      },
+    );
     const task = await h.store().getTask(taskId);
     const branch = resolveTaskWorkingBranch(task);
+    const sourcePath = options.sourcePath ?? "src/task-0/change.txt";
     git(root, ["switch", "-c", branch, "main"]);
-    await mkdir(join(root, "src"), { recursive: true });
-    writeFileSync(join(root, "src", "change.txt"), "feature\n");
-    git(root, ["add", "src/change.txt"]);
+    await mkdir(dirname(join(root, sourcePath)), { recursive: true });
+    writeFileSync(join(root, sourcePath), "feature\n");
+    git(root, ["add", sourcePath]);
     git(root, ["commit", "-m", "feature"]);
-    git(root, ["switch", "--detach", "main"]);
+    if (options.targetCheckout === "checked-out") {
+      git(root, ["switch", "main"]);
+    } else {
+      git(root, ["switch", "--detach", "main"]);
+    }
     writeFileSync(join(root, ".git", "info", "exclude"), "*\n");
     const context = await h.store().getCccCampaignContextForTask(taskId);
     if (!context) throw new Error(`missing campaign context for ${taskId}`);
+    expect(context).toMatchObject({
+      taskId,
+      semanticTaskId,
+    });
+    const proofReceipt = options.proofReceipt ?? "passing";
+    if (proofReceipt !== "missing") {
+      const branchCommit = git(root, ["rev-parse", `refs/heads/${branch}`]);
+      const sourceCommit = proofReceipt === "wrong-commit" ? base : branchCommit;
+      const sourceTree = proofReceipt === "wrong-tree"
+        ? git(root, ["rev-parse", `${base}^{tree}`])
+        : git(root, ["rev-parse", `${sourceCommit}^{tree}`]);
+      const exactChangedPathsSha256 = createHash("sha256")
+        .update(JSON.stringify([sourcePath]), "utf8")
+        .digest("hex");
+      const changedPathsSha256 = proofReceipt === "wrong-paths"
+        ? "0".repeat(64)
+        : exactChangedPathsSha256;
+      for (const proof of context.proofs) {
+        const reserved = await reserveCccCampaignProofAttempt({
+          layer: h.layer(),
+          rootDir: root,
+          taskId,
+          proofId: proof.id,
+          sourceCommit,
+          sourceTree,
+          workItemFence: {
+            workItemId: options.proofFence === "fake-work-item"
+              ? `WORK-fake-proof-${suffix}-${proof.id}`
+              : parkedWorkItem.id,
+            runId: options.proofFence === "stale-run"
+              ? `${parkedWorkItem.runId}:stale`
+              : parkedWorkItem.runId,
+            attempt: options.proofFence === "stale-attempt"
+              ? parkedWorkItem.attempt + 1
+              : parkedWorkItem.attempt,
+          },
+        });
+        await beginCccCampaignProofAttemptDispatch({
+          layer: h.layer(),
+          attemptKey: reserved.attemptKey,
+          controllerToken: reserved.controllerToken,
+        });
+        if (proofReceipt === "dispatched-unknown") continue;
+        await settleCccCampaignProofAttempt({
+          layer: h.layer(),
+          attemptKey: reserved.attemptKey,
+          controllerToken: reserved.controllerToken,
+          result: {
+            success: proofReceipt !== "failed",
+            exitCode: proofReceipt === "failed" ? 1 : 0,
+            durationMs: 1,
+            stdout: proofReceipt === "failed" ? "" : "proof passed\n",
+            stderr: proofReceipt === "failed" ? "proof failed\n" : "",
+            timedOut: false,
+            killed: false,
+            warnings: [],
+            changedPathsSha256,
+          },
+        });
+      }
+    }
     const issued = await issueCccCampaignApproval(h.layer(), {
       authorityStore: h.store(),
       rootDir: root,
@@ -354,7 +479,15 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
       runId: `approval-claim:${suffix}`,
       claimToken: `claim-${suffix}`,
     });
-    return { root, taskId, action, issued, claimed, claimToken: `claim-${suffix}` };
+    return {
+      root,
+      taskId,
+      action,
+      issued,
+      claimed,
+      parkedWorkItem,
+      claimToken: `claim-${suffix}`,
+    };
   }
 
   const landingMutationTypes = async (taskId: string) => (await queryRunAuditEvents(h.layer().db, {
@@ -391,6 +524,132 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     });
     return prepared.commitObject;
   }
+
+  it("refuses landing without exact passing proof receipts and preserves human approval", async () => {
+    const fixture = await importedMergeFixture("missing-proof-receipt", {
+      proofReceipt: "missing",
+    });
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).rejects.toThrow(/proof receipt|proof execution|exact commit|passing receipt/i);
+
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"]))
+      .toBe(fixture.claimed.campaign!.binding.targetBase);
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
+    expectNoForbiddenEffects(forbidden);
+  });
+
+  it("refuses a bundle-admitted source change outside every product route write root", async () => {
+    const fixture = await importedMergeFixture("route-source-root", {
+      sourcePath: "src/foreign/change.txt",
+    });
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).rejects.toThrow(/admitted|undeclared|write root|ownership/i);
+
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"]))
+      .toBe(fixture.claimed.campaign!.binding.targetBase);
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
+    expectNoForbiddenEffects(forbidden);
+  });
+
+  it.each([
+    ["failed", "failed proof"],
+    ["dispatched-unknown", "uncertain dispatched proof"],
+    ["wrong-commit", "stale commit"],
+    ["wrong-tree", "wrong tree"],
+    ["wrong-paths", "wrong changed paths"],
+  ] as const)(
+    "refuses %s proof receipts before intent and leaves approval reusable",
+    async (proofReceipt, suffix) => {
+      const fixture = await importedMergeFixture(
+        `proof-receipt-${suffix.replaceAll(" ", "-")}`,
+        { proofReceipt },
+      );
+      const forbidden = createForbiddenEffectRecorder();
+
+      await expect(runAiMerge(
+        h.store(),
+        fixture.root,
+        fixture.taskId,
+        {},
+        forbidden.deps,
+      )).rejects.toThrow(/proof|receipt|source/i);
+
+      expect(git(fixture.root, ["rev-parse", "refs/heads/main"]))
+        .toBe(fixture.claimed.campaign!.binding.targetBase);
+      await expectClaimedApprovalAndLease(fixture);
+      await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
+      expectNoForbiddenEffects(forbidden);
+    },
+  );
+
+  it.each([
+    ["fake receipt work-item fence", { proofFence: "fake-work-item" as const }],
+    ["stale receipt run fence", { proofFence: "stale-run" as const }],
+    ["stale receipt attempt fence", { proofFence: "stale-attempt" as const }],
+    ["incomplete imported workflow work item", { workItemState: "running" as const }],
+    ["failed imported workflow work item", { workItemState: "failed" as const }],
+    ["premature succeeded imported workflow work item", { workItemState: "succeeded" as const }],
+  ])(
+    "refuses otherwise-valid proof receipts with %s before intent and leaves approval reusable",
+    async (suffix, options) => {
+      const fixture = await importedMergeFixture(
+        `proof-work-item-${suffix.replaceAll(" ", "-")}`,
+        options,
+      );
+      const forbidden = createForbiddenEffectRecorder();
+
+      await expect(runAiMerge(
+        h.store(),
+        fixture.root,
+        fixture.taskId,
+        {},
+        forbidden.deps,
+      )).rejects.toThrow(/proof|receipt|work item|workflow|fence|campaign/i);
+
+      expect(git(fixture.root, ["rev-parse", "refs/heads/main"]))
+        .toBe(fixture.claimed.campaign!.binding.targetBase);
+      await expectClaimedApprovalAndLease(fixture);
+      await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
+      expectNoForbiddenEffects(forbidden);
+    },
+  );
+
+  it("keeps v1 landing fail-closed even with otherwise-valid synthetic proof receipts", async () => {
+    const fixture = await importedMergeFixture("v1-landing-fail-closed", {
+      executionPolicy: "v1",
+    });
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).rejects.toThrow(/product-v2|proof execution/i);
+
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"]))
+      .toBe(fixture.claimed.campaign!.binding.targetBase);
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([]);
+    expectNoForbiddenEffects(forbidden);
+  });
 
   it("refuses after deterministic objects before durable intent with ref unchanged and replayable commit identity", async () => {
     const fixture = await importedMergeFixture("after-objects-before-intent");
@@ -505,6 +764,309 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     expectNoForbiddenEffects(forbidden);
   });
 
+  it("lands onto the exact clean target branch checked out at the canonical target root", async () => {
+    const fixture = await importedMergeFixture("checked-out-target-root", {
+      targetCheckout: "checked-out",
+    });
+    const branch = resolveTaskWorkingBranch(await h.store().getTask(fixture.taskId));
+    const sourceCommit = git(fixture.root, ["rev-parse", `refs/heads/${branch}`]);
+    const baseCommit = fixture.claimed.campaign!.binding.targetBase;
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).resolves.toMatchObject({
+      merged: true,
+      noOp: false,
+    });
+
+    expect(git(fixture.root, ["symbolic-ref", "HEAD"])).toBe("refs/heads/main");
+    const landedCommit = git(fixture.root, ["rev-parse", "HEAD"]);
+    expect(landedCommit).not.toBe(baseCommit);
+    expect(landedCommit).not.toBe(sourceCommit);
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(landedCommit);
+    expect(git(fixture.root, ["rev-parse", `${landedCommit}^{tree}`]))
+      .toBe(git(fixture.root, ["rev-parse", `${sourceCommit}^{tree}`]));
+    expect(git(fixture.root, ["status", "--short"])).toBe("");
+    expectNoForbiddenEffects(forbidden);
+  });
+
+  it("recovers exact checked-out landing materialization without replaying an uncertain filesystem effect", async () => {
+    const fixture = await importedMergeFixture("checked-out-materialization-recovery", {
+      targetCheckout: "checked-out",
+    });
+    const baseCommit = fixture.claimed.campaign!.binding.targetBase;
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
+      ...forbidden.deps,
+      cccCampaignGitLandingFault: "after-checkout-materialization" as never,
+    })).rejects.toThrow(/after checkout materialization/i);
+
+    const intentEvents = await queryRunAuditEvents(h.layer().db, {
+      taskId: fixture.taskId,
+      domain: "git",
+      mutationType: "ccc-campaign-git-landing:intent",
+    });
+    const intent = intentEvents[0]?.metadata as { commitObject?: unknown } | null | undefined;
+    expect(intent?.commitObject).toEqual(expect.stringMatching(/^[a-f0-9]{40}$/u));
+    const commitObject = intent!.commitObject as string;
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(baseCommit);
+    expect(git(fixture.root, ["write-tree"])).toBe(git(fixture.root, ["rev-parse", `${commitObject}^{tree}`]));
+    expect(git(fixture.root, ["status", "--short"])).not.toBe("");
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:intent",
+    ]);
+
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
+      ...forbidden.deps,
+      cccCampaignGitLandingFault: "after-checkout-receipt" as never,
+    })).rejects.toThrow(/after checkout materialization receipt/i);
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(baseCommit);
+    expect(git(fixture.root, ["write-tree"])).toBe(git(fixture.root, ["rev-parse", `${commitObject}^{tree}`]));
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:checkout-materialized",
+      "ccc-campaign-git-landing:intent",
+    ]);
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).resolves.toMatchObject({ merged: true, noOp: false });
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(commitObject);
+    expect(git(fixture.root, ["status", "--short"])).toBe("");
+    await expect(getApprovalRequest(h.layer().db, fixture.issued.id))
+      .resolves.toMatchObject({ status: "consumed" });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:checkout-materialized",
+      "ccc-campaign-git-landing:intent",
+      "ccc-campaign-git-landing:terminal",
+    ]);
+    expectNoForbiddenEffects(forbidden);
+  });
+
+  it("requires manual recovery when a durable checkout receipt exists without its filesystem effect", async () => {
+    const fixture = await importedMergeFixture("checked-out-materialization-missing", {
+      targetCheckout: "checked-out",
+    });
+    const baseCommit = fixture.claimed.campaign!.binding.targetBase;
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
+      ...forbidden.deps,
+      cccCampaignGitLandingFault: "after-checkout-receipt" as never,
+    })).rejects.toThrow(/after checkout materialization receipt/i);
+
+    const intentEvents = await queryRunAuditEvents(h.layer().db, {
+      taskId: fixture.taskId,
+      domain: "git",
+      mutationType: "ccc-campaign-git-landing:intent",
+    });
+    const intent = intentEvents[0]?.metadata as {
+      commitObject?: unknown;
+    } | null | undefined;
+    expect(intent?.commitObject).toEqual(expect.stringMatching(/^[a-f0-9]{40}$/u));
+    const commitObject = intent!.commitObject as string;
+    git(fixture.root, [
+      "read-tree",
+      "--no-sparse-checkout",
+      "-u",
+      "-m",
+      commitObject,
+      baseCommit,
+    ]);
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(baseCommit);
+    expect(git(fixture.root, ["status", "--short"])).toBe("");
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).rejects.toThrow(/receipt exists.*filesystem effect is absent.*manual recovery/i);
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:checkout-materialized",
+      "ccc-campaign-git-landing:intent",
+    ]);
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(baseCommit);
+    expect(git(fixture.root, ["status", "--short"])).toBe("");
+    expectNoForbiddenEffects(forbidden);
+  });
+
+  it.each([
+    "tracked dirty",
+    "untracked",
+    "mixed index/worktree",
+  ] as const)(
+    "refuses %s checked-out restart state without overwriting operator bytes",
+    async (mode) => {
+      const fixture = await importedMergeFixture(
+        `checked-out-${mode.replaceAll(/[^a-z]+/gu, "-")}`,
+        { targetCheckout: "checked-out" },
+      );
+      const baseCommit = fixture.claimed.campaign!.binding.targetBase;
+      const forbidden = createForbiddenEffectRecorder();
+
+      await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
+        ...forbidden.deps,
+        cccCampaignGitLandingFault: "after-intent",
+      })).rejects.toThrow(/after durable intent/i);
+
+      let observedPath = join(fixture.root, "README.md");
+      if (mode === "tracked dirty") {
+        writeFileSync(observedPath, "operator dirty bytes\n");
+      } else if (mode === "untracked") {
+        writeFileSync(join(fixture.root, ".git", "info", "exclude"), "\n");
+        observedPath = join(fixture.root, "operator-untracked.txt");
+        writeFileSync(observedPath, "operator untracked bytes\n");
+      } else {
+        writeFileSync(observedPath, "operator staged bytes\n");
+        git(fixture.root, ["add", "README.md"]);
+        writeFileSync(observedPath, "operator worktree bytes\n");
+      }
+      const statusBefore = git(fixture.root, [
+        "status",
+        "--short",
+        "--untracked-files=all",
+      ]);
+      const indexBefore = git(fixture.root, ["write-tree"]);
+      const bytesBefore = readFileSync(observedPath, "utf8");
+      expect(statusBefore).not.toBe("");
+
+      await expect(runAiMerge(
+        h.store(),
+        fixture.root,
+        fixture.taskId,
+        {},
+        forbidden.deps,
+      )).rejects.toThrow(/dirty|untracked|index|worktree|manual recovery/i);
+      expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(baseCommit);
+      expect(git(fixture.root, [
+        "status",
+        "--short",
+        "--untracked-files=all",
+      ])).toBe(statusBefore);
+      expect(git(fixture.root, ["write-tree"])).toBe(indexBefore);
+      expect(readFileSync(observedPath, "utf8")).toBe(bytesBefore);
+      await expectClaimedApprovalAndLease(fixture);
+      await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+        "ccc-campaign-git-landing:intent",
+      ]);
+      expectNoForbiddenEffects(forbidden);
+    },
+  );
+
+  it("recovers a checked-out target after CAS without repeating landing or approval", async () => {
+    const fixture = await importedMergeFixture("checked-out-after-cas-recovery", {
+      targetCheckout: "checked-out",
+    });
+    const baseCommit = fixture.claimed.campaign!.binding.targetBase;
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(h.store(), fixture.root, fixture.taskId, {}, {
+      ...forbidden.deps,
+      cccCampaignGitLandingFault: "after-cas",
+    })).rejects.toThrow(/test fault after CAS/i);
+    const landedCommit = git(fixture.root, ["rev-parse", "HEAD"]);
+    expect(landedCommit).not.toBe(baseCommit);
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(landedCommit);
+    expect(git(fixture.root, ["status", "--short"])).toBe("");
+    await expectClaimedApprovalAndLease(fixture);
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:checkout-materialized",
+      "ccc-campaign-git-landing:intent",
+    ]);
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).resolves.toMatchObject({ merged: true, noOp: false });
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(landedCommit);
+    expect(git(fixture.root, ["rev-parse", "refs/heads/main"])).toBe(landedCommit);
+    expect(git(fixture.root, ["status", "--short"])).toBe("");
+    await expect(getApprovalRequest(h.layer().db, fixture.issued.id))
+      .resolves.toMatchObject({ status: "consumed" });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:checkout-materialized",
+      "ccc-campaign-git-landing:intent",
+      "ccc-campaign-git-landing:terminal",
+    ]);
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).resolves.toMatchObject({ merged: true, noOp: false });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:checkout-materialized",
+      "ccc-campaign-git-landing:intent",
+      "ccc-campaign-git-landing:terminal",
+    ]);
+    expectNoForbiddenEffects(forbidden);
+  });
+
+  it("accepts a succeeded imported workflow work item only on durable terminal replay", async () => {
+    const fixture = await importedMergeFixture("succeeded-work-item-terminal-replay");
+    const forbidden = createForbiddenEffectRecorder();
+
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).resolves.toMatchObject({ merged: true, noOp: false });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:intent",
+      "ccc-campaign-git-landing:terminal",
+    ]);
+
+    await h.store().transitionWorkflowWorkItem(
+      fixture.parkedWorkItem.id,
+      "succeeded",
+      {
+        expectedState: "manual-required",
+        expectedAttempt: fixture.parkedWorkItem.attempt,
+        attempt: fixture.parkedWorkItem.attempt,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: null,
+        blockedReason: null,
+      },
+    );
+    await expect(runAiMerge(
+      h.store(),
+      fixture.root,
+      fixture.taskId,
+      {},
+      forbidden.deps,
+    )).resolves.toMatchObject({ merged: true, noOp: false });
+
+    await expect(getApprovalRequest(h.layer().db, fixture.issued.id))
+      .resolves.toMatchObject({ status: "consumed" });
+    await expect(landingMutationTypes(fixture.taskId)).resolves.toEqual([
+      "ccc-campaign-git-landing:intent",
+      "ccc-campaign-git-landing:terminal",
+    ]);
+    expectNoForbiddenEffects(forbidden);
+  });
+
   it("Task 5 RED: refuses a foreign target ref race before CAS without terminal audit or approval consume", async () => {
     const fixture = await importedMergeFixture("foreign-before-cas");
     const branch = resolveTaskWorkingBranch(await h.store().getTask(fixture.taskId));
@@ -581,7 +1143,12 @@ describe("CCC campaign deterministic Git object primitives", () => {
     const checkedOut = makeObjectRepo("ccc-campaign-git-checked-out-");
     makeObjectFeature(checkedOut);
     git(checkedOut, ["switch", "main"]);
-    await expect(prepareCccCampaignGitObjects(objectInput(checkedOut))).rejects.toThrow(/checked out/i);
+    await expect(prepareCccCampaignGitObjects(objectInput(checkedOut))).resolves.toMatchObject({
+      targetCheckout: {
+        mode: "target-root",
+        path: realpathSync(checkedOut),
+      },
+    });
 
     const conflict = makeObjectRepo("ccc-campaign-git-conflict-");
     writeFileSync(join(conflict, "README.md"), "main\n");
@@ -762,6 +1329,42 @@ describe("CCC campaign deterministic Git object primitives", () => {
     });
   });
 
+  it("never executes repository hooks during checked-out prepare, materialization, or CAS", async () => {
+    const root = makeObjectRepo("ccc-campaign-git-hook-canary-");
+    makeObjectFeature(root);
+    git(root, ["switch", "main"]);
+    const hookRoot = join(root, ".git", "test-hooks");
+    const marker = join(root, ".git", "hook-executed");
+    mkdirSync(hookRoot);
+    const hookSource = [
+      "#!/bin/sh",
+      `/usr/bin/touch ${JSON.stringify(marker)}`,
+      "",
+    ].join("\n");
+    for (const hookName of [
+      "post-checkout",
+      "pre-commit",
+      "reference-transaction",
+    ]) {
+      const hookPath = join(hookRoot, hookName);
+      writeFileSync(hookPath, hookSource);
+      chmodSync(hookPath, 0o755);
+    }
+    git(root, ["config", "core.hooksPath", hookRoot]);
+
+    const prepared = await prepareCccCampaignGitObjects(objectInput(root));
+    expect(prepared.targetCheckout).toMatchObject({ mode: "target-root" });
+    await materializeCccCampaignGitCheckout(prepared);
+    await expect(casCccCampaignGitRef(prepared)).resolves.toMatchObject({
+      advanced: true,
+      current: prepared.commitObject,
+    });
+
+    expect(git(root, ["rev-parse", "HEAD"])).toBe(prepared.commitObject);
+    expect(git(root, ["status", "--short"])).toBe("");
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it("detects target checked out by a sibling worktree", async () => {
     const root = makeObjectRepo("ccc-campaign-git-worktree-");
     makeObjectFeature(root);
@@ -770,5 +1373,19 @@ describe("CCC campaign deterministic Git object primitives", () => {
     git(root, ["worktree", "add", sibling, "main"]);
 
     await expect(prepareCccCampaignGitObjects(objectInput(root))).rejects.toThrow(/checked out/i);
+  });
+
+  it("refuses a target branch checked out by more than one sibling worktree", async () => {
+    const root = makeObjectRepo("ccc-campaign-git-multiple-worktrees-");
+    makeObjectFeature(root);
+    const firstSibling = `${root}-sibling-a`;
+    const secondSibling = `${root}-sibling-b`;
+    trackedTmpDirs.add(firstSibling);
+    trackedTmpDirs.add(secondSibling);
+    git(root, ["worktree", "add", firstSibling, "main"]);
+    git(root, ["worktree", "add", "--force", secondSibling, "main"]);
+
+    await expect(prepareCccCampaignGitObjects(objectInput(root)))
+      .rejects.toThrow(/checked out more than once/i);
   });
 });

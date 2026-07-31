@@ -1,4 +1,8 @@
-export { authorCccPrdPacket } from "./authoring.js";
+export {
+  authorCccPrdPacket,
+  validateCccPrdImplementationFactProvenance,
+  validateCccPrdPacketImplementationFactProvenance,
+} from "./authoring.js";
 export type { AuthorCccPrdInput } from "./authoring.js";
 export {
   createNativeCccPrdAuthoringAdapter,

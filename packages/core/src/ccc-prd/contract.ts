@@ -107,6 +107,8 @@ export function projectCccPrdSemanticBundleForHash(
     admittedWriteRoots: bundle.admittedWriteRoots,
     targetRepository: bundle.targetRepository,
     nonGoals: bundle.nonGoals,
+    ...(bundle.materialCoverage ? { materialCoverage: bundle.materialCoverage } : {}),
+    ...(bundle.implementationFactProvenance ? { implementationFactProvenance: bundle.implementationFactProvenance } : {}),
     confidence: bundle.confidence,
   };
 }

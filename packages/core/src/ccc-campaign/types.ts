@@ -6,8 +6,13 @@ import type {
   CccPrdTargetRepository,
 } from "../ccc-prd/types.js";
 
-export const CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION =
+export const CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION =
   "ccc-campaign.execution-policy.v1" as const;
+export const CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION =
+  "ccc-campaign.execution-policy.v2" as const;
+/** @deprecated Use the version-specific execution-policy constant. */
+export const CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION =
+  CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION;
 export const CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION =
   "ccc-campaign.manifest.v1" as const;
 export const CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION =
@@ -17,6 +22,117 @@ export type CccCampaignTransport = "pi" | "cli" | "workflow";
 
 export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
   "ccc-campaign.provider-attempt.v2" as const;
+export const CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION =
+  "ccc-campaign.proof-attempt.v1" as const;
+
+export type CccCampaignProofAttemptState =
+  | "reserved"
+  | "dispatched_unknown"
+  | "committed"
+  | "proved_failed";
+
+export type CccCampaignProofAttemptScope = "task" | "campaign";
+
+export type CccCampaignProofWorkItemFence = Readonly<{
+  workItemId: string;
+  runId: string;
+  attempt: number;
+}>;
+
+export type CccCampaignProofExecutionResultInput = Readonly<{
+  success: boolean;
+  exitCode: number | null;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  killed: boolean;
+  warnings: readonly string[];
+  changedPathsSha256?: string;
+  negativeControlLabel?: string;
+}>;
+
+export type CccCampaignProofExecutionResult = Readonly<{
+  success: boolean;
+  exitCode: number | null;
+  durationMs: number;
+  stdoutSha256: string;
+  stderrSha256: string;
+  stdoutTail: string;
+  stderrTail: string;
+  timedOut: boolean;
+  killed: boolean;
+  warnings: readonly string[];
+  changedPathsSha256?: string;
+  negativeControlLabel?: string;
+}>;
+
+export type CccCampaignProofAttempt = Readonly<{
+  schema: typeof CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION;
+  attemptKey: string;
+  controllerToken: string;
+  projectId: string;
+  importId: string;
+  campaignId: string;
+  taskId: string;
+  semanticTaskId: string;
+  proofId: string;
+  packetHash: string;
+  sidecarHash: string;
+  bundleHash: string;
+  manifestHash: string;
+  campaignBindingHash: string;
+  targetRepository: string;
+  targetBase: string;
+  sourceCommit: string;
+  sourceTree: string;
+  definitionSha256: string;
+  command: string;
+  commandSha256: string;
+  workItemId: string;
+  runId: string;
+  workItemAttempt: number;
+  state: CccCampaignProofAttemptState;
+  result?: CccCampaignProofExecutionResult;
+  createdAt: string;
+  updatedAt: string;
+  dispatchedAt?: string;
+  settledAt?: string;
+}>;
+
+export type CccCampaignProofAttemptDispatchDecision =
+  | Readonly<{ kind: "dispatch-permit"; attempt: CccCampaignProofAttempt }>
+  | Readonly<{
+    kind: "dispatched-unknown" | "terminal";
+    attempt: CccCampaignProofAttempt;
+  }>;
+
+export class CccCampaignProofAttemptIdentityError extends Error {
+  public readonly code = "CCC_CAMPAIGN_PROOF_ATTEMPT_IDENTITY_REFUSED";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccCampaignProofAttemptIdentityError";
+  }
+}
+
+export class CccCampaignProofAttemptStateError extends Error {
+  public readonly code = "CCC_CAMPAIGN_PROOF_ATTEMPT_STATE_REFUSED";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccCampaignProofAttemptStateError";
+  }
+}
+
+export class CccCampaignProofAttemptCollisionError extends Error {
+  public readonly code = "CCC_CAMPAIGN_PROOF_ATTEMPT_COLLISION";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "CccCampaignProofAttemptCollisionError";
+  }
+}
 
 export type CccProviderAttemptState =
   | "reserved"
@@ -126,6 +242,23 @@ export type CccCampaignExecutionRoute = {
   modelId: string;
   transport: CccCampaignTransport;
   workflowExtensionId?: string;
+  executor?: "model" | "cli-agent";
+  toolMode?: "coding";
+  worktreeMode?: "isolated";
+  ownedPaths?: string[];
+  allowedWriteRoots?: string[];
+  commitPolicy?: "required";
+  cliAdapterId?: string;
+};
+
+export type CccCampaignProductExecutionRoute = CccCampaignExecutionRoute & {
+  transport: "pi" | "cli";
+  executor: "model" | "cli-agent";
+  toolMode: "coding";
+  worktreeMode: "isolated";
+  ownedPaths: string[];
+  allowedWriteRoots: string[];
+  commitPolicy: "required";
 };
 
 export type CccCampaignActionLookup = {
@@ -174,8 +307,15 @@ export class CccCampaignContextError extends Error {
 }
 
 export type CccCampaignExecutionPolicy = {
-  schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION;
+  schema:
+    | typeof CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION
+    | typeof CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION;
   routes: CccCampaignExecutionRoute[];
+};
+
+export type CccCampaignProductExecutionPolicy = CccCampaignExecutionPolicy & {
+  schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION;
+  routes: CccCampaignProductExecutionRoute[];
 };
 
 export type CccCampaignManifest = {
@@ -212,4 +352,14 @@ export type CccCampaignTaskContext = CccCampaignContext & {
   proofIds: readonly string[];
   /** Exact protected actions declared by this semantic task; may be empty. */
   protectedActionIds: readonly string[];
+  /**
+   * Product-v2 execution material re-derived from immutable campaign custody.
+   * Runtime compares these digests with the imported workflow node before any
+   * graph, provider, or tool effect.
+   */
+  executionCustody?: Readonly<{
+    promptSchema: "ccc-prd.execution-prompt.v1";
+    promptSha256: string;
+    routeSha256: string;
+  }>;
 };

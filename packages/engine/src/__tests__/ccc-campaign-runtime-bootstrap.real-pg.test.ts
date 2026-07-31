@@ -9,6 +9,7 @@ import {
   deriveWorkflowExtensionHostProvenance,
   getWorkflowExtensionHostProvenanceBinding,
   importCccPrdBundle,
+  inspectCccPrdProductStatus,
   queryRunAuditEvents,
   registerTaskMoveDisposer,
   TaskStore as FreshTaskStore,
@@ -21,6 +22,7 @@ import {
 import {
   createCccPrdImportTestBundle,
   createCccPrdImportTestExecutionPolicy,
+  createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import { createSharedPgTaskStoreTestHarness, pgDescribe, type SharedPgTaskStoreHarness } from "../../../core/src/__test-utils__/pg-test-harness.js";
@@ -46,6 +48,8 @@ type RuntimeHarness = InProcessRuntime & {
     execute: ReturnType<typeof vi.fn>;
     createAuthoritativeWorkflowPrimitives: ReturnType<typeof vi.fn>;
     createAuthoritativeWorkflowCustomNodeRunner: ReturnType<typeof vi.fn>;
+    createAuthoritativeWorkflowNodePreparation: ReturnType<typeof vi.fn>;
+    createAuthoritativeWorkflowBranchPersistence: ReturnType<typeof vi.fn>;
     createCccCampaignWorkflowNodeProviderControllerResolver: ReturnType<typeof vi.fn>;
   };
   cccCampaignProofBootstrapPromise?: Promise<void>;
@@ -75,7 +79,11 @@ async function commitGitRoot(rootDir: string, message: string): Promise<void> {
 
 const pgTest = pgDescribe;
 
-function runtimeWithStore(store: TaskStore, rootDir: string): RuntimeHarness {
+function runtimeWithStore(
+  store: TaskStore,
+  rootDir: string,
+  prepareNodeExecution = vi.fn(async () => undefined),
+): RuntimeHarness {
   const runtime = new InProcessRuntime({
     projectId: "runtime-real-pg",
     workingDirectory: rootDir,
@@ -92,6 +100,13 @@ function runtimeWithStore(store: TaskStore, rootDir: string): RuntimeHarness {
       outcome: "success" as const,
       value: "mocked-provider-effect",
     }))),
+    createAuthoritativeWorkflowNodePreparation: vi.fn(() => prepareNodeExecution),
+    createAuthoritativeWorkflowBranchPersistence: vi.fn(() => ({
+      saveBranchState: (state) => store.saveWorkflowRunBranch(state),
+      loadBranchStates: (taskId, runId) => store.loadWorkflowRunBranches(taskId, runId),
+      clearStaleBranchStates: (taskId, keepRunId) =>
+        store.clearWorkflowRunBranches(taskId, keepRunId),
+    })),
     createCccCampaignWorkflowNodeProviderControllerResolver: vi.fn(() => undefined),
   };
   runtime.cccCampaignProofBootstrapPromise = bootstrapCccCampaignProofAdmissionHost({
@@ -100,20 +115,66 @@ function runtimeWithStore(store: TaskStore, rootDir: string): RuntimeHarness {
   return runtime;
 }
 
-async function importCampaignFixture(h: SharedPgTaskStoreHarness, suffix: string): Promise<WorkflowWorkItem> {
+async function nativeTaskIdForImport(
+  h: SharedPgTaskStoreHarness,
+  input: Readonly<{
+    idempotencyKey: string;
+    importId: string;
+    semanticTaskId: string;
+  }>,
+): Promise<string> {
+  const productStatus = await inspectCccPrdProductStatus({
+    idempotencyKey: input.idempotencyKey,
+    layer: h.layer(),
+    rootDir: h.rootDir(),
+  });
+  if (!productStatus) {
+    throw new Error(`missing product status for ${input.idempotencyKey}`);
+  }
+  expect(productStatus.import.importId).toBe(input.importId);
+  const taskStatuses = productStatus.tasks.filter(
+    ({ semanticTaskId }) => semanticTaskId === input.semanticTaskId,
+  );
+  expect(taskStatuses).toHaveLength(1);
+  const nativeTaskId = taskStatuses[0]!.nativeTaskId;
+  expect(nativeTaskId).not.toBe(input.semanticTaskId);
+  return nativeTaskId;
+}
+
+async function importCampaignFixture(
+  h: SharedPgTaskStoreHarness,
+  suffix: string,
+  productExecution = false,
+): Promise<WorkflowWorkItem> {
   const source = await createAdmittedCampaignBundle(h.rootDir(), suffix);
-  await importCccPrdBundle({
+  const idempotencyKey = `runtime-real-pg-${suffix}`;
+  const imported = await importCccPrdBundle({
     bundle: source,
-    idempotencyKey: `runtime-real-pg-${suffix}`,
+    idempotencyKey,
     store: h.store(),
     layer: h.layer(),
     rootDir: h.rootDir(),
-    executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+    executionPolicy: productExecution
+      ? createCccPrdImportTestProductExecutionPolicy(source)
+      : createCccPrdImportTestExecutionPolicy(source),
   });
-  const items = await h.store().listWorkflowWorkItemsForTask(`TASK-${suffix}`);
-  const item = items.find((candidate) => candidate.id === `WORK-${suffix}`);
+  const semanticTaskId = `TASK-${suffix}`;
+  const nativeTaskId = await nativeTaskIdForImport(h, {
+    idempotencyKey,
+    importId: imported.importId,
+    semanticTaskId,
+  });
+  await expect(h.store().getCccCampaignContextForTask(nativeTaskId)).resolves.toMatchObject({
+    taskId: nativeTaskId,
+    semanticTaskId,
+  });
+  const items = await h.store().listWorkflowWorkItemsForTask(nativeTaskId);
+  const nativeWorkItemId = `${imported.importId}--WORK-${suffix}`;
+  const item = items.find((candidate) => candidate.id === nativeWorkItemId);
   if (!item) throw new Error(`missing campaign work item for ${suffix}`);
-  return h.store().upsertWorkflowWorkItem({
+  expect(item.id).toBe(nativeWorkItemId);
+  expect(item.taskId).toBe(nativeTaskId);
+  const runnable = await h.store().upsertWorkflowWorkItem({
     id: item.id,
     runId: item.runId,
     taskId: item.taskId,
@@ -126,6 +187,8 @@ async function importCampaignFixture(h: SharedPgTaskStoreHarness, suffix: string
     targetColumn: "todo",
     irHash: item.irHash ?? "1".repeat(64),
   });
+  expect(runnable.taskId).toBe(nativeTaskId);
+  return runnable;
 }
 
 async function createAdmittedCampaignBundle(rootDir: string, suffix: string) {
@@ -216,8 +279,9 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     const logEntrySpy = vi.spyOn(store, "logEntry");
 
     expect(campaign).toMatchObject({
-      id: "WORK-runtime-realpg",
-      taskId: "TASK-runtime-realpg",
+      id: expect.stringMatching(
+        /^ccc-prd-[0-9a-f]{32}--WORK-runtime-realpg$/u,
+      ),
       state: "runnable",
       attempt: 0,
       leaseOwner: null,
@@ -305,6 +369,185 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     });
   });
 
+  it("product v2 RED: the in-process campaign runtime prepares coding nodes before provider dispatch", async () => {
+    const store = h.store();
+    const campaign = await importCampaignFixture(h, "product-v2-preparation", true);
+    const prepareNodeExecution = vi.fn(async () => undefined);
+    const runtime = runtimeWithStore(store, h.rootDir(), prepareNodeExecution);
+
+    await runtime.drainWorkflowContinuations();
+    await waitFor(
+      async () => prepareNodeExecution.mock.calls.length,
+      (calls) => calls === 2,
+      "authoritative coding-node preparation",
+    );
+
+    expect(runtime.executor.createAuthoritativeWorkflowNodePreparation).toHaveBeenCalledTimes(1);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(2);
+    expect(prepareNodeExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "prompt",
+        config: expect.objectContaining({
+          cccPrdTaskId: "TASK-product-v2-preparation",
+          toolMode: "coding",
+          worktreeMode: "isolated",
+          commitPolicy: "required",
+        }),
+      }),
+      expect.objectContaining({ id: campaign.taskId }),
+      expect.objectContaining({ requiresWorktree: true }),
+      expect.objectContaining({
+        nodeId: expect.any(String),
+        materializedNodeId: expect.any(String),
+      }),
+      expect.objectContaining({
+        executionFence: expect.objectContaining({
+          workItemId: campaign.id,
+          runId: campaign.runId,
+        }),
+      }),
+    );
+    expect(prepareNodeExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "prompt",
+        config: expect.objectContaining({
+          cccPrdTaskId: "TASK-terminal-product-v2-preparation",
+          toolMode: "coding",
+          worktreeMode: "isolated",
+          ownedPaths: ["src/task-1"],
+          allowedWriteRoots: ["src/task-1"],
+          commitPolicy: "required",
+        }),
+      }),
+      expect.objectContaining({ id: expect.any(String) }),
+      expect.objectContaining({ requiresWorktree: true }),
+      expect.objectContaining({
+        nodeId: expect.any(String),
+        materializedNodeId: expect.any(String),
+      }),
+      expect.objectContaining({
+        executionFence: expect.objectContaining({
+          workItemId: campaign.id,
+          runId: campaign.runId,
+        }),
+      }),
+    );
+    const terminal = await waitFor(
+      () => store.getWorkflowWorkItem(campaign.id),
+      (item): item is WorkflowWorkItem => item?.state === "manual-required",
+      "product-v2 preparation campaign terminal state",
+    );
+    expect(terminal).toMatchObject({
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_PROOF_EXECUTION_REFUSED",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    });
+  });
+
+  it("product v2 RED: a restarted claim parks mutated imported IR before any graph or provider effect", async () => {
+    const campaign = await importCampaignFixture(h, "product-v2-ir-drift", true);
+    const selection = await h.store().getTaskWorkflowSelectionAsync(campaign.taskId);
+    if (!selection) throw new Error("missing imported workflow selection");
+    const workflow = await h.store().getWorkflowDefinition(selection.workflowId);
+    if (!workflow) throw new Error("missing imported workflow");
+    const mutatedIr = structuredClone(workflow.ir);
+    const promptNode = mutatedIr.nodes.find((node) =>
+      node.kind === "prompt" && node.config?.cccPrdTaskId === "TASK-product-v2-ir-drift");
+    if (!promptNode?.config) throw new Error("missing imported prompt node");
+    promptNode.config.prompt = "tampered-after-import";
+    await h.store().updateWorkflowDefinition(workflow.id, { ir: mutatedIr });
+    const mutatedCandidate = await h.store().upsertWorkflowWorkItem({
+      id: campaign.id,
+      runId: campaign.runId,
+      taskId: campaign.taskId,
+      nodeId: campaign.nodeId,
+      kind: campaign.kind,
+      state: "runnable",
+      attempt: campaign.attempt,
+      waitReason: "planning",
+      sourceColumn: "todo",
+      targetColumn: "todo",
+      irHash: campaign.irHash!,
+    });
+
+    const restartedStore = new FreshTaskStore(h.rootDir(), undefined, {
+      asyncLayer: h.layer(),
+    });
+    await restartedStore.init();
+    try {
+      const promptEffect = vi.fn(async () => ({ outcome: "success" as const }));
+      const runtime = new WorkflowTaskRuntime({
+        store: restartedStore,
+        primitives: {},
+        runCustomNode: promptEffect,
+        handlers: { prompt: promptEffect },
+      });
+
+      const result = await processDueWorkflowWorkItem(
+        restartedStore,
+        runtime,
+        await restartedStore.getSettings(),
+        {
+          leaseOwner: "product-v2-ir-drift-restart",
+          leaseDurationMs: 60_000,
+          kinds: ["task"],
+          campaignRequired: true,
+          exactCandidate: {
+            id: mutatedCandidate.id,
+            runId: mutatedCandidate.runId,
+            attempt: mutatedCandidate.attempt,
+          },
+        },
+      );
+
+      expect(result).toMatchObject({
+        claimed: true,
+        runtime: {
+          disposition: "manual-required",
+          outcome: "failure",
+          visitedNodeIds: [],
+          reason: "ccc-permanent:CCC_CAMPAIGN_NATIVE_IR_DRIFT",
+        },
+      });
+      expect(promptEffect).not.toHaveBeenCalled();
+      await expect(restartedStore.getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({
+        state: "manual-required",
+        attempt: 1,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        blockedReason: "ccc-permanent:CCC_CAMPAIGN_NATIVE_IR_DRIFT",
+      });
+
+      const secondRestart = new FreshTaskStore(h.rootDir(), undefined, {
+        asyncLayer: h.layer(),
+      });
+      await secondRestart.init();
+      try {
+        const redispatch = vi.fn();
+        await expect(processDueWorkflowWorkItem(
+          secondRestart,
+          { run: redispatch } as unknown as WorkflowTaskRuntime,
+          await secondRestart.getSettings(),
+          {
+            leaseOwner: "product-v2-ir-drift-second-restart",
+            leaseDurationMs: 60_000,
+            kinds: ["task"],
+            exactCandidate: {
+              id: campaign.id,
+              runId: campaign.runId,
+              attempt: 1,
+            },
+          },
+        )).resolves.toMatchObject({ claimed: false });
+        expect(redispatch).not.toHaveBeenCalled();
+      } finally {
+        secondRestart.stopWatching();
+      }
+    } finally {
+      restartedStore.stopWatching();
+    }
+  });
+
   it("keeps campaignRequired fail-closed after a real PostgreSQL claim when custody is absent", async () => {
     const store = h.store();
     const task = await store.createTask({
@@ -375,7 +618,7 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     expect(afterMove).toMatchObject({ id: campaign.id, runId: campaign.runId, state: "runnable", attempt: campaign.attempt, retryAfter: null, leaseOwner: null, leaseExpiresAt: null });
     let observedSignal: AbortSignal | undefined;
     const runtime = {
-      run: vi.fn((_task: unknown, _settings: unknown, options: { signal: AbortSignal }) => new Promise<any>((resolve) => {
+      run: vi.fn((_task: unknown, _settings: unknown, options: { signal: AbortSignal }) => new Promise<Awaited<ReturnType<WorkflowTaskRuntime["run"]>>>((resolve) => {
         observedSignal = options.signal;
         options.signal.addEventListener("abort", () => resolve({
           disposition: "failed",
@@ -633,18 +876,25 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
         spans: [initial.tasks[0]!.spans[0]!],
       }],
     });
-    await importCccPrdBundle({
+    const idempotencyKey = "runtime-real-pg-task6-committed-replay";
+    const imported = await importCccPrdBundle({
       bundle: source,
-      idempotencyKey: "runtime-real-pg-task6-committed-replay",
+      idempotencyKey,
       store,
       layer: h.layer(),
       rootDir,
       executionPolicy: createCccPrdImportTestExecutionPolicy(source),
     });
     await commitGitRoot(rootDir, "campaign import");
-    const taskId = "TASK-task6-committed-replay";
+    const semanticTaskId = "TASK-task6-committed-replay";
+    const taskId = await nativeTaskIdForImport(h, {
+      idempotencyKey,
+      importId: imported.importId,
+      semanticTaskId,
+    });
     const campaign = await store.getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error("missing Task 6 campaign context");
+    expect(campaign).toMatchObject({ taskId, semanticTaskId });
     const issued = await issueCccCampaignApproval(h.layer(), {
       authorityStore: store,
       rootDir,
@@ -700,7 +950,8 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       layer: h.layer(),
       rootDir,
       authorityStore: store,
-      semanticTaskId: taskId,
+      semanticTaskId,
+      nativeTaskId: taskId,
       turnKey: dispatch.turnKey,
       expectedRoute: {
         transport: "pi",
@@ -744,18 +995,25 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
         spans: [initial.tasks[0]!.spans[0]!],
       }],
     });
-    await importCccPrdBundle({
+    const idempotencyKey = "runtime-real-pg-task6-provider-identity";
+    const imported = await importCccPrdBundle({
       bundle: source,
-      idempotencyKey: "runtime-real-pg-task6-provider-identity",
+      idempotencyKey,
       store,
       layer: h.layer(),
       rootDir,
       executionPolicy: createCccPrdImportTestExecutionPolicy(source),
     });
     await commitGitRoot(rootDir, "campaign import");
-    const taskId = "TASK-task6-provider-identity";
+    const semanticTaskId = "TASK-task6-provider-identity";
+    const taskId = await nativeTaskIdForImport(h, {
+      idempotencyKey,
+      importId: imported.importId,
+      semanticTaskId,
+    });
     const campaign = await store.getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error("missing Task 6 provider-identity campaign context");
+    expect(campaign).toMatchObject({ taskId, semanticTaskId });
     const issued = await issueCccCampaignApproval(h.layer(), {
       authorityStore: store,
       rootDir,
@@ -791,11 +1049,11 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       transport: campaign.route.transport,
     });
     const bindingA = await createCccCampaignProviderAttemptBinding({
-      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId: taskId, turnKey: dispatchA.turnKey,
+      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchA.turnKey,
       expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
     });
     const bindingB = await createCccCampaignProviderAttemptBinding({
-      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId: taskId, turnKey: dispatchB.turnKey,
+      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchB.turnKey,
       expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
     });
     const permitB = await bindingB.controller.preDispatch(dispatchB);

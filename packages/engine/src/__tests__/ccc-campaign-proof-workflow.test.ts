@@ -35,19 +35,22 @@ type ProofWorkflowModule = {
 const exactBinding = ({
   originTaskId,
   semanticTaskId,
+  nativeTaskId = semanticTaskId,
   runId,
   nodeId,
 }: {
   originTaskId: string;
   semanticTaskId: string;
+  nativeTaskId?: string;
   runId: string;
   nodeId: string;
 }): CccCampaignProofAdmissionExecutionBinding => {
-  const semanticTask = Object.freeze({ id: semanticTaskId } as TaskDetail);
+  const semanticTask = Object.freeze({ id: nativeTaskId } as TaskDetail);
   const visitIdentity = Object.freeze({ nodeId, materializedNodeId: nodeId });
   const execution = Object.freeze({
     originTaskId,
     semanticTaskId,
+    nativeTaskId,
     semanticTask,
     runId,
     visitIdentity,
@@ -207,6 +210,96 @@ describe("CCC campaign proof workflow admission", () => {
     });
   });
 
+  it("uses a distinct audit identity when the same proof is re-admitted after a later durable work-item transition", async () => {
+    const evaluate: WorkflowProofAdmissionEvaluator = vi.fn(
+      async ({ inputSha256 }) => ({
+        outcome: "pass",
+        evaluatedInputSha256: inputSha256,
+        summary: "definition admitted; command not executed",
+      }),
+    );
+    const fixture = await proofFixture(evaluate);
+    const first = admissionHarness(fixture);
+    const second = admissionHarness(
+      fixture,
+      [fixture.proof.id],
+      new AbortController().signal,
+      {
+        ...proofFence(),
+        eventTimestamp: "2026-07-25T12:00:01.000Z",
+      },
+    );
+
+    await first.admit(first.node, first.signal);
+    await second.admit(second.node, second.signal);
+
+    const firstKey =
+      first.recordFencedAudit.mock.calls[0]?.[0].event.campaign?.eventKey;
+    const secondKey =
+      second.recordFencedAudit.mock.calls[0]?.[0].event.campaign?.eventKey;
+    expect(firstKey).not.toBe(secondKey);
+  });
+
+  it("admits every globally declared proof for the final proof-suite node", async () => {
+    const evaluate: WorkflowProofAdmissionEvaluator = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const { admission: _admission, ...secondDefinition } = {
+      ...fixture.proof,
+      id: "PROOF-2",
+      requirementIds: ["REQ-2"],
+      command: "pnpm --filter @fusion/core test -- proof-workflow",
+    };
+    const secondProof: CccPrdProof = {
+      ...secondDefinition,
+      admission: {
+        ...fixture.proof.admission!,
+        definitionSha256: computeCccPrdProofDefinitionSha256(secondDefinition),
+      },
+    };
+    const proofIds = [fixture.proof.id, secondProof.id];
+    const origin = {
+      ...campaignContext("TASK-ORIGIN", "TASK-ORIGIN", [fixture.proof.id], fixture.proof),
+      proofs: [fixture.proof, secondProof],
+    };
+    const nodeContext = {
+      ...campaignContext("TASK-NODE", "TASK-NODE", [fixture.proof.id], fixture.proof),
+      proofs: [fixture.proof, secondProof],
+    };
+    const recordFencedAudit = vi.fn(async (input: FencedAuditInput) => input.event);
+    const admit = createCccCampaignProofNodeAdmission({
+      store: {
+        getCccCampaignContextForTask: vi.fn(async (taskId: string) => {
+          if (taskId === origin.taskId) return origin;
+          if (taskId === nodeContext.taskId) return nodeContext;
+          return null;
+        }),
+        recordFencedCccCampaignProofAudit: recordFencedAudit,
+      },
+      originTaskId: origin.taskId,
+      fence: proofFence(),
+      registry: fixture.registry,
+    });
+
+    await admit({
+      id: "proof-suite",
+      kind: "gate",
+      config: {
+        cccProofSuite: true,
+        cccProofIds: proofIds,
+        cccPrdTaskId: nodeContext.semanticTaskId,
+      },
+    }, new AbortController().signal);
+
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(recordFencedAudit).toHaveBeenCalledTimes(2);
+    expect(recordFencedAudit.mock.calls.map(([input]) => input.event.metadata?.proofId))
+      .toEqual(proofIds);
+  });
+
   it("admits a fixture with exact admission binding and sealed execution provenance", async () => {
     const evaluate = vi.fn(async ({ inputSha256 }) => ({
       outcome: "pass",
@@ -227,6 +320,62 @@ describe("CCC campaign proof workflow admission", () => {
     expect(evaluate).toHaveBeenCalledOnce();
     expect(evaluate.mock.calls[0]).toHaveLength(1);
     expect(harness.recordFencedAudit).toHaveBeenCalledOnce();
+  });
+
+  it("admits distinct semantic and allocator-native task identities", async () => {
+    const evaluate = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass" as const,
+      evaluatedInputSha256: inputSha256,
+      summary: "definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const origin = campaignContext(
+      "FN-101",
+      "TASK-ORIGIN",
+      [fixture.proof.id],
+      fixture.proof,
+    );
+    const nodeContext = campaignContext(
+      "FN-102",
+      "TASK-NODE",
+      [fixture.proof.id],
+      fixture.proof,
+    );
+    const store = {
+      getCccCampaignContextForTask: vi.fn(async (taskId: string) => {
+        if (taskId === origin.taskId) return origin;
+        if (taskId === nodeContext.taskId) return nodeContext;
+        return null;
+      }),
+      recordFencedCccCampaignProofAudit: vi.fn(async (input: FencedAuditInput) => input.event),
+    };
+    const admit = createCccCampaignProofNodeAdmission({
+      store,
+      originTaskId: origin.taskId,
+      fence: proofFence(),
+      registry: fixture.registry,
+      requireExecutionBinding: true,
+    });
+    const node = {
+      id: "node-1",
+      kind: "prompt",
+      config: {
+        cccPrdTaskId: nodeContext.semanticTaskId,
+        cccNativeTaskId: nodeContext.taskId,
+      },
+    } as const;
+    const binding = exactBinding({
+      originTaskId: origin.taskId,
+      semanticTaskId: nodeContext.semanticTaskId,
+      nativeTaskId: nodeContext.taskId,
+      runId: "run-1",
+      nodeId: node.id,
+    });
+
+    await admit(node, new AbortController().signal, binding);
+
+    expect(store.getCccCampaignContextForTask).toHaveBeenCalledWith(nodeContext.taskId);
+    expect(evaluate).toHaveBeenCalledOnce();
   });
 
   it("refuses before evaluator dispatch when execution origin differs from factory origin", async () => {
@@ -712,7 +861,12 @@ function campaignContext(
         { taskId: "TASK-NODE", providerId: "fake", modelId: "fake-v1", transport: "workflow" },
       ],
     },
-    route: { taskId, providerId: "fake", modelId: "fake-v1", transport: "workflow" },
+    route: {
+      taskId: semanticTaskId,
+      providerId: "fake",
+      modelId: "fake-v1",
+      transport: "workflow",
+    },
     campaignStartedAt: "2026-07-25T11:59:00.000Z",
     campaignDeadlineAt: "2026-07-25T12:01:00.000Z",
     requestCount: 0,
@@ -734,6 +888,7 @@ function admissionHarness(
   fixture: Awaited<ReturnType<typeof proofFixture>>,
   proofIds: string[] = [fixture.proof.id],
   signal = new AbortController().signal,
+  fence = proofFence(),
 ) {
   const origin = campaignContext(
     "TASK-ORIGIN",
@@ -767,7 +922,7 @@ function admissionHarness(
     admit: createCccCampaignProofNodeAdmission({
       store,
       originTaskId: origin.taskId,
-      fence: proofFence(),
+      fence,
       registry: fixture.registry,
     }),
   };

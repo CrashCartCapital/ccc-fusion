@@ -434,6 +434,7 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
       controllerFenced?: boolean;
       cancellationState?: string | null;
       nativeCliClosureState?: "held-closed" | "settled" | null;
+      nativeCliHeldClosureEvidence?: Readonly<Record<string, unknown>> | null;
     },
   ): Promise<CliSession | undefined> {
     this.assertAgentState(input.agentState);
@@ -465,6 +466,10 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
       if (input.nativeCliClosureState === null) delete nextPosture.cccNativeCliClosureState;
       else if (input.nativeCliClosureState !== undefined) {
         nextPosture.cccNativeCliClosureState = input.nativeCliClosureState;
+      }
+      if (input.nativeCliHeldClosureEvidence === null) delete nextPosture.cccNativeCliHeldClosureEvidence;
+      else if (input.nativeCliHeldClosureEvidence !== undefined) {
+        nextPosture.cccNativeCliHeldClosureEvidence = input.nativeCliHeldClosureEvidence;
       }
       const next: CliSession = {
         ...current,

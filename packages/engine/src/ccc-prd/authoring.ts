@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
+  CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
@@ -13,6 +14,10 @@ import {
   type CccPrdAuthoringConstraints,
   type CccPrdAuthoringProposal,
   type CccPrdAuthoringResult,
+  type CccPrdDiagnostic,
+  type CccPrdExecutionBounds,
+  type CccPrdImplementationFactBinding,
+  type CccPrdImplementationFactProvenance,
   type CccPrdProposalArtifact,
   type CccPrdProposalDocument,
   type CccPrdProposalProof,
@@ -25,6 +30,7 @@ import {
   type CccPrdSourceReferenceProposal,
   type CccPrdSourceSpan,
   type CccPrdSidecar,
+  type CccPrdTargetRepository,
   type WorkflowExtensionRegistry,
 } from "@fusion/core";
 import {
@@ -43,6 +49,7 @@ import {
   canonicalizeProtectedActionIds,
   isWellFormedProtectedActionId,
 } from "./protected-action-ids.js";
+import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
 
 export type AuthorCccPrdInput = {
   rootDir: string;
@@ -189,6 +196,28 @@ type SourceBoundEntity = {
   spans: CccPrdSourceSpan[];
 };
 
+type ImplementationFacts = {
+  targetRepository: CccPrdTargetRepository;
+  bounds: CccPrdExecutionBounds;
+  admittedWriteRoots: Array<{ path: string; purpose: string }>;
+  nonGoals: string[];
+  requirements: Array<{ id: string; acceptance: string; spans?: CccPrdSourceSpan[] }>;
+  proofs: Array<{
+    id: string;
+    command: string;
+    positiveOracle: string;
+    negativeControls: string[];
+    spans?: CccPrdSourceSpan[];
+  }>;
+  protectedActions: Array<{
+    id: string;
+    kind: string;
+    target: string;
+    spans: CccPrdSourceSpan[];
+  }>;
+  implementationFactProvenance?: CccPrdImplementationFactProvenance;
+};
+
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -231,6 +260,302 @@ function sourceBindingInventory(
       })),
     })).sort((left, right) => compareCodeUnits(left.id, right.id)),
   ]));
+}
+
+function bindingFromAbsoluteSpan(
+  value: string | number,
+  sourceBytes: Map<string, Buffer>,
+  sourcePath: string,
+  byteStart: number,
+  byteEnd: number,
+): CccPrdImplementationFactBinding {
+  const source = sourceBytes.get(sourcePath)!;
+  const bytes = source.subarray(byteStart, byteEnd);
+  return {
+    value,
+    spans: [{
+      ...createCccPrdSpanFromBytes(sourcePath, source, byteStart, byteEnd),
+      excerptSha256: sha256(bytes),
+    }],
+  };
+}
+
+function findFactBindingInSource(
+  value: string | number,
+  sourceBytes: Map<string, Buffer>,
+): CccPrdImplementationFactBinding | undefined {
+  const needle = Buffer.from(String(value), "utf8");
+  if (needle.byteLength === 0) return undefined;
+  for (const [sourcePath, source] of sourceBytes) {
+    const byteStart = source.indexOf(needle);
+    if (byteStart >= 0) {
+      return bindingFromAbsoluteSpan(
+        value,
+        sourceBytes,
+        sourcePath,
+        byteStart,
+        byteStart + needle.byteLength,
+      );
+    }
+  }
+  return undefined;
+}
+
+function findFactBindingInEntitySpans(
+  value: string | number,
+  sourceBytes: Map<string, Buffer>,
+  spans: readonly CccPrdSourceSpan[],
+): CccPrdImplementationFactBinding | undefined {
+  const needle = Buffer.from(String(value), "utf8");
+  if (needle.byteLength === 0) return undefined;
+  const sorted = [...spans].sort(compareSourceSpans);
+  for (const span of sorted) {
+    const source = sourceBytes.get(span.path);
+    if (!source) continue;
+    const haystack = source.subarray(span.byteStart, span.byteEnd);
+    const offset = haystack.indexOf(needle);
+    if (offset >= 0) {
+      const byteStart = span.byteStart + offset;
+      return bindingFromAbsoluteSpan(
+        value,
+        sourceBytes,
+        span.path,
+        byteStart,
+        byteStart + needle.byteLength,
+      );
+    }
+  }
+  return undefined;
+}
+
+function requireTopLevelBinding(
+  diagnostics: CccPrdDiagnostic[],
+  sourceBytes: Map<string, Buffer>,
+  code: string,
+  message: string,
+  value: string | number,
+): CccPrdImplementationFactBinding {
+  const binding = findFactBindingInSource(value, sourceBytes);
+  if (binding) return binding;
+  diagnostics.push({ code, message });
+  return { value, spans: [] };
+}
+
+function requireEntityBinding(
+  diagnostics: CccPrdDiagnostic[],
+  sourceBytes: Map<string, Buffer>,
+  code: string,
+  message: string,
+  value: string | number,
+  spans: readonly CccPrdSourceSpan[],
+): CccPrdImplementationFactBinding {
+  const binding = findFactBindingInEntitySpans(value, sourceBytes, spans);
+  if (binding) return binding;
+  diagnostics.push({ code, message, ...(spans[0] ? { span: spans[0] } : {}) });
+  return { value, spans: [] };
+}
+
+export function computeCccPrdImplementationFactProvenance(input: {
+  sourceBytes: Map<string, Buffer>;
+  facts: ImplementationFacts;
+}): { provenance?: CccPrdImplementationFactProvenance; diagnostics: CccPrdDiagnostic[] } {
+  const diagnostics: CccPrdDiagnostic[] = [];
+  const provenance: CccPrdImplementationFactProvenance = {
+    schema: CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
+    targetRepository: {
+      path: requireTopLevelBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_TARGET_REPOSITORY_PROVENANCE_REQUIRED",
+        "Target repository must be stated in an admitted PRD source or reviewed operator-decision source; CLI flags alone are not source facts.",
+        input.facts.targetRepository.path,
+      ),
+      baseCommit: requireTopLevelBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_BASELINE_PROVENANCE_REQUIRED",
+        "Baseline commit must be stated in an admitted PRD source or reviewed operator-decision source; CLI flags alone are not source facts.",
+        input.facts.targetRepository.baseCommit,
+      ),
+    },
+    bounds: {
+      maxRequests: requireTopLevelBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_EXECUTION_BOUND_PROVENANCE_REQUIRED",
+        `Execution bound maxRequests=${input.facts.bounds.maxRequests} must be stated in an admitted PRD source or reviewed operator-decision source.`,
+        input.facts.bounds.maxRequests,
+      ),
+      maxDurationMs: requireTopLevelBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_EXECUTION_BOUND_PROVENANCE_REQUIRED",
+        `Execution bound maxDurationMs=${input.facts.bounds.maxDurationMs} must be stated in an admitted PRD source or reviewed operator-decision source.`,
+        input.facts.bounds.maxDurationMs,
+      ),
+      maxConcurrency: requireTopLevelBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_EXECUTION_BOUND_PROVENANCE_REQUIRED",
+        `Execution bound maxConcurrency=${input.facts.bounds.maxConcurrency} must be stated in an admitted PRD source or reviewed operator-decision source.`,
+        input.facts.bounds.maxConcurrency,
+      ),
+    },
+    admittedWriteRoots: input.facts.admittedWriteRoots.map((root) => ({
+      path: requireTopLevelBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_ALLOWED_WRITE_ROOT_PROVENANCE_REQUIRED",
+        `Allowed write root ${root.path} must be stated in an admitted PRD source or reviewed operator-decision source.`,
+        root.path,
+      ),
+      purpose: requireTopLevelBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_ALLOWED_WRITE_ROOT_PURPOSE_PROVENANCE_REQUIRED",
+        `Allowed write root purpose ${root.purpose} must be stated in an admitted PRD source or reviewed operator-decision source.`,
+        root.purpose,
+      ),
+    })),
+    nonGoals: input.facts.nonGoals.map((nonGoal) => requireTopLevelBinding(
+      diagnostics,
+      input.sourceBytes,
+      "CCC_PRD_NON_GOAL_PROVENANCE_REQUIRED",
+      `Non-goal must be stated in an admitted PRD source or reviewed operator-decision source: ${nonGoal}`,
+      nonGoal,
+    )),
+    requirements: input.facts.requirements.map((requirement) => ({
+      id: requirement.id,
+      acceptance: requireEntityBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_ACCEPTANCE_PROVENANCE_REQUIRED",
+        `Acceptance behavior for requirement ${requirement.id} must be stated inside that requirement's cited source span.`,
+        requirement.acceptance,
+        "spans" in requirement && Array.isArray(requirement.spans) ? requirement.spans : [],
+      ),
+    })),
+    proofs: input.facts.proofs.map((proof) => ({
+      id: proof.id,
+      command: requireEntityBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_PROOF_COMMAND_PROVENANCE_REQUIRED",
+        `Verifier command for proof ${proof.id} must be stated inside that proof's cited source span.`,
+        proof.command,
+        proof.spans ?? [],
+      ),
+      positiveOracle: requireEntityBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_PROOF_ORACLE_PROVENANCE_REQUIRED",
+        `Positive proof oracle for proof ${proof.id} must be stated inside that proof's cited source span.`,
+        proof.positiveOracle,
+        proof.spans ?? [],
+      ),
+      negativeControls: proof.negativeControls.map((negativeControl) => requireEntityBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_NEGATIVE_CONTROL_PROVENANCE_REQUIRED",
+        `Negative control for proof ${proof.id} must be stated inside that proof's cited source span: ${negativeControl}`,
+        negativeControl,
+        proof.spans ?? [],
+      )),
+    })),
+    protectedActions: input.facts.protectedActions.map((action) => ({
+      id: action.id,
+      kind: requireEntityBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_PROTECTED_ACTION_KIND_PROVENANCE_REQUIRED",
+        `Protected action kind for ${action.id} must be stated inside that action's cited source span.`,
+        action.kind,
+        action.spans,
+      ),
+      target: requireEntityBinding(
+        diagnostics,
+        input.sourceBytes,
+        "CCC_PRD_PROTECTED_ACTION_TARGET_PROVENANCE_REQUIRED",
+        `Protected action target for ${action.id} must be stated inside that action's cited source span.`,
+        action.target,
+        action.spans,
+      ),
+    })),
+  };
+  return diagnostics.length > 0 ? { diagnostics } : { provenance, diagnostics };
+}
+
+export function validateCccPrdImplementationFactProvenance(input: {
+  sourceBytes: Map<string, Buffer>;
+  facts: ImplementationFacts;
+  provenance?: CccPrdImplementationFactProvenance;
+}): CccPrdDiagnostic[] {
+  const diagnostics: CccPrdDiagnostic[] = [];
+  if (!input.provenance) {
+    return [{
+      code: "CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_REQUIRED",
+      message: "supported product intake requires exact source custody for implementation-changing facts",
+    }];
+  }
+  const provenanceActions = new Map(input.provenance.protectedActions.map((action) => [action.id, action]));
+  for (const action of input.facts.protectedActions) {
+    const provenanceAction = provenanceActions.get(action.id);
+    if (
+      provenanceAction
+      && (
+        provenanceAction.kind.value !== action.kind
+        || provenanceAction.target.value !== action.target
+      )
+    ) {
+      diagnostics.push({
+        code: "CCC_PRD_PROTECTED_ACTION_PROVENANCE_STALE",
+        message: "protected-action kind or target no longer matches exact implementation fact provenance",
+      });
+    }
+  }
+  const computed = computeCccPrdImplementationFactProvenance({
+    sourceBytes: input.sourceBytes,
+    facts: input.facts,
+  });
+  diagnostics.push(...computed.diagnostics);
+  if (!computed.provenance) return diagnostics;
+  if (
+    canonicalCccPrdJson(input.provenance.protectedActions)
+    !== canonicalCccPrdJson(computed.provenance.protectedActions)
+  ) {
+    diagnostics.push({
+      code: "CCC_PRD_PROTECTED_ACTION_PROVENANCE_STALE",
+      message: "protected-action kind or target no longer matches exact implementation fact provenance",
+    });
+  }
+  if (
+    canonicalCccPrdJson(input.provenance)
+    !== canonicalCccPrdJson(computed.provenance)
+    && diagnostics.length === 0
+  ) {
+    diagnostics.push({
+      code: "CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_STALE",
+      message: "implementation-changing fact provenance no longer matches admitted source bytes and declarations",
+    });
+  }
+  return diagnostics;
+}
+
+export function validateCccPrdPacketImplementationFactProvenance(input: {
+  rootDir: string;
+  manifestPath: string;
+  facts: ImplementationFacts;
+  provenance?: CccPrdImplementationFactProvenance;
+}): CccPrdDiagnostic[] {
+  const custody = readCccPrdPacketCustody({
+    rootDir: input.rootDir,
+    manifestPath: input.manifestPath,
+  });
+  return validateCccPrdImplementationFactProvenance({
+    sourceBytes: custody.sourceBytes,
+    facts: input.facts,
+    provenance: input.provenance ?? input.facts.implementationFactProvenance,
+  });
 }
 
 function resolveSourceRefs(
@@ -418,6 +743,22 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       });
     }
     const mapped = mapProposal(proposalValue, custody.sourceBytes);
+    let implementationFactProvenance: CccPrdImplementationFactProvenance | undefined;
+    if (input.constraints) {
+      const computedProvenance = computeCccPrdImplementationFactProvenance({
+        sourceBytes: custody.sourceBytes,
+        facts: {
+          ...proposalValue,
+          requirements: mapped.requirements,
+          proofs: mapped.proofs,
+          protectedActions: mapped.protectedActions,
+        },
+      });
+      if (computedProvenance.diagnostics.length > 0 || !computedProvenance.provenance) {
+        return { kind: "refusal", diagnostics: computedProvenance.diagnostics };
+      }
+      implementationFactProvenance = computedProvenance.provenance;
+    }
     if (
       samePacketAsPrevious
       && canonicalCccPrdJson(sourceBindingInventory(input.previousSidecar!))
@@ -497,7 +838,7 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       },
     }));
     const proposalHash = sha256(canonicalCccPrdJson(proposalValue));
-    const sidecar: CccPrdSidecar = {
+    const sidecarWithoutCoverage: CccPrdSidecar = {
       schema: CCC_PRD_SIDECAR_SCHEMA_VERSION,
       sourceVersion: custody.sourceVersion,
       orderedSources: custody.sources,
@@ -525,6 +866,17 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       ambiguities: mapped.ambiguities,
       exceptions: mapped.exceptions,
       confidence: proposalValue.confidence,
+      ...(implementationFactProvenance ? { implementationFactProvenance } : {}),
+    };
+    const materialCoverage = analyzeCccPrdMaterialCoverage({
+      sourceBytes: custody.sourceBytes,
+      requirements: sidecarWithoutCoverage.requirements,
+      tasks: sidecarWithoutCoverage.tasks,
+      unresolvedDecisions: sidecarWithoutCoverage.unresolvedDecisions,
+    }).coverage;
+    const sidecar: CccPrdSidecar = {
+      ...sidecarWithoutCoverage,
+      materialCoverage,
     };
     return {
       kind: "candidate",

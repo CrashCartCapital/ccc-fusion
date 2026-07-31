@@ -47,6 +47,7 @@ type CliExecutorHarness = {
   authorityBinding: ReturnType<typeof createCccCampaignAuthorityBinding>;
   binding: CccNativeCliBinding;
   context: CccCampaignTaskContext;
+  cliSettings: Record<string, unknown> | undefined;
   executionFence: Readonly<{
     workItemId: string;
     attempt: number;
@@ -55,9 +56,11 @@ type CliExecutorHarness = {
   activeCliTaskSessions: Map<string, unknown>;
   launchCliTaskSession: typeof launchCliTaskSessionMock;
   killLiveTaskSessions: typeof killLiveTaskSessionsMock;
+  preflightPtyRuntime: ReturnType<typeof vi.fn>;
   preDispatch: ReturnType<typeof vi.fn>;
   reconcile: ReturnType<typeof vi.fn>;
   settleCccProviderAttemptAndFence: ReturnType<typeof vi.fn>;
+  runtimeSessions: unknown[];
   resolver: ReturnType<typeof vi.fn>;
   resolveMcpServers: ReturnType<typeof vi.fn>;
   resolveMcpServersSpy: ReturnType<typeof vi.spyOn<ExecutorPrivate, "resolveMcpServers">>;
@@ -193,6 +196,8 @@ type HarnessOptions = {
   omitNodeTaskWorktree?: boolean;
   sealedSignal?: AbortSignal;
   cliProfile?: string;
+  cliProviderId?: string;
+  cliModel?: string;
   omitCliSettings?: boolean;
   legacyRootProfile?: string;
 };
@@ -293,12 +298,18 @@ function createHarness(
   });
 
   const store = createMockStore();
+  const runtimeSessions: unknown[] = [];
   const runtimeStore = {
-    listByTask: () => [] as unknown[],
+    listByTask: () => runtimeSessions,
     settleCccProviderAttemptAndFence,
   };
+  const preflightPtyRuntime = vi.fn(async () => {
+    sequence.push("pty-preflight");
+  });
   const runtime: TaskExecutorOptions["cliAgentRuntime"] = {
-    manager: {} as TaskExecutorOptions["cliAgentRuntime"]["manager"],
+    manager: {
+      preflightPtyRuntime,
+    } as unknown as TaskExecutorOptions["cliAgentRuntime"]["manager"],
     hub: {} as TaskExecutorOptions["cliAgentRuntime"]["hub"],
     registry: {} as TaskExecutorOptions["cliAgentRuntime"]["registry"],
     store: runtimeStore as TaskExecutorOptions["cliAgentRuntime"]["store"],
@@ -335,6 +346,7 @@ function createHarness(
   const execution = Object.freeze({
     originTaskId: "FN-6226",
     semanticTaskId: "REQ-9",
+    nativeTaskId: "REQ-9",
     semanticTask: { id: "REQ-9", executionMode: "fast" },
     runId: "FN-6226-run",
     visitIdentity: Object.freeze({ nodeId: "cli-node", materializedNodeId: "cli-node" }),
@@ -378,18 +390,28 @@ function createHarness(
     updatedAt: "2026-07-25T19:00:00.000Z",
   };
   store.getTask.mockResolvedValue(nodeTask);
+  const cliSettings = options.omitCliSettings
+    ? undefined
+    : {
+      profile: options.cliProfile ?? "ccc-fusion",
+      providerId: options.cliProviderId ?? "openai",
+      model: options.cliModel ?? "gpt-4o",
+    };
 
   return {
     authorityBinding,
     binding,
+    cliSettings,
     context,
     executionFence,
     activeCliTaskSessions: executor["activeCliTaskSessions"] as Map<string, unknown>,
     launchCliTaskSession: launchCliTaskSessionMock,
     killLiveTaskSessions: killLiveTaskSessionsMock,
+    preflightPtyRuntime,
     preDispatch,
     reconcile,
     settleCccProviderAttemptAndFence,
+    runtimeSessions,
     resolver,
     resolveMcpServers,
     resolveMcpServersSpy,
@@ -404,9 +426,7 @@ function createHarness(
           ...(options.legacyRootProfile
             ? { profile: options.legacyRootProfile }
             : {}),
-          ...(options.omitCliSettings ? {} : {
-            cliSettings: { profile: options.cliProfile ?? "ccc-fusion" },
-          }),
+          ...(cliSettings ? { cliSettings } : {}),
           prompt: "Run ccc native CLI task",
         },
       },
@@ -472,6 +492,14 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       expect(h.launchCliTaskSession).toHaveBeenCalledOnce();
       expect(h.activeCliTaskSessions.get("REQ-9")).toBeDefined();
       expect(h.launchCliTaskSession.mock.calls.at(0)?.[0]).toEqual(expect.objectContaining({
+        config: expect.objectContaining({
+          settings: {
+            profile: "ccc-fusion",
+            providerId: "openai",
+            model: "gpt-4o",
+            subscriptionReady: true,
+          },
+        }),
         cccNativeCli: expect.objectContaining({
           attemptKey: createPermitScope(h.context, h.turnKey, h.authorityBinding).attemptKey,
           controllerToken: createPermitScope(h.context, h.turnKey, h.authorityBinding).controllerToken,
@@ -481,6 +509,11 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
           dispatchKey: CCC_NATIVE_CLI_DISPATCH_KEY,
         }),
       }));
+      expect(h.cliSettings).toEqual({
+        profile: "ccc-fusion",
+        providerId: "openai",
+        model: "gpt-4o",
+      });
       expect(h.store.logEntry).not.toHaveBeenCalled();
       expect(h.store.updateTask).not.toHaveBeenCalled();
 
@@ -495,11 +528,221 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         visitIdentity: { nodeId: "cli-node", materializedNodeId: "cli-node" },
       });
 
-      expect(h.sequence).toEqual(["resolver", "preDispatch", "mcp", "kill", "launch"]);
+      expect(h.sequence).toEqual([
+        "pty-preflight",
+        "resolver",
+        "preDispatch",
+        "mcp",
+        "kill",
+        "launch",
+      ]);
     } finally {
       h.resolveMcpServersSpy.mockRestore();
       h.launchCliTaskSession.mockReset();
       h.killLiveTaskSessions.mockReset();
+    }
+  });
+
+  it("P1 RED: restart reconciles one exact durable held-closed CLI receipt without replaying the provider", async () => {
+    const h = createHarness(({ scope }) => Object.freeze({
+      kind: "hold",
+      reason: "dispatched-unknown",
+      scope,
+    }));
+    const permitScope = createPermitScope(h.context, h.turnKey, h.authorityBinding);
+    const receipt = createHeldClosureReceipt(
+      permitScope,
+      h.authorityBinding.bindingHash,
+    );
+    h.runtimeSessions.push({
+      id: receipt.sessionId,
+      taskId: permitScope.taskId,
+      purpose: "execute",
+      adapterId: h.route.adapterId,
+      agentState: "needsAttention",
+      terminationReason: null,
+      worktreePath: "/tmp/cli-test",
+      autonomyPosture: {
+        cccNativeCliOneShot: true,
+        cccProviderAttemptKey: permitScope.attemptKey,
+        cccProviderAttemptControllerToken: permitScope.controllerToken,
+        cccControllerGeneration: permitScope.controllerToken,
+        cccControllerFenced: false,
+        cccAuthorityBindingHash: h.authorityBinding.bindingHash,
+        cccNativeCliTurnKey: permitScope.turnKey,
+        cccNativeCliDispatchKey: permitScope.dispatchKey,
+        cccNativeCliClosureState: "held-closed",
+        cccNativeCliHeldClosureEvidence: {
+          kind: "ccc-fusion.native-cli-held-closure-evidence",
+          version: 1,
+          sessionId: receipt.sessionId,
+          trigger: receipt.trigger,
+          exitCode: receipt.exitCode,
+          exitSignal: receipt.exitSignal,
+          processGroupClosed: true,
+          proxyClosed: true,
+          durableFloorFlushed: true,
+          slotHeld: true,
+        },
+      },
+    });
+    vi.mocked(h.binding.observer.observe).mockImplementationOnce(() => {
+      h.sequence.push("observe-restart");
+      return Object.freeze({
+        kind: "ccc-fusion.native-cli-observation",
+        version: 1,
+        outcome: "committed",
+        evidenceDigest: "e".repeat(64),
+      });
+    });
+
+    try {
+      await expect(h.run()).resolves.toEqual({
+        outcome: "success",
+        value: "cli-agent-done",
+      });
+      expect(h.sequence).toEqual([
+        "pty-preflight",
+        "resolver",
+        "preDispatch",
+        "observe-restart",
+        "reconcile",
+      ]);
+      expect(h.resolveMcpServers).not.toHaveBeenCalled();
+      expect(h.killLiveTaskSessions).not.toHaveBeenCalled();
+      expect(h.launchCliTaskSession).not.toHaveBeenCalled();
+      expect(h.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+        taskId: permitScope.taskId,
+        attemptKey: permitScope.attemptKey,
+        controllerToken: permitScope.controllerToken,
+        outcome: "committed",
+        observerId: "ccc-native-cli-observer.v1",
+      }));
+    } finally {
+      h.resolveMcpServersSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    { outcome: "committed" as const, expected: { outcome: "success", value: "cli-agent-done" } },
+    { outcome: "proved_failed" as const, expected: { outcome: "failure", value: "cli-agent-proved-failed" } },
+  ])("P1 RED: restart replays an exact terminal CLI attempt as $outcome without dispatch", async ({ outcome, expected }) => {
+    const h = createHarness(({ scope }) => Object.freeze({
+      kind: "hold",
+      reason: "terminal",
+      scope: createTerminalScope(scope, {
+        outcome,
+        evidenceDigest: "f".repeat(64),
+        observerId: "ccc-native-cli-observer.v1",
+      }),
+    }));
+
+    try {
+      await expect(h.run()).resolves.toEqual(expected);
+      expect(h.sequence).toEqual([
+        "pty-preflight",
+        "resolver",
+        "preDispatch",
+      ]);
+      expect(h.resolveMcpServers).not.toHaveBeenCalled();
+      expect(h.killLiveTaskSessions).not.toHaveBeenCalled();
+      expect(h.launchCliTaskSession).not.toHaveBeenCalled();
+      expect(h.reconcile).not.toHaveBeenCalled();
+    } finally {
+      h.resolveMcpServersSpy.mockRestore();
+    }
+  });
+
+  it("refuses a missing PTY dependency before binding, permit, session, or provider residue", async () => {
+    const h = createHarness();
+    const preflightError = Object.assign(
+      new Error("CCC native CLI PTY runtime is unavailable"),
+      { code: "CCC_NATIVE_CLI_PTY_PREFLIGHT_FAILED" },
+    );
+    h.preflightPtyRuntime.mockImplementationOnce(async () => {
+      h.sequence.push("pty-preflight");
+      throw preflightError;
+    });
+
+    try {
+      await expect(h.run()).rejects.toBe(preflightError);
+      expect(h.sequence).toEqual(["pty-preflight"]);
+      expect(h.resolver).not.toHaveBeenCalled();
+      expect(h.preDispatch).not.toHaveBeenCalled();
+      expect(h.resolveMcpServers).not.toHaveBeenCalled();
+      expect(h.killLiveTaskSessions).not.toHaveBeenCalled();
+      expect(h.launchCliTaskSession).not.toHaveBeenCalled();
+      expect(h.reconcile).not.toHaveBeenCalled();
+      expect(h.settleCccProviderAttemptAndFence).not.toHaveBeenCalled();
+      expect(h.store.logEntry).not.toHaveBeenCalled();
+      expect(h.store.updateTask).not.toHaveBeenCalled();
+    } finally {
+      h.resolveMcpServersSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      name: "provider",
+      options: { cliProviderId: "anthropic" },
+      message: "CLI settings providerId 'anthropic' does not match execution route providerId 'openai'",
+    },
+    {
+      name: "model",
+      options: { cliModel: "gpt-4.1" },
+      message: "CLI settings model 'gpt-4.1' does not match execution route modelId 'gpt-4o'",
+    },
+  ])("refuses stable $name route drift before binding resolution or launch", async ({ options, message }) => {
+    const h = createHarness(undefined, options);
+
+    try {
+      await expect(h.run()).rejects.toMatchObject({
+        code: CCC_NATIVE_CLI_BINDING_REFUSED_CODE,
+        message: expect.stringContaining(message),
+      });
+      expect(h.sequence).toEqual([]);
+      expect(h.preDispatch).toHaveBeenCalledTimes(0);
+      expect(h.resolveMcpServers).toHaveBeenCalledTimes(0);
+      expect(h.killLiveTaskSessions).toHaveBeenCalledTimes(0);
+      expect(h.launchCliTaskSession).toHaveBeenCalledTimes(0);
+      expect(h.cliSettings).not.toHaveProperty("subscriptionReady");
+    } finally {
+      h.resolveMcpServersSpy.mockRestore();
+    }
+  });
+
+  it("snapshots stable route settings before the async permit so launch values cannot drift", async () => {
+    const h = createHarness();
+    const preDispatchImplementation = h.preDispatch.getMockImplementation();
+    h.preDispatch.mockImplementationOnce(async (...args: unknown[]) => {
+      h.cliSettings!.providerId = "anthropic";
+      h.cliSettings!.model = "gpt-4.1";
+      return preDispatchImplementation!(...args);
+    });
+
+    try {
+      await h.run();
+
+      expect(h.launchCliTaskSession.mock.calls.at(0)?.[0]).toEqual(expect.objectContaining({
+        config: expect.objectContaining({
+          settings: {
+            profile: "ccc-fusion",
+            providerId: "openai",
+            model: "gpt-4o",
+            subscriptionReady: true,
+          },
+        }),
+      }));
+      expect(h.sequence).toEqual([
+        "pty-preflight",
+        "resolver",
+        "preDispatch",
+        "mcp",
+        "kill",
+        "launch",
+      ]);
+    } finally {
+      h.resolveMcpServersSpy.mockRestore();
     }
   });
 
@@ -528,7 +771,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
           throw error;
         });
       },
-      sequence: ["resolver", "preDispatch", "mcp", "reconcile"],
+      sequence: ["pty-preflight", "resolver", "preDispatch", "mcp", "reconcile"],
     },
     {
       name: "prior-session kill",
@@ -538,7 +781,14 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
           throw error;
         });
       },
-      sequence: ["resolver", "preDispatch", "mcp", "kill", "reconcile"],
+      sequence: [
+        "pty-preflight",
+        "resolver",
+        "preDispatch",
+        "mcp",
+        "kill",
+        "reconcile",
+      ],
     },
   ])("Task 4 RED: terminalizes permit when $name fails before session ownership", async ({ arrange, sequence }) => {
     const h = createHarness();
@@ -588,7 +838,15 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       terminationReason: "crashed",
       cancellationState: null,
     });
-    expect(h.sequence).toEqual(["resolver", "preDispatch", "mcp", "kill", "launch", "reconcile"]);
+    expect(h.sequence).toEqual([
+      "pty-preflight",
+      "resolver",
+      "preDispatch",
+      "mcp",
+      "kill",
+      "launch",
+      "reconcile",
+    ]);
   });
 
   it("Task 4 RED: generic launch rejection remains unknown/no auto-reconcile before ownership", async () => {
@@ -602,7 +860,14 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
 
     expect(h.activeCliTaskSessions.get("REQ-9")).toBeUndefined();
     expect(h.reconcile).toHaveBeenCalledTimes(0);
-    expect(h.sequence).toEqual(["resolver", "preDispatch", "mcp", "kill", "launch"]);
+    expect(h.sequence).toEqual([
+      "pty-preflight",
+      "resolver",
+      "preDispatch",
+      "mcp",
+      "kill",
+      "launch",
+    ]);
   });
 
   it("Task 4 GREEN: pre-provider evidence is stable across different thrown messages", async () => {
@@ -670,7 +935,15 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
 
     expect(h.activeCliTaskSessions.get("REQ-9")).toBeUndefined();
     expect(h.store.logEntry).not.toHaveBeenCalled();
-    expect(h.sequence).toEqual(["resolver", "preDispatch", "mcp", "kill", "launch", "reconcile"]);
+    expect(h.sequence).toEqual([
+      "pty-preflight",
+      "resolver",
+      "preDispatch",
+      "mcp",
+      "kill",
+      "launch",
+      "reconcile",
+    ]);
   });
 
   it("Task 4 RED: active session stays owned while held closure observer/reconcile runs", async () => {
@@ -729,7 +1002,17 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
     });
 
     expect(h.activeCliTaskSessions.get("REQ-9")).toBeUndefined();
-    expect(h.sequence).toEqual(["resolver", "preDispatch", "mcp", "kill", "launch", "observe", "reconcile", "release"]);
+    expect(h.sequence).toEqual([
+      "pty-preflight",
+      "resolver",
+      "preDispatch",
+      "mcp",
+      "kill",
+      "launch",
+      "observe",
+      "reconcile",
+      "release",
+    ]);
     expect(releaseCccNativeCli).toHaveBeenCalledTimes(1);
     expect(h.reconcile).toHaveBeenCalledWith({
       taskId: permitScope.taskId,
@@ -795,7 +1078,16 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       outcome: "success",
       value: "cli-agent-done",
     });
-    expect(h.sequence).toEqual(["resolver", "preDispatch", "mcp", "kill", "launch", "observe-pending", "reconcile"]);
+    expect(h.sequence).toEqual([
+      "pty-preflight",
+      "resolver",
+      "preDispatch",
+      "mcp",
+      "kill",
+      "launch",
+      "observe-pending",
+      "reconcile",
+    ]);
     expect(h.reconcile).toHaveBeenCalledTimes(1);
     expect(h.settleCccProviderAttemptAndFence).not.toHaveBeenCalled();
   });
@@ -901,7 +1193,14 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
 
     await expect(h.run()).rejects.toThrow("observer threw");
     expect(h.activeCliTaskSessions.get("REQ-9")).toBeDefined();
-    expect(h.sequence).toEqual(["resolver", "preDispatch", "mcp", "kill", "observe"]);
+    expect(h.sequence).toEqual([
+      "pty-preflight",
+      "resolver",
+      "preDispatch",
+      "mcp",
+      "kill",
+      "observe",
+    ]);
     expect(releaseCccNativeCli).toHaveBeenCalledTimes(0);
   });
 
@@ -1152,7 +1451,11 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
     expect.soft(rejection).toMatchObject({
       code: CCC_NATIVE_CLI_BINDING_REFUSED_CODE,
     });
-    expect.soft(h.sequence).toEqual(["resolver", "preDispatch"]);
+    expect.soft(h.sequence).toEqual([
+      "pty-preflight",
+      "resolver",
+      "preDispatch",
+    ]);
     expect.soft(h.reconcile).toHaveBeenCalledTimes(0);
     expect.soft(h.resolveMcpServers).toHaveBeenCalledTimes(0);
     expect.soft(h.killLiveTaskSessions).toHaveBeenCalledTimes(0);

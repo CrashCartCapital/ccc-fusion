@@ -153,6 +153,15 @@ function getStagedEmbeddedPgBundlePath(): string | null {
  * outside its own bundle). Primary resolution always wins.
  */
 function requireEmbeddedPostgresModule(): unknown {
+  /*
+   * embedded-postgres installs async-exit-hook at module evaluation time.
+   * That dependency's beforeExit listener always calls process.exit(0), which
+   * overwrites a caller's non-zero process.exitCode after an otherwise clean
+   * embedded-cluster shutdown. Fusion owns shutdown through this lifecycle's
+   * exact-instance hook, so retain every pre-existing listener and remove only
+   * listeners synchronously added while evaluating the dependency.
+   */
+  const beforeExitListeners = new Set(process.rawListeners("beforeExit"));
   try {
     return require("embedded-postgres");
   } catch (primaryError) {
@@ -165,6 +174,12 @@ function requireEmbeddedPostgresModule(): unknown {
       }
     }
     throw primaryError;
+  } finally {
+    for (const listener of process.rawListeners("beforeExit")) {
+      if (!beforeExitListeners.has(listener)) {
+        process.removeListener("beforeExit", listener);
+      }
+    }
   }
 }
 

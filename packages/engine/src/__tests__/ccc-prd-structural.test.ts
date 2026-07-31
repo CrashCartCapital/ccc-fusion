@@ -25,6 +25,12 @@ const ccc = engine as typeof engine & {
     rootDir: string;
     manifestPath: string;
     adapter: { id: string; model?: string; generateCandidate(input: unknown): Promise<unknown> };
+    constraints?: {
+      targetRepository: { path: string; baseCommit: string };
+      bounds: { maxRequests: number; maxDurationMs: number; maxConcurrency: number };
+      maxReviewItems: number;
+    };
+    workflowExtensionRegistry?: WorkflowExtensionRegistry;
   }): Promise<{ kind: string; sidecar?: Record<string, unknown>; review?: Record<string, unknown[]> }>;
   compileCccPrdPacket(input: CompileInput): Record<string, unknown>;
   validateCccPrdPacket(input: CompileInput): Record<string, unknown>;
@@ -36,6 +42,22 @@ type CompileInput = {
   sidecarPath: string;
   expectedTarget?: string;
   expectedBase?: string;
+  requireMaterialCoverage?: boolean;
+};
+
+type MutableStructuralSidecar = {
+  requirements: Array<{ spans: Array<{ byteEnd: number }> }>;
+  tasks: Array<{ title: string; requirementIds: string[] }>;
+  unresolvedDecisions: Array<Record<string, unknown>>;
+  bounds: { maxRequests: number };
+  targetRepository: { path: string; baseCommit: string };
+  authorityRoles: Array<{ role: string }>;
+  proofs: Array<{ confidence: string }>;
+  workflows: Array<{ title: string }>;
+  protectedActions: Array<{ target: string }>;
+  materialCoverage: Array<Record<string, unknown> & { id: string }>;
+  implementationFactProvenance?: Record<string, unknown>;
+  rogueProse?: string;
 };
 
 const roots: string[] = [];
@@ -47,6 +69,22 @@ const source = [
   "- `REQ-2`: second requirement",
   "- `REQ-1`: first requirement",
   "while true DEFERRED delete publish",
+].join("\n");
+const firstRequirementLine = "- `REQ-1`: first requirement. Acceptance: first proof passes. Proof: task prove:first. Oracle: exit 0 and first assertion observed. Negative: mutated first declaration refuses.";
+const secondRequirementLine = "- `REQ-2`: second requirement. Acceptance: second proof passes. Proof: task prove:second. Oracle: exit 0 and second assertion observed. Negative: mutated second declaration refuses.";
+const productSource = [
+  "# Small packet",
+  `- Target repository: ${target}`,
+  `- Baseline commit: ${base}`,
+  `- Allowed write root: ${target}/tasks`,
+  "- Allowed write root purpose: task projection",
+  "- Max requests: 4",
+  "- Max duration ms: 30000",
+  "- Max concurrency: 2",
+  "- Non-goal: live execution",
+  `- Protected action: deletion ${target}/retired delete publish`,
+  secondRequirementLine,
+  firstRequirementLine,
 ].join("\n");
 
 afterEach(() => {
@@ -198,6 +236,7 @@ function proposal() {
       { id: "IMPORT-2", entityType: "task", entityId: "TASK-2", operation: "create", target: "project.tasks" },
       { id: "IMPORT-3", entityType: "dependency_edge", entityId: "EDGE-1", operation: "create", target: "project.tasks.dependencies" },
       { id: "IMPORT-4", entityType: "workflow", entityId: "WORKFLOW-1", operation: "create", target: "project.workflow_work_items" },
+      { id: "IMPORT-10", entityType: "work_item", entityId: "WORKFLOW-1", operation: "create", target: "project.workflow_work_items" },
       { id: "IMPORT-5", entityType: "document", entityId: "DOCUMENT-1", operation: "create", target: "project.task_documents" },
       { id: "IMPORT-6", entityType: "artifact", entityId: "ARTIFACT-1", operation: "create", target: "project.artifacts" },
       { id: "IMPORT-7", entityType: "campaign", entityId: "CAMPAIGN-1", operation: "create", target: "project.missions" },
@@ -221,7 +260,47 @@ function proposal() {
   };
 }
 
-async function author(input: ReturnType<typeof packet>) {
+function singleTaskProductProposal(): ReturnType<typeof proposal> {
+  const candidate = structuredClone(proposal());
+  const task = candidate.tasks.find(({ id }) => id === "TASK-1")!;
+  task.requirementIds = ["REQ-1", "REQ-2"];
+  task.proofIds = ["PROOF-1", "PROOF-2"];
+  task.artifactIds = ["ARTIFACT-1"];
+  task.protectedActionIds = ["ACTION-1"];
+  candidate.tasks = [task];
+  candidate.edges = [];
+  candidate.workflows[0]!.taskIds = ["TASK-1"];
+  candidate.workflows[0]!.entryTaskIds = ["TASK-1"];
+  candidate.workflows[0]!.terminalTaskIds = ["TASK-1"];
+  candidate.artifacts[0]!.taskId = "TASK-1";
+  candidate.importIntents = candidate.importIntents.filter(
+    ({ entityId }) => entityId !== "TASK-2" && entityId !== "EDGE-1",
+  );
+  return candidate;
+}
+
+function productProposal(): ReturnType<typeof proposal> {
+  const candidate = singleTaskProductProposal();
+  candidate.requirements.find(({ id }) => id === "REQ-1")!.sourceRefs = ref(firstRequirementLine);
+  candidate.requirements.find(({ id }) => id === "REQ-2")!.sourceRefs = ref(secondRequirementLine);
+  candidate.proofs.find(({ id }) => id === "PROOF-1")!.sourceRefs = ref(firstRequirementLine);
+  candidate.proofs.find(({ id }) => id === "PROOF-2")!.sourceRefs = ref(secondRequirementLine);
+  candidate.tasks[0]!.sourceRefs = ref(firstRequirementLine);
+  candidate.workflows[0]!.sourceRefs = ref("Small packet");
+  candidate.artifacts[0]!.sourceRefs = ref(firstRequirementLine);
+  candidate.protectedActions[0]!.sourceRefs = ref(`Protected action: deletion ${target}/retired delete publish`);
+  return candidate;
+}
+
+function productConstraints() {
+  return {
+    targetRepository: { path: target, baseCommit: base },
+    bounds: { maxRequests: 4, maxDurationMs: 30_000, maxConcurrency: 2 },
+    maxReviewItems: 4,
+  };
+}
+
+async function proofAdmissionRegistry(input: ReturnType<typeof packet>): Promise<WorkflowExtensionRegistry> {
   const workflowExtensionRegistry = new WorkflowExtensionRegistry();
   workflowExtensionRegistry.register(
     CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
@@ -234,6 +313,15 @@ async function author(input: ReturnType<typeof packet>) {
       manifestRelativePath: input.manifestPath.slice(input.root.length + 1),
     }),
   );
+  return workflowExtensionRegistry;
+}
+
+async function author(
+  input: ReturnType<typeof packet>,
+  candidate = proposal(),
+  constraints?: ReturnType<typeof productConstraints>,
+) {
+  const workflowExtensionRegistry = await proofAdmissionRegistry(input);
   let request: unknown;
   const result = await ccc.authorCccPrdPacket({
     rootDir: input.root,
@@ -243,15 +331,16 @@ async function author(input: ReturnType<typeof packet>) {
       model: "fixture-v1",
       generateCandidate: async (value) => {
         request = value;
-        return proposal();
+        return candidate;
       },
     },
+    ...(constraints ? { constraints } : {}),
     workflowExtensionRegistry,
   });
   expect(result.kind, JSON.stringify(result)).toBe("candidate");
   expect(request).toMatchObject({
     sourceVersion: "structural-test",
-    sources: [{ path: "source.md", content: source }],
+    sources: [{ path: "source.md", content: readFileSync(join(input.root, "source.md"), "utf8") }],
   });
   expect(result.review).toMatchObject({
     ambiguities: [],
@@ -306,6 +395,107 @@ describe("ccc-prd structural sidecar", () => {
     }
   });
 
+  it("refuses constrained authoring when implementation-changing facts are not source-bound", async () => {
+    const input = packet();
+    const workflowExtensionRegistry = new WorkflowExtensionRegistry();
+    workflowExtensionRegistry.register(
+      CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+      CCC_CAMPAIGN_PROOF_ADMISSION_CONTRIBUTION,
+      await deriveWorkflowExtensionHostProvenance({
+        pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+        pluginVersion: "1.0.0",
+        trustedRootPath: input.root,
+        entryRelativePath: "source.md",
+        manifestRelativePath: input.manifestPath.slice(input.root.length + 1),
+      }),
+    );
+    const result = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      adapter: {
+        id: "local-deterministic-fixture",
+        model: "fixture-v1",
+        generateCandidate: async () => proposal(),
+      },
+      constraints: {
+        targetRepository: { path: target, baseCommit: base },
+        bounds: { maxRequests: 4, maxDurationMs: 30_000, maxConcurrency: 2 },
+        maxReviewItems: 4,
+      },
+      workflowExtensionRegistry,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "CCC_PRD_TARGET_REPOSITORY_PROVENANCE_REQUIRED" }),
+        expect.objectContaining({ code: "CCC_PRD_BASELINE_PROVENANCE_REQUIRED" }),
+        expect.objectContaining({ code: "CCC_PRD_ALLOWED_WRITE_ROOT_PROVENANCE_REQUIRED" }),
+      ]),
+    });
+  });
+
+  it("persists exact-span custody for implementation facts on the supported product route", async () => {
+    const input = packet(productSource);
+    const authored = await author(input, productProposal(), productConstraints());
+    expect(authored.sidecar.implementationFactProvenance).toMatchObject({
+      schema: "ccc-prd.implementation-fact-provenance.v1",
+      targetRepository: {
+        path: { value: target, spans: [expect.objectContaining({ excerptSha256: digest(target) })] },
+        baseCommit: { value: base, spans: [expect.objectContaining({ excerptSha256: digest(base) })] },
+      },
+      admittedWriteRoots: [
+        expect.objectContaining({
+          path: {
+            value: `${target}/tasks`,
+            spans: [expect.objectContaining({ excerptSha256: digest(`${target}/tasks`) })],
+          },
+        }),
+      ],
+    });
+
+    const result = ccc.compileCccPrdPacket({
+      ...input,
+      sidecarPath: authored.sidecarPath,
+      expectedTarget: target,
+      expectedBase: base,
+      requireMaterialCoverage: true,
+    }) as Record<string, unknown> & { kind: string; implementationFactProvenance?: unknown };
+
+    expect(result.kind, JSON.stringify(result)).toBe("bundle");
+    expect(result.implementationFactProvenance).toEqual(authored.sidecar.implementationFactProvenance);
+    expect(result.bundleHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("refuses a fact value that appears in source but outside the entity cited span", async () => {
+    const input = packet([
+      productSource,
+      "",
+      "Elsewhere only: first proof passes",
+    ].join("\n"));
+    const candidate = productProposal();
+    candidate.requirements.find(({ id }) => id === "REQ-1")!.acceptance = "Elsewhere only: first proof passes";
+
+    const result = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      adapter: {
+        id: "local-deterministic-fixture",
+        model: "fixture-v1",
+        generateCandidate: async () => candidate,
+      },
+      constraints: productConstraints(),
+      workflowExtensionRegistry: await proofAdmissionRegistry(input),
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "CCC_PRD_ACCEPTANCE_PROVENANCE_REQUIRED" }),
+      ]),
+    });
+  });
+
   it.each([
     ["raw byte mutation"],
     ["stale span"],
@@ -319,10 +509,11 @@ describe("ccc-prd structural sidecar", () => {
     ["invalid authority role"],
     ["invalid proof confidence"],
     ["blank workflow title"],
+    ["stale material coverage"],
   ])("refuses %s deterministically", async (label) => {
     const input = packet();
     const authored = await author(input);
-    const sidecar = structuredClone(authored.sidecar) as Record<string, any>;
+    const sidecar = structuredClone(authored.sidecar) as unknown as MutableStructuralSidecar;
     if (label === "raw byte mutation") write(input.root, "source.md", `${source}\nchanged byte`);
     if (label === "stale span") sidecar.requirements[0].spans[0].byteEnd += 1;
     if (label === "duplicate id") sidecar.tasks.push({ ...sidecar.tasks[0] });
@@ -342,6 +533,9 @@ describe("ccc-prd structural sidecar", () => {
     if (label === "invalid authority role") sidecar.authorityRoles[0].role = "self_asserted";
     if (label === "invalid proof confidence") sidecar.proofs[0].confidence = "certain";
     if (label === "blank workflow title") sidecar.workflows[0].title = "";
+    if (label === "stale material coverage") {
+      sidecar.materialCoverage.push({ ...sidecar.materialCoverage[0], id: "MAT-foreign" });
+    }
     writeFileSync(authored.sidecarPath, JSON.stringify(sidecar));
     const compileInput = {
       ...input,
@@ -383,18 +577,101 @@ describe("ccc-prd structural sidecar", () => {
   });
 
   it("does not infer actions, deferred state, or loops from prose", async () => {
-    const input = packet();
-    const authored = await author(input);
+    const input = packet(productSource);
+    const authored = await author(input, productProposal(), productConstraints());
     const result = ccc.compileCccPrdPacket({
       ...input,
       sidecarPath: authored.sidecarPath,
       expectedTarget: target,
       expectedBase: base,
+      requireMaterialCoverage: true,
     });
     expect(result.kind).toBe("bundle");
     expect(result.protectedActions).toEqual([
       expect.objectContaining({ id: "ACTION-1", kind: "deletion", target: `${target}/retired` }),
     ]);
+  });
+
+  it("refuses protected-action drift against durable implementation fact provenance", async () => {
+    const input = packet(productSource);
+    const authored = await author(input, productProposal(), productConstraints());
+    const sidecar = structuredClone(authored.sidecar) as unknown as MutableStructuralSidecar;
+    sidecar.protectedActions[0]!.target = `${target}/elsewhere`;
+    writeFileSync(authored.sidecarPath, JSON.stringify(sidecar));
+
+    const result = ccc.compileCccPrdPacket({
+      ...input,
+      sidecarPath: authored.sidecarPath,
+      expectedTarget: target,
+      expectedBase: base,
+      requireMaterialCoverage: true,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "CCC_PRD_PROTECTED_ACTION_PROVENANCE_STALE" }),
+      ]),
+    });
+  });
+
+  it("refuses an extracted requirement that has no task disposition", async () => {
+    const input = packet();
+    const authored = await author(input);
+    const sidecar = structuredClone(authored.sidecar) as unknown as MutableStructuralSidecar;
+    sidecar.tasks[0].requirementIds = ["REQ-2"];
+    writeFileSync(authored.sidecarPath, JSON.stringify(sidecar));
+
+    const result = ccc.compileCccPrdPacket({
+      ...input,
+      sidecarPath: authored.sidecarPath,
+      expectedTarget: target,
+      expectedBase: base,
+      requireMaterialCoverage: true,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "CCC_PRD_REQUIREMENT_UNDISPOSITIONED",
+          message: expect.stringContaining("REQ-1"),
+        }),
+      ]),
+    });
+  });
+
+  it("refuses a material source section and explicit source requirement omitted by extraction", async () => {
+    const expandedSource = [
+      source,
+      "",
+      "## Safety constraints",
+      "- `REQ-3`: never write outside the admitted root.",
+    ].join("\n");
+    const input = packet(expandedSource);
+    const authored = await author(input);
+
+    const result = ccc.compileCccPrdPacket({
+      ...input,
+      sidecarPath: authored.sidecarPath,
+      expectedTarget: target,
+      expectedBase: base,
+      requireMaterialCoverage: true,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: "CCC_PRD_MATERIAL_SECTION_UNDISPOSITIONED",
+          message: expect.stringContaining("Safety constraints"),
+        }),
+        expect.objectContaining({
+          code: "CCC_PRD_SOURCE_REQUIREMENT_UNDISPOSITIONED",
+          message: expect.stringContaining("REQ-3"),
+        }),
+      ]),
+    });
   });
 
   it("validates with diagnostics only and never returns a bundle", async () => {

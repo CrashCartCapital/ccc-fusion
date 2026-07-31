@@ -49,14 +49,46 @@ export function createPacketRoot() {
   roots.push(root);
   const target = "fixture/repo";
   const base = "a".repeat(40);
+  const declarations = {
+    schema: "ccc-prd.declarations.v1",
+    authority: { source: "prd", producer: "fixture" },
+    bounds: { maxRequests: 1, maxDurationMs: 30000, maxConcurrency: 1 },
+    admittedWriteRoots: [`${target}/src/task-1`],
+    targetRepository: target,
+    targetBase: base,
+    requirements: [{
+      id: "CF-CLI-001",
+      statement: "Generate a traceable sidecar.",
+      acceptance: "Sidecar has source spans and proof IDs.",
+      producer: "fixture",
+      dependencies: [],
+      proofIds: ["PF-CLI-001"],
+    }],
+    proofs: [{
+      id: "PF-CLI-001",
+      verifierCommand: "pnpm test",
+      positiveOracle: "exit 0",
+      negativeControl: "missing sidecar refuses",
+    }],
+    protectedActions: [{ kind: "live_execution", target: "fixture/repo:provider-canary" }],
+    nonGoals: ["live provider call"],
+    unresolvedDecisions: [],
+  };
   const source = [
     "# Dense PRD Packet", "", "## Functional Requirements", "", "| ID | Statement | Acceptance |", "|---|---|---|", "| FR-1 | Generate a traceable sidecar. | Sidecar has source spans and proof IDs. |", "", "## CCC Fusion Packet Declarations", "", "```json",
-    JSON.stringify({ schema: "ccc-prd.declarations.v1", authority: { source: "prd", producer: "fixture" }, bounds: { requests: 0, seconds: 30, concurrency: 1 }, admittedWriteRoots: ["."], targetRepository: target, targetBase: "abc123", requirements: [{ id: "CF-CLI-001", statement: "Generate a traceable sidecar.", acceptance: "Sidecar has source spans and proof IDs.", producer: "fixture", dependencies: [], proofIds: ["PF-CLI-001"] }], proofs: [{ id: "PF-CLI-001", verifierCommand: "pnpm test", positiveOracle: "exit 0", negativeControl: "missing sidecar refuses" }], protectedActions: [], nonGoals: ["live provider call"], unresolvedDecisions: [] }),
+    JSON.stringify(declarations),
     "```", "",
   ].join("\n");
   writeFileSync(join(root, "packet.md"), source);
   writeFileSync(join(root, "manifest.json"), JSON.stringify({ schema: "ccc-prd.packet.v1", source_version: "test", entries: [{ relative_path: "packet.md", role: "root", authoritative: true, sha256: createHash("sha256").update(source).digest("hex") }] }, null, 2));
-  const sourceRefs = [{ path: "packet.md", exactQuote: "Dense PRD Packet" }];
+  const sourceRefs = [
+    { path: "packet.md", exactQuote: "Dense PRD Packet" },
+    {
+      path: "packet.md",
+      exactQuote: "| FR-1 | Generate a traceable sidecar. | Sidecar has source spans and proof IDs. |",
+    },
+    { path: "packet.md", exactQuote: "CCC Fusion Packet Declarations" },
+  ];
   const proposal = join(root, "authoring-response.fixture.json");
   writeFileSync(proposal, JSON.stringify({
     schema: "ccc-prd.authoring-proposal.v1",
@@ -65,17 +97,16 @@ export function createPacketRoot() {
     proofs: [{ id: "PF-CLI-001", requirementIds: ["CF-CLI-001"], command: "pnpm test", positiveOracle: "exit 0", negativeControls: ["missing sidecar refuses"], sourceRefs, confidence: "high" }],
     tasks: [
       { id: "TASK-CLI-001", title: "Author sidecar", description: "Generate the candidate sidecar.", accountableProducer: "fixture", requirementIds: ["CF-CLI-001"], dependencyTaskIds: [], proofIds: ["PF-CLI-001"], workflowId: "WORKFLOW-CLI-001", documentIds: ["DOCUMENT-CLI-001"], artifactIds: [], protectedActionIds: [], sourceRefs },
-      { id: "TASK-CLI-002", title: "Validate sidecar", description: "Validate and compile the candidate sidecar.", accountableProducer: "fixture", requirementIds: ["CF-CLI-001"], dependencyTaskIds: ["TASK-CLI-001"], proofIds: ["PF-CLI-001"], workflowId: "WORKFLOW-CLI-001", documentIds: [], artifactIds: ["ARTIFACT-CLI-001"], protectedActionIds: ["ACTION-CLI-001"], sourceRefs },
     ],
-    edges: [{ id: "EDGE-CLI-001", fromTaskId: "TASK-CLI-002", toTaskId: "TASK-CLI-001", kind: "depends_on" }],
-    workflows: [{ id: "WORKFLOW-CLI-001", title: "CLI workflow", taskIds: ["TASK-CLI-001", "TASK-CLI-002"], entryTaskIds: ["TASK-CLI-001"], terminalTaskIds: ["TASK-CLI-002"], sourceRefs }],
+    edges: [],
+    workflows: [{ id: "WORKFLOW-CLI-001", title: "CLI workflow", taskIds: ["TASK-CLI-001"], entryTaskIds: ["TASK-CLI-001"], terminalTaskIds: ["TASK-CLI-001"], sourceRefs }],
     documents: [{ id: "DOCUMENT-CLI-001", taskId: "TASK-CLI-001", key: "plan", title: "Plan", content: "Generate a traceable sidecar.", sourceRefs }],
-    artifacts: [{ id: "ARTIFACT-CLI-001", taskId: "TASK-CLI-002", type: "proof", title: "CLI proof", mimeType: "text/plain", content: "pnpm test", sourceRefs }],
+    artifacts: [{ id: "ARTIFACT-CLI-001", taskId: "TASK-CLI-001", type: "proof", title: "CLI proof", mimeType: "text/plain", content: "pnpm test", sourceRefs }],
     importIntents: [
-      { id: "IMPORT-CLI-001", entityType: "task", entityId: "TASK-CLI-001", operation: "create", target: "project.tasks" }, { id: "IMPORT-CLI-002", entityType: "task", entityId: "TASK-CLI-002", operation: "create", target: "project.tasks" }, { id: "IMPORT-CLI-003", entityType: "dependency_edge", entityId: "EDGE-CLI-001", operation: "create", target: "project.tasks.dependencies" }, { id: "IMPORT-CLI-004", entityType: "workflow", entityId: "WORKFLOW-CLI-001", operation: "create", target: "project.workflow_work_items" }, { id: "IMPORT-CLI-005", entityType: "document", entityId: "DOCUMENT-CLI-001", operation: "create", target: "project.task_documents" }, { id: "IMPORT-CLI-006", entityType: "artifact", entityId: "ARTIFACT-CLI-001", operation: "create", target: "project.artifacts" }, { id: "IMPORT-CLI-007", entityType: "campaign", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.missions" }, { id: "IMPORT-CLI-008", entityType: "source", entityId: "SOURCE-CLI-001", operation: "create", target: "project.ccc_prd_import_sources" }, { id: "IMPORT-CLI-009", entityType: "run_audit", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.run_audit_events" },
+      { id: "IMPORT-CLI-001", entityType: "task", entityId: "TASK-CLI-001", operation: "create", target: "project.tasks" }, { id: "IMPORT-CLI-004", entityType: "workflow", entityId: "WORKFLOW-CLI-001", operation: "create", target: "project.workflow_work_items" }, { id: "IMPORT-CLI-010", entityType: "work_item", entityId: "WORKFLOW-CLI-001", operation: "create", target: "project.workflow_work_items" }, { id: "IMPORT-CLI-005", entityType: "document", entityId: "DOCUMENT-CLI-001", operation: "create", target: "project.task_documents" }, { id: "IMPORT-CLI-006", entityType: "artifact", entityId: "ARTIFACT-CLI-001", operation: "create", target: "project.artifacts" }, { id: "IMPORT-CLI-007", entityType: "campaign", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.missions" }, { id: "IMPORT-CLI-008", entityType: "source", entityId: "SOURCE-CLI-001", operation: "create", target: "project.ccc_prd_import_sources" }, { id: "IMPORT-CLI-009", entityType: "run_audit", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.run_audit_events" },
     ],
     protectedActions: [{ id: "ACTION-CLI-001", kind: "live_execution", target: "fixture/repo:provider-canary", sourceRefs: [{ path: "packet.md", exactQuote: "live provider call" }] }],
-    bounds: { maxRequests: 1, maxDurationMs: 30_000, maxConcurrency: 1 }, admittedWriteRoots: [{ path: ".", purpose: "fixture projection" }], targetRepository: { path: target, baseCommit: base }, nonGoals: ["live provider call"], unresolvedDecisions: [], ambiguities: [], exceptions: [], confidence: "high",
+    bounds: { maxRequests: 1, maxDurationMs: 30_000, maxConcurrency: 1 }, admittedWriteRoots: [{ path: `${target}/src/task-1`, purpose: "fixture projection" }], targetRepository: { path: target, baseCommit: base }, nonGoals: ["live provider call"], unresolvedDecisions: [], ambiguities: [], exceptions: [], confidence: "high",
   }, null, 2));
   return { root, manifest: join(root, "manifest.json"), proposal, sidecar: join(root, "candidate.sidecar.json"), target, base };
 }

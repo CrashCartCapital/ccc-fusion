@@ -800,6 +800,46 @@ describe("processDueWorkflowWorkItem symbol lock renewal", () => {
     expect(run.mock.calls[0]?.[2]?.signal).toBeInstanceOf(AbortSignal);
   });
 
+  it("persists the exact campaign blocker when full-graph execution requires a human decision", async () => {
+    const reason =
+      "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+    const run = vi.fn(async () => ({
+      disposition: "manual-required",
+      outcome: "failure",
+      visitedNodeIds: ["start", "execute"],
+      context: {},
+      reason,
+    }));
+    const transitionWorkflowWorkItem = vi.fn(async () => ({
+      ...item,
+      state: "manual-required",
+    }));
+    const store = {
+      listDueWorkflowWorkItems: async () => [item],
+      acquireWorkflowWorkItemLease: async () => item,
+      transitionWorkflowWorkItem,
+      renewWorkflowWorkItemLease: vi.fn(async () => item),
+      getCccCampaignContextForTask: vi.fn(async () => campaignContext()),
+      getTask: vi.fn(async () => ({ id: "FN-renew", title: "Campaign task" })),
+    };
+
+    await processDueWorkflowWorkItem(
+      store as any,
+      { run } as any,
+      undefined,
+      { leaseOwner: "worker", leaseDurationMs: 1_000 },
+    );
+
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
+      item.id,
+      "manual-required",
+      expect.objectContaining({
+        lastError: reason,
+        blockedReason: reason,
+      }),
+    );
+  });
+
   it("Task 3 RED: a first imported campaign claim promotes attempt zero before building its fence", async () => {
     const imported = {
       ...item,

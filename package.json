@@ -40,6 +40,7 @@
     "build:exe:all": "pnpm build:full && pnpm --filter @runfusion/fusion build:exe:all",
     "test": "node scripts/test-changed.mjs",
     "verify:fast": "node scripts/verify-fast.mjs",
+    "verify:ccc-prd-product": "node scripts/ccc-prd-product-acceptance.mjs",
     "test:scripts": "node scripts/run-script-tests.mjs",
     "test:workflow-release-check": "node scripts/workflow-reliability-release-check.mjs",
     "fn:cache-stats": "node scripts/cache-stats.mjs",

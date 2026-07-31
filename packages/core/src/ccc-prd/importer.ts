@@ -16,6 +16,7 @@ import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import { recordRunAuditEventWithinTransaction } from "../postgres/data-layer.js";
 import type { TaskStore } from "../store.js";
 import { insertTaskRowInTransaction } from "../task-store/async-persistence.js";
+import { allocateCommittedTaskIdsInTransaction } from "../task-store/async-allocator.js";
 import type { Task } from "../types.js";
 import { createCccCampaignManifest, hashCccCampaignManifest, parseCccCampaignExecutionPolicy } from "../ccc-campaign/canonical.js";
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
@@ -27,7 +28,16 @@ import {
   physicalCccPrdImportRoot,
 } from "./import-admission.js";
 import { CccPrdImportError } from "./import-error.js";
-import { buildCccPrdProjection, CCC_PRD_IMPORT_PREPARED_STATUS, nativeCccPrdScopedId, preparedCccPrdTask, type PreparedCccPrdProjection } from "./projection.js";
+import {
+  buildCccPrdProjection,
+  buildCccPrdTaskExecutionPrompt,
+  CCC_PRD_IMPORT_PREPARED_STATUS,
+  nativeCccPrdScopedId,
+  nativeCccPrdTaskId,
+  preparedCccPrdTask,
+  type CccPrdNativeTaskIds,
+  type PreparedCccPrdProjection,
+} from "./projection.js";
 import type { CccPrdImportEntityType, CccPrdImportIntent, CccPrdSemanticBundle, CccPrdWorkflow } from "./types.js";
 import { parseWorkflowIr } from "../workflow-ir.js";
 import type { WorkflowIr, WorkflowIrEdge, WorkflowIrNode } from "../workflow-ir-types.js";
@@ -294,9 +304,10 @@ async function writeCampaign(
 ): Promise<string> {
   observeWriter(recorder, "campaign", tx);
   const intent = oneIntent(bundle, "campaign");
+  const nativeCampaignId = nativeCccPrdScopedId(importId, intent.entityId);
   await tx.insert(schema.project.missions).values({
     projectId,
-    id: intent.entityId,
+    id: nativeCampaignId,
     title: `CCC PRD ${bundle.sourceVersion}`,
     description: `Generated import of ${bundle.sourceHash}`,
     status: "draft",
@@ -312,10 +323,46 @@ async function writeCampaign(
   });
   await insertEntityLedger(tx, projectId, importId, "campaign", [{
     intent,
-    nativeId: intent.entityId,
+    nativeId: nativeCampaignId,
     value: { intent, sourceVersion: bundle.sourceVersion },
   }]);
-  return intent.entityId;
+  return nativeCampaignId;
+}
+
+async function allocateNativeTaskIds(
+  tx: DbTransaction,
+  bundle: CccPrdSemanticBundle,
+  projectId: string,
+  importId: string,
+  now: string,
+): Promise<CccPrdNativeTaskIds> {
+  const intents = intentRows(bundle, "task");
+  if (intents.length !== bundle.tasks.length) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      `CCC PRD task intent count ${intents.length} does not match task count ${bundle.tasks.length}`,
+    );
+  }
+  const semanticTaskIds = new Set(bundle.tasks.map(({ id }) => id));
+  if (
+    semanticTaskIds.size !== bundle.tasks.length
+    || intents.some(({ entityId }) => !semanticTaskIds.has(entityId))
+    || new Set(intents.map(({ entityId }) => entityId)).size !== intents.length
+  ) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      "CCC PRD task intents do not map one-to-one onto semantic tasks",
+    );
+  }
+  const allocated = await allocateCommittedTaskIdsInTransaction(tx, {
+    projectId,
+    nodeId: `ccc-prd-import:${importId}`,
+    count: intents.length,
+    now,
+  });
+  return new Map(
+    intents.map((intent, index) => [intent.entityId, allocated[index]!]),
+  );
 }
 
 async function writeTasks(
@@ -329,6 +376,7 @@ async function writeTasks(
   executionPolicy: CccCampaignExecutionPolicy,
   store: TaskStore,
   now: string,
+  nativeTaskIds: CccPrdNativeTaskIds,
 ): Promise<Array<Task & { state: "prepared"; runnable: false }>> {
   observeWriter(recorder, "task", tx);
   const byId = new Map(bundle.tasks.map((task) => [task.id, task]));
@@ -365,6 +413,7 @@ async function writeTasks(
       bundle.targetRepository.baseCommit,
       route,
       now,
+      nativeTaskIds,
     );
     await insertTaskRowInTransaction(
       tx,
@@ -373,7 +422,7 @@ async function writeTasks(
       projectId,
     );
     tasks.push(task);
-    ledger.push({ intent, nativeId: source.id, value: source });
+    ledger.push({ intent, nativeId: task.id, value: source });
   }
   await insertEntityLedger(tx, projectId, importId, "task", ledger);
   return tasks;
@@ -385,6 +434,7 @@ async function writeDependencyEdges(
   bundle: CccPrdSemanticBundle,
   projectId: string,
   importId: string,
+  nativeTaskIds: CccPrdNativeTaskIds,
 ): Promise<void> {
   observeWriter(recorder, "dependency_edge", tx);
   const byId = new Map(bundle.edges.map((edge) => [edge.id, edge]));
@@ -405,10 +455,13 @@ async function writeDependencyEdges(
     }
     await tx
       .update(schema.project.tasks)
-      .set({ dependencies: [...target.dependencyTaskIds] })
+      .set({
+        dependencies: target.dependencyTaskIds.map((taskId) =>
+          nativeCccPrdTaskId(taskId, nativeTaskIds)),
+      })
       .where(and(
         eq(schema.project.tasks.projectId, projectId),
-        eq(schema.project.tasks.id, target.id),
+        eq(schema.project.tasks.id, nativeCccPrdTaskId(target.id, nativeTaskIds)),
       ));
   }
   await insertEntityLedger(
@@ -424,7 +477,11 @@ async function writeDependencyEdges(
           `CCC PRD dependency intent references unknown edge ${intent.entityId}`,
         );
       }
-      return { intent, nativeId: edge.fromTaskId, value: edge };
+      return {
+        intent,
+        nativeId: nativeCccPrdTaskId(edge.fromTaskId, nativeTaskIds),
+        value: edge,
+      };
     }),
   );
 }
@@ -437,6 +494,7 @@ async function writeWorkflows(
   projectId: string,
   importId: string,
   now: string,
+  nativeTaskIds: CccPrdNativeTaskIds,
 ): Promise<void> {
   observeWriter(recorder, "workflow", tx);
   const byId = new Map(bundle.workflows.map((workflow) => [workflow.id, workflow]));
@@ -453,7 +511,7 @@ async function writeWorkflows(
       id: nativeWorkflowId,
       name: workflow.title,
       description: `Generated from CCC PRD ${bundle.sourceVersion}`,
-      ir: nativeWorkflowIr(bundle, workflow, executionPolicy),
+      ir: nativeWorkflowIr(bundle, workflow, executionPolicy, nativeTaskIds),
       layout: {},
       kind: "workflow",
       createdAt: now,
@@ -462,7 +520,7 @@ async function writeWorkflows(
     for (const taskId of workflow.taskIds) {
       await tx.insert(schema.project.taskWorkflowSelection).values({
         projectId,
-        taskId,
+        taskId: nativeCccPrdTaskId(taskId, nativeTaskIds),
         workflowId: nativeWorkflowId,
         stepIds: [],
         updatedAt: now,
@@ -503,14 +561,37 @@ function nativeWorkflowMergeNodeId(workflowId: string, taskId: string): string {
   return `ccc-merge-${sha256(`${workflowId}\0${taskId}`).slice(0, 24)}`;
 }
 
+function nativeWorkflowProofNodeId(workflowId: string): string {
+  return `ccc-proof-${sha256(workflowId).slice(0, 24)}`;
+}
+
+function nativeWorkflowProofJoinNodeId(workflowId: string): string {
+  return `ccc-proof-join-${sha256(workflowId).slice(0, 24)}`;
+}
+
 function nativeWorkflowIr(
   bundle: CccPrdSemanticBundle,
   workflow: CccPrdWorkflow,
   executionPolicy: CccCampaignExecutionPolicy,
+  nativeTaskIds: CccPrdNativeTaskIds,
 ): WorkflowIr {
   const taskById = new Map(bundle.tasks.map((task) => [task.id, task]));
   const routeByTaskId = new Map(executionPolicy.routes.map((route) => [route.taskId, route]));
   const mergeLanding = mergeLandingFor(bundle, workflow, taskById);
+  const productExecution = executionPolicy.schema === "ccc-campaign.execution-policy.v2";
+  if (productExecution && bundle.proofs.length === 0) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      `CCC PRD product workflow ${workflow.id} requires at least one proof`,
+    );
+  }
+  if (productExecution && workflow.terminalTaskIds.length !== 1) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_INVALID_BUNDLE",
+      `CCC PRD product workflow ${workflow.id} requires exactly one integration terminal task before final proof`,
+    );
+  }
+  const proofTaskId = workflow.terminalTaskIds[0]!;
   const taskNodes: WorkflowIrNode[] = workflow.taskIds.map((taskId) => {
     const task = taskById.get(taskId);
     if (!task) {
@@ -526,14 +607,47 @@ function nativeWorkflowIr(
         `CCC campaign execution route disappeared for workflow task ${task.id}`,
       );
     }
+    const executionPrompt = productExecution
+      ? buildCccPrdTaskExecutionPrompt(bundle, task, route)
+      : undefined;
     return {
       id: nativeWorkflowTaskNodeId(taskId),
       kind: "prompt",
       config: {
         name: task.title,
-        prompt: task.description,
+        prompt: executionPrompt?.content ?? task.description,
         cccPrdTaskId: task.id,
+        cccNativeTaskId: nativeCccPrdTaskId(task.id, nativeTaskIds),
         gateMode: "gate",
+        ...(productExecution
+          ? {
+            cccExecutionPromptSchema: executionPrompt!.schema,
+            cccExecutionPromptSha256: executionPrompt!.sha256,
+            cccExecutionTransport: route.transport,
+            cccExecutionProviderId: route.providerId,
+            cccExecutionModelId: route.modelId,
+            cccExecutionRouteSha256: contentDigest(route),
+            ...(route.workflowExtensionId
+              ? { cccExecutionWorkflowExtensionId: route.workflowExtensionId }
+              : {}),
+            executor: route.executor,
+            toolMode: route.toolMode,
+            worktreeMode: route.worktreeMode,
+            ownedPaths: [...(route.ownedPaths ?? [])],
+            allowedWriteRoots: [...(route.allowedWriteRoots ?? [])],
+            commitPolicy: route.commitPolicy,
+            ...(route.transport === "cli" && route.cliAdapterId
+              ? {
+                cliAdapterId: route.cliAdapterId,
+                cliSettings: {
+                  profile: "ccc-fusion",
+                  providerId: route.providerId,
+                  model: route.modelId,
+                },
+              }
+              : {}),
+          }
+          : {}),
       },
       ...(route.transport === "workflow"
         ? { extensions: { [route.workflowExtensionId!]: {} } }
@@ -574,6 +688,9 @@ function nativeWorkflowIr(
   for (const [taskNodeId, joinNodeId] of joinByTaskNodeId) {
     topologyEdges.push({ from: joinNodeId, to: taskNodeId, condition: "success" });
   }
+  const proofNodeId = nativeWorkflowProofNodeId(workflow.id);
+  const proofJoinNodeId = nativeWorkflowProofJoinNodeId(workflow.id);
+  const requiresProofJoin = productExecution && workflow.terminalTaskIds.length > 1;
   const ir: WorkflowIr = {
     version: "v2",
     name: workflow.title,
@@ -584,17 +701,49 @@ function nativeWorkflowIr(
       ...splitTaskIds.map((taskId) => ({
         id: nativeWorkflowSplitNodeId(taskId),
         kind: "split" as const,
-        config: { cccPrdTaskId: taskId },
+        config: {
+          cccPrdTaskId: taskId,
+          cccNativeTaskId: nativeCccPrdTaskId(taskId, nativeTaskIds),
+        },
       })),
       ...joinTaskIds.map((taskId) => ({
         id: nativeWorkflowJoinNodeId(taskId),
         kind: "join" as const,
-        config: { mode: "all", cccPrdTaskId: taskId },
+        config: {
+          mode: "all",
+          cccPrdTaskId: taskId,
+          cccNativeTaskId: nativeCccPrdTaskId(taskId, nativeTaskIds),
+        },
       })),
+      ...(requiresProofJoin ? [{
+        id: proofJoinNodeId,
+        kind: "join" as const,
+        config: { mode: "all", cccProofJoin: true },
+      }] : []),
+      ...(productExecution ? [{
+        id: proofNodeId,
+        kind: "gate" as const,
+        config: {
+          name: "CCC PRD proof suite",
+          cccProofSuite: true,
+          cccProofIds: bundle.proofs.map(({ id }) => id),
+          cccPrdTaskIds: workflow.taskIds,
+          cccNativeTaskIds: workflow.taskIds.map((taskId) =>
+            nativeCccPrdTaskId(taskId, nativeTaskIds)),
+          cccPrdTaskId: proofTaskId,
+          cccNativeTaskId: nativeCccPrdTaskId(proofTaskId, nativeTaskIds),
+          gateMode: "gate",
+          toolMode: "readonly",
+        },
+      }] : []),
       ...(mergeLanding ? [{
         id: nativeWorkflowMergeNodeId(workflow.id, mergeLanding.taskId),
         kind: "prompt" as const,
-        config: { seam: "merge", cccPrdTaskId: mergeLanding.taskId },
+        config: {
+          seam: "merge",
+          cccPrdTaskId: mergeLanding.taskId,
+          cccNativeTaskId: nativeCccPrdTaskId(mergeLanding.taskId, nativeTaskIds),
+        },
       }] : []),
       { id: "end", kind: "end" },
     ],
@@ -605,18 +754,43 @@ function nativeWorkflowIr(
         condition: "success" as const,
       })),
       ...topologyEdges,
-      ...workflow.terminalTaskIds.map((taskId) => ({
-        from: nativeWorkflowTaskNodeId(taskId),
-        to: mergeLanding?.taskId === taskId
-          ? nativeWorkflowMergeNodeId(workflow.id, taskId)
-          : "end",
-        condition: "success" as const,
-      })),
-      ...(mergeLanding ? [{
-        from: nativeWorkflowMergeNodeId(workflow.id, mergeLanding.taskId),
-        to: "end",
-        condition: "success" as const,
-      }] : []),
+      ...(productExecution
+        ? [
+          ...workflow.terminalTaskIds.map((taskId) => ({
+            from: nativeWorkflowTaskNodeId(taskId),
+            to: requiresProofJoin ? proofJoinNodeId : proofNodeId,
+            condition: "success" as const,
+          })),
+          ...(requiresProofJoin
+            ? [{ from: proofJoinNodeId, to: proofNodeId, condition: "success" as const }]
+            : []),
+          {
+            from: proofNodeId,
+            to: mergeLanding
+              ? nativeWorkflowMergeNodeId(workflow.id, mergeLanding.taskId)
+              : "end",
+            condition: "success" as const,
+          },
+          ...(mergeLanding ? [{
+            from: nativeWorkflowMergeNodeId(workflow.id, mergeLanding.taskId),
+            to: "end",
+            condition: "success" as const,
+          }] : []),
+        ]
+        : [
+          ...workflow.terminalTaskIds.map((taskId) => ({
+            from: nativeWorkflowTaskNodeId(taskId),
+            to: mergeLanding?.taskId === taskId
+              ? nativeWorkflowMergeNodeId(workflow.id, taskId)
+              : "end",
+            condition: "success" as const,
+          })),
+          ...(mergeLanding ? [{
+            from: nativeWorkflowMergeNodeId(workflow.id, mergeLanding.taskId),
+            to: "end",
+            condition: "success" as const,
+          }] : []),
+        ]),
     ],
   };
   return parseWorkflowIr(ir);
@@ -666,6 +840,7 @@ async function writeDocuments(
   projectId: string,
   importId: string,
   now: string,
+  nativeTaskIds: CccPrdNativeTaskIds,
 ): Promise<void> {
   observeWriter(recorder, "document", tx);
   const byId = new Map(bundle.documents.map((document) => [document.id, document]));
@@ -677,10 +852,11 @@ async function writeDocuments(
     );
   }
   for (const document of bundle.documents) {
+    const nativeDocumentId = nativeCccPrdScopedId(importId, document.id);
     await tx.insert(schema.project.taskDocuments).values({
       projectId,
-      id: document.id,
-      taskId: document.taskId,
+      id: nativeDocumentId,
+      taskId: nativeCccPrdTaskId(document.taskId, nativeTaskIds),
       key: document.key,
       content: document.content,
       revision: 1,
@@ -706,7 +882,11 @@ async function writeDocuments(
           `CCC PRD document intent references unknown document ${intent.entityId}`,
         );
       }
-      return { intent, nativeId: document.id, value: document };
+      return {
+        intent,
+        nativeId: nativeCccPrdScopedId(importId, document.id),
+        value: document,
+      };
     }),
   );
 }
@@ -718,6 +898,7 @@ async function writeArtifacts(
   projectId: string,
   importId: string,
   now: string,
+  nativeTaskIds: CccPrdNativeTaskIds,
 ): Promise<void> {
   observeWriter(recorder, "artifact", tx);
   const byId = new Map(bundle.artifacts.map((artifact) => [artifact.id, artifact]));
@@ -741,8 +922,12 @@ async function writeArtifacts(
       content: artifact.content,
       authorId: "ccc-prd-import",
       authorType: "system",
-      taskId: artifact.taskId,
-      metadata: { bundleHash: bundle.bundleHash, projectId },
+      taskId: nativeCccPrdTaskId(artifact.taskId, nativeTaskIds),
+      metadata: {
+        bundleHash: bundle.bundleHash,
+        projectId,
+        semanticTaskId: artifact.taskId,
+      },
       createdAt: now,
       updatedAt: now,
     });
@@ -797,9 +982,11 @@ async function writeWorkItems(
   tx: DbTransaction,
   recorder: ImportTransactionWitnessRecorder,
   bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignExecutionPolicy,
   projectId: string,
   importId: string,
   now: string,
+  nativeTaskIds: CccPrdNativeTaskIds,
 ): Promise<void> {
   observeWriter(recorder, "work_item", tx);
   const intents = intentRows(bundle, "work_item");
@@ -818,22 +1005,24 @@ async function writeWorkItems(
         `CCC PRD workflow ${workflow.id} has no task for work item`,
       );
     }
+    const nativeWorkItemId = nativeCccPrdScopedId(importId, intent.id);
+    const ir = nativeWorkflowIr(bundle, workflow, executionPolicy, nativeTaskIds);
     await tx.insert(schema.project.workflowWorkItems).values({
       projectId,
-      id: intent.id,
+      id: nativeWorkItemId,
       runId: `ccc-prd:${importId}`,
-      taskId,
+      taskId: nativeCccPrdTaskId(taskId, nativeTaskIds),
       nodeId: nativeWorkflowTaskNodeId(taskId),
       kind: "task",
       state: "held",
       attempt: 0,
       blockedReason: CCC_PRD_IMPORT_PREPARED_STATUS,
       stableWorkflowRunId: `ccc-prd:${importId}`,
-      irHash: contentDigest(workflow),
+      irHash: contentDigest(ir),
       createdAt: now,
       updatedAt: now,
     });
-    ledger.push({ intent, nativeId: intent.id, value: workflow });
+    ledger.push({ intent, nativeId: nativeWorkItemId, value: workflow });
   }
   await insertEntityLedger(tx, projectId, importId, "work_item", ledger);
 }
@@ -934,6 +1123,39 @@ async function selectImportRow(
   return (rows[0] as ImportRow | undefined) ?? null;
 }
 
+async function loadNativeTaskIds(
+  db: AsyncDataLayer["db"] | DbTransaction,
+  row: Pick<ImportRow, "projectId" | "importId" | "canonicalBundle">,
+): Promise<CccPrdNativeTaskIds> {
+  const entities = await db
+    .select({
+      semanticTaskId: schema.project.cccPrdImportEntities.entityId,
+      nativeTaskId: schema.project.cccPrdImportEntities.nativeId,
+    })
+    .from(schema.project.cccPrdImportEntities)
+    .where(and(
+      eq(schema.project.cccPrdImportEntities.projectId, row.projectId),
+      eq(schema.project.cccPrdImportEntities.importId, row.importId),
+      eq(schema.project.cccPrdImportEntities.entityType, "task"),
+    ))
+    .orderBy(schema.project.cccPrdImportEntities.ordinal);
+  const expected = new Set(row.canonicalBundle.tasks.map(({ id }) => id));
+  if (
+    entities.length !== expected.size
+    || new Set(entities.map(({ semanticTaskId }) => semanticTaskId)).size !== entities.length
+    || new Set(entities.map(({ nativeTaskId }) => nativeTaskId)).size !== entities.length
+    || entities.some(({ semanticTaskId }) => !expected.has(semanticTaskId))
+  ) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_PROJECTION_DRIFT",
+      `CCC PRD import ${row.importId} has an incomplete or ambiguous native task mapping`,
+    );
+  }
+  return new Map(
+    entities.map(({ semanticTaskId, nativeTaskId }) => [semanticTaskId, nativeTaskId]),
+  );
+}
+
 function persistedCampaignIdentity(row: ImportRow): CccCampaignImportIdentity {
   try {
     const { executionPolicy, manifest, manifestHash } =
@@ -1010,6 +1232,13 @@ async function prepareDatabaseImport(
           campaignStartedAt: now,
         });
         const identityHash = hashCccCampaignManifest(manifest);
+        const nativeTaskIds = await allocateNativeTaskIds(
+          tx,
+          bundle,
+          projectId,
+          importId,
+          now,
+        );
         const stagingRelativePath = join(STAGING_PREFIX, importId);
         const transactionWitness: CccPrdImportTransactionWitness = {
           transactionId: recorder.transactionId,
@@ -1022,6 +1251,7 @@ async function prepareDatabaseImport(
           identityHash,
           campaignId,
           now,
+          nativeTaskIds,
         });
         const projectionDigest = contentDigest(projection);
         await tx.insert(schema.project.cccPrdImports).values({
@@ -1066,19 +1296,61 @@ async function prepareDatabaseImport(
           executionPolicy,
           store,
           now,
+          nativeTaskIds,
         );
         await inject(failureInjection, "task");
-        await writeDependencyEdges(tx, recorder, bundle, projectId, importId);
+        await writeDependencyEdges(
+          tx,
+          recorder,
+          bundle,
+          projectId,
+          importId,
+          nativeTaskIds,
+        );
         await inject(failureInjection, "dependency_edge");
-        await writeWorkflows(tx, recorder, bundle, executionPolicy, projectId, importId, now);
+        await writeWorkflows(
+          tx,
+          recorder,
+          bundle,
+          executionPolicy,
+          projectId,
+          importId,
+          now,
+          nativeTaskIds,
+        );
         await inject(failureInjection, "workflow");
-        await writeDocuments(tx, recorder, bundle, projectId, importId, now);
+        await writeDocuments(
+          tx,
+          recorder,
+          bundle,
+          projectId,
+          importId,
+          now,
+          nativeTaskIds,
+        );
         await inject(failureInjection, "document");
-        await writeArtifacts(tx, recorder, bundle, projectId, importId, now);
+        await writeArtifacts(
+          tx,
+          recorder,
+          bundle,
+          projectId,
+          importId,
+          now,
+          nativeTaskIds,
+        );
         await inject(failureInjection, "artifact");
         await writeSources(tx, recorder, bundle, projectId, importId);
         await inject(failureInjection, "source");
-        await writeWorkItems(tx, recorder, bundle, projectId, importId, now);
+        await writeWorkItems(
+          tx,
+          recorder,
+          bundle,
+          executionPolicy,
+          projectId,
+          importId,
+          now,
+          nativeTaskIds,
+        );
         await inject(failureInjection, "work_item");
         await writeRunAudit(tx, recorder, bundle, projectId, importId, now);
         await inject(failureInjection, "run_audit");
@@ -1637,6 +1909,9 @@ async function activateImport(
         .set({
           state: "runnable",
           blockedReason: null,
+          waitReason: row.executionPolicy.schema === "ccc-campaign.execution-policy.v2"
+            ? "planning"
+            : null,
           updatedAt: now,
         })
         .where(and(
@@ -1963,6 +2238,7 @@ async function reconcileOwned(
           throw error;
         }
         const campaignIdentity = persistedCampaignIdentity(row);
+        const nativeTaskIds = await loadNativeTaskIds(input.layer.db, row);
         const projection = buildCccPrdProjection({
           bundle: row.canonicalBundle,
           executionPolicy: campaignIdentity.executionPolicy,
@@ -1970,6 +2246,7 @@ async function reconcileOwned(
           identityHash: row.identityHash,
           campaignId: campaignIdentity.manifest.campaignId,
           now: row.createdAt,
+          nativeTaskIds,
         });
         if (row.state === "active") {
           await withImportIdentityLock(input.layer, row.projectId, row.idempotencyKey, waitBudgetMs, async (tx) => {

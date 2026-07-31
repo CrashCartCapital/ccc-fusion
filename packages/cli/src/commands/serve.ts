@@ -417,6 +417,12 @@ export async function runServe(
 
   const engineManager = startupEngineManager = new ProjectEngineManager(sharedCentralCore, {
     cliPackageVersion,
+    ...(selectedPort > 0
+      ? {
+        cliAgentHookEndpointUrl:
+          `http://127.0.0.1:${selectedPort}/api/cli-agent/hooks`,
+      }
+      : {}),
     getMergeStrategy,
     processPullRequestMerge: (s, wd, taskId, pool) =>
       processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, pool),
@@ -578,6 +584,16 @@ export async function runServe(
   );
 
   const store = primaryEngine.getTaskStore();
+  /*
+  FNXC:ProjectPartitionIdentity 2026-07-30-23:34:
+  A fresh serve boot may have cached the pre-registration `local-*` store at
+  startup, while ProjectEngineManager correctly reopens the selected engine on
+  its registered `proj_*` partition. Replace the host extension cache with that
+  authoritative engine store so in-process fn_* tools cannot recreate the
+  identity split. The host owns both lifecycles; this cache replacement closes
+  neither store.
+  */
+  setHostTaskStore(primaryCwd, store);
 
   // InProcessRuntime does not call store.watch() — do it here so SSE events
   // and file-watcher triggers are active for the HTTP layer.
@@ -969,10 +985,20 @@ export async function runServe(
         getPluginSkills: getProjectScopedPluginSkills,
       })
     : undefined;
+  const cliAgentHubResolver = (
+    projectId: string | undefined,
+    _sessionId: string,
+  ) => {
+    const targetEngine = projectId
+      ? engineManager.getEngine(projectId)
+      : primaryEngine;
+    return targetEngine?.getCliAgentRuntime()?.bundle.hub;
+  };
 
   const app = createServer(store, {
     engine: primaryEngine,
     engineManager,
+    cliAgentHubResolver,
     centralCore: sharedCentralCore ?? undefined,
     onMerge: (taskId) => primaryEngine.onMerge(taskId),
     authStorage: dashboardAuthStorage,

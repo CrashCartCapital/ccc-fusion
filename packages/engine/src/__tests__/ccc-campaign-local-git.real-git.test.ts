@@ -881,6 +881,8 @@ describe("CCC campaign local Git observation", () => {
         firstArguments: [
           "-c",
           "core.fsmonitor=false",
+          "-c",
+          `core.hooksPath=${devNull}`,
           "-C",
           root,
           "rev-parse",

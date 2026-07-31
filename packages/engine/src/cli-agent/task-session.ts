@@ -300,13 +300,17 @@ export class CliTaskSession {
     // fires around the same time). To avoid a race we write the scripts as part of
     // launch, immediately after spawn, before injecting.
     const hookScriptPath = join(hookDir, HOOK_SCRIPT_NAMES.hook);
+    const notifyScriptPath = join(hookDir, HOOK_SCRIPT_NAMES.notify);
     const settingsPath = join(hookDir, "settings.json");
 
     // Build adapter launch settings carrying the hook-script refs. Claude's
-    // settings flow reads `hookScripts` + `settingsPath` off ctx.settings; other
-    // adapters ignore unknown keys.
+    // settings flow reads `hookScripts` + `settingsPath`; Codex reads the
+    // deterministic `notifyProgram` path and emits it as a session-scoped
+    // `-c notify=[...]` override. The scripts are written immediately after
+    // spawn, before the first prompt is injected.
     const settings: Record<string, unknown> = {
       ...expandedSettings,
+      notifyProgram: notifyScriptPath,
       hookScripts: {
         stopScript: hookScriptPath,
         notificationScript: hookScriptPath,

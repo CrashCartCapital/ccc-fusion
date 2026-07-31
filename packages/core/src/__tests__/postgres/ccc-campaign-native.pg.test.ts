@@ -258,6 +258,25 @@ pgTest("CCC campaign native persistence", () => {
     };
   }
 
+  async function nativeTaskIdForImport(
+    importId: string,
+    semanticTaskId: string,
+  ): Promise<string> {
+    const rows = await h.layer().db.execute(sql`
+      SELECT entity_id, native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${importId}
+        AND entity_type = 'task'
+        AND entity_id = ${semanticTaskId}
+    `) as unknown as Array<{ entity_id: string; native_id: string }>;
+    expect(rows).toEqual([{
+      entity_id: semanticTaskId,
+      native_id: expect.any(String),
+    }]);
+    expect(rows[0]!.native_id).not.toBe(semanticTaskId);
+    return rows[0]!.native_id;
+  }
+
   async function importContext(
     suffix: string,
     options: {
@@ -271,10 +290,21 @@ pgTest("CCC campaign native persistence", () => {
     const source = protectedActions.length > 0
       ? withProtectedActions(initial, protectedActions)
       : initial;
-    await importCccPrdBundle(request(source, `idem-${suffix}`, policyFor(source)));
+    const imported = await importCccPrdBundle(
+      request(source, `idem-${suffix}`, policyFor(source)),
+    );
+    const semanticTaskId = `TASK-${suffix}`;
+    const nativeTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      semanticTaskId,
+    );
     const context = await (h.store() as unknown as CampaignContextStore)
-      .getCccCampaignContextForTask(`TASK-${suffix}`);
-    expect(context).not.toBeNull();
+      .getCccCampaignContextForTask(nativeTaskId);
+    expect(context).toMatchObject({
+      taskId: nativeTaskId,
+      semanticTaskId,
+      route: { taskId: semanticTaskId },
+    });
     return context!;
   }
 
@@ -421,6 +451,8 @@ pgTest("CCC campaign native persistence", () => {
 
   it("derives a full authority binding and canonical hash from persisted campaign context", async () => {
     const context = await importContext("authority-binding");
+    expect(context.taskId).not.toBe(context.semanticTaskId);
+    expect(context.route.taskId).toBe(context.semanticTaskId);
     const binding = authorityApi.createCccCampaignAuthorityBinding(context, {
       actionId: "receipt-action",
       actionTarget: "local://receipt",
@@ -731,12 +763,20 @@ pgTest("CCC campaign native persistence", () => {
     );
     expect(first.replayed).toBe(false);
     expect(replay.replayed).toBe(true);
+    const semanticTaskId = "TASK-sequential-context";
+    const nativeTaskId = await nativeTaskIdForImport(
+      first.importId,
+      semanticTaskId,
+    );
     const context = await (h.store() as unknown as CampaignContextStore)
-      .getCccCampaignContextForTask("TASK-sequential-context");
+      .getCccCampaignContextForTask(nativeTaskId);
     expect(context).toMatchObject({
       importId: first.importId,
       manifestHash: first.identityHash,
       executionPolicy,
+      taskId: nativeTaskId,
+      semanticTaskId,
+      route: { taskId: semanticTaskId },
     });
   });
 
@@ -749,12 +789,20 @@ pgTest("CCC campaign native persistence", () => {
     ]);
     expect(new Set([left.importId, right.importId])).toEqual(new Set([left.importId]));
     expect([left.replayed, right.replayed].sort()).toEqual([false, true]);
+    const semanticTaskId = "TASK-concurrent-context";
+    const nativeTaskId = await nativeTaskIdForImport(
+      left.importId,
+      semanticTaskId,
+    );
     const context = await (h.store() as unknown as CampaignContextStore)
-      .getCccCampaignContextForTask("TASK-concurrent-context");
+      .getCccCampaignContextForTask(nativeTaskId);
     expect(context).toMatchObject({
       importId: left.importId,
       manifestHash: left.identityHash,
       executionPolicy,
+      taskId: nativeTaskId,
+      semanticTaskId,
+      route: { taskId: semanticTaskId },
     });
   });
 
@@ -769,17 +817,25 @@ pgTest("CCC campaign native persistence", () => {
       request(source, "idem-lost-context", executionPolicy),
     );
     expect(replay.replayed).toBe(true);
+    const semanticTaskId = "TASK-lost-context";
+    const nativeTaskId = await nativeTaskIdForImport(
+      replay.importId,
+      semanticTaskId,
+    );
     const restarted = new TaskStore(
       h.rootDir(),
       undefined,
       { asyncLayer: h.layer() },
     ) as unknown as CampaignContextStore;
     await expect(
-      restarted.getCccCampaignContextForTask("TASK-lost-context"),
+      restarted.getCccCampaignContextForTask(nativeTaskId),
     ).resolves.toMatchObject({
       importId: replay.importId,
       manifestHash: replay.identityHash,
       executionPolicy,
+      taskId: nativeTaskId,
+      semanticTaskId,
+      route: { taskId: semanticTaskId },
     });
   });
 
@@ -787,6 +843,11 @@ pgTest("CCC campaign native persistence", () => {
     const source = bundle(h.rootDir(), "context");
     const executionPolicy = policyFor(source);
     const imported = await importCccPrdBundle(request(source, "idem-context", executionPolicy));
+    const semanticTaskId = "TASK-context";
+    const nativeTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      semanticTaskId,
+    );
 
     const rows = await h.layer().db.execute(sql`
       SELECT execution_policy, campaign_manifest, campaign_manifest_hash
@@ -808,14 +869,14 @@ pgTest("CCC campaign native persistence", () => {
     });
 
     const restarted = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }) as unknown as CampaignContextStore;
-    await expect(restarted.getCccCampaignContextForTask("TASK-context")).resolves.toEqual({
+    await expect(restarted.getCccCampaignContextForTask(nativeTaskId)).resolves.toEqual({
       schema: "ccc-campaign.context.v1",
       projectId: "__legacy_unscoped__",
       importId: imported.importId,
       idempotencyKey: "idem-context",
       campaignId: "CAMPAIGN-context",
-      taskId: "TASK-context",
-      semanticTaskId: "TASK-context",
+      taskId: nativeTaskId,
+      semanticTaskId,
       proofIds: ["PROOF-context"],
       protectedActionIds: source.tasks[0]!.protectedActionIds,
       packetHash: source.sourceHash,
@@ -839,7 +900,8 @@ pgTest("CCC campaign native persistence", () => {
       activeActionLeases: {},
     });
 
-    await expect(restarted.getTask("TASK-context")).resolves.toMatchObject({
+    await expect(restarted.getTask(nativeTaskId)).resolves.toMatchObject({
+      id: nativeTaskId,
       modelProvider: "deterministic-fake",
       modelId: "fixture-v1",
       baseCommitSha: source.targetRepository.baseCommit,
@@ -849,7 +911,14 @@ pgTest("CCC campaign native persistence", () => {
   it("does not accept caller task metadata as campaign context", async () => {
     const source = bundle(h.rootDir(), "caller-metadata");
     const executionPolicy = policyFor(source);
-    await importCccPrdBundle(request(source, "idem-caller-metadata", executionPolicy));
+    const imported = await importCccPrdBundle(
+      request(source, "idem-caller-metadata", executionPolicy),
+    );
+    const semanticTaskId = "TASK-caller-metadata";
+    const nativeTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      semanticTaskId,
+    );
     const callerMetadata = JSON.stringify({
       bundleHash: source.bundleHash,
       proofIds: source.tasks[0]!.proofIds,
@@ -860,17 +929,18 @@ pgTest("CCC campaign native persistence", () => {
     await h.layer().db.execute(sql`
       UPDATE project.tasks
       SET source_metadata = ${callerMetadata}::jsonb
-      WHERE id = ${"TASK-caller-metadata"}
+      WHERE id = ${nativeTaskId}
     `);
 
     const restarted = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }) as unknown as CampaignContextStore;
-    const context = await restarted.getCccCampaignContextForTask("TASK-caller-metadata");
+    const context = await restarted.getCccCampaignContextForTask(nativeTaskId);
     expect(context).toMatchObject({
       campaignId: "CAMPAIGN-caller-metadata",
-      semanticTaskId: "TASK-caller-metadata",
+      taskId: nativeTaskId,
+      semanticTaskId,
       proofIds: ["PROOF-caller-metadata"],
       executionPolicy,
-      route: routesFor(source)[0],
+      route: { ...routesFor(source)[0], taskId: semanticTaskId },
     });
     expect(context).not.toMatchObject({
       campaignId: "caller-asserted",
@@ -880,12 +950,17 @@ pgTest("CCC campaign native persistence", () => {
 
   it("refuses a canonical bundle task proof-id mutation that is not rehashed", async () => {
     const source = bundle(h.rootDir(), "bundle-proof-drift");
-    await importCccPrdBundle(
+    const imported = await importCccPrdBundle(
       request(source, "idem-bundle-proof-drift", policyFor(source)),
+    );
+    const semanticTaskId = "TASK-bundle-proof-drift";
+    const nativeTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      semanticTaskId,
     );
     await mutateCanonicalBundleTask(
       "idem-bundle-proof-drift",
-      "TASK-bundle-proof-drift",
+      semanticTaskId,
       sql`${JSON.stringify({
         ...source.tasks[0]!,
         proofIds: ["PROOF-bundle-proof-drift-mutated"],
@@ -898,7 +973,7 @@ pgTest("CCC campaign native persistence", () => {
       { asyncLayer: h.layer() },
     ) as unknown as CampaignContextStore;
     await expect(
-      restarted.getCccCampaignContextForTask("TASK-bundle-proof-drift"),
+      restarted.getCccCampaignContextForTask(nativeTaskId),
     ).rejects.toMatchObject({
       name: "CccCampaignContextError",
       code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
@@ -910,13 +985,18 @@ pgTest("CCC campaign native persistence", () => {
     ["bundle hash", "native-metadata-hash-drift", { bundleHash: "0".repeat(64) }],
   ] as const)("refuses native task source metadata drift in %s", async (_kind, suffix, patch) => {
     const source = bundle(h.rootDir(), suffix);
-    await importCccPrdBundle(
+    const imported = await importCccPrdBundle(
       request(source, `idem-${suffix}`, policyFor(source)),
+    );
+    const semanticTaskId = `TASK-${suffix}`;
+    const nativeTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      semanticTaskId,
     );
     await h.layer().db.execute(sql`
       UPDATE project.tasks
       SET source_metadata = source_metadata || ${JSON.stringify(patch)}::jsonb
-      WHERE id = ${`TASK-${suffix}`}
+      WHERE id = ${nativeTaskId}
     `);
 
     const restarted = new TaskStore(
@@ -925,7 +1005,7 @@ pgTest("CCC campaign native persistence", () => {
       { asyncLayer: h.layer() },
     ) as unknown as CampaignContextStore;
     await expect(
-      restarted.getCccCampaignContextForTask(`TASK-${suffix}`),
+      restarted.getCccCampaignContextForTask(nativeTaskId),
     ).rejects.toMatchObject({
       name: "CccCampaignContextError",
       code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
@@ -934,8 +1014,12 @@ pgTest("CCC campaign native persistence", () => {
 
   it("fails closed with a typed refusal when persisted campaign custody is malformed", async () => {
     const source = bundle(h.rootDir(), "malformed-custody");
-    await importCccPrdBundle(
+    const imported = await importCccPrdBundle(
       request(source, "idem-malformed-custody", policyFor(source)),
+    );
+    const nativeTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      "TASK-malformed-custody",
     );
     await h.layer().db.execute(sql`
       UPDATE project.ccc_prd_imports
@@ -949,7 +1033,7 @@ pgTest("CCC campaign native persistence", () => {
       { asyncLayer: h.layer() },
     ) as unknown as CampaignContextStore;
     await expect(
-      restarted.getCccCampaignContextForTask("TASK-malformed-custody"),
+      restarted.getCccCampaignContextForTask(nativeTaskId),
     ).rejects.toMatchObject({
       name: "CccCampaignContextError",
       code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
@@ -962,10 +1046,14 @@ pgTest("CCC campaign native persistence", () => {
     await symlink(h.rootDir(), linkPath, "dir");
     try {
       const source = bundle(linkPath, "symlink-retarget");
-      await importCccPrdBundle({
+      const imported = await importCccPrdBundle({
         ...request(source, "idem-symlink-retarget", policyFor(source)),
         rootDir: linkPath,
       });
+      const nativeTaskId = await nativeTaskIdForImport(
+        imported.importId,
+        "TASK-symlink-retarget",
+      );
       const restarted = new TaskStore(
         linkPath,
         undefined,
@@ -976,7 +1064,7 @@ pgTest("CCC campaign native persistence", () => {
       await symlink(retargetPath, linkPath, "dir");
 
       await expect(
-        restarted.getCccCampaignContextForTask("TASK-symlink-retarget"),
+        restarted.getCccCampaignContextForTask(nativeTaskId),
       ).rejects.toMatchObject({
         name: "CccCampaignContextError",
         code: "CCC_CAMPAIGN_CONTEXT_REFUSED",
@@ -988,11 +1076,15 @@ pgTest("CCC campaign native persistence", () => {
 
   it("refuses a shifted persisted campaign window even when its duration is preserved", async () => {
     const source = bundle(h.rootDir(), "shifted-window");
-    await importCccPrdBundle(
+    const imported = await importCccPrdBundle(
       request(source, "idem-shifted-window", policyFor(source)),
     );
+    const nativeTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      "TASK-shifted-window",
+    );
     const admitted = await (h.store() as unknown as CampaignContextStore)
-      .getCccCampaignContextForTask("TASK-shifted-window");
+      .getCccCampaignContextForTask(nativeTaskId);
     const shiftedStart = new Date(
       Date.parse(admitted!.campaignStartedAt) + 1_000,
     ).toISOString();
@@ -1013,7 +1105,7 @@ pgTest("CCC campaign native persistence", () => {
       { asyncLayer: h.layer() },
     ) as unknown as CampaignContextStore;
     await expect(
-      restarted.getCccCampaignContextForTask("TASK-shifted-window"),
+      restarted.getCccCampaignContextForTask(nativeTaskId),
     ).rejects.toMatchObject({
       name: "CccCampaignContextError",
       code: "CCC_CAMPAIGN_CONTEXT_REFUSED",

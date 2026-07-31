@@ -75,5 +75,21 @@ describe("CCC PRD proof identity contract", () => {
       callerInjectedAuthority: "must-not-enter-canonical-hash",
     } as CccPrdSemanticBundle)).toBe(bundle.bundleHash);
     expect(compute!({ ...bundle, sourceVersion: "changed" })).not.toBe(bundle.bundleHash);
+    expect(compute!({
+      ...bundle,
+      materialCoverage: [{
+        id: "MAT-contract",
+        sourcePath: "prd.md",
+        materialKind: "requirement",
+        headingPath: ["Requirements"],
+        title: "REQ-contract",
+        spans: [],
+        disposition: {
+          kind: "task",
+          taskIds: [bundle.tasks[0]!.id],
+          requirementIds: [bundle.requirements[0]!.id],
+        },
+      }],
+    })).not.toBe(bundle.bundleHash);
   });
 });

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, win32 } from "node:path";
 import {
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
+  CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
@@ -30,6 +31,8 @@ import {
   isCanonicalProtectedActionIdSet,
   isWellFormedProtectedActionId,
 } from "./protected-action-ids.js";
+import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
+import { validateCccPrdImplementationFactProvenance } from "./authoring.js";
 
 export type CompileCccPrdInput = {
   rootDir: string;
@@ -37,6 +40,7 @@ export type CompileCccPrdInput = {
   sidecarPath?: string;
   expectedTarget?: string;
   expectedBase?: string;
+  requireMaterialCoverage?: boolean;
 };
 
 type CheckedSidecar = {
@@ -105,6 +109,8 @@ const SIDECAR_FIELDS = new Set([
   "ambiguities",
   "exceptions",
   "confidence",
+  "materialCoverage",
+  "implementationFactProvenance",
 ]);
 const CONFIDENCE_VALUES = new Set(["high", "medium", "low"]);
 const AUTHORITY_ROLE_VALUES = new Set(["root", "production_module", "blocking_test_index", "support"]);
@@ -618,7 +624,19 @@ function validateSidecar(
     importIntents: validateUniqueIds("importIntents", sidecar.importIntents, diagnostics),
     protectedActions: validateUniqueIds("protectedActions", sidecar.protectedActions, diagnostics),
   };
-  for (const [name, values] of Object.entries(collections)) {
+  // Dependency edges, documents, artifacts, and protected actions are optional
+  // semantic declarations. Requiring a fabricated row in each collection makes
+  // a valid single-task PRD impossible to represent without inventing product
+  // meaning. The executable spine itself must still be non-empty.
+  for (const name of [
+    "authorityRoles",
+    "requirements",
+    "proofs",
+    "tasks",
+    "workflows",
+    "importIntents",
+  ] as const) {
+    const values = collections[name];
     if (values.size === 0) {
       diagnostics.push(diagnostic("CCC_PRD_DECLARATION_MISSING", `sidecar ${name} must be non-empty`));
     }
@@ -782,6 +800,21 @@ function validateSidecar(
   if (taskCycle) {
     diagnostics.push(diagnostic("CCC_PRD_DEPENDENCY_CYCLE", `task dependency cycle includes ${taskCycle}`));
   }
+  const requirementTaskIds = new Set<string>();
+  for (const task of collections.tasks.values()) {
+    if (!Array.isArray(task.requirementIds)) continue;
+    for (const requirementId of task.requirementIds) {
+      if (typeof requirementId === "string") requirementTaskIds.add(requirementId);
+    }
+  }
+  for (const requirementId of collections.requirements.keys()) {
+    if (!requirementTaskIds.has(requirementId)) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_REQUIREMENT_UNDISPOSITIONED",
+        `requirement ${requirementId} has no task disposition`,
+      ));
+    }
+  }
 
   for (const edge of collections.edges.values()) {
     validateExactKeys(
@@ -911,7 +944,13 @@ function validateSidecar(
       diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `import intent ${String(intent.id)} references unknown workflow`));
     }
   }
-  for (const entityType of ["campaign", "source", "run_audit"]) {
+  for (const entityType of [
+    "campaign",
+    "source",
+    "run_audit",
+    "workflow",
+    "work_item",
+  ]) {
     const intents = intentsByType.get(entityType) ?? [];
     if (intents.length !== 1) {
       diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_CARDINALITY", `sidecar requires exactly one ${entityType} import intent; received ${intents.length}`));
@@ -921,6 +960,139 @@ function validateSidecar(
   for (const intent of intentsByType.get("run_audit") ?? []) {
     if (intent.entityId !== campaign?.entityId) {
       diagnostics.push(diagnostic("CCC_PRD_IMPORT_INTENT_INVALID", `run audit import intent ${String(intent.id)} must reference the campaign entity`));
+    }
+  }
+  const workflowIntents = intentsByType.get("workflow") ?? [];
+  const workItemIntents = intentsByType.get("work_item") ?? [];
+  if (
+    workflowIntents.length === 1
+    && workItemIntents.length === 1
+    && workItemIntents[0]!.entityId !== workflowIntents[0]!.entityId
+  ) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_IMPORT_INTENT_INVALID",
+      `work item import intent ${String(workItemIntents[0]!.id)} must reference the sole imported workflow ${String(workflowIntents[0]!.entityId)}`,
+    ));
+  }
+
+  if (
+    input.requireMaterialCoverage
+    && workflowIntents.length === 1
+    && workItemIntents.length === 1
+  ) {
+    const taskIntents = intentsByType.get("task") ?? [];
+    const declaredWorkflows = [...collections.workflows.values()];
+    const declaredTasks = [...collections.tasks.values()];
+    const workflow = declaredWorkflows[0];
+    const task = declaredTasks[0];
+    const taskId = task?.id;
+    const workflowId = workflow?.id;
+    const exactTaskReference = (value: unknown): boolean => (
+      Array.isArray(value)
+      && value.length === 1
+      && value[0] === taskId
+    );
+    if (
+      declaredWorkflows.length !== 1
+      || declaredTasks.length !== 1
+      || taskIntents.length !== 1
+      || !workflow
+      || !task
+      || workflowIntents[0]!.entityId !== workflowId
+      || workItemIntents[0]!.entityId !== workflowId
+      || taskIntents[0]!.entityId !== taskId
+      || task.workflowId !== workflowId
+      || !exactTaskReference(workflow.taskIds)
+      || !exactTaskReference(workflow.entryTaskIds)
+      || !exactTaskReference(workflow.terminalTaskIds)
+    ) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED",
+        "supported product path currently requires exactly one declared workflow containing exactly one declared and imported task; multi-task campaign integration is not yet supported",
+      ));
+    }
+  }
+
+  if (input.requireMaterialCoverage || sidecar.materialCoverage !== undefined) {
+    const analysis = analyzeCccPrdMaterialCoverage({
+      sourceBytes: custody.sourceBytes,
+      requirements: sidecar.requirements,
+      tasks: sidecar.tasks,
+      unresolvedDecisions: sidecar.unresolvedDecisions,
+    });
+    if (!Array.isArray(sidecar.materialCoverage)) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_MATERIAL_COVERAGE_REQUIRED",
+        "supported product intake requires a generated material coverage inventory",
+      ));
+    } else if (
+      canonicalCccPrdJson(sidecar.materialCoverage)
+      !== canonicalCccPrdJson(analysis.coverage)
+    ) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_MATERIAL_COVERAGE_INVALID",
+        "material coverage does not match the deterministic inventory and dispositions derived from admitted bytes",
+      ));
+    }
+
+    if (!input.requireMaterialCoverage) return;
+    if (
+      sidecar.implementationFactProvenance !== undefined
+      && sidecar.implementationFactProvenance.schema !== CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION
+    ) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_INVALID",
+        `implementation fact provenance schema must be ${CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION}`,
+      ));
+    }
+    diagnostics.push(...validateCccPrdImplementationFactProvenance({
+      sourceBytes: custody.sourceBytes,
+      facts: sidecar,
+      provenance: sidecar.implementationFactProvenance,
+    }));
+    if (analysis.conflicts.length > 0) {
+      const sample = analysis.conflicts.slice(0, 5).map((item) => (
+        `${item.sourcePath}:${item.spans[0]!.line} ${item.title}`
+      ));
+      diagnostics.push(diagnostic(
+        "CCC_PRD_MATERIAL_COVERAGE_INVALID",
+        `material items have conflicting task, deferral, out-of-scope, or unresolved dispositions (${analysis.conflicts.length}): ${sample.join("; ")}`,
+      ));
+    }
+    const missingSections = analysis.missing.filter(({ materialKind }) => materialKind === "section");
+    if (missingSections.length > 0) {
+      const sample = missingSections.slice(0, 5).map((item) => (
+        `${item.sourcePath}:${item.spans[0]!.line} ${item.title}`
+      ));
+      diagnostics.push(diagnostic(
+        "CCC_PRD_MATERIAL_SECTION_UNDISPOSITIONED",
+        `material source sections need a task, explicit deferral, out-of-scope decision, or unresolved question (${missingSections.length}): ${sample.join("; ")}`,
+      ));
+    }
+    const missingRequirements = analysis.missing.filter(({ materialKind }) => materialKind === "requirement");
+    if (missingRequirements.length > 0) {
+      const sample = missingRequirements.slice(0, 8).map((item) => (
+        `${item.sourcePath}:${item.spans[0]!.line} ${item.title}`
+      ));
+      diagnostics.push(diagnostic(
+        "CCC_PRD_SOURCE_REQUIREMENT_UNDISPOSITIONED",
+        `explicit source requirements need a task, explicit deferral, out-of-scope decision, or unresolved question (${missingRequirements.length}): ${sample.join("; ")}`,
+      ));
+    }
+    const resolvedCount = analysis.coverage.length;
+    const materialCount = analysis.inventory.length;
+    if (
+      materialCount >= 4
+      && (
+        analysis.missing.length > 0
+        || analysis.conflicts.length > 0
+      )
+      && resolvedCount / materialCount < 0.8
+    ) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_EXTRACTION_IMPLAUSIBLY_SHALLOW",
+        `material extraction disposed ${resolvedCount} of ${materialCount} deterministic source items`,
+      ));
     }
   }
 }
@@ -999,6 +1171,8 @@ export function compileCccPrdPacket(input: CompileCccPrdInput): CccPrdSemanticBu
     admittedWriteRoots: sidecar.admittedWriteRoots,
     targetRepository: sidecar.targetRepository,
     nonGoals: sidecar.nonGoals,
+    ...(sidecar.materialCoverage ? { materialCoverage: sidecar.materialCoverage } : {}),
+    ...(sidecar.implementationFactProvenance ? { implementationFactProvenance: sidecar.implementationFactProvenance } : {}),
     confidence: sidecar.confidence,
   };
   return {

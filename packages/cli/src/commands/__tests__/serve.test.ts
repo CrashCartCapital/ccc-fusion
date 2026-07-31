@@ -553,6 +553,11 @@ const mocks = vi.hoisted(() => {
       Keep the serve startup fixture aligned with the HTTP host contract: createServer receives the engine PluginRunner so model routes can resolve runtime-backed providers while startup remains non-blocking.
       */
       getPluginRunner: vi.fn(() => pluginRunner),
+      getCliAgentRuntime: vi.fn(() => ({
+        bundle: {
+          hub: { projectId: runtimeConfig.projectId },
+        },
+      })),
       startRemoteTunnel: vi.fn(async () => remoteStatus),
       stopRemoteTunnel: vi.fn(async () => ({ ...remoteStatus, state: "stopped" as const, provider: null, pid: null, url: null })),
       onMerge: vi.fn().mockResolvedValue(undefined),
@@ -609,6 +614,7 @@ const mocks = vi.hoisted(() => {
     refreshAllCustomProviderModels,
     createSkillsAdapterMock,
     globalSettingsGetSettings,
+    forceDistinctEngineStore: false,
     reset() {
       taskStores.length = 0;
       automationStores.length = 0;
@@ -636,6 +642,7 @@ const mocks = vi.hoisted(() => {
       refreshAllCustomProviderModels.mockResolvedValue({ refreshed: 0, failed: 0, skipped: 0 });
       globalSettingsGetSettings.mockReset();
       globalSettingsGetSettings.mockResolvedValue({});
+      this.forceDistinctEngineStore = false;
       // Reset multi-project state
       engineUsageLog.length = 0;
       getProjectByPathResolver = null;
@@ -718,6 +725,10 @@ vi.mock("@fusion/engine", async (importOriginal) => {
         const listed = await centralCore.listProjects();
         const fromList = listed.find((p: { id: string }) => p.id === id);
         const project = fromList ?? (await centralCore.getProject(id));
+        const engineOptions = { ...options, projectId: id };
+        if (mocks.forceDistinctEngineStore) {
+          delete engineOptions.externalTaskStore;
+        }
         const engine = mocks.projectEngineCtor(
           {
             projectId: id,
@@ -727,7 +738,7 @@ vi.mock("@fusion/engine", async (importOriginal) => {
             maxWorktrees: 10,
           },
           centralCore,
-          { ...options, projectId: id },
+          engineOptions,
         );
         await engine.start();
         engines.set(id, engine);
@@ -1005,6 +1016,45 @@ describe("runServe", () => {
     expect(mocks.stuckDetectorInstances[0].start).toHaveBeenCalledTimes(1);
     expect(mocks.selfHealingInstances[0].start).toHaveBeenCalledTimes(1);
     expect(mocks.executorInstances[0].resumeOrphaned).toHaveBeenCalledTimes(1);
+
+    await triggerSignal("SIGINT");
+  });
+
+  it("rebinds host extension tools to the selected engine store", async () => {
+    mocks.forceDistinctEngineStore = true;
+    const { __peekCachedStoreForTesting } = await import("../../extension.js");
+
+    await runServe(4040, {});
+
+    const primaryEngine = mocks.projectEngineInstances.find(
+      (engine) => engine.getProjectId() === PROJECT_FIXTURES.primary.id,
+    );
+    const engineStore = primaryEngine?.getTaskStore();
+    expect(engineStore).toBeDefined();
+    expect(engineStore).not.toBe(mocks.taskStores[0]);
+    expect(__peekCachedStoreForTesting(PROJECT_FIXTURES.primary.path))
+      .toBe(engineStore);
+
+    await triggerSignal("SIGINT");
+  });
+
+  it("routes native CLI completion hooks to the live engine on the exact selected port", async () => {
+    const { createServer } = await import("@fusion/dashboard");
+    const { ProjectEngineManager } = await import("@fusion/engine");
+
+    await runServe(4555, {});
+
+    expect(ProjectEngineManager).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        cliAgentHookEndpointUrl:
+          "http://127.0.0.1:4555/api/cli-agent/hooks",
+      }),
+    );
+    const serverOptions = createServer.mock.calls[0][1];
+    expect(serverOptions.cliAgentHubResolver).toEqual(expect.any(Function));
+    expect(serverOptions.cliAgentHubResolver(undefined, "session-1"))
+      .toEqual(serverOptions.engine.getCliAgentRuntime().bundle.hub);
 
     await triggerSignal("SIGINT");
   });

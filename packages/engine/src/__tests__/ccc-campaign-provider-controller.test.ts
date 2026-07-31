@@ -40,15 +40,17 @@ const preDispatch = Object.freeze({
 
 const action = Object.freeze({ actionId: "ACTION-1", actionTarget: "target", requireProtected: true });
 const authority = Object.freeze({ bindingHash: "binding-hash" });
+const semanticTaskId = "TASK-1";
+const nativeTaskId = "FN-1";
 const lease = Object.freeze({
   binding: authority,
   lease: Object.freeze({ bindingHash: authority.bindingHash, actionId: action.actionId, actionTarget: action.actionTarget, approvalRequestId: "approval-1", claimToken: "claim-1" }),
 });
 const contextFor = (route: Readonly<{ transport: "pi" | "workflow" | "cli"; providerId: string; modelId: string; workflowExtensionId?: string }>) => Object.freeze({
-  taskId: "TASK-1",
-  semanticTaskId: "TASK-1",
+  taskId: nativeTaskId,
+  semanticTaskId,
   targetRepository: Object.freeze({ path: "/tmp/target", baseCommit: "a".repeat(40) }),
-  route,
+  route: Object.freeze({ taskId: semanticTaskId, ...route }),
   protectedActions: [],
   protectedActionIds: [action.actionId],
 });
@@ -62,7 +64,7 @@ function bindingInput(route: Readonly<{ transport: "pi" | "workflow" | "cli"; pr
   };
   return {
     authorityStore,
-    input: { layer: { transaction: async (fn: (tx: unknown) => unknown) => fn({}) }, rootDir: "/tmp/target", authorityStore, semanticTaskId: "TASK-1", turnKey: "turn-1", expectedRoute } as never,
+    input: { layer: { transaction: async (fn: (tx: unknown) => unknown) => fn({}) }, rootDir: "/tmp/target", authorityStore, semanticTaskId, nativeTaskId, turnKey: "turn-1", expectedRoute } as never,
   };
 }
 
@@ -201,7 +203,7 @@ describe("CCC campaign provider controller", () => {
     const { input } = bindingInput({ transport: "pi", providerId: "provider-1", modelId: "model-1" }, { transport: "pi", providerId: "provider-1", modelId: "model-1" });
     const binding = await createCccCampaignProviderAttemptBinding(input);
     await expect(binding.controller.preDispatch(dispatch)).resolves.toEqual({ kind: "dispatch-permit" });
-    expect(effects.core).toHaveBeenCalledWith(expect.objectContaining(dispatch));
+    expect(effects.core).toHaveBeenCalledWith(expect.objectContaining({ ...dispatch, taskId: nativeTaskId }));
   });
 
   it("Task 6 P1 RED: refuses a reconciliation whose submitted turn is not the binding's sealed turn", async () => {
@@ -213,7 +215,7 @@ describe("CCC campaign provider controller", () => {
     authorityStore.settleCccProviderAttemptAndApproval.mockResolvedValue({});
 
     await expect(binding.controller.reconcile({
-      taskId: "TASK-1",
+      taskId: nativeTaskId,
       attemptKey: "attempt-B",
       controllerToken: "controller-B",
       outcome: "committed",

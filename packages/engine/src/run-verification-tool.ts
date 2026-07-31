@@ -19,8 +19,9 @@
  */
 
 import { superviseSpawn, type SupervisedChild } from "@fusion/core";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { isAbsolute, join, relative } from "node:path";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { executorLog } from "./logger.js";
@@ -37,6 +38,341 @@ const NORMAL_EXIT_REAP_GRACE_MS = 500;
 export const DEFAULT_TIMEOUT_PACKAGE_SEC = 300;
 export const DEFAULT_TIMEOUT_WORKSPACE_SEC = 900;
 export const MAX_TIMEOUT_SEC = 1800;
+
+/*
+ * Verifier commands are agent-authored. Give them only the stable local
+ * execution context needed by Node/package managers/Git; never forward the
+ * controller's credential, broker, database, provider, or shell-control env.
+ */
+const VERIFICATION_CHILD_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TMPDIR",
+  "TERM",
+  "NODE_ENV",
+  "PNPM_HOME",
+  "COREPACK_HOME",
+  // Windows shell, executable lookup, temp, and user-cache roots.
+  "SystemRoot",
+  "SYSTEMROOT",
+  "WINDIR",
+  "ComSpec",
+  "COMSPEC",
+  "PATHEXT",
+  "TEMP",
+  "TMP",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+] as const;
+
+const UNSAFE_VERIFICATION_ENV_KEYS = new Set([
+  "BASH_ENV",
+  "BASHOPTS",
+  "CDPATH",
+  "ENV",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_ASKPASS",
+  "GIT_COMMON_DIR",
+  "GIT_CONFIG_COUNT",
+  "GIT_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_WORK_TREE",
+  "JAVA_TOOL_OPTIONS",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NPM_CONFIG_USERCONFIG",
+  "PERL5OPT",
+  "PROMPT_COMMAND",
+  "PYTHONHOME",
+  "PYTHONPATH",
+  "RUBYOPT",
+  "SHELLOPTS",
+  "SSH_ASKPASS",
+]);
+
+const MIN_EXACT_REDACTION_LENGTH = 8;
+const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
+const PROTECTED_DIRECTORY_SBPL_REGEX =
+  '#".*/(\\\\.agentsecrets|\\\\.obsidian|_secrets|_KELSEY)(/.*)?$"';
+
+interface VerificationSandboxLaunch {
+  command: string;
+  env: NodeJS.ProcessEnv;
+  warning?: string;
+  cleanup: () => void;
+}
+
+function buildVerificationChildEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of VERIFICATION_CHILD_ENV_ALLOWLIST) {
+    const value = source[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return {
+    ...env,
+    CI: "1",
+    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "never",
+  };
+}
+
+function isSensitiveVerificationEnvKey(key: string): boolean {
+  const normalized = key.toUpperCase();
+  return UNSAFE_VERIFICATION_ENV_KEYS.has(normalized)
+    || /(?:^|_)(?:API_?KEY|ACCESS_?KEY|AUTH(?:ORIZATION)?|CREDENTIALS?|COOKIE|OAUTH|PRIVATE_?KEY|SESSION|SECRET|TOKEN|PASS(?:WORD|WD)?)(?:_|$)/u.test(normalized)
+    || /^(?:DATABASE|DB|MARIADB|MONGO(?:DB)?|MYSQL|POSTGRES(?:QL)?|REDIS)(?:_[A-Z0-9]+)*_(?:DSN|URI|URL)(?:_|$)/u.test(normalized)
+    || normalized === "PGPASSFILE"
+    || normalized === "PGPASSWORD"
+    || normalized.startsWith("DYLD_")
+    || normalized.startsWith("LD_PRELOAD");
+}
+
+function collectExcludedSensitiveValues(
+  source: NodeJS.ProcessEnv,
+  childEnv: NodeJS.ProcessEnv,
+): readonly string[] {
+  const values = new Set<string>();
+  for (const [key, value] of Object.entries(source)) {
+    if (
+      value === undefined
+      || value.length < MIN_EXACT_REDACTION_LENGTH
+      || value === "[REDACTED]"
+      || Object.hasOwn(childEnv, key)
+      || !isSensitiveVerificationEnvKey(key)
+    ) {
+      continue;
+    }
+    values.add(value);
+  }
+  return [...values].sort((left, right) => right.length - left.length);
+}
+
+function redactExcludedSensitiveValues(
+  text: string,
+  sensitiveValues: readonly string[],
+): string {
+  /*
+   * Redact only exact values collected from excluded sensitive env keys.
+   * Generic opaque-string/entropy redaction would corrupt legitimate commit and
+   * content digests in proof output.
+   */
+  let redacted = text;
+  for (const value of sensitiveValues) {
+    redacted = redacted.split(value).join("[REDACTED]");
+  }
+  return redacted;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function shellEnvAssignments(env: NodeJS.ProcessEnv): string {
+  return Object.entries(env)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    .map(([key, value]) => `${key}=${shellSingleQuote(value)}`)
+    .join(" ");
+}
+
+function sbplString(value: string): string {
+  const bytes = Buffer.from(value, "utf8");
+  let escaped = "";
+  for (const byte of bytes) {
+    if (byte === 0x22) escaped += '\\"';
+    else if (byte === 0x5c) escaped += "\\\\";
+    else if (byte >= 0x20 && byte <= 0x7e) escaped += String.fromCharCode(byte);
+    else escaped += `\\x${byte.toString(16).padStart(2, "0")}`;
+  }
+  return `"${escaped}"`;
+}
+
+function sbplSubpath(path: string): string {
+  return `(subpath ${sbplString(path)})`;
+}
+
+function sbplLiteral(path: string): string {
+  return `(literal ${sbplString(path)})`;
+}
+
+function uniqueResolvedPaths(paths: readonly string[]): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const path of paths) {
+    const resolved = resolve(path);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    result.push(resolved);
+  }
+  return result;
+}
+
+function maybeRealpath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function resolveCanonicalVerificationCwd(
+  worktreePath: string,
+  requestedCwd?: string,
+): string {
+  const canonicalWorktree = realpathSync(worktreePath);
+  const candidate = requestedCwd
+    ? isAbsolute(requestedCwd)
+      ? resolve(requestedCwd)
+      : resolve(canonicalWorktree, requestedCwd)
+    : canonicalWorktree;
+  let canonicalCandidate: string;
+  try {
+    canonicalCandidate = realpathSync(candidate);
+  } catch {
+    throw new Error(
+      `Verification cwd is missing or cannot be resolved inside the canonical worktree: ${requestedCwd ?? worktreePath}`,
+    );
+  }
+  const fromWorktree = relative(canonicalWorktree, canonicalCandidate);
+  if (
+    fromWorktree === ".."
+    || fromWorktree.startsWith(`..${sep}`)
+    || isAbsolute(fromWorktree)
+  ) {
+    throw new Error(
+      `Verification cwd is outside the canonical worktree: ${requestedCwd ?? canonicalCandidate}`,
+    );
+  }
+  return canonicalCandidate;
+}
+
+function buildStrictDarwinVerifierProfile(input: {
+  cwd: string;
+  sandboxHome: string;
+  sandboxTmp: string;
+  hostHome?: string;
+}): string {
+  const cwd = maybeRealpath(input.cwd);
+  const sandboxHome = maybeRealpath(input.sandboxHome);
+  const sandboxTmp = maybeRealpath(input.sandboxTmp);
+  const hostHome = input.hostHome ? maybeRealpath(input.hostHome) : undefined;
+  const writablePaths = uniqueResolvedPaths([cwd, sandboxHome, sandboxTmp]);
+  const protectedReadPaths = uniqueResolvedPaths([
+    ...(hostHome && cwd !== hostHome && !cwd.startsWith(`${hostHome}/`) ? [hostHome] : []),
+    ...(hostHome
+      ? [
+        join(hostHome, ".agentsecrets"),
+        join(hostHome, ".aws"),
+        join(hostHome, ".azure"),
+        join(hostHome, ".config", "gh"),
+        join(hostHome, ".gnupg"),
+        join(hostHome, ".netrc"),
+        join(hostHome, ".npmrc"),
+        join(hostHome, ".pypirc"),
+        join(hostHome, ".ssh"),
+        join(hostHome, "_secrets"),
+        join(hostHome, "_KELSEY"),
+      ]
+      : []),
+    join(cwd, ".agentsecrets"),
+    join(cwd, ".env"),
+    join(cwd, "_secrets"),
+    join(cwd, "_KELSEY"),
+  ]);
+
+  const lines = [
+    "(version 1)",
+    "(deny default)",
+    "(allow process*)",
+    "(allow signal (target self))",
+    "(allow sysctl-read)",
+    `(allow file-write* ${sbplLiteral("/dev/null")})`,
+  ];
+
+  for (const protectedReadPath of protectedReadPaths) {
+    lines.push(`(deny file-read* ${sbplSubpath(protectedReadPath)})`);
+  }
+  lines.push(
+    `(deny file-read* (regex ${PROTECTED_DIRECTORY_SBPL_REGEX}))`,
+    `(deny file-write* (regex ${PROTECTED_DIRECTORY_SBPL_REGEX}))`,
+  );
+
+  lines.push("(allow file-read*)");
+
+  for (const writePath of writablePaths) {
+    lines.push(`(allow file-write* ${sbplSubpath(writePath)})`);
+  }
+
+  lines.push("(deny network*)");
+  return `${lines.join("\n")}\n`;
+}
+
+function buildVerificationSandboxLaunch(input: {
+  command: string;
+  cwd: string;
+  childEnv: NodeJS.ProcessEnv;
+}): VerificationSandboxLaunch | { error: string } {
+  if (process.platform !== "darwin") {
+    return {
+      error:
+        "No enforced verifier sandbox backend is available on this platform; refusing to run verification natively.",
+    };
+  }
+  if (!existsSync(SANDBOX_EXEC_PATH)) {
+    return {
+      error:
+        "sandbox-exec is required for verifier confinement on this host but was not found; refusing to run verification natively.",
+    };
+  }
+
+  const scratchRoot = mkdtempSync(join(maybeRealpath(tmpdir()), "fusion-verifier-sandbox-"));
+  const sandboxHome = join(scratchRoot, "home");
+  const sandboxTmp = join(scratchRoot, "tmp");
+  mkdtempSync(`${sandboxHome}-`);
+  mkdtempSync(`${sandboxTmp}-`);
+  const actualHome = readdirSync(scratchRoot)
+    .map((entry) => join(scratchRoot, entry))
+    .find((entry) => entry.startsWith(sandboxHome));
+  const actualTmp = readdirSync(scratchRoot)
+    .map((entry) => join(scratchRoot, entry))
+    .find((entry) => entry.startsWith(sandboxTmp));
+  if (!actualHome || !actualTmp) {
+    rmSync(scratchRoot, { recursive: true, force: true });
+    return { error: "failed to create isolated verifier HOME/TMPDIR; refusing to run verification" };
+  }
+
+  const env = {
+    ...input.childEnv,
+    HOME: actualHome,
+    TMPDIR: actualTmp,
+    npm_config_cache: join(actualTmp, "npm-cache"),
+    PNPM_HOME: input.childEnv.PNPM_HOME ?? join(actualHome, ".local", "share", "pnpm"),
+    COREPACK_HOME: input.childEnv.COREPACK_HOME ?? join(actualHome, ".cache", "node", "corepack"),
+  };
+  const profile = buildStrictDarwinVerifierProfile({
+    cwd: input.cwd,
+    sandboxHome: actualHome,
+    sandboxTmp: actualTmp,
+    hostHome: input.childEnv.HOME,
+  });
+
+  return {
+    command: `${SANDBOX_EXEC_PATH} -p ${shellSingleQuote(profile)} /usr/bin/env -i ${shellEnvAssignments(env)} /bin/sh -c ${shellSingleQuote(input.command)}`,
+    env,
+    warning: "verification command ran under sandbox-exec with network disabled and isolated HOME/TMPDIR",
+    cleanup: () => {
+      rmSync(scratchRoot, { recursive: true, force: true });
+    },
+  };
+}
 
 /*
 FNXC:Verification 2026-06-21-12:05:
@@ -504,18 +840,40 @@ async function runVerificationCommandUnlocked(
 
   const stdoutBuf = createBuffer();
   const stderrBuf = createBuffer();
+  const childEnv = buildVerificationChildEnv(process.env);
+  const sensitiveValues = collectExcludedSensitiveValues(process.env, childEnv);
+  const redactCapturedText = (text: string): string =>
+    redactExcludedSensitiveValues(text, sensitiveValues);
+  const launch = buildVerificationSandboxLaunch({ command, cwd, childEnv });
+  if ("error" in launch) {
+    return {
+      success: false,
+      exitCode: null,
+      durationMs: Date.now() - startMs,
+      stdout: "",
+      stderr: launch.error,
+      timedOut: false,
+      killed: false,
+      command,
+      cwd,
+      warnings: [launch.error],
+    };
+  }
+  if (launch.warning) {
+    warnings.push(launch.warning);
+  }
 
   return new Promise<VerificationResult>((resolve) => {
-    const supervised = superviseSpawn(command, [], {
+    let cleanupCalled = false;
+    const cleanup = () => {
+      if (cleanupCalled) return;
+      cleanupCalled = true;
+      launch.cleanup();
+    };
+    const supervised = superviseSpawn(launch.command, [], {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        // Corepack otherwise prompts interactively before fetching a pinned
-        // packageManager version, which hangs the non-TTY child until the
-        // hard timeout. Disable the prompt so it proceeds (or errors fast).
-        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
-      },
+      env: launch.env,
       shell: true,
       killGraceMs: SIGKILL_GRACE_MS,
       maxLifetimeMs: timeoutMs > 0 ? timeoutMs + SIGKILL_GRACE_MS + 1_000 : undefined,
@@ -566,7 +924,7 @@ async function runVerificationCommandUnlocked(
       const lines = text.split("\n");
       stdoutRemainder = lines.pop() ?? "";
       for (const line of lines) {
-        const lineWithNewline = line + "\n";
+        const lineWithNewline = redactCapturedText(line + "\n");
         appendToBuffer(stdoutBuf, lineWithNewline);
         lastLineMs = Date.now();
         onHeartbeat();
@@ -581,7 +939,7 @@ async function runVerificationCommandUnlocked(
       const lines = text.split("\n");
       stderrRemainder = lines.pop() ?? "";
       for (const line of lines) {
-        const lineWithNewline = line + "\n";
+        const lineWithNewline = redactCapturedText(line + "\n");
         appendToBuffer(stderrBuf, lineWithNewline);
         lastLineMs = Date.now();
         onHeartbeat();
@@ -598,8 +956,8 @@ async function runVerificationCommandUnlocked(
       if (killTimer) clearTimeout(killTimer);
 
       // Flush remainders
-      if (stdoutRemainder) appendToBuffer(stdoutBuf, stdoutRemainder);
-      if (stderrRemainder) appendToBuffer(stderrBuf, stderrRemainder);
+      if (stdoutRemainder) appendToBuffer(stdoutBuf, redactCapturedText(stdoutRemainder));
+      if (stderrRemainder) appendToBuffer(stderrBuf, redactCapturedText(stderrRemainder));
 
       const exitCode = code ?? null;
       const durationMs = Date.now() - startMs;
@@ -614,6 +972,7 @@ async function runVerificationCommandUnlocked(
       if (!timedOut) {
         reapVerificationProcessGroup(supervised);
       }
+      cleanup();
 
       resolve({
         success,
@@ -625,7 +984,7 @@ async function runVerificationCommandUnlocked(
         killed,
         command,
         cwd,
-        warnings,
+        warnings: warnings.map(redactCapturedText),
       });
     });
 
@@ -637,17 +996,20 @@ async function runVerificationCommandUnlocked(
       if (killTimer) clearTimeout(killTimer);
       const durationMs = Date.now() - startMs;
       warnings.push(`Spawn error: ${err.message}`);
+      const stdout = redactCapturedText(flattenBuffer(stdoutBuf));
+      const spawnError = redactCapturedText(`Spawn error: ${err.message}`);
+      cleanup();
       resolve({
         success: false,
         exitCode: null,
         durationMs,
-        stdout: flattenBuffer(stdoutBuf),
-        stderr: flattenBuffer(stderrBuf) + `\nSpawn error: ${err.message}`,
+        stdout,
+        stderr: redactCapturedText(flattenBuffer(stderrBuf)) + `\n${spawnError}`,
         timedOut: false,
         killed: false,
         command,
         cwd,
-        warnings,
+        warnings: warnings.map(redactCapturedText),
       });
     });
   });
@@ -732,14 +1094,10 @@ export function createRunVerificationTool(
       }
 
       // ── Resolve cwd ───────────────────────────────────────────────────────
-      let resolvedCwd: string;
-      if (params.cwd && isAbsolute(params.cwd)) {
-        resolvedCwd = params.cwd;
-      } else if (params.cwd) {
-        resolvedCwd = join(worktreePath, params.cwd);
-      } else {
-        resolvedCwd = worktreePath;
-      }
+      const resolvedCwd = resolveCanonicalVerificationCwd(
+        worktreePath,
+        params.cwd,
+      );
 
       // ── Resolve timeout ───────────────────────────────────────────────────
       /*

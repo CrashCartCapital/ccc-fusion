@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "../ccc-prd/contract.js";
 import type { CccPrdSemanticBundle } from "../ccc-prd/types.js";
 import {
   CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
+  CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
   CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
   CccCampaignContextError,
   type CccCampaignActionLookup,
@@ -13,11 +14,26 @@ import {
   type CccCampaignExecutionPolicy,
   type CccCampaignExecutionRoute,
   type CccCampaignManifest,
+  type CccCampaignProductExecutionPolicy,
+  type CccCampaignProductExecutionRoute,
   type CccCampaignTransport,
 } from "./types.js";
 
 const ROUTE_KEYS = ["modelId", "providerId", "taskId", "transport"] as const;
 const WORKFLOW_ROUTE_KEYS = [...ROUTE_KEYS, "workflowExtensionId"] as const;
+const PRODUCT_ROUTE_KEYS = [
+  "allowedWriteRoots",
+  "commitPolicy",
+  "executor",
+  "modelId",
+  "ownedPaths",
+  "providerId",
+  "taskId",
+  "toolMode",
+  "transport",
+  "worktreeMode",
+] as const;
+const PRODUCT_CLI_ROUTE_KEYS = [...PRODUCT_ROUTE_KEYS, "cliAdapterId"] as const;
 const POLICY_KEYS = ["routes", "schema"] as const;
 const AUTHORITY_BINDING_KEYS = [
   "actionId",
@@ -121,6 +137,152 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
   };
 }
 
+function exactTargetRelativePaths(
+  value: unknown,
+  index: number,
+  field: "ownedPaths" | "allowedWriteRoots",
+): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} ${field} must be a non-empty array of canonical target-relative paths`,
+    );
+  }
+  const paths = value.map((candidate, pathIndex) => {
+    if (
+      typeof candidate !== "string"
+      || candidate.length === 0
+      || candidate !== candidate.trim()
+      || candidate.includes("\\")
+      || candidate.includes("\0")
+      || isAbsolute(candidate)
+      || candidate === "."
+      || candidate.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+    ) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC campaign execution route ${index} ${field}[${pathIndex}] must be a canonical target-relative path`,
+      );
+    }
+    return candidate;
+  });
+  if (new Set(paths).size !== paths.length) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} ${field} must not contain duplicates`,
+    );
+  }
+  return paths;
+}
+
+function pathContains(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(`${parent}/`);
+}
+
+function filesystemPathContains(parent: string, child: string): boolean {
+  const descendant = relative(parent, child);
+  return descendant === ""
+    || (descendant !== ".." && !descendant.startsWith(`..${sep}`) && !isAbsolute(descendant));
+}
+
+function parseProductRoute(
+  value: unknown,
+  index: number,
+  bundle: Pick<CccPrdSemanticBundle, "admittedWriteRoots" | "targetRepository">,
+): CccCampaignProductExecutionRoute {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} must be an object`,
+    );
+  }
+  const route = value as Record<string, unknown>;
+  const transport = exactIdentifier(
+    route.transport,
+    `CCC campaign execution route ${index} transport`,
+  );
+  if (transport !== "pi" && transport !== "cli") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} product transport must be pi or cli`,
+    );
+  }
+  exactKeys(
+    route,
+    transport === "cli" ? PRODUCT_CLI_ROUTE_KEYS : PRODUCT_ROUTE_KEYS,
+    `CCC campaign execution route ${index}`,
+  );
+  const executor = exactIdentifier(
+    route.executor,
+    `CCC campaign execution route ${index} executor`,
+  );
+  if (transport === "pi" && executor !== "model") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} pi transport requires executor model`,
+    );
+  }
+  if (transport === "cli" && executor !== "cli-agent") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} cli transport requires executor cli-agent`,
+    );
+  }
+  if (route.toolMode !== "coding") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} toolMode must be coding`,
+    );
+  }
+  if (route.worktreeMode !== "isolated") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} worktreeMode must be isolated`,
+    );
+  }
+  if (route.commitPolicy !== "required") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} commitPolicy must be required`,
+    );
+  }
+  const ownedPaths = exactTargetRelativePaths(route.ownedPaths, index, "ownedPaths");
+  const allowedWriteRoots = exactTargetRelativePaths(
+    route.allowedWriteRoots,
+    index,
+    "allowedWriteRoots",
+  );
+  for (const allowedRoot of allowedWriteRoots) {
+    if (!ownedPaths.some((ownedPath) => pathContains(ownedPath, allowedRoot))) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC campaign execution route ${index} allowedWriteRoots path ${JSON.stringify(allowedRoot)} is outside task ownership`,
+      );
+    }
+    const absoluteAllowedRoot = resolve(bundle.targetRepository.path, allowedRoot);
+    if (
+      !bundle.admittedWriteRoots.some(({ path }) =>
+        filesystemPathContains(resolve(path), absoluteAllowedRoot))
+    ) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC campaign execution route ${index} allowedWriteRoots path ${JSON.stringify(allowedRoot)} is outside PRD-admitted write roots`,
+      );
+    }
+  }
+  return {
+    taskId: exactIdentifier(route.taskId, `CCC campaign execution route ${index} taskId`),
+    providerId: exactIdentifier(
+      route.providerId,
+      `CCC campaign execution route ${index} providerId`,
+    ),
+    modelId: exactIdentifier(route.modelId, `CCC campaign execution route ${index} modelId`),
+    transport,
+    executor: executor as CccCampaignProductExecutionRoute["executor"],
+    toolMode: "coding",
+    worktreeMode: "isolated",
+    ownedPaths,
+    allowedWriteRoots,
+    commitPolicy: "required",
+    ...(transport === "cli"
+      ? {
+        cliAdapterId: exactIdentifier(
+          route.cliAdapterId,
+          `CCC campaign execution route ${index} cliAdapterId`,
+        ),
+      }
+      : {}),
+  };
+}
+
 function exactWorkflowExtensionRegistryId(value: unknown, index: number): string {
   if (typeof value !== "string" || value !== value.trim() || !WORKFLOW_EXTENSION_REGISTRY_ID_PATTERN.test(value)) {
     throw new CccCampaignExecutionPolicyError(
@@ -130,28 +292,10 @@ function exactWorkflowExtensionRegistryId(value: unknown, index: number): string
   return value;
 }
 
-export function parseCccCampaignExecutionPolicy(
-  value: unknown,
+function assertCompleteRouteSet(
+  routes: CccCampaignExecutionRoute[],
   bundle: Pick<CccPrdSemanticBundle, "tasks">,
-): CccCampaignExecutionPolicy {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new CccCampaignExecutionPolicyError(
-      "CCC PRD import requires a versioned execution policy",
-    );
-  }
-  const policy = value as Record<string, unknown>;
-  exactKeys(policy, POLICY_KEYS, "CCC campaign execution policy");
-  if (policy.schema !== CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION) {
-    throw new CccCampaignExecutionPolicyError(
-      `CCC campaign execution policy schema must be ${CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION}`,
-    );
-  }
-  if (!Array.isArray(policy.routes)) {
-    throw new CccCampaignExecutionPolicyError(
-      "CCC campaign execution policy routes must be an array",
-    );
-  }
-  const routes = policy.routes.map(parseRoute);
+): void {
   const routeIds = routes.map(({ taskId }) => taskId);
   const duplicateIds = routeIds.filter((id, index) => routeIds.indexOf(id) !== index);
   const expectedIds = bundle.tasks.map(({ id }) => id).sort(compareCccPrdCodeUnits);
@@ -168,8 +312,126 @@ export function parseCccCampaignExecutionPolicy(
       `CCC campaign routes must bind every task exactly once; missing=${missing.join(",") || "none"}; extra=${extra.join(",") || "none"}; duplicate=${[...new Set(duplicateIds)].sort(compareCccPrdCodeUnits).join(",") || "none"}`,
     );
   }
+}
+
+function taskDependsOn(
+  taskId: string,
+  dependencyId: string,
+  tasks: ReadonlyMap<string, Pick<CccPrdSemanticBundle["tasks"][number], "dependencyTaskIds">>,
+  visited = new Set<string>(),
+): boolean {
+  if (taskId === dependencyId) return true;
+  if (visited.has(taskId)) return false;
+  visited.add(taskId);
+  const task = tasks.get(taskId);
+  if (!task) return false;
+  return task.dependencyTaskIds.some((candidate) =>
+    candidate === dependencyId || taskDependsOn(candidate, dependencyId, tasks, visited));
+}
+
+function assertConcurrentOwnershipDoesNotOverlap(
+  routes: CccCampaignProductExecutionRoute[],
+  bundle: Pick<CccPrdSemanticBundle, "tasks">,
+): void {
+  const tasks = new Map(bundle.tasks.map((task) => [task.id, task]));
+  for (let leftIndex = 0; leftIndex < routes.length; leftIndex += 1) {
+    const left = routes[leftIndex]!;
+    for (let rightIndex = leftIndex + 1; rightIndex < routes.length; rightIndex += 1) {
+      const right = routes[rightIndex]!;
+      if (
+        taskDependsOn(left.taskId, right.taskId, tasks)
+        || taskDependsOn(right.taskId, left.taskId, tasks)
+      ) {
+        continue;
+      }
+      const overlap = left.ownedPaths.find((leftPath) =>
+        right.ownedPaths.some((rightPath) =>
+          pathContains(leftPath, rightPath) || pathContains(rightPath, leftPath)));
+      if (overlap) {
+        throw new CccCampaignExecutionPolicyError(
+          `CCC campaign concurrently runnable tasks ${left.taskId} and ${right.taskId} have overlapping ownership at ${overlap}`,
+        );
+      }
+    }
+  }
+}
+
+type CccCampaignExecutionPolicyBundle = Pick<CccPrdSemanticBundle, "tasks">
+  & Partial<Pick<CccPrdSemanticBundle, "admittedWriteRoots" | "targetRepository">>;
+
+export function parseCccCampaignExecutionPolicy(
+  value: unknown,
+  bundle: CccCampaignExecutionPolicyBundle,
+): CccCampaignExecutionPolicy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD import requires a versioned execution policy",
+    );
+  }
+  const policy = value as Record<string, unknown>;
+  exactKeys(policy, POLICY_KEYS, "CCC campaign execution policy");
+  if (
+    policy.schema !== CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION
+    && policy.schema !== CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION
+  ) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution policy schema must be ${CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION} or ${CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION}`,
+    );
+  }
+  if (!Array.isArray(policy.routes)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC campaign execution policy routes must be an array",
+    );
+  }
+  if (policy.schema === CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION) {
+    if (!bundle.admittedWriteRoots || !bundle.targetRepository) {
+      throw new CccCampaignExecutionPolicyError(
+        "CCC campaign execution-policy v2 requires target repository and admitted write roots",
+      );
+    }
+    return parseCccCampaignProductExecutionPolicy(policy, {
+      tasks: bundle.tasks,
+      admittedWriteRoots: bundle.admittedWriteRoots,
+      targetRepository: bundle.targetRepository,
+    });
+  }
+  const routes = policy.routes.map(parseRoute);
+  assertCompleteRouteSet(routes, bundle);
   return {
     schema: CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
+    routes: routes.sort((left, right) => compareCccPrdCodeUnits(left.taskId, right.taskId)),
+  };
+}
+
+export function parseCccCampaignProductExecutionPolicy(
+  value: unknown,
+  bundle: Pick<
+    CccPrdSemanticBundle,
+    "tasks" | "admittedWriteRoots" | "targetRepository"
+  >,
+): CccCampaignProductExecutionPolicy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD product import requires a versioned execution policy",
+    );
+  }
+  const policy = value as Record<string, unknown>;
+  exactKeys(policy, POLICY_KEYS, "CCC campaign execution policy");
+  if (policy.schema !== CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC PRD product import requires ${CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION}`,
+    );
+  }
+  if (!Array.isArray(policy.routes)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC campaign execution policy routes must be an array",
+    );
+  }
+  const routes = policy.routes.map((route, index) => parseProductRoute(route, index, bundle));
+  assertCompleteRouteSet(routes, bundle);
+  assertConcurrentOwnershipDoesNotOverlap(routes, bundle);
+  return {
+    schema: CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
     routes: routes.sort((left, right) => compareCccPrdCodeUnits(left.taskId, right.taskId)),
   };
 }
@@ -274,8 +536,17 @@ function requireAuthorityContext(
     throw new CccCampaignContextError("CCC campaign context execution route is missing");
   }
   const taskId = requireAuthorityText(context.taskId, "campaign taskId");
-  if (requireAuthorityText(context.route.taskId, "campaign route taskId") !== taskId) {
-    throw new CccCampaignContextError("CCC campaign route taskId does not match campaign taskId");
+  const semanticTaskId = "semanticTaskId" in context
+    ? requireAuthorityText(context.semanticTaskId, "campaign semanticTaskId")
+    : taskId;
+  const routeTaskId = requireAuthorityText(
+    context.route.taskId,
+    "campaign route taskId",
+  );
+  if (routeTaskId !== semanticTaskId) {
+    throw new CccCampaignContextError(
+      `CCC campaign route taskId ${routeTaskId} does not match campaign semanticTaskId ${semanticTaskId} (native taskId ${taskId})`,
+    );
   }
   return {
     projectId: requireAuthorityText(context.projectId, "campaign projectId"),

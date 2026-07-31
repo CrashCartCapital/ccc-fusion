@@ -3,6 +3,8 @@ export const CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION = "ccc-prd.authoring-prop
 export const CCC_PRD_SIDECAR_SCHEMA_VERSION = "ccc-prd.sidecar.v1" as const;
 export const CCC_PRD_BUNDLE_SCHEMA_VERSION = "ccc-prd.bundle.v1" as const;
 export const CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION = "ccc-prd.proof-admission.v1" as const;
+export const CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION =
+  "ccc-prd.implementation-fact-provenance.v1" as const;
 
 /** @deprecated Use the specific packet, sidecar, or bundle schema constant. */
 export const CCC_PRD_SCHEMA_VERSION = CCC_PRD_BUNDLE_SCHEMA_VERSION;
@@ -228,6 +230,73 @@ export type CccPrdProvenance = {
   packetHash: string;
 };
 
+export type CccPrdMaterialCoverageDisposition =
+  | {
+      kind: "task";
+      taskIds: string[];
+      requirementIds: string[];
+    }
+  | {
+      kind: "explicit_deferral";
+      reason: string;
+    }
+  | {
+      kind: "out_of_scope";
+      reason: string;
+    }
+  | {
+      kind: "unresolved_question";
+      unresolvedDecisionIds: string[];
+    };
+
+export type CccPrdMaterialCoverageItem = {
+  id: string;
+  sourcePath: string;
+  materialKind: "section" | "requirement";
+  headingPath: string[];
+  title: string;
+  spans: CccPrdSourceSpan[];
+  disposition: CccPrdMaterialCoverageDisposition;
+};
+
+export type CccPrdImplementationFactBinding = {
+  value: string | number;
+  spans: CccPrdSourceSpan[];
+};
+
+export type CccPrdImplementationFactProvenance = {
+  schema: typeof CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION;
+  targetRepository: {
+    path: CccPrdImplementationFactBinding;
+    baseCommit: CccPrdImplementationFactBinding;
+  };
+  bounds: {
+    maxRequests: CccPrdImplementationFactBinding;
+    maxDurationMs: CccPrdImplementationFactBinding;
+    maxConcurrency: CccPrdImplementationFactBinding;
+  };
+  admittedWriteRoots: Array<{
+    path: CccPrdImplementationFactBinding;
+    purpose: CccPrdImplementationFactBinding;
+  }>;
+  nonGoals: CccPrdImplementationFactBinding[];
+  requirements: Array<{
+    id: string;
+    acceptance: CccPrdImplementationFactBinding;
+  }>;
+  proofs: Array<{
+    id: string;
+    command: CccPrdImplementationFactBinding;
+    positiveOracle: CccPrdImplementationFactBinding;
+    negativeControls: CccPrdImplementationFactBinding[];
+  }>;
+  protectedActions: Array<{
+    id: string;
+    kind: CccPrdImplementationFactBinding;
+    target: CccPrdImplementationFactBinding;
+  }>;
+};
+
 export type CccPrdSemanticDeclarations = {
   authorityRoles: CccPrdAuthorityRole[];
   requirements: CccPrdRequirement[];
@@ -254,6 +323,16 @@ export type CccPrdSidecar = CccPrdSemanticDeclarations & {
   sourceVersion: string;
   orderedSources: CccPrdSource[];
   provenance: CccPrdProvenance;
+  /**
+   * Deterministic coverage inventory generated from admitted Markdown bytes.
+   * Legacy v1 sidecars may omit it, but the supported product route requires it.
+   */
+  materialCoverage?: CccPrdMaterialCoverageItem[];
+  /**
+   * Exact source custody for implementation-changing facts. Legacy v1 sidecars
+   * may omit it, but the supported product route requires it.
+   */
+  implementationFactProvenance?: CccPrdImplementationFactProvenance;
 };
 
 export type CccPrdSemanticBundle = Omit<

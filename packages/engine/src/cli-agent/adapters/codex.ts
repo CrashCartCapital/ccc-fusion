@@ -66,7 +66,10 @@ import type {
   CliReadinessDetector,
 } from "../adapter.js";
 import { stripAnsiControl, type TelemetryEvent } from "../telemetry-hub.js";
-import { cccFusionEnvAllowlist } from "../ccc-subscription-policy.js";
+import {
+  cccFusionEnvAllowlist,
+  isCccFusionProfile,
+} from "../ccc-subscription-policy.js";
 import { resolveCccNativeMcpServers } from "../ccc-native-mcp-policy.js";
 
 // ── Capabilities ────────────────────────────────────────────────────────────
@@ -85,6 +88,28 @@ export const CODEX_CAPABILITIES: CliAdapterCapabilities = {
 // ── Launch settings ───────────────────────────────────────────────────────────
 
 const DEFAULT_COMMAND = "codex";
+const CCC_CODEX_PERMISSION_PROFILE = "ccc_fusion";
+const CCC_CODEX_FILESYSTEM_PROFILE =
+  'permissions.ccc_fusion.filesystem={":minimal"="read",":workspace_roots"={"."="write","**/_secrets/**"="deny","**/_KELSEY/**"="deny","**/.agentsecrets/**"="deny","**/.env"="deny","**/.env.*"="deny"}}';
+const CCC_CODEX_PERMISSION_ARGS = [
+  "-c",
+  CCC_CODEX_FILESYSTEM_PROFILE,
+  "-c",
+  `permissions.${CCC_CODEX_PERMISSION_PROFILE}.network.enabled=false`,
+  "-c",
+  `default_permissions=${JSON.stringify(CCC_CODEX_PERMISSION_PROFILE)}`,
+  "--ask-for-approval",
+  "never",
+] as const;
+
+export class CccCodexSandboxPolicyError extends Error {
+  readonly code = "CCC_CODEX_SANDBOX_POLICY_REFUSED";
+
+  constructor(reason: string) {
+    super(`CCC Fusion Codex sandbox policy refused: ${reason}`);
+    this.name = "CccCodexSandboxPolicyError";
+  }
+}
 
 /**
  * Adapter-specific launch settings recognized by the Codex adapter. All optional
@@ -190,6 +215,37 @@ function buildBaseArgs(ctx: CliAdapterLaunchContext): { command: string; args: s
   args.push(...buildNotifyOverrideArg(settings.notifyProgram));
   args.push(...buildNativeMcpOverrideArgs(settings));
   return { command, args };
+}
+
+/**
+ * The supported CCC coding lane is unattended only inside Codex's fixed
+ * ccc_fusion permission profile. It never accepts a command replacement,
+ * appended arguments, or the full-access autonomy shortcut: each can replace or
+ * expand the fixed permission/approval contract after admission.
+ *
+ * Path ownership remains the campaign's independent commit-bound fence. This
+ * launch boundary limits model-generated writes to the isolated task worktree;
+ * the commit fence then admits only the route's exact allowedWriteRoots.
+ */
+function appendCccSandboxContract(
+  args: string[],
+  ctx: CliAdapterLaunchContext,
+  settings: CodexLaunchSettings,
+): boolean {
+  if (!isCccFusionProfile(ctx.settings)) return false;
+  if (settings.command !== undefined && settings.command !== DEFAULT_COMMAND) {
+    throw new CccCodexSandboxPolicyError("command replacement is not allowed");
+  }
+  if (settings.extraArgs !== undefined && settings.extraArgs.length > 0) {
+    throw new CccCodexSandboxPolicyError("extra arguments are not allowed");
+  }
+  if (ctx.posture?.autoApprove === true) {
+    throw new CccCodexSandboxPolicyError(
+      "full-access autoApprove posture is not allowed",
+    );
+  }
+  args.push(...CCC_CODEX_PERMISSION_ARGS);
+  return true;
 }
 
 /** Append the autonomy posture's privileged flags, only when permitted. */
@@ -641,8 +697,11 @@ export const codexAdapter: CliAgentAdapter = {
   buildLaunch(ctx: CliAdapterLaunchContext): CliLaunchSpec {
     const settings = readSettings(ctx);
     const { command, args } = buildBaseArgs(ctx);
-    appendPostureFlags(args, ctx);
-    if (settings.extraArgs) args.push(...settings.extraArgs);
+    const cccSandboxed = appendCccSandboxContract(args, ctx, settings);
+    if (!cccSandboxed) {
+      appendPostureFlags(args, ctx);
+      if (settings.extraArgs) args.push(...settings.extraArgs);
+    }
     return { command, args };
   },
 
@@ -698,8 +757,11 @@ export const codexAdapter: CliAgentAdapter = {
     }
     args.push(...buildNotifyOverrideArg(settings.notifyProgram));
     args.push(...buildNativeMcpOverrideArgs(settings));
-    appendPostureFlags(args, ctx);
-    if (settings.extraArgs) args.push(...settings.extraArgs);
+    const cccSandboxed = appendCccSandboxContract(args, ctx, settings);
+    if (!cccSandboxed) {
+      appendPostureFlags(args, ctx);
+      if (settings.extraArgs) args.push(...settings.extraArgs);
+    }
     return { command, args };
   },
 };

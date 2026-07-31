@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   deriveWorkflowExtensionHostProvenance,
   getWorkflowExtensionRegistry,
@@ -41,9 +42,16 @@ type FixedProofModule = {
 };
 
 export type BootstrapCccCampaignProofAdmissionHostInput = {
-  builtRootPath: string;
+  builtRootPath?: string;
   registry?: WorkflowExtensionRegistry;
 };
+
+function defaultBuiltRootPath(): string {
+  const moduleRoot = dirname(fileURLToPath(import.meta.url));
+  return basename(moduleRoot) === "src"
+    ? resolve(moduleRoot, "../dist")
+    : moduleRoot;
+}
 
 // Keep this canonical asset in plain `tsc` output. Custody still reads and
 // validates its raw bytes below; this import is never called or trusted as manifest data.
@@ -126,19 +134,20 @@ function requireFixedProofModule(value: unknown): FixedProofModule {
 
 /** Registers one fixed, custody-bound proof evaluator. It never interprets proof commands. */
 export async function bootstrapCccCampaignProofAdmissionHost(
-  input: BootstrapCccCampaignProofAdmissionHostInput,
+  input: BootstrapCccCampaignProofAdmissionHostInput = {},
 ): Promise<WorkflowExtensionRegistry> {
-  const manifestAsset = await readFixedProofManifest(input.builtRootPath);
+  const builtRootPath = input.builtRootPath ?? defaultBuiltRootPath();
+  const manifestAsset = await readFixedProofManifest(builtRootPath);
   const manifestBytes = manifestAsset.bytes;
   const manifest = parseFixedProofManifest(manifestBytes);
-  const entryPath = join(input.builtRootPath, manifest.entry);
+  const entryPath = join(builtRootPath, manifest.entry);
   const entryBytes = await readFile(entryPath);
   const expectedEntrySha256 = sha256(entryBytes);
   const expectedManifestSha256 = sha256(manifestBytes);
   const provenance = await deriveWorkflowExtensionHostProvenance({
     pluginId: manifest.pluginId,
     pluginVersion: manifest.pluginVersion,
-    trustedRootPath: input.builtRootPath,
+    trustedRootPath: builtRootPath,
     entryRelativePath: manifest.entry,
     manifestRelativePath: manifestAsset.relativePath,
   });

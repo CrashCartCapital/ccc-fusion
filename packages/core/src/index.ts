@@ -2648,11 +2648,20 @@ export { queryRunAuditEvents } from "./task-store/async-audit.js";
 export {
   assertActiveClaimedCccCampaignApprovalWithinTransaction,
   assertClaimedCccCampaignApprovalWithinTransaction,
+  claimCccCampaignApproval,
   consumeCccCampaignApprovalWithinTransaction,
+  denyCccCampaignApproval,
+  expireCccCampaignApproval,
+  getApprovalRequest,
+  issueCccCampaignApproval,
+  listApprovalRequests,
   readConsumedCccCampaignApprovalCustodyWithinTransaction,
 } from "./async-approval-request-store.js";
 export type {
+  ClaimCccCampaignApprovalInput,
   ConsumedCccCampaignApprovalCustody,
+  DecideCccCampaignApprovalInput,
+  IssueCccCampaignApprovalInput,
   ReadConsumedCccCampaignApprovalCustodyInput,
 } from "./async-approval-request-store.js";
 /*

@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -12,20 +14,47 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
+  importCccPrdBundle,
+  inspectCccCampaignProofAttempt,
+  inspectCccPrdImport,
+  inspectCccPrdProductStatus,
+  parseCccCampaignProductExecutionPolicy,
+  reconcileCccPrdImport,
+  settleCccCampaignProofAttempt,
+  type ApprovalRequest,
+  type CccCampaignProductExecutionPolicy,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringConstraints,
   type CccPrdAuthoringProposal,
+  type CccPrdImportInspection,
+  type CccPrdImportResult,
+  type CccPrdProductApprovalStatus,
+  type CccPrdProductStatus,
+  type CccPrdSemanticBundle,
   type CccPrdSidecar,
   type WorkflowExtensionRegistry,
 } from "@fusion/core";
 import * as engine from "@fusion/engine";
 import { bootstrapCccCampaignProofAdmissionHost } from "./ccc-native-proof-host.js";
+import {
+  closeProjectStore,
+  resolveProject,
+  type ProjectContext,
+} from "../project-context.js";
 
 export type PrdCommandIo = {
   write(line: string): void;
 };
 
 type Compiler = {
+  CCC_PRD_INTAKE_CONTRACT_SCHEMA_VERSION: string;
+  lintCccPrdIntakeMarkdown(input: {
+    sourcePath: string;
+    markdown: string;
+  }): {
+    readyForIntake: boolean;
+  };
+  renderCccPrdIntakeTemplate(): string;
   authorCccPrdPacket(input: {
     rootDir: string;
     manifestPath: string;
@@ -47,24 +76,66 @@ type Compiler = {
     sidecarPath: string;
     expectedTarget: string;
     expectedBase: string;
-  }): { kind: "bundle" | "refusal" };
+    requireMaterialCoverage?: boolean;
+  }): CccPrdSemanticBundle | { kind: "refusal"; diagnostics?: unknown[] };
   validateCccPrdPacket(input: {
     rootDir: string;
     manifestPath: string;
     sidecarPath: string;
     expectedTarget: string;
     expectedBase: string;
+    requireMaterialCoverage?: boolean;
   }): { kind: "validation"; valid: boolean; diagnostics: unknown[] };
+  validateCccPrdPacketImplementationFactProvenance(input: {
+    rootDir: string;
+    manifestPath: string;
+    facts: CccPrdSemanticBundle;
+  }): unknown[];
 };
 
 const compiler = engine as typeof engine & Compiler;
 export type PrdCommandDependencies = {
   bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
+  discoverCccPrdCandidates?: typeof engine.discoverCccPrdCandidates;
+  freezeCccPrdPacket?: typeof engine.freezeCccPrdPacket;
+  resolveProject?: (projectName?: string) => Promise<ProjectContext>;
+  closeProjectStore?: (context: ProjectContext) => Promise<void>;
+  readTargetHead?: (targetRoot: string) => Promise<string>;
+  importCccPrdBundle?: typeof importCccPrdBundle;
+  inspectCccPrdImport?: typeof inspectCccPrdImport;
+  reconcileCccPrdImport?: typeof reconcileCccPrdImport;
+  inspectCccPrdProductStatus?: typeof inspectCccPrdProductStatus;
+  inspectCccCampaignProofAttempt?: typeof inspectCccCampaignProofAttempt;
+  settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
+  computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
+  computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
+  approveCccCampaignLiveExecution?: typeof engine.approveCccCampaignLiveExecution;
+  approveCccCampaignMerge?: typeof engine.approveCccCampaignMerge;
+  computeCccCampaignOperatorControlConfirmation?: typeof engine.computeCccCampaignOperatorControlConfirmation;
+  describeCccCampaignOperatorControls?: typeof engine.describeCccCampaignOperatorControls;
+  applyCccCampaignOperatorControl?: typeof engine.applyCccCampaignOperatorControl;
+};
+export type PrdCommandContext = {
+  projectName?: string;
 };
 const usage = [
   "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+  "       fn prd discover <active-projects-root>",
+  "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
+  "       fn prd template",
+  "       fn prd lint <prd-path>",
   "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
+  "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]",
+  "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
+  "       fn prd <inspect|reconcile> <idempotency-key> [--project <id|name>]",
+  "       fn prd status <idempotency-key> [--project <id|name>]",
+  "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
+  "       fn prd <stop|abandon> <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]",
+  "       fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]",
+  "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
+  "       fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
+  "       fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
 ].join("\n");
 
 function isEscaping(path: string): boolean {
@@ -400,11 +471,1773 @@ async function runGeneratedAuthor(
   return 0;
 }
 
+const CCC_PRD_PRODUCT_PREVIEW_SCHEMA = "ccc-prd.product-preview.v1" as const;
+
+class PrdProductCommandError extends Error {
+  public constructor(
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "PrdProductCommandError";
+  }
+}
+
+function writeProductRefusal(
+  io: PrdCommandIo,
+  code: string,
+  message: string,
+): number {
+  io.write(JSON.stringify({
+    kind: "refusal",
+    diagnostics: [{ code, message }],
+    safeState:
+      "Fusion did not report this operation complete. Durable state may include previously completed transactional steps; inspect current status before retrying.",
+    decisionOwner: "human operator",
+    consequence:
+      "The requested transition is not complete and Fusion will not assume the refused or uncertain effect succeeded.",
+    approvalExpiresAt: null,
+    recoveryOptions: [
+      "Run fn prd status <idempotency-key> to inspect durable work, receipts, approvals, and the next safe action.",
+      "Correct the cited input or custody problem and request a fresh confirmation.",
+      "Use fn prd stop with a fresh status digest to abandon an unleased campaign while preserving evidence.",
+    ],
+    nextSafeAction:
+      "Run fn prd status <idempotency-key> and follow its fresh operator controls; do not blindly retry an uncertain effect.",
+  }));
+  return 1;
+}
+
+function runIntakeContractCommand(
+  args: string[],
+  io: PrdCommandIo,
+): number {
+  const [subcommand, inputPath] = args;
+  if (subcommand === "template" && args.length === 1) {
+    io.write(JSON.stringify({
+      kind: "prd-intake-template",
+      schema: compiler.CCC_PRD_INTAKE_CONTRACT_SCHEMA_VERSION,
+      markdown: compiler.renderCccPrdIntakeTemplate(),
+    }));
+    return 0;
+  }
+  if (subcommand !== "lint" || args.length !== 2 || !inputPath) {
+    io.write(usage);
+    return 2;
+  }
+
+  try {
+    const lexicalPath = resolve(inputPath);
+    if (isProtected(lexicalPath) || !/\.md$/iu.test(lexicalPath)) {
+      throw new Error("the intake lint input must be one unprotected Markdown file");
+    }
+    const sourcePath = resolveAuthorInput(dirname(lexicalPath), lexicalPath);
+    const lint = compiler.lintCccPrdIntakeMarkdown({
+      sourcePath,
+      markdown: readFileSync(sourcePath, "utf8"),
+    });
+    io.write(JSON.stringify(lint));
+    return lint.readyForIntake ? 0 : 1;
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_INTAKE_LINT_READ_FAILED",
+      error instanceof Error ? error.message : "the PRD could not be linted",
+    );
+  }
+}
+
+function runIntakePacketCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+): number {
+  const [subcommand, activeProjectsRoot, selectedPrdPath, outputDir] = args;
+  try {
+    if (subcommand === "discover" && args.length === 2 && activeProjectsRoot) {
+      io.write(JSON.stringify(
+        (dependencies.discoverCccPrdCandidates ?? engine.discoverCccPrdCandidates)({
+          activeProjectsRoot,
+        }),
+      ));
+      return 0;
+    }
+    if (
+      subcommand === "freeze"
+      && args.length === 4
+      && activeProjectsRoot
+      && selectedPrdPath
+      && outputDir
+    ) {
+      io.write(JSON.stringify(
+        (dependencies.freezeCccPrdPacket ?? engine.freezeCccPrdPacket)({
+          activeProjectsRoot,
+          selectedPrdPath,
+          outputDir,
+        }),
+      ));
+      return 0;
+    }
+    io.write(usage);
+    return 2;
+  } catch (error) {
+    const code = (
+      error
+      && typeof error === "object"
+      && "code" in error
+      && typeof error.code === "string"
+    )
+      ? error.code
+      : "CCC_PRD_INTAKE_FAILED";
+    return writeProductRefusal(
+      io,
+      code,
+      error instanceof Error ? error.message : "CCC PRD intake failed",
+    );
+  }
+}
+
+async function readTargetHead(targetRoot: string): Promise<string> {
+  const env = { ...process.env };
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  ]) {
+    delete env[key];
+  }
+  return execFileSync(
+    "git",
+    ["rev-parse", "--verify", "HEAD^{commit}"],
+    {
+      cwd: targetRoot,
+      encoding: "utf8",
+      env,
+      timeout: 10_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  ).trim();
+}
+
+function readProductExecutionPolicy(
+  rootDir: string,
+  policyPath: string,
+  bundle: CccPrdSemanticBundle,
+): CccCampaignProductExecutionPolicy {
+  let value: unknown;
+  try {
+    value = JSON.parse(
+      readFileSync(resolveAuthorInput(rootDir, policyPath), "utf8"),
+    ) as unknown;
+  } catch (error) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_EXECUTION_POLICY_READ_FAILED",
+      error instanceof Error
+        ? `execution policy could not be read: ${error.message}`
+        : `execution policy could not be read: ${policyPath}`,
+    );
+  }
+  return parseCccCampaignProductExecutionPolicy(value, bundle);
+}
+
+function assertProductBundleComplete(bundle: CccPrdSemanticBundle): void {
+  for (const [label, values] of [
+    ["requirements", bundle.requirements],
+    ["proofs", bundle.proofs],
+    ["tasks", bundle.tasks],
+    ["workflows", bundle.workflows],
+  ] as const) {
+    if (values.length === 0) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_BUNDLE_SHALLOW",
+        `CCC PRD product import refuses zero ${label}`,
+      );
+    }
+  }
+  const taskRequirementIds = new Set(
+    bundle.tasks.flatMap(({ requirementIds }) => requirementIds),
+  );
+  const declaredProofIds = new Set(bundle.proofs.map(({ id }) => id));
+  for (const requirement of bundle.requirements) {
+    if (!taskRequirementIds.has(requirement.id)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_REQUIREMENT_TASK_COVERAGE_MISSING",
+        `CCC PRD requirement ${requirement.id} has no task disposition`,
+      );
+    }
+    if (
+      requirement.proofIds.length === 0
+      || requirement.proofIds.some((proofId) => !declaredProofIds.has(proofId))
+    ) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_REQUIREMENT_PROOF_COVERAGE_MISSING",
+        `CCC PRD requirement ${requirement.id} has no complete proof disposition`,
+      );
+    }
+  }
+}
+
+function productPreviewIdentity(input: {
+  projectId: string;
+  projectPath: string;
+  targetHead: string;
+  bundle: CccPrdSemanticBundle;
+  executionPolicy: CccCampaignProductExecutionPolicy;
+}) {
+  return {
+    schema: CCC_PRD_PRODUCT_PREVIEW_SCHEMA,
+    projectId: input.projectId,
+    projectPath: resolve(input.projectPath),
+    bundleHash: input.bundle.bundleHash,
+    packetHash: input.bundle.sourceHash,
+    sidecarHash: input.bundle.sidecarHash,
+    targetRepository: resolve(input.bundle.targetRepository.path),
+    targetBase: input.bundle.targetRepository.baseCommit,
+    targetHead: input.targetHead,
+    executionPolicy: input.executionPolicy,
+  };
+}
+
+function productConfirmationDigest(
+  identity: ReturnType<typeof productPreviewIdentity>,
+): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(identity), "utf8")
+    .digest("hex");
+}
+
+function productPreview(
+  identity: ReturnType<typeof productPreviewIdentity>,
+  bundle: CccPrdSemanticBundle,
+) {
+  return {
+    kind: "preview" as const,
+    ...identity,
+    confirmationDigest: productConfirmationDigest(identity),
+    orderedSources: bundle.orderedSources,
+    requirements: bundle.requirements,
+    tasks: bundle.tasks,
+    proofs: bundle.proofs,
+    workflows: bundle.workflows,
+    protectedActions: bundle.protectedActions,
+    admittedWriteRoots: bundle.admittedWriteRoots,
+    bounds: bundle.bounds,
+    nonGoals: bundle.nonGoals,
+    materialCoverage: bundle.materialCoverage,
+  };
+}
+
+async function withPrdProject(
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  context: PrdCommandContext,
+  operation: (project: ProjectContext) => Promise<number>,
+): Promise<number> {
+  const resolveProjectDependency = dependencies.resolveProject ?? resolveProject;
+  const closeProjectStoreDependency = dependencies.closeProjectStore ?? closeProjectStore;
+  let project: ProjectContext | undefined;
+  let closeAttempted = false;
+  try {
+    project = await resolveProjectDependency(context.projectName);
+    const result = await operation(project);
+    closeAttempted = true;
+    await closeProjectStoreDependency(project);
+    return result;
+  } catch (error) {
+    let failure: unknown = error;
+    if (project && !closeAttempted) {
+      try {
+        closeAttempted = true;
+        await closeProjectStoreDependency(project);
+      } catch (closeError) {
+        failure = new AggregateError(
+          [error, closeError],
+          "CCC PRD project operation and PostgreSQL cleanup both failed",
+        );
+      }
+    }
+    const detail = failure as { code?: unknown; message?: unknown };
+    return writeProductRefusal(
+      io,
+      typeof detail.code === "string" ? detail.code : "CCC_PRD_PROJECT_OPERATION_FAILED",
+      typeof detail.message === "string" ? detail.message : "CCC PRD project operation failed",
+    );
+  }
+}
+
+function compileProductBundle(input: {
+  rootDir: string;
+  manifestPath: string;
+  sidecarPath: string;
+  expectedTarget: string;
+  expectedBase: string;
+}): CccPrdSemanticBundle | { kind: "refusal"; diagnostics?: unknown[] } {
+  const result = compiler.compileCccPrdPacket({
+    ...input,
+    requireMaterialCoverage: true,
+  });
+  if (result.kind === "refusal") return result;
+  assertProductBundleComplete(result);
+  const provenanceDiagnostics = compiler.validateCccPrdPacketImplementationFactProvenance({
+    rootDir: input.rootDir,
+    manifestPath: input.manifestPath,
+    facts: result,
+  });
+  if (provenanceDiagnostics.length > 0) {
+    return { kind: "refusal", diagnostics: provenanceDiagnostics };
+  }
+  return result;
+}
+
+async function runProductPacketCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  commandContext: PrdCommandContext,
+): Promise<number> {
+  const [
+    subcommand,
+    rootDir,
+    manifestPath,
+    sidecarPath,
+    executionPolicyPath,
+    expectedTarget,
+    expectedBase,
+    idempotencyKey,
+    confirmFlag,
+    confirmationDigest,
+  ] = args;
+  const preview = subcommand === "preview";
+  const importing = subcommand === "import";
+  if (
+    !rootDir
+    || !manifestPath
+    || !sidecarPath
+    || !executionPolicyPath
+    || !expectedTarget
+    || !expectedBase
+    || !/^[0-9a-f]{40}$/.test(expectedBase)
+    || (preview && args.length !== 7)
+    || (importing && (
+      args.length !== 10
+      || !idempotencyKey
+      || confirmFlag !== "--confirm"
+      || !confirmationDigest
+      || !/^[0-9a-f]{64}$/.test(confirmationDigest)
+    ))
+    || (!preview && !importing)
+  ) {
+    io.write(usage);
+    return 2;
+  }
+
+  let bundle: CccPrdSemanticBundle;
+  let executionPolicy: CccCampaignProductExecutionPolicy;
+  try {
+    const compiled = compileProductBundle({
+      rootDir,
+      manifestPath,
+      sidecarPath,
+      expectedTarget,
+      expectedBase,
+    });
+    if (compiled.kind === "refusal") {
+      io.write(JSON.stringify(compiled));
+      return 1;
+    }
+    bundle = compiled;
+    executionPolicy = readProductExecutionPolicy(rootDir, executionPolicyPath, bundle);
+  } catch (error) {
+    const detail = error as { code?: unknown; message?: unknown };
+    return writeProductRefusal(
+      io,
+      typeof detail.code === "string" ? detail.code : "CCC_PRD_PRODUCT_PREFLIGHT_FAILED",
+      typeof detail.message === "string" ? detail.message : "CCC PRD product preflight failed",
+    );
+  }
+
+  return withPrdProject(io, dependencies, commandContext, async (project) => {
+    const layer = project.store.getAsyncLayer();
+    if (!layer) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_POSTGRES_UNAVAILABLE",
+        `PostgreSQL AsyncDataLayer unavailable for ${project.projectPath}`,
+      );
+    }
+    if (resolve(project.projectPath) !== resolve(bundle.targetRepository.path)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PROJECT_TARGET_MISMATCH",
+        `resolved project ${project.projectPath} does not match PRD target ${bundle.targetRepository.path}`,
+      );
+    }
+    const targetHead = await (dependencies.readTargetHead ?? readTargetHead)(project.projectPath);
+    if (targetHead !== bundle.targetRepository.baseCommit) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_TARGET_HEAD_DRIFT",
+        `target HEAD ${targetHead} does not match frozen base ${bundle.targetRepository.baseCommit}`,
+      );
+    }
+    const identity = productPreviewIdentity({
+      projectId: project.projectId,
+      projectPath: project.projectPath,
+      targetHead,
+      bundle,
+      executionPolicy,
+    });
+    const currentPreview = productPreview(identity, bundle);
+    if (preview) {
+      io.write(JSON.stringify(currentPreview));
+      return 0;
+    }
+    if (confirmationDigest !== currentPreview.confirmationDigest) {
+      return writeProductRefusal(
+        io,
+        "CCC_PRD_CONFIRMATION_MISMATCH",
+        `confirmation digest does not match current preview ${currentPreview.confirmationDigest}`,
+      );
+    }
+    const result = await (dependencies.importCccPrdBundle ?? importCccPrdBundle)({
+      bundle,
+      executionPolicy,
+      idempotencyKey: idempotencyKey!,
+      store: project.store,
+      layer,
+      rootDir: project.projectPath,
+    });
+    io.write(JSON.stringify({
+      kind: "imported",
+      confirmationDigest: currentPreview.confirmationDigest,
+      result,
+    }));
+    return 0;
+  });
+}
+
+async function runProductStateCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  commandContext: PrdCommandContext,
+): Promise<number> {
+  const [subcommand, idempotencyKey] = args;
+  if (
+    (subcommand !== "inspect" && subcommand !== "reconcile")
+    || args.length !== 2
+    || !idempotencyKey
+  ) {
+    io.write(usage);
+    return 2;
+  }
+  return withPrdProject(io, dependencies, commandContext, async (project) => {
+    const layer = project.store.getAsyncLayer();
+    if (!layer) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_POSTGRES_UNAVAILABLE",
+        `PostgreSQL AsyncDataLayer unavailable for ${project.projectPath}`,
+      );
+    }
+    if (subcommand === "inspect") {
+      const inspection: CccPrdImportInspection | null = await (
+        dependencies.inspectCccPrdImport ?? inspectCccPrdImport
+      )({
+        idempotencyKey,
+        layer,
+        rootDir: project.projectPath,
+      });
+      io.write(JSON.stringify({ kind: "inspection", found: inspection !== null, inspection }));
+      return inspection ? 0 : 1;
+    }
+    const result: CccPrdImportResult = await (
+      dependencies.reconcileCccPrdImport ?? reconcileCccPrdImport
+    )({
+      idempotencyKey,
+      layer,
+      store: project.store,
+      rootDir: project.projectPath,
+    });
+    io.write(JSON.stringify({ kind: "reconciled", result }));
+    return 0;
+  });
+}
+
+const CCC_PRODUCT_MERGE_HOLD =
+  "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
+const CCC_PRODUCT_LIVE_EXECUTION_HOLD =
+  "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+const OPERATOR_REDACTED_KEYS = new Set([
+  "claimToken",
+  "controllerToken",
+]);
+
+function writeOperatorJson(io: PrdCommandIo, value: unknown): void {
+  io.write(JSON.stringify(value, (key, entry) =>
+    OPERATOR_REDACTED_KEYS.has(key) ? undefined : entry));
+}
+
+function isMergeApproval(
+  approval: CccPrdProductApprovalStatus,
+): boolean {
+  return approval.targetAction.resourceType === "ccc-campaign-merge"
+    && approval.targetAction.context?.protectedActionKind === "merge";
+}
+
+function isLiveExecutionApproval(
+  approval: CccPrdProductApprovalStatus,
+): boolean {
+  return approval.targetAction.resourceType === "ccc-campaign-live_execution"
+    && approval.targetAction.context?.protectedActionKind === "live_execution";
+}
+
+function exactDigest(provided: string, expected: string): boolean {
+  if (!/^[0-9a-f]{64}$/.test(provided) || !/^[0-9a-f]{64}$/.test(expected)) {
+    return false;
+  }
+  return timingSafeEqual(
+    Buffer.from(provided, "hex"),
+    Buffer.from(expected, "hex"),
+  );
+}
+
+function exactImportedProductWorkItem(status: CccPrdProductStatus) {
+  if (status.workItems.length !== 1) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_MERGE_WORK_ITEM_AMBIGUOUS",
+      `merge approval requires exactly one imported workflow work item; found ${status.workItems.length}`,
+    );
+  }
+  const workItem = status.workItems[0]!;
+  if (
+    workItem.kind !== "task"
+    || workItem.runId !== `ccc-prd:${status.import.importId}`
+    || workItem.stableWorkflowRunId !== workItem.runId
+    || workItem.leaseOwner !== null
+    || workItem.leaseExpiresAt !== null
+    || !Number.isSafeInteger(workItem.attempt)
+    || workItem.attempt < 1
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_MERGE_WORK_ITEM_REFUSED",
+      `workflow work item ${workItem.id} does not match exact imported campaign custody`,
+    );
+  }
+  return workItem;
+}
+
+function exactMergeWorkItem(status: CccPrdProductStatus) {
+  const workItem = exactImportedProductWorkItem(status);
+  const exactHold = workItem.state === "manual-required"
+    && workItem.lastError === CCC_PRODUCT_MERGE_HOLD
+    && workItem.blockedReason === CCC_PRODUCT_MERGE_HOLD;
+  if (!exactHold && workItem.state !== "succeeded") {
+    throw new PrdProductCommandError(
+      "CCC_PRD_MERGE_WORK_ITEM_REFUSED",
+      `workflow work item ${workItem.id} is not parked for exact merge approval`,
+    );
+  }
+  return workItem;
+}
+
+function exactLiveExecutionWorkItem(status: CccPrdProductStatus) {
+  const workItem = exactImportedProductWorkItem(status);
+  const exactHold = workItem.state === "manual-required"
+    && workItem.lastError === CCC_PRODUCT_LIVE_EXECUTION_HOLD
+    && workItem.blockedReason === CCC_PRODUCT_LIVE_EXECUTION_HOLD;
+  if (
+    !exactHold
+    && workItem.state !== "runnable"
+    && workItem.state !== "retrying"
+    && workItem.state !== "running"
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_LIVE_EXECUTION_WORK_ITEM_REFUSED",
+      `workflow work item ${workItem.id} is not parked for exact live-execution approval`,
+    );
+  }
+  return workItem;
+}
+
+async function inspectProductStatus(
+  dependencies: PrdCommandDependencies,
+  project: ProjectContext,
+  idempotencyKey: string,
+): Promise<CccPrdProductStatus | null> {
+  const layer = project.store.getAsyncLayer();
+  if (!layer) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_POSTGRES_UNAVAILABLE",
+      `PostgreSQL AsyncDataLayer unavailable for ${project.projectPath}`,
+    );
+  }
+  return (dependencies.inspectCccPrdProductStatus ?? inspectCccPrdProductStatus)({
+    idempotencyKey,
+    layer,
+    rootDir: project.projectPath,
+  });
+}
+
+async function runProductControlCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  commandContext: PrdCommandContext,
+): Promise<number> {
+  const [
+    subcommand,
+    idempotencyKey,
+    approvalRequestId,
+    confirmFlag,
+    confirmation,
+  ] = args;
+  const showingStatus = subcommand === "status";
+  const approvingExecution = subcommand === "approve-execution";
+  const approvingMerge = subcommand === "approve-merge";
+  if (
+    !idempotencyKey
+    || (showingStatus && args.length !== 2)
+    || ((approvingExecution || approvingMerge) && (
+      args.length !== 5
+      || !approvalRequestId
+      || confirmFlag !== "--confirm"
+      || !confirmation
+      || !/^[0-9a-f]{64}$/.test(confirmation)
+    ))
+    || (!showingStatus && !approvingExecution && !approvingMerge)
+  ) {
+    io.write(usage);
+    return 2;
+  }
+
+  return withPrdProject(io, dependencies, commandContext, async (project) => {
+    const status = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!status) {
+      writeOperatorJson(io, {
+        kind: "product-status",
+        found: false,
+        idempotencyKey,
+      });
+      return 1;
+    }
+    const computeConfirmation =
+      dependencies.computeCccCampaignMergeApprovalConfirmation
+      ?? engine.computeCccCampaignMergeApprovalConfirmation;
+    const computeLiveExecutionConfirmation =
+      dependencies.computeCccCampaignLiveExecutionApprovalConfirmation
+      ?? engine.computeCccCampaignLiveExecutionApprovalConfirmation;
+    if (showingStatus) {
+      const mergeApprovalConfirmations = status.approvals
+        .filter(isMergeApproval)
+        .map((approval) => ({
+          approvalRequestId: approval.id,
+          confirmation: computeConfirmation(
+            approval as ApprovalRequest,
+          ),
+          expiresAt: approval.campaign.expiresAt,
+          status: approval.status,
+        }));
+      const liveExecutionApprovalConfirmations = status.approvals
+        .filter(isLiveExecutionApproval)
+        .map((approval) => ({
+          approvalRequestId: approval.id,
+          confirmation: computeLiveExecutionConfirmation(
+            approval as ApprovalRequest,
+          ),
+          expiresAt: approval.campaign.expiresAt,
+          status: approval.status,
+          taskId: approval.taskId,
+        }));
+      writeOperatorJson(io, {
+        kind: "product-status",
+        found: true,
+        status,
+        operatorControls: (
+          dependencies.describeCccCampaignOperatorControls
+          ?? engine.describeCccCampaignOperatorControls
+        )(status),
+        mergeApprovalConfirmations,
+        liveExecutionApprovalConfirmations,
+      });
+      return 0;
+    }
+
+    const approval = status.approvals.find(({ id }) =>
+      id === approvalRequestId);
+    if (!approval || (
+      approvingExecution
+        ? !isLiveExecutionApproval(approval)
+        : !isMergeApproval(approval)
+    )) {
+      throw new PrdProductCommandError(
+        approvingExecution
+          ? "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING"
+          : "CCC_PRD_MERGE_APPROVAL_MISSING",
+        `${approvingExecution ? "live-execution" : "merge"} approval ${approvalRequestId} is missing from exact product status`,
+      );
+    }
+    const expectedConfirmation = (
+      approvingExecution
+        ? computeLiveExecutionConfirmation
+        : computeConfirmation
+    )(approval as ApprovalRequest);
+    if (!exactDigest(confirmation!, expectedConfirmation)) {
+      throw new PrdProductCommandError(
+        approvingExecution
+          ? "CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED"
+          : "CCC_PRD_MERGE_CONFIRMATION_REFUSED",
+        `${approvingExecution ? "live-execution" : "merge"} approval confirmation is stale or does not match`,
+      );
+    }
+    if (approvingExecution) {
+      const workItem = exactLiveExecutionWorkItem(status);
+      const approved = await (
+        dependencies.approveCccCampaignLiveExecution
+        ?? engine.approveCccCampaignLiveExecution
+      )({
+        store: project.store,
+        rootDir: project.projectPath,
+        taskId: approval.taskId!,
+        approvalRequestId: approval.id,
+        confirmation: confirmation!,
+        actor: {
+          actorId: "ccc-fusion-local-operator",
+          actorType: "user",
+          actorName: "CCC Fusion Local Operator",
+        },
+      });
+      if (workItem.state === "manual-required") {
+        await project.store.transitionWorkflowWorkItem(
+          workItem.id,
+          "runnable",
+          {
+            expectedState: "manual-required",
+            expectedAttempt: workItem.attempt,
+            attempt: workItem.attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastError: null,
+            blockedReason: null,
+          },
+        );
+      }
+      const resumedStatus = await inspectProductStatus(
+        dependencies,
+        project,
+        idempotencyKey,
+      );
+      if (!resumedStatus) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_PRODUCT_STATUS_MISSING",
+          "product status disappeared after live-execution approval",
+        );
+      }
+      writeOperatorJson(io, {
+        kind: "execution-approved",
+        approvalRequestId: approval.id,
+        approval: approved,
+        status: resumedStatus,
+      });
+      return 0;
+    }
+    const workItem = exactMergeWorkItem(status);
+    const result = await (
+      dependencies.approveCccCampaignMerge
+      ?? engine.approveCccCampaignMerge
+    )({
+      store: project.store,
+      rootDir: project.projectPath,
+      taskId: approval.taskId!,
+      approvalRequestId: approval.id,
+      confirmation: confirmation!,
+      actor: {
+        actorId: "ccc-fusion-local-operator",
+        actorType: "user",
+        actorName: "CCC Fusion Local Operator",
+      },
+    });
+    if (workItem.state === "manual-required") {
+      await project.store.transitionWorkflowWorkItem(
+        workItem.id,
+        "succeeded",
+        {
+          expectedState: "manual-required",
+          expectedAttempt: workItem.attempt,
+          attempt: workItem.attempt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastError: null,
+          blockedReason: null,
+        },
+      );
+    }
+    const completedStatus = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!completedStatus) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_STATUS_MISSING",
+        "product status disappeared after controlled Git landing",
+      );
+    }
+    writeOperatorJson(io, {
+      kind: "merge-approved",
+      approvalRequestId: approval.id,
+      result,
+      status: completedStatus,
+    });
+    return 0;
+  });
+}
+
+async function runCampaignLifecycleCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  commandContext: PrdCommandContext,
+): Promise<number> {
+  const [subcommand, idempotencyKey] = args;
+  const action = subcommand === "abandon" ? "stop" : subcommand;
+  const simpleControl = action === "pause" || action === "resume";
+  const stopping = action === "stop";
+  const reason = stopping && args[2] === "--reason" ? args[3] : undefined;
+  const confirmIndex = stopping ? 4 : 2;
+  const confirmation = args[confirmIndex + 1];
+  if (
+    !idempotencyKey
+    || (!simpleControl && !stopping)
+    || args[confirmIndex] !== "--confirm"
+    || !confirmation
+    || !/^[0-9a-f]{64}$/.test(confirmation)
+    || (simpleControl && args.length !== 4)
+    || (stopping && (
+      args.length !== 6
+      || args[2] !== "--reason"
+      || typeof reason !== "string"
+      || reason.trim() !== reason
+      || reason.length < 10
+    ))
+  ) {
+    io.write(usage);
+    return 2;
+  }
+  return withPrdProject(io, dependencies, commandContext, async (project) => {
+    const status = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!status) {
+      writeOperatorJson(io, {
+        kind: "product-status",
+        found: false,
+        idempotencyKey,
+      });
+      return 1;
+    }
+    const exactAction = action as engine.CccCampaignOperatorControlAction;
+    const computeConfirmation =
+      dependencies.computeCccCampaignOperatorControlConfirmation
+      ?? engine.computeCccCampaignOperatorControlConfirmation;
+    const expectedConfirmation = computeConfirmation(status, exactAction);
+    if (!exactDigest(confirmation, expectedConfirmation)) {
+      return writeProductRefusal(
+        io,
+        "CCC_CAMPAIGN_OPERATOR_CONTROL_CONFIRMATION_REFUSED",
+        `operator ${exactAction} confirmation is stale or does not match current campaign status`,
+      );
+    }
+    const result = await (
+      dependencies.applyCccCampaignOperatorControl
+      ?? engine.applyCccCampaignOperatorControl
+    )({
+      action: exactAction,
+      ...(stopping ? { reason } : {}),
+      status,
+      store: project.store,
+    });
+    const completedStatus = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!completedStatus) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_STATUS_MISSING",
+        "product status disappeared after operator campaign control",
+      );
+    }
+    const describeControls =
+      dependencies.describeCccCampaignOperatorControls
+      ?? engine.describeCccCampaignOperatorControls;
+    writeOperatorJson(io, {
+      kind: exactAction === "pause"
+        ? "campaign-paused"
+        : exactAction === "resume"
+          ? "campaign-resumed"
+          : "campaign-stopped",
+      result,
+      status: completedStatus,
+      operatorControls: describeControls(completedStatus),
+    });
+    return 0;
+  });
+}
+
+type ProofResolutionEvidence = Readonly<{
+  schema: "ccc-campaign.proof-resolution.v1";
+  observerId: string;
+  summary: string;
+  result: Readonly<{
+    success: boolean;
+    exitCode: number | null;
+    durationMs: number;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    killed: boolean;
+    warnings: readonly string[];
+    changedPathsSha256?: string;
+    negativeControlLabel?: string;
+  }>;
+}>;
+
+function exactObjectKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.hasOwn(value, key))
+    && Object.keys(value).every((key) => allowed.has(key));
+}
+
+function readProofResolutionEvidence(
+  evidencePath: string,
+): ProofResolutionEvidence {
+  if (isProtected(evidencePath)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_PROTECTED",
+      "proof-resolution evidence cannot be read from a protected path",
+    );
+  }
+  const lexicalPath = resolve(evidencePath);
+  let physicalPath: string;
+  try {
+    if (!lstatSync(lexicalPath).isFile()) throw new Error("not a regular file");
+    physicalPath = realpathSync(lexicalPath);
+  } catch (error) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_READ_FAILED",
+      `proof-resolution evidence is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (isProtected(physicalPath)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_SYMLINK_REFUSED",
+      "proof-resolution evidence must resolve outside protected paths",
+    );
+  }
+  const raw = readFileSync(physicalPath, "utf8");
+  if (Buffer.byteLength(raw, "utf8") > 1_000_000) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_TOO_LARGE",
+      "proof-resolution evidence exceeds the 1 MB operator limit",
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_INVALID",
+      "proof-resolution evidence must be valid JSON",
+    );
+  }
+  if (
+    !parsed
+    || typeof parsed !== "object"
+    || Array.isArray(parsed)
+    || !exactObjectKeys(
+      parsed as Record<string, unknown>,
+      ["schema", "observerId", "summary", "result"],
+    )
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_INVALID",
+      "proof-resolution evidence has unexpected or missing top-level fields",
+    );
+  }
+  const candidate = parsed as Record<string, unknown>;
+  const result = candidate.result;
+  if (
+    candidate.schema !== "ccc-campaign.proof-resolution.v1"
+    || typeof candidate.observerId !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u.test(candidate.observerId)
+    || typeof candidate.summary !== "string"
+    || candidate.summary !== candidate.summary.trim()
+    || candidate.summary.length < 10
+    || candidate.summary.length > 1_000
+    || !result
+    || typeof result !== "object"
+    || Array.isArray(result)
+    || !exactObjectKeys(
+      result as Record<string, unknown>,
+      [
+        "success",
+        "exitCode",
+        "durationMs",
+        "stdout",
+        "stderr",
+        "timedOut",
+        "killed",
+        "warnings",
+      ],
+      ["changedPathsSha256", "negativeControlLabel"],
+    )
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_INVALID",
+      "proof-resolution evidence identity or result shape is invalid",
+    );
+  }
+  const proofResult = result as Record<string, unknown>;
+  const warnings = proofResult.warnings;
+  const validExitCode = proofResult.exitCode === null
+    || (
+      Number.isSafeInteger(proofResult.exitCode)
+      && (proofResult.exitCode as number) >= -2_147_483_648
+      && (proofResult.exitCode as number) <= 2_147_483_647
+    );
+  if (
+    typeof proofResult.success !== "boolean"
+    || !validExitCode
+    || !Number.isSafeInteger(proofResult.durationMs)
+    || (proofResult.durationMs as number) < 0
+    || typeof proofResult.stdout !== "string"
+    || typeof proofResult.stderr !== "string"
+    || Buffer.byteLength(proofResult.stdout, "utf8") > 400_000
+    || Buffer.byteLength(proofResult.stderr, "utf8") > 400_000
+    || typeof proofResult.timedOut !== "boolean"
+    || typeof proofResult.killed !== "boolean"
+    || !Array.isArray(warnings)
+    || warnings.length > 63
+    || !warnings.every((warning) =>
+      typeof warning === "string"
+      && warning.length > 0
+      && warning.length <= 2_000)
+    || (
+      proofResult.changedPathsSha256 !== undefined
+      && (
+        typeof proofResult.changedPathsSha256 !== "string"
+        || !/^[0-9a-f]{64}$/u.test(proofResult.changedPathsSha256)
+      )
+    )
+    || (
+      proofResult.negativeControlLabel !== undefined
+      && (
+        typeof proofResult.negativeControlLabel !== "string"
+        || proofResult.negativeControlLabel.length === 0
+        || proofResult.negativeControlLabel.length > 512
+      )
+    )
+    || (
+      proofResult.success === true
+      && (
+        proofResult.exitCode !== 0
+        || proofResult.timedOut !== false
+        || proofResult.killed !== false
+      )
+    )
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_EVIDENCE_INVALID",
+      "proof-resolution result fields are invalid or internally inconsistent",
+    );
+  }
+  const evidence = candidate as unknown as ProofResolutionEvidence;
+  return Object.freeze({
+    ...evidence,
+    result: Object.freeze({
+      ...evidence.result,
+      warnings: Object.freeze([
+        ...evidence.result.warnings,
+        `operator-reconciliation:${evidence.observerId}: ${evidence.summary}`,
+      ]),
+    }),
+  });
+}
+
+function exactProofResolutionContext(
+  status: CccPrdProductStatus,
+  attemptKey: string,
+) {
+  const matches = status.proofs
+    .flatMap(({ attempts }) => attempts)
+    .filter((attempt) => attempt.attemptKey === attemptKey);
+  if (matches.length !== 1) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_ATTEMPT_MISSING",
+      `proof attempt ${attemptKey} is not one exact declared campaign attempt`,
+    );
+  }
+  const attempt = matches[0]!;
+  if (
+    attempt.importId !== status.import.importId
+    || attempt.packetHash !== status.import.packetHash
+    || attempt.sidecarHash !== status.import.sidecarHash
+    || attempt.bundleHash !== status.import.bundleHash
+    || attempt.targetRepository !== status.import.targetRepository
+    || attempt.targetBase !== status.import.targetBase
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_IMPORT_BINDING_REFUSED",
+      `proof attempt ${attemptKey} does not match the frozen import custody`,
+    );
+  }
+  if (
+    attempt.state !== "dispatched_unknown"
+    && attempt.state !== "committed"
+    && attempt.state !== "proved_failed"
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_STATE_REFUSED",
+      `proof attempt ${attemptKey} cannot be manually resolved from ${attempt.state}`,
+    );
+  }
+  const workItems = status.workItems.filter(({ id }) =>
+    id === attempt.workItemId);
+  if (workItems.length !== 1) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_WORK_ITEM_MISSING",
+      `proof attempt ${attemptKey} has no exact imported workflow work item`,
+    );
+  }
+  const workItem = workItems[0]!;
+  if (
+    workItem.state !== "manual-required"
+    || workItem.runId !== attempt.runId
+    || workItem.attempt !== attempt.workItemAttempt
+    || workItem.leaseOwner !== null
+    || workItem.leaseExpiresAt !== null
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_WORK_ITEM_REFUSED",
+      `proof attempt ${attemptKey} is not parked at one unleased manual-resolution boundary`,
+    );
+  }
+  return { attempt, workItem };
+}
+
+function proofResolutionConfirmation(
+  status: CccPrdProductStatus,
+  attemptKey: string,
+  evidence: ProofResolutionEvidence,
+): string {
+  const { attempt, workItem } = exactProofResolutionContext(status, attemptKey);
+  return createHash("sha256")
+    .update(canonicalCccPrdJson({
+      schema: "ccc-campaign.proof-resolution-confirmation.v1",
+      projectId: status.projectId,
+      import: {
+        importId: status.import.importId,
+        idempotencyKey: status.import.idempotencyKey,
+        packetHash: status.import.packetHash,
+        sidecarHash: status.import.sidecarHash,
+        bundleHash: status.import.bundleHash,
+        targetRepository: status.import.targetRepository,
+        targetBase: status.import.targetBase,
+      },
+      attempt: {
+        attemptKey: attempt.attemptKey,
+        taskId: attempt.taskId,
+        semanticTaskId: attempt.semanticTaskId,
+        proofId: attempt.proofId,
+        sourceCommit: attempt.sourceCommit,
+        sourceTree: attempt.sourceTree,
+        definitionSha256: attempt.definitionSha256,
+        commandSha256: attempt.commandSha256,
+        state: attempt.state,
+      },
+      workItem: {
+        id: workItem.id,
+        runId: workItem.runId,
+        state: workItem.state,
+        attempt: workItem.attempt,
+        leaseOwner: workItem.leaseOwner,
+        leaseExpiresAt: workItem.leaseExpiresAt,
+      },
+      evidence,
+    }), "utf8")
+    .digest("hex");
+}
+
+function sameProofAttemptIdentity(
+  statusAttempt: ReturnType<typeof exactProofResolutionContext>["attempt"],
+  persisted: Awaited<ReturnType<typeof inspectCccCampaignProofAttempt>>,
+): boolean {
+  if (!persisted) return false;
+  return canonicalCccPrdJson({
+    attemptKey: persisted.attemptKey,
+    importId: persisted.importId,
+    campaignId: persisted.campaignId,
+    taskId: persisted.taskId,
+    semanticTaskId: persisted.semanticTaskId,
+    proofId: persisted.proofId,
+    packetHash: persisted.packetHash,
+    sidecarHash: persisted.sidecarHash,
+    bundleHash: persisted.bundleHash,
+    manifestHash: persisted.manifestHash,
+    campaignBindingHash: persisted.campaignBindingHash,
+    targetRepository: persisted.targetRepository,
+    targetBase: persisted.targetBase,
+    sourceCommit: persisted.sourceCommit,
+    sourceTree: persisted.sourceTree,
+    definitionSha256: persisted.definitionSha256,
+    commandSha256: persisted.commandSha256,
+    workItemId: persisted.workItemId,
+    runId: persisted.runId,
+    workItemAttempt: persisted.workItemAttempt,
+    state: persisted.state,
+  }) === canonicalCccPrdJson({
+    attemptKey: statusAttempt.attemptKey,
+    importId: statusAttempt.importId,
+    campaignId: statusAttempt.campaignId,
+    taskId: statusAttempt.taskId,
+    semanticTaskId: statusAttempt.semanticTaskId,
+    proofId: statusAttempt.proofId,
+    packetHash: statusAttempt.packetHash,
+    sidecarHash: statusAttempt.sidecarHash,
+    bundleHash: statusAttempt.bundleHash,
+    manifestHash: statusAttempt.manifestHash,
+    campaignBindingHash: statusAttempt.campaignBindingHash,
+    targetRepository: statusAttempt.targetRepository,
+    targetBase: statusAttempt.targetBase,
+    sourceCommit: statusAttempt.sourceCommit,
+    sourceTree: statusAttempt.sourceTree,
+    definitionSha256: statusAttempt.definitionSha256,
+    commandSha256: statusAttempt.commandSha256,
+    workItemId: statusAttempt.workItemId,
+    runId: statusAttempt.runId,
+    workItemAttempt: statusAttempt.workItemAttempt,
+    state: statusAttempt.state,
+  });
+}
+
+async function runProofResolutionCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  commandContext: PrdCommandContext,
+): Promise<number> {
+  const [, idempotencyKey, attemptKey, evidencePath, confirmFlag, provided] =
+    args;
+  if (
+    !idempotencyKey
+    || !attemptKey
+    || !/^ccc-proof-attempt-[0-9a-f]{64}$/u.test(attemptKey)
+    || !evidencePath
+    || (
+      args.length !== 4
+      && (
+        args.length !== 6
+        || confirmFlag !== "--confirm"
+        || !provided
+        || !/^[0-9a-f]{64}$/u.test(provided)
+      )
+    )
+  ) {
+    io.write(usage);
+    return 2;
+  }
+  const evidence = readProofResolutionEvidence(evidencePath);
+  return withPrdProject(io, dependencies, commandContext, async (project) => {
+    const layer = project.store.getAsyncLayer();
+    if (!layer) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_POSTGRES_UNAVAILABLE",
+        `PostgreSQL AsyncDataLayer unavailable for ${project.projectPath}`,
+      );
+    }
+    const status = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!status) {
+      writeOperatorJson(io, {
+        kind: "product-status",
+        found: false,
+        idempotencyKey,
+      });
+      return 1;
+    }
+    const context = exactProofResolutionContext(status, attemptKey);
+    const confirmation = proofResolutionConfirmation(
+      status,
+      attemptKey,
+      evidence,
+    );
+    if (args.length === 4) {
+      writeOperatorJson(io, {
+        kind: "proof-resolution-preview",
+        attemptKey,
+        decision: "settle",
+        observerId: evidence.observerId,
+        evidenceSummary: evidence.summary,
+        outcome: evidence.result.success ? "committed" : "proved_failed",
+        confirmation,
+        consequence:
+          "Persists the operator-observed verifier result, then requeues only the exact parked work item so runtime replay can settle it.",
+        safeState:
+          "No verifier command is rerun. The source commit, worktree, and existing receipts remain unchanged.",
+        decisionOwner: "human operator",
+        approvalExpiresAt: null,
+        rollback:
+          "Terminal proof evidence is immutable. If the evidence is wrong, stop this campaign and import a corrected reviewed campaign.",
+        nextSafeAction:
+          `Rerun this command with --confirm ${confirmation}.`,
+      });
+      return 0;
+    }
+    if (!exactDigest(provided!, confirmation)) {
+      return writeProductRefusal(
+        io,
+        "CCC_PRD_PROOF_RESOLUTION_CONFIRMATION_REFUSED",
+        "proof-resolution confirmation is stale or does not match current campaign evidence",
+      );
+    }
+    const persisted = await (
+      dependencies.inspectCccCampaignProofAttempt
+      ?? inspectCccCampaignProofAttempt
+    )({
+      layer,
+      attemptKey,
+    });
+    if (!sameProofAttemptIdentity(context.attempt, persisted)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PROOF_RESOLUTION_ATTEMPT_DRIFT",
+        `proof attempt ${attemptKey} no longer matches the redacted product status`,
+      );
+    }
+    const settled = await (
+      dependencies.settleCccCampaignProofAttempt
+      ?? settleCccCampaignProofAttempt
+    )({
+      layer,
+      attemptKey,
+      controllerToken: persisted!.controllerToken,
+      result: evidence.result,
+    });
+    await project.store.transitionWorkflowWorkItem(
+      context.workItem.id,
+      "runnable",
+      {
+        expectedState: "manual-required",
+        expectedAttempt: context.workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: context.workItem.attempt,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        retryAfter: null,
+        lastError: null,
+        blockedReason: null,
+      },
+    );
+    const completedStatus = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!completedStatus) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_STATUS_MISSING",
+        "product status disappeared after proof resolution",
+      );
+    }
+    writeOperatorJson(io, {
+      kind: "proof-resolved",
+      attempt: settled,
+      status: completedStatus,
+      nextSafeAction:
+        "Resume the campaign runtime; it will replay the terminal receipt without rerunning the verifier.",
+    });
+    return 0;
+  });
+}
+
+type ProviderResolutionOutcome = "committed" | "proved_failed";
+
+function exactProviderResolutionContext(
+  status: CccPrdProductStatus,
+  attemptKey: string,
+  outcome: ProviderResolutionOutcome,
+) {
+  const matches = (status.providerAttempts ?? [])
+    .filter((attempt) => attempt.attemptKey === attemptKey);
+  if (matches.length !== 1) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_ATTEMPT_MISSING",
+      `provider attempt ${attemptKey} is not one exact imported campaign attempt`,
+    );
+  }
+  const attempt = matches[0]!;
+  if (
+    attempt.binding.projectId !== status.projectId
+    || attempt.binding.importId !== status.import.importId
+    || attempt.binding.campaignId !== status.import.campaignId
+    || attempt.binding.idempotencyKey !== status.import.idempotencyKey
+    || attempt.binding.packetHash !== status.import.packetHash
+    || attempt.binding.sidecarHash !== status.import.sidecarHash
+    || attempt.binding.bundleHash !== status.import.bundleHash
+    || attempt.binding.targetRepository !== status.import.targetRepository
+    || attempt.binding.targetBase !== status.import.targetBase
+    || attempt.taskId !== attempt.binding.taskId
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_IMPORT_BINDING_REFUSED",
+      `provider attempt ${attemptKey} does not match the frozen import custody`,
+    );
+  }
+  const terminalState = outcome;
+  if (
+    attempt.state !== "dispatched_unknown"
+    && attempt.state !== terminalState
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_STATE_REFUSED",
+      `provider attempt ${attemptKey} cannot settle as ${outcome} from ${attempt.state}`,
+    );
+  }
+  if (attempt.binding.transport === "cli") {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_CLI_FENCE_REQUIRED",
+      "Native CLI provider effects require the held-session recovery fence; restart the campaign runtime to replay that native CLI recovery, or stop the campaign to abandon it.",
+    );
+  }
+  if (
+    attempt.binding.transport !== "pi"
+    && attempt.binding.transport !== "workflow"
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_TRANSPORT_REFUSED",
+      `provider attempt ${attemptKey} uses unsupported transport ${attempt.binding.transport}`,
+    );
+  }
+  const tasks = status.tasks.filter((task) =>
+    task.nativeTaskId === attempt.taskId
+    && task.semanticTaskId === attempt.semanticTaskId);
+  if (
+    tasks.length !== 1
+    || !tasks[0]!.present
+    || !tasks[0]!.route
+    || tasks[0]!.route.providerId !== attempt.binding.providerId
+    || tasks[0]!.route.modelId !== attempt.binding.modelId
+    || tasks[0]!.route.transport !== attempt.binding.transport
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_ROUTE_REFUSED",
+      `provider attempt ${attemptKey} no longer matches one imported task route`,
+    );
+  }
+  const workItems = status.workItems;
+  if (workItems.length !== 1) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_MISSING",
+      `provider attempt ${attemptKey} has no exact imported workflow work item`,
+    );
+  }
+  const workItem = workItems[0]!;
+  const expectedRunId = `ccc-prd:${status.import.importId}`;
+  if (
+    workItem.kind !== "task"
+    || workItem.runId !== expectedRunId
+    || workItem.stableWorkflowRunId !== expectedRunId
+    || !Number.isSafeInteger(workItem.attempt)
+    || workItem.attempt < 0
+    || workItem.state !== "manual-required"
+    || workItem.leaseOwner !== null
+    || workItem.leaseExpiresAt !== null
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_REFUSED",
+      `provider attempt ${attemptKey} is not parked at one unleased manual-resolution boundary`,
+    );
+  }
+  return { attempt, workItem };
+}
+
+function providerResolutionConfirmation(
+  status: CccPrdProductStatus,
+  attemptKey: string,
+  outcome: ProviderResolutionOutcome,
+  observerId: string,
+  evidenceDigest: string,
+): string {
+  const { attempt, workItem } = exactProviderResolutionContext(
+    status,
+    attemptKey,
+    outcome,
+  );
+  return createHash("sha256")
+    .update(canonicalCccPrdJson({
+      schema: "ccc-campaign.provider-resolution-confirmation.v1",
+      projectId: status.projectId,
+      import: {
+        importId: status.import.importId,
+        idempotencyKey: status.import.idempotencyKey,
+        packetHash: status.import.packetHash,
+        sidecarHash: status.import.sidecarHash,
+        bundleHash: status.import.bundleHash,
+        targetRepository: status.import.targetRepository,
+        targetBase: status.import.targetBase,
+      },
+      attempt,
+      workItem: {
+        id: workItem.id,
+        runId: workItem.runId,
+        taskId: workItem.taskId,
+        state: workItem.state,
+        attempt: workItem.attempt,
+        leaseOwner: workItem.leaseOwner,
+        leaseExpiresAt: workItem.leaseExpiresAt,
+      },
+      resolution: {
+        outcome,
+        observerId,
+        evidenceDigest,
+      },
+    }), "utf8")
+    .digest("hex");
+}
+
+function sameProviderAttemptIdentity(
+  statusAttempt: ReturnType<
+    typeof exactProviderResolutionContext
+  >["attempt"],
+  persisted: Awaited<
+    ReturnType<ProjectContext["store"]["inspectCccProviderAttempt"]>
+  >,
+): boolean {
+  if (!persisted) return false;
+  const {
+    controllerToken: _persistedControllerToken,
+    ...persistedRedacted
+  } = persisted;
+  return canonicalCccPrdJson(persistedRedacted)
+    === canonicalCccPrdJson(statusAttempt);
+}
+
+async function runProviderResolutionCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  commandContext: PrdCommandContext,
+): Promise<number> {
+  const [
+    ,
+    idempotencyKey,
+    attemptKey,
+    rawOutcome,
+    observerId,
+    evidenceDigest,
+    confirmFlag,
+    provided,
+  ] = args;
+  const outcome: ProviderResolutionOutcome | undefined =
+    rawOutcome === "committed"
+      ? "committed"
+      : rawOutcome === "proved-failed"
+        ? "proved_failed"
+        : undefined;
+  if (
+    !idempotencyKey
+    || !attemptKey
+    || !/^ccc-provider-attempt-[0-9a-f]{64}$/u.test(attemptKey)
+    || !outcome
+    || !observerId
+    || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u.test(observerId)
+    || !evidenceDigest
+    || !/^[0-9a-f]{64}$/u.test(evidenceDigest)
+    || (
+      args.length !== 6
+      && (
+        args.length !== 8
+        || confirmFlag !== "--confirm"
+        || !provided
+        || !/^[0-9a-f]{64}$/u.test(provided)
+      )
+    )
+  ) {
+    io.write(usage);
+    return 2;
+  }
+  return withPrdProject(io, dependencies, commandContext, async (project) => {
+    const status = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!status) {
+      writeOperatorJson(io, {
+        kind: "product-status",
+        found: false,
+        idempotencyKey,
+      });
+      return 1;
+    }
+    const context = exactProviderResolutionContext(
+      status,
+      attemptKey,
+      outcome,
+    );
+    const confirmation = providerResolutionConfirmation(
+      status,
+      attemptKey,
+      outcome,
+      observerId,
+      evidenceDigest,
+    );
+    if (args.length === 6) {
+      writeOperatorJson(io, {
+        kind: "provider-resolution-preview",
+        attemptKey,
+        outcome,
+        observerId,
+        evidenceDigest,
+        confirmation,
+        consequence:
+          "Persists the operator-observed provider outcome, consumes an exact claimed approval only for a committed effect, then requeues only the exact parked work item.",
+        safeState:
+          "No provider request is replayed. The worktree, source commit, approval, and existing receipts remain unchanged until confirmation.",
+        decisionOwner: "human operator",
+        approvalExpiresAt: null,
+        rollback:
+          "Terminal provider evidence is immutable. If the observation is wrong, stop this campaign and import a corrected reviewed campaign.",
+        nextSafeAction:
+          `Rerun this command with --confirm ${confirmation}, or use fn prd stop to abandon the campaign.`,
+      });
+      return 0;
+    }
+    if (!exactDigest(provided!, confirmation)) {
+      return writeProductRefusal(
+        io,
+        "CCC_PRD_PROVIDER_RESOLUTION_CONFIRMATION_REFUSED",
+        "provider-resolution confirmation is stale or does not match current campaign evidence",
+      );
+    }
+    const persisted = await project.store.inspectCccProviderAttempt({
+      taskId: context.attempt.taskId,
+      attemptKey,
+    });
+    if (!sameProviderAttemptIdentity(context.attempt, persisted)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PROVIDER_RESOLUTION_ATTEMPT_DRIFT",
+        `provider attempt ${attemptKey} no longer matches the redacted product status`,
+      );
+    }
+    const settled = await project.store.settleCccProviderAttemptAndApproval({
+      ...persisted!,
+      outcome,
+      observerId,
+      evidenceDigest,
+    });
+    await project.store.transitionWorkflowWorkItem(
+      context.workItem.id,
+      "runnable",
+      {
+        expectedState: "manual-required",
+        expectedAttempt: context.workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: context.workItem.attempt,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        retryAfter: null,
+        lastError: null,
+        blockedReason: null,
+      },
+    );
+    const completedStatus = await inspectProductStatus(
+      dependencies,
+      project,
+      idempotencyKey,
+    );
+    if (!completedStatus) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_STATUS_MISSING",
+        "product status disappeared after provider resolution",
+      );
+    }
+    writeOperatorJson(io, {
+      kind: "provider-resolved",
+      attempt: settled,
+      status: completedStatus,
+      nextSafeAction:
+        "Resume the campaign runtime; it will replay the terminal receipt without repeating the provider effect.",
+    });
+    return 0;
+  });
+}
+
 export async function runPrdCommand(
   args: string[],
   io: PrdCommandIo = { write: (line) => console.log(line) },
   dependencies: PrdCommandDependencies = {},
+  commandContext: PrdCommandContext = {},
 ): Promise<number> {
+  if (args[0] === "discover" || args[0] === "freeze") {
+    return runIntakePacketCommand(args, io, dependencies);
+  }
+  if (args[0] === "template" || args[0] === "lint") {
+    return runIntakeContractCommand(args, io);
+  }
+  if (args[0] === "preview" || args[0] === "import") {
+    return runProductPacketCommand(args, io, dependencies, commandContext);
+  }
+  if (args[0] === "inspect" || args[0] === "reconcile") {
+    return runProductStateCommand(args, io, dependencies, commandContext);
+  }
+  if (
+    args[0] === "status"
+    || args[0] === "approve-execution"
+    || args[0] === "approve-merge"
+  ) {
+    return runProductControlCommand(args, io, dependencies, commandContext);
+  }
+  if (
+    args[0] === "pause"
+    || args[0] === "resume"
+    || args[0] === "stop"
+    || args[0] === "abandon"
+  ) {
+    return runCampaignLifecycleCommand(
+      args,
+      io,
+      dependencies,
+      commandContext,
+    );
+  }
+  if (args[0] === "resolve-proof") {
+    return runProofResolutionCommand(
+      args,
+      io,
+      dependencies,
+      commandContext,
+    );
+  }
+  if (args[0] === "resolve-provider") {
+    return runProviderResolutionCommand(
+      args,
+      io,
+      dependencies,
+      commandContext,
+    );
+  }
   const [subcommand, rootDir, manifestPath, inputPath, fifth, sixth] = args;
   const author = subcommand === "author";
   const generatedAuthor = parseGeneratedAuthorArgs(args);
@@ -506,6 +2339,7 @@ export async function runPrdCommand(
     sidecarPath: inputPath,
     expectedTarget: fifth!,
     expectedBase: sixth!,
+    requireMaterialCoverage: true,
   };
   if (subcommand === "validate") {
     const result = compiler.validateCccPrdPacket(input);

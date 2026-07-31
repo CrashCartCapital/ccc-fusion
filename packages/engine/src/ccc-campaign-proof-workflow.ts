@@ -89,18 +89,22 @@ export function createCccCampaignProofNodeAdmission(
     }
     const liveSignal = requireLiveSignal(signal);
     const semanticTaskId = requireNodeSemanticTaskId(node);
+    const nativeTaskId = requireNodeNativeTaskId(node);
     const [originContext, nodeContext] = await Promise.all([
       input.store.getCccCampaignContextForTask(originTaskId),
-      input.store.getCccCampaignContextForTask(semanticTaskId),
+      input.store.getCccCampaignContextForTask(nativeTaskId),
     ]);
     const origin = requireCampaignContext(originContext, originTaskId);
-    const context = requireCampaignContext(nodeContext, semanticTaskId);
+    const context = requireCampaignContext(nodeContext, nativeTaskId);
     assertCampaignCustody(origin, context);
-    if (context.taskId !== semanticTaskId || context.semanticTaskId !== semanticTaskId) {
+    if (
+      context.taskId !== nativeTaskId
+      || context.semanticTaskId !== semanticTaskId
+    ) {
       refuse(`CCC proof node ${node.id} task identity does not match persisted custody`);
     }
 
-    const proofs = requireTaskProofs(context);
+    const proofs = requireTaskProofs(context, node);
     for (const proof of proofs) {
       liveSignal.throwIfAborted();
       await admitProof({
@@ -135,12 +139,14 @@ function requireExactExecutionBinding(
     refuse("CCC proof admission visit identity is not frozen");
   }
   const nodeSemanticTaskId = requireNodeSemanticTaskId(node);
+  const nodeNativeTaskId = requireNodeNativeTaskId(node);
   if (
     execution.originTaskId !== originTaskId
     || execution.semanticTaskId !== nodeSemanticTaskId
+    || execution.nativeTaskId !== nodeNativeTaskId
     || binding.semanticTask !== execution.semanticTask
-    || binding.semanticTask.id !== execution.semanticTaskId
-    || execution.semanticTask.id !== execution.semanticTaskId
+    || binding.semanticTask.id !== execution.nativeTaskId
+    || execution.semanticTask.id !== execution.nativeTaskId
     || execution.runId !== fence.runId
     || binding.visitIdentity !== execution.visitIdentity
     || execution.visitIdentity.nodeId !== node.id
@@ -223,6 +229,13 @@ function requireNodeSemanticTaskId(node: WorkflowIrNode): string {
   return requireCanonicalText(node.config?.cccPrdTaskId, `node ${node.id} cccPrdTaskId`);
 }
 
+function requireNodeNativeTaskId(node: WorkflowIrNode): string {
+  return requireCanonicalText(
+    node.config?.cccNativeTaskId ?? node.config?.cccPrdTaskId,
+    `node ${node.id} cccNativeTaskId`,
+  );
+}
+
 function requireCampaignContext(
   value: CccCampaignTaskContext | null,
   taskId: string,
@@ -262,17 +275,35 @@ function assertCampaignCustody(
   }
 }
 
-function requireTaskProofs(context: CccCampaignTaskContext): CccPrdProof[] {
-  if (!Array.isArray(context.proofIds) || context.proofIds.length === 0) {
+function requireTaskProofs(
+  context: CccCampaignTaskContext,
+  node: WorkflowIrNode,
+): CccPrdProof[] {
+  const selectedProofIds = node.config?.cccProofSuite === true
+    ? node.config.cccProofIds
+    : context.proofIds;
+  if (!Array.isArray(selectedProofIds) || selectedProofIds.length === 0) {
     refuse(`CCC proof task ${context.semanticTaskId} declares no proof ids`);
   }
-  const proofIds = context.proofIds.map((proofId) =>
+  const proofIds = selectedProofIds.map((proofId) =>
     requireCanonicalText(proofId, `task ${context.semanticTaskId} proof id`));
   if (new Set(proofIds).size !== proofIds.length) {
     refuse(`CCC proof task ${context.semanticTaskId} declares duplicate proof ids`);
   }
   if (!Array.isArray(context.proofs)) {
     refuse(`CCC proof task ${context.semanticTaskId} has no campaign proof catalog`);
+  }
+  if (node.config?.cccProofSuite === true) {
+    const catalogIds = context.proofs.map((proof) =>
+      requireCanonicalText(proof?.id, `task ${context.semanticTaskId} catalog proof id`));
+    if (new Set(catalogIds).size !== catalogIds.length) {
+      refuse(`CCC proof task ${context.semanticTaskId} has duplicate campaign proof definitions`);
+    }
+    const sortedSelected = [...proofIds].sort(compareCccPrdCodeUnits);
+    const sortedCatalog = [...catalogIds].sort(compareCccPrdCodeUnits);
+    if (canonicalCccPrdJson(sortedSelected) !== canonicalCccPrdJson(sortedCatalog)) {
+      refuse("CCC final proof-suite node must admit every campaign proof exactly once");
+    }
   }
   return proofIds.map((proofId) => {
     const matches = context.proofs.filter((proof) => proof?.id === proofId);
@@ -480,6 +511,7 @@ async function recordProofAdmission(
         input.node.id,
         input.fence.workItemId,
         String(input.fence.attempt),
+        input.fence.eventTimestamp,
       ].join(":"),
       binding,
     },

@@ -47,7 +47,11 @@ export function createCccNativeCliProductionResolver(
   return async (input: CccNativeCliBindingResolverInput): Promise<CccNativeCliBinding> => {
     input.signal?.throwIfAborted();
     const rootDir = await realpath(options.rootDir);
-    const context = await loadContext(options, input.semanticTaskId);
+    const context = await loadContext(
+      options,
+      input.nativeTaskId,
+      input.semanticTaskId,
+    );
     assertRoute(input.expectedRoute, context);
     if (context.targetRepository.path !== rootDir) {
       throw new Error("CCC native CLI resolver root does not match persisted campaign target");
@@ -117,11 +121,17 @@ export function createCccNativeCliProductionResolver(
 
 async function loadContext(
   options: CreateCccNativeCliProductionResolverInput,
+  nativeTaskId: string,
   semanticTaskId: string,
 ): Promise<CccCampaignTaskContext> {
   const context = await options.layer.transaction(async (tx) =>
-    options.campaignAuthorityStore.getCccCampaignContextForTaskWithinTransaction(tx, semanticTaskId));
-  if (!context || context.taskId !== semanticTaskId || context.semanticTaskId !== semanticTaskId) {
+    options.campaignAuthorityStore.getCccCampaignContextForTaskWithinTransaction(tx, nativeTaskId));
+  if (
+    !context
+    || context.taskId !== nativeTaskId
+    || context.semanticTaskId !== semanticTaskId
+    || context.route.taskId !== semanticTaskId
+  ) {
     throw new Error("CCC native CLI resolver requires persisted matching task context");
   }
   return context;

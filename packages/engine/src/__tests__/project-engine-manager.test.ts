@@ -110,9 +110,29 @@ describe("ProjectEngineManager", () => {
       );
     });
 
+    it("threads the exact CLI-agent hook endpoint into every runtime config", async () => {
+      const cliAgentHookEndpointUrl =
+        "http://127.0.0.1:4555/api/cli-agent/hooks";
+      const manager = new ProjectEngineManager(centralCore, {
+        cliAgentHookEndpointUrl,
+      });
+
+      await manager.ensureEngine("proj_aaa");
+
+      expect(ProjectEngine).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: "proj_aaa",
+          cliAgentHookEndpointUrl,
+        }),
+        centralCore,
+        expect.any(Object),
+      );
+    });
+
     it("injects externalTaskStore only when project working directory matches store root", async () => {
       const sharedStore = {
         getRootDir: () => "/mapped/proj_aaa",
+        getAsyncLayer: () => ({ projectId: "proj_aaa" }),
       } as any;
       const manager = new ProjectEngineManager(centralCore, {
         externalTaskStore: sharedStore,
@@ -136,6 +156,7 @@ describe("ProjectEngineManager", () => {
     it("shares externalTaskStore when roots differ only by trailing slash", async () => {
       const sharedStore = {
         getRootDir: () => "/mapped/proj_aaa/",
+        getAsyncLayer: () => ({ projectId: "proj_aaa" }),
       } as any;
       const manager = new ProjectEngineManager(centralCore, {
         externalTaskStore: sharedStore,
@@ -146,6 +167,27 @@ describe("ProjectEngineManager", () => {
         expect.objectContaining({ workingDirectory: "/mapped/proj_aaa" }),
         centralCore,
         expect.objectContaining({ externalTaskStore: sharedStore }),
+      );
+    });
+
+    it("does not share a path-matched store bound to a fallback project partition", async () => {
+      const sharedStore = {
+        getRootDir: () => "/mapped/proj_aaa",
+        getAsyncLayer: () => ({ projectId: "local-fallback-partition" }),
+      } as any;
+      const manager = new ProjectEngineManager(centralCore, {
+        externalTaskStore: sharedStore,
+      });
+
+      await manager.ensureEngine("proj_aaa");
+
+      expect(ProjectEngine).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          projectId: "proj_aaa",
+          workingDirectory: "/mapped/proj_aaa",
+        }),
+        centralCore,
+        expect.not.objectContaining({ externalTaskStore: sharedStore }),
       );
     });
 

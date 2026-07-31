@@ -17,6 +17,7 @@ import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, cano
 import { isNonPlanDefectPlanReviewFailure } from "./transient-error-detector.js";
 import { isRequiredArtifactReadFailedValue, parseRequiredArtifactMissingValue } from "./required-workflow-artifacts.js";
 import { PermanentError, TransientError } from "./engine-errors.js";
+import { isCccCampaignTask } from "./ccc-campaign-routing.js";
 
 import {
   createDefaultNodeHandlers,
@@ -136,6 +137,8 @@ export type WorkflowMaterializedVisitIdentity = Readonly<{
 
 export type WorkflowNodeExecutionFence = Readonly<{
   workItemId: string;
+  /** Present for leased campaign work; ordinary graph callers need no lease. */
+  leaseOwner?: string;
   attempt: number;
   runId: string;
 }>;
@@ -150,11 +153,14 @@ export type WorkflowNodeExecutionResolverInput = Readonly<{
 
 export type WorkflowNodeExecutionResolverOutput = Readonly<{
   semanticTask: TaskDetail;
+  semanticTaskId?: string;
+  nativeTaskId?: string;
 }>;
 
 export type WorkflowNodeSealedExecution = Readonly<{
   originTaskId: string;
   semanticTaskId: string;
+  nativeTaskId: string;
   semanticTask: TaskDetail;
   runId: string;
   visitIdentity: WorkflowMaterializedVisitIdentity;
@@ -448,14 +454,16 @@ function requireWorkflowNodeExecutionFence(
   fence: WorkflowNodeExecutionFence,
   runId: string,
 ): WorkflowNodeExecutionFence {
+  const hasLeaseOwner = isPlainObject(fence) && Object.hasOwn(fence, "leaseOwner");
   if (
     !isPlainObject(fence)
     || !Object.isFrozen(fence)
-    || Object.keys(fence).length !== 3
+    || Object.keys(fence).length !== (hasLeaseOwner ? 4 : 3)
     || !Object.hasOwn(fence, "workItemId")
     || !Object.hasOwn(fence, "attempt")
     || !Object.hasOwn(fence, "runId")
     || !isCanonicalNonblankString(fence.workItemId)
+    || (hasLeaseOwner && !isCanonicalNonblankString(fence.leaseOwner))
     || !Number.isSafeInteger(fence.attempt)
     || fence.attempt <= 0
     || !isCanonicalNonblankString(fence.runId)
@@ -932,7 +940,7 @@ export class WorkflowGraphExecutor {
     after its checkpoint commits; recovery therefore never replays A before a
     split, and a failed checkpoint routes failure before any successor effect.
     */
-    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const cccFusionTask = isCccCampaignTask(task);
     const checkpointCccFrontier = async (node: WorkflowIrNode): Promise<string | undefined> => {
       if (!cccFusionTask || node.kind === "start" || node.kind === "end") return undefined;
       if (typeof this.deps.branchPersistence?.saveBranchState !== "function") {
@@ -2058,12 +2066,26 @@ export class WorkflowGraphExecutor {
       })
       : undefined;
     let semanticTask = this.deps.resolveNodeExecution ? resolvedExecution?.semanticTask : task;
-    if (typeof semanticTask?.id !== "string" || semanticTask.id.length === 0 || semanticTask.id !== semanticTask.id.trim()) {
-      throw new WorkflowIrError(`Workflow node ${node.id} resolved a semantic task without a canonical id`);
+    const nativeTaskId = resolvedExecution?.nativeTaskId ?? semanticTask?.id;
+    const semanticTaskId = resolvedExecution?.semanticTaskId ?? nativeTaskId;
+    if (
+      typeof nativeTaskId !== "string"
+      || nativeTaskId.length === 0
+      || nativeTaskId !== nativeTaskId.trim()
+      || typeof semanticTask?.id !== "string"
+      || semanticTask.id !== nativeTaskId
+    ) {
+      throw new WorkflowIrError(`Workflow node ${node.id} resolved a task without a canonical native id`);
     }
-    const semanticTaskId = semanticTask.id;
+    if (
+      typeof semanticTaskId !== "string"
+      || semanticTaskId.length === 0
+      || semanticTaskId !== semanticTaskId.trim()
+    ) {
+      throw new WorkflowIrError(`Workflow node ${node.id} resolved a task without a canonical semantic id`);
+    }
     if (this.deps.resolveNodeExecution) {
-      semanticTask = cloneTaskWithLockedId(semanticTask, semanticTaskId);
+      semanticTask = cloneTaskWithLockedId(semanticTask, nativeTaskId);
     }
     const providerAttemptTurnKey = executionFence
       ? createProviderAttemptTurnKey({
@@ -2076,6 +2098,7 @@ export class WorkflowGraphExecutor {
     const execution = Object.freeze({
       originTaskId,
       semanticTaskId,
+      nativeTaskId,
       semanticTask,
       runId,
       visitIdentity: effectiveVisitIdentity,
@@ -2099,7 +2122,7 @@ export class WorkflowGraphExecutor {
     exhausted transient failures naturally retain their final retry index.
     */
     let attemptsConsumed = 0;
-    const cccFusionTask = task.customFields?.cccFusionProfile === "ccc-fusion";
+    const cccFusionTask = isCccCampaignTask(task);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // Fail-fast cancellation: a branch or top-level graph abort mid-retry stops re-trying.
       if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
@@ -2140,7 +2163,7 @@ export class WorkflowGraphExecutor {
           if (signal?.aborted || this.isAbortNodeResult(pluginResult)) {
             return this.withEnginePauseAbortContext(node, pluginResult);
           }
-          const projected = await this.publishTaskProjectionFromResult(semanticTaskId, node, pluginResult, signal, this.deps.resolveNodeExecution ? execution : undefined);
+          const projected = await this.publishTaskProjectionFromResult(nativeTaskId, node, pluginResult, signal, this.deps.resolveNodeExecution ? execution : undefined);
           if (this.isAbortNodeResult(projected)) {
             return this.withEnginePauseAbortContext(node, projected);
           }
@@ -2156,7 +2179,7 @@ export class WorkflowGraphExecutor {
         if (signal?.aborted || this.isAbortNodeResult(result)) {
           return this.withEnginePauseAbortContext(node, result);
         }
-        const projected = await this.publishTaskProjectionFromResult(semanticTaskId, node, result, signal, this.deps.resolveNodeExecution ? execution : undefined);
+        const projected = await this.publishTaskProjectionFromResult(nativeTaskId, node, result, signal, this.deps.resolveNodeExecution ? execution : undefined);
         if (this.isAbortNodeResult(projected)) {
           return this.withEnginePauseAbortContext(node, projected);
         }

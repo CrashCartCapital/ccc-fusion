@@ -28,6 +28,33 @@ export type PrepareCccCampaignGitObjectsInput = Readonly<{
   signal?: AbortSignal;
 }>;
 
+export type CccCampaignTargetCheckout =
+  | Readonly<{
+    mode: "not-checked-out";
+    rootBranch: string | null;
+  }>
+  | Readonly<{
+    mode: "target-root";
+    path: string;
+  }>;
+
+type StableStatIdentity = Readonly<{
+  path: string;
+  dev: string;
+  ino: string;
+  mode: string;
+  birthtimeNs: string;
+}>;
+
+export type CccCampaignGitCustodyIdentity = Readonly<{
+  targetRoot: StableStatIdentity;
+  gitControlPath: StableStatIdentity;
+  gitDir: StableStatIdentity;
+  gitCommonDir: StableStatIdentity;
+  gitBinary: StableStatIdentity;
+  indexPath: string;
+}>;
+
 export type PreparedCccCampaignGitObjects = Readonly<{
   snapshot: CccCampaignLocalGitSnapshot;
   targetRef: string;
@@ -43,7 +70,19 @@ export type PreparedCccCampaignGitObjects = Readonly<{
   postObjectSnapshot: CccCampaignLocalGitSnapshot;
   objectBaselineBefore: readonly string[];
   expectedGeneratedObjectIds: readonly string[];
+  targetCheckout: CccCampaignTargetCheckout;
+  custodyIdentity: CccCampaignGitCustodyIdentity;
 }>;
+
+export type RestoreCccCampaignGitObjectsInput = Readonly<
+  Omit<PreparedCccCampaignGitObjects, "snapshot" | "postObjectSnapshot">
+  & { targetRoot: string; signal?: AbortSignal }
+>;
+
+export type CccCampaignGitLandingState =
+  | "base-clean"
+  | "checkout-materialized"
+  | "landed-clean";
 
 export type CccCampaignGitCasResult =
   | Readonly<{ advanced: true; ref: string; previous: string; current: string }>
@@ -252,21 +291,133 @@ async function reachableGeneratedObjectIds(
   return Object.freeze([...ids].sort());
 }
 
-async function parseWorktreeBranches(snapshot: CccCampaignLocalGitSnapshot, signal?: AbortSignal): Promise<readonly string[]> {
+type WorktreeRecord = Readonly<{
+  path: string;
+  head: string;
+  branch: string | null;
+}>;
+
+async function parseWorktrees(snapshot: CccCampaignLocalGitSnapshot, signal?: AbortSignal): Promise<readonly WorktreeRecord[]> {
   const output = await runGitBuffer(snapshot, ["worktree", "list", "--porcelain", "-z"], { signal });
-  const branches: string[] = [];
+  const worktrees: WorktreeRecord[] = [];
+  let path: string | null = null;
+  let head: string | null = null;
+  let branch: string | null = null;
+  const finish = (): void => {
+    if (path === null && head === null && branch === null) return;
+    if (path === null || head === null) {
+      throw new CccCampaignGitObjectsError("CCC campaign refused malformed worktree topology");
+    }
+    worktrees.push(Object.freeze({
+      path,
+      head: requireCanonicalObjectId(head, "worktree HEAD"),
+      branch,
+    }));
+    path = null;
+    head = null;
+    branch = null;
+  };
   for (const record of splitNullRecords(output, "worktree list")) {
-    if (record.length === 0) continue;
-    const line = new TextDecoder("utf-8", { fatal: true }).decode(record);
-    if (line.startsWith("branch ")) branches.push(line.slice("branch ".length));
+    if (record.length === 0) {
+      finish();
+      continue;
+    }
+    let line: string;
+    try {
+      line = new TextDecoder("utf-8", { fatal: true }).decode(record);
+    } catch {
+      throw new CccCampaignGitObjectsError("CCC campaign refused non-UTF-8 worktree topology");
+    }
+    if (line.startsWith("worktree ")) {
+      if (path !== null) {
+        throw new CccCampaignGitObjectsError("CCC campaign refused duplicate worktree path fields");
+      }
+      path = line.slice("worktree ".length);
+    } else if (line.startsWith("HEAD ")) {
+      if (head !== null) {
+        throw new CccCampaignGitObjectsError("CCC campaign refused duplicate worktree HEAD fields");
+      }
+      head = line.slice("HEAD ".length);
+    } else if (line.startsWith("branch ")) {
+      if (branch !== null) {
+        throw new CccCampaignGitObjectsError("CCC campaign refused duplicate worktree branch fields");
+      }
+      branch = requireRef(line.slice("branch ".length), "worktree branch");
+    } else if (
+      line !== "detached"
+      && line !== "bare"
+      && !line.startsWith("locked")
+      && !line.startsWith("prunable")
+    ) {
+      throw new CccCampaignGitObjectsError("CCC campaign refused unknown worktree topology");
+    }
   }
-  return Object.freeze(branches);
+  finish();
+  return Object.freeze(worktrees);
 }
 
-async function assertTargetNotCheckedOut(snapshot: CccCampaignLocalGitSnapshot, targetRef: string, signal?: AbortSignal): Promise<void> {
-  const branches = await parseWorktreeBranches(snapshot, signal);
-  if (branches.includes(targetRef)) {
-    throw new CccCampaignGitObjectsError(`CCC campaign target ref ${targetRef} is checked out in a worktree`);
+async function inspectTargetCheckout(
+  snapshot: CccCampaignLocalGitSnapshot,
+  targetRef: string,
+  signal?: AbortSignal,
+): Promise<CccCampaignTargetCheckout> {
+  const worktrees = await parseWorktrees(snapshot, signal);
+  const targetRootEntries: WorktreeRecord[] = [];
+  for (const worktree of worktrees) {
+    let physicalPath: string;
+    try {
+      physicalPath = await realpath(worktree.path);
+    } catch {
+      throw new CccCampaignGitObjectsError("CCC campaign could not resolve a registered worktree path");
+    }
+    if (physicalPath === snapshot.targetRoot) targetRootEntries.push(worktree);
+  }
+  if (targetRootEntries.length !== 1) {
+    throw new CccCampaignGitObjectsError("CCC campaign target root is not exactly one registered worktree");
+  }
+  const targetEntries = worktrees.filter(({ branch }) => branch === targetRef);
+  if (targetEntries.length > 1) {
+    throw new CccCampaignGitObjectsError(`CCC campaign target ref ${targetRef} is checked out more than once`);
+  }
+  if (targetEntries.length === 1) {
+    let physicalPath: string;
+    try {
+      physicalPath = await realpath(targetEntries[0]!.path);
+    } catch {
+      throw new CccCampaignGitObjectsError("CCC campaign could not resolve the target-ref worktree path");
+    }
+    if (physicalPath !== snapshot.targetRoot) {
+      throw new CccCampaignGitObjectsError(`CCC campaign target ref ${targetRef} is checked out in a sibling worktree`);
+    }
+    return Object.freeze({ mode: "target-root" as const, path: physicalPath });
+  }
+  return Object.freeze({
+    mode: "not-checked-out" as const,
+    rootBranch: targetRootEntries[0]!.branch,
+  });
+}
+
+function targetCheckoutsEqual(
+  left: CccCampaignTargetCheckout,
+  right: CccCampaignTargetCheckout,
+): boolean {
+  return left.mode === right.mode
+    && (
+      left.mode === "target-root"
+        ? right.mode === "target-root" && left.path === right.path
+        : right.mode === "not-checked-out" && left.rootBranch === right.rootBranch
+    );
+}
+
+async function assertTargetCheckoutMatches(
+  snapshot: CccCampaignLocalGitSnapshot,
+  targetRef: string,
+  expected: CccCampaignTargetCheckout,
+  signal?: AbortSignal,
+): Promise<void> {
+  const observed = await inspectTargetCheckout(snapshot, targetRef, signal);
+  if (!targetCheckoutsEqual(observed, expected)) {
+    throw new CccCampaignGitObjectsError("CCC campaign target checkout topology drifted");
   }
 }
 
@@ -418,6 +569,186 @@ async function assertGeneratedObjects(prepared: PreparedCccCampaignGitObjects, s
   await runGitText(prepared.postObjectSnapshot, ["cat-file", "-e", `${prepared.commitObject}^{commit}`], { signal });
 }
 
+function stableCustodyIdentity(
+  snapshot: CccCampaignLocalGitSnapshot,
+): CccCampaignGitCustodyIdentity {
+  const stableStat = (
+    value: CccCampaignLocalGitSnapshot["physicalIdentity"]["targetRoot"],
+  ): StableStatIdentity => Object.freeze({
+    path: value.path,
+    dev: value.dev.toString(10),
+    ino: value.ino.toString(10),
+    mode: value.mode.toString(10),
+    birthtimeNs: value.birthtimeNs.toString(10),
+  });
+  const identity = snapshot.physicalIdentity;
+  return Object.freeze({
+    targetRoot: stableStat(identity.targetRoot),
+    gitControlPath: stableStat(identity.gitControlPath),
+    gitDir: stableStat(identity.gitDir),
+    gitCommonDir: stableStat(identity.gitCommonDir),
+    gitBinary: stableStat(identity.gitBinary),
+    indexPath: identity.indexPath.path,
+  });
+}
+
+function stableCustodyIdentityMatches(
+  expected: CccCampaignGitCustodyIdentity,
+  snapshot: CccCampaignLocalGitSnapshot,
+): boolean {
+  const observed = stableCustodyIdentity(snapshot);
+  const statMatches = (left: StableStatIdentity, right: StableStatIdentity): boolean =>
+    left.path === right.path
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.birthtimeNs === right.birthtimeNs;
+  return statMatches(expected.targetRoot, observed.targetRoot)
+    && statMatches(expected.gitControlPath, observed.gitControlPath)
+    && statMatches(expected.gitDir, observed.gitDir)
+    && statMatches(expected.gitCommonDir, observed.gitCommonDir)
+    && statMatches(expected.gitBinary, observed.gitBinary)
+    && expected.indexPath === observed.indexPath;
+}
+
+function stableCustodyIdentityMismatches(
+  expected: CccCampaignGitCustodyIdentity,
+  snapshot: CccCampaignLocalGitSnapshot,
+): readonly string[] {
+  const observed = stableCustodyIdentity(snapshot);
+  const mismatches: string[] = [];
+  for (const key of [
+    "targetRoot",
+    "gitControlPath",
+    "gitDir",
+    "gitCommonDir",
+    "gitBinary",
+    "indexPath",
+  ] as const) {
+    const matches = key === "indexPath"
+      ? expected[key] === observed[key]
+      : expected[key].path === observed[key].path
+        && expected[key].dev === observed[key].dev
+        && expected[key].ino === observed[key].ino
+        && expected[key].mode === observed[key].mode
+        && expected[key].birthtimeNs === observed[key].birthtimeNs;
+    if (!matches) {
+      mismatches.push(key);
+    }
+  }
+  return Object.freeze(mismatches);
+}
+
+async function inspectExactLandingSnapshot(
+  prepared: PreparedCccCampaignGitObjects,
+  expectedHeadObject: string,
+  expectedCheckoutObject: string,
+  signal?: AbortSignal,
+): Promise<CccCampaignLocalGitSnapshot> {
+  const snapshot = await inspectCccCampaignLocalGit({
+    targetRoot: prepared.snapshot.targetRoot,
+    expectedBaseObject: prepared.expectedTarget,
+    expectedHeadObject,
+    expectedCheckoutObject,
+  }, signal);
+  if (!stableCustodyIdentityMatches(prepared.custodyIdentity, snapshot)) {
+    throw new CccCampaignGitObjectsError("CCC campaign Git custody identity drifted during landing");
+  }
+  await assertTargetCheckoutMatches(snapshot, prepared.targetRef, prepared.targetCheckout, signal);
+  const source = await resolveCommit(snapshot, prepared.sourceRef, signal);
+  if (source !== prepared.sourceCommit) {
+    throw new CccCampaignGitObjectsError("CCC campaign source ref drifted during landing");
+  }
+  const paths = await mutationPaths(snapshot, prepared.expectedTarget, prepared.sourceCommit, signal);
+  if (paths.length !== prepared.mutationPaths.length || paths.some((value, index) => value !== prepared.mutationPaths[index])) {
+    throw new CccCampaignGitObjectsError("CCC campaign mutation path set drifted during landing");
+  }
+  await assertPathsAdmitted(snapshot.targetRoot, paths, prepared.admittedWriteRoots);
+  await assertSourceTreeSafe(snapshot, prepared.sourceCommit, paths, signal);
+  await assertGeneratedObjects(prepared, signal);
+  return snapshot;
+}
+
+async function tryInspectExactLandingSnapshot(
+  prepared: PreparedCccCampaignGitObjects,
+  expectedHeadObject: string,
+  expectedCheckoutObject: string,
+  signal?: AbortSignal,
+): Promise<CccCampaignLocalGitSnapshot | null> {
+  try {
+    return await inspectExactLandingSnapshot(
+      prepared,
+      expectedHeadObject,
+      expectedCheckoutObject,
+      signal,
+    );
+  } catch (error) {
+    if (signal?.aborted) signal.throwIfAborted();
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    return null;
+  }
+}
+
+async function inspectLandingStateWithSnapshot(
+  prepared: PreparedCccCampaignGitObjects,
+  signal?: AbortSignal,
+): Promise<Readonly<{
+  state: CccCampaignGitLandingState;
+  snapshot: CccCampaignLocalGitSnapshot;
+}>> {
+  const target = await resolveCommit(prepared.postObjectSnapshot, prepared.targetRef, signal);
+  if (target !== prepared.expectedTarget && target !== prepared.commitObject) {
+    throw new CccCampaignGitObjectsError("CCC campaign target ref drifted to a foreign value during landing");
+  }
+  if (prepared.targetCheckout.mode === "not-checked-out") {
+    const snapshot = await inspectExactLandingSnapshot(
+      prepared,
+      prepared.expectedTarget,
+      prepared.expectedTarget,
+      signal,
+    );
+    return Object.freeze({
+      state: target === prepared.expectedTarget ? "base-clean" as const : "landed-clean" as const,
+      snapshot,
+    });
+  }
+  if (target === prepared.commitObject) {
+    return Object.freeze({
+      state: "landed-clean" as const,
+      snapshot: await inspectExactLandingSnapshot(
+        prepared,
+        prepared.commitObject,
+        prepared.commitObject,
+        signal,
+      ),
+    });
+  }
+  const baseSnapshot = await tryInspectExactLandingSnapshot(
+    prepared,
+    prepared.expectedTarget,
+    prepared.expectedTarget,
+    signal,
+  );
+  if (baseSnapshot) {
+    return Object.freeze({ state: "base-clean" as const, snapshot: baseSnapshot });
+  }
+  const materializedSnapshot = await tryInspectExactLandingSnapshot(
+    prepared,
+    prepared.expectedTarget,
+    prepared.commitObject,
+    signal,
+  );
+  if (materializedSnapshot) {
+    return Object.freeze({
+      state: "checkout-materialized" as const,
+      snapshot: materializedSnapshot,
+    });
+  }
+  throw new CccCampaignGitObjectsError(
+    "CCC campaign checked-out target is in a mixed or foreign state; manual recovery is required",
+  );
+}
+
 async function recheckPreparedFields(prepared: PreparedCccCampaignGitObjects, signal?: AbortSignal): Promise<void> {
   const admissionSnapshot = await inspectCccCampaignLocalGit({
     targetRoot: prepared.snapshot.targetRoot,
@@ -444,7 +775,7 @@ async function recheckPreparedFields(prepared: PreparedCccCampaignGitObjects, si
   if (snapshot.head !== prepared.expectedTarget) {
     throw new CccCampaignGitObjectsError("CCC campaign HEAD drifted before object CAS");
   }
-  await assertTargetNotCheckedOut(snapshot, prepared.targetRef, signal);
+  await assertTargetCheckoutMatches(snapshot, prepared.targetRef, prepared.targetCheckout, signal);
   const paths = await mutationPaths(snapshot, prepared.expectedTarget, prepared.sourceCommit, signal);
   if (paths.length !== prepared.mutationPaths.length || paths.some((value, index) => value !== prepared.mutationPaths[index])) {
     throw new CccCampaignGitObjectsError("CCC campaign mutation path set drifted before object CAS");
@@ -481,7 +812,7 @@ export async function prepareCccCampaignGitObjects(
   } catch {
     throw new CccCampaignGitObjectsError("CCC campaign source ref does not descend from target ref");
   }
-  await assertTargetNotCheckedOut(snapshot, targetRef, input.signal);
+  const targetCheckout = await inspectTargetCheckout(snapshot, targetRef, input.signal);
   const paths = await mutationPaths(snapshot, expectedBaseObject, sourceCommit, input.signal);
   if (paths.length === 0) {
     throw new CccCampaignGitObjectsError("CCC campaign source ref has no mutation paths");
@@ -544,8 +875,137 @@ export async function prepareCccCampaignGitObjects(
     postObjectSnapshot,
     objectBaselineBefore,
     expectedGeneratedObjectIds,
+    targetCheckout,
+    custodyIdentity: stableCustodyIdentity(postObjectSnapshot),
   });
   return prepared;
+}
+
+export async function restoreCccCampaignGitObjects(
+  input: RestoreCccCampaignGitObjectsInput,
+): Promise<PreparedCccCampaignGitObjects> {
+  input.signal?.throwIfAborted();
+  validateIdentity(input.identity);
+  validateMessage(input.message);
+  const expectedTarget = requireCanonicalObjectId(input.expectedTarget, "restored expected target");
+  const sourceCommit = requireCanonicalObjectId(input.sourceCommit, "restored source commit");
+  const treeObject = requireCanonicalObjectId(input.treeObject, "restored tree object");
+  const commitObject = requireCanonicalObjectId(input.commitObject, "restored commit object");
+  const sourceRef = requireRef(input.sourceRef, "restored source ref");
+  const targetRef = requireRef(input.targetRef, "restored target ref");
+  if (sourceRef === targetRef) {
+    throw new CccCampaignGitObjectsError("CCC campaign restored source ref must differ from target ref");
+  }
+  if (
+    !input.objectBaselineBefore.every((value) => OBJECT_ID_PATTERN.test(value))
+    || !input.expectedGeneratedObjectIds.every((value) => OBJECT_ID_PATTERN.test(value))
+  ) {
+    throw new CccCampaignGitObjectsError("CCC campaign restored object baseline is malformed");
+  }
+  const admittedWriteRoots = await normalizeAdmittedRoots(
+    await realpath(input.targetRoot),
+    input.admittedWriteRoots,
+  );
+  if (JSON.stringify(admittedWriteRoots) !== JSON.stringify(input.admittedWriteRoots)) {
+    throw new CccCampaignGitObjectsError("CCC campaign restored admitted write roots are not canonical");
+  }
+
+  const candidates = input.targetCheckout.mode === "target-root"
+    ? [
+      [expectedTarget, expectedTarget] as const,
+      [expectedTarget, commitObject] as const,
+      [commitObject, commitObject] as const,
+    ]
+    : [[expectedTarget, expectedTarget] as const];
+  const errors: string[] = [];
+  for (const [expectedHeadObject, expectedCheckoutObject] of candidates) {
+    let snapshot: CccCampaignLocalGitSnapshot;
+    try {
+      snapshot = await inspectCccCampaignLocalGit({
+        targetRoot: input.targetRoot,
+        expectedBaseObject: expectedTarget,
+        expectedHeadObject,
+        expectedCheckoutObject,
+      }, input.signal);
+    } catch (error) {
+      if (input.signal?.aborted) input.signal.throwIfAborted();
+      errors.push(error instanceof Error ? error.message : String(error));
+      continue;
+    }
+    const prepared: PreparedCccCampaignGitObjects = Object.freeze({
+      snapshot,
+      targetRef,
+      sourceRef,
+      expectedTarget,
+      sourceCommit,
+      treeObject,
+      commitObject,
+      mutationPaths: Object.freeze([...input.mutationPaths]),
+      admittedWriteRoots,
+      identity: Object.freeze({ ...input.identity }),
+      message: input.message,
+      postObjectSnapshot: snapshot,
+      objectBaselineBefore: Object.freeze([...input.objectBaselineBefore]),
+      expectedGeneratedObjectIds: Object.freeze([...input.expectedGeneratedObjectIds]),
+      targetCheckout: Object.freeze({ ...input.targetCheckout }) as CccCampaignTargetCheckout,
+      custodyIdentity: input.custodyIdentity,
+    });
+    try {
+      if (!stableCustodyIdentityMatches(input.custodyIdentity, snapshot)) {
+        throw new CccCampaignGitObjectsError(
+          `CCC campaign restored Git custody identity drifted at ${
+            stableCustodyIdentityMismatches(input.custodyIdentity, snapshot).join(",")
+          }`,
+        );
+      }
+      await assertTargetCheckoutMatches(snapshot, targetRef, input.targetCheckout, input.signal);
+      if (await resolveCommit(snapshot, sourceRef, input.signal) !== sourceCommit) {
+        throw new CccCampaignGitObjectsError("CCC campaign restored source ref drifted");
+      }
+      const restoredTree = requireCanonicalObjectId(
+        await runGitText(
+          snapshot,
+          ["merge-tree", "--write-tree", expectedTarget, sourceCommit],
+          { signal: input.signal },
+        ),
+        "restored merge tree",
+      );
+      if (restoredTree !== treeObject) {
+        throw new CccCampaignGitObjectsError("CCC campaign restored deterministic tree drifted");
+      }
+      const restoredCommit = requireCanonicalObjectId(
+        await runGitText(snapshot, ["commit-tree", treeObject, "-p", expectedTarget], {
+          input: `${input.message}\n`,
+          identity: input.identity,
+          signal: input.signal,
+        }),
+        "restored deterministic commit",
+      );
+      if (restoredCommit !== commitObject) {
+        throw new CccCampaignGitObjectsError("CCC campaign restored deterministic commit drifted");
+      }
+      const paths = await mutationPaths(snapshot, expectedTarget, sourceCommit, input.signal);
+      if (
+        paths.length !== input.mutationPaths.length
+        || paths.some((value, index) => value !== input.mutationPaths[index])
+      ) {
+        throw new CccCampaignGitObjectsError("CCC campaign restored mutation path set drifted");
+      }
+      await assertPathsAdmitted(snapshot.targetRoot, paths, admittedWriteRoots);
+      await assertSourceTreeSafe(snapshot, sourceCommit, paths, input.signal);
+      await assertGeneratedObjects(prepared, input.signal);
+      await inspectLandingStateWithSnapshot(prepared, input.signal);
+      return prepared;
+    } catch (error) {
+      if (input.signal?.aborted) input.signal.throwIfAborted();
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw new CccCampaignGitObjectsError(
+    `CCC campaign could not restore an exact Git landing state; manual recovery is required${
+      errors.length > 0 ? `: ${errors.join(" | ")}` : ""
+    }`,
+  );
 }
 
 export async function recheckCccCampaignGitObjects(
@@ -556,23 +1016,87 @@ export async function recheckCccCampaignGitObjects(
   return prepared;
 }
 
+export async function inspectCccCampaignGitLandingState(
+  prepared: PreparedCccCampaignGitObjects,
+  signal?: AbortSignal,
+): Promise<CccCampaignGitLandingState> {
+  return (await inspectLandingStateWithSnapshot(prepared, signal)).state;
+}
+
+export async function materializeCccCampaignGitCheckout(
+  prepared: PreparedCccCampaignGitObjects,
+  signal?: AbortSignal,
+): Promise<CccCampaignGitLandingState> {
+  const observed = await inspectLandingStateWithSnapshot(prepared, signal);
+  if (prepared.targetCheckout.mode === "not-checked-out" || observed.state !== "base-clean") {
+    return observed.state;
+  }
+  await recheckPreparedFields(prepared, signal);
+  try {
+    await runGitText(
+      prepared.postObjectSnapshot,
+      [
+        "read-tree",
+        "--no-sparse-checkout",
+        "-u",
+        "-m",
+        prepared.expectedTarget,
+        prepared.commitObject,
+      ],
+      { signal },
+    );
+  } catch (error) {
+    const state = await inspectLandingStateWithSnapshot(prepared, signal).catch(() => null);
+    if (state?.state === "base-clean") {
+      throw new CccCampaignGitObjectsError(
+        `CCC campaign checkout materialization was refused without a filesystem effect: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    throw new CccCampaignGitObjectsError(
+      "CCC campaign checkout materialization ended in a mixed or uncertain state; manual recovery is required",
+    );
+  }
+  const materialized = await inspectLandingStateWithSnapshot(prepared, signal);
+  if (materialized.state !== "checkout-materialized") {
+    throw new CccCampaignGitObjectsError(
+      "CCC campaign checkout materialization did not produce the exact expected state",
+    );
+  }
+  return materialized.state;
+}
+
 export async function casCccCampaignGitRef(
   prepared: PreparedCccCampaignGitObjects,
   signal?: AbortSignal,
 ): Promise<CccCampaignGitCasResult> {
-  await recheckPreparedFields(prepared, signal);
-  const observed = await resolveCommit(prepared.snapshot, prepared.targetRef, signal);
-  if (observed !== prepared.expectedTarget) {
+  const landing = await inspectLandingStateWithSnapshot(prepared, signal);
+  if (landing.state === "landed-clean") {
     return Object.freeze({
       advanced: false as const,
       reason: "stale-ref" as const,
       ref: prepared.targetRef,
       expected: prepared.expectedTarget,
-      observed,
+      observed: prepared.commitObject,
     });
+  }
+  if (prepared.targetCheckout.mode === "target-root" && landing.state !== "checkout-materialized") {
+    throw new CccCampaignGitObjectsError(
+      "CCC campaign checked-out target must be exactly materialized before ref CAS",
+    );
+  }
+  if (prepared.targetCheckout.mode === "not-checked-out") {
+    await recheckPreparedFields(prepared, signal);
   }
   try {
     await runGitText(prepared.snapshot, ["update-ref", prepared.targetRef, prepared.commitObject, prepared.expectedTarget], { signal });
+    const landed = await inspectLandingStateWithSnapshot(prepared, signal);
+    if (landed.state !== "landed-clean") {
+      throw new CccCampaignGitObjectsError(
+        "CCC campaign ref CAS advanced without an exact landed checkout; manual recovery is required",
+      );
+    }
     return Object.freeze({
       advanced: true as const,
       ref: prepared.targetRef,

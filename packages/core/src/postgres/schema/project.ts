@@ -49,6 +49,7 @@ import {
 } from "./campaign-governance.js";
 
 export { approvalRequestAuditEvents, approvalRequests, runAuditEvents };
+export { cccCampaignProofAttempts } from "./ccc-campaign-proof-attempt.js";
 
 /**
  * FNXC:PostgresSchema 2026-06-24-02:25:
@@ -2272,7 +2273,7 @@ export const projectTableNames = [
   "routines", "project_insights", "project_insight_runs", "project_insight_run_events",
   "todo_lists", "todo_items", "usage_events", "plugin_activations",
   "knowledge_pages", "deployments", "incidents", "ai_sessions", "messages",
-  "agent_ratings", "chat_sessions", "cli_sessions", "ccc_effect_receipts", "ccc_effect_turns", "ccc_prd_imports", "ccc_prd_import_sources", "ccc_prd_import_entities", "chat_messages",
+  "agent_ratings", "chat_sessions", "cli_sessions", "ccc_effect_receipts", "ccc_effect_turns", "ccc_prd_imports", "ccc_prd_import_sources", "ccc_prd_import_entities", "ccc_campaign_proof_attempts", "chat_messages",
   "run_audit_events", "mission_contract_assertions", "mission_feature_assertions",
   "mission_validator_runs", "mission_validator_failures",
   "mission_fix_feature_lineage", "verification_cache", "import_translation_cache",
