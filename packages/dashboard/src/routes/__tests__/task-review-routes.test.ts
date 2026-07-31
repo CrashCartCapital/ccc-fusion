@@ -10,6 +10,10 @@ function createMockStore(): TaskStore {
   const now = "2026-05-01T00:00:00.000Z";
   return {
     getRootDir: vi.fn(() => process.cwd()),
+    getPluginStore: vi.fn(() => ({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    })),
     getTask: vi.fn().mockResolvedValue({
       id: "FN-001",
       description: "task",

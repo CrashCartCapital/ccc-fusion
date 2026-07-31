@@ -227,6 +227,19 @@ function expectedReceipt(sessionId: string, trigger: string, exitCode = -1, exit
 }
 
 describe("CCC native CLI campaign-held lifecycle", () => {
+  it("shares one process-exit hook across managers and removes it after the last dispose", async () => {
+    const listenerCountBefore = process.listenerCount("exit");
+    const managers = Array.from({ length: 12 }, () => createHarness().manager);
+
+    try {
+      expect(process.listenerCount("exit")).toBe(listenerCountBefore + 1);
+    } finally {
+      await Promise.all(managers.map((manager) => manager.dispose()));
+    }
+
+    expect(process.listenerCount("exit")).toBe(listenerCountBefore);
+  });
+
   it("Task 4 RED: persists the frozen one-shot policy and uses its permit token as the durable generation before provider spawn", async () => {
     const { order, providerSpawn, spawn, store } = createHarness();
 

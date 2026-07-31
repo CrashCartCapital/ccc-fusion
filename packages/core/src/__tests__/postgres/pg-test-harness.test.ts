@@ -61,6 +61,59 @@ describe("PostgreSQL test availability", () => {
     }
   });
 
+  readinessIt("retries a transient psql readiness failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-psql-retry-"));
+    const executablePath = join(root, "psql");
+
+    try {
+      await writeFile(
+        executablePath,
+        [
+          "#!/bin/sh",
+          'marker="$0.marker"',
+          'if [ ! -e "$marker" ]; then',
+          '  : > "$marker"',
+          "  exit 1",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+      );
+      await chmod(executablePath, 0o755);
+
+      expect(
+        probePsqlReady(
+          "postgresql://127.0.0.1:1",
+          root,
+          500,
+          2,
+          0,
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  readinessIt(
+    "uses the successful psql query as the server readiness proof",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "fusion-psql-canonical-"));
+      const executablePath = join(root, "psql");
+
+      try {
+        await writeFile(executablePath, "#!/bin/sh\nexit 0\n");
+        await chmod(executablePath, 0o755);
+
+        expect(
+          isPgTestAvailable("postgresql://127.0.0.1:1", root),
+        ).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   readinessIt(
     "is unavailable without psql even when the target port is listening",
     async () => {

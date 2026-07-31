@@ -18,7 +18,7 @@ describe("plugin-scaffold", () => {
     "typescript",
     "vitest",
   ];
-  const caretRangePattern = /^\^\d+\.\d+\.\d+$/;
+  const caretRangePattern = /^\^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
   function expectStandaloneIndexInvariants(indexContents: string): void {
     expect(indexContents).toContain('import { definePlugin } from "@runfusion/fusion/plugin-sdk";');

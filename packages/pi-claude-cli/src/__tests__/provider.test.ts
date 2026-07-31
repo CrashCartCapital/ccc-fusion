@@ -79,6 +79,31 @@ import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { spawnClaude } from "../process-manager.js";
 import { streamViaCli } from "../provider";
 
+describe("process-exit cleanup", () => {
+  it("shares one process listener across repeated extension loads", async () => {
+    const listenersBefore = new Set(process.listeners("exit"));
+
+    try {
+      for (let load = 0; load < 12; load += 1) {
+        vi.resetModules();
+        await import("../../index");
+      }
+
+      const addedListeners = process
+        .listeners("exit")
+        .filter((listener) => !listenersBefore.has(listener));
+      expect(addedListeners).toHaveLength(1);
+    } finally {
+      for (const listener of process.listeners("exit")) {
+        if (!listenersBefore.has(listener)) {
+          process.off("exit", listener);
+        }
+      }
+      vi.resetModules();
+    }
+  });
+});
+
 describe("provider registration (default export)", () => {
   it("registers provider with ID pi-claude-cli", async () => {
     const registerProvider = vi.fn();

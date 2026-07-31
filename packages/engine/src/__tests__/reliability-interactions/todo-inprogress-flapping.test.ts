@@ -114,11 +114,28 @@ function makeSchedulerStore(rootDir: string, task: Task, settingsOverrides: Part
       emitter.emit("task:moved", { task, from, to: column, source: (opts?.moveSource as "user" | "engine" | "scheduler" | undefined) ?? "engine" });
       return task;
     }),
+    moveTaskIf: vi.fn(async (
+      _id: string,
+      column: Task["column"],
+      predicate: (live: Task) => boolean | Promise<boolean>,
+      opts?: Record<string, unknown>,
+    ) => {
+      if (!await predicate(task) || task.column === column) return { task, moved: false };
+      const from = task.column;
+      task.column = column;
+      task.columnMovedAt = new Date(Date.now()).toISOString();
+      emitter.emit("task:moved", { task, from, to: column, source: (opts?.moveSource as "user" | "engine" | "scheduler" | undefined) ?? "engine" });
+      return { task, moved: true };
+    }),
     logEntry: vi.fn(async () => undefined),
     recordRunAuditEvent: vi.fn(async () => undefined),
     getRootDir: vi.fn(() => rootDir),
     getTasksDir: vi.fn(() => join(rootDir, ".fusion", "tasks")),
     parseFileScopeFromPrompt: vi.fn(async () => []),
+    getMissionStore: vi.fn(() => ({
+      listMissions: () => [],
+      listGoalIdsForMission: () => [],
+    })),
     on: emitter.on.bind(emitter),
     off: emitter.off.bind(emitter),
   }) as unknown as TaskStore & EventEmitter;
@@ -374,12 +391,17 @@ describe("FN-5941 reliability interactions: todo/in-progress flapping", () => {
     (scheduler as any).running = true;
 
     await scheduler.schedule();
-    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.moveTaskIf).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(5_001);
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({ moveSource: "scheduler" }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      task.id,
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ moveSource: "scheduler" }),
+    );
   });
 
   it("auto-pauses a task once dispatch oscillation exceeds the threshold", async () => {
@@ -405,7 +427,7 @@ describe("FN-5941 reliability interactions: todo/in-progress flapping", () => {
 
     await scheduler.schedule();
 
-    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.moveTaskIf).not.toHaveBeenCalled();
     expect(task.paused).toBe(true);
     expect(task.pausedReason).toBe("dispatch-oscillation");
     expect(task.dispatchStormCount).toBe(6);
@@ -438,7 +460,12 @@ describe("FN-5941 reliability interactions: todo/in-progress flapping", () => {
 
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({ moveSource: "scheduler" }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      task.id,
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ moveSource: "scheduler" }),
+    );
     expect(task.dispatchStormCount).toBe(2);
     expect(task.paused).toBe(false);
   });
@@ -465,7 +492,12 @@ describe("FN-5941 reliability interactions: todo/in-progress flapping", () => {
 
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({ moveSource: "scheduler" }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      task.id,
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ moveSource: "scheduler" }),
+    );
     expect(task.dispatchStormCount).toBe(1);
   });
 
@@ -536,7 +568,12 @@ describe("FN-5941 reliability interactions: todo/in-progress flapping", () => {
 
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({ moveSource: "scheduler" }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      task.id,
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ moveSource: "scheduler" }),
+    );
   });
 
   it("does not delay a user-moved todo task with the settle-window guard", async () => {
@@ -560,6 +597,11 @@ describe("FN-5941 reliability interactions: todo/in-progress flapping", () => {
 
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.objectContaining({ moveSource: "scheduler" }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      task.id,
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ moveSource: "scheduler" }),
+    );
   });
 });

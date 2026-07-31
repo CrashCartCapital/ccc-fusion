@@ -1315,7 +1315,10 @@ describe("ChatView", () => {
     const textarea = screen.getByTestId("chat-input");
     await userEvent.type(textarea, "/new now{enter}");
 
-    expect(sendMessage).toHaveBeenCalledWith("/new now", []);
+    expect(sendMessage).toHaveBeenCalledWith("/new now", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    }));
     expect(createSession).not.toHaveBeenCalled();
   });
 
@@ -1334,7 +1337,10 @@ describe("ChatView", () => {
     const textarea = screen.getByTestId("chat-input");
     await userEvent.type(textarea, "/clear now{enter}");
 
-    expect(sendMessage).toHaveBeenCalledWith("/clear now", []);
+    expect(sendMessage).toHaveBeenCalledWith("/clear now", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    }));
     expect(createSession).not.toHaveBeenCalled();
   });
 
@@ -1351,7 +1357,10 @@ describe("ChatView", () => {
     const textarea = screen.getByTestId("chat-input");
     await userEvent.type(textarea, "Hello world{enter}");
 
-    expect(sendMessage).toHaveBeenCalledWith("Hello world", []);
+    expect(sendMessage).toHaveBeenCalledWith("Hello world", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    }));
   });
 
   it("sends message on touch tap when the synthetic click is suppressed (mobile)", async () => {
@@ -1381,7 +1390,10 @@ describe("ChatView", () => {
       });
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(sendMessage).toHaveBeenCalledWith("Touch hello", []);
+      expect(sendMessage).toHaveBeenCalledWith("Touch hello", [], expect.objectContaining({
+        onDelivered: expect.any(Function),
+        onFailed: expect.any(Function),
+      }));
     } finally {
       Object.defineProperty(window, "innerWidth", { value: originalInnerWidth, configurable: true });
     }
@@ -1404,7 +1416,10 @@ describe("ChatView", () => {
       fireEvent.pointerDown(screen.getByTestId("chat-send-btn"), { pointerType: "touch" });
     });
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenLastCalledWith("Direct first", []);
+    expect(sendMessage).toHaveBeenLastCalledWith("Direct first", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    }));
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 0));
     });
@@ -1415,7 +1430,10 @@ describe("ChatView", () => {
     });
 
     expect(sendMessage).toHaveBeenCalledTimes(2);
-    expect(sendMessage).toHaveBeenLastCalledWith("Direct second", []);
+    expect(sendMessage).toHaveBeenLastCalledWith("Direct second", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    }));
     viewportSpy.mockRestore();
   });
 
@@ -1531,7 +1549,10 @@ describe("ChatView", () => {
     const textarea = screen.getByTestId("chat-input") as HTMLTextAreaElement;
     await userEvent.type(textarea, "Direct hello{enter}");
 
-    expect(sendMessage).toHaveBeenCalledWith("Direct hello", []);
+    expect(sendMessage).toHaveBeenCalledWith("Direct hello", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    }));
     expect(sendRoomMessage).not.toHaveBeenCalled();
     expect(textarea.value).toBe("");
     localStorage.removeItem("fusion:chat-scope");

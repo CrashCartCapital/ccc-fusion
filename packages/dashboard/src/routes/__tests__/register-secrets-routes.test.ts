@@ -33,6 +33,10 @@ function createStore() {
     getGlobalSettingsStore: vi.fn(() => ({ getSettings: vi.fn().mockResolvedValue({}) })),
     getRootDir: vi.fn().mockReturnValue("/tmp"),
     getFusionDir: vi.fn().mockReturnValue("/tmp/.fusion"),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     getMissionStore: vi.fn(),
     on: vi.fn(),

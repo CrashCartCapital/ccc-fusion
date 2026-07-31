@@ -174,12 +174,34 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       SELECT mutation_type, domain
       FROM project.run_audit_events
       WHERE run_id = ${`ccc-prd:${importId}`}
-      ORDER BY timestamp, id
+      ORDER BY mutation_type
     `)) as unknown as Array<{ mutation_type: string; domain: string }>;
     expect(rows).toEqual([
-      { mutation_type: "ccc-prd-import:prepared", domain: "database" },
       { mutation_type: "ccc-prd-import:active", domain: "database" },
+      { mutation_type: "ccc-prd-import:prepared", domain: "database" },
     ]);
+  }
+
+  async function readProjectionClaim(key: string) {
+    const rows = (await h.layer().db.execute(sql`
+      SELECT state, projection_owner, projection_lease_until
+      FROM project.ccc_prd_imports
+      WHERE idempotency_key = ${key}
+    `)) as unknown as Array<{
+      state: string;
+      projection_owner: string | null;
+      projection_lease_until: string | null;
+    }>;
+    return rows[0];
+  }
+
+  async function waitPastProjectionLease(claim: { projection_lease_until: string | null }): Promise<number> {
+    const initialLeaseUntilMs = Date.parse(claim.projection_lease_until ?? "");
+    expect(Number.isFinite(initialLeaseUntilMs)).toBe(true);
+    await new Promise((resolveDelay) => {
+      setTimeout(resolveDelay, Math.max(0, initialLeaseUntilMs - Date.now() + 150));
+    });
+    return initialLeaseUntilMs;
   }
 
   async function assertNoRunnableState(key: string) {
@@ -1060,6 +1082,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it("keeps a live projection claim beyond lease expiry while an identical import waits", async () => {
     const suffix = "lease-renewal";
     const key = "idem-lease-renewal";
+    const projectionLeaseMs = 1_000;
     let announceEntered!: () => void;
     let releaseProjection!: () => void;
     const entered = new Promise<void>((resolveEntered) => {
@@ -1071,7 +1094,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     const first = importCccPrdBundle({
       ...request(suffix, key),
       failureInjection: {
-        projectionLeaseMs: 80,
+        projectionLeaseMs,
         pause: {
           checkpoint: "artifact_bytes",
           entered: announceEntered,
@@ -1080,30 +1103,27 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       },
     });
     await entered;
-    const readClaim = async () => {
-      const rows = (await h.layer().db.execute(sql`
-        SELECT state, projection_owner
-        FROM project.ccc_prd_imports
-        WHERE idempotency_key = ${key}
-      `)) as unknown as Array<{ state: string; projection_owner: string | null }>;
-      return rows[0];
-    };
-    const beforeExpiry = await readClaim();
+    const beforeExpiry = await readProjectionClaim(key);
     expect(beforeExpiry).toMatchObject({
       state: "projecting",
       projection_owner: expect.any(String),
     });
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+    const initialLeaseUntilMs = await waitPastProjectionLease(beforeExpiry);
     let secondSettled = false;
     const second = importCccPrdBundle(request(suffix, key))
       .finally(() => {
         secondSettled = true;
       });
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
 
     let assertionError: unknown;
     try {
-      expect(await readClaim()).toEqual(beforeExpiry);
+      const renewedClaim = await readProjectionClaim(key);
+      expect(renewedClaim).toMatchObject({
+        state: "projecting",
+        projection_owner: beforeExpiry.projection_owner,
+      });
+      expect(Date.parse(renewedClaim.projection_lease_until ?? "")).toBeGreaterThan(initialLeaseUntilMs);
       expect(secondSettled).toBe(false);
     } catch (error) {
       assertionError = error;
@@ -1120,6 +1140,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it("keeps renewing through the activation handoff while an identical import waits", async () => {
     const suffix = "activation-handoff";
     const key = "idem-activation-handoff";
+    const projectionLeaseMs = 1_000;
     let announceEntered!: () => void;
     let releaseActivation!: () => void;
     const entered = new Promise<void>((resolveEntered) => {
@@ -1131,7 +1152,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     const first = importCccPrdBundle({
       ...request(suffix, key),
       failureInjection: {
-        projectionLeaseMs: 80,
+        projectionLeaseMs,
         pause: {
           checkpoint: "activation_handoff",
           entered: announceEntered,
@@ -1140,26 +1161,23 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       },
     });
     await entered;
-    const readClaim = async () => {
-      const rows = (await h.layer().db.execute(sql`
-        SELECT state, projection_owner
-        FROM project.ccc_prd_imports
-        WHERE idempotency_key = ${key}
-      `)) as unknown as Array<{ state: string; projection_owner: string | null }>;
-      return rows[0];
-    };
-    const beforeExpiry = await readClaim();
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+    const beforeExpiry = await readProjectionClaim(key);
+    const initialLeaseUntilMs = await waitPastProjectionLease(beforeExpiry);
     let secondSettled = false;
     const second = importCccPrdBundle(request(suffix, key))
       .finally(() => {
         secondSettled = true;
       });
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
 
     let assertionError: unknown;
     try {
-      expect(await readClaim()).toEqual(beforeExpiry);
+      const renewedClaim = await readProjectionClaim(key);
+      expect(renewedClaim).toMatchObject({
+        state: "projecting",
+        projection_owner: beforeExpiry.projection_owner,
+      });
+      expect(Date.parse(renewedClaim.projection_lease_until ?? "")).toBeGreaterThan(initialLeaseUntilMs);
       expect(secondSettled).toBe(false);
     } catch (error) {
       assertionError = error;

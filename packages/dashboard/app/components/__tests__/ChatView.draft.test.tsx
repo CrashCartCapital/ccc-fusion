@@ -200,7 +200,10 @@ describe("ChatView draft persistence", () => {
     await userEvent.click(screen.getAllByTestId("chat-send-btn")[0]);
 
     await waitFor(() => {
-      expect(sendMessage).toHaveBeenCalledWith("send me", []);
+      expect(sendMessage).toHaveBeenCalledWith("send me", [], expect.objectContaining({
+        onDelivered: expect.any(Function),
+        onFailed: expect.any(Function),
+      }));
       expect(screen.getByPlaceholderText("Type a message...")).toHaveValue("");
       expect(localStorage.getItem("fusion:chat-draft:direct:session-001")).toBeNull();
     });

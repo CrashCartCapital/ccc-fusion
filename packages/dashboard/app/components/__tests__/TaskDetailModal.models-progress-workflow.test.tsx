@@ -1065,7 +1065,7 @@ describe("TaskDetailModal", () => {
       vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
         flagEnabled: true,
         defaultWorkflowId: "wf-edit",
-        workflows: [{ id: "wf-edit", name: "Edit Workflow" }],
+        workflows: [{ id: "wf-edit", name: "Edit Workflow", columns: [] }],
         taskWorkflowIds: { "FN-099": "wf-edit" },
       } as any);
       vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValueOnce([
@@ -1108,7 +1108,7 @@ describe("TaskDetailModal", () => {
       vi.mocked(fetchBoardWorkflows).mockResolvedValueOnce({
         flagEnabled: true,
         defaultWorkflowId: "wf-edit",
-        workflows: [{ id: "wf-edit", name: "Edit Workflow" }],
+        workflows: [{ id: "wf-edit", name: "Edit Workflow", columns: [] }],
         taskWorkflowIds: { "FN-099": "wf-edit" },
       } as any);
       vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValueOnce([

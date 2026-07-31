@@ -12,6 +12,7 @@ vi.mock("../pi.js", () => ({
 vi.mock("../agent-session-helpers.js", () => ({
   createResolvedAgentSession: vi.fn(),
   extractRuntimeHint: vi.fn().mockReturnValue(undefined),
+  resolveValidatorFallbackThinkingLevel: vi.fn().mockReturnValue(undefined),
   resolveValidatorSessionModel: vi.fn().mockReturnValue({
     provider: "mock-provider",
     modelId: "mock-model",

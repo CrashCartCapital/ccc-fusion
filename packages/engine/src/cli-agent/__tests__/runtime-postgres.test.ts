@@ -35,7 +35,7 @@ describe("createCliAgentRuntime PostgreSQL wiring", () => {
       hookEndpointUrl: "http://127.0.0.1:4545/api/cli-agent/hooks",
     });
 
-    expect(create).toHaveBeenCalledWith(layer, "project-a");
+    expect(create).toHaveBeenCalledWith(layer, "project-a", undefined);
     expect(runtime.bundle.store).toBe(fakeStore);
     await runtime.dispose();
     expect(flush).toHaveBeenCalledOnce();

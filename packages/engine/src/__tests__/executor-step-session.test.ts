@@ -774,13 +774,14 @@ describe("Workflow Steps Execution", () => {
     // (3) PROMPT.md injection was invoked with the failure context. The
     // actual file write is covered by other tests; here we just need to
     // confirm sendTaskBackForFix forwards the right step name and feedback.
-    // Last arg is MAX_WORKFLOW_STEP_RETRIES (private const, currently 3) so
-    // the injected PROMPT.md note shows "3/3 (0 remaining)".
+    // The retry presentation carries both values explicitly so bounded and
+    // unbounded review policies render honestly in PROMPT.md. This legacy
+    // hard-failure lane uses the private 3-attempt budget.
     expect(injectSpy).toHaveBeenCalledWith(
       mutableTask,
       feedback,
       stepName,
-      expect.any(Number),
+      { attempt: 3, max: 3 },
     );
 
     // The scheduleWorkflowRerun stub above never registers the 15 s

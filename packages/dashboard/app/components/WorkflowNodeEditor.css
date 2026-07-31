@@ -2075,7 +2075,7 @@ Fusion tokens so light/dark themes never show browser-default white controls.
   display: flex;
   flex-direction: column;
   gap: var(--space-xs);
-  color: var(--text-secondary);
+  color: var(--text-muted);
   font-size: 0.75rem;
 }
 

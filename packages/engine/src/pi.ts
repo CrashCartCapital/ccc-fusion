@@ -384,11 +384,16 @@ type CccTransportClosureSession = AgentSession & {
 };
 
 function awaitNodeTransportCloseCallbacks(): Promise<void> {
-  return new Promise((resolve) => {
-    // Node runs socket close callbacks after check. Two turns make the
-    // completion observable to the owner without a timing delay or polling.
-    setImmediate(() => setImmediate(resolve));
+  const crossCloseCallbackPhase = () => new Promise<void>((resolve) => {
+    // Resolve from the next timers phase, after the current check phase has
+    // yielded through Node's close-callback phase.
+    setImmediate(() => setTimeout(resolve, 0));
   });
+
+  // The first cycle lets abort I/O enqueue transport teardown; the second
+  // crosses the close-callback phase that observes it. This is a phase barrier,
+  // not a claim that we own the provider's raw socket handle.
+  return crossCloseCallbackPhase().then(() => crossCloseCallbackPhase());
 }
 
 type CccResponseIdentitySession = AgentSession & {
@@ -2456,7 +2461,14 @@ export function wrapCccToolsWithDurableEffectReceipts(
           await store.markCccEffectReceiptDispatched(reservation);
           // Do not clear a dispatched_unknown receipt when the handler throws:
           // the downstream effect may have occurred and replay must reconcile.
-          const result = await originalExecute(args[0], reservation.forwardedArguments, ...args.slice(2));
+          /*
+           * The durable row stores only the argument digest, not the raw
+           * payload, so a freshly reserved record legitimately rehydrates
+           * `forwardedArguments` as undefined. Forward the validated in-memory
+           * prepared payload to the handler; use the reservation only for
+           * durable state and committed-result replay.
+           */
+          const result = await originalExecute(args[0], prepared.forwardedArguments, ...args.slice(2));
           await store.commitCccEffectReceipt(reservation, result);
           return result;
         });

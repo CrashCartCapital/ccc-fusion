@@ -35,6 +35,10 @@ const makeAuditEvent = (overrides: Partial<RunAuditEvent> = {}): RunAuditEvent =
 const createHarness = (taskState: any, events: RunAuditEvent[]) => {
   const store: TaskStore = {
     getRootDir: vi.fn(() => process.cwd()),
+    getPluginStore: vi.fn(() => ({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    })),
     getTask: vi.fn(async (id: string) => {
       if (id !== taskState.id) {
         throw new Error(`Task ${id} not found`);

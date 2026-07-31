@@ -228,7 +228,7 @@ describe("KTD-3 IR pin wiring (U9b task-row persistence)", () => {
 
     // Node entries through the boundary never throw with the degraded seam.
     const { boundary } = boundaryFor({ ir, store: bare });
-    await expect(boundary.onNodeEntry(nodeOf(ir, "execute"))).resolves.toBeUndefined();
+    await expect(boundary.onNodeEntry(nodeOf(ir, "execute"))).resolves.toEqual({ kind: "entered" });
 
     // A row that predates the U9b fields (getTask works, fields absent) also
     // yields no prior pin — the drift guard stays inert.

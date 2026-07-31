@@ -66,6 +66,7 @@ import {
   archiveTableNames,
 } from "../postgres/schema/index.js";
 import {
+  FUSION_PG_TEST_AVAILABLE_ENV,
   isPgTestAvailable,
   PG_TEST_URL_BASE,
 } from "./pg-test-availability.js";
@@ -86,7 +87,16 @@ function redactPgDiagnostic(value: unknown): string {
  * the psql binary plus a real read-only query, so an unrelated TCP listener
  * cannot turn the PostgreSQL suites on.
  */
-export const PG_AVAILABLE = isPgTestAvailable(PG_TEST_URL_BASE);
+const publishedPgAvailability =
+  process.env[FUSION_PG_TEST_AVAILABLE_ENV];
+export const PG_AVAILABLE =
+  process.env.FUSION_PG_TEST_SKIP === "1"
+    ? false
+    : publishedPgAvailability === "1"
+      ? true
+      : publishedPgAvailability === "0"
+        ? false
+        : isPgTestAvailable(PG_TEST_URL_BASE);
 
 /**
  * A conditional `describe` that runs when PG is available and skips otherwise.

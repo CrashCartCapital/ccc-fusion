@@ -19,6 +19,7 @@ class MockStore extends EventEmitter {
   }
   addTask(task: Task): void { this.tasks.set(task.id, task); }
   getMissionStore() { return new EventEmitter(); }
+  getPluginStore() { return { init: vi.fn().mockResolvedValue(undefined), listPlugins: vi.fn().mockResolvedValue([]) }; }
   async listTasks(): Promise<Task[]> { return []; }
 }
 

@@ -237,6 +237,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     addPrInfo: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),
@@ -1814,8 +1818,14 @@ describe("Droid CLI auth routes", () => {
 
   function setDroidPluginSettings(settings: Record<string, unknown>) {
     (store as TaskStore & {
-      getPluginStore: () => { getPlugin: (id: string) => Promise<{ settings: Record<string, unknown> }> };
+      getPluginStore: () => {
+        init: () => Promise<void>;
+        listPlugins: () => Promise<unknown[]>;
+        getPlugin: (id: string) => Promise<{ settings: Record<string, unknown> }>;
+      };
     }).getPluginStore = vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
       getPlugin: vi.fn().mockImplementation(async (id: string) => {
         if (id !== "fusion-plugin-droid-runtime") {
           throw new Error("not found");

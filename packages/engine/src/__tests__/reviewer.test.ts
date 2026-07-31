@@ -24,6 +24,10 @@ vi.mock("../pi.js", () => ({
   wrapToolsWithActionGate: vi.fn((tools) => tools),
 }));
 
+vi.mock("../session-skill-context.js", () => ({
+  buildSessionSkillContext: vi.fn(),
+}));
+
 import { resolveAgentPrompt } from "@fusion/core";
 import { reviewStep, ReviewerProviderError } from "../reviewer.js";
 import { createFnAgent, promptWithFallback } from "../pi.js";
@@ -1478,10 +1482,6 @@ describe("reviewStep — user comments in spec review", () => {
 
 describe("reviewStep — skill selection resolver contract (FN-1510/FN-1511)", () => {
   // FNXC:SessionSkillContext 2026-07-13: buildSessionSkillContext mockResolvedValue objects MUST include additionalSkillPaths: [] — the production code (reviewer.ts:429) reads skillContext.additionalSkillPaths.length unconditionally when skillContext is truthy; omitting the field crashes with TypeError before createFnAgent is reached.
-  vi.mock("../session-skill-context.js", () => ({
-    buildSessionSkillContext: vi.fn(),
-  }));
-
   beforeEach(() => {
     vi.clearAllMocks();
   });

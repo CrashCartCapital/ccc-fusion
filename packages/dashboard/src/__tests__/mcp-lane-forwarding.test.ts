@@ -81,6 +81,15 @@ import { resolveManualAiPromptMcpServers } from "../routes.js";
 import { createMissionInterviewAgent } from "../mission-interview.js";
 import { createTargetInterviewAgent } from "../milestone-slice-interview.js";
 
+function createMockStore() {
+  return {
+    getPluginStore: vi.fn(() => ({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    })),
+  } as never;
+}
+
 describe("dashboard MCP lane forwarding", () => {
   beforeEach(() => {
     __resetPlanningState();
@@ -89,7 +98,7 @@ describe("dashboard MCP lane forwarding", () => {
   });
 
   it("forwards the materialized MCP set to chat/planning createFnAgent sessions", async () => {
-    const store = {} as never;
+    const store = createMockStore();
 
     await createSession("127.0.0.1", "Build a feature", store, "/tmp/fusion-dashboard-test");
 
@@ -105,7 +114,7 @@ describe("dashboard MCP lane forwarding", () => {
   it("defaults an undefined MCP resolver result to empty servers for non-streaming planning", async () => {
     resolveMcpServersForStoreMock.mockResolvedValueOnce(undefined as never);
 
-    await createSession("127.0.0.1", "Build without MCP", {} as never, "/tmp/fusion-dashboard-test");
+    await createSession("127.0.0.1", "Build without MCP", createMockStore(), "/tmp/fusion-dashboard-test");
 
     expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
       tools: "readonly",
@@ -121,7 +130,7 @@ describe("dashboard MCP lane forwarding", () => {
       "127.0.0.1",
       "Stream without MCP",
       "/tmp/fusion-dashboard-test",
-      {} as never,
+      createMockStore(),
     );
 
     const startInitialTurn = planningStreamManager.consumeInitialTurn(sessionId);
@@ -136,7 +145,7 @@ describe("dashboard MCP lane forwarding", () => {
   });
 
   it("resolves materialized MCP servers for manual AI-prompt workflow steps", async () => {
-    const store = {} as never;
+    const store = createMockStore();
 
     await expect(resolveManualAiPromptMcpServers(store)).resolves.toEqual([
       expect.objectContaining({ name: "docs", env: { TOKEN: "materialized-secret" } }),
@@ -147,11 +156,11 @@ describe("dashboard MCP lane forwarding", () => {
   it("preserves empty MCP results for manual AI-prompt workflow steps", async () => {
     resolveMcpServersForStoreMock.mockResolvedValueOnce({ servers: [], errors: [] });
 
-    await expect(resolveManualAiPromptMcpServers({} as never)).resolves.toEqual([]);
+    await expect(resolveManualAiPromptMcpServers(createMockStore())).resolves.toEqual([]);
   });
 
   it("forwards materialized MCP servers to mission interview agents", async () => {
-    const store = {} as never;
+    const store = createMockStore();
     const session = { id: "mission-session", thinkingOutput: "" } as never;
 
     await createMissionInterviewAgent(session, "/tmp/fusion-dashboard-test", store);
@@ -168,13 +177,13 @@ describe("dashboard MCP lane forwarding", () => {
   it("forwards empty MCP results to mission interview agents", async () => {
     resolveMcpServersForStoreMock.mockResolvedValueOnce({ servers: [], errors: [] });
 
-    await createMissionInterviewAgent({ id: "mission-empty", thinkingOutput: "" } as never, "/tmp/fusion-dashboard-test", {} as never);
+    await createMissionInterviewAgent({ id: "mission-empty", thinkingOutput: "" } as never, "/tmp/fusion-dashboard-test", createMockStore());
 
     expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
   });
 
   it("forwards materialized MCP servers to milestone and slice interview agents", async () => {
-    const store = {} as never;
+    const store = createMockStore();
     const session = { id: "target-session", targetType: "milestone", thinkingOutput: "" } as never;
 
     await createTargetInterviewAgent(session, "/tmp/fusion-dashboard-test", store);
@@ -191,7 +200,7 @@ describe("dashboard MCP lane forwarding", () => {
   it("forwards empty MCP results to milestone and slice interview agents", async () => {
     resolveMcpServersForStoreMock.mockResolvedValueOnce({ servers: [], errors: [] });
 
-    await createTargetInterviewAgent({ id: "target-empty", targetType: "slice", thinkingOutput: "" } as never, "/tmp/fusion-dashboard-test", {} as never);
+    await createTargetInterviewAgent({ id: "target-empty", targetType: "slice", thinkingOutput: "" } as never, "/tmp/fusion-dashboard-test", createMockStore());
 
     expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
   });

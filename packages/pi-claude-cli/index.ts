@@ -55,8 +55,55 @@ function resolveToolDefs(
   return toolDefs;
 }
 
-// Kill all active Claude subprocesses on process exit to prevent orphans
-process.on("exit", killAllProcesses);
+type ProcessExitCleanup = () => void;
+
+interface ProcessExitCleanupRegistry {
+  callbacks: Set<ProcessExitCleanup>;
+}
+
+const PROCESS_EXIT_CLEANUP_REGISTRY_KEY = Symbol.for(
+  "fusion.pi-claude-cli.process-exit-cleanups",
+);
+
+type ProcessExitCleanupOwner = (() => void) & {
+  [PROCESS_EXIT_CLEANUP_REGISTRY_KEY]?: ProcessExitCleanupRegistry;
+};
+
+/*
+ * Extension loaders may evaluate this entry module more than once. Preserve
+ * every module instance's subprocess cleanup without adding one real process
+ * listener per load.
+ */
+let processExitCleanupOwner = process.listeners("exit").find(
+  (listener) =>
+    Boolean(
+      (listener as ProcessExitCleanupOwner)[
+        PROCESS_EXIT_CLEANUP_REGISTRY_KEY
+      ],
+    ),
+) as ProcessExitCleanupOwner | undefined;
+let processExitCleanupRegistry =
+  processExitCleanupOwner?.[PROCESS_EXIT_CLEANUP_REGISTRY_KEY];
+
+if (!processExitCleanupOwner || !processExitCleanupRegistry) {
+  processExitCleanupRegistry = { callbacks: new Set() };
+  const registry = processExitCleanupRegistry;
+  processExitCleanupOwner = (() => {
+    for (const cleanup of registry.callbacks) {
+      try {
+        cleanup();
+      } catch {
+        // Process exit is best-effort; one extension instance must not block the rest.
+      }
+    }
+    registry.callbacks.clear();
+  }) as ProcessExitCleanupOwner;
+  processExitCleanupOwner[PROCESS_EXIT_CLEANUP_REGISTRY_KEY] =
+    processExitCleanupRegistry;
+  process.on("exit", processExitCleanupOwner);
+}
+
+processExitCleanupRegistry.callbacks.add(killAllProcesses);
 
 const PROVIDER_ID = "pi-claude-cli";
 

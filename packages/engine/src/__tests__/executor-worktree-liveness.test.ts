@@ -184,15 +184,15 @@ describe("FN-4114 worktree liveness assertion", () => {
     mockedCreateFnAgent.mockReset();
     mockCompletingAgent();
 
-    store.moveTask.mockReset();
-    store.moveTask.mockResolvedValue({});
-    store.getTask.mockResolvedValue(task({ worktree: allowedWorktree }));
+    const acceptStore = createMockStore();
+    acceptStore.getSettings.mockResolvedValue(mergedSettings);
+    acceptStore.getTask.mockResolvedValue(task({ worktree: allowedWorktree }));
 
-    const acceptExecutor = new TaskExecutor(store as any, "/repo");
+    const acceptExecutor = new TaskExecutor(acceptStore as any, "/repo");
     await acceptExecutor.execute(task({ worktree: allowedWorktree }) as any);
 
     expect(mockedCreateFnAgent).toHaveBeenCalled();
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-4114", "todo", { preserveProgress: true });
+    expect(acceptStore.moveTask).not.toHaveBeenCalledWith("FN-4114", "todo", { preserveProgress: true });
   });
 
   it("FN-4114 accepts usable pool-acquired worktrees", async () => {

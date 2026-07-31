@@ -76,6 +76,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updateSettings: vi.fn(async (patch: Record<string, unknown>) => patch),
     updateGlobalSettings: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     getFusionDir: vi.fn().mockReturnValue("/fake/root/.fusion"),
     getDatabase: vi.fn().mockReturnValue({
       prepare: vi.fn().mockReturnValue({ run: vi.fn(), get: vi.fn(), all: vi.fn() }),

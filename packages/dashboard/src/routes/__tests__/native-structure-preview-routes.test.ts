@@ -26,6 +26,10 @@ function store(overrides: Record<string, unknown> = {}): TaskStore {
       getMilestone: vi.fn(async (id) => id === roadmapMilestone.id ? roadmapMilestone : undefined),
     })),
     getRootDir: vi.fn(() => process.cwd()),
+    getPluginStore: vi.fn(() => ({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    })),
     ...overrides,
   } as unknown as TaskStore;
 }

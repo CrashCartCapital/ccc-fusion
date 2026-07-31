@@ -251,6 +251,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     removePrInfoByNumber: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),
@@ -1969,31 +1973,30 @@ describe("projectId store scoping regressions", () => {
   });
 
   it("routes planning create-task mutations to scoped store when projectId is provided", async () => {
-    vi.spyOn(planningModule, "getSession").mockReturnValue({
-      id: "plan-session-1",
-      initialPlan: "Scoped initial plan",
-      history: [],
-      thinkingOutput: "",
-      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
-      validated: true,
-      summary: {
-        title: "Scoped planned task",
-        description: "Create task in scoped project",
-        suggestedSize: "M",
-        suggestedDependencies: [],
-        keyDeliverables: [],
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    } as any);
-    vi.spyOn(planningModule, "getSummary").mockReturnValue({
+    const summary = {
       title: "Scoped planned task",
       description: "Create task in scoped project",
       suggestedSize: "M",
       suggestedDependencies: [],
       keyDeliverables: [],
-    });
-    vi.spyOn(planningModule, "cleanupSession").mockImplementation(() => {});
+    };
+    const aiSessionStore = {
+      get: vi.fn().mockResolvedValue({
+        id: "plan-session-1",
+        type: "planning",
+        status: "complete",
+        title: summary.title,
+        inputPayload: JSON.stringify({ initialPlan: "Scoped initial plan", validated: true }),
+        conversationHistory: "[]",
+        currentQuestion: null,
+        result: JSON.stringify(summary),
+        thinkingOutput: "",
+        error: null,
+        projectId,
+        createdAt: "2026-07-30T00:00:00.000Z",
+        updatedAt: "2026-07-30T00:00:00.000Z",
+      }),
+    };
 
     (scopedStore.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...FAKE_TASK_DETAIL,
@@ -2002,7 +2005,7 @@ describe("projectId store scoping regressions", () => {
     });
 
     const res = await REQUEST(
-      buildApp(),
+      buildApp({ aiSessionStore: aiSessionStore as any }),
       "POST",
       "/api/planning/create-task",
       JSON.stringify({ sessionId: "plan-session-1", projectId }),

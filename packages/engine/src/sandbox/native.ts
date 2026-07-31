@@ -116,7 +116,12 @@ export class NativeSandboxBackend implements SandboxBackend {
         resolve({
           stdout,
           stderr,
-          exitCode,
+          // Once the output cap is crossed this command did not complete as a
+          // valid success, even if a fast process exits with code 0 while the
+          // termination signal is racing it. Match timeout/spawn-failure
+          // semantics and prevent callers from treating truncated execution as
+          // a clean zero exit.
+          exitCode: bufferExceeded ? null : exitCode,
           signal,
           timedOut,
           bufferExceeded,

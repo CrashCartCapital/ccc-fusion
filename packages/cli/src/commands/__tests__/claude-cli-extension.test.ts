@@ -16,7 +16,9 @@ describe("resolveClaudeCliExtension", () => {
     expect(result.status).toBe("ok");
     if (result.status === "ok") {
       expect(result.path).toMatch(/pi-claude-cli[\/\\]index\.ts$/);
-      expect(result.packageVersion).toMatch(/^\d+\.\d+\.\d+$/);
+      expect(result.packageVersion).toMatch(
+        /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/,
+      );
     }
   });
 });

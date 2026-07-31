@@ -237,6 +237,10 @@ function createMockStore(): TaskStore {
       getMissionTask: vi.fn(),
       deleteMissionTask: vi.fn(),
     }),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
   };
 
   return store as unknown as TaskStore;

@@ -35,7 +35,13 @@ function makeArtifact(overrides: Partial<Artifact> = {}): Artifact {
 
 function makeApp(store: Partial<TaskStore>) {
   const app = express();
-  app.use("/api", createApiRoutes(store as TaskStore));
+  app.use("/api", createApiRoutes({
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
+    ...store,
+  } as TaskStore));
   return app;
 }
 

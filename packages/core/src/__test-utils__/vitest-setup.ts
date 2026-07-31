@@ -55,6 +55,51 @@ const {
 
 type EmitWarningArgs = Parameters<typeof process.emitWarning>;
 type EmitWarningRestArgs = EmitWarningArgs extends [string | Error, ...infer Rest] ? Rest : never;
+type ProcessExitCleanup = () => void;
+
+interface ProcessExitCleanupRegistry {
+  callbacks: Set<ProcessExitCleanup>;
+}
+
+const PROCESS_EXIT_CLEANUP_REGISTRY_KEY = Symbol.for(
+  "fusion.core.vitest-setup.process-exit-cleanups",
+);
+
+function registerProcessExitCleanup(cleanup: ProcessExitCleanup): void {
+  type RegistryOwner = (() => void) & {
+    [PROCESS_EXIT_CLEANUP_REGISTRY_KEY]?: ProcessExitCleanupRegistry;
+  };
+
+  /*
+   * Vitest isolates setup modules in separate VM contexts. Properties written
+   * onto a context's `process` wrapper are not visible to the next context,
+   * but every wrapper delegates EventEmitter listeners to the same real Node
+   * process. Tag the one shared exit listener itself so later contexts can
+   * discover and reuse its cleanup registry.
+   */
+  const registeredOwner = process.listeners("exit").find(
+    (listener) =>
+      Boolean((listener as RegistryOwner)[PROCESS_EXIT_CLEANUP_REGISTRY_KEY]),
+  ) as RegistryOwner | undefined;
+  let registry =
+    registeredOwner?.[PROCESS_EXIT_CLEANUP_REGISTRY_KEY];
+  if (!registry) {
+    registry = { callbacks: new Set() };
+    const owner = (() => {
+      for (const callback of registry?.callbacks ?? []) {
+        try {
+          callback();
+        } catch {
+          // Exit cleanup is best-effort. Global teardown owns final temp cleanup.
+        }
+      }
+      registry?.callbacks.clear();
+    }) as RegistryOwner;
+    owner[PROCESS_EXIT_CLEANUP_REGISTRY_KEY] = registry;
+    process.once("exit", owner);
+  }
+  registry.callbacks.add(cleanup);
+}
 
 function installWarningFilter(): void {
   const warningState = globalThis as typeof globalThis & { __fusionTestWarningFilterInstalled?: boolean };
@@ -358,7 +403,7 @@ function ensureTmpdirRedirectSink(): string {
 
   if (!tmpdirRedirectExitCleanupInstalled) {
     tmpdirRedirectExitCleanupInstalled = true;
-    process.once("exit", () => {
+    registerProcessExitCleanup(() => {
       try {
         rmSync(sink, { recursive: true, force: true });
       } catch {
@@ -1200,7 +1245,7 @@ export const __fusionWorkerRootCleanupTestHooks = {
   writeWorkerRootOwnerMarker,
 };
 
-process.on("exit", () => {
+registerProcessExitCleanup(() => {
   for (const [proc] of trackedSubprocesses) {
     try {
       proc.kill("SIGKILL");

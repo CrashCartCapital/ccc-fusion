@@ -14,6 +14,7 @@ function makeTask(overrides: Record<string, unknown> = {}) {
     column: "in-progress",
     dependencies: [],
     taskDoneRetryCount: 0,
+    enabledWorkflowSteps: [],
     steps: [{ name: "Step 1", status: "in-progress" as const }],
     currentStep: 0,
     log: [],

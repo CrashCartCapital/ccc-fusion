@@ -299,20 +299,25 @@ describe("useTasks", () => {
     expect(writePayload).toHaveLength(500);
   });
 
-  it("normalizes invalid column values from initial fetch to triage", async () => {
-    const malformedTask = {
+  it("preserves custom column ids from initial fetch and falls back for empty ids", async () => {
+    const customColumnTask = {
       ...createMockTask({ id: "FN-099" }),
-      column: "unknown-column",
+      column: "custom-review",
     } as unknown as Task;
-    mockFetchTasks.mockResolvedValueOnce([malformedTask]);
+    const emptyColumnTask = {
+      ...createMockTask({ id: "FN-100" }),
+      column: "",
+    } as unknown as Task;
+    mockFetchTasks.mockResolvedValueOnce([customColumnTask, emptyColumnTask]);
 
     const { result } = renderHook(() => useTasks());
 
     await waitFor(() => {
-      expect(result.current.tasks).toHaveLength(1);
+      expect(result.current.tasks).toHaveLength(2);
     });
 
-    expect(result.current.tasks[0].column).toBe("triage");
+    expect(result.current.tasks.find((task) => task.id === "FN-099")?.column).toBe("custom-review");
+    expect(result.current.tasks.find((task) => task.id === "FN-100")?.column).toBe("triage");
   });
 
   it("exposes refreshTasks and performs exactly one additional fetch when called", async () => {
@@ -775,7 +780,7 @@ describe("useTasks", () => {
       expect(result.current.tasks[0].id).toBe("FN-002");
     });
 
-    it("normalizes invalid column values from SSE created events", async () => {
+    it("preserves custom column ids from SSE events and falls back for empty ids", async () => {
       mockFetchTasks.mockResolvedValueOnce([]);
       const { result } = renderHook(() => useTasks());
 
@@ -783,17 +788,23 @@ describe("useTasks", () => {
         expect(MockEventSource.instances).toHaveLength(1);
       });
 
-      const malformedTask = {
+      const customColumnTask = {
         ...createMockTask({ id: "FN-003" }),
-        column: "bad-column",
+        column: "custom-review",
+      } as unknown as Task;
+      const emptyColumnTask = {
+        ...createMockTask({ id: "FN-004" }),
+        column: "",
       } as unknown as Task;
 
       act(() => {
-        MockEventSource.instances[0]._emit("task:created", malformedTask);
+        MockEventSource.instances[0]._emit("task:created", customColumnTask);
+        MockEventSource.instances[0]._emit("task:created", emptyColumnTask);
       });
 
-      expect(result.current.tasks).toHaveLength(1);
-      expect(result.current.tasks[0].column).toBe("triage");
+      expect(result.current.tasks).toHaveLength(2);
+      expect(result.current.tasks.find((task) => task.id === "FN-003")?.column).toBe("custom-review");
+      expect(result.current.tasks.find((task) => task.id === "FN-004")?.column).toBe("triage");
     });
   });
 

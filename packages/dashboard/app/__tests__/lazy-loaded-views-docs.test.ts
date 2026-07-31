@@ -1,7 +1,7 @@
 /*
 FNXC:CommandCenter 2026-06-16-09:40:
 The Command Center view (PR #1683) is an App-level lazy-loaded view added to the curated inventory. This
-test enforces that the inventory in AGENTS.md stays in sync with App.tsx (and AppModals.tsx).
+test enforces that the inventory in docs/dashboard-guide.md stays in sync with App.tsx (and AppModals.tsx).
 
 FNXC:CommandCenter 2026-06-17-09:00:
 Merging main reconciled the curated count to 23 (main's 22 lazy views/modals + Command Center).
@@ -22,7 +22,7 @@ FNXC:DashboardLazyViews 2026-06-26-00:00:
 Curated chunks declared outside App.tsx/AppModals.tsx (Plugins settings section, AgentsView) must be scanned at their real call sites so the inventory cannot drift while this guard stays green.
 
 FNXC:DashboardLazyViews 2026-06-26-00:00:
-Session terminals, onboarding internals, and overflow re-imports of already-counted chunks are explicit exclusions because they are not new heavy top-level views or modals for the AGENTS inventory.
+Session terminals, onboarding internals, and overflow re-imports of already-counted chunks are explicit exclusions because they are not new heavy top-level views or modals for the documented inventory.
 */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -118,7 +118,7 @@ const EXPECTED_EXCLUDED_LAZY = [
     file: "../components/overflowViewRegistry.tsx",
     /*
      * FNXC:DashboardLazyViews 2026-06-27-00:00:
-     * The right-dock chat tab re-imports ChatView through the overflow registry, but ChatView remains counted once as the App-level Chat chunk in the curated AGENTS inventory.
+     * The right-dock chat tab re-imports ChatView through the overflow registry, but ChatView remains counted once as the App-level Chat chunk in the curated dashboard-guide inventory.
      */
     symbols: ["DevServerView", "SecretsView", "TodoView", "PullRequestView", "ChatView"],
     reason: "right-dock overflow re-imports of App-level chunks already counted once",
@@ -133,10 +133,10 @@ const EXPECTED_CURATED_LAZY_SOURCES = [
   { file: "../components/AgentsView.tsx", symbols: EXPECTED_AGENTS_VIEW_LAZY_VIEWS },
 ] as const;
 
-function extractLazyLoadedSection(agentsDoc: string): string {
-  const match = agentsDoc.match(/### Lazy-Loaded Heavy Views[\s\S]*?(?=\n### |\n---|$)/);
+function extractLazyLoadedSection(dashboardGuide: string): string {
+  const match = dashboardGuide.match(/### Lazy-Loaded Heavy Views[\s\S]*?(?=\n### |\n---|$)/);
   if (!match) {
-    throw new Error("Lazy-Loaded Heavy Views section not found in AGENTS.md");
+    throw new Error("Lazy-Loaded Heavy Views section not found in docs/dashboard-guide.md");
   }
   return match[0];
 }
@@ -170,15 +170,15 @@ function expectDocumentedViews(include: Iterable<string>, section: string): void
   }
 }
 
-describe("AGENTS lazy-loaded views inventory", () => {
+describe("dashboard guide lazy-loaded views inventory", () => {
   it("documents the App-level and AppModals lazy views accurately and keeps the curated 20-view list in sync", () => {
-    const agentsDoc = readFileSync(resolve(__dirname, "../../../../AGENTS.md"), "utf-8");
+    const dashboardGuide = readFileSync(resolve(__dirname, "../../../../docs/dashboard-guide.md"), "utf-8");
     const appSource = readFileSync(resolve(__dirname, "../App.tsx"), "utf-8");
     const appModalsSource = readFileSync(resolve(__dirname, "../components/AppModals.tsx"), "utf-8");
     const pluginsSectionSource = readFileSync(resolve(__dirname, "../components/settings/sections/PluginsSection.tsx"), "utf-8");
     const agentsViewSource = readFileSync(resolve(__dirname, "../components/AgentsView.tsx"), "utf-8");
 
-    const section = extractLazyLoadedSection(agentsDoc);
+    const section = extractLazyLoadedSection(dashboardGuide);
     const countMatch = section.match(/These\s+(\d+)\s+views\s+are lazy-loaded/);
     expect(countMatch).toBeTruthy();
     expect(Number(countMatch?.[1])).toBe(20);
@@ -206,7 +206,7 @@ describe("AGENTS lazy-loaded views inventory", () => {
 
     /*
      * FNXC:DashboardLazyViews 2026-06-26-00:00:
-     * Plugin manager chunks and the agent detail chunk are curated AGENTS entries, but their lazy declarations live in feature-owned source files rather than App.tsx/AppModals.tsx. Scan those real call sites so removing or renaming one of these declarations fails this inventory guard.
+     * Plugin manager chunks and the agent detail chunk are curated dashboard-guide entries, but their lazy declarations live in feature-owned source files rather than App.tsx/AppModals.tsx. Scan those real call sites so removing or renaming one of these declarations fails this inventory guard.
      */
     const pluginsSectionLazyViews = new Set(extractConstLazyViews(pluginsSectionSource));
     expect(pluginsSectionLazyViews).toEqual(EXPECTED_PLUGINS_SECTION_LAZY_VIEWS);

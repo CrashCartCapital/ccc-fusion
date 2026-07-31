@@ -206,6 +206,10 @@ function createMockStore(
     logEntry: vi.fn().mockResolvedValue(undefined),
     on: vi.fn(),
     off: vi.fn(),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
   } as unknown as TaskStore;
 }
 

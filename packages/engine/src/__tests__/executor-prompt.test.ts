@@ -771,6 +771,9 @@ describe("TaskExecutor pause behavior", () => {
       return {
         session: {
           prompt: vi.fn().mockImplementation(async () => {
+            store._setRow("FN-001", {
+              steps: [{ name: "Step 0", status: "in-progress" }],
+            });
             // Simulate pause happening during agent execution
             store._trigger("task:updated", { id: "FN-001", paused: true, column: "in-progress" });
             // Simulate the dispose causing an error (session terminated)
@@ -2277,6 +2280,9 @@ describe("TaskExecutor global pause behavior", () => {
     mockedCreateFnAgent.mockImplementation(async () => ({
       session: {
         prompt: vi.fn().mockImplementation(async () => {
+          store._setRow("FN-001", {
+            steps: [{ name: "Step 0", status: "in-progress" }],
+          });
           store._trigger("settings:updated", {
             settings: { globalPause: true },
             previous: { globalPause: false },
@@ -2362,14 +2368,15 @@ describe("TaskExecutor global pause behavior", () => {
     const store = createMockStore();
     let capturedCustomTools: any[] = [];
     let taskDoneResult: any;
+    let globalPause = false;
 
     const todoTask = {
       id: "FN-001",
       title: "Test",
       description: "T",
       prompt: "# test\n## Steps\n### Step 0: Preflight\n- [ ] check",
-      column: "todo",
-      paused: true,
+      column: "in-progress",
+      paused: false,
       dependencies: [],
       steps: [{ name: "Step 1", status: "pending" }],
       currentStep: 0,
@@ -2379,14 +2386,14 @@ describe("TaskExecutor global pause behavior", () => {
     };
 
     store.getTask.mockResolvedValue(todoTask);
-    store.getSettings.mockResolvedValue({
+    store.getSettings.mockImplementation(async () => ({
       maxConcurrent: 2,
       maxWorktrees: 4,
       pollIntervalMs: 15000,
       autoMerge: false,
-      globalPause: true,
+      globalPause,
       enginePaused: false,
-    });
+    }));
     store.moveTask.mockImplementation(async (_id: string, to: string) => ({ ...todoTask, column: to, paused: undefined }));
 
     mockedCreateFnAgent.mockImplementation((async (opts: any) => {
@@ -2396,6 +2403,8 @@ describe("TaskExecutor global pause behavior", () => {
           prompt: vi.fn().mockImplementation(async () => {
             const taskDoneTool = capturedCustomTools.find((tool: any) => tool.name === "fn_task_done");
             if (taskDoneTool) {
+              globalPause = true;
+              store._setRow("FN-001", { column: "todo", paused: true });
               taskDoneResult = await taskDoneTool.execute("call-1", { summary: "done" });
             }
           }),
@@ -2445,8 +2454,8 @@ describe("TaskExecutor global pause behavior", () => {
         title: "Paused todo task",
         description: "T",
         prompt: "# test\n## Steps\n### Step 0: Preflight\n- [ ] check",
-        column: "todo",
-        paused: true,
+        column: "in-progress",
+        paused: false,
         pausedByAgentId: "agent-123",
         dependencies: [],
         steps: [{ name: "Step 1", status: "pending" }],
@@ -2474,6 +2483,11 @@ describe("TaskExecutor global pause behavior", () => {
             prompt: vi.fn().mockImplementation(async () => {
               const taskDoneTool = capturedCustomTools.find((tool: any) => tool.name === "fn_task_done");
               if (taskDoneTool) {
+                store._setRow("FN-001", {
+                  column: "todo",
+                  paused: true,
+                  pausedByAgentId: "agent-123",
+                });
                 taskDoneResult = await taskDoneTool.execute("call-1", { summary: "done" });
               }
             }),
@@ -2602,8 +2616,8 @@ describe("TaskExecutor global pause behavior", () => {
         title: "Paused todo task",
         description: "T",
         prompt: "# test\n## Steps\n### Step 0: Preflight\n- [ ] check",
-        column: "todo",
-        paused: true,
+        column: "in-progress",
+        paused: false,
         pausedByAgentId: "agent-123",
         dependencies: [],
         steps: [{ name: "Step 1", status: "pending" }],
@@ -2631,6 +2645,11 @@ describe("TaskExecutor global pause behavior", () => {
             prompt: vi.fn().mockImplementation(async () => {
               const taskDoneTool = capturedCustomTools.find((tool: any) => tool.name === "fn_task_done");
               if (taskDoneTool) {
+                store._setRow("FN-001", {
+                  column: "todo",
+                  paused: true,
+                  pausedByAgentId: "agent-123",
+                });
                 await taskDoneTool.execute("call-1", { summary: "done" });
               }
             }),

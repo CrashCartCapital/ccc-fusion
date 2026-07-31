@@ -296,6 +296,13 @@ export function createInsightsRouter(store: TaskStore, options?: ServerOptions):
     try {
       const resolved = (store as { getInsightStore: () => unknown }).getInsightStore();
       rootInsightStore = resolved as RouteInsightStore;
+      if (
+        typeof (rootInsightStore as { listStalePendingRuns?: unknown }).listStalePendingRuns !== "function"
+        || typeof (rootInsightStore as { updateRun?: unknown }).updateRun !== "function"
+        || typeof (rootInsightStore as { appendRunEvent?: unknown }).appendRunEvent !== "function"
+      ) {
+        rootInsightStore = undefined;
+      }
     } catch {
       rootInsightStore = undefined;
     }

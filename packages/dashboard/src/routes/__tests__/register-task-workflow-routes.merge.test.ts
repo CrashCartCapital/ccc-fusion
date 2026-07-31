@@ -10,6 +10,10 @@ describe("task workflow merge route", () => {
   it("invokes engine.onMerge for manual merge requests", async () => {
     const store: TaskStore = {
       getRootDir: vi.fn(() => process.cwd()),
+      getPluginStore: vi.fn(() => ({
+        init: vi.fn().mockResolvedValue(undefined),
+        listPlugins: vi.fn().mockResolvedValue([]),
+      })),
       mergeTask: vi.fn(),
     } as unknown as TaskStore;
 

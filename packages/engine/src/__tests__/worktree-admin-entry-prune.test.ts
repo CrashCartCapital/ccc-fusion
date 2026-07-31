@@ -7,10 +7,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 afterEach(() => {
   vi.restoreAllMocks();
   vi.resetModules();
-  vi.unmock("node:child_process");
-  vi.unmock("node:fs");
-  vi.unmock("../worktree-hooks.js");
-  vi.unmock("../worktree-prune.js");
+  vi.doUnmock("node:child_process");
+  vi.doUnmock("node:fs");
+  vi.doUnmock("../worktree-hooks.js");
+  vi.doUnmock("../worktree-prune.js");
 });
 
 describe("worktree prune wiring", () => {
@@ -125,14 +125,14 @@ describe("pruneWorktreeAdminEntries helper", () => {
       return { ...actual, exec: execMock, execFile: vi.fn() };
     });
 
-    vi.unmock("../worktree-prune.js");
+    vi.doUnmock("../worktree-prune.js");
     const { pruneWorktreeAdminEntries } = await import("../worktree-prune.js");
     const audit = vi.fn().mockResolvedValue(undefined);
     await pruneWorktreeAdminEntries({ rootDir: "/repo", auditor: { git: audit }, reason: "test-failure", target: "/repo/.worktrees/x" });
   });
 
   it("runs git worktree prune end-to-end in a real repository", async () => {
-    vi.unmock("../worktree-prune.js");
+    vi.doUnmock("../worktree-prune.js");
     const { pruneWorktreeAdminEntries } = await import("../worktree-prune.js");
     const root = mkdtempSync(join(tmpdir(), "fn-5058-prune-"));
     const repo = join(root, "repo");

@@ -14,6 +14,10 @@ vi.mock("../pi.js", () => ({
   compactSessionContext: vi.fn(),
 }));
 
+vi.mock("../session-skill-context.js", () => ({
+  buildSessionSkillContext: vi.fn(),
+}));
+
 // Route async `exec` through the `execSync` mock so existing tests that set up
 // mockedExecSync.mockImplementation for verification commands (vitest run,
 // pnpm build, etc.) keep working unchanged. `promisify(exec)` in merger.ts
@@ -269,10 +273,6 @@ const setupFailingTheirsStrategy = setupFailingFallbackStrategy;
 
 describe("aiMergeTask — skill selection resolver contract (FN-1510/FN-1511)", () => {
   // FNXC:SessionSkillContext 2026-07-13: buildSessionSkillContext mockResolvedValue objects MUST include additionalSkillPaths: [] — production code (merger.ts:1991/3187/3607/12094) reads skillContext.additionalSkillPaths.length unconditionally when skillContext is truthy; omitting the field crashes with TypeError before createFnAgent is reached.
-  vi.mock("../session-skill-context.js", () => ({
-    buildSessionSkillContext: vi.fn(),
-  }));
-
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -550,10 +550,6 @@ describe("aiMergeTask — skill selection resolver contract (FN-1510/FN-1511)", 
 
 describe("aiMergeTask — skill selection non-fatal diagnostics (FN-1510/FN-1511)", () => {
   // FNXC:SessionSkillContext 2026-07-13: buildSessionSkillContext mockResolvedValue objects MUST include additionalSkillPaths: [] — same contract as the resolver-contract block above; production code reads skillContext.additionalSkillPaths.length unconditionally.
-  vi.mock("../session-skill-context.js", () => ({
-    buildSessionSkillContext: vi.fn(),
-  }));
-
   beforeEach(() => {
     vi.clearAllMocks();
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -648,5 +644,4 @@ describe("aiMergeTask — skill selection non-fatal diagnostics (FN-1510/FN-1511
     expect(opts.skillSelection?.requestedSkillNames).toEqual(["custom-skill"]);
   });
 });
-
 

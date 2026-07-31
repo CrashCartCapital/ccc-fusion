@@ -43,6 +43,7 @@ describe("ProjectEngine.stopOverseerTask session advisor cleanup", () => {
       sessionAdvisorLogCursor: cursor,
       plannerObservationEmitDedup: new Map(),
       plannerEscalationEmitDedup: new Set(),
+      plannerLiveRetrySkipLogDedup: new Set(),
     });
 
     const result = await engine.stopOverseerTask(task.id);

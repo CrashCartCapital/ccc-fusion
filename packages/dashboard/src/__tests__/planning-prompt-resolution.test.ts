@@ -37,4 +37,12 @@ describe("resolvePlanningModeSystemPrompt", () => {
     const fallback = await resolvePlanningModeSystemPrompt({ getSettings: vi.fn().mockRejectedValue(new Error("broken")), getWorkflowDefinition: vi.fn().mockRejectedValue(new Error("broken")) } as unknown as TaskStore);
     expect(fallback).toContain("task specification agent");
   });
+
+  it("fails soft when a partial store omits getSettings", async () => {
+    const fallback = await resolvePlanningModeSystemPrompt({
+      getWorkflowDefinition: vi.fn().mockResolvedValue(undefined),
+    } as unknown as TaskStore);
+
+    expect(fallback).toContain("task specification agent");
+  });
 });

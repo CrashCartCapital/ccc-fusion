@@ -106,6 +106,7 @@ const TASK_DETAIL_ACTIVITY_LOG_LIMIT = 500;
  * intentionally remain exported from this file for existing tests/importers.
  */
 export { __resetBatchImportRateLimiter } from "./routes/register-git-github.js";
+export { resolveManualAiPromptMcpServers } from "./routes/automation-step-execution.js";
 
 /**
  * Minimal interface matching pi 0.80.8+ ModelRuntime's ModelRegistry

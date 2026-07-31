@@ -623,6 +623,63 @@ export interface CliSessionManagerOptions {
   cancellationTimeoutMs?: number;
 }
 
+type CliSessionProcessExitCleanup = () => void;
+
+interface CliSessionProcessExitRegistry {
+  callbacks: Set<CliSessionProcessExitCleanup>;
+}
+
+const CLI_SESSION_PROCESS_EXIT_REGISTRY_KEY = Symbol.for(
+  "fusion.engine.cli-session-manager.process-exit-cleanups",
+);
+
+function registerCliSessionProcessExitCleanup(
+  cleanup: CliSessionProcessExitCleanup,
+): () => void {
+  type RegistryOwner = (() => void) & {
+    [CLI_SESSION_PROCESS_EXIT_REGISTRY_KEY]?: CliSessionProcessExitRegistry;
+  };
+
+  let owner = process.listeners("exit").find(
+    (listener) =>
+      Boolean(
+        (listener as RegistryOwner)[CLI_SESSION_PROCESS_EXIT_REGISTRY_KEY],
+      ),
+  ) as RegistryOwner | undefined;
+  let registry = owner?.[CLI_SESSION_PROCESS_EXIT_REGISTRY_KEY];
+
+  if (!owner || !registry) {
+    registry = { callbacks: new Set() };
+    const createdRegistry = registry;
+    owner = (() => {
+      for (const callback of createdRegistry.callbacks) {
+        try {
+          callback();
+        } catch {
+          // Process-exit cleanup is best-effort; one manager must not block the rest.
+        }
+      }
+      createdRegistry.callbacks.clear();
+    }) as RegistryOwner;
+    owner[CLI_SESSION_PROCESS_EXIT_REGISTRY_KEY] = registry;
+    process.on("exit", owner);
+  }
+
+  const sharedOwner = owner;
+  const sharedRegistry = registry;
+  sharedRegistry.callbacks.add(cleanup);
+  let registered = true;
+
+  return () => {
+    if (!registered) return;
+    registered = false;
+    sharedRegistry.callbacks.delete(cleanup);
+    if (sharedRegistry.callbacks.size === 0) {
+      process.off("exit", sharedOwner);
+    }
+  };
+}
+
 // ── CliSessionManager ────────────────────────────────────────────────────────
 
 export class CliSessionManager {
@@ -640,7 +697,7 @@ export class CliSessionManager {
 
   /** Bound exit handler so it can be removed on dispose. */
   private readonly onProcessExit = () => { void this.killAll(); };
-  private exitHookInstalled = false;
+  private removeProcessExitHook: (() => void) | undefined;
 
   constructor(options: CliSessionManagerOptions) {
     this.registry = options.registry;
@@ -1708,17 +1765,16 @@ export class CliSessionManager {
 
   /** Remove the process-exit hook and tear down all sessions. */
   async dispose(): Promise<void> {
-    if (this.exitHookInstalled) {
-      process.off("exit", this.onProcessExit);
-      this.exitHookInstalled = false;
-    }
+    this.removeProcessExitHook?.();
+    this.removeProcessExitHook = undefined;
     await this.killAll();
   }
 
   private installExitHook(): void {
-    if (this.exitHookInstalled) return;
-    process.on("exit", this.onProcessExit);
-    this.exitHookInstalled = true;
+    if (this.removeProcessExitHook) return;
+    this.removeProcessExitHook = registerCliSessionProcessExitCleanup(
+      this.onProcessExit,
+    );
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────

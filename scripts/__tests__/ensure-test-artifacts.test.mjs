@@ -14,6 +14,7 @@ import {
 } from "../ensure-test-artifacts.mjs";
 
 const ENGINE_ENTRY = REQUIRED_BUILD_PACKAGES.find((pkg) => pkg.name === "@fusion/engine");
+const CLI_ENTRY = REQUIRED_BUILD_PACKAGES.find((pkg) => pkg.name === "@runfusion/fusion");
 
 /**
  * A git stub that returns a fixed blob sha for engine src, and reports it as a
@@ -89,6 +90,20 @@ test("detectMissingArtifacts flags @fusion/dashboard when dist/index.js is missi
   const names = missing.map((pkg) => pkg.name);
 
   assert.ok(names.includes("@fusion/dashboard"));
+});
+
+test("registry includes CLI artifacts required by clean-checkout tests", () => {
+  assert.ok(CLI_ENTRY, "@runfusion/fusion must be bootstrapped before workspace tests");
+  assert.deepEqual(CLI_ENTRY.requiredArtifacts, [
+    "packages/cli/dist/bin.js",
+    "packages/cli/dist/extension.js",
+    "packages/cli/dist/ccc-campaign-proof-admission.js",
+    "packages/cli/dist/plugins/fusion-native-proof-admission/manifest.json",
+  ]);
+  assert.deepEqual(packageSourceInputs(CLI_ENTRY), [
+    "packages/cli/src",
+    "packages/engine/src",
+  ]);
 });
 
 test("ensureTestArtifacts rebuilds @fusion/dashboard when its dist is missing", () => {
