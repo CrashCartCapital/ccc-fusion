@@ -4,6 +4,10 @@ This is an optional authoring contract for future PRDs. Existing Markdown PRDs d
 
 Run `fn prd template` to print the recommended Markdown shape. Run `fn prd lint <prd-path>` to report missing facts. Lint is read-only.
 
+## Project boundary
+
+Discovery selects the current PRD inside each top-level project directory under the configured active-projects root. Markdown files placed directly at that root are portfolio trackers, process guidance, or shared context; they are not implementation packets because they do not provide a project-local repository and support-document boundary. Fusion ignores them during discovery and refuses an explicit freeze with an actionable message. Move or copy a genuine implementation PRD into its project directory only through the normal reviewed vault workflow; Fusion never moves or rewrites the source.
+
 ## Facts Fusion must not guess
 
 A PRD is not ready for implementation intake until it identifies:

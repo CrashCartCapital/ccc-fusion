@@ -110,6 +110,42 @@ function expectIntakeError(run: () => unknown, code: string): void {
 }
 
 describe("CCC PRD discovery", () => {
+  it("treats root-level portfolio notes as context rather than project PRDs", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const rootLevelNote = write(
+      activeProjectsRoot,
+      "REF-HUM-End-to-End-PRD-Engineering-Process.md",
+      "# Portfolio process guidance",
+    );
+    write(
+      activeProjectsRoot,
+      "alpha/PRJ-AI-alpha-PRD-v1.0.0.md",
+      "# Alpha implementation PRD",
+    );
+
+    const discovery = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+
+    expect(discovery.projects.map((project) => project.project)).toEqual(["alpha"]);
+
+    const outputDir = join(root, "out", "root-level-note");
+    try {
+      ccc.freezeCccPrdPacket({
+        activeProjectsRoot,
+        selectedPrdPath: rootLevelNote,
+        outputDir,
+      });
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: "CCC_PRD_INTAKE_PROJECT_INVALID",
+        message: "root-level portfolio and process notes are context, not project PRDs; select a Markdown PRD inside one top-level active-project directory",
+      });
+      expect(existsSync(outputDir)).toBe(false);
+      return;
+    }
+    throw new Error("expected root-level portfolio note refusal");
+  });
+
   it("scores current PRDs per project and reports an exact tie as ambiguous", () => {
     const root = fixtureRoot();
     const activeProjectsRoot = write(root, "active/.keep", "").slice(0, -"/.keep".length);

@@ -1009,7 +1009,7 @@ export function freezeCccPrdPacket(input: {
   if (segments.length < 2) {
     return refuse(
       "CCC_PRD_INTAKE_PROJECT_INVALID",
-      "selected PRD must be inside one top-level active project",
+      "root-level portfolio and process notes are context, not project PRDs; select a Markdown PRD inside one top-level active-project directory",
     );
   }
   const project = segments[0]!;
