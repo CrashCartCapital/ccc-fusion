@@ -1221,6 +1221,25 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       },
     });
     await entered;
+    let announceRowLockEntered!: () => void;
+    let releaseRowLock!: () => void;
+    const rowLockEntered = new Promise<void>((resolveEntered) => {
+      announceRowLockEntered = resolveEntered;
+    });
+    const holdRowLock = new Promise<void>((resolveLock) => {
+      releaseRowLock = resolveLock;
+    });
+    const rowLock = h.layer().transactionImmediate(async (tx) => {
+      await tx.execute(sql`
+        SELECT idempotency_key
+        FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+        FOR UPDATE
+      `);
+      announceRowLockEntered();
+      await holdRowLock;
+    });
+    await rowLockEntered;
     const secondOutcome = importCccPrdBundle({
       ...request(suffix, key),
       bundle: boundedBundle,
@@ -1244,8 +1263,10 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     } catch (error) {
       assertionError = error;
     } finally {
+      releaseRowLock();
       releaseProjection();
     }
+    await rowLock;
     await first;
     await secondOutcome;
     if (assertionError) throw assertionError;

@@ -1241,72 +1241,64 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
       .resolves.toEqual([{ project_id: "registered-project", parent_id: "registered-project", payload: "fallback-child" }]);
   });
 
-  it("retains unreplaced registered dependents for every delete action", async () => {
-    for (const [name, deleteAction, childDefinition] of [
-      ["restrict", "RESTRICT", "parent_id text NOT NULL"],
-      ["cascade", "CASCADE", "parent_id text NOT NULL"],
-      ["set_null", "SET NULL", "parent_id text"],
-      ["set_default", "SET DEFAULT", "parent_id text NOT NULL DEFAULT 'registered-project'"],
-    ] as const) {
-      ctx = await setupFreshDb();
-      await applySchemaBaseline(ctx.db);
-      await ctx.db.execute(sql.raw(`
-        CREATE TABLE project.fn8419_delete_${name}_parent (project_id text PRIMARY KEY, payload text NOT NULL);
-        CREATE TABLE project.fn8419_delete_${name}_child (
-          project_id text PRIMARY KEY,
-          ${childDefinition} REFERENCES project.fn8419_delete_${name}_parent(project_id)
-            ON DELETE ${deleteAction} ON UPDATE CASCADE,
-          payload text NOT NULL
-        );
-        INSERT INTO project.fn8419_delete_${name}_parent VALUES
-          ('local-fallback', 'fallback'), ('registered-project', 'scaffold');
-        INSERT INTO project.fn8419_delete_${name}_child(project_id, parent_id, payload)
-          VALUES ('registered-project', 'registered-project', 'must-survive');
-      `));
+  it.each([
+    ["restrict", "RESTRICT", "parent_id text NOT NULL"],
+    ["cascade", "CASCADE", "parent_id text NOT NULL"],
+    ["set_null", "SET NULL", "parent_id text"],
+    ["set_default", "SET DEFAULT", "parent_id text NOT NULL DEFAULT 'registered-project'"],
+  ] as const)("retains an unreplaced registered dependent for ON DELETE %s", async (name, deleteAction, childDefinition) => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db);
+    await ctx.db.execute(sql.raw(`
+      CREATE TABLE project.fn8419_delete_${name}_parent (project_id text PRIMARY KEY, payload text NOT NULL);
+      CREATE TABLE project.fn8419_delete_${name}_child (
+        project_id text PRIMARY KEY,
+        ${childDefinition} REFERENCES project.fn8419_delete_${name}_parent(project_id)
+          ON DELETE ${deleteAction} ON UPDATE CASCADE,
+        payload text NOT NULL
+      );
+      INSERT INTO project.fn8419_delete_${name}_parent VALUES
+        ('local-fallback', 'fallback'), ('registered-project', 'scaffold');
+      INSERT INTO project.fn8419_delete_${name}_child(project_id, parent_id, payload)
+        VALUES ('registered-project', 'registered-project', 'must-survive');
+    `));
 
-      await expect(rekeyFallbackProjectPartition(ctx.db, "local-fallback", "registered-project"))
-        .rejects.toMatchObject({ name: "ProjectPartitionRekeyError", reason: "unreplaced-fk-dependent" } satisfies Partial<ProjectPartitionRekeyError>);
-      await expect(ctx.db.execute(sql.raw(`SELECT project_id, parent_id, payload FROM project.fn8419_delete_${name}_child`)))
-        .resolves.toEqual([{ project_id: "registered-project", parent_id: "registered-project", payload: "must-survive" }]);
-      await expect(ctx.db.execute(sql.raw(`SELECT project_id FROM project.fn8419_delete_${name}_parent ORDER BY project_id`)))
-        .resolves.toEqual([{ project_id: "local-fallback" }, { project_id: "registered-project" }]);
-      await teardownDb(ctx);
-      ctx = null;
-    }
+    await expect(rekeyFallbackProjectPartition(ctx.db, "local-fallback", "registered-project"))
+      .rejects.toMatchObject({ name: "ProjectPartitionRekeyError", reason: "unreplaced-fk-dependent" } satisfies Partial<ProjectPartitionRekeyError>);
+    await expect(ctx.db.execute(sql.raw(`SELECT project_id, parent_id, payload FROM project.fn8419_delete_${name}_child`)))
+      .resolves.toEqual([{ project_id: "registered-project", parent_id: "registered-project", payload: "must-survive" }]);
+    await expect(ctx.db.execute(sql.raw(`SELECT project_id FROM project.fn8419_delete_${name}_parent ORDER BY project_id`)))
+      .resolves.toEqual([{ project_id: "local-fallback" }, { project_id: "registered-project" }]);
   });
 
-  it("rejects unsafe fallback update FK graphs but permits deferred and cascade controls", async () => {
-    for (const [name, updateClause, expected] of [
-      ["unsafe", "ON UPDATE NO ACTION", "unsafe-fk-update-graph"],
-      ["deferred", "ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED", undefined],
-      ["cascade", "ON UPDATE CASCADE", undefined],
-    ] as const) {
-      ctx = await setupFreshDb();
-      await applySchemaBaseline(ctx.db);
-      await ctx.db.execute(sql.raw(`
-        CREATE TABLE project.fn8419_update_${name}_parent (
-          project_id text NOT NULL, id text NOT NULL, PRIMARY KEY(project_id, id)
-        );
-        CREATE TABLE project.fn8419_update_${name}_child (
-          project_id text NOT NULL, parent_id text NOT NULL,
-          PRIMARY KEY(project_id, parent_id),
-          FOREIGN KEY(project_id, parent_id) REFERENCES project.fn8419_update_${name}_parent(project_id, id) ${updateClause}
-        );
-        INSERT INTO project.fn8419_update_${name}_parent VALUES ('local-fallback', 'parent');
-        INSERT INTO project.fn8419_update_${name}_child VALUES ('local-fallback', 'parent');
-      `));
-      const rekey = rekeyFallbackProjectPartition(ctx.db, "local-fallback", "registered-project");
-      if (expected) {
-        await expect(rekey).rejects.toMatchObject({ name: "ProjectPartitionRekeyError", reason: expected } satisfies Partial<ProjectPartitionRekeyError>);
-        await expect(ctx.db.execute(sql.raw(`SELECT project_id FROM project.fn8419_update_${name}_child`)))
-          .resolves.toEqual([{ project_id: "local-fallback" }]);
-      } else {
-        await expect(rekey).resolves.toBe(true);
-        await expect(ctx.db.execute(sql.raw(`SELECT project_id FROM project.fn8419_update_${name}_child`)))
-          .resolves.toEqual([{ project_id: "registered-project" }]);
-      }
-      await teardownDb(ctx);
-      ctx = null;
+  it.each([
+    ["unsafe", "ON UPDATE NO ACTION", "unsafe-fk-update-graph"],
+    ["deferred", "ON UPDATE NO ACTION DEFERRABLE INITIALLY DEFERRED", undefined],
+    ["cascade", "ON UPDATE CASCADE", undefined],
+  ] as const)("handles the %s fallback update FK graph", async (name, updateClause, expected) => {
+    ctx = await setupFreshDb();
+    await applySchemaBaseline(ctx.db);
+    await ctx.db.execute(sql.raw(`
+      CREATE TABLE project.fn8419_update_${name}_parent (
+        project_id text NOT NULL, id text NOT NULL, PRIMARY KEY(project_id, id)
+      );
+      CREATE TABLE project.fn8419_update_${name}_child (
+        project_id text NOT NULL, parent_id text NOT NULL,
+        PRIMARY KEY(project_id, parent_id),
+        FOREIGN KEY(project_id, parent_id) REFERENCES project.fn8419_update_${name}_parent(project_id, id) ${updateClause}
+      );
+      INSERT INTO project.fn8419_update_${name}_parent VALUES ('local-fallback', 'parent');
+      INSERT INTO project.fn8419_update_${name}_child VALUES ('local-fallback', 'parent');
+    `));
+    const rekey = rekeyFallbackProjectPartition(ctx.db, "local-fallback", "registered-project");
+    if (expected) {
+      await expect(rekey).rejects.toMatchObject({ name: "ProjectPartitionRekeyError", reason: expected } satisfies Partial<ProjectPartitionRekeyError>);
+      await expect(ctx.db.execute(sql.raw(`SELECT project_id FROM project.fn8419_update_${name}_child`)))
+        .resolves.toEqual([{ project_id: "local-fallback" }]);
+    } else {
+      await expect(rekey).resolves.toBe(true);
+      await expect(ctx.db.execute(sql.raw(`SELECT project_id FROM project.fn8419_update_${name}_child`)))
+        .resolves.toEqual([{ project_id: "registered-project" }]);
     }
   });
 

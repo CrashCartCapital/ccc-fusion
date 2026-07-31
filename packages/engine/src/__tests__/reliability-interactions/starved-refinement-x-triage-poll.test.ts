@@ -26,7 +26,7 @@ function triageTask(overrides: Partial<Task> & Pick<Task, "id">): Task {
 }
 
 describe("reliability interaction: starved refinement x triage poll", () => {
-  it("escalation surfaces a previously-starved refinement to poll within bounded ticks", async () => {
+  it("keeps oldest-first admission while a recovered refinement drains behind older work", async () => {
     const root = await mkdtemp(join(tmpdir(), "fusion-fn4662-poll-"));
     await mkdir(join(root, ".fusion", "tasks"), { recursive: true });
 
@@ -65,14 +65,22 @@ describe("reliability interaction: starved refinement x triage poll", () => {
       });
 
       (triage as any).running = true;
-      for (let i = 0; i < 2; i++) {
+      for (let i = 0; i < 7; i++) {
         await (triage as any).poll();
       }
 
-      expect(specifySpy.mock.calls.some(([t]) => t.id === "FN-R1")).toBe(true);
+      expect(specifySpy.mock.calls.map(([task]) => task.id)).toEqual([
+        "FN-B1",
+        "FN-B2",
+        "FN-B3",
+        "FN-B4",
+        "FN-B5",
+        "FN-B6",
+        "FN-R1",
+      ]);
       expect(tasks.find((t) => t.id === "FN-R1")?.column).toBe("todo");
-      vi.useRealTimers();
     } finally {
+      vi.useRealTimers();
       await rm(root, { recursive: true, force: true });
     }
   });
