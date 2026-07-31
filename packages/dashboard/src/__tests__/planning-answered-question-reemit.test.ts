@@ -30,6 +30,10 @@ vi.mock("@fusion/engine", () => ({
   createChatTaskLogsReadTool: () => ({}),
 }));
 
+vi.mock("../planning-board-tools.js", () => ({
+  createPlanningBoardTools: () => [],
+}));
+
 import type { AiSessionRow, AiSessionStore } from "../ai-session-store.js";
 import {
   __resetPlanningState,
@@ -47,6 +51,10 @@ const MOCK_TASK_STORE = {
   getTask: vi.fn(async () => {
     throw new Error("not found");
   }),
+  getPluginStore: vi.fn(() => ({
+    init: vi.fn().mockResolvedValue(undefined),
+    listPlugins: vi.fn().mockResolvedValue([]),
+  })),
 } as unknown as TaskStore;
 
 const Q1 = { id: "q1", type: "text", question: "What should the plan prioritize first?" } as const;
@@ -179,6 +187,7 @@ async function startSessionAtFirstQuestion(
   if (!session?.currentQuestion) {
     throw new Error("first question never arrived");
   }
+  await new Promise<void>((resolve) => setImmediate(resolve));
   return sessionId;
 }
 

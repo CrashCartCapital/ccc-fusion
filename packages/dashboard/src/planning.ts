@@ -257,7 +257,7 @@ export async function resolvePlanningModeSystemPrompt(
   promptOverrides?: PromptOverrideMap,
   workflowId?: string,
 ): Promise<string> {
-  const settings: Partial<Settings> = (await store.getSettings().catch(() => ({}))) ?? {};
+  const settings: Partial<Settings> = (await store.getSettings?.().catch(() => ({}))) ?? {};
   const overrides = promptOverrides ?? settings.promptOverrides;
   const explicitOverride = overrides && Object.prototype.hasOwnProperty.call(overrides, "planning-system")
     && typeof overrides["planning-system"] === "string"

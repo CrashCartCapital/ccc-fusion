@@ -522,11 +522,16 @@ describe("SettingsModal", () => {
       await settingsModalUser.click(screen.getByRole("button", { name: "Add file" }));
       const updatedInputs = screen.getAllByLabelText("File to copy into new worktrees") as HTMLInputElement[];
       await settingsModalUser.type(updatedInputs[2], " README.md ");
-
-
-      await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalled());
-      const payload = mockUpdateSettings.mock.calls[0][0] as Record<string, unknown>;
-      expect(payload.worktreeCopyFiles).toEqual([".env", "README.md"]);
+      await waitFor(() => {
+        const payloads = mockUpdateSettings.mock.calls.map(
+          ([payload]) => payload as Record<string, unknown>,
+        );
+        expect(payloads).toContainEqual(
+          expect.objectContaining({
+            worktreeCopyFiles: [".env", "README.md"],
+          }),
+        );
+      });
     });
 
     it("clears worktree copy files to an empty persisted list", async () => {
@@ -1988,4 +1993,3 @@ describe("SettingsModal", () => {
 
   });
 });
-

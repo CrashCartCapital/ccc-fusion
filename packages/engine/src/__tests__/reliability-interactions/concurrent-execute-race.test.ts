@@ -131,6 +131,18 @@ describe("FN-4811 follow-up (FN-4814): concurrent execute() must not produce par
     const executor = new TaskExecutor(store as any, "/tmp/test");
     await executor.execute(makeTask());
     const firstCount = mockedCreateFnAgent.mock.calls.length;
+
+    // The first no-fn_task_done run is honestly requeued to todo. A real second
+    // dispatch only happens after the scheduler moves that row back to
+    // in-progress, so mirror that lifecycle transition before proving the
+    // process-wide graph-routing claim was released.
+    store._setRow("FN-4814", {
+      column: "in-progress",
+      status: undefined,
+      error: undefined,
+      paused: false,
+      userPaused: false,
+    });
     await executor.execute(makeTask());
     const secondCount = mockedCreateFnAgent.mock.calls.length;
 

@@ -76,7 +76,11 @@ function prepareStore(child: TaskDetail, dependencies: TaskDetail[], shadowEnabl
 }
 
 function spyOuterDispatch(executor: TaskExecutor) {
-  const graph = vi.spyOn(executor as any, "executeWorkflowGraph").mockResolvedValue(undefined);
+  const graph = vi.spyOn(executor as any, "executeWorkflowGraph").mockImplementation(async (task: TaskDetail) => {
+    // The real graph runner releases the process-wide routing claim in its
+    // finally block. This focused seam must mirror that ownership cleanup.
+    (executor as any).graphRouting.delete(task.id);
+  });
   return { graph };
 }
 
@@ -154,7 +158,7 @@ describe("executor outer dispatch dependency gate", () => {
 
     expect(store.moveTask).not.toHaveBeenCalled();
     expect(store.updateTask).not.toHaveBeenCalledWith(child.id, expect.objectContaining({ status: "queued" }), undefined);
-    expect(graph).toHaveBeenCalledWith(child);
+    expect(graph).toHaveBeenCalledWith(child, { alreadyClaimed: true });
   });
 
   it("allows missing or soft-deleted dependency residue past the outer gate", async () => {
@@ -167,7 +171,7 @@ describe("executor outer dispatch dependency gate", () => {
     await executor.execute(child);
 
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(graph).toHaveBeenCalledWith(child);
+    expect(graph).toHaveBeenCalledWith(child, { alreadyClaimed: true });
   });
 
   it("observes an accepted marker in shadow mode without letting it unblock a live dependency", async () => {
@@ -203,7 +207,7 @@ describe("executor outer dispatch dependency gate", () => {
 
     expect(store.getCompletionHandoffAcceptedMarker).toHaveBeenCalledWith(parent.id);
     expect(store.moveTask).not.toHaveBeenCalled();
-    expect(graph).toHaveBeenCalledWith(child);
+    expect(graph).toHaveBeenCalledWith(child, { alreadyClaimed: true });
   });
 
   it.each([

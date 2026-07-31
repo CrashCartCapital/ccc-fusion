@@ -885,7 +885,7 @@ describe("SettingsModal", () => {
 
       await settingsModalUser.click(screen.getByRole("button", { name: "Scheduling · Project" }));
       expect(screen.getByLabelText("Max Concurrent Tasks")).toBeDisabled();
-      expect(screen.getByLabelText("Max Triage Concurrent")).toBeDisabled();
+      expect(screen.getByLabelText("Max Concurrent Verifications")).toBeDisabled();
     });
 
     it("enables memory backend status hook only when Memory section is active", async () => {
@@ -1870,7 +1870,7 @@ describe("SettingsModal", () => {
       expect(screen.queryByText("Title, commit message, and GitHub tracking issue summarization model")).not.toBeInTheDocument();
     });
 
-    it("does not show a moved-to-workflow note for the summarizer model when GitHub tracking defaults are on", async () => {
+    it("keeps summarization project-scoped without either legacy moved-to-workflow notice", async () => {
       mockFetchSettings.mockResolvedValueOnce({
         ...defaultSettings,
         githubTrackingEnabledByDefault: true,
@@ -1882,7 +1882,9 @@ describe("SettingsModal", () => {
       await settingsModalUser.click(screen.getByRole("button", { name: "Models · Project" }));
 
       expect(screen.queryByText(/model used for summarization now lives on the workflow/i)).not.toBeInTheDocument();
-      expect(screen.getByText(/per-phase model lanes \(execution, planning, reviewer, and their fallbacks\) now live on the workflow/i)).toBeInTheDocument();
+      expect(screen.queryByText(/per-phase model lanes .* now live on the workflow/i)).not.toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Project workflow model lanes" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "AI Title and Git Commit Message Summarization" })).toBeInTheDocument();
     });
 
     it("picks a project repo suggestion and preserves label association", async () => {

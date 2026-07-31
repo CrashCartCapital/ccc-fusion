@@ -6,6 +6,7 @@ import { __fusionWorkerRootCleanupTestHooks } from "../__test-utils__/vitest-set
 import setup, {
   __setWorkerRootRmSyncForTests,
   __setWorkerRootSleepMsSyncForTests,
+  publishPgTestAvailability,
   removeLegacyTopLevelHomeRoots,
 } from "../__test-utils__/vitest-teardown";
 
@@ -41,6 +42,28 @@ afterEach(() => {
 });
 
 describe("vitest global teardown worker-root cleanup", () => {
+  it("refuses to silently skip an explicitly configured PostgreSQL target", () => {
+    const env = {
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres@localhost:5432",
+    } as NodeJS.ProcessEnv;
+
+    expect(() => publishPgTestAvailability(env, () => false)).toThrow(
+      /refusing to skip required PostgreSQL coverage/i,
+    );
+    expect(env.FUSION_PG_TEST_AVAILABLE).toBe("0");
+    expect(env.FUSION_PG_TEST_SKIP).toBeUndefined();
+  });
+
+  it("publishes one positive PostgreSQL decision for Vitest workers", () => {
+    const env = {
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres@localhost:5432",
+    } as NodeJS.ProcessEnv;
+
+    expect(publishPgTestAvailability(env, () => true)).toBe(true);
+    expect(env.FUSION_PG_TEST_AVAILABLE).toBe("1");
+    expect(env.FUSION_PG_TEST_SKIP).toBeUndefined();
+  });
+
   it("removes the per-invocation worker root on the clean path", async () => {
     const teardown = setup();
     const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);

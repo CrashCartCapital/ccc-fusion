@@ -68,6 +68,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updateWorkflowStep: vi.fn(),
     deleteWorkflowStep: vi.fn(),
     getMissionStore: vi.fn().mockReturnValue(createMockMissionStore()),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     ...overrides,
   } as unknown as TaskStore;
 }

@@ -38,6 +38,10 @@ function createMockStore(settingsByScope = {
   return {
     getRootDir: () => "/repo",
     getSettingsByScopeFast: async () => settingsByScope,
+    getPluginStore: vi.fn(() => ({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    })),
   };
 }
 

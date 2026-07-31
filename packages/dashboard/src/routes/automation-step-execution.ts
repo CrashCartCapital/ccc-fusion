@@ -178,7 +178,8 @@ function truncateAutomationOutput(stdout: string, stderr: string): string {
 }
 
 export async function resolveManualAiPromptMcpServers(taskStore: TaskStore) {
-  return (await resolveMcpServersForStore(taskStore)).servers;
+  const resolvedMcpServers = await resolveMcpServersForStore(taskStore);
+  return Array.isArray(resolvedMcpServers?.servers) ? resolvedMcpServers.servers : [];
 }
 
 async function executeAiPromptStep(

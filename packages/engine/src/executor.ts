@@ -613,14 +613,22 @@ function detectPendingReviewBlock(
   task: Task,
   _codeReviewVerdicts: Map<number, ReviewVerdict>,
 ): PendingReviewBlockResult {
-  const inProgressStepIndices: number[] = [];
+  const reviewableStepIndices: number[] = [];
   for (let stepIndex = 0; stepIndex < task.steps.length; stepIndex++) {
-    if (task.steps[stepIndex]?.status === "in-progress") {
-      inProgressStepIndices.push(stepIndex);
+    const status = task.steps[stepIndex]?.status;
+    /*
+     * The workflow graph re-parses PROMPT.md at run entry and projects an
+     * existing step back to `pending` before the implementation seam starts.
+     * A durable review request from the prior session still blocks that step;
+     * requiring `in-progress` here made the executor miss the request, burn all
+     * no-fn_task_done retries, and requeue instead of parking cleanly in review.
+     */
+    if (status === "pending" || status === "in-progress") {
+      reviewableStepIndices.push(stepIndex);
     }
   }
 
-  if (inProgressStepIndices.length === 0) {
+  if (reviewableStepIndices.length === 0) {
     return { blocked: false };
   }
 
@@ -629,7 +637,7 @@ function detectPendingReviewBlock(
     .map((entry) => entry.action?.trim())
     .filter((action): action is string => Boolean(action));
 
-  for (const stepIndex of inProgressStepIndices) {
+  for (const stepIndex of reviewableStepIndices) {
     const stepDisplay = stepIndex;
     const codeRequest = `code review requested for Step ${stepDisplay}`;
     const planRequest = `plan review requested for Step ${stepDisplay}`;

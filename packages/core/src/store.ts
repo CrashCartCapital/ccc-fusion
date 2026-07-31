@@ -922,7 +922,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   public async buildActiveTaskDependencyLookup(overrides?: Map<string, readonly string[]>): Promise<Map<string, readonly string[]>> {
     return buildActiveTaskDependencyLookupImpl(this, overrides);
   }
-  public recordDependencyCycleRejectedAudit( taskId: string, cyclePath: readonly string[], source: "createTask" | "createTaskWithReservedId" | "updateTask" | "replication", ): void {
+  public async recordDependencyCycleRejectedAudit( taskId: string, cyclePath: readonly string[], source: "createTask" | "createTaskWithReservedId" | "updateTask" | "replication", ): Promise<void> {
     return recordDependencyCycleRejectedAuditImpl(this, taskId, cyclePath, source);
   }
   public async assertNoDependencyCycle( taskId: string, dependencies: readonly string[], source: "createTask" | "createTaskWithReservedId" | "updateTask" | "replication", overrides?: Map<string, readonly string[]>, ): Promise<void> {    return assertNoDependencyCycleImpl(this, taskId, dependencies, source, overrides);

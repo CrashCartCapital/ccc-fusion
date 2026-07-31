@@ -164,7 +164,10 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     fireEvent.change(textarea, { target: { value: "hello there" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("hello there", []));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("hello there", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    })));
     expect(mockAddSteeringComment).not.toHaveBeenCalled();
   });
 
@@ -181,7 +184,10 @@ describe("ChatView slash-command dispatch (/steer)", () => {
     fireEvent.change(textarea, { target: { value: "please /steer this" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("please /steer this", []));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith("please /steer this", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    })));
     expect(mockAddSteeringComment).not.toHaveBeenCalled();
   });
 

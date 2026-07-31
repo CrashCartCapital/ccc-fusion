@@ -24,6 +24,10 @@ describe("task move route — bypassGuards is not forwardable", () => {
 
     const store: TaskStore = {
       getRootDir: vi.fn(() => process.cwd()),
+      getPluginStore: vi.fn(() => ({
+        init: vi.fn().mockResolvedValue(undefined),
+        listPlugins: vi.fn().mockResolvedValue([]),
+      })),
       getTask: vi.fn(async () => ({ id: "FN-001", column: "todo" })),
       getSettings: vi.fn(async () => ({})),
       moveTask,

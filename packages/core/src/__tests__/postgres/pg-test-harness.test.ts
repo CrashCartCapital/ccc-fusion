@@ -5,9 +5,17 @@
  * schema, and tears down cleanly.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
-import { access, readFile } from "node:fs/promises";
+import { once } from "node:events";
+import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { describe, it, expect, afterEach } from "vitest";
+import {
+  hasPsqlClient,
+  isPgTestAvailable,
+  probePsqlReady,
+} from "../../__test-utils__/pg-test-availability.js";
 import {
   createTaskStoreForTest,
   PG_AVAILABLE,
@@ -16,6 +24,131 @@ import {
 import { insertTaskRow } from "../../task-store/async-persistence.js";
 
 const testDescribe = PG_AVAILABLE ? describe : describe.skip;
+
+describe("PostgreSQL test availability", () => {
+  it("requires an executable psql client on PATH", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-psql-client-"));
+    const executableName = process.platform === "win32" ? "psql.exe" : "psql";
+    const executablePath = join(root, executableName);
+
+    try {
+      await writeFile(executablePath, "");
+      if (process.platform !== "win32") {
+        await chmod(executablePath, 0o755);
+      }
+
+      expect(hasPsqlClient(root)).toBe(true);
+      expect(hasPsqlClient(join(root, "missing"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  const readinessIt = process.platform === "win32" ? it.skip : it;
+  readinessIt("requires psql to reach a usable test database", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-psql-ready-"));
+    const executablePath = join(root, "psql");
+
+    try {
+      await writeFile(executablePath, "#!/bin/sh\nexit 0\n");
+      await chmod(executablePath, 0o755);
+      expect(probePsqlReady("postgresql://localhost:5432", root)).toBe(true);
+
+      await writeFile(executablePath, "#!/bin/sh\nexit 1\n");
+      expect(probePsqlReady("postgresql://localhost:5432", root)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  readinessIt("retries a transient psql readiness failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-psql-retry-"));
+    const executablePath = join(root, "psql");
+
+    try {
+      await writeFile(
+        executablePath,
+        [
+          "#!/bin/sh",
+          'marker="$0.marker"',
+          'if [ ! -e "$marker" ]; then',
+          '  : > "$marker"',
+          "  exit 1",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+      );
+      await chmod(executablePath, 0o755);
+
+      expect(
+        probePsqlReady(
+          "postgresql://127.0.0.1:1",
+          root,
+          500,
+          2,
+          0,
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  readinessIt(
+    "uses the successful psql query as the server readiness proof",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "fusion-psql-canonical-"));
+      const executablePath = join(root, "psql");
+
+      try {
+        await writeFile(executablePath, "#!/bin/sh\nexit 0\n");
+        await chmod(executablePath, 0o755);
+
+        expect(
+          isPgTestAvailable("postgresql://127.0.0.1:1", root),
+        ).toBe(true);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  readinessIt(
+    "is unavailable without psql even when the target port is listening",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "fusion-pg-availability-"));
+      const missingBin = join(root, "missing-bin");
+      const server = createServer();
+      const originalSkip = process.env.FUSION_PG_TEST_SKIP;
+
+      try {
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          throw new Error("expected a TCP listener address");
+        }
+
+        delete process.env.FUSION_PG_TEST_SKIP;
+        expect(
+          isPgTestAvailable(
+            `postgresql://127.0.0.1:${address.port}`,
+            missingBin,
+          ),
+        ).toBe(false);
+      } finally {
+        if (originalSkip === undefined) {
+          delete process.env.FUSION_PG_TEST_SKIP;
+        } else {
+          process.env.FUSION_PG_TEST_SKIP = originalSkip;
+        }
+        server.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 testDescribe("createTaskStoreForTest (PG fixture helper)", () => {
   let harness: PgTestHarness | null = null;

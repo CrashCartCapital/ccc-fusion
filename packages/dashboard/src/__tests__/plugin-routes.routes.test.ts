@@ -34,6 +34,7 @@ vi.spyOn(projectStoreResolver, "getOrCreateProjectStore").mockImplementation(moc
 
 function createMockPluginStore(overrides: Partial<PluginStore> = {}): PluginStore {
   return {
+    init: vi.fn().mockResolvedValue(undefined),
     listPlugins: vi.fn().mockResolvedValue([]),
     getPlugin: vi.fn(),
     registerPlugin: vi.fn(),
@@ -138,7 +139,7 @@ function createMockTaskStore(overrides: Partial<TaskStore> = {}): TaskStore {
       getMissionTask: vi.fn(),
       deleteMissionTask: vi.fn(),
     }),
-    getPluginStore: vi.fn(),
+    getPluginStore: vi.fn().mockReturnValue(createMockPluginStore()),
     ...overrides,
   } as unknown as TaskStore;
 }
@@ -674,6 +675,11 @@ describe("POST /plugins/:id/enable", () => {
       on: vi.fn(),
       off: vi.fn(),
     });
+    (
+      scopedStore as TaskStore & {
+        getProjectScopedPluginMcpServers: () => Promise<unknown[]>;
+      }
+    ).getProjectScopedPluginMcpServers = vi.fn().mockResolvedValue([]);
     mockGetOrCreateProjectStore.mockResolvedValue(scopedStore);
     const loadAll = vi.spyOn(PluginLoader.prototype, "loadAllPlugins");
     const app = express();

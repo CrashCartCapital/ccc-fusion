@@ -563,7 +563,7 @@ describe("bin command routing and fallbacks", () => {
     expect(commandMocks.runMessageSend).toHaveBeenCalledWith("agent-7", "hello there", "demo");
     expect(commandMocks.runMessageRead).toHaveBeenCalledWith("msg-1", "demo");
     expect(commandMocks.runMessageDelete).toHaveBeenCalledWith("msg-1", "demo");
-    expect(commandMocks.runMessageInbox).toHaveBeenCalledWith("demo");
+    expect(commandMocks.runMessageInbox).toHaveBeenCalledWith("demo", undefined);
     expect(commandMocks.runMessageOutbox).toHaveBeenCalledWith("demo");
   });
 

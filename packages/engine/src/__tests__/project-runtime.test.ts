@@ -5,6 +5,7 @@ vi.mock("@earendil-works/pi-ai", () => ({
     Object: (props: Record<string, unknown>) => ({ type: "object", properties: props }),
     String: (opts?: unknown) => ({ type: "string", ...((opts as object) ?? {}) }),
     Number: (opts?: unknown) => ({ type: "number", ...((opts as object) ?? {}) }),
+    Integer: (opts?: unknown) => ({ type: "integer", ...((opts as object) ?? {}) }),
     Boolean: (opts?: unknown) => ({ type: "boolean", ...((opts as object) ?? {}) }),
     Optional: (schema: unknown) => schema,
     Array: (schema: unknown, opts?: unknown) => ({ type: "array", items: schema, ...((opts as object) ?? {}) }),

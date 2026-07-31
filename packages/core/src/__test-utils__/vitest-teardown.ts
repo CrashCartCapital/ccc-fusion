@@ -9,6 +9,11 @@
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  FUSION_PG_TEST_AVAILABLE_ENV,
+  isPgTestAvailable,
+  PG_TEST_URL_BASE,
+} from "./pg-test-availability.js";
 
 export const WORKER_ROOT_OWNER_FILE = ".fusion-test-worker-root-owner";
 const FUSION_TEST_RUN_TOKEN_ENV = "FUSION_TEST_RUN_TOKEN";
@@ -81,8 +86,43 @@ export function removeWorkerRootWithRetry(workerRoot: string, retries = 8, delay
   console.warn(`[vitest-teardown] failed to remove worker root ${workerRoot} after ${retries} attempts: ${message}`);
 }
 
+export function publishPgTestAvailability(
+  env: NodeJS.ProcessEnv = process.env,
+  probe: () => boolean = () =>
+    isPgTestAvailable(
+      env.FUSION_PG_TEST_URL_BASE ?? PG_TEST_URL_BASE,
+      env.PATH ?? "",
+    ),
+): boolean {
+  const explicitlySkipped = env.FUSION_PG_TEST_SKIP === "1";
+  const explicitlyConfigured =
+    typeof env.FUSION_PG_TEST_URL_BASE === "string" &&
+    env.FUSION_PG_TEST_URL_BASE.trim().length > 0;
+  const available = !explicitlySkipped && probe();
+
+  env[FUSION_PG_TEST_AVAILABLE_ENV] = available ? "1" : "0";
+  if (available) return true;
+
+  if (explicitlyConfigured && !explicitlySkipped) {
+    throw new Error(
+      "[vitest-teardown] PostgreSQL was explicitly configured but did not become ready after bounded retries; refusing to skip required PostgreSQL coverage.",
+    );
+  }
+
+  env.FUSION_PG_TEST_SKIP = "1";
+  return false;
+}
+
 export default function setup(): () => Promise<void> {
   removeLegacyTopLevelHomeRoots();
+  /*
+  FNXC:PgTestGuard 2026-07-28:
+  Decide PostgreSQL availability once in Vitest's main process, before workers
+  start. Older PG suites still honor FUSION_PG_TEST_SKIP directly; publishing
+  the canonical result here prevents those suites from bypassing the shared
+  harness when localhost:5432 is an unusable SSH tunnel.
+  */
+  publishPgTestAvailability();
   // Use a fresh root for each Vitest invocation. A static shared root makes the
   // setup-time redirect sweep proportional to stale directories left by every
   // prior interrupted run.

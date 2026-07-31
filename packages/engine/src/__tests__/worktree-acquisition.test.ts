@@ -132,10 +132,14 @@ describe("acquireTaskWorktree", () => {
       nonAttributedCount: 0,
     });
 
-    const worktreePath = process.cwd();
+    const rootDir = makeRepo();
+    git(rootDir, "git branch fusion/fn-1");
+    const worktreeRoot = track(mkdtempSync(join(tmpdir(), "fn-6861-acquisition-resume-")));
+    const worktreePath = join(worktreeRoot, "wt");
+    git(rootDir, `git worktree add ${JSON.stringify(worktreePath)} fusion/fn-1`);
     const result = await acquireTaskWorktree({
       task: { ...task, worktree: worktreePath, branch: "fusion/fn-1" },
-      rootDir: dirname(worktreePath),
+      rootDir,
       store,
       settings: {},
       audit,

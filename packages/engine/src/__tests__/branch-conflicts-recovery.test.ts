@@ -1,7 +1,7 @@
 // Real-git wallclock under parallel CI load; do not lower per-test timeouts
 // without re-measuring under pnpm test:full. (FN-4839)
 import { afterEach, describe, expect, it } from "vitest";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { exec } from "node:child_process";
@@ -237,19 +237,32 @@ describe("branch contamination recovery classification", () => {
     const secondaryWorktree = path.join(worktreeRoot, "wt");
     await run(`git worktree add --detach ${JSON.stringify(secondaryWorktree)} ${baseSha}`, repoDir);
 
-    await expect(
-      run(`git checkout -B feature ${baseSha}`, secondaryWorktree),
-    ).rejects.toThrow(/already used by worktree/i);
-
-    const result = await reanchorBranchToBase({
-      repoDir,
-      worktreePath: secondaryWorktree,
-      branchName: "feature",
-      baseSha,
-      taskId: "FN-4884",
-    });
+    const tracePath = path.join(worktreeRoot, "git-trace.json");
+    const priorTracePath = process.env.GIT_TRACE2_EVENT;
+    const result = await (async () => {
+      process.env.GIT_TRACE2_EVENT = tracePath;
+      try {
+        return await reanchorBranchToBase({
+          repoDir,
+          worktreePath: secondaryWorktree,
+          branchName: "feature",
+          baseSha,
+          taskId: "FN-4884",
+        });
+      } finally {
+        if (priorTracePath === undefined) delete process.env.GIT_TRACE2_EVENT;
+        else process.env.GIT_TRACE2_EVENT = priorTracePath;
+      }
+    })();
 
     const headSha = await run("git rev-parse HEAD", secondaryWorktree);
+    const tracedArgv = (await readFile(tracePath, "utf-8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { argv?: string[] })
+      .flatMap((event) => event.argv ? [event.argv] : []);
+    expect(tracedArgv.length).toBeGreaterThan(0);
+    expect(tracedArgv.some((argv) => argv.includes("checkout") && argv.includes("-B"))).toBe(false);
     expect(result.previousTipSha).toBe(baseSha);
     expect(result.newTipSha).toBe(baseSha);
     expect(headSha).toBe(baseSha);
@@ -301,4 +314,3 @@ describe("branch contamination recovery classification", () => {
     expect(result.newTipSha).not.toEqual(originalTip);
   });
 });
-

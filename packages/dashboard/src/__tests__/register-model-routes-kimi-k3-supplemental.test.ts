@@ -1,30 +1,23 @@
 import type { Router } from "express";
 import { describe, expect, it, vi } from "vitest";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { registerModelRoutes } from "../routes/register-model-routes.js";
 
 /*
 FNXC:ModelCatalog 2026-07-16-19:05:
 FN-8180 requires Kimi K3 to reach both model-catalog consumers. This route-level
-coverage uses pi 0.81.1's actual built-in ModelRuntime catalog after refresh, so an
-SDK catalog regression cannot leave the Dashboard dropdown missing K3 while the engine
-registry test remains green.
+coverage reads pi 0.81.1's generated built-in catalog directly, so an SDK catalog
+regression cannot leave the Dashboard dropdown missing K3 while the engine registry
+test remains green. The engine suite separately proves ModelRuntime integration.
 */
 
-async function createNativeKimiRegistry(): Promise<ModelRegistry> {
-  const runtime = await ModelRuntime.create({
-    credentials: {
-      read: async (providerId) => providerId === "kimi-coding"
-        ? { type: "api_key", key: "test-kimi-key" }
-        : undefined,
-      list: async () => [{ providerId: "kimi-coding", type: "api_key" }],
-      modify: async (_providerId, fn) => fn(undefined),
-      delete: async () => undefined,
-    },
-    modelsPath: null,
-    allowModelNetwork: false,
-  });
-  return new ModelRegistry(runtime);
+function createNativeKimiRegistry(): ModelRegistry {
+  const models = getBuiltinModels("kimi-coding");
+  return {
+    refresh: async () => undefined,
+    getAvailable: () => models,
+  } as unknown as ModelRegistry;
 }
 
 function createModelsHandler(modelRegistry: ModelRegistry) {
@@ -58,7 +51,7 @@ function createModelsHandler(modelRegistry: ModelRegistry) {
 
 describe("FN-8180: Kimi K3 /api/models catalog", () => {
   it("surfaces the native K3 model once for a configured Kimi provider", async () => {
-    const handler = createModelsHandler(await createNativeKimiRegistry());
+    const handler = createModelsHandler(createNativeKimiRegistry());
     const json = vi.fn();
 
     await handler({}, { json });

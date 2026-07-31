@@ -794,9 +794,10 @@ describe("CronRunner", () => {
   describe("output truncation", () => {
     it("truncates large output to prevent memory exhaustion", async () => {
       const store = createMockStore();
-      // Generate output larger than 10KB using printf
+      // Generate output larger than 10KB using a POSIX tool available on the
+      // same minimal local-runner images as production.
       const schedule = createMockSchedule({
-        command: "python3 -c \"print('x' * 15000)\"",
+        command: "awk 'BEGIN { for (i = 0; i < 15000; i++) printf \"x\" }'",
       });
       const automationStore = createMockAutomationStore([schedule]);
       runner = new CronRunner(store, automationStore);

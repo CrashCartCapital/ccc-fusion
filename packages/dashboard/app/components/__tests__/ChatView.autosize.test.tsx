@@ -155,7 +155,10 @@ describe("ChatView composer autosize", () => {
     await userEvent.click(screen.getAllByTestId("chat-send-btn")[0]);
 
     await waitFor(() => {
-      expect(sendMessage).toHaveBeenCalledWith("line one\nline two\nline three", []);
+      expect(sendMessage).toHaveBeenCalledWith("line one\nline two\nline three", [], expect.objectContaining({
+        onDelivered: expect.any(Function),
+        onFailed: expect.any(Function),
+      }));
       expect(textarea).toHaveValue("");
       const resetHeight = Number.parseInt(textarea.style.height, 10);
       expect(resetHeight).toBeLessThan(expandedHeight);

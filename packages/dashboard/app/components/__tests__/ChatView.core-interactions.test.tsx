@@ -699,8 +699,8 @@ describe("ChatView core interactions", () => {
         filteredSessions: [activeSessionFixture],
         messages: [],
         isStreaming,
-        sendMessage: (message, files) => {
-          sendMessage(message, files);
+        sendMessage: (message, files, options) => {
+          sendMessage(message, files, options);
           setIsStreaming(true);
         },
         stopStreaming,
@@ -715,7 +715,10 @@ describe("ChatView core interactions", () => {
       fireEvent.touchStart(screen.getByTestId("chat-send-btn"));
     });
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith("Start streaming", []);
+    expect(sendMessage).toHaveBeenCalledWith("Start streaming", [], expect.objectContaining({
+      onDelivered: expect.any(Function),
+      onFailed: expect.any(Function),
+    }));
 
     await act(async () => {
       fireEvent.click(screen.getByTestId("chat-stop-btn"));

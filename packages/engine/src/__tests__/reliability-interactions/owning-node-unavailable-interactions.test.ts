@@ -55,12 +55,25 @@ function createMockStore(task: Task, settings: Record<string, unknown> = {}): Ta
     getTask: vi.fn().mockResolvedValue(task),
     updateTask: vi.fn().mockResolvedValue(undefined),
     moveTask: vi.fn().mockResolvedValue(undefined),
+    moveTaskIf: vi.fn(async (
+      _id: string,
+      column: Task["column"],
+      predicate: (live: Task) => boolean | Promise<boolean>,
+    ) => {
+      if (!await predicate(task) || task.column === column) return { task, moved: false };
+      task.column = column;
+      return { task, moved: true };
+    }),
     parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
     logEntry: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/tmp/test"),
     getTasksDir: vi.fn().mockReturnValue("/tmp/test/.fusion/tasks"),
     on: vi.fn(),
     off: vi.fn(),
+    getMissionStore: vi.fn(() => ({
+      listMissions: () => [],
+      listGoalIdsForMission: () => [],
+    })),
   } as unknown as TaskStore;
 }
 
@@ -264,7 +277,7 @@ describeIfGit("reliability interactions: owning-node unavailable handoff", () =>
     await scheduler.schedule();
 
     expect(store.logEntry).toHaveBeenCalledWith(task.id, expect.stringContaining("Owning-node handoff applied"));
-    expect(store.moveTask).toHaveBeenCalledWith(task.id, "in-progress", expect.any(Object));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(task.id, "in-progress", expect.any(Function), expect.any(Object));
     expect(store.updateTask).not.toHaveBeenCalledWith(task.id, expect.objectContaining({ effectiveNodeId: "node-b" }));
   });
 });

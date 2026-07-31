@@ -319,6 +319,10 @@ export function createApiRoutesContext(store: TaskStore, options?: ServerOptions
     const engineLoader = engine?.getPluginRunner?.()?.getLoader?.();
     if (engineLoader) return engineLoader;
 
+    if (typeof (scopedStore as { getPluginStore?: unknown }).getPluginStore !== "function") {
+      return undefined;
+    }
+
     const scopedPluginStore = scopedStore.getPluginStore();
     if (scopedPluginStore === options?.pluginStore) return options?.pluginLoader;
 
@@ -352,6 +356,7 @@ export function createApiRoutesContext(store: TaskStore, options?: ServerOptions
     // contexts install the same core provider below rather than falling back to
     // raw plugin enumeration.
     if (typeof scopedStore.getProjectScopedPluginMcpServers === "function") return;
+    if (typeof (scopedStore as { getPluginStore?: unknown }).getPluginStore !== "function") return;
 
     const engineLoader = (context.engine as { getPluginRunner?: () => { getLoader?: () => PluginLoader } | undefined } | undefined)
       ?.getPluginRunner?.()?.getLoader?.();

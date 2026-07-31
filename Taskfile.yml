@@ -1,0 +1,135 @@
+version: "3"
+
+# Canonical acceptance-gate surface for fusion-workspace.
+#
+# Every caller — human, Claude, Codex, and CI — should name the SAME task
+# instead of re-typing pnpm script chains. Nothing here reimplements a check:
+# each task is a thin passthrough to the pnpm script that already owns it, so
+# package.json stays the single source of truth for what a check actually does.
+#
+# Two distinct gates exist in this repo and neither is a superset of the other
+# (see the drift note at the bottom of this file):
+#
+#   task verify  -> pnpm verify:workspace   deep local gate (lint + FULL test suite + full build)
+#   task ci      -> the exact PR merge-gate set (lint + typecheck + build + test:gate)
+#
+# Run `task --list` to see everything.
+
+tasks:
+  # ---------------------------------------------------------------------------
+  # Granular checks — one task per pnpm script, no behavior added.
+  # ---------------------------------------------------------------------------
+
+  lint:
+    desc: Lint the workspace (eslint)
+    cmds:
+      - pnpm lint
+
+  typecheck:
+    desc: Type-check every package except desktop/mobile
+    cmds:
+      - pnpm typecheck
+
+  build:
+    desc: Build the default workspace packages
+    cmds:
+      - pnpm build
+
+  build:full:
+    desc: Build the full workspace (no skip cache)
+    cmds:
+      - pnpm build:full
+
+  test:
+    desc: Run the changed-only test suite
+    cmds:
+      - pnpm test
+
+  test:full:
+    desc: Run the full test suite plus the engine slow tier
+    cmds:
+      - pnpm test:full
+
+  gate:
+    desc: Run the curated merge-gate tests (guards + engine-core + pg-gate + CI shape)
+    cmds:
+      - pnpm test:gate
+
+  smoke:
+    desc: Boot smoke — the app starts and serves /api/health
+    cmds:
+      - node scripts/boot-smoke.mjs
+
+  # ---------------------------------------------------------------------------
+  # Aggregates
+  # ---------------------------------------------------------------------------
+
+  verify:
+    desc: Canonical deep acceptance gate (thin wrapper over `pnpm verify:workspace`)
+    cmds:
+      - pnpm verify:workspace
+
+  check:
+    desc: Alias for `task verify`
+    cmds:
+      - task: verify
+
+  verify:fast:
+    desc: Test-free fast verification (typecheck + build + boot smoke on changed packages)
+    cmds:
+      - pnpm verify:fast
+
+  ci:
+    desc: Reproduce the exact PR merge-gate check set locally (.github/workflows/pr-checks.yml)
+    cmds:
+      - task: lint
+      - task: changesets
+      - task: routes-modular
+      - task: typecheck
+      - task: build
+      - task: smoke
+      - task: gate
+
+  changesets:
+    desc: Validate changeset format (PR-gate Lint job step)
+    cmds:
+      - pnpm check:changesets
+
+  routes-modular:
+    desc: Assert dashboard route modularity (PR-gate Lint job step)
+    cmds:
+      - pnpm check:routes-modular
+
+  pre-commit-gate:
+    desc: Fast pre-commit proof — verify:fast plus a whitespace-damage check
+    cmds:
+      - task: verify:fast
+      - git diff --check
+
+# ---------------------------------------------------------------------------
+# KNOWN CI-vs-LOCAL DRIFT (documented, deliberately NOT silently "fixed" here)
+#
+# `pnpm verify:workspace` = `pnpm lint && pnpm test:full && pnpm build:full`.
+# The blocking PR gate = Lint (+ changesets + routes-modular), Typecheck,
+# Build, Gate (build + boot smoke + `pnpm test:gate`).
+#
+# Checks CI blocks on that `task verify` does NOT run:
+#   * `pnpm typecheck`. `build:full` is not a substitute: @runfusion/fusion
+#     builds with tsup (esbuild strips types, never type-checks) and
+#     @fusion/dashboard's build runs `tsc` but not the extra
+#     `tsc --noEmit -p tsconfig.app.json` that its typecheck script adds.
+#     A type error in either place passes `verify:workspace` and then blocks
+#     the PR.
+#   * `node scripts/check-mock-completeness.mjs` — present in `test:gate`,
+#     absent from the `pretest:full` guard list that `test:full` fires.
+#   * `node scripts/boot-smoke.mjs` — in the Gate job and in `verify:fast`,
+#     but not in `verify:workspace`.
+#
+# Checks `task verify` runs that the PR gate does NOT:
+#   * the full test suite + engine slow tier (`test:full`). The PR gate only
+#     runs the curated `test:gate`; the full suite is post-merge, non-blocking,
+#     in full-suite.yml.
+#
+# `task ci` above closes the gap from the local side: it is the one command
+# that runs exactly what the merge gate runs.
+# ---------------------------------------------------------------------------

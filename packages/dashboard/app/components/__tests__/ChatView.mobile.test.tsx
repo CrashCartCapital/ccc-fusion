@@ -881,7 +881,10 @@ describe("ChatView mobile behavior", () => {
       fireEvent.click(sendButton);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(sendMessage).toHaveBeenCalledWith("Hello mobile", []);
+      expect(sendMessage).toHaveBeenCalledWith("Hello mobile", [], expect.objectContaining({
+        onDelivered: expect.any(Function),
+        onFailed: expect.any(Function),
+      }));
       expect(document.activeElement).toBe(input);
     } finally {
       isIOSSpy.mockRestore();
@@ -911,7 +914,10 @@ describe("ChatView mobile behavior", () => {
       fireEvent.click(sendButton);
 
       expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(sendMessage).toHaveBeenCalledWith("Hello mobile", []);
+      expect(sendMessage).toHaveBeenCalledWith("Hello mobile", [], expect.objectContaining({
+        onDelivered: expect.any(Function),
+        onFailed: expect.any(Function),
+      }));
       expect(document.activeElement).toBe(input);
     } finally {
       restoreMatchMedia.mockRestore();
@@ -2433,4 +2439,3 @@ describe("ChatView empty-state token guards", () => {
     expect(chatViewCss.includes(legacyToken)).toBe(false);
   });
 });
-

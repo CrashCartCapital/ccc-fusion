@@ -230,6 +230,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     updatePrInfo: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     /*
     FNXC:DashboardTests 2026-07-18-09:45:
     Backup automation path calls resolveGlobalBackupRoot(store) which requires
@@ -3086,4 +3090,3 @@ describe("Routine routes", () => {
 
 
 // --- Settings API Tests ---
-

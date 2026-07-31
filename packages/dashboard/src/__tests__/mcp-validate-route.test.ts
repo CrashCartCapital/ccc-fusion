@@ -31,6 +31,10 @@ function createMockStore() {
     getRootDir: () => "/workspace",
     getSecretsStore: () => ({ revealSecret: vi.fn() }),
     getSettingsByScope: async () => ({ global: { mcpServers: { enabled: true, servers: [] } }, project: {} }),
+    getPluginStore: vi.fn(() => ({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    })),
   };
 }
 

@@ -34,6 +34,10 @@ class MockStore extends EventEmitter {
   getWorkflowDefinition = vi.fn(async () => undefined);
   getWorkflowSettingValues = vi.fn((workflowId: string, projectId: string) => this.workflowValues.get(`${workflowId}::${projectId}`) ?? {});
   getWorkflowSettingsProjectId = vi.fn(() => "default");
+  getPluginStore = vi.fn(() => ({
+    init: vi.fn().mockResolvedValue(undefined),
+    listPlugins: vi.fn().mockResolvedValue([]),
+  }));
 
   setSelection(taskId: string, workflowId: string): void {
     this.workflowSelections.set(taskId, { workflowId, stepIds: [] });

@@ -53,12 +53,25 @@ function createStore(task: Task, settings: Record<string, unknown>, tasksForList
     getTask: vi.fn().mockResolvedValue(task),
     updateTask: vi.fn().mockResolvedValue(undefined),
     moveTask: vi.fn().mockResolvedValue(undefined),
+    moveTaskIf: vi.fn(async (
+      _id: string,
+      column: Task["column"],
+      predicate: (live: Task) => boolean | Promise<boolean>,
+    ) => {
+      if (!await predicate(task) || task.column === column) return { task, moved: false };
+      task.column = column;
+      return { task, moved: true };
+    }),
     parseFileScopeFromPrompt: vi.fn().mockResolvedValue([]),
     logEntry: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/tmp/project"),
     getTasksDir: vi.fn().mockReturnValue("/tmp/project/.fusion/tasks"),
     on: vi.fn(),
     off: vi.fn(),
+    getMissionStore: vi.fn(() => ({
+      listMissions: () => [],
+      listGoalIdsForMission: () => [],
+    })),
   } as unknown as TaskStore;
 }
 
@@ -83,7 +96,7 @@ describe("Scheduler ephemeralAgentsEnabled toggle", () => {
     await runSchedulerOnce(scheduler);
 
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-101", expect.objectContaining({ assignedAgentId: expect.any(String) }));
-    expect(store.moveTask).toHaveBeenCalledWith("FN-101", "in-progress", expect.any(Object));
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-101", "in-progress", expect.any(Function), expect.any(Object));
   });
 
   it("off + no permanent executor: keeps task queued in todo", async () => {
@@ -100,7 +113,7 @@ describe("Scheduler ephemeralAgentsEnabled toggle", () => {
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-102", { status: "queued" });
     expect(store.logEntry).toHaveBeenCalledWith("FN-102", "queued — no permanent executor available (ephemeral agents disabled)");
-    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(store.moveTaskIf).not.toHaveBeenCalled();
   });
 
   it("off + permanent executor: assigns then dispatches", async () => {
@@ -116,7 +129,7 @@ describe("Scheduler ephemeralAgentsEnabled toggle", () => {
     await runSchedulerOnce(scheduler);
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-103", { assignedAgentId: "agent-1" });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-103", "in-progress", expect.any(Object));
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-103", "in-progress", expect.any(Function), expect.any(Object));
   });
 
   it("off + multiple executors: picks least-loaded", async () => {
@@ -141,6 +154,6 @@ describe("Scheduler ephemeralAgentsEnabled toggle", () => {
     await runSchedulerOnce(scheduler);
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-104", { assignedAgentId: "agent-light" });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-104", "in-progress", expect.any(Object));
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-104", "in-progress", expect.any(Function), expect.any(Object));
   });
 });

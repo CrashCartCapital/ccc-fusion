@@ -32,7 +32,7 @@ env:
 jobs:
   test-shards:
     name: Test shard ${{ matrix.shard }}/4
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
     # FNXC:FixPgTestsAndCi 2026-06-26-09:10:
     # Provision a PostgreSQL service container so the postgres/*.pg.test.ts
     # suites run in the non-blocking full suite too (parity with the gate).
@@ -45,15 +45,12 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
-          - 5432:5432
+          - 5432/tcp
         options: >-
           --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@localhost:5432"
-      PGPASSWORD: "postgres"
     # Backstop for a wedged shard. The per-invocation watchdog (L2,
     # scripts/lib/run-vitest-watchdog.mjs) kills any single hung invocation at
     # its budget ceiling (<=30min), so this job budget only fires if L2 itself
@@ -118,6 +115,9 @@ jobs:
 
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4
+        env:
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
+          PGPASSWORD: "postgres"
 
       # Each shard emits per-file vitest JSON timing reporter output under
       # .timings/. Upload as an artifact so the timing snapshot can be
@@ -146,7 +146,7 @@ jobs:
   # `vitest list`, not the tests.
   test-inventory-guard:
     name: Dashboard curated-gate guard
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
     # Runs only `vitest list` (no tests execute), so this is generous headroom,
     # not a tight bound — but no CI job should be able to hang to the 6h ceiling.
     timeout-minutes: 20
@@ -189,7 +189,7 @@ jobs:
 
   line-count-audit:
     name: Line-count audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -211,7 +211,7 @@ jobs:
   # git operations, so a full clone (fetch-depth: 0) is required.
   test-slow:
     name: Engine slow tier
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
     # FNXC:FixPgTestsAndCi 2026-07-14-00:00:
     # Provision a PostgreSQL service container so reliability-interaction test
     # helpers (which now require a PG-backed TaskStore after SQLite removal
@@ -224,15 +224,12 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
-          - 5432:5432
+          - 5432/tcp
         options: >-
           --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@localhost:5432"
-      PGPASSWORD: "postgres"
     # Real-git slow suites; same backstop rationale as test-shards. Sits above
     # the L2 per-invocation ceiling so the watchdog fires first on a single hang.
     timeout-minutes: 60
@@ -247,3 +244,6 @@ jobs:
 
       - name: Run engine-slow with non-empty-execution assertion
         run: node scripts/assert-engine-slow-nonempty.mjs
+        env:
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
+          PGPASSWORD: "postgres"

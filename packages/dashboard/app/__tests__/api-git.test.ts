@@ -1081,7 +1081,9 @@ describe("Planning Mode API", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z",
       };
-      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, createdTask, 201));
+      globalThis.fetch = vi.fn().mockReturnValue(
+        mockFetchResponse(true, { task: createdTask, alreadyCreated: false }, 201),
+      );
 
       const result = await createTaskFromPlanning("plan-123");
 
@@ -1123,7 +1125,9 @@ describe("Planning Mode API", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: "2026-01-01T00:00:00.000Z",
       };
-      globalThis.fetch = vi.fn().mockReturnValue(mockFetchResponse(true, createdTask, 201));
+      globalThis.fetch = vi.fn().mockReturnValue(
+        mockFetchResponse(true, { task: createdTask, alreadyCreated: false }, 201),
+      );
 
       await createTaskFromPlanning("plan-123", undefined, undefined, {
         branchSelection: {
@@ -1150,4 +1154,3 @@ describe("Planning Mode API", () => {
 });
 
 /** Mock helper for HTML error responses (e.g., 404 page) */
-

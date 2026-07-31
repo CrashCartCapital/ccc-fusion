@@ -4,9 +4,9 @@ import { EventEmitter } from "node:events";
 afterEach(() => {
   vi.restoreAllMocks();
   vi.resetModules();
-  vi.unmock("node:child_process");
-  vi.unmock("node:fs");
-  vi.unmock("node:os");
+  vi.doUnmock("node:child_process");
+  vi.doUnmock("node:fs");
+  vi.doUnmock("node:os");
 });
 
 function createSpawnMock(options: {

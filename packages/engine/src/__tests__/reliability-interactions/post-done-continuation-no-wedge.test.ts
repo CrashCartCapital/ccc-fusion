@@ -86,7 +86,28 @@ function createStore(task: Task, settingsOverrides: Record<string, unknown> = {}
   (emitter as any).listWorkflowSteps = vi.fn().mockResolvedValue([]);
   (emitter as any).getWorkflowStep = vi.fn().mockResolvedValue(undefined);
   (emitter as any).setPluginWorkflowStepTemplates = vi.fn().mockResolvedValue(undefined);
-  (emitter as any).updateStep = vi.fn().mockResolvedValue(undefined);
+  (emitter as any).updateStep = vi.fn().mockImplementation(
+    async (_taskId: string, stepIndex: number, status: Task["steps"][number]["status"]) => {
+      task.steps = task.steps.map((step, index) =>
+        index === stepIndex ? { ...step, status } : step,
+      );
+      task.currentStep = stepIndex;
+      task.updatedAt = new Date(Date.now()).toISOString();
+      return task;
+    },
+  );
+  (emitter as any).startStep = vi.fn().mockImplementation(async (
+    taskId: string,
+    stepIndex: number,
+    options?: { source?: "graph" },
+  ) => {
+    const updated = await (emitter as any).updateStep(taskId, stepIndex, "in-progress", options);
+    return {
+      task: updated,
+      accepted: updated.steps[stepIndex]?.status === "in-progress",
+      disposition: updated.steps[stepIndex]?.status === "in-progress" ? "started" : "blocked",
+    };
+  });
   (emitter as any).parseStepsFromPrompt = vi.fn().mockResolvedValue([]);
   (emitter as any).parseFileScopeFromPrompt = vi.fn().mockResolvedValue([]);
   (emitter as any).getAgentLogs = vi.fn().mockResolvedValue([]);

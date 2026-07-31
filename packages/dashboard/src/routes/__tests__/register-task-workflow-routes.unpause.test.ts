@@ -25,6 +25,10 @@ const createPauseRouteHarness = (initialTaskState: any) => {
   let taskState = initialTaskState;
   const store: TaskStore = {
     getRootDir: vi.fn(() => process.cwd()),
+    getPluginStore: vi.fn(() => ({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    })),
     getTask: vi.fn(async () => taskState),
     pauseTask: vi.fn(async (_id: string, paused: boolean) => {
       taskState = {

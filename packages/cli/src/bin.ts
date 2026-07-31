@@ -465,7 +465,7 @@ PR:
   fn message read <id>              Read a specific message
   fn message delete <id>            Delete a message
   fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>] [--reply-timeout-ms <n>] [--conversation-id <id>]
-                                    Named mailbox conversation with deadline-bounded inbox replies
+                                    Named mailbox conversation; delivers to agent inbox with deadline-bounded replies
   fn backup --create         Create a database backup immediately
   fn backup --list           List all database backups
   fn backup --restore <file> Restore database from a backup file

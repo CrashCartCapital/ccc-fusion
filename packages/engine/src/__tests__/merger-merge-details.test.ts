@@ -599,7 +599,7 @@ describe("aiMergeTask — usage limit detection", () => {
       undefined,
     );
     expect(store.pauseTask).toHaveBeenCalledWith("FN-050", true, undefined, {
-      pausedReason: "provider-rate-limit",
+      pausedReason: "provider-rate-limit:unknown",
     });
     expect(store.updateSettings).not.toHaveBeenCalled();
   });

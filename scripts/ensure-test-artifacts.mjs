@@ -28,6 +28,22 @@ export const REQUIRED_BUILD_PACKAGES = [
     staleAgainstGlobs: [{ sourcePath: "packages/engine/src" }],
   },
   {
+    // Clean-checkout CLI tests execute bin.mjs and copy the bundled native
+    // proof host. Build those test inputs before the recursive workspace run;
+    // otherwise test:full depends on untracked dist files from an earlier build.
+    name: "@runfusion/fusion",
+    requiredArtifacts: [
+      "packages/cli/dist/bin.js",
+      "packages/cli/dist/extension.js",
+      "packages/cli/dist/ccc-campaign-proof-admission.js",
+      "packages/cli/dist/plugins/fusion-native-proof-admission/manifest.json",
+    ],
+    staleAgainstGlobs: [
+      { sourcePath: "packages/cli/src" },
+      { sourcePath: "packages/engine/src" },
+    ],
+  },
+  {
     name: "@fusion/plugin-sdk",
     requiredArtifacts: ["packages/plugin-sdk/dist/index.js"],
     sourceInputs: ["packages/plugin-sdk/src"],

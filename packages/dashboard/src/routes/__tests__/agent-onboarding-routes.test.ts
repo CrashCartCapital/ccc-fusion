@@ -53,6 +53,10 @@ function createMockStore(): TaskStore {
     updateIssueInfo: vi.fn(),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
     getFusionDir: vi.fn().mockReturnValue("/fake/root/.fusion"),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     getDatabase: vi.fn(),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),

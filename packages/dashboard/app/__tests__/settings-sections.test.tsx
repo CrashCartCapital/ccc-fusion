@@ -121,7 +121,7 @@ describe("AppearanceSection", () => {
 });
 
 describe("GeneralSection", () => {
-  it("hides deprecated built-ins from the workflow enablement toggles", async () => {
+  it("hides deprecated built-ins while keeping active built-ins in the workflow enablement toggles", async () => {
     vi.mocked(fetchWorkflows).mockResolvedValue([
       { id: "builtin:coding", name: "Coding", kind: "workflow", ir: {} },
       { id: "builtin:brainstorming", name: "Brainstorming", kind: "workflow", ir: {} },
@@ -143,7 +143,7 @@ describe("GeneralSection", () => {
 
     await waitFor(() => expect(screen.getByLabelText("Coding")).toBeInTheDocument());
     expect(screen.queryByLabelText("Brainstorming")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Coding (Ideas)")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Coding (Ideas)")).toBeInTheDocument();
   });
 
   it("emits the absolute file-browser path toggle via setForm", () => {

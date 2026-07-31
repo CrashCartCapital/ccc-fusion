@@ -158,7 +158,10 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   this until FN-8142's SDK bump (this PR); mock ModelRuntime so createFnAgent's registry path resolves.
   */
   ModelRuntime: {
-    create: async () => ({ getAuth: modelRuntimeGetAuthMock }),
+    create: async () => ({
+      getAuth: modelRuntimeGetAuthMock,
+      refresh: refreshMock,
+    }),
   },
   ModelRegistry: class {
     static create(...args: unknown[]) {

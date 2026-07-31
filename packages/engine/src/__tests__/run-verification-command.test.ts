@@ -593,7 +593,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       // POSIX shell expansion ($USER) differs from Windows (%USERNAME%).
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
-        command: "echo $USER",
+        command: "FUSION_TEST_ENV=fusion-test; export FUSION_TEST_ENV; printf '%s\\n' \"$FUSION_TEST_ENV\"",
         cwd: tempDir,
         timeoutMs: 30000,
         onHeartbeat,
@@ -602,8 +602,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       const result = await runVerificationCommand(opts);
 
       expect(result.success).toBe(true);
-      // Should have output (USER is typically set)
-      expect(result.stdout.trim().length).toBeGreaterThan(0);
+      expect(result.stdout.trim()).toBe("fusion-test");
     });
   });
 });

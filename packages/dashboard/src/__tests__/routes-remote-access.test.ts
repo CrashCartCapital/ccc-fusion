@@ -62,6 +62,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     getAgentLogs: vi.fn().mockResolvedValue([]),
     on: vi.fn(),
     off: vi.fn(),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     ...overrides,
   } as unknown as TaskStore;
 }

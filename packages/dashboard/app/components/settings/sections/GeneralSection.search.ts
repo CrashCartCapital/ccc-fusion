@@ -10,6 +10,15 @@ import type { SettingsSearchEntry } from "../search/types";
 export const generalSearchEntries: SettingsSearchEntry[] = [
   {
     sectionId: "general",
+    key: "report-action-menu",
+    labelKey: "settings.general.report",
+    labelFallback: "Report",
+    helpKey: "settings.general.reportHelp",
+    helpFallback: "Report a bug, send feedback, share an idea, or get help from Fusion.",
+    keywords: ["bug", "feedback", "idea", "help"],
+  },
+  {
+    sectionId: "general",
     key: "taskPrefix",
     labelKey: "settings.general.taskPrefix",
     labelFallback: "Task Prefix",

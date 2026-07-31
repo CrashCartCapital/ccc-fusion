@@ -32,7 +32,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
 
     steps:
       - name: Checkout
@@ -52,7 +52,7 @@ jobs:
 
   typecheck:
     name: Typecheck
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
 
     steps:
       - name: Checkout
@@ -66,7 +66,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
 
     steps:
       - name: Checkout
@@ -85,13 +85,13 @@ jobs:
   # project); a flaky gate test is evicted by removing it from that list.
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
     # FNXC:FixPgTestsAndCi 2026-06-26-09:10:
     # Provision a PostgreSQL service container so the postgres/*.pg.test.ts
     # suites (pgDescribe) run in the merge gate. The pg-test-harness probe
-    # detects reachability via a TCP probe on localhost:5432 and skips when
-    # unavailable, so this service is what makes the 57 PG twin tests actually
-    # execute instead of being silently skipped.
+    # requires the psql client plus a successful read-only query. The service
+    # uses a random host port so it cannot collide with Ryan's SSH tunnel on
+    # localhost:5432.
     services:
       postgres:
         image: postgres:15
@@ -100,7 +100,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
-          - 5432:5432
+          - 5432/tcp
         # Mark the service healthy only when pg_isready succeeds on the mapped
         # port, so job steps don't start before Postgres accepts connections.
         options: >-
@@ -108,11 +108,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-    env:
-      # Point the PG test harness at the service container. psql admin DDL
-      # (CREATE/DROP DATABASE) runs against this URL's maintenance database.
-      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@localhost:5432"
-      PGPASSWORD: "postgres"
     # The gate's value is speed; without a job timeout a hung build or
     # deadlocked vitest worker blocks every PR for GitHub's default 6 hours.
     # Expected runtime is ~3-5 min.
@@ -160,6 +155,11 @@ jobs:
 
       - name: Gate tests (curated engine-core + CI-shape)
         run: pnpm test:gate
+        env:
+          # The runner itself is a Docker container. Reach the sibling
+          # PostgreSQL service through its random Docker Desktop host port.
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
+          PGPASSWORD: "postgres"
 
   # Advisory desktop-packaging validation lives in its OWN workflow (desktop-packaging.yml) so this
   # thin gate stays exactly [Lint, Typecheck, Build, Gate] — the job set here maps 1:1 to the

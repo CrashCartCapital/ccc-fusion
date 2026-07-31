@@ -46,6 +46,18 @@ function createStore(tasks: Task[], scopes: Record<string, string[]>, settings: 
     if (task) task.column = column;
     return task as Task;
   });
+  const moveTaskIf = vi.fn(async (
+    id: string,
+    column: Task["column"],
+    predicate: (live: Task) => boolean | Promise<boolean>,
+  ) => {
+    const task = tasks.find((candidate) => candidate.id === id);
+    if (!task || !await predicate(task) || task.column === column) {
+      return { task: task as Task, moved: false };
+    }
+    task.column = column;
+    return { task, moved: true };
+  });
 
   return {
     listTasks: vi.fn(async () => tasks),
@@ -58,6 +70,7 @@ function createStore(tasks: Task[], scopes: Record<string, string[]>, settings: 
     parseFileScopeFromPrompt: vi.fn(async (id: string) => scopes[id] ?? []),
     updateTask,
     moveTask,
+    moveTaskIf,
     getTask: vi.fn(async (id: string) => tasks.find((task) => task.id === id) ?? null),
     logEntry: vi.fn(async () => undefined),
     getRootDir: vi.fn(() => "/tmp/project"),
@@ -65,6 +78,10 @@ function createStore(tasks: Task[], scopes: Record<string, string[]>, settings: 
     on: vi.fn(),
     off: vi.fn(),
     recordRunAuditEvent: vi.fn(async () => undefined),
+    getMissionStore: vi.fn(() => ({
+      listMissions: () => [],
+      listGoalIdsForMission: () => [],
+    })),
   } as unknown as TaskStore;
 }
 
@@ -155,7 +172,12 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-028", { status: "queued", blockedBy: "FN-039" });
     expect(store.logEntry).toHaveBeenCalledWith("FN-028", "queued — unmet dependencies: FN-039");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-030", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      "FN-030",
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ allocateWorktree: expect.any(Function) }),
+    );
     expect(store.updateTask).not.toHaveBeenCalledWith(
       "FN-030",
       expect.objectContaining({ status: "queued", overlapBlockedBy: "FN-028" }),
@@ -187,7 +209,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
       "FN-028",
       expect.objectContaining({ status: "queued", overlapBlockedBy: "FN-039" }),
     );
-    expect(store.moveTask).toHaveBeenCalledWith("FN-030", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-030", "in-progress", expect.any(Function), expect.anything());
     expect(store.logEntry).not.toHaveBeenCalledWith(
       "FN-030",
       "queued — deferred for higher-priority runnable queued task FN-028 (overlap)",
@@ -208,7 +230,12 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
     (scheduler as any).running = true;
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-030", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      "FN-030",
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ allocateWorktree: expect.any(Function) }),
+    );
     expect(store.updateTask).not.toHaveBeenCalledWith(
       "FN-030",
       expect.objectContaining({ status: "queued", overlapBlockedBy: "FN-039" }),
@@ -234,7 +261,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
       blockedBy: null,
       overlapBlockedBy: "FN-039",
     });
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-030", "in-progress", expect.anything());
+    expect(store.moveTaskIf).not.toHaveBeenCalledWith("FN-030", "in-progress", expect.any(Function), expect.anything());
   });
 
   it("keeps active file-scope leases bounded while non-overlapping ready work proceeds", async () => {
@@ -262,7 +289,12 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
       "FN-030",
       "queued — blocked by active file-scope lease FN-039 (column=in-progress)",
     );
-    expect(store.moveTask).toHaveBeenCalledWith("FN-031", "in-progress", expect.objectContaining({ allocateWorktree: expect.any(Function) }));
+    expect(store.moveTaskIf).toHaveBeenCalledWith(
+      "FN-031",
+      "in-progress",
+      expect.any(Function),
+      expect.objectContaining({ allocateWorktree: expect.any(Function) }),
+    );
   });
 
   it("FN-6954: clears stale running durable agents when overlap requeue parks todo task", async () => {
@@ -357,7 +389,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
       "FN-045",
       "queued — blocked by active file-scope lease FN-033 (column=in-progress)",
     );
-    expect(store.moveTask).toHaveBeenCalledWith("FN-078", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-078", "in-progress", expect.any(Function), expect.anything());
     expect(store.logEntry).not.toHaveBeenCalledWith(
       "FN-078",
       "queued — deferred for higher-priority runnable queued task FN-070 (overlap)",
@@ -391,7 +423,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
     (scheduler as any).running = true;
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-158", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-158", "in-progress", expect.any(Function), expect.anything());
     expect(store.updateTask).toHaveBeenCalledWith("FN-158", { overlapBlockedBy: null });
     expect(store.logEntry).toHaveBeenCalledWith(
       "FN-158",
@@ -419,7 +451,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
     (scheduler as any).running = true;
     await scheduler.schedule();
 
-    expect(store.moveTask).toHaveBeenCalledWith("FN-033", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-033", "in-progress", expect.any(Function), expect.anything());
     expect(store.updateTask).toHaveBeenCalledWith(
       "FN-045",
       expect.objectContaining({ status: "queued", overlapBlockedBy: "FN-033" }),
@@ -428,7 +460,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
       "FN-045",
       "queued — blocked by active file-scope lease FN-033 (column=in-progress)",
     );
-    expect(store.moveTask).toHaveBeenCalledWith("FN-078", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-078", "in-progress", expect.any(Function), expect.anything());
     expect(store.logEntry).not.toHaveBeenCalledWith(
       "FN-078",
       "queued — deferred for higher-priority runnable queued task FN-045 (overlap)",
@@ -452,7 +484,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
     await scheduler.schedule();
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-100", { overlapBlockedBy: null });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-100", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-100", "in-progress", expect.any(Function), expect.anything());
     expect(store.logEntry).not.toHaveBeenCalledWith(
       "FN-100",
       "queued — deferred for higher-priority runnable queued task FN-070 (overlap)",
@@ -481,7 +513,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
     await scheduler.schedule();
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-779", { overlapBlockedBy: null });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-779", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-779", "in-progress", expect.any(Function), expect.anything());
     expect(store.updateTask).not.toHaveBeenCalledWith(
       "FN-779",
       expect.objectContaining({ status: "queued", overlapBlockedBy: "FN-756" }),
@@ -507,7 +539,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
       blockedBy: null,
       overlapBlockedBy: "FN-756",
     });
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-800", "in-progress", expect.anything());
+    expect(store.moveTaskIf).not.toHaveBeenCalledWith("FN-800", "in-progress", expect.any(Function), expect.anything());
   });
 
   it("reroutes a stale overlap blocker to another current active lease", async () => {
@@ -535,7 +567,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
       "FN-900",
       "queued — blocked by active file-scope lease FN-NEW (column=in-progress)",
     );
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-900", "in-progress", expect.anything());
+    expect(store.moveTaskIf).not.toHaveBeenCalledWith("FN-900", "in-progress", expect.any(Function), expect.anything());
   });
 
   it("clears an absent overlap blocker only after confirming no current overlap remains", async () => {
@@ -551,7 +583,7 @@ describe("scheduler overlap starvation regression (FN-057)", () => {
     await scheduler.schedule();
 
     expect(store.updateTask).toHaveBeenCalledWith("FN-901", { overlapBlockedBy: null });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-901", "in-progress", expect.anything());
+    expect(store.moveTaskIf).toHaveBeenCalledWith("FN-901", "in-progress", expect.any(Function), expect.anything());
   });
 
 });

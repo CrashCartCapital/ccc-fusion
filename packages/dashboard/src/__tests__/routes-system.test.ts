@@ -255,6 +255,10 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
       getMissionTask: vi.fn(),
       deleteMissionTask: vi.fn(),
     }),
+    getPluginStore: vi.fn().mockReturnValue({
+      init: vi.fn().mockResolvedValue(undefined),
+      listPlugins: vi.fn().mockResolvedValue([]),
+    }),
     ...overrides,
   } as unknown as TaskStore;
 }
@@ -866,8 +870,12 @@ describe("GET /api/plugins/dashboard-views", () => {
 describe("GET /api/plugins/runtimes", () => {
   function buildApp(pluginLoader?: { getPluginRuntimes?: () => Array<{ pluginId: string; runtime: { metadata: { runtimeId: string; name: string; description?: string; version?: string }; factory: () => unknown } }> }) {
     const app = express();
+    const store = createMockStore();
     app.use(express.json());
-    app.use("/api", createApiRoutes(createMockStore(), { pluginLoader }));
+    app.use("/api", createApiRoutes(store, {
+      pluginStore: store.getPluginStore(),
+      pluginLoader,
+    }));
     return app;
   }
 
