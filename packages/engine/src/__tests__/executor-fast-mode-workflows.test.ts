@@ -1675,7 +1675,9 @@ describe("fast mode workflow/runtime invariants", () => {
     });
     const executor = new TaskExecutor(store, "/tmp/test", {
       cliAgentRuntime: {
-        manager: {} as any,
+        manager: {
+          preflightPtyRuntime: vi.fn(async () => undefined),
+        } as any,
         hub: {} as any,
         registry: {} as any,
         store: runtimeStore,
@@ -1722,7 +1724,11 @@ describe("fast mode workflow/runtime invariants", () => {
           config: {
             executor: "cli-agent",
             cliAdapterId: "test-cli-adapter",
-            cliSettings: { profile: "ccc-fusion" },
+            cliSettings: {
+              profile: "ccc-fusion",
+              providerId: "openai",
+              model: "gpt-4o",
+            },
             prompt: "test cli",
           },
         },

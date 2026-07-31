@@ -1,4 +1,5 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,9 +13,29 @@ import type {
 } from "@fusion/core";
 import { PermanentError } from "../engine-errors.js";
 import { createCccCampaignProofSuiteHandler } from "../ccc-campaign-proof-execution.js";
+import { __testOnlyDetectTrustedVerifierBwrap } from "../run-verification-tool.js";
 
 const execFile = promisify(execFileCallback);
 const scratchRoots: string[] = [];
+
+function canExecuteVerifierSandbox(): boolean {
+  if (process.platform === "darwin") return existsSync("/usr/bin/sandbox-exec");
+  if (process.platform !== "linux") return false;
+  const detected = __testOnlyDetectTrustedVerifierBwrap();
+  if (!detected.available || !detected.path) return false;
+  const probe = spawnSync(detected.path, [
+    "--die-with-parent",
+    "--unshare-net",
+    "--ro-bind",
+    "/",
+    "/",
+    "--",
+    "/bin/true",
+  ], { stdio: "ignore", timeout: 5_000 });
+  return probe.status === 0;
+}
+
+const itVerifierHost = canExecuteVerifierSandbox() ? it : it.skip;
 
 async function commit(repo: string, message: string): Promise<string> {
   await execFile("git", ["-C", repo, "add", "--all"]);
@@ -159,7 +180,7 @@ afterEach(async () => {
 });
 
 describe("CCC campaign proof-suite execution", () => {
-  it("executes the declared verifier on the exact campaign commit: planted defect fails, corrected commit passes", async () => {
+  itVerifierHost("executes the declared verifier on the exact campaign commit: planted defect fails, corrected commit passes", async () => {
     const f = await fixture();
     const settled: Array<{
       attemptKey: string;

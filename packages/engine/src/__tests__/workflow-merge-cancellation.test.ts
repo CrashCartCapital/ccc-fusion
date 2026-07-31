@@ -13,12 +13,23 @@ Surface enumeration (engine-only; no UI, so desktop/mobile breakpoints are N/A):
 - The classification boundary: `merge-cancelled` must not be read as a retryable merge failure.
 */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { issuePersistedCccCampaignApprovalMock } = vi.hoisted(() => ({
+  issuePersistedCccCampaignApprovalMock: vi.fn(),
+}));
+
+vi.mock("@fusion/core", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@fusion/core")>(),
+  issueCccCampaignApproval: issuePersistedCccCampaignApprovalMock,
+}));
+
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import { primitiveNodeContext } from "../runtime-primitives.js";
 import { classifyMergePrimitiveResult } from "../workflow-merge-nodes.js";
 import { createMergeAttemptHandler } from "../workflow-node-runners/merge-runner.js";
 import { createCccCampaignMergeControl, matchesCccCampaignMergeControl } from "../ccc-campaign-merge-control.js";
+import { CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_CODE } from "../ccc-campaign-product-control.js";
 import { executorLog } from "../logger.js";
 import { createMockStore, mockedExistsSync, resetExecutorMocks } from "./executor-test-helpers.js";
 
@@ -101,37 +112,91 @@ describe("workflow merge cancellation", () => {
   });
 
   describe("requestMerge primitive", () => {
-    it("uses persisted campaign custody without a workflow boundary or legacy finalization", async () => {
+    it("parks persisted campaign custody at human approval without a workflow boundary or merge dispatch", async () => {
       const liveTask = mergeReadyTask({
         id: "FN-CAMPAIGN",
         lineageId: "ccc-prd:0123456789abcdef01234567:merge",
       });
       const { store, executor } = executorFor(liveTask);
+      const semanticTaskId = "TASK-CAMPAIGN";
+      const mergeAction = {
+        id: "ACTION-CAMPAIGN-MERGE",
+        kind: "merge",
+        target: "refs/heads/main",
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_merge",
+        spans: [],
+      };
       const context = {
         taskId: liveTask.id,
+        semanticTaskId,
         projectId: "project-1",
         importId: "import-1",
         campaignId: "campaign-1",
         bundleHash: "bundle-1",
         manifestHash: "manifest-1",
-        targetRepository: { path: "/tmp/campaign-repo", baseCommit: "base-1" },
+        packetHash: "packet-1",
+        sidecarHash: "sidecar-1",
+        idempotencyKey: "campaign-merge",
+        targetRepository: { path: "/tmp/test", baseCommit: "base-1" },
+        route: {
+          taskId: semanticTaskId,
+          kind: "local",
+          providerId: "native",
+          modelId: "native-git",
+          transport: "native",
+        },
+        executionPolicy: { schema: "ccc-campaign.execution-policy.v2" },
+        protectedActionIds: [mergeAction.id],
+        protectedActions: [mergeAction],
+        activeActionLeases: {},
+        campaignStartedAt: "2026-07-15T00:00:00.000Z",
+        campaignDeadlineAt: "2026-07-16T00:00:00.000Z",
       };
       store.getCccCampaignContextForTask = vi.fn(async () => context);
-      const requester = vi.fn(async () => ({
-        task: liveTask,
-        merged: true,
-        worktreeRemoved: false,
-        branchDeleted: false,
-        campaignControlled: createCccCampaignMergeControl(context as any),
-      }));
+      const layer = { projectId: "project-1" };
+      store.getAsyncLayer = vi.fn(() => layer);
+      issuePersistedCccCampaignApprovalMock.mockResolvedValueOnce({
+        id: "ccc-approval-campaign-merge",
+        status: "issued",
+        taskId: liveTask.id,
+        runId: "FN-CANCEL:run",
+        campaign: {
+          binding: {
+            projectId: context.projectId,
+            importId: context.importId,
+            campaignId: context.campaignId,
+            taskId: liveTask.id,
+            actionId: mergeAction.id,
+            actionTarget: mergeAction.target,
+          },
+          notBeforeAt: context.campaignStartedAt,
+          expiresAt: context.campaignDeadlineAt,
+        },
+      });
+      const requester = vi.fn();
       executor.setMergeRequester(requester);
 
-      const result = await executor
+      await expect(executor
         .createAuthoritativeWorkflowPrimitives({ autoMerge: true })
-        .requestMerge(mergeCtx(undefined), liveTask);
+        .requestMerge(mergeCtx(undefined), liveTask)).rejects.toMatchObject({
+          code: CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_CODE,
+        });
 
-      expect(result).toMatchObject({ outcome: "success", value: "merged" });
-      expect(requester).toHaveBeenCalledWith("FN-CAMPAIGN", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+      expect(issuePersistedCccCampaignApprovalMock).toHaveBeenCalledWith(
+        layer,
+        expect.objectContaining({
+          authorityStore: store,
+          rootDir: "/tmp/test",
+          taskId: liveTask.id,
+          action: expect.objectContaining({
+            actionId: mergeAction.id,
+            actionTarget: mergeAction.target,
+          }),
+          runId: "FN-CANCEL:run",
+        }),
+      );
+      expect(requester).not.toHaveBeenCalled();
       expect(store.moveTask).not.toHaveBeenCalled();
     });
 

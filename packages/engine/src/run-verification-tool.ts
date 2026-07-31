@@ -19,12 +19,14 @@
  */
 
 import { superviseSpawn, type SupervisedChild } from "@fusion/core";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, type Dirent } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { executorLog } from "./logger.js";
+import type { BwrapDetectResult } from "./sandbox/bubblewrap-detect.js";
+import { policyToBwrapArgs } from "./sandbox/bubblewrap-policy.js";
 import { withVerificationSlot } from "./verification-concurrency.js";
 
 // ---------------------------------------------------------------------------
@@ -105,9 +107,16 @@ const PROTECTED_DIRECTORY_SBPL_REGEX =
 
 interface VerificationSandboxLaunch {
   command: string;
+  args: string[];
+  shell: boolean;
   env: NodeJS.ProcessEnv;
   warning?: string;
   cleanup: () => void;
+}
+
+interface VerificationSandboxProbe {
+  platform: NodeJS.Platform;
+  bubblewrap?: BwrapDetectResult;
 }
 
 function buildVerificationChildEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -315,15 +324,237 @@ function buildStrictDarwinVerifierProfile(input: {
   return `${lines.join("\n")}\n`;
 }
 
-function buildVerificationSandboxLaunch(input: {
+interface VerificationSandboxInput {
   command: string;
   cwd: string;
   childEnv: NodeJS.ProcessEnv;
-}): VerificationSandboxLaunch | { error: string } {
-  if (process.platform !== "darwin") {
+}
+
+const PROTECTED_VERIFIER_ENTRY_NAMES = new Set([
+  ".agentsecrets",
+  ".obsidian",
+  "_secrets",
+  "_KELSEY",
+]);
+const TRUSTED_VERIFIER_BWRAP_PATHS = ["/usr/bin/bwrap", "/bin/bwrap"] as const;
+const MAX_VERIFIER_OVERLAY_SCAN_DIRECTORIES = 100_000;
+
+interface VerificationPathOverlay {
+  kind: "empty-directory" | "empty-file" | "read-only";
+  path: string;
+}
+
+function resolveVerificationReadRoot(cwd: string): string {
+  const canonicalCwd = maybeRealpath(cwd);
+  let candidate = canonicalCwd;
+  while (true) {
+    if (existsSync(join(candidate, ".git"))) return candidate;
+    const parent = dirname(candidate);
+    if (parent === candidate) return canonicalCwd;
+    candidate = parent;
+  }
+}
+
+function collectVerificationPathOverlays(readRoot: string): VerificationPathOverlay[] {
+  const overlays: VerificationPathOverlay[] = [];
+  let scannedDirectories = 0;
+  const readEntries = (directory: string): Dirent<string>[] | undefined => {
+    try {
+      return readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
+    } catch {
+      return undefined;
+    }
+  };
+  const visit = (directory: string): void => {
+    scannedDirectories += 1;
+    if (scannedDirectories > MAX_VERIFIER_OVERLAY_SCAN_DIRECTORIES) {
+      throw new Error(
+        `verifier protected-path scan exceeded ${MAX_VERIFIER_OVERLAY_SCAN_DIRECTORIES} directories`,
+      );
+    }
+    const entries = readEntries(directory);
+    if (!entries) return;
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (PROTECTED_VERIFIER_ENTRY_NAMES.has(entry.name)) {
+        overlays.push({
+          kind: entry.isDirectory() ? "empty-directory" : "empty-file",
+          path,
+        });
+        continue;
+      }
+      if (entry.name === ".env") {
+        overlays.push({ kind: "empty-file", path });
+        continue;
+      }
+      if (entry.name === ".git" || entry.name === ".fusion") {
+        overlays.push({ kind: "read-only", path });
+        continue;
+      }
+      if (entry.isDirectory()) {
+        visit(path);
+      }
+    }
+  };
+  visit(readRoot);
+  return overlays;
+}
+
+function packageRootForExecutable(path: string): string | undefined {
+  const marker = `${sep}node_modules${sep}`;
+  const markerIndex = path.lastIndexOf(marker);
+  if (markerIndex === -1) return undefined;
+  const packageStart = markerIndex + marker.length;
+  const segments = path.slice(packageStart).split(sep);
+  const packageSegmentCount = segments[0]?.startsWith("@") ? 2 : 1;
+  if (segments.length < packageSegmentCount) return undefined;
+  return path.slice(0, packageStart + segments.slice(0, packageSegmentCount).join(sep).length);
+}
+
+function verificationRuntimeReadPaths(childEnv: NodeJS.ProcessEnv): string[] {
+  const paths: string[] = [];
+  for (const pathEntry of (childEnv.PATH ?? "").split(process.platform === "win32" ? ";" : ":")) {
+    if (!pathEntry || !existsSync(pathEntry)) continue;
+    paths.push(pathEntry);
+    for (const executable of ["node", "pnpm", "git", "sh"]) {
+      const candidate = join(pathEntry, executable);
+      if (!existsSync(candidate)) continue;
+      const canonicalExecutable = maybeRealpath(candidate);
+      paths.push(dirname(canonicalExecutable));
+      const packageRoot = packageRootForExecutable(canonicalExecutable);
+      if (packageRoot) paths.push(packageRoot);
+    }
+  }
+  paths.push(dirname(maybeRealpath(process.execPath)));
+  return uniqueResolvedPaths(paths);
+}
+
+function detectTrustedVerifierBwrap(): BwrapDetectResult {
+  for (const candidate of TRUSTED_VERIFIER_BWRAP_PATHS) {
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      const canonical = realpathSync(candidate);
+      if (!TRUSTED_VERIFIER_BWRAP_PATHS.includes(
+        canonical as (typeof TRUSTED_VERIFIER_BWRAP_PATHS)[number],
+      )) {
+        continue;
+      }
+      return { available: true, path: canonical };
+    } catch {
+      // Try the next fixed system location. Ambient PATH is never consulted.
+    }
+  }
+  return { available: false, reason: "not-installed-at-trusted-system-path" };
+}
+
+function buildStrictLinuxVerifierLaunch(
+  input: VerificationSandboxInput,
+  bubblewrap: BwrapDetectResult,
+): VerificationSandboxLaunch | { error: string } {
+  if (!bubblewrap.available || !bubblewrap.path) {
     return {
       error:
-        "No enforced verifier sandbox backend is available on this platform; refusing to run verification natively.",
+        `bubblewrap is required for verifier confinement on Linux (${bubblewrap.reason ?? "unavailable"}); refusing to run verification natively.`,
+    };
+  }
+
+  const cwd = maybeRealpath(input.cwd);
+  const readRoot = resolveVerificationReadRoot(cwd);
+  const scratchRoot = mkdtempSync(join(maybeRealpath(tmpdir()), "fusion-verifier-bwrap-"));
+  const maskRoot = mkdtempSync(join(maybeRealpath(tmpdir()), "fusion-verifier-mask-"));
+  const sandboxHome = join(scratchRoot, "home");
+  const sandboxTmp = join(scratchRoot, "tmp");
+  const sandboxStore = join(scratchRoot, "pnpm-store");
+  const emptyProtectedDirectory = join(maskRoot, "empty");
+  for (const path of [sandboxHome, sandboxTmp, sandboxStore, emptyProtectedDirectory]) {
+    mkdirSync(path, { recursive: true });
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...input.childEnv,
+    HOME: sandboxHome,
+    TMPDIR: sandboxTmp,
+    npm_config_cache: join(sandboxTmp, "npm-cache"),
+    PNPM_HOME: input.childEnv.PNPM_HOME ?? join(sandboxHome, ".local", "share", "pnpm"),
+    COREPACK_HOME: input.childEnv.COREPACK_HOME ?? join(sandboxHome, ".cache", "node", "corepack"),
+  };
+
+  let args: string[];
+  try {
+    args = policyToBwrapArgs(
+      {
+        allowNetwork: false,
+        allowedReadPaths: [readRoot, ...verificationRuntimeReadPaths(input.childEnv)],
+        allowedWritePaths: [cwd, scratchRoot],
+      },
+      {
+        worktreePath: cwd,
+        repoRootPath: readRoot,
+        pnpmStorePath: sandboxStore,
+        nodeBinPath: maybeRealpath(process.execPath),
+        homeDir: sandboxHome,
+        tmpDirOverride: "/tmp",
+        pathExists: existsSync,
+        envSource: {},
+      },
+    );
+
+    if (args.at(-2) === "--chdir" && args.at(-1) === cwd) {
+      args.splice(-2, 2);
+    }
+    // policyToBwrapArgs emits writable mounts before read-only mounts. Rebind
+    // the writable roots after their read-only ancestors so a package cwd
+    // remains writable when the repository root is mounted read-only.
+    args.push("--bind", cwd, cwd, "--bind", scratchRoot, scratchRoot);
+
+    for (const overlay of collectVerificationPathOverlays(readRoot)) {
+      if (overlay.kind === "read-only") {
+        args.push("--ro-bind", overlay.path, overlay.path);
+      } else if (overlay.kind === "empty-directory") {
+        args.push("--ro-bind", emptyProtectedDirectory, overlay.path);
+      } else {
+        args.push("--ro-bind", "/dev/null", overlay.path);
+      }
+    }
+    for (const [key, value] of Object.entries(env)) {
+      if (value !== undefined) args.push("--setenv", key, value);
+    }
+    args.push("--chdir", cwd);
+  } catch (error) {
+    rmSync(scratchRoot, { recursive: true, force: true });
+    rmSync(maskRoot, { recursive: true, force: true });
+    return {
+      error: `failed to build Linux verifier sandbox policy (${error instanceof Error ? error.message : String(error)}); refusing to run verification natively.`,
+    };
+  }
+
+  args.push("--", "/bin/sh", "-c", input.command);
+  return {
+    command: bubblewrap.path,
+    args,
+    shell: false,
+    env,
+    warning: "verification command ran under bubblewrap with network disabled and isolated HOME/TMPDIR",
+    cleanup: () => {
+      rmSync(scratchRoot, { recursive: true, force: true });
+      rmSync(maskRoot, { recursive: true, force: true });
+    },
+  };
+}
+
+async function buildVerificationSandboxLaunch(
+  input: VerificationSandboxInput,
+  probe?: VerificationSandboxProbe,
+): Promise<VerificationSandboxLaunch | { error: string }> {
+  const platform = probe?.platform ?? process.platform;
+  if (platform === "linux") {
+    const bubblewrap = probe?.bubblewrap ?? detectTrustedVerifierBwrap();
+    return buildStrictLinuxVerifierLaunch(input, bubblewrap);
+  }
+  if (platform !== "darwin") {
+    return {
+      error:
+        `No enforced verifier sandbox backend is available on platform ${platform}; refusing to run verification natively.`,
     };
   }
   if (!existsSync(SANDBOX_EXEC_PATH)) {
@@ -366,12 +597,25 @@ function buildVerificationSandboxLaunch(input: {
 
   return {
     command: `${SANDBOX_EXEC_PATH} -p ${shellSingleQuote(profile)} /usr/bin/env -i ${shellEnvAssignments(env)} /bin/sh -c ${shellSingleQuote(input.command)}`,
+    args: [],
+    shell: true,
     env,
     warning: "verification command ran under sandbox-exec with network disabled and isolated HOME/TMPDIR",
     cleanup: () => {
       rmSync(scratchRoot, { recursive: true, force: true });
     },
   };
+}
+
+export async function __testOnlyBuildVerificationSandboxLaunch(
+  input: VerificationSandboxInput,
+  probe: VerificationSandboxProbe,
+): Promise<VerificationSandboxLaunch | { error: string }> {
+  return buildVerificationSandboxLaunch(input, probe);
+}
+
+export function __testOnlyDetectTrustedVerifierBwrap(): BwrapDetectResult {
+  return detectTrustedVerifierBwrap();
 }
 
 /*
@@ -844,7 +1088,7 @@ async function runVerificationCommandUnlocked(
   const sensitiveValues = collectExcludedSensitiveValues(process.env, childEnv);
   const redactCapturedText = (text: string): string =>
     redactExcludedSensitiveValues(text, sensitiveValues);
-  const launch = buildVerificationSandboxLaunch({ command, cwd, childEnv });
+  const launch = await buildVerificationSandboxLaunch({ command, cwd, childEnv });
   if ("error" in launch) {
     return {
       success: false,
@@ -870,11 +1114,11 @@ async function runVerificationCommandUnlocked(
       cleanupCalled = true;
       launch.cleanup();
     };
-    const supervised = superviseSpawn(launch.command, [], {
+    const supervised = superviseSpawn(launch.command, launch.args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: launch.env,
-      shell: true,
+      shell: launch.shell,
       killGraceMs: SIGKILL_GRACE_MS,
       maxLifetimeMs: timeoutMs > 0 ? timeoutMs + SIGKILL_GRACE_MS + 1_000 : undefined,
     });

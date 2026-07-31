@@ -2307,6 +2307,15 @@ export async function runPrdCommand(
         model: "proposal-file-v1",
         generateCandidate: async () => proposal,
       },
+      constraints: {
+        targetRepository: proposal.targetRepository,
+        bounds: proposal.bounds,
+        maxReviewItems:
+          proposal.ambiguities.length
+          + proposal.unresolvedDecisions.length
+          + proposal.exceptions.length
+          + proposal.protectedActions.length,
+      },
       workflowExtensionRegistry,
     });
     if (result.kind === "refusal") {

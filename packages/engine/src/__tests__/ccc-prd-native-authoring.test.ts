@@ -1,5 +1,14 @@
-import { readFileSync } from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import {
+  cpSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   WorkflowExtensionRegistry,
@@ -17,22 +26,154 @@ import {
   type CccPrdNativeAuthoringTransport,
 } from "../ccc-prd/native-authoring-adapter.js";
 
-const fixture = new URL("./fixtures/ccc-prd-canaries/ccc-lab-super-r2/", import.meta.url);
-const manifestPath = new URL("manifest.json", fixture).pathname;
-const firstSourcePath = (
-  JSON.parse(readFileSync(manifestPath, "utf8")) as {
-    entries: Array<{ relative_path: string }>;
-  }
-).entries[0]!.relative_path;
-const proposal = JSON.parse(
-  readFileSync(new URL("authoring-response.fixture.json", fixture), "utf8"),
+const sourceFixture = new URL("./fixtures/ccc-prd-canaries/ccc-lab-super-r2/", import.meta.url);
+const sourceManifestPath = new URL("manifest.json", sourceFixture).pathname;
+const baseProposal = JSON.parse(
+  readFileSync(new URL("authoring-response.fixture.json", sourceFixture), "utf8"),
 ) as CccPrdAuthoringProposal;
+const REVIEWED_DECISIONS_PATH = "reviewed-operator-decisions.md";
 
-const constraints = {
-  targetRepository: proposal.targetRepository,
-  bounds: proposal.bounds,
-  maxReviewItems: 8,
+type SourceReference = CccPrdAuthoringProposal["requirements"][number]["sourceRefs"];
+type FixtureConstraints = {
+  targetRepository: CccPrdAuthoringProposal["targetRepository"];
+  bounds: CccPrdAuthoringProposal["bounds"];
+  maxReviewItems: number;
 };
+
+let temporaryFixtureRoot = "";
+let fixtureRoot = "";
+let manifestPath = "";
+let firstSourcePath = "";
+let proposal: CccPrdAuthoringProposal;
+let constraints: FixtureConstraints;
+let alternateRequirementSourceRefs: SourceReference;
+
+const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+function sourceReference(exactQuote: string): SourceReference {
+  return [{ path: REVIEWED_DECISIONS_PATH, exactQuote }];
+}
+
+function buildReviewedOperatorDecisions(input: CccPrdAuthoringProposal): {
+  content: string;
+  proposal: CccPrdAuthoringProposal;
+  alternateRequirementSourceRefs: SourceReference;
+} {
+  const executionContract = [
+    "## Target repository, execution bounds, and admitted writes",
+    `Target repository path: ${input.targetRepository.path}`,
+    `Frozen baseline commit: ${input.targetRepository.baseCommit}`,
+    `Maximum requests: ${input.bounds.maxRequests}`,
+    `Maximum duration in milliseconds: ${input.bounds.maxDurationMs}`,
+    `Maximum concurrency: ${input.bounds.maxConcurrency}`,
+    ...input.admittedWriteRoots.flatMap((root) => [
+      `Admitted write root: ${root.path}`,
+      `Admitted write purpose: ${root.purpose}`,
+    ]),
+    ...input.nonGoals.map((nonGoal) => `Non-goal: ${nonGoal}`),
+  ].join("\n");
+  const requirementSections = new Map(input.requirements.map((requirement) => [
+    requirement.id,
+    [
+      `## Reviewed requirement: ${requirement.id}`,
+      `Requirement statement: ${requirement.statement}`,
+      `Acceptance behavior: ${requirement.acceptance}`,
+    ].join("\n"),
+  ]));
+  const proofSections = new Map(input.proofs.map((proof) => [
+    proof.id,
+    [
+      `## Reviewed proof: ${proof.id}`,
+      `Verifier command: ${proof.command}`,
+      `Positive oracle: ${proof.positiveOracle}`,
+      ...proof.negativeControls.map((control) => `Negative control: ${control}`),
+    ].join("\n"),
+  ]));
+  const protectedActionSections = new Map(input.protectedActions.map((action) => [
+    action.id,
+    [
+      `## Reviewed protected action: ${action.id}`,
+      `Protected action kind: ${action.kind}`,
+      `Protected action target: ${action.target}`,
+    ].join("\n"),
+  ]));
+  const alternateRequirement = input.requirements[0]!;
+  const alternateRequirementSection = [
+    `## Alternate reviewed requirement evidence: ${alternateRequirement.id}`,
+    `Alternate requirement statement: ${alternateRequirement.statement}`,
+    `Alternate acceptance behavior: ${alternateRequirement.acceptance}`,
+  ].join("\n");
+  const reviewedProposal = structuredClone(input);
+  reviewedProposal.requirements = reviewedProposal.requirements.map((requirement) => ({
+    ...requirement,
+    sourceRefs: sourceReference(requirementSections.get(requirement.id)!),
+  }));
+  reviewedProposal.proofs = reviewedProposal.proofs.map((proof) => ({
+    ...proof,
+    sourceRefs: sourceReference(proofSections.get(proof.id)!),
+  }));
+  reviewedProposal.protectedActions = reviewedProposal.protectedActions.map((action) => ({
+    ...action,
+    sourceRefs: sourceReference(protectedActionSections.get(action.id)!),
+  }));
+  return {
+    content: [
+      "# Reviewed Operator Decisions",
+      executionContract,
+      ...requirementSections.values(),
+      ...proofSections.values(),
+      ...protectedActionSections.values(),
+      alternateRequirementSection,
+      "",
+    ].join("\n\n"),
+    proposal: reviewedProposal,
+    alternateRequirementSourceRefs: sourceReference(alternateRequirementSection),
+  };
+}
+
+beforeAll(() => {
+  temporaryFixtureRoot = mkdtempSync(join(tmpdir(), "ccc-prd-native-authoring-"));
+  fixtureRoot = join(temporaryFixtureRoot, "packet");
+  cpSync(sourceFixture.pathname, fixtureRoot, { recursive: true });
+
+  const reviewed = buildReviewedOperatorDecisions(baseProposal);
+  writeFileSync(join(fixtureRoot, REVIEWED_DECISIONS_PATH), reviewed.content, "utf8");
+  const originalManifest = JSON.parse(readFileSync(sourceManifestPath, "utf8")) as {
+    schema: string;
+    source_version: string;
+    entries: Array<Record<string, unknown>>;
+  };
+  const testManifest = {
+    schema: originalManifest.schema,
+    source_version: originalManifest.source_version,
+    entries: [
+      ...originalManifest.entries,
+      {
+        authoritative: true,
+        relative_path: REVIEWED_DECISIONS_PATH,
+        role: "operator_decision",
+        sha256: sha256(reviewed.content),
+      },
+    ],
+  };
+  manifestPath = join(fixtureRoot, "manifest.json");
+  writeFileSync(manifestPath, `${JSON.stringify(testManifest, null, 2)}\n`, "utf8");
+
+  firstSourcePath = testManifest.entries[0]!.relative_path as string;
+  proposal = reviewed.proposal;
+  alternateRequirementSourceRefs = reviewed.alternateRequirementSourceRefs;
+  constraints = {
+    targetRepository: proposal.targetRepository,
+    bounds: proposal.bounds,
+    maxReviewItems: 8,
+  };
+});
+
+afterAll(() => {
+  if (temporaryFixtureRoot) {
+    rmSync(temporaryFixtureRoot, { recursive: true, force: true });
+  }
+});
 
 async function proofAdmissionRegistry(
   proofVersion = "ccc-proof-admission.v1",
@@ -54,7 +195,7 @@ async function proofAdmissionRegistry(
   const provenance = await deriveWorkflowExtensionHostProvenance({
     pluginId: "fusion-native",
     pluginVersion: "1.0.0",
-    trustedRootPath: fixture.pathname,
+    trustedRootPath: fixtureRoot,
     entryRelativePath: "authoring-response.fixture.json",
     manifestRelativePath: "manifest.json",
   });
@@ -101,7 +242,7 @@ describe("CCC PRD native authoring adapter", () => {
     const workflowExtensionRegistry = await proofAdmissionRegistry();
 
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter,
       constraints,
@@ -158,7 +299,7 @@ describe("CCC PRD native authoring adapter", () => {
 
   it("refuses authoring when the fixed native proof admission entry is missing", async () => {
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(proposal),
@@ -184,7 +325,7 @@ describe("CCC PRD native authoring adapter", () => {
     );
 
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(proposal),
@@ -203,7 +344,7 @@ describe("CCC PRD native authoring adapter", () => {
 
   it("refuses authoring when the fixed registry id is occupied by the wrong proof identity", async () => {
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(proposal),
@@ -222,7 +363,7 @@ describe("CCC PRD native authoring adapter", () => {
 
   it("refuses malformed native response text instead of accepting prose", async () => {
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: "Here is the sidecar:\n{}",
@@ -243,7 +384,7 @@ describe("CCC PRD native authoring adapter", () => {
     malformedProposal.requirements = [null];
 
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(malformedProposal),
@@ -261,7 +402,7 @@ describe("CCC PRD native authoring adapter", () => {
 
   it("refuses provider or model identity drift from the native transport", async () => {
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(proposal),
@@ -281,7 +422,7 @@ describe("CCC PRD native authoring adapter", () => {
     const generate = vi.fn<CccPrdNativeAuthoringTransport>();
 
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(generate, { maxPromptBytes: 1 }),
       constraints,
@@ -302,7 +443,7 @@ describe("CCC PRD native authoring adapter", () => {
     }));
 
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(generate, { maxResponseBytes: 1 }),
       constraints,
@@ -324,7 +465,7 @@ describe("CCC PRD native authoring adapter", () => {
     }];
 
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(excessiveReview),
@@ -352,7 +493,7 @@ describe("CCC PRD native authoring adapter", () => {
     }));
 
     const result = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(noReview),
@@ -375,7 +516,7 @@ describe("CCC PRD native authoring adapter", () => {
         model: request.model,
       }));
     const first = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: firstAdapter,
       constraints,
@@ -386,7 +527,7 @@ describe("CCC PRD native authoring adapter", () => {
     const changed = structuredClone(proposal);
     changed.requirements[0]!.id = "REQ-CHURNED";
     const second = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
           text: canonicalCccPrdJson(changed),
@@ -405,7 +546,7 @@ describe("CCC PRD native authoring adapter", () => {
 
   it("accepts an unchanged packet when prior source-bound declarations are reordered", async () => {
     const first = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(proposal),
@@ -420,7 +561,7 @@ describe("CCC PRD native authoring adapter", () => {
     const previousSidecar = structuredClone(first.sidecar);
     previousSidecar.requirements.reverse();
     const second = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
         text: canonicalCccPrdJson(proposal),
@@ -436,7 +577,7 @@ describe("CCC PRD native authoring adapter", () => {
 
   it("refuses a stable ID that is silently rebound to different source evidence", async () => {
     const first = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
           text: canonicalCccPrdJson(proposal),
@@ -449,9 +590,9 @@ describe("CCC PRD native authoring adapter", () => {
     if (first.kind !== "candidate") throw new Error("expected initial candidate");
 
     const rebound = structuredClone(proposal);
-    rebound.requirements[0]!.sourceRefs = structuredClone(proposal.requirements[1]!.sourceRefs);
+    rebound.requirements[0]!.sourceRefs = structuredClone(alternateRequirementSourceRefs);
     const second = await authorCccPrdPacket({
-      rootDir: fixture.pathname,
+      rootDir: fixtureRoot,
       manifestPath,
       adapter: nativeAdapter(async (request) => ({
           text: canonicalCccPrdJson(rebound),

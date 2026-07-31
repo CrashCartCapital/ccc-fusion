@@ -74,29 +74,77 @@ export function createPacketRoot() {
     nonGoals: ["live provider call"],
     unresolvedDecisions: [],
   };
-  const source = [
-    "# Dense PRD Packet", "", "## Functional Requirements", "", "| ID | Statement | Acceptance |", "|---|---|---|", "| FR-1 | Generate a traceable sidecar. | Sidecar has source spans and proof IDs. |", "", "## CCC Fusion Packet Declarations", "", "```json",
+  const functionalRequirements = [
+    "## Functional Requirements",
+    "",
+    "| ID | Statement | Acceptance |",
+    "|---|---|---|",
+    "| CF-CLI-001 | Generate a traceable sidecar. | Sidecar has source spans and proof IDs. |",
+  ].join("\n");
+  const executionContract = [
+    "## Reviewed Operator Decisions",
+    `Target repository path: ${target}`,
+    `Frozen baseline commit: ${base}`,
+    "Maximum requests: 1",
+    "Maximum duration in milliseconds: 30000",
+    "Maximum concurrency: 1",
+    `Admitted write root: ${target}/src/task-1`,
+    "Admitted write purpose: fixture projection",
+    "Non-goal: live provider call",
+  ].join("\n");
+  const requirementEvidence = [
+    "## Reviewed requirement: CF-CLI-001",
+    "Requirement statement: Generate a traceable sidecar.",
+    "Acceptance behavior: Sidecar has source spans and proof IDs.",
+  ].join("\n");
+  const proofEvidence = [
+    "## Reviewed proof: PF-CLI-001",
+    "Verifier command: pnpm test",
+    "Positive oracle: exit 0",
+    "Negative control: missing sidecar refuses",
+  ].join("\n");
+  const protectedActionEvidence = [
+    "## Reviewed protected action: ACTION-CLI-001",
+    "Protected action kind: live_execution",
+    "Protected action target: fixture/repo:provider-canary",
+  ].join("\n");
+  const declarationEvidence = [
+    "## CCC Fusion Packet Declarations",
+    "",
+    "```json",
     JSON.stringify(declarations),
-    "```", "",
+    "```",
+  ].join("\n");
+  const source = [
+    "# Dense PRD Packet", "", functionalRequirements, "", executionContract, "", requirementEvidence, "", proofEvidence, "", protectedActionEvidence, "", declarationEvidence, "",
   ].join("\n");
   writeFileSync(join(root, "packet.md"), source);
   writeFileSync(join(root, "manifest.json"), JSON.stringify({ schema: "ccc-prd.packet.v1", source_version: "test", entries: [{ relative_path: "packet.md", role: "root", authoritative: true, sha256: createHash("sha256").update(source).digest("hex") }] }, null, 2));
-  const sourceRefs = [
-    { path: "packet.md", exactQuote: "Dense PRD Packet" },
-    {
-      path: "packet.md",
-      exactQuote: "| FR-1 | Generate a traceable sidecar. | Sidecar has source spans and proof IDs. |",
-    },
-    { path: "packet.md", exactQuote: "CCC Fusion Packet Declarations" },
+  const functionalRequirementsSourceRef = { path: "packet.md", exactQuote: functionalRequirements };
+  const executionSourceRef = { path: "packet.md", exactQuote: executionContract };
+  const requirementSourceRef = { path: "packet.md", exactQuote: requirementEvidence };
+  const proofSourceRef = { path: "packet.md", exactQuote: proofEvidence };
+  const protectedActionSourceRef = { path: "packet.md", exactQuote: protectedActionEvidence };
+  const declarationSourceRef = { path: "packet.md", exactQuote: declarationEvidence };
+  const sourceRefs = [functionalRequirementsSourceRef, executionSourceRef, requirementSourceRef];
+  const proofSourceRefs = [executionSourceRef, proofSourceRef];
+  const protectedActionSourceRefs = [executionSourceRef, protectedActionSourceRef];
+  const taskSourceRefs = [
+    functionalRequirementsSourceRef,
+    executionSourceRef,
+    requirementSourceRef,
+    proofSourceRef,
+    protectedActionSourceRef,
+    declarationSourceRef,
   ];
   const proposal = join(root, "authoring-response.fixture.json");
   writeFileSync(proposal, JSON.stringify({
     schema: "ccc-prd.authoring-proposal.v1",
     authorityRoles: [{ id: "AUTHORITY-1", role: "root", sourcePaths: ["packet.md"], accountableProducer: "fixture" }],
     requirements: [{ id: "CF-CLI-001", statement: "Generate a traceable sidecar.", acceptance: "Sidecar has source spans and proof IDs.", accountableProducer: "fixture", dependencies: [], proofIds: ["PF-CLI-001"], sourceRefs, confidence: "high" }],
-    proofs: [{ id: "PF-CLI-001", requirementIds: ["CF-CLI-001"], command: "pnpm test", positiveOracle: "exit 0", negativeControls: ["missing sidecar refuses"], sourceRefs, confidence: "high" }],
+    proofs: [{ id: "PF-CLI-001", requirementIds: ["CF-CLI-001"], command: "pnpm test", positiveOracle: "exit 0", negativeControls: ["missing sidecar refuses"], sourceRefs: proofSourceRefs, confidence: "high" }],
     tasks: [
-      { id: "TASK-CLI-001", title: "Author sidecar", description: "Generate the candidate sidecar.", accountableProducer: "fixture", requirementIds: ["CF-CLI-001"], dependencyTaskIds: [], proofIds: ["PF-CLI-001"], workflowId: "WORKFLOW-CLI-001", documentIds: ["DOCUMENT-CLI-001"], artifactIds: [], protectedActionIds: [], sourceRefs },
+      { id: "TASK-CLI-001", title: "Author sidecar", description: "Generate the candidate sidecar.", accountableProducer: "fixture", requirementIds: ["CF-CLI-001"], dependencyTaskIds: [], proofIds: ["PF-CLI-001"], workflowId: "WORKFLOW-CLI-001", documentIds: ["DOCUMENT-CLI-001"], artifactIds: [], protectedActionIds: [], sourceRefs: taskSourceRefs },
     ],
     edges: [],
     workflows: [{ id: "WORKFLOW-CLI-001", title: "CLI workflow", taskIds: ["TASK-CLI-001"], entryTaskIds: ["TASK-CLI-001"], terminalTaskIds: ["TASK-CLI-001"], sourceRefs }],
@@ -105,7 +153,7 @@ export function createPacketRoot() {
     importIntents: [
       { id: "IMPORT-CLI-001", entityType: "task", entityId: "TASK-CLI-001", operation: "create", target: "project.tasks" }, { id: "IMPORT-CLI-004", entityType: "workflow", entityId: "WORKFLOW-CLI-001", operation: "create", target: "project.workflow_work_items" }, { id: "IMPORT-CLI-010", entityType: "work_item", entityId: "WORKFLOW-CLI-001", operation: "create", target: "project.workflow_work_items" }, { id: "IMPORT-CLI-005", entityType: "document", entityId: "DOCUMENT-CLI-001", operation: "create", target: "project.task_documents" }, { id: "IMPORT-CLI-006", entityType: "artifact", entityId: "ARTIFACT-CLI-001", operation: "create", target: "project.artifacts" }, { id: "IMPORT-CLI-007", entityType: "campaign", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.missions" }, { id: "IMPORT-CLI-008", entityType: "source", entityId: "SOURCE-CLI-001", operation: "create", target: "project.ccc_prd_import_sources" }, { id: "IMPORT-CLI-009", entityType: "run_audit", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.run_audit_events" },
     ],
-    protectedActions: [{ id: "ACTION-CLI-001", kind: "live_execution", target: "fixture/repo:provider-canary", sourceRefs: [{ path: "packet.md", exactQuote: "live provider call" }] }],
+    protectedActions: [{ id: "ACTION-CLI-001", kind: "live_execution", target: "fixture/repo:provider-canary", sourceRefs: protectedActionSourceRefs }],
     bounds: { maxRequests: 1, maxDurationMs: 30_000, maxConcurrency: 1 }, admittedWriteRoots: [{ path: `${target}/src/task-1`, purpose: "fixture projection" }], targetRepository: { path: target, baseCommit: base }, nonGoals: ["live provider call"], unresolvedDecisions: [], ambiguities: [], exceptions: [], confidence: "high",
   }, null, 2));
   return { root, manifest: join(root, "manifest.json"), proposal, sidecar: join(root, "candidate.sidecar.json"), target, base };
