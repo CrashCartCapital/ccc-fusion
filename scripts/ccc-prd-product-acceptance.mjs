@@ -1385,7 +1385,7 @@ async function main() {
           "Every implementation-changing fact must be source-bound",
         )
         && JSON.stringify(generationRequests[0].body?.messages).includes(
-          "Dense PRD Packet",
+          "CCC Fusion Product Vertical Slice",
         ),
       "CCC_PRODUCT_NATIVE_AUTHORING_REQUEST_INVALID",
       JSON.stringify(generationRequests),
