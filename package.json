@@ -44,7 +44,7 @@
     "test:scripts": "node scripts/run-script-tests.mjs",
     "test:workflow-release-check": "node scripts/workflow-reliability-release-check.mjs",
     "fn:cache-stats": "node scripts/cache-stats.mjs",
-    "test:full": "node scripts/test-changed.mjs --full --no-cache && pnpm --filter @fusion/engine test:slow",
+    "test:full": "node scripts/test-changed.mjs --full --no-cache && pnpm --filter @fusion/engine test:slow && pnpm --filter @fusion/engine test:product-route",
     "test:velocity": "node scripts/test-velocity-baseline.mjs",
     "test:feedback-baseline": "node scripts/test-feedback-baseline.mjs",
     "test:ci:shard": "node scripts/ci-test-shard.mjs",

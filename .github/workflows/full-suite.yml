@@ -283,13 +283,13 @@ jobs:
         continue-on-error: true
         run: node scripts/check-file-line-count.mjs
 
-  # The engine-slow tier (src/**/*.slow.test.ts) runs here with a non-empty
-  # execution assertion, so a glob/config drift that silently empties the tier
-  # fails this workflow instead of passing vacuously. Engine slow tests do real
-  # git operations, so a full clone (fetch-depth: 0) is required.
+  # The heavyweight product route and engine-slow tier run serially against one
+  # disposable PostgreSQL service. Product acceptance consumes the exact built
+  # proof host prepared above; slow tests retain their non-empty assertion.
   test-slow:
-    name: Engine slow tier
+    name: Product route + engine slow
     runs-on: [self-hosted, linux, ARM64, ccc-fusion]
+    needs: prepare-test-artifacts
     # FNXC:FixPgTestsAndCi 2026-07-14-00:00:
     # Provision a PostgreSQL service container so reliability-interaction test
     # helpers (which now require a PG-backed TaskStore after SQLite removal
@@ -319,6 +319,40 @@ jobs:
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup-node-pnpm
+
+      - name: Compute dist source hash
+        id: dist-hash
+        run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore built dist artifacts
+        id: dist-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            packages/core/dist
+            packages/dashboard/dist
+            packages/engine/dist
+            packages/cli/dist
+            packages/plugin-sdk/dist
+            plugins/fusion-plugin-dependency-graph/dist
+            plugins/fusion-plugin-hermes-runtime/dist
+            plugins/fusion-plugin-openclaw-runtime/dist
+            plugins/fusion-plugin-paperclip-runtime/dist
+            plugins/fusion-plugin-compound-engineering/dist
+          key: fusion-dist-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+          fail-on-cache-miss: true
+
+      - name: Assert restored artifacts are complete
+        run: node scripts/ensure-test-artifacts.mjs --assert-artifacts-present
+
+      - name: Seed artifact hash-cache
+        run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
+
+      - name: Run serialized product-route acceptance
+        run: pnpm --filter @fusion/engine test:product-route
+        env:
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
+          PGPASSWORD: "postgres"
 
       - name: Run engine-slow with non-empty-execution assertion
         run: node scripts/assert-engine-slow-nonempty.mjs

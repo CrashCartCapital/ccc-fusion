@@ -2777,6 +2777,27 @@ export class TaskExecutor {
   }
 
   /**
+   * Claim process-wide execution ownership for a native workflow processor.
+   *
+   * Imported CCC campaigns bypass {@link execute} and drive the authoritative
+   * workflow runtime directly. They still create executor-owned worktrees, so
+   * self-healing must see the task as live for the entire processor attempt.
+   * The returned release is idempotent; a null result means another executor
+   * already owns this task and the durable work item should remain retryable.
+   */
+  tryBeginAuthoritativeWorkflowExecution(taskId: string): (() => void) | null {
+    if (!executingTaskLock.tryClaim(taskId)) return null;
+    this.executing.add(taskId);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.executing.delete(taskId);
+      executingTaskLock.release(taskId);
+    };
+  }
+
+  /**
    * FNXC:TaskTiming 2026-08-01-12:00:
    * A planning segment has one owner: a graph Plan Review session is live only
    * while both its session registration and planning ownership marker remain.

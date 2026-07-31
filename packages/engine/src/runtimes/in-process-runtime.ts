@@ -1839,10 +1839,24 @@ export class InProcessRuntime
    * Get current runtime metrics.
    */
   getMetrics(): RuntimeMetrics {
-    // Estimate in-flight tasks by checking active sessions
-    const inFlightTasks = this.executor
-      ? (this.executor as unknown as { activeWorktrees?: Map<string, string> }).activeWorktrees?.size ?? 0
-      : 0;
+    // Count unique task owners across worktree-backed sessions and native
+    // workflow processors. A campaign processor can be live before it acquires
+    // a worktree (or after it releases one while persisting terminal state), so
+    // shutdown must not close plugins/backend resources based on worktrees alone.
+    const inFlightTaskIds = new Set<string>();
+    if (this.executor) {
+      const executorState = this.executor as unknown as {
+        activeWorktrees?: Map<string, unknown>;
+        getExecutingTaskIds?: () => Set<string>;
+      };
+      for (const taskId of executorState.activeWorktrees?.keys() ?? []) {
+        inFlightTaskIds.add(taskId);
+      }
+      for (const taskId of executorState.getExecutingTaskIds?.() ?? []) {
+        inFlightTaskIds.add(taskId);
+      }
+    }
+    const inFlightTasks = inFlightTaskIds.size;
 
     // Get active agent count from the semaphore
     const activeAgents = this.globalSemaphore?.activeCount ?? 0;
@@ -2161,6 +2175,15 @@ export class InProcessRuntime
             await this.failCampaignWorkflowCandidateClosed(resolved.item, bootstrapError);
             continue;
           }
+          const releaseExecution = this.executor.tryBeginAuthoritativeWorkflowExecution(
+            resolved.task.id,
+          );
+          if (!releaseExecution) {
+            runtimeLog.log(
+              `Workflow continuation ${resolved.item.id}: task ${resolved.task.id} already has a live execution owner`,
+            );
+            continue;
+          }
           this.campaignWorkflowContinuationsInFlight.add(processingKey);
           void processDueWorkflowWorkItem(this.taskStore, campaignRuntime, settings, {
             leaseOwner: `in-process-runtime:${this.config.projectId}`,
@@ -2177,6 +2200,7 @@ export class InProcessRuntime
               runtimeLog.error(`Workflow continuation ${resolved.item.id} campaign processor failed:`, error);
             })
             .finally(() => {
+              releaseExecution();
               this.campaignWorkflowContinuationsInFlight.delete(processingKey);
             });
           continue;

@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Task, TaskStore, WorkflowWorkItem } from "@fusion/core";
+import { executingTaskLock } from "../active-session-registry.js";
 import {
   InProcessRuntime,
   isPlanningContinuationTaskDispatchable,
@@ -120,6 +121,10 @@ describe("selectActionablePlanningContinuations", () => {
 });
 
 describe("InProcessRuntime campaign continuation dispatch", () => {
+  afterEach(() => {
+    executingTaskLock._clearForTest();
+  });
+
   it("does not dispatch the same exact candidate while its first claim is in flight", async () => {
     const item = workItem("campaign-in-flight", "planning", {
       runId: "run-campaign-in-flight",
@@ -164,18 +169,28 @@ describe("InProcessRuntime campaign continuation dispatch", () => {
     } as never, {} as never) as InProcessRuntime & {
       status: "active";
       taskStore: TaskStore;
-      executor: { execute: ReturnType<typeof vi.fn> };
+      executor: {
+        execute: ReturnType<typeof vi.fn>;
+        tryBeginAuthoritativeWorkflowExecution: (taskId: string) => (() => void) | null;
+      };
       cccCampaignWorkflowRuntime: object;
       campaignWorkflowContinuationsInFlight: Set<string>;
       drainWorkflowContinuations: () => Promise<void>;
     };
     runtime.status = "active";
     runtime.taskStore = store;
-    runtime.executor = { execute: vi.fn() };
+    runtime.executor = {
+      execute: vi.fn(),
+      tryBeginAuthoritativeWorkflowExecution: (taskId: string) => {
+        if (!executingTaskLock.tryClaim(taskId)) return null;
+        return () => executingTaskLock.release(taskId);
+      },
+    };
     runtime.cccCampaignWorkflowRuntime = {};
 
     await runtime.drainWorkflowContinuations();
     await firstClaimStarted;
+    expect(executingTaskLock.has(item.taskId)).toBe(true);
     await runtime.drainWorkflowContinuations();
 
     expect(matchingClaimReads).toBe(1);
@@ -185,5 +200,6 @@ describe("InProcessRuntime campaign continuation dispatch", () => {
     await vi.waitFor(() => {
       expect(runtime.campaignWorkflowContinuationsInFlight.size).toBe(0);
     });
+    expect(executingTaskLock.has(item.taskId)).toBe(false);
   });
 });

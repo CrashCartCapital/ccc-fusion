@@ -389,6 +389,19 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(testStep?.env?.FUSION_TEST_CONCURRENCY).toBe("2");
   });
 
+  it("runs product-route real-PG acceptance in the serialized engine job", () => {
+    const slowJob = workflow.jobs?.["test-slow"];
+    const productStep = (slowJob?.steps ?? []).find(
+      (step: any) => step.name === "Run serialized product-route acceptance",
+    );
+
+    expect(productStep?.run).toBe("pnpm --filter @fusion/engine test:product-route");
+    expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).toContain(
+      "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
+    );
+    expect(productStep?.env?.PGPASSWORD).toBe("postgres");
+  });
+
   it("keeps full clones where real-git tests need history", () => {
     const shardSteps = workflow.jobs?.["test-shards"]?.steps ?? [];
     const slowSteps = workflow.jobs?.["test-slow"]?.steps ?? [];
@@ -443,7 +456,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     }
     expect(prepareSave.with?.key).toBe(prepareRestore.with?.key);
 
-    for (const jobName of ["test-shards", "test-inventory-guard"]) {
+    for (const jobName of ["test-shards", "test-inventory-guard", "test-slow"]) {
       const job = workflow.jobs?.[jobName];
       const needs = Array.isArray(job?.needs) ? job.needs : [job?.needs];
       expect(needs).toContain("prepare-test-artifacts");
@@ -470,7 +483,8 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
         (step: any) =>
           typeof step.run === "string" &&
           (step.run.includes("pnpm test:ci:shard") ||
-            step.run.includes("check-test-inventory.mjs")),
+            step.run.includes("check-test-inventory.mjs") ||
+            step.run.includes("test:product-route")),
       );
       expect(assertIndex).toBeGreaterThan(-1);
       expect(seedIndex).toBeGreaterThan(assertIndex);
@@ -484,7 +498,6 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
       ).toBe(false);
     }
 
-    expect(workflow.jobs?.["test-slow"]?.needs).toBeUndefined();
     expect(workflow.jobs?.["line-count-audit"]?.needs).toBeUndefined();
   });
 

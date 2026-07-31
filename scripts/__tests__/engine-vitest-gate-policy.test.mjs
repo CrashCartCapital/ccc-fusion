@@ -91,6 +91,36 @@ test("root and package gate scripts still propagate real Vitest failures", () =>
   assert.doesNotMatch(root.scripts?.["test"] ?? "", /NODE_NO_WARNINGS/);
 });
 
+test("real-PG product routes run in an explicit serialized lane outside engine-default", () => {
+  const config = read("packages/engine/vitest.config.ts");
+  const engine = readJson("packages/engine/package.json");
+  const root = readJson("package.json");
+  const defaultStart = config.indexOf('name: "engine-default"');
+  const reliabilityStart = config.indexOf('name: "engine-reliability"');
+  const productStart = config.indexOf('name: "engine-product-route"');
+  const slowStart = config.indexOf('name: "engine-slow"');
+
+  assert.ok(defaultStart >= 0 && reliabilityStart > defaultStart, "engine-default project must remain present");
+  assert.ok(productStart > reliabilityStart && slowStart > productStart, "serialized product-route project must be explicit");
+
+  const defaultBlock = config.slice(defaultStart, reliabilityStart);
+  const productBlock = config.slice(productStart, slowStart);
+  for (const file of [
+    "src/__tests__/ccc-native-cli-public-route.real-pg.test.ts",
+    "src/__tests__/ccc-prd-product-vertical-slice.real-pg.test.ts",
+  ]) {
+    assert.match(defaultBlock, new RegExp(`"${file.replaceAll(".", "\\.")}"`), `${file} must be excluded from engine-default`);
+    assert.match(productBlock, new RegExp(`"${file.replaceAll(".", "\\.")}"`), `${file} must be included in the product lane`);
+  }
+  assert.match(productBlock, /maxWorkers:\s*1/, "product-route acceptance must use one worker");
+  assert.match(productBlock, /fileParallelism:\s*false/, "product-route acceptance files must not overlap");
+  assert.equal(
+    engine.scripts?.["test:product-route"],
+    "vitest run --silent=passed-only --reporter=dot --project=engine-product-route",
+  );
+  assert.match(root.scripts?.["test:full"] ?? "", /@fusion\/engine test:product-route/);
+});
+
 /*
 FNXC:MergeGatePerformance 2026-07-22-15:35:
 FN-8497 keeps only lifecycle and transactional-handoff PostgreSQL canaries in
