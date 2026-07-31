@@ -1,6 +1,6 @@
 # CCC Fusion PRD Product Vertical Slice
 
-**Status:** implementation candidate; broad dirty-tree gates green, exact clean-tree acceptance pending
+**Status:** locally proven on the clean integrated tree; not live or deployed
 **Plan path:** `docs/plans/2026-07-30-ccc-fusion-prd-product-vertical-slice.md`
 **Accepted base:** `1dd173311fbf7c16f85213066cc881fc959a2a2c`
 **Accepted base tree:** `ec30f36368d72b756640793374541636e307e696`
@@ -14,10 +14,12 @@ A normal operator can freeze a Markdown PRD packet, review a hash-bound semantic
 ## Baseline evidence
 
 - Local `origin/main` is the accepted product lineage at `1dd173311fbf7c16f85213066cc881fc959a2a2c`; the dirty shared checkout is inspection-only and is not an implementation baseline.
-- `pnpm verify:fast` passed all 11 static/build/boot-smoke steps on the integrated dirty implementation tree, including built `fn --help` and a real `/api/health` 200 response.
-- `node scripts/run-ccc-pg-proof.mjs --wave 6` passed the exact six-command PostgreSQL inventory on the integrated dirty implementation tree: 416 passed (69 + 53 + 95 + 139 + 54 + 6), with zero missing, skipped, extra, timed-out, or force-killed tests.
-- `pnpm test:gate`, bound explicitly to an owned disposable PostgreSQL service, passed PostgreSQL 10/10, engine 299/299, and CLI 65/65 on the integrated dirty implementation tree.
-- `pnpm lint`, `pnpm typecheck`, `pnpm build`, and `git diff --check` passed on the same integrated bytes. These are not substitutes for the final clean-commit product acceptance.
+- `pnpm verify:ccc-prd-product` passed all 18 exact checks on the clean integrated tree and proved the repository HEAD, tree, and porcelain status were unchanged from start to finish.
+- `pnpm verify:fast` passed all 18 static/typecheck/build/boot-smoke steps on the clean integrated tree, including built `fn --help` and a real `/api/health` 200 response.
+- `node scripts/run-ccc-pg-proof.mjs --wave 6` passed the exact six-command PostgreSQL inventory on the clean integrated tree: 416 passed (69 + 53 + 95 + 139 + 54 + 6), with zero missing, skipped, extra, timed-out, or force-killed tests.
+- `pnpm test:gate`, bound explicitly to an owned disposable PostgreSQL service, passed PostgreSQL 10/10, engine 299/299, and CLI 65/65 on the clean integrated tree.
+- `pnpm lint`, `pnpm typecheck`, `pnpm build`, and `git diff --check` passed on the same integrated bytes.
+- No external provider or production infrastructure was authorized or called. The supported path is locally proven, not live or deployed.
 - No fetch was performed. The remote-tracking ref is a local fact, not proof of current GitHub state.
 
 ## Approach decision
