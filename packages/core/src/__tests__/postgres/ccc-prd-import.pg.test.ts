@@ -1132,7 +1132,90 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     }
     const results = await Promise.allSettled([first, second]);
     if (assertionError) throw assertionError;
-    expect(results.every(({ status }) => status === "fulfilled")).toBe(true);
+    const rejected = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (rejected) throw rejected.reason;
+    expect(results.map((result) => result.status === "fulfilled" && result.value.replayed))
+      .toEqual([false, true]);
+  });
+
+  it("lets an in-flight heartbeat renew before reclaiming its just-expired projection lease", async () => {
+    const suffix = "lease-renewal-in-flight";
+    const key = "idem-lease-renewal-in-flight";
+    const baseLayer = h.layer();
+    let blockNextTransaction = false;
+    let announceRenewalBlocked!: () => void;
+    let releaseRenewal!: () => void;
+    const renewalBlocked = new Promise<void>((resolveBlocked) => {
+      announceRenewalBlocked = resolveBlocked;
+    });
+    const holdRenewal = new Promise<void>((resolveRenewal) => {
+      releaseRenewal = resolveRenewal;
+    });
+    const ownerLayer: AsyncDataLayer = {
+      ...baseLayer,
+      transactionImmediate: async (fn, options) => {
+        if (blockNextTransaction) {
+          blockNextTransaction = false;
+          announceRenewalBlocked();
+          await holdRenewal;
+        }
+        return baseLayer.transactionImmediate(fn, options);
+      },
+    };
+    let announceProjectionEntered!: () => void;
+    let releaseProjection!: () => void;
+    const projectionEntered = new Promise<void>((resolveEntered) => {
+      announceProjectionEntered = resolveEntered;
+    });
+    const holdProjection = new Promise<void>((resolveProjection) => {
+      releaseProjection = resolveProjection;
+    });
+    const first = importCccPrdBundle({
+      ...request(suffix, key),
+      layer: ownerLayer,
+      failureInjection: {
+        projectionLeaseMs: 200,
+        pause: {
+          checkpoint: "artifact_bytes",
+          entered: announceProjectionEntered,
+          until: holdProjection,
+        },
+      },
+    });
+    await projectionEntered;
+    blockNextTransaction = true;
+    await renewalBlocked;
+    const ownerClaim = await readProjectionClaim(key);
+    await waitPastProjectionLease(ownerClaim);
+
+    let secondSettled = false;
+    const second = importCccPrdBundle(request(suffix, key))
+      .finally(() => {
+        secondSettled = true;
+      });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+
+    let assertionError: unknown;
+    try {
+      expect(await readProjectionClaim(key)).toMatchObject({
+        state: "projecting",
+        projection_owner: ownerClaim.projection_owner,
+      });
+      expect(secondSettled).toBe(false);
+    } catch (error) {
+      assertionError = error;
+    } finally {
+      releaseRenewal();
+      releaseProjection();
+    }
+    const results = await Promise.allSettled([first, second]);
+    if (assertionError) throw assertionError;
+    const rejected = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (rejected) throw rejected.reason;
     expect(results.map((result) => result.status === "fulfilled" && result.value.replayed))
       .toEqual([false, true]);
   });
@@ -1186,7 +1269,10 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     }
     const results = await Promise.allSettled([first, second]);
     if (assertionError) throw assertionError;
-    expect(results.every(({ status }) => status === "fulfilled")).toBe(true);
+    const rejected = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (rejected) throw rejected.reason;
     expect(results.map((result) => result.status === "fulfilled" && result.value.replayed))
       .toEqual([false, true]);
   });
