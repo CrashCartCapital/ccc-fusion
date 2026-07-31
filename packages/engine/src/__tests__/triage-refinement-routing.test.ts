@@ -58,7 +58,7 @@ describe("refinement routing from triage", () => {
     return root;
   }
 
-  it("promotes a refinement to todo within bounded polls under same-priority backlog", async () => {
+  it("admits a refinement after its older same-priority backlog drains", async () => {
     const rootDir = await createRoot();
     const refinement = createTriageTask({
       id: "FN-R1",
@@ -93,13 +93,23 @@ describe("refinement routing from triage", () => {
     });
 
     (processor as any).running = true;
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 5; i++) {
       await (processor as any).poll();
       if (tasks.find((t) => t.id === refinement.id)?.column === "todo") break;
     }
 
     expect(tasks.find((t) => t.id === refinement.id)?.column).toBe("todo");
-    expect(specifySpy.mock.calls.some(([task]) => task.id === refinement.id)).toBe(true);
+    expect(specifySpy.mock.calls.map(([task]) => task.id)).toEqual([
+      "FN-B1",
+      "FN-B2",
+      "FN-B3",
+      "FN-B4",
+      "FN-B5",
+      "FN-B6",
+      "FN-B7",
+      "FN-B8",
+      "FN-R1",
+    ]);
   });
 
   it("preserves approval gate for refinements when plan approval is required", async () => {
@@ -255,7 +265,7 @@ describe("refinement routing from triage", () => {
     expect(store.updateTask).not.toHaveBeenCalledWith(taskId, expect.objectContaining({ status: "awaiting-approval" }));
   });
 
-  it("retains baseline ordering for non-refinement triage tasks", async () => {
+  it("retains oldest-first ordering for non-refinement triage tasks", async () => {
     const rootDir = await createRoot();
     const tasks: Task[] = [
       createTriageTask({ id: "FN-101", priority: "urgent", createdAt: "2026-05-15T10:00:00.000Z" }),
@@ -282,10 +292,10 @@ describe("refinement routing from triage", () => {
     await (processor as any).poll();
 
     expect(specifySpy.mock.calls.map(([task]) => task.id)).toEqual([
+      "FN-100",
       "FN-101",
       "FN-103",
       "FN-102",
-      "FN-100",
     ]);
   });
 });

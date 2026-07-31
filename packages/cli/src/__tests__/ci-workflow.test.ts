@@ -401,6 +401,26 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
       ),
     ).toBe(false);
   });
+
+  it("runs the line-count audit without installing or remotely caching the workspace", () => {
+    const lineCountSteps = workflow.jobs?.["line-count-audit"]?.steps ?? [];
+    expect(findCompositeSetupStep(lineCountSteps)).toBeUndefined();
+    expect(
+      lineCountSteps.some(
+        (step: any) =>
+          step.uses === "pnpm/action-setup@v4" ||
+          (typeof step.uses === "string" && step.uses.startsWith("actions/cache@")) ||
+          (typeof step.run === "string" && step.run.includes("pnpm install")),
+      ),
+    ).toBe(false);
+
+    const setupNodeStep = lineCountSteps.find((step: any) => step.uses === "actions/setup-node@v5");
+    expect(setupNodeStep?.with?.["node-version"]).toBe("24");
+    expect(setupNodeStep?.with?.cache).toBeUndefined();
+
+    const auditStep = lineCountSteps.find((step: any) => step.name === "Run line-count audit");
+    expect(auditStep?.run).toBe("node scripts/check-file-line-count.mjs");
+  });
 });
 
 describe("Desktop packaging workflow (.github/workflows/desktop-packaging.yml)", () => {

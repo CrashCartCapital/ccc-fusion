@@ -891,6 +891,16 @@ function isRetryableTransactionError(error: unknown): boolean {
   return false;
 }
 
+function isPostgresLockTimeout(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    const detail = current as { code?: unknown; cause?: unknown };
+    if (String(detail.code ?? "") === "55P03") return true;
+    current = detail.cause;
+  }
+  return false;
+}
+
 async function serializable<T>(
   layer: AsyncDataLayer,
   operation: () => Promise<T>,
@@ -1388,64 +1398,79 @@ async function claimProjection(
   idempotencyKey: string,
   token: string,
   leaseDurationMs: number,
+  lockWaitMs: number,
 ): Promise<{ row: ImportRow; claimed: boolean }> {
-  return serializable(layer, () => layer.transactionImmediate(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(schema.project.cccPrdImports)
-      .where(and(
-        eq(schema.project.cccPrdImports.projectId, projectId),
-        eq(schema.project.cccPrdImports.idempotencyKey, idempotencyKey),
-      ))
-      .limit(1)
-      .for("update");
-    const row = rows[0] as ImportRow | undefined;
-    if (!row) {
+  const boundedLockWaitMs = Math.max(1, Math.ceil(lockWaitMs));
+  try {
+    return await serializable(layer, () => layer.transactionImmediate(async (tx) => {
+      await tx.execute(sql`
+        SELECT set_config('lock_timeout', ${`${boundedLockWaitMs}ms`}, true)
+      `);
+      const rows = await tx
+        .select()
+        .from(schema.project.cccPrdImports)
+        .where(and(
+          eq(schema.project.cccPrdImports.projectId, projectId),
+          eq(schema.project.cccPrdImports.idempotencyKey, idempotencyKey),
+        ))
+        .limit(1)
+        .for("update");
+      const row = rows[0] as ImportRow | undefined;
+      if (!row) {
+        throw new CccPrdImportError(
+          "CCC_PRD_IMPORT_NOT_FOUND",
+          `CCC PRD import not found for ${JSON.stringify(idempotencyKey)}`,
+        );
+      }
+      if (row.state === "active") return { row, claimed: false };
+      const nowMs = Date.now();
+      const leaseMs = Date.parse(row.projectionLeaseUntil ?? "");
+      if (
+        row.state === "projecting"
+        && row.projectionOwner
+        && row.projectionOwner !== token
+        && Number.isFinite(leaseMs)
+        && leaseMs > nowMs
+      ) {
+        return { row, claimed: false };
+      }
+      const now = new Date(nowMs).toISOString();
+      const leaseUntil = new Date(nowMs + leaseDurationMs).toISOString();
+      await tx
+        .update(schema.project.cccPrdImports)
+        .set({
+          state: "projecting",
+          runnable: 0,
+          projectionOwner: token,
+          projectionLeaseUntil: leaseUntil,
+          lastError: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(schema.project.cccPrdImports.projectId, projectId),
+          eq(schema.project.cccPrdImports.idempotencyKey, idempotencyKey),
+        ));
+      return {
+        row: {
+          ...row,
+          state: "projecting",
+          runnable: 0,
+          projectionOwner: token,
+          projectionLeaseUntil: leaseUntil,
+          updatedAt: now,
+        },
+        claimed: true,
+      };
+    }));
+  } catch (error) {
+    if (isPostgresLockTimeout(error)) {
       throw new CccPrdImportError(
-        "CCC_PRD_IMPORT_NOT_FOUND",
-        `CCC PRD import not found for ${JSON.stringify(idempotencyKey)}`,
+        "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
+        `Timed out after ${boundedLockWaitMs}ms waiting for CCC PRD import ${importIdFor(projectId, idempotencyKey)} projection row lock`,
       );
     }
-    if (row.state === "active") return { row, claimed: false };
-    const nowMs = Date.now();
-    const leaseMs = Date.parse(row.projectionLeaseUntil ?? "");
-    if (
-      row.state === "projecting"
-      && row.projectionOwner
-      && row.projectionOwner !== token
-      && Number.isFinite(leaseMs)
-      && leaseMs > nowMs
-    ) {
-      return { row, claimed: false };
-    }
-    const now = new Date(nowMs).toISOString();
-    const leaseUntil = new Date(nowMs + leaseDurationMs).toISOString();
-    await tx
-      .update(schema.project.cccPrdImports)
-      .set({
-        state: "projecting",
-        runnable: 0,
-        projectionOwner: token,
-        projectionLeaseUntil: leaseUntil,
-        lastError: null,
-        updatedAt: now,
-      })
-      .where(and(
-        eq(schema.project.cccPrdImports.projectId, projectId),
-        eq(schema.project.cccPrdImports.idempotencyKey, idempotencyKey),
-      ));
-    return {
-      row: {
-        ...row,
-        state: "projecting",
-        runnable: 0,
-        projectionOwner: token,
-        projectionLeaseUntil: leaseUntil,
-        updatedAt: now,
-      },
-      claimed: true,
-    };
-  }));
+    throw error;
+  }
 }
 
 async function renewProjectionLease(
@@ -1850,6 +1875,7 @@ async function reconcileOwned(
   const waitStartedAt = Date.now();
   const leaseDurationMs = failureInjection?.projectionLeaseMs ?? 5_000;
   const reconciliationOverheadMs = reconciliationAllowance(failureInjection);
+  const waitBudgetMs = preflightRow.canonicalBundle.bounds.maxDurationMs + reconciliationOverheadMs;
   if (!Number.isFinite(leaseDurationMs) || leaseDurationMs <= 0) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_INVALID_FAILURE_INJECTION",
@@ -1857,12 +1883,20 @@ async function reconcileOwned(
     );
   }
   while (true) {
+    const remainingWaitMs = waitBudgetMs - (Date.now() - waitStartedAt);
+    if (remainingWaitMs <= 0) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
+        `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${preflightRow.importId} projection owner`,
+      );
+    }
     const claim = await claimProjection(
       input.layer,
       projectId,
       input.idempotencyKey,
       token,
       leaseDurationMs,
+      remainingWaitMs,
     );
     const row = claim.row;
     try {
@@ -1896,7 +1930,6 @@ async function reconcileOwned(
       campaignId: campaignIdentity.manifest.campaignId,
       now: row.createdAt,
     });
-    const waitBudgetMs = row.canonicalBundle.bounds.maxDurationMs + reconciliationOverheadMs;
     if (row.state === "active") {
       await withImportIdentityLock(input.layer, row.projectId, row.idempotencyKey, waitBudgetMs, async (tx) => {
         const locked = await selectImportRow(tx, row.projectId, row.idempotencyKey);
