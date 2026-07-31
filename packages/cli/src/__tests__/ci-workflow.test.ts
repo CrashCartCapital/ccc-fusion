@@ -379,6 +379,16 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     }
   });
 
+  it("caps deterministic shard worker fan-out around the shared PostgreSQL service", () => {
+    const shardSteps = workflow.jobs?.["test-shards"]?.steps ?? [];
+    const testStep = shardSteps.find(
+      (step: any) => step.name === "Test (deterministic shard)",
+    );
+
+    expect(testStep?.env?.FUSION_TEST_TOTAL_WORKERS).toBe("6");
+    expect(testStep?.env?.FUSION_TEST_CONCURRENCY).toBe("2");
+  });
+
   it("keeps full clones where real-git tests need history", () => {
     const shardSteps = workflow.jobs?.["test-shards"]?.steps ?? [];
     const slowSteps = workflow.jobs?.["test-slow"]?.steps ?? [];

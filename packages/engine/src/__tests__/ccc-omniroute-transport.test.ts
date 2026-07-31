@@ -1144,7 +1144,6 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
             Object.assign(task, await update(task))
           );
           return new TaskExecutor(taskStore as any, fixture.rootDir, {
-            cancellationTimeoutMs: 40,
             cliAgentRuntime: {
               store: durable,
               projectId,
@@ -1284,7 +1283,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
           };
           return created;
         });
-        const oldExecutor = late.makeExecutor();
+        const oldExecutor = late.makeExecutor({ cancellationTimeoutMs: 40 });
         const oldExecution = oldExecutor.execute(late.task as any);
         const oldDispatched = await observe("D old dispatch", () => requestCount("CCC_ABORT late-finalizer") === 1);
         const oldCancellation = await settle(

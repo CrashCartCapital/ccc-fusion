@@ -182,6 +182,11 @@ jobs:
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4
         env:
+          # Each shard shares one PostgreSQL service. Keep the default Vitest
+          # lane at three workers while allowing two package lanes so DB and
+          # real-git integration tests retain scheduling headroom.
+          FUSION_TEST_TOTAL_WORKERS: "6"
+          FUSION_TEST_CONCURRENCY: "2"
           FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
 
