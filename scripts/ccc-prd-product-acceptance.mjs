@@ -123,6 +123,33 @@ async function pathExists(candidate) {
   }
 }
 
+async function directorySnapshot(root, relativeRoot = "") {
+  const entries = [];
+  const names = await readdir(path.join(root, relativeRoot), {
+    withFileTypes: true,
+  });
+  names.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of names) {
+    const relativePath = relativeRoot
+      ? path.join(relativeRoot, entry.name)
+      : entry.name;
+    if (entry.isDirectory()) {
+      entries.push(`directory:${relativePath}`);
+      entries.push(...await directorySnapshot(root, relativePath));
+      continue;
+    }
+    assert(
+      entry.isFile(),
+      "CCC_PRODUCT_RESIDUE_SNAPSHOT_UNSUPPORTED_ENTRY",
+      relativePath,
+    );
+    entries.push(
+      `file:${relativePath}:sha256:${sha256(await readFile(path.join(root, relativePath)))}`,
+    );
+  }
+  return entries;
+}
+
 function exactArray(actual, expected, code) {
   assert(
     JSON.stringify(actual) === JSON.stringify(expected),
@@ -1336,7 +1363,6 @@ async function main() {
         }],
       }],
     }, null, 2)}\n`);
-    const globalSettingsSha256 = sha256(await readFile(globalSettingsPath));
     const authored = jsonOutput(
       await prd([
         "author",
@@ -1477,6 +1503,8 @@ async function main() {
       proofIds: ["PROOF-VERTICAL"],
     });
 
+    const globalSettingsBeforeForgedPreview =
+      await directorySnapshot(globalSettingsDir);
     const forgedSidecarPath = path.join(packetRoot, "forged.sidecar.json");
     await cp(packet.sidecarPath, forgedSidecarPath);
     const forged = JSON.parse(await readFile(forgedSidecarPath, "utf8"));
@@ -1506,12 +1534,10 @@ async function main() {
       "CCC_PRODUCT_FORGED_PROVENANCE_DIAGNOSTIC_MISSING",
       JSON.stringify(forgedPreview),
     );
-    assert(
-      JSON.stringify((await readdir(globalSettingsDir)).sort())
-        === JSON.stringify(["settings.json"])
-        && sha256(await readFile(globalSettingsPath)) === globalSettingsSha256,
+    exactArray(
+      await directorySnapshot(globalSettingsDir),
+      globalSettingsBeforeForgedPreview,
       "CCC_PRODUCT_FORGED_PREVIEW_LEFT_DATABASE_RESIDUE",
-      JSON.stringify(await readdir(globalSettingsDir)),
     );
     assert(
       !await pathExists(path.join(targetRoot, ".fusion")),
