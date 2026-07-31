@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
-import type { Task, WorkflowWorkItem } from "@fusion/core";
+import { describe, expect, it, vi } from "vitest";
+import type { Task, TaskStore, WorkflowWorkItem } from "@fusion/core";
 import {
+  InProcessRuntime,
   isPlanningContinuationTaskDispatchable,
   resolvePlanningContinuationCandidate,
   selectActionablePlanningContinuations,
@@ -115,5 +116,74 @@ describe("selectActionablePlanningContinuations", () => {
       ["eligible", "T-1"],
       ["later-live", "FN-8471"],
     ]);
+  });
+});
+
+describe("InProcessRuntime campaign continuation dispatch", () => {
+  it("does not dispatch the same exact candidate while its first claim is in flight", async () => {
+    const item = workItem("campaign-in-flight", "planning", {
+      runId: "run-campaign-in-flight",
+      kind: "task",
+      state: "runnable",
+      attempt: 0,
+    });
+    const liveTask = task(item.taskId);
+    let matchingClaimReads = 0;
+    let releaseFirstClaim!: () => void;
+    let reportFirstClaimStarted!: () => void;
+    const firstClaimStarted = new Promise<void>((resolve) => {
+      reportFirstClaimStarted = resolve;
+    });
+    const holdFirstClaim = new Promise<void>((resolve) => {
+      releaseFirstClaim = resolve;
+    });
+    const store = {
+      listDueWorkflowWorkItems: vi.fn(async () => [item]),
+      getTask: vi.fn(async () => liveTask),
+      getCccCampaignContextForTask: vi.fn(async () => ({ campaignId: "campaign-in-flight" })),
+      getSettings: vi.fn(async () => ({})),
+      transitionWorkflowWorkItem: vi.fn(),
+      acquireWorkflowWorkItemLease: vi.fn(),
+      getWorkflowWorkItem: vi.fn(async (id: string) => {
+        if (id === item.id) {
+          matchingClaimReads += 1;
+          if (matchingClaimReads === 1) {
+            reportFirstClaimStarted();
+            await holdFirstClaim;
+          }
+        }
+        return null;
+      }),
+    } as unknown as TaskStore;
+    const runtime = new InProcessRuntime({
+      projectId: "continuation-fence",
+      workingDirectory: "/tmp/continuation-fence",
+      isolationMode: "in-process",
+      maxConcurrent: 1,
+      maxWorktrees: 1,
+    } as never, {} as never) as InProcessRuntime & {
+      status: "active";
+      taskStore: TaskStore;
+      executor: { execute: ReturnType<typeof vi.fn> };
+      cccCampaignWorkflowRuntime: object;
+      campaignWorkflowContinuationsInFlight: Set<string>;
+      drainWorkflowContinuations: () => Promise<void>;
+    };
+    runtime.status = "active";
+    runtime.taskStore = store;
+    runtime.executor = { execute: vi.fn() };
+    runtime.cccCampaignWorkflowRuntime = {};
+
+    await runtime.drainWorkflowContinuations();
+    await firstClaimStarted;
+    await runtime.drainWorkflowContinuations();
+
+    expect(matchingClaimReads).toBe(1);
+    expect(store.acquireWorkflowWorkItemLease).not.toHaveBeenCalled();
+
+    releaseFirstClaim();
+    await vi.waitFor(() => {
+      expect(runtime.campaignWorkflowContinuationsInFlight.size).toBe(0);
+    });
   });
 });

@@ -330,6 +330,22 @@ const originalExit = process.exit;
 const originalPiPackageDir = process.env.PI_PACKAGE_DIR;
 const originalSkipOnboardingEnv = process.env.FUSION_SKIP_ONBOARDING;
 
+// Warm the CLI's dynamically imported command graph during module setup, not
+// inside the first selected test's five-second budget. All command handlers are
+// mocked above, and beforeEach clears this probe's call history.
+process.argv = ["node", "bin.ts", "message", "inbox", "-P", "warmup"];
+process.env.FUSION_SKIP_ONBOARDING = "1";
+try {
+  await import("../bin.ts?test=command-graph-warmup");
+} finally {
+  process.argv = originalArgv;
+  if (originalSkipOnboardingEnv === undefined) {
+    delete process.env.FUSION_SKIP_ONBOARDING;
+  } else {
+    process.env.FUSION_SKIP_ONBOARDING = originalSkipOnboardingEnv;
+  }
+}
+
 let importCounter = 0;
 
 async function runBin(args: string[]) {
@@ -558,17 +574,33 @@ describe("bin command routing and fallbacks", () => {
     expect(commandMocks.runAgentMailbox).toHaveBeenCalledWith("agent-1", "demo");
   });
 
-  it("routes message subcommands send/read/delete/inbox/outbox", async () => {
+  it("routes message send", async () => {
+    process.env.FUSION_SKIP_ONBOARDING = "1";
     await runBin(["message", "send", "agent-7", "hello", "there", "-P", "demo"]);
-    await runBin(["message", "read", "msg-1", "-P", "demo"]);
-    await runBin(["message", "delete", "msg-1", "-P", "demo"]);
-    await runBin(["message", "inbox", "-P", "demo"]);
-    await runBin(["message", "outbox", "-P", "demo"]);
-
     expect(commandMocks.runMessageSend).toHaveBeenCalledWith("agent-7", "hello there", "demo");
+  });
+
+  it("routes message read", async () => {
+    process.env.FUSION_SKIP_ONBOARDING = "1";
+    await runBin(["message", "read", "msg-1", "-P", "demo"]);
     expect(commandMocks.runMessageRead).toHaveBeenCalledWith("msg-1", "demo");
+  });
+
+  it("routes message delete", async () => {
+    process.env.FUSION_SKIP_ONBOARDING = "1";
+    await runBin(["message", "delete", "msg-1", "-P", "demo"]);
     expect(commandMocks.runMessageDelete).toHaveBeenCalledWith("msg-1", "demo");
-    expect(commandMocks.runMessageInbox).toHaveBeenCalledWith("demo", undefined);
+  });
+
+  it("routes message inbox without overriding its default owner filter", async () => {
+    process.env.FUSION_SKIP_ONBOARDING = "1";
+    await runBin(["message", "inbox", "-P", "demo"]);
+    expect(commandMocks.runMessageInbox).toHaveBeenCalledWith("demo");
+  });
+
+  it("routes message outbox", async () => {
+    process.env.FUSION_SKIP_ONBOARDING = "1";
+    await runBin(["message", "outbox", "-P", "demo"]);
     expect(commandMocks.runMessageOutbox).toHaveBeenCalledWith("demo");
   });
 

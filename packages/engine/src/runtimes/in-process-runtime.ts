@@ -323,6 +323,13 @@ export class InProcessRuntime
   private triageProcessor?: TriageProcessor;
   private workflowContinuationTimer?: ReturnType<typeof setInterval>;
   private workflowContinuationDrainActive = false;
+  /**
+   * Campaign processors outlive the bounded due-item scan that launches them.
+   * Keep an exact in-memory fence until each processor settles so a timer or
+   * explicit wakeup cannot launch the same durable candidate before its first
+   * claim has reached PostgreSQL.
+   */
+  private readonly campaignWorkflowContinuationsInFlight = new Set<string>();
   private cccCampaignProofBootstrapPromise?: Promise<void>;
   private cccCampaignProofBootstrapError?: Error;
   private cccCampaignWorkflowRuntime?: WorkflowTaskRuntime;
@@ -2140,6 +2147,12 @@ export class InProcessRuntime
         if (resolved.kind !== "actionable") continue;
         const campaignCandidate = await this.classifyCampaignWorkflowCandidate(resolved.item);
         if (campaignCandidate === "campaign") {
+          const processingKey = JSON.stringify([
+            resolved.item.id,
+            resolved.item.runId,
+            resolved.item.attempt,
+          ]);
+          if (this.campaignWorkflowContinuationsInFlight.has(processingKey)) continue;
           const settings = await this.taskStore.getSettings();
           const campaignRuntime = await this.ensureCccCampaignWorkflowRuntime(settings);
           if (!campaignRuntime) {
@@ -2148,6 +2161,7 @@ export class InProcessRuntime
             await this.failCampaignWorkflowCandidateClosed(resolved.item, bootstrapError);
             continue;
           }
+          this.campaignWorkflowContinuationsInFlight.add(processingKey);
           void processDueWorkflowWorkItem(this.taskStore, campaignRuntime, settings, {
             leaseOwner: `in-process-runtime:${this.config.projectId}`,
             leaseDurationMs: 10 * 60_000,
@@ -2158,9 +2172,13 @@ export class InProcessRuntime
               runId: resolved.item.runId,
               attempt: resolved.item.attempt,
             },
-          }).catch((error) => {
-            runtimeLog.error(`Workflow continuation ${resolved.item.id} campaign processor failed:`, error);
-          });
+          })
+            .catch((error) => {
+              runtimeLog.error(`Workflow continuation ${resolved.item.id} campaign processor failed:`, error);
+            })
+            .finally(() => {
+              this.campaignWorkflowContinuationsInFlight.delete(processingKey);
+            });
           continue;
         }
         void this.executor.execute(resolved.task).catch((error) => {
