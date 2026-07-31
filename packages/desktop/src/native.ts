@@ -339,39 +339,37 @@ async function applyConfiguredUpdateChannel(autoUpdater: AutoUpdaterLike): Promi
   }
 }
 
-export function setupAutoUpdater(mainWindow?: BrowserWindow): void {
+export async function setupAutoUpdater(mainWindow?: BrowserWindow): Promise<void> {
   if (mainWindow) {
     autoUpdaterWindow = mainWindow;
   }
 
-  void (async () => {
-    try {
-      const autoUpdater = await resolveAutoUpdater();
-      if (!autoUpdater) {
-        return;
-      }
-
-      bindAutoUpdaterListeners(autoUpdater);
-      await applyConfiguredUpdateChannel(autoUpdater);
-
-      if (hasRunInitialUpdateCheck) {
-        return;
-      }
-
-      hasRunInitialUpdateCheck = true;
-      await autoUpdater.checkForUpdates().catch((error: unknown) => {
-        console.error("[desktop/native] Auto-updater check failed", error);
-      });
-    } catch (error) {
-      console.warn("[desktop/native] Auto-updater setup failed", error);
+  try {
+    const autoUpdater = await resolveAutoUpdater();
+    if (!autoUpdater) {
+      return;
     }
-  })();
+
+    bindAutoUpdaterListeners(autoUpdater);
+    await applyConfiguredUpdateChannel(autoUpdater);
+
+    if (hasRunInitialUpdateCheck) {
+      return;
+    }
+
+    hasRunInitialUpdateCheck = true;
+    await autoUpdater.checkForUpdates().catch((error: unknown) => {
+      console.error("[desktop/native] Auto-updater check failed", error);
+    });
+  } catch (error) {
+    console.warn("[desktop/native] Auto-updater setup failed", error);
+  }
 }
 
 export async function triggerUpdateCheck(
   mainWindow?: BrowserWindow,
 ): Promise<{ status: "checking" } | { status: "unavailable"; reason: string } | { status: "error"; error: string }> {
-  setupAutoUpdater(mainWindow);
+  await setupAutoUpdater(mainWindow);
 
   const autoUpdater = await resolveAutoUpdater();
   if (!autoUpdater) {

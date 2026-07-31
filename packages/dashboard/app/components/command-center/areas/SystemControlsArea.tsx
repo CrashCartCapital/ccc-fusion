@@ -335,7 +335,7 @@ export function SystemControlsArea({ projectId, addToast }: SystemControlsAreaPr
   useEffect(() => {
     if (!job || job.status !== "running") return;
     const frame = requestAnimationFrame(() => {
-      jobSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      jobSectionRef.current?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
     });
     return () => cancelAnimationFrame(frame);
   }, [job?.id, job?.status]);
