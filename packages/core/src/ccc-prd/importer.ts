@@ -1478,7 +1478,7 @@ async function renewProjectionLease(
   row: ImportRow,
   token: string,
   leaseDurationMs: number,
-  allowActive: boolean,
+  allowActive: () => boolean,
 ): Promise<void> {
   await serializable(layer, () => layer.transactionImmediate(async (tx) => {
     const lockedRows = await tx
@@ -1491,7 +1491,7 @@ async function renewProjectionLease(
       .limit(1)
       .for("update");
     const current = lockedRows[0] as ImportRow | undefined;
-    if (current?.state === "active" && allowActive) return;
+    if (current?.state === "active" && allowActive()) return;
     if (
       !current
       || current.state !== "projecting"
@@ -1536,7 +1536,7 @@ function startProjectionLeaseHeartbeat(
     renewal = renewal.then(async () => {
       if (stopped || failure) return;
       try {
-        await renewProjectionLease(layer, row, token, leaseDurationMs, activationStarted);
+        await renewProjectionLease(layer, row, token, leaseDurationMs, () => activationStarted);
       } catch (error) {
         failure = error;
       }
@@ -1743,6 +1743,34 @@ async function withImportIdentityLock<T>(
   }
 }
 
+async function withProjectionOwnerLock<T>(
+  layer: AsyncDataLayer,
+  projectId: string,
+  idempotencyKey: string,
+  waitBudgetMs: number,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const lockIdentity = canonicalCccPrdJson(["projection-owner", projectId, idempotencyKey]);
+  const deadline = Date.now() + waitBudgetMs;
+  while (true) {
+    const attempt = await serializable(layer, () => layer.transactionImmediate(async (tx) => {
+      const rows = await tx.execute(sql`
+        SELECT pg_try_advisory_xact_lock(hashtextextended(${lockIdentity}, 0)) AS acquired
+      `) as unknown as Array<{ acquired: boolean }>;
+      if (!rows[0]?.acquired) return { acquired: false as const };
+      return { acquired: true as const, value: await operation() };
+    }, { isolationLevel: "serializable", accessMode: "read write" }));
+    if (attempt.acquired) return attempt.value;
+    if (Date.now() >= deadline) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
+        `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${importIdFor(projectId, idempotencyKey)} live projection owner`,
+      );
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+  }
+}
+
 async function inspectDirectCounts(
   layer: AsyncDataLayer,
   row: ImportRow,
@@ -1890,118 +1918,142 @@ async function reconcileOwned(
         `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${preflightRow.importId} projection owner`,
       );
     }
-    const claim = await claimProjection(
+    const outcome = await withProjectionOwnerLock(
       input.layer,
       projectId,
       input.idempotencyKey,
-      token,
-      leaseDurationMs,
       remainingWaitMs,
-    );
-    const row = claim.row;
-    try {
-      if (claim.claimed) await inject(failureInjection, "after_projection_claim");
-      const currentRoot = await physicalCccPrdImportRoot(input.rootDir);
-      if (row.rootDir !== currentRoot) {
-        throw new CccPrdImportError(
-          "CCC_PRD_IMPORT_ROOT_MISMATCH",
-          `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${currentRoot}`,
-        );
-      }
-    } catch (error) {
-      if (claim.claimed) {
-        try {
-          await releaseProjection(input.layer, row, token, error);
-        } catch (releaseError) {
-          throw new AggregateError(
-            [error, releaseError],
-            `CCC PRD import ${row.importId} could not release its projection claim`,
-          );
-        }
-      }
-      throw error;
-    }
-    const campaignIdentity = persistedCampaignIdentity(row);
-    const projection = buildCccPrdProjection({
-      bundle: row.canonicalBundle,
-      executionPolicy: campaignIdentity.executionPolicy,
-      importId: row.importId,
-      identityHash: row.identityHash,
-      campaignId: campaignIdentity.manifest.campaignId,
-      now: row.createdAt,
-    });
-    if (row.state === "active") {
-      await withImportIdentityLock(input.layer, row.projectId, row.idempotencyKey, waitBudgetMs, async (tx) => {
-        const locked = await selectImportRow(tx, row.projectId, row.idempotencyKey);
-        if (locked?.state !== "active") {
+      async () => {
+        const claimWaitMs = waitBudgetMs - (Date.now() - waitStartedAt);
+        if (claimWaitMs <= 0) {
           throw new CccPrdImportError(
-            "CCC_PRD_IMPORT_RECONCILE_CONFLICT",
-            `CCC PRD import ${row.importId} left active state during projection repair`,
+            "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
+            `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${preflightRow.importId} projection owner`,
           );
         }
-        const stagingPath = await ensureStagedFiles(row.rootDir, row, projection, failureInjection);
-        await moveCanonicalProjection(row.rootDir, stagingPath, projection);
-        await cleanupStagingProjection(row.rootDir, row);
-      });
-      const active = await inspectCccPrdImport(input);
-      if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
-      return active;
-    }
-    if (!claim.claimed) {
-      if (Date.now() - waitStartedAt >= waitBudgetMs) {
+        const claim = await claimProjection(
+          input.layer,
+          projectId,
+          input.idempotencyKey,
+          token,
+          leaseDurationMs,
+          claimWaitMs,
+        );
+        const row = claim.row;
+        try {
+          if (claim.claimed) await inject(failureInjection, "after_projection_claim");
+          const currentRoot = await physicalCccPrdImportRoot(input.rootDir);
+          if (row.rootDir !== currentRoot) {
+            throw new CccPrdImportError(
+              "CCC_PRD_IMPORT_ROOT_MISMATCH",
+              `CCC PRD import ${row.importId} belongs to ${row.rootDir}, not ${currentRoot}`,
+            );
+          }
+        } catch (error) {
+          if (claim.claimed) {
+            try {
+              await releaseProjection(input.layer, row, token, error);
+            } catch (releaseError) {
+              throw new AggregateError(
+                [error, releaseError],
+                `CCC PRD import ${row.importId} could not release its projection claim`,
+              );
+            }
+          }
+          throw error;
+        }
+        const campaignIdentity = persistedCampaignIdentity(row);
+        const projection = buildCccPrdProjection({
+          bundle: row.canonicalBundle,
+          executionPolicy: campaignIdentity.executionPolicy,
+          importId: row.importId,
+          identityHash: row.identityHash,
+          campaignId: campaignIdentity.manifest.campaignId,
+          now: row.createdAt,
+        });
+        if (row.state === "active") {
+          await withImportIdentityLock(input.layer, row.projectId, row.idempotencyKey, waitBudgetMs, async (tx) => {
+            const locked = await selectImportRow(tx, row.projectId, row.idempotencyKey);
+            if (locked?.state !== "active") {
+              throw new CccPrdImportError(
+                "CCC_PRD_IMPORT_RECONCILE_CONFLICT",
+                `CCC PRD import ${row.importId} left active state during projection repair`,
+              );
+            }
+            const stagingPath = await ensureStagedFiles(row.rootDir, row, projection, failureInjection);
+            await moveCanonicalProjection(row.rootDir, stagingPath, projection);
+            await cleanupStagingProjection(row.rootDir, row);
+          });
+          const active = await inspectCccPrdImport(input);
+          if (!active) {
+            throw new CccPrdImportError(
+              "CCC_PRD_IMPORT_NOT_FOUND",
+              `CCC PRD import ${row.importId} disappeared`,
+            );
+          }
+          return { status: "complete" as const, value: active };
+        }
+        if (!claim.claimed) return { status: "retry" as const };
+        const heartbeat = startProjectionLeaseHeartbeat(
+          input.layer,
+          row,
+          token,
+          leaseDurationMs,
+        );
+        try {
+          const stagingPath = await ensureStagedFiles(row.rootDir, row, projection, failureInjection);
+          await heartbeat.assertHealthy();
+          await moveCanonicalProjection(
+            row.rootDir,
+            stagingPath,
+            projection,
+            () => heartbeat.assertHealthy(),
+          );
+          await inject(failureInjection, "canonical_projection_move");
+          await inject(failureInjection, "before_activation");
+          await heartbeat.assertHealthy();
+          await inject(failureInjection, "activation_handoff");
+          await heartbeat.assertHealthy();
+          heartbeat.beginActivation();
+          await activateImport({ layer: input.layer, row, token });
+          await heartbeat.stop();
+          await inject(failureInjection, "after_activation");
+          await withImportIdentityLock(
+            input.layer,
+            row.projectId,
+            row.idempotencyKey,
+            waitBudgetMs,
+            async () => cleanupStagingProjection(row.rootDir, row),
+          );
+          const active = await inspectCccPrdImport(input);
+          if (!active) {
+            throw new CccPrdImportError(
+              "CCC_PRD_IMPORT_NOT_FOUND",
+              `CCC PRD import ${row.importId} disappeared`,
+            );
+          }
+          return { status: "complete" as const, value: active };
+        } catch (error) {
+          const heartbeatError = await heartbeat.stop().then(
+            () => null,
+            (stopError: unknown) => stopError,
+          );
+          await releaseProjection(input.layer, row, token, error).catch(() => {});
+          if (heartbeatError) {
+            throw heartbeatError;
+          }
+          throw error;
+        }
+      },
+    );
+    if (outcome.status === "complete") return outcome.value;
+    if (Date.now() - waitStartedAt >= waitBudgetMs) {
         throw new CccPrdImportError(
           "CCC_PRD_IMPORT_RECONCILE_TIMEOUT",
-          `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${row.importId} projection owner`,
+          `Timed out after ${waitBudgetMs}ms waiting for CCC PRD import ${preflightRow.importId} projection owner`,
         );
-      }
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
-      continue;
     }
-    const heartbeat = startProjectionLeaseHeartbeat(
-      input.layer,
-      row,
-      token,
-      leaseDurationMs,
-    );
-    try {
-      const stagingPath = await ensureStagedFiles(row.rootDir, row, projection, failureInjection);
-      await heartbeat.assertHealthy();
-      await moveCanonicalProjection(
-        row.rootDir,
-        stagingPath,
-        projection,
-        () => heartbeat.assertHealthy(),
-      );
-      await inject(failureInjection, "canonical_projection_move");
-      await inject(failureInjection, "before_activation");
-      await heartbeat.assertHealthy();
-      await inject(failureInjection, "activation_handoff");
-      await heartbeat.assertHealthy();
-      heartbeat.beginActivation();
-      await activateImport({ layer: input.layer, row, token });
-      await heartbeat.stop();
-      await inject(failureInjection, "after_activation");
-      await withImportIdentityLock(
-        input.layer,
-        row.projectId,
-        row.idempotencyKey,
-        waitBudgetMs,
-        async () => cleanupStagingProjection(row.rootDir, row),
-      );
-      const active = await inspectCccPrdImport(input);
-      if (!active) throw new CccPrdImportError("CCC_PRD_IMPORT_NOT_FOUND", `CCC PRD import ${row.importId} disappeared`);
-      return active;
-    } catch (error) {
-      const heartbeatError = await heartbeat.stop().then(
-        () => null,
-        (stopError: unknown) => stopError,
-      );
-      await releaseProjection(input.layer, row, token, error).catch(() => {});
-      if (heartbeatError) {
-        throw heartbeatError;
-      }
-      throw error;
-    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
   }
 }
 
