@@ -201,6 +201,7 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "24"
+          package-manager-cache: false
 
       # FNXC:TestInfrastructure 2026-06-21-10:26:
       # Keep line-count drift visible in automated post-merge signal without restoring it to the blocking PR gate.

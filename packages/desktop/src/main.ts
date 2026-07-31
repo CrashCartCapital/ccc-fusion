@@ -528,7 +528,7 @@ export async function initializeApp(): Promise<void> {
   });
   registerDeepLinkProtocol();
   setupDeepLinkHandler(createdWindow);
-  setupAutoUpdater(createdWindow);
+  void setupAutoUpdater(createdWindow);
   stopUpdateCheckInterval = startUpdateCheckInterval(createdWindow);
 
   if (windowState?.isMaximized === true) {
