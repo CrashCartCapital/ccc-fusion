@@ -125,4 +125,21 @@ describe("FN-4811 follow-up (FN-4809): process-wide executingTaskLock", () => {
     await executor.execute(makeTask());
     expect(executingTaskLock.has("FN-4809")).toBe(false);
   });
+
+  it("advertises native campaign processing as live execution across executor instances", () => {
+    const executorA = new TaskExecutor(createMockStore() as any, "/tmp/test");
+    const executorB = new TaskExecutor(createMockStore() as any, "/tmp/test");
+
+    const release = executorA.tryBeginAuthoritativeWorkflowExecution("KB-001");
+
+    expect(release).not.toBeNull();
+    expect(executingTaskLock.has("KB-001")).toBe(true);
+    expect(executorA.getExecutingTaskIds()).toContain("KB-001");
+    expect(executorB.tryBeginAuthoritativeWorkflowExecution("KB-001")).toBeNull();
+
+    release!();
+    release!();
+    expect(executingTaskLock.has("KB-001")).toBe(false);
+    expect(executorA.getExecutingTaskIds()).not.toContain("KB-001");
+  });
 });

@@ -4,8 +4,10 @@ import { InProcessRuntime } from "../../runtimes/in-process-runtime.js";
 function makeExecutor(overrides: Record<string, unknown> = {}) {
   return {
     activeWorktrees: new Map(),
+    getExecutingTaskIds: vi.fn().mockReturnValue(new Set<string>()),
     abortAllSessionBash: vi.fn(),
     abortAllInFlight: vi.fn().mockResolvedValue(undefined),
+    disposeStoreLifecycleDisposers: vi.fn(),
     disposeEphemeralTimers: vi.fn(),
     ...overrides,
   };
@@ -46,6 +48,28 @@ describe("FN-5403 reliability interactions: engine stop aborts execution", () =>
     const stopPromise = runtime.stop();
     await vi.advanceTimersByTimeAsync(50);
     await expect(stopPromise).resolves.toBeUndefined();
+  });
+
+  it("waits for authoritative workflow execution even before a worktree is active", async () => {
+    const runtime = new InProcessRuntime({ projectId: "p", workingDirectory: "/tmp", isolationMode: "in-process" } as any, {} as any) as any;
+    const executingTaskIds = new Set(["KB-001"]);
+    const shutdown = vi.fn().mockResolvedValue(undefined);
+    runtime.status = "active";
+    runtime.taskStore = { getSettings: vi.fn().mockResolvedValue({ runtimeStopDrainMs: 1_000 }) };
+    runtime.pluginRunner = { shutdown };
+    runtime.worktreePool = { drain: vi.fn().mockReturnValue([]) };
+    runtime.executor = makeExecutor({
+      getExecutingTaskIds: vi.fn(() => new Set(executingTaskIds)),
+    });
+
+    const stopPromise = runtime.stop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(shutdown).not.toHaveBeenCalled();
+
+    executingTaskIds.clear();
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(stopPromise).resolves.toBeUndefined();
+    expect(shutdown).toHaveBeenCalledTimes(1);
   });
 
   it("FN-5403: engine stop interacts with TriageProcessor.stop", async () => {

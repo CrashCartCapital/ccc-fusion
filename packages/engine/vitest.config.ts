@@ -239,6 +239,11 @@ export default defineConfig({
           include: ["src/**/*.test.ts"],
           exclude: [
             "src/__tests__/reliability-interactions/**/*.test.ts",
+            // Product-route acceptance owns disposable PostgreSQL, native CLI
+            // sessions, and real worktrees. Keep it out of the broad parallel
+            // shard and execute it in engine-product-route below.
+            "src/__tests__/ccc-native-cli-public-route.real-pg.test.ts",
+            "src/__tests__/ccc-prd-product-vertical-slice.real-pg.test.ts",
             // Real-git heavy files run in the engine-slow project so local
             // `pnpm test` stays snappy. CI picks them up via `test:slow`
             // / `test:all` invoked from the root `test:full` script.
@@ -378,6 +383,20 @@ export default defineConfig({
           // SQLite rowid interleaving (e.g. FN-5521 hit
           // `expected 24 to be less than 19` in merge-reuse-task-worktree).
           // Serialize at the file level; within-file order is already linear.
+          minWorkers: 1,
+          maxWorkers: 1,
+          fileParallelism: false,
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: "engine-product-route",
+          include: [
+            "src/__tests__/ccc-native-cli-public-route.real-pg.test.ts",
+            "src/__tests__/ccc-prd-product-vertical-slice.real-pg.test.ts",
+          ],
+          exclude: ["node_modules/**", "dist/**"],
           minWorkers: 1,
           maxWorkers: 1,
           fileParallelism: false,
