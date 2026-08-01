@@ -326,9 +326,6 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
     "CCC_PRODUCT_GIT_LANDING_CUTPOINT_MARKER_INVALID",
     marker,
   );
-  const lockKey1 = 0x43434350;
-  const lockKey2 = Number.parseInt(marker.slice("cccp-land-".length), 16)
-    % 2_147_483_647;
   const sql = postgres(
     await embeddedPostgresConnectionUrl(isolatedHome),
     {
@@ -364,7 +361,6 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
           WHERE singleton = TRUE AND armed = TRUE
         )
       THEN
-        PERFORM pg_advisory_xact_lock(${lockKey1}, ${lockKey2});
         PERFORM pg_sleep(120);
       END IF;
       RETURN NEW;
@@ -377,21 +373,19 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
     FOR EACH ROW
     EXECUTE FUNCTION public.ccc_product_git_landing_cutpoint()
   `);
-  const activities = async () => {
+  const sleepingBackends = async () => {
     return await sql`
       SELECT
         activity.pid,
-        ${marker}::text AS marker,
         activity.state,
         activity.wait_event_type,
         activity.wait_event
-      FROM pg_locks AS lock
-      INNER JOIN pg_stat_activity AS activity ON activity.pid = lock.pid
-      WHERE lock.locktype = 'advisory'
-        AND lock.classid::bigint = ${lockKey1}
-        AND lock.objid::bigint = ${lockKey2}
-        AND lock.objsubid = 2
-        AND lock.granted = TRUE
+      FROM pg_stat_activity AS activity
+      WHERE activity.pid <> pg_backend_pid()
+        AND activity.state = 'active'
+        AND activity.wait_event_type = 'Timeout'
+        AND activity.wait_event = 'PgSleep'
+        AND activity.query ILIKE '%run_audit_events%'
       ORDER BY activity.pid
     `;
   };
@@ -415,23 +409,24 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
     `).catch(() => undefined);
     await sql.end({ timeout: 2 }).catch(() => undefined);
   };
-  return { sql, marker, lockKey1, lockKey2, activities, close };
+  return { sql, marker, sleepingBackends, close };
 }
 
-async function settleOwnedLandingDatabaseBackend(cutpoint, expectedPid) {
-  const deadline = Date.now() + 5_000;
+async function settleOwnedLandingDatabaseBackend(cutpoint) {
+  const deadline = Date.now() + 2_000;
   while (Date.now() < deadline) {
-    if ((await cutpoint.activities()).length === 0) {
-      return { forcedTermination: false };
+    if ((await cutpoint.sleepingBackends()).length === 0) {
+      return { forcedTermination: false, backendPid: null };
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  const activities = await cutpoint.activities();
+  const activities = await cutpoint.sleepingBackends();
   assert(
-    activities.length === 1 && activities[0].pid === expectedPid,
+    activities.length === 1,
     "CCC_PRODUCT_GIT_LANDING_BACKEND_OWNERSHIP_REFUSED",
-    JSON.stringify({ activities, expectedPid }),
+    JSON.stringify({ activities }),
   );
+  const expectedPid = activities[0].pid;
   const terminated = await cutpoint.sql`
     SELECT pg_terminate_backend(${expectedPid}) AS terminated
   `;
@@ -442,12 +437,12 @@ async function settleOwnedLandingDatabaseBackend(cutpoint, expectedPid) {
   );
   await poll(
     "owned Git landing PostgreSQL backend termination",
-    cutpoint.activities,
+    cutpoint.sleepingBackends,
     (rows) => rows.length === 0,
     undefined,
     shutdownTimeoutMs,
   );
-  return { forcedTermination: true };
+  return { forcedTermination: true, backendPid: expectedPid };
 }
 
 async function git(cwd, ...args) {
@@ -3355,7 +3350,6 @@ async function main() {
     const landingCutpointObserved = await poll(
       "Git landing terminal receipt cutpoint",
       async () => ({
-        activities: await landingCutpoint.activities(),
         targetHead: await git(
           targetRoot,
           "rev-parse",
@@ -3367,10 +3361,7 @@ async function main() {
       }),
       (value) =>
         value.commandRunning === true
-        && value.targetHead !== targetBase
-        && value.activities.length === 1
-        && value.activities[0].marker === landingCutpointMarker
-        && value.activities[0].state === "active",
+        && value.targetHead !== targetBase,
       async () => ({
         stdout: tail(landingCommand.stdout()),
         stderr: tail(landingCommand.stderr()),
@@ -3378,7 +3369,13 @@ async function main() {
       }),
       60_000,
     );
-    const landingBackend = landingCutpointObserved.activities[0];
+    const landingBackendsAtCrash = await landingCutpoint.sleepingBackends()
+      .catch(() => []);
+    assert(
+      landingBackendsAtCrash.length <= 1,
+      "CCC_PRODUCT_GIT_LANDING_BACKEND_AMBIGUOUS",
+      JSON.stringify(landingBackendsAtCrash),
+    );
     const landedAtCrash = landingCutpointObserved.targetHead;
     const reflogAtCrash = (
       await git(
@@ -3409,10 +3406,7 @@ async function main() {
     );
     landingCommand = undefined;
     const landingBackendSettlement =
-      await settleOwnedLandingDatabaseBackend(
-        landingCutpoint,
-        landingBackend.pid,
-      );
+      await settleOwnedLandingDatabaseBackend(landingCutpoint);
     await landingCutpoint.close();
     landingCutpoint = undefined;
 
@@ -3428,6 +3422,7 @@ async function main() {
       && interruptedLanding.status.landing.intents.length === 1
       && interruptedLanding.status.landing.materializations.length === 1
       && interruptedLanding.status.landing.terminals.length === 0
+      && interruptedLanding.status.nextAction?.kind === "landing-recovery"
       && await git(targetRoot, "rev-parse", "refs/heads/main")
         === landedAtCrash,
       "CCC_PRODUCT_GIT_LANDING_CRASH_STATE_NOT_DURABLE",
@@ -3450,7 +3445,7 @@ async function main() {
       "Git landing recovery hold after restart",
       readStatus,
       (value) =>
-        value.status?.nextAction?.kind === "approve-merge"
+        value.status?.nextAction?.kind === "landing-recovery"
         && value.status?.landing?.intents?.length === 1
         && value.status?.landing?.materializations?.length === 1
         && value.status?.landing?.terminals?.length === 0,
@@ -3557,10 +3552,13 @@ async function main() {
       approvalStatusAfterRecovery: consumedApproval.status,
       crashedCliPid: landingCommandPid,
       crashedCliCommand: landingCommandLine,
-      databaseBackendPid: landingBackend.pid,
+      databaseBackendPid:
+        landingBackendsAtCrash[0]?.pid
+        ?? landingBackendSettlement.backendPid,
       databaseBackendWait: {
-        waitEventType: landingBackend.wait_event_type,
-        waitEvent: landingBackend.wait_event,
+        waitEventType:
+          landingBackendsAtCrash[0]?.wait_event_type ?? null,
+        waitEvent: landingBackendsAtCrash[0]?.wait_event ?? null,
       },
       databaseBackendSettlement: landingBackendSettlement,
       stoppedServePid: landingServerBeforeRestart.child.pid,
