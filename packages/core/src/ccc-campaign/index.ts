@@ -1,11 +1,13 @@
 export {
   assertCccCampaignAuthorityBinding,
   CccCampaignExecutionPolicyError,
+  createCccPrdProductExecutionPlan,
   createCccCampaignAuthorityBinding,
   createCccCampaignManifest,
   hashCccCampaignManifest,
   parseCccCampaignExecutionPolicy,
   parseCccCampaignProductExecutionPolicy,
+  parseCccPrdProductExecutionPlan,
 } from "./canonical.js";
 export {
   assertCccCampaignActionLease,
@@ -20,6 +22,7 @@ export {
   CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
   CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
+  CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION,
   CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
   CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION,
   CCC_PROVIDER_ATTEMPT_V2_SCHEMA_VERSION,
@@ -41,6 +44,8 @@ export type {
   CccCampaignExecutionRoute,
   CccCampaignProductExecutionPolicy,
   CccCampaignProductExecutionRoute,
+  CccPrdProductExecutionPlan,
+  CccPrdProductExecutionRouteSelection,
   CccCampaignManifest,
   CccCampaignProofAttempt,
   CccCampaignProofAttemptDispatchDecision,

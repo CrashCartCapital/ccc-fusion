@@ -45,6 +45,20 @@ The dashboard remains the first-class operator experience, but building it befor
 
 A developer-written glue script would not be the supported product route and would create a second control plane. The exact-tree acceptance script may provision disposable resources and invoke the normal CLI/engine; it may not import, mutate campaign state, create the implementation commit, or mark proof results directly.
 
+## 2026-07-31 completion correction: remove operator-authored glue
+
+Fresh review at commit `60ec7595320abbfa9b71845de24a6a2740f98691`, tree `b71ee1c9aa05d26b08e20a8e4d647c74c114ac31`, found two remaining product gaps hidden by the disposable acceptance harness. The harness writes `ccc-campaign.execution-policy.v2` itself, and current PRDs cannot add missing target/base/path authority without a manually authored companion. Those are test-driver inputs, not a complete normal-person journey.
+
+The accepted correction is dependency ordered:
+
+1. Add source-bound task custody to the semantic sidecar. Product-authored tasks may carry separate `ownedPaths` and `allowedWriteRoots`; the normal product route refuses empty, escaping, out-of-bound, or source-uncited values. Existing compatibility sidecars may omit them, but they cannot use automatic product policy generation.
+2. Add `ccc-prd.execution-plan.v1`, a product-owned envelope around the existing strict `ccc-campaign.execution-policy.v2`. The envelope binds `packetHash`, `sidecarHash`, and `bundleHash` to the generated routes. A normal `fn prd policy` command recompiles the packet, creates one coding/isolated/commit-required route per task from source-bound task custody plus an operator-selected provider/model/transport, validates it through the existing v2 parser, and writes canonical bytes atomically. Raw v2 JSON remains compatibility-only and is not the supported product input.
+3. Preserve the difference between concurrency ownership and filesystem permission. `ownedPaths` identify the exclusive semantic surface for a task; `allowedWriteRoots` identify the declared directories or files the executor may write, and every allowed root must remain inside both task ownership and the PRD-wide admitted roots. The generator never substitutes all global roots or invents a task split.
+4. Add a guided operator-context intake mode. Fusion renders deterministic supplemental Markdown inside the packet staging transaction from explicit operator answers, hashes it as an authoritative companion, and leaves the original PRD untouched. Supplemental authority may fill missing transient implementation facts; it may not silently contradict or expand an existing PRD decision. A contradiction or omitted implementation-changing fact remains an understandable unresolved question with zero output residue. Automation may use the same typed stdin contract; handwritten Markdown or JSON is not required.
+5. Treat route readiness as execution-host evidence. Preview shows the selected route and the readiness evidence currently available, but an importer-host binary or credential probe is not sufficient. The actual campaign runtime must re-check adapter, provider, and tool readiness on the dispatch host before reserving an external effect and persist a clear blocker when unavailable. No special fake-provider bypass is admitted into production.
+
+The first implementation slice is task custody plus the generated, hash-bound execution plan because it removes the largest current developer-glue dependency. The guided operator-context packet follows on the same spine. Both must enter the built CLI and exact-tree acceptance command before they count as product capability.
+
 ## Audit-finding disposition ledger
 
 | July 30 finding | Disposition | Current evidence | Acceptance requirement |

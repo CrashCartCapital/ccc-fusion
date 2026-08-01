@@ -10,6 +10,8 @@ export const CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION =
   "ccc-campaign.execution-policy.v1" as const;
 export const CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION =
   "ccc-campaign.execution-policy.v2" as const;
+export const CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION =
+  "ccc-prd.execution-plan.v1" as const;
 /** @deprecated Use the version-specific execution-policy constant. */
 export const CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION =
   CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION;
@@ -324,6 +326,21 @@ export type CccCampaignExecutionPolicy = {
 export type CccCampaignProductExecutionPolicy = CccCampaignExecutionPolicy & {
   schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION;
   routes: CccCampaignProductExecutionRoute[];
+};
+
+export type CccPrdProductExecutionRouteSelection = {
+  providerId: string;
+  modelId: string;
+  transport: "pi" | "cli";
+  cliAdapterId?: string;
+};
+
+export type CccPrdProductExecutionPlan = {
+  schema: typeof CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION;
+  packetHash: string;
+  sidecarHash: string;
+  bundleHash: string;
+  policy: CccCampaignProductExecutionPolicy;
 };
 
 export type CccCampaignManifest = {

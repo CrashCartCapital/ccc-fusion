@@ -29,8 +29,11 @@ describe("prd built CLI user contract", () => {
     expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>");
     expect(result.stdout).toContain("fn prd template");
     expect(result.stdout).toContain("fn prd lint <prd-path>");
+    expect(result.stdout).toContain("fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path>");
     expect(result.stdout).toContain("fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>");
     expect(result.stdout).toContain("fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>");
+    expect(result.stdout).toContain("fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path>");
+    expect(result.stdout).toContain("fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path>");
     expect(result.stdout).toContain("fn prd status <idempotency-key>");
     expect(result.stdout).toContain("fn prd pause <idempotency-key> --confirm <status-digest>");
     expect(result.stdout).toContain("fn prd resume <idempotency-key> --confirm <status-digest>");
@@ -196,27 +199,27 @@ version: 2.0.0
   it("preserves a product refusal exit code after embedded PostgreSQL cleanup", async () => {
     const packet = createPacketRoot();
     const home = join(packet.root, "home");
-    const policy = join(packet.root, "execution-policy.json");
+    const policy = join(packet.root, "execution-plan.json");
     mkdirSync(home);
     execFileSync("/usr/bin/git", ["init", "-q"], { cwd: packet.root });
     expect(runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]).status).toBe(0);
-    writeFileSync(policy, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [
-        {
-          taskId: "TASK-CLI-001",
-          providerId: "deterministic-fake",
-          modelId: "fixture-v2",
-          transport: "pi",
-          executor: "model",
-          toolMode: "coding",
-          worktreeMode: "isolated",
-          ownedPaths: ["src/task-1"],
-          allowedWriteRoots: ["src/task-1"],
-          commitPolicy: "required",
-        },
-      ],
-    }));
+    const generated = runFn([
+      "prd",
+      "policy",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      packet.target,
+      packet.base,
+      policy,
+      "--provider",
+      "deterministic-fake",
+      "--model",
+      "fixture-v2",
+      "--transport",
+      "pi",
+    ]);
+    expect(generated.status, generated.stdout + generated.stderr).toBe(0);
 
     const result = await runFnAsync(
       [

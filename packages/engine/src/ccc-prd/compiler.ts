@@ -756,6 +756,8 @@ function validateSidecar(
         "documentIds",
         "artifactIds",
         "protectedActionIds",
+        "ownedPaths",
+        "allowedWriteRoots",
         "spans",
       ],
       diagnostics,

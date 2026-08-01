@@ -31,6 +31,7 @@ const expectedChecks = Object.freeze([
   "planted-defect-rejected",
   "native-local-authoring",
   "frozen-packet-validated",
+  "product-owned-execution-plan",
   "forged-provenance-refused-without-residue",
   "exact-preview-confirmed",
   "wrong-confirmation-refused-without-residue",
@@ -674,6 +675,7 @@ async function buildCurrentCli(ledger) {
     "fn prd author",
     "fn prd discover",
     "fn prd freeze",
+    "fn prd policy",
     "fn prd validate",
     "fn prd compile",
     "fn prd preview",
@@ -710,6 +712,7 @@ async function buildCurrentCli(ledger) {
       "author",
       "discover",
       "freeze",
+      "policy",
       "validate",
       "compile",
       "preview",
@@ -913,7 +916,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const manifestPath = frozen.manifestPath;
   const proposalPath = path.join(packetRoot, "authoring-proposal.json");
   const sidecarPath = path.join(packetRoot, "candidate.sidecar.json");
-  const policyPath = path.join(packetRoot, "execution-policy.json");
+  const executionPlanPath = path.join(packetRoot, "execution-plan.json");
   const frozenPrdRelativePath = `sources/${prdFileName}`;
   const sourceRefs = [{
     path: frozenPrdRelativePath,
@@ -981,6 +984,8 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       title: "Implement the admitted value change",
       description:
         "Edit only src/value.txt so the exact verifier passes; the Fusion controller creates the campaign commit.",
+      ownedPaths: ["src/value.txt"],
+      allowedWriteRoots: ["src/value.txt"],
       accountableProducer: "campaign-coding-agent",
       requirementIds: ["REQ-VERTICAL"],
       dependencyTaskIds: [],
@@ -1089,29 +1094,12 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     exceptions: [],
     confidence: "high",
   };
-  const policy = {
-    schema: "ccc-campaign.execution-policy.v2",
-    routes: [{
-      taskId: "TASK-VERTICAL",
-      providerId: "openai",
-      modelId: "gpt-5.6-sol",
-      transport: "cli",
-      executor: "cli-agent",
-      cliAdapterId: "codex",
-      toolMode: "coding",
-      worktreeMode: "isolated",
-      ownedPaths: ["src/value.txt"],
-      allowedWriteRoots: ["src/value.txt"],
-      commitPolicy: "required",
-    }],
-  };
   await writeFile(proposalPath, `${JSON.stringify(proposal, null, 2)}\n`);
-  await writeFile(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
   return {
     manifestPath,
     proposalPath,
     sidecarPath,
-    policyPath,
+    executionPlanPath,
     sourcePath: frozenPrdRelativePath,
     discovery: {
       project: projectName,
@@ -1341,7 +1329,7 @@ async function main() {
       packetRoot,
       packet.manifestPath,
       packet.sidecarPath,
-      packet.policyPath,
+      packet.executionPlanPath,
       targetRoot,
       targetBase,
     ];
@@ -1506,6 +1494,69 @@ async function main() {
       proofIds: ["PROOF-VERTICAL"],
     });
 
+    const generatedExecutionPlan = jsonOutput(
+      await prd([
+        "policy",
+        packetRoot,
+        packet.manifestPath,
+        packet.sidecarPath,
+        targetRoot,
+        targetBase,
+        packet.executionPlanPath,
+        "--provider",
+        "openai",
+        "--model",
+        "gpt-5.6-sol",
+        "--transport",
+        "cli",
+        "--cli-adapter",
+        "codex",
+      ]),
+      "prd policy",
+    );
+    const executionPlanBytes = await readFile(packet.executionPlanPath);
+    const executionPlan = JSON.parse(executionPlanBytes.toString("utf8"));
+    const executionRoute = executionPlan.policy?.routes?.[0];
+    assert(
+      generatedExecutionPlan.kind === "execution-plan"
+        && generatedExecutionPlan.path === packet.executionPlanPath
+        && generatedExecutionPlan.sha256 === sha256(executionPlanBytes)
+        && generatedExecutionPlan.routeCount === 1
+        && executionPlan.schema === "ccc-prd.execution-plan.v1"
+        && executionPlan.packetHash === compiled.sourceHash
+        && executionPlan.sidecarHash === compiled.sidecarHash
+        && executionPlan.bundleHash === compiled.bundleHash
+        && executionRoute?.taskId === "TASK-VERTICAL"
+        && executionRoute.providerId === "openai"
+        && executionRoute.modelId === "gpt-5.6-sol"
+        && executionRoute.transport === "cli"
+        && executionRoute.cliAdapterId === "codex"
+        && executionRoute.executor === "cli-agent"
+        && executionRoute.toolMode === "coding"
+        && executionRoute.worktreeMode === "isolated"
+        && executionRoute.commitPolicy === "required",
+      "CCC_PRODUCT_EXECUTION_PLAN_INVALID",
+      JSON.stringify(executionPlan),
+    );
+    exactArray(
+      executionRoute.ownedPaths,
+      ["src/value.txt"],
+      "CCC_PRODUCT_EXECUTION_PLAN_OWNERSHIP_DRIFT",
+    );
+    exactArray(
+      executionRoute.allowedWriteRoots,
+      ["src/value.txt"],
+      "CCC_PRODUCT_EXECUTION_PLAN_WRITE_ROOT_DRIFT",
+    );
+    ledger.pass("product-owned-execution-plan", {
+      path: generatedExecutionPlan.path,
+      sha256: generatedExecutionPlan.sha256,
+      packetHash: executionPlan.packetHash,
+      sidecarHash: executionPlan.sidecarHash,
+      bundleHash: executionPlan.bundleHash,
+      route: executionRoute,
+    });
+
     const globalSettingsBeforeForgedPreview =
       await directorySnapshot(globalSettingsDir);
     const forgedSidecarPath = path.join(packetRoot, "forged.sidecar.json");
@@ -1519,7 +1570,7 @@ async function main() {
         packetRoot,
         packet.manifestPath,
         forgedSidecarPath,
-        packet.policyPath,
+        packet.executionPlanPath,
         targetRoot,
         targetBase,
       ], [1]),

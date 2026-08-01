@@ -310,15 +310,17 @@ Usage:
                                       Select the current PRD inside each project using project-local lineage
   fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>
                                       Freeze the selected PRD and recursive support packet outside its source tree
+  fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]
+                                      Generate a hash-bound coding route plan without hand-written policy JSON
   fn prd template                     Print the optional future-PRD intake template
   fn prd lint <prd-path>              Report missing implementation facts without rewriting the PRD
   fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Validate custody and semantics; emit diagnostics only
   fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Compile a validated sidecar into the complete deterministic semantic bundle
-  fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]
+  fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]
                                       Show the exact hash-bound product import, coding routes, paths, proof, and approval contract
-  fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]
+  fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]
                                       Recheck the preview identity and transactionally admit the campaign
   fn prd inspect <idempotency-key> [--project <id|name>]
                                       Inspect durable PRD import and recovery state

@@ -97,6 +97,17 @@ function buildReviewedOperatorDecisions(input: CccPrdAuthoringProposal): {
       `Protected action target: ${action.target}`,
     ].join("\n"),
   ]));
+  const taskCustodySections = new Map(input.tasks.map((task) => {
+    const taskRoot = ".fusion/tasks/" + task.id.toLowerCase();
+    return [
+      task.id,
+      [
+        "## Reviewed task custody: " + task.id,
+        "Owned path: " + taskRoot,
+        "Allowed write root: " + taskRoot,
+      ].join("\n"),
+    ];
+  }));
   const alternateRequirement = input.requirements[0]!;
   const alternateRequirementSection = [
     `## Alternate reviewed requirement evidence: ${alternateRequirement.id}`,
@@ -116,6 +127,18 @@ function buildReviewedOperatorDecisions(input: CccPrdAuthoringProposal): {
     ...action,
     sourceRefs: sourceReference(protectedActionSections.get(action.id)!),
   }));
+  reviewedProposal.tasks = reviewedProposal.tasks.map((task) => {
+    const taskRoot = ".fusion/tasks/" + task.id.toLowerCase();
+    return {
+      ...task,
+      ownedPaths: [taskRoot],
+      allowedWriteRoots: [taskRoot],
+      sourceRefs: [
+        ...task.sourceRefs,
+        ...sourceReference(taskCustodySections.get(task.id)!),
+      ],
+    };
+  });
   return {
     content: [
       "# Reviewed Operator Decisions",
@@ -123,6 +146,7 @@ function buildReviewedOperatorDecisions(input: CccPrdAuthoringProposal): {
       ...requirementSections.values(),
       ...proofSections.values(),
       ...protectedActionSections.values(),
+      ...taskCustodySections.values(),
       alternateRequirementSection,
       "",
     ].join("\n\n"),
@@ -295,6 +319,33 @@ describe("CCC PRD native authoring adapter", () => {
         definitionSha256: computeCccPrdProofDefinitionSha256(proof),
       });
     }
+  });
+
+  it("refuses task custody paths that are not present in task-specific source evidence", async () => {
+    const invented = structuredClone(proposal);
+    invented.tasks[0] = {
+      ...invented.tasks[0]!,
+      ownedPaths: ["src/invented"],
+      allowedWriteRoots: ["src/invented"],
+    };
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(invented),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([expect.objectContaining({
+        code: "CCC_PRD_TASK_CUSTODY_PROVENANCE_REQUIRED",
+      })]),
+    });
   });
 
   it("refuses authoring when the fixed native proof admission entry is missing", async () => {

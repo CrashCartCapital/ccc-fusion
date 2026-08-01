@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  createCccPrdProductExecutionPlan,
+  parseCccPrdProductExecutionPlan,
+} from "../ccc-campaign/index.js";
+import {
   createCccPrdImportTestBundle,
   createCccPrdImportTestExecutionPolicy,
 } from "../__test-utils__/ccc-prd-import-fixture.js";
@@ -32,6 +36,73 @@ function productPolicy() {
     })),
   };
 }
+
+describe("CCC PRD product execution-plan generation", () => {
+  it("generates a hash-bound product execution plan from source-owned task custody", () => {
+    const semanticBundle = bundle();
+    const custodiedBundle = {
+      ...semanticBundle,
+      tasks: semanticBundle.tasks.map((task, index) => ({
+        ...task,
+        ownedPaths: ["src/task-" + index],
+        allowedWriteRoots: ["src/task-" + index],
+      })),
+    };
+    expect(createCccPrdProductExecutionPlan({
+      bundle: custodiedBundle,
+      route: {
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+      },
+    })).toEqual({
+      schema: "ccc-prd.execution-plan.v1",
+      packetHash: custodiedBundle.sourceHash,
+      sidecarHash: custodiedBundle.sidecarHash,
+      bundleHash: custodiedBundle.bundleHash,
+      policy: {
+        schema: "ccc-campaign.execution-policy.v2",
+        routes: custodiedBundle.tasks.map((task) => ({
+          taskId: task.id,
+          providerId: "deterministic-fake",
+          modelId: "fixture-v2",
+          transport: "pi",
+          executor: "model",
+          toolMode: "coding",
+          worktreeMode: "isolated",
+          ownedPaths: task.ownedPaths,
+          allowedWriteRoots: task.allowedWriteRoots,
+          commitPolicy: "required",
+        })),
+      },
+    });
+  });
+
+  it("refuses an execution plan whose semantic bindings are stale", () => {
+    const semanticBundle = bundle();
+    const custodiedBundle = {
+      ...semanticBundle,
+      tasks: semanticBundle.tasks.map((task, index) => ({
+        ...task,
+        ownedPaths: ["src/task-" + index],
+        allowedWriteRoots: ["src/task-" + index],
+      })),
+    };
+    const plan = createCccPrdProductExecutionPlan({
+      bundle: custodiedBundle,
+      route: {
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+      },
+    });
+    expect(parseCccPrdProductExecutionPlan(plan, custodiedBundle)).toEqual(plan);
+    expect(() => parseCccPrdProductExecutionPlan({
+      ...plan,
+      sidecarHash: "d".repeat(64),
+    }, custodiedBundle)).toThrow(/sidecar hash does not match/);
+  });
+});
 
 describe("CCC campaign execution-policy v2", () => {
   it("accepts and canonicalizes a complete coding route for every semantic task", () => {

@@ -14,15 +14,17 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
+  createCccPrdProductExecutionPlan,
   importCccPrdBundle,
   inspectCccCampaignProofAttempt,
   inspectCccPrdImport,
   inspectCccPrdProductStatus,
-  parseCccCampaignProductExecutionPolicy,
+  parseCccPrdProductExecutionPlan,
   reconcileCccPrdImport,
   settleCccCampaignProofAttempt,
   type ApprovalRequest,
   type CccCampaignProductExecutionPolicy,
+  type CccPrdProductExecutionPlan,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringConstraints,
   type CccPrdAuthoringProposal,
@@ -125,11 +127,12 @@ const usage = [
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
   "       fn prd discover <active-projects-root>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
+  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
   "       fn prd template",
   "       fn prd lint <prd-path>",
   "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
-  "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]",
-  "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
+  "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]",
+  "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
   "       fn prd <inspect|reconcile> <idempotency-key> [--project <id|name>]",
   "       fn prd status <idempotency-key> [--project <id|name>]",
   "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
@@ -368,6 +371,191 @@ function writeSidecarAtomically(
     renameSync(temporaryPath, output);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+type ProductPolicyArgs = {
+  rootDir: string;
+  manifestPath: string;
+  sidecarPath: string;
+  expectedTarget: string;
+  expectedBase: string;
+  outputPath: string;
+  providerId: string;
+  modelId: string;
+  transport: "pi" | "cli";
+  cliAdapterId?: string;
+};
+
+function parseProductPolicyArgs(args: string[]): ProductPolicyArgs | undefined {
+  const [
+    subcommand,
+    rootDir,
+    manifestPath,
+    sidecarPath,
+    expectedTarget,
+    expectedBase,
+    outputPath,
+    ...options
+  ] = args;
+  if (
+    subcommand !== "policy"
+    || !rootDir
+    || !manifestPath
+    || !sidecarPath
+    || !expectedTarget
+    || !expectedBase
+    || !outputPath
+    || !/^[0-9a-f]{40}$/.test(expectedBase)
+    || options.length % 2 !== 0
+  ) {
+    return undefined;
+  }
+  const values = new Map<string, string>();
+  for (let index = 0; index < options.length; index += 2) {
+    const flag = options[index];
+    const value = options[index + 1];
+    if (
+      !flag
+      || !["--provider", "--model", "--transport", "--cli-adapter"].includes(flag)
+      || !value
+      || value.startsWith("--")
+      || values.has(flag)
+    ) {
+      return undefined;
+    }
+    values.set(flag, value);
+  }
+  const providerId = values.get("--provider");
+  const modelId = values.get("--model");
+  const transport = values.get("--transport");
+  const cliAdapterId = values.get("--cli-adapter");
+  if (
+    !providerId
+    || !modelId
+    || (transport !== "pi" && transport !== "cli")
+    || (transport === "cli" && !cliAdapterId)
+    || (transport === "pi" && cliAdapterId)
+    || values.size !== (transport === "cli" ? 4 : 3)
+  ) {
+    return undefined;
+  }
+  return {
+    rootDir,
+    manifestPath,
+    sidecarPath,
+    expectedTarget,
+    expectedBase,
+    outputPath,
+    providerId,
+    modelId,
+    transport,
+    ...(cliAdapterId ? { cliAdapterId } : {}),
+  };
+}
+
+function writeExecutionPlanAtomically(
+  input: ProductPolicyArgs,
+  plan: CccPrdProductExecutionPlan,
+): string {
+  const root = realpathSync(input.rootDir);
+  const output = resolve(input.outputPath);
+  const relativeOutput = relative(resolve(input.rootDir), output);
+  if (isEscaping(relativeOutput) || isProtected(relativeOutput)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PATH_ESCAPE",
+      "execution-plan output is outside the admitted packet root",
+    );
+  }
+  const parent = realpathSync(dirname(output));
+  const canonicalRelative = relative(root, parent);
+  if (isEscaping(canonicalRelative) || isProtected(canonicalRelative)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PATH_ESCAPE",
+      "execution-plan output parent is outside the admitted packet root",
+    );
+  }
+  if (existsSync(output)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_EXECUTION_PLAN_OUTPUT_EXISTS",
+      "execution-plan output already exists",
+    );
+  }
+  const protectedPaths = authorProtectedPaths(
+    input.rootDir,
+    input.manifestPath,
+    input.sidecarPath,
+  );
+  if (protectedPaths.has(output)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_EXECUTION_PLAN_TARGET_PROTECTED",
+      "execution-plan output overlaps an admitted input",
+    );
+  }
+  const temporaryRoot = mkdtempSync(join(root, ".fusion-prd-tmp-"));
+  const temporaryPath = join(temporaryRoot, "execution-plan.json");
+  try {
+    writeFileSync(
+      temporaryPath,
+      canonicalCccPrdJson(plan) + "\n",
+      { encoding: "utf8", flag: "wx" },
+    );
+    renameSync(temporaryPath, output);
+    return output;
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+async function runProductPolicyCommand(
+  args: string[],
+  io: PrdCommandIo,
+): Promise<number> {
+  const parsed = parseProductPolicyArgs(args);
+  if (!parsed) {
+    io.write(usage);
+    return 2;
+  }
+  try {
+    const compiled = compileProductBundle({
+      rootDir: parsed.rootDir,
+      manifestPath: parsed.manifestPath,
+      sidecarPath: parsed.sidecarPath,
+      expectedTarget: parsed.expectedTarget,
+      expectedBase: parsed.expectedBase,
+    });
+    if (compiled.kind === "refusal") {
+      io.write(JSON.stringify(compiled));
+      return 1;
+    }
+    const plan = createCccPrdProductExecutionPlan({
+      bundle: compiled,
+      route: {
+        providerId: parsed.providerId,
+        modelId: parsed.modelId,
+        transport: parsed.transport,
+        ...(parsed.cliAdapterId ? { cliAdapterId: parsed.cliAdapterId } : {}),
+      },
+    });
+    const outputPath = writeExecutionPlanAtomically(parsed, plan);
+    const bytes = readFileSync(outputPath);
+    io.write(JSON.stringify({
+      kind: "execution-plan",
+      path: outputPath,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      packetHash: plan.packetHash,
+      sidecarHash: plan.sidecarHash,
+      bundleHash: plan.bundleHash,
+      routeCount: plan.policy.routes.length,
+    }));
+    return 0;
+  } catch (error) {
+    const detail = error as { code?: unknown; message?: unknown };
+    return writeProductRefusal(
+      io,
+      typeof detail.code === "string" ? detail.code : "CCC_PRD_EXECUTION_PLAN_FAILED",
+      typeof detail.message === "string" ? detail.message : "CCC PRD execution plan failed",
+    );
   }
 }
 
@@ -685,23 +873,23 @@ async function readTargetHead(targetRoot: string): Promise<string> {
 
 function readProductExecutionPolicy(
   rootDir: string,
-  policyPath: string,
+  executionPlanPath: string,
   bundle: CccPrdSemanticBundle,
 ): CccCampaignProductExecutionPolicy {
   let value: unknown;
   try {
     value = JSON.parse(
-      readFileSync(resolveAuthorInput(rootDir, policyPath), "utf8"),
+      readFileSync(resolveAuthorInput(rootDir, executionPlanPath), "utf8"),
     ) as unknown;
   } catch (error) {
     throw new PrdProductCommandError(
       "CCC_PRD_EXECUTION_POLICY_READ_FAILED",
       error instanceof Error
-        ? `execution policy could not be read: ${error.message}`
-        : `execution policy could not be read: ${policyPath}`,
+        ? "execution plan could not be read: " + error.message
+        : "execution plan could not be read: " + executionPlanPath,
     );
   }
-  return parseCccCampaignProductExecutionPolicy(value, bundle);
+  return parseCccPrdProductExecutionPlan(value, bundle).policy;
 }
 
 function assertProductBundleComplete(bundle: CccPrdSemanticBundle): void {
@@ -910,7 +1098,7 @@ async function runProductPacketCommand(
     rootDir,
     manifestPath,
     sidecarPath,
-    executionPolicyPath,
+    executionPlanPath,
     expectedTarget,
     expectedBase,
     idempotencyKey,
@@ -923,7 +1111,7 @@ async function runProductPacketCommand(
     !rootDir
     || !manifestPath
     || !sidecarPath
-    || !executionPolicyPath
+    || !executionPlanPath
     || !expectedTarget
     || !expectedBase
     || !/^[0-9a-f]{40}$/.test(expectedBase)
@@ -956,7 +1144,7 @@ async function runProductPacketCommand(
       return 1;
     }
     bundle = compiled;
-    executionPolicy = readProductExecutionPolicy(rootDir, executionPolicyPath, bundle);
+    executionPolicy = readProductExecutionPolicy(rootDir, executionPlanPath, bundle);
   } catch (error) {
     const detail = error as { code?: unknown; message?: unknown };
     return writeProductRefusal(
@@ -2326,6 +2514,9 @@ export async function runPrdCommand(
   dependencies: PrdCommandDependencies = {},
   commandContext: PrdCommandContext = {},
 ): Promise<number> {
+  if (args[0] === "policy") {
+    return runProductPolicyCommand(args, io);
+  }
   if (args[0] === "discover" || args[0] === "freeze") {
     return runIntakePacketCommand(args, io, dependencies);
   }

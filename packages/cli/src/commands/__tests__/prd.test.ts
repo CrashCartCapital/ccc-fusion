@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
@@ -14,6 +14,31 @@ const bootstrapProofAdmission = () => bootstrapCccCampaignProofAdmissionHost({
   builtRootPath: join(repoRoot, "packages/cli/dist"),
 });
 
+async function createExecutionPlan(
+  packet: ReturnType<typeof createPacketRoot>,
+  name = "execution-plan.json",
+): Promise<string> {
+  const outputPath = join(packet.root, name);
+  const output: string[] = [];
+  const exit = await runPrdCommand([
+    "policy",
+    packet.root,
+    packet.manifest,
+    packet.sidecar,
+    packet.target,
+    packet.base,
+    outputPath,
+    "--provider",
+    "deterministic-fake",
+    "--model",
+    "fixture-v2",
+    "--transport",
+    "pi",
+  ], { write: (line) => output.push(line) });
+  expect(exit, output.join("\n")).toBe(0);
+  return outputPath;
+}
+
 describe("prd command exit contract", () => {
   it("returns usage exit 2 before any compiler or filesystem work", async () => {
     const output: string[] = [];
@@ -24,11 +49,12 @@ describe("prd command exit contract", () => {
         "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
         "       fn prd discover <active-projects-root>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
+        "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
         "       fn prd template",
         "       fn prd lint <prd-path>",
         "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
-        "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]",
-        "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
+        "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]",
+        "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
         "       fn prd <inspect|reconcile> <idempotency-key> [--project <id|name>]",
         "       fn prd status <idempotency-key> [--project <id|name>]",
         "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
@@ -111,6 +137,66 @@ describe("prd command exit contract", () => {
     });
   });
 
+  it("generates a hash-bound execution plan without operator-authored policy JSON", async () => {
+    const packet = createPacketRoot();
+    const authorOutput: string[] = [];
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: (line) => authorOutput.push(line) },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+
+    const executionPlanPath = join(packet.root, "execution-plan.json");
+    const output: string[] = [];
+    const policyExit = await runPrdCommand(
+      [
+        "policy",
+        packet.root,
+        packet.manifest,
+        packet.sidecar,
+        packet.target,
+        packet.base,
+        executionPlanPath,
+        "--provider",
+        "deterministic-fake",
+        "--model",
+        "fixture-v2",
+        "--transport",
+        "pi",
+      ],
+      { write: (line) => output.push(line) },
+      { bootstrapProofAdmission },
+    );
+    expect(policyExit, output.join("\n")).toBe(0);
+
+    expect(existsSync(executionPlanPath)).toBe(true);
+    expect(JSON.parse(readFileSync(executionPlanPath, "utf8"))).toMatchObject({
+      schema: "ccc-prd.execution-plan.v1",
+      packetHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      sidecarHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      bundleHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      policy: {
+        schema: "ccc-campaign.execution-policy.v2",
+        routes: [{
+          taskId: "TASK-CLI-001",
+          providerId: "deterministic-fake",
+          modelId: "fixture-v2",
+          transport: "pi",
+          executor: "model",
+          toolMode: "coding",
+          worktreeMode: "isolated",
+          ownedPaths: ["src/task-1"],
+          allowedWriteRoots: ["src/task-1"],
+          commitPolicy: "required",
+        }],
+      },
+    });
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "execution-plan",
+      path: executionPlanPath,
+    });
+  });
+
   it("prints the optional intake template and lints implementation-changing facts without rewriting the PRD", async () => {
     const templateOutput: string[] = [];
     expect(await runPrdCommand(
@@ -167,24 +253,22 @@ describe("prd command exit contract", () => {
       { write: (line) => authorOutput.push(line) },
       { bootstrapProofAdmission },
     )).toBe(0);
-    const policyPath = join(packet.root, "execution-policy.json");
-    writeFileSync(policyPath, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [
-        {
-          taskId: "TASK-CLI-001",
-          providerId: "deterministic-fake",
-          modelId: "fixture-v2",
-          transport: "pi",
-          executor: "model",
-          toolMode: "coding",
-          worktreeMode: "isolated",
-          ownedPaths: ["src/task-1"],
-          allowedWriteRoots: ["src/task-1"],
-          commitPolicy: "required",
-        },
-      ],
-    }));
+    const policyPath = join(packet.root, "execution-plan.json");
+    expect(await runPrdCommand([
+      "policy",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      packet.target,
+      packet.base,
+      policyPath,
+      "--provider",
+      "deterministic-fake",
+      "--model",
+      "fixture-v2",
+      "--transport",
+      "pi",
+    ], { write: () => undefined })).toBe(0);
     const layer = {};
     const store = { getAsyncLayer: vi.fn(() => layer) };
     const context = {
@@ -299,22 +383,7 @@ describe("prd command exit contract", () => {
       { write: () => undefined },
       { bootstrapProofAdmission },
     )).toBe(0);
-    const policyPath = join(packet.root, "execution-policy.json");
-    writeFileSync(policyPath, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [{
-        taskId: "TASK-CLI-001",
-        providerId: "deterministic-fake",
-        modelId: "fixture-v2",
-        transport: "pi",
-        executor: "model",
-        toolMode: "coding",
-        worktreeMode: "isolated",
-        ownedPaths: ["src/task-1"],
-        allowedWriteRoots: ["src/task-1"],
-        commitPolicy: "required",
-      }],
-    }));
+    const policyPath = await createExecutionPlan(packet);
     const context = {
       projectId: "project-1",
       projectPath: resolve(packet.target),
@@ -380,22 +449,7 @@ describe("prd command exit contract", () => {
       { write: () => undefined },
       { bootstrapProofAdmission },
     )).toBe(0);
-    const policyPath = join(packet.root, "execution-policy.json");
-    writeFileSync(policyPath, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [{
-        taskId: "TASK-CLI-001",
-        providerId: "deterministic-fake",
-        modelId: "fixture-v2",
-        transport: "pi",
-        executor: "model",
-        toolMode: "coding",
-        worktreeMode: "isolated",
-        ownedPaths: ["src/task-1"],
-        allowedWriteRoots: ["src/task-1"],
-        commitPolicy: "required",
-      }],
-    }));
+    const policyPath = await createExecutionPlan(packet);
     const context = {
       projectId: "project-1",
       projectPath: resolve(packet.target),
@@ -484,24 +538,7 @@ describe("prd command exit contract", () => {
       { write: () => undefined },
       { bootstrapProofAdmission },
     )).toBe(0);
-    const policyPath = join(packet.root, "execution-policy.json");
-    writeFileSync(policyPath, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [
-        {
-          taskId: "TASK-CLI-001",
-          providerId: "deterministic-fake",
-          modelId: "fixture-v2",
-          transport: "pi",
-          executor: "model",
-          toolMode: "coding",
-          worktreeMode: "isolated",
-          ownedPaths: ["src/task-1"],
-          allowedWriteRoots: ["src/task-1"],
-          commitPolicy: "required",
-        },
-      ],
-    }));
+    const policyPath = await createExecutionPlan(packet);
     const importBundle = vi.fn();
     const closeProjectStore = vi.fn(async () => undefined);
     const context = {

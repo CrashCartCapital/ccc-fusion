@@ -97,6 +97,62 @@ function hasSourceBoundRows(value: unknown): boolean {
   });
 }
 
+function sourceQuoteContainsCanonicalPath(
+  reference: CccPrdSourceReferenceProposal,
+  path: string,
+): boolean {
+  const isPathCharacter = (value: string | undefined): boolean => (
+    typeof value === "string" && /[A-Za-z0-9._/-]/u.test(value)
+  );
+  let index = reference.exactQuote.indexOf(path);
+  while (index !== -1) {
+    const before = index > 0 ? reference.exactQuote[index - 1] : undefined;
+    const afterIndex = index + path.length;
+    const after = afterIndex < reference.exactQuote.length
+      ? reference.exactQuote[afterIndex]
+      : undefined;
+    if (!isPathCharacter(before) && !isPathCharacter(after)) return true;
+    index = reference.exactQuote.indexOf(path, index + 1);
+  }
+  return false;
+}
+
+function validateTaskCustodyProvenance(
+  proposal: CccPrdAuthoringProposal,
+): CccPrdDiagnostic[] {
+  const diagnostics: CccPrdDiagnostic[] = [];
+  for (const task of proposal.tasks) {
+    for (const [field, paths] of [
+      ["ownedPaths", task.ownedPaths],
+      ["allowedWriteRoots", task.allowedWriteRoots],
+    ] as const) {
+      if (
+        !Array.isArray(paths)
+        || paths.length === 0
+        || paths.some((path) => typeof path !== "string" || path.length === 0 || path !== path.trim())
+      ) {
+        diagnostics.push({
+          code: "CCC_PRD_TASK_CUSTODY_REQUIRED",
+          message: "task " + task.id + " requires non-empty source-owned " + field,
+        });
+        continue;
+      }
+      for (const path of paths) {
+        if (!task.sourceRefs.some((reference) =>
+          sourceQuoteContainsCanonicalPath(reference, path)
+        )) {
+          diagnostics.push({
+            code: "CCC_PRD_TASK_CUSTODY_PROVENANCE_REQUIRED",
+            message: "task " + task.id + " " + field + " path " + path
+              + " is absent from its exact source evidence",
+          });
+        }
+      }
+    }
+  }
+  return diagnostics;
+}
+
 function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal {
   if (!isPlainRecord(value) || value.schema !== CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION) return false;
   const collections = [
@@ -698,6 +754,10 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       return malformed(`authoring adapter ${input.adapter.id} returned a task protected-action ID that is empty or not trimmed`);
     }
     if (input.constraints) {
+      const taskCustodyDiagnostics = validateTaskCustodyProvenance(proposalValue);
+      if (taskCustodyDiagnostics.length > 0) {
+        return { kind: "refusal", diagnostics: taskCustodyDiagnostics };
+      }
       if (
         canonicalCccPrdJson(proposalValue.targetRepository)
         !== canonicalCccPrdJson(input.constraints.targetRepository)

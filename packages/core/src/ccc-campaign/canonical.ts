@@ -7,6 +7,7 @@ import {
   CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
   CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
+  CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION,
   CccCampaignContextError,
   type CccCampaignActionLookup,
   type CccCampaignAuthorityBinding,
@@ -17,6 +18,8 @@ import {
   type CccCampaignProductExecutionPolicy,
   type CccCampaignProductExecutionRoute,
   type CccCampaignTransport,
+  type CccPrdProductExecutionPlan,
+  type CccPrdProductExecutionRouteSelection,
 } from "./types.js";
 
 const ROUTE_KEYS = ["modelId", "providerId", "taskId", "transport"] as const;
@@ -35,6 +38,13 @@ const PRODUCT_ROUTE_KEYS = [
 ] as const;
 const PRODUCT_CLI_ROUTE_KEYS = [...PRODUCT_ROUTE_KEYS, "cliAdapterId"] as const;
 const POLICY_KEYS = ["routes", "schema"] as const;
+const EXECUTION_PLAN_KEYS = [
+  "bundleHash",
+  "packetHash",
+  "policy",
+  "schema",
+  "sidecarHash",
+] as const;
 const AUTHORITY_BINDING_KEYS = [
   "actionId",
   "actionTarget",
@@ -433,6 +443,102 @@ export function parseCccCampaignProductExecutionPolicy(
   return {
     schema: CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
     routes: routes.sort((left, right) => compareCccPrdCodeUnits(left.taskId, right.taskId)),
+  };
+}
+
+export function createCccPrdProductExecutionPlan(input: {
+  bundle: CccPrdSemanticBundle;
+  route: CccPrdProductExecutionRouteSelection;
+}): CccPrdProductExecutionPlan {
+  const routes = input.bundle.tasks.map((task) => {
+    if (!Array.isArray(task.ownedPaths) || task.ownedPaths.length === 0) {
+      throw new CccCampaignExecutionPolicyError(
+        "CCC PRD task " + task.id + " has no source-owned paths for product policy generation",
+      );
+    }
+    if (!Array.isArray(task.allowedWriteRoots) || task.allowedWriteRoots.length === 0) {
+      throw new CccCampaignExecutionPolicyError(
+        "CCC PRD task " + task.id + " has no allowed write roots for product policy generation",
+      );
+    }
+    return {
+      taskId: task.id,
+      providerId: input.route.providerId,
+      modelId: input.route.modelId,
+      transport: input.route.transport,
+      executor: input.route.transport === "cli" ? "cli-agent" as const : "model" as const,
+      toolMode: "coding" as const,
+      worktreeMode: "isolated" as const,
+      ownedPaths: [...task.ownedPaths],
+      allowedWriteRoots: [...task.allowedWriteRoots],
+      commitPolicy: "required" as const,
+      ...(input.route.transport === "cli"
+        ? { cliAdapterId: input.route.cliAdapterId }
+        : {}),
+    };
+  });
+  const policy = parseCccCampaignProductExecutionPolicy({
+    schema: CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
+    routes,
+  }, input.bundle);
+  return {
+    schema: CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION,
+    packetHash: input.bundle.sourceHash,
+    sidecarHash: input.bundle.sidecarHash,
+    bundleHash: input.bundle.bundleHash,
+    policy,
+  };
+}
+
+function executionPlanHash(value: unknown, label: string): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD execution plan " + label + " must be a lowercase SHA-256 hash",
+    );
+  }
+  return value;
+}
+
+export function parseCccPrdProductExecutionPlan(
+  value: unknown,
+  bundle: CccPrdSemanticBundle,
+): CccPrdProductExecutionPlan {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD product import requires a versioned execution plan",
+    );
+  }
+  const plan = value as Record<string, unknown>;
+  exactKeys(plan, EXECUTION_PLAN_KEYS, "CCC PRD execution plan");
+  if (plan.schema !== CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD product import requires " + CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION,
+    );
+  }
+  const packetHash = executionPlanHash(plan.packetHash, "packet hash");
+  const sidecarHash = executionPlanHash(plan.sidecarHash, "sidecar hash");
+  const bundleHash = executionPlanHash(plan.bundleHash, "bundle hash");
+  if (packetHash !== bundle.sourceHash) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD execution plan packet hash does not match the compiled bundle",
+    );
+  }
+  if (sidecarHash !== bundle.sidecarHash) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD execution plan sidecar hash does not match the compiled bundle",
+    );
+  }
+  if (bundleHash !== bundle.bundleHash) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD execution plan bundle hash does not match the compiled bundle",
+    );
+  }
+  return {
+    schema: CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION,
+    packetHash,
+    sidecarHash,
+    bundleHash,
+    policy: parseCccCampaignProductExecutionPolicy(plan.policy, bundle),
   };
 }
 
