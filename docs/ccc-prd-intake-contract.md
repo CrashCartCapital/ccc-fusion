@@ -35,7 +35,7 @@ Repeat the owned-path and write-root flags for additional task custody. Automati
 
     fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin
 
-Fusion validates the typed values, compares them with explicit labeled facts in every authoritative source, renders deterministic Markdown at sources/__fusion__/REF-HUM-FusionOperatorContext.md, and includes its bytes in the packet manifest, hash, and freeze receipt. A conflict, escaping path, incomplete context, oversized input, or invalid bound refuses before the output directory is published. The original PRD bytes remain unchanged. This companion can supply target, baseline, task custody, write-root purpose, and execution bounds; it cannot replace requirements, acceptance behavior, expected proof, non-goals, protected actions, or other missing product decisions.
+Fusion validates the typed values, compares them with explicit labeled facts in every authoritative source, renders deterministic Markdown at sources/__fusion__/REF-HUM-FusionOperatorContext.md, and includes its bytes in the packet manifest, hash, and freeze receipt. A conflict, escaping path, incomplete context, oversized input, or invalid bound refuses before the output directory is published. The original PRD bytes remain unchanged. The companion records the reviewed source-write roots separately from Fusion's fixed target-local .fusion state-and-artifact root; coding tasks receive only their own reviewed roots. This companion can supply target, baseline, task custody, write-root purpose, and execution bounds; it cannot replace requirements, acceptance behavior, expected proof, non-goals, protected actions, or other missing product decisions.
 
 ## Recommended structure
 

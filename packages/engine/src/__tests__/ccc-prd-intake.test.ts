@@ -572,6 +572,10 @@ describe("CCC PRD packet freeze", () => {
     expect(context).toContain("Baseline commit: " + "a".repeat(40));
     expect(context).toContain("Task owned path: src/value.txt");
     expect(context).toContain("Task allowed write root: src/value.txt");
+    expect(context).toContain("Allowed write root: " + join(targetRepository, ".fusion"));
+    expect(context).toContain(
+      "Allowed write root purpose: Fusion-managed campaign state and artifacts",
+    );
     expect(context).toContain("Allowed write root: " + join(targetRepository, "src/value.txt"));
     expect(context).toContain("Maximum requests: 3");
     expect(manifest.entries).toContainEqual(expect.objectContaining({

@@ -454,7 +454,7 @@ async function assertExactImplementationFactProvenance(
   );
   assert(
     Array.isArray(provenance.admittedWriteRoots)
-      && provenance.admittedWriteRoots.length === 1
+      && provenance.admittedWriteRoots.length === 2
       && Array.isArray(provenance.nonGoals)
       && provenance.nonGoals.length === 1
       && Array.isArray(provenance.requirements)
@@ -495,11 +495,21 @@ async function assertExactImplementationFactProvenance(
     [
       "admittedWriteRoots[0].path",
       provenance.admittedWriteRoots[0]?.path,
-      expected.admittedWriteRoot,
+      expected.fusionStateWriteRoot,
     ],
     [
       "admittedWriteRoots[0].purpose",
       provenance.admittedWriteRoots[0]?.purpose,
+      "Fusion-managed campaign state and artifacts",
+    ],
+    [
+      "admittedWriteRoots[1].path",
+      provenance.admittedWriteRoots[1]?.path,
+      expected.admittedWriteRoot,
+    ],
+    [
+      "admittedWriteRoots[1].purpose",
+      provenance.admittedWriteRoots[1]?.purpose,
       "disposable product acceptance repository",
     ],
     [
@@ -552,6 +562,8 @@ async function assertExactImplementationFactProvenance(
     "bounds.maxConcurrency",
     "admittedWriteRoots[0].path",
     "admittedWriteRoots[0].purpose",
+    "admittedWriteRoots[1].path",
+    "admittedWriteRoots[1].purpose",
   ]);
   const sources = new Map();
   const sourceFor = async (sourceRelativePath) => {
@@ -834,8 +846,13 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const baselineLine = "- Baseline commit: " + targetBase;
   const taskOwnedPathLine = "- Task owned path: src/value.txt";
   const taskAllowedWriteRootLine = "- Task allowed write root: src/value.txt";
+  const fusionStateWriteRoot = path.join(targetRoot, ".fusion");
   const admittedWriteRoot = path.join(targetRoot, "src/value.txt");
+  const fusionStateWriteRootLine =
+    "- Allowed write root: " + fusionStateWriteRoot;
   const allowedWriteRootLine = "- Allowed write root: " + admittedWriteRoot;
+  const fusionStateWriteRootPurposeLine =
+    "- Allowed write root purpose: Fusion-managed campaign state and artifacts";
   const allowedWriteRootPurposeLine =
     "- Allowed write root purpose: disposable product acceptance repository";
   const maxRequestsLine = "- Maximum requests: 1";
@@ -988,7 +1005,9 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     baselineLine,
     taskOwnedPathLine,
     taskAllowedWriteRootLine,
+    fusionStateWriteRootLine,
     allowedWriteRootLine,
+    fusionStateWriteRootPurposeLine,
     allowedWriteRootPurposeLine,
     maxRequestsLine,
     maxDurationLine,
@@ -1158,10 +1177,16 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       maxDurationMs: 120_000,
       maxConcurrency: 1,
     },
-    admittedWriteRoots: [{
-      path: admittedWriteRoot,
-      purpose: "disposable product acceptance repository",
-    }],
+    admittedWriteRoots: [
+      {
+        path: fusionStateWriteRoot,
+        purpose: "Fusion-managed campaign state and artifacts",
+      },
+      {
+        path: admittedWriteRoot,
+        purpose: "disposable product acceptance repository",
+      },
+    ],
     targetRepository: { path: targetRoot, baseCommit: targetBase },
     nonGoals: ["Modify any path outside src/value.txt."],
     unresolvedDecisions: [],
@@ -1524,6 +1549,7 @@ async function main() {
         {
           targetRoot,
           targetBase,
+          fusionStateWriteRoot: path.join(targetRoot, ".fusion"),
           admittedWriteRoot: path.join(targetRoot, "src/value.txt"),
           contextSourcePath: packet.contextSourcePath,
         },

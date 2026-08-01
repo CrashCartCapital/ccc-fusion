@@ -7,6 +7,9 @@ export const CCC_PRD_OPERATOR_CONTEXT_SOURCE_PATH =
   "__fusion__/REF-HUM-FusionOperatorContext.md" as const;
 export const CCC_PRD_OPERATOR_CONTEXT_ORIGIN =
   "operator-context://ccc-prd.operator-context.v1" as const;
+export const CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_ROOT = ".fusion" as const;
+export const CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_PURPOSE =
+  "Fusion-managed campaign state and artifacts" as const;
 
 export type CccPrdOperatorContext = Readonly<{
   schema: typeof CCC_PRD_OPERATOR_CONTEXT_SCHEMA_VERSION;
@@ -301,6 +304,10 @@ export function assertCccPrdOperatorContextCompatible(input: {
 }): void {
   const absoluteWriteRoots = input.context.taskCustody.allowedWriteRoots.map((path) =>
     resolve(input.context.targetRepository.path, path));
+  const internalWriteRoot = resolve(
+    input.context.targetRepository.path,
+    CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_ROOT,
+  );
   assertCompatibleValues(
     input.sources,
     "target repository",
@@ -334,6 +341,8 @@ export function assertCccPrdOperatorContextCompatible(input: {
     new Set([
       ...input.context.taskCustody.allowedWriteRoots,
       ...absoluteWriteRoots,
+      CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_ROOT,
+      internalWriteRoot,
     ]),
     true,
   );
@@ -341,7 +350,10 @@ export function assertCccPrdOperatorContextCompatible(input: {
     input.sources,
     "write-root purpose",
     ["Allowed write root purpose", "Admitted write purpose"],
-    new Set([input.context.writeRootPurpose]),
+    new Set([
+      input.context.writeRootPurpose,
+      CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_PURPOSE,
+    ]),
   );
   assertCompatibleValues(
     input.sources,
@@ -367,6 +379,10 @@ export function renderCccPrdOperatorContextMarkdown(
   value: unknown,
 ): { context: CccPrdOperatorContext; markdown: string } {
   const context = parseCccPrdOperatorContext(value);
+  const internalWriteRoot = resolve(
+    context.targetRepository.path,
+    CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_ROOT,
+  );
   const lines = [
     "# Fusion Reviewed Operator Context",
     "",
@@ -387,9 +403,12 @@ export function renderCccPrdOperatorContextMarkdown(
     "",
     "## Admitted write roots",
     "",
+    "- Allowed write root: " + internalWriteRoot,
     ...context.taskCustody.allowedWriteRoots.map(
       (path) => "- Allowed write root: " + resolve(context.targetRepository.path, path),
     ),
+    "- Allowed write root purpose: "
+      + CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_PURPOSE,
     "- Allowed write root purpose: " + context.writeRootPurpose,
     "",
     "## Execution bounds",

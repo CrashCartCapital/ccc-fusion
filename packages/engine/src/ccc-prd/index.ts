@@ -18,6 +18,8 @@ export { compileCccPrdPacket, validateCccPrdPacket, validateNeoCandidate } from 
 export type { CompileCccPrdInput } from "./compiler.js";
 export {
   CCC_PRD_OPERATOR_CONTEXT_ORIGIN,
+  CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_PURPOSE,
+  CCC_PRD_OPERATOR_CONTEXT_INTERNAL_WRITE_ROOT,
   CCC_PRD_OPERATOR_CONTEXT_SCHEMA_VERSION,
   CCC_PRD_OPERATOR_CONTEXT_SOURCE_PATH,
   CccPrdOperatorContextError,
