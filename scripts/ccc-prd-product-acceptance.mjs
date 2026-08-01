@@ -1239,6 +1239,13 @@ async function writeFakeCodex(fakeBin) {
       "const fs = require('node:fs');",
       "const { spawnSync } = require('node:child_process');",
       "const args = process.argv.slice(2);",
+      "const cutpointActivation = process.env.CCC_PRODUCT_PROVIDER_CUTPOINT_ACTIVATION;",
+      "const cutpointMarker = process.env.CCC_PRODUCT_PROVIDER_CUTPOINT_MARKER;",
+      "const cutpointInvocationLog = process.env.CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATIONS;",
+      "const cutpointActive = Boolean(cutpointActivation && fs.existsSync(cutpointActivation));",
+      "if (cutpointActive && cutpointInvocationLog) {",
+      "  fs.appendFileSync(cutpointInvocationLog, JSON.stringify({ pid: process.pid, cwd: process.cwd(), executable: process.argv[1] }) + '\\n');",
+      "}",
       "let notifyProgram;",
       "for (let index = 0; index < args.length - 1; index += 1) {",
       "  if (args[index] !== '-c' || !args[index + 1].startsWith('notify=')) continue;",
@@ -1273,6 +1280,17 @@ async function writeFakeCodex(fakeBin) {
       "  if (missingPromptFacts.length > 0) {",
       "    process.stderr.write(`FAKE_CODEX_SEALED_PROMPT_MISSING:${JSON.stringify(missingPromptFacts)}\\n`);",
       "    process.exit(10);",
+      "  }",
+      "  if (cutpointActive && cutpointMarker) {",
+      "    try {",
+      "      fs.writeFileSync(cutpointMarker, JSON.stringify({ pid: process.pid, cwd: process.cwd(), executable: process.argv[1] }), { flag: 'wx' });",
+      "    } catch (error) {",
+      "      process.stderr.write('FAKE_CODEX_CUTPOINT_MARKER_REFUSED:' + String(error) + '\\n');",
+      "      process.exit(11);",
+      "    }",
+      "    process.stdout.write('CAMPAIGN_PROVIDER_CUTPOINT_READY\\n');",
+      "    setInterval(() => {}, 1000);",
+      "    return;",
       "  }",
       "  fs.writeFileSync('src/value.txt', 'good\\n');",
       "  const payload = JSON.stringify({",
@@ -1376,6 +1394,82 @@ async function stopServe(server) {
   }
 }
 
+async function crashServe(server) {
+  assert(
+    server && server.child.exitCode === null,
+    "CCC_PRODUCT_CRASH_TARGET_INVALID",
+    JSON.stringify({ pid: server?.child?.pid, exitCode: server?.child?.exitCode }),
+  );
+  server.child.kill("SIGKILL");
+  const result = await server.exited;
+  assert(
+    result.signal === "SIGKILL",
+    "CCC_PRODUCT_CRASH_SIGNAL_DRIFT",
+    JSON.stringify(result),
+  );
+  return result;
+}
+
+async function readJsonLines(filePath) {
+  if (!await pathExists(filePath)) return [];
+  return (await readFile(filePath, "utf8"))
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function terminateOwnedCutpointProcess(marker, fakeCodexPath) {
+  assert(
+    Number.isSafeInteger(marker?.pid) && marker.pid > 1,
+    "CCC_PRODUCT_CUTPOINT_PID_INVALID",
+    JSON.stringify(marker),
+  );
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(marker.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  assert(
+    inspected.code === 0
+      && marker.executable === fakeCodexPath
+      && inspected.stdout.includes(fakeCodexPath),
+    "CCC_PRODUCT_CUTPOINT_PROCESS_OWNERSHIP_REFUSED",
+    JSON.stringify({ marker, command: inspected.stdout.trim() }),
+  );
+  process.kill(marker.pid, "SIGKILL");
+  await poll(
+    "owned cutpoint process termination",
+    async () => {
+      const result = await run(
+        "/bin/ps",
+        ["-p", String(marker.pid), "-o", "command="],
+        { allowedExitCodes: [0, 1] },
+      );
+      return result.code === 1;
+    },
+    (exited) => exited === true,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return inspected.stdout.trim();
+}
+
+async function cleanupOwnedCutpointProcess(marker, fakeCodexPath) {
+  if (!marker || !fakeCodexPath || !Number.isSafeInteger(marker.pid)) return;
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(marker.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  if (
+    inspected.code === 0
+    && marker.executable === fakeCodexPath
+    && inspected.stdout.includes(fakeCodexPath)
+  ) {
+    process.kill(marker.pid, "SIGKILL");
+  }
+}
+
 async function main() {
   const ledger = new AcceptanceLedger(expectedChecks);
   const startedAt = new Date();
@@ -1383,6 +1477,8 @@ async function main() {
   let server;
   let restartedServer;
   let authoringServer;
+  let ownedCutpointMarker;
+  let ownedFakeCodexPath;
   let repositoryStart;
   try {
     repositoryStart = await repositorySnapshot();
@@ -1401,7 +1497,23 @@ async function main() {
     const fakeBin = path.join(tempRoot, "fake-bin");
     const worktreesRoot = path.join(tempRoot, "worktrees");
     await writeFakeCodex(fakeBin);
+    ownedFakeCodexPath = path.join(fakeBin, "codex");
     const env = cleanEnvironment(isolatedHome, fakeBin);
+    const providerCutpointActivation = path.join(
+      tempRoot,
+      "provider-cutpoint.activate",
+    );
+    const providerCutpointMarker = path.join(
+      tempRoot,
+      "provider-cutpoint.marker.json",
+    );
+    const providerCutpointInvocations = path.join(
+      tempRoot,
+      "provider-cutpoint.invocations.jsonl",
+    );
+    env.CCC_PRODUCT_PROVIDER_CUTPOINT_ACTIVATION = providerCutpointActivation;
+    env.CCC_PRODUCT_PROVIDER_CUTPOINT_MARKER = providerCutpointMarker;
+    env.CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATIONS = providerCutpointInvocations;
     const targetBase = await initializeTarget(targetRoot);
     const packet = await createPacket(packetRoot, targetRoot, targetBase, env);
     ledger.pass("current-prd-discovered-and-frozen", {
@@ -1982,6 +2094,196 @@ async function main() {
       targetHead: targetBase,
     });
 
+    const providerCutpointKey = `${idempotencyKey}-provider-cutpoint`;
+    await writeFile(providerCutpointActivation, "armed\n");
+    const providerCutpointImport = jsonOutput(
+      await prd([
+        "import",
+        ...commonPacketArgs,
+        providerCutpointKey,
+        "--confirm",
+        preview.confirmationDigest,
+      ]),
+      "prd provider-cutpoint import",
+    );
+    assert(
+      providerCutpointImport.kind === "imported"
+      && providerCutpointImport.result?.state === "active"
+      && providerCutpointImport.result?.runnable === true,
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_IMPORT_NOT_RUNNABLE",
+      JSON.stringify(providerCutpointImport),
+    );
+    const readProviderCutpointStatus = async () =>
+      readStatusFor(providerCutpointKey);
+    server = await startServe(targetRoot, env, port);
+    const providerApprovalHold = await poll(
+      "provider cutpoint execution approval",
+      readProviderCutpointStatus,
+      (value) => value.status?.nextAction?.kind === "approve-execution",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProviderCutpointStatus(),
+      }),
+    );
+    const providerLiveConfirmation =
+      providerApprovalHold.liveExecutionApprovalConfirmations?.find(
+        ({ approvalRequestId, status }) =>
+          approvalRequestId
+            === providerApprovalHold.status.nextAction.approvalRequestId
+          && status === "issued",
+      );
+    assert(
+      providerLiveConfirmation
+      && /^[0-9a-f]{64}$/u.test(providerLiveConfirmation.confirmation),
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_APPROVAL_MISSING",
+      JSON.stringify(providerApprovalHold.liveExecutionApprovalConfirmations),
+    );
+    const providerExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        providerCutpointKey,
+        providerLiveConfirmation.approvalRequestId,
+        "--confirm",
+        providerLiveConfirmation.confirmation,
+      ]),
+      "approve provider-cutpoint execution",
+    );
+    assert(
+      providerExecutionApproved.kind === "execution-approved"
+      && providerExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_APPROVAL_FAILED",
+      JSON.stringify(providerExecutionApproved),
+    );
+    const providerMarker = await poll(
+      "provider process reached post-dispatch cutpoint",
+      async () => {
+        if (!await pathExists(providerCutpointMarker)) return null;
+        return JSON.parse(await readFile(providerCutpointMarker, "utf8"));
+      },
+      (value) =>
+        Number.isSafeInteger(value?.pid)
+        && value.pid > 1
+        && typeof value.cwd === "string"
+        && typeof value.executable === "string",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProviderCutpointStatus(),
+      }),
+    );
+    ownedCutpointMarker = providerMarker;
+    const canonicalProviderWorktree = await realpath(providerMarker.cwd);
+    const providerWorktreeRelative = path.relative(
+      await realpath(worktreesRoot),
+      canonicalProviderWorktree,
+    );
+    assert(
+      providerWorktreeRelative.length > 0
+      && providerWorktreeRelative !== ".."
+      && !providerWorktreeRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(providerWorktreeRelative),
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_WORKTREE_INVALID",
+      JSON.stringify({ marker: providerMarker, worktreesRoot }),
+    );
+    const crashedProviderServer = server;
+    await crashServe(crashedProviderServer);
+    server = undefined;
+    const providerProcessCommand = await terminateOwnedCutpointProcess(
+      providerMarker,
+      ownedFakeCodexPath,
+    );
+    ownedCutpointMarker = undefined;
+    const providerInvocationsBeforeRestart = await readJsonLines(
+      providerCutpointInvocations,
+    );
+    exactArray(
+      providerInvocationsBeforeRestart.map(({ pid }) => pid),
+      [providerMarker.pid],
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATION_DRIFT",
+    );
+    server = await startServe(targetRoot, env, port);
+    const recoveredProviderCutpoint = await poll(
+      "provider uncertainty parked after restart",
+      readProviderCutpointStatus,
+      (value) =>
+        value.status?.nextAction?.kind === "resolve-manual-required"
+        && value.status?.workItems?.length === 1
+        && value.status.workItems[0]?.state === "manual-required",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProviderCutpointStatus(),
+      }),
+      180_000,
+    );
+    assert(
+      recoveredProviderCutpoint.status.providerAttempts.length === 1
+      && recoveredProviderCutpoint.status.providerAttempts[0]?.state
+        === "dispatched_unknown"
+      && recoveredProviderCutpoint.status.proofs.every(
+        ({ attempts }) => attempts.length === 0,
+      ),
+      "CCC_PRODUCT_PROVIDER_UNCERTAINTY_NOT_PRESERVED",
+      JSON.stringify(recoveredProviderCutpoint.status),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    exactArray(
+      (await readJsonLines(providerCutpointInvocations)).map(({ pid }) => pid),
+      [providerMarker.pid],
+      "CCC_PRODUCT_PROVIDER_EFFECT_RETRIED",
+    );
+    assert(
+      await git(targetRoot, "rev-parse", "HEAD") === targetBase
+      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8")
+        === "bad\n",
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_CHANGED_SOURCE",
+      await git(targetRoot, "status", "--porcelain"),
+    );
+    const providerStopControl =
+      recoveredProviderCutpoint.operatorControls?.find(
+        ({ action }) => action === "stop",
+      );
+    assert(
+      providerStopControl?.allowed === true
+      && /^[0-9a-f]{64}$/u.test(providerStopControl.confirmation),
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_STOP_MISSING",
+      JSON.stringify(recoveredProviderCutpoint.operatorControls),
+    );
+    const providerStopped = jsonOutput(
+      await prd([
+        "stop",
+        providerCutpointKey,
+        "--reason",
+        "Acceptance canary abandons one uncertain provider effect after explicit review.",
+        "--confirm",
+        providerStopControl.confirmation,
+      ]),
+      "stop provider-cutpoint campaign",
+    );
+    assert(
+      providerStopped.kind === "campaign-stopped"
+      && providerStopped.status?.nextAction?.kind === "abandoned"
+      && providerStopped.status?.providerAttempts?.length === 1
+      && providerStopped.status.providerAttempts[0]?.state
+        === "dispatched_unknown",
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_ABANDON_FAILED",
+      JSON.stringify(providerStopped),
+    );
+    ledger.pass("provider-dispatch-restart-manual-required", {
+      importId: providerCutpointImport.result.importId,
+      crashedServePid: crashedProviderServer.child.pid,
+      providerPid: providerMarker.pid,
+      providerProcessCommand,
+      providerAttempt:
+        recoveredProviderCutpoint.status.providerAttempts[0],
+      recoveredWorkItem: recoveredProviderCutpoint.status.workItems[0],
+      recoveredNextAction: recoveredProviderCutpoint.status.nextAction,
+      stoppedNextAction: providerStopped.status.nextAction,
+      invocationCount: providerInvocationsBeforeRestart.length,
+      targetHead: targetBase,
+    });
+    await stopServe(server);
+    server = undefined;
+    await rm(providerCutpointActivation, { force: true });
+
     const imported = jsonOutput(
       await prd([
         "import",
@@ -2420,6 +2722,10 @@ async function main() {
     await stopNativeAuthoringServer(authoringServer).catch(() => undefined);
     await stopServe(restartedServer).catch(() => undefined);
     await stopServe(server).catch(() => undefined);
+    await cleanupOwnedCutpointProcess(
+      ownedCutpointMarker,
+      ownedFakeCodexPath,
+    ).catch(() => undefined);
     if (tempRoot && process.env.CCC_PRD_PRODUCT_KEEP_TMP !== "1") {
       await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
     }
