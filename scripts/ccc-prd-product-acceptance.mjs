@@ -1239,9 +1239,15 @@ async function writeFakeCodex(fakeBin) {
       "const fs = require('node:fs');",
       "const { spawnSync } = require('node:child_process');",
       "const args = process.argv.slice(2);",
-      "const cutpointActivation = process.env.CCC_PRODUCT_PROVIDER_CUTPOINT_ACTIVATION;",
-      "const cutpointMarker = process.env.CCC_PRODUCT_PROVIDER_CUTPOINT_MARKER;",
-      "const cutpointInvocationLog = process.env.CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATIONS;",
+      "const cutpointActivation = "
+        + JSON.stringify(path.join(fakeBin, "provider-cutpoint.activate"))
+        + ";",
+      "const cutpointMarker = "
+        + JSON.stringify(path.join(fakeBin, "provider-cutpoint.marker.json"))
+        + ";",
+      "const cutpointInvocationLog = "
+        + JSON.stringify(path.join(fakeBin, "provider-cutpoint.invocations.jsonl"))
+        + ";",
       "const cutpointActive = Boolean(cutpointActivation && fs.existsSync(cutpointActivation));",
       "if (cutpointActive && cutpointInvocationLog) {",
       "  fs.appendFileSync(cutpointInvocationLog, JSON.stringify({ pid: process.pid, cwd: process.cwd(), executable: process.argv[1] }) + '\\n');",
@@ -1500,20 +1506,17 @@ async function main() {
     ownedFakeCodexPath = path.join(fakeBin, "codex");
     const env = cleanEnvironment(isolatedHome, fakeBin);
     const providerCutpointActivation = path.join(
-      tempRoot,
+      fakeBin,
       "provider-cutpoint.activate",
     );
     const providerCutpointMarker = path.join(
-      tempRoot,
+      fakeBin,
       "provider-cutpoint.marker.json",
     );
     const providerCutpointInvocations = path.join(
-      tempRoot,
+      fakeBin,
       "provider-cutpoint.invocations.jsonl",
     );
-    env.CCC_PRODUCT_PROVIDER_CUTPOINT_ACTIVATION = providerCutpointActivation;
-    env.CCC_PRODUCT_PROVIDER_CUTPOINT_MARKER = providerCutpointMarker;
-    env.CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATIONS = providerCutpointInvocations;
     const targetBase = await initializeTarget(targetRoot);
     const packet = await createPacket(packetRoot, targetRoot, targetBase, env);
     ledger.pass("current-prd-discovered-and-frozen", {
