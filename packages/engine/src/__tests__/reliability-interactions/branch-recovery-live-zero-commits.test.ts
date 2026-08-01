@@ -16,6 +16,7 @@ vi.mock("node:child_process", async () => {
 });
 
 import { SelfHealingManager } from "../../self-healing.js";
+import { CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON } from "../../ccc-campaign-startup-recovery.js";
 import { RestartRecoveryCoordinator } from "../../restart-recovery-coordinator.js";
 import * as branchConflicts from "../../branch-conflicts.js";
 import * as worktreePool from "../../worktree-pool.js";
@@ -28,6 +29,7 @@ function createStore(): TaskStore & EventEmitter {
   (emitter as any).moveTask = vi.fn().mockResolvedValue(undefined);
   (emitter as any).logEntry = vi.fn().mockResolvedValue(undefined);
   (emitter as any).recordRunAuditEvent = vi.fn().mockResolvedValue(undefined);
+  (emitter as any).listWorkflowWorkItemsForTask = vi.fn().mockResolvedValue([]);
   return emitter;
 }
 
@@ -123,6 +125,40 @@ describe("reliability interactions: live-zero reclaim", () => {
 
     expect(recovered).toBe(0);
     expect(inspectSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves a campaign worktree parked for uncertain-effect resolution", async () => {
+    const task = {
+      id: "KB-002",
+      column: "in-progress",
+      checkedOutBy: null,
+      branch: "fusion/kb-002",
+      worktree: "/tmp/live-kb-002",
+      userPaused: false,
+      autoMerge: true,
+      lineageId: "lin-kb-002",
+    };
+    (store.listTasks as any)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([task])
+      .mockResolvedValueOnce([]);
+    (store.listWorkflowWorkItemsForTask as any).mockResolvedValueOnce([{
+      id: "campaign-work-item",
+      kind: "task",
+      state: "manual-required",
+      lastError: CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON,
+      blockedReason: CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON,
+    }]);
+    const inspectSpy = vi.spyOn(branchConflicts, "inspectBranchConflict")
+      .mockResolvedValueOnce({
+        kind: "stale-resolved",
+      } as any);
+
+    const recovered = await manager.reclaimSelfOwnedBranchConflicts();
+
+    expect(recovered).toBe(0);
+    expect(inspectSpy).not.toHaveBeenCalled();
+    expect(store.updateTask).not.toHaveBeenCalled();
   });
 
   it("is idempotent across two sweeps", async () => {
