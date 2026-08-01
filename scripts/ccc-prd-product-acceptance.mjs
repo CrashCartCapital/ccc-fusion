@@ -52,6 +52,7 @@ const expectedChecks = Object.freeze([
 const commandTimeoutMs = 180_000;
 const productTimeoutMs = 120_000;
 const shutdownTimeoutMs = 15_000;
+const proofCutpointMarkerName = "ccc-proof-cutpoint.marker.json";
 
 class AcceptanceLedger {
   constructor(expected) {
@@ -770,7 +771,10 @@ async function buildCurrentCli(ledger) {
   });
 }
 
-async function initializeTarget(targetRoot) {
+async function initializeTarget(
+  targetRoot,
+  { proofCutpointActivation, proofCutpointToken },
+) {
   await mkdir(path.join(targetRoot, "src"), { recursive: true });
   await writeFile(
     path.join(targetRoot, ".gitignore"),
@@ -781,18 +785,46 @@ async function initializeTarget(targetRoot) {
     path.join(targetRoot, "verify.cjs"),
     [
       "const fs = require('node:fs');",
-      "const value = fs.readFileSync('src/value.txt', 'utf8').trim();",
-      "const accepts = candidate => candidate === 'good';",
-      "if (accepts('bad')) {",
-      "  console.error('NEGATIVE_CONTROL_FAIL');",
-      "  process.exit(2);",
+      "const path = require('node:path');",
+      `const cutpointActivation = ${JSON.stringify(proofCutpointActivation)};`,
+      `const cutpointToken = ${JSON.stringify(proofCutpointToken)};`,
+      `const cutpointMarkerName = ${JSON.stringify(proofCutpointMarkerName)};`,
+      "if (fs.existsSync(cutpointActivation)) {",
+      "  const home = process.env.HOME;",
+      "  if (!home) {",
+      "    console.error('PROOF_CUTPOINT_HOME_MISSING');",
+      "    process.exit(9);",
+      "  }",
+      "  const processTitle = `ccc-proof-cutpoint-${cutpointToken}`;",
+      "  process.title = processTitle;",
+      "  fs.writeFileSync(",
+      "    path.join(home, cutpointMarkerName),",
+      "    JSON.stringify({",
+      "      token: cutpointToken,",
+      "      pid: process.pid,",
+      "      cwd: process.cwd(),",
+      "      executable: process.execPath,",
+      "      argv1: process.argv[1],",
+      "      processTitle,",
+      "    }),",
+      "    { flag: 'wx' },",
+      "  );",
+      "  console.log('PROOF_CUTPOINT_READY');",
+      "  setInterval(() => {}, 1000);",
+      "} else {",
+      "  const value = fs.readFileSync('src/value.txt', 'utf8').trim();",
+      "  const accepts = candidate => candidate === 'good';",
+      "  if (accepts('bad')) {",
+      "    console.error('NEGATIVE_CONTROL_FAIL');",
+      "    process.exit(2);",
+      "  }",
+      "  console.log('NEGATIVE_CONTROL_PASS: planted bad value is rejected');",
+      "  if (!accepts(value)) {",
+      "    console.error(`POSITIVE_ORACLE_FAIL:${value}`);",
+      "    process.exit(1);",
+      "  }",
+      "  console.log('POSITIVE_ORACLE_PASS: campaign value is good');",
       "}",
-      "console.log('NEGATIVE_CONTROL_PASS: planted bad value is rejected');",
-      "if (!accepts(value)) {",
-      "  console.error(`POSITIVE_ORACLE_FAIL:${value}`);",
-      "  process.exit(1);",
-      "}",
-      "console.log('POSITIVE_ORACLE_PASS: campaign value is good');",
       "",
     ].join("\n"),
   );
@@ -1477,6 +1509,115 @@ async function cleanupOwnedCutpointProcess(marker, fakeCodexPath) {
   }
 }
 
+async function readOwnedProofCutpointMarkers(token) {
+  if (!token) return [];
+  const canonicalTmp = await realpath(tmpdir());
+  const scratchEntries = await readdir(canonicalTmp, { withFileTypes: true });
+  const markers = [];
+  for (const scratchEntry of scratchEntries) {
+    if (
+      !scratchEntry.isDirectory()
+      || !scratchEntry.name.startsWith("fusion-verifier-sandbox-")
+    ) {
+      continue;
+    }
+    const scratchRoot = path.join(canonicalTmp, scratchEntry.name);
+    let homeEntries;
+    try {
+      homeEntries = await readdir(scratchRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const homeEntry of homeEntries) {
+      if (
+        !homeEntry.isDirectory()
+        || (
+          homeEntry.name !== "home"
+          && !homeEntry.name.startsWith("home-")
+        )
+      ) {
+        continue;
+      }
+      const home = path.join(scratchRoot, homeEntry.name);
+      const markerPath = path.join(home, proofCutpointMarkerName);
+      if (!await pathExists(markerPath)) continue;
+      const marker = JSON.parse(await readFile(markerPath, "utf8"));
+      if (marker?.token !== token) continue;
+      markers.push(Object.freeze({
+        ...marker,
+        scratchRoot,
+        home,
+        markerPath,
+      }));
+    }
+  }
+  return markers.sort((left, right) => left.pid - right.pid);
+}
+
+async function terminateOwnedProofCutpointProcess(
+  marker,
+  token,
+  expectedWorktree,
+) {
+  const expectedTitle = `ccc-proof-cutpoint-${token}`;
+  assert(
+    marker?.token === token
+      && marker.processTitle === expectedTitle
+      && Number.isSafeInteger(marker.pid)
+      && marker.pid > 1
+      && typeof marker.cwd === "string"
+      && await realpath(marker.cwd) === expectedWorktree,
+    "CCC_PRODUCT_PROOF_CUTPOINT_MARKER_INVALID",
+    JSON.stringify({ marker, expectedWorktree }),
+  );
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(marker.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  assert(
+    inspected.code === 0 && inspected.stdout.includes(expectedTitle),
+    "CCC_PRODUCT_PROOF_CUTPOINT_PROCESS_OWNERSHIP_REFUSED",
+    JSON.stringify({ marker, command: inspected.stdout.trim() }),
+  );
+  process.kill(marker.pid, "SIGKILL");
+  await poll(
+    "owned proof cutpoint process termination",
+    async () => {
+      const result = await run(
+        "/bin/ps",
+        ["-p", String(marker.pid), "-o", "command="],
+        { allowedExitCodes: [0, 1] },
+      );
+      return result.code === 1;
+    },
+    (exited) => exited === true,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return inspected.stdout.trim();
+}
+
+async function cleanupOwnedProofCutpointMarkers(token) {
+  const markers = await readOwnedProofCutpointMarkers(token);
+  for (const marker of markers) {
+    const inspected = await run(
+      "/bin/ps",
+      ["-p", String(marker.pid), "-o", "command="],
+      { allowedExitCodes: [0, 1] },
+    );
+    if (
+      inspected.code === 0
+      && inspected.stdout.includes(`ccc-proof-cutpoint-${token}`)
+    ) {
+      process.kill(marker.pid, "SIGKILL");
+    }
+  }
+  for (const scratchRoot of new Set(markers.map(({ scratchRoot }) => scratchRoot))) {
+    await rm(scratchRoot, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const ledger = new AcceptanceLedger(expectedChecks);
   const startedAt = new Date();
@@ -1486,6 +1627,7 @@ async function main() {
   let authoringServer;
   let ownedCutpointMarker;
   let ownedFakeCodexPath;
+  let ownedProofCutpointToken;
   let repositoryStart;
   try {
     repositoryStart = await repositorySnapshot();
@@ -1518,7 +1660,15 @@ async function main() {
       fakeBin,
       "provider-cutpoint.invocations.jsonl",
     );
-    const targetBase = await initializeTarget(targetRoot);
+    const proofCutpointActivation = path.join(
+      fakeBin,
+      "proof-cutpoint.activate",
+    );
+    ownedProofCutpointToken = randomUUID().replaceAll("-", "").slice(0, 16);
+    const targetBase = await initializeTarget(targetRoot, {
+      proofCutpointActivation,
+      proofCutpointToken: ownedProofCutpointToken,
+    });
     const packet = await createPacket(packetRoot, targetRoot, targetBase, env);
     ledger.pass("current-prd-discovered-and-frozen", {
       discovery: packet.discovery,
@@ -2305,6 +2455,306 @@ async function main() {
     server = undefined;
     await rm(providerCutpointActivation, { force: true });
 
+    const proofCutpointToken = ownedProofCutpointToken;
+    assert(
+      typeof proofCutpointToken === "string"
+        && /^[0-9a-f]{16}$/u.test(proofCutpointToken),
+      "CCC_PRODUCT_PROOF_CUTPOINT_TOKEN_INVALID",
+      String(proofCutpointToken),
+    );
+    const proofCutpointKey = `${idempotencyKey}-proof-cutpoint`;
+    await writeFile(proofCutpointActivation, "armed\n");
+    const proofCutpointImport = jsonOutput(
+      await prd([
+        "import",
+        ...commonPacketArgs,
+        proofCutpointKey,
+        "--confirm",
+        preview.confirmationDigest,
+      ]),
+      "prd proof-cutpoint import",
+    );
+    assert(
+      proofCutpointImport.kind === "imported"
+      && proofCutpointImport.result?.state === "active"
+      && proofCutpointImport.result?.runnable === true,
+      "CCC_PRODUCT_PROOF_CUTPOINT_IMPORT_NOT_RUNNABLE",
+      JSON.stringify(proofCutpointImport),
+    );
+    const readProofCutpointStatus = async () =>
+      readStatusFor(proofCutpointKey);
+    server = await startServe(targetRoot, env, port);
+    const proofApprovalHold = await poll(
+      "proof cutpoint execution approval",
+      readProofCutpointStatus,
+      (value) => value.status?.nextAction?.kind === "approve-execution",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+    );
+    const proofLiveConfirmation =
+      proofApprovalHold.liveExecutionApprovalConfirmations?.find(
+        ({ approvalRequestId, status }) =>
+          approvalRequestId
+            === proofApprovalHold.status.nextAction.approvalRequestId
+          && status === "issued",
+      );
+    assert(
+      proofLiveConfirmation
+      && /^[0-9a-f]{64}$/u.test(proofLiveConfirmation.confirmation),
+      "CCC_PRODUCT_PROOF_CUTPOINT_APPROVAL_MISSING",
+      JSON.stringify(proofApprovalHold.liveExecutionApprovalConfirmations),
+    );
+    const proofExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        proofCutpointKey,
+        proofLiveConfirmation.approvalRequestId,
+        "--confirm",
+        proofLiveConfirmation.confirmation,
+      ]),
+      "approve proof-cutpoint execution",
+    );
+    assert(
+      proofExecutionApproved.kind === "execution-approved"
+      && proofExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_PROOF_CUTPOINT_APPROVAL_FAILED",
+      JSON.stringify(proofExecutionApproved),
+    );
+    const proofMarkersAtDispatch = await poll(
+      "verifier process reached post-dispatch cutpoint",
+      () => readOwnedProofCutpointMarkers(proofCutpointToken),
+      (markers) => markers.length === 1,
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+        markers: await readOwnedProofCutpointMarkers(proofCutpointToken),
+      }),
+    );
+    const proofMarker = proofMarkersAtDispatch[0];
+    const canonicalProofWorktree = await realpath(proofMarker.cwd);
+    const proofWorktreeRelative = path.relative(
+      await realpath(worktreesRoot),
+      canonicalProofWorktree,
+    );
+    assert(
+      proofWorktreeRelative.length > 0
+      && proofWorktreeRelative !== ".."
+      && !proofWorktreeRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(proofWorktreeRelative),
+      "CCC_PRODUCT_PROOF_CUTPOINT_WORKTREE_INVALID",
+      JSON.stringify({ proofMarker, worktreesRoot }),
+    );
+    const proofDispatchStatus = await poll(
+      "durable proof dispatch receipt",
+      readProofCutpointStatus,
+      (value) =>
+        value.status?.providerAttempts?.length === 1
+        && value.status.providerAttempts[0]?.state === "committed"
+        && value.status?.proofs?.length === 1
+        && value.status.proofs[0]?.attempts?.length === 1
+        && value.status.proofs[0].attempts[0]?.state
+          === "dispatched_unknown",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+    );
+    const proofAttempt =
+      proofDispatchStatus.status.proofs[0].attempts[0];
+    const proofSourceCommit = proofAttempt.sourceCommit;
+    assert(
+      /^[0-9a-f]{40}$/u.test(proofSourceCommit)
+      && proofSourceCommit !== targetBase
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
+        === "good",
+      "CCC_PRODUCT_PROOF_CUTPOINT_SOURCE_COMMIT_INVALID",
+      JSON.stringify({ proofAttempt, targetBase }),
+    );
+    const crashedProofServer = server;
+    await crashServe(crashedProofServer);
+    server = undefined;
+    const proofProcessCommand =
+      await terminateOwnedProofCutpointProcess(
+        proofMarker,
+        proofCutpointToken,
+        canonicalProofWorktree,
+      );
+    server = await startServe(targetRoot, env, port);
+    const recoveredProofCutpoint = await poll(
+      "proof uncertainty parked after restart",
+      readProofCutpointStatus,
+      (value) =>
+        value.status?.nextAction?.kind === "resolve-manual-required"
+        && value.status?.workItems?.length === 1
+        && value.status.workItems[0]?.state === "manual-required",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+      180_000,
+    );
+    const recoveredProofAttempt =
+      recoveredProofCutpoint.status.proofs[0]?.attempts[0];
+    const recoveredProofTask = recoveredProofCutpoint.status.tasks[0];
+    assert(
+      recoveredProofAttempt?.attemptKey === proofAttempt.attemptKey
+      && recoveredProofAttempt.state === "dispatched_unknown"
+      && recoveredProofCutpoint.status.providerAttempts.length === 1
+      && recoveredProofCutpoint.status.providerAttempts[0]?.state
+        === "committed"
+      && typeof recoveredProofTask?.worktree === "string"
+      && await pathExists(recoveredProofTask.worktree)
+      && await realpath(recoveredProofTask.worktree)
+        === canonicalProofWorktree,
+      "CCC_PRODUCT_PROOF_UNCERTAINTY_NOT_PRESERVED",
+      JSON.stringify(recoveredProofCutpoint.status),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    exactArray(
+      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+        .map(({ pid }) => pid),
+      [proofMarker.pid],
+      "CCC_PRODUCT_PROOF_EFFECT_RETRIED_AFTER_RESTART",
+    );
+    assert(
+      await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
+        === "good",
+      "CCC_PRODUCT_PROOF_CUTPOINT_CHANGED_TARGET",
+      await git(targetRoot, "status", "--porcelain"),
+    );
+    const proofResolutionPath = path.join(
+      tempRoot,
+      "proof-cutpoint-resolution.json",
+    );
+    await writeFile(
+      proofResolutionPath,
+      JSON.stringify({
+        schema: "ccc-campaign.proof-resolution.v1",
+        observerId: "ccc-product-acceptance",
+        summary:
+          "The verifier was intentionally killed after durable dispatch; no terminal verifier result was observed.",
+        result: {
+          success: false,
+          exitCode: null,
+          durationMs: 0,
+          stdout: "",
+          stderr:
+            "Acceptance canary terminated the owned verifier after the durable dispatch receipt.",
+          timedOut: false,
+          killed: true,
+          warnings: [
+            "proof-dispatch-crash-canary:no-terminal-result-observed",
+          ],
+        },
+      }),
+    );
+    const proofResolutionPreview = jsonOutput(
+      await prd([
+        "resolve-proof",
+        proofCutpointKey,
+        proofAttempt.attemptKey,
+        proofResolutionPath,
+      ]),
+      "preview proof-cutpoint resolution",
+    );
+    assert(
+      proofResolutionPreview.kind === "proof-resolution-preview"
+      && proofResolutionPreview.outcome === "proved_failed"
+      && /^[0-9a-f]{64}$/u.test(proofResolutionPreview.confirmation),
+      "CCC_PRODUCT_PROOF_RESOLUTION_PREVIEW_INVALID",
+      JSON.stringify(proofResolutionPreview),
+    );
+    const proofResolved = jsonOutput(
+      await prd([
+        "resolve-proof",
+        proofCutpointKey,
+        proofAttempt.attemptKey,
+        proofResolutionPath,
+        "--confirm",
+        proofResolutionPreview.confirmation,
+      ]),
+      "settle proof-cutpoint resolution",
+    );
+    assert(
+      proofResolved.kind === "proof-resolved"
+      && proofResolved.attempt?.state === "proved_failed",
+      "CCC_PRODUCT_PROOF_RESOLUTION_FAILED",
+      JSON.stringify(proofResolved),
+    );
+    const replayedProofResolution = await poll(
+      "terminal proof receipt replay without verifier rerun",
+      readProofCutpointStatus,
+      (value) =>
+        value.status?.proofs?.[0]?.attempts?.[0]?.state === "proved_failed"
+        && value.status?.workItems?.[0]?.state === "failed"
+        && value.status.workItems[0].leaseOwner === null
+        && value.status.workItems[0].leaseExpiresAt === null,
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+    );
+    exactArray(
+      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+        .map(({ pid }) => pid),
+      [proofMarker.pid],
+      "CCC_PRODUCT_PROOF_EFFECT_RERUN_DURING_SETTLEMENT",
+    );
+    const proofStopControl =
+      replayedProofResolution.operatorControls?.find(
+        ({ action }) => action === "stop",
+      );
+    assert(
+      proofStopControl?.allowed === true
+      && /^[0-9a-f]{64}$/u.test(proofStopControl.confirmation),
+      "CCC_PRODUCT_PROOF_CUTPOINT_STOP_MISSING",
+      JSON.stringify(replayedProofResolution.operatorControls),
+    );
+    const proofStopped = jsonOutput(
+      await prd([
+        "stop",
+        proofCutpointKey,
+        "--reason",
+        "Acceptance canary records the failed verifier observation and abandons this disposable campaign.",
+        "--confirm",
+        proofStopControl.confirmation,
+      ]),
+      "stop proof-cutpoint campaign",
+    );
+    assert(
+      proofStopped.kind === "campaign-stopped"
+      && proofStopped.status?.nextAction?.kind === "abandoned"
+      && proofStopped.status?.proofs?.[0]?.attempts?.[0]?.state
+        === "proved_failed",
+      "CCC_PRODUCT_PROOF_CUTPOINT_ABANDON_FAILED",
+      JSON.stringify(proofStopped),
+    );
+    ledger.pass("proof-dispatch-restart-manual-required", {
+      importId: proofCutpointImport.result.importId,
+      crashedServePid: crashedProofServer.child.pid,
+      verifierPid: proofMarker.pid,
+      verifierProcessCommand: proofProcessCommand,
+      proofAttemptBeforeResolution: recoveredProofAttempt,
+      proofAttemptAfterResolution:
+        proofStopped.status.proofs[0].attempts[0],
+      recoveredWorkItem: recoveredProofCutpoint.status.workItems[0],
+      recoveredNextAction: recoveredProofCutpoint.status.nextAction,
+      terminalWorkItem: replayedProofResolution.status.workItems[0],
+      stoppedNextAction: proofStopped.status.nextAction,
+      invocationCount: proofMarkersAtDispatch.length,
+      sourceCommit: proofSourceCommit,
+      targetHead: targetBase,
+    });
+    await stopServe(server);
+    server = undefined;
+    await rm(proofCutpointActivation, { force: true });
+    await cleanupOwnedProofCutpointMarkers(proofCutpointToken);
+    ownedProofCutpointToken = undefined;
+
     const imported = jsonOutput(
       await prd([
         "import",
@@ -2746,6 +3196,9 @@ async function main() {
     await cleanupOwnedCutpointProcess(
       ownedCutpointMarker,
       ownedFakeCodexPath,
+    ).catch(() => undefined);
+    await cleanupOwnedProofCutpointMarkers(
+      ownedProofCutpointToken,
     ).catch(() => undefined);
     if (tempRoot && process.env.CCC_PRD_PRODUCT_KEEP_TMP !== "1") {
       await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
