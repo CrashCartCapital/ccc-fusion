@@ -2146,7 +2146,8 @@ async function main() {
       JSON.stringify(understandingRequests),
     );
     assert(
-      understandingValidation.kind === "refusal"
+      understandingValidation.kind === "diagnostics"
+        && understandingValidation.valid === false
         && understandingValidation.diagnostics?.some(
           ({ code }) => code === "CCC_PRD_UNKNOWN_SIDECAR_SCHEMA",
         ),
