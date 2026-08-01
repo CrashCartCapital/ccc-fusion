@@ -433,7 +433,7 @@ const expectedWave6EngineDefaultNames = [
   "CCC campaign provider controller > Task 6 P1 RED: refuses a persisted workflow extension mismatch before lease, Git, or provider permit work",
   "CCC campaign provider controller > refuses persisted Pi provider or model drift before lease or Git work",
   "CCC campaign provider controller > creates a frozen exact workflow binding and refuses a wrong dispatch turn or transport before core",
-  "CCC campaign provider controller > preserves the actual matching Pi route into core",
+  "CCC campaign provider controller > Task provider-fence RED: injects the sealed work-item fence after provider-controlled Pi dispatch fields",
   "CCC campaign provider controller > Task 6 P1 RED: refuses a reconciliation whose submitted turn is not the binding's sealed turn",
   "executor workflow-step model resolution > uses the project execution lane instead of the global default when the step has no override",
   "executor workflow-step model resolution > keeps step and task overrides ahead of execution-lane settings",
