@@ -68,6 +68,9 @@ import { attachAgentLinkSync } from "../task-agent-sync.js";
 import { createRunAuditor, generateSyntheticRunId } from "../run-audit.js";
 import { setImmediate as setImmediateCb } from "node:timers";
 import { resolvePreReleasePlanReviewNode } from "../hold-release.js";
+import {
+  recoverCccCampaignUncertainEffectsOnStartup,
+} from "../ccc-campaign-startup-recovery.js";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 
@@ -385,6 +388,13 @@ export class InProcessRuntime
     runtimeLog.log(`Created InProcessRuntime for project ${config.projectId}`);
   }
 
+  private campaignWorkflowLeaseOwner(): string {
+    const base = `in-process-runtime:${this.config.projectId}`;
+    return this.config.engineInstanceId
+      ? `${base}:${this.config.engineInstanceId}`
+      : base;
+  }
+
   /**
    * Start the runtime and initialize all subsystems.
    *
@@ -452,6 +462,18 @@ export class InProcessRuntime
       const messageLayer = this.taskStore.getAsyncLayer();
       if (!messageLayer) {
         throw new Error("PostgreSQL TaskStore did not expose its AsyncDataLayer");
+      }
+      if (this.config.engineInstanceId) {
+        const recoveries = await recoverCccCampaignUncertainEffectsOnStartup({
+          store: this.taskStore,
+          rootDir: this.config.workingDirectory,
+          currentLeaseOwner: this.campaignWorkflowLeaseOwner(),
+        });
+        if (recoveries.length > 0) {
+          runtimeLog.warn(
+            `Parked ${recoveries.length} prior-boot CCC campaign uncertain effect(s) for explicit operator resolution`,
+          );
+        }
       }
       // FNXC:PostgresMeshClaims 2026-07-14-17:31: Cross-node checkout and
       // recovery share the central.task_claims table through the project pool.
@@ -2119,7 +2141,8 @@ export class InProcessRuntime
       return;
     }
     try {
-      const leaseOwner = `in-process-runtime:${this.config.projectId}:bootstrap-refusal`;
+      const leaseOwner =
+        `${this.campaignWorkflowLeaseOwner()}:bootstrap-refusal`;
       const claimed = await claimDueWorkflowWorkItem(this.taskStore, {
         leaseOwner,
         leaseDurationMs: 10 * 60_000,
@@ -2226,7 +2249,7 @@ export class InProcessRuntime
           }
           this.campaignWorkflowContinuationsInFlight.add(processingKey);
           void processDueWorkflowWorkItem(this.taskStore, campaignRuntime, settings, {
-            leaseOwner: `in-process-runtime:${this.config.projectId}`,
+            leaseOwner: this.campaignWorkflowLeaseOwner(),
             leaseDurationMs: 10 * 60_000,
             kinds: [resolved.item.kind],
             campaignRequired: true,

@@ -2227,6 +2227,23 @@ async function main() {
       "CCC_PRODUCT_PROVIDER_UNCERTAINTY_NOT_PRESERVED",
       JSON.stringify(recoveredProviderCutpoint.status),
     );
+    const recoveredProviderTask = recoveredProviderCutpoint.status.tasks[0];
+    assert(
+      typeof recoveredProviderTask?.worktree === "string"
+      && recoveredProviderTask.worktree.length > 0
+      && await pathExists(recoveredProviderTask.worktree),
+      "CCC_PRODUCT_PROVIDER_RECOVERY_LOST_WORKTREE",
+      JSON.stringify(recoveredProviderTask),
+    );
+    assert(
+      await realpath(recoveredProviderTask.worktree)
+        === canonicalProviderWorktree,
+      "CCC_PRODUCT_PROVIDER_RECOVERY_WORKTREE_DRIFT",
+      JSON.stringify({
+        beforeCrash: canonicalProviderWorktree,
+        afterRestart: recoveredProviderTask.worktree,
+      }),
+    );
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     exactArray(
       (await readJsonLines(providerCutpointInvocations)).map(({ pid }) => pid),
