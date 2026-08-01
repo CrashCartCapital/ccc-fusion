@@ -94,6 +94,7 @@ describe("prd command exit contract", () => {
       [
         "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
         "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+        "       fn prd corpus <active-projects-root>",
         "       fn prd discover <active-projects-root>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
@@ -259,6 +260,32 @@ describe("prd command exit contract", () => {
       outputDir: "/tmp/frozen-alpha",
       operatorContext,
     });
+  });
+
+  it("prints the read-only corpus manifest through the normal CLI", async () => {
+    const manifest = {
+      schema: "ccc-prd.corpus-manifest.v1",
+      activeProjectsRoot: "/vault/active",
+      summary: {
+        projectCount: 1,
+        selectedCount: 1,
+        ambiguousCount: 0,
+        noPrdCount: 0,
+        readyForIntakeCount: 0,
+        blockingQuestionCount: 2,
+      },
+      projects: [],
+    };
+    const buildCorpus = vi.fn(() => manifest);
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      ["corpus", "/vault/active"],
+      { write: (line) => output.push(line) },
+      { buildCccPrdCorpusManifest: buildCorpus } as never,
+    )).toBe(0);
+    expect(JSON.parse(output[0]!)).toEqual(manifest);
+    expect(buildCorpus).toHaveBeenCalledWith({ activeProjectsRoot: "/vault/active" });
   });
 
   it("generates a hash-bound execution plan without operator-authored policy JSON", async () => {

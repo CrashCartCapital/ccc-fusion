@@ -25,6 +25,7 @@ describe("prd built CLI user contract", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model>");
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>");
+    expect(result.stdout).toContain("fn prd corpus <active-projects-root>");
     expect(result.stdout).toContain("fn prd discover <active-projects-root>");
     expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>");
     expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository>");
@@ -79,6 +80,26 @@ version: 2.0.0
         },
       }],
     });
+
+    const corpus = runFn(["prd", "corpus", activeProjectsRoot]);
+    expect(corpus.status, `${corpus.stdout}\n${corpus.stderr}`).toBe(0);
+    expect(JSON.parse(corpus.stdout)).toMatchObject({
+      schema: "ccc-prd.corpus-manifest.v1",
+      summary: {
+        projectCount: 1,
+        selectedCount: 1,
+      },
+      projects: [{
+        project: "alpha",
+        selection: {
+          kind: "selected",
+          selectedPrdPath,
+          sourceSha256: sha256(sourceBefore),
+          sourceBytes: sourceBefore.byteLength,
+        },
+      }],
+    });
+    expect(corpus.stdout).not.toContain("# Alpha Product Requirements");
 
     const frozen = runFn([
       "prd",

@@ -40,6 +40,41 @@ type DiscoveryResult = {
   }>;
 };
 
+type CorpusManifest = {
+  schema: "ccc-prd.corpus-manifest.v1";
+  activeProjectsRoot: string;
+  summary: {
+    projectCount: number;
+    selectedCount: number;
+    ambiguousCount: number;
+    noPrdCount: number;
+    readyForIntakeCount: number;
+    blockingQuestionCount: number;
+  };
+  projects: Array<{
+    project: string;
+    projectRoot: string;
+    candidateCount: number;
+    selection:
+      | {
+          kind: "selected";
+          selectedPrdPath: string;
+          projectRelativePath: string;
+          sourceSha256: string;
+          sourceBytes: number;
+          version: string | null;
+          status: string | null;
+          intakeContract: {
+            readyForIntake: boolean;
+            blockingQuestions: Array<{ code: string; message: string }>;
+            advisories: Array<{ code: string; message: string }>;
+          };
+        }
+      | { kind: "ambiguous"; candidatePaths: string[]; reason: string }
+      | { kind: "none" };
+  }>;
+};
+
 type FreezeResult = {
   schema: "ccc-prd.freeze-result.v1";
   rootDir: string;
@@ -69,6 +104,7 @@ type FreezeResult = {
 
 const ccc = engine as typeof engine & {
   discoverCccPrdCandidates(input: { activeProjectsRoot: string }): DiscoveryResult;
+  buildCccPrdCorpusManifest(input: { activeProjectsRoot: string }): CorpusManifest;
   freezeCccPrdPacket(input: {
     activeProjectsRoot: string;
     selectedPrdPath: string;
@@ -117,6 +153,88 @@ function expectIntakeError(run: () => unknown, code: string): void {
 }
 
 describe("CCC PRD discovery", () => {
+  it("builds a deterministic private-safe corpus manifest without copying PRD text", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const readyBytes = Buffer.from([
+      "# Alpha PRD",
+      "Target repository: /workspace/alpha",
+      `Baseline commit: ${"a".repeat(40)}`,
+      "Allowed write roots: src/alpha",
+      "## Acceptance behavior and expected proof",
+      "Proof: task verify",
+      "## Protected actions",
+      "None.",
+      "TOP SECRET PAYLOAD MUST NOT LEAK",
+    ].join("\n"));
+    const readyPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      readyBytes,
+    );
+    const blockedPath = write(
+      activeProjectsRoot,
+      "beta/PRJ-HUM-beta-PRD-v2.0.0.md",
+      "# Beta PRD\n\n## Requirements\n\n- Make beta work.\n",
+    );
+    write(activeProjectsRoot, "gamma/.keep", "");
+
+    const first = ccc.buildCccPrdCorpusManifest({ activeProjectsRoot });
+    const second = ccc.buildCccPrdCorpusManifest({ activeProjectsRoot });
+
+    expect(second).toEqual(first);
+    expect(first).toMatchObject({
+      schema: "ccc-prd.corpus-manifest.v1",
+      activeProjectsRoot: resolve(activeProjectsRoot),
+      summary: {
+        projectCount: 3,
+        selectedCount: 2,
+        ambiguousCount: 0,
+        noPrdCount: 1,
+        readyForIntakeCount: 1,
+        blockingQuestionCount: 6,
+      },
+      projects: [
+        {
+          project: "alpha",
+          candidateCount: 1,
+          selection: {
+            kind: "selected",
+            selectedPrdPath: resolve(readyPath),
+            projectRelativePath: "PRJ-HUM-alpha-PRD-v1.0.0.md",
+            sourceSha256: sha256(readyBytes),
+            sourceBytes: readyBytes.byteLength,
+            version: "1.0.0",
+            intakeContract: { readyForIntake: true, blockingQuestions: [] },
+          },
+        },
+        {
+          project: "beta",
+          candidateCount: 1,
+          selection: {
+            kind: "selected",
+            selectedPrdPath: resolve(blockedPath),
+            projectRelativePath: "PRJ-HUM-beta-PRD-v2.0.0.md",
+            version: "2.0.0",
+            intakeContract: {
+              readyForIntake: false,
+              blockingQuestions: expect.arrayContaining([
+                expect.objectContaining({ code: "CCC_PRD_TARGET_REPOSITORY_REQUIRED" }),
+              ]),
+            },
+          },
+        },
+        {
+          project: "gamma",
+          candidateCount: 0,
+          selection: { kind: "none" },
+        },
+      ],
+    });
+    expect(JSON.stringify(first)).not.toContain("TOP SECRET PAYLOAD");
+    expect(readFileSync(readyPath).equals(readyBytes)).toBe(true);
+  });
+
   it("treats root-level portfolio notes as context rather than project PRDs", () => {
     const root = fixtureRoot();
     const activeProjectsRoot = join(root, "active");

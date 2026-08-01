@@ -1241,9 +1241,12 @@ export type {
 } from "./ccc-campaign-provider-controller.js";
 export * from "./ccc-prd/index.js";
 export {
+  buildCccPrdCorpusManifest,
   CccPrdIntakeError,
   discoverCccPrdCandidates,
   freezeCccPrdPacket,
+  type CccPrdCorpusManifest,
+  type CccPrdCorpusProject,
   type CccPrdDiscoveryCandidate,
   type CccPrdDiscoveryCandidateScore,
   type CccPrdDiscoveryResult,

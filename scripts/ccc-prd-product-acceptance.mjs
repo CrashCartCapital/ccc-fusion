@@ -32,6 +32,7 @@ const postgres = requireCoreDependency("postgres");
 const cliBin = path.join(repoRoot, "packages/cli/bin.mjs");
 const expectedChecks = Object.freeze([
   "built-cli-current-run",
+  "current-prd-corpus-manifest",
   "current-prd-discovered-and-frozen",
   "guided-operator-context-frozen",
   "planted-defect-rejected",
@@ -1182,6 +1183,34 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   await writeFile(supportSourcePath, support);
   const prdSourceSha256 = sha256(await readFile(prdSourcePath));
 
+  const corpus = jsonOutput(
+    await run(
+      process.execPath,
+      [cliBin, "prd", "corpus", activeProjectsRoot],
+      { cwd: targetRoot, env },
+    ),
+    "prd corpus",
+  );
+  const corpusProject = corpus.projects?.find(
+    ({ project }) => project === projectName,
+  );
+  assert(
+    corpus.schema === "ccc-prd.corpus-manifest.v1"
+    && corpus.summary?.projectCount === 1
+    && corpus.summary?.selectedCount === 1
+    && corpusProject?.selection?.kind === "selected"
+    && corpusProject.selection.selectedPrdPath === prdSourcePath
+    && corpusProject.selection.sourceSha256 === prdSourceSha256
+    && corpusProject.selection.sourceBytes === Buffer.byteLength(prd, "utf8"),
+    "CCC_PRODUCT_CURRENT_PRD_CORPUS_FAILED",
+    JSON.stringify({ summary: corpus.summary, project: corpusProject }),
+  );
+  assert(
+    !JSON.stringify(corpus).includes(requirementLine),
+    "CCC_PRODUCT_CORPUS_LEAKED_SOURCE_TEXT",
+    projectName,
+  );
+
   const discovery = jsonOutput(
     await run(
       process.execPath,
@@ -1485,6 +1514,17 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       sha256: operatorContextReceipt.sha256,
       prdSourceSha256,
       sourceUnchanged: true,
+    },
+    corpus: {
+      schema: corpus.schema,
+      summary: corpus.summary,
+      project: {
+        project: corpusProject.project,
+        selectedPrdPath: corpusProject.selection.selectedPrdPath,
+        sourceSha256: corpusProject.selection.sourceSha256,
+        sourceBytes: corpusProject.selection.sourceBytes,
+      },
+      sourceTextExcluded: true,
     },
     discovery: {
       project: projectName,
@@ -1938,6 +1978,7 @@ async function main() {
       proofCutpointToken: ownedProofCutpointToken,
     });
     const packet = await createPacket(packetRoot, targetRoot, targetBase, env);
+    ledger.pass("current-prd-corpus-manifest", packet.corpus);
     ledger.pass("current-prd-discovered-and-frozen", {
       discovery: packet.discovery,
       freeze: packet.freeze,

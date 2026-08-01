@@ -104,6 +104,7 @@ const compiler = engine as typeof engine & Compiler;
 export type VerifierConfinementReadiness = engine.VerifierConfinementReadiness;
 export type PrdCommandDependencies = {
   bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
+  buildCccPrdCorpusManifest?: typeof engine.buildCccPrdCorpusManifest;
   discoverCccPrdCandidates?: typeof engine.discoverCccPrdCandidates;
   freezeCccPrdPacket?: typeof engine.freezeCccPrdPacket;
   resolveProject?: (projectName?: string) => Promise<ProjectContext>;
@@ -130,6 +131,7 @@ export type PrdCommandContext = {
 const usage = [
   "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+  "       fn prd corpus <active-projects-root>",
   "       fn prd discover <active-projects-root>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
@@ -873,6 +875,14 @@ async function runIntakePacketCommand(
 ): Promise<number> {
   const [subcommand, activeProjectsRoot, selectedPrdPath, outputDir, ...options] = args;
   try {
+    if (subcommand === "corpus" && args.length === 2 && activeProjectsRoot) {
+      io.write(JSON.stringify(
+        (dependencies.buildCccPrdCorpusManifest ?? engine.buildCccPrdCorpusManifest)({
+          activeProjectsRoot,
+        }),
+      ));
+      return 0;
+    }
     if (subcommand === "discover" && args.length === 2 && activeProjectsRoot) {
       io.write(JSON.stringify(
         (dependencies.discoverCccPrdCandidates ?? engine.discoverCccPrdCandidates)({
@@ -2621,7 +2631,7 @@ export async function runPrdCommand(
   if (args[0] === "policy") {
     return runProductPolicyCommand(args, io);
   }
-  if (args[0] === "discover" || args[0] === "freeze") {
+  if (args[0] === "corpus" || args[0] === "discover" || args[0] === "freeze") {
     return runIntakePacketCommand(args, io, dependencies);
   }
   if (args[0] === "template" || args[0] === "lint") {

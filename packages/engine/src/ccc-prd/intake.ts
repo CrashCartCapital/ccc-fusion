@@ -34,8 +34,13 @@ import {
   renderCccPrdOperatorContextMarkdown,
   type CccPrdOperatorContext,
 } from "./operator-context.js";
+import {
+  lintCccPrdIntakeMarkdown,
+  type CccPrdIntakeLintResult,
+} from "./intake-contract.js";
 
 const DISCOVERY_SCHEMA = "ccc-prd.discovery.v1" as const;
+const CORPUS_MANIFEST_SCHEMA = "ccc-prd.corpus-manifest.v1" as const;
 const FREEZE_RESULT_SCHEMA = "ccc-prd.freeze-result.v1" as const;
 const FREEZE_RECEIPT_SCHEMA = "ccc-prd.freeze-receipt.v1" as const;
 const MAX_PACKET_FILES = 128;
@@ -113,6 +118,39 @@ export type CccPrdDiscoveryResult = {
   schema: typeof DISCOVERY_SCHEMA;
   activeProjectsRoot: string;
   projects: CccPrdProjectDiscovery[];
+};
+
+export type CccPrdCorpusProject = {
+  project: string;
+  projectRoot: string;
+  candidateCount: number;
+  selection:
+    | {
+        kind: "selected";
+        selectedPrdPath: string;
+        projectRelativePath: string;
+        sourceSha256: string;
+        sourceBytes: number;
+        version: string | null;
+        status: string | null;
+        intakeContract: CccPrdIntakeLintResult;
+      }
+    | { kind: "ambiguous"; candidatePaths: string[]; reason: string }
+    | { kind: "none" };
+};
+
+export type CccPrdCorpusManifest = {
+  schema: typeof CORPUS_MANIFEST_SCHEMA;
+  activeProjectsRoot: string;
+  summary: {
+    projectCount: number;
+    selectedCount: number;
+    ambiguousCount: number;
+    noPrdCount: number;
+    readyForIntakeCount: number;
+    blockingQuestionCount: number;
+  };
+  projects: CccPrdCorpusProject[];
 };
 
 export type CccPrdFreezeReceiptEntry = {
@@ -565,6 +603,86 @@ export function discoverCccPrdCandidates(input: {
       error,
       "CCC_PRD_DISCOVERY_FAILED",
       "CCC PRD discovery failed",
+    );
+  }
+}
+
+export function buildCccPrdCorpusManifest(input: {
+  activeProjectsRoot: string;
+}): CccPrdCorpusManifest {
+  try {
+    const discovery = discoverCccPrdCandidates(input);
+    let selectedCount = 0;
+    let ambiguousCount = 0;
+    let noPrdCount = 0;
+    let readyForIntakeCount = 0;
+    let blockingQuestionCount = 0;
+    const projects: CccPrdCorpusProject[] = discovery.projects.map((project) => {
+      const common = {
+        project: project.project,
+        projectRoot: project.projectRoot,
+        candidateCount: project.candidates.length,
+      };
+      if (project.selection.kind === "none") {
+        noPrdCount += 1;
+        return { ...common, selection: project.selection };
+      }
+      if (project.selection.kind === "ambiguous") {
+        ambiguousCount += 1;
+        return { ...common, selection: project.selection };
+      }
+
+      const selectedPrdPath = project.selection.selectedPrdPath;
+      const candidate = project.candidates.find(
+        (entry) => entry.path === selectedPrdPath,
+      );
+      if (!candidate) {
+        return refuse(
+          "CCC_PRD_CORPUS_SELECTION_INVALID",
+          `selected PRD disappeared from its discovery inventory: ${selectedPrdPath}`,
+        );
+      }
+      const bytes = readFileSync(candidate.path);
+      const intakeContract = lintCccPrdIntakeMarkdown({
+        sourcePath: candidate.path,
+        markdown: bytes.toString("utf8"),
+      });
+      selectedCount += 1;
+      if (intakeContract.readyForIntake) readyForIntakeCount += 1;
+      blockingQuestionCount += intakeContract.blockingQuestions.length;
+      return {
+        ...common,
+        selection: {
+          kind: "selected",
+          selectedPrdPath: candidate.path,
+          projectRelativePath: candidate.projectRelativePath,
+          sourceSha256: sha256(bytes),
+          sourceBytes: bytes.byteLength,
+          version: candidate.version,
+          status: candidate.status,
+          intakeContract,
+        },
+      };
+    });
+
+    return {
+      schema: CORPUS_MANIFEST_SCHEMA,
+      activeProjectsRoot: discovery.activeProjectsRoot,
+      summary: {
+        projectCount: projects.length,
+        selectedCount,
+        ambiguousCount,
+        noPrdCount,
+        readyForIntakeCount,
+        blockingQuestionCount,
+      },
+      projects,
+    };
+  } catch (error) {
+    return asIntakeError(
+      error,
+      "CCC_PRD_CORPUS_MANIFEST_FAILED",
+      "CCC PRD corpus manifest failed",
     );
   }
 }

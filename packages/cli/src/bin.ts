@@ -306,6 +306,8 @@ Usage:
                                       Generate a traceable candidate sidecar from an admitted packet through native bounded authoring
   fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
                                       Compatibility fixture authoring path for deterministic tests
+  fn prd corpus <active-projects-root>
+                                      Build a private-safe current-PRD manifest with hashes and blocking questions
   fn prd discover <active-projects-root>
                                       Select the current PRD inside each project using project-local lineage
   fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>
