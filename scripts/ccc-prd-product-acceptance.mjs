@@ -795,7 +795,7 @@ async function initializeTarget(
       "    console.error('PROOF_CUTPOINT_HOME_MISSING');",
       "    process.exit(9);",
       "  }",
-      "  const processTitle = `ccc-proof-cutpoint-${cutpointToken}`;",
+      "  const processTitle = `cccp-${cutpointToken.slice(0, 8)}`;",
       "  process.title = processTitle;",
       "  fs.writeFileSync(",
       "    path.join(home, cutpointMarkerName),",
@@ -1559,7 +1559,7 @@ async function terminateOwnedProofCutpointProcess(
   token,
   expectedWorktree,
 ) {
-  const expectedTitle = `ccc-proof-cutpoint-${token}`;
+  const expectedTitle = `cccp-${token.slice(0, 8)}`;
   assert(
     marker?.token === token
       && marker.processTitle === expectedTitle
@@ -1576,7 +1576,8 @@ async function terminateOwnedProofCutpointProcess(
     { allowedExitCodes: [0, 1] },
   );
   assert(
-    inspected.code === 0 && inspected.stdout.includes(expectedTitle),
+    inspected.code === 0
+      && inspected.stdout.trim().startsWith(expectedTitle),
     "CCC_PRODUCT_PROOF_CUTPOINT_PROCESS_OWNERSHIP_REFUSED",
     JSON.stringify({ marker, command: inspected.stdout.trim() }),
   );
@@ -1600,20 +1601,41 @@ async function terminateOwnedProofCutpointProcess(
 
 async function cleanupOwnedProofCutpointMarkers(token) {
   const markers = await readOwnedProofCutpointMarkers(token);
+  const removableScratchRoots = new Set();
   for (const marker of markers) {
     const inspected = await run(
       "/bin/ps",
       ["-p", String(marker.pid), "-o", "command="],
       { allowedExitCodes: [0, 1] },
     );
+    if (inspected.code === 1) {
+      removableScratchRoots.add(marker.scratchRoot);
+      continue;
+    }
+    const expectedTitle = `cccp-${token.slice(0, 8)}`;
     if (
-      inspected.code === 0
-      && inspected.stdout.includes(`ccc-proof-cutpoint-${token}`)
+      marker.processTitle === expectedTitle
+      && inspected.stdout.trim().startsWith(expectedTitle)
     ) {
       process.kill(marker.pid, "SIGKILL");
+      await poll(
+        "owned proof cutpoint cleanup",
+        async () => {
+          const result = await run(
+            "/bin/ps",
+            ["-p", String(marker.pid), "-o", "command="],
+            { allowedExitCodes: [0, 1] },
+          );
+          return result.code === 1;
+        },
+        (exited) => exited === true,
+        undefined,
+        shutdownTimeoutMs,
+      );
+      removableScratchRoots.add(marker.scratchRoot);
     }
   }
-  for (const scratchRoot of new Set(markers.map(({ scratchRoot }) => scratchRoot))) {
+  for (const scratchRoot of removableScratchRoots) {
     await rm(scratchRoot, { recursive: true, force: true });
   }
 }
