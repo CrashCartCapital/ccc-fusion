@@ -945,8 +945,8 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   exactArray(
     freezeReceipt.entries?.map(({ projectRelativePath }) => projectRelativePath),
     [
-      "__fusion__/REF-HUM-FusionOperatorContext.md",
       prdFileName,
+      "__fusion__/REF-HUM-FusionOperatorContext.md",
       supportRelativePath,
     ],
     "CCC_PRODUCT_FROZEN_SOURCE_SET_DRIFT",
