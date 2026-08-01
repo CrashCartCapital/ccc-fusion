@@ -37,6 +37,7 @@ const expectedChecks = Object.freeze([
   "exact-preview-confirmed",
   "wrong-confirmation-refused-without-residue",
   "operator-lifecycle-controls",
+  "provider-dispatch-restart-manual-required",
   "campaign-import-admitted",
   "import-restart-recovery",
   "live-execution-human-hold",
