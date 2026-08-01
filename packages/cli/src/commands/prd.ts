@@ -76,7 +76,15 @@ type Compiler = {
     maxDurationMs: number;
     maxPromptBytes: number;
     maxResponseBytes: number;
+    mode?: "execution" | "understanding";
   }): CccPrdAuthoringAdapter;
+  understandCccPrdPacket(input: {
+    rootDir: string;
+    manifestPath: string;
+    adapter: CccPrdAuthoringAdapter;
+    maxReviewItems: number;
+    workflowExtensionRegistry: WorkflowExtensionRegistry;
+  }): Promise<engine.CccPrdUnderstandingResult>;
   compileCccPrdPacket(input: {
     rootDir: string;
     manifestPath: string;
@@ -105,6 +113,7 @@ export type VerifierConfinementReadiness = engine.VerifierConfinementReadiness;
 export type PrdCommandDependencies = {
   bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
   buildCccPrdCorpusManifest?: typeof engine.buildCccPrdCorpusManifest;
+  createNativeCccPrdAuthoringAdapter?: typeof engine.createNativeCccPrdAuthoringAdapter;
   discoverCccPrdCandidates?: typeof engine.discoverCccPrdCandidates;
   freezeCccPrdPacket?: typeof engine.freezeCccPrdPacket;
   resolveProject?: (projectName?: string) => Promise<ProjectContext>;
@@ -117,6 +126,7 @@ export type PrdCommandDependencies = {
   inspectCccPrdProductStatus?: typeof inspectCccPrdProductStatus;
   inspectCccCampaignProofAttempt?: typeof inspectCccCampaignProofAttempt;
   settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
+  understandCccPrdPacket?: typeof engine.understandCccPrdPacket;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
   approveCccCampaignLiveExecution?: typeof engine.approveCccCampaignLiveExecution;
@@ -131,6 +141,7 @@ export type PrdCommandContext = {
 const usage = [
   "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+  "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd corpus <active-projects-root>",
   "       fn prd discover <active-projects-root>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
@@ -275,6 +286,27 @@ type GeneratedAuthorArgs = {
   maxResponseBytes: number;
 };
 
+type GeneratedUnderstandingArgs = {
+  rootDir: string;
+  manifestPath: string;
+  outputPath: string;
+  provider: string;
+  model: string;
+  maxDurationMs: number;
+  maxPromptBytes: number;
+  maxResponseBytes: number;
+  maxReviewItems: number;
+};
+
+const generatedUnderstandingFlags = [
+  "--provider",
+  "--model",
+  "--max-duration-ms",
+  "--max-prompt-bytes",
+  "--max-response-bytes",
+  "--max-review-items",
+] as const;
+
 const generatedAuthorFlags = [
   "--target",
   "--base",
@@ -362,6 +394,66 @@ function parseGeneratedAuthorArgs(args: string[]): GeneratedAuthorArgs | undefin
     maxDurationMs,
     maxPromptBytes,
     maxResponseBytes,
+  };
+}
+
+function parseGeneratedUnderstandingArgs(
+  args: string[],
+): GeneratedUnderstandingArgs | undefined {
+  const [subcommand, rootDir, manifestPath, outputPath, ...options] = args;
+  if (
+    subcommand !== "understand"
+    || !rootDir
+    || !manifestPath
+    || !outputPath
+    || options.length !== generatedUnderstandingFlags.length * 2
+  ) {
+    return undefined;
+  }
+  const values = new Map<string, string>();
+  for (let index = 0; index < options.length; index += 2) {
+    const flag = options[index];
+    const value = options[index + 1];
+    if (
+      !flag
+      || !generatedUnderstandingFlags.includes(
+        flag as (typeof generatedUnderstandingFlags)[number],
+      )
+      || values.has(flag)
+      || !value
+      || value.startsWith("--")
+    ) {
+      return undefined;
+    }
+    values.set(flag, value);
+  }
+  const provider = values.get("--provider");
+  const model = values.get("--model");
+  const maxDurationMs = parsePositiveInteger(values.get("--max-duration-ms"));
+  const maxPromptBytes = parsePositiveInteger(values.get("--max-prompt-bytes"));
+  const maxResponseBytes = parsePositiveInteger(values.get("--max-response-bytes"));
+  const maxReviewItems = parseNonNegativeInteger(values.get("--max-review-items"));
+  if (
+    !provider
+    || !model
+    || !maxDurationMs
+    || !maxPromptBytes
+    || !maxResponseBytes
+    || maxReviewItems === undefined
+    || values.size !== generatedUnderstandingFlags.length
+  ) {
+    return undefined;
+  }
+  return {
+    rootDir,
+    manifestPath,
+    outputPath,
+    provider,
+    model,
+    maxDurationMs,
+    maxPromptBytes,
+    maxResponseBytes,
+    maxReviewItems,
   };
 }
 
@@ -667,6 +759,105 @@ async function runGeneratedAuthor(
     sidecarPath: outputPath,
     review: result.review,
   }));
+  return 0;
+}
+
+async function runGeneratedUnderstanding(
+  input: GeneratedUnderstandingArgs,
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+): Promise<number> {
+  let outputPath: string;
+  try {
+    outputPath = resolveAuthorOutput(
+      input.rootDir,
+      input.manifestPath,
+      input.manifestPath,
+      input.outputPath,
+    );
+    if (existsSync(outputPath)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_UNDERSTANDING_OUTPUT_EXISTS",
+        "understanding review output already exists",
+      );
+    }
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_UNDERSTANDING_ADMISSION_FAILED",
+      error instanceof Error
+        ? error.message
+        : "understanding review request could not be admitted",
+    );
+  }
+
+  let adapter: CccPrdAuthoringAdapter;
+  try {
+    adapter = (
+      dependencies.createNativeCccPrdAuthoringAdapter
+      ?? compiler.createNativeCccPrdAuthoringAdapter
+    )({
+      provider: input.provider,
+      model: input.model,
+      maxDurationMs: input.maxDurationMs,
+      maxPromptBytes: input.maxPromptBytes,
+      maxResponseBytes: input.maxResponseBytes,
+      mode: "understanding",
+    });
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_UNDERSTANDING_ADMISSION_FAILED",
+      error instanceof Error
+        ? error.message
+        : "native understanding adapter could not be created",
+    );
+  }
+
+  let workflowExtensionRegistry: WorkflowExtensionRegistry;
+  try {
+    workflowExtensionRegistry = await (
+      dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost
+    )();
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_PROOF_ADMISSION_BOOTSTRAP_FAILED",
+      error instanceof Error
+        ? error.message
+        : "fixed proof-admission host could not be bootstrapped",
+    );
+  }
+
+  const result = await (
+    dependencies.understandCccPrdPacket ?? compiler.understandCccPrdPacket
+  )({
+    rootDir: input.rootDir,
+    manifestPath: input.manifestPath,
+    adapter,
+    maxReviewItems: input.maxReviewItems,
+    workflowExtensionRegistry,
+  });
+  if (result.kind === "refusal") {
+    io.write(JSON.stringify(result));
+    return 1;
+  }
+  try {
+    writeSidecarAtomically(
+      input.rootDir,
+      input.manifestPath,
+      input.manifestPath,
+      outputPath,
+      result,
+    );
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_UNDERSTANDING_WRITE_FAILED",
+      error instanceof Error ? error.message : "understanding review could not be written",
+    );
+  }
+  io.write(JSON.stringify({ ...result, reviewPath: outputPath }));
   return 0;
 }
 
@@ -2628,6 +2819,14 @@ export async function runPrdCommand(
   dependencies: PrdCommandDependencies = {},
   commandContext: PrdCommandContext = {},
 ): Promise<number> {
+  if (args[0] === "understand") {
+    const parsed = parseGeneratedUnderstandingArgs(args);
+    if (!parsed) {
+      io.write(usage);
+      return 2;
+    }
+    return runGeneratedUnderstanding(parsed, io, dependencies);
+  }
   if (args[0] === "policy") {
     return runProductPolicyCommand(args, io);
   }

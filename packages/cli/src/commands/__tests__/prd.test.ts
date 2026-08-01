@@ -94,6 +94,7 @@ describe("prd command exit contract", () => {
       [
         "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
         "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+        "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
         "       fn prd corpus <active-projects-root>",
         "       fn prd discover <active-projects-root>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
@@ -286,6 +287,99 @@ describe("prd command exit contract", () => {
     )).toBe(0);
     expect(JSON.parse(output[0]!)).toEqual(manifest);
     expect(buildCorpus).toHaveBeenCalledWith({ activeProjectsRoot: "/vault/active" });
+  });
+
+  it("writes a non-executable understanding review through one bounded native adapter", async () => {
+    const packet = createPacketRoot();
+    const reviewPath = join(packet.root, "understanding-review.json");
+    const review = {
+      schema: "ccc-prd.understanding-review.v1",
+      kind: "understanding-review",
+      executable: false,
+      requirements: [{ id: "REQ-REVIEW", statement: "Understand the PRD." }],
+      proofs: [],
+      tasks: [],
+      implementationContext: {
+        approvalStatus: "unapproved",
+        targetRepository: { path: null, baseCommit: null },
+        bounds: {
+          maxRequests: null,
+          maxDurationMs: null,
+          maxConcurrency: null,
+        },
+        admittedWriteRoots: [],
+        missingFacts: [{
+          code: "CCC_PRD_TARGET_REPOSITORY_REQUIRED",
+          question: "Which target repository should this PRD change?",
+        }],
+      },
+      coverage: {
+        inventoryCount: 2,
+        dispositionCount: 1,
+        dispositions: [],
+        missing: [{ id: "MAT-1", title: "Unmapped section" }],
+        conflicts: [],
+      },
+      review: {
+        ambiguities: [],
+        unresolvedDecisions: [],
+        exceptions: [],
+        protectedActions: [],
+      },
+    };
+    const understand = vi.fn(async () => review);
+    const adapter = {
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(),
+    };
+    const createAdapter = vi.fn(() => adapter);
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "understand",
+      packet.root,
+      packet.manifest,
+      reviewPath,
+      "--provider",
+      "loopback",
+      "--model",
+      "fixture",
+      "--max-duration-ms",
+      "30000",
+      "--max-prompt-bytes",
+      "1000000",
+      "--max-response-bytes",
+      "262144",
+      "--max-review-items",
+      "8",
+    ], { write: (line) => output.push(line) }, {
+      bootstrapProofAdmission: async () => ({}) as never,
+      createNativeCccPrdAuthoringAdapter: createAdapter,
+      understandCccPrdPacket: understand,
+    } as never)).toBe(0);
+
+    expect(createAdapter).toHaveBeenCalledWith({
+      provider: "loopback",
+      model: "fixture",
+      maxDurationMs: 30000,
+      maxPromptBytes: 1000000,
+      maxResponseBytes: 262144,
+      mode: "understanding",
+    });
+    expect(understand).toHaveBeenCalledWith({
+      rootDir: packet.root,
+      manifestPath: packet.manifest,
+      adapter,
+      maxReviewItems: 8,
+      workflowExtensionRegistry: {},
+    });
+    expect(JSON.parse(readFileSync(reviewPath, "utf8"))).toEqual(review);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ...review,
+      reviewPath,
+    });
+    expect(JSON.parse(output[0]!).executable).toBe(false);
   });
 
   it("generates a hash-bound execution plan without operator-authored policy JSON", async () => {

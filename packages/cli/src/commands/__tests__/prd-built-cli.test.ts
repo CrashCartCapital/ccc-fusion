@@ -25,6 +25,7 @@ describe("prd built CLI user contract", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model>");
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>");
+    expect(result.stdout).toContain("fn prd understand <root-dir> <manifest-path> <review-output>");
     expect(result.stdout).toContain("fn prd corpus <active-projects-root>");
     expect(result.stdout).toContain("fn prd discover <active-projects-root>");
     expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>");

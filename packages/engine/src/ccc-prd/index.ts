@@ -9,11 +9,22 @@ export {
   fusionModelRuntimeAuthoringTransport,
 } from "./native-authoring-adapter.js";
 export type {
+  CccPrdNativeAuthoringMode,
   CccPrdNativeAuthoringTransport,
   CccPrdNativeAuthoringTransportRequest,
   CccPrdNativeAuthoringTransportResponse,
   CreateNativeCccPrdAuthoringAdapterOptions,
 } from "./native-authoring-adapter.js";
+export {
+  CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
+  understandCccPrdPacket,
+} from "./understanding.js";
+export type {
+  CccPrdUnderstandingMissingFact,
+  CccPrdUnderstandingResult,
+  CccPrdUnderstandingReview,
+  UnderstandCccPrdInput,
+} from "./understanding.js";
 export { compileCccPrdPacket, validateCccPrdPacket, validateNeoCandidate } from "./compiler.js";
 export type { CompileCccPrdInput } from "./compiler.js";
 export {

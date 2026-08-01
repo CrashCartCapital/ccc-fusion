@@ -306,6 +306,8 @@ Usage:
                                       Generate a traceable candidate sidecar from an admitted packet through native bounded authoring
   fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
                                       Compatibility fixture authoring path for deterministic tests
+  fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+                                      Extract a cited, non-executable review before implementation facts are approved
   fn prd corpus <active-projects-root>
                                       Build a private-safe current-PRD manifest with hashes and blocking questions
   fn prd discover <active-projects-root>

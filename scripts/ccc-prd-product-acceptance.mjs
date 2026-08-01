@@ -36,6 +36,7 @@ const expectedChecks = Object.freeze([
   "current-prd-discovered-and-frozen",
   "guided-operator-context-frozen",
   "planted-defect-rejected",
+  "native-local-understanding-review",
   "native-local-authoring",
   "frozen-packet-validated",
   "product-owned-execution-plan",
@@ -958,6 +959,8 @@ async function buildCurrentCli(ledger) {
   const prdUsage = `${prdHelp.stdout}\n${prdProductUsage.stdout}`;
   for (const command of [
     "fn prd author",
+    "fn prd understand",
+    "fn prd corpus",
     "fn prd discover",
     "fn prd freeze",
     "fn prd policy",
@@ -995,6 +998,8 @@ async function buildCurrentCli(ledger) {
     outputs: evidence,
     publicPrdCommands: [
       "author",
+      "understand",
+      "corpus",
       "discover",
       "freeze",
       "policy",
@@ -2022,25 +2027,162 @@ async function main() {
     ];
 
     const proposalText = await readFile(packet.proposalPath, "utf8");
-    const nativeAuthoring = await startNativeAuthoringServer(proposalText);
-    authoringServer = nativeAuthoring.server;
     const loopbackAuthoringApiKey = "ccc-local-loopback-non-secret";
     const globalSettingsDir = path.join(isolatedHome, ".fusion");
     const globalSettingsPath = path.join(globalSettingsDir, "settings.json");
     await mkdir(globalSettingsDir, { recursive: true });
-    await writeFile(globalSettingsPath, `${JSON.stringify({
-      customProviders: [{
-        id: "550e8400-e29b-41d4-a716-446655440004",
-        name: "CCC Product Authoring",
-        apiType: "openai-compatible",
-        baseUrl: nativeAuthoring.baseUrl,
-        apiKey: loopbackAuthoringApiKey,
-        models: [{
-          id: "vertical-authoring-model",
-          name: "Vertical Authoring Model",
+    const configureNativeAuthoring = async (baseUrl) => {
+      await writeFile(globalSettingsPath, `${JSON.stringify({
+        customProviders: [{
+          id: "550e8400-e29b-41d4-a716-446655440004",
+          name: "CCC Product Authoring",
+          apiType: "openai-compatible",
+          baseUrl,
+          apiKey: loopbackAuthoringApiKey,
+          models: [{
+            id: "vertical-authoring-model",
+            name: "Vertical Authoring Model",
+          }],
         }],
-      }],
-    }, null, 2)}\n`);
+      }, null, 2)}\n`);
+    };
+
+    const understandingProposal = JSON.parse(proposalText);
+    understandingProposal.targetRepository = { path: "", baseCommit: "" };
+    understandingProposal.bounds = {
+      maxRequests: 0,
+      maxDurationMs: 0,
+      maxConcurrency: 0,
+    };
+    understandingProposal.admittedWriteRoots = [];
+    const nativeUnderstanding = await startNativeAuthoringServer(
+      JSON.stringify(understandingProposal),
+    );
+    authoringServer = nativeUnderstanding.server;
+    await configureNativeAuthoring(nativeUnderstanding.baseUrl);
+    const understandingReviewPath = path.join(
+      packetRoot,
+      "understanding-review.json",
+    );
+    const understood = jsonOutput(
+      await prd([
+        "understand",
+        packetRoot,
+        packet.manifestPath,
+        understandingReviewPath,
+        "--provider",
+        "ccc-product-authoring",
+        "--model",
+        "vertical-authoring-model",
+        "--max-duration-ms",
+        "120000",
+        "--max-prompt-bytes",
+        "262144",
+        "--max-response-bytes",
+        "262144",
+        "--max-review-items",
+        "4",
+      ]),
+      "prd native local understand",
+    );
+    const understandingRequests = nativeUnderstanding.requests.filter(
+      ({ method }) => method === "POST",
+    );
+    const storedUnderstanding = JSON.parse(
+      await readFile(understandingReviewPath, "utf8"),
+    );
+    const understandingValidation = jsonOutput(
+      await prd([
+        "validate",
+        packetRoot,
+        packet.manifestPath,
+        understandingReviewPath,
+        targetRoot,
+        targetBase,
+      ], [1]),
+      "prd validate understanding review",
+    );
+    const missingImplementationFacts =
+      understood.implementationContext?.missingFacts?.map(({ code }) => code)
+        ?? [];
+    assert(
+      understood.schema === "ccc-prd.understanding-review.v1"
+        && understood.kind === "understanding-review"
+        && understood.executable === false
+        && understood.reviewPath === understandingReviewPath
+        && understood.implementationContext?.approvalStatus === "unapproved"
+        && understood.implementationContext?.targetRepository?.path === null
+        && understood.implementationContext?.targetRepository?.baseCommit === null
+        && missingImplementationFacts.includes(
+          "CCC_PRD_TARGET_REPOSITORY_REQUIRED",
+        )
+        && missingImplementationFacts.includes("CCC_PRD_BASELINE_REQUIRED")
+        && missingImplementationFacts.includes(
+          "CCC_PRD_EXECUTION_BOUNDS_REQUIRED",
+        )
+        && missingImplementationFacts.includes(
+          "CCC_PRD_ALLOWED_PATHS_REQUIRED",
+        )
+        && storedUnderstanding.schema === understood.schema
+        && storedUnderstanding.executable === false,
+      "CCC_PRODUCT_NATIVE_UNDERSTANDING_REVIEW_INVALID",
+      JSON.stringify(understood),
+    );
+    assert(
+      understandingRequests.length === 1
+        && understandingRequests[0].url === "/v1/chat/completions"
+        && understandingRequests[0].body?.model
+          === "vertical-authoring-model"
+        && understandingRequests[0].body?.stream === true
+        && understandingRequests[0].headers?.authorization
+          === `Bearer ${loopbackAuthoringApiKey}`
+        && JSON.stringify(
+          understandingRequests[0].body?.messages,
+        ).includes("review-only")
+        && JSON.stringify(
+          understandingRequests[0].body?.messages,
+        ).includes("CCC Fusion Product Vertical Slice"),
+      "CCC_PRODUCT_NATIVE_UNDERSTANDING_REQUEST_INVALID",
+      JSON.stringify(understandingRequests),
+    );
+    assert(
+      understandingValidation.kind === "refusal"
+        && understandingValidation.diagnostics?.some(
+          ({ code }) => code === "CCC_PRD_UNKNOWN_SIDECAR_SCHEMA",
+        ),
+      "CCC_PRODUCT_UNDERSTANDING_REVIEW_BECAME_EXECUTABLE",
+      JSON.stringify(understandingValidation),
+    );
+    ledger.pass("native-local-understanding-review", {
+      mode: "native-local-loopback-review-only",
+      normalCli: true,
+      executable: false,
+      approvalStatus: understood.implementationContext.approvalStatus,
+      externalProviderCalled: false,
+      secretConfigured: false,
+      credentialMode: "fixed-disposable-non-secret-sentinel",
+      requestCount: understandingRequests.length,
+      requestSha256: sha256(
+        JSON.stringify(understandingRequests[0].body),
+      ),
+      promptContractObserved: true,
+      missingImplementationFacts,
+      coverage: {
+        inventoryCount: understood.coverage?.inventoryCount,
+        dispositionCount: understood.coverage?.dispositionCount,
+        missingCount: understood.coverage?.missing?.length,
+        conflictCount: understood.coverage?.conflicts?.length,
+      },
+      storedReviewSha256: sha256(await readFile(understandingReviewPath)),
+      executableValidationRefusal:
+        "CCC_PRD_UNKNOWN_SIDECAR_SCHEMA",
+    });
+    await stopNativeAuthoringServer(authoringServer);
+    authoringServer = undefined;
+
+    const nativeAuthoring = await startNativeAuthoringServer(proposalText);
+    authoringServer = nativeAuthoring.server;
+    await configureNativeAuthoring(nativeAuthoring.baseUrl);
     const authored = jsonOutput(
       await prd([
         "author",
