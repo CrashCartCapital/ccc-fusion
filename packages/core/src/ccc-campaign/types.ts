@@ -20,8 +20,12 @@ export const CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION =
 
 export type CccCampaignTransport = "pi" | "cli" | "workflow";
 
-export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
+export const CCC_PROVIDER_ATTEMPT_V2_SCHEMA_VERSION =
   "ccc-campaign.provider-attempt.v2" as const;
+export const CCC_PROVIDER_ATTEMPT_V3_SCHEMA_VERSION =
+  "ccc-campaign.provider-attempt.v3" as const;
+export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
+  CCC_PROVIDER_ATTEMPT_V3_SCHEMA_VERSION;
 export const CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION =
   "ccc-campaign.proof-attempt.v1" as const;
 
@@ -33,11 +37,13 @@ export type CccCampaignProofAttemptState =
 
 export type CccCampaignProofAttemptScope = "task" | "campaign";
 
-export type CccCampaignProofWorkItemFence = Readonly<{
+export type CccCampaignWorkItemFence = Readonly<{
   workItemId: string;
   runId: string;
   attempt: number;
 }>;
+
+export type CccCampaignProofWorkItemFence = CccCampaignWorkItemFence;
 
 export type CccCampaignProofExecutionResultInput = Readonly<{
   success: boolean;
@@ -149,6 +155,7 @@ export type CccProviderAttemptRequest = Readonly<{
   providerId: string;
   modelId: string;
   transport: CccCampaignTransport;
+  workItemFence: CccCampaignWorkItemFence;
 }>;
 
 export type CccProviderAttemptTransition = Readonly<{
@@ -182,6 +189,7 @@ export type CccProviderAttemptScope = Readonly<{
   dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
+  workItemFence: CccCampaignWorkItemFence | null;
   state: CccProviderAttemptState;
   terminal?: CccProviderAttemptTerminalEvidence;
   binding: Readonly<CccCampaignAuthorityBinding>;
@@ -190,7 +198,7 @@ export type CccProviderAttemptScope = Readonly<{
 /** Full immutable persisted identity required to settle a native provider attempt. */
 export type CccProviderAttemptSettlementInput = CccProviderAttemptReconciliation & Pick<
   CccProviderAttemptScope,
-  "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "binding"
+  "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "workItemFence" | "binding"
 >;
 
 export type CccProviderAttemptDispatchDecision =

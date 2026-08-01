@@ -58,6 +58,19 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error("missing campaign");
     expect(campaign).toMatchObject({ taskId, semanticTaskId });
+    const [workItem] = await h.store().listWorkflowWorkItemsForTask(taskId, { kinds: ["task"] });
+    if (!workItem) throw new Error("missing campaign workflow work item");
+    const workItemLeaseOwner = `controller-lease-${suffix}`;
+    const leasedWorkItem = await h.store().transitionWorkflowWorkItem(workItem.id, "running", {
+      attempt: 1,
+      leaseOwner: workItemLeaseOwner,
+      leaseExpiresAt: campaign.campaignDeadlineAt,
+    });
+    const workItemFence = Object.freeze({
+      workItemId: leasedWorkItem.id,
+      runId: leasedWorkItem.runId,
+      attempt: leasedWorkItem.attempt,
+    });
     const action = { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate", requireProtected: true };
     const issued = options.issueApproval === false
       ? ({ id: `approval-${suffix}` } as Awaited<ReturnType<typeof issueCccCampaignApproval>>)
@@ -66,7 +79,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     if (options.issueApproval !== false) {
       await claimCccCampaignApproval(h.layer(), { authorityStore: h.store(), rootDir: h.rootDir(), taskId, action, claimant: worker, runId: `claim-${suffix}`, claimToken });
     }
-    return { taskId, semanticTaskId, campaign, issued, claimToken };
+    return { taskId, semanticTaskId, campaign, issued, claimToken, workItemFence, workItemLeaseOwner };
   }
 
   function input(f: Awaited<ReturnType<typeof fixture>>, suffix: string) {
@@ -88,6 +101,8 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
       providerId: f.campaign.route.providerId,
       modelId: f.campaign.route.modelId,
       transport: f.campaign.route.transport,
+      workItemFence: f.workItemFence,
+      workItemLeaseOwner: f.workItemLeaseOwner,
     };
     return request;
   }
@@ -100,8 +115,51 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
 
   it("requires one exact active claimed approval and lease before atomic reservation", async () => {
     const f = await fixture("exact");
-    await expect(atomicReserveCccCampaignProviderDispatch(input(f, "exact"))).resolves.toMatchObject({ kind: "dispatch-permit", scope: { semanticTaskId: f.campaign.semanticTaskId, binding: { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate" } } });
+    await expect(atomicReserveCccCampaignProviderDispatch(input(f, "exact"))).resolves.toMatchObject({ kind: "dispatch-permit", scope: { semanticTaskId: f.campaign.semanticTaskId, workItemFence: f.workItemFence, binding: { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate" } } });
     expect(await counts()).toEqual({ attempts: 2, requestCount: 1 });
+  });
+
+  it.each([
+    "run-id-mismatch",
+    "attempt-mismatch",
+    "non-running",
+    "missing-owner",
+    "changed-owner",
+    "expired",
+  ] as const)("refuses a %s workflow work-item fence before provider-attempt writes", async (kind) => {
+    const f = await fixture(`work-item-${kind}`);
+    let workItemFence = f.workItemFence;
+    let workItemLeaseOwner = f.workItemLeaseOwner;
+    if (kind === "run-id-mismatch") {
+      workItemFence = { ...workItemFence, runId: `${workItemFence.runId}-stale` };
+    } else if (kind === "attempt-mismatch") {
+      workItemFence = { ...workItemFence, attempt: workItemFence.attempt + 1 };
+    } else if (kind === "non-running") {
+      await h.layer().db.execute(sql`
+        UPDATE project.workflow_work_items SET state = 'retrying'
+        WHERE id = ${workItemFence.workItemId}
+      `);
+    } else if (kind === "missing-owner") {
+      await h.layer().db.execute(sql`
+        UPDATE project.workflow_work_items SET lease_owner = NULL
+        WHERE id = ${workItemFence.workItemId}
+      `);
+    } else if (kind === "changed-owner") {
+      workItemLeaseOwner = `${workItemLeaseOwner}-stale`;
+    } else {
+      await h.layer().db.execute(sql`
+        UPDATE project.workflow_work_items
+        SET lease_expires_at = ${new Date(Date.now() - 1_000).toISOString()}
+        WHERE id = ${workItemFence.workItemId}
+      `);
+    }
+
+    await expect(atomicReserveCccCampaignProviderDispatch({
+      ...input(f, `work-item-${kind}`),
+      workItemFence,
+      workItemLeaseOwner,
+    })).rejects.toThrow(/workflow work-item fence/i);
+    expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
   });
 
   it("selects the one live-execution action assigned to this task, not another task's action", async () => {
@@ -305,6 +363,8 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
       claimToken: "claim",
       turnKey: "turn-nonimported",
       dispatchKey: "dispatch-nonimported",
+      workItemFence: { workItemId: "work-item-nonimported", runId: "run-nonimported", attempt: 1 },
+      workItemLeaseOwner: "lease-owner-nonimported",
     })).rejects.toThrow(/no persisted CCC campaign context/i);
     expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
   });

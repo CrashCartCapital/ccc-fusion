@@ -1,5 +1,17 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { readFileSync, accessSync, constants, existsSync, readdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "yaml";
 
@@ -197,10 +209,31 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     ).toBe(true);
   });
 
+  it("fails fast on real verifier confinement readiness after build and before acceptance", () => {
+    const gateSteps = workflow.jobs?.gate?.steps ?? [];
+    const buildIndex = gateSteps.findIndex((step: any) => step.name === "Build");
+    const readinessIndex = gateSteps.findIndex(
+      (step: any) => step.name === "Verifier confinement readiness",
+    );
+    const bootSmokeIndex = gateSteps.findIndex(
+      (step: any) => step.name === "Boot smoke (app starts and serves)",
+    );
+    const gateTestsIndex = gateSteps.findIndex(
+      (step: any) => step.name === "Gate tests (engine-core + CCC PRD safety + CI-shape)",
+    );
+
+    expect(readinessIndex).toBeGreaterThan(buildIndex);
+    expect(readinessIndex).toBeLessThan(bootSmokeIndex);
+    expect(readinessIndex).toBeLessThan(gateTestsIndex);
+    expect(gateSteps[readinessIndex]?.run).toBe(
+      "node scripts/check-verifier-confinement.mjs",
+    );
+  });
+
   it("keeps the PostgreSQL service off the laptop's fixed 5432 tunnel", () => {
     expect(workflow.jobs?.gate?.services?.postgres?.ports).toEqual(["5432/tcp"]);
     const gateTestStep = (workflow.jobs?.gate?.steps ?? []).find(
-      (step: any) => step.name === "Gate tests (curated engine-core + CI-shape)",
+      (step: any) => step.name === "Gate tests (engine-core + CCC PRD safety + CI-shape)",
     );
     expect(gateTestStep?.env?.FUSION_PG_TEST_URL_BASE).toContain(
       "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
@@ -213,6 +246,7 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
   */
   it("pins test:gate to the audited guard scripts and curated suites", () => {
     const testGateScript = rootPackageJson.scripts?.["test:gate"] ?? "";
+    const cccPrdSafetyScript = rootPackageJson.scripts?.["test:ccc-prd-safety"] ?? "";
 
     expect(testGateScript).toContain("node scripts/check-no-" + "no" + "hup" + ".mjs"); // process-supervisor-allowlist: asserts the gate wires the checker; not a real spawn
     expect(testGateScript).toContain("node scripts/check-no-kill-" + "40" + "40" + ".mjs"); // port-4040-allowlist: asserts the gate wires the checker; not a real port bind
@@ -221,6 +255,13 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(testGateScript).toContain("pnpm --filter @fusion/engine test:core");
     expect(testGateScript).toContain("pnpm --filter @fusion/core test:pg-gate");
     expect(testGateScript).toContain("pnpm --filter @runfusion/fusion test:ci-shape");
+    expect(testGateScript).toContain("pnpm test:ccc-prd-safety");
+    expect(cccPrdSafetyScript).toContain("src/__tests__/process-supervisor.test.ts");
+    expect(cccPrdSafetyScript).toContain("src/__tests__/run-verification-command.test.ts");
+    expect(cccPrdSafetyScript).toContain("src/__tests__/ccc-campaign-proof-execution.test.ts");
+    expect(cccPrdSafetyScript).toContain("src/commands/__tests__/prd.test.ts");
+    expect(cccPrdSafetyScript).toContain("src/__tests__/postgres/ccc-prd-product-status.pg.test.ts");
+    expect(cccPrdSafetyScript).toContain("--config vitest.pg.config.ts");
   });
 
   it("pins engine test:core to the engine-core vitest project", () => {
@@ -326,6 +367,115 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
   });
 });
 
+describe("Canonical Fusion runner verifier contract", () => {
+  let dockerfile: string;
+  let readinessScript: string;
+
+  beforeAll(() => {
+    dockerfile = readFileSync(join(workspaceRoot, ".github", "runner", "Dockerfile"), "utf-8");
+    readinessScript = readFileSync(
+      join(workspaceRoot, "scripts", "check-verifier-confinement.mjs"),
+      "utf-8",
+    );
+  });
+
+  it("provisions bubblewrap and a checksum-bound ARM64 Go Task binary", () => {
+    expect(dockerfile).toMatch(/apt-get install[^;]*\bbubblewrap\b/s);
+    expect(dockerfile).toContain("ARG GO_TASK_VERSION=3.51.1");
+    expect(dockerfile).toContain(
+      "ARG GO_TASK_LINUX_ARM64_SHA256=49c58bb00eff2449a5553f3b3e694fc424e0dc04d5c669d8831126daee1000f8",
+    );
+    expect(dockerfile).toContain("task_linux_arm64.tar.gz");
+    expect(dockerfile).toContain("sha256sum -c -");
+    expect(dockerfile).toContain("task --version");
+    expect(dockerfile).not.toMatch(/curl[^\n]*\|\s*(?:ba)?sh/);
+  });
+
+  it("runs the built engine's functional readiness probe and fails closed", () => {
+    expect(readinessScript).toContain('../packages/engine/dist/index.js');
+    expect(readinessScript).toContain("inspectVerifierConfinementReadiness");
+    expect(readinessScript).toContain("JSON.stringify");
+    expect(readinessScript).toMatch(/process\.exitCode\s*=\s*1/);
+    expect(readinessScript).toMatch(/slice\(0,\s*\d+\)/);
+    expect(readinessScript).not.toContain("fallback");
+  });
+
+  it("functionally refuses a runner that lacks the required Go Task verifier", () => {
+    const result = spawnSync(
+      process.execPath,
+      [join(workspaceRoot, "scripts", "check-verifier-confinement.mjs")],
+      {
+        cwd: workspaceRoot,
+        encoding: "utf8",
+        env: { ...process.env, PATH: "/fusion-test-missing-verifier-toolchain" },
+        timeout: 15_000,
+      },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout.trim())).toMatchObject({
+      kind: "fusion.verifier-confinement-readiness.v1",
+      ready: false,
+      backend: null,
+      code: "VERIFIER_TOOLCHAIN_UNAVAILABLE",
+      message: expect.stringMatching(/Go Task.*required/i),
+      taskVersion: "",
+    });
+  });
+
+  it("functionally refuses malformed engine readiness even when it claims ready", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "fusion-verifier-preflight-"));
+    try {
+      const scriptDir = join(fixtureRoot, "scripts");
+      const engineDir = join(fixtureRoot, "packages", "engine", "dist");
+      const binDir = join(fixtureRoot, "bin");
+      mkdirSync(scriptDir, { recursive: true });
+      mkdirSync(engineDir, { recursive: true });
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(
+        join(scriptDir, "check-verifier-confinement.mjs"),
+        readinessScript,
+        "utf8",
+      );
+      writeFileSync(
+        join(engineDir, "index.js"),
+        "export async function inspectVerifierConfinementReadiness() { return { ready: true, backend: null, code: 'MALFORMED_READY', message: 'malformed fixture', trustedPaths: [] }; }\n",
+        "utf8",
+      );
+      const taskPath = join(binDir, "task");
+      writeFileSync(taskPath, "#!/bin/sh\necho 'Task version: v-test'\n", {
+        encoding: "utf8",
+        mode: 0o755,
+      });
+
+      const result = spawnSync(
+        process.execPath,
+        [join(scriptDir, "check-verifier-confinement.mjs")],
+        {
+          cwd: fixtureRoot,
+          encoding: "utf8",
+          env: { ...process.env, PATH: binDir },
+          timeout: 15_000,
+        },
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout.trim())).toMatchObject({
+        kind: "fusion.verifier-confinement-readiness.v1",
+        ready: false,
+        backend: null,
+        code: "MALFORMED_READY",
+        message: "malformed fixture",
+        taskVersion: "Task version: v-test",
+      });
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
   let workflow: any;
   let content: string;
@@ -379,14 +529,26 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     }
   });
 
-  it("caps deterministic shard worker fan-out around the shared PostgreSQL service", () => {
+  it("caps full-suite fan-out to the measured shared-runner resource budget", () => {
+    const shardJob = workflow.jobs?.["test-shards"];
     const shardSteps = workflow.jobs?.["test-shards"]?.steps ?? [];
     const testStep = shardSteps.find(
       (step: any) => step.name === "Test (deterministic shard)",
     );
 
-    expect(testStep?.env?.FUSION_TEST_TOTAL_WORKERS).toBe("6");
-    expect(testStep?.env?.FUSION_TEST_CONCURRENCY).toBe("2");
+    expect(shardJob?.strategy?.["max-parallel"]).toBe(2);
+    expect(testStep?.env?.FUSION_TEST_TOTAL_WORKERS).toBe("4");
+    expect(testStep?.env?.FUSION_TEST_CONCURRENCY).toBe("1");
+    expect(workflow.jobs?.["test-slow"]?.needs).toEqual([
+      "prepare-test-artifacts",
+      "test-shards",
+    ]);
+    const slowCondition = String(workflow.jobs?.["test-slow"]?.if ?? "");
+    expect(slowCondition).toContain("!cancelled()");
+    expect(slowCondition).toContain(
+      "needs.prepare-test-artifacts.result == 'success'",
+    );
+    expect(slowCondition).not.toContain("needs.test-shards.result");
   });
 
   it("runs product-route real-PG acceptance in the serialized engine job", () => {
@@ -400,6 +562,25 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
       "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
     );
     expect(productStep?.env?.PGPASSWORD).toBe("postgres");
+  });
+
+  it("fails fast on real verifier confinement readiness before product acceptance", () => {
+    const slowSteps = workflow.jobs?.["test-slow"]?.steps ?? [];
+    const seedIndex = slowSteps.findIndex(
+      (step: any) => step.name === "Seed artifact hash-cache",
+    );
+    const readinessIndex = slowSteps.findIndex(
+      (step: any) => step.name === "Verifier confinement readiness",
+    );
+    const productIndex = slowSteps.findIndex(
+      (step: any) => step.name === "Run serialized product-route acceptance",
+    );
+
+    expect(readinessIndex).toBeGreaterThan(seedIndex);
+    expect(readinessIndex).toBeLessThan(productIndex);
+    expect(slowSteps[readinessIndex]?.run).toBe(
+      "node scripts/check-verifier-confinement.mjs",
+    );
   });
 
   it("keeps full clones where real-git tests need history", () => {

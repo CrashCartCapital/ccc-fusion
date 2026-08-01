@@ -34,6 +34,12 @@ export interface SuperviseSpawnOptions extends Omit<SpawnOptions, "detached"> {
   /** Override spawn for tests or alternate process factories. */
   spawnImpl?: typeof spawn;
   /**
+   * Safe, bounded-identifying text for process lifecycle logs. Use this when
+   * `command` contains expanded policy, environment, or other private launch
+   * details that must still be passed to the child but must not be logged.
+   */
+  diagnosticLabel?: string;
+  /**
    * Grace period between SIGTERM and SIGKILL when the supervisor tears a child
    * down because the parent is exiting or a lifetime limit expires.
    */
@@ -266,8 +272,10 @@ export function superviseSpawn(
     killGraceMs = DEFAULT_KILL_GRACE_MS,
     maxLifetimeMs = DEFAULT_MAX_LIFETIME_MS,
     spawnImpl = spawn,
+    diagnosticLabel,
     ...spawnOptions
   } = options;
+  const loggedCommand = (diagnosticLabel ?? command).replace(/[\r\n]+/g, " ").slice(0, 256);
 
   const processGroup = usesProcessGroup();
   const child = spawnImpl(command, [...args], {
@@ -299,9 +307,9 @@ export function superviseSpawn(
 
   if (typeof child.pid === "number") {
     registry.set(child.pid, entry);
-    log.log(`spawned pid=${child.pid} pgid=${entry.pgid ?? "n/a"} command=${command}`);
+    log.log(`spawned pid=${child.pid} pgid=${entry.pgid ?? "n/a"} command=${loggedCommand}`);
   } else {
-    log.warn(`spawned child without pid for command=${command}`);
+    log.warn(`spawned child without pid for command=${loggedCommand}`);
   }
 
   if (Number.isFinite(maxLifetimeMs) && maxLifetimeMs > 0) {

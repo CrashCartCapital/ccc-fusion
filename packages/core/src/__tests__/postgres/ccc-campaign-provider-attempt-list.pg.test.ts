@@ -85,6 +85,11 @@ pgDescribe("CCC campaign provider-attempt listing (PostgreSQL)", () => {
       providerId: "deterministic-fake",
       modelId: "fixture-v1",
       transport: "pi",
+      workItemFence: {
+        workItemId: `work-item-${turnKey}`,
+        runId: `run-${turnKey}`,
+        attempt: 1,
+      },
     };
   }
 
@@ -147,10 +152,29 @@ pgDescribe("CCC campaign provider-attempt listing (PostgreSQL)", () => {
       requestCount: attempt.requestCount,
       state: attempt.state,
       semanticTaskId: attempt.semanticTaskId,
+      workItemFence: attempt.workItemFence,
     }))).toEqual([
-      { attemptKey: reserved.attemptKey, requestCount: 1, state: "reserved", semanticTaskId },
-      { attemptKey: dispatched.attemptKey, requestCount: 2, state: "dispatched_unknown", semanticTaskId },
-      { attemptKey: terminal.attemptKey, requestCount: 3, state: "committed", semanticTaskId },
+      {
+        attemptKey: reserved.attemptKey,
+        requestCount: 1,
+        state: "reserved",
+        semanticTaskId,
+        workItemFence: { workItemId: "work-item-turn-reserved", runId: "run-turn-reserved", attempt: 1 },
+      },
+      {
+        attemptKey: dispatched.attemptKey,
+        requestCount: 2,
+        state: "dispatched_unknown",
+        semanticTaskId,
+        workItemFence: { workItemId: "work-item-turn-dispatched", runId: "run-turn-dispatched", attempt: 1 },
+      },
+      {
+        attemptKey: terminal.attemptKey,
+        requestCount: 3,
+        state: "committed",
+        semanticTaskId,
+        workItemFence: { workItemId: "work-item-turn-terminal", runId: "run-turn-terminal", attempt: 1 },
+      },
     ]);
     expect(restarted[2]?.terminal).toEqual({
       kind: "reconciled",
@@ -176,6 +200,7 @@ pgDescribe("CCC campaign provider-attempt listing (PostgreSQL)", () => {
     expect(Object.isFrozen(attempts)).toBe(true);
     expect(Object.isFrozen(attempts[0])).toBe(true);
     expect(Object.isFrozen(attempts[0]?.binding)).toBe(true);
+    expect(Object.isFrozen(attempts[0]?.workItemFence)).toBe(true);
     expect(() => {
       (attempts as CccProviderAttemptScope[]).push(attempts[0]!);
     }).toThrow(TypeError);

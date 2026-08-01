@@ -209,11 +209,20 @@ describe("prd command exit contract", () => {
       replayed: false,
     }));
     const closeProjectStore = vi.fn(async () => undefined);
+    const inspectVerifierConfinementReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "sandbox-exec" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "verifier confinement readiness probe executed successfully",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      detail: "test-injected ready confinement",
+    }));
     const dependencies = {
       resolveProject: vi.fn(async () => context),
       closeProjectStore,
       readTargetHead: vi.fn(async () => packet.base),
       importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness,
     };
     const common = [
       packet.root,
@@ -247,6 +256,13 @@ describe("prd command exit contract", () => {
         expect.objectContaining({ id: "TASK-CLI-001" }),
       ],
       proofs: [expect.objectContaining({ id: "PF-CLI-001" })],
+      verifierConfinement: {
+        ready: true,
+        backend: "sandbox-exec",
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"],
+      },
     });
     expect(preview.confirmationDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(closeProjectStore).toHaveBeenCalledTimes(1);
@@ -273,6 +289,192 @@ describe("prd command exit contract", () => {
       }),
     }));
     expect(closeProjectStore).toHaveBeenCalledTimes(2);
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows extracted PRD work and actionable verifier guidance when confinement is unavailable", async () => {
+    const packet = createPacketRoot();
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: () => undefined },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+    const policyPath = join(packet.root, "execution-policy.json");
+    writeFileSync(policyPath, JSON.stringify({
+      schema: "ccc-campaign.execution-policy.v2",
+      routes: [{
+        taskId: "TASK-CLI-001",
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        executor: "model",
+        toolMode: "coding",
+        worktreeMode: "isolated",
+        ownedPaths: ["src/task-1"],
+        allowedWriteRoots: ["src/task-1"],
+        commitPolicy: "required",
+      }],
+    }));
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store: { getAsyncLayer: vi.fn(() => ({})) },
+    };
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      [
+        "preview",
+        packet.root,
+        packet.manifest,
+        packet.sidecar,
+        policyPath,
+        packet.target,
+        packet.base,
+      ],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => context),
+        closeProjectStore: vi.fn(async () => undefined),
+        readTargetHead: vi.fn(async () => packet.base),
+        inspectVerifierConfinementReadiness: vi.fn(async () => ({
+          ready: false,
+          backend: "bubblewrap" as const,
+          code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+          message: "trusted bubblewrap confinement is unavailable",
+          trustedPaths: ["/usr/bin/bwrap", "/bin/bwrap"] as const,
+          detail: "private runner detail must not reach operator output",
+        })),
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const preview = JSON.parse(output[0]!);
+    expect(preview).toMatchObject({
+      kind: "preview",
+      requirements: [expect.objectContaining({ id: "CF-CLI-001" })],
+      tasks: [expect.objectContaining({ id: "TASK-CLI-001" })],
+      verifierConfinement: {
+        ready: false,
+        backend: "bubblewrap",
+        code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+        safeState: "The frozen PRD preview is intact; no campaign, approval, provider effect, or source change was created.",
+        decisionOwner: "Fusion host or CI runner operator",
+        consequence: "Campaign import and live execution remain blocked because exact requirement proof cannot run safely.",
+        recoveryOptions: [
+          "Provision and functionally verify the trusted verifier confinement backend on this host.",
+          "Keep the packet as a review-only preview until confinement is ready.",
+        ],
+        nextSafeAction: "Repair the trusted verifier confinement backend, then rerun fn prd preview before import.",
+      },
+    });
+    expect(output[0]).not.toContain("private runner detail");
+  });
+
+  it("refuses import before project or importer residue when readiness has no admitted backend", async () => {
+    const packet = createPacketRoot();
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: () => undefined },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+    const policyPath = join(packet.root, "execution-policy.json");
+    writeFileSync(policyPath, JSON.stringify({
+      schema: "ccc-campaign.execution-policy.v2",
+      routes: [{
+        taskId: "TASK-CLI-001",
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        executor: "model",
+        toolMode: "coding",
+        worktreeMode: "isolated",
+        ownedPaths: ["src/task-1"],
+        allowedWriteRoots: ["src/task-1"],
+        commitPolicy: "required",
+      }],
+    }));
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store: { getAsyncLayer: vi.fn(() => ({})) },
+    };
+    const resolveProject = vi.fn(async () => context);
+    const importBundle = vi.fn();
+    const inspectVerifierConfinementReadiness = vi.fn()
+      .mockResolvedValueOnce({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })
+      .mockResolvedValueOnce({
+        ready: true,
+        backend: "native" as never,
+        code: "VERIFIER_CONFINEMENT_INVALID_RESULT",
+        message: "readiness result named an unadmitted backend",
+        trustedPaths: [] as const,
+        detail: "private runner detail must not reach operator output",
+      });
+    const dependencies = {
+      resolveProject,
+      closeProjectStore: vi.fn(async () => undefined),
+      readTargetHead: vi.fn(async () => packet.base),
+      importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness,
+    };
+    const common = [
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      policyPath,
+      packet.target,
+      packet.base,
+    ];
+    const previewOutput: string[] = [];
+    expect(await runPrdCommand(
+      ["preview", ...common],
+      { write: (line) => previewOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(0);
+    const preview = JSON.parse(previewOutput[0]!) as {
+      confirmationDigest: string;
+    };
+    const importOutput: string[] = [];
+
+    expect(await runPrdCommand(
+      ["import", ...common, "operator-key", "--confirm", preview.confirmationDigest],
+      { write: (line) => importOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(JSON.parse(importOutput[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+        message: "Exact requirement verification is unavailable: readiness result named an unadmitted backend",
+      }],
+      safeState: "This import created no campaign rows, staging files, approvals, provider effects, or source changes.",
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence: "The PRD packet remains reviewable, but Fusion cannot safely import or execute it on this host.",
+      approvalExpiresAt: null,
+      recoveryOptions: [
+        "Provision and functionally verify the trusted verifier confinement backend at one trusted system path.",
+        "Keep the frozen packet unchanged and rerun preview after the host is repaired.",
+      ],
+      nextSafeAction: "Repair verifier confinement, rerun fn prd preview, then issue a fresh import confirmation.",
+    });
+    expect(importOutput[0]).not.toContain("private runner detail");
+    expect(resolveProject).toHaveBeenCalledTimes(1);
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(2);
   });
 
   it("recomputes preview identity and refuses a stale confirmation before import residue", async () => {
@@ -1014,6 +1216,11 @@ describe("prd command exit contract", () => {
     const controllerToken =
       "ccc-provider-controller-00000000-0000-4000-8000-000000000001";
     const evidenceDigest = "7".repeat(64);
+    const workItemFence = {
+      workItemId: "work-item-1",
+      runId: "ccc-prd:import-1",
+      attempt: 2,
+    } as const;
     const binding = {
       projectId: "project-1",
       importId: "import-1",
@@ -1042,17 +1249,18 @@ describe("prd command exit contract", () => {
       dispatchKey: "dispatch-1",
       attemptOrdinal: 1,
       requestCount: 1,
+      workItemFence,
       state: "dispatched_unknown",
       binding,
     } as const;
     const workItem = {
-      id: "work-item-1",
-      runId: "ccc-prd:import-1",
-      taskId: "FN-entry",
+      id: workItemFence.workItemId,
+      runId: workItemFence.runId,
+      taskId: "FN-1",
       nodeId: "node-provider",
       kind: "task",
       state: "manual-required",
-      attempt: 2,
+      attempt: workItemFence.attempt,
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
@@ -1447,6 +1655,153 @@ describe("prd command exit contract", () => {
     });
   });
 
+  it("keeps live-execution approval issued and work parked when verifier confinement is unavailable", async () => {
+    const confirmation = "8".repeat(64);
+    const approval = {
+      id: "approval-live-1",
+      status: "issued",
+      taskId: "TASK-coding",
+      runId: "RUN-product",
+      requester: {
+        actorId: "ccc-campaign-runtime",
+        actorType: "agent",
+        actorName: "CCC Campaign Runtime",
+      },
+      targetAction: {
+        category: "command_execution",
+        action: "ACTION-live",
+        summary: "Run the admitted coding provider",
+        resourceType: "ccc-campaign-live_execution",
+        resourceId: "provider://fixture/TASK-coding",
+        context: {
+          protectedActionKind: "live_execution",
+          operatorDecision: "approve_live_execution",
+        },
+      },
+      requestedAt: "2026-07-31T00:00:00.000Z",
+      createdAt: "2026-07-31T00:00:00.000Z",
+      updatedAt: "2026-07-31T00:00:00.000Z",
+      campaign: {
+        binding: {
+          projectId: "project-1",
+          importId: "import-1",
+          campaignId: "campaign-1",
+          taskId: "TASK-coding",
+          actionId: "ACTION-live",
+          actionTarget: "provider://fixture/TASK-coding",
+          idempotencyKey: "operator-key",
+          packetHash: "a".repeat(64),
+          sidecarHash: "b".repeat(64),
+          bundleHash: "c".repeat(64),
+          targetRepository: "/tmp/product-target",
+          targetBase: "d".repeat(40),
+          providerId: "fixture",
+          modelId: "fixture-v2",
+          transport: "cli",
+          manifestHash: "e".repeat(64),
+          bindingHash: "f".repeat(64),
+        },
+        notBeforeAt: "2026-07-31T00:00:00.000Z",
+        expiresAt: "2026-07-31T01:00:00.000Z",
+      },
+    };
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const status = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-1",
+      import: {
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        state: "active",
+        runnable: true,
+      },
+      tasks: [],
+      workItems: [workItem],
+      proofs: [],
+      orphanProofAttempts: [],
+      approvals: [approval],
+      landing: { intents: [], terminals: [] },
+      nextAction: {
+        kind: "approve-execution",
+        reason: "Approve exact live execution.",
+      },
+    };
+    const transitionWorkflowWorkItem = vi.fn();
+    const context = {
+      projectId: "project-1",
+      projectPath: "/tmp/product-target",
+      projectName: "Fixture",
+      isRegistered: true,
+      store: {
+        getAsyncLayer: () => ({}),
+        transitionWorkflowWorkItem,
+      },
+    };
+    const approveExecution = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      ["approve-execution", "operator-key", "approval-live-1", "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => context),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => status),
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: vi.fn(async () => ({
+          ready: true,
+          backend: "native" as never,
+          code: "VERIFIER_CONFINEMENT_INVALID_RESULT",
+          message: "readiness result named an unadmitted backend",
+          trustedPaths: [] as const,
+          detail: "private runner detail must not reach operator output",
+        })),
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    const refusal = JSON.parse(output[0]!);
+    expect(refusal).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+        message: "Exact requirement verification is unavailable: readiness result named an unadmitted backend",
+      }],
+      safeState: "Approval approval-live-1 remains issued and workflow work-item-1 remains manual-required; this command started no provider, source, or proof effect.",
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence: "Live coding cannot start because Fusion could not prove exact requirement tests can run under enforced confinement.",
+      approvalExpiresAt: "2026-07-31T01:00:00.000Z",
+      recoveryOptions: [
+        "Repair and functionally verify the trusted verifier confinement backend before this approval expires.",
+        "If the approval expires, request a fresh exact live-execution approval after the host is ready.",
+        "Stop the campaign with a fresh status digest if the operator does not want to continue.",
+      ],
+      nextSafeAction: "Repair verifier confinement, rerun fn prd status operator-key, then submit a still-current exact approval.",
+    });
+    expect(JSON.stringify(refusal.verifierConfinement)).not.toContain(
+      "no campaign",
+    );
+    expect(output[0]).not.toContain("private runner detail");
+    expect(approveExecution).not.toHaveBeenCalled();
+    expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
+  });
+
   it("claims exact live-execution approval and requeues only its parked imported work item", async () => {
     const confirmation = "8".repeat(64);
     const approval = {
@@ -1563,6 +1918,13 @@ describe("prd command exit contract", () => {
       .mockResolvedValueOnce(before)
       .mockResolvedValueOnce(after);
     const approveExecution = vi.fn(async () => after.approvals[0]);
+    const inspectVerifierConfinementReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "sandbox-exec" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "verifier confinement readiness probe executed successfully",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+    }));
     const output: string[] = [];
 
     expect(await runPrdCommand(
@@ -1574,6 +1936,7 @@ describe("prd command exit contract", () => {
         inspectCccPrdProductStatus: inspectStatus,
         computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
         approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness,
       },
       { projectName: "fixture" },
     )).toBe(0);
@@ -1609,5 +1972,6 @@ describe("prd command exit contract", () => {
       approval: { status: "claimed" },
       status: { nextAction: { kind: "wait-for-runtime" } },
     });
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(1);
   });
 });

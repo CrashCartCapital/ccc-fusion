@@ -29,7 +29,8 @@ import {
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
 
-vi.mock("../ccc-campaign-provider-controller.js", () => ({
+vi.mock("../ccc-campaign-provider-controller.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../ccc-campaign-provider-controller.js")>(),
   createCccCampaignProviderAttemptBinding: createCccCampaignProviderAttemptBindingMock,
 }));
 
@@ -1454,7 +1455,7 @@ describe("fast mode workflow/runtime invariants", () => {
       semanticTask: task({ id: "FN-6226-semantic" }),
       runId: "FN-6226-run",
       visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
-      executionFence: Object.freeze({ workItemId: "wi-provider-binding", attempt: 1, runId: "FN-6226-run" }),
+      executionFence: Object.freeze({ workItemId: "wi-provider-binding", leaseOwner: "provider-worker", attempt: 1, runId: "FN-6226-run" }),
       providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     });
 
@@ -1510,7 +1511,7 @@ describe("fast mode workflow/runtime invariants", () => {
       semanticTask: task({ id: "FN-6226-semantic" }),
       runId: "FN-6226-run",
       visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
-      executionFence: Object.freeze({ workItemId: "wi-provider-binding", attempt: 1, runId: "FN-6226-run" }),
+      executionFence: Object.freeze({ workItemId: "wi-provider-binding", leaseOwner: "pi-provider-worker", attempt: 1, runId: "FN-6226-run" }),
       providerAttemptTurnKey: turnKey,
     });
 
@@ -1535,6 +1536,12 @@ describe("fast mode workflow/runtime invariants", () => {
     expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledWith(expect.objectContaining({
       semanticTaskId: "FN-6226-semantic",
       turnKey: execution.providerAttemptTurnKey,
+      workItemFence: Object.freeze({
+        workItemId: execution.executionFence.workItemId,
+        runId: execution.executionFence.runId,
+        attempt: execution.executionFence.attempt,
+      }),
+      workItemLeaseOwner: execution.executionFence.leaseOwner,
       signal,
       expectedRoute: Object.freeze({ providerId: "openai", modelId: "gpt-4o", transport: "pi" }),
     }));
@@ -1549,6 +1556,124 @@ describe("fast mode workflow/runtime invariants", () => {
     expect(Object.isFrozen(binding)).toBe(true);
     expect(Object.isFrozen(binding.controller)).toBe(true);
     expect(binding.turnKey).toBe(execution.providerAttemptTurnKey);
+  });
+
+  it("Task provider-fence RED: workflow-extension resolver passes the sealed execution fence into provider binding", async () => {
+    const nodeTask = task({ executionMode: "fast", worktree: "/tmp/ccc-provider-binding" });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    const binding = Object.freeze({
+      providerController: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
+      providerRoute: Object.freeze({
+        providerId: "openai",
+        modelId: "gpt-4o",
+        transport: "workflow",
+        workflowExtensionId: "plugin:ccc-campaign:provider",
+      }),
+    });
+    createCccCampaignProviderAttemptBindingMock.mockResolvedValueOnce(binding);
+    const executionFence = Object.freeze({
+      workItemId: "wi-workflow-provider-binding",
+      leaseOwner: "workflow-provider-worker",
+      attempt: 2,
+      runId: "FN-6226-workflow-run",
+    });
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "FN-6226-semantic",
+      nativeTaskId: nodeTask.id,
+      semanticTask: task({ id: "FN-6226-semantic" }),
+      runId: executionFence.runId,
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence,
+      providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    const signal = new AbortController().signal;
+
+    const resolver = executor.createCccCampaignWorkflowNodeProviderControllerResolver();
+    await expect(resolver({
+      node: { id: "provider-node", kind: "prompt" },
+      semanticTask: execution.semanticTask,
+      workflow: { id: "workflow-1", name: "Workflow", version: 1, nodes: [], edges: [] },
+      extensionId: "plugin:ccc-campaign:provider",
+      execution,
+      signal,
+    } as any)).resolves.toBe(binding);
+
+    expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledWith(expect.objectContaining({
+      semanticTaskId: execution.semanticTaskId,
+      nativeTaskId: execution.nativeTaskId,
+      turnKey: execution.providerAttemptTurnKey,
+      workItemFence: Object.freeze({
+        workItemId: executionFence.workItemId,
+        runId: executionFence.runId,
+        attempt: executionFence.attempt,
+      }),
+      workItemLeaseOwner: executionFence.leaseOwner,
+      signal,
+      workflowProviderBinding: true,
+    }));
+  });
+
+  it.each([undefined, " bad-owner "])("Task provider-owner RED: workflow-extension route refuses noncanonical lease owner %s", async (leaseOwner) => {
+    const nodeTask = task({ executionMode: "fast", worktree: "/tmp/ccc-provider-binding" });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    createCccCampaignProviderAttemptBindingMock.mockResolvedValueOnce(Object.freeze({}));
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "FN-6226-semantic",
+      nativeTaskId: nodeTask.id,
+      semanticTask: task({ id: "FN-6226-semantic" }),
+      runId: "FN-6226-workflow-run",
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence: Object.freeze({
+        workItemId: "wi-workflow-provider-binding",
+        ...(leaseOwner === undefined ? {} : { leaseOwner }),
+        attempt: 2,
+        runId: "FN-6226-workflow-run",
+      }),
+      providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+
+    const resolver = executor.createCccCampaignWorkflowNodeProviderControllerResolver();
+    await expect(resolver({
+      node: { id: "provider-node", kind: "prompt" },
+      semanticTask: execution.semanticTask,
+      workflow: { id: "workflow-1", name: "Workflow", version: 1, nodes: [], edges: [] },
+      extensionId: "plugin:ccc-campaign:provider",
+      execution,
+    } as any)).rejects.toThrow(/lease owner/i);
+    expect(createCccCampaignProviderAttemptBindingMock).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, " bad-owner "])("Task provider-owner RED: Pi route refuses noncanonical lease owner %s", async (leaseOwner) => {
+    const nodeTask = task({ executionMode: "fast", worktree: "/tmp/ccc-provider-binding" });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    createCccCampaignProviderAttemptBindingMock.mockResolvedValueOnce(Object.freeze({}));
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "FN-6226-semantic",
+      nativeTaskId: nodeTask.id,
+      semanticTask: task({ id: "FN-6226-semantic" }),
+      runId: "FN-6226-pi-run",
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence: Object.freeze({
+        workItemId: "wi-pi-provider-binding",
+        ...(leaseOwner === undefined ? {} : { leaseOwner }),
+        attempt: 2,
+        runId: "FN-6226-pi-run",
+      }),
+      providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+
+    await expect((executor as any).createCccProviderAttemptBindingForWorkflowStep({
+      execution,
+      provider: "openai",
+      modelId: "gpt-4o",
+    })).rejects.toThrow(/lease owner/i);
+    expect(createCccCampaignProviderAttemptBindingMock).not.toHaveBeenCalled();
   });
 
   it("Task 4 RED: fenced CLI node without a host-native binding refuses before log or session effects", async () => {

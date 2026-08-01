@@ -5,10 +5,17 @@ import {
   type AssertActiveClaimedCccCampaignApprovalInput,
 } from "../async-approval-request-store.js";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
+import { and, eq, sql } from "drizzle-orm";
+import * as schema from "../postgres/schema/index.js";
 import { beginCccProviderAttemptDispatch, reserveCccProviderAttempt } from "./provider-attempt.js";
 import { loadCccCampaignContextForTask, type CccCampaignAuthorityStore } from "./store.js";
 import type { CccPrdProtectedActionIntent } from "../ccc-prd/types.js";
-import type { CccCampaignTransport, CccProviderAttemptDispatchDecision, CccProviderAttemptScope } from "./types.js";
+import type {
+  CccCampaignTransport,
+  CccCampaignWorkItemFence,
+  CccProviderAttemptDispatchDecision,
+  CccProviderAttemptScope,
+} from "./types.js";
 
 export type CccCampaignProviderControllerHoldReason = "dispatched-unknown" | "terminal";
 
@@ -32,6 +39,8 @@ export type AtomicCccCampaignProviderDispatchInput = Readonly<{
   taskId: string;
   approvalRequestId: string;
   claimToken: string;
+  workItemFence: CccCampaignWorkItemFence;
+  workItemLeaseOwner: string;
 }> & CccCampaignProviderDispatchInput;
 
 export type CccCampaignLiveExecutionAction = Readonly<{
@@ -41,6 +50,40 @@ export type CccCampaignLiveExecutionAction = Readonly<{
 }>;
 
 const CANONICAL_GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const CANONICAL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+
+function requireWorkItemFence(value: unknown): CccCampaignWorkItemFence {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("CCC campaign workflow work-item fence must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (JSON.stringify(keys) !== JSON.stringify(["attempt", "runId", "workItemId"])) {
+    throw new Error("CCC campaign workflow work-item fence fields must be exactly attempt, runId, workItemId");
+  }
+  if (
+    typeof record.workItemId !== "string"
+    || !CANONICAL_IDENTIFIER.test(record.workItemId)
+    || typeof record.runId !== "string"
+    || !CANONICAL_IDENTIFIER.test(record.runId)
+    || !Number.isSafeInteger(record.attempt)
+    || (record.attempt as number) < 1
+  ) {
+    throw new Error("CCC campaign workflow work-item fence is invalid");
+  }
+  return Object.freeze({
+    workItemId: record.workItemId,
+    runId: record.runId,
+    attempt: record.attempt as number,
+  });
+}
+
+function requireWorkItemLeaseOwner(value: unknown): string {
+  if (typeof value !== "string" || !CANONICAL_IDENTIFIER.test(value)) {
+    throw new Error("CCC campaign workflow work-item lease owner is invalid");
+  }
+  return value;
+}
 
 export function selectCccCampaignDeclaredLiveExecutionAction(
   protectedActions: readonly CccPrdProtectedActionIntent[],
@@ -81,6 +124,8 @@ export function selectCccCampaignDeclaredLiveExecutionAction(
 export async function atomicReserveCccCampaignProviderDispatch(
   input: AtomicCccCampaignProviderDispatchInput,
 ): Promise<CccCampaignProviderControllerDecision> {
+  const workItemFence = requireWorkItemFence(input.workItemFence);
+  const workItemLeaseOwner = requireWorkItemLeaseOwner(input.workItemLeaseOwner);
   return input.layer.transactionImmediate(async (tx) => {
     const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, input.taskId, tx, true);
     if (!context) throw new Error(`Task ${input.taskId} has no persisted CCC campaign context`);
@@ -92,6 +137,25 @@ export async function atomicReserveCccCampaignProviderDispatch(
       || input.gitObservation.headDescendsFromExpectedBase !== true
     ) {
       throw new Error("CCC campaign local Git snapshot does not match locked campaign custody");
+    }
+    const workItems = await tx
+      .select({ id: schema.project.workflowWorkItems.id })
+      .from(schema.project.workflowWorkItems)
+      .where(and(
+        eq(schema.project.workflowWorkItems.projectId, context.projectId),
+        eq(schema.project.workflowWorkItems.id, workItemFence.workItemId),
+        eq(schema.project.workflowWorkItems.taskId, context.taskId),
+        eq(schema.project.workflowWorkItems.runId, workItemFence.runId),
+        eq(schema.project.workflowWorkItems.attempt, workItemFence.attempt),
+        eq(schema.project.workflowWorkItems.state, "running"),
+        eq(schema.project.workflowWorkItems.leaseOwner, workItemLeaseOwner),
+        sql`${schema.project.workflowWorkItems.leaseExpiresAt} IS NOT NULL
+          AND ${schema.project.workflowWorkItems.leaseExpiresAt}::timestamptz > clock_timestamp()`,
+      ))
+      .limit(1)
+      .for("update");
+    if (workItems.length !== 1) {
+      throw new Error(`CCC campaign workflow work-item fence refused ${workItemFence.workItemId}`);
     }
     const action = selectCccCampaignDeclaredLiveExecutionAction(
       context.protectedActions,
@@ -118,6 +182,7 @@ export async function atomicReserveCccCampaignProviderDispatch(
         providerId: input.providerId,
         modelId: input.modelId,
         transport: input.transport,
+        workItemFence,
       },
     });
     switch (reserved.state) {

@@ -94,6 +94,7 @@ type Compiler = {
 };
 
 const compiler = engine as typeof engine & Compiler;
+export type VerifierConfinementReadiness = engine.VerifierConfinementReadiness;
 export type PrdCommandDependencies = {
   bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
   discoverCccPrdCandidates?: typeof engine.discoverCccPrdCandidates;
@@ -102,6 +103,7 @@ export type PrdCommandDependencies = {
   closeProjectStore?: (context: ProjectContext) => Promise<void>;
   readTargetHead?: (targetRoot: string) => Promise<string>;
   importCccPrdBundle?: typeof importCccPrdBundle;
+  inspectVerifierConfinementReadiness?: typeof engine.inspectVerifierConfinementReadiness;
   inspectCccPrdImport?: typeof inspectCccPrdImport;
   reconcileCccPrdImport?: typeof reconcileCccPrdImport;
   inspectCccPrdProductStatus?: typeof inspectCccPrdProductStatus;
@@ -508,6 +510,66 @@ function writeProductRefusal(
   return 1;
 }
 
+function writeVerifierConfinementImportRefusal(
+  io: PrdCommandIo,
+  readiness: VerifierConfinementReadiness,
+): number {
+  const backend = verifierConfinementBackendLabel(readiness);
+  io.write(JSON.stringify({
+    kind: "refusal",
+    diagnostics: [{
+      code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      message: `Exact requirement verification is unavailable: ${readiness.message}`,
+    }],
+    verifierConfinement: sanitizedVerifierConfinementReadiness(readiness),
+    safeState:
+      "This import created no campaign rows, staging files, approvals, provider effects, or source changes.",
+    decisionOwner: "Fusion host or CI runner operator",
+    consequence:
+      "The PRD packet remains reviewable, but Fusion cannot safely import or execute it on this host.",
+    approvalExpiresAt: null,
+    recoveryOptions: [
+      `Provision and functionally verify ${backend} at one trusted system path.`,
+      "Keep the frozen packet unchanged and rerun preview after the host is repaired.",
+    ],
+    nextSafeAction:
+      "Repair verifier confinement, rerun fn prd preview, then issue a fresh import confirmation.",
+  }));
+  return 1;
+}
+
+function writeVerifierConfinementExecutionRefusal(
+  io: PrdCommandIo,
+  readiness: VerifierConfinementReadiness,
+  approval: Pick<CccPrdProductApprovalStatus, "id" | "status" | "campaign">,
+  workItem: Readonly<{ id: string; state: string }>,
+  idempotencyKey: string,
+): number {
+  const backend = verifierConfinementBackendLabel(readiness);
+  io.write(JSON.stringify({
+    kind: "refusal",
+    diagnostics: [{
+      code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      message: `Exact requirement verification is unavailable: ${readiness.message}`,
+    }],
+    verifierConfinement: sanitizedVerifierConfinementReadiness(readiness),
+    safeState:
+      `Approval ${approval.id} remains ${approval.status} and workflow ${workItem.id} remains ${workItem.state}; this command started no provider, source, or proof effect.`,
+    decisionOwner: "Fusion host or CI runner operator",
+    consequence:
+      "Live coding cannot start because Fusion could not prove exact requirement tests can run under enforced confinement.",
+    approvalExpiresAt: approval.campaign.expiresAt,
+    recoveryOptions: [
+      `Repair and functionally verify ${backend} before this approval expires.`,
+      "If the approval expires, request a fresh exact live-execution approval after the host is ready.",
+      "Stop the campaign with a fresh status digest if the operator does not want to continue.",
+    ],
+    nextSafeAction:
+      `Repair verifier confinement, rerun fn prd status ${idempotencyKey}, then submit a still-current exact approval.`,
+  }));
+  return 1;
+}
+
 function runIntakeContractCommand(
   args: string[],
   io: PrdCommandIo,
@@ -708,9 +770,52 @@ function productConfirmationDigest(
     .digest("hex");
 }
 
+function operatorVerifierConfinementReadiness(
+  readiness: VerifierConfinementReadiness,
+) {
+  const operatorReadiness = sanitizedVerifierConfinementReadiness(readiness);
+  if (engine.isVerifierConfinementReady(readiness)) return operatorReadiness;
+  return {
+    ...operatorReadiness,
+    safeState:
+      "The frozen PRD preview is intact; no campaign, approval, provider effect, or source change was created.",
+    decisionOwner: "Fusion host or CI runner operator",
+    consequence:
+      "Campaign import and live execution remain blocked because exact requirement proof cannot run safely.",
+    recoveryOptions: [
+      "Provision and functionally verify the trusted verifier confinement backend on this host.",
+      "Keep the packet as a review-only preview until confinement is ready.",
+    ],
+    nextSafeAction:
+      "Repair the trusted verifier confinement backend, then rerun fn prd preview before import.",
+  };
+}
+
+function sanitizedVerifierConfinementReadiness(
+  readiness: VerifierConfinementReadiness,
+) {
+  const { detail: _detail, ...operatorReadiness } = readiness;
+  return {
+    ...operatorReadiness,
+    ready: engine.isVerifierConfinementReady(readiness),
+    backend: engine.isAdmittedVerifierConfinementBackend(readiness.backend)
+      ? readiness.backend
+      : null,
+  };
+}
+
+function verifierConfinementBackendLabel(
+  readiness: VerifierConfinementReadiness,
+): string {
+  return engine.isAdmittedVerifierConfinementBackend(readiness.backend)
+    ? readiness.backend
+    : "the trusted verifier confinement backend";
+}
+
 function productPreview(
   identity: ReturnType<typeof productPreviewIdentity>,
   bundle: CccPrdSemanticBundle,
+  verifierConfinement: VerifierConfinementReadiness,
 ) {
   return {
     kind: "preview" as const,
@@ -726,6 +831,9 @@ function productPreview(
     bounds: bundle.bounds,
     nonGoals: bundle.nonGoals,
     materialCoverage: bundle.materialCoverage,
+    verifierConfinement: operatorVerifierConfinementReadiness(
+      verifierConfinement,
+    ),
   };
 }
 
@@ -858,6 +966,14 @@ async function runProductPacketCommand(
     );
   }
 
+  const verifierConfinement = await (
+    dependencies.inspectVerifierConfinementReadiness
+    ?? compiler.inspectVerifierConfinementReadiness
+  )();
+  if (importing && !engine.isVerifierConfinementReady(verifierConfinement)) {
+    return writeVerifierConfinementImportRefusal(io, verifierConfinement);
+  }
+
   return withPrdProject(io, dependencies, commandContext, async (project) => {
     const layer = project.store.getAsyncLayer();
     if (!layer) {
@@ -886,7 +1002,7 @@ async function runProductPacketCommand(
       bundle,
       executionPolicy,
     });
-    const currentPreview = productPreview(identity, bundle);
+    const currentPreview = productPreview(identity, bundle, verifierConfinement);
     if (preview) {
       io.write(JSON.stringify(currentPreview));
       return 0;
@@ -1194,6 +1310,19 @@ async function runProductControlCommand(
     }
     if (approvingExecution) {
       const workItem = exactLiveExecutionWorkItem(status);
+      const verifierConfinement = await (
+        dependencies.inspectVerifierConfinementReadiness
+        ?? compiler.inspectVerifierConfinementReadiness
+      )();
+      if (!engine.isVerifierConfinementReady(verifierConfinement)) {
+        return writeVerifierConfinementExecutionRefusal(
+          io,
+          verifierConfinement,
+          approval,
+          workItem,
+          idempotencyKey,
+        );
+      }
       const approved = await (
         dependencies.approveCccCampaignLiveExecution
         ?? engine.approveCccCampaignLiveExecution
@@ -1945,7 +2074,16 @@ function exactProviderResolutionContext(
       `provider attempt ${attemptKey} no longer matches one imported task route`,
     );
   }
-  const workItems = status.workItems;
+  if (attempt.workItemFence === null) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_FENCE_MISSING",
+      `provider attempt ${attemptKey} predates exact work-item fencing and requires campaign stop or direct evidence review`,
+    );
+  }
+  const workItems = status.workItems.filter((workItem) =>
+    workItem.id === attempt.workItemFence!.workItemId
+    && workItem.runId === attempt.workItemFence!.runId
+    && workItem.attempt === attempt.workItemFence!.attempt);
   if (workItems.length !== 1) {
     throw new PrdProductCommandError(
       "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_MISSING",
@@ -1958,8 +2096,6 @@ function exactProviderResolutionContext(
     workItem.kind !== "task"
     || workItem.runId !== expectedRunId
     || workItem.stableWorkflowRunId !== expectedRunId
-    || !Number.isSafeInteger(workItem.attempt)
-    || workItem.attempt < 0
     || workItem.state !== "manual-required"
     || workItem.leaseOwner !== null
     || workItem.leaseExpiresAt !== null

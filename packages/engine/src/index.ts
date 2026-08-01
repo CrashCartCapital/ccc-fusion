@@ -323,6 +323,12 @@ export {
   type CreateCccCampaignProofNodeAdmissionInput,
   type CccCampaignProofAdmissionExecutionBinding,
 } from "./ccc-campaign-proof-workflow.js";
+export {
+  isAdmittedVerifierConfinementBackend,
+  isVerifierConfinementReady,
+  inspectVerifierConfinementReadiness,
+  type VerifierConfinementReadiness,
+} from "./run-verification-tool.js";
 export { collectTaskEvaluationEvidence } from "./evaluator-evidence.js";
 export { Scheduler, type SchedulerOptions } from "./scheduler.js";
 export {

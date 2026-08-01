@@ -51,6 +51,7 @@ type RuntimeHarness = InProcessRuntime & {
     createAuthoritativeWorkflowNodePreparation: ReturnType<typeof vi.fn>;
     createAuthoritativeWorkflowBranchPersistence: ReturnType<typeof vi.fn>;
     createCccCampaignWorkflowNodeProviderControllerResolver: ReturnType<typeof vi.fn>;
+    tryBeginAuthoritativeWorkflowExecution: ReturnType<typeof vi.fn>;
   };
   cccCampaignProofBootstrapPromise?: Promise<void>;
   cccCampaignProofBootstrapError?: Error;
@@ -108,6 +109,7 @@ function runtimeWithStore(
         store.clearWorkflowRunBranches(taskId, keepRunId),
     })),
     createCccCampaignWorkflowNodeProviderControllerResolver: vi.fn(() => undefined),
+    tryBeginAuthoritativeWorkflowExecution: vi.fn(() => () => undefined),
   };
   runtime.cccCampaignProofBootstrapPromise = bootstrapCccCampaignProofAdmissionHost({
     builtRootPath: ENGINE_DIST_ROOT,
@@ -139,6 +141,40 @@ async function nativeTaskIdForImport(
   const nativeTaskId = taskStatuses[0]!.nativeTaskId;
   expect(nativeTaskId).not.toBe(input.semanticTaskId);
   return nativeTaskId;
+}
+
+async function claimProviderWorkItem(
+  store: TaskStore,
+  taskId: string,
+  workItemLeaseOwner: string,
+) {
+  const workItems = await store.listWorkflowWorkItemsForTask(taskId, {
+    kinds: ["task"],
+  });
+  if (workItems.length !== 1) {
+    throw new Error(`expected one provider workflow work item for ${taskId}`);
+  }
+  const workItem = workItems[0]!;
+  const claimed = await store.transitionWorkflowWorkItem(
+    workItem.id,
+    "running",
+    {
+      expectedState: workItem.state,
+      expectedAttempt: workItem.attempt,
+      expectedLeaseOwner: workItem.leaseOwner,
+      attempt: workItem.attempt + 1,
+      leaseOwner: workItemLeaseOwner,
+      leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+    },
+  );
+  return Object.freeze({
+    workItemFence: Object.freeze({
+      workItemId: claimed.id,
+      runId: claimed.runId,
+      attempt: claimed.attempt,
+    }),
+    workItemLeaseOwner,
+  });
 }
 
 async function importCampaignFixture(
@@ -895,6 +931,11 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     const campaign = await store.getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error("missing Task 6 campaign context");
     expect(campaign).toMatchObject({ taskId, semanticTaskId });
+    const providerWorkItem = await claimProviderWorkItem(
+      store,
+      taskId,
+      "runtime-task6-committed-replay-owner",
+    );
     const issued = await issueCccCampaignApproval(h.layer(), {
       authorityStore: store,
       rootDir,
@@ -926,6 +967,7 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       taskId,
       actionId: action.actionId,
       actionTarget: action.actionTarget,
+      workItemFence: providerWorkItem.workItemFence,
       ...dispatch,
     });
     await expect(store.beginCccProviderAttemptDispatch({
@@ -953,6 +995,7 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       semanticTaskId,
       nativeTaskId: taskId,
       turnKey: dispatch.turnKey,
+      ...providerWorkItem,
       expectedRoute: {
         transport: "pi",
         providerId: campaign.route.providerId,
@@ -1014,6 +1057,11 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     const campaign = await store.getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error("missing Task 6 provider-identity campaign context");
     expect(campaign).toMatchObject({ taskId, semanticTaskId });
+    const providerWorkItem = await claimProviderWorkItem(
+      store,
+      taskId,
+      "runtime-task6-provider-identity-owner",
+    );
     const issued = await issueCccCampaignApproval(h.layer(), {
       authorityStore: store,
       rootDir,
@@ -1050,10 +1098,12 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
     });
     const bindingA = await createCccCampaignProviderAttemptBinding({
       layer: h.layer(), rootDir, authorityStore: store, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchA.turnKey,
+      ...providerWorkItem,
       expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
     });
     const bindingB = await createCccCampaignProviderAttemptBinding({
       layer: h.layer(), rootDir, authorityStore: store, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchB.turnKey,
+      ...providerWorkItem,
       expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
     });
     const permitB = await bindingB.controller.preDispatch(dispatchB);

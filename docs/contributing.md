@@ -77,7 +77,7 @@ pnpm dev:ui            # dashboard dev server only
 pnpm dev:hmr           # dashboard API + Vite HMR UI, with no startup prebuild
 pnpm lint              # lint all packages
 pnpm test              # merge-gate suite + changed-only affected tests (bounded; never full-suite)
-pnpm test:gate         # the merge gate: curated engine-core suite + CI-shape test
+pnpm test:gate         # merge gate: engine-core + focused CCC PRD safety + CI-shape
 pnpm smoke:boot        # boot smoke: CLI --help + real serve /api/health
 pnpm test:full         # full workspace suite (explicit opt-in; clean-worktree compatible)
 pnpm build             # workspace builds (excludes desktop/mobile)
@@ -95,7 +95,7 @@ Fusion codifies workspace verification as a deterministic contract:
 - Root test entrypoints (`pnpm test` via `scripts/test-changed.mjs` and `pnpm test:ci:shard` via `scripts/ci-test-shard.mjs`) call `scripts/ensure-test-artifacts.mjs`, which deterministically builds only missing/stale required workspace dist artifacts (`@fusion/core`, `@fusion/dashboard`, `@fusion/engine`, `@fusion/plugin-sdk`, and `@fusion-plugin-examples/{dependency-graph,hermes-runtime,openclaw-runtime,paperclip-runtime}`).
 - Package-scoped hooks now mirror this bootstrap for fresh worktrees where needed: `@fusion/dashboard` and `@fusion-plugin-examples/dependency-graph` run `pretest: node ../../scripts/ensure-test-artifacts.mjs`.
 - This includes clean states where those required dist directories are absent.
-- `pnpm test:gate` is the merge gate: the curated `engine-core` suite plus the CI-shape test. CI blocks PRs on exactly Lint, Typecheck, Build, and Gate (boot smoke + `pnpm test:gate`) — see `.github/workflows/pr-checks.yml` and docs/testing.md.
+- `pnpm test:gate` is the merge gate: the curated `engine-core` suite, focused CCC PRD fail-closed safety tests, and the CI-shape test. CI blocks PRs on exactly Lint, Typecheck, Build, and Gate (boot smoke + `pnpm test:gate`) — see `.github/workflows/pr-checks.yml` and docs/testing.md.
 - `pnpm verify:workspace` is the deep opt-in verification (not the merge gate) and runs in strict order:
   1. `pnpm lint`
   2. `pnpm test:full`
@@ -157,7 +157,7 @@ Never fabricate source URLs, command names, release locations, or checksums. Cit
 
 Before submitting changes, verify:
 
-- [ ] `pnpm test:gate` — the merge gate (curated engine-core suite + CI-shape test)
+- [ ] `pnpm test:gate` — the merge gate (engine-core + focused CCC PRD safety + CI-shape)
 - [ ] `pnpm verify:workspace` — deep opt-in lint → test:full → build verification
 - [ ] `pnpm typecheck` — type checking passes
 

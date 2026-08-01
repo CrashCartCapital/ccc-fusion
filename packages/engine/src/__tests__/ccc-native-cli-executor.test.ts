@@ -38,6 +38,18 @@ vi.mock("../cli-agent/task-session.js", async (importOriginal) => {
   };
 });
 
+const EXECUTION_FENCE = Object.freeze({
+  workItemId: "wi-cli-binding-red",
+  leaseOwner: "native-cli-worker",
+  attempt: 1,
+  runId: "FN-6226-run",
+});
+const WORK_ITEM_FENCE = Object.freeze({
+  workItemId: EXECUTION_FENCE.workItemId,
+  runId: EXECUTION_FENCE.runId,
+  attempt: EXECUTION_FENCE.attempt,
+});
+
 type ExecutorPrivate = {
   resolveMcpServers: (agentId?: string) => Promise<unknown[]>;
   runGraphCustomNode: (node: unknown, nodeTask: unknown, settings: unknown, columnBinding: unknown, graphContext: unknown, executionContext: unknown) => Promise<unknown>;
@@ -144,6 +156,7 @@ function createPermitScope(
     attemptOrdinal: 1,
     requestCount: 1,
     state: "dispatched_unknown",
+    workItemFence: WORK_ITEM_FENCE,
     binding,
   }) satisfies CccProviderAttemptScope;
 }
@@ -338,11 +351,7 @@ function createHarness(
   });
   const resolveMcpServersSpy = vi.spyOn(executorPrivate, "resolveMcpServers").mockImplementation(resolveMcpServers);
 
-  const executionFence = Object.freeze({
-    workItemId: "wi-cli-binding-red",
-    attempt: 1,
-    runId: "FN-6226-run",
-  });
+  const executionFence = EXECUTION_FENCE;
   const execution = Object.freeze({
     originTaskId: "FN-6226",
     semanticTaskId: "REQ-9",
@@ -484,6 +493,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         attemptOrdinal: 1,
         requestCount: 1,
         state: "dispatched_unknown",
+        workItemFence: WORK_ITEM_FENCE,
         binding: h.authorityBinding,
       });
       expect(h.reconcile).toHaveBeenCalledTimes(0);

@@ -79,10 +79,10 @@ jobs:
         run: pnpm build
 
   # The only merge-blocking TEST signal (R3). Runs the boot smoke (the app
-  # starts and serves) plus the curated engine-core suite and the CI-shape
-  # test — see `test:gate` in the root package.json. Gate membership is the
-  # explicit allow-list in packages/engine/vitest.config.ts (engine-core
-  # project); a flaky gate test is evicted by removing it from that list.
+  # starts and serves) plus the curated engine-core suite, the focused CCC PRD
+  # fail-closed safety suite, and the CI-shape test — see `test:gate` in the
+  # root package.json. General engine gate membership remains the explicit
+  # allow-list in packages/engine/vitest.config.ts (engine-core project).
   gate:
     name: Gate
     runs-on: [self-hosted, linux, ARM64, ccc-fusion]
@@ -150,10 +150,13 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Verifier confinement readiness
+        run: node scripts/check-verifier-confinement.mjs
+
       - name: Boot smoke (app starts and serves)
         run: node scripts/boot-smoke.mjs
 
-      - name: Gate tests (curated engine-core + CI-shape)
+      - name: Gate tests (engine-core + CCC PRD safety + CI-shape)
         run: pnpm test:gate
         env:
           # The runner itself is a Docker container. Reach the sibling

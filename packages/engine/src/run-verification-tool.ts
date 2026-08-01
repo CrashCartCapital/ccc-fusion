@@ -976,6 +976,35 @@ export interface VerificationResult {
   warnings: string[];
 }
 
+export interface VerifierConfinementReadiness {
+  ready: boolean;
+  backend: "sandbox-exec" | "bubblewrap" | null;
+  code: string;
+  message: string;
+  trustedPaths: readonly string[];
+  detail?: string;
+}
+
+export function isAdmittedVerifierConfinementBackend(
+  value: unknown,
+): value is Exclude<VerifierConfinementReadiness["backend"], null> {
+  return value === "sandbox-exec" || value === "bubblewrap";
+}
+
+export function isVerifierConfinementReady(
+  value: unknown,
+): value is VerifierConfinementReadiness & {
+  ready: true;
+  backend: Exclude<VerifierConfinementReadiness["backend"], null>;
+} {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const readiness = value as { ready?: unknown; backend?: unknown };
+  return readiness.ready === true
+    && isAdmittedVerifierConfinementBackend(readiness.backend);
+}
+
 // ---------------------------------------------------------------------------
 // Output buffer helper — keeps head + tail within the byte cap
 //
@@ -1075,12 +1104,88 @@ export async function runVerificationCommand(
   return withVerificationSlot(() => runVerificationCommandUnlocked(opts), opts.signal);
 }
 
+/**
+ * Proves that the host's trusted verifier-confinement backend can actually
+ * execute an isolated command. Package presence alone is insufficient: Linux
+ * container policy can make an installed bubblewrap binary unusable.
+ */
+export async function inspectVerifierConfinementReadiness(): Promise<VerifierConfinementReadiness> {
+  const backend = process.platform === "darwin"
+    ? "sandbox-exec" as const
+    : process.platform === "linux"
+      ? "bubblewrap" as const
+      : null;
+  const trustedPaths = backend === "sandbox-exec"
+    ? [SANDBOX_EXEC_PATH] as const
+    : backend === "bubblewrap"
+      ? TRUSTED_VERIFIER_BWRAP_PATHS
+      : [] as const;
+
+  if (backend === null) {
+    return {
+      ready: false,
+      backend,
+      code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+      message: `No enforced verifier confinement backend is supported on platform ${process.platform}.`,
+      trustedPaths,
+      detail: "verification was not executed because the host platform has no admitted backend",
+    };
+  }
+
+  let probeRoot: string | undefined;
+  try {
+    probeRoot = mkdtempSync(join(maybeRealpath(tmpdir()), "fusion-verifier-readiness-"));
+    const result = await runVerificationCommand({
+      command: "exit 0",
+      cwd: probeRoot,
+      timeoutMs: 10_000,
+      onHeartbeat: () => undefined,
+    });
+    const backendEvidence = result.warnings.find((warning) => warning.includes(backend));
+    if (result.success && result.exitCode === 0 && backendEvidence) {
+      return {
+        ready: true,
+        backend,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: `Verifier confinement is ready; an isolated no-op executed under ${backend}.`,
+        trustedPaths,
+        detail: backendEvidence,
+      };
+    }
+
+    const detail = [result.stderr, ...result.warnings]
+      .filter((value) => value.length > 0)
+      .join("\n")
+      .slice(0, 2_000);
+    return {
+      ready: false,
+      backend,
+      code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+      message: `Verifier confinement is unavailable; the isolated ${backend} readiness probe failed.`,
+      trustedPaths,
+      detail: detail || `readiness probe exited ${result.exitCode ?? "without an exit code"}`,
+    };
+  } catch (error) {
+    return {
+      ready: false,
+      backend,
+      code: "VERIFIER_CONFINEMENT_PROBE_FAILED",
+      message: `Verifier confinement readiness could not be established under ${backend}.`,
+      trustedPaths,
+      detail: (error instanceof Error ? error.message : String(error)).slice(0, 2_000),
+    };
+  } finally {
+    if (probeRoot) rmSync(probeRoot, { recursive: true, force: true });
+  }
+}
+
 async function runVerificationCommandUnlocked(
   opts: RunVerificationOptions,
 ): Promise<VerificationResult> {
   const { command, cwd, timeoutMs, expectFailure = false, onHeartbeat, onLine } = opts;
   const startMs = Date.now();
   const warnings: string[] = [];
+  const commandDiagnostic = `verifier command (${Buffer.byteLength(command, "utf8")} bytes)`;
 
   const stdoutBuf = createBuffer();
   const stderrBuf = createBuffer();
@@ -1119,6 +1224,7 @@ async function runVerificationCommandUnlocked(
       stdio: ["ignore", "pipe", "pipe"],
       env: launch.env,
       shell: launch.shell,
+      diagnosticLabel: launch.shell ? SANDBOX_EXEC_PATH : launch.command,
       killGraceMs: SIGKILL_GRACE_MS,
       maxLifetimeMs: timeoutMs > 0 ? timeoutMs + SIGKILL_GRACE_MS + 1_000 : undefined,
     });
@@ -1127,6 +1233,15 @@ async function runVerificationCommandUnlocked(
     let timedOut = false;
     let killed = false;
     let settled = false;
+    let aborted = false;
+    let abortListener: (() => void) | undefined;
+
+    const detachAbortListener = () => {
+      if (abortListener) {
+        opts.signal?.removeEventListener("abort", abortListener);
+        abortListener = undefined;
+      }
+    };
 
     // ── Quiet-interval synthetic heartbeat ──────────────────────────────────
     let lastLineMs = Date.now();
@@ -1134,7 +1249,7 @@ async function runVerificationCommandUnlocked(
       const silenceMs = Date.now() - lastLineMs;
       if (silenceMs >= QUIET_HEARTBEAT_INTERVAL_MS) {
         executorLog.log(
-          `[fn_run_verification] command quiet for ${Math.round(silenceMs / 1000)}s, still running... (${command})`,
+          `[fn_run_verification] ${commandDiagnostic} quiet for ${Math.round(silenceMs / 1000)}s, still running...`,
         );
         onHeartbeat();
       }
@@ -1146,20 +1261,45 @@ async function runVerificationCommandUnlocked(
       if (settled) return;
       timedOut = true;
       executorLog.warn(
-        `[fn_run_verification] hard timeout (${timeoutMs / 1000}s) — sending SIGTERM to: ${command}`,
+        `[fn_run_verification] hard timeout (${timeoutMs / 1000}s) — sending SIGTERM to ${commandDiagnostic}`,
       );
       killVerificationProcess(supervised, "SIGTERM");
 
       killTimer = setTimeout(() => {
         if (!settled) {
           executorLog.warn(
-            `[fn_run_verification] SIGTERM ignored — sending SIGKILL to: ${command}`,
+            `[fn_run_verification] SIGTERM ignored — sending SIGKILL to ${commandDiagnostic}`,
           );
           killVerificationProcess(supervised, "SIGKILL");
           killed = true;
         }
       }, SIGKILL_GRACE_MS);
     }, timeoutMs);
+
+    if (opts.signal) {
+      abortListener = () => {
+        if (settled || aborted) return;
+        aborted = true;
+        killed = true;
+        warnings.push("Verification aborted by caller signal");
+        executorLog.warn(
+          "[fn_run_verification] caller abort — sending SIGTERM to verifier process group",
+        );
+        killVerificationProcess(supervised, "SIGTERM");
+        if (!killTimer) {
+          killTimer = setTimeout(() => {
+            if (!settled) {
+              executorLog.warn(
+                "[fn_run_verification] caller abort SIGTERM ignored — sending SIGKILL to verifier process group",
+              );
+              killVerificationProcess(supervised, "SIGKILL");
+            }
+          }, SIGKILL_GRACE_MS);
+        }
+      };
+      opts.signal.addEventListener("abort", abortListener, { once: true });
+      if (opts.signal.aborted) abortListener();
+    }
 
     // ── stdout ───────────────────────────────────────────────────────────────
     let stdoutRemainder = "";
@@ -1198,6 +1338,7 @@ async function runVerificationCommandUnlocked(
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
       if (killTimer) clearTimeout(killTimer);
+      detachAbortListener();
 
       // Flush remainders
       if (stdoutRemainder) appendToBuffer(stdoutBuf, redactCapturedText(stdoutRemainder));
@@ -1206,11 +1347,11 @@ async function runVerificationCommandUnlocked(
       const exitCode = code ?? null;
       const durationMs = Date.now() - startMs;
       const zeroExit = exitCode === 0;
-      const success = expectFailure ? true : zeroExit;
+      const success = !aborted && (expectFailure ? true : zeroExit);
 
       if (!success && !timedOut) {
         executorLog.warn(
-          `[fn_run_verification] command failed (exit=${exitCode}, signal=${signal ?? "none"}): ${command}`,
+          `[fn_run_verification] ${commandDiagnostic} failed (exit=${exitCode}, signal=${signal ?? "none"})`,
         );
       }
       if (!timedOut) {
@@ -1238,6 +1379,7 @@ async function runVerificationCommandUnlocked(
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
       if (killTimer) clearTimeout(killTimer);
+      detachAbortListener();
       const durationMs = Date.now() - startMs;
       warnings.push(`Spawn error: ${err.message}`);
       const stdout = redactCapturedText(flattenBuffer(stdoutBuf));
@@ -1250,7 +1392,7 @@ async function runVerificationCommandUnlocked(
         stdout,
         stderr: redactCapturedText(flattenBuffer(stderrBuf)) + `\n${spawnError}`,
         timedOut: false,
-        killed: false,
+        killed: aborted,
         command,
         cwd,
         warnings: warnings.map(redactCapturedText),
@@ -1402,8 +1544,10 @@ export function createRunVerificationTool(
         }
       }
 
+      const effectiveCommandDiagnostic =
+        `verifier command (${Buffer.byteLength(effectiveCommand, "utf8")} bytes)`;
       log.info(
-        `[fn_run_verification] ${taskId}: scope=${scope} timeout=${timeoutSec}s cwd=${resolvedCwd} cmd=${effectiveCommand}`,
+        `[fn_run_verification] ${taskId}: scope=${scope} timeout=${timeoutSec}s cwd=${resolvedCwd} cmd=${effectiveCommandDiagnostic}`,
       );
 
       // ── Run ───────────────────────────────────────────────────────────────

@@ -321,6 +321,11 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       providerId: route.providerId,
       modelId: route.modelId,
       transport: "pi",
+      workItemFence: {
+        workItemId: campaign.parkedWorkItem.id,
+        runId: campaign.parkedWorkItem.runId,
+        attempt: campaign.parkedWorkItem.attempt,
+      },
     });
     await h.store().beginCccProviderAttemptDispatch({
       taskId: campaign.taskId,
@@ -348,9 +353,36 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
         attemptKey: reserved.attemptKey,
         taskId: campaign.taskId,
         semanticTaskId: campaign.semanticTaskId,
+        workItemFence: {
+          workItemId: campaign.parkedWorkItem.id,
+          runId: campaign.parkedWorkItem.runId,
+          attempt: campaign.parkedWorkItem.attempt,
+        },
         state: "dispatched_unknown",
       }),
     ]);
+
+    await h.store().upsertWorkflowWorkItem({
+      ...campaign.parkedWorkItem,
+      attempt: campaign.parkedWorkItem.attempt + 1,
+    });
+    const wrongAttempt = await runCommand([
+      "resolve-provider",
+      campaign.idempotencyKey,
+      reserved.attemptKey,
+      "proved-failed",
+      "operator-pg-provider",
+      PROVIDER_EVIDENCE,
+    ]);
+    expect(wrongAttempt.exitCode).toBe(1);
+    expect(wrongAttempt.json).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_MISSING",
+        message: expect.stringContaining("exact imported workflow work item"),
+      }],
+    });
+    await h.store().upsertWorkflowWorkItem(campaign.parkedWorkItem);
 
     const preview = await runCommand([
       "resolve-provider",
@@ -449,6 +481,11 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       providerId: route.providerId,
       modelId: route.modelId,
       transport: "cli",
+      workItemFence: {
+        workItemId: campaign.parkedWorkItem.id,
+        runId: campaign.parkedWorkItem.runId,
+        attempt: campaign.parkedWorkItem.attempt,
+      },
     });
     await h.store().beginCccProviderAttemptDispatch({
       taskId: campaign.taskId,

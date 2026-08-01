@@ -9,7 +9,10 @@ import {
   type CccCampaignTaskContext,
 } from "@fusion/core";
 import { inspectCccCampaignLocalGit } from "../ccc-campaign-local-git.js";
-import { preDispatchCccCampaignProviderFromEngine } from "../ccc-campaign-provider-controller.js";
+import {
+  preDispatchCccCampaignProviderFromEngine,
+  requireCccCampaignWorkItemLeaseOwner,
+} from "../ccc-campaign-provider-controller.js";
 import {
   CCC_NATIVE_CLI_BINDING_ID,
   CCC_NATIVE_CLI_BINDING_KIND,
@@ -46,6 +49,7 @@ export function createCccNativeCliProductionResolver(
 ): CccNativeCliBindingResolver {
   return async (input: CccNativeCliBindingResolverInput): Promise<CccNativeCliBinding> => {
     input.signal?.throwIfAborted();
+    const workItemLeaseOwner = requireCccCampaignWorkItemLeaseOwner(input.executionFence.leaseOwner);
     const rootDir = await realpath(options.rootDir);
     const context = await loadContext(
       options,
@@ -80,6 +84,11 @@ export function createCccNativeCliProductionResolver(
     });
     const limits = oneShotLimits(context.bounds.maxDurationMs);
     const route = Object.freeze({ ...input.expectedRoute });
+    const workItemFence = Object.freeze({
+      workItemId: input.executionFence.workItemId,
+      runId: input.executionFence.runId,
+      attempt: input.executionFence.attempt,
+    });
 
     return Object.freeze({
       kind: CCC_NATIVE_CLI_BINDING_KIND,
@@ -107,6 +116,8 @@ export function createCccNativeCliProductionResolver(
             approvalRequestId: lease.lease.approvalRequestId,
             claimToken: lease.lease.claimToken,
             ...dispatch,
+            workItemFence,
+            workItemLeaseOwner,
           },
         }),
         reconcile: (reconciliation: CccNativeCliControllerReconciliation) => options.cliSessionStore.settleCccProviderAttemptAndFence({

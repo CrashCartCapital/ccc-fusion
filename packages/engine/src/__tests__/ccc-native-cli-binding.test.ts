@@ -20,6 +20,7 @@ import {
   CCC_NATIVE_CLI_OBSERVATION_KIND,
   CCC_NATIVE_CLI_OBSERVATION_VERSION,
   buildCccNativeCliSessionPolicy,
+  validateCccNativeCliPermitScope,
   validateCccNativeCliSessionPolicy,
   validateCccNativeCliObservation,
   validateCccNativeCliBinding,
@@ -90,6 +91,11 @@ function createPermitScope(): CccProviderAttemptScope {
     attemptOrdinal: 1,
     requestCount: 1,
     state: "dispatched_unknown",
+    workItemFence: Object.freeze({
+      workItemId: "work-item-native-cli-1",
+      runId: "run-native-cli-1",
+      attempt: 1,
+    }),
     binding: Object.freeze(
       createCccCampaignAuthorityBinding(context, {
         actionId: "provider:direct",
@@ -97,6 +103,25 @@ function createPermitScope(): CccProviderAttemptScope {
       }),
     ),
   }) satisfies CccProviderAttemptScope;
+}
+
+function permitScopeExpectation(
+  scope: CccProviderAttemptScope,
+  executionFence: object = scope.workItemFence as object,
+) {
+  return {
+    dispatchRequest: Object.freeze({
+      turnKey: scope.turnKey,
+      dispatchKey: scope.dispatchKey,
+      providerId: scope.binding.providerId,
+      modelId: scope.binding.modelId,
+      transport: scope.binding.transport,
+    }),
+    semanticTaskId: scope.semanticTaskId,
+    nativeTaskId: scope.taskId,
+    authorityBindingHash: scope.binding.bindingHash,
+    executionFence,
+  } as const;
 }
 
 function createObservation(overrides: Partial<{
@@ -162,6 +187,25 @@ function createTerminalScope(
 }
 
 describe("CCC native CLI binding", () => {
+  it("Task provider-fence RED: requires one frozen exact work-item fence matching sealed execution", () => {
+    const scope = createPermitScope();
+    const sealedExecutionFence = Object.freeze({
+      ...scope.workItemFence,
+      leaseOwner: "native-cli-worker",
+    });
+    expect(validateCccNativeCliPermitScope(scope, permitScopeExpectation(scope, sealedExecutionFence))).toBe(scope);
+
+    for (const [label, candidate] of [
+      ["missing", Object.freeze(Object.fromEntries(Object.entries(scope).filter(([key]) => key !== "workItemFence")))],
+      ["mutable", Object.freeze({ ...scope, workItemFence: { ...scope.workItemFence } })],
+      ["extra-key", Object.freeze({ ...scope, workItemFence: Object.freeze({ ...scope.workItemFence, extra: true }) })],
+      ["mismatch", Object.freeze({ ...scope, workItemFence: Object.freeze({ ...scope.workItemFence, attempt: 2 }) })],
+    ] as const) {
+      expect(() => validateCccNativeCliPermitScope(candidate, permitScopeExpectation(scope, sealedExecutionFence)), label)
+        .toThrow(/work-item fence|workItemFence|exact keys/i);
+    }
+  });
+
   it("Task 4 GREEN: host policy preserves the frozen route and limits and caps lifetime at observation", () => {
     const permitScope = createPermitScope();
     const route = Object.freeze({ adapterId: "test-cli-adapter", providerId: "openai", modelId: "gpt-4o", transport: "cli" as const });

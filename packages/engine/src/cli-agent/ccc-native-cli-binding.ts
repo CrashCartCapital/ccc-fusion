@@ -163,6 +163,7 @@ export interface CccNativeCliPermitScopeValidationExpectation {
   semanticTaskId: string;
   nativeTaskId: string;
   authorityBindingHash: string;
+  executionFence: WorkflowNodeExecutionFence;
 }
 
 export interface CccNativeCliSessionPolicyValidationExpectation {
@@ -181,8 +182,8 @@ const ATTEMPT_KEY_PATTERN = /^ccc-provider-attempt-[a-f0-9]{64}$/;
 const CONTROLLER_TOKEN_PATTERN = /^ccc-provider-controller-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ROOT_KEYS = ["kind", "version", "id", "turnKey", "dispatchKey", "authorityBindingHash", "route", "limits", "followUp", "observer", "controller"] as const;
 const SESSION_POLICY_KEYS = ["kind", "version", "attemptKey", "controllerToken", "taskId", "authorityBindingHash", "turnKey", "dispatchKey", "route", "deadlineAtMs", "limits"] as const;
-const PERMIT_SCOPE_KEYS = ["attemptKey", "controllerToken", "taskId", "semanticTaskId", "campaignDeadlineAt", "turnKey", "dispatchKey", "attemptOrdinal", "requestCount", "state", "binding"] as const;
-const TERMINAL_SCOPE_KEYS = ["attemptKey", "controllerToken", "taskId", "semanticTaskId", "campaignDeadlineAt", "turnKey", "dispatchKey", "attemptOrdinal", "requestCount", "state", "binding", "terminal"] as const;
+const PERMIT_SCOPE_KEYS = ["attemptKey", "controllerToken", "taskId", "semanticTaskId", "campaignDeadlineAt", "turnKey", "dispatchKey", "attemptOrdinal", "requestCount", "state", "workItemFence", "binding"] as const;
+const TERMINAL_SCOPE_KEYS = ["attemptKey", "controllerToken", "taskId", "semanticTaskId", "campaignDeadlineAt", "turnKey", "dispatchKey", "attemptOrdinal", "requestCount", "state", "workItemFence", "binding", "terminal"] as const;
 const OBSERVATION_KEYS = ["kind", "version", "outcome", "evidenceDigest"] as const;
 const TERMINAL_KEYS = ["kind", "state", "evidenceDigest", "observerId"] as const;
 const HELD_CLOSURE_RECEIPT_KEYS = ["kind", "version", "sessionId", "attemptKey", "controllerToken", "taskId", "authorityBindingHash", "turnKey", "dispatchKey", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
@@ -191,6 +192,8 @@ const ROUTE_KEYS = ["adapterId", "providerId", "modelId", "transport"] as const;
 const LIMIT_KEYS = ["maxRequests", "lifetimeMs", "termGraceMs", "killClosureMs"] as const;
 const OBSERVER_KEYS = ["id", "observe"] as const;
 const CONTROLLER_KEYS = ["preDispatch", "reconcile"] as const;
+const WORK_ITEM_FENCE_KEYS = ["workItemId", "runId", "attempt"] as const;
+const LEASED_EXECUTION_FENCE_KEYS = ["workItemId", "leaseOwner", "attempt", "runId"] as const;
 
 export function assertCanonicalCccNativeCliTurnKey(value: unknown, label = "turnKey"): string {
   if (typeof value !== "string" || !TURN_KEY_PATTERN.test(value)) {
@@ -251,6 +254,7 @@ export function validateCccNativeCliPermitScope(
   if (scope.requestCount !== 1) throw refused("permit scope requestCount must be exactly 1");
   if (scope.state !== "dispatched_unknown") throw refused("permit scope state must be dispatched_unknown");
   if (Object.hasOwn(scope, "terminal")) throw refused("permit scope terminal must be absent");
+  validateWorkItemFence(scope.workItemFence, expected.executionFence, "permit scope work-item fence");
   if (!Object.isFrozen(scope.binding)) throw refused("permit scope binding must be frozen");
 
   let authorityBinding: CccCampaignAuthorityBinding;
@@ -312,6 +316,7 @@ export function validateCccNativeCliHoldScope(
     attemptOrdinal: scope.attemptOrdinal,
     requestCount: scope.requestCount,
     state: "dispatched_unknown" as const,
+    workItemFence: scope.workItemFence,
     binding: scope.binding,
   });
   const validatedPermit = validateCccNativeCliPermitScope(permitScope, expected);
@@ -422,6 +427,11 @@ export function validateCccNativeCliTerminalScope(
   if (scope.attemptOrdinal !== expected.permitScope.attemptOrdinal) throw refused("terminal scope attemptOrdinal mismatch");
   if (scope.requestCount !== expected.permitScope.requestCount) throw refused("terminal scope requestCount mismatch");
   if (scope.state !== observation.outcome) throw refused("terminal scope state must match observation outcome");
+  validateWorkItemFence(
+    scope.workItemFence,
+    expected.permitScope.workItemFence,
+    "terminal scope work-item fence",
+  );
   const terminalBinding = validateAuthorityBinding(scope.binding, "terminal scope authority binding");
   const permitBinding = validateAuthorityBinding(expected.permitScope.binding, "permit scope authority binding");
   if (terminalBinding.bindingHash !== permitBinding.bindingHash) {
@@ -611,6 +621,49 @@ function validateAuthorityBinding(value: unknown, label: string): CccCampaignAut
       `CCC native CLI binding refused: ${label} invalid: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+function validateWorkItemFence(
+  value: unknown,
+  expected: unknown,
+  label: string,
+): WorkflowNodeExecutionFence {
+  const expectedHasLeaseOwner = isPlainObject(expected) && Object.hasOwn(expected, "leaseOwner");
+  const sealedFence = requirePlainFrozenExactObject(
+    expected,
+    expectedHasLeaseOwner ? LEASED_EXECUTION_FENCE_KEYS : WORK_ITEM_FENCE_KEYS,
+    "sealed execution work-item fence",
+  ) as Record<string, unknown>;
+  const sealedWorkItemId = assertCanonicalCccNativeCliText(
+    sealedFence.workItemId,
+    "sealed execution work-item fence workItemId",
+  );
+  const sealedRunId = assertCanonicalCccNativeCliText(
+    sealedFence.runId,
+    "sealed execution work-item fence runId",
+  );
+  const sealedAttempt = requirePositiveSafeInteger(
+    sealedFence.attempt,
+    "sealed execution work-item fence attempt",
+  );
+  if (expectedHasLeaseOwner) {
+    assertCanonicalCccNativeCliText(
+      sealedFence.leaseOwner,
+      "sealed execution work-item fence leaseOwner",
+    );
+  }
+  const fence = requirePlainFrozenExactObject(value, WORK_ITEM_FENCE_KEYS, label) as Record<string, unknown>;
+  const workItemId = assertCanonicalCccNativeCliText(fence.workItemId, `${label} workItemId`);
+  const runId = assertCanonicalCccNativeCliText(fence.runId, `${label} runId`);
+  const attempt = requirePositiveSafeInteger(fence.attempt, `${label} attempt`);
+  if (
+    workItemId !== sealedWorkItemId
+    || runId !== sealedRunId
+    || attempt !== sealedAttempt
+  ) {
+    throw refused(`${label} must match sealed execution fence`);
+  }
+  return value as WorkflowNodeExecutionFence;
 }
 
 function validateTerminalReceipt(value: unknown, observation: CccNativeCliObservation, observerId: CccNativeCliTerminalObserverId): void {

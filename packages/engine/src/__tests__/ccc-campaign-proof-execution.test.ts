@@ -17,6 +17,16 @@ import { __testOnlyDetectTrustedVerifierBwrap } from "../run-verification-tool.j
 
 const execFile = promisify(execFileCallback);
 const scratchRoots: string[] = [];
+const verifierConfinementReady = async () => ({
+  ready: true as const,
+  backend: process.platform === "darwin" ? "sandbox-exec" as const : "bubblewrap" as const,
+  code: "VERIFIER_CONFINEMENT_READY",
+  message: "verifier confinement readiness probe passed",
+  trustedPaths: process.platform === "darwin"
+    ? ["/usr/bin/sandbox-exec"] as const
+    : ["/usr/bin/bwrap", "/bin/bwrap"] as const,
+  detail: "test-injected ready confinement",
+});
 
 function canExecuteVerifierSandbox(): boolean {
   if (process.platform === "darwin") return existsSync("/usr/bin/sandbox-exec");
@@ -281,6 +291,88 @@ describe("CCC campaign proof-suite execution", () => {
     expect(begin).toHaveBeenCalledTimes(2);
   });
 
+  it("refuses unavailable verifier confinement before reserving a proof attempt or running a verifier", async () => {
+    const f = await fixture();
+    const reserve = vi.fn(async () => ({
+      attemptKey: "ccc-proof-attempt-readiness",
+      controllerToken: "ccc-proof-controller-readiness",
+      state: "reserved" as const,
+    }));
+    const begin = vi.fn(async () => ({
+      kind: "dispatch-permit" as const,
+      attempt: {
+        attemptKey: "ccc-proof-attempt-readiness",
+        controllerToken: "ccc-proof-controller-readiness",
+        state: "dispatched_unknown" as const,
+      },
+    }));
+    const settle = vi.fn(async () => ({
+      attemptKey: "ccc-proof-attempt-readiness",
+      controllerToken: "ccc-proof-controller-readiness",
+      state: "committed" as const,
+    }));
+    const runVerification = vi.fn(async (options: { command: string; cwd: string }) => ({
+      success: true,
+      exitCode: 0,
+      durationMs: 1,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      killed: false,
+      command: options.command,
+      cwd: options.cwd,
+      warnings: [],
+    }));
+    const inspectVerifierConfinementReadiness = vi.fn(async () => ({
+      ready: true as const,
+      backend: "native" as never,
+      code: "VERIFIER_CONFINEMENT_INVALID_RESULT",
+      message: "readiness result named an unadmitted backend",
+      trustedPaths: [] as const,
+      detail: "malformed readiness must fail closed",
+    }));
+    const handler = createCccCampaignProofSuiteHandler({
+      rootDir: f.repo,
+      store: {
+        getTask: async () => f.task,
+        getCccCampaignContextForTask: async () => f.campaign,
+        getAsyncLayer: () => ({}) as never,
+        assertCccCampaignWorkflowLeaseFence: async () => undefined,
+      },
+      proofAttempts: { reserve, begin, settle },
+      runVerification,
+      inspectVerifierConfinementReadiness,
+    });
+
+    await expect(handler(f.node, {
+      task: f.task,
+      settings: { verificationCommandTimeoutMs: 30_000 },
+      context: {},
+      execution: {
+        originTaskId: f.task.id,
+        semanticTaskId: f.semanticTaskId,
+        nativeTaskId: f.task.id,
+        semanticTask: f.task,
+        runId: "RUN-proof",
+        visitIdentity: { nodeId: f.node.id, materializedNodeId: f.node.id },
+        executionFence: {
+          workItemId: "WORK-proof",
+          leaseOwner: "proof-worker",
+          attempt: 1,
+          runId: "RUN-proof",
+        },
+      },
+    } as never)).rejects.toMatchObject({
+      name: PermanentError.name,
+      code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+    });
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(1);
+    expect(reserve).not.toHaveBeenCalled();
+    expect(begin).not.toHaveBeenCalled();
+    expect(runVerification).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
+  });
+
   it("settles an otherwise successful verifier as failed when it mutates the inspected worktree", async () => {
     const f = await fixture();
     const settle = vi.fn(async (input: {
@@ -331,6 +423,7 @@ describe("CCC campaign proof-suite execution", () => {
         settle,
       },
       runVerification: runVerification as never,
+      inspectVerifierConfinementReadiness: verifierConfinementReady,
     });
 
     await expect(handler(f.node, {
@@ -409,6 +502,7 @@ describe("CCC campaign proof-suite execution", () => {
         cwd: options.cwd,
         warnings: [],
       }),
+      inspectVerifierConfinementReadiness: verifierConfinementReady,
     });
 
     await expect(handler(f.node, {
@@ -461,6 +555,7 @@ describe("CCC campaign proof-suite execution", () => {
         settle: vi.fn(),
       },
       runVerification,
+      inspectVerifierConfinementReadiness: verifierConfinementReady,
     });
 
     await expect(handler(f.node, {
@@ -507,6 +602,7 @@ describe("CCC campaign proof-suite execution", () => {
         begin: vi.fn(),
         settle: vi.fn(),
       },
+      inspectVerifierConfinementReadiness: verifierConfinementReady,
     });
 
     await expect(handler(f.node, {

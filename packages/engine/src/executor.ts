@@ -81,7 +81,10 @@ import { createWorkflowRuntimePrimitiveProvider } from "./workflow-runtime-primi
 import { WorkflowCustomNodeExecutionService } from "./workflow-custom-node-execution.js";
 import { WorkflowReviewService } from "./workflow-review-service.js";
 import { WorkflowPlanningService } from "./workflow-planning-service.js";
-import { createCccCampaignProviderAttemptBinding } from "./ccc-campaign-provider-controller.js";
+import {
+  createCccCampaignProviderAttemptBinding,
+  requireCccCampaignWorkItemLeaseOwner,
+} from "./ccc-campaign-provider-controller.js";
 import type { WorkflowNodeProviderControllerResolverInput } from "./workflow-graph-executor.js";
 import {
   buildPlanVerifiedMessage,
@@ -7788,7 +7791,16 @@ export class TaskExecutor {
   public createCccCampaignWorkflowNodeProviderControllerResolver() {
     return async (input: WorkflowNodeProviderControllerResolverInput) => {
       const turnKey = input.execution.providerAttemptTurnKey;
-      if (!turnKey) throw new Error("CCC workflow provider controller requires sealed provider attempt turn identity");
+      const executionFence = input.execution.executionFence;
+      if (!turnKey || !executionFence) {
+        throw new Error("CCC workflow provider controller requires sealed provider attempt turn and work-item fence identity");
+      }
+      const workItemFence = Object.freeze({
+        workItemId: executionFence.workItemId,
+        runId: executionFence.runId,
+        attempt: executionFence.attempt,
+      });
+      const workItemLeaseOwner = requireCccCampaignWorkItemLeaseOwner(executionFence.leaseOwner);
       const layer = this.store.getAsyncLayer();
       if (!layer) throw new Error("CCC workflow provider controller requires PostgreSQL TaskStore");
       const binding = await createCccCampaignProviderAttemptBinding({
@@ -7798,6 +7810,8 @@ export class TaskExecutor {
         semanticTaskId: input.execution.semanticTaskId,
         nativeTaskId: input.execution.nativeTaskId,
         turnKey,
+        workItemFence,
+        workItemLeaseOwner,
         expectedRoute: Object.freeze({
           transport: "workflow" as const,
           workflowExtensionId: input.extensionId,
@@ -7816,9 +7830,16 @@ export class TaskExecutor {
     signal?: AbortSignal;
   }) {
     const turnKey = input.execution.providerAttemptTurnKey;
-    if (!turnKey || !input.provider || !input.modelId) {
-      throw new Error("CCC workflow model node requires sealed turn identity and resolved provider/model before PI session creation");
+    const executionFence = input.execution.executionFence;
+    if (!turnKey || !executionFence || !input.provider || !input.modelId) {
+      throw new Error("CCC workflow model node requires sealed turn and work-item fence identity plus resolved provider/model before PI session creation");
     }
+    const workItemFence = Object.freeze({
+      workItemId: executionFence.workItemId,
+      runId: executionFence.runId,
+      attempt: executionFence.attempt,
+    });
+    const workItemLeaseOwner = requireCccCampaignWorkItemLeaseOwner(executionFence.leaseOwner);
     const layer = this.store.getAsyncLayer();
     if (!layer) throw new Error("CCC workflow model node requires PostgreSQL TaskStore");
     return createCccCampaignProviderAttemptBinding({
@@ -7828,6 +7849,8 @@ export class TaskExecutor {
       semanticTaskId: input.execution.semanticTaskId,
       nativeTaskId: input.execution.nativeTaskId,
       turnKey,
+      workItemFence,
+      workItemLeaseOwner,
       expectedRoute: Object.freeze({ providerId: input.provider, modelId: input.modelId, transport: "pi" as const }),
       signal: input.signal,
     });
@@ -9975,6 +9998,7 @@ export class TaskExecutor {
           semanticTaskId: execution.semanticTaskId,
           nativeTaskId: execution.nativeTaskId,
           authorityBindingHash: binding.authorityBindingHash,
+          executionFence,
         });
         if (preDispatchDecision.reason === "terminal") {
           if (heldScope.state !== "committed" && heldScope.state !== "proved_failed") {
@@ -10026,6 +10050,7 @@ export class TaskExecutor {
         semanticTaskId: execution.semanticTaskId,
         nativeTaskId: execution.nativeTaskId,
         authorityBindingHash: binding.authorityBindingHash,
+        executionFence,
       });
       fencedCliConfig = Object.freeze({
         ...resolvedConfig,
