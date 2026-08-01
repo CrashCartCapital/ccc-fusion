@@ -554,11 +554,14 @@ async function assertExactImplementationFactProvenance(
     "admittedWriteRoots[0].purpose",
   ]);
   const sources = new Map();
-  const sourceFor = async (path) => {
-    if (!sources.has(path)) {
-      sources.set(path, await readFile(path.join(packetRoot, path)));
+  const sourceFor = async (sourceRelativePath) => {
+    if (!sources.has(sourceRelativePath)) {
+      sources.set(
+        sourceRelativePath,
+        await readFile(path.join(packetRoot, sourceRelativePath)),
+      );
     }
-    return sources.get(path);
+    return sources.get(sourceRelativePath);
   };
   const displayPosition = (source, byteOffset) => {
     const lines = source.subarray(0, byteOffset).toString("utf8").split("\n");
