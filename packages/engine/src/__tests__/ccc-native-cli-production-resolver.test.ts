@@ -126,6 +126,7 @@ describe("CCC native CLI production resolver", () => {
     expect(effects.preDispatch).toHaveBeenCalledWith(expect.objectContaining({
       initialGitSnapshot: gitSnapshot,
       preDispatch: expect.objectContaining({
+        originTaskId: "FN-9",
         taskId: "FN-9",
         workItemFence,
         workItemLeaseOwner: executionFence.leaseOwner,

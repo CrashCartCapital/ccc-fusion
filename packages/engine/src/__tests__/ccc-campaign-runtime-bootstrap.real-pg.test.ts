@@ -992,6 +992,7 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       layer: h.layer(),
       rootDir,
       authorityStore: store,
+      originTaskId: taskId,
       semanticTaskId,
       nativeTaskId: taskId,
       turnKey: dispatch.turnKey,
@@ -1097,12 +1098,12 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       transport: campaign.route.transport,
     });
     const bindingA = await createCccCampaignProviderAttemptBinding({
-      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchA.turnKey,
+      layer: h.layer(), rootDir, authorityStore: store, originTaskId: taskId, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchA.turnKey,
       ...providerWorkItem,
       expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
     });
     const bindingB = await createCccCampaignProviderAttemptBinding({
-      layer: h.layer(), rootDir, authorityStore: store, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchB.turnKey,
+      layer: h.layer(), rootDir, authorityStore: store, originTaskId: taskId, semanticTaskId, nativeTaskId: taskId, turnKey: dispatchB.turnKey,
       ...providerWorkItem,
       expectedRoute: { transport: "pi", providerId: campaign.route.providerId, modelId: campaign.route.modelId },
     });

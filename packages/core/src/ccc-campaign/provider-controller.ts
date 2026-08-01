@@ -36,6 +36,8 @@ export type AtomicCccCampaignProviderDispatchInput = Readonly<{
   rootDir: string;
   authorityStore: CccCampaignAuthorityStore;
   gitObservation: Readonly<{ targetRoot: string; expectedBaseObject: string; head: string; headDescendsFromExpectedBase: true }>;
+  /** Sealed graph task that owns the active workflow work item for this semantic task dispatch. */
+  originTaskId: string;
   taskId: string;
   approvalRequestId: string;
   claimToken: string;
@@ -85,6 +87,13 @@ function requireWorkItemLeaseOwner(value: unknown): string {
   return value;
 }
 
+function requireOriginTaskId(value: unknown): string {
+  if (typeof value !== "string" || !CANONICAL_IDENTIFIER.test(value)) {
+    throw new Error("CCC campaign workflow origin task ID is invalid");
+  }
+  return value;
+}
+
 export function selectCccCampaignDeclaredLiveExecutionAction(
   protectedActions: readonly CccPrdProtectedActionIntent[],
   protectedActionIds?: readonly string[],
@@ -126,9 +135,29 @@ export async function atomicReserveCccCampaignProviderDispatch(
 ): Promise<CccCampaignProviderControllerDecision> {
   const workItemFence = requireWorkItemFence(input.workItemFence);
   const workItemLeaseOwner = requireWorkItemLeaseOwner(input.workItemLeaseOwner);
+  const originTaskId = requireOriginTaskId(input.originTaskId);
   return input.layer.transactionImmediate(async (tx) => {
     const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, input.taskId, tx, true);
     if (!context) throw new Error(`Task ${input.taskId} has no persisted CCC campaign context`);
+    const originContext = originTaskId === context.taskId
+      ? context
+      : await loadCccCampaignContextForTask(input.layer, input.rootDir, originTaskId, tx, true);
+    if (
+      !originContext
+      || originContext.taskId !== originTaskId
+      || originContext.projectId !== context.projectId
+      || originContext.importId !== context.importId
+      || originContext.campaignId !== context.campaignId
+      || originContext.idempotencyKey !== context.idempotencyKey
+      || originContext.packetHash !== context.packetHash
+      || originContext.sidecarHash !== context.sidecarHash
+      || originContext.bundleHash !== context.bundleHash
+      || originContext.manifestHash !== context.manifestHash
+      || originContext.targetRepository.path !== context.targetRepository.path
+      || originContext.targetRepository.baseCommit !== context.targetRepository.baseCommit
+    ) {
+      throw new Error("CCC campaign workflow origin task does not match semantic task campaign custody");
+    }
     if (
       input.gitObservation.targetRoot !== context.targetRepository.path
       || input.gitObservation.expectedBaseObject !== context.targetRepository.baseCommit
@@ -144,7 +173,7 @@ export async function atomicReserveCccCampaignProviderDispatch(
       .where(and(
         eq(schema.project.workflowWorkItems.projectId, context.projectId),
         eq(schema.project.workflowWorkItems.id, workItemFence.workItemId),
-        eq(schema.project.workflowWorkItems.taskId, context.taskId),
+        eq(schema.project.workflowWorkItems.taskId, originTaskId),
         eq(schema.project.workflowWorkItems.runId, workItemFence.runId),
         eq(schema.project.workflowWorkItems.attempt, workItemFence.attempt),
         eq(schema.project.workflowWorkItems.state, "running"),

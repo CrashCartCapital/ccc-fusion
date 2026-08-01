@@ -30,6 +30,7 @@ const preDispatch = Object.freeze({
   layer: {},
   rootDir: "/tmp/store",
   authorityStore: {},
+  originTaskId: "TASK-ORIGIN",
   taskId: "TASK-1",
   approvalRequestId: "approval-1",
   claimToken: "claim-1",
@@ -46,6 +47,7 @@ const action = Object.freeze({ actionId: "ACTION-1", actionTarget: "target", req
 const authority = Object.freeze({ bindingHash: "binding-hash" });
 const semanticTaskId = "TASK-1";
 const nativeTaskId = "FN-1";
+const originTaskId = "FN-ORIGIN";
 const lease = Object.freeze({
   binding: authority,
   lease: Object.freeze({ bindingHash: authority.bindingHash, actionId: action.actionId, actionTarget: action.actionTarget, approvalRequestId: "approval-1", claimToken: "claim-1" }),
@@ -68,7 +70,7 @@ function bindingInput(route: Readonly<{ transport: "pi" | "workflow" | "cli"; pr
   };
   return {
     authorityStore,
-    input: { layer: { transaction: async (fn: (tx: unknown) => unknown) => fn({}) }, rootDir: "/tmp/target", authorityStore, semanticTaskId, nativeTaskId, turnKey: "turn-1", workItemFence, workItemLeaseOwner, expectedRoute } as never,
+    input: { layer: { transaction: async (fn: (tx: unknown) => unknown) => fn({}) }, rootDir: "/tmp/target", authorityStore, originTaskId, semanticTaskId, nativeTaskId, turnKey: "turn-1", workItemFence, workItemLeaseOwner, expectedRoute } as never,
   };
 }
 
@@ -103,6 +105,7 @@ describe("CCC campaign provider controller", () => {
       providerId: "provider-1",
       modelId: "model-1",
       transport: "pi",
+      originTaskId: "TASK-ORIGIN",
     }));
     expect(snapshot).toEqual(expect.objectContaining({ head: "a".repeat(40) }));
   });
@@ -215,6 +218,7 @@ describe("CCC campaign provider controller", () => {
       .resolves.toEqual({ kind: "dispatch-permit" });
     expect(effects.core).toHaveBeenCalledWith(expect.objectContaining({
       ...dispatch,
+      originTaskId,
       taskId: nativeTaskId,
       workItemFence,
       workItemLeaseOwner,

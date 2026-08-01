@@ -41,20 +41,23 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
 
   async function fixture(
     suffix: string,
-    options: Readonly<{ protectedActions?: TestBundle["protectedActions"]; taskProtectedActionIds?: readonly string[]; issueApproval?: boolean; baseCommit?: string }> = {},
+    options: Readonly<{ protectedActions?: TestBundle["protectedActions"]; taskProtectedActionIds?: readonly string[]; protectedTaskIndexes?: readonly number[]; issueApproval?: boolean; baseCommit?: string }> = {},
   ) {
     const initial = createCccPrdImportTestBundle(h.rootDir(), suffix);
     const protectedActions = options.protectedActions ?? [{ id: "ACTION-LIVE-EXECUTION", kind: "live_execution", target: "ccc-lab-super:pre-live-provider-gate", requiresOperatorDecision: true, operatorDecision: "approve_live_execution", spans: [initial.tasks[0]!.spans[0]!] }];
+    const protectedTaskIndexes = new Set(options.protectedTaskIndexes ?? [0]);
     const source = rehashCccPrdImportTestBundle({
       ...initial,
       targetRepository: options.baseCommit ? { ...initial.targetRepository, baseCommit: options.baseCommit } : initial.targetRepository,
       bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
-      tasks: initial.tasks.map((task, index) => index === 0 ? { ...task, protectedActionIds: [...(options.taskProtectedActionIds ?? ["ACTION-LIVE-EXECUTION"])] } : task),
+      tasks: initial.tasks.map((task, index) => protectedTaskIndexes.has(index) ? { ...task, protectedActionIds: [...(options.taskProtectedActionIds ?? ["ACTION-LIVE-EXECUTION"])] } : task),
       protectedActions,
     });
     const imported = await importCccPrdBundle({ bundle: source, idempotencyKey: `controller-${suffix}`, store: h.store(), layer: h.layer(), rootDir: h.rootDir(), executionPolicy: createCccPrdImportTestExecutionPolicy(source) });
     const semanticTaskId = `TASK-${suffix}`;
+    const terminalSemanticTaskId = `TASK-terminal-${suffix}`;
     const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
+    const terminalTaskId = await nativeTaskIdForImport(imported.importId, terminalSemanticTaskId);
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error("missing campaign");
     expect(campaign).toMatchObject({ taskId, semanticTaskId });
@@ -79,7 +82,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     if (options.issueApproval !== false) {
       await claimCccCampaignApproval(h.layer(), { authorityStore: h.store(), rootDir: h.rootDir(), taskId, action, claimant: worker, runId: `claim-${suffix}`, claimToken });
     }
-    return { taskId, semanticTaskId, campaign, issued, claimToken, workItemFence, workItemLeaseOwner };
+    return { taskId, semanticTaskId, terminalTaskId, terminalSemanticTaskId, campaign, issued, claimToken, workItemFence, workItemLeaseOwner };
   }
 
   function input(f: Awaited<ReturnType<typeof fixture>>, suffix: string) {
@@ -93,6 +96,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
         head: f.campaign.targetRepository.baseCommit,
         headDescendsFromExpectedBase: true as const,
       },
+      originTaskId: f.taskId,
       taskId: f.taskId,
       approvalRequestId: f.issued.id,
       claimToken: f.claimToken,
@@ -117,6 +121,68 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     const f = await fixture("exact");
     await expect(atomicReserveCccCampaignProviderDispatch(input(f, "exact"))).resolves.toMatchObject({ kind: "dispatch-permit", scope: { semanticTaskId: f.campaign.semanticTaskId, workItemFence: f.workItemFence, binding: { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate" } } });
     expect(await counts()).toEqual({ attempts: 2, requestCount: 1 });
+  });
+
+  it("admits a semantic branch against its campaign origin task's active workflow work-item fence", async () => {
+    const f = await fixture("branch-origin-fence", {
+      protectedTaskIndexes: [0, 1],
+      issueApproval: false,
+    });
+    const branchCampaign = await h.store().getCccCampaignContextForTask(f.terminalTaskId);
+    if (!branchCampaign) throw new Error("missing branch campaign context");
+    const action = { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate", requireProtected: true };
+    const branchIssued = await issueCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: f.terminalTaskId,
+      action,
+      requester: worker,
+      runId: "issue-branch-origin-fence",
+      notBeforeAt: branchCampaign.campaignStartedAt,
+      expiresAt: branchCampaign.campaignDeadlineAt,
+    });
+    const branchClaimToken = "claim-branch-origin-fence";
+    await claimCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: f.terminalTaskId,
+      action,
+      claimant: worker,
+      runId: "claim-branch-origin-fence",
+      claimToken: branchClaimToken,
+    });
+
+    await expect(atomicReserveCccCampaignProviderDispatch({
+      ...input(f, "branch-origin-fence"),
+      originTaskId: f.taskId,
+      taskId: f.terminalTaskId,
+      approvalRequestId: branchIssued.id,
+      claimToken: branchClaimToken,
+      providerId: branchCampaign.route.providerId,
+      modelId: branchCampaign.route.modelId,
+      transport: branchCampaign.route.transport,
+    })).resolves.toMatchObject({
+      kind: "dispatch-permit",
+      scope: {
+        taskId: f.terminalTaskId,
+        semanticTaskId: f.terminalSemanticTaskId,
+        workItemFence: f.workItemFence,
+      },
+    });
+    expect(await counts()).toEqual({ attempts: 2, requestCount: 1 });
+  });
+
+  it("refuses a workflow origin task and work-item fence from a different campaign without provider-attempt residue", async () => {
+    const semantic = await fixture("semantic-origin");
+    const foreign = await fixture("foreign-origin", { issueApproval: false });
+
+    await expect(atomicReserveCccCampaignProviderDispatch({
+      ...input(semantic, "foreign-origin"),
+      originTaskId: foreign.taskId,
+      workItemFence: foreign.workItemFence,
+      workItemLeaseOwner: foreign.workItemLeaseOwner,
+    })).rejects.toThrow(/origin task.*campaign custody/i);
+    expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
   });
 
   it.each([
@@ -358,6 +424,7 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
       rootDir: h.rootDir(),
       authorityStore: h.store(),
       gitObservation: { targetRoot: h.rootDir(), expectedBaseObject: "a".repeat(40), head: "a".repeat(40), headDescendsFromExpectedBase: true },
+      originTaskId: "TASK-not-imported",
       taskId: "TASK-not-imported",
       approvalRequestId: "approval",
       claimToken: "claim",

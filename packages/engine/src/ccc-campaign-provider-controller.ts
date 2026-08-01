@@ -59,6 +59,8 @@ type CccCampaignProviderAttemptBindingInput = Readonly<{
   layer: AsyncDataLayer;
   rootDir: string;
   authorityStore: CccCampaignAuthorityStore;
+  /** Sealed graph task that owns the active workflow work-item fence. */
+  originTaskId: string;
   semanticTaskId: string;
   nativeTaskId?: string;
   turnKey: string;
@@ -145,6 +147,7 @@ export async function createCccCampaignProviderAttemptBinding(
           layer: input.layer,
           authorityStore: input.authorityStore,
           rootDir,
+          originTaskId: input.originTaskId,
           taskId: context.taskId,
           approvalRequestId: approvalCustody.approvalRequestId,
           claimToken: approvalCustody.claimToken,

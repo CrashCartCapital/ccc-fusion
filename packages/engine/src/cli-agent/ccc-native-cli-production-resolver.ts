@@ -112,6 +112,7 @@ export function createCccNativeCliProductionResolver(
             layer: options.layer,
             authorityStore: options.campaignAuthorityStore,
             rootDir,
+            originTaskId: input.originTaskId,
             taskId: context.taskId,
             approvalRequestId: lease.lease.approvalRequestId,
             claimToken: lease.lease.claimToken,

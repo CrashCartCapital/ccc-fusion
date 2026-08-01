@@ -1534,6 +1534,7 @@ describe("fast mode workflow/runtime invariants", () => {
     );
 
     expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledWith(expect.objectContaining({
+      originTaskId: execution.originTaskId,
       semanticTaskId: "FN-6226-semantic",
       turnKey: execution.providerAttemptTurnKey,
       workItemFence: Object.freeze({
@@ -1601,6 +1602,7 @@ describe("fast mode workflow/runtime invariants", () => {
     } as any)).resolves.toBe(binding);
 
     expect(createCccCampaignProviderAttemptBindingMock).toHaveBeenCalledWith(expect.objectContaining({
+      originTaskId: execution.originTaskId,
       semanticTaskId: execution.semanticTaskId,
       nativeTaskId: execution.nativeTaskId,
       turnKey: execution.providerAttemptTurnKey,
