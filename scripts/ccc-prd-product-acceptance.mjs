@@ -15,6 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
+import { createRequire } from "node:module";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -24,6 +25,10 @@ const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+const requireCoreDependency = createRequire(
+  path.join(repoRoot, "packages/core/package.json"),
+);
+const postgres = requireCoreDependency("postgres");
 const cliBin = path.join(repoRoot, "packages/cli/bin.mjs");
 const expectedChecks = Object.freeze([
   "built-cli-current-run",
@@ -200,6 +205,236 @@ async function run(command, args, options = {}) {
       resolve(result);
     });
   });
+}
+
+function startOwnedCommand(command, args, options = {}) {
+  const child = spawn(command, args, {
+    cwd: options.cwd ?? repoRoot,
+    env: options.env ?? process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exited = new Promise((resolve) => {
+    child.once("error", (error) => resolve({
+      code: null,
+      signal: null,
+      error,
+    }));
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  return {
+    child,
+    command,
+    args: [...args],
+    cwd: options.cwd ?? repoRoot,
+    exited,
+    stdout: () => stdout,
+    stderr: () => stderr,
+  };
+}
+
+async function crashOwnedCommand(owned, requiredCommandFragments) {
+  assert(
+    owned
+      && Number.isSafeInteger(owned.child.pid)
+      && owned.child.pid > 1
+      && owned.child.exitCode === null
+      && owned.child.signalCode === null,
+    "CCC_PRODUCT_OWNED_COMMAND_CRASH_TARGET_INVALID",
+    JSON.stringify({
+      pid: owned?.child?.pid,
+      exitCode: owned?.child?.exitCode,
+      signalCode: owned?.child?.signalCode,
+    }),
+  );
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(owned.child.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  assert(
+    inspected.code === 0
+      && requiredCommandFragments.every((fragment) =>
+        inspected.stdout.includes(fragment)),
+    "CCC_PRODUCT_OWNED_COMMAND_PROCESS_REFUSED",
+    JSON.stringify({
+      pid: owned.child.pid,
+      requiredCommandFragments,
+      command: inspected.stdout.trim(),
+    }),
+  );
+  owned.child.kill("SIGKILL");
+  const result = await owned.exited;
+  assert(
+    result.signal === "SIGKILL",
+    "CCC_PRODUCT_OWNED_COMMAND_CRASH_SIGNAL_DRIFT",
+    JSON.stringify(result),
+  );
+  return inspected.stdout.trim();
+}
+
+async function cleanupOwnedCommand(owned) {
+  if (
+    !owned
+    || owned.child.exitCode !== null
+    || owned.child.signalCode !== null
+  ) return;
+  owned.child.kill("SIGKILL");
+  await owned.exited;
+}
+
+async function embeddedPostgresConnectionUrl(isolatedHome) {
+  const pidPath = path.join(
+    isolatedHome,
+    ".fusion",
+    "embedded-postgres",
+    "default",
+    "postmaster.pid",
+  );
+  const observed = await poll(
+    "owned embedded PostgreSQL identity",
+    async () => {
+      if (!await pathExists(pidPath)) return null;
+      const lines = (await readFile(pidPath, "utf8")).split("\n");
+      return {
+        pid: Number.parseInt(lines[0] ?? "", 10),
+        port: Number.parseInt(lines[3] ?? "", 10),
+      };
+    },
+    (value) =>
+      Number.isSafeInteger(value?.pid)
+      && value.pid > 1
+      && Number.isSafeInteger(value?.port)
+      && value.port > 0
+      && value.port <= 65_535,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return `postgresql://postgres:password@localhost:${observed.port}/fusion`;
+}
+
+async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
+  assert(
+    /^cccp-land-[0-9a-f]{8}$/u.test(marker),
+    "CCC_PRODUCT_GIT_LANDING_CUTPOINT_MARKER_INVALID",
+    marker,
+  );
+  const sql = postgres(
+    await embeddedPostgresConnectionUrl(isolatedHome),
+    {
+      connect_timeout: 10,
+      idle_timeout: 30,
+      max: 1,
+      onnotice: () => undefined,
+    },
+  );
+  let closed = false;
+  await sql`SELECT 1 AS ready`;
+  await sql.unsafe(`
+    CREATE TABLE project.ccc_product_git_landing_cutpoint_gate (
+      singleton boolean PRIMARY KEY CHECK (singleton),
+      armed boolean NOT NULL
+    )
+  `);
+  await sql.unsafe(`
+    INSERT INTO project.ccc_product_git_landing_cutpoint_gate
+      (singleton, armed)
+    VALUES (TRUE, TRUE)
+  `);
+  await sql.unsafe(`
+    CREATE FUNCTION project.ccc_product_git_landing_cutpoint()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $ccc_product_cutpoint$
+    BEGIN
+      IF NEW.mutation_type = 'ccc-campaign-git-landing:terminal'
+        AND EXISTS (
+          SELECT 1
+          FROM project.ccc_product_git_landing_cutpoint_gate
+          WHERE singleton = TRUE AND armed = TRUE
+        )
+      THEN
+        PERFORM set_config('application_name', '${marker}', FALSE);
+        PERFORM pg_sleep(120);
+      END IF;
+      RETURN NEW;
+    END
+    $ccc_product_cutpoint$
+  `);
+  await sql.unsafe(`
+    CREATE TRIGGER ccc_product_git_landing_cutpoint
+    BEFORE INSERT ON project.run_audit_events
+    FOR EACH ROW
+    EXECUTE FUNCTION project.ccc_product_git_landing_cutpoint()
+  `);
+  const activities = async () => {
+    return await sql`
+      SELECT pid, application_name, state, wait_event_type, wait_event
+      FROM pg_stat_activity
+      WHERE application_name = ${marker}
+      ORDER BY pid
+    `;
+  };
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await sql.unsafe(`
+      UPDATE project.ccc_product_git_landing_cutpoint_gate
+      SET armed = FALSE
+      WHERE singleton = TRUE
+    `).catch(() => undefined);
+    await sql.unsafe(`
+      DROP TRIGGER IF EXISTS ccc_product_git_landing_cutpoint
+      ON project.run_audit_events
+    `).catch(() => undefined);
+    await sql.unsafe(`
+      DROP FUNCTION IF EXISTS project.ccc_product_git_landing_cutpoint()
+    `).catch(() => undefined);
+    await sql.unsafe(`
+      DROP TABLE IF EXISTS project.ccc_product_git_landing_cutpoint_gate
+    `).catch(() => undefined);
+    await sql.end({ timeout: 2 }).catch(() => undefined);
+  };
+  return { sql, marker, activities, close };
+}
+
+async function settleOwnedLandingDatabaseBackend(cutpoint, expectedPid) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if ((await cutpoint.activities()).length === 0) {
+      return { forcedTermination: false };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const activities = await cutpoint.activities();
+  assert(
+    activities.length === 1 && activities[0].pid === expectedPid,
+    "CCC_PRODUCT_GIT_LANDING_BACKEND_OWNERSHIP_REFUSED",
+    JSON.stringify({ activities, expectedPid }),
+  );
+  const terminated = await cutpoint.sql`
+    SELECT pg_terminate_backend(${expectedPid}) AS terminated
+  `;
+  assert(
+    terminated.length === 1 && terminated[0].terminated === true,
+    "CCC_PRODUCT_GIT_LANDING_BACKEND_TERMINATION_FAILED",
+    JSON.stringify(terminated),
+  );
+  await poll(
+    "owned Git landing PostgreSQL backend termination",
+    cutpoint.activities,
+    (rows) => rows.length === 0,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return { forcedTermination: true };
 }
 
 async function git(cwd, ...args) {
@@ -1651,6 +1886,8 @@ async function main() {
   let ownedCutpointMarker;
   let ownedFakeCodexPath;
   let ownedProofCutpointToken;
+  let landingCommand;
+  let landingCutpoint;
   let repositoryStart;
   try {
     repositoryStart = await repositorySnapshot();
@@ -3074,15 +3311,162 @@ async function main() {
       proofAttemptKey: attempt.attemptKey,
     });
 
+    const mergeApprovalArgs = [
+      "approve-merge",
+      idempotencyKey,
+      mergeConfirmation.approvalRequestId,
+      "--confirm",
+      mergeConfirmation.confirmation,
+    ];
+    const reflogBeforeLanding = (
+      await git(
+        targetRoot,
+        "reflog",
+        "show",
+        "--format=%H",
+        "refs/heads/main",
+      )
+    ).split("\n").filter(Boolean);
+    const landingCutpointMarker =
+      `cccp-land-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+    landingCutpoint = await armGitLandingTerminalCutpoint(
+      isolatedHome,
+      landingCutpointMarker,
+    );
+    landingCommand = startOwnedCommand(
+      process.execPath,
+      [cliBin, "prd", ...mergeApprovalArgs],
+      { cwd: targetRoot, env },
+    );
+    const landingCommandPid = landingCommand.child.pid;
+    const landingCutpointObserved = await poll(
+      "Git landing terminal receipt cutpoint",
+      async () => ({
+        activities: await landingCutpoint.activities(),
+        targetHead: await git(
+          targetRoot,
+          "rev-parse",
+          "refs/heads/main",
+        ),
+        commandRunning:
+          landingCommand.child.exitCode === null
+          && landingCommand.child.signalCode === null,
+      }),
+      (value) =>
+        value.commandRunning === true
+        && value.targetHead !== targetBase
+        && value.activities.length === 1
+        && value.activities[0].application_name === landingCutpointMarker
+        && value.activities[0].state === "active",
+      async () => ({
+        stdout: tail(landingCommand.stdout()),
+        stderr: tail(landingCommand.stderr()),
+        status: await readStatus(),
+      }),
+      60_000,
+    );
+    const landingBackend = landingCutpointObserved.activities[0];
+    const landedAtCrash = landingCutpointObserved.targetHead;
+    const reflogAtCrash = (
+      await git(
+        targetRoot,
+        "reflog",
+        "show",
+        "--format=%H",
+        "refs/heads/main",
+      )
+    ).split("\n").filter(Boolean);
+    exactArray(
+      reflogAtCrash,
+      [landedAtCrash, ...reflogBeforeLanding],
+      "CCC_PRODUCT_GIT_LANDING_CRASH_REFLOG_INVALID",
+    );
+    assert(
+      landedAtCrash !== targetBase
+      && landedAtCrash !== sourceCommit
+      && await git(targetRoot, "rev-parse", `${landedAtCrash}^{tree}`)
+        === await git(targetRoot, "rev-parse", `${sourceCommit}^{tree}`)
+      && await git(targetRoot, "status", "--porcelain") === "",
+      "CCC_PRODUCT_GIT_LANDING_CRASH_EFFECT_INVALID",
+      JSON.stringify({ targetBase, sourceCommit, landedAtCrash }),
+    );
+    const landingCommandLine = await crashOwnedCommand(
+      landingCommand,
+      [cliBin, "prd", "approve-merge", idempotencyKey],
+    );
+    landingCommand = undefined;
+    const landingBackendSettlement =
+      await settleOwnedLandingDatabaseBackend(
+        landingCutpoint,
+        landingBackend.pid,
+      );
+    await landingCutpoint.close();
+    landingCutpoint = undefined;
+
+    const interruptedLanding = await readStatus();
+    const interruptedApproval = interruptedLanding.status.approvals.find(
+      ({ id }) => id === mergeConfirmation.approvalRequestId,
+    );
+    assert(
+      interruptedLanding.status.workItems[0]?.state === "manual-required"
+      && interruptedLanding.status.workItems[0]?.lastError
+        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && interruptedApproval?.status === "claimed"
+      && interruptedLanding.status.landing.intents.length === 1
+      && interruptedLanding.status.landing.materializations.length === 1
+      && interruptedLanding.status.landing.terminals.length === 0
+      && await git(targetRoot, "rev-parse", "refs/heads/main")
+        === landedAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_CRASH_STATE_NOT_DURABLE",
+      JSON.stringify(interruptedLanding.status),
+    );
+
+    const landingServerBeforeRestart = server;
+    await stopServe(landingServerBeforeRestart);
+    server = undefined;
+    server = await startServe(targetRoot, env, port);
+    assert(
+      landingServerBeforeRestart.child.pid !== server.child.pid,
+      "CCC_PRODUCT_GIT_LANDING_RESTART_PROCESS_INVALID",
+      JSON.stringify({
+        stoppedPid: landingServerBeforeRestart.child.pid,
+        restartedPid: server.child.pid,
+      }),
+    );
+    const landingRecoveryHold = await poll(
+      "Git landing recovery hold after restart",
+      readStatus,
+      (value) =>
+        value.status?.nextAction?.kind === "approve-merge"
+        && value.status?.landing?.intents?.length === 1
+        && value.status?.landing?.materializations?.length === 1
+        && value.status?.landing?.terminals?.length === 0,
+      async () => ({
+        serve: tail(server.output()),
+        targetHead: await git(
+          targetRoot,
+          "rev-parse",
+          "refs/heads/main",
+        ),
+      }),
+    );
+    exactArray(
+      (
+        await git(
+          targetRoot,
+          "reflog",
+          "show",
+          "--format=%H",
+          "refs/heads/main",
+        )
+      ).split("\n").filter(Boolean),
+      reflogAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_EFFECT_REPEATED_ON_RESTART",
+    );
+
     const merged = jsonOutput(
-      await prd([
-        "approve-merge",
-        idempotencyKey,
-        mergeConfirmation.approvalRequestId,
-        "--confirm",
-        mergeConfirmation.confirmation,
-      ]),
-      "approve merge",
+      await prd(mergeApprovalArgs),
+      "recover approve merge",
     );
     assert(
       merged.kind === "merge-approved"
@@ -3125,6 +3509,56 @@ async function main() {
       "CCC_PRODUCT_LANDING_RECEIPTS_INVALID",
       JSON.stringify(merged.status.landing),
     );
+    const reflogAfterRecovery = (
+      await git(
+        targetRoot,
+        "reflog",
+        "show",
+        "--format=%H",
+        "refs/heads/main",
+      )
+    ).split("\n").filter(Boolean);
+    exactArray(
+      reflogAfterRecovery,
+      reflogAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_EFFECT_REPEATED_DURING_RECOVERY",
+    );
+    const consumedApproval = merged.status.approvals.find(
+      ({ id }) => id === mergeConfirmation.approvalRequestId,
+    );
+    assert(
+      landingRecoveryHold.status.workItems[0]?.state === "manual-required"
+      && consumedApproval?.status === "consumed"
+      && landedCommit === landedAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_RECOVERY_SETTLEMENT_INVALID",
+      JSON.stringify({
+        recoveryWorkItem: landingRecoveryHold.status.workItems[0],
+        consumedApproval,
+        landedAtCrash,
+        landedCommit,
+      }),
+    );
+    ledger.pass("git-landing-restart-no-repeated-effect", {
+      approvalRequestId: mergeConfirmation.approvalRequestId,
+      approvalStatusAtCrash: interruptedApproval.status,
+      approvalStatusAfterRecovery: consumedApproval.status,
+      crashedCliPid: landingCommandPid,
+      crashedCliCommand: landingCommandLine,
+      databaseBackendPid: landingBackend.pid,
+      databaseBackendWait: {
+        waitEventType: landingBackend.wait_event_type,
+        waitEvent: landingBackend.wait_event,
+      },
+      databaseBackendSettlement: landingBackendSettlement,
+      stoppedServePid: landingServerBeforeRestart.child.pid,
+      restartedServePid: server.child.pid,
+      targetBase,
+      sourceCommit,
+      landedCommit,
+      refEffectCount: reflogAfterRecovery.length - reflogBeforeLanding.length,
+      landingBeforeRecovery: interruptedLanding.status.landing,
+      landingAfterRecovery: merged.status.landing,
+    });
     ledger.pass("controlled-landing", {
       targetBase,
       sourceCommit,
@@ -3209,6 +3643,8 @@ async function main() {
     process.exitCode = 1;
   } finally {
     await stopNativeAuthoringServer(authoringServer).catch(() => undefined);
+    await cleanupOwnedCommand(landingCommand).catch(() => undefined);
+    await landingCutpoint?.close().catch(() => undefined);
     await stopServe(restartedServer).catch(() => undefined);
     await stopServe(server).catch(() => undefined);
     await cleanupOwnedCutpointProcess(
