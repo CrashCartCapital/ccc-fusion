@@ -2726,34 +2726,27 @@ async function main() {
       [proofMarker.pid],
       "CCC_PRODUCT_PROOF_EFFECT_RERUN_DURING_SETTLEMENT",
     );
-    const proofStopControl =
-      replayedProofResolution.operatorControls?.find(
-        ({ action }) => action === "stop",
-      );
     assert(
-      proofStopControl?.allowed === true
-      && /^[0-9a-f]{64}$/u.test(proofStopControl.confirmation),
-      "CCC_PRODUCT_PROOF_CUTPOINT_STOP_MISSING",
-      JSON.stringify(replayedProofResolution.operatorControls),
-    );
-    const proofStopped = jsonOutput(
-      await prd([
-        "stop",
-        proofCutpointKey,
-        "--reason",
-        "Acceptance canary records the failed verifier observation and abandons this disposable campaign.",
-        "--confirm",
-        proofStopControl.confirmation,
-      ]),
-      "stop proof-cutpoint campaign",
-    );
-    assert(
-      proofStopped.kind === "campaign-stopped"
-      && proofStopped.status?.nextAction?.kind === "abandoned"
-      && proofStopped.status?.proofs?.[0]?.attempts?.[0]?.state
-        === "proved_failed",
-      "CCC_PRODUCT_PROOF_CUTPOINT_ABANDON_FAILED",
-      JSON.stringify(proofStopped),
+      replayedProofResolution.status.nextAction?.kind === "blocked"
+      && replayedProofResolution.status.nextAction.reason.includes(
+        "ended as failed",
+      )
+      && replayedProofResolution.operatorControls?.every(
+        ({ allowed }) => allowed === false,
+      )
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await pathExists(canonicalProofWorktree),
+      "CCC_PRODUCT_PROOF_CUTPOINT_TERMINAL_SETTLEMENT_INVALID",
+      JSON.stringify({
+        nextAction: replayedProofResolution.status.nextAction,
+        operatorControls: replayedProofResolution.operatorControls,
+        targetHead: await git(
+          targetRoot,
+          "rev-parse",
+          "refs/heads/main",
+        ),
+        worktree: canonicalProofWorktree,
+      }),
     );
     ledger.pass("proof-dispatch-restart-manual-required", {
       importId: proofCutpointImport.result.importId,
@@ -2762,11 +2755,13 @@ async function main() {
       verifierProcessCommand: proofProcessCommand,
       proofAttemptBeforeResolution: recoveredProofAttempt,
       proofAttemptAfterResolution:
-        proofStopped.status.proofs[0].attempts[0],
+        replayedProofResolution.status.proofs[0].attempts[0],
       recoveredWorkItem: recoveredProofCutpoint.status.workItems[0],
       recoveredNextAction: recoveredProofCutpoint.status.nextAction,
       terminalWorkItem: replayedProofResolution.status.workItems[0],
-      stoppedNextAction: proofStopped.status.nextAction,
+      terminalNextAction: replayedProofResolution.status.nextAction,
+      terminalOperatorControls:
+        replayedProofResolution.operatorControls,
       invocationCount: proofMarkersAtDispatch.length,
       sourceCommit: proofSourceCommit,
       targetHead: targetBase,
