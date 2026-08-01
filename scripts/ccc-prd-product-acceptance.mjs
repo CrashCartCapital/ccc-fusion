@@ -46,6 +46,7 @@ const expectedChecks = Object.freeze([
   "campaign-created-commit",
   "commit-bound-proof-executed",
   "merge-human-hold",
+  "git-landing-restart-no-repeated-effect",
   "controlled-landing",
   "terminal-restart-recovery",
 ]);
