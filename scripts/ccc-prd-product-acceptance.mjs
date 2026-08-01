@@ -326,6 +326,9 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
     "CCC_PRODUCT_GIT_LANDING_CUTPOINT_MARKER_INVALID",
     marker,
   );
+  const lockKey1 = 0x43434350;
+  const lockKey2 = Number.parseInt(marker.slice("cccp-land-".length), 16)
+    % 2_147_483_647;
   const sql = postgres(
     await embeddedPostgresConnectionUrl(isolatedHome),
     {
@@ -361,7 +364,7 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
           WHERE singleton = TRUE AND armed = TRUE
         )
       THEN
-        PERFORM set_config('application_name', '${marker}', FALSE);
+        PERFORM pg_advisory_xact_lock(${lockKey1}, ${lockKey2});
         PERFORM pg_sleep(120);
       END IF;
       RETURN NEW;
@@ -376,10 +379,20 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
   `);
   const activities = async () => {
     return await sql`
-      SELECT pid, application_name, state, wait_event_type, wait_event
-      FROM pg_stat_activity
-      WHERE application_name = ${marker}
-      ORDER BY pid
+      SELECT
+        activity.pid,
+        ${marker}::text AS marker,
+        activity.state,
+        activity.wait_event_type,
+        activity.wait_event
+      FROM pg_locks AS lock
+      INNER JOIN pg_stat_activity AS activity ON activity.pid = lock.pid
+      WHERE lock.locktype = 'advisory'
+        AND lock.classid::bigint = ${lockKey1}
+        AND lock.objid::bigint = ${lockKey2}
+        AND lock.objsubid = 2
+        AND lock.granted = TRUE
+      ORDER BY activity.pid
     `;
   };
   const close = async () => {
@@ -402,7 +415,7 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
     `).catch(() => undefined);
     await sql.end({ timeout: 2 }).catch(() => undefined);
   };
-  return { sql, marker, activities, close };
+  return { sql, marker, lockKey1, lockKey2, activities, close };
 }
 
 async function settleOwnedLandingDatabaseBackend(cutpoint, expectedPid) {
@@ -3356,7 +3369,7 @@ async function main() {
         value.commandRunning === true
         && value.targetHead !== targetBase
         && value.activities.length === 1
-        && value.activities[0].application_name === landingCutpointMarker
+        && value.activities[0].marker === landingCutpointMarker
         && value.activities[0].state === "active",
       async () => ({
         stdout: tail(landingCommand.stdout()),
