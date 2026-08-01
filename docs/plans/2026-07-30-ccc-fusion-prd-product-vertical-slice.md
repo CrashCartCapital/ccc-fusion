@@ -1,10 +1,12 @@
 # CCC Fusion PRD Product Vertical Slice
 
-**Status:** locally proven on the clean integrated tree; not live or deployed
+**Status:** disposable product path locally proven; current real ccc-fusion packet blocked before freeze; not live or deployed
 **Plan path:** `docs/plans/2026-07-30-ccc-fusion-prd-product-vertical-slice.md`
 **Accepted base:** `1dd173311fbf7c16f85213066cc881fc959a2a2c`
 **Accepted base tree:** `ec30f36368d72b756640793374541636e307e696`
-**Implementation worktree:** `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/prd-product-vertical-slice`
+**Current local tracking baseline:** `origin/main` at `79b0ec3d0a27d7393de1b74d17762ad37648eadf`, tree `13ecd8f17fc96e6fddf179fd5d521d166f82e490` (local fact only; no fetch performed)
+**Current code-bearing evidence commit:** `a818c215a0df490b1f125055d7ad1251a240b6c2`, tree `6209506501395fbffb7cb9a3287c63f955962dfb`
+**Implementation worktree:** `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/prd-product-postmerge-fix5`
 **Product target:** one supported CLI-first operator journey, with the dashboard consuming the same contracts after the spine is proven
 
 ## Outcome
@@ -13,14 +15,21 @@ A normal operator can freeze a Markdown PRD packet, review a hash-bound semantic
 
 ## Baseline evidence
 
-- Local `origin/main` is the accepted product lineage at `1dd173311fbf7c16f85213066cc881fc959a2a2c`; the dirty shared checkout is inspection-only and is not an implementation baseline.
-- `pnpm verify:ccc-prd-product` passed all 18 exact checks on the clean integrated tree and proved the repository HEAD, tree, and porcelain status were unchanged from start to finish.
-- `pnpm verify:fast` passed all 18 static/typecheck/build/boot-smoke steps on the clean integrated tree, including built `fn --help` and a real `/api/health` 200 response.
-- `node scripts/run-ccc-pg-proof.mjs --wave 6` passed the exact six-command PostgreSQL inventory on the clean integrated tree: 416 passed (69 + 53 + 95 + 139 + 54 + 6), with zero missing, skipped, extra, timed-out, or force-killed tests.
-- `pnpm test:gate`, bound explicitly to an owned disposable PostgreSQL service, passed PostgreSQL 10/10, engine 299/299, and CLI 65/65 on the clean integrated tree.
-- `pnpm lint`, `pnpm typecheck`, `pnpm build`, and `git diff --check` passed on the same integrated bytes.
+- Local `origin/main` at `79b0ec3d0a27d7393de1b74d17762ad37648eadf` is the current local tracking baseline. The dirty shared checkout remains inspection-only and is not an implementation baseline.
+- `pnpm verify:ccc-prd-product` passed all 18 exact checks on clean commit `a818c215a0df490b1f125055d7ad1251a240b6c2`, tree `6209506501395fbffb7cb9a3287c63f955962dfb`, and proved repository HEAD, tree, and porcelain status were unchanged from start to finish.
+- `node scripts/run-ccc-pg-proof.mjs --wave 6` passed the exact six-command PostgreSQL inventory on the same clean commit: 425 passed (77 + 54 + 95 + 139 + 54 + 6), with zero missing, skipped, extra, duplicate, timed-out, or force-killed tests.
+- `pnpm test:gate`, bound explicitly to a separately owned disposable PostgreSQL service, passed engine core 299/299, PostgreSQL gate 10/10, PRD safety groups 8/8 + 64 passed with 2 declared skips + 16/16 + 7/7, and CI-shape 79/79; the service and data root were removed on success.
+- Core and engine typechecks, focused engine tests 74/74, proof-runner policy self-tests, targeted lint, and `git diff --check` passed on the repair bytes before the clean exact-tree acceptance runs.
 - No external provider or production infrastructure was authorized or called. The supported path is locally proven, not live or deployed.
 - No fetch was performed. The remote-tracking ref is a local fact, not proof of current GitHub state.
+
+## Current real-PRD boundary
+
+The normal built CLI selected `/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-fusion/PRJ-AI-ccc-fusion-PRD-v0.1.md` as the current ccc-fusion PRD. `fn prd lint` refused intake because the document does not machine-declare the target repository, exact current baseline, allowed paths, or exact executable proof. Those are implementation-changing facts and cannot be invented from prose.
+
+`fn prd freeze` then refused before writing a packet because the PRD declares `REF-HUM-OrchestratorForkSecondOpinion-2026-07-23` as authority but no current non-archive Markdown file resolves that name. The project-local Phase 3 ledger says this note and `REF-HUM-MultiProviderAgentOrchestratorLandscape-2026-07-22` were moved under `_archive/`; the active mission explicitly forbids reading archive-like paths. The scratch output root remained empty, no campaign or import was created, and neither the vault nor a target repository changed.
+
+This is a precise authority block, not permission to bypass provenance. A real ccc-fusion campaign requires one of three explicit operator decisions: approve an exact successor PRD in the vault with current target/base/path/proof fields and repaired authority links; authorize reading the two exact archived authority notes so a successor proposal can be built without changing the original; or select a different implementation-ready current PRD and target repository. Until then, the disposable path is `locally proven`, the current real-PRD path is `blocked`, and product completion remains unclaimed.
 
 ## Approach decision
 
@@ -40,12 +49,12 @@ A developer-written glue script would not be the supported product route and wou
 
 | July 30 finding | Disposition | Current evidence | Acceptance requirement |
 |---|---|---|---|
-| The shared checkout lacked the accepted product while local `origin/main` contained it. | Adopt | The accepted isolated worktree starts at local `origin/main` commit `1dd173311fbf7c16f85213066cc881fc959a2a2c`, tree `ec30f36368d72b756640793374541636e307e696`; the dirty shared checkout remains inspection-only. | Final proof names the integrated commit/tree and reruns all gates there. No local remote-tracking ref is described as live GitHub proof. |
+| The shared checkout lacked the accepted product while local `origin/main` contained it. | Adopt | The current isolated worktree descends from local `origin/main` commit `79b0ec3d0a27d7393de1b74d17762ad37648eadf`, tree `13ecd8f17fc96e6fddf179fd5d521d166f82e490`; the dirty shared checkout remains inspection-only. | Final proof names the integrated commit/tree and reruns all gates there. No local remote-tracking ref is described as live GitHub proof. |
 | The transactional importer had no normal operator caller. | Adopt | `fn prd preview`, confirmation-bound `import`, `inspect`, `reconcile`, and redacted `status` call the production compiler/import/status services. | The exact acceptance command must invoke the built CLI and prove rejected provenance leaves no database or filesystem residue. |
 | Imported tasks defaulted to read-only thinking rather than coding custody. | Adopt | Product policy v2 requires coding tool mode, isolated worktrees, owned paths, route-scoped write roots, provider/model/transport, and required commits; importer and runtime tests exercise the production preparation seam. | A real runtime provider must change one admitted file in the acquired worktree; the fenced controller must create the required commit and refuse dirty, unchanged, wrong-branch, filtered, or foreign-path output. |
 | Proof admission checked declarations but did not execute tests. | Adopt with modification | Admission remains an explicit pre-dispatch trust check. A separate durable proof-attempt service now runs every declared command against the exact campaign commit and records terminal evidence. | A planted defect must produce a fresh `proved_failed` receipt; a corrected campaign commit must produce a fresh `committed` receipt; landing must reject every stale or mismatched receipt. |
 | Real-PRD canaries extracted only three requirements and did not change target code. | Adopt | Historical fixtures are treated only as intake leads; they are not product completion evidence. | Build a current three-packet manifest, report omissions/questions/coverage, run one approved live authoring experiment, and keep private vault bytes out of Git. The product acceptance route must change disposable target source. |
-| The broad campaign gate and PostgreSQL proof were not fresh. | Adopt | On the integrated implementation bytes, `pnpm test:gate` passed PostgreSQL 10/10, engine 299/299, and CLI 65/65; Wave 6 passed its exact 416-test inventory. | Rerun the exact product acceptance on the clean integrated commit; stale baseline runs do not close this item. |
+| The broad campaign gate and PostgreSQL proof were not fresh. | Adopt | On clean commit `a818c215a`, `pnpm test:gate` passed its current engine, PostgreSQL, PRD-safety, and CI-shape groups; Wave 6 passed its exact 425-test inventory with no missing, skipped, extra, duplicate, timed-out, or force-killed checks. | Rerun the exact product acceptance on the clean integrated commit; stale baseline runs do not close this item. |
 | Documentation overstated import/runtime completeness. | Adopt | This plan separates designed, implemented, tested, locally proven, live, and deployed states and identifies the remaining real-runtime/acceptance work. | Update operator documentation only after the built CLI/runtime acceptance is fresh-green; do not claim live provider or deployment proof. |
 | A unified campaign-admission helper may be unused while runtime-specific gates exist. | Defer | Current product safety is enforced at the narrower work-item lease, provider-attempt, proof-attempt, approval, path, and Git-CAS seams. Centralization is not required for the shortest vertical slice. | Every supported execution route must reach those exact gates. Remove or consolidate the compatibility helper only in a separately proved cleanup; do not weaken a runtime-specific fence to make the helper appear authoritative. |
 
