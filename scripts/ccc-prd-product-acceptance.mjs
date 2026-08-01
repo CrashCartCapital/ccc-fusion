@@ -338,18 +338,18 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
   let closed = false;
   await sql`SELECT 1 AS ready`;
   await sql.unsafe(`
-    CREATE TABLE project.ccc_product_git_landing_cutpoint_gate (
+    CREATE TABLE public.ccc_product_git_landing_cutpoint_gate (
       singleton boolean PRIMARY KEY CHECK (singleton),
       armed boolean NOT NULL
     )
   `);
   await sql.unsafe(`
-    INSERT INTO project.ccc_product_git_landing_cutpoint_gate
+    INSERT INTO public.ccc_product_git_landing_cutpoint_gate
       (singleton, armed)
     VALUES (TRUE, TRUE)
   `);
   await sql.unsafe(`
-    CREATE FUNCTION project.ccc_product_git_landing_cutpoint()
+    CREATE FUNCTION public.ccc_product_git_landing_cutpoint()
     RETURNS trigger
     LANGUAGE plpgsql
     AS $ccc_product_cutpoint$
@@ -357,7 +357,7 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
       IF NEW.mutation_type = 'ccc-campaign-git-landing:terminal'
         AND EXISTS (
           SELECT 1
-          FROM project.ccc_product_git_landing_cutpoint_gate
+          FROM public.ccc_product_git_landing_cutpoint_gate
           WHERE singleton = TRUE AND armed = TRUE
         )
       THEN
@@ -372,7 +372,7 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
     CREATE TRIGGER ccc_product_git_landing_cutpoint
     BEFORE INSERT ON project.run_audit_events
     FOR EACH ROW
-    EXECUTE FUNCTION project.ccc_product_git_landing_cutpoint()
+    EXECUTE FUNCTION public.ccc_product_git_landing_cutpoint()
   `);
   const activities = async () => {
     return await sql`
@@ -386,7 +386,7 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
     if (closed) return;
     closed = true;
     await sql.unsafe(`
-      UPDATE project.ccc_product_git_landing_cutpoint_gate
+      UPDATE public.ccc_product_git_landing_cutpoint_gate
       SET armed = FALSE
       WHERE singleton = TRUE
     `).catch(() => undefined);
@@ -395,10 +395,10 @@ async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
       ON project.run_audit_events
     `).catch(() => undefined);
     await sql.unsafe(`
-      DROP FUNCTION IF EXISTS project.ccc_product_git_landing_cutpoint()
+      DROP FUNCTION IF EXISTS public.ccc_product_git_landing_cutpoint()
     `).catch(() => undefined);
     await sql.unsafe(`
-      DROP TABLE IF EXISTS project.ccc_product_git_landing_cutpoint_gate
+      DROP TABLE IF EXISTS public.ccc_product_git_landing_cutpoint_gate
     `).catch(() => undefined);
     await sql.end({ timeout: 2 }).catch(() => undefined);
   };
