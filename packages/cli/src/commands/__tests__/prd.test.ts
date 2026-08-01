@@ -2,6 +2,10 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
+import {
+  MAX_OPERATOR_CONTEXT_BYTES,
+  readBoundedPrdStdin,
+} from "../prd-stdin.js";
 import { runPrdCommand } from "../prd.js";
 import {
   cleanupPacketRoots,
@@ -40,6 +44,49 @@ async function createExecutionPlan(
 }
 
 describe("prd command exit contract", () => {
+  it("stops reading typed operator context as soon as the byte limit is crossed", async () => {
+    let chunksRead = 0;
+    async function* chunks(): AsyncGenerator<Buffer> {
+      chunksRead += 1;
+      yield Buffer.alloc(MAX_OPERATOR_CONTEXT_BYTES, "a");
+      chunksRead += 1;
+      yield Buffer.from("b");
+      chunksRead += 1;
+      yield Buffer.from("c");
+    }
+
+    await expect(readBoundedPrdStdin(chunks())).rejects.toMatchObject({
+      code: "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+      message: "typed operator context exceeds 262144 bytes",
+    });
+    expect(chunksRead).toBe(2);
+  });
+
+  it("refuses malformed typed operator context before calling packet freeze", async () => {
+    const freeze = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      [
+        "freeze",
+        "/vault/active",
+        "/vault/active/alpha/PRD-v1.0.0.md",
+        "/tmp/frozen-alpha",
+        "--context-stdin",
+      ],
+      {
+        write: (line) => output.push(line),
+        readStdin: async () => "{",
+      },
+      { freezeCccPrdPacket: freeze },
+    )).toBe(1);
+    expect(freeze).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_OPERATOR_CONTEXT_INVALID" }],
+    });
+  });
+
   it("returns usage exit 2 before any compiler or filesystem work", async () => {
     const output: string[] = [];
     expect(await runPrdCommand(["compile"], { write: (line) => output.push(line) })).toBe(2);
@@ -49,6 +96,8 @@ describe("prd command exit contract", () => {
         "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
         "       fn prd discover <active-projects-root>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
+        "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
+        "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin",
         "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
         "       fn prd template",
         "       fn prd lint <prd-path>",
@@ -134,6 +183,81 @@ describe("prd command exit contract", () => {
       activeProjectsRoot: "/vault/active",
       selectedPrdPath: "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
       outputDir: "/tmp/frozen-alpha",
+    });
+
+    const operatorContext = {
+      schema: "ccc-prd.operator-context.v1" as const,
+      targetRepository: {
+        path: "/workspace/alpha",
+        baseCommit: "d".repeat(40),
+      },
+      taskCustody: {
+        ownedPaths: ["src/alpha", "tests/alpha"],
+        allowedWriteRoots: ["src/alpha", "tests/alpha"],
+      },
+      writeRootPurpose: "implement and verify Alpha",
+      bounds: {
+        maxRequests: 4,
+        maxDurationMs: 120000,
+        maxConcurrency: 2,
+      },
+    };
+    expect(await runPrdCommand(
+      [
+        "freeze",
+        "/vault/active",
+        "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+        "/tmp/frozen-alpha",
+        "--target",
+        "/workspace/alpha",
+        "--base",
+        "d".repeat(40),
+        "--owned-path",
+        "src/alpha",
+        "--owned-path",
+        "tests/alpha",
+        "--write-root",
+        "src/alpha",
+        "--write-root",
+        "tests/alpha",
+        "--write-purpose",
+        "implement and verify Alpha",
+        "--max-requests",
+        "4",
+        "--max-duration-ms",
+        "120000",
+        "--max-concurrency",
+        "2",
+      ],
+      { write: () => undefined },
+      { freezeCccPrdPacket: freeze },
+    )).toBe(0);
+    expect(freeze).toHaveBeenLastCalledWith({
+      activeProjectsRoot: "/vault/active",
+      selectedPrdPath: "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+      outputDir: "/tmp/frozen-alpha",
+      operatorContext,
+    });
+
+    expect(await runPrdCommand(
+      [
+        "freeze",
+        "/vault/active",
+        "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+        "/tmp/frozen-alpha",
+        "--context-stdin",
+      ],
+      {
+        write: () => undefined,
+        readStdin: async () => JSON.stringify(operatorContext),
+      },
+      { freezeCccPrdPacket: freeze },
+    )).toBe(0);
+    expect(freeze).toHaveBeenLastCalledWith({
+      activeProjectsRoot: "/vault/active",
+      selectedPrdPath: "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+      outputDir: "/tmp/frozen-alpha",
+      operatorContext,
     });
   });
 

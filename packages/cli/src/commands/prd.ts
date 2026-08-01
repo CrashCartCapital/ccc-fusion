@@ -43,9 +43,14 @@ import {
   resolveProject,
   type ProjectContext,
 } from "../project-context.js";
+import {
+  MAX_OPERATOR_CONTEXT_BYTES,
+  readBoundedPrdStdin,
+} from "./prd-stdin.js";
 
 export type PrdCommandIo = {
   write(line: string): void;
+  readStdin?(): Promise<string>;
 };
 
 type Compiler = {
@@ -127,6 +132,8 @@ const usage = [
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
   "       fn prd discover <active-projects-root>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
+  "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
+  "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin",
   "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
   "       fn prd template",
   "       fn prd lint <prd-path>",
@@ -797,12 +804,74 @@ function runIntakeContractCommand(
   }
 }
 
-function runIntakePacketCommand(
+function parseGuidedFreezeContext(
+  options: string[],
+): engine.CccPrdOperatorContext | undefined {
+  if (options.length === 0 || options.length % 2 !== 0) return undefined;
+  const ownedPaths: string[] = [];
+  const allowedWriteRoots: string[] = [];
+  const values = new Map<string, string>();
+  const accepted = new Set([
+    "--target",
+    "--base",
+    "--owned-path",
+    "--write-root",
+    "--write-purpose",
+    "--max-requests",
+    "--max-duration-ms",
+    "--max-concurrency",
+  ]);
+  for (let index = 0; index < options.length; index += 2) {
+    const flag = options[index];
+    const value = options[index + 1];
+    if (!flag || !value || !accepted.has(flag) || value.startsWith("--")) {
+      return undefined;
+    }
+    if (flag === "--owned-path") {
+      ownedPaths.push(value);
+      continue;
+    }
+    if (flag === "--write-root") {
+      allowedWriteRoots.push(value);
+      continue;
+    }
+    if (values.has(flag)) return undefined;
+    values.set(flag, value);
+  }
+  const maxRequests = parsePositiveInteger(values.get("--max-requests"));
+  const maxDurationMs = parsePositiveInteger(values.get("--max-duration-ms"));
+  const maxConcurrency = parsePositiveInteger(values.get("--max-concurrency"));
+  const target = values.get("--target");
+  const baseCommit = values.get("--base");
+  const writeRootPurpose = values.get("--write-purpose");
+  if (
+    !target
+    || !baseCommit
+    || !writeRootPurpose
+    || ownedPaths.length === 0
+    || allowedWriteRoots.length === 0
+    || !maxRequests
+    || !maxDurationMs
+    || !maxConcurrency
+    || values.size !== 6
+  ) {
+    return undefined;
+  }
+  return engine.parseCccPrdOperatorContext({
+    schema: engine.CCC_PRD_OPERATOR_CONTEXT_SCHEMA_VERSION,
+    targetRepository: { path: target, baseCommit },
+    taskCustody: { ownedPaths, allowedWriteRoots },
+    writeRootPurpose,
+    bounds: { maxRequests, maxDurationMs, maxConcurrency },
+  });
+}
+
+async function runIntakePacketCommand(
   args: string[],
   io: PrdCommandIo,
   dependencies: PrdCommandDependencies,
-): number {
-  const [subcommand, activeProjectsRoot, selectedPrdPath, outputDir] = args;
+): Promise<number> {
+  const [subcommand, activeProjectsRoot, selectedPrdPath, outputDir, ...options] = args;
   try {
     if (subcommand === "discover" && args.length === 2 && activeProjectsRoot) {
       io.write(JSON.stringify(
@@ -814,16 +883,48 @@ function runIntakePacketCommand(
     }
     if (
       subcommand === "freeze"
-      && args.length === 4
       && activeProjectsRoot
       && selectedPrdPath
       && outputDir
     ) {
+      let operatorContext: engine.CccPrdOperatorContext | undefined;
+      if (options.length === 1 && options[0] === "--context-stdin") {
+        if (!io.readStdin) {
+          throw new PrdProductCommandError(
+            "CCC_PRD_OPERATOR_CONTEXT_STDIN_UNAVAILABLE",
+            "typed operator context stdin is unavailable",
+          );
+        }
+        const contextJson = await io.readStdin();
+        if (Buffer.byteLength(contextJson, "utf8") > MAX_OPERATOR_CONTEXT_BYTES) {
+          throw new PrdProductCommandError(
+            "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+            "typed operator context exceeds " + MAX_OPERATOR_CONTEXT_BYTES + " bytes",
+          );
+        }
+        let value: unknown;
+        try {
+          value = JSON.parse(contextJson) as unknown;
+        } catch {
+          throw new PrdProductCommandError(
+            "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+            "typed operator context stdin must contain one JSON object",
+          );
+        }
+        operatorContext = engine.parseCccPrdOperatorContext(value);
+      } else if (options.length > 0) {
+        operatorContext = parseGuidedFreezeContext(options);
+        if (!operatorContext) {
+          io.write(usage);
+          return 2;
+        }
+      }
       io.write(JSON.stringify(
         (dependencies.freezeCccPrdPacket ?? engine.freezeCccPrdPacket)({
           activeProjectsRoot,
           selectedPrdPath,
           outputDir,
+          ...(operatorContext ? { operatorContext } : {}),
         }),
       ));
       return 0;
@@ -2510,7 +2611,10 @@ async function runProviderResolutionCommand(
 
 export async function runPrdCommand(
   args: string[],
-  io: PrdCommandIo = { write: (line) => console.log(line) },
+  io: PrdCommandIo = {
+    write: (line) => console.log(line),
+    readStdin: () => readBoundedPrdStdin(process.stdin),
+  },
   dependencies: PrdCommandDependencies = {},
   commandContext: PrdCommandContext = {},
 ): Promise<number> {

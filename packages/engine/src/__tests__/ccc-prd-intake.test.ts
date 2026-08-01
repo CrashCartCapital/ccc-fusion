@@ -73,6 +73,13 @@ const ccc = engine as typeof engine & {
     activeProjectsRoot: string;
     selectedPrdPath: string;
     outputDir: string;
+    operatorContext?: {
+      schema: "ccc-prd.operator-context.v1";
+      targetRepository: { path: string; baseCommit: string };
+      taskCustody: { ownedPaths: string[]; allowedWriteRoots: string[] };
+      writeRootPurpose: string;
+      bounds: { maxRequests: number; maxDurationMs: number; maxConcurrency: number };
+    };
   }): FreezeResult;
 };
 
@@ -501,6 +508,159 @@ describe("CCC PRD discovery", () => {
 });
 
 describe("CCC PRD packet freeze", () => {
+  it("renders reviewed operator facts into the atomic frozen packet without changing the PRD", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      [
+        "# Alpha PRD",
+        "",
+        "## Requirement and proof",
+        "",
+        "Change src/value.txt. Acceptance: task verify succeeds. Proof: task verify.",
+        "",
+        "## Protected actions",
+        "",
+        "Merge refs/heads/main requires human approval.",
+        "",
+      ].join("\n"),
+    );
+    const sourceBefore = readFileSync(selectedPrdPath);
+    const outputDir = join(root, "out", "guided");
+    const targetRepository = join(root, "target");
+
+    const frozen = ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+      operatorContext: {
+        schema: "ccc-prd.operator-context.v1",
+        targetRepository: {
+          path: targetRepository,
+          baseCommit: "a".repeat(40),
+        },
+        taskCustody: {
+          ownedPaths: ["src/value.txt"],
+          allowedWriteRoots: ["src/value.txt"],
+        },
+        writeRootPurpose: "implement the reviewed Alpha requirement",
+        bounds: {
+          maxRequests: 3,
+          maxDurationMs: 120000,
+          maxConcurrency: 1,
+        },
+      },
+    });
+
+    const contextPath = join(
+      outputDir,
+      "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+    );
+    const context = readFileSync(contextPath, "utf8");
+    const manifest = JSON.parse(readFileSync(frozen.manifestPath, "utf8")) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    const receipt = JSON.parse(readFileSync(frozen.receiptPath, "utf8")) as {
+      entries: Array<Record<string, unknown>>;
+    };
+
+    expect(readFileSync(selectedPrdPath)).toEqual(sourceBefore);
+    expect(frozen.packet.fileCount).toBe(2);
+    expect(context).toContain("Target repository: " + targetRepository);
+    expect(context).toContain("Baseline commit: " + "a".repeat(40));
+    expect(context).toContain("Task owned path: src/value.txt");
+    expect(context).toContain("Task allowed write root: src/value.txt");
+    expect(context).toContain("Allowed write root: " + join(targetRepository, "src/value.txt"));
+    expect(context).toContain("Maximum requests: 3");
+    expect(manifest.entries).toContainEqual(expect.objectContaining({
+      relative_path: "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+      role: "support",
+      authoritative: true,
+      sha256: sha256(context),
+    }));
+    expect(receipt.entries).toContainEqual(expect.objectContaining({
+      originPath: "operator-context://ccc-prd.operator-context.v1",
+      relativePath: "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+      authoritative: true,
+    }));
+    expect(readCccPrdPacketCustody({
+      rootDir: outputDir,
+      manifestPath: frozen.manifestPath,
+    }).packetHash).toBe(frozen.packet.packetHash);
+  });
+
+  it("refuses contradictory operator context with zero freeze residue", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      "# Alpha PRD\n\n- Target repository: /already/decided\n",
+    );
+    const outputDir = join(root, "out", "conflict");
+
+    expectIntakeError(() => ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+      operatorContext: {
+        schema: "ccc-prd.operator-context.v1",
+        targetRepository: {
+          path: "/different/target",
+          baseCommit: "a".repeat(40),
+        },
+        taskCustody: {
+          ownedPaths: ["src"],
+          allowedWriteRoots: ["src"],
+        },
+        writeRootPurpose: "implementation",
+        bounds: {
+          maxRequests: 3,
+          maxDurationMs: 120000,
+          maxConcurrency: 1,
+        },
+      },
+    }), "CCC_PRD_OPERATOR_CONTEXT_CONFLICT");
+    expect(existsSync(outputDir)).toBe(false);
+  });
+
+  it("refuses escaping guided task custody with zero freeze residue", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      "# Alpha PRD\n\nChange the admitted source file.\n",
+    );
+    const outputDir = join(root, "out", "escaping-context");
+
+    expectIntakeError(() => ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+      operatorContext: {
+        schema: "ccc-prd.operator-context.v1",
+        targetRepository: {
+          path: join(root, "target"),
+          baseCommit: "a".repeat(40),
+        },
+        taskCustody: {
+          ownedPaths: ["../outside"],
+          allowedWriteRoots: ["../outside"],
+        },
+        writeRootPurpose: "implementation",
+        bounds: {
+          maxRequests: 3,
+          maxDurationMs: 120000,
+          maxConcurrency: 1,
+        },
+      },
+    }), "CCC_PRD_OPERATOR_CONTEXT_INVALID");
+    expect(existsSync(outputDir)).toBe(false);
+  });
+
   it("allows explicit operator selection of a PRD omitted from automatic artifact discovery", () => {
     const root = fixtureRoot();
     const activeProjectsRoot = join(root, "active");

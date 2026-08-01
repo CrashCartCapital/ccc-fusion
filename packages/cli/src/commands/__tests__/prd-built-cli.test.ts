@@ -27,6 +27,8 @@ describe("prd built CLI user contract", () => {
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>");
     expect(result.stdout).toContain("fn prd discover <active-projects-root>");
     expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>");
+    expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository>");
+    expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin");
     expect(result.stdout).toContain("fn prd template");
     expect(result.stdout).toContain("fn prd lint <prd-path>");
     expect(result.stdout).toContain("fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path>");
@@ -99,6 +101,42 @@ version: 2.0.0
     });
     expect(existsSync(join(outputDir, "manifest.json"))).toBe(true);
     expect(existsSync(join(outputDir, "freeze-receipt.json"))).toBe(true);
+    expect(readFileSync(selectedPrdPath).equals(sourceBefore)).toBe(true);
+
+    const guidedOutputDir = join(packet.root, "frozen-alpha-guided");
+    const guidedTarget = join(packet.root, "guided-target");
+    const guided = runFn([
+      "prd",
+      "freeze",
+      activeProjectsRoot,
+      selectedPrdPath,
+      guidedOutputDir,
+      "--target",
+      guidedTarget,
+      "--base",
+      "d".repeat(40),
+      "--owned-path",
+      "src/alpha",
+      "--write-root",
+      "src/alpha",
+      "--write-purpose",
+      "implement Alpha",
+      "--max-requests",
+      "3",
+      "--max-duration-ms",
+      "120000",
+      "--max-concurrency",
+      "1",
+    ]);
+    expect(guided.status, guided.stdout + guided.stderr).toBe(0);
+    expect(JSON.parse(guided.stdout)).toMatchObject({
+      schema: "ccc-prd.freeze-result.v1",
+      packet: { fileCount: 3 },
+    });
+    expect(readFileSync(join(
+      guidedOutputDir,
+      "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+    ), "utf8")).toContain("Target repository: " + guidedTarget);
     expect(readFileSync(selectedPrdPath).equals(sourceBefore)).toBe(true);
   });
 

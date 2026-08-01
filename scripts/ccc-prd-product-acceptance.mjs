@@ -28,6 +28,7 @@ const cliBin = path.join(repoRoot, "packages/cli/bin.mjs");
 const expectedChecks = Object.freeze([
   "built-cli-current-run",
   "current-prd-discovered-and-frozen",
+  "guided-operator-context-frozen",
   "planted-defect-rejected",
   "native-local-authoring",
   "frozen-packet-validated",
@@ -494,7 +495,7 @@ async function assertExactImplementationFactProvenance(
     [
       "admittedWriteRoots[0].path",
       provenance.admittedWriteRoots[0]?.path,
-      expected.targetRoot,
+      expected.admittedWriteRoot,
     ],
     [
       "admittedWriteRoots[0].purpose",
@@ -543,9 +544,23 @@ async function assertExactImplementationFactProvenance(
       "refs/heads/main",
     ],
   ];
-  const source = await readFile(path.join(packetRoot, sourcePath));
-  const sourceSha256 = sha256(source);
-  const displayPosition = (byteOffset) => {
+  const contextFacts = new Set([
+    "targetRepository.path",
+    "targetRepository.baseCommit",
+    "bounds.maxRequests",
+    "bounds.maxDurationMs",
+    "bounds.maxConcurrency",
+    "admittedWriteRoots[0].path",
+    "admittedWriteRoots[0].purpose",
+  ]);
+  const sources = new Map();
+  const sourceFor = async (path) => {
+    if (!sources.has(path)) {
+      sources.set(path, await readFile(path.join(packetRoot, path)));
+    }
+    return sources.get(path);
+  };
+  const displayPosition = (source, byteOffset) => {
     const lines = source.subarray(0, byteOffset).toString("utf8").split("\n");
     return {
       line: lines.length,
@@ -562,11 +577,16 @@ async function assertExactImplementationFactProvenance(
       `${label}: ${JSON.stringify(binding)}`,
     );
     const [span] = binding.spans;
+    const expectedSourcePath = contextFacts.has(label)
+      ? expected.contextSourcePath
+      : sourcePath;
+    const source = await sourceFor(expectedSourcePath);
+    const sourceSha256 = sha256(source);
     const excerpt = source.subarray(span.byteStart, span.byteEnd);
-    const expectedStart = displayPosition(span.byteStart);
-    const expectedEnd = displayPosition(span.byteEnd);
+    const expectedStart = displayPosition(source, span.byteStart);
+    const expectedEnd = displayPosition(source, span.byteEnd);
     assert(
-      span.path === sourcePath
+      span.path === expectedSourcePath
         && Number.isSafeInteger(span.byteStart)
         && Number.isSafeInteger(span.byteEnd)
         && span.byteStart >= 0
@@ -603,8 +623,10 @@ async function assertExactImplementationFactProvenance(
   }
   return {
     schema: provenance.schema,
-    sourcePath,
-    sourceSha256,
+    sourcePaths: [...sources.keys()],
+    sourceSha256ByPath: Object.fromEntries(
+      [...sources].map(([path, source]) => [path, sha256(source)]),
+    ),
     bindingCount: spans.length,
     spans,
   };
@@ -805,14 +827,17 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "Positive oracle: The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
     "Negative control: The same verifier exits nonzero for the frozen planted bad value.",
   ].join(" ");
-  const targetRepositoryLine = `- Target repository: ${targetRoot}`;
-  const baselineLine = `- Baseline commit: ${targetBase}`;
-  const allowedWriteRootLine = `- Allowed write root: ${targetRoot}`;
+  const targetRepositoryLine = "- Target repository: " + targetRoot;
+  const baselineLine = "- Baseline commit: " + targetBase;
+  const taskOwnedPathLine = "- Task owned path: src/value.txt";
+  const taskAllowedWriteRootLine = "- Task allowed write root: src/value.txt";
+  const admittedWriteRoot = path.join(targetRoot, "src/value.txt");
+  const allowedWriteRootLine = "- Allowed write root: " + admittedWriteRoot;
   const allowedWriteRootPurposeLine =
     "- Allowed write root purpose: disposable product acceptance repository";
-  const maxRequestsLine = "- Max requests: 1";
-  const maxDurationLine = "- Max duration ms: 120000";
-  const maxConcurrencyLine = "- Max concurrency: 1";
+  const maxRequestsLine = "- Maximum requests: 1";
+  const maxDurationLine = "- Maximum duration in milliseconds: 120000";
+  const maxConcurrencyLine = "- Maximum concurrency: 1";
   const nonGoalLine =
     "- Non-goal: Modify any path outside src/value.txt.";
   const liveActionLine =
@@ -832,13 +857,6 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "",
     "## Implementation contract",
     "",
-    targetRepositoryLine,
-    baselineLine,
-    allowedWriteRootLine,
-    allowedWriteRootPurposeLine,
-    maxRequestsLine,
-    maxDurationLine,
-    maxConcurrencyLine,
     nonGoalLine,
     "",
     "## Protected actions",
@@ -864,6 +882,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   await mkdir(path.dirname(supportSourcePath), { recursive: true });
   await writeFile(prdSourcePath, prd);
   await writeFile(supportSourcePath, support);
+  const prdSourceSha256 = sha256(await readFile(prdSourcePath));
 
   const discovery = jsonOutput(
     await run(
@@ -893,6 +912,22 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         activeProjectsRoot,
         prdSourcePath,
         packetRoot,
+        "--target",
+        targetRoot,
+        "--base",
+        targetBase,
+        "--owned-path",
+        "src/value.txt",
+        "--write-root",
+        "src/value.txt",
+        "--write-purpose",
+        "disposable product acceptance repository",
+        "--max-requests",
+        "1",
+        "--max-duration-ms",
+        "120000",
+        "--max-concurrency",
+        "1",
       ],
       { cwd: targetRoot, env },
     ),
@@ -900,7 +935,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   );
   assert(
     frozen.schema === "ccc-prd.freeze-result.v1"
-    && frozen.packet?.fileCount === 2
+    && frozen.packet?.fileCount === 3
     && frozen.packet?.unresolvedReferenceCount === 0
     && frozen.unresolvedReferences?.length === 0,
     "CCC_PRODUCT_CURRENT_PRD_FREEZE_FAILED",
@@ -909,8 +944,29 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const freezeReceipt = JSON.parse(await readFile(frozen.receiptPath, "utf8"));
   exactArray(
     freezeReceipt.entries?.map(({ projectRelativePath }) => projectRelativePath),
-    [prdFileName, supportRelativePath],
+    [
+      "__fusion__/REF-HUM-FusionOperatorContext.md",
+      prdFileName,
+      supportRelativePath,
+    ],
     "CCC_PRODUCT_FROZEN_SOURCE_SET_DRIFT",
+  );
+  const operatorContextReceipt = freezeReceipt.entries?.find(
+    ({ projectRelativePath }) =>
+      projectRelativePath === "__fusion__/REF-HUM-FusionOperatorContext.md",
+  );
+  assert(
+    operatorContextReceipt?.originPath
+      === "operator-context://ccc-prd.operator-context.v1"
+      && operatorContextReceipt.role === "support"
+      && operatorContextReceipt.authoritative === true,
+    "CCC_PRODUCT_GUIDED_CONTEXT_RECEIPT_INVALID",
+    JSON.stringify(operatorContextReceipt),
+  );
+  assert(
+    sha256(await readFile(prdSourcePath)) === prdSourceSha256,
+    "CCC_PRODUCT_GUIDED_FREEZE_CHANGED_PRD",
+    prdSourcePath,
   );
 
   const manifestPath = frozen.manifestPath;
@@ -918,6 +974,8 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const sidecarPath = path.join(packetRoot, "candidate.sidecar.json");
   const executionPlanPath = path.join(packetRoot, "execution-plan.json");
   const frozenPrdRelativePath = `sources/${prdFileName}`;
+  const frozenContextRelativePath =
+    "sources/__fusion__/REF-HUM-FusionOperatorContext.md";
   const sourceRefs = [{
     path: frozenPrdRelativePath,
     exactQuote: requirementLine,
@@ -925,16 +983,21 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const implementationRefs = [
     targetRepositoryLine,
     baselineLine,
+    taskOwnedPathLine,
+    taskAllowedWriteRootLine,
     allowedWriteRootLine,
     allowedWriteRootPurposeLine,
     maxRequestsLine,
     maxDurationLine,
     maxConcurrencyLine,
-    nonGoalLine,
   ].map((exactQuote) => ({
-    path: frozenPrdRelativePath,
+    path: frozenContextRelativePath,
     exactQuote,
   }));
+  const nonGoalRefs = [{
+    path: frozenPrdRelativePath,
+    exactQuote: nonGoalLine,
+  }];
   const liveActionRefs = [{
     path: frozenPrdRelativePath,
     exactQuote: liveActionLine,
@@ -949,12 +1012,20 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   }];
   const proposal = {
     schema: "ccc-prd.authoring-proposal.v1",
-    authorityRoles: [{
-      id: "AUTHORITY-VERTICAL",
-      role: "root",
-      sourcePaths: [frozenPrdRelativePath],
-      accountableProducer: "product-owner",
-    }],
+    authorityRoles: [
+      {
+        id: "AUTHORITY-VERTICAL",
+        role: "root",
+        sourcePaths: [frozenPrdRelativePath],
+        accountableProducer: "product-owner",
+      },
+      {
+        id: "AUTHORITY-VERTICAL-CONTEXT",
+        role: "support",
+        sourcePaths: [frozenContextRelativePath],
+        accountableProducer: "operator",
+      },
+    ],
     requirements: [{
       id: "REQ-VERTICAL",
       statement:
@@ -999,6 +1070,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       ],
       sourceRefs: [
         ...implementationRefs,
+        ...nonGoalRefs,
         ...sourceRefs,
         ...liveActionRefs,
         ...mergeActionRefs,
@@ -1084,7 +1156,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       maxConcurrency: 1,
     },
     admittedWriteRoots: [{
-      path: targetRoot,
+      path: admittedWriteRoot,
       purpose: "disposable product acceptance repository",
     }],
     targetRepository: { path: targetRoot, baseCommit: targetBase },
@@ -1101,6 +1173,13 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     sidecarPath,
     executionPlanPath,
     sourcePath: frozenPrdRelativePath,
+    contextSourcePath: frozenContextRelativePath,
+    operatorContext: {
+      originPath: operatorContextReceipt.originPath,
+      sha256: operatorContextReceipt.sha256,
+      prdSourceSha256,
+      sourceUnchanged: true,
+    },
     discovery: {
       project: projectName,
       selectedPrdPath: discoveredProject.selection.selectedPrdPath,
@@ -1300,6 +1379,10 @@ async function main() {
       discovery: packet.discovery,
       freeze: packet.freeze,
     });
+    ledger.pass("guided-operator-context-frozen", {
+      sourcePath: packet.contextSourcePath,
+      ...packet.operatorContext,
+    });
     const idempotencyKey = `ccc-product-${randomUUID()}`;
 
     const planted = await run(process.execPath, ["verify.cjs"], {
@@ -1403,6 +1486,9 @@ async function main() {
         )
         && JSON.stringify(generationRequests[0].body?.messages).includes(
           "CCC Fusion Product Vertical Slice",
+        )
+        && JSON.stringify(generationRequests[0].body?.messages).includes(
+          "Fusion Reviewed Operator Context",
         ),
       "CCC_PRODUCT_NATIVE_AUTHORING_REQUEST_INVALID",
       JSON.stringify(generationRequests),
@@ -1418,12 +1504,26 @@ async function main() {
       "CCC_PRODUCT_NATIVE_AUTHORING_PROVENANCE_INVALID",
       JSON.stringify(authoredSidecar.provenance),
     );
+    const taskSpanPaths = [...new Set(
+      authoredSidecar.tasks?.[0]?.spans?.map(({ path }) => path) ?? [],
+    )].sort();
+    assert(
+      taskSpanPaths.includes(packet.sourcePath)
+        && taskSpanPaths.includes(packet.contextSourcePath),
+      "CCC_PRODUCT_TASK_CUSTODY_SOURCE_BINDING_MISSING",
+      JSON.stringify(taskSpanPaths),
+    );
     const implementationFactProvenance =
       await assertExactImplementationFactProvenance(
         authoredSidecar,
         packetRoot,
         packet.sourcePath,
-        { targetRoot, targetBase },
+        {
+          targetRoot,
+          targetBase,
+          admittedWriteRoot: path.join(targetRoot, "src/value.txt"),
+          contextSourcePath: packet.contextSourcePath,
+        },
       );
     const nativeAuthoringEvidence = {
       mode: "native-local-loopback",
@@ -1437,6 +1537,7 @@ async function main() {
       requestCount: generationRequests.length,
       requestSha256: sha256(JSON.stringify(generationRequests[0].body)),
       promptContractObserved: true,
+      taskSpanPaths,
       provenance: authoredSidecar.provenance,
       implementationFactProvenance,
     };

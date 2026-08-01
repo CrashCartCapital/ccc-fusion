@@ -26,6 +26,14 @@ import {
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
 } from "@fusion/core";
+import {
+  CCC_PRD_OPERATOR_CONTEXT_ORIGIN,
+  CCC_PRD_OPERATOR_CONTEXT_SOURCE_PATH,
+  CccPrdOperatorContextError,
+  assertCccPrdOperatorContextCompatible,
+  renderCccPrdOperatorContextMarkdown,
+  type CccPrdOperatorContext,
+} from "./operator-context.js";
 
 const DISCOVERY_SCHEMA = "ccc-prd.discovery.v1" as const;
 const FREEZE_RESULT_SCHEMA = "ccc-prd.freeze-result.v1" as const;
@@ -1056,6 +1064,7 @@ export function freezeCccPrdPacket(input: {
   activeProjectsRoot: string;
   selectedPrdPath: string;
   outputDir: string;
+  operatorContext?: CccPrdOperatorContext;
 }): CccPrdFreezeResult {
   const activeProjectsRoot = canonicalDirectory(
     input.activeProjectsRoot,
@@ -1110,7 +1119,55 @@ export function freezeCccPrdPacket(input: {
     );
   }
 
-  const manifestEntries = collected.sources.map((source) => ({
+  let sources = [...collected.sources];
+  let totalBytes = collected.totalBytes;
+  if (input.operatorContext) {
+    try {
+      const rendered = renderCccPrdOperatorContextMarkdown(input.operatorContext);
+      assertCccPrdOperatorContextCompatible({
+        context: rendered.context,
+        sources: collected.sources.map((source) => ({
+          path: source.projectRelativePath,
+          markdown: source.bytes.toString("utf8"),
+          authoritative: source.authoritative,
+        })),
+      });
+      const contextBytes = Buffer.from(rendered.markdown, "utf8");
+      if (sources.length >= MAX_PACKET_FILES) {
+        return refuse(
+          "CCC_PRD_INTAKE_FILE_LIMIT",
+          "packet has no remaining file slot for reviewed operator context",
+        );
+      }
+      if (totalBytes + contextBytes.byteLength > MAX_PACKET_BYTES) {
+        return refuse(
+          "CCC_PRD_INTAKE_BYTE_LIMIT",
+          "packet plus reviewed operator context exceeds the source byte limit",
+        );
+      }
+      sources.push({
+        path: CCC_PRD_OPERATOR_CONTEXT_ORIGIN,
+        projectRelativePath: CCC_PRD_OPERATOR_CONTEXT_SOURCE_PATH,
+        bytes: contextBytes,
+        authoritative: true,
+        role: "support",
+      });
+      sources = sources.sort((left, right) =>
+        compareCccPrdCodeUnits(left.projectRelativePath, right.projectRelativePath));
+      totalBytes += contextBytes.byteLength;
+    } catch (error) {
+      if (error instanceof CccPrdOperatorContextError) {
+        return refuse(error.code, error.message);
+      }
+      return asIntakeError(
+        error,
+        "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+        "reviewed operator context is invalid",
+      );
+    }
+  }
+
+  const manifestEntries = sources.map((source) => ({
     relative_path: `sources/${source.projectRelativePath}`,
     role: source.role,
     sha256: sha256(source.bytes),
@@ -1123,7 +1180,7 @@ export function freezeCccPrdPacket(input: {
   };
   const manifestBytes = Buffer.from(`${canonicalCccPrdJson(manifest)}\n`, "utf8");
   const manifestSha256 = sha256(manifestBytes);
-  const authoritativeSources = collected.sources
+  const authoritativeSources = sources
     .filter((source) => source.authoritative)
     .map((source) => ({
       path: `sources/${source.projectRelativePath}`,
@@ -1139,7 +1196,7 @@ export function freezeCccPrdPacket(input: {
 
   const manifestPath = join(outputDir, "manifest.json");
   const receiptPath = join(outputDir, "freeze-receipt.json");
-  const receiptEntries: CccPrdFreezeReceiptEntry[] = collected.sources.map((source) => ({
+  const receiptEntries: CccPrdFreezeReceiptEntry[] = sources.map((source) => ({
     originPath: source.path,
     frozenPath: join(outputDir, "sources", ...source.projectRelativePath.split("/")),
     relativePath: `sources/${source.projectRelativePath}`,
@@ -1176,8 +1233,8 @@ export function freezeCccPrdPacket(input: {
       manifestSha256,
       packetHash,
       receiptSha256,
-      fileCount: collected.sources.length,
-      totalBytes: collected.totalBytes,
+      fileCount: sources.length,
+      totalBytes,
       unresolvedReferenceCount: collected.unresolvedReferences.length,
       project,
       selectedPrdPath,
@@ -1191,7 +1248,7 @@ export function freezeCccPrdPacket(input: {
     createdParents = createOutputParent(outputDir);
     const outputParent = dirname(outputDir);
     stageDir = mkdtempSync(join(outputParent, `.${basename(outputDir)}.stage-`));
-    for (const source of collected.sources) {
+    for (const source of sources) {
       const destination = join(
         stageDir,
         "sources",

@@ -23,7 +23,19 @@ Missing facts become blocking questions. The operator can answer them in a revie
 
 For the supported product route, every implementation-changing fact must also have exact-span custody in the frozen packet. Fusion records the target path and baseline, task ownership, task write roots, admitted write-root paths and purposes, execution bounds, non-goals, requirement acceptance behavior, proof commands and oracles, negative controls, and protected-action kinds and targets in `implementationFactProvenance`. Each recorded value cites admitted source bytes and hashes. Requirement, proof, and task-custody facts must appear inside that entity's cited source span; a matching phrase elsewhere in the PRD is not enough.
 
-Operator decisions can supply missing facts only when they are admitted into the frozen packet as a reviewed source. CLI flags and transient prompts are constraints, not source facts.
+Operator decisions can supply missing facts only when they are admitted into the frozen packet as a reviewed source. Raw CLI flags and transient prompts are constraints, not source facts; guided freeze promotes the reviewed values only by rendering, hashing, and receipting the companion described below.
+
+## Guided intake for existing PRDs
+
+When an existing PRD has the product decision but omits transient implementation facts, the normal freeze command can generate an authoritative companion without changing the source:
+
+    fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>
+
+Repeat the owned-path and write-root flags for additional task custody. Automation can send the same exact ccc-prd.operator-context.v1 object through standard input:
+
+    fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin
+
+Fusion validates the typed values, compares them with explicit labeled facts in every authoritative source, renders deterministic Markdown at sources/__fusion__/REF-HUM-FusionOperatorContext.md, and includes its bytes in the packet manifest, hash, and freeze receipt. A conflict, escaping path, incomplete context, oversized input, or invalid bound refuses before the output directory is published. The original PRD bytes remain unchanged. This companion can supply target, baseline, task custody, write-root purpose, and execution bounds; it cannot replace requirements, acceptance behavior, expected proof, non-goals, protected actions, or other missing product decisions.
 
 ## Recommended structure
 

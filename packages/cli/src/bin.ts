@@ -310,6 +310,10 @@ Usage:
                                       Select the current PRD inside each project using project-local lineage
   fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>
                                       Freeze the selected PRD and recursive support packet outside its source tree
+  fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>
+                                      Freeze with reviewed operator facts; repeat owned/write path flags as needed
+  fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin
+                                      Read the same typed operator-context contract from standard input
   fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]
                                       Generate a hash-bound coding route plan without hand-written policy JSON
   fn prd template                     Print the optional future-PRD intake template

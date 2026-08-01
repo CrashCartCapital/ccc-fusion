@@ -16,3 +16,13 @@ export type {
 } from "./native-authoring-adapter.js";
 export { compileCccPrdPacket, validateCccPrdPacket, validateNeoCandidate } from "./compiler.js";
 export type { CompileCccPrdInput } from "./compiler.js";
+export {
+  CCC_PRD_OPERATOR_CONTEXT_ORIGIN,
+  CCC_PRD_OPERATOR_CONTEXT_SCHEMA_VERSION,
+  CCC_PRD_OPERATOR_CONTEXT_SOURCE_PATH,
+  CccPrdOperatorContextError,
+  assertCccPrdOperatorContextCompatible,
+  parseCccPrdOperatorContext,
+  renderCccPrdOperatorContextMarkdown,
+} from "./operator-context.js";
+export type { CccPrdOperatorContext } from "./operator-context.js";
