@@ -304,7 +304,7 @@ export function assertCccPrdOperatorContextCompatible(input: {
   assertCompatibleValues(
     input.sources,
     "target repository",
-    ["Target repository", "Repository target"],
+    ["Target repository", "Target repository path", "Repository target"],
     new Set([input.context.targetRepository.path]),
   );
   assertCompatibleValues(
