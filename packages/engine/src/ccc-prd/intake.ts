@@ -43,6 +43,16 @@ const ARCHIVE_SEGMENTS = new Set([
   "_sources",
   "_lame",
 ]);
+const DISCOVERY_ARTIFACT_SEGMENTS = new Set([
+  "_prompts",
+  "_templates",
+  "eval-prompts",
+  "fixtures",
+  "iterations",
+  "runs",
+  "staging",
+]);
+const DISCOVERY_SUPPORT_PROJECTS = new Set(["_project-explainers"]);
 const RETIRED_STATUS = new Set([
   "archived",
   "deprecated",
@@ -75,6 +85,10 @@ export type CccPrdDiscoveryCandidate = {
   version: string | null;
   status: string | null;
   score: CccPrdDiscoveryCandidateScore;
+};
+
+type RankedCccPrdDiscoveryCandidate = CccPrdDiscoveryCandidate & {
+  selectionStage: "implementation" | "upstream";
 };
 
 export type CccPrdProjectDiscovery = {
@@ -350,12 +364,29 @@ function parseSemver(...values: Array<string | undefined>): [number, number, num
   return null;
 }
 
+function parsePrdSemver(
+  frontmatter: Map<string, string>,
+  name: string,
+  text: string,
+): [number, number, number] | null {
+  const prdHeading = /^#{1,2}\s+.*(?:\bPRD\b|product requirements?)[^\r\n]*$/imu.exec(
+    text.slice(0, 16_384),
+  )?.[0];
+  return parseSemver(
+    frontmatter.get("version"),
+    frontmatter.get("prd_version"),
+    name,
+    prdHeading,
+  );
+}
+
 function statusScore(status: string | null): number {
   switch (status?.toLowerCase()) {
     case "accepted":
     case "approved":
     case "current":
     case "final":
+    case "frozen":
       return 4;
     case "active":
     case "ready":
@@ -375,7 +406,22 @@ function statusScore(status: string | null): number {
 function candidateFromMarkdown(
   file: IndexedMarkdown,
   admittedBytes?: Buffer,
-): CccPrdDiscoveryCandidate | null {
+  mode: "discovery" | "explicit" = "discovery",
+): RankedCccPrdDiscoveryCandidate | null {
+  const pathSegments = file.projectRelativePath.split("/").filter(Boolean);
+  if (
+    mode === "discovery"
+    && pathSegments.some((segment) => {
+      const lower = segment.toLowerCase();
+      return (
+        segment.startsWith(".")
+        || DISCOVERY_ARTIFACT_SEGMENTS.has(lower)
+        || /^brainstorming(?:[-_.].*)?$/u.test(lower)
+        || /^staging(?:[-_.].*)?$/u.test(lower)
+      );
+    })
+  ) return null;
+
   const bytes = admittedBytes ?? readFileSync(file.path);
   const text = bytes.toString("utf8");
   const frontmatter = parseFrontmatter(text);
@@ -383,18 +429,39 @@ function candidateFromMarkdown(
   if (status && RETIRED_STATUS.has(status.toLowerCase())) return null;
 
   const name = basename(file.path);
-  const filenameSignal = /(?:^|[-_.])prd(?:[-_.]|$)/i.test(name);
+  const filenameSignal = /(?:^|[-_.])(?:prod|uf)?prd(?:[-_.]|$)/i.test(name);
   const type = frontmatter.get("type")?.toLowerCase();
   const tagSignal = /(?:^|[\s,[\]-])prd(?:$|[\s,\]])/i.test(frontmatter.get("tags") ?? "");
   const headingSignal = /^#{1,2}\s+.*(?:\bPRD\b|product requirements?)/im.test(text.slice(0, 16_384));
-  const metadataSignal = type === "prd" || type === "product-requirements";
+  const repoBoundProjectContract = (
+    type === "prj"
+    && Boolean(frontmatter.get("repo"))
+    && /^#{1,3}\s+goals?\s*$/imu.test(text)
+    && /^#{1,3}\s+acceptance(?:\s+criteria|\s+behavior)?\s*$/imu.test(text)
+    && /^#{1,3}\s+(?:stop gates?|non-goals?)\s*$/imu.test(text)
+  );
+  const metadataSignal = (
+    type === "prd"
+    || type === "product-requirements"
+    || repoBoundProjectContract
+  );
   if (!filenameSignal && !tagSignal && !headingSignal && !metadataSignal) return null;
 
-  const semver = parseSemver(
-    frontmatter.get("version"),
-    frontmatter.get("prd_version"),
-    name,
-    text.slice(0, 4_096),
+  const semver = parsePrdSemver(frontmatter, name, text);
+  const versionDirectoryMatch = pathSegments.length === 2
+    ? /^(?:prd[-_.]?)?v?(\d+)\.(\d+)(?:\.(\d+|x))?$/iu.exec(pathSegments[0]!)
+    : null;
+  const versionRootSignal = Boolean(
+    filenameSignal
+    && semver
+    && versionDirectoryMatch
+    && semver[0] === Number(versionDirectoryMatch[1])
+    && semver[1] === Number(versionDirectoryMatch[2])
+    && (
+      !versionDirectoryMatch[3]
+      || versionDirectoryMatch[3].toLowerCase() === "x"
+      || semver[2] === Number(versionDirectoryMatch[3])
+    ),
   );
   return {
     path: file.path,
@@ -404,15 +471,23 @@ function candidateFromMarkdown(
     score: {
       semver,
       status: statusScore(status),
-      signal: filenameSignal ? 2 : 1,
+      signal: versionRootSignal ? 3 : (filenameSignal || metadataSignal) ? 2 : 1,
     },
+    selectionStage: /(?:^|[-_.])ufprd(?:[-_.]|$)/iu.test(name)
+      ? "upstream"
+      : "implementation",
   };
 }
 
 function compareCandidateScore(
-  left: CccPrdDiscoveryCandidate,
-  right: CccPrdDiscoveryCandidate,
+  left: RankedCccPrdDiscoveryCandidate,
+  right: RankedCccPrdDiscoveryCandidate,
 ): number {
+  const authorityDifference = Number(left.score.signal >= 2) - Number(right.score.signal >= 2);
+  if (authorityDifference !== 0) return authorityDifference;
+  const stageDifference = Number(left.selectionStage === "implementation")
+    - Number(right.selectionStage === "implementation");
+  if (stageDifference !== 0) return stageDifference;
   if (left.score.semver && !right.score.semver) return 1;
   if (!left.score.semver && right.score.semver) return -1;
   if (left.score.semver && right.score.semver) {
@@ -421,13 +496,13 @@ function compareCandidateScore(
       if (difference !== 0) return difference;
     }
   }
-  const statusDifference = left.score.status - right.score.status;
-  if (statusDifference !== 0) return statusDifference;
-  return left.score.signal - right.score.signal;
+  const signalDifference = left.score.signal - right.score.signal;
+  if (signalDifference !== 0) return signalDifference;
+  return left.score.status - right.score.status;
 }
 
 function projectSelection(
-  candidates: CccPrdDiscoveryCandidate[],
+  candidates: RankedCccPrdDiscoveryCandidate[],
 ): CccPrdProjectDiscovery["selection"] {
   if (candidates.length === 0) return { kind: "none" };
   let highest = candidates[0]!;
@@ -441,7 +516,7 @@ function projectSelection(
     return {
       kind: "ambiguous",
       candidatePaths: ties,
-      reason: "multiple current PRD candidates share the highest project-local semver/status score",
+      reason: "multiple current PRD candidates share the highest project-local authority, stage, version, location, and status score",
     };
   }
   return { kind: "selected", selectedPrdPath: highest.path };
@@ -459,17 +534,20 @@ export function discoverCccPrdCandidates(input: {
     const entries = readdirSync(activeProjectsRoot, { withFileTypes: true })
       .sort((left, right) => compareCccPrdCodeUnits(left.name, right.name));
     for (const entry of entries) {
-      if (segmentKind(entry.name)) continue;
+      if (
+        segmentKind(entry.name)
+        || DISCOVERY_SUPPORT_PROJECTS.has(entry.name.toLowerCase())
+      ) continue;
       const projectRoot = join(activeProjectsRoot, entry.name);
       const stat = lstatSync(projectRoot);
       if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
       const candidates = walkMarkdown(projectRoot)
         .map((file) => candidateFromMarkdown(file))
-        .filter((candidate): candidate is CccPrdDiscoveryCandidate => candidate !== null);
+        .filter((candidate): candidate is RankedCccPrdDiscoveryCandidate => candidate !== null);
       projects.push({
         project: entry.name,
         projectRoot,
-        candidates,
+        candidates: candidates.map(({ selectionStage: _selectionStage, ...candidate }) => candidate),
         selection: projectSelection(candidates),
       });
     }
@@ -799,7 +877,7 @@ function collectPacketSources(
     "selected PRD",
     MAX_PACKET_BYTES,
   );
-  if (!candidateFromMarkdown(selected, selectedAdmissionBytes)) {
+  if (!candidateFromMarkdown(selected, selectedAdmissionBytes, "explicit")) {
     return refuse(
       "CCC_PRD_INTAKE_SOURCE_INVALID",
       `selected Markdown file is not a current PRD candidate: ${selectedRelativePath}`,
@@ -888,11 +966,10 @@ function collectPacketSources(
   const selectedBytes = bytesByPath.get(selectedPrdPath)!;
   const selectedText = selectedBytes.toString("utf8");
   const selectedFrontmatter = parseFrontmatter(selectedText);
-  const semver = parseSemver(
-    selectedFrontmatter.get("version"),
-    selectedFrontmatter.get("prd_version"),
+  const semver = parsePrdSemver(
+    selectedFrontmatter,
     basename(selectedPrdPath),
-    selectedText.slice(0, 4_096),
+    selectedText,
   );
   const sources = [...queued.values()]
     .map(({ source, authoritative }): PacketSource => {
