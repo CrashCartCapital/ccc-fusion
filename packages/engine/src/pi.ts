@@ -406,11 +406,45 @@ type CccResponseIdentitySession = AgentSession & {
 class CccCustomProviderEgressPolicyViolationError extends Error {
   readonly code = "CCC_CUSTOM_PROVIDER_EGRESS_POLICY_VIOLATION";
 
-  constructor(public readonly selection: "primary" | "fallback") {
-    super(`ccc-fusion ${selection} custom-provider base URL rejected by loopback policy`);
+  constructor(
+    public readonly selection: "primary" | "fallback",
+    public readonly providerKey: string,
+    reason: string,
+  ) {
+    super(`ccc-fusion ${selection} provider ${providerKey} is outside the admitted transport set: ${reason}`);
     this.name = "CccCustomProviderEgressPolicyViolationError";
   }
 }
+
+/*
+FNXC:CCCEgressAllowlist 2026-08-01-19:05:
+The ccc-fusion profile admits exactly two transport shapes, and this set is the
+record of the second one. A configured custom provider is admitted only when its
+base URL matches the loopback policy (CF-DIV-002). A provider key listed here is
+admitted with no URL check because it names a child-process CLI bridge that has
+no HTTP base URL to validate: it reuses the operator's already-authenticated
+session, and CF-DIV-001's env-key stripping is what contains it instead.
+
+`pi-claude-cli` is the vendored Claude Code CLI bridge. provider-auth.ts
+classifies it as a CLI provider (excluded from the API-key catalog because it
+has no key to store), and the ProviderAuth note below in this file separates it
+from pi-ai's built-in `anthropic` provider precisely on this axis: `anthropic`
+speaks HTTP to a remote `/v1` whether authenticated by OAuth or by raw key,
+while `pi-claude-cli/<model>` runs the vendored CLI as a child process.
+
+`droid-cli` has the same structural shape but no ccc-fusion call site or
+admitted campaign route anywhere in the repo, so it stays out. This is an
+admission record, not a capability list -- add a member only with evidence that
+ccc-fusion actually routes through it.
+
+Every other provider key fails closed, including built-in cloud HTTP routes such
+as `anthropic`, `openai`, and `openrouter`. Before this set existed, a key that
+resolved to no configured custom provider was silently skipped, so any built-in
+cloud route bypassed the loopback boundary entirely.
+*/
+export const CCC_ADMITTED_NON_HTTP_TRANSPORTS: ReadonlySet<string> = new Set([
+  "pi-claude-cli",
+]);
 
 /*
 FNXC:CCCCampaignFallback 2026-08-01-17:10:
@@ -454,12 +488,20 @@ function assertCccCustomProviderEgress(
   ] as const;
   for (const [selection, providerKey] of selections) {
     if (!providerKey) continue;
+    if (CCC_ADMITTED_NON_HTTP_TRANSPORTS.has(providerKey)) continue;
     const provider = providers.find(
       (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
     );
-    if (!provider) continue;
-    if (!validateCccLoopbackHttpUrl(provider.baseUrl).ok) {
-      throw new CccCustomProviderEgressPolicyViolationError(selection);
+    if (!provider) {
+      throw new CccCustomProviderEgressPolicyViolationError(
+        selection,
+        providerKey,
+        "provider resolves to no configured custom provider and is not an admitted non-HTTP transport",
+      );
+    }
+    const validation = validateCccLoopbackHttpUrl(provider.baseUrl);
+    if (!validation.ok) {
+      throw new CccCustomProviderEgressPolicyViolationError(selection, providerKey, validation.reason);
     }
   }
 }

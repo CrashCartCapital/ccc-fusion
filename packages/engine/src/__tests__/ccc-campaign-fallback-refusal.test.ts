@@ -18,9 +18,26 @@ vi.mock("../skill-resolver.js", () => ({
 }));
 
 // Keep custom-provider resolution deterministic and off the operator's real
-// ~/.fusion/settings.json; the CCC egress guard reads this exact seam.
+// ~/.fusion/settings.json; the CCC egress guard reads this exact seam. Both
+// selections this suite dispatches must resolve to configured loopback custom
+// providers, because the egress guard now fails closed on any provider key
+// that resolves to nothing (slugifyProviderName derives the registry keys
+// "ccc-loopback" and "settings-fallback" from these names).
 vi.mock("../custom-providers.js", () => ({
-  readCustomProviders: () => [],
+  readCustomProviders: () => [
+    {
+      id: "ccc-loopback",
+      name: "CCC Loopback",
+      apiType: "openai-compatible",
+      baseUrl: "http://127.0.0.1:18080/v1",
+    },
+    {
+      id: "settings-fallback",
+      name: "Settings Fallback",
+      apiType: "openai-compatible",
+      baseUrl: "http://127.0.0.1:18081/v1",
+    },
+  ],
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({

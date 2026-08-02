@@ -936,7 +936,10 @@ describe("session failure diagnostics", () => {
     await createFnAgent({
       cwd: "/test/project",
       systemPrompt: "Test ccc MCP forwarding",
-      defaultProvider: "anthropic",
+      // pi-claude-cli is an admitted ccc-fusion transport (see
+      // CCC_ADMITTED_NON_HTTP_TRANSPORTS); the built-in `anthropic` HTTP route
+      // is refused by the egress guard before MCP connection is reached.
+      defaultProvider: "pi-claude-cli",
       defaultModelId: "primary-model",
       mcpServers,
       profile: "ccc-fusion",
@@ -1005,7 +1008,7 @@ describe("session failure diagnostics", () => {
     await createFnAgent({
       cwd: "/test/project",
       systemPrompt: "Test ccc no-MCP runtime forwarding",
-      defaultProvider: "anthropic",
+      defaultProvider: "pi-claude-cli",
       defaultModelId: "primary-model",
       profile: "ccc-fusion",
       subscriptionReady: true,
@@ -1129,7 +1132,7 @@ describe("session failure diagnostics", () => {
     await createFnAgent({
       cwd: "/test/project",
       systemPrompt: "Test ccc dual forwarding",
-      defaultProvider: "anthropic",
+      defaultProvider: "pi-claude-cli",
       defaultModelId: "primary-model",
       mcpServers,
       profile: "ccc-fusion",

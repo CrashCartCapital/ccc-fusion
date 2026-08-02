@@ -17,8 +17,10 @@ ccc-fusion pins CLI-agent child processes toward subscription-authenticated Clau
 
 Any loopback HTTP transport ccc-fusion admits for provider/tool routing must match one exact shape: literal `http://127.0.0.1:<port>/<path>` with an explicit positive port, no hostname aliases, no IPv6, no userinfo, and no query/hash suffix. This is stricter than upstream Fusion's general transport handling and matches the single admitted local-gateway shape ccc-fusion routes through.
 
-- **Status:** active divergence — maintained.
-- **Owning surfaces:** `packages/engine/src/ccc-loopback-policy.ts`
+That loopback shape governs configured custom providers. Because a provider selection under the ccc-fusion profile is not always a custom provider, the profile now resolves every selection — primary and fallback alike — against exactly two admitted transports: a configured custom provider, whose base URL must satisfy the loopback shape above, or a non-HTTP subscription transport enumerated in `CCC_ADMITTED_NON_HTTP_TRANSPORTS` (`packages/engine/src/pi.ts`), which currently holds only the `pi-claude-cli` child-process bridge. An enumerated transport skips URL validation because it has no HTTP base URL to validate; CF-DIV-001's env-key stripping is what contains it. Every other provider selection — including pi-ai's built-in cloud HTTP routes such as `anthropic`, `openai`, and `openrouter` — now fails closed with `CCC_CUSTOM_PROVIDER_EGRESS_POLICY_VIOLATION` before the model registry, the session, or any provider dispatch exists. Previously a selection that resolved to no configured custom provider was skipped rather than refused, so a built-in cloud route bypassed the boundary entirely. The fallback selection is validated too, because an unresolvable primary promotes the fallback to the session's selected model.
+
+- **Status:** active divergence — maintained. Fail-closed provider admission added 2026-08-01.
+- **Owning surfaces:** `packages/engine/src/ccc-loopback-policy.ts`, `packages/engine/src/pi.ts` (`CCC_ADMITTED_NON_HTTP_TRANSPORTS`, `assertCccCustomProviderEgress`)
 
 ## CF-DIV-003 — Cancellation/effect durability
 
