@@ -1,10 +1,15 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CccPrdSemanticBundle, CccPrdSourceSpan } from "@fusion/core";
 import * as engine from "@fusion/engine";
 import { runPrdCommand } from "../prd.js";
 import { cleanupPacketRoots, createPacketRoot } from "./prd-built-cli-fixture.js";
+// Cross-package relative import into core's test-only bundle fixture, matching
+// the established pattern in ../prd-recovery.real-pg.test.ts. Reusing the same
+// real helper core's own per-task routing tests use
+// (packages/core/src/__tests__/ccc-campaign-execution-policy.test.ts) keeps this
+// fixture from drifting out of sync with the real CccPrdSemanticBundle shape.
+import { createCccPrdImportTestBundle } from "../../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 
 // The packet compiler (packages/engine) currently refuses any product bundle
 // with more than one declared task whenever requireMaterialCoverage is set
@@ -31,135 +36,35 @@ afterEach(() => {
     .mockReturnValue([]);
 });
 
-function span(): CccPrdSourceSpan {
+const ROUTE_SUFFIX = "policy-routes";
+const TASK_A_ID = `TASK-${ROUTE_SUFFIX}`;
+const TASK_B_ID = `TASK-terminal-${ROUTE_SUFFIX}`;
+
+// Mirrors packages/core/src/__tests__/ccc-campaign-execution-policy.test.ts's
+// own `custodiedBundleFor` helper exactly: the shared real fixture only needs
+// ownedPaths/allowedWriteRoots layered on for the product policy generator,
+// which legacy (pre-product-policy) sidecars may omit.
+function custodiedTwoTaskBundle(target: string) {
+  const semanticBundle = createCccPrdImportTestBundle(target, ROUTE_SUFFIX);
   return {
-    path: "packet.md",
-    byteStart: 0,
-    byteEnd: 1,
-    line: 1,
-    column: 1,
-    endLine: 1,
-    endColumn: 2,
-    sha256: "a".repeat(64),
-    excerptSha256: "a".repeat(64),
+    ...semanticBundle,
+    tasks: semanticBundle.tasks.map((task, index) => ({
+      ...task,
+      ownedPaths: [`src/task-${index}`],
+      allowedWriteRoots: [`src/task-${index}`],
+    })),
   };
 }
 
-const TASK_A_ID = "TASK-per-task-a";
-const TASK_B_ID = "TASK-per-task-b";
-
-function twoTaskBundle(target: string, base: string): CccPrdSemanticBundle {
-  const requirementId = "REQ-per-task-route";
-  const proofId = "PROOF-per-task-route";
-  const workflowId = "WF-per-task-route";
-  return {
-    kind: "bundle",
-    schema: "ccc-prd.bundle.v1",
-    sourceHash: "a".repeat(64),
-    sidecarHash: "b".repeat(64),
-    bundleHash: "c".repeat(64),
-    sourceVersion: "per-task-route-fixture",
-    orderedSources: [{
-      path: "packet.md",
-      role: "root",
-      authoritative: true,
-      sha256: "a".repeat(64),
-      byteLength: 1,
-    }],
-    provenance: {
-      authoringAdapterId: "fixture",
-      proposalHash: "d".repeat(64),
-      packetHash: "a".repeat(64),
-    },
-    authorityRoles: [{
-      id: "AUTH-root",
-      role: "root",
-      sourcePaths: ["packet.md"],
-      accountableProducer: "fixture",
-    }],
-    requirements: [{
-      id: requirementId,
-      statement: "Route each task independently.",
-      acceptance: "Each task carries its own provider and model.",
-      accountableProducer: "fixture",
-      dependencies: [],
-      proofIds: [proofId],
-      spans: [span()],
-      confidence: "high",
-    }],
-    proofs: [{
-      id: proofId,
-      requirementIds: [requirementId],
-      command: "pnpm test",
-      positiveOracle: "exit 0",
-      negativeControls: ["missing route refuses"],
-      spans: [span()],
-      confidence: "high",
-    }],
-    tasks: [
-      {
-        id: TASK_A_ID,
-        title: "Task A",
-        description: "First independent task.",
-        accountableProducer: "fixture",
-        requirementIds: [requirementId],
-        dependencyTaskIds: [],
-        proofIds: [proofId],
-        workflowId,
-        documentIds: [],
-        artifactIds: [],
-        protectedActionIds: [],
-        ownedPaths: ["src/task-a"],
-        allowedWriteRoots: ["src/task-a"],
-        spans: [span()],
-      },
-      {
-        id: TASK_B_ID,
-        title: "Task B",
-        description: "Second independent task.",
-        accountableProducer: "fixture",
-        requirementIds: [requirementId],
-        dependencyTaskIds: [],
-        proofIds: [proofId],
-        workflowId,
-        documentIds: [],
-        artifactIds: [],
-        protectedActionIds: [],
-        ownedPaths: ["src/task-b"],
-        allowedWriteRoots: ["src/task-b"],
-        spans: [span()],
-      },
-    ],
-    edges: [],
-    workflows: [{
-      id: workflowId,
-      title: "Per-task workflow",
-      taskIds: [TASK_A_ID, TASK_B_ID],
-      entryTaskIds: [TASK_A_ID, TASK_B_ID],
-      terminalTaskIds: [TASK_A_ID, TASK_B_ID],
-      spans: [span()],
-    }],
-    documents: [],
-    artifacts: [],
-    importIntents: [],
-    protectedActions: [],
-    bounds: { maxRequests: 1, maxDurationMs: 30_000, maxConcurrency: 2 },
-    admittedWriteRoots: [{ path: resolve(target, "src"), purpose: "fixture projection" }],
-    targetRepository: { path: target, baseCommit: base },
-    nonGoals: ["live provider call"],
-    confidence: "high",
-  };
-}
-
-function stubTwoTaskBundle(target: string, base: string): void {
-  vi.mocked(engine.compileCccPrdPacket).mockReturnValue(twoTaskBundle(target, base));
+function stubTwoTaskBundle(target: string): void {
+  vi.mocked(engine.compileCccPrdPacket).mockReturnValue(custodiedTwoTaskBundle(target));
 }
 
 describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("wires distinct per-task provider/model/transport routes from a routes file into the execution plan", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, JSON.stringify({
       schema: "ccc-prd.routes-by-task.v1",
@@ -216,7 +121,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("refuses when the routes file omits a declared task, surfacing the core missing/extra message", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, JSON.stringify({
       schema: "ccc-prd.routes-by-task.v1",
@@ -309,7 +214,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("refuses malformed JSON in the routes file, naming the path, and writes no plan file", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, "{");
     const outputPath = join(packet.root, "execution-plan.json");
@@ -338,7 +243,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("refuses a routes file with the wrong schema", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, JSON.stringify({
       schema: "ccc-prd.routes-by-task.v0",
@@ -362,7 +267,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("refuses a routes file whose routes field is not an object", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, JSON.stringify({ schema: "ccc-prd.routes-by-task.v1", routes: [] }));
     const outputPath = join(packet.root, "execution-plan.json");
@@ -383,7 +288,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("refuses a routes file with an empty routes object", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, JSON.stringify({ schema: "ccc-prd.routes-by-task.v1", routes: {} }));
     const outputPath = join(packet.root, "execution-plan.json");
@@ -404,7 +309,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("refuses a route entry with an unknown field", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, JSON.stringify({
       schema: "ccc-prd.routes-by-task.v1",
@@ -432,7 +337,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("refuses a cli-transport route entry that omits cliAdapterId", async () => {
     const packet = createPacketRoot();
     writeFileSync(packet.sidecar, "{}");
-    stubTwoTaskBundle(packet.target, packet.base);
+    stubTwoTaskBundle(packet.target);
     const routesPath = join(packet.root, "routes.json");
     writeFileSync(routesPath, JSON.stringify({
       schema: "ccc-prd.routes-by-task.v1",
