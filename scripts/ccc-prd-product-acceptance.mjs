@@ -2221,21 +2221,18 @@ async function main() {
       return found[0];
     };
 
-    // A chained campaign parks once per task, but the guided `nextAction`
-    // projection can only report the FIRST of those holds. It matches an
-    // issued live-execution approval by the work item's own taskId
-    // (packages/core/src/ccc-prd/product-status.ts:850-861), and a work item
-    // row stays pinned to the workflow's entry task for the life of the
-    // campaign. The second task's approval therefore carries a taskId the
-    // projection never looks up, so nextAction degrades to "blocked" even
-    // though the runtime issued a correct, distinct, per-task approval.
+    // A chained campaign parks once per task. The guided `nextAction`
+    // projection selects the earliest unconsumed live-execution approval by the
+    // approval's own identity, so a chained task's hold is walked exactly like
+    // the entry task's, and the reason names the held task whenever it differs
+    // from the work item's pinned entry task
+    // (packages/core/src/ccc-prd/product-status.ts:854-882).
     //
-    // The canary drives that approval from `liveExecutionApprovalConfirmations`
-    // -- the same operator-visible field the first approval came from -- and
-    // records the nextAction kind it actually observed instead of asserting
-    // the guided one. This is a deliberate, reported gap, not a relaxation of
-    // the hold itself: the park, the distinct approval, and the exact
-    // confirmation are all still proven below.
+    // Both surfaces must agree before the canary claims anything: the guided
+    // next action must be `approve-execution` naming the same approval that the
+    // operator-visible confirmation list reports as issued. Requiring the
+    // agreement here means every parked hold proves the guided operator path,
+    // not just the confirmation list.
     const awaitParkedLiveExecutionApproval = async (
       label,
       readKeyStatus,
@@ -2250,31 +2247,37 @@ async function main() {
       const hold = await poll(
         label,
         readKeyStatus,
-        (value) =>
-          value.status?.workItems?.length === 1
-          && value.status.workItems[0]?.state === "manual-required"
-          && value.status.workItems[0]?.lastError
-            === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
-          && Boolean(issuedFor(value)),
+        (value) => {
+          const pending = issuedFor(value);
+          return value.status?.workItems?.length === 1
+            && value.status.workItems[0]?.state === "manual-required"
+            && value.status.workItems[0]?.lastError
+              === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
+            && Boolean(pending)
+            && value.status.nextAction?.kind === "approve-execution"
+            && value.status.nextAction.approvalRequestId
+              === pending.approvalRequestId;
+        },
         async () => ({
           serve: tail(server.output()),
           status: await readKeyStatus(),
         }),
       );
       const confirmation = issuedFor(hold);
+      const nextAction = hold.status.nextAction;
       assert(
-        confirmation && /^[0-9a-f]{64}$/u.test(confirmation.confirmation),
+        confirmation
+        && /^[0-9a-f]{64}$/u.test(confirmation.confirmation)
+        && nextAction?.kind === "approve-execution"
+        && nextAction.approvalRequestId === confirmation.approvalRequestId,
         "CCC_PRODUCT_PARKED_LIVE_EXECUTION_APPROVAL_MISSING",
         JSON.stringify({
           label,
+          nextAction,
           confirmations: hold.liveExecutionApprovalConfirmations,
         }),
       );
-      return {
-        hold,
-        confirmation,
-        observedNextActionKind: hold.status.nextAction?.kind ?? null,
-      };
+      return { hold, confirmation, nextAction };
     };
 
     const prd = async (args, allowedExitCodes = [0]) => {
@@ -3781,6 +3784,7 @@ async function main() {
     );
     const secondLiveHold = secondLiveApproval.hold;
     const secondLiveConfirmation = secondLiveApproval.confirmation;
+    const secondGuidedNextAction = secondLiveApproval.nextAction;
     const firstApprovalAfterSecondPark =
       secondLiveHold.liveExecutionApprovalConfirmations?.find(
         ({ approvalRequestId }) =>
@@ -3801,6 +3805,25 @@ async function main() {
       JSON.stringify({
         workItems: secondLiveHold.status.workItems,
         confirmations: secondLiveHold.liveExecutionApprovalConfirmations,
+      }),
+    );
+    // The guided operator path must route to the chained task's own approval,
+    // not merely leave it discoverable in the confirmation list, and must name
+    // the held task because it differs from the work item's pinned entry task.
+    assert(
+      secondGuidedNextAction.kind === "approve-execution"
+      && secondGuidedNextAction.approvalRequestId
+        === secondLiveConfirmation.approvalRequestId
+      && secondGuidedNextAction.approvalStatus === "issued"
+      && secondGuidedNextAction.reason.includes(
+        ` for campaign task ${restartedSecondTask.nativeTaskId}`,
+      ),
+      "CCC_PRODUCT_SECOND_LIVE_EXECUTION_GUIDED_ACTION_INVALID",
+      JSON.stringify({
+        nextAction: secondGuidedNextAction,
+        expectedApprovalRequestId: secondLiveConfirmation.approvalRequestId,
+        chainedNativeTaskId: restartedSecondTask.nativeTaskId,
+        workItemTaskId: secondLiveHold.status.workItems[0].taskId,
       }),
     );
     assert(
@@ -3827,9 +3850,14 @@ async function main() {
       distinctApprovalRequestIds: true,
       distinctTaskIds: true,
       firstApprovalStatusAtSecondPark: firstApprovalAfterSecondPark.status,
-      observedNextActionKind: secondLiveApproval.observedNextActionKind,
-      guidedNextActionGap:
-        "fn prd status nextAction reports 'blocked' at this hold instead of 'approve-execution': the projection matches an issued live-execution approval by the work item's own taskId, and that row stays pinned to the workflow entry task, so a chained task's approval is never surfaced by the guided path (packages/core/src/ccc-prd/product-status.ts:850-861). The approval itself is issued, exact, and claimable through fn prd approve-execution.",
+      guidedNextAction: {
+        kind: secondGuidedNextAction.kind,
+        approvalRequestId: secondGuidedNextAction.approvalRequestId,
+        approvalStatus: secondGuidedNextAction.approvalStatus,
+        reason: secondGuidedNextAction.reason,
+      },
+      guidedActionNamesChainedTask: restartedSecondTask.nativeTaskId,
+      workItemTaskId: secondLiveHold.status.workItems[0].taskId,
       targetHead: targetBase,
     });
 
