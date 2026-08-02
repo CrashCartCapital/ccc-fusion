@@ -197,3 +197,90 @@ describe("CCC campaign execution-policy v2", () => {
       .toThrow(/concurrently runnable tasks.*overlapping ownership/);
   });
 });
+
+function custodiedBundleFor(suffix: string) {
+  const semanticBundle = createCccPrdImportTestBundle(targetRoot, suffix);
+  return {
+    ...semanticBundle,
+    tasks: semanticBundle.tasks.map((task, index) => ({
+      ...task,
+      ownedPaths: ["src/task-" + index],
+      allowedWriteRoots: ["src/task-" + index],
+    })),
+  };
+}
+
+describe("CCC PRD product execution-plan generation with per-task routing", () => {
+  it("routes each task to its own provider/model/transport via routesByTaskId", () => {
+    const custodiedBundle = custodiedBundleFor("per-task-a");
+    const [taskA, taskB] = custodiedBundle.tasks;
+    const plan = createCccPrdProductExecutionPlan({
+      bundle: custodiedBundle,
+      routesByTaskId: {
+        [taskA!.id]: { providerId: "provider-x", modelId: "model-x", transport: "pi" },
+        [taskB!.id]: {
+          providerId: "provider-y",
+          modelId: "model-y",
+          transport: "cli",
+          cliAdapterId: "adapter-y",
+        },
+      },
+    });
+    const routeA = plan.policy.routes.find((route) => route.taskId === taskA!.id)!;
+    const routeB = plan.policy.routes.find((route) => route.taskId === taskB!.id)!;
+    expect(routeA.providerId).toBe("provider-x");
+    expect(routeA.modelId).toBe("model-x");
+    expect(routeA.transport).toBe("pi");
+    expect(routeB.providerId).toBe("provider-y");
+    expect(routeB.modelId).toBe("model-y");
+    expect(routeB.transport).toBe("cli");
+    expect(routeB.cliAdapterId).toBe("adapter-y");
+    expect(routeA.providerId).not.toBe(routeB.providerId);
+  });
+
+  it("fails closed when routesByTaskId is missing a task", () => {
+    const custodiedBundle = custodiedBundleFor("per-task-missing");
+    const [taskA] = custodiedBundle.tasks;
+    expect(() => createCccPrdProductExecutionPlan({
+      bundle: custodiedBundle,
+      routesByTaskId: {
+        [taskA!.id]: { providerId: "provider-x", modelId: "model-x", transport: "pi" },
+      },
+    })).toThrow(/routesByTaskId must bind every task exactly once/);
+  });
+
+  it("fails closed when routesByTaskId has an extra unknown taskId", () => {
+    const custodiedBundle = custodiedBundleFor("per-task-extra");
+    const routesByTaskId: Record<string, { providerId: string; modelId: string; transport: "pi" }> = {};
+    for (const task of custodiedBundle.tasks) {
+      routesByTaskId[task.id] = { providerId: "provider-x", modelId: "model-x", transport: "pi" };
+    }
+    routesByTaskId["TASK-does-not-exist"] = { providerId: "provider-x", modelId: "model-x", transport: "pi" };
+    expect(() => createCccPrdProductExecutionPlan({
+      bundle: custodiedBundle,
+      routesByTaskId,
+    })).toThrow(/routesByTaskId must bind every task exactly once/);
+  });
+
+  it("keeps the single-route fan-out unchanged when route is provided (compatibility pin)", () => {
+    const custodiedBundle = custodiedBundleFor("per-task-compat");
+    const plan = createCccPrdProductExecutionPlan({
+      bundle: custodiedBundle,
+      route: { providerId: "deterministic-fake", modelId: "fixture-v2", transport: "pi" },
+    });
+    expect(plan.policy.routes.every((route) =>
+      route.providerId === "deterministic-fake" && route.modelId === "fixture-v2")).toBe(true);
+  });
+
+  it("fails closed when both route and routesByTaskId are provided", () => {
+    const custodiedBundle = custodiedBundleFor("per-task-both");
+    const [taskA] = custodiedBundle.tasks;
+    expect(() => createCccPrdProductExecutionPlan({
+      bundle: custodiedBundle,
+      route: { providerId: "deterministic-fake", modelId: "fixture-v2", transport: "pi" },
+      routesByTaskId: {
+        [taskA!.id]: { providerId: "provider-x", modelId: "model-x", transport: "pi" },
+      },
+    } as never)).toThrow(/accepts exactly one of route or routesByTaskId/);
+  });
+});

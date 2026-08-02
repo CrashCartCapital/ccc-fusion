@@ -6,6 +6,7 @@ import {
   CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
+  CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION,
   CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
   CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION,
   CccCampaignContextError,
@@ -16,7 +17,16 @@ import {
   type CccCampaignExecutionRoute,
   type CccCampaignManifest,
   type CccCampaignProductExecutionPolicy,
+  type CccCampaignProductExecutionPolicyV3,
   type CccCampaignProductExecutionRoute,
+  type CccCampaignProductExecutionRouteV3,
+  type CccCampaignRouteAccessTier,
+  type CccCampaignRouteEgressPolicy,
+  type CccCampaignRouteFallbackPolicy,
+  type CccCampaignRouteLimits,
+  type CccCampaignRouteReasoningEffort,
+  type CccCampaignRouteSensitivityClass,
+  type CccCampaignRouteServiceTier,
   type CccCampaignTransport,
   type CccPrdProductExecutionPlan,
   type CccPrdProductExecutionRouteSelection,
@@ -37,6 +47,68 @@ const PRODUCT_ROUTE_KEYS = [
   "worktreeMode",
 ] as const;
 const PRODUCT_CLI_ROUTE_KEYS = [...PRODUCT_ROUTE_KEYS, "cliAdapterId"] as const;
+const PRODUCT_ROUTE_V3_KEYS = [
+  "accessTier",
+  "allowedWriteRoots",
+  "catalogDigest",
+  "commitPolicy",
+  "decidedAt",
+  "egressPolicy",
+  "executor",
+  "fallbackPolicy",
+  "limits",
+  "modelId",
+  "ownedPaths",
+  "providerId",
+  "reasoningEffort",
+  "routeProfileId",
+  "sensitivityClass",
+  "serviceTier",
+  "taskArchetype",
+  "taskId",
+  "toolMode",
+  "transport",
+  "worktreeMode",
+] as const;
+const PRODUCT_CLI_ROUTE_V3_KEYS = [...PRODUCT_ROUTE_V3_KEYS, "cliAdapterId"] as const;
+const EGRESS_POLICY_LOOPBACK_KEYS = ["kind"] as const;
+const EGRESS_POLICY_ALLOWLISTED_KEYS = ["kind", "providers"] as const;
+const FALLBACK_POLICY_KEYS = ["kind"] as const;
+const LIMITS_REQUIRED_KEYS = ["maxConcurrency", "maxDurationMs", "maxRequests"] as const;
+const LIMITS_ALL_KEYS = [
+  "maxConcurrency",
+  "maxDurationMs",
+  "maxRequests",
+  "maxResponseTokens",
+  "maxSpendUsd",
+] as const;
+const REASONING_EFFORTS = new Set<CccCampaignRouteReasoningEffort>([
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+  "not-applicable",
+]);
+const SERVICE_TIERS = new Set<CccCampaignRouteServiceTier>([
+  "standard",
+  "priority",
+  "flex",
+  "default",
+]);
+const ACCESS_TIERS = new Set<CccCampaignRouteAccessTier>([
+  "subscription",
+  "free",
+  "plan",
+  "metered",
+  "unknown",
+]);
+const SENSITIVITY_CLASSES = new Set<CccCampaignRouteSensitivityClass>([
+  "private-vault",
+  "sanitized",
+  "synthetic",
+  "public",
+]);
 const POLICY_KEYS = ["routes", "schema"] as const;
 const EXECUTION_PLAN_KEYS = [
   "bundleHash",
@@ -293,6 +365,274 @@ function parseProductRoute(
   };
 }
 
+function exactEnum<T extends string>(value: unknown, allowed: ReadonlySet<T>, label: string): T {
+  if (typeof value !== "string" || !allowed.has(value as T)) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} must be one of ${[...allowed].join(", ")}`,
+    );
+  }
+  return value as T;
+}
+
+function positiveInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new CccCampaignExecutionPolicyError(`${label} must be a positive integer`);
+  }
+  return value;
+}
+
+/**
+ * v3-only counterpart of exactTargetRelativePaths that labels errors with
+ * the owning taskId instead of just the array index, kept separate from the
+ * v2 helper so v2 error text (and the tests pinning it) never changes.
+ */
+function exactTargetRelativePathsV3(
+  value: unknown,
+  label: string,
+  field: "ownedPaths" | "allowedWriteRoots",
+): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} ${field} must be a non-empty array of canonical target-relative paths`,
+    );
+  }
+  const paths = value.map((candidate, pathIndex) => {
+    if (
+      typeof candidate !== "string"
+      || candidate.length === 0
+      || candidate !== candidate.trim()
+      || candidate.includes("\\")
+      || candidate.includes("\0")
+      || isAbsolute(candidate)
+      || candidate === "."
+      || candidate.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+    ) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} ${field}[${pathIndex}] must be a canonical target-relative path`,
+      );
+    }
+    return candidate;
+  });
+  if (new Set(paths).size !== paths.length) {
+    throw new CccCampaignExecutionPolicyError(`${label} ${field} must not contain duplicates`);
+  }
+  return paths;
+}
+
+function assertAllowedWriteRootsWithinCustodyV3(
+  ownedPaths: string[],
+  allowedWriteRoots: string[],
+  label: string,
+  bundle: Pick<CccPrdSemanticBundle, "admittedWriteRoots" | "targetRepository">,
+): void {
+  for (const allowedRoot of allowedWriteRoots) {
+    if (!ownedPaths.some((ownedPath) => pathContains(ownedPath, allowedRoot))) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} allowedWriteRoots path ${JSON.stringify(allowedRoot)} is outside task ownership`,
+      );
+    }
+    const absoluteAllowedRoot = resolve(bundle.targetRepository.path, allowedRoot);
+    if (
+      !bundle.admittedWriteRoots.some(({ path }) =>
+        filesystemPathContains(resolve(path), absoluteAllowedRoot))
+    ) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} allowedWriteRoots path ${JSON.stringify(allowedRoot)} is outside PRD-admitted write roots`,
+      );
+    }
+  }
+}
+
+function parseEgressPolicy(value: unknown, label: string): CccCampaignRouteEgressPolicy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(`${label} egressPolicy must be an object`);
+  }
+  const policy = value as Record<string, unknown>;
+  if (policy.kind === "loopback-only") {
+    exactKeys(policy, EGRESS_POLICY_LOOPBACK_KEYS, `${label} egressPolicy`);
+    return { kind: "loopback-only" };
+  }
+  if (policy.kind === "allowlisted") {
+    exactKeys(policy, EGRESS_POLICY_ALLOWLISTED_KEYS, `${label} egressPolicy`);
+    if (!Array.isArray(policy.providers) || policy.providers.length === 0) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} egressPolicy.providers must be a non-empty array`,
+      );
+    }
+    const providers = policy.providers.map((provider, providerIndex) =>
+      exactIdentifier(provider, `${label} egressPolicy.providers[${providerIndex}]`));
+    if (new Set(providers).size !== providers.length) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} egressPolicy.providers must not contain duplicates`,
+      );
+    }
+    return { kind: "allowlisted", providers };
+  }
+  throw new CccCampaignExecutionPolicyError(
+    `${label} egressPolicy.kind must be loopback-only or allowlisted`,
+  );
+}
+
+function parseLimits(
+  value: unknown,
+  label: string,
+  transport: "pi" | "cli",
+): CccCampaignRouteLimits {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(`${label} limits must be an object`);
+  }
+  const limits = value as Record<string, unknown>;
+  const observed = Object.keys(limits).sort(compareCccPrdCodeUnits);
+  const unknownKeys = observed.filter((key) => !(LIMITS_ALL_KEYS as readonly string[]).includes(key));
+  if (unknownKeys.length > 0) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} limits fields must be a subset of ${LIMITS_ALL_KEYS.join(", ")}; received unexpected ${unknownKeys.join(", ")}`,
+    );
+  }
+  const missing = LIMITS_REQUIRED_KEYS.filter((key) => !(key in limits));
+  if (missing.length > 0) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} limits missing required fields ${missing.join(", ")}`,
+    );
+  }
+  if (transport === "cli" && "maxSpendUsd" in limits) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} limits.maxSpendUsd is forbidden for cli transport (receipt-incapable); enforceable caps are maxRequests, maxDurationMs, maxConcurrency`,
+    );
+  }
+  return {
+    maxRequests: positiveInteger(limits.maxRequests, `${label} limits.maxRequests`),
+    maxDurationMs: positiveInteger(limits.maxDurationMs, `${label} limits.maxDurationMs`),
+    maxConcurrency: positiveInteger(limits.maxConcurrency, `${label} limits.maxConcurrency`),
+    ...("maxResponseTokens" in limits
+      ? { maxResponseTokens: positiveInteger(limits.maxResponseTokens, `${label} limits.maxResponseTokens`) }
+      : {}),
+    ...("maxSpendUsd" in limits
+      ? { maxSpendUsd: positiveInteger(limits.maxSpendUsd, `${label} limits.maxSpendUsd`) }
+      : {}),
+  };
+}
+
+function parseFallbackPolicy(value: unknown, label: string): CccCampaignRouteFallbackPolicy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(`${label} fallbackPolicy must be an object`);
+  }
+  const policy = value as Record<string, unknown>;
+  if (policy.kind === "ordered") {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} fallbackPolicy kind "ordered" is not yet supported`,
+    );
+  }
+  if (policy.kind !== "forbidden") {
+    throw new CccCampaignExecutionPolicyError(`${label} fallbackPolicy.kind must be forbidden`);
+  }
+  exactKeys(policy, FALLBACK_POLICY_KEYS, `${label} fallbackPolicy`);
+  return { kind: "forbidden" };
+}
+
+function parseCatalogDigest(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} catalogDigest must be null or a lowercase SHA-256 hash`,
+    );
+  }
+  return value;
+}
+
+function parseDecidedAt(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new CccCampaignExecutionPolicyError(`${label} decidedAt must be a canonical ISO timestamp`);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    throw new CccCampaignExecutionPolicyError(`${label} decidedAt must be a canonical ISO timestamp`);
+  }
+  return value;
+}
+
+function parseProductRouteV3(
+  value: unknown,
+  index: number,
+  bundle: Pick<CccPrdSemanticBundle, "admittedWriteRoots" | "targetRepository">,
+): CccCampaignProductExecutionRouteV3 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} must be an object`,
+    );
+  }
+  const route = value as Record<string, unknown>;
+  const taskId = exactIdentifier(route.taskId, `CCC campaign execution route ${index} taskId`);
+  const label = `CCC campaign execution route ${index} (task ${taskId})`;
+  const transport = exactIdentifier(route.transport, `${label} transport`);
+  if (transport !== "pi" && transport !== "cli") {
+    throw new CccCampaignExecutionPolicyError(`${label} product transport must be pi or cli`);
+  }
+  exactKeys(
+    route,
+    transport === "cli" ? PRODUCT_CLI_ROUTE_V3_KEYS : PRODUCT_ROUTE_V3_KEYS,
+    label,
+  );
+  const executor = exactIdentifier(route.executor, `${label} executor`);
+  if (transport === "pi" && executor !== "model") {
+    throw new CccCampaignExecutionPolicyError(`${label} pi transport requires executor model`);
+  }
+  if (transport === "cli" && executor !== "cli-agent") {
+    throw new CccCampaignExecutionPolicyError(`${label} cli transport requires executor cli-agent`);
+  }
+  if (route.toolMode !== "coding") {
+    throw new CccCampaignExecutionPolicyError(`${label} toolMode must be coding`);
+  }
+  if (route.worktreeMode !== "isolated") {
+    throw new CccCampaignExecutionPolicyError(`${label} worktreeMode must be isolated`);
+  }
+  if (route.commitPolicy !== "required") {
+    throw new CccCampaignExecutionPolicyError(`${label} commitPolicy must be required`);
+  }
+  const ownedPaths = exactTargetRelativePathsV3(route.ownedPaths, label, "ownedPaths");
+  const allowedWriteRoots = exactTargetRelativePathsV3(route.allowedWriteRoots, label, "allowedWriteRoots");
+  assertAllowedWriteRootsWithinCustodyV3(ownedPaths, allowedWriteRoots, label, bundle);
+  const routeProfileId = exactIdentifier(route.routeProfileId, `${label} routeProfileId`);
+  const taskArchetype = exactIdentifier(route.taskArchetype, `${label} taskArchetype`);
+  const reasoningEffort = exactEnum(route.reasoningEffort, REASONING_EFFORTS, `${label} reasoningEffort`);
+  const serviceTier = exactEnum(route.serviceTier, SERVICE_TIERS, `${label} serviceTier`);
+  const accessTier = exactEnum(route.accessTier, ACCESS_TIERS, `${label} accessTier`);
+  const sensitivityClass = exactEnum(route.sensitivityClass, SENSITIVITY_CLASSES, `${label} sensitivityClass`);
+  const egressPolicy = parseEgressPolicy(route.egressPolicy, label);
+  const limits = parseLimits(route.limits, label, transport);
+  const fallbackPolicy = parseFallbackPolicy(route.fallbackPolicy, label);
+  const catalogDigest = parseCatalogDigest(route.catalogDigest, label);
+  const decidedAt = parseDecidedAt(route.decidedAt, label);
+  return {
+    taskId,
+    providerId: exactIdentifier(route.providerId, `${label} providerId`),
+    modelId: exactIdentifier(route.modelId, `${label} modelId`),
+    transport,
+    executor: executor as CccCampaignProductExecutionRouteV3["executor"],
+    toolMode: "coding",
+    worktreeMode: "isolated",
+    ownedPaths,
+    allowedWriteRoots,
+    commitPolicy: "required",
+    routeProfileId,
+    taskArchetype,
+    reasoningEffort,
+    serviceTier,
+    accessTier,
+    sensitivityClass,
+    egressPolicy,
+    limits,
+    fallbackPolicy,
+    catalogDigest,
+    decidedAt,
+    ...(transport === "cli"
+      ? {
+        cliAdapterId: exactIdentifier(route.cliAdapterId, `${label} cliAdapterId`),
+      }
+      : {}),
+  };
+}
+
 function exactWorkflowExtensionRegistryId(value: unknown, index: number): string {
   if (typeof value !== "string" || value !== value.trim() || !WORKFLOW_EXTENSION_REGISTRY_ID_PATTERN.test(value)) {
     throw new CccCampaignExecutionPolicyError(
@@ -446,10 +786,76 @@ export function parseCccCampaignProductExecutionPolicy(
   };
 }
 
+/**
+ * Routing-contract v3 parser. A distinct entry point from the v2 parser: a
+ * v2 policy object is refused here (no automatic v2->v3 backfill), and a v3
+ * policy object is refused by the v2 parser (unknown schema). Callers must
+ * pick their schema version explicitly.
+ */
+export function parseCccCampaignProductExecutionPolicyV3(
+  value: unknown,
+  bundle: Pick<
+    CccPrdSemanticBundle,
+    "tasks" | "admittedWriteRoots" | "targetRepository"
+  >,
+): CccCampaignProductExecutionPolicyV3 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD product import requires a versioned execution policy",
+    );
+  }
+  const policy = value as Record<string, unknown>;
+  exactKeys(policy, POLICY_KEYS, "CCC campaign execution policy");
+  if (policy.schema !== CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC PRD product import requires ${CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION}; upgrade the policy schema explicitly before importing (no automatic v2-to-v3 backfill is performed)`,
+    );
+  }
+  if (!Array.isArray(policy.routes)) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC campaign execution policy routes must be an array",
+    );
+  }
+  const routes = policy.routes.map((route, index) => parseProductRouteV3(route, index, bundle));
+  assertCompleteRouteSet(routes, bundle);
+  assertConcurrentOwnershipDoesNotOverlap(routes, bundle);
+  return {
+    schema: CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION,
+    routes: routes.sort((left, right) => compareCccPrdCodeUnits(left.taskId, right.taskId)),
+  };
+}
+
 export function createCccPrdProductExecutionPlan(input: {
   bundle: CccPrdSemanticBundle;
-  route: CccPrdProductExecutionRouteSelection;
+  route?: CccPrdProductExecutionRouteSelection;
+  routesByTaskId?: Record<string, CccPrdProductExecutionRouteSelection>;
 }): CccPrdProductExecutionPlan {
+  if (input.route && input.routesByTaskId) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD product execution plan accepts exactly one of route or routesByTaskId",
+    );
+  }
+  let routeSelectionForTask: (taskId: string) => CccPrdProductExecutionRouteSelection;
+  if (input.routesByTaskId) {
+    const routesByTaskId = input.routesByTaskId;
+    const expectedIds = input.bundle.tasks.map(({ id }) => id).sort(compareCccPrdCodeUnits);
+    const observedIds = Object.keys(routesByTaskId).sort(compareCccPrdCodeUnits);
+    const missing = expectedIds.filter((id) => !observedIds.includes(id));
+    const extra = observedIds.filter((id) => !expectedIds.includes(id));
+    if (missing.length > 0 || extra.length > 0) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC PRD product execution plan routesByTaskId must bind every task exactly once; missing=${missing.join(",") || "none"}; extra=${extra.join(",") || "none"}`,
+      );
+    }
+    routeSelectionForTask = (taskId) => routesByTaskId[taskId]!;
+  } else if (input.route) {
+    const route = input.route;
+    routeSelectionForTask = () => route;
+  } else {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC PRD product execution plan requires route or routesByTaskId",
+    );
+  }
   const routes = input.bundle.tasks.map((task) => {
     if (!Array.isArray(task.ownedPaths) || task.ownedPaths.length === 0) {
       throw new CccCampaignExecutionPolicyError(
@@ -461,19 +867,20 @@ export function createCccPrdProductExecutionPlan(input: {
         "CCC PRD task " + task.id + " has no allowed write roots for product policy generation",
       );
     }
+    const selection = routeSelectionForTask(task.id);
     return {
       taskId: task.id,
-      providerId: input.route.providerId,
-      modelId: input.route.modelId,
-      transport: input.route.transport,
-      executor: input.route.transport === "cli" ? "cli-agent" as const : "model" as const,
+      providerId: selection.providerId,
+      modelId: selection.modelId,
+      transport: selection.transport,
+      executor: selection.transport === "cli" ? "cli-agent" as const : "model" as const,
       toolMode: "coding" as const,
       worktreeMode: "isolated" as const,
       ownedPaths: [...task.ownedPaths],
       allowedWriteRoots: [...task.allowedWriteRoots],
       commitPolicy: "required" as const,
-      ...(input.route.transport === "cli"
-        ? { cliAdapterId: input.route.cliAdapterId }
+      ...(selection.transport === "cli"
+        ? { cliAdapterId: selection.cliAdapterId }
         : {}),
     };
   });

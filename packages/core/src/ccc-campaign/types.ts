@@ -10,6 +10,8 @@ export const CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION =
   "ccc-campaign.execution-policy.v1" as const;
 export const CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION =
   "ccc-campaign.execution-policy.v2" as const;
+export const CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION =
+  "ccc-campaign.execution-policy.v3" as const;
 export const CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION =
   "ccc-prd.execution-plan.v1" as const;
 /** @deprecated Use the version-specific execution-policy constant. */
@@ -326,6 +328,73 @@ export type CccCampaignExecutionPolicy = {
 export type CccCampaignProductExecutionPolicy = CccCampaignExecutionPolicy & {
   schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION;
   routes: CccCampaignProductExecutionRoute[];
+};
+
+/**
+ * Routing-contract v3 per-task metadata. Additive to the v2 product route
+ * shape; a v3 route is never accepted where a v2 route is expected and vice
+ * versa (versions are parsed and rejected exactly, never migrated silently).
+ */
+export type CccCampaignRouteReasoningEffort =
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "max"
+  | "not-applicable";
+
+export type CccCampaignRouteServiceTier = "standard" | "priority" | "flex" | "default";
+
+export type CccCampaignRouteAccessTier =
+  | "subscription"
+  | "free"
+  | "plan"
+  | "metered"
+  | "unknown";
+
+export type CccCampaignRouteSensitivityClass =
+  | "private-vault"
+  | "sanitized"
+  | "synthetic"
+  | "public";
+
+export type CccCampaignRouteEgressPolicy =
+  | Readonly<{ kind: "loopback-only" }>
+  | Readonly<{ kind: "allowlisted"; providers: string[] }>;
+
+export type CccCampaignRouteLimits = Readonly<{
+  maxRequests: number;
+  maxDurationMs: number;
+  maxConcurrency: number;
+  maxResponseTokens?: number;
+  /** Forbidden on receipt-incapable transports (e.g. cli); see limits parsing. */
+  maxSpendUsd?: number;
+}>;
+
+/**
+ * "ordered" fallback is intentionally not modeled as data yet; the v3 parser
+ * rejects it with a not-yet-supported error rather than accepting a shape it
+ * cannot enforce.
+ */
+export type CccCampaignRouteFallbackPolicy = Readonly<{ kind: "forbidden" }>;
+
+export type CccCampaignProductExecutionRouteV3 = CccCampaignProductExecutionRoute & {
+  routeProfileId: string;
+  taskArchetype: string;
+  reasoningEffort: CccCampaignRouteReasoningEffort;
+  serviceTier: CccCampaignRouteServiceTier;
+  accessTier: CccCampaignRouteAccessTier;
+  sensitivityClass: CccCampaignRouteSensitivityClass;
+  egressPolicy: CccCampaignRouteEgressPolicy;
+  limits: CccCampaignRouteLimits;
+  fallbackPolicy: CccCampaignRouteFallbackPolicy;
+  catalogDigest: string | null;
+  decidedAt: string;
+};
+
+export type CccCampaignProductExecutionPolicyV3 = {
+  schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION;
+  routes: CccCampaignProductExecutionRouteV3[];
 };
 
 export type CccPrdProductExecutionRouteSelection = {
