@@ -37,6 +37,33 @@ import { createJoinedLocalCampaignScenario } from "./fixtures/ccc-campaign/joine
 const ENGINE_DIST_ROOT = fileURLToPath(new URL("../../dist/", import.meta.url));
 const APPROVE_OUTPUT = '{"verdict":"APPROVE","notes":""}';
 
+/*
+FNXC:CCCEgressAllowlist 2026-08-02-00:00:
+Under the ccc-fusion profile the egress guard (`assertCccCustomProviderEgress`,
+pi.ts) resolves every provider key against CONFIGURED custom providers and
+refuses anything that is neither a loopback HTTP custom provider nor an admitted
+non-HTTP transport. These fixture providers were always local loopback routes,
+but they were registered only in the bottom model runtime below, so once the
+guard stopped silently skipping unresolved providers it refused them before the
+coding node could dispatch. Register them at the exact seam the guard reads.
+Mocked rather than written to disk so the suite never touches the operator's
+real ~/.fusion/settings.json; the base URLs are never dialed because the model
+runtime is stubbed. The registry key is the slugified `name`
+(`customProviderRegistryKey`), which is what must equal the provider key.
+*/
+const cccLoopbackProviders = vi.hoisted(() => ({
+  customProviders: ["a", "b", "d"].map((suffix, index) => ({
+    id: `local-pi-${suffix}`,
+    name: `local-pi-${suffix}`,
+    apiType: "openai-compatible" as const,
+    baseUrl: `http://127.0.0.1:${7401 + index}/v1`,
+  })),
+}));
+
+vi.mock("../custom-providers.js", () => ({
+  readCustomProviders: () => cccLoopbackProviders.customProviders,
+}));
+
 const piHarness = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   sessions: [] as Array<{ model: { provider?: string; id?: string }; options: Record<string, unknown> }>,

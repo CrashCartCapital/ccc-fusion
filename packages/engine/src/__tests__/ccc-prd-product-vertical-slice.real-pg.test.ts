@@ -320,6 +320,17 @@ async function createPacket(
       documentIds: [],
       artifactIds: [],
       protectedActionIds: ["ACTION-VERTICAL-LIVE", "ACTION-VERTICAL-MERGE"],
+      /*
+       * Constrained authoring requires every task to declare source-owned
+       * custody (`validateTaskCustodyProvenance`, ccc-prd/authoring.ts): both
+       * lists must be non-empty AND each path must appear as a whole path
+       * inside the task's own exact source evidence. `requirementLine` quotes
+       * "src/value.txt" between spaces, so this custody is provable from the
+       * packet rather than asserted by the fixture, and it matches the write
+       * custody the execution-policy route below already declares.
+       */
+      ownedPaths: ["src/value.txt"],
+      allowedWriteRoots: ["src/value.txt"],
       sourceRefs,
     }],
     edges: [],
