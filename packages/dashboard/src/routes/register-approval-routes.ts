@@ -213,6 +213,47 @@ function emitSandboxProvisioningDecisionAudit(params: {
   }
 }
 
+/*
+FNXC:CccCampaignApprovalGuard 2026-08-01-17:00:
+Matches by resourceType prefix (not an exact "merge"/"live_execution" allowlist) so a
+future protected-action kind added under the "ccc-campaign-" namespace fails closed
+through this generic endpoint by default, instead of silently falling through to the
+plain decide() path the way merge/live_execution did before this guard existed.
+*/
+const CCC_CAMPAIGN_RESOURCE_TYPE_PREFIX = "ccc-campaign-";
+
+function isCccCampaignApproval(resourceType: string): boolean {
+  return resourceType.startsWith(CCC_CAMPAIGN_RESOURCE_TYPE_PREFIX);
+}
+
+function cccCampaignDecisionRefusalMessage(request: ApprovalRequest): string {
+  const resourceType = request.targetAction.resourceType;
+  const cliSubcommand =
+    resourceType === "ccc-campaign-merge"
+      ? "approve-merge"
+      : resourceType === "ccc-campaign-live_execution"
+        ? "approve-execution"
+        : "approve-merge|approve-execution";
+  return (
+    `This approval belongs to a protected CCC campaign action (resourceType "${resourceType}") and cannot be `
+    + "approved or denied from the dashboard. The dashboard's generic approval endpoint does not verify the "
+    + "confirmation digest or advance the campaign's manual-required work item, so deciding it here would show "
+    + "\"decided\" while the campaign stays stuck. Decide it from the CLI instead: run `fn prd status "
+    + "<idempotency-key>` to get the current confirmation digest, then run `fn prd "
+    + `${cliSubcommand} <idempotency-key> ${request.id} --confirm <digest>\`.`
+  );
+}
+
+/*
+FNXC:CccCampaignApprovalGuard 2026-08-01-17:00:
+Excluding (rather than flagging) keeps the response shape unchanged for every existing
+consumer, so a dashboard build that hasn't learned about a metadata flag can't render a
+false approvable row for an approval this endpoint refuses to decide.
+*/
+function excludeCccCampaignApprovals(requests: ApprovalRequest[]): ApprovalRequest[] {
+  return requests.filter((request) => !isCccCampaignApproval(request.targetAction.resourceType));
+}
+
 async function resumeAfterDecision(params: {
   scopedStore: import("@fusion/core").TaskStore;
   request: import("@fusion/core").ApprovalRequest;
@@ -265,12 +306,17 @@ export function registerApprovalRoutes(ctx: ApiRoutesContext): void {
       const offset = parseOptionalInt(req.query.offset, "offset") ?? 0;
 
       const requests = await approvalStore.list({ status, limit, offset });
-      const summaries = await Promise.all(requests.map(async (request) => {
+      const visibleRequests = excludeCccCampaignApprovals(requests);
+      const summaries = await Promise.all(visibleRequests.map(async (request) => {
         const history = await approvalStore.getAuditHistory(request.id);
         return toSummaryDto(request, history);
       }));
-      const total = (await approvalStore.list({ status, limit: Number.MAX_SAFE_INTEGER, offset: 0 })).length;
-      const pendingCount = (await approvalStore.list({ status: "pending", limit: Number.MAX_SAFE_INTEGER, offset: 0 })).length;
+      const total = excludeCccCampaignApprovals(
+        await approvalStore.list({ status, limit: Number.MAX_SAFE_INTEGER, offset: 0 }),
+      ).length;
+      const pendingCount = excludeCccCampaignApprovals(
+        await approvalStore.list({ status: "pending", limit: Number.MAX_SAFE_INTEGER, offset: 0 }),
+      ).length;
 
       res.json({ requests: summaries, total, pendingCount });
     } catch (err: unknown) {
@@ -311,6 +357,10 @@ export function registerApprovalRoutes(ctx: ApiRoutesContext): void {
       const requestId = String(req.params.id);
       const existing = await approvalStore.get(requestId);
       if (!existing) throw notFound("Approval request not found");
+
+      if (isCccCampaignApproval(existing.targetAction.resourceType)) {
+        throw conflict(cccCampaignDecisionRefusalMessage(existing));
+      }
 
       const actor = body.actor ?? DEFAULT_ACTOR;
       if (!actor || typeof actor.actorId !== "string" || typeof actor.actorType !== "string" || typeof actor.actorName !== "string") {
