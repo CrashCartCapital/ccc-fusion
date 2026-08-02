@@ -255,8 +255,14 @@ export function validateCccNativeCliPermitScope(
   if (semanticTaskId !== expected.semanticTaskId) throw refused("permit scope semanticTaskId must match sealed semanticTaskId");
   if (scope.turnKey !== expected.dispatchRequest.turnKey) throw refused("permit scope turnKey mismatch");
   if (scope.dispatchKey !== expected.dispatchRequest.dispatchKey) throw refused("permit scope dispatchKey mismatch");
-  requirePositiveSafeInteger(scope.attemptOrdinal, "permit scope attemptOrdinal");
-  if (scope.requestCount !== 1) throw refused("permit scope requestCount must be exactly 1");
+  const attemptOrdinal = requirePositiveSafeInteger(scope.attemptOrdinal, "permit scope attemptOrdinal");
+  // requestCount is the campaign-wide reservation counter, not a per-attempt request budget:
+  // core mints attemptOrdinal and requestCount together, so a later task legitimately carries N > 1.
+  // One-shot semantics stay pinned by the equality, which admits exactly one request per ordinal.
+  requirePositiveSafeInteger(scope.requestCount, "permit scope requestCount");
+  if (scope.requestCount !== attemptOrdinal) {
+    throw refused("permit scope requestCount must equal attemptOrdinal");
+  }
   if (scope.state !== "dispatched_unknown") throw refused("permit scope state must be dispatched_unknown");
   if (Object.hasOwn(scope, "terminal")) throw refused("permit scope terminal must be absent");
   validateWorkItemFence(scope.workItemFence, expected.executionFence, "permit scope work-item fence");

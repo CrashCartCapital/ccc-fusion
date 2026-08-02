@@ -1471,10 +1471,16 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       }),
     },
     {
-      name: "requestCount not one",
+      /*
+       * requestCount is the campaign-wide reservation counter, so a later campaign
+       * task legitimately dispatches with requestCount > 1 (core mints it together
+       * with attemptOrdinal). What must never dispatch is a scope whose counter and
+       * ordinal disagree — that is a permit that no longer describes one request.
+       */
+      name: "requestCount diverging from attemptOrdinal",
       createScope: ({ scope }) => Object.freeze({
         ...scope,
-        attemptOrdinal: 2,
+        attemptOrdinal: 1,
         requestCount: 2,
       }),
     },

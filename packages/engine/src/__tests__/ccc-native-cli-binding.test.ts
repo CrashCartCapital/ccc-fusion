@@ -225,6 +225,55 @@ describe("CCC native CLI binding", () => {
     }
   });
 
+  it("Task multi-task-dispatch RED: admits a later campaign attempt whose requestCount matches its attemptOrdinal", () => {
+    const first = createPermitScope();
+    expect(validateCccNativeCliPermitScope(first, permitScopeExpectation(first))).toBe(first);
+
+    const second = Object.freeze({ ...first, attemptOrdinal: 2, requestCount: 2 }) as CccProviderAttemptScope;
+
+    expect(validateCccNativeCliPermitScope(second, permitScopeExpectation(second))).toBe(second);
+  });
+
+  it("Task multi-task-dispatch RED: refuses a permit scope whose requestCount diverges from its attemptOrdinal", () => {
+    const scope = createPermitScope();
+
+    for (const [label, overrides] of [
+      ["ordinal behind count", { attemptOrdinal: 1, requestCount: 2 }],
+      ["ordinal ahead of count", { attemptOrdinal: 2, requestCount: 1 }],
+      ["zero count", { attemptOrdinal: 0, requestCount: 0 }],
+      ["negative count", { attemptOrdinal: -1, requestCount: -1 }],
+      ["fractional count", { attemptOrdinal: 1.5, requestCount: 1.5 }],
+      ["nonnumeric count", { attemptOrdinal: 2, requestCount: "2" }],
+    ] as const) {
+      const candidate = Object.freeze({ ...scope, ...overrides });
+
+      let failure: unknown;
+      try {
+        validateCccNativeCliPermitScope(candidate, permitScopeExpectation(scope));
+      } catch (err) {
+        failure = err;
+      }
+
+      expect(failure, label).toMatchObject({ code: CCC_NATIVE_CLI_BINDING_REFUSED_CODE });
+    }
+  });
+
+  it("Task multi-task-dispatch RED: terminal scope still pins requestCount to its own permit scope", () => {
+    const permitScope = Object.freeze({
+      ...createPermitScope(),
+      attemptOrdinal: 2,
+      requestCount: 2,
+    }) as CccProviderAttemptScope;
+    const observation = createObservation();
+    const terminalScope = createTerminalScope(permitScope, observation);
+
+    expect(validateCccNativeCliTerminalScope(terminalScope, { permitScope, observation })).toBe(terminalScope);
+
+    const drifted = Object.freeze({ ...(terminalScope as Record<string, unknown>), requestCount: 3 });
+    expect(() => validateCccNativeCliTerminalScope(drifted, { permitScope, observation }))
+      .toThrow(/requestCount/i);
+  });
+
   it("Task 4 GREEN: host policy preserves the frozen route and limits and caps lifetime at observation", () => {
     const permitScope = createPermitScope();
     const route = Object.freeze({ adapterId: "test-cli-adapter", providerId: "openai", modelId: "gpt-4o", transport: "cli" as const });

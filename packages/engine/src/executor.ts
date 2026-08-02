@@ -19322,7 +19322,21 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     // Fall-soft: any failure in this path falls back to the legacy behavior
     // so we don't break worktree creation for setups where the squash flow
     // can't run (no main branch resolvable, network down, etc.).
-    const squashImport = resolvedStartPoint
+    /*
+    FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+    Campaign exemption from the squash-import rewrite above. A chained campaign successor is
+    handed its predecessor's branch as the start point on purpose
+    (resolveCccCampaignChainedStartBranch); squash-importing it would rebase the successor onto
+    the frozen base and re-apply the predecessor's content as a NEW commit, so the predecessor's
+    tip stops being an ancestor of the successor and the campaign proof gate's per-task ancestry
+    loop (ccc-campaign-proof-execution.ts:317-326) refuses the whole campaign. True ancestry IS
+    the campaign model, so fork straight from the chain branch. Content leakage — the defect the
+    squash rewrite prevents — is not reachable here: campaign tasks land as one campaign, not as
+    independently squash-merged siblings. The exemption is deliberately narrow: it applies only
+    when the start point is exactly the chain branch this task's own predecessor resolves to.
+    */
+    const chainedCampaignBase = await this.usesCccCampaignChainedStartBranch(taskId, startPoint);
+    const squashImport = resolvedStartPoint && !chainedCampaignBase
       ? await this.planSquashImportFromDep(taskId, resolvedStartPoint, startPoint)
       : null;
     const initialStartPoint = squashImport ? squashImport.mainBase : resolvedStartPoint;
@@ -19361,11 +19375,20 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         // start from origin/main + local main both, so divergence only matters
         // if the user actively skips this setting. Best-effort: failures here
         // don't abort task setup.
-        await this.rebaseNewWorktreeOntoRemote(result.path, result.branch, taskId).catch((err: unknown) => {
-          executorLog.warn(
-            `Post-create worktree rebase failed for ${taskId} (continuing): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
+        /*
+        FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+        Same ancestry reason as the squash exemption: rebasing a chained campaign successor onto
+        the remote default branch replays the predecessor's commits under new SHAs, which breaks
+        `merge-base --is-ancestor <predecessor> <successor>` just as effectively as the squash
+        rewrite would. Leave the chain intact.
+        */
+        if (!chainedCampaignBase) {
+          await this.rebaseNewWorktreeOntoRemote(result.path, result.branch, taskId).catch((err: unknown) => {
+            executorLog.warn(
+              `Post-create worktree rebase failed for ${taskId} (continuing): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
         return result;
       } catch (error: unknown) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -19399,6 +19422,27 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
 
   private quoteShellArg(value: string): string {
     return `'${value.replace(/'/g, "'\\''")}'`;
+  }
+
+  /**
+   * True when `startPoint` is exactly the chain branch this imported CCC
+   * campaign task's dependency predecessor resolves to — i.e. the base was
+   * chosen by `resolveCccCampaignChainedStartBranch`, not by ordinary dep
+   * inheritance. Callers use it to keep the campaign chain's true ancestry.
+   *
+   * Never refuses on its own: an unresolvable chain is already a refusal at
+   * preparation time, so a failure to prove the exemption here just falls back
+   * to the ordinary dep-base handling rather than inventing a new failure mode.
+   */
+  private async usesCccCampaignChainedStartBranch(
+    taskId: string,
+    startPoint: string | undefined,
+  ): Promise<boolean> {
+    if (!startPoint) return false;
+    const task = await this.store.getTask(taskId).catch(() => null);
+    if (!task || !isImportedCccCampaignTask(task)) return false;
+    const chainedStartBranch = await this.resolveCccCampaignChainedStartBranch(task).catch(() => null);
+    return chainedStartBranch !== null && chainedStartBranch === startPoint;
   }
 
   /**

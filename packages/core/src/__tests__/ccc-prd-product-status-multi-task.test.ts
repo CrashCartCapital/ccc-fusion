@@ -31,9 +31,13 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  productNextAction,
   providerAttemptStatusesForCampaign,
   resolveCccPrdProductStatusProviderAttemptAnchorTaskId,
+  type CccPrdProductApprovalStatus,
+  type CccPrdProductNextActionInput,
   type CccPrdProductTaskStatus,
+  type CccPrdProductWorkItemStatus,
 } from "../ccc-prd/product-status.js";
 import { CccCampaignContextError } from "../ccc-campaign/types.js";
 import type { CccProviderAttemptScope } from "../ccc-campaign/types.js";
@@ -154,5 +158,180 @@ describe("providerAttemptStatusesForCampaign multi-task surfacing", () => {
     const statuses = providerAttemptStatusesForCampaign([laterTask, earlierTask]);
 
     expect(statuses.map((status) => status.taskId)).toEqual(["task-1", "task-2"]);
+  });
+});
+
+/**
+ * RED-M1c: the guided `nextAction` must see a SECOND task's live-execution hold.
+ *
+ * The parked work item's `taskId` stays pinned to the workflow entry task for
+ * the whole campaign, so matching the issued live-execution approval by the WORK
+ * ITEM's task ID can only ever surface task A's approval. Once task A's approval
+ * is consumed and task B's is issued, the operator is told the campaign is
+ * `blocked` while a claimable approval is sitting right there.
+ */
+const LIVE_EXECUTION_APPROVAL_REQUIRED_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+const LIVE_EXECUTION_ACTION_ID = "ccc:live-execution";
+
+function workItem(
+  overrides: Partial<CccPrdProductWorkItemStatus> = {},
+): CccPrdProductWorkItemStatus {
+  return {
+    id: "work-item-1",
+    runId: "run-1",
+    taskId: "task-1",
+    nodeId: "node-1",
+    kind: "prompt",
+    state: "manual-required",
+    attempt: 1,
+    retryAfter: null,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    lastError: LIVE_EXECUTION_APPROVAL_REQUIRED_REASON,
+    blockedReason: LIVE_EXECUTION_APPROVAL_REQUIRED_REASON,
+    waitReason: null,
+    stableWorkflowRunId: null,
+    continuationSequence: null,
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function approval(
+  overrides: Partial<{
+    id: string;
+    taskId: string;
+    status: string;
+    actionId: string;
+    requestedAt: string;
+  }> = {},
+): CccPrdProductApprovalStatus {
+  return {
+    id: "approval-1",
+    status: "issued",
+    taskId: "task-1",
+    runId: "run-1",
+    actionId: LIVE_EXECUTION_ACTION_ID,
+    actionTarget: "/repo",
+    requester: { actorId: "runtime", actorKind: "agent" },
+    targetAction: { category: "live-execution", description: "dispatch" },
+    requestedAt: "2026-08-01T00:00:00.000Z",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+    campaign: {},
+    ...overrides,
+  } as unknown as CccPrdProductApprovalStatus;
+}
+
+/** A present task with a resolved route, so custody checks do not pre-empt the hold. */
+const routedTask = {
+  providerId: "anthropic",
+  modelId: "claude-sonnet-5",
+  transport: "pi",
+  executor: "model",
+  toolMode: "coding",
+  worktreeMode: "isolated",
+  ownedPaths: [],
+  allowedWriteRoots: [],
+  commitPolicy: "required",
+  cliAdapterId: null,
+} as const;
+
+function nextActionInput(
+  overrides: Partial<{
+    workItems: readonly CccPrdProductWorkItemStatus[];
+    approvals: readonly CccPrdProductApprovalStatus[];
+    taskStatuses: readonly CccPrdProductTaskStatus[];
+  }> = {},
+): CccPrdProductNextActionInput {
+  return {
+    row: { state: "active", runnable: 1 } as unknown as CccPrdProductNextActionInput["row"],
+    taskStatuses: overrides.taskStatuses ?? [
+      taskStatus({ nativeTaskId: "task-1", semanticTaskId: "TASK-1", ordinal: 0, route: routedTask }),
+      taskStatus({ nativeTaskId: "task-2", semanticTaskId: "TASK-2", ordinal: 1, route: routedTask }),
+    ],
+    workItems: overrides.workItems ?? [],
+    proofs: [],
+    orphanProofAttempts: [],
+    providerAttempts: [],
+    approvals: overrides.approvals ?? [],
+    landingIntents: [],
+    landingMaterializations: [],
+    landingTerminals: [],
+    liveExecutionActionIds: new Set([LIVE_EXECUTION_ACTION_ID]),
+    mergeActionIds: new Set(["ccc:merge"]),
+  };
+}
+
+describe("productNextAction multi-task live-execution holds", () => {
+  it("RED-M1c: surfaces the second task's issued live-execution approval instead of reporting blocked", () => {
+    const action = productNextAction(nextActionInput({
+      // The parked item's taskId stays pinned to the workflow entry task.
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [
+        approval({ id: "approval-1", taskId: "task-1", status: "consumed" }),
+        approval({
+          id: "approval-2",
+          taskId: "task-2",
+          status: "issued",
+          requestedAt: "2026-08-01T01:00:00.000Z",
+        }),
+      ],
+    }));
+
+    expect(action.kind).toBe("approve-execution");
+    expect(action).toMatchObject({ approvalRequestId: "approval-2", approvalStatus: "issued" });
+  });
+
+  it("still surfaces the entry task's own issued live-execution approval", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [approval({ id: "approval-1", taskId: "task-1", status: "issued" })],
+    }));
+
+    expect(action.kind).toBe("approve-execution");
+    expect(action).toMatchObject({ approvalRequestId: "approval-1" });
+  });
+
+  it("surfaces the EARLIEST unconsumed issued approval when several campaign tasks hold", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [
+        approval({
+          id: "approval-3",
+          taskId: "task-3",
+          status: "issued",
+          requestedAt: "2026-08-01T03:00:00.000Z",
+        }),
+        approval({
+          id: "approval-2",
+          taskId: "task-2",
+          status: "issued",
+          requestedAt: "2026-08-01T02:00:00.000Z",
+        }),
+      ],
+    }));
+
+    expect(action).toMatchObject({ kind: "approve-execution", approvalRequestId: "approval-2" });
+  });
+
+  it("does not surface an approval whose action is not a live-execution action", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [approval({ id: "approval-9", taskId: "task-2", actionId: "ccc:merge" })],
+    }));
+
+    expect(action.kind).not.toBe("approve-execution");
+  });
+
+  it("does not surface a consumed live-execution approval", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [approval({ id: "approval-1", taskId: "task-2", status: "consumed" })],
+    }));
+
+    expect(action.kind).not.toBe("approve-execution");
   });
 });

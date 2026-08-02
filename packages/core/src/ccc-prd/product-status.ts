@@ -599,7 +599,7 @@ function hasLiveRuntimeLease(item: CccPrdProductWorkItemStatus): boolean {
   return Number.isFinite(leaseExpiresAt) && leaseExpiresAt > Date.now();
 }
 
-function productNextAction(input: {
+export type CccPrdProductNextActionInput = Readonly<{
   row: ProductImportRow;
   taskStatuses: readonly CccPrdProductTaskStatus[];
   workItems: readonly CccPrdProductWorkItemStatus[];
@@ -612,7 +612,11 @@ function productNextAction(input: {
   landingTerminals: readonly CccPrdProductLandingAudit[];
   liveExecutionActionIds: ReadonlySet<string>;
   mergeActionIds: ReadonlySet<string>;
-}): CccPrdProductStatus["nextAction"] {
+}>;
+
+export function productNextAction(
+  input: CccPrdProductNextActionInput,
+): CccPrdProductStatus["nextAction"] {
   if (input.row.state !== "active" || input.row.runnable !== 1) {
     return {
       kind: "reconcile-import",
@@ -848,14 +852,30 @@ function productNextAction(input: {
     }
   }
   if (liveExecutionApprovalWorkItem) {
-    const approval = input.approvals.find((candidate) =>
-      candidate.taskId === liveExecutionApprovalWorkItem.taskId
-      && input.liveExecutionActionIds.has(candidate.actionId)
-      && (candidate.status === "issued" || candidate.status === "claimed"));
+    /*
+    A multi-task campaign holds once per task, but the parked work item's `taskId` stays pinned
+    to the workflow entry task for the whole campaign. Matching the approval by the WORK ITEM's
+    task ID therefore surfaces only the first task's approval; once that one is consumed and the
+    second task's approval is issued (its own distinct id and taskId), the guided next action
+    degraded to `blocked` while a claimable approval was sitting unclaimed. Match on the
+    approval's own identity instead and surface the earliest unconsumed one, so the operator is
+    walked through the holds in the order the runtime issued them.
+    */
+    const approval = input.approvals
+      .filter((candidate) =>
+        input.liveExecutionActionIds.has(candidate.actionId)
+        && (candidate.status === "issued" || candidate.status === "claimed"))
+      .sort((left, right) =>
+        left.requestedAt.localeCompare(right.requestedAt)
+        || left.createdAt.localeCompare(right.createdAt)
+        || left.id.localeCompare(right.id))[0];
     if (approval) {
+      const heldTask = approval.taskId && approval.taskId !== liveExecutionApprovalWorkItem.taskId
+        ? ` for campaign task ${approval.taskId}`
+        : "";
       return {
         kind: "approve-execution",
-        reason: `Workflow work item ${liveExecutionApprovalWorkItem.id} requires exact live-execution approval.`,
+        reason: `Workflow work item ${liveExecutionApprovalWorkItem.id} requires exact live-execution approval${heldTask}.`,
         approvalRequestId: approval.id,
         approvalStatus: approval.status,
       };
