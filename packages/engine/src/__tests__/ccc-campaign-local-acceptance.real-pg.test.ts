@@ -184,9 +184,33 @@ function configurePiBottomRuntime(input: {
         modelWaiters.delete(requestedModel.id);
       }
       input.entered?.(requestedModel);
+      /*
+       * pi-ai's AssistantMessage declares provider/model identity as
+       * non-optional, and campaign receipt reconciliation reads
+       * `result.provider` and `result.responseModel ?? result.model` off this
+       * exact object. A hand-built message without them is malformed, and the
+       * attempt validator fail-closes on undefined identity — which surfaces as
+       * a post-verdict node failure rather than anything about the verdict.
+       * Derive identity from the dispatched model so every pi-transport route
+       * (local-pi-a/b/d) reports the provider and model it actually ran on.
+       */
       const complete = async () => {
         if (requestedModel.id === input.blockModelId) await blocked;
-        return { role: "assistant", content: [{ type: "text", text: APPROVE_OUTPUT }] };
+        return {
+          role: "assistant",
+          content: [{ type: "text", text: APPROVE_OUTPUT }],
+          provider: requestedModel.provider,
+          model: requestedModel.id,
+          responseModel: requestedModel.id,
+          usage: {
+            input: 120,
+            output: 340,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 460,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
       };
       const finalMessage = complete();
       return {

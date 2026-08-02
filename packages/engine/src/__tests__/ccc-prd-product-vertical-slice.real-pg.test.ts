@@ -26,6 +26,7 @@ import {
   CentralCore,
   GlobalSettingsStore,
   __resetWorkflowExtensionRegistryForTests,
+  createCccPrdProductExecutionPlan,
   drizzleSql as sql,
   queryRunAuditEvents,
   resolveGlobalDirForHome,
@@ -1037,6 +1038,27 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
           proofs: [expect.objectContaining({ id: "PROOF-VERTICAL" })],
         })],
       });
+
+      /*
+       * `preview` consumes an execution PLAN (schema, packetHash, sidecarHash,
+       * bundleHash, policy), not a bare execution policy. Build it from the
+       * bundle the compile step just produced so the three hashes come from
+       * that bundle rather than being hand-copied, and so the per-task
+       * ownedPaths/allowedWriteRoots are derived from admitted custody. The
+       * route selection is exactly what the packet fixture's routes intended.
+       */
+      const plan = createCccPrdProductExecutionPlan({
+        bundle: compiled.values[0] as Parameters<
+          typeof createCccPrdProductExecutionPlan
+        >[0]["bundle"],
+        route: {
+          providerId: "vertical-fixture-provider",
+          modelId: "vertical-fixture-model",
+          transport: "cli",
+          cliAdapterId: "ccc-product-vertical-fixture",
+        },
+      });
+      await writeFile(packet.policyPath, `${JSON.stringify(plan, null, 2)}\n`);
 
       const common = [
         packet.packetRoot,
