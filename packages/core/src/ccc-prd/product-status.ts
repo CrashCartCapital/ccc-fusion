@@ -10,6 +10,7 @@ import type {
   CccProviderAttemptTerminalEvidence,
   CccProviderAttemptUsage,
 } from "../ccc-campaign/types.js";
+import { CccCampaignContextError } from "../ccc-campaign/types.js";
 import {
   listCccProviderAttemptsForCampaign,
 } from "../ccc-campaign/provider-attempt.js";
@@ -423,6 +424,43 @@ export function providerAttemptStatus(
       : {}),
     binding: { ...attempt.binding },
   };
+}
+
+/**
+ * `listCccProviderAttemptsForCampaign` scopes its history query to the whole
+ * campaign import, not to a single task (see `loadHistory` in
+ * ccc-campaign/provider-attempt.ts, which filters only by `campaignImportId`
+ * and validates the campaign-wide, not per-task, request-count sequence), so
+ * any one persisted campaign task can anchor the lookup and the full,
+ * multi-task attempt history comes back regardless of which task anchors it.
+ * Refuse rather than pick an unresolvable anchor: an empty task list, or an
+ * anchor task whose own row is missing from persisted custody, both make
+ * `listCccProviderAttemptsForCampaign` silently return zero attempts, which
+ * would hide a real `dispatched_unknown` provider attempt from status output.
+ */
+export function resolveCccPrdProductStatusProviderAttemptAnchorTaskId(
+  taskStatuses: readonly CccPrdProductTaskStatus[],
+): string {
+  const anchor = taskStatuses[0];
+  if (!anchor || !anchor.present) {
+    throw new CccCampaignContextError(
+      "CCC PRD product status has no resolvable campaign context anchor task to load provider attempts",
+    );
+  }
+  return anchor.nativeTaskId;
+}
+
+export function providerAttemptStatusesForCampaign(
+  attempts: Awaited<ReturnType<typeof listCccProviderAttemptsForCampaign>>,
+): readonly CccPrdProductProviderAttemptStatus[] {
+  return attempts
+    .map(providerAttemptStatus)
+    .sort((left, right) => {
+      const byTask = compareCccPrdCodeUnits(left.taskId, right.taskId);
+      if (byTask !== 0) return byTask;
+      return left.requestCount - right.requestCount
+        || compareCccPrdCodeUnits(left.attemptKey, right.attemptKey);
+    });
 }
 
 function textMetadata(
@@ -936,23 +974,14 @@ export async function inspectCccPrdProductStatus(
         },
       };
     });
-    const providerAttempts = (
-      nativeTaskIds[0]
-        ? await listCccProviderAttemptsForCampaign({
-          layer: input.layer,
-          rootDir,
-          taskId: nativeTaskIds[0],
-          tx,
-        })
-        : []
-    )
-      .map(providerAttemptStatus)
-      .sort((left, right) => {
-        const byTask = compareCccPrdCodeUnits(left.taskId, right.taskId);
-        if (byTask !== 0) return byTask;
-        return left.requestCount - right.requestCount
-          || compareCccPrdCodeUnits(left.attemptKey, right.attemptKey);
-      });
+    const providerAttempts = providerAttemptStatusesForCampaign(
+      await listCccProviderAttemptsForCampaign({
+        layer: input.layer,
+        rootDir,
+        taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
+        tx,
+      }),
+    );
 
     const campaignRunId = `ccc-prd:${row.importId}`;
     const workItemRows = await tx
