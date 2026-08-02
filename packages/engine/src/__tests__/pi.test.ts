@@ -1233,7 +1233,21 @@ describe("session failure diagnostics", () => {
         ...overrides,
       },
     );
-    const message = { role: "assistant", content: [{ type: "text", text: "provider message" }] } as any;
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "provider message" }],
+      provider: "pi-claude-cli",
+      model: "claude-sonnet-4-6",
+      responseModel: "claude-sonnet-4-6-20260101",
+      usage: {
+        input: 120,
+        output: 340,
+        cacheRead: 5,
+        cacheWrite: 2,
+        totalTokens: 460,
+        cost: { input: 0.0012, output: 0.0034, cacheRead: 0.0001, cacheWrite: 0.0001, total: 0.0048 },
+      },
+    } as any;
     const successfulAsyncStream = () => {
       const source = {
         result: vi.fn(async () => message),
@@ -1319,7 +1333,93 @@ describe("session failure diagnostics", () => {
       await expect(handle.result()).resolves.toBe(message);
       expect(created.providerStream).toHaveBeenCalledTimes(1);
       expect(events).toContainEqual({ type: "done", reason: "stop", message });
-      expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining(scope("attempt-1")));
+      expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+        ...scope("attempt-1"),
+        effectiveRoute: {
+          effectiveProvider: "pi-claude-cli",
+          effectiveModel: "claude-sonnet-4-6-20260101",
+          usage: { inputTokens: 120, outputTokens: 340 },
+          cost: { amountUsd: 0.0048, source: "pi-ai" },
+          receiptSource: "stream-usage",
+        },
+      }));
+    });
+
+    it("reports an honest-unknown effectiveRoute when stream usage is present but all-zero", async () => {
+      const zeroUsageMessage = {
+        ...message,
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+      };
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => zeroUsageMessage),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "done", reason: "stop", message: zeroUsageMessage };
+        },
+      }));
+      const controller = {
+        preDispatch: vi.fn(async () => ({ kind: "dispatch-permit", scope: scope("attempt-1") })),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller, providerStream });
+
+      await created.modelRuntime.stream(providerModel, providerContext, {}).result();
+
+      expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+        effectiveRoute: {
+          effectiveProvider: "pi-claude-cli",
+          effectiveModel: "claude-sonnet-4-6-20260101",
+          usage: null,
+          cost: { kind: "unknown", reason: "no-usage-in-stream" },
+          receiptSource: "none",
+        },
+      }));
+    });
+
+    it("propagates a route-drift reconcile refusal without swallowing it or falsely committing the attempt", async () => {
+      const driftedMessage = { ...message, responseModel: "claude-opus-9-drift" };
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => driftedMessage),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "done", reason: "stop", message: driftedMessage };
+        },
+      }));
+      const driftError = Object.assign(
+        new Error(
+          "CCC provider attempt effective route does not match its requested provider and model identity; "
+            + "campaign fallback is not an admitted behavior",
+        ),
+        { code: "CCC_PROVIDER_ATTEMPT_IDENTITY_REFUSED", reason: "route-drift" },
+      );
+      const controller = {
+        preDispatch: vi.fn()
+          .mockResolvedValueOnce({ kind: "dispatch-permit", scope: scope("attempt-1") })
+          .mockResolvedValueOnce({ kind: "hold", reason: "dispatched-unknown", scope: scope("attempt-1") }),
+        reconcile: vi.fn(async () => { throw driftError; }),
+      };
+      const created = await createBoundAgent({ controller, providerStream });
+
+      const handle = created.modelRuntime.stream(providerModel, providerContext, {});
+      const events = [] as any[];
+      for await (const event of handle) events.push(event);
+      await expect(handle.result()).rejects.toBe(driftError);
+
+      expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+        effectiveRoute: expect.objectContaining({ effectiveModel: "claude-opus-9-drift" }),
+      }));
+      // The slot was never committed, so re-entry retries the same dispatchKey rather than advancing.
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result()).rejects.toThrow(/dispatched_unknown/);
+      expect(controller.preDispatch.mock.calls.map(([callInput]) => callInput.dispatchKey)).toEqual([
+        "pi-stream:1",
+        "pi-stream:1",
+      ]);
+      expect(created.providerStream).toHaveBeenCalledTimes(1);
     });
 
     it("uses stable turn keys and sequential PI dispatch keys for successful stream paths", async () => {

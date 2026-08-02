@@ -627,6 +627,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         controllerToken: permitScope.controllerToken,
         outcome: "committed",
         observerId: "ccc-native-cli-observer.v1",
+        effectiveRoute: {
+          effectiveProvider: h.route.providerId,
+          effectiveModel: h.route.modelId,
+          usage: null,
+          cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+          receiptSource: "none",
+        },
       }));
     } finally {
       h.resolveMcpServersSpy.mockRestore();
@@ -848,6 +855,8 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       terminationReason: "crashed",
       cancellationState: null,
     });
+    // Pre-provider failure never dispatched, so it must not carry an effectiveRoute claim.
+    expect(h.reconcile.mock.calls.at(0)?.[0]).not.toHaveProperty("effectiveRoute");
     expect(h.sequence).toEqual([
       "pty-preflight",
       "resolver",
@@ -1033,6 +1042,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       observerId: "ccc-native-cli-observer.v1",
       terminationReason: "completed",
       cancellationState: null,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     });
     expect(Object.isFrozen(h.reconcile.mock.calls.at(0)?.[0])).toBe(true);
     expect(h.settleCccProviderAttemptAndFence).not.toHaveBeenCalled();
@@ -1156,6 +1172,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       observerId: "ccc-native-cli-observer.v1",
       terminationReason: "completed",
       cancellationState: null,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     });
     expect(h.settleCccProviderAttemptAndFence).not.toHaveBeenCalled();
   });
@@ -1271,6 +1294,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       observerId: "ccc-native-cli-observer.v1",
       terminationReason: "completed",
       cancellationState: null,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     });
     expect(releaseCccNativeCli).toHaveBeenCalledTimes(0);
   });
@@ -1390,6 +1420,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       outcome,
       terminationReason,
       cancellationState,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     }));
   });
 

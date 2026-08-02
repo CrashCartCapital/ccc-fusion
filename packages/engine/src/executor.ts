@@ -10039,6 +10039,15 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
+          // Honest "this is what we launched" identity, not an independent
+          // confirmation — the CLI adapter has no usage/cost telemetry.
+          effectiveRoute: {
+            effectiveProvider: binding.route.providerId,
+            effectiveModel: binding.route.modelId,
+            usage: null,
+            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+            receiptSource: "none" as const,
+          },
         })), {
           permitScope: heldScope,
           observation,
@@ -10258,6 +10267,15 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
+          // Honest "this is what we launched" identity, not an independent
+          // confirmation — the CLI adapter has no usage/cost telemetry.
+          effectiveRoute: {
+            effectiveProvider: nativeCliBinding.route.providerId,
+            effectiveModel: nativeCliBinding.route.modelId,
+            usage: null,
+            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+            receiptSource: "none" as const,
+          },
         })), {
           permitScope: nativeCliPermitScope,
           observation,

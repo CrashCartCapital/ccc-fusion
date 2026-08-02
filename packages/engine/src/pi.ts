@@ -820,6 +820,12 @@ function createCccProviderAttemptControlledStream(input: {
                   : new Error("ccc-fusion provider attempt did not observe a terminal done event");
               }
               assertCccProviderAttemptDoneMatchesResult(terminalDoneEvent, result);
+              // pi-ai's Usage type is non-optional, but transports that predate this
+              // receipt wiring can still hand back a result without it; an all-zero
+              // usage is indistinguishable from "never populated" and must not be
+              // reported as a real receipt.
+              const usage = result.usage;
+              const hasUsage = usage != null && !(usage.input === 0 && usage.output === 0);
               const reconciliation: CccProviderAttemptSubmittedReconciliation = {
                 ...scope,
                 outcome: "committed" as const,
@@ -830,6 +836,15 @@ function createCccProviderAttemptControlledStream(input: {
                   message: result,
                 }),
                 observerId: "pi",
+                effectiveRoute: {
+                  effectiveProvider: result.provider,
+                  effectiveModel: result.responseModel ?? result.model,
+                  usage: hasUsage ? { inputTokens: usage.input, outputTokens: usage.output } : null,
+                  cost: hasUsage
+                    ? { amountUsd: usage.cost.total, source: "pi-ai" }
+                    : { kind: "unknown" as const, reason: "no-usage-in-stream" },
+                  receiptSource: hasUsage ? "stream-usage" as const : "none" as const,
+                },
               };
               const reconciledScope = await input.binding.controller.reconcile(reconciliation);
               assertCccProviderAttemptReconciledScope(reconciliation, reconciledScope);

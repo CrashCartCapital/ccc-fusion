@@ -186,6 +186,11 @@ const PERMIT_SCOPE_KEYS = ["attemptKey", "controllerToken", "taskId", "semanticT
 const TERMINAL_SCOPE_KEYS = ["attemptKey", "controllerToken", "taskId", "semanticTaskId", "campaignDeadlineAt", "turnKey", "dispatchKey", "attemptOrdinal", "requestCount", "state", "workItemFence", "binding", "terminal"] as const;
 const OBSERVATION_KEYS = ["kind", "version", "outcome", "evidenceDigest"] as const;
 const TERMINAL_KEYS = ["kind", "state", "evidenceDigest", "observerId"] as const;
+const TERMINAL_KEYS_WITH_EFFECTIVE_ROUTE = [...TERMINAL_KEYS, "effectiveRoute"] as const;
+const EFFECTIVE_ROUTE_KEYS = ["effectiveProvider", "effectiveModel", "usage", "cost", "receiptSource"] as const;
+const EFFECTIVE_ROUTE_USAGE_KEYS = ["inputTokens", "outputTokens"] as const;
+const EFFECTIVE_ROUTE_COST_CLAIM_KEYS = ["amountUsd", "source"] as const;
+const EFFECTIVE_ROUTE_COST_UNKNOWN_KEYS = ["kind", "reason"] as const;
 const HELD_CLOSURE_RECEIPT_KEYS = ["kind", "version", "sessionId", "attemptKey", "controllerToken", "taskId", "authorityBindingHash", "turnKey", "dispatchKey", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
 const HELD_CLOSURE_EVIDENCE_KEYS = ["kind", "version", "sessionId", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
 const ROUTE_KEYS = ["adapterId", "providerId", "modelId", "transport"] as const;
@@ -288,11 +293,7 @@ export function validateCccNativeCliHoldScope(
     throw refused("hold scope state must be dispatched_unknown, committed, or proved_failed");
   }
   const scope = requirePlainFrozenExactObject(value, TERMINAL_SCOPE_KEYS, "hold terminal scope") as Record<string, unknown>;
-  const terminal = requirePlainFrozenExactObject(
-    scope.terminal,
-    TERMINAL_KEYS,
-    "hold terminal scope terminal",
-  ) as Record<string, unknown>;
+  const terminal = requireCccNativeCliTerminalReceiptShape(scope.terminal, "hold terminal scope terminal");
   if (
     terminal.observerId !== CCC_NATIVE_CLI_OBSERVER_ID
     && terminal.observerId !== CCC_NATIVE_CLI_PRE_PROVIDER_OBSERVER_ID
@@ -667,11 +668,78 @@ function validateWorkItemFence(
 }
 
 function validateTerminalReceipt(value: unknown, observation: CccNativeCliObservation, observerId: CccNativeCliTerminalObserverId): void {
-  const terminal = requirePlainFrozenExactObject(value, TERMINAL_KEYS, "terminal scope terminal") as Record<string, unknown>;
+  const terminal = requireCccNativeCliTerminalReceiptShape(value, "terminal scope terminal");
   if (terminal.kind !== "reconciled") throw refused("terminal scope terminal.kind mismatch");
   if (terminal.state !== observation.outcome) throw refused("terminal scope terminal.state mismatch");
   if (terminal.evidenceDigest !== observation.evidenceDigest) throw refused("terminal scope terminal.evidenceDigest mismatch");
   if (terminal.observerId !== observerId) throw refused("terminal scope terminal.observerId mismatch");
+  if (Object.hasOwn(terminal, "effectiveRoute")) {
+    validateCccNativeCliEffectiveRoute(terminal.effectiveRoute);
+  }
+}
+
+/**
+ * A terminal receipt is legacy-shaped (kind/state/evidenceDigest/observerId
+ * only) unless it also carries an `effectiveRoute` claim, which is optional
+ * and validated separately. Shared by the terminal-scope validator and the
+ * terminal-hold replay peek so both paths accept the same persisted shape.
+ */
+function requireCccNativeCliTerminalReceiptShape(value: unknown, label: string): Record<string, unknown> {
+  const hasEffectiveRoute = isPlainObject(value) && Object.hasOwn(value, "effectiveRoute");
+  return requirePlainFrozenExactObject(
+    value,
+    hasEffectiveRoute ? TERMINAL_KEYS_WITH_EFFECTIVE_ROUTE : TERMINAL_KEYS,
+    label,
+  ) as Record<string, unknown>;
+}
+
+/**
+ * Honest "this is what we launched" identity only — shape validation, not an
+ * independent drift check (that already happened upstream when the receipt
+ * was reconciled). Mirrors the exact-key discipline the CCC provider-attempt
+ * schema enforces, without importing its unexported parser.
+ */
+function validateCccNativeCliEffectiveRoute(value: unknown): void {
+  const route = requirePlainFrozenExactObject(value, EFFECTIVE_ROUTE_KEYS, "terminal scope terminal.effectiveRoute") as Record<string, unknown>;
+  assertCanonicalCccNativeCliText(route.effectiveProvider, "terminal scope terminal.effectiveRoute.effectiveProvider");
+  assertCanonicalCccNativeCliText(route.effectiveModel, "terminal scope terminal.effectiveRoute.effectiveModel");
+  validateEffectiveRouteUsage(route.usage);
+  validateEffectiveRouteCost(route.cost);
+  if (route.receiptSource !== "stream-usage" && route.receiptSource !== "provider-api" && route.receiptSource !== "none") {
+    throw refused("terminal scope terminal.effectiveRoute.receiptSource must be stream-usage, provider-api, or none");
+  }
+}
+
+function validateEffectiveRouteUsage(value: unknown): void {
+  if (value === null) return;
+  const usage = requirePlainFrozenExactObject(
+    value,
+    EFFECTIVE_ROUTE_USAGE_KEYS,
+    "terminal scope terminal.effectiveRoute.usage",
+  ) as Record<string, unknown>;
+  requireNonNegativeSafeInteger(usage.inputTokens, "terminal scope terminal.effectiveRoute.usage.inputTokens");
+  requireNonNegativeSafeInteger(usage.outputTokens, "terminal scope terminal.effectiveRoute.usage.outputTokens");
+}
+
+function validateEffectiveRouteCost(value: unknown): void {
+  const keys = isPlainObject(value) ? Object.keys(value) : [];
+  const looksLikeClaim = keys.includes("amountUsd") || keys.includes("source");
+  const cost = requirePlainFrozenExactObject(
+    value,
+    looksLikeClaim ? EFFECTIVE_ROUTE_COST_CLAIM_KEYS : EFFECTIVE_ROUTE_COST_UNKNOWN_KEYS,
+    "terminal scope terminal.effectiveRoute.cost",
+  ) as Record<string, unknown>;
+  if (looksLikeClaim) {
+    if (typeof cost.amountUsd !== "number" || !Number.isFinite(cost.amountUsd) || cost.amountUsd < 0) {
+      throw refused("terminal scope terminal.effectiveRoute.cost.amountUsd must be a finite non-negative amount");
+    }
+    assertCanonicalCccNativeCliText(cost.source, "terminal scope terminal.effectiveRoute.cost.source");
+    return;
+  }
+  if (cost.kind !== "unknown") {
+    throw refused("terminal scope terminal.effectiveRoute.cost.kind must be unknown when no amount is claimed");
+  }
+  assertCanonicalCccNativeCliText(cost.reason, "terminal scope terminal.effectiveRoute.cost.reason");
 }
 
 function sameCanonicalAuthorityBinding(
@@ -723,6 +791,13 @@ function requirePlainFrozenExactObject(
 function requirePositiveSafeInteger(value: unknown, label: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
     throw refused(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function requireNonNegativeSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw refused(`${label} must be a non-negative safe integer`);
   }
   return value;
 }

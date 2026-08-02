@@ -173,6 +173,7 @@ function createTerminalScope(
   permitScope: CccProviderAttemptScope,
   observation: ReturnType<typeof createObservation>,
   observerId = CCC_NATIVE_CLI_OBSERVER_ID,
+  effectiveRoute?: Record<string, unknown>,
 ): unknown {
   return Object.freeze({
     ...permitScope,
@@ -182,7 +183,25 @@ function createTerminalScope(
       state: observation.outcome,
       evidenceDigest: observation.evidenceDigest,
       observerId,
+      ...(effectiveRoute !== undefined ? { effectiveRoute } : {}),
     }),
+  });
+}
+
+function createEffectiveRoute(overrides: Partial<{
+  effectiveProvider: string;
+  effectiveModel: string;
+  usage: Record<string, unknown> | null;
+  cost: Record<string, unknown>;
+  receiptSource: "stream-usage" | "provider-api" | "none";
+}> = {}): Record<string, unknown> {
+  return Object.freeze({
+    effectiveProvider: "openai",
+    effectiveModel: "gpt-4o",
+    usage: null,
+    cost: Object.freeze({ kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" }),
+    receiptSource: "none" as const,
+    ...overrides,
   });
 }
 
@@ -277,6 +296,103 @@ describe("CCC native CLI binding", () => {
     });
 
     expect(validated).toBe(terminalScope);
+  });
+
+  it("Task provider-attempt-receipt GREEN: admits a well-formed terminal effectiveRoute receipt", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const effectiveRoute = createEffectiveRoute();
+    const terminalScope = createTerminalScope(permitScope, observation, CCC_NATIVE_CLI_OBSERVER_ID, effectiveRoute);
+
+    const validated = validateCccNativeCliTerminalScope(terminalScope, {
+      permitScope,
+      observation,
+    });
+
+    expect(validated).toBe(terminalScope);
+  });
+
+  it("Task provider-attempt-receipt GREEN: admits a claimed-cost terminal effectiveRoute receipt", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const effectiveRoute = createEffectiveRoute({
+      usage: Object.freeze({ inputTokens: 120, outputTokens: 340 }),
+      cost: Object.freeze({ amountUsd: 0.0048, source: "pi-ai" }),
+      receiptSource: "stream-usage",
+    });
+    const terminalScope = createTerminalScope(permitScope, observation, CCC_NATIVE_CLI_OBSERVER_ID, effectiveRoute);
+
+    const validated = validateCccNativeCliTerminalScope(terminalScope, {
+      permitScope,
+      observation,
+    });
+
+    expect(validated).toBe(terminalScope);
+  });
+
+  it("Task provider-attempt-receipt GREEN: terminal-hold replay admits a well-formed terminal effectiveRoute receipt", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const effectiveRoute = createEffectiveRoute();
+    const terminalScope = createTerminalScope(permitScope, observation, CCC_NATIVE_CLI_OBSERVER_ID, effectiveRoute);
+
+    const validated = nativeCliBinding.validateCccNativeCliHoldScope(terminalScope, permitScopeExpectation(permitScope));
+
+    expect(validated).toBe(terminalScope);
+  });
+
+  it("Task provider-attempt-receipt RED: legacy terminal without effectiveRoute still validates exactly as before", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const terminalScope = createTerminalScope(permitScope, observation);
+
+    const validated = validateCccNativeCliTerminalScope(terminalScope, {
+      permitScope,
+      observation,
+    });
+
+    expect(validated).toBe(terminalScope);
+    expect(Object.hasOwn((terminalScope as { terminal: object }).terminal, "effectiveRoute")).toBe(false);
+  });
+
+  it("Task provider-attempt-receipt RED: refuses a terminal effectiveRoute with an extra key", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const malformed = Object.freeze({ ...createEffectiveRoute(), extra: "nope" });
+    const terminalScope = createTerminalScope(permitScope, observation, CCC_NATIVE_CLI_OBSERVER_ID, malformed);
+
+    expect(() => validateCccNativeCliTerminalScope(terminalScope, { permitScope, observation }))
+      .toThrow(/effectiveRoute.*exact keys/i);
+  });
+
+  it("Task provider-attempt-receipt RED: refuses a terminal effectiveRoute with a malformed cost shape", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const malformed = createEffectiveRoute({ cost: Object.freeze({ amountUsd: 0.01 }) });
+    const terminalScope = createTerminalScope(permitScope, observation, CCC_NATIVE_CLI_OBSERVER_ID, malformed);
+
+    expect(() => validateCccNativeCliTerminalScope(terminalScope, { permitScope, observation }))
+      .toThrow(/effectiveRoute\.cost.*exact keys/i);
+  });
+
+  it("Task provider-attempt-receipt RED: refuses a terminal effectiveRoute with a malformed usage shape", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const malformed = createEffectiveRoute({ usage: Object.freeze({ inputTokens: 1, outputTokens: 2, extra: 3 }) });
+    const terminalScope = createTerminalScope(permitScope, observation, CCC_NATIVE_CLI_OBSERVER_ID, malformed);
+
+    expect(() => validateCccNativeCliTerminalScope(terminalScope, { permitScope, observation }))
+      .toThrow(/effectiveRoute\.usage.*exact keys/i);
+  });
+
+  it("Task provider-attempt-receipt RED: refuses a mutable (unfrozen) terminal effectiveRoute", () => {
+    const permitScope = createPermitScope();
+    const observation = createObservation();
+    const mutable = { ...createEffectiveRoute() };
+    const terminalScope = createTerminalScope(permitScope, observation, CCC_NATIVE_CLI_OBSERVER_ID, mutable);
+
+    expect(() => validateCccNativeCliTerminalScope(terminalScope, { permitScope, observation }))
+      .toThrow(/effectiveRoute.*frozen/i);
   });
 
   it.each([
