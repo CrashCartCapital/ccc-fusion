@@ -412,6 +412,37 @@ class CccCustomProviderEgressPolicyViolationError extends Error {
   }
 }
 
+/*
+FNXC:CCCCampaignFallback 2026-08-01-17:10:
+The ccc-fusion profile pins one admitted provider/model route per session, and a
+campaign turn seals that route into a provider attempt binding. A
+settings-derived fallback is a different wire identity, so the pi seam refuses
+the swap rather than re-pinning the expected-identity marker onto it. The
+refusal carries the sealed turn key so an operator can tie it back to the
+attempt; the underlying provider failure stays in the message and in `cause` so
+downstream failure classification is unchanged.
+*/
+class CccFallbackRefusedError extends Error {
+  readonly code = "CCC_FALLBACK_REFUSED";
+
+  constructor(
+    readonly triggerPoint: "session-creation" | "prompt-time",
+    readonly sealedRoute: string,
+    readonly refusedFallback: string,
+    readonly turnKey: string | undefined,
+    underlying: unknown,
+  ) {
+    const reason = underlying instanceof Error ? underlying.message : String(underlying);
+    super(
+      `ccc-fusion refused the ${triggerPoint} model fallback`
+      + (turnKey ? ` for provider attempt turn ${turnKey}` : "")
+      + `: sealed route ${sealedRoute} failed and ${refusedFallback} is outside the admitted route: ${reason}`,
+      { cause: underlying },
+    );
+    this.name = "CccFallbackRefusedError";
+  }
+}
+
 function assertCccCustomProviderEgress(
   options: AgentOptions,
   providers: ReturnType<typeof readCustomProviders>,
@@ -3436,6 +3467,18 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     });
   };
 
+  const cccFallbackRefused = options.profile === CCC_FUSION_PROFILE;
+  const makeCccFallbackRefusedError = (
+    triggerPoint: "session-creation" | "prompt-time",
+    underlying: unknown,
+  ): CccFallbackRefusedError => new CccFallbackRefusedError(
+    triggerPoint,
+    modelDescription(selectedModel),
+    modelDescription(fallbackModel),
+    cccProviderAttemptBinding?.turnKey,
+    underlying,
+  );
+
   const emitFallbackUsed = async (
     triggerPoint: "session-creation" | "prompt-time",
     primaryFailure: unknown,
@@ -3481,9 +3524,16 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     sessionResult = await createSessionWithModel(selectedModel);
     piLog.log(`Session created successfully (model=${selectedModel ? `${selectedModel.provider}/${selectedModel.id}` : "default"})`);
   } catch (err: any) {
-    if (!fallbackModel || !selectedModel || !hasDistinctFallback || !isRetryableModelSelectionError(err?.message || "")) {
+    const wouldSwapToFallback = Boolean(
+      fallbackModel && selectedModel && hasDistinctFallback && isRetryableModelSelectionError(err?.message || ""),
+    );
+    if (!wouldSwapToFallback) {
       piLog.error(`Session creation failed: ${err.message}`);
       throw err;
+    }
+    if (cccFallbackRefused) {
+      piLog.error(`Session creation failed: ${err.message}`);
+      throw makeCccFallbackRefusedError("session-creation", err);
     }
     piLog.warn(`Primary model failed (${err.message}), trying fallback`);
     usingFallback = true;
@@ -3661,6 +3711,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       }
       if (!hasDistinctFallback) {
         throw makeFallbackExhaustedError("prompt-time", 1, err);
+      }
+      if (cccFallbackRefused) {
+        throw makeCccFallbackRefusedError("prompt-time", err);
       }
 
       usingFallback = true;

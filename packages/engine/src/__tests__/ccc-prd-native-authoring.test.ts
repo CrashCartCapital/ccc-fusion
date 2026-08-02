@@ -16,6 +16,7 @@ import {
   computeCccPrdProofDefinitionSha256,
   deriveWorkflowExtensionHostProvenance,
   type CccPrdAuthoringProposal,
+  type CustomProvider,
   type WorkflowProofAdmissionExtensionContribution,
 } from "@fusion/core";
 import {
@@ -240,6 +241,33 @@ async function authorCccPrdPacket(
   });
 }
 
+/*
+FNXC:CCCAuthoringEgress 2026-08-01-17:40:
+The native authoring adapter resolves its selected provider through the
+configured custom-provider list and refuses any route outside the ccc-fusion
+loopback boundary before a prompt exists. Declare the loopback providers these
+adapter ids already claimed so the suite exercises the admitted route; the
+refusal behavior itself is proved in ccc-authoring-egress.test.ts.
+*/
+const loopbackAuthoringProviders: CustomProvider[] = [
+  {
+    id: "ccc-loopback-authoring",
+    name: "Loopback Authoring",
+    apiType: "openai-compatible",
+    baseUrl: "http://127.0.0.1:7443/v1",
+    apiKey: "synthetic-never-read",
+    models: [{ id: "fixture-model", name: "Fixture" }],
+  },
+  {
+    id: "ccc-loopback-understanding",
+    name: "Loopback Understanding",
+    apiType: "openai-compatible",
+    baseUrl: "http://127.0.0.1:7444/v1",
+    apiKey: "synthetic-never-read",
+    models: [{ id: "fixture-model", name: "Fixture" }],
+  },
+];
+
 function nativeAdapter(
   transport: CccPrdNativeAuthoringTransport,
   overrides: Partial<{
@@ -255,6 +283,7 @@ function nativeAdapter(
     maxPromptBytes: overrides.maxPromptBytes ?? 1_000_000,
     maxResponseBytes: overrides.maxResponseBytes ?? 256_000,
     transport,
+    customProviders: loopbackAuthoringProviders,
   });
 }
 
@@ -281,6 +310,7 @@ describe("CCC PRD native authoring adapter", () => {
       maxResponseBytes: 256_000,
       mode: "understanding",
       transport: generate,
+      customProviders: loopbackAuthoringProviders,
     });
 
     const result = await understandCccPrdPacket({
@@ -326,6 +356,7 @@ describe("CCC PRD native authoring adapter", () => {
         provider: request.provider,
         model: request.model,
       }),
+      customProviders: loopbackAuthoringProviders,
     });
 
     const result = await understandCccPrdPacket({

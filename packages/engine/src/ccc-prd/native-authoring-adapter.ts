@@ -1,15 +1,18 @@
 import {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   canonicalCccPrdJson,
+  customProviderRegistryKey,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringProposal,
   type CccPrdAuthoringRequest,
+  type CustomProvider,
 } from "@fusion/core";
 import {
   createFusionAuthStorage,
   createFusionModelRegistry,
   getHomeDir,
 } from "../auth-storage.js";
+import { validateCccLoopbackHttpUrl } from "../ccc-loopback-policy.js";
 import { registerCustomProviders } from "../custom-provider-registry.js";
 import { readCustomProviders } from "../custom-providers.js";
 
@@ -42,11 +45,52 @@ export type CreateNativeCccPrdAuthoringAdapterOptions = {
   maxResponseBytes: number;
   mode?: CccPrdNativeAuthoringMode;
   transport?: CccPrdNativeAuthoringTransport;
+  /** Configured custom providers; defaults to the operator's stored settings. */
+  customProviders?: CustomProvider[];
 };
 
 function positiveInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${label} must be a finite positive integer`);
+  }
+}
+
+export class CccPrdAuthoringEgressPolicyViolationError extends Error {
+  readonly code = "CCC_PRD_AUTHORING_EGRESS_POLICY_VIOLATION";
+
+  constructor(providerKey: string, reason: string) {
+    super(`CCC PRD authoring provider ${providerKey} is outside the ccc-fusion loopback boundary: ${reason}`);
+    this.name = "CccPrdAuthoringEgressPolicyViolationError";
+  }
+}
+
+/*
+FNXC:CCCAuthoringEgress 2026-08-01-17:40:
+Authoring and understanding serialize every admitted source verbatim into one
+prompt, so the transport target is decided before any corpus bytes exist. Resolve
+the selected provider through the same registry-key rule the pi seam uses and
+validate it with the shared loopback policy; a provider id that resolves to no
+configured custom provider (including every built-in id) fails closed rather than
+inheriting that provider's own remote route. The refusal deliberately names only
+the provider key and the policy reason — never the base URL, credential, or any
+source text — so a refusal log cannot become the leak it just prevented.
+*/
+function assertCccPrdAuthoringLoopbackEgress(
+  providerKey: string,
+  providers: CustomProvider[],
+): void {
+  const provider = providers.find(
+    (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
+  );
+  if (!provider) {
+    throw new CccPrdAuthoringEgressPolicyViolationError(
+      providerKey,
+      "provider does not resolve to a configured custom provider",
+    );
+  }
+  const validation = validateCccLoopbackHttpUrl(provider.baseUrl);
+  if (!validation.ok) {
+    throw new CccPrdAuthoringEgressPolicyViolationError(providerKey, validation.reason);
   }
 }
 
@@ -175,11 +219,13 @@ export function createNativeCccPrdAuthoringAdapter(
   }
   const transport = options.transport ?? fusionModelRuntimeAuthoringTransport;
   const mode = options.mode ?? "execution";
+  const configuredProviders = options.customProviders ?? readCustomProviders(getHomeDir());
 
   return {
     id: "fusion-native-model-runtime-v1",
     model: `${options.provider}/${options.model}`,
     async generateCandidate(request): Promise<CccPrdAuthoringProposal> {
+      assertCccPrdAuthoringLoopbackEgress(options.provider, configuredProviders);
       const prompt = buildPrompt(request, mode);
       const promptBytes = Buffer.byteLength(prompt, "utf8");
       if (promptBytes > options.maxPromptBytes) {

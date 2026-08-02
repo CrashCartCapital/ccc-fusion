@@ -18602,8 +18602,17 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         tools: toolMode,
         defaultProvider: provider,
         defaultModelId: modelId,
-        fallbackProvider: executorFallback.provider,
-        fallbackModelId: executorFallback.modelId,
+        /*
+         * FNXC:CCCCampaignFallback 2026-08-01-17:10:
+         * A sealed CCC campaign attempt binds exactly one provider/model route.
+         * The executor's settings-derived fallback pair is outside that route,
+         * so it is never offered to a campaign-bound session; pi refuses the
+         * swap independently for any ccc-fusion session that still receives one.
+         */
+        ...(cccProviderAttemptBinding ? {} : {
+          fallbackProvider: executorFallback.provider,
+          fallbackModelId: executorFallback.modelId,
+        }),
         fallbackThinkingLevel: workflowStepFallbackThinkingLevel,
         defaultThinkingLevel: workflowStepThinkingLevel,
         runAuditor: createRunAuditor(this.store, this.getRunContextFor(task.id)),
