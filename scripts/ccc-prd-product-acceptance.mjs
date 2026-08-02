@@ -40,6 +40,7 @@ const expectedChecks = Object.freeze([
   "native-local-authoring",
   "frozen-packet-validated",
   "product-owned-execution-plan",
+  "per-task-route-profiles",
   "forged-provenance-refused-without-residue",
   "exact-preview-confirmed",
   "wrong-confirmation-refused-without-residue",
@@ -49,9 +50,12 @@ const expectedChecks = Object.freeze([
   "campaign-import-admitted",
   "import-restart-recovery",
   "live-execution-human-hold",
+  "second-task-live-execution-hold",
   "coding-route-and-worktree-custody",
+  "chained-task-worktree-custody",
   "campaign-created-commit",
   "commit-bound-proof-executed",
+  "integrated-proof-over-two-commits",
   "merge-human-hold",
   "git-landing-restart-no-repeated-effect",
   "controlled-landing",
@@ -703,23 +707,23 @@ async function assertExactImplementationFactProvenance(
   );
   assert(
     Array.isArray(provenance.admittedWriteRoots)
-      && provenance.admittedWriteRoots.length === 2
+      && provenance.admittedWriteRoots.length === 3
       && Array.isArray(provenance.nonGoals)
       && provenance.nonGoals.length === 1
       && Array.isArray(provenance.requirements)
-      && provenance.requirements.length === 1
+      && provenance.requirements.length === 2
       && Array.isArray(provenance.proofs)
       && provenance.proofs.length === 1
       && Array.isArray(provenance.proofs[0]?.negativeControls)
       && provenance.proofs[0].negativeControls.length === 1
       && Array.isArray(provenance.protectedActions)
-      && provenance.protectedActions.length === 2,
+      && provenance.protectedActions.length === 3,
     "CCC_PRODUCT_IMPLEMENTATION_FACT_PROVENANCE_CARDINALITY",
     JSON.stringify(provenance),
   );
   exactArray(
     provenance.requirements.map(({ id }) => id),
-    ["REQ-VERTICAL"],
+    ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
     "CCC_PRODUCT_IMPLEMENTATION_FACT_REQUIREMENT_DRIFT",
   );
   exactArray(
@@ -729,7 +733,13 @@ async function assertExactImplementationFactProvenance(
   );
   exactArray(
     provenance.protectedActions.map(({ id }) => id),
-    ["ACTION-VERTICAL-LIVE", "ACTION-VERTICAL-MERGE"],
+    // Authoring canonicalizes protected actions into sorted id order, so this
+    // is the sorted set, not the declaration order.
+    [
+      "ACTION-VERTICAL-LIVE",
+      "ACTION-VERTICAL-MERGE",
+      "ACTION-VERTICAL-SECOND-LIVE",
+    ],
     "CCC_PRODUCT_IMPLEMENTATION_FACT_ACTION_DRIFT",
   );
   const actionBindings = new Map(
@@ -738,7 +748,7 @@ async function assertExactImplementationFactProvenance(
   const bindings = [
     ["targetRepository.path", provenance.targetRepository?.path, expected.targetRoot],
     ["targetRepository.baseCommit", provenance.targetRepository?.baseCommit, expected.targetBase],
-    ["bounds.maxRequests", provenance.bounds?.maxRequests, 1],
+    ["bounds.maxRequests", provenance.bounds?.maxRequests, 2],
     ["bounds.maxDurationMs", provenance.bounds?.maxDurationMs, 120_000],
     ["bounds.maxConcurrency", provenance.bounds?.maxConcurrency, 1],
     [
@@ -762,14 +772,29 @@ async function assertExactImplementationFactProvenance(
       "disposable product acceptance repository",
     ],
     [
+      "admittedWriteRoots[2].path",
+      provenance.admittedWriteRoots[2]?.path,
+      expected.admittedSecondWriteRoot,
+    ],
+    [
+      "admittedWriteRoots[2].purpose",
+      provenance.admittedWriteRoots[2]?.purpose,
+      "disposable product acceptance repository",
+    ],
+    [
       "nonGoals[0]",
       provenance.nonGoals[0],
-      "Modify any path outside src/value.txt.",
+      "Modify any path outside the two admitted task write roots.",
     ],
     [
       "requirements[0].acceptance",
       provenance.requirements[0]?.acceptance,
       "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
+    ],
+    [
+      "requirements[1].acceptance",
+      provenance.requirements[1]?.acceptance,
+      "The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
     ],
     ["proofs[0].command", provenance.proofs[0]?.command, "task verify:vertical"],
     [
@@ -793,6 +818,16 @@ async function assertExactImplementationFactProvenance(
       "provider://openai/TASK-VERTICAL",
     ],
     [
+      "protectedActions[ACTION-VERTICAL-SECOND-LIVE].kind",
+      actionBindings.get("ACTION-VERTICAL-SECOND-LIVE")?.kind,
+      "live_execution",
+    ],
+    [
+      "protectedActions[ACTION-VERTICAL-SECOND-LIVE].target",
+      actionBindings.get("ACTION-VERTICAL-SECOND-LIVE")?.target,
+      "provider://openai/TASK-VERTICAL-SECOND",
+    ],
+    [
       "protectedActions[ACTION-VERTICAL-MERGE].kind",
       actionBindings.get("ACTION-VERTICAL-MERGE")?.kind,
       "merge",
@@ -813,6 +848,8 @@ async function assertExactImplementationFactProvenance(
     "admittedWriteRoots[0].purpose",
     "admittedWriteRoots[1].path",
     "admittedWriteRoots[1].purpose",
+    "admittedWriteRoots[2].path",
+    "admittedWriteRoots[2].purpose",
   ]);
   const sources = new Map();
   const sourceFor = async (sourceRelativePath) => {
@@ -1031,6 +1068,7 @@ async function initializeTarget(
     [".fusion/", ".fusion-global-settings/", ".worktrees/", ""].join("\n"),
   );
   await writeFile(path.join(targetRoot, "src/value.txt"), "bad\n");
+  await writeFile(path.join(targetRoot, "src/second.txt"), "pending\n");
   await writeFile(
     path.join(targetRoot, "verify.cjs"),
     [
@@ -1063,17 +1101,23 @@ async function initializeTarget(
       "  setInterval(() => {}, 1000);",
       "} else {",
       "  const value = fs.readFileSync('src/value.txt', 'utf8').trim();",
+      "  const second = fs.readFileSync('src/second.txt', 'utf8').trim();",
       "  const accepts = candidate => candidate === 'good';",
-      "  if (accepts('bad')) {",
+      "  const acceptsSecond = candidate => candidate === 'second-good';",
+      "  if (accepts('bad') || acceptsSecond('pending')) {",
       "    console.error('NEGATIVE_CONTROL_FAIL');",
       "    process.exit(2);",
       "  }",
-      "  console.log('NEGATIVE_CONTROL_PASS: planted bad value is rejected');",
+      "  console.log('NEGATIVE_CONTROL_PASS: planted bad and pending values are rejected');",
       "  if (!accepts(value)) {",
       "    console.error(`POSITIVE_ORACLE_FAIL:${value}`);",
       "    process.exit(1);",
       "  }",
-      "  console.log('POSITIVE_ORACLE_PASS: campaign value is good');",
+      "  if (!acceptsSecond(second)) {",
+      "    console.error(`POSITIVE_ORACLE_FAIL:${second}`);",
+      "    process.exit(1);",
+      "  }",
+      "  console.log('POSITIVE_ORACLE_PASS: campaign values are good');",
       "}",
       "",
     ].join("\n"),
@@ -1104,6 +1148,7 @@ async function initializeTarget(
     "--",
     ".gitignore",
     "Taskfile.yml",
+    "src/second.txt",
     "src/value.txt",
     "verify.cjs",
   );
@@ -1126,26 +1171,39 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "Positive oracle: The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
     "Negative control: The same verifier exits nonzero for the frozen planted bad value.",
   ].join(" ");
+  const secondRequirementLine = [
+    "- REQ-VERTICAL-SECOND: Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task's commit.",
+    "Acceptance: The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
+    "Proof command: task verify:vertical.",
+  ].join(" ");
   const targetRepositoryLine = "- Target repository: " + targetRoot;
   const baselineLine = "- Baseline commit: " + targetBase;
   const taskOwnedPathLine = "- Task owned path: src/value.txt";
   const taskAllowedWriteRootLine = "- Task allowed write root: src/value.txt";
+  const secondTaskOwnedPathLine = "- Task owned path: src/second.txt";
+  const secondTaskAllowedWriteRootLine =
+    "- Task allowed write root: src/second.txt";
   const fusionStateWriteRoot = path.join(targetRoot, ".fusion");
   const admittedWriteRoot = path.join(targetRoot, "src/value.txt");
+  const admittedSecondWriteRoot = path.join(targetRoot, "src/second.txt");
   const fusionStateWriteRootLine =
     "- Allowed write root: " + fusionStateWriteRoot;
   const allowedWriteRootLine = "- Allowed write root: " + admittedWriteRoot;
+  const allowedSecondWriteRootLine =
+    "- Allowed write root: " + admittedSecondWriteRoot;
   const fusionStateWriteRootPurposeLine =
     "- Allowed write root purpose: Fusion-managed campaign state and artifacts";
   const allowedWriteRootPurposeLine =
     "- Allowed write root purpose: disposable product acceptance repository";
-  const maxRequestsLine = "- Maximum requests: 1";
+  const maxRequestsLine = "- Maximum requests: 2";
   const maxDurationLine = "- Maximum duration in milliseconds: 120000";
   const maxConcurrencyLine = "- Maximum concurrency: 1";
   const nonGoalLine =
-    "- Non-goal: Modify any path outside src/value.txt.";
+    "- Non-goal: Modify any path outside the two admitted task write roots.";
   const liveActionLine =
     "- Protected action: live_execution provider://openai/TASK-VERTICAL requires explicit human approval.";
+  const secondLiveActionLine =
+    "- Protected action: live_execution provider://openai/TASK-VERTICAL-SECOND requires explicit human approval.";
   const mergeActionLine =
     "- Protected action: merge refs/heads/main requires separate explicit human approval.";
   const supportingContextLine =
@@ -1166,11 +1224,13 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "## Protected actions",
     "",
     liveActionLine,
+    secondLiveActionLine,
     mergeActionLine,
     "",
     "## Requirement and proof",
     "",
     requirementLine,
+    secondRequirementLine,
     "",
     "## Supporting context",
     "",
@@ -1250,12 +1310,16 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         targetBase,
         "--owned-path",
         "src/value.txt",
+        "--owned-path",
+        "src/second.txt",
         "--write-root",
         "src/value.txt",
+        "--write-root",
+        "src/second.txt",
         "--write-purpose",
         "disposable product acceptance repository",
         "--max-requests",
-        "1",
+        "2",
         "--max-duration-ms",
         "120000",
         "--max-concurrency",
@@ -1312,6 +1376,10 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     path: frozenPrdRelativePath,
     exactQuote: requirementLine,
   }];
+  const secondSourceRefs = [{
+    path: frozenPrdRelativePath,
+    exactQuote: secondRequirementLine,
+  }];
   const implementationRefs = [
     targetRepositoryLine,
     baselineLine,
@@ -1328,6 +1396,18 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     path: frozenContextRelativePath,
     exactQuote,
   }));
+  // The compiler requires per-task custody once the chain holds more than one
+  // task, and authoring additionally requires each task's own quoted evidence
+  // to contain that task's paths verbatim. The second task therefore cites its
+  // own custody and write-root lines rather than reusing the first task's.
+  const secondImplementationRefs = [
+    secondTaskOwnedPathLine,
+    secondTaskAllowedWriteRootLine,
+    allowedSecondWriteRootLine,
+  ].map((exactQuote) => ({
+    path: frozenContextRelativePath,
+    exactQuote,
+  }));
   const nonGoalRefs = [{
     path: frozenPrdRelativePath,
     exactQuote: nonGoalLine,
@@ -1335,6 +1415,10 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const liveActionRefs = [{
     path: frozenPrdRelativePath,
     exactQuote: liveActionLine,
+  }];
+  const secondLiveActionRefs = [{
+    path: frozenPrdRelativePath,
+    exactQuote: secondLiveActionLine,
   }];
   const mergeActionRefs = [{
     path: frozenPrdRelativePath,
@@ -1360,21 +1444,35 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         accountableProducer: "operator",
       },
     ],
-    requirements: [{
-      id: "REQ-VERTICAL",
-      statement:
-        "Change src/value.txt from bad to good in an isolated worktree.",
-      acceptance:
-        "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
-      accountableProducer: "campaign-coding-agent",
-      dependencies: [],
-      proofIds: ["PROOF-VERTICAL"],
-      sourceRefs,
-      confidence: "high",
-    }],
+    requirements: [
+      {
+        id: "REQ-VERTICAL",
+        statement:
+          "Change src/value.txt from bad to good in an isolated worktree.",
+        acceptance:
+          "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
+        accountableProducer: "campaign-coding-agent",
+        dependencies: [],
+        proofIds: ["PROOF-VERTICAL"],
+        sourceRefs,
+        confidence: "high",
+      },
+      {
+        id: "REQ-VERTICAL-SECOND",
+        statement:
+          "Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task's commit.",
+        acceptance:
+          "The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
+        accountableProducer: "campaign-coding-agent",
+        dependencies: ["REQ-VERTICAL"],
+        proofIds: ["PROOF-VERTICAL"],
+        sourceRefs: secondSourceRefs,
+        confidence: "high",
+      },
+    ],
     proofs: [{
       id: "PROOF-VERTICAL",
-      requirementIds: ["REQ-VERTICAL"],
+      requirementIds: ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       command: "task verify:vertical",
       positiveOracle:
         "The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
@@ -1384,40 +1482,72 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       sourceRefs,
       confidence: "high",
     }],
-    tasks: [{
-      id: "TASK-VERTICAL",
-      title: "Implement the admitted value change",
-      description:
-        "Edit only src/value.txt so the exact verifier passes; the Fusion controller creates the campaign commit.",
-      ownedPaths: ["src/value.txt"],
-      allowedWriteRoots: ["src/value.txt"],
-      accountableProducer: "campaign-coding-agent",
-      requirementIds: ["REQ-VERTICAL"],
-      dependencyTaskIds: [],
-      proofIds: ["PROOF-VERTICAL"],
-      workflowId: "WORKFLOW-VERTICAL",
-      documentIds: [],
-      artifactIds: [],
-      protectedActionIds: [
-        "ACTION-VERTICAL-LIVE",
-        "ACTION-VERTICAL-MERGE",
-      ],
-      sourceRefs: [
-        ...implementationRefs,
-        ...nonGoalRefs,
-        ...sourceRefs,
-        ...liveActionRefs,
-        ...mergeActionRefs,
-        ...supportingRefs,
-      ],
+    tasks: [
+      {
+        id: "TASK-VERTICAL",
+        title: "Implement the admitted value change",
+        description:
+          "Edit only src/value.txt so the exact verifier passes; the Fusion controller creates the campaign commit.",
+        ownedPaths: ["src/value.txt"],
+        allowedWriteRoots: ["src/value.txt"],
+        accountableProducer: "campaign-coding-agent",
+        requirementIds: ["REQ-VERTICAL"],
+        dependencyTaskIds: [],
+        proofIds: ["PROOF-VERTICAL"],
+        workflowId: "WORKFLOW-VERTICAL",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: ["ACTION-VERTICAL-LIVE"],
+        sourceRefs: [
+          ...implementationRefs,
+          ...nonGoalRefs,
+          ...sourceRefs,
+          ...liveActionRefs,
+          ...supportingRefs,
+        ],
+      },
+      {
+        id: "TASK-VERTICAL-SECOND",
+        title: "Implement the admitted second value change",
+        description:
+          "Edit only src/second.txt so the exact verifier passes over both admitted files; the Fusion controller creates the campaign commit.",
+        ownedPaths: ["src/second.txt"],
+        allowedWriteRoots: ["src/second.txt"],
+        accountableProducer: "campaign-coding-agent",
+        requirementIds: ["REQ-VERTICAL-SECOND"],
+        dependencyTaskIds: ["TASK-VERTICAL"],
+        proofIds: ["PROOF-VERTICAL"],
+        workflowId: "WORKFLOW-VERTICAL",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: [
+          "ACTION-VERTICAL-SECOND-LIVE",
+          "ACTION-VERTICAL-MERGE",
+        ],
+        sourceRefs: [
+          ...secondImplementationRefs,
+          ...secondSourceRefs,
+          ...secondLiveActionRefs,
+          ...mergeActionRefs,
+        ],
+      },
+    ],
+    // The declared edge must mirror dependencyTaskIds exactly: the compiler
+    // reads dependencyTaskIds for ordering while the importer persists
+    // dependency rows from edges, so a disagreement would execute an order
+    // that was never admitted.
+    edges: [{
+      id: "EDGE-VERTICAL-CHAIN",
+      fromTaskId: "TASK-VERTICAL-SECOND",
+      toTaskId: "TASK-VERTICAL",
+      kind: "depends_on",
     }],
-    edges: [],
     workflows: [{
       id: "WORKFLOW-VERTICAL",
       title: "CCC Fusion product vertical slice",
-      taskIds: ["TASK-VERTICAL"],
+      taskIds: ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
       entryTaskIds: ["TASK-VERTICAL"],
-      terminalTaskIds: ["TASK-VERTICAL"],
+      terminalTaskIds: ["TASK-VERTICAL-SECOND"],
       sourceRefs,
     }],
     documents: [],
@@ -1429,6 +1559,20 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         entityId: "TASK-VERTICAL",
         operation: "create",
         target: "project.tasks",
+      },
+      {
+        id: "IMPORT-VERTICAL-TASK-SECOND",
+        entityType: "task",
+        entityId: "TASK-VERTICAL-SECOND",
+        operation: "create",
+        target: "project.tasks",
+      },
+      {
+        id: "IMPORT-VERTICAL-EDGE",
+        entityType: "dependency_edge",
+        entityId: "EDGE-VERTICAL-CHAIN",
+        operation: "create",
+        target: "project.tasks.dependencies",
       },
       {
         id: "IMPORT-VERTICAL-WORKFLOW",
@@ -1476,6 +1620,14 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         sourceRefs: liveActionRefs,
       },
       {
+        id: "ACTION-VERTICAL-SECOND-LIVE",
+        kind: "live_execution",
+        target: "provider://openai/TASK-VERTICAL-SECOND",
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_live_execution",
+        sourceRefs: secondLiveActionRefs,
+      },
+      {
         id: "ACTION-VERTICAL-MERGE",
         kind: "merge",
         target: "refs/heads/main",
@@ -1485,7 +1637,11 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       },
     ],
     bounds: {
-      maxRequests: 1,
+      // Two dispatches, one per task. The import-wide provider-attempt audit
+      // history is bounded by (maxRequests * 3) + 1 rows and each attempt
+      // writes exactly three rows, so this is the smallest budget that admits
+      // a two-task chain.
+      maxRequests: 2,
       maxDurationMs: 120_000,
       maxConcurrency: 1,
     },
@@ -1498,9 +1654,13 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         path: admittedWriteRoot,
         purpose: "disposable product acceptance repository",
       },
+      {
+        path: admittedSecondWriteRoot,
+        purpose: "disposable product acceptance repository",
+      },
     ],
     targetRepository: { path: targetRoot, baseCommit: targetBase },
-    nonGoals: ["Modify any path outside src/value.txt."],
+    nonGoals: ["Modify any path outside the two admitted task write roots."],
     unresolvedDecisions: [],
     ambiguities: [],
     exceptions: [],
@@ -1596,14 +1756,44 @@ async function writeFakeCodex(fakeBin) {
       "  injectedPrompt += chunk;",
       "  if (!injectedPrompt.includes('\\u001b[201~\\r')) return;",
       "  handled = true;",
-      "  const requiredPromptFacts = [",
-      "    'Change src/value.txt from bad to good in an isolated worktree.',",
-      "    'The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.',",
-      "    'Allowed write roots:\\n- src/value.txt',",
-      "    'Modify any path outside src/value.txt.',",
-      "    'requires human decision approve_merge',",
+      // The sealed prompt is per task, so the required facts are per task too.
+      // The branch key is the task's own allowed-write-root block rather than
+      // its id, because one semantic task id is a prefix of the other.
+      "  const sharedPromptFacts = [",
+      "    'Modify any path outside the two admitted task write roots.',",
       "    'Do not run git add, git commit, or mutate Git refs',",
       "  ];",
+      "  const taskProfiles = [",
+      "    {",
+      "      marker: 'Allowed write roots:\\n- src/second.txt',",
+      "      editPath: 'src/second.txt',",
+      "      editContent: 'second-good\\n',",
+      "      facts: [",
+      "        'Semantic task: TASK-VERTICAL-SECOND\\nAccountable producer:',",
+      "        'Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task\\u0027s commit.',",
+      "        'The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.',",
+      "        'ACTION-VERTICAL-SECOND-LIVE: live_execution on provider://openai/TASK-VERTICAL-SECOND; requires human decision approve_live_execution.',",
+      "        'requires human decision approve_merge',",
+      "      ],",
+      "    },",
+      "    {",
+      "      marker: 'Allowed write roots:\\n- src/value.txt',",
+      "      editPath: 'src/value.txt',",
+      "      editContent: 'good\\n',",
+      "      facts: [",
+      "        'Semantic task: TASK-VERTICAL\\nAccountable producer:',",
+      "        'Change src/value.txt from bad to good in an isolated worktree.',",
+      "        'The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.',",
+      "        'ACTION-VERTICAL-LIVE: live_execution on provider://openai/TASK-VERTICAL; requires human decision approve_live_execution.',",
+      "      ],",
+      "    },",
+      "  ];",
+      "  const profile = taskProfiles.find((candidate) => injectedPrompt.includes(candidate.marker));",
+      "  if (!profile) {",
+      "    process.stderr.write('FAKE_CODEX_SEALED_PROMPT_TASK_UNRECOGNIZED\\n');",
+      "    process.exit(12);",
+      "  }",
+      "  const requiredPromptFacts = [...sharedPromptFacts, ...profile.facts];",
       "  const missingPromptFacts = requiredPromptFacts.filter((fact) => !injectedPrompt.includes(fact));",
       "  if (missingPromptFacts.length > 0) {",
       "    process.stderr.write(`FAKE_CODEX_SEALED_PROMPT_MISSING:${JSON.stringify(missingPromptFacts)}\\n`);",
@@ -1620,7 +1810,7 @@ async function writeFakeCodex(fakeBin) {
       "    setInterval(() => {}, 1000);",
       "    return;",
       "  }",
-      "  fs.writeFileSync('src/value.txt', 'good\\n');",
+      "  fs.writeFileSync(profile.editPath, profile.editContent);",
       "  const payload = JSON.stringify({",
       "    type: 'agent-turn-complete',",
       "    'thread-id': `acceptance-${process.pid}`,",
@@ -2010,6 +2200,83 @@ async function main() {
       signature: "POSITIVE_ORACLE_FAIL:bad",
     });
 
+    // Both admitted files stay at their planted values until the campaign is
+    // approved and landed, so every residue check covers the whole owned set
+    // rather than only the first task's file.
+    const plantedSourcesIntact = async () =>
+      await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n"
+      && await readFile(path.join(targetRoot, "src/second.txt"), "utf8")
+        === "pending\n";
+
+    // Two tasks mean positional task indexing is no longer meaningful; every
+    // task assertion below names the task it is about.
+    const taskFor = (status, semanticTaskId) => {
+      const found = (status.tasks ?? []).filter((candidate) =>
+        candidate?.semanticTaskId === semanticTaskId);
+      assert(
+        found.length === 1,
+        "CCC_PRODUCT_SEMANTIC_TASK_LOOKUP_INVALID",
+        JSON.stringify({ semanticTaskId, matched: found.length }),
+      );
+      return found[0];
+    };
+
+    // A chained campaign parks once per task, but the guided `nextAction`
+    // projection can only report the FIRST of those holds. It matches an
+    // issued live-execution approval by the work item's own taskId
+    // (packages/core/src/ccc-prd/product-status.ts:850-861), and a work item
+    // row stays pinned to the workflow's entry task for the life of the
+    // campaign. The second task's approval therefore carries a taskId the
+    // projection never looks up, so nextAction degrades to "blocked" even
+    // though the runtime issued a correct, distinct, per-task approval.
+    //
+    // The canary drives that approval from `liveExecutionApprovalConfirmations`
+    // -- the same operator-visible field the first approval came from -- and
+    // records the nextAction kind it actually observed instead of asserting
+    // the guided one. This is a deliberate, reported gap, not a relaxation of
+    // the hold itself: the park, the distinct approval, and the exact
+    // confirmation are all still proven below.
+    const awaitParkedLiveExecutionApproval = async (
+      label,
+      readKeyStatus,
+      alreadyApprovedRequestIds,
+    ) => {
+      const issuedFor = (value) =>
+        (value.liveExecutionApprovalConfirmations ?? []).find(
+          ({ approvalRequestId, status }) =>
+            status === "issued"
+            && !alreadyApprovedRequestIds.includes(approvalRequestId),
+        );
+      const hold = await poll(
+        label,
+        readKeyStatus,
+        (value) =>
+          value.status?.workItems?.length === 1
+          && value.status.workItems[0]?.state === "manual-required"
+          && value.status.workItems[0]?.lastError
+            === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
+          && Boolean(issuedFor(value)),
+        async () => ({
+          serve: tail(server.output()),
+          status: await readKeyStatus(),
+        }),
+      );
+      const confirmation = issuedFor(hold);
+      assert(
+        confirmation && /^[0-9a-f]{64}$/u.test(confirmation.confirmation),
+        "CCC_PRODUCT_PARKED_LIVE_EXECUTION_APPROVAL_MISSING",
+        JSON.stringify({
+          label,
+          confirmations: hold.liveExecutionApprovalConfirmations,
+        }),
+      );
+      return {
+        hold,
+        confirmation,
+        observedNextActionKind: hold.status.nextAction?.kind ?? null,
+      };
+    };
+
     const prd = async (args, allowedExitCodes = [0]) => {
       return await run(process.execPath, [cliBin, "prd", ...args], {
         cwd: targetRoot,
@@ -2199,7 +2466,7 @@ async function main() {
         "--model",
         "vertical-authoring-model",
         "--max-requests",
-        "1",
+        "2",
         "--max-duration-ms",
         "120000",
         "--max-concurrency",
@@ -2251,15 +2518,32 @@ async function main() {
       "CCC_PRODUCT_NATIVE_AUTHORING_PROVENANCE_INVALID",
       JSON.stringify(authoredSidecar.provenance),
     );
-    const taskSpanPaths = [...new Set(
-      authoredSidecar.tasks?.[0]?.spans?.map(({ path }) => path) ?? [],
-    )].sort();
-    assert(
-      taskSpanPaths.includes(packet.sourcePath)
-        && taskSpanPaths.includes(packet.contextSourcePath),
-      "CCC_PRODUCT_TASK_CUSTODY_SOURCE_BINDING_MISSING",
-      JSON.stringify(taskSpanPaths),
+    // Both tasks must carry their own source-bound custody: the compiler
+    // refuses a multi-task chain whose tasks do not each declare ownedPaths
+    // and allowedWriteRoots, and authoring refuses a task whose declared paths
+    // are absent from that task's own quoted evidence.
+    const taskSpanPathsBySemanticTaskId = Object.fromEntries(
+      (authoredSidecar.tasks ?? []).map((authoredTask) => [
+        authoredTask.id,
+        [...new Set(authoredTask.spans?.map(({ path }) => path) ?? [])].sort(),
+      ]),
     );
+    exactArray(
+      Object.keys(taskSpanPathsBySemanticTaskId).sort(),
+      ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
+      "CCC_PRODUCT_TASK_CUSTODY_TASK_SET_DRIFT",
+    );
+    for (const [semanticTaskId, spanPaths] of Object.entries(
+      taskSpanPathsBySemanticTaskId,
+    )) {
+      assert(
+        spanPaths.includes(packet.sourcePath)
+          && spanPaths.includes(packet.contextSourcePath),
+        "CCC_PRODUCT_TASK_CUSTODY_SOURCE_BINDING_MISSING",
+        JSON.stringify({ semanticTaskId, spanPaths }),
+      );
+    }
+    const taskSpanPaths = taskSpanPathsBySemanticTaskId["TASK-VERTICAL"];
     const implementationFactProvenance =
       await assertExactImplementationFactProvenance(
         authoredSidecar,
@@ -2270,6 +2554,7 @@ async function main() {
           targetBase,
           fusionStateWriteRoot: path.join(targetRoot, ".fusion"),
           admittedWriteRoot: path.join(targetRoot, "src/value.txt"),
+          admittedSecondWriteRoot: path.join(targetRoot, "src/second.txt"),
           contextSourcePath: packet.contextSourcePath,
         },
       );
@@ -2321,12 +2606,12 @@ async function main() {
     );
     exactArray(
       compiled.requirements?.map(({ id }) => id),
-      ["REQ-VERTICAL"],
+      ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       "CCC_PRODUCT_REQUIREMENT_SET_DRIFT",
     );
     exactArray(
       compiled.tasks?.map(({ id }) => id),
-      ["TASK-VERTICAL"],
+      ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
       "CCC_PRODUCT_TASK_SET_DRIFT",
     );
     exactArray(
@@ -2338,11 +2623,37 @@ async function main() {
       packetHash: compiled.sourceHash,
       sidecarHash: compiled.sidecarHash,
       bundleHash: compiled.bundleHash,
-      requirementIds: ["REQ-VERTICAL"],
-      taskIds: ["TASK-VERTICAL"],
+      requirementIds: ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
+      taskIds: ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
       proofIds: ["PROOF-VERTICAL"],
     });
 
+    // One route profile per task, selected through the product's own
+    // routes-by-task file rather than a single flag set broadcast to every
+    // task. Both profiles are CLI/codex and differ by model; the pi transport
+    // is deliberately not exercised here.
+    const routesFilePath = path.join(packetRoot, "routes.json");
+    const routeProfiles = {
+      "TASK-VERTICAL": {
+        providerId: "openai",
+        modelId: "gpt-5.6-sol",
+        transport: "cli",
+        cliAdapterId: "codex",
+      },
+      "TASK-VERTICAL-SECOND": {
+        providerId: "openai",
+        modelId: "gpt-5.6-terra",
+        transport: "cli",
+        cliAdapterId: "codex",
+      },
+    };
+    await writeFile(
+      routesFilePath,
+      `${JSON.stringify({
+        schema: "ccc-prd.routes-by-task.v1",
+        routes: routeProfiles,
+      }, null, 2)}\n`,
+    );
     const generatedExecutionPlan = jsonOutput(
       await prd([
         "policy",
@@ -2352,25 +2663,23 @@ async function main() {
         targetRoot,
         targetBase,
         packet.executionPlanPath,
-        "--provider",
-        "openai",
-        "--model",
-        "gpt-5.6-sol",
-        "--transport",
-        "cli",
-        "--cli-adapter",
-        "codex",
+        "--routes-file",
+        routesFilePath,
       ]),
       "prd policy",
     );
     const executionPlanBytes = await readFile(packet.executionPlanPath);
     const executionPlan = JSON.parse(executionPlanBytes.toString("utf8"));
-    const executionRoute = executionPlan.policy?.routes?.[0];
+    const planRoutesByTaskId = new Map(
+      (executionPlan.policy?.routes ?? []).map((route) => [route.taskId, route]),
+    );
+    const executionRoute = planRoutesByTaskId.get("TASK-VERTICAL");
+    const secondExecutionRoute = planRoutesByTaskId.get("TASK-VERTICAL-SECOND");
     assert(
       generatedExecutionPlan.kind === "execution-plan"
         && generatedExecutionPlan.path === packet.executionPlanPath
         && generatedExecutionPlan.sha256 === sha256(executionPlanBytes)
-        && generatedExecutionPlan.routeCount === 1
+        && generatedExecutionPlan.routeCount === 2
         && executionPlan.schema === "ccc-prd.execution-plan.v1"
         && executionPlan.packetHash === compiled.sourceHash
         && executionPlan.sidecarHash === compiled.sidecarHash
@@ -2404,6 +2713,52 @@ async function main() {
       sidecarHash: executionPlan.sidecarHash,
       bundleHash: executionPlan.bundleHash,
       route: executionRoute,
+    });
+
+    assert(
+      secondExecutionRoute?.taskId === "TASK-VERTICAL-SECOND"
+        && secondExecutionRoute.providerId === "openai"
+        && secondExecutionRoute.modelId === "gpt-5.6-terra"
+        && secondExecutionRoute.transport === "cli"
+        && secondExecutionRoute.cliAdapterId === "codex"
+        && secondExecutionRoute.executor === "cli-agent"
+        && secondExecutionRoute.toolMode === "coding"
+        && secondExecutionRoute.worktreeMode === "isolated"
+        && secondExecutionRoute.commitPolicy === "required"
+        && executionRoute.modelId !== secondExecutionRoute.modelId,
+      "CCC_PRODUCT_SECOND_EXECUTION_ROUTE_INVALID",
+      JSON.stringify({ executionRoute, secondExecutionRoute }),
+    );
+    exactArray(
+      secondExecutionRoute.ownedPaths,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_EXECUTION_PLAN_OWNERSHIP_DRIFT",
+    );
+    exactArray(
+      secondExecutionRoute.allowedWriteRoots,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_EXECUTION_PLAN_WRITE_ROOT_DRIFT",
+    );
+    const routeOwnershipOverlap = executionRoute.ownedPaths.filter((ownedPath) =>
+      secondExecutionRoute.ownedPaths.includes(ownedPath));
+    assert(
+      routeOwnershipOverlap.length === 0,
+      "CCC_PRODUCT_ROUTE_OWNERSHIP_NOT_DISJOINT",
+      JSON.stringify(routeOwnershipOverlap),
+    );
+    ledger.pass("per-task-route-profiles", {
+      routeSelection: "routes-file",
+      routesFileSchema: "ccc-prd.routes-by-task.v1",
+      routesFileSha256: sha256(await readFile(routesFilePath)),
+      routeCount: generatedExecutionPlan.routeCount,
+      routes: {
+        "TASK-VERTICAL": executionRoute,
+        "TASK-VERTICAL-SECOND": secondExecutionRoute,
+      },
+      distinctModelIds: [executionRoute.modelId, secondExecutionRoute.modelId],
+      ownershipDisjoint: true,
+      transportCoverage:
+        "two CLI route profiles differing by model; the pi transport is deliberately deferred and is not exercised by this canary.",
     });
 
     const globalSettingsBeforeForgedPreview =
@@ -2453,9 +2808,9 @@ async function main() {
       await git(targetRoot, "status", "--porcelain"),
     );
     assert(
-      await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n",
+      await plantedSourcesIntact(),
       "CCC_PRODUCT_FORGED_PREVIEW_MUTATED_SOURCE",
-      "src/value.txt changed",
+      "an admitted source file changed",
     );
     ledger.pass("forged-provenance-refused-without-residue", {
       diagnostics: forgedPreview.diagnostics,
@@ -2470,8 +2825,12 @@ async function main() {
         experimentalFeatures: { cliAgentExecutor: true },
       },
       project: {
+        // Two worktrees are admitted so the chained second task can hold its
+        // own isolated checkout, while maxConcurrent stays at 1 so the two
+        // tasks can only ever run one at a time. The pairing is the serialism
+        // proof: capacity for two custody roots, permission for one runner.
         maxConcurrent: 1,
-        maxWorktrees: 1,
+        maxWorktrees: 2,
         pollIntervalMs: 500,
         worktreesDir: worktreesRoot,
       },
@@ -2506,7 +2865,7 @@ async function main() {
     );
     exactArray(
       preview.requirements?.map(({ id }) => id),
-      ["REQ-VERTICAL"],
+      ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       "CCC_PRODUCT_PREVIEW_REQUIREMENTS_DRIFT",
     );
     ledger.pass("exact-preview-confirmed", {
@@ -2546,7 +2905,7 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "HEAD") === targetBase
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n",
+      && await plantedSourcesIntact(),
       "CCC_PRODUCT_WRONG_CONFIRMATION_LEFT_SOURCE_RESIDUE",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -2685,8 +3044,7 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "HEAD") === targetBase
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8")
-        === "bad\n",
+      && await plantedSourcesIntact(),
       "CCC_PRODUCT_LIFECYCLE_CONTROL_CHANGED_SOURCE",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -2830,7 +3188,10 @@ async function main() {
       "CCC_PRODUCT_PROVIDER_UNCERTAINTY_NOT_PRESERVED",
       JSON.stringify(recoveredProviderCutpoint.status),
     );
-    const recoveredProviderTask = recoveredProviderCutpoint.status.tasks[0];
+    const recoveredProviderTask = taskFor(
+      recoveredProviderCutpoint.status,
+      "TASK-VERTICAL",
+    );
     assert(
       typeof recoveredProviderTask?.worktree === "string"
       && recoveredProviderTask.worktree.length > 0
@@ -2855,8 +3216,7 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "HEAD") === targetBase
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8")
-        === "bad\n",
+      && await plantedSourcesIntact(),
       "CCC_PRODUCT_PROVIDER_CUTPOINT_CHANGED_SOURCE",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -2974,6 +3334,39 @@ async function main() {
       "CCC_PRODUCT_PROOF_CUTPOINT_APPROVAL_FAILED",
       JSON.stringify(proofExecutionApproved),
     );
+    // One proof runs after the terminal task, so both tasks must be approved
+    // and executed before the verifier is dispatched at all. The single work
+    // item parks a second time with its own distinct approval request.
+    const proofSecondApproval = await awaitParkedLiveExecutionApproval(
+      "proof cutpoint second-task execution approval",
+      readProofCutpointStatus,
+      [proofLiveConfirmation.approvalRequestId],
+    );
+    const proofSecondLiveConfirmation = proofSecondApproval.confirmation;
+    assert(
+      proofSecondLiveConfirmation.approvalRequestId
+        !== proofLiveConfirmation.approvalRequestId,
+      "CCC_PRODUCT_PROOF_CUTPOINT_SECOND_APPROVAL_MISSING",
+      JSON.stringify(
+        proofSecondApproval.hold.liveExecutionApprovalConfirmations,
+      ),
+    );
+    const proofSecondExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        proofCutpointKey,
+        proofSecondLiveConfirmation.approvalRequestId,
+        "--confirm",
+        proofSecondLiveConfirmation.confirmation,
+      ]),
+      "approve proof-cutpoint second-task execution",
+    );
+    assert(
+      proofSecondExecutionApproved.kind === "execution-approved"
+      && proofSecondExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_PROOF_CUTPOINT_SECOND_APPROVAL_FAILED",
+      JSON.stringify(proofSecondExecutionApproved),
+    );
     const proofMarkersAtDispatch = await poll(
       "verifier process reached post-dispatch cutpoint",
       () => readOwnedProofCutpointMarkers(proofCutpointToken),
@@ -3002,8 +3395,10 @@ async function main() {
       "durable proof dispatch receipt",
       readProofCutpointStatus,
       (value) =>
-        value.status?.providerAttempts?.length === 1
-        && value.status.providerAttempts[0]?.state === "committed"
+        value.status?.providerAttempts?.length === 2
+        && value.status.providerAttempts.every(
+          ({ state }) => state === "committed",
+        )
         && value.status?.proofs?.length === 1
         && value.status.proofs[0]?.attempts?.length === 1
         && value.status.proofs[0].attempts[0]?.state
@@ -3021,7 +3416,9 @@ async function main() {
       && proofSourceCommit !== targetBase
       && await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
       && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
-        === "good",
+        === "good"
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/second.txt`)
+        === "second-good",
       "CCC_PRODUCT_PROOF_CUTPOINT_SOURCE_COMMIT_INVALID",
       JSON.stringify({ proofAttempt, targetBase }),
     );
@@ -3050,13 +3447,19 @@ async function main() {
     );
     const recoveredProofAttempt =
       recoveredProofCutpoint.status.proofs[0]?.attempts[0];
-    const recoveredProofTask = recoveredProofCutpoint.status.tasks[0];
+    // The proof is dispatched from the terminal task's worktree, so recovery
+    // must preserve that task's custody specifically.
+    const recoveredProofTask = taskFor(
+      recoveredProofCutpoint.status,
+      "TASK-VERTICAL-SECOND",
+    );
     assert(
       recoveredProofAttempt?.attemptKey === proofAttempt.attemptKey
       && recoveredProofAttempt.state === "dispatched_unknown"
-      && recoveredProofCutpoint.status.providerAttempts.length === 1
-      && recoveredProofCutpoint.status.providerAttempts[0]?.state
-        === "committed"
+      && recoveredProofCutpoint.status.providerAttempts.length === 2
+      && recoveredProofCutpoint.status.providerAttempts.every(
+        ({ state }) => state === "committed",
+      )
       && typeof recoveredProofTask?.worktree === "string"
       && await pathExists(recoveredProofTask.worktree)
       && await realpath(recoveredProofTask.worktree)
@@ -3074,7 +3477,9 @@ async function main() {
     assert(
       await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
       && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
-        === "good",
+        === "good"
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/second.txt`)
+        === "second-good",
       "CCC_PRODUCT_PROOF_CUTPOINT_CHANGED_TARGET",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -3251,7 +3656,11 @@ async function main() {
       (value) => value.status?.nextAction?.kind === "approve-execution",
       async () => ({ serve: tail(server.output()), status: await readStatus() }),
     );
-    const restartedTask = postImportRestart.status.tasks[0];
+    const restartedTask = taskFor(postImportRestart.status, "TASK-VERTICAL");
+    const restartedSecondTask = taskFor(
+      postImportRestart.status,
+      "TASK-VERTICAL-SECOND",
+    );
     const restartedWorkItem = postImportRestart.status.workItems[0];
     assert(
       postRestartInspection.kind === "inspection"
@@ -3262,14 +3671,17 @@ async function main() {
         === imported.result.transactionWitness?.transactionId
       && postRestartInspection.inspection.state === "active"
       && postRestartInspection.inspection.runnable === true
-      && postRestartInspection.inspection.directCounts?.tasks === 1
+      && postRestartInspection.inspection.directCounts?.tasks === 2
       && postRestartInspection.inspection.directCounts?.workItems === 1
       && postImportRestart.status.import.importId === imported.result.importId
       && postImportRestart.status.import.identityHash === imported.result.identityHash
-      && postImportRestart.status.tasks.length === 1
+      && postImportRestart.status.tasks.length === 2
       && restartedTask?.semanticTaskId === "TASK-VERTICAL"
       && /^[A-Z][A-Z0-9]*-\d+$/u.test(restartedTask.nativeTaskId)
       && restartedTask.nativeTaskId !== restartedTask.semanticTaskId
+      && /^[A-Z][A-Z0-9]*-\d+$/u.test(restartedSecondTask.nativeTaskId)
+      && restartedSecondTask.nativeTaskId !== restartedSecondTask.semanticTaskId
+      && restartedSecondTask.nativeTaskId !== restartedTask.nativeTaskId
       && postImportRestart.status.workItems.length === 1
       && restartedWorkItem?.taskId === restartedTask.nativeTaskId
       && restartedWorkItem.runId === `ccc-prd:${imported.result.importId}`
@@ -3289,10 +3701,16 @@ async function main() {
       identityHash: imported.result.identityHash,
       transactionId: postRestartInspection.inspection.transactionWitness.transactionId,
       importIdentityPersisted: true,
-      nativeTaskMapping: {
-        semanticTaskId: restartedTask.semanticTaskId,
-        nativeTaskId: restartedTask.nativeTaskId,
-      },
+      nativeTaskMapping: [
+        {
+          semanticTaskId: restartedTask.semanticTaskId,
+          nativeTaskId: restartedTask.nativeTaskId,
+        },
+        {
+          semanticTaskId: restartedSecondTask.semanticTaskId,
+          nativeTaskId: restartedSecondTask.nativeTaskId,
+        },
+      ],
       counts: {
         tasks: postImportRestart.status.tasks.length,
         workItems: postImportRestart.status.workItems.length,
@@ -3311,7 +3729,7 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "HEAD") === targetBase
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n",
+      && await plantedSourcesIntact(),
       "CCC_PRODUCT_EXECUTED_BEFORE_APPROVAL",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -3322,13 +3740,16 @@ async function main() {
     );
     assert(
       liveConfirmation
-      && /^[0-9a-f]{64}$/.test(liveConfirmation.confirmation),
+      && /^[0-9a-f]{64}$/.test(liveConfirmation.confirmation)
+      && liveConfirmation.taskId === restartedTask.nativeTaskId,
       "CCC_PRODUCT_LIVE_CONFIRMATION_MISSING",
       JSON.stringify(liveHold.liveExecutionApprovalConfirmations),
     );
     ledger.pass("live-execution-human-hold", {
       approvalRequestId: liveConfirmation.approvalRequestId,
       expiresAt: liveConfirmation.expiresAt,
+      taskId: liveConfirmation.taskId,
+      semanticTaskId: "TASK-VERTICAL",
       targetHead: targetBase,
       workItemState: liveHold.status.workItems[0].state,
     });
@@ -3350,15 +3771,95 @@ async function main() {
       JSON.stringify(executionApproved),
     );
 
+    // Live execution is authorized per task, not per campaign: the one work
+    // item parks a second time before the chained task may run, carrying its
+    // own approval request bound to its own task.
+    const secondLiveApproval = await awaitParkedLiveExecutionApproval(
+      "second-task live execution approval hold",
+      readStatus,
+      [liveConfirmation.approvalRequestId],
+    );
+    const secondLiveHold = secondLiveApproval.hold;
+    const secondLiveConfirmation = secondLiveApproval.confirmation;
+    const firstApprovalAfterSecondPark =
+      secondLiveHold.liveExecutionApprovalConfirmations?.find(
+        ({ approvalRequestId }) =>
+          approvalRequestId === liveConfirmation.approvalRequestId,
+      );
+    assert(
+      secondLiveHold.status.workItems.length === 1
+      && secondLiveHold.status.workItems[0].state === "manual-required"
+      && secondLiveHold.status.workItems[0].lastError
+        === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
+      && /^[0-9a-f]{64}$/.test(secondLiveConfirmation.confirmation)
+      && secondLiveConfirmation.approvalRequestId
+        !== liveConfirmation.approvalRequestId
+      && secondLiveConfirmation.taskId === restartedSecondTask.nativeTaskId
+      && secondLiveConfirmation.taskId !== liveConfirmation.taskId
+      && firstApprovalAfterSecondPark?.status === "consumed",
+      "CCC_PRODUCT_SECOND_LIVE_EXECUTION_HOLD_INVALID",
+      JSON.stringify({
+        workItems: secondLiveHold.status.workItems,
+        confirmations: secondLiveHold.liveExecutionApprovalConfirmations,
+      }),
+    );
+    assert(
+      await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await plantedSourcesIntact(),
+      "CCC_PRODUCT_SECOND_TASK_EXECUTED_BEFORE_APPROVAL",
+      await git(targetRoot, "status", "--porcelain"),
+    );
+    ledger.pass("second-task-live-execution-hold", {
+      workItemCount: secondLiveHold.status.workItems.length,
+      workItemState: secondLiveHold.status.workItems[0].state,
+      approvals: [
+        {
+          approvalRequestId: liveConfirmation.approvalRequestId,
+          taskId: liveConfirmation.taskId,
+          semanticTaskId: "TASK-VERTICAL",
+        },
+        {
+          approvalRequestId: secondLiveConfirmation.approvalRequestId,
+          taskId: secondLiveConfirmation.taskId,
+          semanticTaskId: "TASK-VERTICAL-SECOND",
+        },
+      ],
+      distinctApprovalRequestIds: true,
+      distinctTaskIds: true,
+      firstApprovalStatusAtSecondPark: firstApprovalAfterSecondPark.status,
+      observedNextActionKind: secondLiveApproval.observedNextActionKind,
+      guidedNextActionGap:
+        "fn prd status nextAction reports 'blocked' at this hold instead of 'approve-execution': the projection matches an issued live-execution approval by the work item's own taskId, and that row stays pinned to the workflow entry task, so a chained task's approval is never surfaced by the guided path (packages/core/src/ccc-prd/product-status.ts:850-861). The approval itself is issued, exact, and claimable through fn prd approve-execution.",
+      targetHead: targetBase,
+    });
+
+    const secondExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        idempotencyKey,
+        secondLiveConfirmation.approvalRequestId,
+        "--confirm",
+        secondLiveConfirmation.confirmation,
+      ]),
+      "approve second-task execution",
+    );
+    assert(
+      secondExecutionApproved.kind === "execution-approved"
+      && secondExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_SECOND_EXECUTION_APPROVAL_FAILED",
+      JSON.stringify(secondExecutionApproved),
+    );
+
     const mergeHold = await poll(
       "merge approval hold",
       readStatus,
       (value) => value.status?.nextAction?.kind === "approve-merge",
       async () => ({ serve: tail(server.output()), status: await readStatus() }),
     );
-    const task = mergeHold.status.tasks[0];
+    const task = taskFor(mergeHold.status, "TASK-VERTICAL");
+    const secondTask = taskFor(mergeHold.status, "TASK-VERTICAL-SECOND");
     assert(
-      mergeHold.status.tasks.length === 1
+      mergeHold.status.tasks.length === 2
       && task.semanticTaskId === "TASK-VERTICAL"
       && task.route?.providerId === "openai"
       && task.route?.modelId === "gpt-5.6-sol"
@@ -3402,10 +3903,148 @@ async function main() {
       }),
     );
     ledger.pass("coding-route-and-worktree-custody", {
+      semanticTaskId: task.semanticTaskId,
       route: task.route,
       worktree: canonicalWorktree,
       branch: task.branch,
       baseCommit: task.baseCommit,
+    });
+
+    // The chained task runs in its own registered worktree whose history
+    // already contains the first task's commit, and each task's diff stays
+    // inside its own owned path.
+    assert(
+      secondTask.route?.providerId === "openai"
+      && secondTask.route?.modelId === "gpt-5.6-terra"
+      && secondTask.route?.transport === "cli"
+      && secondTask.route?.executor === "cli-agent"
+      && secondTask.route?.cliAdapterId === "codex"
+      && secondTask.route?.toolMode === "coding"
+      && secondTask.route?.worktreeMode === "isolated"
+      && secondTask.route.modelId !== task.route.modelId,
+      "CCC_PRODUCT_SECOND_CODING_ROUTE_DRIFT",
+      JSON.stringify(secondTask),
+    );
+    exactArray(
+      secondTask.route.ownedPaths,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_OWNED_PATH_DRIFT",
+    );
+    exactArray(
+      secondTask.route.allowedWriteRoots,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_WRITE_ROOT_DRIFT",
+    );
+    const canonicalSecondWorktree = secondTask.worktree
+      ? await realpath(secondTask.worktree)
+      : null;
+    const secondWorktreeRelative = canonicalSecondWorktree
+      ? path.relative(canonicalWorktreesRoot, canonicalSecondWorktree)
+      : "";
+    assert(
+      canonicalSecondWorktree
+      && canonicalSecondWorktree !== targetRoot
+      && canonicalSecondWorktree !== canonicalWorktree
+      && secondWorktreeRelative.length > 0
+      && secondWorktreeRelative !== ".."
+      && !secondWorktreeRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(secondWorktreeRelative),
+      "CCC_PRODUCT_SECOND_WORKTREE_CUSTODY_INVALID",
+      JSON.stringify({
+        worktree: canonicalSecondWorktree,
+        firstWorktree: canonicalWorktree,
+        worktreesRoot: canonicalWorktreesRoot,
+        relative: secondWorktreeRelative,
+      }),
+    );
+    const registeredWorktrees = (
+      await git(targetRoot, "worktree", "list", "--porcelain")
+    )
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length));
+    const canonicalRegisteredWorktrees = await Promise.all(
+      registeredWorktrees.map((candidate) => realpath(candidate)),
+    );
+    assert(
+      canonicalRegisteredWorktrees.includes(canonicalWorktree)
+      && canonicalRegisteredWorktrees.includes(canonicalSecondWorktree),
+      "CCC_PRODUCT_CHAINED_WORKTREE_NOT_REGISTERED",
+      JSON.stringify({
+        registered: canonicalRegisteredWorktrees,
+        first: canonicalWorktree,
+        second: canonicalSecondWorktree,
+      }),
+    );
+    const firstTaskCommit = await git(canonicalWorktree, "rev-parse", "HEAD");
+    const secondTaskCommit = await git(
+      canonicalSecondWorktree,
+      "rev-parse",
+      "HEAD",
+    );
+    const chainAncestry = await run(
+      "/usr/bin/git",
+      ["merge-base", "--is-ancestor", firstTaskCommit, secondTaskCommit],
+      { cwd: canonicalSecondWorktree, allowedExitCodes: [0, 1] },
+    );
+    assert(
+      firstTaskCommit !== secondTaskCommit
+      && firstTaskCommit !== targetBase
+      && secondTaskCommit !== targetBase
+      && chainAncestry.code === 0,
+      "CCC_PRODUCT_CHAINED_WORKTREE_ANCESTRY_REFUSED",
+      JSON.stringify({
+        targetBase,
+        firstTaskCommit,
+        secondTaskCommit,
+        mergeBaseExitCode: chainAncestry.code,
+      }),
+    );
+    exactArray(
+      (await git(
+        targetRoot,
+        "diff",
+        "--name-only",
+        targetBase,
+        firstTaskCommit,
+      )).split("\n").filter(Boolean),
+      ["src/value.txt"],
+      "CCC_PRODUCT_FIRST_TASK_MUTATION_SCOPE_DRIFT",
+    );
+    exactArray(
+      (await git(
+        targetRoot,
+        "diff",
+        "--name-only",
+        firstTaskCommit,
+        secondTaskCommit,
+      )).split("\n").filter(Boolean),
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_TASK_MUTATION_SCOPE_DRIFT",
+    );
+    ledger.pass("chained-task-worktree-custody", {
+      worktrees: [
+        {
+          semanticTaskId: task.semanticTaskId,
+          worktree: canonicalWorktree,
+          branch: task.branch,
+          headCommit: firstTaskCommit,
+          ownedPaths: task.route.ownedPaths,
+          mutationPaths: ["src/value.txt"],
+        },
+        {
+          semanticTaskId: secondTask.semanticTaskId,
+          worktree: canonicalSecondWorktree,
+          branch: secondTask.branch,
+          headCommit: secondTaskCommit,
+          ownedPaths: secondTask.route.ownedPaths,
+          mutationPaths: ["src/second.txt"],
+        },
+      ],
+      distinctRegisteredWorktrees: true,
+      firstCommitIsAncestorOfSecond: true,
+      maxConcurrent: 1,
+      maxWorktrees: 2,
     });
 
     const proof = mergeHold.status.proofs[0];
@@ -3427,11 +4066,13 @@ async function main() {
       (await git(targetRoot, "diff", "--name-only", targetBase, sourceCommit))
         .split("\n")
         .filter(Boolean),
-      ["src/value.txt"],
+      ["src/second.txt", "src/value.txt"],
       "CCC_PRODUCT_CAMPAIGN_MUTATION_SCOPE_DRIFT",
     );
     assert(
-      await git(targetRoot, "show", `${sourceCommit}:src/value.txt`) === "good",
+      await git(targetRoot, "show", `${sourceCommit}:src/value.txt`) === "good"
+      && await git(targetRoot, "show", `${sourceCommit}:src/second.txt`)
+        === "second-good",
       "CCC_PRODUCT_CAMPAIGN_COMMIT_CONTENT_INVALID",
       sourceCommit,
     );
@@ -3443,7 +4084,7 @@ async function main() {
     ledger.pass("campaign-created-commit", {
       sourceCommit,
       sourceTree: await git(targetRoot, "rev-parse", `${sourceCommit}^{tree}`),
-      mutationPaths: ["src/value.txt"],
+      mutationPaths: ["src/second.txt", "src/value.txt"],
       targetHeadStill: targetBase,
     });
 
@@ -3479,6 +4120,48 @@ async function main() {
       result: attempt.result,
       dispatchedAt: attempt.dispatchedAt,
       settledAt: attempt.settledAt,
+    });
+
+    // One campaign-wide proof covers both tasks: a single attempt bound to a
+    // single source commit, taken from the terminal task's worktree, whose
+    // diff against the frozen base is exactly the two owned files.
+    assert(
+      mergeHold.status.proofs.length === 1
+      && proof.attempts.length === 1
+      && sourceCommit === secondTaskCommit
+      && attempt.result?.stdoutTail?.includes(
+        "NEGATIVE_CONTROL_PASS: planted bad and pending values are rejected",
+      )
+      && attempt.result?.stdoutTail?.includes(
+        "POSITIVE_ORACLE_PASS: campaign values are good",
+      ),
+      "CCC_PRODUCT_INTEGRATED_PROOF_INVALID",
+      JSON.stringify({
+        proofCount: mergeHold.status.proofs.length,
+        attemptCount: proof.attempts.length,
+        sourceCommit,
+        secondTaskCommit,
+        result: attempt.result,
+      }),
+    );
+    exactArray(
+      (await git(targetRoot, "diff", "--name-only", targetBase, sourceCommit))
+        .split("\n")
+        .filter(Boolean),
+      ["src/second.txt", "src/value.txt"],
+      "CCC_PRODUCT_INTEGRATED_PROOF_SCOPE_DRIFT",
+    );
+    ledger.pass("integrated-proof-over-two-commits", {
+      proofId: proof.definition.id,
+      proofCount: mergeHold.status.proofs.length,
+      attemptCount: proof.attempts.length,
+      attemptKey: attempt.attemptKey,
+      sourceCommit,
+      firstTaskCommit,
+      secondTaskCommit,
+      integratedMutationPaths: ["src/second.txt", "src/value.txt"],
+      command: proof.definition.command,
+      result: attempt.result,
     });
 
     const mergeConfirmation = mergeHold.mergeApprovalConfirmations?.find(
@@ -3681,12 +4364,14 @@ async function main() {
       (await git(targetRoot, "diff", "--name-only", targetBase, landedCommit))
         .split("\n")
         .filter(Boolean),
-      ["src/value.txt"],
+      ["src/second.txt", "src/value.txt"],
       "CCC_PRODUCT_LANDING_SCOPE_DRIFT",
     );
     assert(
       await git(targetRoot, "status", "--porcelain") === ""
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "good\n",
+      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "good\n"
+      && await readFile(path.join(targetRoot, "src/second.txt"), "utf8")
+        === "second-good\n",
       "CCC_PRODUCT_LANDING_CHECKOUT_DIRTY",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -3759,7 +4444,7 @@ async function main() {
       sourceCommit,
       landedCommit,
       landing: merged.status.landing,
-      mutationPaths: ["src/value.txt"],
+      mutationPaths: ["src/second.txt", "src/value.txt"],
     });
 
     await stopServe(server);
