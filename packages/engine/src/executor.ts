@@ -28,6 +28,7 @@ import {
   isImportedCccCampaignTask,
   isImportedCccCampaignWorkItem,
 } from "./ccc-campaign-routing.js";
+import { PermanentError } from "./engine-errors.js";
 import { matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
 import {
   requireCccCampaignLiveExecutionApproval,
@@ -9257,6 +9258,46 @@ export class TaskExecutor {
     }
   }
 
+  /*
+  FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+  A multi-task campaign import links its native tasks through `dependencies` and M1 executes that
+  chain serially, but the importer never writes `executionStartBranch`. Without an explicit start
+  point every task worktree is created from the integration branch (worktree-acquisition.ts:265-270),
+  so a successor's branch does not contain its predecessor's commit and the campaign proof gate's
+  per-task ancestry loop (ccc-campaign-proof-execution.ts:317-326) refuses the whole campaign.
+  An unresolvable predecessor is a REFUSAL, never an integration-branch fallback: falling back
+  silently produces a worktree whose history is missing prior task work, and the defect would
+  resurface much later as an opaque proof-integration failure with no pointer back to this choice.
+  */
+  private async resolveCccCampaignChainedStartBranch(task: TaskDetail): Promise<string | null> {
+    if (!isImportedCccCampaignTask(task)) return null;
+    const dependencies = (task.dependencies ?? []).filter((id): id is string =>
+      typeof id === "string" && id.length > 0);
+    if (dependencies.length === 0) return null;
+    if (dependencies.length > 1) {
+      throw new PermanentError(
+        `CCC campaign task ${task.id} declares ${dependencies.length} dependency predecessors (${dependencies.join(", ")}); serial campaign execution requires exactly one`,
+        "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+      );
+    }
+    const predecessorId = dependencies[0]!;
+    const predecessor = await this.store.getTask(predecessorId).catch(() => null);
+    if (!predecessor) {
+      throw new PermanentError(
+        `CCC campaign task ${task.id} cannot load its dependency predecessor ${predecessorId}`,
+        "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+      );
+    }
+    const branch = resolveTaskWorkingBranch(predecessor);
+    if (await this.resolveWorktreeStartPoint(branch, task.id) === null) {
+      throw new PermanentError(
+        `CCC campaign task ${task.id} predecessor ${predecessorId} has no resolvable working branch "${branch}"`,
+        "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+      );
+    }
+    return branch;
+  }
+
   private async prepareGraphNodeExecution(
     node: WorkflowIrNode,
     nodeTask: TaskDetail,
@@ -9266,9 +9307,13 @@ export class TaskExecutor {
     if (!requirement.requiresWorktree) return;
     const live = await this.store.getTask(nodeTask.id);
     if (live.worktree && existsSync(live.worktree)) return;
-    const taskForAcquisition = live.worktree
+    const chainedStartBranch = await this.resolveCccCampaignChainedStartBranch(live);
+    const acquisitionBase = live.worktree
       ? ({ ...live, worktree: undefined, sessionFile: undefined } as TaskDetail)
       : live;
+    const taskForAcquisition = chainedStartBranch
+      ? ({ ...acquisitionBase, executionStartBranch: chainedStartBranch } as TaskDetail)
+      : acquisitionBase;
     if (live.worktree) {
       /*
       FNXC:WorkflowExecution 2026-06-29-15:28:
@@ -19214,6 +19259,21 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     if (startPoint) {
       const resolved = await this.resolveWorktreeStartPoint(startPoint, taskId);
       if (resolved === null) {
+        /*
+        FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+        Backstop for the chained-worktree refusal. Clearing the base branch and proceeding from
+        HEAD is correct for ordinary tasks, but for an imported campaign task it would drop the
+        predecessor's commits out of the successor's history without any signal, so refuse here
+        too — this path is reachable if the predecessor branch disappears between preparation and
+        creation.
+        */
+        const campaignTask = await this.store.getTask(taskId).catch(() => null);
+        if (campaignTask && isImportedCccCampaignTask(campaignTask)) {
+          throw new PermanentError(
+            `CCC campaign task ${taskId} worktree base ref "${startPoint}" is unresolvable; refusing the integration-branch fallback`,
+            "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+          );
+        }
         // Stored baseBranch no longer exists (e.g., upstream dep merged and branch
         // deleted while this task sat queued/stuck). Clear it on the task so any
         // subsequent retry branches from the default base, and proceed from HEAD.

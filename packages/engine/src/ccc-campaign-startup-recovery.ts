@@ -1,5 +1,6 @@
 import type { TaskStore } from "@fusion/core";
 import {
+  CccCampaignContextError,
   drizzleSql,
   inspectCccPrdProductStatus,
   postgresSchema,
@@ -7,6 +8,15 @@ import {
 
 export const CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON =
   "ccc-permanent:CCC_CAMPAIGN_UNCERTAIN_EXTERNAL_EFFECT_REQUIRES_OPERATOR";
+
+/**
+ * A campaign whose product status cannot be inspected at all — the refusal is
+ * about custody, not about an uncertain external effect, so it is deliberately
+ * a distinct reason from {@link CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON}.
+ * Self-healing's parked-uncertain-effect exclusion must not match it.
+ */
+export const CCC_CAMPAIGN_STATUS_REFUSED_RECOVERY_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_PRODUCT_STATUS_REFUSED_REQUIRES_OPERATOR";
 
 export type CccCampaignStartupRecovery = Readonly<{
   workItemId: string;
@@ -98,11 +108,40 @@ export async function recoverCccCampaignUncertainEffectsOnStartup(
     if (!context) continue;
     let status = statusByImport.get(context.idempotencyKey);
     if (status === undefined) {
-      status = await inspectCccPrdProductStatus({
-        idempotencyKey: context.idempotencyKey,
-        layer,
-        rootDir: input.rootDir,
-      });
+      try {
+        status = await inspectCccPrdProductStatus({
+          idempotencyKey: context.idempotencyKey,
+          layer,
+          rootDir: input.rootDir,
+        });
+      } catch (error) {
+        /*
+         * Status inspection refuses when a campaign's custody is unresolvable
+         * (for example a missing provider-attempt anchor task). Containing that
+         * refusal to its own work item is what keeps one corrupt campaign from
+         * denying startup recovery — and, through the uncaught path in
+         * InProcessRuntime.start(), engine boot itself — to every other campaign
+         * in this partition. Only the custody refusal is contained; any other
+         * error class is still a genuine recovery failure and propagates.
+         */
+        if (!(error instanceof CccCampaignContextError)) throw error;
+        await input.store.transitionWorkflowWorkItem(
+          workItem.id,
+          "manual-required",
+          {
+            now: new Date().toISOString(),
+            expectedState: "running",
+            expectedLeaseOwner: workItem.leaseOwner,
+            expectedAttempt: workItem.attempt,
+            attempt: workItem.attempt,
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastError: `${CCC_CAMPAIGN_STATUS_REFUSED_RECOVERY_REASON}: ${error.message}`,
+            blockedReason: CCC_CAMPAIGN_STATUS_REFUSED_RECOVERY_REASON,
+          },
+        );
+        continue;
+      }
       statusByImport.set(context.idempotencyKey, status);
     }
     if (!status) {
