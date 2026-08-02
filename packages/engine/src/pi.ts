@@ -633,6 +633,25 @@ function cccProviderAttemptStreamFailure(error: unknown): Error {
   return new Error("ccc-fusion provider attempt stream failed");
 }
 
+/*
+FNXC:CccEffectiveRouteRoundTrip 2026-08-02-00:00:
+`reconcileCccProviderAttempt` records the submitted effective-route receipt into
+the terminal evidence it returns, so the reconciled terminal carries an
+`effectiveRoute` key whenever this transport submitted one. It persists the
+receipt fields only: `fallbackReason` is an input-only refusal probe (a non-null
+value is rejected outright as unadmitted campaign fallback) and is validated then
+dropped rather than recorded. Project the submitted receipt the same way so the
+terminal comparison stays an EXACT round-trip check — the store must return
+precisely the evidence this transport handed it, receipt included — instead of
+refusing the receipt it was designed to persist.
+*/
+function persistedCccProviderAttemptEffectiveRoute(
+  submitted: NonNullable<CccProviderAttemptSubmittedReconciliation["effectiveRoute"]>,
+): Record<string, unknown> {
+  const { fallbackReason: _fallbackReason, ...persisted } = submitted;
+  return persisted;
+}
+
 function assertCccProviderAttemptReconciledScope(
   requested: CccProviderAttemptSubmittedReconciliation,
   observed: CccProviderAttemptScope,
@@ -672,6 +691,9 @@ function assertCccProviderAttemptReconciledScope(
     state: "committed",
     evidenceDigest: requested.evidenceDigest,
     observerId: requested.observerId,
+    ...(requested.effectiveRoute
+      ? { effectiveRoute: persistedCccProviderAttemptEffectiveRoute(requested.effectiveRoute) }
+      : {}),
   };
   if (canonicalCccPrdJson(observed.terminal) !== canonicalCccPrdJson(expectedTerminal)) {
     throw new Error("ccc-fusion provider attempt reconciliation terminal evidence mismatch");

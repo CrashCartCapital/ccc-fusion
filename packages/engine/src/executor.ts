@@ -9854,6 +9854,27 @@ export class TaskExecutor {
     const contextPatch: Record<string, unknown> = {};
     if (typeof stepOutput === "string") contextPatch.output = stepOutput;
     if (typeof stepNotes === "string" && stepNotes) contextPatch.notes = stepNotes;
+    /*
+     * FNXC:WorkflowStepDiagnosis 2026-08-02-00:00:
+     * A step that FAILS WITHOUT THROWING reports its cause only as
+     * `outcome.error`, and the node result below carries just a routing `value`
+     * (`"failed"`). That string was the sole surviving trace: `graphFailureReason`
+     * (workflow-task-runtime) falls back to `workflow-node-failed:<node>:failed`,
+     * the work item records that as `lastError`, and the operator gets a terminal
+     * failure with no reason and no step rows — the silent-failure signature that
+     * hid a fail-closed campaign refusal ("provider attempt reconciliation
+     * terminal evidence mismatch") behind a bare `failed`. `executeNodeWithRetries`
+     * already publishes thrown-exception text under `node:<id>:error`, so record
+     * the non-throwing equivalent on the same key: `graphFailureReason` then
+     * prefers it (`workflow-node-error:<node>:<cause>`) and
+     * `synthesizeNonVerdictFailureOutput` can surface it as the step's `output`.
+     * Scoped to genuine non-verdict failures so reviewer verdicts, which own their
+     * own routing and feedback, are untouched.
+     */
+    const stepError = (outcome as { error?: string }).error;
+    if (!outcome.success && !verdict && typeof stepError === "string" && stepError.trim()) {
+      contextPatch[`node:${node.id}:error`] = stepError.trim();
+    }
     if (cfg.summaryTarget === "task" && typeof stepOutput === "string" && stepOutput.trim()) {
       /*
        * FNXC:WorkflowCompletion 2026-06-29-11:09:

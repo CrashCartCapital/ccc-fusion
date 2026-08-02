@@ -1214,6 +1214,16 @@ describe("session failure diagnostics", () => {
         state: "committed",
         evidenceDigest: input.evidenceDigest,
         observerId: input.observerId,
+        /*
+        FNXC:CccEffectiveRouteRoundTrip 2026-08-02-00:00:
+        `reconcileCccProviderAttempt` (core) writes the submitted effective-route
+        receipt INTO the terminal evidence it returns. This helper previously
+        dropped it, modelling a store that cannot exist — which is why every test
+        here stayed green while the real-PostgreSQL campaign acceptance suite
+        fail-closed on "reconciliation terminal evidence mismatch". Echo the
+        receipt like the real store so these scopes exercise the real round trip.
+        */
+        ...(input.effectiveRoute ? { effectiveRoute: input.effectiveRoute } : {}),
       },
       ...overrides,
     } as any);
@@ -1380,6 +1390,44 @@ describe("session failure diagnostics", () => {
           receiptSource: "none",
         },
       }));
+    });
+
+    it("accepts the reconciled terminal when the store round-trips the submitted effectiveRoute receipt", async () => {
+      const controller = {
+        preDispatch: vi.fn(async () => ({ kind: "dispatch-permit", scope: scope("attempt-1") })),
+        reconcile: vi.fn(async (input) => committedScope(input)),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result())
+        .resolves.toBe(message);
+      expect(controller.reconcile.mock.calls[0]?.[0]?.effectiveRoute).toEqual({
+        effectiveProvider: "pi-claude-cli",
+        effectiveModel: "claude-sonnet-4-6-20260101",
+        usage: { inputTokens: 120, outputTokens: 340 },
+        cost: { amountUsd: 0.0048, source: "pi-ai" },
+        receiptSource: "stream-usage",
+      });
+    });
+
+    it("still refuses a reconciled terminal whose effectiveRoute receipt is not the one submitted", async () => {
+      const controller = {
+        preDispatch: vi.fn(async () => ({ kind: "dispatch-permit", scope: scope("attempt-1") })),
+        reconcile: vi.fn(async (input) => {
+          const base = committedScope(input);
+          return {
+            ...base,
+            terminal: {
+              ...base.terminal,
+              effectiveRoute: { ...input.effectiveRoute, effectiveModel: "claude-opus-9-tampered" },
+            },
+          } as any;
+        }),
+      };
+      const created = await createBoundAgent({ controller });
+
+      await expect(created.modelRuntime.stream(providerModel, providerContext, {}).result())
+        .rejects.toThrow("ccc-fusion provider attempt reconciliation terminal evidence mismatch");
     });
 
     it("propagates a route-drift reconcile refusal without swallowing it or falsely committing the attempt", async () => {
