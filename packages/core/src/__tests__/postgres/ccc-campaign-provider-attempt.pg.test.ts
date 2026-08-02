@@ -397,7 +397,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       campaign_manifest_hash: campaign.manifestHash,
       campaign_binding_hash: first.binding.bindingHash,
       metadata: expect.objectContaining({
-        schema: "ccc-campaign.provider-attempt.v3",
+        schema: "ccc-campaign.provider-attempt.v4",
         workItemFence: input.workItemFence,
       }),
     });

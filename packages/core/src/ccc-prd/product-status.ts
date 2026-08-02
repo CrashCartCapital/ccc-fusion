@@ -4,8 +4,11 @@ import type {
   CccCampaignExecutionRoute,
   CccCampaignProofAttemptState,
   CccCampaignWorkItemFence,
+  CccProviderAttemptCost,
+  CccProviderAttemptReceiptSource,
   CccProviderAttemptState,
   CccProviderAttemptTerminalEvidence,
+  CccProviderAttemptUsage,
 } from "../ccc-campaign/types.js";
 import {
   listCccProviderAttemptsForCampaign,
@@ -174,6 +177,19 @@ export type CccPrdProductProviderAttemptStatus = Readonly<{
   workItemFence: CccCampaignWorkItemFence | null;
   state: CccProviderAttemptState;
   terminal?: CccProviderAttemptTerminalEvidence;
+  /**
+   * Flattened terminal-evidence receipt facts (effective-route-and-usage-cost
+   * substrate), derived from `terminal` for direct consumption. Honestly
+   * absent (undefined) whenever the attempt has no reconciled effective-route
+   * receipt; data-layer only, no display strings invented here.
+   */
+  effectiveProvider?: string;
+  effectiveModel?: string;
+  effectiveReasoningEffort?: string;
+  effectiveServiceTier?: string;
+  usage?: CccProviderAttemptUsage | null;
+  cost?: CccProviderAttemptCost;
+  receiptSource?: CccProviderAttemptReceiptSource;
   binding: Readonly<CccCampaignAuthorityBinding>;
 }>;
 
@@ -368,11 +384,12 @@ function proofAttemptStatus(
   };
 }
 
-function providerAttemptStatus(
+export function providerAttemptStatus(
   attempt: Awaited<
     ReturnType<typeof listCccProviderAttemptsForCampaign>
   >[number],
 ): CccPrdProductProviderAttemptStatus {
+  const effectiveRoute = attempt.terminal?.kind === "reconciled" ? attempt.terminal.effectiveRoute : undefined;
   return {
     attemptKey: attempt.attemptKey,
     taskId: attempt.taskId,
@@ -388,6 +405,21 @@ function providerAttemptStatus(
     state: attempt.state,
     ...(attempt.terminal
       ? { terminal: { ...attempt.terminal } }
+      : {}),
+    ...(effectiveRoute
+      ? {
+        effectiveProvider: effectiveRoute.effectiveProvider,
+        effectiveModel: effectiveRoute.effectiveModel,
+        ...(effectiveRoute.effectiveReasoningEffort !== undefined
+          ? { effectiveReasoningEffort: effectiveRoute.effectiveReasoningEffort }
+          : {}),
+        ...(effectiveRoute.effectiveServiceTier !== undefined
+          ? { effectiveServiceTier: effectiveRoute.effectiveServiceTier }
+          : {}),
+        usage: effectiveRoute.usage,
+        cost: effectiveRoute.cost,
+        receiptSource: effectiveRoute.receiptSource,
+      }
       : {}),
     binding: { ...attempt.binding },
   };

@@ -28,8 +28,10 @@ export const CCC_PROVIDER_ATTEMPT_V2_SCHEMA_VERSION =
   "ccc-campaign.provider-attempt.v2" as const;
 export const CCC_PROVIDER_ATTEMPT_V3_SCHEMA_VERSION =
   "ccc-campaign.provider-attempt.v3" as const;
+export const CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION =
+  "ccc-campaign.provider-attempt.v4" as const;
 export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
-  CCC_PROVIDER_ATTEMPT_V3_SCHEMA_VERSION;
+  CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION;
 export const CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION =
   "ccc-campaign.proof-attempt.v1" as const;
 
@@ -168,10 +170,56 @@ export type CccProviderAttemptTransition = Readonly<{
   controllerToken: string;
 }>;
 
+/**
+ * Terminal-evidence receipt fields (effective-route-and-usage-cost substrate).
+ * Requested identity lives in the route/binding; these fields record what the
+ * transport actually did, at settlement time only. Additive to the v3 terminal
+ * shape and versioned under {@link CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION}.
+ */
+export type CccProviderAttemptUsage = Readonly<{
+  inputTokens: number;
+  outputTokens: number;
+}>;
+
+export type CccProviderAttemptCostClaim = Readonly<{ amountUsd: number; source: string }>;
+export type CccProviderAttemptCostUnknown = Readonly<{ kind: "unknown"; reason: string }>;
+export type CccProviderAttemptCost = CccProviderAttemptCostClaim | CccProviderAttemptCostUnknown;
+
+export type CccProviderAttemptReceiptSource = "stream-usage" | "provider-api" | "none";
+
+/** The validated, persisted shape: what the transport actually used. */
+export type CccProviderAttemptEffectiveRoute = Readonly<{
+  effectiveProvider: string;
+  effectiveModel: string;
+  effectiveReasoningEffort?: string;
+  effectiveServiceTier?: string;
+  usage: CccProviderAttemptUsage | null;
+  cost: CccProviderAttemptCost;
+  receiptSource: CccProviderAttemptReceiptSource;
+}>;
+
+/**
+ * The raw settlement input shape. `fallbackReason` exists only so a caller
+ * that still believes fallback happened is refused explicitly; campaign
+ * fallback is not an admitted behavior right now, so it must be null/absent
+ * and is never persisted.
+ */
+export type CccProviderAttemptEffectiveRouteInput = Readonly<{
+  effectiveProvider: string;
+  effectiveModel: string;
+  effectiveReasoningEffort?: string;
+  effectiveServiceTier?: string;
+  fallbackReason?: string | null;
+  usage: CccProviderAttemptUsage | null;
+  cost: CccProviderAttemptCost;
+  receiptSource: CccProviderAttemptReceiptSource;
+}>;
+
 export type CccProviderAttemptReconciliation = CccProviderAttemptTransition & Readonly<{
   outcome: Extract<CccProviderAttemptState, "committed" | "proved_failed">;
   evidenceDigest: string;
   observerId: string;
+  effectiveRoute?: CccProviderAttemptEffectiveRouteInput;
 }>;
 
 export type CccProviderAttemptTerminalEvidence =
@@ -181,6 +229,7 @@ export type CccProviderAttemptTerminalEvidence =
     state: Extract<CccProviderAttemptState, "committed" | "proved_failed">;
     evidenceDigest: string;
     observerId: string;
+    effectiveRoute?: CccProviderAttemptEffectiveRoute;
   }>;
 
 export type CccProviderAttemptScope = Readonly<{
