@@ -25,6 +25,7 @@ import {
   type ApprovalRequest,
   type CccCampaignProductExecutionPolicy,
   type CccPrdProductExecutionPlan,
+  type CccPrdProductExecutionRouteSelection,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringConstraints,
   type CccPrdAuthoringProposal,
@@ -148,6 +149,7 @@ const usage = [
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin",
   "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
+  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path> (mutually exclusive with --provider/--model/--transport/--cli-adapter; exactly one form required)",
   "       fn prd template",
   "       fn prd lint <prd-path>",
   "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
@@ -475,20 +477,46 @@ function writeSidecarAtomically(
   }
 }
 
-type ProductPolicyArgs = {
+type ProductPolicyCommonArgs = {
   rootDir: string;
   manifestPath: string;
   sidecarPath: string;
   expectedTarget: string;
   expectedBase: string;
   outputPath: string;
-  providerId: string;
-  modelId: string;
-  transport: "pi" | "cli";
-  cliAdapterId?: string;
 };
 
-function parseProductPolicyArgs(args: string[]): ProductPolicyArgs | undefined {
+type ProductPolicyArgs = ProductPolicyCommonArgs & (
+  | {
+    routeSelection: "single";
+    providerId: string;
+    modelId: string;
+    transport: "pi" | "cli";
+    cliAdapterId?: string;
+  }
+  | {
+    routeSelection: "routes-file";
+    routesFilePath: string;
+  }
+);
+
+const PRODUCT_POLICY_FLAGS = [
+  "--provider",
+  "--model",
+  "--transport",
+  "--cli-adapter",
+  "--routes-file",
+] as const;
+
+const PRODUCT_POLICY_ROUTE_SELECTION_MESSAGE =
+  "fn prd policy requires exactly one route selection: --provider/--model/--transport [--cli-adapter] for a single route applied to every task, or --routes-file <path> for one route per task; provide exactly one form, not both and not neither.";
+
+type ProductPolicyParseResult =
+  | { kind: "usage" }
+  | { kind: "route-selection-invalid" }
+  | { kind: "parsed"; value: ProductPolicyArgs };
+
+function parseProductPolicyArgs(args: string[]): ProductPolicyParseResult {
   const [
     subcommand,
     rootDir,
@@ -510,7 +538,7 @@ function parseProductPolicyArgs(args: string[]): ProductPolicyArgs | undefined {
     || !/^[0-9a-f]{40}$/.test(expectedBase)
     || options.length % 2 !== 0
   ) {
-    return undefined;
+    return { kind: "usage" };
   }
   const values = new Map<string, string>();
   for (let index = 0; index < options.length; index += 2) {
@@ -518,19 +546,47 @@ function parseProductPolicyArgs(args: string[]): ProductPolicyArgs | undefined {
     const value = options[index + 1];
     if (
       !flag
-      || !["--provider", "--model", "--transport", "--cli-adapter"].includes(flag)
+      || !PRODUCT_POLICY_FLAGS.includes(flag as (typeof PRODUCT_POLICY_FLAGS)[number])
       || !value
       || value.startsWith("--")
       || values.has(flag)
     ) {
-      return undefined;
+      return { kind: "usage" };
     }
     values.set(flag, value);
   }
+
+  const routesFilePath = values.get("--routes-file");
   const providerId = values.get("--provider");
   const modelId = values.get("--model");
   const transport = values.get("--transport");
   const cliAdapterId = values.get("--cli-adapter");
+  const hasRoutesFile = routesFilePath !== undefined;
+  const hasSingleFlag = providerId !== undefined
+    || modelId !== undefined
+    || transport !== undefined
+    || cliAdapterId !== undefined;
+
+  if (hasRoutesFile === hasSingleFlag) {
+    return { kind: "route-selection-invalid" };
+  }
+
+  const common: ProductPolicyCommonArgs = {
+    rootDir,
+    manifestPath,
+    sidecarPath,
+    expectedTarget,
+    expectedBase,
+    outputPath,
+  };
+
+  if (hasRoutesFile) {
+    return {
+      kind: "parsed",
+      value: { ...common, routeSelection: "routes-file", routesFilePath: routesFilePath! },
+    };
+  }
+
   if (
     !providerId
     || !modelId
@@ -539,20 +595,145 @@ function parseProductPolicyArgs(args: string[]): ProductPolicyArgs | undefined {
     || (transport === "pi" && cliAdapterId)
     || values.size !== (transport === "cli" ? 4 : 3)
   ) {
-    return undefined;
+    return { kind: "usage" };
   }
   return {
-    rootDir,
-    manifestPath,
-    sidecarPath,
-    expectedTarget,
-    expectedBase,
-    outputPath,
-    providerId,
-    modelId,
-    transport,
-    ...(cliAdapterId ? { cliAdapterId } : {}),
+    kind: "parsed",
+    value: {
+      ...common,
+      routeSelection: "single",
+      providerId,
+      modelId,
+      transport,
+      ...(cliAdapterId ? { cliAdapterId } : {}),
+    },
   };
+}
+
+const CCC_PRD_ROUTES_BY_TASK_SCHEMA = "ccc-prd.routes-by-task.v1" as const;
+const PRODUCT_POLICY_ROUTE_ENTRY_PI_KEYS = new Set(["providerId", "modelId", "transport"]);
+const PRODUCT_POLICY_ROUTE_ENTRY_CLI_KEYS = new Set([
+  "providerId",
+  "modelId",
+  "transport",
+  "cliAdapterId",
+]);
+
+function readProductPolicyRoutesFile(
+  rootDir: string,
+  routesFilePath: string,
+): Record<string, CccPrdProductExecutionRouteSelection> {
+  let resolvedPath: string;
+  try {
+    resolvedPath = resolveAuthorInput(rootDir, routesFilePath);
+  } catch (error) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_READ_FAILED",
+      `routes file ${routesFilePath} could not be admitted: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(resolvedPath, "utf8");
+  } catch (error) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_READ_FAILED",
+      `routes file ${routesFilePath} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_READ_FAILED",
+      `routes file ${routesFilePath} is not valid JSON`,
+    );
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} must contain one JSON object`,
+    );
+  }
+  const document = value as Record<string, unknown>;
+  const extraTopKeys = Object.keys(document).filter((key) => key !== "schema" && key !== "routes");
+  if (extraTopKeys.length > 0) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} has unknown top-level fields: ${extraTopKeys.join(", ")}`,
+    );
+  }
+  if (document.schema !== CCC_PRD_ROUTES_BY_TASK_SCHEMA) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} must declare schema ${CCC_PRD_ROUTES_BY_TASK_SCHEMA}`,
+    );
+  }
+  if (
+    !document.routes
+    || typeof document.routes !== "object"
+    || Array.isArray(document.routes)
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} routes field must be an object keyed by task id`,
+    );
+  }
+  const routesRaw = document.routes as Record<string, unknown>;
+  const taskIds = Object.keys(routesRaw);
+  if (taskIds.length === 0) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} routes must declare at least one task route`,
+    );
+  }
+  const routesByTaskId: Record<string, CccPrdProductExecutionRouteSelection> = {};
+  for (const taskId of taskIds) {
+    const entry = routesRaw[taskId];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} must be an object`,
+      );
+    }
+    const route = entry as Record<string, unknown>;
+    const transport = route.transport;
+    const allowedKeys = transport === "cli"
+      ? PRODUCT_POLICY_ROUTE_ENTRY_CLI_KEYS
+      : PRODUCT_POLICY_ROUTE_ENTRY_PI_KEYS;
+    const unknownKeys = Object.keys(route).filter((key) => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} has unknown fields: ${unknownKeys.join(", ")}`,
+      );
+    }
+    const providerId = route.providerId;
+    const modelId = route.modelId;
+    const cliAdapterId = route.cliAdapterId;
+    if (
+      typeof providerId !== "string"
+      || providerId.length === 0
+      || typeof modelId !== "string"
+      || modelId.length === 0
+      || (transport !== "pi" && transport !== "cli")
+      || (transport === "cli" && (typeof cliAdapterId !== "string" || cliAdapterId.length === 0))
+      || (transport === "pi" && cliAdapterId !== undefined)
+    ) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} must declare providerId, modelId, and transport pi|cli (cliAdapterId is required only for cli transport)`,
+      );
+    }
+    routesByTaskId[taskId] = {
+      providerId,
+      modelId,
+      transport,
+      ...(transport === "cli" ? { cliAdapterId: cliAdapterId as string } : {}),
+    };
+  }
+  return routesByTaskId;
 }
 
 function writeExecutionPlanAtomically(
@@ -613,32 +794,45 @@ async function runProductPolicyCommand(
   io: PrdCommandIo,
 ): Promise<number> {
   const parsed = parseProductPolicyArgs(args);
-  if (!parsed) {
+  if (parsed.kind === "usage") {
     io.write(usage);
     return 2;
   }
+  if (parsed.kind === "route-selection-invalid") {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_POLICY_ROUTE_SELECTION_INVALID",
+      PRODUCT_POLICY_ROUTE_SELECTION_MESSAGE,
+    );
+  }
+  const input = parsed.value;
   try {
     const compiled = compileProductBundle({
-      rootDir: parsed.rootDir,
-      manifestPath: parsed.manifestPath,
-      sidecarPath: parsed.sidecarPath,
-      expectedTarget: parsed.expectedTarget,
-      expectedBase: parsed.expectedBase,
+      rootDir: input.rootDir,
+      manifestPath: input.manifestPath,
+      sidecarPath: input.sidecarPath,
+      expectedTarget: input.expectedTarget,
+      expectedBase: input.expectedBase,
     });
     if (compiled.kind === "refusal") {
       io.write(JSON.stringify(compiled));
       return 1;
     }
-    const plan = createCccPrdProductExecutionPlan({
-      bundle: compiled,
-      route: {
-        providerId: parsed.providerId,
-        modelId: parsed.modelId,
-        transport: parsed.transport,
-        ...(parsed.cliAdapterId ? { cliAdapterId: parsed.cliAdapterId } : {}),
-      },
-    });
-    const outputPath = writeExecutionPlanAtomically(parsed, plan);
+    const plan = input.routeSelection === "routes-file"
+      ? createCccPrdProductExecutionPlan({
+        bundle: compiled,
+        routesByTaskId: readProductPolicyRoutesFile(input.rootDir, input.routesFilePath),
+      })
+      : createCccPrdProductExecutionPlan({
+        bundle: compiled,
+        route: {
+          providerId: input.providerId,
+          modelId: input.modelId,
+          transport: input.transport,
+          ...(input.cliAdapterId ? { cliAdapterId: input.cliAdapterId } : {}),
+        },
+      });
+    const outputPath = writeExecutionPlanAtomically(input, plan);
     const bytes = readFileSync(outputPath);
     io.write(JSON.stringify({
       kind: "execution-plan",
