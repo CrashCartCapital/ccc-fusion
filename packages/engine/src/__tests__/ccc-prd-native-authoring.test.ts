@@ -630,6 +630,10 @@ describe("CCC PRD native authoring adapter", () => {
     expect(prompt).toContain("\"exactQuote\"");
     expect(prompt).toContain("\"maxRequests\"");
     expect(prompt).toContain("\"high\" | \"medium\" | \"low\"");
+    // Quote discipline: dense models copy verbatim but pick repeating phrases
+    // unless told to quote at sentence length (CCC_PRD_SOURCE_QUOTE_AMBIGUOUS).
+    expect(prompt).toContain("verbatim");
+    expect(prompt).toContain("complete sentence");
   });
 
   it("refuses provider or model identity drift from the native transport", async () => {
