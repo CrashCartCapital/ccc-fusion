@@ -8,12 +8,22 @@ import {
   type CccPrdUnresolvedDecision,
 } from "@fusion/core";
 
-type SourceLine = {
+export type CccPrdSourceLine = {
   text: string;
   byteStart: number;
   byteEnd: number;
   contentEnd: number;
   fenced: boolean;
+};
+type SourceLine = CccPrdSourceLine;
+
+export type CccPrdSourceHeading = {
+  index: number;
+  level: number;
+  title: string;
+  headingPath: string[];
+  byteStart: number;
+  contentEnd: number;
 };
 
 type MaterialInventoryItem = Omit<CccPrdMaterialCoverageItem, "disposition"> & {
@@ -60,7 +70,8 @@ function stableMaterialId(
   return `MAT-${digest}`;
 }
 
-function sourceLines(bytes: Buffer): SourceLine[] {
+/** The line-and-fence walk that both the coverage scorer and the chunk planner read (design §1). */
+export function computeCccPrdSourceLines(bytes: Buffer): CccPrdSourceLine[] {
   const lines: SourceLine[] = [];
   let byteStart = 0;
   let fence: "`" | "~" | undefined;
@@ -84,14 +95,17 @@ function sourceLines(bytes: Buffer): SourceLine[] {
   return lines;
 }
 
-function inventoryForSource(path: string, bytes: Buffer): MaterialInventoryItem[] {
-  const lines = sourceLines(bytes);
-  const headings: Array<{
-    index: number;
-    level: number;
-    title: string;
-    headingPath: string[];
-  }> = [];
+/**
+ * ATX heading walk only (fenced lines skipped, `:97` in the design's
+ * citation); setext headings and any preamble before the first heading are
+ * deliberately invisible here, which is exactly the blind spot the chunk
+ * planner's byte-partition invariant has to cover independently (design §1).
+ */
+export function computeCccPrdSourceHeadings(
+  bytes: Buffer,
+  lines: CccPrdSourceLine[],
+): CccPrdSourceHeading[] {
+  const headings: CccPrdSourceHeading[] = [];
   const headingStack: string[] = [];
   for (const [index, line] of lines.entries()) {
     if (line.fenced) continue;
@@ -106,8 +120,16 @@ function inventoryForSource(path: string, bytes: Buffer): MaterialInventoryItem[
       level,
       title,
       headingPath: headingStack.filter((entry): entry is string => Boolean(entry)),
+      byteStart: line.byteStart,
+      contentEnd: line.contentEnd,
     });
   }
+  return headings;
+}
+
+export function computeCccPrdMaterialInventory(path: string, bytes: Buffer): MaterialInventoryItem[] {
+  const lines = computeCccPrdSourceLines(bytes);
+  const headings = computeCccPrdSourceHeadings(bytes, lines);
 
   const inventory: MaterialInventoryItem[] = [];
   for (const [headingIndex, heading] of headings.entries()) {
@@ -207,7 +229,7 @@ export function analyzeCccPrdMaterialCoverage(
   input: AnalyzeCccPrdMaterialCoverageInput,
 ): CccPrdMaterialCoverageAnalysis {
   const inventory = [...input.sourceBytes.entries()]
-    .flatMap(([path, bytes]) => inventoryForSource(path, bytes));
+    .flatMap(([path, bytes]) => computeCccPrdMaterialInventory(path, bytes));
   const coverage: CccPrdMaterialCoverageItem[] = [];
   const missing: MaterialInventoryItem[] = [];
   const conflicts: MaterialInventoryItem[] = [];
