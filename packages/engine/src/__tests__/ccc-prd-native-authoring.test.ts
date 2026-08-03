@@ -570,6 +570,68 @@ describe("CCC PRD native authoring adapter", () => {
     });
   });
 
+  /*
+  Stage 4 regression pair (2026-08-03). A real local model (Qwen3.6-35B-A3B via
+  oMLX) produced a complete, parseable proposal with all 19 top-level keys that
+  still failed the shape gate three ways: rows cited sources under a `sources`
+  key because the prompt never names `sourceRefs`; `bounds` came back as an
+  array because the prompt never shapes it; `confidence` came back as the float
+  0.95 because the prompt never says it is a "high"|"medium"|"low" string. The
+  refusal said only "wrong proposal schema or shape", so the operator could not
+  see any of that. The prompt must state the exact field contract, and the
+  refusal must name the violated fields.
+  */
+  it("names the violated fields when a proposal fails the shape gate", async () => {
+    const drifted = structuredClone(proposal) as Record<string, unknown>;
+    const tasks = drifted.tasks as Array<Record<string, unknown>>;
+    for (const task of tasks) {
+      task.sources = task.sourceRefs;
+      delete task.sourceRefs;
+    }
+    drifted.bounds = [];
+    drifted.confidence = 0.95;
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(drifted),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result.kind).toBe("refusal");
+    const message = (result as { diagnostics: Array<{ code: string; message: string }> })
+      .diagnostics[0]!;
+    expect(message.code).toBe("CCC_PRD_AUTHORING_PROPOSAL_INVALID");
+    expect(message.message).toContain("tasks[0].sourceRefs");
+    expect(message.message).toContain("bounds");
+    expect(message.message).toContain("confidence");
+  });
+
+  it("states the exact proposal field contract in the transport prompt", async () => {
+    const generate = vi.fn<CccPrdNativeAuthoringTransport>(async (request) => ({
+      text: canonicalCccPrdJson(proposal),
+      provider: request.provider,
+      model: request.model,
+    }));
+
+    await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(generate),
+      constraints,
+    });
+
+    const prompt = generate.mock.calls[0]![0].prompt;
+    expect(prompt).toContain("\"sourceRefs\"");
+    expect(prompt).toContain("\"exactQuote\"");
+    expect(prompt).toContain("\"maxRequests\"");
+    expect(prompt).toContain("\"high\" | \"medium\" | \"low\"");
+  });
+
   it("refuses provider or model identity drift from the native transport", async () => {
     const result = await authorCccPrdPacket({
       rootDir: fixtureRoot,
