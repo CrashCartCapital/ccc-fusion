@@ -82,21 +82,6 @@ function hasIdentifiedRows(value: unknown): boolean {
   ));
 }
 
-function hasSourceBoundRows(value: unknown): boolean {
-  return hasIdentifiedRows(value) && (value as unknown[]).every((entry) => {
-    const sourceRefs = (entry as Record<string, unknown>).sourceRefs;
-    return Array.isArray(sourceRefs)
-      && sourceRefs.length > 0
-      && sourceRefs.every((reference) => (
-        isPlainRecord(reference)
-        && typeof reference.path === "string"
-        && reference.path.length > 0
-        && typeof reference.exactQuote === "string"
-        && reference.exactQuote.length > 0
-      ));
-  });
-}
-
 function sourceQuoteContainsCanonicalPath(
   reference: CccPrdSourceReferenceProposal,
   path: string,
@@ -153,8 +138,20 @@ function validateTaskCustodyProvenance(
   return diagnostics;
 }
 
-function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal {
-  if (!isPlainRecord(value) || value.schema !== CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION) return false;
+/*
+Stage 4 (2026-08-03): a real model produced a complete, parseable proposal that
+failed this gate three ways at once, and the bare "wrong proposal schema or
+shape" message left the operator blind. Enumerate the violations (first
+offending row per collection) so the refusal can name them.
+*/
+function describeProposalShapeViolations(value: unknown): string[] {
+  if (!isPlainRecord(value)) {
+    return ["proposal is not a JSON object"];
+  }
+  const violations: string[] = [];
+  if (value.schema !== CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION) {
+    violations.push(`schema must be "${CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION}"`);
+  }
   const collections = [
     "authorityRoles",
     "requirements",
@@ -199,12 +196,56 @@ function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal
     "ambiguities",
     "exceptions",
   ];
-  return collections.every((key) => hasArray(value, key))
-    && identifiedCollections.every((key) => hasIdentifiedRows(value[key]))
-    && sourceBoundCollections.every((key) => hasSourceBoundRows(value[key]))
-    && isPlainRecord(value.bounds)
-    && isPlainRecord(value.targetRepository)
-    && typeof value.confidence === "string";
+  for (const key of collections) {
+    if (!hasArray(value, key)) {
+      violations.push(`${key} must be an array`);
+    }
+  }
+  for (const key of identifiedCollections) {
+    const rows = value[key];
+    if (!Array.isArray(rows)) continue;
+    const badIndex = rows.findIndex((entry) => !(
+      isPlainRecord(entry) && typeof entry.id === "string" && entry.id.length > 0
+    ));
+    if (badIndex >= 0) {
+      violations.push(`${key}[${badIndex}].id must be a non-empty string`);
+    }
+  }
+  for (const key of sourceBoundCollections) {
+    const rows = value[key];
+    if (!Array.isArray(rows) || !hasIdentifiedRows(rows)) continue;
+    const badIndex = rows.findIndex((entry) => {
+      const sourceRefs = (entry as Record<string, unknown>).sourceRefs;
+      return !(Array.isArray(sourceRefs)
+        && sourceRefs.length > 0
+        && sourceRefs.every((reference) => (
+          isPlainRecord(reference)
+          && typeof reference.path === "string"
+          && reference.path.length > 0
+          && typeof reference.exactQuote === "string"
+          && reference.exactQuote.length > 0
+        )));
+    });
+    if (badIndex >= 0) {
+      violations.push(
+        `${key}[${badIndex}].sourceRefs must be a non-empty array of {path, exactQuote} objects`,
+      );
+    }
+  }
+  if (!isPlainRecord(value.bounds)) {
+    violations.push("bounds must be an object with maxRequests, maxDurationMs, maxConcurrency");
+  }
+  if (!isPlainRecord(value.targetRepository)) {
+    violations.push("targetRepository must be an object with path and baseCommit");
+  }
+  if (typeof value.confidence !== "string") {
+    violations.push('confidence must be the string "high", "medium", or "low"');
+  }
+  return violations;
+}
+
+function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal {
+  return describeProposalShapeViolations(value).length === 0;
 }
 
 const IDENTITY_COLLECTIONS = [
@@ -807,7 +848,12 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       ...(input.previousSidecar ? { previousSidecar: input.previousSidecar } : {}),
     });
     if (!validateProposalShape(proposalValue)) {
-      return malformed(`authoring adapter ${input.adapter.id} returned the wrong proposal schema or shape`);
+      const violations = describeProposalShapeViolations(proposalValue);
+      const shown = violations.slice(0, 8).join("; ");
+      const suffix = violations.length > 8 ? ` (+${violations.length - 8} more)` : "";
+      return malformed(
+        `authoring adapter ${input.adapter.id} returned the wrong proposal schema or shape: ${shown}${suffix}`,
+      );
     }
     if (!hasWellFormedProtectedActionIds(proposalValue)) {
       return malformed(`authoring adapter ${input.adapter.id} returned a task protected-action ID that is empty or not trimmed`);

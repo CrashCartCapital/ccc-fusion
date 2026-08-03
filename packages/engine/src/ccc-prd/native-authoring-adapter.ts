@@ -119,10 +119,41 @@ function buildPrompt(
     "Preserve the source packet. Do not execute actions or invent source text.",
     ...modeInstructions,
     "Every requirement, proof, task, workflow, document, artifact, unresolved decision, ambiguity, exception, and protected action must cite one or more admitted sources using {path, exactQuote}; every exactQuote must occur exactly once in that source.",
+    "Copy each exactQuote verbatim from the source bytes -- never paraphrase, summarize, or normalize whitespace. Choose quotes long enough to occur exactly once: quote the complete sentence or line, and extend with adjacent text whenever a shorter phrase could repeat elsewhere in the document.",
+    "When a short identifier, test name, or phrase repeats across the document, never quote it alone: quote the entire sentence or line around its defining occurrence, extended until the quote is unique. When quoting lines from code blocks, tables, or directory trees, reproduce interior spacing, alignment runs of spaces, and trailing comments byte-for-byte.",
     "Every implementation-changing fact must be source-bound too: targetRepository.path, targetRepository.baseCommit, every admittedWriteRoots.path, every task ownedPaths and allowedWriteRoots path, execution bounds, requirement acceptance behavior, proof command/oracle/negative controls, protected actions, and non-goals must appear in the admitted source text. If a fact is missing, return a source-bound unresolved question instead of inventing it from constraints.",
     "Every task must return non-empty ownedPaths and allowedWriteRoots arrays using canonical target-relative paths. Each path must occur literally in that task's exact source quote. Keep concurrency ownership distinct from filesystem write permission; never broaden either from a global root.",
     "Source references must collectively disposition every Markdown heading block and requirement-like row. Map it to a task when implemented; otherwise cite an explicit source deferral/out-of-scope statement or return a source-bound unresolved question. Never guess a missing decision.",
     "Return all required arrays and objects: schema, authorityRoles, requirements, proofs, tasks, edges, workflows, documents, artifacts, importIntents, protectedActions, bounds, admittedWriteRoots, targetRepository, nonGoals, unresolvedDecisions, ambiguities, exceptions, confidence.",
+    /*
+    Stage 4 (2026-08-03): without this explicit field contract a real model
+    invented reasonable-but-wrong shapes (citations under `sources`, bounds as
+    an array, confidence as a number) and every run failed the shape gate.
+    The template below is documentation for the model, not parseable JSON --
+    enum alternatives are written with `|`.
+    */
+    "The exact field contract, with every key name mandatory (enumerated values are written with |; all other values are strings unless shown as numbers; every source-bound row carries its citations under \"sourceRefs\"):",
+    "{",
+    "  \"schema\": \"ccc-prd.authoring-proposal.v1\",",
+    "  \"authorityRoles\": [{ \"id\": \"\", \"role\": \"root\" | \"production_module\" | \"blocking_test_index\" | \"support\", \"sourcePaths\": [\"\"], \"accountableProducer\": \"\" }],",
+    "  \"requirements\": [{ \"id\": \"\", \"statement\": \"\", \"acceptance\": \"\", \"accountableProducer\": \"\", \"dependencies\": [\"\"], \"proofIds\": [\"\"], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"proofs\": [{ \"id\": \"\", \"requirementIds\": [\"\"], \"command\": \"\", \"positiveOracle\": \"\", \"negativeControls\": [\"\"], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"tasks\": [{ \"id\": \"\", \"title\": \"\", \"description\": \"\", \"accountableProducer\": \"\", \"requirementIds\": [\"\"], \"dependencyTaskIds\": [\"\"], \"proofIds\": [\"\"], \"workflowId\": \"\", \"documentIds\": [\"\"], \"artifactIds\": [\"\"], \"protectedActionIds\": [\"\"], \"ownedPaths\": [\"\"], \"allowedWriteRoots\": [\"\"], \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"edges\": [{ \"id\": \"\", \"fromTaskId\": \"\", \"toTaskId\": \"\", \"kind\": \"depends_on\" }],",
+    "  \"workflows\": [{ \"id\": \"\", \"title\": \"\", \"taskIds\": [\"\"], \"entryTaskIds\": [\"\"], \"terminalTaskIds\": [\"\"], \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"documents\": [{ \"id\": \"\", \"taskId\": \"\", \"key\": \"\", \"title\": \"\", \"content\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"artifacts\": [{ \"id\": \"\", \"taskId\": \"\", \"type\": \"\", \"title\": \"\", \"mimeType\": \"\", \"content\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"importIntents\": [{ \"id\": \"\", \"entityType\": \"campaign\" | \"task\" | \"dependency_edge\" | \"workflow\" | \"document\" | \"artifact\" | \"source\" | \"work_item\" | \"run_audit\", \"entityId\": \"\", \"operation\": \"create\", \"target\": \"\" }],",
+    "  \"protectedActions\": [{ \"id\": \"\", \"kind\": \"promotion\" | \"live_execution\" | \"deletion\" | \"merge\" | \"publication\" | \"credential\" | \"billing\" | \"upstream_write\", \"target\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"bounds\": { \"maxRequests\": 0, \"maxDurationMs\": 0, \"maxConcurrency\": 0 },",
+    "  \"admittedWriteRoots\": [{ \"path\": \"\", \"purpose\": \"\" }],",
+    "  \"targetRepository\": { \"path\": \"\", \"baseCommit\": \"\" },",
+    "  \"nonGoals\": [\"\"],",
+    "  \"unresolvedDecisions\": [{ \"id\": \"\", \"question\": \"\", \"state\": \"unresolved\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"ambiguities\": [{ \"id\": \"\", \"message\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"exceptions\": [{ \"id\": \"\", \"message\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    "  \"confidence\": \"high\" | \"medium\" | \"low\"",
+    "}",
     "Use stable IDs. Protected actions must name exact targets. Human review is limited to ambiguities, unresolved decisions, exceptions, and protected actions.",
     canonicalCccPrdJson({
       mode,

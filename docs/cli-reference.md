@@ -1243,6 +1243,24 @@ Secret handling:
 
 ---
 
+## `fn provider`
+
+Manage custom AI providers from the CLI — the setup path for CCC PRD understanding and authoring on a headless node.
+
+```bash
+fn provider list [--json]
+fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--max-tokens <n>] [--context-window <n>] [--api-key-stdin] [--allow-remote]
+fn provider remove <registry-key|id> [--yes]
+```
+
+`fn provider add` echoes the derived registry key to pass as `--provider`. It is loopback-only by default: a base URL outside `http://127.0.0.1:<port>/<path>` is refused unless `--allow-remote` is given, and CCC PRD authoring/understanding will still refuse a remote provider. API keys are read from stdin only (`--api-key-stdin`) — an inline value would leak into shell history — and many local backends also require a placeholder key so credential resolution succeeds at prompt time.
+
+`--max-tokens` and `--context-window` declare the backend's real generation and window limits on every `--model` entry of the registration. When absent, the registry assumes 16384 response tokens and a 128000-token window; declare the real values when long structured responses truncate with finish reason "length", or when the backend's window is smaller than the default. A model id containing a literal colon is written `\:` (the unescaped colon separates the optional display name).
+
+`fn provider remove` refuses without `--yes` and identifies the provider by registry key or id. Re-adding a name that already exists creates a second entry whose registry key gets a `-2` suffix — remove the old entry first when the intent is replacement.
+
+---
+
 ## `fn git`
 
 Project git operations.

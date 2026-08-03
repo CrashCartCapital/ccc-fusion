@@ -186,7 +186,13 @@ export interface CustomProvider {
    * `google-generative-ai` (no cache_control concept).
    */
   anthropicPromptCaching?: boolean;
-  models?: { id: string; name: string }[];
+  /**
+   * Per-model generation limits. When absent, the model registry falls back to
+   * its historical defaults (maxTokens 16384, contextWindow 128000); declare
+   * them when the backend's real window differs, or long structured responses
+   * truncate with finish reason "length".
+   */
+  models?: { id: string; name: string; maxTokens?: number; contextWindow?: number }[];
 }
 
 export interface WorkflowStepInput {

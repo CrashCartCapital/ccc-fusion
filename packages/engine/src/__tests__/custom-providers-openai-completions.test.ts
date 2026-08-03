@@ -97,6 +97,72 @@ describe("custom providers openai-completions regression", () => {
     }
   });
 
+  /*
+  Stage 4 finding (2026-08-03): oMLX emits SSE keepalive chunks during prompt
+  processing whose `model` field is the literal placeholder "keepalive" (and
+  whose delta carries only an empty content/role). pi-ai captured responseModel
+  from the FIRST chunk whose model differed from the requested id, so the
+  placeholder poisoned response identity and the ccc transport-identity gate
+  refused every oMLX response as drifted. Identity must be captured only from
+  substantive chunks (non-empty content, tool calls, or a finish_reason), and a
+  genuinely aliased backend must still be surfaced for the gate to refuse.
+  */
+  async function streamIdentityProbe(
+    sseChunks: string[],
+  ): Promise<{ responseModel?: string; model: string }> {
+    const server = createServer((request, response) => {
+      request.on("data", () => {});
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        for (const chunk of sseChunks) {
+          response.write(`data: ${chunk}\n\n`);
+        }
+        response.end("data: [DONE]\n\n");
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address() as AddressInfo;
+    try {
+      const modelRegistry = await createInMemoryModelRegistry();
+      modelRegistry.registerProvider("keepalive-probe", {
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        api: "openai-completions",
+        apiKey: "CUSTOM_KEY",
+        models: [{ id: "my-model", name: "My Model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16384 }],
+      });
+      await modelRegistry.refresh();
+      const model = modelRegistry.find("keepalive-probe", "my-model");
+      const response = await completeSimple(
+        model!,
+        { messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+        { apiKey: "CUSTOM_KEY" },
+      );
+      return response as { responseModel?: string; model: string };
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  }
+
+  it("ignores transport keepalive placeholder chunks when capturing response identity", async () => {
+    const response = await streamIdentityProbe([
+      "{\"id\":\"chatcmpl-ka\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"keepalive\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+      "{\"id\":\"chatcmpl-ka\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+      "{\"id\":\"chatcmpl-ka\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
+    ]);
+    expect(response.responseModel).toBeUndefined();
+  });
+
+  it("still surfaces a genuinely aliased backend model for the identity gate", async () => {
+    const response = await streamIdentityProbe([
+      "{\"id\":\"chatcmpl-alias\",\"object\":\"chat.completion.chunk\",\"model\":\"other-backend-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+      "{\"id\":\"chatcmpl-alias\",\"object\":\"chat.completion.chunk\",\"model\":\"other-backend-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
+    ]);
+    expect(response.responseModel).toBe("other-backend-model");
+  });
+
   it("uses system role when reasoning model explicitly disables developer role compat", () => {
     const params = convertMessages(
       { provider: "openai", reasoning: true, input: ["text"] } as never,

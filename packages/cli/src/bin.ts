@@ -480,7 +480,7 @@ PR:
   fn mcp validate [--scope <global|project|effective>] [--json]
                                       Validate MCP definitions without revealing secrets
   fn provider list [--json]           List custom AI providers with the registry key to pass as --provider
-  fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--api-key-stdin] [--allow-remote]
+  fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--max-tokens <n>] [--context-window <n>] [--api-key-stdin] [--allow-remote]
                                       Register a custom provider; loopback-only unless --allow-remote, API key read from stdin only
   fn provider remove <registry-key|id> [--yes]
                                       Remove a custom provider by registry key or id

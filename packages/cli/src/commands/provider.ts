@@ -200,7 +200,9 @@ function singleValue(parsed: ParsedFlags, flag: string): string | undefined {
  * Parse `--model <id>[:<name>]`. Model ids commonly contain a colon
  * (`gpt-oss:20b`), so a literal colon inside an id is written `\:`.
  */
-function parseModelSpec(spec: string): { id: string; name: string } {
+function parseModelSpec(
+  spec: string,
+): { id: string; name: string; maxTokens?: number; contextWindow?: number } {
   let id = "";
   let name: string | undefined;
 
@@ -227,6 +229,23 @@ function parseModelSpec(spec: string): { id: string; name: string } {
   }
 
   return { id: id.trim(), name: resolvedName ?? id.trim() };
+}
+
+/**
+ * Parse an optional positive-integer limit flag. A malformed value fails the
+ * command rather than being dropped, so the stored provider always matches
+ * what the operator asked for.
+ */
+function parseModelLimit(parsed: ParsedFlags, flag: string): number | undefined {
+  const raw = singleValue(parsed, flag);
+  if (raw === undefined) {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    fail(`${flag} must be a positive integer, got ${raw}`);
+  }
+  return value;
 }
 
 async function readStdinLineDefault(): Promise<string> {
@@ -323,7 +342,7 @@ async function runProviderList(args: string[], deps: ProviderCommandDeps): Promi
 async function runProviderAdd(args: string[], deps: ProviderCommandDeps): Promise<number> {
   const parsed = parseFlags(
     args,
-    ["--name", "--base-url", "--api-type", "--model"],
+    ["--name", "--base-url", "--api-type", "--model", "--max-tokens", "--context-window"],
     ["--api-key-stdin", "--allow-remote"],
   );
   if (parsed.positionals.length > 0) {
@@ -356,6 +375,20 @@ async function runProviderAdd(args: string[], deps: ProviderCommandDeps): Promis
   const apiType = apiTypeValue as CustomProvider["apiType"];
 
   const models = (parsed.values.get("--model") ?? []).map(parseModelSpec);
+
+  // Stage 4 finding (2026-08-02): the registry hardcoded 16384/128000 for every
+  // custom-provider model, truncating long structured responses against local
+  // backends with different real windows. These provider-level flags stamp the
+  // declared limits onto every model entry of this registration.
+  const maxTokens = parseModelLimit(parsed, "--max-tokens");
+  const contextWindow = parseModelLimit(parsed, "--context-window");
+  if ((maxTokens !== undefined || contextWindow !== undefined) && models.length === 0) {
+    fail("--max-tokens/--context-window apply to model entries; pass at least one --model");
+  }
+  for (const model of models) {
+    if (maxTokens !== undefined) model.maxTokens = maxTokens;
+    if (contextWindow !== undefined) model.contextWindow = contextWindow;
+  }
 
   let apiKey: string | undefined;
   if (parsed.booleans.has("--api-key-stdin")) {
@@ -465,7 +498,7 @@ async function runProviderRemove(args: string[], deps: ProviderCommandDeps): Pro
 
 const USAGE = `Usage:
   fn provider list [--json]
-  fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--api-key-stdin] [--allow-remote]
+  fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--max-tokens <n>] [--context-window <n>] [--api-key-stdin] [--allow-remote]
   fn provider remove <registry-key|id> [--yes]`;
 
 /**

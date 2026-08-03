@@ -501,3 +501,78 @@ describe("bin.ts operator help surface", () => {
     }
   });
 });
+
+/*
+Stage 4 finding (2026-08-02): the registry hardcoded every custom-provider
+model at maxTokens 16384 / contextWindow 128000, so real PRD understanding
+against a 65k-window local model truncated with "length: incomplete response".
+These flags let the operator declare what the backend actually supports.
+*/
+describe("fn provider add -- per-model token limits", () => {
+  it("persists --max-tokens and --context-window onto every model entry", async () => {
+    const code = await run([
+      "add",
+      "--name", "Local",
+      "--base-url", LOOPBACK_BASE_URL,
+      "--model", "big-model",
+      "--model", "small-model",
+      "--max-tokens", "32768",
+      "--context-window", "65536",
+    ]);
+
+    expect(code).toBe(0);
+    const providers = persisted();
+    expect(providers[0]!.models).toEqual([
+      { id: "big-model", name: "big-model", maxTokens: 32768, contextWindow: 65536 },
+      { id: "small-model", name: "small-model", maxTokens: 32768, contextWindow: 65536 },
+    ]);
+  });
+
+  it("stores no limit fields when the flags are absent", async () => {
+    await run(["add", "--name", "Local", "--base-url", LOOPBACK_BASE_URL, "--model", "m"]);
+
+    const providers = persisted();
+    expect(providers[0]!.models).toEqual([{ id: "m", name: "m" }]);
+  });
+
+  it.each(["0", "-1", "1.5", "abc"])("refuses --max-tokens %s", async (value) => {
+    const code = await run([
+      "add",
+      "--name", "Local",
+      "--base-url", LOOPBACK_BASE_URL,
+      "--model", "m",
+      "--max-tokens", value,
+    ]);
+
+    expect(code).toBe(1);
+    expect(output()).toContain("--max-tokens");
+    expect(persisted()).toEqual([]);
+  });
+
+  it.each(["0", "-1", "1.5", "abc"])("refuses --context-window %s", async (value) => {
+    const code = await run([
+      "add",
+      "--name", "Local",
+      "--base-url", LOOPBACK_BASE_URL,
+      "--model", "m",
+      "--context-window", value,
+    ]);
+
+    expect(code).toBe(1);
+    expect(output()).toContain("--context-window");
+    expect(persisted()).toEqual([]);
+  });
+
+  it("refuses limit flags when no --model is given, instead of silently dropping them", async () => {
+    const code = await run([
+      "add",
+      "--name", "Local",
+      "--base-url", LOOPBACK_BASE_URL,
+      "--max-tokens", "32768",
+    ]);
+
+    expect(code).toBe(1);
+    expect(output()).toContain("--model");
+    expect(persisted()).toEqual([]);
+  });
+});
