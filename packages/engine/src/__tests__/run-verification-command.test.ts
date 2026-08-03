@@ -1218,16 +1218,24 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
 
     itPosix("executes commands with allowlisted locale variables (POSIX shell)", async () => {
-      const result = await runVerificationCommand({
-        command: "echo $LANG",
-        cwd: tempDir,
-        timeoutMs: 30000,
-        onHeartbeat: vi.fn(),
-      });
+      // A minimal host (for example a slim container runner) may set no locale
+      // variable at all, so stub LANG and assert the exact value round-trips —
+      // this proves allowlist passthrough deterministically instead of
+      // assuming the ambient environment.
+      vi.stubEnv("LANG", "C.UTF-8");
+      try {
+        const result = await runVerificationCommand({
+          command: "echo $LANG",
+          cwd: tempDir,
+          timeoutMs: 30000,
+          onHeartbeat: vi.fn(),
+        });
 
-      expect(result.success).toBe(true);
-      // Should have output (LANG is part of the deterministic allowlist).
-      expect(result.stdout.trim().length).toBeGreaterThan(0);
+        expect(result.success).toBe(true);
+        expect(result.stdout.trim()).toBe("C.UTF-8");
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
   });
 });
