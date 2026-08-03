@@ -64,6 +64,19 @@ export class CccPrdAuthoringEgressPolicyViolationError extends Error {
   }
 }
 
+export class CccPrdRouteNotVerbatimCapableError extends Error {
+  readonly code = "CCC_PRD_ROUTE_NOT_VERBATIM_CAPABLE";
+
+  constructor(providerKey: string, model: string) {
+    super(
+      `CCC PRD quote-bearing work refuses ${providerKey}/${model}: verbatimCapable is not declared. `
+        + "Absent means unknown means not admitted (design D-4) -- register with "
+        + "`fn provider add --verbatim-capable` once the route is confirmed to copy quotes byte-exact.",
+    );
+    this.name = "CccPrdRouteNotVerbatimCapableError";
+  }
+}
+
 /*
 FNXC:CCCAuthoringEgress 2026-08-01-17:40:
 Authoring and understanding serialize every admitted source verbatim into one
@@ -75,7 +88,7 @@ inheriting that provider's own remote route. The refusal deliberately names only
 the provider key and the policy reason — never the base URL, credential, or any
 source text — so a refusal log cannot become the leak it just prevented.
 */
-function assertCccPrdAuthoringLoopbackEgress(
+export function assertCccPrdAuthoringLoopbackEgress(
   providerKey: string,
   providers: CustomProvider[],
 ): void {
@@ -91,6 +104,29 @@ function assertCccPrdAuthoringLoopbackEgress(
   const validation = validateCccLoopbackHttpUrl(provider.baseUrl);
   if (!validation.ok) {
     throw new CccPrdAuthoringEgressPolicyViolationError(providerKey, validation.reason);
+  }
+}
+
+/*
+Design §8 / D-4: verbatimCapable is a declared operator assertion, not a
+measurement -- the product cannot see the architecture behind an
+OpenAI-compatible URL, so MoE disqualification (D3) is enforced by
+declaration. Absent means unknown means not admitted for quote-bearing work.
+Required for BOTH modes (execution and understanding), since both emit
+sourceRefs. Checked before a single corpus byte is serialized, alongside the
+egress assertion.
+*/
+export function assertCccPrdRouteVerbatimCapable(
+  providerKey: string,
+  model: string,
+  providers: CustomProvider[],
+): void {
+  const provider = providers.find(
+    (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
+  );
+  const modelEntry = provider?.models?.find((entry) => entry.id === model);
+  if (!modelEntry?.verbatimCapable) {
+    throw new CccPrdRouteNotVerbatimCapableError(providerKey, model);
   }
 }
 
@@ -257,6 +293,7 @@ export function createNativeCccPrdAuthoringAdapter(
     model: `${options.provider}/${options.model}`,
     async generateCandidate(request): Promise<CccPrdAuthoringProposal> {
       assertCccPrdAuthoringLoopbackEgress(options.provider, configuredProviders);
+      assertCccPrdRouteVerbatimCapable(options.provider, options.model, configuredProviders);
       const prompt = buildPrompt(request, mode);
       const promptBytes = Buffer.byteLength(prompt, "utf8");
       if (promptBytes > options.maxPromptBytes) {

@@ -249,6 +249,14 @@ loopback boundary before a prompt exists. Declare the loopback providers these
 adapter ids already claimed so the suite exercises the admitted route; the
 refusal behavior itself is proved in ccc-authoring-egress.test.ts.
 */
+/*
+Design §8 finding 4: a fail-closed verbatimCapable gate would otherwise
+refuse every fixture call in this suite with zero POSTs, since none of them
+exercise the capability-refusal path itself (that is
+ccc-authoring-egress.test.ts's job, mirroring how the loopback-egress
+refusal is proved there and not here). verbatimCapable: true here is
+fixture setup, not a claim about a real model.
+*/
 const loopbackAuthoringProviders: CustomProvider[] = [
   {
     id: "ccc-loopback-authoring",
@@ -256,7 +264,7 @@ const loopbackAuthoringProviders: CustomProvider[] = [
     apiType: "openai-compatible",
     baseUrl: "http://127.0.0.1:7443/v1",
     apiKey: "synthetic-never-read",
-    models: [{ id: "fixture-model", name: "Fixture" }],
+    models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: true }],
   },
   {
     id: "ccc-loopback-understanding",
@@ -264,7 +272,7 @@ const loopbackAuthoringProviders: CustomProvider[] = [
     apiType: "openai-compatible",
     baseUrl: "http://127.0.0.1:7444/v1",
     apiKey: "synthetic-never-read",
-    models: [{ id: "fixture-model", name: "Fixture" }],
+    models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: true }],
   },
 ];
 
