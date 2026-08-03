@@ -61,7 +61,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
   async function runCommand(args: string[]) {
     const output: string[] = [];
     const exitCode = await runPrdCommand(
-      args,
+      [...args, "--json"],
       { write: (line) => output.push(line) },
       commandDependencies(),
       { projectName: "cli-recovery-integration" },
