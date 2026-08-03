@@ -154,6 +154,7 @@ async function loadCommandHandlers() {
   const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = await import("./commands/research.js");
   const { runExperimentFinalize } = await import("./commands/experiment-finalize.js");
   const { runPrdCommand } = await import("./commands/prd.js");
+  const { runProviderCommand } = await import("./commands/provider.js");
   const { dispatchUpdateCliArgs } = await import("./commands/update.js");
 
   return {
@@ -291,6 +292,7 @@ async function loadCommandHandlers() {
     runResearchRetry,
     runExperimentFinalize,
     runPrdCommand,
+    runProviderCommand,
     dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
@@ -326,29 +328,29 @@ Usage:
                                       Validate custody and semantics; emit diagnostics only
   fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Compile a validated sidecar into the complete deterministic semantic bundle
-  fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]
+  fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>] [--json]
                                       Show the exact hash-bound product import, coding routes, paths, proof, and approval contract
-  fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]
+  fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>] [--json]
                                       Recheck the preview identity and transactionally admit the campaign
-  fn prd inspect <idempotency-key> [--project <id|name>]
+  fn prd inspect <idempotency-key> [--project <id|name>] [--json]
                                       Inspect durable PRD import and recovery state
-  fn prd reconcile <idempotency-key> [--project <id|name>]
+  fn prd reconcile <idempotency-key> [--project <id|name>] [--json]
                                       Resume an incomplete transactional projection without replaying uncertain effects
-  fn prd status <idempotency-key> [--project <id|name>]
+  fn prd status <idempotency-key> [--project <id|name>] [--json]
                                       Show tasks, routes, worktrees, proofs, approvals, recovery state, and fresh operator confirmations
-  fn prd pause <idempotency-key> --confirm <status-digest> [--project <id|name>]
+  fn prd pause <idempotency-key> --confirm <status-digest> [--project <id|name>] [--json]
                                       Park an unleased campaign at its current safe boundary
-  fn prd resume <idempotency-key> --confirm <status-digest> [--project <id|name>]
+  fn prd resume <idempotency-key> --confirm <status-digest> [--project <id|name>] [--json]
                                       Resume a campaign held by the exact operator pause receipt
-  fn prd stop <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]
+  fn prd stop <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>] [--json]
                                       Terminally stop a campaign while preserving worktrees, receipts, and uncertain-effect evidence
-  fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]
+  fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>] [--json]
                                       Settle an uncertain verifier from reviewed external evidence without rerunning it
-  fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]
+  fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>] [--json]
                                       Settle an uncertain PI/workflow provider effect; native CLI attempts retain their held-session fence
-  fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]
+  fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>] [--json]
                                       Claim the exact campaign-bound live-execution approval
-  fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]
+  fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>] [--json]
                                       Land only the exact proof-bound campaign commit after human approval
   fn init [opts]                      Initialize a new fn project (--name, --path, --git)
   fn onboard [--force] [--skip-onboarding]
@@ -477,6 +479,11 @@ PR:
                                       Export Fusion MCP JSON with secret references only
   fn mcp validate [--scope <global|project|effective>] [--json]
                                       Validate MCP definitions without revealing secrets
+  fn provider list [--json]           List custom AI providers with the registry key to pass as --provider
+  fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--api-key-stdin] [--allow-remote]
+                                      Register a custom provider; loopback-only unless --allow-remote, API key read from stdin only
+  fn provider remove <registry-key|id> [--yes]
+                                      Remove a custom provider by registry key or id
   fn workflow validate <id> | --file <path> [--json]
                                       Dry-run validate a workflow IR without creating or mutating it
 
@@ -867,6 +874,7 @@ async function main() {
     runResearchRetry,
     runExperimentFinalize,
     runPrdCommand,
+    runProviderCommand,
     dispatchUpdateCliArgs,
     runChatInteractive,
     parseChatCliArgs,
@@ -883,6 +891,13 @@ async function main() {
         );
         break;
       }
+
+      case "provider": {
+        // Custom providers are global, not project-scoped, so no projectName.
+        process.exitCode = await runProviderCommand(args.slice(1));
+        break;
+      }
+
       case "init": {
         // Parse init options
         const nameIdx = args.indexOf("--name");
