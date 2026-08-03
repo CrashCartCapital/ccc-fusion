@@ -32,6 +32,8 @@ Three packets re-froze into scratch space with packet hashes identical to the 20
 
 Model-class evidence (same packet, same contract prompt): the 35B-A3B MoE **invented** 25 of 33 quotes (paraphrase, not copy — none matched even whitespace-normalized); the dense 27B **copied** verbatim and failed only on uniqueness. Prompt-contract evidence: before the field contract was stated, 100% of runs failed shape; after, zero shape failures. Quote-discipline evidence: 6 bad refs → 1 across two guidance iterations. cqw and atm overnight lanes were launched on the final recipe (dense models, disciplined prompt; atm on the M2 Max's 262k-token window, the only place its ~98k-token prompt fits).
 
+The cqw overnight result exposed the second, independent ceiling: the dense 27B cleared shape **and** provenance on the 5-file packet but refused at the depth gate — `CCC_PRD_UNDERSTANDING_IMPLAUSIBLY_SHALLOW`, material inventory 88 heading blocks, only 20 dispositioned. Coverage completeness × byte-exact quoting × a single bounded response is arithmetically impossible for a multi-file packet: 88 dispositions with anchored quotes cannot fit one ~20k-token response. Together with the duplicated-sentence case, this makes the task #9 design (chunked extraction with per-chunk mechanical quote verification) the required path for real packets, not an optimization.
+
 The first understanding attempts fought through a ladder of real product defects, each surfaced by an honest refusal (no partial writes anywhere):
 
 1. `CCC_PRD_PATH_ESCAPE` — review output outside the packet root, correctly refused before any provider call.
