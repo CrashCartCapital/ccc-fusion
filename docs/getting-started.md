@@ -159,6 +159,16 @@ Fusion uses six default lifecycle columns:
 
 Custom workflows can define their own graph policy, typed settings, fields, and (when workflow columns are enabled) column behavior. The default columns remain the baseline mental model for ordinary coding tasks.
 
+## Run a PRD Campaign (advanced)
+
+A PRD campaign is the heavier path: instead of creating tasks one at a time, you freeze a product requirements document plus its admitted source files into a deterministic packet, land that whole packet on the board in one transaction, and then supervise execution through explicit approvals. Use it when a body of work needs to be planned once, proved against fixed requirements, and landed under operator control — not for everyday single tasks.
+
+Campaigns require a project backed by PostgreSQL. The `fn prd` operator commands refuse to run against a project without a PostgreSQL data layer, so set that up first.
+
+The command ladder is `fn prd freeze` (turn a chosen PRD into a frozen packet) → `fn prd policy` (write the execution plan that names providers and routes) → `fn prd preview` (see exactly what would land, and get a confirmation digest) → `fn prd import` (land it, confirming that digest) → `fn serve` (run the engine so campaign work executes) → `fn prd status` plus `fn prd approve-execution` / `fn prd approve-merge` (watch progress and approve the gated steps). Every board-changing step needs a digest read fresh from `preview` or `status`; a stale digest is refused rather than applied.
+
+For the full argument shapes, refusal payloads, and the recovery commands (`inspect`, `reconcile`, `pause`, `resume`, `stop`, `resolve-proof`, `resolve-provider`), see [CLI Reference — PRD campaign](./cli-reference.md#prd-campaign-fn-prd).
+
 ## Daily CLI Commands
 
 ```bash
@@ -172,6 +182,7 @@ fn task unpause FN-001
 
 ## Next Steps
 
+- [CLI Reference — PRD campaign](./cli-reference.md#prd-campaign-fn-prd) — the full `fn prd` campaign surface: freeze, preview, import, approvals, and recovery
 - [Architecture](./architecture.md) — system internals and package layout
 - [Task Management](./task-management.md) — deeper task workflow and lifecycle details
 - [Dashboard Guide](./dashboard-guide.md) — board, workflow editor, chat, and UI features
