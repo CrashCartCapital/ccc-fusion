@@ -129,8 +129,16 @@ export type UnderstandCccPrdInput = {
   customProviders?: CustomProvider[];
 };
 
+/**
+ * `lane` is carried on the return value only, never on
+ * {@link CccPrdUnderstandingReview} itself -- design §7 requires the CLI to
+ * emit it in its JSON wrapper "not in the stored artifact, so
+ * CccPrdUnderstandingReview and the on-disk schema are unchanged." The CLI
+ * strips this field before persisting and re-adds it only to the printed
+ * payload.
+ */
 export type CccPrdUnderstandingResult =
-  | CccPrdUnderstandingReview
+  | (CccPrdUnderstandingReview & { lane: "single" | "chunked" })
   | { kind: "refusal"; diagnostics: CccPrdDiagnostic[] };
 
 function positive(value: number): number | null {
@@ -275,6 +283,7 @@ async function runSingleShotUnderstanding(
     };
   }
   return {
+    lane: "single",
     schema: CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
     kind: "understanding-review",
     executable: false,
@@ -394,6 +403,7 @@ async function runChunkedUnderstanding(
   // and neither conflicted -- the shallow-floor gate is structurally
   // unreachable here (design §4 "Interaction with IMPLAUSIBLY_SHALLOW").
   return {
+    lane: "chunked",
     schema: CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
     kind: "understanding-review",
     executable: false,

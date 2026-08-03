@@ -1138,13 +1138,17 @@ async function runGeneratedUnderstanding(
     io.write(JSON.stringify(result));
     return 1;
   }
+  // Design §7: `lane` is emitted in this JSON wrapper only, never in the
+  // persisted sidecar -- CccPrdUnderstandingReview and its on-disk schema
+  // stay exactly as they are today.
+  const { lane, ...persistedReview } = result;
   try {
     writeSidecarAtomically(
       input.rootDir,
       input.manifestPath,
       input.manifestPath,
       outputPath,
-      result,
+      persistedReview,
     );
   } catch (error) {
     return writeProductRefusal(
@@ -1153,7 +1157,7 @@ async function runGeneratedUnderstanding(
       error instanceof Error ? error.message : "understanding review could not be written",
     );
   }
-  io.write(JSON.stringify({ ...result, reviewPath: outputPath }));
+  io.write(JSON.stringify({ ...persistedReview, reviewPath: outputPath, lane }));
   return 0;
 }
 
