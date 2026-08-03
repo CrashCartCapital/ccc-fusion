@@ -1225,7 +1225,6 @@ export {
   type ResolvedCliExecutorConfig,
   type LaunchCliTaskSessionOptions,
 } from "./cli-agent/task-session.js";
-export * from "./ccc-campaign-admission.js";
 export {
   CccCampaignLocalGitError,
   inspectCccCampaignLocalGit,

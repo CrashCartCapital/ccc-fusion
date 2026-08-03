@@ -38,7 +38,7 @@ Landing a campaign-driven change onto a git branch is fail-closed: the local-git
 
 ## CF-DIV-005 — PRD compiler/import
 
-ccc-fusion adds a full CCC PRD campaign pipeline that upstream Fusion does not have: an authoring/compiler layer that turns an admitted manifest of source files into a deterministic, hash-addressed semantic bundle (`author` → `validate`/`compile`), and a transactional PostgreSQL importer that lands a compiled bundle onto the task board with idempotency and restart/reconciliation support. The CLI surface (`fn prd author|validate|compile`) is documented in [`docs/cli-reference.md`](./cli-reference.md#prd-campaign-fn-prd); import itself is programmatic only (`importCccPrdBundle` from `@fusion/core`).
+ccc-fusion adds a full CCC PRD campaign pipeline that upstream Fusion does not have: an authoring/compiler layer that turns an admitted manifest of source files into a deterministic, hash-addressed semantic bundle (`author` → `validate`/`compile`), and a transactional PostgreSQL importer that lands a compiled bundle onto the task board with idempotency and restart/reconciliation support. The CLI surface — authoring/compiling plus the operator commands that drive a campaign, including `fn prd preview` and the digest-confirmed `fn prd import` — is documented in [`docs/cli-reference.md`](./cli-reference.md#prd-campaign-fn-prd). The importer itself is `importCccPrdBundle` from `@fusion/core`, which the CLI calls after an operator confirms an exact preview digest.
 
 - **Status:** active divergence — maintained.
 - **Owning surfaces:** `packages/engine/src/ccc-prd/`, `packages/core/src/ccc-prd/`
@@ -54,9 +54,9 @@ Campaign execution runs inside a native, admission-gated proof/enforcement layer
 
 Merge and admission decisions for imported campaign tasks distinguish "ordinary" task custody from "campaign" custody and route campaign-owned tasks through dedicated conflict/authority checks (task drift, provider drift, route drift, action drift, git base/target drift, dirty tree) rather than the general-purpose merge path. This is the manual-intervention surface: an admission refusal names the exact drift reason instead of silently proceeding or silently discarding operator scope.
 
-The production admission enforcement for campaign execution lives in `packages/engine/src/cli-agent/ccc-native-cli-production-resolver.ts` (wired in `cli-agent/runtime.ts`) plus per-seam route/identity checks in provider-attempt, store, binding, and workflow-graph-executor code. `packages/engine/src/ccc-campaign-admission.ts` is a designed-but-unwired unification helper with no production call site; it is marked deprecated in-source and must not be cited as a live gate.
+The production admission enforcement for campaign execution lives in `packages/engine/src/ccc-campaign-merge-control.ts` and `packages/engine/src/cli-agent/ccc-native-cli-production-resolver.ts` (wired in `cli-agent/runtime.ts`), plus per-seam route/identity checks in provider-attempt, store, binding, and workflow-graph-executor code. Those are the only admission surfaces; there is no separate unification helper to consult. A designed-but-unwired helper (`packages/engine/src/ccc-campaign-admission.ts`) previously sat alongside them with no production call site; it was deleted on 2026-08-02 with operator approval so the deprecated path could not be mistaken for a gate.
 
-- **Status:** active divergence — maintained. Live enforcement: merge-control + native CLI production resolver + per-seam checks. `ccc-campaign-admission.ts`: deprecated, unwired.
+- **Status:** active divergence — maintained. Live enforcement: merge-control + native CLI production resolver + per-seam checks. The deprecated unwired admission helper was deleted 2026-08-02.
 - **Owning surfaces:** `packages/engine/src/ccc-campaign-merge-control.ts`, `packages/engine/src/cli-agent/ccc-native-cli-production-resolver.ts`
 
 ## CF-DIV-008 — Shallow operator brand and CLI alias

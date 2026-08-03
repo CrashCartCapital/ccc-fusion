@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -48,6 +48,12 @@ import {
   MAX_OPERATOR_CONTEXT_BYTES,
   readBoundedPrdStdin,
 } from "./prd-stdin.js";
+import {
+  parseOperatorJsonFlag,
+  renderIdempotencyKey,
+  renderOperatorPayload,
+  renderPreview,
+} from "./prd-render.js";
 
 export type PrdCommandIo = {
   write(line: string): void;
@@ -138,7 +144,45 @@ export type PrdCommandDependencies = {
 };
 export type PrdCommandContext = {
   projectName?: string;
+  /**
+   * Set by {@link runPrdCommand} from the `--json` flag. Human-readable prose
+   * is the default; JSON keeps the exact machine-readable payload.
+   */
+  json?: boolean;
 };
+
+function operatorJson(context: PrdCommandContext): boolean {
+  return context.json === true;
+}
+
+/**
+ * The operator loop writes either the exact machine-readable payload or its
+ * prose rendering. The JSON branch is deliberately the untouched original
+ * expression so `--json` output cannot drift from what tooling already parses.
+ */
+function writeOperatorPayload(
+  io: PrdCommandIo,
+  context: PrdCommandContext,
+  value: unknown,
+): void {
+  if (operatorJson(context)) {
+    writeOperatorJson(io, value);
+    return;
+  }
+  for (const line of renderOperatorPayload(value)) io.write(line);
+}
+
+function writeOperatorValue(
+  io: PrdCommandIo,
+  context: PrdCommandContext,
+  value: unknown,
+): void {
+  if (operatorJson(context)) {
+    io.write(JSON.stringify(value));
+    return;
+  }
+  for (const line of renderOperatorPayload(value)) io.write(line);
+}
 const usage = [
   "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
@@ -155,6 +199,7 @@ const usage = [
   "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
   "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]",
   "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
+  "       fn prd new-key",
   "       fn prd <inspect|reconcile> <idempotency-key> [--project <id|name>]",
   "       fn prd status <idempotency-key> [--project <id|name>]",
   "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
@@ -163,6 +208,7 @@ const usage = [
   "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
   "       fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
   "       fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
+  "       add --json to any command above for the exact machine-readable payload instead of operator prose",
 ].join("\n");
 
 function isEscaping(path: string): boolean {
@@ -1071,8 +1117,9 @@ function writeProductRefusal(
   io: PrdCommandIo,
   code: string,
   message: string,
+  json = true,
 ): number {
-  io.write(JSON.stringify({
+  writeRefusalPayload(io, json, {
     kind: "refusal",
     diagnostics: [{ code, message }],
     safeState:
@@ -1088,16 +1135,29 @@ function writeProductRefusal(
     ],
     nextSafeAction:
       "Run fn prd status <idempotency-key> and follow its fresh operator controls; do not blindly retry an uncertain effect.",
-  }));
+  });
   return 1;
+}
+
+function writeRefusalPayload(
+  io: PrdCommandIo,
+  json: boolean,
+  payload: unknown,
+): void {
+  if (json) {
+    io.write(JSON.stringify(payload));
+    return;
+  }
+  for (const line of renderOperatorPayload(payload)) io.write(line);
 }
 
 function writeVerifierConfinementImportRefusal(
   io: PrdCommandIo,
   readiness: VerifierConfinementReadiness,
+  json: boolean,
 ): number {
   const backend = verifierConfinementBackendLabel(readiness);
-  io.write(JSON.stringify({
+  writeRefusalPayload(io, json, {
     kind: "refusal",
     diagnostics: [{
       code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
@@ -1116,7 +1176,7 @@ function writeVerifierConfinementImportRefusal(
     ],
     nextSafeAction:
       "Repair verifier confinement, rerun fn prd preview, then issue a fresh import confirmation.",
-  }));
+  });
   return 1;
 }
 
@@ -1126,9 +1186,10 @@ function writeVerifierConfinementExecutionRefusal(
   approval: Pick<CccPrdProductApprovalStatus, "id" | "status" | "campaign">,
   workItem: Readonly<{ id: string; state: string }>,
   idempotencyKey: string,
+  json: boolean,
 ): number {
   const backend = verifierConfinementBackendLabel(readiness);
-  io.write(JSON.stringify({
+  writeRefusalPayload(io, json, {
     kind: "refusal",
     diagnostics: [{
       code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
@@ -1148,7 +1209,7 @@ function writeVerifierConfinementExecutionRefusal(
     ],
     nextSafeAction:
       `Repair verifier confinement, rerun fn prd status ${idempotencyKey}, then submit a still-current exact approval.`,
-  }));
+  });
   return 1;
 }
 
@@ -1555,6 +1616,7 @@ async function withPrdProject(
       io,
       typeof detail.code === "string" ? detail.code : "CCC_PRD_PROJECT_OPERATION_FAILED",
       typeof detail.message === "string" ? detail.message : "CCC PRD project operation failed",
+      operatorJson(context),
     );
   }
 }
@@ -1636,7 +1698,7 @@ async function runProductPacketCommand(
       expectedBase,
     });
     if (compiled.kind === "refusal") {
-      io.write(JSON.stringify(compiled));
+      writeRefusalPayload(io, operatorJson(commandContext), compiled);
       return 1;
     }
     bundle = compiled;
@@ -1647,6 +1709,7 @@ async function runProductPacketCommand(
       io,
       typeof detail.code === "string" ? detail.code : "CCC_PRD_PRODUCT_PREFLIGHT_FAILED",
       typeof detail.message === "string" ? detail.message : "CCC PRD product preflight failed",
+      operatorJson(commandContext),
     );
   }
 
@@ -1655,7 +1718,11 @@ async function runProductPacketCommand(
     ?? compiler.inspectVerifierConfinementReadiness
   )();
   if (importing && !engine.isVerifierConfinementReady(verifierConfinement)) {
-    return writeVerifierConfinementImportRefusal(io, verifierConfinement);
+    return writeVerifierConfinementImportRefusal(
+      io,
+      verifierConfinement,
+      operatorJson(commandContext),
+    );
   }
 
   return withPrdProject(io, dependencies, commandContext, async (project) => {
@@ -1688,7 +1755,24 @@ async function runProductPacketCommand(
     });
     const currentPreview = productPreview(identity, bundle, verifierConfinement);
     if (preview) {
-      io.write(JSON.stringify(currentPreview));
+      if (operatorJson(commandContext)) {
+        io.write(JSON.stringify(currentPreview));
+        return 0;
+      }
+      // The candidate key is not an input to productPreviewIdentity, so
+      // printing one here cannot change the confirmation digest below it.
+      const previewLines = renderPreview(currentPreview, {
+        packetArgs: [
+          rootDir,
+          manifestPath,
+          sidecarPath,
+          executionPlanPath,
+          expectedTarget,
+          expectedBase,
+        ],
+        candidateIdempotencyKey: newIdempotencyKey(),
+      });
+      for (const line of previewLines) io.write(line);
       return 0;
     }
     if (confirmationDigest !== currentPreview.confirmationDigest) {
@@ -1696,6 +1780,7 @@ async function runProductPacketCommand(
         io,
         "CCC_PRD_CONFIRMATION_MISMATCH",
         `confirmation digest does not match current preview ${currentPreview.confirmationDigest}`,
+        operatorJson(commandContext),
       );
     }
     const result = await (dependencies.importCccPrdBundle ?? importCccPrdBundle)({
@@ -1706,11 +1791,11 @@ async function runProductPacketCommand(
       layer,
       rootDir: project.projectPath,
     });
-    io.write(JSON.stringify({
+    writeOperatorValue(io, commandContext, {
       kind: "imported",
       confirmationDigest: currentPreview.confirmationDigest,
       result,
-    }));
+    });
     return 0;
   });
 }
@@ -1746,7 +1831,11 @@ async function runProductStateCommand(
         layer,
         rootDir: project.projectPath,
       });
-      io.write(JSON.stringify({ kind: "inspection", found: inspection !== null, inspection }));
+      writeOperatorValue(
+        io,
+        commandContext,
+        { kind: "inspection", found: inspection !== null, inspection },
+      );
       return inspection ? 0 : 1;
     }
     const result: CccPrdImportResult = await (
@@ -1757,7 +1846,7 @@ async function runProductStateCommand(
       store: project.store,
       rootDir: project.projectPath,
     });
-    io.write(JSON.stringify({ kind: "reconciled", result }));
+    writeOperatorValue(io, commandContext, { kind: "reconciled", result });
     return 0;
   });
 }
@@ -1916,7 +2005,7 @@ async function runProductControlCommand(
       idempotencyKey,
     );
     if (!status) {
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "product-status",
         found: false,
         idempotencyKey,
@@ -1951,7 +2040,7 @@ async function runProductControlCommand(
           status: approval.status,
           taskId: approval.taskId,
         }));
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "product-status",
         found: true,
         status,
@@ -2005,6 +2094,7 @@ async function runProductControlCommand(
           approval,
           workItem,
           idempotencyKey,
+          operatorJson(commandContext),
         );
       }
       const approved = await (
@@ -2048,7 +2138,7 @@ async function runProductControlCommand(
           "product status disappeared after live-execution approval",
         );
       }
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "execution-approved",
         approvalRequestId: approval.id,
         approval: approved,
@@ -2098,7 +2188,7 @@ async function runProductControlCommand(
         "product status disappeared after controlled Git landing",
       );
     }
-    writeOperatorJson(io, {
+    writeOperatorPayload(io, commandContext, {
       kind: "merge-approved",
       approvalRequestId: approval.id,
       result,
@@ -2146,7 +2236,7 @@ async function runCampaignLifecycleCommand(
       idempotencyKey,
     );
     if (!status) {
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "product-status",
         found: false,
         idempotencyKey,
@@ -2163,6 +2253,7 @@ async function runCampaignLifecycleCommand(
         io,
         "CCC_CAMPAIGN_OPERATOR_CONTROL_CONFIRMATION_REFUSED",
         `operator ${exactAction} confirmation is stale or does not match current campaign status`,
+        operatorJson(commandContext),
       );
     }
     const result = await (
@@ -2188,7 +2279,7 @@ async function runCampaignLifecycleCommand(
     const describeControls =
       dependencies.describeCccCampaignOperatorControls
       ?? engine.describeCccCampaignOperatorControls;
-    writeOperatorJson(io, {
+    writeOperatorPayload(io, commandContext, {
       kind: exactAction === "pause"
         ? "campaign-paused"
         : exactAction === "resume"
@@ -2583,7 +2674,7 @@ async function runProofResolutionCommand(
       idempotencyKey,
     );
     if (!status) {
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "product-status",
         found: false,
         idempotencyKey,
@@ -2597,7 +2688,7 @@ async function runProofResolutionCommand(
       evidence,
     );
     if (args.length === 4) {
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "proof-resolution-preview",
         attemptKey,
         decision: "settle",
@@ -2623,6 +2714,7 @@ async function runProofResolutionCommand(
         io,
         "CCC_PRD_PROOF_RESOLUTION_CONFIRMATION_REFUSED",
         "proof-resolution confirmation is stale or does not match current campaign evidence",
+        operatorJson(commandContext),
       );
     }
     const persisted = await (
@@ -2673,7 +2765,7 @@ async function runProofResolutionCommand(
         "product status disappeared after proof resolution",
       );
     }
-    writeOperatorJson(io, {
+    writeOperatorPayload(io, commandContext, {
       kind: "proof-resolved",
       attempt: settled,
       status: completedStatus,
@@ -2904,7 +2996,7 @@ async function runProviderResolutionCommand(
       idempotencyKey,
     );
     if (!status) {
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "product-status",
         found: false,
         idempotencyKey,
@@ -2924,7 +3016,7 @@ async function runProviderResolutionCommand(
       evidenceDigest,
     );
     if (args.length === 6) {
-      writeOperatorJson(io, {
+      writeOperatorPayload(io, commandContext, {
         kind: "provider-resolution-preview",
         attemptKey,
         outcome,
@@ -2949,6 +3041,7 @@ async function runProviderResolutionCommand(
         io,
         "CCC_PRD_PROVIDER_RESOLUTION_CONFIRMATION_REFUSED",
         "provider-resolution confirmation is stale or does not match current campaign evidence",
+        operatorJson(commandContext),
       );
     }
     const persisted = await project.store.inspectCccProviderAttempt({
@@ -2993,7 +3086,7 @@ async function runProviderResolutionCommand(
         "product status disappeared after provider resolution",
       );
     }
-    writeOperatorJson(io, {
+    writeOperatorPayload(io, commandContext, {
       kind: "provider-resolved",
       attempt: settled,
       status: completedStatus,
@@ -3004,15 +3097,36 @@ async function runProviderResolutionCommand(
   });
 }
 
+function newIdempotencyKey(): string {
+  return `ccc-prd-${randomUUID()}`;
+}
+
 export async function runPrdCommand(
-  args: string[],
+  rawArgs: string[],
   io: PrdCommandIo = {
     write: (line) => console.log(line),
     readStdin: () => readBoundedPrdStdin(process.stdin),
   },
   dependencies: PrdCommandDependencies = {},
-  commandContext: PrdCommandContext = {},
+  rawCommandContext: PrdCommandContext = {},
 ): Promise<number> {
+  // Every subcommand below checks an exact argument count, so the output-mode
+  // flag has to be removed before any dispatch.
+  const { args, json } = parseOperatorJsonFlag(rawArgs);
+  const commandContext: PrdCommandContext = { ...rawCommandContext, json };
+  if (args[0] === "new-key") {
+    if (args.length !== 1) {
+      io.write(usage);
+      return 2;
+    }
+    const idempotencyKey = newIdempotencyKey();
+    if (json) {
+      writeOperatorJson(io, { kind: "idempotency-key", idempotencyKey });
+      return 0;
+    }
+    for (const line of renderIdempotencyKey(idempotencyKey)) io.write(line);
+    return 0;
+  }
   if (args[0] === "understand") {
     const parsed = parseGeneratedUnderstandingArgs(args);
     if (!parsed) {

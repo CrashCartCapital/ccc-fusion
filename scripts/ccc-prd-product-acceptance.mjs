@@ -57,6 +57,7 @@ const expectedChecks = Object.freeze([
   "commit-bound-proof-executed",
   "integrated-proof-over-two-commits",
   "merge-human-hold",
+  "operator-readable-status",
   "git-landing-restart-no-repeated-effect",
   "controlled-landing",
   "terminal-restart-recovery",
@@ -2280,7 +2281,16 @@ async function main() {
       return { hold, confirmation, nextAction };
     };
 
+    // The operator loop prints human-readable prose by default, so every
+    // machine-read assertion below asks for the exact JSON payload.
     const prd = async (args, allowedExitCodes = [0]) => {
+      return await run(process.execPath, [cliBin, "prd", ...args, "--json"], {
+        cwd: targetRoot,
+        env,
+        allowedExitCodes,
+      });
+    };
+    const prdHumanReadable = async (args, allowedExitCodes = [0]) => {
       return await run(process.execPath, [cliBin, "prd", ...args], {
         cwd: targetRoot,
         env,
@@ -4212,6 +4222,51 @@ async function main() {
       sourceCommit,
       targetHead: targetBase,
       proofAttemptKey: attempt.attemptKey,
+    });
+
+    // The same merge hold, read the way an operator reads it: prose only, and
+    // carrying the exact command that spends this exact digest.
+    const readableStatus = await prdHumanReadable(["status", idempotencyKey]);
+    const readableLines = readableStatus.stdout.split("\n");
+    const readableJsonLines = readableLines.filter((line) => {
+      const trimmed = line.trim();
+      return trimmed.startsWith("{") && trimmed.endsWith("}");
+    });
+    const readableApproveMergeCommand = [
+      "fn prd approve-merge",
+      idempotencyKey,
+      mergeConfirmation.approvalRequestId,
+      "--confirm",
+      mergeConfirmation.confirmation,
+    ].join(" ");
+    assert(
+      readableJsonLines.length === 0,
+      "CCC_PRODUCT_OPERATOR_STATUS_NOT_READABLE",
+      JSON.stringify({
+        jsonLineCount: readableJsonLines.length,
+        sample: readableJsonLines[0] ?? null,
+      }),
+    );
+    assert(
+      readableLines.some((line) => line.includes(readableApproveMergeCommand)),
+      "CCC_PRODUCT_OPERATOR_STATUS_COMMAND_MISSING",
+      JSON.stringify({
+        expected: readableApproveMergeCommand,
+        stdout: tail(readableStatus.stdout),
+      }),
+    );
+    assert(
+      !readableStatus.stdout.includes("claimToken")
+      && !readableStatus.stdout.includes("controllerToken"),
+      "CCC_PRODUCT_OPERATOR_STATUS_TOKEN_LEAK",
+      tail(readableStatus.stdout),
+    );
+    ledger.pass("operator-readable-status", {
+      approvalRequestId: mergeConfirmation.approvalRequestId,
+      confirmation: mergeConfirmation.confirmation,
+      lineCount: readableLines.length,
+      jsonObjectLineCount: readableJsonLines.length,
+      approveMergeCommand: readableApproveMergeCommand,
     });
 
     const mergeApprovalArgs = [

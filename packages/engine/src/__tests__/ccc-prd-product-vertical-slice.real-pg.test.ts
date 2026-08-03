@@ -528,7 +528,7 @@ async function runProductCommand(
 ): Promise<CommandResult> {
   const output: string[] = [];
   const exitCode = await runPrdCommand(
-    args,
+    [...args, "--json"],
     { write: (line) => output.push(line) },
     dependencies,
     { projectName: "ccc-product-vertical" },

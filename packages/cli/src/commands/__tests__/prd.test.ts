@@ -43,6 +43,19 @@ async function createExecutionPlan(
   return outputPath;
 }
 
+/**
+ * The operator loop prints human-readable prose by default. These assertions
+ * pin the machine-readable contract, so they ask for it explicitly.
+ */
+async function runPrdJson(
+  args: string[],
+  io: Parameters<typeof runPrdCommand>[1],
+  dependencies?: Parameters<typeof runPrdCommand>[2],
+  commandContext?: Parameters<typeof runPrdCommand>[3],
+): Promise<number> {
+  return runPrdCommand([...args, "--json"], io, dependencies, commandContext);
+}
+
 describe("prd command exit contract", () => {
   it("stops reading typed operator context as soon as the byte limit is crossed", async () => {
     let chunksRead = 0;
@@ -107,6 +120,7 @@ describe("prd command exit contract", () => {
         "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
         "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]",
         "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
+        "       fn prd new-key",
         "       fn prd <inspect|reconcile> <idempotency-key> [--project <id|name>]",
         "       fn prd status <idempotency-key> [--project <id|name>]",
         "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
@@ -115,6 +129,7 @@ describe("prd command exit contract", () => {
         "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
         "       fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
         "       fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
+        "       add --json to any command above for the exact machine-readable payload instead of operator prose",
       ].join("\n"),
     ]);
   });
@@ -563,7 +578,7 @@ describe("prd command exit contract", () => {
       packet.base,
     ];
     const previewOutput: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["preview", ...common],
       { write: (line) => previewOutput.push(line) },
       dependencies,
@@ -598,7 +613,7 @@ describe("prd command exit contract", () => {
     expect(closeProjectStore).toHaveBeenCalledTimes(1);
 
     const importOutput: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["import", ...common, "operator-key", "--confirm", preview.confirmationDigest],
       { write: (line) => importOutput.push(line) },
       dependencies,
@@ -639,7 +654,7 @@ describe("prd command exit contract", () => {
     };
     const output: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "preview",
         packet.root,
@@ -737,7 +752,7 @@ describe("prd command exit contract", () => {
       packet.base,
     ];
     const previewOutput: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["preview", ...common],
       { write: (line) => previewOutput.push(line) },
       dependencies,
@@ -748,7 +763,7 @@ describe("prd command exit contract", () => {
     };
     const importOutput: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["import", ...common, "operator-key", "--confirm", preview.confirmationDigest],
       { write: (line) => importOutput.push(line) },
       dependencies,
@@ -795,7 +810,7 @@ describe("prd command exit contract", () => {
       store: { getAsyncLayer: () => ({}) },
     };
     const output: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "import",
         packet.root,
@@ -871,7 +886,7 @@ describe("prd command exit contract", () => {
       importCccPrdBundle: importBundle,
     };
     const output: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "import",
         packet.root,
@@ -997,7 +1012,7 @@ describe("prd command exit contract", () => {
     };
     const output: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["status", "operator-key"],
       { write: (line) => output.push(line) },
       {
@@ -1104,7 +1119,7 @@ describe("prd command exit contract", () => {
       .mockResolvedValueOnce(afterPause);
     const output: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["pause", "operator-key", "--confirm", confirmation],
       { write: (line) => output.push(line) },
       {
@@ -1220,7 +1235,7 @@ describe("prd command exit contract", () => {
       .mockResolvedValueOnce(afterStop);
     const output: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "stop",
         "operator-key",
@@ -1403,7 +1418,7 @@ describe("prd command exit contract", () => {
     }));
     const previewOutput: string[] = [];
 
-    const previewExit = await runPrdCommand(
+    const previewExit = await runPrdJson(
       ["resolve-proof", "operator-key", attemptKey, evidencePath],
       { write: (line) => previewOutput.push(line) },
       {
@@ -1429,7 +1444,7 @@ describe("prd command exit contract", () => {
     expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
 
     const settleOutput: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "resolve-proof",
         "operator-key",
@@ -1646,7 +1661,7 @@ describe("prd command exit contract", () => {
       .mockResolvedValueOnce(after);
     const previewOutput: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "resolve-provider",
         "operator-key",
@@ -1676,7 +1691,7 @@ describe("prd command exit contract", () => {
     expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
 
     const settleOutput: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "resolve-provider",
         "operator-key",
@@ -1745,7 +1760,7 @@ describe("prd command exit contract", () => {
       }],
     };
     const cliOutput: string[] = [];
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       [
         "resolve-provider",
         "operator-key",
@@ -1892,7 +1907,7 @@ describe("prd command exit contract", () => {
     }));
     const output: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["approve-merge", "operator-key", "approval-1", "--confirm", confirmation],
       { write: (line) => output.push(line) },
       {
@@ -2038,7 +2053,7 @@ describe("prd command exit contract", () => {
     const approveExecution = vi.fn();
     const output: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["approve-execution", "operator-key", "approval-live-1", "--confirm", confirmation],
       { write: (line) => output.push(line) },
       {
@@ -2210,7 +2225,7 @@ describe("prd command exit contract", () => {
     }));
     const output: string[] = [];
 
-    expect(await runPrdCommand(
+    expect(await runPrdJson(
       ["approve-execution", "operator-key", "approval-live-1", "--confirm", confirmation],
       { write: (line) => output.push(line) },
       {

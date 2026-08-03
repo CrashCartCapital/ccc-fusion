@@ -1324,9 +1324,22 @@ Subcommands: `search`, `install`.
 
 ## PRD campaign (`fn prd`)
 
-Author, validate, and compile a CCC PRD campaign packet: a manifest-scoped set of admitted source files that is turned into a deterministic, hash-addressed workflow bundle before any task board write happens. `fn prd` never mutates the task board itself — it only produces or checks a sidecar/bundle on disk. Board import is a separate, programmatic step (see [Import](#import-programmatic-only) below).
+Author, validate, compile, import, and operate a CCC PRD campaign: a manifest-scoped set of admitted source files that is frozen into a deterministic, hash-addressed workflow bundle, landed on the task board, and then driven to completion under explicit operator confirmation.
+
+The subcommands split into two halves with very different blast radius:
+
+- **Packet subcommands** — `template`, `lint`, `corpus`, `discover`, `freeze`, `author`, `validate`, `compile`, `policy`, `understand`. These read and write files on disk only. They never touch the task board and never need a database.
+- **Operator subcommands** — `preview`, `import`, `inspect`, `reconcile`, `status`, `approve-execution`, `approve-merge`, `pause`, `resume`, `stop`, `resolve-proof`, `resolve-provider`. These resolve a project and require a PostgreSQL async data layer; without one they refuse with `CCC_PRD_POSTGRES_UNAVAILABLE`. `import`, the approvals, and the lifecycle controls mutate durable campaign state.
+
+Every state-changing operator subcommand requires an exact `--confirm <digest>` echoed back from a fresh `preview`, `status`, or resolution-preview read. The digest covers the identity of what you looked at, so a plan that drifted underneath you produces a mismatch refusal instead of an unintended write.
 
 ```bash
+fn prd template
+fn prd lint <prd-path>
+fn prd corpus <active-projects-root>
+fn prd discover <active-projects-root>
+fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> [context flags | --context-stdin]
+
 fn prd author <root-dir> <manifest-path> <sidecar-output> \
   --target <repository> --base <40-hex-commit> \
   --provider <provider> --model <model> \
@@ -1335,9 +1348,52 @@ fn prd author <root-dir> <manifest-path> <sidecar-output> \
 
 fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
 
+fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> \
+  --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+
 fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
 fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
+
+fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> \
+  --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]
+fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> \
+  --routes-file <path>
+
+fn prd new-key
+fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base>
+fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> \
+  <idempotency-key> --confirm <preview-digest>
+
+fn prd inspect <idempotency-key>
+fn prd reconcile <idempotency-key>
+fn prd status <idempotency-key>
+fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest>
+fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest>
+fn prd pause <idempotency-key> --confirm <status-digest>
+fn prd resume <idempotency-key> --confirm <status-digest>
+fn prd stop <idempotency-key> --reason <reason> --confirm <status-digest>
+fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>]
+fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> \
+  [--confirm <resolution-digest>]
 ```
+
+Every operator subcommand also accepts `[--project <id|name>]` to pick the project context, and `--json` to force machine-readable JSON output.
+
+### Packet intake helpers
+
+`fn prd template` prints the PRD intake contract template (schema version plus the Markdown skeleton) so an author starts from the shape the compiler expects. `fn prd lint <prd-path>` checks one PRD document against that contract and reports diagnostics without writing anything.
+
+`fn prd corpus <active-projects-root>` builds a manifest of the PRD corpus under a projects root; `fn prd discover <active-projects-root>` reports which documents in that root look like campaign candidates. Both are read-only.
+
+`fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>` copies one selected PRD into a frozen packet directory — the manifest plus admitted sources the rest of the pipeline consumes. Typed operator context can be supplied either as guided flags (`--target`, `--base`, `--owned-path`, `--write-root`, `--write-purpose`, and the `--max-*` bounds) or as one bounded JSON object on stdin with `--context-stdin`.
+
+### `fn prd understand`
+
+```bash
+fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+```
+
+Runs a bounded, review-only pass over an admitted manifest and writes a generated understanding report to `<review-output>`. It produces no sidecar and no bundle, so it cannot advance a packet toward import — use it to check whether the manifest says what you think it says before authoring.
 
 ### `fn prd author` — native bounded form
 
@@ -1386,16 +1442,112 @@ fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expe
 
 Re-derives and checks the sidecar against the manifest and expected target/base, then emits the deterministic semantic bundle (`{ "kind": "bundle", ... }`) that downstream import consumes. `compile` is pure with respect to the task board: it reads the manifest and sidecar from disk and writes nothing back to either.
 
-### Import (programmatic only)
+### `fn prd policy`
 
-There is no `fn prd import` subcommand. Importing a compiled bundle onto the task board is a programmatic call — `importCccPrdBundle` from `@fusion/core` — invoked by the engine's campaign import path with a `TaskStore`, data layer, and idempotency key. This keeps the board-mutating step out of the CLI surface entirely; `fn prd` only ever produces or checks bundles on disk.
+```bash
+fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]
+fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path>
+```
+
+Compiles the packet and writes the execution plan (`kind: "execution-plan"`) that `preview` and `import` later read as `<execution-plan-path>`. The two forms are mutually exclusive and exactly one is required: single-route (`--provider`/`--model`/`--transport`, with `--cli-adapter <id>` required for and only for `--transport cli`) or a multi-route file (`--routes-file`). Mixing them is a usage error.
+
+### `fn prd new-key`
+
+```bash
+fn prd new-key
+```
+
+Prints one freshly generated idempotency key for use as the `<idempotency-key>` argument to `import` and to every later command that addresses the campaign. The key is the campaign's durable handle — record it before importing, because `inspect`, `status`, the approvals, and the lifecycle controls all require it.
+
+### `fn prd preview`
+
+```bash
+fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]
+```
+
+Compiles the packet, reads the execution plan, resolves the project, and reports exactly what an import would land: ordered sources, requirements, tasks, proofs, workflows, protected actions, admitted write roots, bounds, non-goals, material coverage, verifier-confinement readiness, and a `confirmationDigest`. **`preview` writes nothing** — no campaign rows, no staging files, no approvals.
+
+The digest is computed over the project identity, target repository, resolved target `HEAD`, packet and sidecar hashes, and the execution policy. Preview refuses rather than reporting a stale plan if the resolved project does not match the packet's target (`CCC_PRD_PROJECT_TARGET_MISMATCH`) or if the repository `HEAD` has moved off the frozen base (`CCC_PRD_TARGET_HEAD_DRIFT`).
+
+### `fn prd import`
+
+```bash
+fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]
+```
+
+Lands the compiled bundle on the task board transactionally: campaign rows, tasks, workflow work items, and the idempotency record keyed by `<idempotency-key>`. Re-running with the same key is idempotent — it reports the existing import rather than creating a second campaign. This is the first board-mutating step in the ladder.
+
+Import re-derives the preview from live state and compares it to `--confirm <preview-digest>`, which must be the 64-character hex `confirmationDigest` from a **fresh** `preview`. A digest that no longer matches current state is refused with `CCC_PRD_CONFIRMATION_MISMATCH` and nothing is written — the refusal is the point, not an error to work around. Import additionally refuses when verifier confinement is unavailable on the host (`CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE`), because exact requirement proof could not be run safely; the frozen packet stays reviewable and untouched.
+
+### `fn prd inspect` / `fn prd reconcile`
+
+```bash
+fn prd inspect <idempotency-key> [--project <id|name>]
+fn prd reconcile <idempotency-key> [--project <id|name>]
+```
+
+`inspect` reports the durable import record for a key without changing it, and exits `1` when no import exists for that key (`found: false`). `reconcile` re-runs the importer's restart path against durable state so an interrupted import converges to a consistent record.
+
+### `fn prd status`
+
+```bash
+fn prd status <idempotency-key> [--project <id|name>]
+```
+
+The operator's main read: campaign work items, provider and proof attempts, receipts, pending approvals, and the currently available operator controls. It also emits the fresh confirmation digests for each pending merge and live-execution approval, with their expiry times. Claim and controller tokens are redacted from the output. An unknown key reports `found: false` and exits `1`.
+
+Every digest the control commands need comes from here, so the normal loop is: run `status`, read the digest for the exact action you intend, then run that action with `--confirm <digest>`.
+
+### `fn prd approve-execution`
+
+```bash
+fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]
+```
+
+Grants one pending live-execution approval, releasing a campaign work item that is holding at `manual-required` so live coding can start. The digest must match the approval's current confirmation from `status`; a stale or mismatched digest is refused (`CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED`), as is an unknown approval id. If verifier confinement is not ready on this host, the approval is left untouched and the command refuses rather than starting execution that cannot be proved.
+
+### `fn prd approve-merge`
+
+```bash
+fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]
+```
+
+Grants one pending merge approval and performs the controlled Git landing for that campaign task. Same freshness rule: the digest comes from `status` and a stale one is refused (`CCC_PRD_MERGE_CONFIRMATION_REFUSED`). Approvals carry an expiry, so a digest read long before the decision may need to be re-read.
+
+### `fn prd pause` / `fn prd resume` / `fn prd stop`
+
+```bash
+fn prd pause <idempotency-key> --confirm <status-digest> [--project <id|name>]
+fn prd resume <idempotency-key> --confirm <status-digest> [--project <id|name>]
+fn prd stop <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]
+```
+
+Lifecycle controls over a running campaign. `pause` stops new work from being leased and `resume` lifts that hold; both take a status digest and nothing else. `stop` ends the campaign and additionally requires `--reason <reason>` — a non-empty, non-padded string recorded with the stop — so the durable record says why. `abandon` is accepted as an alias for `stop` and takes the same arguments. Stopping preserves evidence; it does not delete receipts or work items.
+
+### `fn prd resolve-proof`
+
+```bash
+fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]
+```
+
+Resolves one proof attempt that Fusion could not settle on its own, using operator-supplied evidence read from `<evidence-path>`. `<attempt-key>` is the exact `ccc-proof-attempt-<64-hex>` key from `status`. Run it **without** `--confirm` first: that form is a preview that reports the resolution context and the digest to confirm, and changes nothing. Re-run with `--confirm <resolution-digest>` to commit the resolution.
+
+### `fn prd resolve-provider`
+
+```bash
+fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]
+```
+
+Settles a provider effect that ended in `dispatched_unknown` — Fusion issued the effect but never learned the outcome. `<attempt-key>` is the exact `ccc-provider-attempt-<64-hex>` key from `status`, the outcome must be `committed` or `proved-failed`, `<observer-id>` names who observed it, and `<evidence-sha256>` is the 64-character hex digest of the evidence. As with `resolve-proof`, omitting `--confirm` previews the resolution and writes nothing; adding the returned digest commits it. Only assert `committed` when you have actually observed the effect landing — this is the operator taking responsibility for durable state Fusion could not verify.
 
 ### Exit-code contract
 
 | Exit code | Meaning |
 |---|---|
-| `0` | Success — candidate authored, diagnostics report valid, or bundle compiled. |
+| `0` | Success — candidate authored, diagnostics report valid, bundle compiled, preview/status rendered, import landed, or a control action applied. |
 | `1` | Semantic refusal — admission, provider, review-bound, or validation/compile failure reported in the JSON payload (`kind: "refusal"` for author, `valid: false` for validate, `kind: "refusal"` for compile). |
+| `1` | Not found — `fn prd inspect` and `fn prd status` exit `1` with `found: false` when no campaign exists for the given idempotency key. This is a lookup miss, not a failure. |
+| `1` | Operator-loop refusal — a `preview`/`import`/approval/lifecycle/resolution command declined to act. The payload is `kind: "refusal"` with `diagnostics`, plus operator-facing fields: `safeState` (what is and is not true of durable state), `decisionOwner`, `consequence`, `approvalExpiresAt`, `recoveryOptions[]`, and `nextSafeAction`. Read `nextSafeAction` before retrying — an uncertain effect should be inspected with `fn prd status`, not blindly repeated. |
 | `2` | Usage error — missing/malformed arguments; prints the `fn prd` usage string instead of JSON. |
 
 ---
@@ -1416,6 +1568,9 @@ There is no `fn prd import` subcommand. Importing a compiled bundle onto the tas
 | `--depends` | `fn task create` |
 | `--node` | `fn task create` |
 | `--feedback` | `fn task refine` |
+| `--confirm` | `fn prd import`, `fn prd approve-execution`, `fn prd approve-merge`, `fn prd pause`, `fn prd resume`, `fn prd stop`, and (optionally) `fn prd resolve-proof` / `fn prd resolve-provider`. Takes the 64-character hex digest from a fresh `fn prd preview`, `fn prd status`, or resolution preview. Not skippable and not a yes/no flag — a stale digest is refused. |
+| `--reason` | `fn prd stop` (and its `abandon` alias), where it is required. Records a non-empty operator reason with the stop. |
+| `--json` | `fn update`, `fn pr automerge-cleanup`, `fn research *`, `fn project list`, `fn node list/show`, `fn mesh status`, `fn mcp list/validate`, `fn workflow validate`, and the `fn prd` operator subcommands, which render a human-readable summary by default and emit the raw JSON envelope with `--json`. |
 | `--yes` | confirmation-skipping flows (`task plan`, `settings import`, git pull/push, etc.) |
 | `--limit`, `-l` | `fn task import`, `fn task import-gitlab` (default: 30, max: 100), `fn skills search` (default: 10, max: 50) |
 | `--labels`, `-L` | `fn task import`, `fn task import-gitlab` |
