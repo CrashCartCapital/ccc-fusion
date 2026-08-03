@@ -154,18 +154,26 @@ describe("fn provider add -- registry key echo", () => {
     expect(output()).toContain("--provider");
   });
 
-  it("truthfully reports the -N suffix when a duplicate name collides", async () => {
+  it("refuses a duplicate name instead of silently forking a -N registry key", async () => {
+    /*
+    Task #8: customProviderRegistryKey()'s -N suffix exists to disambiguate an
+    already-persisted collision (e.g. hand-edited settings.json) when
+    *listing*, not to bless creating a second one. `fn provider add` used to
+    accept a second "Local Llama" silently, forking a distinct
+    "local-llama-2" provider the operator likely never intended.
+    */
     await run(["add", "--name", "Local Llama", "--base-url", LOOPBACK_BASE_URL]);
     logSpy.mockClear();
     errorSpy.mockClear();
-    await run(["add", "--name", "Local Llama", "--base-url", "http://127.0.0.1:11435/v1"]);
+    const code = await run(["add", "--name", "Local Llama", "--base-url", "http://127.0.0.1:11435/v1"]);
+
+    expect(code).toBe(1);
+    expect(output()).toContain("already exists");
+    expect(output()).toContain("fn provider remove");
 
     const providers = persisted();
-    expect(providers).toHaveLength(2);
-
-    const secondKey = customProviderRegistryKey(providers[1]!, providers);
-    expect(secondKey).toBe("local-llama-2");
-    expect(output()).toContain(`registry key: ${secondKey}`);
+    expect(providers).toHaveLength(1);
+    expect(providers[0]!.baseUrl).toBe(LOOPBACK_BASE_URL);
   });
 
   it("assigns a generated uuid id", async () => {
@@ -336,10 +344,17 @@ describe("fn provider list", () => {
   });
 
   it("echoes the registry key for every provider", async () => {
-    await run(["add", "--name", "Local Llama", "--base-url", LOOPBACK_BASE_URL]);
-    await run(["add", "--name", "Local Llama", "--base-url", "http://127.0.0.1:11435/v1"]);
-    logSpy.mockClear();
-    errorSpy.mockClear();
+    /*
+    Task #8: `fn provider add` now refuses a duplicate name (see "fn provider
+    add -- registry key echo"), so a same-name collision can only reach
+    settings.json some other way (hand-edited JSON, a pre-fix persisted
+    file). Seed it directly to keep covering customProviderRegistryKey()'s -N
+    disambiguation in `fn provider list` output.
+    */
+    seedProviders([
+      { id: "aaaaaaaa-0000-4000-8000-000000000001", name: "Local Llama", apiType: "openai-compatible", baseUrl: LOOPBACK_BASE_URL },
+      { id: "aaaaaaaa-0000-4000-8000-000000000002", name: "Local Llama", apiType: "openai-compatible", baseUrl: "http://127.0.0.1:11435/v1" },
+    ]);
 
     const code = await run(["list"]);
     expect(code).toBe(0);

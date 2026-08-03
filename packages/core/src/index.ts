@@ -54,7 +54,7 @@ export type {
   EntryPointBranchAssignmentInput,
   EntryPointBranchAssignment,
 } from "./branch-assignment.js";
-export { customProviderRegistryKey } from "./custom-provider-key.js";
+export { customProviderRegistryKey, slugifyProviderName } from "./custom-provider-key.js";
 export {
   ANTHROPIC_PROVIDER_ID,
   CLAUDE_SONNET_5_MODEL_ID,
@@ -1057,7 +1057,7 @@ export type { Statement, VacuumResult } from "./db.js";
 export type { ProjectIdentity } from "./project-identity.js";
 export type { EnsureProjectForPathInput, EnsureProjectForPathResult } from "./central-core.js";
 export { ArchiveDatabase } from "./archive-db.js";
-export { GlobalSettingsStore, resolveGlobalDir, resolveGlobalDirForHome } from "./global-settings.js";
+export { GlobalSettingsStore, resolveGlobalDir, resolveGlobalDirForHome, closeDirectGlobalRevisionLayers } from "./global-settings.js";
 export { ConfigurationRevisionStore, GLOBAL_CONFIGURATION_OWNER_ID } from "./configuration-revision-store.js";
 export { configurationTargetKey, createConfigurationRevision, diffConfigurationSnapshots, appendConfigurationRevision, appendGlobalConfigurationRevision, listConfigurationRevisions, listGlobalConfigurationRevisions, getConfigurationRevision, getGlobalConfigurationRevision, rollbackConfiguration } from "./async-configuration-revision-store.js";
 export type { ConfigKind, ConfigChangedBy, ConfigurationOwnerScope, ConfigurationTarget, ConfigurationRevision } from "./types.js";

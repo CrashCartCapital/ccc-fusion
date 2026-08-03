@@ -33,6 +33,18 @@ remain layerless; production always initializes the central PostgreSQL layer.
 */
 const directGlobalRevisionLayers = new Map<string, Promise<AsyncDataLayer>>();
 
+/*
+FNXC:ConfigVersioning 2026-08-03-10:40:
+Task #7: getRevisionLayer() only ever cached the resolved AsyncDataLayer, not
+the CentralCore that owns the embedded-PostgreSQL lifecycle it started. That
+CentralCore (and its shutdown handle) was discarded on return, so nothing
+could ever stop the embedded postmaster a one-shot CLI settings write (e.g.
+`fn provider add`) spun up — the process hung at exit until an external
+`gtimeout` killed it. Cache the owning CentralCore alongside the layer so
+closeDirectGlobalRevisionLayers() can shut it down once the invocation ends.
+*/
+const directGlobalRevisionCores = new Map<string, Promise<import("./central-core.js").CentralCore>>();
+
 function getHomeDir(): string {
   return process.env.HOME || process.env.USERPROFILE || homedir();
 }
@@ -175,15 +187,17 @@ export class GlobalSettingsStore {
 
     let layer = directGlobalRevisionLayers.get(this.dir);
     if (!layer) {
-      layer = (async () => {
+      const centralPromise = (async () => {
         const { CentralCore } = await import("./central-core.js");
         const central = new CentralCore(this.dir);
         await central.init();
         if (!central.asyncLayer) {
           throw new Error("Global configuration history requires the central PostgreSQL layer");
         }
-        return central.asyncLayer;
+        return central;
       })();
+      directGlobalRevisionCores.set(this.dir, centralPromise);
+      layer = centralPromise.then((central) => central.asyncLayer!);
       directGlobalRevisionLayers.set(this.dir, layer);
     }
     return layer;
@@ -488,4 +502,26 @@ export class GlobalSettingsStore {
       }
     });
   }
+}
+
+/**
+ * Close every layer-less CentralCore that getRevisionLayer() lazily started
+ * for a direct (non-injected) GlobalSettingsStore — the embedded-PostgreSQL
+ * lifecycle a one-shot CLI settings write (e.g. `fn provider add`) owns.
+ * Long-running hosts (serve/daemon/dashboard) inject their own AsyncDataLayer
+ * via the constructor and never populate this cache, so this is a no-op for
+ * them; calling it after their own shutdown is still correct, just idle.
+ */
+export async function closeDirectGlobalRevisionLayers(): Promise<void> {
+  const cores = [...directGlobalRevisionCores.values()];
+  directGlobalRevisionCores.clear();
+  directGlobalRevisionLayers.clear();
+  await Promise.all(cores.map(async (centralPromise) => {
+    try {
+      const central = await centralPromise;
+      await central.close();
+    } catch {
+      // Best-effort: init() itself failed, so there is nothing to close.
+    }
+  }));
 }

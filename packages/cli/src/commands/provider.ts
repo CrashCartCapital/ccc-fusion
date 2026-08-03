@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import {
   GlobalSettingsStore,
   customProviderRegistryKey,
+  slugifyProviderName,
   type CustomProvider,
   type GlobalSettings,
 } from "@fusion/core";
@@ -418,6 +419,30 @@ async function runProviderAdd(args: string[], deps: ProviderCommandDeps): Promis
 
   const store = await openSettingsStore(deps);
   const existing = readProviders(await store.getSettings());
+
+  /*
+  Task #8: customProviderRegistryKey() disambiguates a name collision by
+  suffixing the second provider's registry key with "-2", "-3", etc. Left
+  unchecked here, that meant "fn provider add --name X" run twice silently
+  forked a second provider sharing X's display name under a different key
+  instead of failing loudly -- an operator scripting re-runs (or retrying
+  after an unrelated error) got a duplicate they never asked for. Refuse
+  before writing; only a non-empty slug can actually collide (an empty slug
+  always falls back to the provider's own unique id, per
+  customProviderRegistryKey).
+  */
+  const nameSlug = slugifyProviderName(name);
+  if (nameSlug.length > 0) {
+    const collision = existing.find((candidate) => slugifyProviderName(candidate.name) === nameSlug);
+    if (collision) {
+      const collisionKey = customProviderRegistryKey(collision, existing);
+      fail(
+        `a custom provider named "${collision.name}" already exists (registry key "${collisionKey}"). `
+          + `Remove it first with "fn provider remove ${collisionKey} --yes", or choose a different --name.`,
+      );
+    }
+  }
+
   const next = [...existing, provider];
   await store.updateSettings({ customProviders: next });
 
