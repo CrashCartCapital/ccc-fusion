@@ -107,7 +107,10 @@
       "esbuild",
       "koffi",
       "protobufjs"
-    ]
+    ],
+    "patchedDependencies": {
+      "@earendil-works/pi-ai@0.81.1": "patches/@earendil-works__pi-ai@0.81.1.patch"
+    }
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
