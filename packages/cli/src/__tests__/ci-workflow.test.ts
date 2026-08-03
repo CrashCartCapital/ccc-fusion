@@ -173,7 +173,7 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
   });
 
   it("routes every blocking job to the dedicated local Fusion runners", () => {
-    for (const jobName of ["lint", "typecheck", "build", "gate"]) {
+    for (const jobName of ["lint", "typecheck", "build"]) {
       expect(workflow.jobs?.[jobName]?.["runs-on"]).toEqual([
         "self-hosted",
         "linux",
@@ -181,6 +181,16 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
         "ccc-fusion",
       ]);
     }
+    // The gate runs the verifier-confinement readiness probe, which needs a
+    // runner whose container permits full-capability unprivileged user
+    // namespaces for bubblewrap. Only the ccc-fusion-bwrap runner lane
+    // provides that; the general ccc-fusion lane refuses namespace creation.
+    expect(workflow.jobs?.gate?.["runs-on"]).toEqual([
+      "self-hosted",
+      "linux",
+      "ARM64",
+      "ccc-fusion-bwrap",
+    ]);
     expect(content).not.toContain("ubuntu-latest");
   });
 
@@ -228,6 +238,15 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(gateSteps[readinessIndex]?.run).toBe(
       "node scripts/check-verifier-confinement.mjs",
     );
+
+    // The readiness probe fails closed without Go Task on PATH and bubblewrap
+    // at a trusted path; the runner image ships neither, so the job must
+    // install the toolchain after Build and before the probe.
+    const toolchainIndex = gateSteps.findIndex(
+      (step: any) => step.name === "Install verifier toolchain (Go Task + bubblewrap)",
+    );
+    expect(toolchainIndex).toBeGreaterThan(buildIndex);
+    expect(toolchainIndex).toBeLessThan(readinessIndex);
   });
 
   it("keeps the PostgreSQL service off the laptop's fixed 5432 tunnel", () => {
@@ -497,12 +516,14 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
   });
 
   it("routes every post-merge job to the dedicated local Fusion runners", () => {
-    for (const job of Object.values(workflow.jobs ?? {}) as any[]) {
+    for (const [jobName, job] of Object.entries(workflow.jobs ?? {}) as [string, any][]) {
+      // test-slow runs the verifier-confinement readiness probe and the
+      // serialized product acceptance, so it needs the bwrap-capable lane.
       expect(job?.["runs-on"]).toEqual([
         "self-hosted",
         "linux",
         "ARM64",
-        "ccc-fusion",
+        jobName === "test-slow" ? "ccc-fusion-bwrap" : "ccc-fusion",
       ]);
     }
     expect(content).not.toContain("ubuntu-latest");
