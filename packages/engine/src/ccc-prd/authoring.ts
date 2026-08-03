@@ -82,21 +82,6 @@ function hasIdentifiedRows(value: unknown): boolean {
   ));
 }
 
-function hasSourceBoundRows(value: unknown): boolean {
-  return hasIdentifiedRows(value) && (value as unknown[]).every((entry) => {
-    const sourceRefs = (entry as Record<string, unknown>).sourceRefs;
-    return Array.isArray(sourceRefs)
-      && sourceRefs.length > 0
-      && sourceRefs.every((reference) => (
-        isPlainRecord(reference)
-        && typeof reference.path === "string"
-        && reference.path.length > 0
-        && typeof reference.exactQuote === "string"
-        && reference.exactQuote.length > 0
-      ));
-  });
-}
-
 function sourceQuoteContainsCanonicalPath(
   reference: CccPrdSourceReferenceProposal,
   path: string,
