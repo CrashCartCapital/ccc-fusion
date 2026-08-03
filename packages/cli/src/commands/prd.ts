@@ -91,6 +91,13 @@ type Compiler = {
     adapter: CccPrdAuthoringAdapter;
     maxReviewItems: number;
     workflowExtensionRegistry: WorkflowExtensionRegistry;
+    requestedLane?: "auto" | "single" | "chunked";
+    provider?: string;
+    model?: string;
+    maxDurationMs?: number;
+    maxPromptBytes?: number;
+    maxResponseBytes?: number;
+    maxChunkAttempts?: number;
   }): Promise<engine.CccPrdUnderstandingResult>;
   compileCccPrdPacket(input: {
     rootDir: string;
@@ -186,7 +193,7 @@ function writeOperatorValue(
 const usage = [
   "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
-  "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
+  "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n> [--lane auto|single|chunked] [--max-chunk-attempts <n>]",
   "       fn prd corpus <active-projects-root>",
   "       fn prd discover <active-projects-root>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
@@ -344,6 +351,9 @@ type GeneratedUnderstandingArgs = {
   maxPromptBytes: number;
   maxResponseBytes: number;
   maxReviewItems: number;
+  /** Design §7 (D-3): defaults to "auto" when --lane is not given, so an existing invocation with only the six required flags is unaffected -- the classifier still routes it and the frozen fixture measures item-count/byte-budget well under threshold. */
+  lane: "auto" | "single" | "chunked";
+  maxChunkAttempts?: number;
 };
 
 const generatedUnderstandingFlags = [
@@ -354,6 +364,24 @@ const generatedUnderstandingFlags = [
   "--max-response-bytes",
   "--max-review-items",
 ] as const;
+
+/*
+Design §6 "CLI surface": an allowlist plus a range check, not a mandatory
+--lane, so "options.length === required.length * 2" (an existing, exact
+invocation with only the six required flags) keeps parsing exactly as
+before. --chunk-journal and --resume are named in the design's allowlist
+but are refused here with an explicit "not yet implemented" message rather
+than silently accepted-and-ignored: the resume journal (D-1) does not
+exist in this build, and an operator passing --resume expecting to skip
+already-run chunks would otherwise get single-shot-from-scratch behavior
+with no warning.
+*/
+const optionalUnderstandingFlags = [
+  "--lane",
+  "--max-chunk-attempts",
+] as const;
+const notYetImplementedUnderstandingFlags = ["--chunk-journal", "--resume"] as const;
+const LANE_VALUES = ["auto", "single", "chunked"] as const;
 
 const generatedAuthorFlags = [
   "--target",
@@ -447,14 +475,18 @@ function parseGeneratedAuthorArgs(args: string[]): GeneratedAuthorArgs | undefin
 
 function parseGeneratedUnderstandingArgs(
   args: string[],
-): GeneratedUnderstandingArgs | undefined {
+): GeneratedUnderstandingArgs | { error: string } | undefined {
   const [subcommand, rootDir, manifestPath, outputPath, ...options] = args;
+  const requiredCount = generatedUnderstandingFlags.length;
+  const optionalCount = optionalUnderstandingFlags.length;
   if (
     subcommand !== "understand"
     || !rootDir
     || !manifestPath
     || !outputPath
-    || options.length !== generatedUnderstandingFlags.length * 2
+    || options.length % 2 !== 0
+    || options.length < requiredCount * 2
+    || options.length > (requiredCount + optionalCount) * 2
   ) {
     return undefined;
   }
@@ -462,15 +494,15 @@ function parseGeneratedUnderstandingArgs(
   for (let index = 0; index < options.length; index += 2) {
     const flag = options[index];
     const value = options[index + 1];
-    if (
-      !flag
-      || !generatedUnderstandingFlags.includes(
-        flag as (typeof generatedUnderstandingFlags)[number],
-      )
-      || values.has(flag)
-      || !value
-      || value.startsWith("--")
-    ) {
+    if (!flag || !value || value.startsWith("--")) {
+      return undefined;
+    }
+    if (notYetImplementedUnderstandingFlags.includes(flag as never)) {
+      return { error: `${flag} is not yet implemented (the chunked understanding resume journal does not exist in this build)` };
+    }
+    const isRequired = generatedUnderstandingFlags.includes(flag as (typeof generatedUnderstandingFlags)[number]);
+    const isOptional = optionalUnderstandingFlags.includes(flag as (typeof optionalUnderstandingFlags)[number]);
+    if ((!isRequired && !isOptional) || values.has(flag)) {
       return undefined;
     }
     values.set(flag, value);
@@ -481,6 +513,18 @@ function parseGeneratedUnderstandingArgs(
   const maxPromptBytes = parsePositiveInteger(values.get("--max-prompt-bytes"));
   const maxResponseBytes = parsePositiveInteger(values.get("--max-response-bytes"));
   const maxReviewItems = parseNonNegativeInteger(values.get("--max-review-items"));
+  const laneRaw = values.get("--lane");
+  if (laneRaw !== undefined && !LANE_VALUES.includes(laneRaw as (typeof LANE_VALUES)[number])) {
+    return { error: `--lane must be one of: ${LANE_VALUES.join(", ")}` };
+  }
+  const lane = (laneRaw as (typeof LANE_VALUES)[number] | undefined) ?? "auto";
+  const maxChunkAttemptsRaw = values.get("--max-chunk-attempts");
+  const maxChunkAttempts = maxChunkAttemptsRaw === undefined
+    ? undefined
+    : parsePositiveInteger(maxChunkAttemptsRaw);
+  if (maxChunkAttemptsRaw !== undefined && maxChunkAttempts === undefined) {
+    return { error: "--max-chunk-attempts must be a positive integer" };
+  }
   if (
     !provider
     || !model
@@ -488,11 +532,12 @@ function parseGeneratedUnderstandingArgs(
     || !maxPromptBytes
     || !maxResponseBytes
     || maxReviewItems === undefined
-    || values.size !== generatedUnderstandingFlags.length
   ) {
     return undefined;
   }
   return {
+    lane,
+    ...(maxChunkAttempts !== undefined ? { maxChunkAttempts } : {}),
     rootDir,
     manifestPath,
     outputPath,
@@ -1077,6 +1122,17 @@ async function runGeneratedUnderstanding(
     adapter,
     maxReviewItems: input.maxReviewItems,
     workflowExtensionRegistry,
+    // Design §7: --lane defaults to "auto" at the CLI layer. A small packet
+    // (like the frozen acceptance fixture) classifies to "single" and takes
+    // the byte-identical single-shot path below; only a packet over the
+    // fast-lane thresholds reaches the chunked pipeline.
+    requestedLane: input.lane,
+    provider: input.provider,
+    model: input.model,
+    maxDurationMs: input.maxDurationMs,
+    maxPromptBytes: input.maxPromptBytes,
+    maxResponseBytes: input.maxResponseBytes,
+    ...(input.maxChunkAttempts !== undefined ? { maxChunkAttempts: input.maxChunkAttempts } : {}),
   });
   if (result.kind === "refusal") {
     io.write(JSON.stringify(result));
@@ -3131,6 +3187,10 @@ export async function runPrdCommand(
     const parsed = parseGeneratedUnderstandingArgs(args);
     if (!parsed) {
       io.write(usage);
+      return 2;
+    }
+    if ("error" in parsed) {
+      io.write(parsed.error);
       return 2;
     }
     return runGeneratedUnderstanding(parsed, io, dependencies);
