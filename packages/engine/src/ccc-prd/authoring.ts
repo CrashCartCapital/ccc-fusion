@@ -330,7 +330,7 @@ function hasWellFormedProtectedActionIds(proposal: CccPrdAuthoringProposal): boo
   ));
 }
 
-function compareSourceSpans(left: CccPrdSourceSpan, right: CccPrdSourceSpan): number {
+export function compareSourceSpans(left: CccPrdSourceSpan, right: CccPrdSourceSpan): number {
   return compareCodeUnits(left.path, right.path)
     || left.byteStart - right.byteStart
     || left.byteEnd - right.byteEnd
