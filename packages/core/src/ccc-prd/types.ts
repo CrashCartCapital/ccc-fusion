@@ -1,5 +1,7 @@
 export const CCC_PRD_PACKET_SCHEMA_VERSION = "ccc-prd.packet.v1" as const;
 export const CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION = "ccc-prd.authoring-proposal.v1" as const;
+export const CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION =
+  "ccc-prd.authoring-proposal-fragment.v1" as const;
 export const CCC_PRD_SIDECAR_SCHEMA_VERSION = "ccc-prd.sidecar.v1" as const;
 export const CCC_PRD_BUNDLE_SCHEMA_VERSION = "ccc-prd.bundle.v1" as const;
 export const CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION = "ccc-prd.proof-admission.v1" as const;
@@ -438,6 +440,35 @@ export type CccPrdAuthoringProposal = Omit<
   unresolvedDecisions: CccPrdProposalUnresolvedDecision[];
   ambiguities: CccPrdProposalReviewItem[];
   exceptions: CccPrdProposalReviewItem[];
+};
+
+/** A chunk-scoped row carries a ledger of the material items it claims to
+ * disposition; per design §2 this is checked against the real analyzer and
+ * never trusted on the model's word. */
+export type CccPrdFragmentRow<T> = T & { materialItemIds?: string[] };
+
+/**
+ * The per-chunk understanding fragment (design §2). Unlike
+ * {@link CccPrdAuthoringProposal}, a fragment never carries `bounds`,
+ * `admittedWriteRoots`, `targetRepository`, `nonGoals`, or packet-level
+ * `confidence` -- those are packet-global singletons synthesized once at
+ * assembly (design §4), not re-emitted per chunk.
+ */
+export type CccPrdAuthoringProposalFragment = {
+  schema: typeof CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION;
+  authorityRoles: CccPrdFragmentRow<CccPrdAuthorityRole>[];
+  requirements: CccPrdFragmentRow<CccPrdProposalRequirement>[];
+  proofs: CccPrdFragmentRow<CccPrdProposalProof>[];
+  tasks: CccPrdFragmentRow<CccPrdProposalTask>[];
+  edges: CccPrdFragmentRow<CccPrdDependencyEdge>[];
+  workflows: CccPrdFragmentRow<CccPrdProposalWorkflow>[];
+  documents: CccPrdFragmentRow<CccPrdProposalDocument>[];
+  artifacts: CccPrdFragmentRow<CccPrdProposalArtifact>[];
+  importIntents: CccPrdFragmentRow<CccPrdImportIntent>[];
+  protectedActions: CccPrdFragmentRow<CccPrdProposalProtectedAction>[];
+  unresolvedDecisions: CccPrdFragmentRow<CccPrdProposalUnresolvedDecision>[];
+  ambiguities: CccPrdFragmentRow<CccPrdProposalReviewItem>[];
+  exceptions: CccPrdFragmentRow<CccPrdProposalReviewItem>[];
 };
 
 export type CccPrdAuthoringConstraints = {

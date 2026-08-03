@@ -102,7 +102,7 @@ function sourceQuoteContainsCanonicalPath(
   return false;
 }
 
-function validateTaskCustodyProvenance(
+export function validateTaskCustodyProvenance(
   proposal: CccPrdAuthoringProposal,
 ): CccPrdDiagnostic[] {
   const diagnostics: CccPrdDiagnostic[] = [];
@@ -248,7 +248,7 @@ function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal
   return describeProposalShapeViolations(value).length === 0;
 }
 
-const IDENTITY_COLLECTIONS = [
+export const IDENTITY_COLLECTIONS = [
   "authorityRoles",
   "requirements",
   "proofs",
@@ -264,7 +264,7 @@ const IDENTITY_COLLECTIONS = [
   "exceptions",
 ] as const;
 
-const SOURCE_BOUND_COLLECTIONS = [
+export const SOURCE_BOUND_COLLECTIONS = [
   "requirements",
   "proofs",
   "tasks",
