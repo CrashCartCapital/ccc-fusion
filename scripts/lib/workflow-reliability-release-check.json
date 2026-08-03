@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "FNXC:CustomWorkflowReliability 2026-06-19-00:00: FN-6694 requires this manifest to encode goal G-MPW67VQR-0001-97S3's release-check checklist as objective, runnable seam evidence instead of prose-only QA signoff.",
+  "_comment": "FNXC:CustomWorkflowReliability 2026-06-19-00:00: FN-6694 requires this manifest to encode goal G-MPW67VQR-0001-97S3's release-check checklist as objective, runnable seam evidence instead of prose-only QA signoff. FNXC:SuiteHygiene 2026-08-03: re-pointed 9 seams that went stale across the SQLite->PostgreSQL migration (c15c78fee) and one dead-code removal (142bce0b9) to their current equivalents; see PR for per-seam evidence. Two dashboard route seams (workflow import/export, workflow design) had no current successor and were dropped rather than left pointing at deleted files or a fabricated reference -- packages/dashboard/src/routes/register-workflow-routes.ts still serves /api/workflows/import, /api/workflows/:id/export, and /api/workflows/design, but no current test file exercises them; that coverage gap is tracked as follow-up, not papered over here.",
   "checklist": [
     {
       "id": "author-import-save-discover-reload",
@@ -9,19 +9,15 @@
       "seams": [
         {
           "package": "@fusion/core",
-          "file": "packages/core/src/__tests__/workflow-definition-store.test.ts"
-        },
-        {
-          "package": "@fusion/dashboard",
-          "file": "packages/dashboard/src/routes/__tests__/workflow-import-export.test.ts"
-        },
-        {
-          "package": "@fusion/dashboard",
-          "file": "packages/dashboard/src/routes/__tests__/workflow-design-route.test.ts"
+          "file": "packages/core/src/__tests__/postgres/workflow-definitions.pg.test.ts"
         },
         {
           "package": "@fusion/core",
-          "file": "packages/core/src/__tests__/workflow-selection-store.test.ts"
+          "file": "packages/core/src/__tests__/builtin-workflows.test.ts"
+        },
+        {
+          "package": "@fusion/engine",
+          "file": "packages/engine/src/__tests__/workflow-graph-task-runner.test.ts"
         }
       ]
     },
@@ -32,7 +28,11 @@
       "seams": [
         {
           "package": "@fusion/core",
-          "file": "packages/core/src/__tests__/workflow-selection-store.test.ts"
+          "file": "packages/core/src/__tests__/builtin-workflows.test.ts"
+        },
+        {
+          "package": "@fusion/engine",
+          "file": "packages/engine/src/__tests__/workflow-graph-task-runner.test.ts"
         },
         {
           "package": "@fusion/engine",
@@ -59,7 +59,7 @@
         },
         {
           "package": "@fusion/engine",
-          "file": "packages/engine/src/__tests__/executor-workflow-revision-scope.test.ts"
+          "file": "packages/engine/src/__tests__/workflow-step-review.test.ts"
         }
       ]
     },
@@ -74,11 +74,11 @@
         },
         {
           "package": "@fusion/engine",
-          "file": "packages/engine/src/__tests__/reliability-interactions/workflow-interpreter-cutover.test.ts"
+          "file": "packages/engine/src/__tests__/executor-fast-mode-workflows.test.ts"
         },
         {
           "package": "@fusion/engine",
-          "file": "packages/engine/src/__tests__/self-healing-custom-workflow-recovery.test.ts"
+          "file": "packages/engine/src/__tests__/self-healing-trait-rekey.test.ts"
         }
       ]
     },
@@ -89,11 +89,15 @@
       "seams": [
         {
           "package": "@fusion/core",
-          "file": "packages/core/src/__tests__/workflow-restart-durability.test.ts"
+          "file": "packages/core/src/__tests__/postgres/workflow-run-step-instances.pg.test.ts"
         },
         {
           "package": "@fusion/engine",
-          "file": "packages/engine/src/__tests__/self-healing-custom-workflow-recovery.test.ts"
+          "file": "packages/engine/src/__tests__/restart.integration.test.ts"
+        },
+        {
+          "package": "@fusion/engine",
+          "file": "packages/engine/src/__tests__/self-healing.test.ts"
         }
       ]
     }
