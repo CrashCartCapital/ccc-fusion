@@ -15,6 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
+import { createRequire } from "node:module";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -24,30 +25,46 @@ const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+const requireCoreDependency = createRequire(
+  path.join(repoRoot, "packages/core/package.json"),
+);
+const postgres = requireCoreDependency("postgres");
 const cliBin = path.join(repoRoot, "packages/cli/bin.mjs");
 const expectedChecks = Object.freeze([
   "built-cli-current-run",
+  "current-prd-corpus-manifest",
   "current-prd-discovered-and-frozen",
+  "guided-operator-context-frozen",
   "planted-defect-rejected",
+  "native-local-understanding-review",
   "native-local-authoring",
   "frozen-packet-validated",
+  "product-owned-execution-plan",
+  "per-task-route-profiles",
   "forged-provenance-refused-without-residue",
   "exact-preview-confirmed",
   "wrong-confirmation-refused-without-residue",
   "operator-lifecycle-controls",
+  "provider-dispatch-restart-manual-required",
+  "proof-dispatch-restart-manual-required",
   "campaign-import-admitted",
   "import-restart-recovery",
   "live-execution-human-hold",
+  "second-task-live-execution-hold",
   "coding-route-and-worktree-custody",
+  "chained-task-worktree-custody",
   "campaign-created-commit",
   "commit-bound-proof-executed",
+  "integrated-proof-over-two-commits",
   "merge-human-hold",
+  "git-landing-restart-no-repeated-effect",
   "controlled-landing",
   "terminal-restart-recovery",
 ]);
 const commandTimeoutMs = 180_000;
 const productTimeoutMs = 120_000;
 const shutdownTimeoutMs = 15_000;
+const proofCutpointMarkerName = "ccc-proof-cutpoint.marker.json";
 
 class AcceptanceLedger {
   constructor(expected) {
@@ -194,6 +211,244 @@ async function run(command, args, options = {}) {
       resolve(result);
     });
   });
+}
+
+function startOwnedCommand(command, args, options = {}) {
+  const child = spawn(command, args, {
+    cwd: options.cwd ?? repoRoot,
+    env: options.env ?? process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exited = new Promise((resolve) => {
+    child.once("error", (error) => resolve({
+      code: null,
+      signal: null,
+      error,
+    }));
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  return {
+    child,
+    command,
+    args: [...args],
+    cwd: options.cwd ?? repoRoot,
+    exited,
+    stdout: () => stdout,
+    stderr: () => stderr,
+  };
+}
+
+async function crashOwnedCommand(owned, requiredCommandFragments) {
+  assert(
+    owned
+      && Number.isSafeInteger(owned.child.pid)
+      && owned.child.pid > 1
+      && owned.child.exitCode === null
+      && owned.child.signalCode === null,
+    "CCC_PRODUCT_OWNED_COMMAND_CRASH_TARGET_INVALID",
+    JSON.stringify({
+      pid: owned?.child?.pid,
+      exitCode: owned?.child?.exitCode,
+      signalCode: owned?.child?.signalCode,
+    }),
+  );
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(owned.child.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  assert(
+    inspected.code === 0
+      && requiredCommandFragments.every((fragment) =>
+        inspected.stdout.includes(fragment)),
+    "CCC_PRODUCT_OWNED_COMMAND_PROCESS_REFUSED",
+    JSON.stringify({
+      pid: owned.child.pid,
+      requiredCommandFragments,
+      command: inspected.stdout.trim(),
+    }),
+  );
+  owned.child.kill("SIGKILL");
+  const result = await owned.exited;
+  assert(
+    result.signal === "SIGKILL",
+    "CCC_PRODUCT_OWNED_COMMAND_CRASH_SIGNAL_DRIFT",
+    JSON.stringify(result),
+  );
+  return inspected.stdout.trim();
+}
+
+async function cleanupOwnedCommand(owned) {
+  if (
+    !owned
+    || owned.child.exitCode !== null
+    || owned.child.signalCode !== null
+  ) return;
+  owned.child.kill("SIGKILL");
+  await owned.exited;
+}
+
+async function embeddedPostgresConnectionUrl(isolatedHome) {
+  const pidPath = path.join(
+    isolatedHome,
+    ".fusion",
+    "embedded-postgres",
+    "default",
+    "postmaster.pid",
+  );
+  const observed = await poll(
+    "owned embedded PostgreSQL identity",
+    async () => {
+      if (!await pathExists(pidPath)) return null;
+      const lines = (await readFile(pidPath, "utf8")).split("\n");
+      return {
+        pid: Number.parseInt(lines[0] ?? "", 10),
+        port: Number.parseInt(lines[3] ?? "", 10),
+      };
+    },
+    (value) =>
+      Number.isSafeInteger(value?.pid)
+      && value.pid > 1
+      && Number.isSafeInteger(value?.port)
+      && value.port > 0
+      && value.port <= 65_535,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return `postgresql://postgres:password@localhost:${observed.port}/fusion`;
+}
+
+async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
+  assert(
+    /^cccp-land-[0-9a-f]{8}$/u.test(marker),
+    "CCC_PRODUCT_GIT_LANDING_CUTPOINT_MARKER_INVALID",
+    marker,
+  );
+  const sql = postgres(
+    await embeddedPostgresConnectionUrl(isolatedHome),
+    {
+      connect_timeout: 10,
+      idle_timeout: 30,
+      max: 1,
+      onnotice: () => undefined,
+    },
+  );
+  let closed = false;
+  await sql`SELECT 1 AS ready`;
+  await sql.unsafe(`
+    CREATE TABLE public.ccc_product_git_landing_cutpoint_gate (
+      singleton boolean PRIMARY KEY CHECK (singleton),
+      armed boolean NOT NULL
+    )
+  `);
+  await sql.unsafe(`
+    INSERT INTO public.ccc_product_git_landing_cutpoint_gate
+      (singleton, armed)
+    VALUES (TRUE, TRUE)
+  `);
+  await sql.unsafe(`
+    CREATE FUNCTION public.ccc_product_git_landing_cutpoint()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $ccc_product_cutpoint$
+    BEGIN
+      IF NEW.mutation_type = 'ccc-campaign-git-landing:terminal'
+        AND EXISTS (
+          SELECT 1
+          FROM public.ccc_product_git_landing_cutpoint_gate
+          WHERE singleton = TRUE AND armed = TRUE
+        )
+      THEN
+        PERFORM pg_sleep(120);
+      END IF;
+      RETURN NEW;
+    END
+    $ccc_product_cutpoint$
+  `);
+  await sql.unsafe(`
+    CREATE TRIGGER ccc_product_git_landing_cutpoint
+    BEFORE INSERT ON project.run_audit_events
+    FOR EACH ROW
+    EXECUTE FUNCTION public.ccc_product_git_landing_cutpoint()
+  `);
+  const sleepingBackends = async () => {
+    return await sql`
+      SELECT
+        activity.pid,
+        activity.state,
+        activity.wait_event_type,
+        activity.wait_event
+      FROM pg_stat_activity AS activity
+      WHERE activity.pid <> pg_backend_pid()
+        AND activity.state = 'active'
+        AND activity.wait_event_type = 'Timeout'
+        AND activity.wait_event = 'PgSleep'
+        AND activity.query ILIKE '%run_audit_events%'
+      ORDER BY activity.pid
+    `;
+  };
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await sql.unsafe(`
+      UPDATE public.ccc_product_git_landing_cutpoint_gate
+      SET armed = FALSE
+      WHERE singleton = TRUE
+    `).catch(() => undefined);
+    await sql.unsafe(`
+      DROP TRIGGER IF EXISTS ccc_product_git_landing_cutpoint
+      ON project.run_audit_events
+    `).catch(() => undefined);
+    await sql.unsafe(`
+      DROP FUNCTION IF EXISTS public.ccc_product_git_landing_cutpoint()
+    `).catch(() => undefined);
+    await sql.unsafe(`
+      DROP TABLE IF EXISTS public.ccc_product_git_landing_cutpoint_gate
+    `).catch(() => undefined);
+    await sql.end({ timeout: 2 }).catch(() => undefined);
+  };
+  return { sql, marker, sleepingBackends, close };
+}
+
+async function settleOwnedLandingDatabaseBackend(cutpoint) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if ((await cutpoint.sleepingBackends()).length === 0) {
+      return { forcedTermination: false, backendPid: null };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const activities = await cutpoint.sleepingBackends();
+  assert(
+    activities.length === 1,
+    "CCC_PRODUCT_GIT_LANDING_BACKEND_OWNERSHIP_REFUSED",
+    JSON.stringify({ activities }),
+  );
+  const expectedPid = activities[0].pid;
+  const terminated = await cutpoint.sql`
+    SELECT pg_terminate_backend(${expectedPid}) AS terminated
+  `;
+  assert(
+    terminated.length === 1 && terminated[0].terminated === true,
+    "CCC_PRODUCT_GIT_LANDING_BACKEND_TERMINATION_FAILED",
+    JSON.stringify(terminated),
+  );
+  await poll(
+    "owned Git landing PostgreSQL backend termination",
+    cutpoint.sleepingBackends,
+    (rows) => rows.length === 0,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return { forcedTermination: true, backendPid: expectedPid };
 }
 
 async function git(cwd, ...args) {
@@ -452,23 +707,23 @@ async function assertExactImplementationFactProvenance(
   );
   assert(
     Array.isArray(provenance.admittedWriteRoots)
-      && provenance.admittedWriteRoots.length === 1
+      && provenance.admittedWriteRoots.length === 3
       && Array.isArray(provenance.nonGoals)
       && provenance.nonGoals.length === 1
       && Array.isArray(provenance.requirements)
-      && provenance.requirements.length === 1
+      && provenance.requirements.length === 2
       && Array.isArray(provenance.proofs)
       && provenance.proofs.length === 1
       && Array.isArray(provenance.proofs[0]?.negativeControls)
       && provenance.proofs[0].negativeControls.length === 1
       && Array.isArray(provenance.protectedActions)
-      && provenance.protectedActions.length === 2,
+      && provenance.protectedActions.length === 3,
     "CCC_PRODUCT_IMPLEMENTATION_FACT_PROVENANCE_CARDINALITY",
     JSON.stringify(provenance),
   );
   exactArray(
     provenance.requirements.map(({ id }) => id),
-    ["REQ-VERTICAL"],
+    ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
     "CCC_PRODUCT_IMPLEMENTATION_FACT_REQUIREMENT_DRIFT",
   );
   exactArray(
@@ -478,7 +733,13 @@ async function assertExactImplementationFactProvenance(
   );
   exactArray(
     provenance.protectedActions.map(({ id }) => id),
-    ["ACTION-VERTICAL-LIVE", "ACTION-VERTICAL-MERGE"],
+    // Authoring canonicalizes protected actions into sorted id order, so this
+    // is the sorted set, not the declaration order.
+    [
+      "ACTION-VERTICAL-LIVE",
+      "ACTION-VERTICAL-MERGE",
+      "ACTION-VERTICAL-SECOND-LIVE",
+    ],
     "CCC_PRODUCT_IMPLEMENTATION_FACT_ACTION_DRIFT",
   );
   const actionBindings = new Map(
@@ -487,28 +748,53 @@ async function assertExactImplementationFactProvenance(
   const bindings = [
     ["targetRepository.path", provenance.targetRepository?.path, expected.targetRoot],
     ["targetRepository.baseCommit", provenance.targetRepository?.baseCommit, expected.targetBase],
-    ["bounds.maxRequests", provenance.bounds?.maxRequests, 1],
+    ["bounds.maxRequests", provenance.bounds?.maxRequests, 2],
     ["bounds.maxDurationMs", provenance.bounds?.maxDurationMs, 120_000],
     ["bounds.maxConcurrency", provenance.bounds?.maxConcurrency, 1],
     [
       "admittedWriteRoots[0].path",
       provenance.admittedWriteRoots[0]?.path,
-      expected.targetRoot,
+      expected.fusionStateWriteRoot,
     ],
     [
       "admittedWriteRoots[0].purpose",
       provenance.admittedWriteRoots[0]?.purpose,
+      "Fusion-managed campaign state and artifacts",
+    ],
+    [
+      "admittedWriteRoots[1].path",
+      provenance.admittedWriteRoots[1]?.path,
+      expected.admittedWriteRoot,
+    ],
+    [
+      "admittedWriteRoots[1].purpose",
+      provenance.admittedWriteRoots[1]?.purpose,
+      "disposable product acceptance repository",
+    ],
+    [
+      "admittedWriteRoots[2].path",
+      provenance.admittedWriteRoots[2]?.path,
+      expected.admittedSecondWriteRoot,
+    ],
+    [
+      "admittedWriteRoots[2].purpose",
+      provenance.admittedWriteRoots[2]?.purpose,
       "disposable product acceptance repository",
     ],
     [
       "nonGoals[0]",
       provenance.nonGoals[0],
-      "Modify any path outside src/value.txt.",
+      "Modify any path outside the two admitted task write roots.",
     ],
     [
       "requirements[0].acceptance",
       provenance.requirements[0]?.acceptance,
       "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
+    ],
+    [
+      "requirements[1].acceptance",
+      provenance.requirements[1]?.acceptance,
+      "The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
     ],
     ["proofs[0].command", provenance.proofs[0]?.command, "task verify:vertical"],
     [
@@ -532,6 +818,16 @@ async function assertExactImplementationFactProvenance(
       "provider://openai/TASK-VERTICAL",
     ],
     [
+      "protectedActions[ACTION-VERTICAL-SECOND-LIVE].kind",
+      actionBindings.get("ACTION-VERTICAL-SECOND-LIVE")?.kind,
+      "live_execution",
+    ],
+    [
+      "protectedActions[ACTION-VERTICAL-SECOND-LIVE].target",
+      actionBindings.get("ACTION-VERTICAL-SECOND-LIVE")?.target,
+      "provider://openai/TASK-VERTICAL-SECOND",
+    ],
+    [
       "protectedActions[ACTION-VERTICAL-MERGE].kind",
       actionBindings.get("ACTION-VERTICAL-MERGE")?.kind,
       "merge",
@@ -542,9 +838,30 @@ async function assertExactImplementationFactProvenance(
       "refs/heads/main",
     ],
   ];
-  const source = await readFile(path.join(packetRoot, sourcePath));
-  const sourceSha256 = sha256(source);
-  const displayPosition = (byteOffset) => {
+  const contextFacts = new Set([
+    "targetRepository.path",
+    "targetRepository.baseCommit",
+    "bounds.maxRequests",
+    "bounds.maxDurationMs",
+    "bounds.maxConcurrency",
+    "admittedWriteRoots[0].path",
+    "admittedWriteRoots[0].purpose",
+    "admittedWriteRoots[1].path",
+    "admittedWriteRoots[1].purpose",
+    "admittedWriteRoots[2].path",
+    "admittedWriteRoots[2].purpose",
+  ]);
+  const sources = new Map();
+  const sourceFor = async (sourceRelativePath) => {
+    if (!sources.has(sourceRelativePath)) {
+      sources.set(
+        sourceRelativePath,
+        await readFile(path.join(packetRoot, sourceRelativePath)),
+      );
+    }
+    return sources.get(sourceRelativePath);
+  };
+  const displayPosition = (source, byteOffset) => {
     const lines = source.subarray(0, byteOffset).toString("utf8").split("\n");
     return {
       line: lines.length,
@@ -561,11 +878,16 @@ async function assertExactImplementationFactProvenance(
       `${label}: ${JSON.stringify(binding)}`,
     );
     const [span] = binding.spans;
+    const expectedSourcePath = contextFacts.has(label)
+      ? expected.contextSourcePath
+      : sourcePath;
+    const source = await sourceFor(expectedSourcePath);
+    const sourceSha256 = sha256(source);
     const excerpt = source.subarray(span.byteStart, span.byteEnd);
-    const expectedStart = displayPosition(span.byteStart);
-    const expectedEnd = displayPosition(span.byteEnd);
+    const expectedStart = displayPosition(source, span.byteStart);
+    const expectedEnd = displayPosition(source, span.byteEnd);
     assert(
-      span.path === sourcePath
+      span.path === expectedSourcePath
         && Number.isSafeInteger(span.byteStart)
         && Number.isSafeInteger(span.byteEnd)
         && span.byteStart >= 0
@@ -602,8 +924,10 @@ async function assertExactImplementationFactProvenance(
   }
   return {
     schema: provenance.schema,
-    sourcePath,
-    sourceSha256,
+    sourcePaths: [...sources.keys()],
+    sourceSha256ByPath: Object.fromEntries(
+      [...sources].map(([path, source]) => [path, sha256(source)]),
+    ),
     bindingCount: spans.length,
     spans,
   };
@@ -672,8 +996,11 @@ async function buildCurrentCli(ledger) {
   const prdUsage = `${prdHelp.stdout}\n${prdProductUsage.stdout}`;
   for (const command of [
     "fn prd author",
+    "fn prd understand",
+    "fn prd corpus",
     "fn prd discover",
     "fn prd freeze",
+    "fn prd policy",
     "fn prd validate",
     "fn prd compile",
     "fn prd preview",
@@ -708,8 +1035,11 @@ async function buildCurrentCli(ledger) {
     outputs: evidence,
     publicPrdCommands: [
       "author",
+      "understand",
+      "corpus",
       "discover",
       "freeze",
+      "policy",
       "validate",
       "compile",
       "preview",
@@ -728,29 +1058,67 @@ async function buildCurrentCli(ledger) {
   });
 }
 
-async function initializeTarget(targetRoot) {
+async function initializeTarget(
+  targetRoot,
+  { proofCutpointActivation, proofCutpointToken },
+) {
   await mkdir(path.join(targetRoot, "src"), { recursive: true });
   await writeFile(
     path.join(targetRoot, ".gitignore"),
     [".fusion/", ".fusion-global-settings/", ".worktrees/", ""].join("\n"),
   );
   await writeFile(path.join(targetRoot, "src/value.txt"), "bad\n");
+  await writeFile(path.join(targetRoot, "src/second.txt"), "pending\n");
   await writeFile(
     path.join(targetRoot, "verify.cjs"),
     [
       "const fs = require('node:fs');",
-      "const value = fs.readFileSync('src/value.txt', 'utf8').trim();",
-      "const accepts = candidate => candidate === 'good';",
-      "if (accepts('bad')) {",
-      "  console.error('NEGATIVE_CONTROL_FAIL');",
-      "  process.exit(2);",
+      "const path = require('node:path');",
+      `const cutpointActivation = ${JSON.stringify(proofCutpointActivation)};`,
+      `const cutpointToken = ${JSON.stringify(proofCutpointToken)};`,
+      `const cutpointMarkerName = ${JSON.stringify(proofCutpointMarkerName)};`,
+      "if (fs.existsSync(cutpointActivation)) {",
+      "  const home = process.env.HOME;",
+      "  if (!home) {",
+      "    console.error('PROOF_CUTPOINT_HOME_MISSING');",
+      "    process.exit(9);",
+      "  }",
+      "  const processTitle = `cccp-${cutpointToken.slice(0, 8)}`;",
+      "  process.title = processTitle;",
+      "  fs.writeFileSync(",
+      "    path.join(home, cutpointMarkerName),",
+      "    JSON.stringify({",
+      "      token: cutpointToken,",
+      "      pid: process.pid,",
+      "      cwd: process.cwd(),",
+      "      executable: process.execPath,",
+      "      argv1: process.argv[1],",
+      "      processTitle,",
+      "    }),",
+      "    { flag: 'wx' },",
+      "  );",
+      "  console.log('PROOF_CUTPOINT_READY');",
+      "  setInterval(() => {}, 1000);",
+      "} else {",
+      "  const value = fs.readFileSync('src/value.txt', 'utf8').trim();",
+      "  const second = fs.readFileSync('src/second.txt', 'utf8').trim();",
+      "  const accepts = candidate => candidate === 'good';",
+      "  const acceptsSecond = candidate => candidate === 'second-good';",
+      "  if (accepts('bad') || acceptsSecond('pending')) {",
+      "    console.error('NEGATIVE_CONTROL_FAIL');",
+      "    process.exit(2);",
+      "  }",
+      "  console.log('NEGATIVE_CONTROL_PASS: planted bad and pending values are rejected');",
+      "  if (!accepts(value)) {",
+      "    console.error(`POSITIVE_ORACLE_FAIL:${value}`);",
+      "    process.exit(1);",
+      "  }",
+      "  if (!acceptsSecond(second)) {",
+      "    console.error(`POSITIVE_ORACLE_FAIL:${second}`);",
+      "    process.exit(1);",
+      "  }",
+      "  console.log('POSITIVE_ORACLE_PASS: campaign values are good');",
       "}",
-      "console.log('NEGATIVE_CONTROL_PASS: planted bad value is rejected');",
-      "if (!accepts(value)) {",
-      "  console.error(`POSITIVE_ORACLE_FAIL:${value}`);",
-      "  process.exit(1);",
-      "}",
-      "console.log('POSITIVE_ORACLE_PASS: campaign value is good');",
       "",
     ].join("\n"),
   );
@@ -780,6 +1148,7 @@ async function initializeTarget(targetRoot) {
     "--",
     ".gitignore",
     "Taskfile.yml",
+    "src/second.txt",
     "src/value.txt",
     "verify.cjs",
   );
@@ -802,18 +1171,39 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "Positive oracle: The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
     "Negative control: The same verifier exits nonzero for the frozen planted bad value.",
   ].join(" ");
-  const targetRepositoryLine = `- Target repository: ${targetRoot}`;
-  const baselineLine = `- Baseline commit: ${targetBase}`;
-  const allowedWriteRootLine = `- Allowed write root: ${targetRoot}`;
+  const secondRequirementLine = [
+    "- REQ-VERTICAL-SECOND: Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task's commit.",
+    "Acceptance: The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
+    "Proof command: task verify:vertical.",
+  ].join(" ");
+  const targetRepositoryLine = "- Target repository: " + targetRoot;
+  const baselineLine = "- Baseline commit: " + targetBase;
+  const taskOwnedPathLine = "- Task owned path: src/value.txt";
+  const taskAllowedWriteRootLine = "- Task allowed write root: src/value.txt";
+  const secondTaskOwnedPathLine = "- Task owned path: src/second.txt";
+  const secondTaskAllowedWriteRootLine =
+    "- Task allowed write root: src/second.txt";
+  const fusionStateWriteRoot = path.join(targetRoot, ".fusion");
+  const admittedWriteRoot = path.join(targetRoot, "src/value.txt");
+  const admittedSecondWriteRoot = path.join(targetRoot, "src/second.txt");
+  const fusionStateWriteRootLine =
+    "- Allowed write root: " + fusionStateWriteRoot;
+  const allowedWriteRootLine = "- Allowed write root: " + admittedWriteRoot;
+  const allowedSecondWriteRootLine =
+    "- Allowed write root: " + admittedSecondWriteRoot;
+  const fusionStateWriteRootPurposeLine =
+    "- Allowed write root purpose: Fusion-managed campaign state and artifacts";
   const allowedWriteRootPurposeLine =
     "- Allowed write root purpose: disposable product acceptance repository";
-  const maxRequestsLine = "- Max requests: 1";
-  const maxDurationLine = "- Max duration ms: 120000";
-  const maxConcurrencyLine = "- Max concurrency: 1";
+  const maxRequestsLine = "- Maximum requests: 2";
+  const maxDurationLine = "- Maximum duration in milliseconds: 120000";
+  const maxConcurrencyLine = "- Maximum concurrency: 1";
   const nonGoalLine =
-    "- Non-goal: Modify any path outside src/value.txt.";
+    "- Non-goal: Modify any path outside the two admitted task write roots.";
   const liveActionLine =
     "- Protected action: live_execution provider://openai/TASK-VERTICAL requires explicit human approval.";
+  const secondLiveActionLine =
+    "- Protected action: live_execution provider://openai/TASK-VERTICAL-SECOND requires explicit human approval.";
   const mergeActionLine =
     "- Protected action: merge refs/heads/main requires separate explicit human approval.";
   const supportingContextLine =
@@ -829,23 +1219,18 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "",
     "## Implementation contract",
     "",
-    targetRepositoryLine,
-    baselineLine,
-    allowedWriteRootLine,
-    allowedWriteRootPurposeLine,
-    maxRequestsLine,
-    maxDurationLine,
-    maxConcurrencyLine,
     nonGoalLine,
     "",
     "## Protected actions",
     "",
     liveActionLine,
+    secondLiveActionLine,
     mergeActionLine,
     "",
     "## Requirement and proof",
     "",
     requirementLine,
+    secondRequirementLine,
     "",
     "## Supporting context",
     "",
@@ -861,6 +1246,35 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   await mkdir(path.dirname(supportSourcePath), { recursive: true });
   await writeFile(prdSourcePath, prd);
   await writeFile(supportSourcePath, support);
+  const prdSourceSha256 = sha256(await readFile(prdSourcePath));
+
+  const corpus = jsonOutput(
+    await run(
+      process.execPath,
+      [cliBin, "prd", "corpus", activeProjectsRoot],
+      { cwd: targetRoot, env },
+    ),
+    "prd corpus",
+  );
+  const corpusProject = corpus.projects?.find(
+    ({ project }) => project === projectName,
+  );
+  assert(
+    corpus.schema === "ccc-prd.corpus-manifest.v1"
+    && corpus.summary?.projectCount === 1
+    && corpus.summary?.selectedCount === 1
+    && corpusProject?.selection?.kind === "selected"
+    && corpusProject.selection.selectedPrdPath === prdSourcePath
+    && corpusProject.selection.sourceSha256 === prdSourceSha256
+    && corpusProject.selection.sourceBytes === Buffer.byteLength(prd, "utf8"),
+    "CCC_PRODUCT_CURRENT_PRD_CORPUS_FAILED",
+    JSON.stringify({ summary: corpus.summary, project: corpusProject }),
+  );
+  assert(
+    !JSON.stringify(corpus).includes(requirementLine),
+    "CCC_PRODUCT_CORPUS_LEAKED_SOURCE_TEXT",
+    projectName,
+  );
 
   const discovery = jsonOutput(
     await run(
@@ -890,6 +1304,26 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         activeProjectsRoot,
         prdSourcePath,
         packetRoot,
+        "--target",
+        targetRoot,
+        "--base",
+        targetBase,
+        "--owned-path",
+        "src/value.txt",
+        "--owned-path",
+        "src/second.txt",
+        "--write-root",
+        "src/value.txt",
+        "--write-root",
+        "src/second.txt",
+        "--write-purpose",
+        "disposable product acceptance repository",
+        "--max-requests",
+        "2",
+        "--max-duration-ms",
+        "120000",
+        "--max-concurrency",
+        "1",
       ],
       { cwd: targetRoot, env },
     ),
@@ -897,7 +1331,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   );
   assert(
     frozen.schema === "ccc-prd.freeze-result.v1"
-    && frozen.packet?.fileCount === 2
+    && frozen.packet?.fileCount === 3
     && frozen.packet?.unresolvedReferenceCount === 0
     && frozen.unresolvedReferences?.length === 0,
     "CCC_PRODUCT_CURRENT_PRD_FREEZE_FAILED",
@@ -906,35 +1340,85 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const freezeReceipt = JSON.parse(await readFile(frozen.receiptPath, "utf8"));
   exactArray(
     freezeReceipt.entries?.map(({ projectRelativePath }) => projectRelativePath),
-    [prdFileName, supportRelativePath],
+    [
+      prdFileName,
+      "__fusion__/REF-HUM-FusionOperatorContext.md",
+      supportRelativePath,
+    ],
     "CCC_PRODUCT_FROZEN_SOURCE_SET_DRIFT",
+  );
+  const operatorContextReceipt = freezeReceipt.entries?.find(
+    ({ projectRelativePath }) =>
+      projectRelativePath === "__fusion__/REF-HUM-FusionOperatorContext.md",
+  );
+  assert(
+    operatorContextReceipt?.originPath
+      === "operator-context://ccc-prd.operator-context.v1"
+      && operatorContextReceipt.role === "support"
+      && operatorContextReceipt.authoritative === true,
+    "CCC_PRODUCT_GUIDED_CONTEXT_RECEIPT_INVALID",
+    JSON.stringify(operatorContextReceipt),
+  );
+  assert(
+    sha256(await readFile(prdSourcePath)) === prdSourceSha256,
+    "CCC_PRODUCT_GUIDED_FREEZE_CHANGED_PRD",
+    prdSourcePath,
   );
 
   const manifestPath = frozen.manifestPath;
   const proposalPath = path.join(packetRoot, "authoring-proposal.json");
   const sidecarPath = path.join(packetRoot, "candidate.sidecar.json");
-  const policyPath = path.join(packetRoot, "execution-policy.json");
+  const executionPlanPath = path.join(packetRoot, "execution-plan.json");
   const frozenPrdRelativePath = `sources/${prdFileName}`;
+  const frozenContextRelativePath =
+    "sources/__fusion__/REF-HUM-FusionOperatorContext.md";
   const sourceRefs = [{
     path: frozenPrdRelativePath,
     exactQuote: requirementLine,
   }];
+  const secondSourceRefs = [{
+    path: frozenPrdRelativePath,
+    exactQuote: secondRequirementLine,
+  }];
   const implementationRefs = [
     targetRepositoryLine,
     baselineLine,
+    taskOwnedPathLine,
+    taskAllowedWriteRootLine,
+    fusionStateWriteRootLine,
     allowedWriteRootLine,
+    fusionStateWriteRootPurposeLine,
     allowedWriteRootPurposeLine,
     maxRequestsLine,
     maxDurationLine,
     maxConcurrencyLine,
-    nonGoalLine,
   ].map((exactQuote) => ({
-    path: frozenPrdRelativePath,
+    path: frozenContextRelativePath,
     exactQuote,
   }));
+  // The compiler requires per-task custody once the chain holds more than one
+  // task, and authoring additionally requires each task's own quoted evidence
+  // to contain that task's paths verbatim. The second task therefore cites its
+  // own custody and write-root lines rather than reusing the first task's.
+  const secondImplementationRefs = [
+    secondTaskOwnedPathLine,
+    secondTaskAllowedWriteRootLine,
+    allowedSecondWriteRootLine,
+  ].map((exactQuote) => ({
+    path: frozenContextRelativePath,
+    exactQuote,
+  }));
+  const nonGoalRefs = [{
+    path: frozenPrdRelativePath,
+    exactQuote: nonGoalLine,
+  }];
   const liveActionRefs = [{
     path: frozenPrdRelativePath,
     exactQuote: liveActionLine,
+  }];
+  const secondLiveActionRefs = [{
+    path: frozenPrdRelativePath,
+    exactQuote: secondLiveActionLine,
   }];
   const mergeActionRefs = [{
     path: frozenPrdRelativePath,
@@ -946,27 +1430,49 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   }];
   const proposal = {
     schema: "ccc-prd.authoring-proposal.v1",
-    authorityRoles: [{
-      id: "AUTHORITY-VERTICAL",
-      role: "root",
-      sourcePaths: [frozenPrdRelativePath],
-      accountableProducer: "product-owner",
-    }],
-    requirements: [{
-      id: "REQ-VERTICAL",
-      statement:
-        "Change src/value.txt from bad to good in an isolated worktree.",
-      acceptance:
-        "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
-      accountableProducer: "campaign-coding-agent",
-      dependencies: [],
-      proofIds: ["PROOF-VERTICAL"],
-      sourceRefs,
-      confidence: "high",
-    }],
+    authorityRoles: [
+      {
+        id: "AUTHORITY-VERTICAL",
+        role: "root",
+        sourcePaths: [frozenPrdRelativePath],
+        accountableProducer: "product-owner",
+      },
+      {
+        id: "AUTHORITY-VERTICAL-CONTEXT",
+        role: "support",
+        sourcePaths: [frozenContextRelativePath],
+        accountableProducer: "operator",
+      },
+    ],
+    requirements: [
+      {
+        id: "REQ-VERTICAL",
+        statement:
+          "Change src/value.txt from bad to good in an isolated worktree.",
+        acceptance:
+          "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
+        accountableProducer: "campaign-coding-agent",
+        dependencies: [],
+        proofIds: ["PROOF-VERTICAL"],
+        sourceRefs,
+        confidence: "high",
+      },
+      {
+        id: "REQ-VERTICAL-SECOND",
+        statement:
+          "Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task's commit.",
+        acceptance:
+          "The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
+        accountableProducer: "campaign-coding-agent",
+        dependencies: ["REQ-VERTICAL"],
+        proofIds: ["PROOF-VERTICAL"],
+        sourceRefs: secondSourceRefs,
+        confidence: "high",
+      },
+    ],
     proofs: [{
       id: "PROOF-VERTICAL",
-      requirementIds: ["REQ-VERTICAL"],
+      requirementIds: ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       command: "task verify:vertical",
       positiveOracle:
         "The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
@@ -976,37 +1482,72 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       sourceRefs,
       confidence: "high",
     }],
-    tasks: [{
-      id: "TASK-VERTICAL",
-      title: "Implement the admitted value change",
-      description:
-        "Edit only src/value.txt so the exact verifier passes; the Fusion controller creates the campaign commit.",
-      accountableProducer: "campaign-coding-agent",
-      requirementIds: ["REQ-VERTICAL"],
-      dependencyTaskIds: [],
-      proofIds: ["PROOF-VERTICAL"],
-      workflowId: "WORKFLOW-VERTICAL",
-      documentIds: [],
-      artifactIds: [],
-      protectedActionIds: [
-        "ACTION-VERTICAL-LIVE",
-        "ACTION-VERTICAL-MERGE",
-      ],
-      sourceRefs: [
-        ...implementationRefs,
-        ...sourceRefs,
-        ...liveActionRefs,
-        ...mergeActionRefs,
-        ...supportingRefs,
-      ],
+    tasks: [
+      {
+        id: "TASK-VERTICAL",
+        title: "Implement the admitted value change",
+        description:
+          "Edit only src/value.txt so the exact verifier passes; the Fusion controller creates the campaign commit.",
+        ownedPaths: ["src/value.txt"],
+        allowedWriteRoots: ["src/value.txt"],
+        accountableProducer: "campaign-coding-agent",
+        requirementIds: ["REQ-VERTICAL"],
+        dependencyTaskIds: [],
+        proofIds: ["PROOF-VERTICAL"],
+        workflowId: "WORKFLOW-VERTICAL",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: ["ACTION-VERTICAL-LIVE"],
+        sourceRefs: [
+          ...implementationRefs,
+          ...nonGoalRefs,
+          ...sourceRefs,
+          ...liveActionRefs,
+          ...supportingRefs,
+        ],
+      },
+      {
+        id: "TASK-VERTICAL-SECOND",
+        title: "Implement the admitted second value change",
+        description:
+          "Edit only src/second.txt so the exact verifier passes over both admitted files; the Fusion controller creates the campaign commit.",
+        ownedPaths: ["src/second.txt"],
+        allowedWriteRoots: ["src/second.txt"],
+        accountableProducer: "campaign-coding-agent",
+        requirementIds: ["REQ-VERTICAL-SECOND"],
+        dependencyTaskIds: ["TASK-VERTICAL"],
+        proofIds: ["PROOF-VERTICAL"],
+        workflowId: "WORKFLOW-VERTICAL",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: [
+          "ACTION-VERTICAL-SECOND-LIVE",
+          "ACTION-VERTICAL-MERGE",
+        ],
+        sourceRefs: [
+          ...secondImplementationRefs,
+          ...secondSourceRefs,
+          ...secondLiveActionRefs,
+          ...mergeActionRefs,
+        ],
+      },
+    ],
+    // The declared edge must mirror dependencyTaskIds exactly: the compiler
+    // reads dependencyTaskIds for ordering while the importer persists
+    // dependency rows from edges, so a disagreement would execute an order
+    // that was never admitted.
+    edges: [{
+      id: "EDGE-VERTICAL-CHAIN",
+      fromTaskId: "TASK-VERTICAL-SECOND",
+      toTaskId: "TASK-VERTICAL",
+      kind: "depends_on",
     }],
-    edges: [],
     workflows: [{
       id: "WORKFLOW-VERTICAL",
       title: "CCC Fusion product vertical slice",
-      taskIds: ["TASK-VERTICAL"],
+      taskIds: ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
       entryTaskIds: ["TASK-VERTICAL"],
-      terminalTaskIds: ["TASK-VERTICAL"],
+      terminalTaskIds: ["TASK-VERTICAL-SECOND"],
       sourceRefs,
     }],
     documents: [],
@@ -1018,6 +1559,20 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         entityId: "TASK-VERTICAL",
         operation: "create",
         target: "project.tasks",
+      },
+      {
+        id: "IMPORT-VERTICAL-TASK-SECOND",
+        entityType: "task",
+        entityId: "TASK-VERTICAL-SECOND",
+        operation: "create",
+        target: "project.tasks",
+      },
+      {
+        id: "IMPORT-VERTICAL-EDGE",
+        entityType: "dependency_edge",
+        entityId: "EDGE-VERTICAL-CHAIN",
+        operation: "create",
+        target: "project.tasks.dependencies",
       },
       {
         id: "IMPORT-VERTICAL-WORKFLOW",
@@ -1065,6 +1620,14 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         sourceRefs: liveActionRefs,
       },
       {
+        id: "ACTION-VERTICAL-SECOND-LIVE",
+        kind: "live_execution",
+        target: "provider://openai/TASK-VERTICAL-SECOND",
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_live_execution",
+        sourceRefs: secondLiveActionRefs,
+      },
+      {
         id: "ACTION-VERTICAL-MERGE",
         kind: "merge",
         target: "refs/heads/main",
@@ -1074,45 +1637,60 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       },
     ],
     bounds: {
-      maxRequests: 1,
+      // Two dispatches, one per task. The import-wide provider-attempt audit
+      // history is bounded by (maxRequests * 3) + 1 rows and each attempt
+      // writes exactly three rows, so this is the smallest budget that admits
+      // a two-task chain.
+      maxRequests: 2,
       maxDurationMs: 120_000,
       maxConcurrency: 1,
     },
-    admittedWriteRoots: [{
-      path: targetRoot,
-      purpose: "disposable product acceptance repository",
-    }],
+    admittedWriteRoots: [
+      {
+        path: fusionStateWriteRoot,
+        purpose: "Fusion-managed campaign state and artifacts",
+      },
+      {
+        path: admittedWriteRoot,
+        purpose: "disposable product acceptance repository",
+      },
+      {
+        path: admittedSecondWriteRoot,
+        purpose: "disposable product acceptance repository",
+      },
+    ],
     targetRepository: { path: targetRoot, baseCommit: targetBase },
-    nonGoals: ["Modify any path outside src/value.txt."],
+    nonGoals: ["Modify any path outside the two admitted task write roots."],
     unresolvedDecisions: [],
     ambiguities: [],
     exceptions: [],
     confidence: "high",
   };
-  const policy = {
-    schema: "ccc-campaign.execution-policy.v2",
-    routes: [{
-      taskId: "TASK-VERTICAL",
-      providerId: "openai",
-      modelId: "gpt-5.6-sol",
-      transport: "cli",
-      executor: "cli-agent",
-      cliAdapterId: "codex",
-      toolMode: "coding",
-      worktreeMode: "isolated",
-      ownedPaths: ["src/value.txt"],
-      allowedWriteRoots: ["src/value.txt"],
-      commitPolicy: "required",
-    }],
-  };
   await writeFile(proposalPath, `${JSON.stringify(proposal, null, 2)}\n`);
-  await writeFile(policyPath, `${JSON.stringify(policy, null, 2)}\n`);
   return {
     manifestPath,
     proposalPath,
     sidecarPath,
-    policyPath,
+    executionPlanPath,
     sourcePath: frozenPrdRelativePath,
+    contextSourcePath: frozenContextRelativePath,
+    operatorContext: {
+      originPath: operatorContextReceipt.originPath,
+      sha256: operatorContextReceipt.sha256,
+      prdSourceSha256,
+      sourceUnchanged: true,
+    },
+    corpus: {
+      schema: corpus.schema,
+      summary: corpus.summary,
+      project: {
+        project: corpusProject.project,
+        selectedPrdPath: corpusProject.selection.selectedPrdPath,
+        sourceSha256: corpusProject.selection.sourceSha256,
+        sourceBytes: corpusProject.selection.sourceBytes,
+      },
+      sourceTextExcluded: true,
+    },
     discovery: {
       project: projectName,
       selectedPrdPath: discoveredProject.selection.selectedPrdPath,
@@ -1143,6 +1721,19 @@ async function writeFakeCodex(fakeBin) {
       "const fs = require('node:fs');",
       "const { spawnSync } = require('node:child_process');",
       "const args = process.argv.slice(2);",
+      "const cutpointActivation = "
+        + JSON.stringify(path.join(fakeBin, "provider-cutpoint.activate"))
+        + ";",
+      "const cutpointMarker = "
+        + JSON.stringify(path.join(fakeBin, "provider-cutpoint.marker.json"))
+        + ";",
+      "const cutpointInvocationLog = "
+        + JSON.stringify(path.join(fakeBin, "provider-cutpoint.invocations.jsonl"))
+        + ";",
+      "const cutpointActive = Boolean(cutpointActivation && fs.existsSync(cutpointActivation));",
+      "if (cutpointActive && cutpointInvocationLog) {",
+      "  fs.appendFileSync(cutpointInvocationLog, JSON.stringify({ pid: process.pid, cwd: process.cwd(), executable: process.argv[1] }) + '\\n');",
+      "}",
       "let notifyProgram;",
       "for (let index = 0; index < args.length - 1; index += 1) {",
       "  if (args[index] !== '-c' || !args[index + 1].startsWith('notify=')) continue;",
@@ -1165,20 +1756,61 @@ async function writeFakeCodex(fakeBin) {
       "  injectedPrompt += chunk;",
       "  if (!injectedPrompt.includes('\\u001b[201~\\r')) return;",
       "  handled = true;",
-      "  const requiredPromptFacts = [",
-      "    'Change src/value.txt from bad to good in an isolated worktree.',",
-      "    'The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.',",
-      "    'Allowed write roots:\\n- src/value.txt',",
-      "    'Modify any path outside src/value.txt.',",
-      "    'requires human decision approve_merge',",
+      // The sealed prompt is per task, so the required facts are per task too.
+      // The branch key is the task's own allowed-write-root block rather than
+      // its id, because one semantic task id is a prefix of the other.
+      "  const sharedPromptFacts = [",
+      "    'Modify any path outside the two admitted task write roots.',",
       "    'Do not run git add, git commit, or mutate Git refs',",
       "  ];",
+      "  const taskProfiles = [",
+      "    {",
+      "      marker: 'Allowed write roots:\\n- src/second.txt',",
+      "      editPath: 'src/second.txt',",
+      "      editContent: 'second-good\\n',",
+      "      facts: [",
+      "        'Semantic task: TASK-VERTICAL-SECOND\\nAccountable producer:',",
+      "        'Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task\\u0027s commit.',",
+      "        'The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.',",
+      "        'ACTION-VERTICAL-SECOND-LIVE: live_execution on provider://openai/TASK-VERTICAL-SECOND; requires human decision approve_live_execution.',",
+      "        'requires human decision approve_merge',",
+      "      ],",
+      "    },",
+      "    {",
+      "      marker: 'Allowed write roots:\\n- src/value.txt',",
+      "      editPath: 'src/value.txt',",
+      "      editContent: 'good\\n',",
+      "      facts: [",
+      "        'Semantic task: TASK-VERTICAL\\nAccountable producer:',",
+      "        'Change src/value.txt from bad to good in an isolated worktree.',",
+      "        'The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.',",
+      "        'ACTION-VERTICAL-LIVE: live_execution on provider://openai/TASK-VERTICAL; requires human decision approve_live_execution.',",
+      "      ],",
+      "    },",
+      "  ];",
+      "  const profile = taskProfiles.find((candidate) => injectedPrompt.includes(candidate.marker));",
+      "  if (!profile) {",
+      "    process.stderr.write('FAKE_CODEX_SEALED_PROMPT_TASK_UNRECOGNIZED\\n');",
+      "    process.exit(12);",
+      "  }",
+      "  const requiredPromptFacts = [...sharedPromptFacts, ...profile.facts];",
       "  const missingPromptFacts = requiredPromptFacts.filter((fact) => !injectedPrompt.includes(fact));",
       "  if (missingPromptFacts.length > 0) {",
       "    process.stderr.write(`FAKE_CODEX_SEALED_PROMPT_MISSING:${JSON.stringify(missingPromptFacts)}\\n`);",
       "    process.exit(10);",
       "  }",
-      "  fs.writeFileSync('src/value.txt', 'good\\n');",
+      "  if (cutpointActive && cutpointMarker) {",
+      "    try {",
+      "      fs.writeFileSync(cutpointMarker, JSON.stringify({ pid: process.pid, cwd: process.cwd(), executable: process.argv[1] }), { flag: 'wx' });",
+      "    } catch (error) {",
+      "      process.stderr.write('FAKE_CODEX_CUTPOINT_MARKER_REFUSED:' + String(error) + '\\n');",
+      "      process.exit(11);",
+      "    }",
+      "    process.stdout.write('CAMPAIGN_PROVIDER_CUTPOINT_READY\\n');",
+      "    setInterval(() => {}, 1000);",
+      "    return;",
+      "  }",
+      "  fs.writeFileSync(profile.editPath, profile.editContent);",
       "  const payload = JSON.stringify({",
       "    type: 'agent-turn-complete',",
       "    'thread-id': `acceptance-${process.pid}`,",
@@ -1280,6 +1912,213 @@ async function stopServe(server) {
   }
 }
 
+async function crashServe(server) {
+  assert(
+    server && server.child.exitCode === null,
+    "CCC_PRODUCT_CRASH_TARGET_INVALID",
+    JSON.stringify({ pid: server?.child?.pid, exitCode: server?.child?.exitCode }),
+  );
+  server.child.kill("SIGKILL");
+  const result = await server.exited;
+  assert(
+    result.signal === "SIGKILL",
+    "CCC_PRODUCT_CRASH_SIGNAL_DRIFT",
+    JSON.stringify(result),
+  );
+  return result;
+}
+
+async function readJsonLines(filePath) {
+  if (!await pathExists(filePath)) return [];
+  return (await readFile(filePath, "utf8"))
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function terminateOwnedCutpointProcess(marker, fakeCodexPath) {
+  assert(
+    Number.isSafeInteger(marker?.pid) && marker.pid > 1,
+    "CCC_PRODUCT_CUTPOINT_PID_INVALID",
+    JSON.stringify(marker),
+  );
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(marker.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  assert(
+    inspected.code === 0
+      && marker.executable === fakeCodexPath
+      && inspected.stdout.includes(fakeCodexPath),
+    "CCC_PRODUCT_CUTPOINT_PROCESS_OWNERSHIP_REFUSED",
+    JSON.stringify({ marker, command: inspected.stdout.trim() }),
+  );
+  process.kill(marker.pid, "SIGKILL");
+  await poll(
+    "owned cutpoint process termination",
+    async () => {
+      const result = await run(
+        "/bin/ps",
+        ["-p", String(marker.pid), "-o", "command="],
+        { allowedExitCodes: [0, 1] },
+      );
+      return result.code === 1;
+    },
+    (exited) => exited === true,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return inspected.stdout.trim();
+}
+
+async function cleanupOwnedCutpointProcess(marker, fakeCodexPath) {
+  if (!marker || !fakeCodexPath || !Number.isSafeInteger(marker.pid)) return;
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(marker.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  if (
+    inspected.code === 0
+    && marker.executable === fakeCodexPath
+    && inspected.stdout.includes(fakeCodexPath)
+  ) {
+    process.kill(marker.pid, "SIGKILL");
+  }
+}
+
+async function readOwnedProofCutpointMarkers(token) {
+  if (!token) return [];
+  const canonicalTmp = await realpath(tmpdir());
+  const scratchEntries = await readdir(canonicalTmp, { withFileTypes: true });
+  const markers = [];
+  for (const scratchEntry of scratchEntries) {
+    if (
+      !scratchEntry.isDirectory()
+      || !scratchEntry.name.startsWith("fusion-verifier-sandbox-")
+    ) {
+      continue;
+    }
+    const scratchRoot = path.join(canonicalTmp, scratchEntry.name);
+    let homeEntries;
+    try {
+      homeEntries = await readdir(scratchRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const homeEntry of homeEntries) {
+      if (
+        !homeEntry.isDirectory()
+        || (
+          homeEntry.name !== "home"
+          && !homeEntry.name.startsWith("home-")
+        )
+      ) {
+        continue;
+      }
+      const home = path.join(scratchRoot, homeEntry.name);
+      const markerPath = path.join(home, proofCutpointMarkerName);
+      if (!await pathExists(markerPath)) continue;
+      const marker = JSON.parse(await readFile(markerPath, "utf8"));
+      if (marker?.token !== token) continue;
+      markers.push(Object.freeze({
+        ...marker,
+        scratchRoot,
+        home,
+        markerPath,
+      }));
+    }
+  }
+  return markers.sort((left, right) => left.pid - right.pid);
+}
+
+async function terminateOwnedProofCutpointProcess(
+  marker,
+  token,
+  expectedWorktree,
+) {
+  const expectedTitle = `cccp-${token.slice(0, 8)}`;
+  assert(
+    marker?.token === token
+      && marker.processTitle === expectedTitle
+      && Number.isSafeInteger(marker.pid)
+      && marker.pid > 1
+      && typeof marker.cwd === "string"
+      && await realpath(marker.cwd) === expectedWorktree,
+    "CCC_PRODUCT_PROOF_CUTPOINT_MARKER_INVALID",
+    JSON.stringify({ marker, expectedWorktree }),
+  );
+  const inspected = await run(
+    "/bin/ps",
+    ["-p", String(marker.pid), "-o", "command="],
+    { allowedExitCodes: [0, 1] },
+  );
+  assert(
+    inspected.code === 0
+      && inspected.stdout.trim().startsWith(expectedTitle),
+    "CCC_PRODUCT_PROOF_CUTPOINT_PROCESS_OWNERSHIP_REFUSED",
+    JSON.stringify({ marker, command: inspected.stdout.trim() }),
+  );
+  process.kill(marker.pid, "SIGKILL");
+  await poll(
+    "owned proof cutpoint process termination",
+    async () => {
+      const result = await run(
+        "/bin/ps",
+        ["-p", String(marker.pid), "-o", "command="],
+        { allowedExitCodes: [0, 1] },
+      );
+      return result.code === 1;
+    },
+    (exited) => exited === true,
+    undefined,
+    shutdownTimeoutMs,
+  );
+  return inspected.stdout.trim();
+}
+
+async function cleanupOwnedProofCutpointMarkers(token) {
+  const markers = await readOwnedProofCutpointMarkers(token);
+  const removableScratchRoots = new Set();
+  for (const marker of markers) {
+    const inspected = await run(
+      "/bin/ps",
+      ["-p", String(marker.pid), "-o", "command="],
+      { allowedExitCodes: [0, 1] },
+    );
+    if (inspected.code === 1) {
+      removableScratchRoots.add(marker.scratchRoot);
+      continue;
+    }
+    const expectedTitle = `cccp-${token.slice(0, 8)}`;
+    if (
+      marker.processTitle === expectedTitle
+      && inspected.stdout.trim().startsWith(expectedTitle)
+    ) {
+      process.kill(marker.pid, "SIGKILL");
+      await poll(
+        "owned proof cutpoint cleanup",
+        async () => {
+          const result = await run(
+            "/bin/ps",
+            ["-p", String(marker.pid), "-o", "command="],
+            { allowedExitCodes: [0, 1] },
+          );
+          return result.code === 1;
+        },
+        (exited) => exited === true,
+        undefined,
+        shutdownTimeoutMs,
+      );
+      removableScratchRoots.add(marker.scratchRoot);
+    }
+  }
+  for (const scratchRoot of removableScratchRoots) {
+    await rm(scratchRoot, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   const ledger = new AcceptanceLedger(expectedChecks);
   const startedAt = new Date();
@@ -1287,6 +2126,11 @@ async function main() {
   let server;
   let restartedServer;
   let authoringServer;
+  let ownedCutpointMarker;
+  let ownedFakeCodexPath;
+  let ownedProofCutpointToken;
+  let landingCommand;
+  let landingCutpoint;
   let repositoryStart;
   try {
     repositoryStart = await repositorySnapshot();
@@ -1305,12 +2149,38 @@ async function main() {
     const fakeBin = path.join(tempRoot, "fake-bin");
     const worktreesRoot = path.join(tempRoot, "worktrees");
     await writeFakeCodex(fakeBin);
+    ownedFakeCodexPath = path.join(fakeBin, "codex");
     const env = cleanEnvironment(isolatedHome, fakeBin);
-    const targetBase = await initializeTarget(targetRoot);
+    const providerCutpointActivation = path.join(
+      fakeBin,
+      "provider-cutpoint.activate",
+    );
+    const providerCutpointMarker = path.join(
+      fakeBin,
+      "provider-cutpoint.marker.json",
+    );
+    const providerCutpointInvocations = path.join(
+      fakeBin,
+      "provider-cutpoint.invocations.jsonl",
+    );
+    const proofCutpointActivation = path.join(
+      fakeBin,
+      "proof-cutpoint.activate",
+    );
+    ownedProofCutpointToken = randomUUID().replaceAll("-", "").slice(0, 16);
+    const targetBase = await initializeTarget(targetRoot, {
+      proofCutpointActivation,
+      proofCutpointToken: ownedProofCutpointToken,
+    });
     const packet = await createPacket(packetRoot, targetRoot, targetBase, env);
+    ledger.pass("current-prd-corpus-manifest", packet.corpus);
     ledger.pass("current-prd-discovered-and-frozen", {
       discovery: packet.discovery,
       freeze: packet.freeze,
+    });
+    ledger.pass("guided-operator-context-frozen", {
+      sourcePath: packet.contextSourcePath,
+      ...packet.operatorContext,
     });
     const idempotencyKey = `ccc-product-${randomUUID()}`;
 
@@ -1330,6 +2200,86 @@ async function main() {
       signature: "POSITIVE_ORACLE_FAIL:bad",
     });
 
+    // Both admitted files stay at their planted values until the campaign is
+    // approved and landed, so every residue check covers the whole owned set
+    // rather than only the first task's file.
+    const plantedSourcesIntact = async () =>
+      await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n"
+      && await readFile(path.join(targetRoot, "src/second.txt"), "utf8")
+        === "pending\n";
+
+    // Two tasks mean positional task indexing is no longer meaningful; every
+    // task assertion below names the task it is about.
+    const taskFor = (status, semanticTaskId) => {
+      const found = (status.tasks ?? []).filter((candidate) =>
+        candidate?.semanticTaskId === semanticTaskId);
+      assert(
+        found.length === 1,
+        "CCC_PRODUCT_SEMANTIC_TASK_LOOKUP_INVALID",
+        JSON.stringify({ semanticTaskId, matched: found.length }),
+      );
+      return found[0];
+    };
+
+    // A chained campaign parks once per task. The guided `nextAction`
+    // projection selects the earliest unconsumed live-execution approval by the
+    // approval's own identity, so a chained task's hold is walked exactly like
+    // the entry task's, and the reason names the held task whenever it differs
+    // from the work item's pinned entry task
+    // (packages/core/src/ccc-prd/product-status.ts:854-882).
+    //
+    // Both surfaces must agree before the canary claims anything: the guided
+    // next action must be `approve-execution` naming the same approval that the
+    // operator-visible confirmation list reports as issued. Requiring the
+    // agreement here means every parked hold proves the guided operator path,
+    // not just the confirmation list.
+    const awaitParkedLiveExecutionApproval = async (
+      label,
+      readKeyStatus,
+      alreadyApprovedRequestIds,
+    ) => {
+      const issuedFor = (value) =>
+        (value.liveExecutionApprovalConfirmations ?? []).find(
+          ({ approvalRequestId, status }) =>
+            status === "issued"
+            && !alreadyApprovedRequestIds.includes(approvalRequestId),
+        );
+      const hold = await poll(
+        label,
+        readKeyStatus,
+        (value) => {
+          const pending = issuedFor(value);
+          return value.status?.workItems?.length === 1
+            && value.status.workItems[0]?.state === "manual-required"
+            && value.status.workItems[0]?.lastError
+              === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
+            && Boolean(pending)
+            && value.status.nextAction?.kind === "approve-execution"
+            && value.status.nextAction.approvalRequestId
+              === pending.approvalRequestId;
+        },
+        async () => ({
+          serve: tail(server.output()),
+          status: await readKeyStatus(),
+        }),
+      );
+      const confirmation = issuedFor(hold);
+      const nextAction = hold.status.nextAction;
+      assert(
+        confirmation
+        && /^[0-9a-f]{64}$/u.test(confirmation.confirmation)
+        && nextAction?.kind === "approve-execution"
+        && nextAction.approvalRequestId === confirmation.approvalRequestId,
+        "CCC_PRODUCT_PARKED_LIVE_EXECUTION_APPROVAL_MISSING",
+        JSON.stringify({
+          label,
+          nextAction,
+          confirmations: hold.liveExecutionApprovalConfirmations,
+        }),
+      );
+      return { hold, confirmation, nextAction };
+    };
+
     const prd = async (args, allowedExitCodes = [0]) => {
       return await run(process.execPath, [cliBin, "prd", ...args], {
         cwd: targetRoot,
@@ -1341,31 +2291,169 @@ async function main() {
       packetRoot,
       packet.manifestPath,
       packet.sidecarPath,
-      packet.policyPath,
+      packet.executionPlanPath,
       targetRoot,
       targetBase,
     ];
 
     const proposalText = await readFile(packet.proposalPath, "utf8");
-    const nativeAuthoring = await startNativeAuthoringServer(proposalText);
-    authoringServer = nativeAuthoring.server;
     const loopbackAuthoringApiKey = "ccc-local-loopback-non-secret";
     const globalSettingsDir = path.join(isolatedHome, ".fusion");
     const globalSettingsPath = path.join(globalSettingsDir, "settings.json");
     await mkdir(globalSettingsDir, { recursive: true });
-    await writeFile(globalSettingsPath, `${JSON.stringify({
-      customProviders: [{
-        id: "550e8400-e29b-41d4-a716-446655440004",
-        name: "CCC Product Authoring",
-        apiType: "openai-compatible",
-        baseUrl: nativeAuthoring.baseUrl,
-        apiKey: loopbackAuthoringApiKey,
-        models: [{
-          id: "vertical-authoring-model",
-          name: "Vertical Authoring Model",
+    const configureNativeAuthoring = async (baseUrl) => {
+      await writeFile(globalSettingsPath, `${JSON.stringify({
+        customProviders: [{
+          id: "550e8400-e29b-41d4-a716-446655440004",
+          name: "CCC Product Authoring",
+          apiType: "openai-compatible",
+          baseUrl,
+          apiKey: loopbackAuthoringApiKey,
+          models: [{
+            id: "vertical-authoring-model",
+            name: "Vertical Authoring Model",
+          }],
         }],
-      }],
-    }, null, 2)}\n`);
+      }, null, 2)}\n`);
+    };
+
+    const understandingProposal = JSON.parse(proposalText);
+    understandingProposal.targetRepository = { path: "", baseCommit: "" };
+    understandingProposal.bounds = {
+      maxRequests: 0,
+      maxDurationMs: 0,
+      maxConcurrency: 0,
+    };
+    understandingProposal.admittedWriteRoots = [];
+    const nativeUnderstanding = await startNativeAuthoringServer(
+      JSON.stringify(understandingProposal),
+    );
+    authoringServer = nativeUnderstanding.server;
+    await configureNativeAuthoring(nativeUnderstanding.baseUrl);
+    const understandingReviewPath = path.join(
+      packetRoot,
+      "understanding-review.json",
+    );
+    const understood = jsonOutput(
+      await prd([
+        "understand",
+        packetRoot,
+        packet.manifestPath,
+        understandingReviewPath,
+        "--provider",
+        "ccc-product-authoring",
+        "--model",
+        "vertical-authoring-model",
+        "--max-duration-ms",
+        "120000",
+        "--max-prompt-bytes",
+        "262144",
+        "--max-response-bytes",
+        "262144",
+        "--max-review-items",
+        "4",
+      ]),
+      "prd native local understand",
+    );
+    const understandingRequests = nativeUnderstanding.requests.filter(
+      ({ method }) => method === "POST",
+    );
+    const storedUnderstanding = JSON.parse(
+      await readFile(understandingReviewPath, "utf8"),
+    );
+    const understandingValidation = jsonOutput(
+      await prd([
+        "validate",
+        packetRoot,
+        packet.manifestPath,
+        understandingReviewPath,
+        targetRoot,
+        targetBase,
+      ], [1]),
+      "prd validate understanding review",
+    );
+    const missingImplementationFacts =
+      understood.implementationContext?.missingFacts?.map(({ code }) => code)
+        ?? [];
+    assert(
+      understood.schema === "ccc-prd.understanding-review.v1"
+        && understood.kind === "understanding-review"
+        && understood.executable === false
+        && understood.reviewPath === understandingReviewPath
+        && understood.implementationContext?.approvalStatus === "unapproved"
+        && understood.implementationContext?.targetRepository?.path === null
+        && understood.implementationContext?.targetRepository?.baseCommit === null
+        && missingImplementationFacts.includes(
+          "CCC_PRD_TARGET_REPOSITORY_REQUIRED",
+        )
+        && missingImplementationFacts.includes("CCC_PRD_BASELINE_REQUIRED")
+        && missingImplementationFacts.includes(
+          "CCC_PRD_EXECUTION_BOUNDS_REQUIRED",
+        )
+        && missingImplementationFacts.includes(
+          "CCC_PRD_ALLOWED_PATHS_REQUIRED",
+        )
+        && storedUnderstanding.schema === understood.schema
+        && storedUnderstanding.executable === false,
+      "CCC_PRODUCT_NATIVE_UNDERSTANDING_REVIEW_INVALID",
+      JSON.stringify(understood),
+    );
+    assert(
+      understandingRequests.length === 1
+        && understandingRequests[0].url === "/v1/chat/completions"
+        && understandingRequests[0].body?.model
+          === "vertical-authoring-model"
+        && understandingRequests[0].body?.stream === true
+        && understandingRequests[0].headers?.authorization
+          === `Bearer ${loopbackAuthoringApiKey}`
+        && JSON.stringify(
+          understandingRequests[0].body?.messages,
+        ).includes("review-only")
+        && JSON.stringify(
+          understandingRequests[0].body?.messages,
+        ).includes("CCC Fusion Product Vertical Slice"),
+      "CCC_PRODUCT_NATIVE_UNDERSTANDING_REQUEST_INVALID",
+      JSON.stringify(understandingRequests),
+    );
+    assert(
+      understandingValidation.kind === "diagnostics"
+        && understandingValidation.valid === false
+        && understandingValidation.diagnostics?.some(
+          ({ code }) => code === "CCC_PRD_UNKNOWN_SIDECAR_SCHEMA",
+        ),
+      "CCC_PRODUCT_UNDERSTANDING_REVIEW_BECAME_EXECUTABLE",
+      JSON.stringify(understandingValidation),
+    );
+    ledger.pass("native-local-understanding-review", {
+      mode: "native-local-loopback-review-only",
+      normalCli: true,
+      executable: false,
+      approvalStatus: understood.implementationContext.approvalStatus,
+      externalProviderCalled: false,
+      secretConfigured: false,
+      credentialMode: "fixed-disposable-non-secret-sentinel",
+      requestCount: understandingRequests.length,
+      requestSha256: sha256(
+        JSON.stringify(understandingRequests[0].body),
+      ),
+      promptContractObserved: true,
+      missingImplementationFacts,
+      coverage: {
+        inventoryCount: understood.coverage?.inventoryCount,
+        dispositionCount: understood.coverage?.dispositionCount,
+        missingCount: understood.coverage?.missing?.length,
+        conflictCount: understood.coverage?.conflicts?.length,
+      },
+      storedReviewSha256: sha256(await readFile(understandingReviewPath)),
+      executableValidationRefusal:
+        "CCC_PRD_UNKNOWN_SIDECAR_SCHEMA",
+    });
+    await stopNativeAuthoringServer(authoringServer);
+    authoringServer = undefined;
+
+    const nativeAuthoring = await startNativeAuthoringServer(proposalText);
+    authoringServer = nativeAuthoring.server;
+    await configureNativeAuthoring(nativeAuthoring.baseUrl);
     const authored = jsonOutput(
       await prd([
         "author",
@@ -1381,7 +2469,7 @@ async function main() {
         "--model",
         "vertical-authoring-model",
         "--max-requests",
-        "1",
+        "2",
         "--max-duration-ms",
         "120000",
         "--max-concurrency",
@@ -1415,6 +2503,9 @@ async function main() {
         )
         && JSON.stringify(generationRequests[0].body?.messages).includes(
           "CCC Fusion Product Vertical Slice",
+        )
+        && JSON.stringify(generationRequests[0].body?.messages).includes(
+          "Fusion Reviewed Operator Context",
         ),
       "CCC_PRODUCT_NATIVE_AUTHORING_REQUEST_INVALID",
       JSON.stringify(generationRequests),
@@ -1430,12 +2521,45 @@ async function main() {
       "CCC_PRODUCT_NATIVE_AUTHORING_PROVENANCE_INVALID",
       JSON.stringify(authoredSidecar.provenance),
     );
+    // Both tasks must carry their own source-bound custody: the compiler
+    // refuses a multi-task chain whose tasks do not each declare ownedPaths
+    // and allowedWriteRoots, and authoring refuses a task whose declared paths
+    // are absent from that task's own quoted evidence.
+    const taskSpanPathsBySemanticTaskId = Object.fromEntries(
+      (authoredSidecar.tasks ?? []).map((authoredTask) => [
+        authoredTask.id,
+        [...new Set(authoredTask.spans?.map(({ path }) => path) ?? [])].sort(),
+      ]),
+    );
+    exactArray(
+      Object.keys(taskSpanPathsBySemanticTaskId).sort(),
+      ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
+      "CCC_PRODUCT_TASK_CUSTODY_TASK_SET_DRIFT",
+    );
+    for (const [semanticTaskId, spanPaths] of Object.entries(
+      taskSpanPathsBySemanticTaskId,
+    )) {
+      assert(
+        spanPaths.includes(packet.sourcePath)
+          && spanPaths.includes(packet.contextSourcePath),
+        "CCC_PRODUCT_TASK_CUSTODY_SOURCE_BINDING_MISSING",
+        JSON.stringify({ semanticTaskId, spanPaths }),
+      );
+    }
+    const taskSpanPaths = taskSpanPathsBySemanticTaskId["TASK-VERTICAL"];
     const implementationFactProvenance =
       await assertExactImplementationFactProvenance(
         authoredSidecar,
         packetRoot,
         packet.sourcePath,
-        { targetRoot, targetBase },
+        {
+          targetRoot,
+          targetBase,
+          fusionStateWriteRoot: path.join(targetRoot, ".fusion"),
+          admittedWriteRoot: path.join(targetRoot, "src/value.txt"),
+          admittedSecondWriteRoot: path.join(targetRoot, "src/second.txt"),
+          contextSourcePath: packet.contextSourcePath,
+        },
       );
     const nativeAuthoringEvidence = {
       mode: "native-local-loopback",
@@ -1449,6 +2573,7 @@ async function main() {
       requestCount: generationRequests.length,
       requestSha256: sha256(JSON.stringify(generationRequests[0].body)),
       promptContractObserved: true,
+      taskSpanPaths,
       provenance: authoredSidecar.provenance,
       implementationFactProvenance,
     };
@@ -1484,12 +2609,12 @@ async function main() {
     );
     exactArray(
       compiled.requirements?.map(({ id }) => id),
-      ["REQ-VERTICAL"],
+      ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       "CCC_PRODUCT_REQUIREMENT_SET_DRIFT",
     );
     exactArray(
       compiled.tasks?.map(({ id }) => id),
-      ["TASK-VERTICAL"],
+      ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
       "CCC_PRODUCT_TASK_SET_DRIFT",
     );
     exactArray(
@@ -1501,9 +2626,142 @@ async function main() {
       packetHash: compiled.sourceHash,
       sidecarHash: compiled.sidecarHash,
       bundleHash: compiled.bundleHash,
-      requirementIds: ["REQ-VERTICAL"],
-      taskIds: ["TASK-VERTICAL"],
+      requirementIds: ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
+      taskIds: ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
       proofIds: ["PROOF-VERTICAL"],
+    });
+
+    // One route profile per task, selected through the product's own
+    // routes-by-task file rather than a single flag set broadcast to every
+    // task. Both profiles are CLI/codex and differ by model; the pi transport
+    // is deliberately not exercised here.
+    const routesFilePath = path.join(packetRoot, "routes.json");
+    const routeProfiles = {
+      "TASK-VERTICAL": {
+        providerId: "openai",
+        modelId: "gpt-5.6-sol",
+        transport: "cli",
+        cliAdapterId: "codex",
+      },
+      "TASK-VERTICAL-SECOND": {
+        providerId: "openai",
+        modelId: "gpt-5.6-terra",
+        transport: "cli",
+        cliAdapterId: "codex",
+      },
+    };
+    await writeFile(
+      routesFilePath,
+      `${JSON.stringify({
+        schema: "ccc-prd.routes-by-task.v1",
+        routes: routeProfiles,
+      }, null, 2)}\n`,
+    );
+    const generatedExecutionPlan = jsonOutput(
+      await prd([
+        "policy",
+        packetRoot,
+        packet.manifestPath,
+        packet.sidecarPath,
+        targetRoot,
+        targetBase,
+        packet.executionPlanPath,
+        "--routes-file",
+        routesFilePath,
+      ]),
+      "prd policy",
+    );
+    const executionPlanBytes = await readFile(packet.executionPlanPath);
+    const executionPlan = JSON.parse(executionPlanBytes.toString("utf8"));
+    const planRoutesByTaskId = new Map(
+      (executionPlan.policy?.routes ?? []).map((route) => [route.taskId, route]),
+    );
+    const executionRoute = planRoutesByTaskId.get("TASK-VERTICAL");
+    const secondExecutionRoute = planRoutesByTaskId.get("TASK-VERTICAL-SECOND");
+    assert(
+      generatedExecutionPlan.kind === "execution-plan"
+        && generatedExecutionPlan.path === packet.executionPlanPath
+        && generatedExecutionPlan.sha256 === sha256(executionPlanBytes)
+        && generatedExecutionPlan.routeCount === 2
+        && executionPlan.schema === "ccc-prd.execution-plan.v1"
+        && executionPlan.packetHash === compiled.sourceHash
+        && executionPlan.sidecarHash === compiled.sidecarHash
+        && executionPlan.bundleHash === compiled.bundleHash
+        && executionRoute?.taskId === "TASK-VERTICAL"
+        && executionRoute.providerId === "openai"
+        && executionRoute.modelId === "gpt-5.6-sol"
+        && executionRoute.transport === "cli"
+        && executionRoute.cliAdapterId === "codex"
+        && executionRoute.executor === "cli-agent"
+        && executionRoute.toolMode === "coding"
+        && executionRoute.worktreeMode === "isolated"
+        && executionRoute.commitPolicy === "required",
+      "CCC_PRODUCT_EXECUTION_PLAN_INVALID",
+      JSON.stringify(executionPlan),
+    );
+    exactArray(
+      executionRoute.ownedPaths,
+      ["src/value.txt"],
+      "CCC_PRODUCT_EXECUTION_PLAN_OWNERSHIP_DRIFT",
+    );
+    exactArray(
+      executionRoute.allowedWriteRoots,
+      ["src/value.txt"],
+      "CCC_PRODUCT_EXECUTION_PLAN_WRITE_ROOT_DRIFT",
+    );
+    ledger.pass("product-owned-execution-plan", {
+      path: generatedExecutionPlan.path,
+      sha256: generatedExecutionPlan.sha256,
+      packetHash: executionPlan.packetHash,
+      sidecarHash: executionPlan.sidecarHash,
+      bundleHash: executionPlan.bundleHash,
+      route: executionRoute,
+    });
+
+    assert(
+      secondExecutionRoute?.taskId === "TASK-VERTICAL-SECOND"
+        && secondExecutionRoute.providerId === "openai"
+        && secondExecutionRoute.modelId === "gpt-5.6-terra"
+        && secondExecutionRoute.transport === "cli"
+        && secondExecutionRoute.cliAdapterId === "codex"
+        && secondExecutionRoute.executor === "cli-agent"
+        && secondExecutionRoute.toolMode === "coding"
+        && secondExecutionRoute.worktreeMode === "isolated"
+        && secondExecutionRoute.commitPolicy === "required"
+        && executionRoute.modelId !== secondExecutionRoute.modelId,
+      "CCC_PRODUCT_SECOND_EXECUTION_ROUTE_INVALID",
+      JSON.stringify({ executionRoute, secondExecutionRoute }),
+    );
+    exactArray(
+      secondExecutionRoute.ownedPaths,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_EXECUTION_PLAN_OWNERSHIP_DRIFT",
+    );
+    exactArray(
+      secondExecutionRoute.allowedWriteRoots,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_EXECUTION_PLAN_WRITE_ROOT_DRIFT",
+    );
+    const routeOwnershipOverlap = executionRoute.ownedPaths.filter((ownedPath) =>
+      secondExecutionRoute.ownedPaths.includes(ownedPath));
+    assert(
+      routeOwnershipOverlap.length === 0,
+      "CCC_PRODUCT_ROUTE_OWNERSHIP_NOT_DISJOINT",
+      JSON.stringify(routeOwnershipOverlap),
+    );
+    ledger.pass("per-task-route-profiles", {
+      routeSelection: "routes-file",
+      routesFileSchema: "ccc-prd.routes-by-task.v1",
+      routesFileSha256: sha256(await readFile(routesFilePath)),
+      routeCount: generatedExecutionPlan.routeCount,
+      routes: {
+        "TASK-VERTICAL": executionRoute,
+        "TASK-VERTICAL-SECOND": secondExecutionRoute,
+      },
+      distinctModelIds: [executionRoute.modelId, secondExecutionRoute.modelId],
+      ownershipDisjoint: true,
+      transportCoverage:
+        "two CLI route profiles differing by model; the pi transport is deliberately deferred and is not exercised by this canary.",
     });
 
     const globalSettingsBeforeForgedPreview =
@@ -1519,7 +2777,7 @@ async function main() {
         packetRoot,
         packet.manifestPath,
         forgedSidecarPath,
-        packet.policyPath,
+        packet.executionPlanPath,
         targetRoot,
         targetBase,
       ], [1]),
@@ -1553,9 +2811,9 @@ async function main() {
       await git(targetRoot, "status", "--porcelain"),
     );
     assert(
-      await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n",
+      await plantedSourcesIntact(),
       "CCC_PRODUCT_FORGED_PREVIEW_MUTATED_SOURCE",
-      "src/value.txt changed",
+      "an admitted source file changed",
     );
     ledger.pass("forged-provenance-refused-without-residue", {
       diagnostics: forgedPreview.diagnostics,
@@ -1570,8 +2828,12 @@ async function main() {
         experimentalFeatures: { cliAgentExecutor: true },
       },
       project: {
+        // Two worktrees are admitted so the chained second task can hold its
+        // own isolated checkout, while maxConcurrent stays at 1 so the two
+        // tasks can only ever run one at a time. The pairing is the serialism
+        // proof: capacity for two custody roots, permission for one runner.
         maxConcurrent: 1,
-        maxWorktrees: 1,
+        maxWorktrees: 2,
         pollIntervalMs: 500,
         worktreesDir: worktreesRoot,
       },
@@ -1606,7 +2868,7 @@ async function main() {
     );
     exactArray(
       preview.requirements?.map(({ id }) => id),
-      ["REQ-VERTICAL"],
+      ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       "CCC_PRODUCT_PREVIEW_REQUIREMENTS_DRIFT",
     );
     ledger.pass("exact-preview-confirmed", {
@@ -1646,7 +2908,7 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "HEAD") === targetBase
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n",
+      && await plantedSourcesIntact(),
       "CCC_PRODUCT_WRONG_CONFIRMATION_LEFT_SOURCE_RESIDUE",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -1785,8 +3047,7 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "HEAD") === targetBase
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8")
-        === "bad\n",
+      && await plantedSourcesIntact(),
       "CCC_PRODUCT_LIFECYCLE_CONTROL_CHANGED_SOURCE",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -1799,6 +3060,555 @@ async function main() {
       nextAction: stopped.status.nextAction,
       targetHead: targetBase,
     });
+
+    const providerCutpointKey = `${idempotencyKey}-provider-cutpoint`;
+    await writeFile(providerCutpointActivation, "armed\n");
+    const providerCutpointImport = jsonOutput(
+      await prd([
+        "import",
+        ...commonPacketArgs,
+        providerCutpointKey,
+        "--confirm",
+        preview.confirmationDigest,
+      ]),
+      "prd provider-cutpoint import",
+    );
+    assert(
+      providerCutpointImport.kind === "imported"
+      && providerCutpointImport.result?.state === "active"
+      && providerCutpointImport.result?.runnable === true,
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_IMPORT_NOT_RUNNABLE",
+      JSON.stringify(providerCutpointImport),
+    );
+    const readProviderCutpointStatus = async () =>
+      readStatusFor(providerCutpointKey);
+    server = await startServe(targetRoot, env, port);
+    const providerApprovalHold = await poll(
+      "provider cutpoint execution approval",
+      readProviderCutpointStatus,
+      (value) => value.status?.nextAction?.kind === "approve-execution",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProviderCutpointStatus(),
+      }),
+    );
+    const providerLiveConfirmation =
+      providerApprovalHold.liveExecutionApprovalConfirmations?.find(
+        ({ approvalRequestId, status }) =>
+          approvalRequestId
+            === providerApprovalHold.status.nextAction.approvalRequestId
+          && status === "issued",
+      );
+    assert(
+      providerLiveConfirmation
+      && /^[0-9a-f]{64}$/u.test(providerLiveConfirmation.confirmation),
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_APPROVAL_MISSING",
+      JSON.stringify(providerApprovalHold.liveExecutionApprovalConfirmations),
+    );
+    const providerExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        providerCutpointKey,
+        providerLiveConfirmation.approvalRequestId,
+        "--confirm",
+        providerLiveConfirmation.confirmation,
+      ]),
+      "approve provider-cutpoint execution",
+    );
+    assert(
+      providerExecutionApproved.kind === "execution-approved"
+      && providerExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_APPROVAL_FAILED",
+      JSON.stringify(providerExecutionApproved),
+    );
+    const providerMarker = await poll(
+      "provider process reached post-dispatch cutpoint",
+      async () => {
+        if (!await pathExists(providerCutpointMarker)) return null;
+        return JSON.parse(await readFile(providerCutpointMarker, "utf8"));
+      },
+      (value) =>
+        Number.isSafeInteger(value?.pid)
+        && value.pid > 1
+        && typeof value.cwd === "string"
+        && typeof value.executable === "string",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProviderCutpointStatus(),
+      }),
+    );
+    ownedCutpointMarker = providerMarker;
+    const canonicalProviderWorktree = await realpath(providerMarker.cwd);
+    const providerWorktreeRelative = path.relative(
+      await realpath(worktreesRoot),
+      canonicalProviderWorktree,
+    );
+    assert(
+      providerWorktreeRelative.length > 0
+      && providerWorktreeRelative !== ".."
+      && !providerWorktreeRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(providerWorktreeRelative),
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_WORKTREE_INVALID",
+      JSON.stringify({ marker: providerMarker, worktreesRoot }),
+    );
+    const crashedProviderServer = server;
+    await crashServe(crashedProviderServer);
+    server = undefined;
+    const providerProcessCommand = await terminateOwnedCutpointProcess(
+      providerMarker,
+      ownedFakeCodexPath,
+    );
+    ownedCutpointMarker = undefined;
+    const providerInvocationsBeforeRestart = await readJsonLines(
+      providerCutpointInvocations,
+    );
+    exactArray(
+      providerInvocationsBeforeRestart.map(({ pid }) => pid),
+      [providerMarker.pid],
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATION_DRIFT",
+    );
+    server = await startServe(targetRoot, env, port);
+    const recoveredProviderCutpoint = await poll(
+      "provider uncertainty parked after restart",
+      readProviderCutpointStatus,
+      (value) =>
+        value.status?.nextAction?.kind === "resolve-manual-required"
+        && value.status?.workItems?.length === 1
+        && value.status.workItems[0]?.state === "manual-required",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProviderCutpointStatus(),
+      }),
+      180_000,
+    );
+    assert(
+      recoveredProviderCutpoint.status.providerAttempts.length === 1
+      && recoveredProviderCutpoint.status.providerAttempts[0]?.state
+        === "dispatched_unknown"
+      && recoveredProviderCutpoint.status.proofs.every(
+        ({ attempts }) => attempts.length === 0,
+      ),
+      "CCC_PRODUCT_PROVIDER_UNCERTAINTY_NOT_PRESERVED",
+      JSON.stringify(recoveredProviderCutpoint.status),
+    );
+    const recoveredProviderTask = taskFor(
+      recoveredProviderCutpoint.status,
+      "TASK-VERTICAL",
+    );
+    assert(
+      typeof recoveredProviderTask?.worktree === "string"
+      && recoveredProviderTask.worktree.length > 0
+      && await pathExists(recoveredProviderTask.worktree),
+      "CCC_PRODUCT_PROVIDER_RECOVERY_LOST_WORKTREE",
+      JSON.stringify(recoveredProviderTask),
+    );
+    assert(
+      await realpath(recoveredProviderTask.worktree)
+        === canonicalProviderWorktree,
+      "CCC_PRODUCT_PROVIDER_RECOVERY_WORKTREE_DRIFT",
+      JSON.stringify({
+        beforeCrash: canonicalProviderWorktree,
+        afterRestart: recoveredProviderTask.worktree,
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    exactArray(
+      (await readJsonLines(providerCutpointInvocations)).map(({ pid }) => pid),
+      [providerMarker.pid],
+      "CCC_PRODUCT_PROVIDER_EFFECT_RETRIED",
+    );
+    assert(
+      await git(targetRoot, "rev-parse", "HEAD") === targetBase
+      && await plantedSourcesIntact(),
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_CHANGED_SOURCE",
+      await git(targetRoot, "status", "--porcelain"),
+    );
+    const providerStopControl =
+      recoveredProviderCutpoint.operatorControls?.find(
+        ({ action }) => action === "stop",
+      );
+    assert(
+      providerStopControl?.allowed === true
+      && /^[0-9a-f]{64}$/u.test(providerStopControl.confirmation),
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_STOP_MISSING",
+      JSON.stringify(recoveredProviderCutpoint.operatorControls),
+    );
+    const providerStopped = jsonOutput(
+      await prd([
+        "stop",
+        providerCutpointKey,
+        "--reason",
+        "Acceptance canary abandons one uncertain provider effect after explicit review.",
+        "--confirm",
+        providerStopControl.confirmation,
+      ]),
+      "stop provider-cutpoint campaign",
+    );
+    assert(
+      providerStopped.kind === "campaign-stopped"
+      && providerStopped.status?.nextAction?.kind === "abandoned"
+      && providerStopped.status?.providerAttempts?.length === 1
+      && providerStopped.status.providerAttempts[0]?.state
+        === "dispatched_unknown",
+      "CCC_PRODUCT_PROVIDER_CUTPOINT_ABANDON_FAILED",
+      JSON.stringify(providerStopped),
+    );
+    ledger.pass("provider-dispatch-restart-manual-required", {
+      importId: providerCutpointImport.result.importId,
+      crashedServePid: crashedProviderServer.child.pid,
+      providerPid: providerMarker.pid,
+      providerProcessCommand,
+      providerAttempt:
+        recoveredProviderCutpoint.status.providerAttempts[0],
+      recoveredWorkItem: recoveredProviderCutpoint.status.workItems[0],
+      recoveredNextAction: recoveredProviderCutpoint.status.nextAction,
+      stoppedNextAction: providerStopped.status.nextAction,
+      invocationCount: providerInvocationsBeforeRestart.length,
+      targetHead: targetBase,
+    });
+    await stopServe(server);
+    server = undefined;
+    await rm(providerCutpointActivation, { force: true });
+
+    const proofCutpointToken = ownedProofCutpointToken;
+    assert(
+      typeof proofCutpointToken === "string"
+        && /^[0-9a-f]{16}$/u.test(proofCutpointToken),
+      "CCC_PRODUCT_PROOF_CUTPOINT_TOKEN_INVALID",
+      String(proofCutpointToken),
+    );
+    const proofCutpointKey = `${idempotencyKey}-proof-cutpoint`;
+    await writeFile(proofCutpointActivation, "armed\n");
+    const proofCutpointImport = jsonOutput(
+      await prd([
+        "import",
+        ...commonPacketArgs,
+        proofCutpointKey,
+        "--confirm",
+        preview.confirmationDigest,
+      ]),
+      "prd proof-cutpoint import",
+    );
+    assert(
+      proofCutpointImport.kind === "imported"
+      && proofCutpointImport.result?.state === "active"
+      && proofCutpointImport.result?.runnable === true,
+      "CCC_PRODUCT_PROOF_CUTPOINT_IMPORT_NOT_RUNNABLE",
+      JSON.stringify(proofCutpointImport),
+    );
+    const readProofCutpointStatus = async () =>
+      readStatusFor(proofCutpointKey);
+    server = await startServe(targetRoot, env, port);
+    const proofApprovalHold = await poll(
+      "proof cutpoint execution approval",
+      readProofCutpointStatus,
+      (value) => value.status?.nextAction?.kind === "approve-execution",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+    );
+    const proofLiveConfirmation =
+      proofApprovalHold.liveExecutionApprovalConfirmations?.find(
+        ({ approvalRequestId, status }) =>
+          approvalRequestId
+            === proofApprovalHold.status.nextAction.approvalRequestId
+          && status === "issued",
+      );
+    assert(
+      proofLiveConfirmation
+      && /^[0-9a-f]{64}$/u.test(proofLiveConfirmation.confirmation),
+      "CCC_PRODUCT_PROOF_CUTPOINT_APPROVAL_MISSING",
+      JSON.stringify(proofApprovalHold.liveExecutionApprovalConfirmations),
+    );
+    const proofExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        proofCutpointKey,
+        proofLiveConfirmation.approvalRequestId,
+        "--confirm",
+        proofLiveConfirmation.confirmation,
+      ]),
+      "approve proof-cutpoint execution",
+    );
+    assert(
+      proofExecutionApproved.kind === "execution-approved"
+      && proofExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_PROOF_CUTPOINT_APPROVAL_FAILED",
+      JSON.stringify(proofExecutionApproved),
+    );
+    // One proof runs after the terminal task, so both tasks must be approved
+    // and executed before the verifier is dispatched at all. The single work
+    // item parks a second time with its own distinct approval request.
+    const proofSecondApproval = await awaitParkedLiveExecutionApproval(
+      "proof cutpoint second-task execution approval",
+      readProofCutpointStatus,
+      [proofLiveConfirmation.approvalRequestId],
+    );
+    const proofSecondLiveConfirmation = proofSecondApproval.confirmation;
+    assert(
+      proofSecondLiveConfirmation.approvalRequestId
+        !== proofLiveConfirmation.approvalRequestId,
+      "CCC_PRODUCT_PROOF_CUTPOINT_SECOND_APPROVAL_MISSING",
+      JSON.stringify(
+        proofSecondApproval.hold.liveExecutionApprovalConfirmations,
+      ),
+    );
+    const proofSecondExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        proofCutpointKey,
+        proofSecondLiveConfirmation.approvalRequestId,
+        "--confirm",
+        proofSecondLiveConfirmation.confirmation,
+      ]),
+      "approve proof-cutpoint second-task execution",
+    );
+    assert(
+      proofSecondExecutionApproved.kind === "execution-approved"
+      && proofSecondExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_PROOF_CUTPOINT_SECOND_APPROVAL_FAILED",
+      JSON.stringify(proofSecondExecutionApproved),
+    );
+    const proofMarkersAtDispatch = await poll(
+      "verifier process reached post-dispatch cutpoint",
+      () => readOwnedProofCutpointMarkers(proofCutpointToken),
+      (markers) => markers.length === 1,
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+        markers: await readOwnedProofCutpointMarkers(proofCutpointToken),
+      }),
+    );
+    const proofMarker = proofMarkersAtDispatch[0];
+    const canonicalProofWorktree = await realpath(proofMarker.cwd);
+    const proofWorktreeRelative = path.relative(
+      await realpath(worktreesRoot),
+      canonicalProofWorktree,
+    );
+    assert(
+      proofWorktreeRelative.length > 0
+      && proofWorktreeRelative !== ".."
+      && !proofWorktreeRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(proofWorktreeRelative),
+      "CCC_PRODUCT_PROOF_CUTPOINT_WORKTREE_INVALID",
+      JSON.stringify({ proofMarker, worktreesRoot }),
+    );
+    const proofDispatchStatus = await poll(
+      "durable proof dispatch receipt",
+      readProofCutpointStatus,
+      (value) =>
+        value.status?.providerAttempts?.length === 2
+        && value.status.providerAttempts.every(
+          ({ state }) => state === "committed",
+        )
+        && value.status?.proofs?.length === 1
+        && value.status.proofs[0]?.attempts?.length === 1
+        && value.status.proofs[0].attempts[0]?.state
+          === "dispatched_unknown",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+    );
+    const proofAttempt =
+      proofDispatchStatus.status.proofs[0].attempts[0];
+    const proofSourceCommit = proofAttempt.sourceCommit;
+    assert(
+      /^[0-9a-f]{40}$/u.test(proofSourceCommit)
+      && proofSourceCommit !== targetBase
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
+        === "good"
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/second.txt`)
+        === "second-good",
+      "CCC_PRODUCT_PROOF_CUTPOINT_SOURCE_COMMIT_INVALID",
+      JSON.stringify({ proofAttempt, targetBase }),
+    );
+    const crashedProofServer = server;
+    await crashServe(crashedProofServer);
+    server = undefined;
+    const proofProcessCommand =
+      await terminateOwnedProofCutpointProcess(
+        proofMarker,
+        proofCutpointToken,
+        canonicalProofWorktree,
+      );
+    server = await startServe(targetRoot, env, port);
+    const recoveredProofCutpoint = await poll(
+      "proof uncertainty parked after restart",
+      readProofCutpointStatus,
+      (value) =>
+        value.status?.nextAction?.kind === "resolve-manual-required"
+        && value.status?.workItems?.length === 1
+        && value.status.workItems[0]?.state === "manual-required",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+      180_000,
+    );
+    const recoveredProofAttempt =
+      recoveredProofCutpoint.status.proofs[0]?.attempts[0];
+    // The proof is dispatched from the terminal task's worktree, so recovery
+    // must preserve that task's custody specifically.
+    const recoveredProofTask = taskFor(
+      recoveredProofCutpoint.status,
+      "TASK-VERTICAL-SECOND",
+    );
+    assert(
+      recoveredProofAttempt?.attemptKey === proofAttempt.attemptKey
+      && recoveredProofAttempt.state === "dispatched_unknown"
+      && recoveredProofCutpoint.status.providerAttempts.length === 2
+      && recoveredProofCutpoint.status.providerAttempts.every(
+        ({ state }) => state === "committed",
+      )
+      && typeof recoveredProofTask?.worktree === "string"
+      && await pathExists(recoveredProofTask.worktree)
+      && await realpath(recoveredProofTask.worktree)
+        === canonicalProofWorktree,
+      "CCC_PRODUCT_PROOF_UNCERTAINTY_NOT_PRESERVED",
+      JSON.stringify(recoveredProofCutpoint.status),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    exactArray(
+      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+        .map(({ pid }) => pid),
+      [proofMarker.pid],
+      "CCC_PRODUCT_PROOF_EFFECT_RETRIED_AFTER_RESTART",
+    );
+    assert(
+      await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
+        === "good"
+      && await git(targetRoot, "show", `${proofSourceCommit}:src/second.txt`)
+        === "second-good",
+      "CCC_PRODUCT_PROOF_CUTPOINT_CHANGED_TARGET",
+      await git(targetRoot, "status", "--porcelain"),
+    );
+    const proofResolutionPath = path.join(
+      tempRoot,
+      "proof-cutpoint-resolution.json",
+    );
+    await writeFile(
+      proofResolutionPath,
+      JSON.stringify({
+        schema: "ccc-campaign.proof-resolution.v1",
+        observerId: "ccc-product-acceptance",
+        summary:
+          "The verifier was intentionally killed after durable dispatch; no terminal verifier result was observed.",
+        result: {
+          success: false,
+          exitCode: null,
+          durationMs: 0,
+          stdout: "",
+          stderr:
+            "Acceptance canary terminated the owned verifier after the durable dispatch receipt.",
+          timedOut: false,
+          killed: true,
+          warnings: [
+            "proof-dispatch-crash-canary:no-terminal-result-observed",
+          ],
+        },
+      }),
+    );
+    const proofResolutionPreview = jsonOutput(
+      await prd([
+        "resolve-proof",
+        proofCutpointKey,
+        proofAttempt.attemptKey,
+        proofResolutionPath,
+      ]),
+      "preview proof-cutpoint resolution",
+    );
+    assert(
+      proofResolutionPreview.kind === "proof-resolution-preview"
+      && proofResolutionPreview.outcome === "proved_failed"
+      && /^[0-9a-f]{64}$/u.test(proofResolutionPreview.confirmation),
+      "CCC_PRODUCT_PROOF_RESOLUTION_PREVIEW_INVALID",
+      JSON.stringify(proofResolutionPreview),
+    );
+    const proofResolved = jsonOutput(
+      await prd([
+        "resolve-proof",
+        proofCutpointKey,
+        proofAttempt.attemptKey,
+        proofResolutionPath,
+        "--confirm",
+        proofResolutionPreview.confirmation,
+      ]),
+      "settle proof-cutpoint resolution",
+    );
+    assert(
+      proofResolved.kind === "proof-resolved"
+      && proofResolved.attempt?.state === "proved_failed",
+      "CCC_PRODUCT_PROOF_RESOLUTION_FAILED",
+      JSON.stringify(proofResolved),
+    );
+    const replayedProofResolution = await poll(
+      "terminal proof receipt replay without verifier rerun",
+      readProofCutpointStatus,
+      (value) =>
+        value.status?.proofs?.[0]?.attempts?.[0]?.state === "proved_failed"
+        && value.status?.workItems?.[0]?.state === "failed"
+        && value.status.workItems[0].leaseOwner === null
+        && value.status.workItems[0].leaseExpiresAt === null,
+      async () => ({
+        serve: tail(server.output()),
+        status: await readProofCutpointStatus(),
+      }),
+    );
+    exactArray(
+      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+        .map(({ pid }) => pid),
+      [proofMarker.pid],
+      "CCC_PRODUCT_PROOF_EFFECT_RERUN_DURING_SETTLEMENT",
+    );
+    assert(
+      replayedProofResolution.status.nextAction?.kind === "blocked"
+      && replayedProofResolution.status.nextAction.reason.includes(
+        "ended as failed",
+      )
+      && replayedProofResolution.operatorControls?.every(
+        ({ allowed }) => allowed === false,
+      )
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await pathExists(canonicalProofWorktree),
+      "CCC_PRODUCT_PROOF_CUTPOINT_TERMINAL_SETTLEMENT_INVALID",
+      JSON.stringify({
+        nextAction: replayedProofResolution.status.nextAction,
+        operatorControls: replayedProofResolution.operatorControls,
+        targetHead: await git(
+          targetRoot,
+          "rev-parse",
+          "refs/heads/main",
+        ),
+        worktree: canonicalProofWorktree,
+      }),
+    );
+    ledger.pass("proof-dispatch-restart-manual-required", {
+      importId: proofCutpointImport.result.importId,
+      crashedServePid: crashedProofServer.child.pid,
+      verifierPid: proofMarker.pid,
+      verifierProcessCommand: proofProcessCommand,
+      proofAttemptBeforeResolution: recoveredProofAttempt,
+      proofAttemptAfterResolution:
+        replayedProofResolution.status.proofs[0].attempts[0],
+      recoveredWorkItem: recoveredProofCutpoint.status.workItems[0],
+      recoveredNextAction: recoveredProofCutpoint.status.nextAction,
+      terminalWorkItem: replayedProofResolution.status.workItems[0],
+      terminalNextAction: replayedProofResolution.status.nextAction,
+      terminalOperatorControls:
+        replayedProofResolution.operatorControls,
+      invocationCount: proofMarkersAtDispatch.length,
+      sourceCommit: proofSourceCommit,
+      targetHead: targetBase,
+    });
+    await stopServe(server);
+    server = undefined;
+    await rm(proofCutpointActivation, { force: true });
+    await cleanupOwnedProofCutpointMarkers(proofCutpointToken);
+    ownedProofCutpointToken = undefined;
 
     const imported = jsonOutput(
       await prd([
@@ -1849,7 +3659,11 @@ async function main() {
       (value) => value.status?.nextAction?.kind === "approve-execution",
       async () => ({ serve: tail(server.output()), status: await readStatus() }),
     );
-    const restartedTask = postImportRestart.status.tasks[0];
+    const restartedTask = taskFor(postImportRestart.status, "TASK-VERTICAL");
+    const restartedSecondTask = taskFor(
+      postImportRestart.status,
+      "TASK-VERTICAL-SECOND",
+    );
     const restartedWorkItem = postImportRestart.status.workItems[0];
     assert(
       postRestartInspection.kind === "inspection"
@@ -1860,14 +3674,17 @@ async function main() {
         === imported.result.transactionWitness?.transactionId
       && postRestartInspection.inspection.state === "active"
       && postRestartInspection.inspection.runnable === true
-      && postRestartInspection.inspection.directCounts?.tasks === 1
+      && postRestartInspection.inspection.directCounts?.tasks === 2
       && postRestartInspection.inspection.directCounts?.workItems === 1
       && postImportRestart.status.import.importId === imported.result.importId
       && postImportRestart.status.import.identityHash === imported.result.identityHash
-      && postImportRestart.status.tasks.length === 1
+      && postImportRestart.status.tasks.length === 2
       && restartedTask?.semanticTaskId === "TASK-VERTICAL"
       && /^[A-Z][A-Z0-9]*-\d+$/u.test(restartedTask.nativeTaskId)
       && restartedTask.nativeTaskId !== restartedTask.semanticTaskId
+      && /^[A-Z][A-Z0-9]*-\d+$/u.test(restartedSecondTask.nativeTaskId)
+      && restartedSecondTask.nativeTaskId !== restartedSecondTask.semanticTaskId
+      && restartedSecondTask.nativeTaskId !== restartedTask.nativeTaskId
       && postImportRestart.status.workItems.length === 1
       && restartedWorkItem?.taskId === restartedTask.nativeTaskId
       && restartedWorkItem.runId === `ccc-prd:${imported.result.importId}`
@@ -1887,10 +3704,16 @@ async function main() {
       identityHash: imported.result.identityHash,
       transactionId: postRestartInspection.inspection.transactionWitness.transactionId,
       importIdentityPersisted: true,
-      nativeTaskMapping: {
-        semanticTaskId: restartedTask.semanticTaskId,
-        nativeTaskId: restartedTask.nativeTaskId,
-      },
+      nativeTaskMapping: [
+        {
+          semanticTaskId: restartedTask.semanticTaskId,
+          nativeTaskId: restartedTask.nativeTaskId,
+        },
+        {
+          semanticTaskId: restartedSecondTask.semanticTaskId,
+          nativeTaskId: restartedSecondTask.nativeTaskId,
+        },
+      ],
       counts: {
         tasks: postImportRestart.status.tasks.length,
         workItems: postImportRestart.status.workItems.length,
@@ -1909,7 +3732,7 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "HEAD") === targetBase
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "bad\n",
+      && await plantedSourcesIntact(),
       "CCC_PRODUCT_EXECUTED_BEFORE_APPROVAL",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -1920,13 +3743,16 @@ async function main() {
     );
     assert(
       liveConfirmation
-      && /^[0-9a-f]{64}$/.test(liveConfirmation.confirmation),
+      && /^[0-9a-f]{64}$/.test(liveConfirmation.confirmation)
+      && liveConfirmation.taskId === restartedTask.nativeTaskId,
       "CCC_PRODUCT_LIVE_CONFIRMATION_MISSING",
       JSON.stringify(liveHold.liveExecutionApprovalConfirmations),
     );
     ledger.pass("live-execution-human-hold", {
       approvalRequestId: liveConfirmation.approvalRequestId,
       expiresAt: liveConfirmation.expiresAt,
+      taskId: liveConfirmation.taskId,
+      semanticTaskId: "TASK-VERTICAL",
       targetHead: targetBase,
       workItemState: liveHold.status.workItems[0].state,
     });
@@ -1948,15 +3774,120 @@ async function main() {
       JSON.stringify(executionApproved),
     );
 
+    // Live execution is authorized per task, not per campaign: the one work
+    // item parks a second time before the chained task may run, carrying its
+    // own approval request bound to its own task.
+    const secondLiveApproval = await awaitParkedLiveExecutionApproval(
+      "second-task live execution approval hold",
+      readStatus,
+      [liveConfirmation.approvalRequestId],
+    );
+    const secondLiveHold = secondLiveApproval.hold;
+    const secondLiveConfirmation = secondLiveApproval.confirmation;
+    const secondGuidedNextAction = secondLiveApproval.nextAction;
+    const firstApprovalAfterSecondPark =
+      secondLiveHold.liveExecutionApprovalConfirmations?.find(
+        ({ approvalRequestId }) =>
+          approvalRequestId === liveConfirmation.approvalRequestId,
+      );
+    assert(
+      secondLiveHold.status.workItems.length === 1
+      && secondLiveHold.status.workItems[0].state === "manual-required"
+      && secondLiveHold.status.workItems[0].lastError
+        === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
+      && /^[0-9a-f]{64}$/.test(secondLiveConfirmation.confirmation)
+      && secondLiveConfirmation.approvalRequestId
+        !== liveConfirmation.approvalRequestId
+      && secondLiveConfirmation.taskId === restartedSecondTask.nativeTaskId
+      && secondLiveConfirmation.taskId !== liveConfirmation.taskId
+      && firstApprovalAfterSecondPark?.status === "consumed",
+      "CCC_PRODUCT_SECOND_LIVE_EXECUTION_HOLD_INVALID",
+      JSON.stringify({
+        workItems: secondLiveHold.status.workItems,
+        confirmations: secondLiveHold.liveExecutionApprovalConfirmations,
+      }),
+    );
+    // The guided operator path must route to the chained task's own approval,
+    // not merely leave it discoverable in the confirmation list, and must name
+    // the held task because it differs from the work item's pinned entry task.
+    assert(
+      secondGuidedNextAction.kind === "approve-execution"
+      && secondGuidedNextAction.approvalRequestId
+        === secondLiveConfirmation.approvalRequestId
+      && secondGuidedNextAction.approvalStatus === "issued"
+      && secondGuidedNextAction.reason.includes(
+        ` for campaign task ${restartedSecondTask.nativeTaskId}`,
+      ),
+      "CCC_PRODUCT_SECOND_LIVE_EXECUTION_GUIDED_ACTION_INVALID",
+      JSON.stringify({
+        nextAction: secondGuidedNextAction,
+        expectedApprovalRequestId: secondLiveConfirmation.approvalRequestId,
+        chainedNativeTaskId: restartedSecondTask.nativeTaskId,
+        workItemTaskId: secondLiveHold.status.workItems[0].taskId,
+      }),
+    );
+    assert(
+      await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await plantedSourcesIntact(),
+      "CCC_PRODUCT_SECOND_TASK_EXECUTED_BEFORE_APPROVAL",
+      await git(targetRoot, "status", "--porcelain"),
+    );
+    ledger.pass("second-task-live-execution-hold", {
+      workItemCount: secondLiveHold.status.workItems.length,
+      workItemState: secondLiveHold.status.workItems[0].state,
+      approvals: [
+        {
+          approvalRequestId: liveConfirmation.approvalRequestId,
+          taskId: liveConfirmation.taskId,
+          semanticTaskId: "TASK-VERTICAL",
+        },
+        {
+          approvalRequestId: secondLiveConfirmation.approvalRequestId,
+          taskId: secondLiveConfirmation.taskId,
+          semanticTaskId: "TASK-VERTICAL-SECOND",
+        },
+      ],
+      distinctApprovalRequestIds: true,
+      distinctTaskIds: true,
+      firstApprovalStatusAtSecondPark: firstApprovalAfterSecondPark.status,
+      guidedNextAction: {
+        kind: secondGuidedNextAction.kind,
+        approvalRequestId: secondGuidedNextAction.approvalRequestId,
+        approvalStatus: secondGuidedNextAction.approvalStatus,
+        reason: secondGuidedNextAction.reason,
+      },
+      guidedActionNamesChainedTask: restartedSecondTask.nativeTaskId,
+      workItemTaskId: secondLiveHold.status.workItems[0].taskId,
+      targetHead: targetBase,
+    });
+
+    const secondExecutionApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        idempotencyKey,
+        secondLiveConfirmation.approvalRequestId,
+        "--confirm",
+        secondLiveConfirmation.confirmation,
+      ]),
+      "approve second-task execution",
+    );
+    assert(
+      secondExecutionApproved.kind === "execution-approved"
+      && secondExecutionApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_SECOND_EXECUTION_APPROVAL_FAILED",
+      JSON.stringify(secondExecutionApproved),
+    );
+
     const mergeHold = await poll(
       "merge approval hold",
       readStatus,
       (value) => value.status?.nextAction?.kind === "approve-merge",
       async () => ({ serve: tail(server.output()), status: await readStatus() }),
     );
-    const task = mergeHold.status.tasks[0];
+    const task = taskFor(mergeHold.status, "TASK-VERTICAL");
+    const secondTask = taskFor(mergeHold.status, "TASK-VERTICAL-SECOND");
     assert(
-      mergeHold.status.tasks.length === 1
+      mergeHold.status.tasks.length === 2
       && task.semanticTaskId === "TASK-VERTICAL"
       && task.route?.providerId === "openai"
       && task.route?.modelId === "gpt-5.6-sol"
@@ -2000,10 +3931,148 @@ async function main() {
       }),
     );
     ledger.pass("coding-route-and-worktree-custody", {
+      semanticTaskId: task.semanticTaskId,
       route: task.route,
       worktree: canonicalWorktree,
       branch: task.branch,
       baseCommit: task.baseCommit,
+    });
+
+    // The chained task runs in its own registered worktree whose history
+    // already contains the first task's commit, and each task's diff stays
+    // inside its own owned path.
+    assert(
+      secondTask.route?.providerId === "openai"
+      && secondTask.route?.modelId === "gpt-5.6-terra"
+      && secondTask.route?.transport === "cli"
+      && secondTask.route?.executor === "cli-agent"
+      && secondTask.route?.cliAdapterId === "codex"
+      && secondTask.route?.toolMode === "coding"
+      && secondTask.route?.worktreeMode === "isolated"
+      && secondTask.route.modelId !== task.route.modelId,
+      "CCC_PRODUCT_SECOND_CODING_ROUTE_DRIFT",
+      JSON.stringify(secondTask),
+    );
+    exactArray(
+      secondTask.route.ownedPaths,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_OWNED_PATH_DRIFT",
+    );
+    exactArray(
+      secondTask.route.allowedWriteRoots,
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_WRITE_ROOT_DRIFT",
+    );
+    const canonicalSecondWorktree = secondTask.worktree
+      ? await realpath(secondTask.worktree)
+      : null;
+    const secondWorktreeRelative = canonicalSecondWorktree
+      ? path.relative(canonicalWorktreesRoot, canonicalSecondWorktree)
+      : "";
+    assert(
+      canonicalSecondWorktree
+      && canonicalSecondWorktree !== targetRoot
+      && canonicalSecondWorktree !== canonicalWorktree
+      && secondWorktreeRelative.length > 0
+      && secondWorktreeRelative !== ".."
+      && !secondWorktreeRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(secondWorktreeRelative),
+      "CCC_PRODUCT_SECOND_WORKTREE_CUSTODY_INVALID",
+      JSON.stringify({
+        worktree: canonicalSecondWorktree,
+        firstWorktree: canonicalWorktree,
+        worktreesRoot: canonicalWorktreesRoot,
+        relative: secondWorktreeRelative,
+      }),
+    );
+    const registeredWorktrees = (
+      await git(targetRoot, "worktree", "list", "--porcelain")
+    )
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => line.slice("worktree ".length));
+    const canonicalRegisteredWorktrees = await Promise.all(
+      registeredWorktrees.map((candidate) => realpath(candidate)),
+    );
+    assert(
+      canonicalRegisteredWorktrees.includes(canonicalWorktree)
+      && canonicalRegisteredWorktrees.includes(canonicalSecondWorktree),
+      "CCC_PRODUCT_CHAINED_WORKTREE_NOT_REGISTERED",
+      JSON.stringify({
+        registered: canonicalRegisteredWorktrees,
+        first: canonicalWorktree,
+        second: canonicalSecondWorktree,
+      }),
+    );
+    const firstTaskCommit = await git(canonicalWorktree, "rev-parse", "HEAD");
+    const secondTaskCommit = await git(
+      canonicalSecondWorktree,
+      "rev-parse",
+      "HEAD",
+    );
+    const chainAncestry = await run(
+      "/usr/bin/git",
+      ["merge-base", "--is-ancestor", firstTaskCommit, secondTaskCommit],
+      { cwd: canonicalSecondWorktree, allowedExitCodes: [0, 1] },
+    );
+    assert(
+      firstTaskCommit !== secondTaskCommit
+      && firstTaskCommit !== targetBase
+      && secondTaskCommit !== targetBase
+      && chainAncestry.code === 0,
+      "CCC_PRODUCT_CHAINED_WORKTREE_ANCESTRY_REFUSED",
+      JSON.stringify({
+        targetBase,
+        firstTaskCommit,
+        secondTaskCommit,
+        mergeBaseExitCode: chainAncestry.code,
+      }),
+    );
+    exactArray(
+      (await git(
+        targetRoot,
+        "diff",
+        "--name-only",
+        targetBase,
+        firstTaskCommit,
+      )).split("\n").filter(Boolean),
+      ["src/value.txt"],
+      "CCC_PRODUCT_FIRST_TASK_MUTATION_SCOPE_DRIFT",
+    );
+    exactArray(
+      (await git(
+        targetRoot,
+        "diff",
+        "--name-only",
+        firstTaskCommit,
+        secondTaskCommit,
+      )).split("\n").filter(Boolean),
+      ["src/second.txt"],
+      "CCC_PRODUCT_SECOND_TASK_MUTATION_SCOPE_DRIFT",
+    );
+    ledger.pass("chained-task-worktree-custody", {
+      worktrees: [
+        {
+          semanticTaskId: task.semanticTaskId,
+          worktree: canonicalWorktree,
+          branch: task.branch,
+          headCommit: firstTaskCommit,
+          ownedPaths: task.route.ownedPaths,
+          mutationPaths: ["src/value.txt"],
+        },
+        {
+          semanticTaskId: secondTask.semanticTaskId,
+          worktree: canonicalSecondWorktree,
+          branch: secondTask.branch,
+          headCommit: secondTaskCommit,
+          ownedPaths: secondTask.route.ownedPaths,
+          mutationPaths: ["src/second.txt"],
+        },
+      ],
+      distinctRegisteredWorktrees: true,
+      firstCommitIsAncestorOfSecond: true,
+      maxConcurrent: 1,
+      maxWorktrees: 2,
     });
 
     const proof = mergeHold.status.proofs[0];
@@ -2025,11 +4094,13 @@ async function main() {
       (await git(targetRoot, "diff", "--name-only", targetBase, sourceCommit))
         .split("\n")
         .filter(Boolean),
-      ["src/value.txt"],
+      ["src/second.txt", "src/value.txt"],
       "CCC_PRODUCT_CAMPAIGN_MUTATION_SCOPE_DRIFT",
     );
     assert(
-      await git(targetRoot, "show", `${sourceCommit}:src/value.txt`) === "good",
+      await git(targetRoot, "show", `${sourceCommit}:src/value.txt`) === "good"
+      && await git(targetRoot, "show", `${sourceCommit}:src/second.txt`)
+        === "second-good",
       "CCC_PRODUCT_CAMPAIGN_COMMIT_CONTENT_INVALID",
       sourceCommit,
     );
@@ -2041,7 +4112,7 @@ async function main() {
     ledger.pass("campaign-created-commit", {
       sourceCommit,
       sourceTree: await git(targetRoot, "rev-parse", `${sourceCommit}^{tree}`),
-      mutationPaths: ["src/value.txt"],
+      mutationPaths: ["src/second.txt", "src/value.txt"],
       targetHeadStill: targetBase,
     });
 
@@ -2079,6 +4150,48 @@ async function main() {
       settledAt: attempt.settledAt,
     });
 
+    // One campaign-wide proof covers both tasks: a single attempt bound to a
+    // single source commit, taken from the terminal task's worktree, whose
+    // diff against the frozen base is exactly the two owned files.
+    assert(
+      mergeHold.status.proofs.length === 1
+      && proof.attempts.length === 1
+      && sourceCommit === secondTaskCommit
+      && attempt.result?.stdoutTail?.includes(
+        "NEGATIVE_CONTROL_PASS: planted bad and pending values are rejected",
+      )
+      && attempt.result?.stdoutTail?.includes(
+        "POSITIVE_ORACLE_PASS: campaign values are good",
+      ),
+      "CCC_PRODUCT_INTEGRATED_PROOF_INVALID",
+      JSON.stringify({
+        proofCount: mergeHold.status.proofs.length,
+        attemptCount: proof.attempts.length,
+        sourceCommit,
+        secondTaskCommit,
+        result: attempt.result,
+      }),
+    );
+    exactArray(
+      (await git(targetRoot, "diff", "--name-only", targetBase, sourceCommit))
+        .split("\n")
+        .filter(Boolean),
+      ["src/second.txt", "src/value.txt"],
+      "CCC_PRODUCT_INTEGRATED_PROOF_SCOPE_DRIFT",
+    );
+    ledger.pass("integrated-proof-over-two-commits", {
+      proofId: proof.definition.id,
+      proofCount: mergeHold.status.proofs.length,
+      attemptCount: proof.attempts.length,
+      attemptKey: attempt.attemptKey,
+      sourceCommit,
+      firstTaskCommit,
+      secondTaskCommit,
+      integratedMutationPaths: ["src/second.txt", "src/value.txt"],
+      command: proof.definition.command,
+      result: attempt.result,
+    });
+
     const mergeConfirmation = mergeHold.mergeApprovalConfirmations?.find(
       ({ approvalRequestId, status }) =>
         approvalRequestId === mergeHold.status.nextAction.approvalRequestId
@@ -2101,15 +4214,162 @@ async function main() {
       proofAttemptKey: attempt.attemptKey,
     });
 
+    const mergeApprovalArgs = [
+      "approve-merge",
+      idempotencyKey,
+      mergeConfirmation.approvalRequestId,
+      "--confirm",
+      mergeConfirmation.confirmation,
+    ];
+    const reflogBeforeLanding = (
+      await git(
+        targetRoot,
+        "reflog",
+        "show",
+        "--format=%H",
+        "refs/heads/main",
+      )
+    ).split("\n").filter(Boolean);
+    const landingCutpointMarker =
+      `cccp-land-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+    landingCutpoint = await armGitLandingTerminalCutpoint(
+      isolatedHome,
+      landingCutpointMarker,
+    );
+    landingCommand = startOwnedCommand(
+      process.execPath,
+      [cliBin, "prd", ...mergeApprovalArgs],
+      { cwd: targetRoot, env },
+    );
+    const landingCommandPid = landingCommand.child.pid;
+    const landingCutpointObserved = await poll(
+      "Git landing terminal receipt cutpoint",
+      async () => ({
+        targetHead: await git(
+          targetRoot,
+          "rev-parse",
+          "refs/heads/main",
+        ),
+        commandRunning:
+          landingCommand.child.exitCode === null
+          && landingCommand.child.signalCode === null,
+      }),
+      (value) =>
+        value.commandRunning === true
+        && value.targetHead !== targetBase,
+      async () => ({
+        stdout: tail(landingCommand.stdout()),
+        stderr: tail(landingCommand.stderr()),
+        status: await readStatus(),
+      }),
+      60_000,
+    );
+    const landingBackendsAtCrash = await landingCutpoint.sleepingBackends()
+      .catch(() => []);
+    assert(
+      landingBackendsAtCrash.length <= 1,
+      "CCC_PRODUCT_GIT_LANDING_BACKEND_AMBIGUOUS",
+      JSON.stringify(landingBackendsAtCrash),
+    );
+    const landedAtCrash = landingCutpointObserved.targetHead;
+    const reflogAtCrash = (
+      await git(
+        targetRoot,
+        "reflog",
+        "show",
+        "--format=%H",
+        "refs/heads/main",
+      )
+    ).split("\n").filter(Boolean);
+    exactArray(
+      reflogAtCrash,
+      [landedAtCrash, ...reflogBeforeLanding],
+      "CCC_PRODUCT_GIT_LANDING_CRASH_REFLOG_INVALID",
+    );
+    assert(
+      landedAtCrash !== targetBase
+      && landedAtCrash !== sourceCommit
+      && await git(targetRoot, "rev-parse", `${landedAtCrash}^{tree}`)
+        === await git(targetRoot, "rev-parse", `${sourceCommit}^{tree}`)
+      && await git(targetRoot, "status", "--porcelain") === "",
+      "CCC_PRODUCT_GIT_LANDING_CRASH_EFFECT_INVALID",
+      JSON.stringify({ targetBase, sourceCommit, landedAtCrash }),
+    );
+    const landingCommandLine = await crashOwnedCommand(
+      landingCommand,
+      [cliBin, "prd", "approve-merge", idempotencyKey],
+    );
+    landingCommand = undefined;
+    const landingBackendSettlement =
+      await settleOwnedLandingDatabaseBackend(landingCutpoint);
+    await landingCutpoint.close();
+    landingCutpoint = undefined;
+
+    const interruptedLanding = await readStatus();
+    const interruptedApproval = interruptedLanding.status.approvals.find(
+      ({ id }) => id === mergeConfirmation.approvalRequestId,
+    );
+    assert(
+      interruptedLanding.status.workItems[0]?.state === "manual-required"
+      && interruptedLanding.status.workItems[0]?.lastError
+        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && interruptedApproval?.status === "claimed"
+      && interruptedLanding.status.landing.intents.length === 1
+      && interruptedLanding.status.landing.materializations.length === 1
+      && interruptedLanding.status.landing.terminals.length === 0
+      && interruptedLanding.status.nextAction?.kind === "landing-recovery"
+      && await git(targetRoot, "rev-parse", "refs/heads/main")
+        === landedAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_CRASH_STATE_NOT_DURABLE",
+      JSON.stringify(interruptedLanding.status),
+    );
+
+    const landingServerBeforeRestart = server;
+    await stopServe(landingServerBeforeRestart);
+    server = undefined;
+    server = await startServe(targetRoot, env, port);
+    assert(
+      landingServerBeforeRestart.child.pid !== server.child.pid,
+      "CCC_PRODUCT_GIT_LANDING_RESTART_PROCESS_INVALID",
+      JSON.stringify({
+        stoppedPid: landingServerBeforeRestart.child.pid,
+        restartedPid: server.child.pid,
+      }),
+    );
+    const landingRecoveryHold = await poll(
+      "Git landing recovery hold after restart",
+      readStatus,
+      (value) =>
+        value.status?.nextAction?.kind === "landing-recovery"
+        && value.status?.landing?.intents?.length === 1
+        && value.status?.landing?.materializations?.length === 1
+        && value.status?.landing?.terminals?.length === 0,
+      async () => ({
+        serve: tail(server.output()),
+        targetHead: await git(
+          targetRoot,
+          "rev-parse",
+          "refs/heads/main",
+        ),
+      }),
+    );
+    exactArray(
+      (
+        await git(
+          targetRoot,
+          "reflog",
+          "show",
+          "--format=%H",
+          "refs/heads/main",
+        )
+      ).split("\n").filter(Boolean),
+      reflogAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_EFFECT_REPEATED_ON_RESTART",
+    );
+
     const merged = jsonOutput(
-      await prd([
-        "approve-merge",
-        idempotencyKey,
-        mergeConfirmation.approvalRequestId,
-        "--confirm",
-        mergeConfirmation.confirmation,
-      ]),
-      "approve merge",
+      await prd(mergeApprovalArgs),
+      "recover approve merge",
     );
     assert(
       merged.kind === "merge-approved"
@@ -2132,12 +4392,14 @@ async function main() {
       (await git(targetRoot, "diff", "--name-only", targetBase, landedCommit))
         .split("\n")
         .filter(Boolean),
-      ["src/value.txt"],
+      ["src/second.txt", "src/value.txt"],
       "CCC_PRODUCT_LANDING_SCOPE_DRIFT",
     );
     assert(
       await git(targetRoot, "status", "--porcelain") === ""
-      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "good\n",
+      && await readFile(path.join(targetRoot, "src/value.txt"), "utf8") === "good\n"
+      && await readFile(path.join(targetRoot, "src/second.txt"), "utf8")
+        === "second-good\n",
       "CCC_PRODUCT_LANDING_CHECKOUT_DIRTY",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -2152,12 +4414,65 @@ async function main() {
       "CCC_PRODUCT_LANDING_RECEIPTS_INVALID",
       JSON.stringify(merged.status.landing),
     );
+    const reflogAfterRecovery = (
+      await git(
+        targetRoot,
+        "reflog",
+        "show",
+        "--format=%H",
+        "refs/heads/main",
+      )
+    ).split("\n").filter(Boolean);
+    exactArray(
+      reflogAfterRecovery,
+      reflogAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_EFFECT_REPEATED_DURING_RECOVERY",
+    );
+    const consumedApproval = merged.status.approvals.find(
+      ({ id }) => id === mergeConfirmation.approvalRequestId,
+    );
+    assert(
+      landingRecoveryHold.status.workItems[0]?.state === "manual-required"
+      && consumedApproval?.status === "consumed"
+      && landedCommit === landedAtCrash,
+      "CCC_PRODUCT_GIT_LANDING_RECOVERY_SETTLEMENT_INVALID",
+      JSON.stringify({
+        recoveryWorkItem: landingRecoveryHold.status.workItems[0],
+        consumedApproval,
+        landedAtCrash,
+        landedCommit,
+      }),
+    );
+    ledger.pass("git-landing-restart-no-repeated-effect", {
+      approvalRequestId: mergeConfirmation.approvalRequestId,
+      approvalStatusAtCrash: interruptedApproval.status,
+      approvalStatusAfterRecovery: consumedApproval.status,
+      crashedCliPid: landingCommandPid,
+      crashedCliCommand: landingCommandLine,
+      databaseBackendPid:
+        landingBackendsAtCrash[0]?.pid
+        ?? landingBackendSettlement.backendPid,
+      databaseBackendWait: {
+        waitEventType:
+          landingBackendsAtCrash[0]?.wait_event_type ?? null,
+        waitEvent: landingBackendsAtCrash[0]?.wait_event ?? null,
+      },
+      databaseBackendSettlement: landingBackendSettlement,
+      stoppedServePid: landingServerBeforeRestart.child.pid,
+      restartedServePid: server.child.pid,
+      targetBase,
+      sourceCommit,
+      landedCommit,
+      refEffectCount: reflogAfterRecovery.length - reflogBeforeLanding.length,
+      landingBeforeRecovery: interruptedLanding.status.landing,
+      landingAfterRecovery: merged.status.landing,
+    });
     ledger.pass("controlled-landing", {
       targetBase,
       sourceCommit,
       landedCommit,
       landing: merged.status.landing,
-      mutationPaths: ["src/value.txt"],
+      mutationPaths: ["src/second.txt", "src/value.txt"],
     });
 
     await stopServe(server);
@@ -2236,8 +4551,17 @@ async function main() {
     process.exitCode = 1;
   } finally {
     await stopNativeAuthoringServer(authoringServer).catch(() => undefined);
+    await cleanupOwnedCommand(landingCommand).catch(() => undefined);
+    await landingCutpoint?.close().catch(() => undefined);
     await stopServe(restartedServer).catch(() => undefined);
     await stopServe(server).catch(() => undefined);
+    await cleanupOwnedCutpointProcess(
+      ownedCutpointMarker,
+      ownedFakeCodexPath,
+    ).catch(() => undefined);
+    await cleanupOwnedProofCutpointMarkers(
+      ownedProofCutpointToken,
+    ).catch(() => undefined);
     if (tempRoot && process.env.CCC_PRD_PRODUCT_KEEP_TMP !== "1") {
       await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
     }

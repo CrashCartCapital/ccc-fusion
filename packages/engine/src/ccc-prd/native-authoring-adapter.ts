@@ -1,15 +1,18 @@
 import {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   canonicalCccPrdJson,
+  customProviderRegistryKey,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringProposal,
   type CccPrdAuthoringRequest,
+  type CustomProvider,
 } from "@fusion/core";
 import {
   createFusionAuthStorage,
   createFusionModelRegistry,
   getHomeDir,
 } from "../auth-storage.js";
+import { validateCccLoopbackHttpUrl } from "../ccc-loopback-policy.js";
 import { registerCustomProviders } from "../custom-provider-registry.js";
 import { readCustomProviders } from "../custom-providers.js";
 
@@ -32,13 +35,18 @@ export type CccPrdNativeAuthoringTransport = (
   request: CccPrdNativeAuthoringTransportRequest,
 ) => Promise<CccPrdNativeAuthoringTransportResponse>;
 
+export type CccPrdNativeAuthoringMode = "execution" | "understanding";
+
 export type CreateNativeCccPrdAuthoringAdapterOptions = {
   provider: string;
   model: string;
   maxDurationMs: number;
   maxPromptBytes: number;
   maxResponseBytes: number;
+  mode?: CccPrdNativeAuthoringMode;
   transport?: CccPrdNativeAuthoringTransport;
+  /** Configured custom providers; defaults to the operator's stored settings. */
+  customProviders?: CustomProvider[];
 };
 
 function positiveInteger(value: number, label: string): void {
@@ -47,23 +55,80 @@ function positiveInteger(value: number, label: string): void {
   }
 }
 
-function buildPrompt(request: CccPrdAuthoringRequest): string {
-  if (!request.constraints) {
+export class CccPrdAuthoringEgressPolicyViolationError extends Error {
+  readonly code = "CCC_PRD_AUTHORING_EGRESS_POLICY_VIOLATION";
+
+  constructor(providerKey: string, reason: string) {
+    super(`CCC PRD authoring provider ${providerKey} is outside the ccc-fusion loopback boundary: ${reason}`);
+    this.name = "CccPrdAuthoringEgressPolicyViolationError";
+  }
+}
+
+/*
+FNXC:CCCAuthoringEgress 2026-08-01-17:40:
+Authoring and understanding serialize every admitted source verbatim into one
+prompt, so the transport target is decided before any corpus bytes exist. Resolve
+the selected provider through the same registry-key rule the pi seam uses and
+validate it with the shared loopback policy; a provider id that resolves to no
+configured custom provider (including every built-in id) fails closed rather than
+inheriting that provider's own remote route. The refusal deliberately names only
+the provider key and the policy reason — never the base URL, credential, or any
+source text — so a refusal log cannot become the leak it just prevented.
+*/
+function assertCccPrdAuthoringLoopbackEgress(
+  providerKey: string,
+  providers: CustomProvider[],
+): void {
+  const provider = providers.find(
+    (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
+  );
+  if (!provider) {
+    throw new CccPrdAuthoringEgressPolicyViolationError(
+      providerKey,
+      "provider does not resolve to a configured custom provider",
+    );
+  }
+  const validation = validateCccLoopbackHttpUrl(provider.baseUrl);
+  if (!validation.ok) {
+    throw new CccPrdAuthoringEgressPolicyViolationError(providerKey, validation.reason);
+  }
+}
+
+function buildPrompt(
+  request: CccPrdAuthoringRequest,
+  mode: CccPrdNativeAuthoringMode,
+): string {
+  if (mode === "execution" && !request.constraints) {
     throw new Error("CCC PRD native authoring requires explicit target, bounds, and review constraints");
   }
+  const modeInstructions = mode === "understanding"
+    ? [
+        "This is review-only PRD understanding. The result is never executable and must not claim operator approval.",
+        "Extract source-grounded product meaning before implementation facts are approved.",
+        "When targetRepository.path or targetRepository.baseCommit is absent, use an empty string in that structural field and add a source-bound unresolved decision asking for it.",
+        "When an execution bound is absent, use 0 in that structural field and add a source-bound unresolved decision asking for it.",
+        "When allowed paths are absent, return an empty admittedWriteRoots array; create no task whose ownedPaths or allowedWriteRoots would be invented, and add a source-bound unresolved decision.",
+        "Do not make assumptions. Convert every missing implementation-changing fact into a source-bound unresolved decision.",
+      ]
+    : [
+        "This is execution-sidecar authoring. Return the exact admitted target, bounds, and review constraints.",
+      ];
   return [
     "Generate exactly one JSON object and no Markdown or commentary.",
     `The object schema must be ${CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION}.`,
     "Preserve the source packet. Do not execute actions or invent source text.",
+    ...modeInstructions,
     "Every requirement, proof, task, workflow, document, artifact, unresolved decision, ambiguity, exception, and protected action must cite one or more admitted sources using {path, exactQuote}; every exactQuote must occur exactly once in that source.",
-    "Every implementation-changing fact must be source-bound too: targetRepository.path, targetRepository.baseCommit, every admittedWriteRoots.path, execution bounds, requirement acceptance behavior, proof command/oracle/negative controls, protected actions, and non-goals must appear in the admitted source text. If a fact is missing, return a source-bound unresolved question instead of inventing it from constraints.",
+    "Every implementation-changing fact must be source-bound too: targetRepository.path, targetRepository.baseCommit, every admittedWriteRoots.path, every task ownedPaths and allowedWriteRoots path, execution bounds, requirement acceptance behavior, proof command/oracle/negative controls, protected actions, and non-goals must appear in the admitted source text. If a fact is missing, return a source-bound unresolved question instead of inventing it from constraints.",
+    "Every task must return non-empty ownedPaths and allowedWriteRoots arrays using canonical target-relative paths. Each path must occur literally in that task's exact source quote. Keep concurrency ownership distinct from filesystem write permission; never broaden either from a global root.",
     "Source references must collectively disposition every Markdown heading block and requirement-like row. Map it to a task when implemented; otherwise cite an explicit source deferral/out-of-scope statement or return a source-bound unresolved question. Never guess a missing decision.",
     "Return all required arrays and objects: schema, authorityRoles, requirements, proofs, tasks, edges, workflows, documents, artifacts, importIntents, protectedActions, bounds, admittedWriteRoots, targetRepository, nonGoals, unresolvedDecisions, ambiguities, exceptions, confidence.",
     "Use stable IDs. Protected actions must name exact targets. Human review is limited to ambiguities, unresolved decisions, exceptions, and protected actions.",
     canonicalCccPrdJson({
+      mode,
       packetHash: request.packetHash,
       sourceVersion: request.sourceVersion,
-      constraints: request.constraints,
+      ...(request.constraints ? { constraints: request.constraints } : {}),
       orderedSources: request.sources,
       ...(request.previousSidecar ? { previousSidecar: request.previousSidecar } : {}),
     }),
@@ -153,12 +218,15 @@ export function createNativeCccPrdAuthoringAdapter(
     throw new Error("CCC PRD native authoring provider and model are required");
   }
   const transport = options.transport ?? fusionModelRuntimeAuthoringTransport;
+  const mode = options.mode ?? "execution";
+  const configuredProviders = options.customProviders ?? readCustomProviders(getHomeDir());
 
   return {
     id: "fusion-native-model-runtime-v1",
     model: `${options.provider}/${options.model}`,
     async generateCandidate(request): Promise<CccPrdAuthoringProposal> {
-      const prompt = buildPrompt(request);
+      assertCccPrdAuthoringLoopbackEgress(options.provider, configuredProviders);
+      const prompt = buildPrompt(request, mode);
       const promptBytes = Buffer.byteLength(prompt, "utf8");
       if (promptBytes > options.maxPromptBytes) {
         throw new Error(

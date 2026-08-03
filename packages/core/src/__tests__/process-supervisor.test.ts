@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawn as nodeSpawn } from "node:child_process";
 import os from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -58,6 +59,63 @@ describe("process-supervisor", () => {
     expect(__getProcessSupervisorStateForTests()).toEqual({ registrySize: 1, handlersInstalled: true });
     await expect(child.waitExit()).resolves.toEqual({ code: 0, signal: null });
     await waitFor(() => __getProcessSupervisorStateForTests().registrySize === 0);
+  });
+
+  it("logs a bounded diagnostic label instead of a sensitive shell command", async () => {
+    const sensitiveCommand =
+      "/usr/bin/sandbox-exec -p '(allow file-read* (subpath \"/Users/operator/private\"))' /bin/true";
+    const diagnosticLabel = "/usr/bin/sandbox-exec";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const spawnImpl = vi.fn((
+      _command: string,
+      _args: readonly string[],
+      options: Parameters<typeof nodeSpawn>[2],
+    ) => {
+      const safeOptions = { ...options } as Record<string, unknown>;
+      delete safeOptions.diagnosticLabel;
+      return nodeSpawn(
+        process.execPath,
+        [fixturePath, "exit-immediately"],
+        safeOptions,
+      );
+    }) as unknown as typeof nodeSpawn;
+
+    const child = superviseSpawn(sensitiveCommand, [], {
+      stdio: "ignore",
+      spawnImpl,
+      diagnosticLabel,
+    });
+
+    await expect(child.waitExit()).resolves.toEqual({ code: 0, signal: null });
+    const logs = errorSpy.mock.calls.flat().map(String).join("\n");
+    expect(logs).toContain(`command=${diagnosticLabel}`);
+    expect(logs).not.toContain("/Users/operator/private");
+  });
+
+  it("normalizes and bounds a diagnostic label before logging it", async () => {
+    const diagnosticLabel = `/usr/bin/sandbox-exec\n${"x".repeat(400)}`;
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const spawnImpl = vi.fn((
+      _command: string,
+      _args: readonly string[],
+      options: Parameters<typeof nodeSpawn>[2],
+    ) => nodeSpawn(process.execPath, [fixturePath, "exit-immediately"], options)) as unknown as typeof nodeSpawn;
+
+    const child = superviseSpawn("private-expanded-command", [], {
+      stdio: "ignore",
+      spawnImpl,
+      diagnosticLabel,
+    });
+
+    await expect(child.waitExit()).resolves.toEqual({ code: 0, signal: null });
+    const spawnLog = errorSpy.mock.calls
+      .flat()
+      .map(String)
+      .find((entry) => entry.includes("spawned pid="));
+    expect(spawnLog).toBeDefined();
+    const loggedLabel = spawnLog?.split(" command=")[1] ?? "";
+    expect(loggedLabel).not.toContain("\n");
+    expect(loggedLabel.length).toBeLessThanOrEqual(256);
   });
 
   it("cascades SIGTERM to the supervised process group", async () => {

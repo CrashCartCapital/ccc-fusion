@@ -3,9 +3,14 @@ import type {
   CccCampaignAuthorityBinding,
   CccCampaignExecutionRoute,
   CccCampaignProofAttemptState,
+  CccCampaignWorkItemFence,
+  CccProviderAttemptCost,
+  CccProviderAttemptReceiptSource,
   CccProviderAttemptState,
   CccProviderAttemptTerminalEvidence,
+  CccProviderAttemptUsage,
 } from "../ccc-campaign/types.js";
+import { CccCampaignContextError } from "../ccc-campaign/types.js";
 import {
   listCccProviderAttemptsForCampaign,
 } from "../ccc-campaign/provider-attempt.js";
@@ -39,6 +44,8 @@ const CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON =
   "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
 const CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON =
   "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+const CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE";
 const CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX =
   "ccc-operator:campaign-stopped:";
 
@@ -168,8 +175,22 @@ export type CccPrdProductProviderAttemptStatus = Readonly<{
   dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
+  workItemFence: CccCampaignWorkItemFence | null;
   state: CccProviderAttemptState;
   terminal?: CccProviderAttemptTerminalEvidence;
+  /**
+   * Flattened terminal-evidence receipt facts (effective-route-and-usage-cost
+   * substrate), derived from `terminal` for direct consumption. Honestly
+   * absent (undefined) whenever the attempt has no reconciled effective-route
+   * receipt; data-layer only, no display strings invented here.
+   */
+  effectiveProvider?: string;
+  effectiveModel?: string;
+  effectiveReasoningEffort?: string;
+  effectiveServiceTier?: string;
+  usage?: CccProviderAttemptUsage | null;
+  cost?: CccProviderAttemptCost;
+  receiptSource?: CccProviderAttemptReceiptSource;
   binding: Readonly<CccCampaignAuthorityBinding>;
 }>;
 
@@ -249,6 +270,12 @@ export type CccPrdProductStatus = Readonly<{
     reason: string;
     approvalRequestId?: string;
     approvalStatus?: CoreApprovalRequest["status"];
+    diagnostic?: string;
+    safeState?: string;
+    decisionOwner?: string;
+    consequence?: string;
+    recoveryOptions?: readonly string[];
+    nextSafeAction?: string;
   }>;
 }>;
 
@@ -358,11 +385,12 @@ function proofAttemptStatus(
   };
 }
 
-function providerAttemptStatus(
+export function providerAttemptStatus(
   attempt: Awaited<
     ReturnType<typeof listCccProviderAttemptsForCampaign>
   >[number],
 ): CccPrdProductProviderAttemptStatus {
+  const effectiveRoute = attempt.terminal?.kind === "reconciled" ? attempt.terminal.effectiveRoute : undefined;
   return {
     attemptKey: attempt.attemptKey,
     taskId: attempt.taskId,
@@ -372,12 +400,67 @@ function providerAttemptStatus(
     dispatchKey: attempt.dispatchKey,
     attemptOrdinal: attempt.attemptOrdinal,
     requestCount: attempt.requestCount,
+    workItemFence: attempt.workItemFence
+      ? { ...attempt.workItemFence }
+      : null,
     state: attempt.state,
     ...(attempt.terminal
       ? { terminal: { ...attempt.terminal } }
       : {}),
+    ...(effectiveRoute
+      ? {
+        effectiveProvider: effectiveRoute.effectiveProvider,
+        effectiveModel: effectiveRoute.effectiveModel,
+        ...(effectiveRoute.effectiveReasoningEffort !== undefined
+          ? { effectiveReasoningEffort: effectiveRoute.effectiveReasoningEffort }
+          : {}),
+        ...(effectiveRoute.effectiveServiceTier !== undefined
+          ? { effectiveServiceTier: effectiveRoute.effectiveServiceTier }
+          : {}),
+        usage: effectiveRoute.usage,
+        cost: effectiveRoute.cost,
+        receiptSource: effectiveRoute.receiptSource,
+      }
+      : {}),
     binding: { ...attempt.binding },
   };
+}
+
+/**
+ * `listCccProviderAttemptsForCampaign` scopes its history query to the whole
+ * campaign import, not to a single task (see `loadHistory` in
+ * ccc-campaign/provider-attempt.ts, which filters only by `campaignImportId`
+ * and validates the campaign-wide, not per-task, request-count sequence), so
+ * any one persisted campaign task can anchor the lookup and the full,
+ * multi-task attempt history comes back regardless of which task anchors it.
+ * Refuse rather than pick an unresolvable anchor: an empty task list, or an
+ * anchor task whose own row is missing from persisted custody, both make
+ * `listCccProviderAttemptsForCampaign` silently return zero attempts, which
+ * would hide a real `dispatched_unknown` provider attempt from status output.
+ */
+export function resolveCccPrdProductStatusProviderAttemptAnchorTaskId(
+  taskStatuses: readonly CccPrdProductTaskStatus[],
+): string {
+  const anchor = taskStatuses[0];
+  if (!anchor || !anchor.present) {
+    throw new CccCampaignContextError(
+      "CCC PRD product status has no resolvable campaign context anchor task to load provider attempts",
+    );
+  }
+  return anchor.nativeTaskId;
+}
+
+export function providerAttemptStatusesForCampaign(
+  attempts: Awaited<ReturnType<typeof listCccProviderAttemptsForCampaign>>,
+): readonly CccPrdProductProviderAttemptStatus[] {
+  return attempts
+    .map(providerAttemptStatus)
+    .sort((left, right) => {
+      const byTask = compareCccPrdCodeUnits(left.taskId, right.taskId);
+      if (byTask !== 0) return byTask;
+      return left.requestCount - right.requestCount
+        || compareCccPrdCodeUnits(left.attemptKey, right.attemptKey);
+    });
 }
 
 function textMetadata(
@@ -485,7 +568,38 @@ function commonPassingProofCommit(
   return [...(candidates ?? [])].sort(compareCccPrdCodeUnits)[0] ?? null;
 }
 
-function productNextAction(input: {
+function isKnownVerifierConfinementFailure(
+  attempt: CccPrdProductProofAttemptStatus,
+): boolean {
+  if (attempt.state !== "proved_failed" || !attempt.result) return false;
+  const evidence = [
+    attempt.result.stderrTail,
+    ...(attempt.result.warnings ?? []),
+  ].filter((value): value is string => typeof value === "string");
+  return evidence.some((value) =>
+    value.includes("bubblewrap is required for verifier confinement on Linux (")
+    || value.includes(
+      "sandbox-exec is required for verifier confinement on this host but was not found; refusing to run verification natively.",
+    )
+    || value.includes(
+      "No enforced verifier sandbox backend is available on platform ",
+    )
+    || value.includes("failed to build Linux verifier sandbox policy ("));
+}
+
+function hasLiveRuntimeLease(item: CccPrdProductWorkItemStatus): boolean {
+  if (
+    item.state !== "running"
+    || item.leaseOwner === null
+    || item.leaseExpiresAt === null
+  ) {
+    return false;
+  }
+  const leaseExpiresAt = Date.parse(item.leaseExpiresAt);
+  return Number.isFinite(leaseExpiresAt) && leaseExpiresAt > Date.now();
+}
+
+export type CccPrdProductNextActionInput = Readonly<{
   row: ProductImportRow;
   taskStatuses: readonly CccPrdProductTaskStatus[];
   workItems: readonly CccPrdProductWorkItemStatus[];
@@ -498,7 +612,11 @@ function productNextAction(input: {
   landingTerminals: readonly CccPrdProductLandingAudit[];
   liveExecutionActionIds: ReadonlySet<string>;
   mergeActionIds: ReadonlySet<string>;
-}): CccPrdProductStatus["nextAction"] {
+}>;
+
+export function productNextAction(
+  input: CccPrdProductNextActionInput,
+): CccPrdProductStatus["nextAction"] {
   if (input.row.state !== "active" || input.row.runnable !== 1) {
     return {
       kind: "reconcile-import",
@@ -515,29 +633,81 @@ function productNextAction(input: {
         `Workflow work item ${operatorStopped.id} was terminally stopped by the operator; worktrees, approvals, proof receipts, and any uncertain-effect evidence remain preserved for review.`,
     };
   }
-  const unknownProof = input.proofs
+  const unknownProofs = input.proofs
     .flatMap((proof) => proof.attempts)
-    .find((attempt) => attempt.state === "dispatched_unknown");
-  const unknownProvider = input.providerAttempts
-    .find((attempt) => attempt.state === "dispatched_unknown");
+    .filter((attempt) => attempt.state === "dispatched_unknown");
+  const unknownProviders = input.providerAttempts
+    .filter((attempt) => attempt.state === "dispatched_unknown");
+  const unknownProof = unknownProofs[0];
+  const unknownProvider = unknownProviders[0];
   const liveExecutionApprovalWorkItem = input.workItems.find((item) =>
     item.state === "manual-required"
     && item.lastError ===
       CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON
     && item.blockedReason ===
       CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON);
+  const verifierConfinementWorkItem = input.workItems.find((item) =>
+    item.state === "manual-required"
+    && item.lastError ===
+      CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON
+    && item.blockedReason ===
+      CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON);
+  if (verifierConfinementWorkItem) {
+    return {
+      kind: "blocked",
+      reason:
+        "Verifier confinement is unavailable, so exact requirement proof cannot run safely.",
+      diagnostic: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      safeState:
+        `Workflow work item ${verifierConfinementWorkItem.id} is parked manual-required; no proof attempt or Git landing effect is assumed.`,
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence:
+        "Campaign execution cannot continue until a trusted verifier sandbox passes its functional readiness probe.",
+      recoveryOptions: [
+        "Repair the trusted bubblewrap or sandbox-exec backend without enabling native fallback.",
+        "After readiness passes, explicitly requeue the parked work item; do not blindly retry an uncertain effect.",
+        "Stop the campaign if the operator does not want to continue, preserving receipts and worktree state.",
+      ],
+      nextSafeAction:
+        "Run the verifier-confinement readiness check on the execution host, then inspect campaign status again.",
+    };
+  }
   const uncertainManualWorkItem = input.workItems.find((item) =>
     item.state === "manual-required"
     && item.lastError !== CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON
     && item.id !== liveExecutionApprovalWorkItem?.id);
+  // Only an unexpired lease matching the full persisted work-item fence proves
+  // that the runtime still owns an uncertain effect. Task identity alone is
+  // insufficient because a later retry can reuse the same task and item ID.
+  const runningWorkOwnsAllUnknownEffects =
+    uncertainManualWorkItem === undefined
+    && (unknownProofs.length + unknownProviders.length) > 0
+    && unknownProofs.every((attempt) => input.workItems.some((item) =>
+      hasLiveRuntimeLease(item)
+      && item.id === attempt.workItemId
+      && item.runId === attempt.runId
+      && item.attempt === attempt.workItemAttempt))
+    && unknownProviders.every((attempt) => attempt.workItemFence !== null
+      && input.workItems.some((item) =>
+        hasLiveRuntimeLease(item)
+        && item.id === attempt.workItemFence!.workItemId
+        && item.runId === attempt.workItemFence!.runId
+        && item.attempt === attempt.workItemFence!.attempt));
+  if (runningWorkOwnsAllUnknownEffects) {
+    return {
+      kind: "wait-for-runtime",
+      reason:
+        "Campaign external work is in flight and still owned by the runtime.",
+    };
+  }
   if (unknownProof || unknownProvider || uncertainManualWorkItem) {
     return {
       kind: "resolve-manual-required",
-      reason: unknownProof
-        ? `Proof attempt ${unknownProof.attemptKey} has an uncertain external effect.`
-        : unknownProvider
-          ? `Provider attempt ${unknownProvider.attemptKey} has an uncertain external effect.`
-        : `Workflow work item ${uncertainManualWorkItem!.id} requires an operator decision.`,
+      reason: uncertainManualWorkItem
+        ? `Workflow work item ${uncertainManualWorkItem.id} requires an operator decision.`
+        : unknownProof
+          ? `Proof attempt ${unknownProof.attemptKey} has an uncertain external effect.`
+          : `Provider attempt ${unknownProvider!.attemptKey} has an uncertain external effect.`,
     };
   }
   if (
@@ -557,6 +727,43 @@ function productNextAction(input: {
     proof.attempts.some((attempt) => attempt.state === "proved_failed")
     && !proof.attempts.some((attempt) =>
       attempt.state === "committed" && attempt.result?.success === true));
+  const historicalVerifierFailure = input.proofs
+    .filter((proof) => !proof.attempts.some((attempt) =>
+      attempt.state === "committed" && attempt.result?.success === true))
+    .map((proof) => ({
+      proof,
+      attempt: proof.attempts.find(isKnownVerifierConfinementFailure),
+    }))
+    .find((candidate) => candidate.attempt !== undefined);
+  if (
+    historicalVerifierFailure?.attempt
+    && input.landingIntents.length === 0
+    && input.landingMaterializations.length === 0
+    && input.landingTerminals.length === 0
+  ) {
+    const attempt = historicalVerifierFailure.attempt;
+    const workflowState = failedWorkItem
+      ? `workflow ${failedWorkItem.id} is ${failedWorkItem.state}`
+      : `workflow ${attempt.workItemId} remains preserved`;
+    return {
+      kind: "blocked",
+      reason:
+        `Verifier confinement was unavailable for proof ${historicalVerifierFailure.proof.definition.id}; the infrastructure failure receipt is preserved and is not a product-test failure.`,
+      diagnostic: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      safeState:
+        `Proof attempt ${attempt.attemptKey} remains proved_failed at commit ${attempt.sourceCommit}; ${workflowState} and no Git landing is recorded.`,
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence:
+        "The campaign-created commit is preserved, but it has no passing requirement proof and cannot proceed to merge approval.",
+      recoveryOptions: [
+        "Repair the trusted bubblewrap or sandbox-exec backend without enabling native fallback.",
+        "After readiness passes, explicitly requeue the failed work item and execute a fresh proof attempt bound to the preserved commit.",
+        "Retain this failed receipt as infrastructure evidence; never relabel it as a planted-defect or product-test result.",
+      ],
+      nextSafeAction:
+        "Run the verifier-confinement readiness check on the execution host, then explicitly requeue proof for the preserved source commit.",
+    };
+  }
   if (failedWorkItem || failedProof) {
     return {
       kind: "blocked",
@@ -645,14 +852,30 @@ function productNextAction(input: {
     }
   }
   if (liveExecutionApprovalWorkItem) {
-    const approval = input.approvals.find((candidate) =>
-      candidate.taskId === liveExecutionApprovalWorkItem.taskId
-      && input.liveExecutionActionIds.has(candidate.actionId)
-      && (candidate.status === "issued" || candidate.status === "claimed"));
+    /*
+    A multi-task campaign holds once per task, but the parked work item's `taskId` stays pinned
+    to the workflow entry task for the whole campaign. Matching the approval by the WORK ITEM's
+    task ID therefore surfaces only the first task's approval; once that one is consumed and the
+    second task's approval is issued (its own distinct id and taskId), the guided next action
+    degraded to `blocked` while a claimable approval was sitting unclaimed. Match on the
+    approval's own identity instead and surface the earliest unconsumed one, so the operator is
+    walked through the holds in the order the runtime issued them.
+    */
+    const approval = input.approvals
+      .filter((candidate) =>
+        input.liveExecutionActionIds.has(candidate.actionId)
+        && (candidate.status === "issued" || candidate.status === "claimed"))
+      .sort((left, right) =>
+        left.requestedAt.localeCompare(right.requestedAt)
+        || left.createdAt.localeCompare(right.createdAt)
+        || left.id.localeCompare(right.id))[0];
     if (approval) {
+      const heldTask = approval.taskId && approval.taskId !== liveExecutionApprovalWorkItem.taskId
+        ? ` for campaign task ${approval.taskId}`
+        : "";
       return {
         kind: "approve-execution",
-        reason: `Workflow work item ${liveExecutionApprovalWorkItem.id} requires exact live-execution approval.`,
+        reason: `Workflow work item ${liveExecutionApprovalWorkItem.id} requires exact live-execution approval${heldTask}.`,
         approvalRequestId: approval.id,
         approvalStatus: approval.status,
       };
@@ -771,23 +994,14 @@ export async function inspectCccPrdProductStatus(
         },
       };
     });
-    const providerAttempts = (
-      nativeTaskIds[0]
-        ? await listCccProviderAttemptsForCampaign({
-          layer: input.layer,
-          rootDir,
-          taskId: nativeTaskIds[0],
-          tx,
-        })
-        : []
-    )
-      .map(providerAttemptStatus)
-      .sort((left, right) => {
-        const byTask = compareCccPrdCodeUnits(left.taskId, right.taskId);
-        if (byTask !== 0) return byTask;
-        return left.requestCount - right.requestCount
-          || compareCccPrdCodeUnits(left.attemptKey, right.attemptKey);
-      });
+    const providerAttempts = providerAttemptStatusesForCampaign(
+      await listCccProviderAttemptsForCampaign({
+        layer: input.layer,
+        rootDir,
+        taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
+        tx,
+      }),
+    );
 
     const campaignRunId = `ccc-prd:${row.importId}`;
     const workItemRows = await tx

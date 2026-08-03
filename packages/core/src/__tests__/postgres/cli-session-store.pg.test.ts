@@ -180,7 +180,24 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
 
   async function dispatchedCliProviderAttempt(suffix: string) {
     const claimed = await claimedCampaignAuthority(`provider-settlement-${suffix}`, undefined, "cli");
-  const provider = await h.store().reserveCccProviderAttempt({
+    const [workItem] = await h.store().listWorkflowWorkItemsForTask(
+      claimed.taskId,
+      { kinds: ["task"] },
+    );
+    if (!workItem) throw new Error("missing CLI provider workflow work item");
+    const leasedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: `cli-provider-worker-${suffix}`,
+        leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+      },
+    );
+    const provider = await h.store().reserveCccProviderAttempt({
       taskId: claimed.taskId,
       actionId: campaignAction.actionId,
       actionTarget: campaignAction.actionTarget,
@@ -189,6 +206,11 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
       providerId: "deterministic-fake",
       modelId: "fixture-v1",
       transport: "cli",
+      workItemFence: {
+        workItemId: leasedWorkItem.id,
+        runId: leasedWorkItem.runId,
+        attempt: leasedWorkItem.attempt,
+      },
     });
     const dispatch = await h.store().beginCccProviderAttemptDispatch({
       taskId: claimed.taskId,

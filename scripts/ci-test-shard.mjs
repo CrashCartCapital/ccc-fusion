@@ -1170,11 +1170,15 @@ export function runColdStartProbe(packageName, options = {}) {
  * appends the JSON reporter flags so telemetry keeps flowing (U1/R4).
  *
  * @param {ShardEntry[]} shardEntries
- * @param {{ timingFlags?: () => string[] }} [options]
+ * @param {{ timingFlags?: () => string[], workspaceConcurrency?: number }} [options]
  * @returns {Array<{ kind: string, label: string, args: string[] }>}
  */
 export function buildShardCommands(shardEntries, options = {}) {
   const timingFlags = options.timingFlags ?? (() => []);
+  const workspaceConcurrency = Number.isSafeInteger(options.workspaceConcurrency)
+    && options.workspaceConcurrency > 0
+    ? options.workspaceConcurrency
+    : 1;
   const commands = [];
 
   const plain = shardEntries.filter((e) => !e.shardCount && e.runKind !== "dashboard-lane");
@@ -1190,7 +1194,12 @@ export function buildShardCommands(shardEntries, options = {}) {
       // expected duration is the SUM of their weights — not a per-package value
       // (see the watchdog budget aggregation, KTD-2).
       weightMs: plain.reduce((sum, e) => sum + (e.weight ?? 0), 0),
-      args: [...filters, "test", ...timingFlags()],
+      args: [
+        ...filters,
+        `--workspace-concurrency=${workspaceConcurrency}`,
+        "test",
+        ...timingFlags(),
+      ],
     });
   }
 
@@ -1339,7 +1348,10 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     return ["--reporter=json", `--outputFile.json=${outputFile}`];
   };
 
-  const commands = buildShardCommands(shardEntries, { timingFlags });
+  const commands = buildShardCommands(shardEntries, {
+    timingFlags,
+    workspaceConcurrency: concurrency,
+  });
   for (const command of commands) {
     const klass = command.kind === "dashboard-lane" ? "dashboard-lane" : "shard";
     const budgetMs = deriveBudgetMs({

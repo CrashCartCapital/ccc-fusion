@@ -26,6 +26,7 @@ import {
   CentralCore,
   GlobalSettingsStore,
   __resetWorkflowExtensionRegistryForTests,
+  createCccPrdProductExecutionPlan,
   drizzleSql as sql,
   queryRunAuditEvents,
   resolveGlobalDirForHome,
@@ -123,11 +124,18 @@ async function waitFor<T>(
   accept: (value: T) => boolean,
   label: string,
   diagnose?: () => Promise<unknown>,
+  terminal?: (value: T) => unknown | null,
 ): Promise<T> {
   let latest: T | undefined;
   for (let attempt = 0; attempt < 800; attempt += 1) {
     latest = await read();
     if (accept(latest)) return latest;
+    const terminalDiagnostic = terminal?.(latest);
+    if (terminalDiagnostic !== null && terminalDiagnostic !== undefined) {
+      throw new Error(
+        `${label} became impossible; diagnostic=${JSON.stringify(terminalDiagnostic)}`,
+      );
+    }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   const diagnostic = diagnose ? await diagnose() : undefined;
@@ -313,6 +321,17 @@ async function createPacket(
       documentIds: [],
       artifactIds: [],
       protectedActionIds: ["ACTION-VERTICAL-LIVE", "ACTION-VERTICAL-MERGE"],
+      /*
+       * Constrained authoring requires every task to declare source-owned
+       * custody (`validateTaskCustodyProvenance`, ccc-prd/authoring.ts): both
+       * lists must be non-empty AND each path must appear as a whole path
+       * inside the task's own exact source evidence. `requirementLine` quotes
+       * "src/value.txt" between spaces, so this custody is provable from the
+       * packet rather than asserted by the fixture, and it matches the write
+       * custody the execution-policy route below already declares.
+       */
+      ownedPaths: ["src/value.txt"],
+      allowedWriteRoots: ["src/value.txt"],
       sourceRefs,
     }],
     edges: [],
@@ -524,6 +543,73 @@ function productStatus(result: CommandResult): ProductStatusOutput {
   expect(result.exitCode).toBe(0);
   expect(result.values).toHaveLength(1);
   return result.values[0] as ProductStatusOutput;
+}
+
+function mergeApprovalTerminalDiagnostic(
+  value: ProductStatusOutput,
+): unknown | null {
+  const failedProof = value.status.proofs
+    .flatMap(({ definition, attempts }) => attempts.map((attempt) => ({
+      definition,
+      attempt,
+    })))
+    .find(({ attempt }) => attempt.state === "proved_failed");
+  if (failedProof) {
+    return {
+      reason: "proof-terminal-before-merge-approval",
+      proofId: failedProof.definition.id,
+      attemptKey: failedProof.attempt.attemptKey,
+      state: failedProof.attempt.state,
+      sourceCommit: failedProof.attempt.sourceCommit,
+      result: failedProof.attempt.result && {
+        success: failedProof.attempt.result.success,
+        exitCode: failedProof.attempt.result.exitCode,
+        timedOut: failedProof.attempt.result.timedOut,
+        killed: failedProof.attempt.result.killed,
+        stderrSha256: failedProof.attempt.result.stderrSha256,
+        confinementWarnings: failedProof.attempt.result.warnings?.filter((warning) =>
+          /bubblewrap|sandbox-exec|confinement|sandbox|namespace/iu.test(warning),
+        ),
+      },
+      nextAction: value.status.nextAction,
+    };
+  }
+
+  const terminalWorkItem = value.status.workItems.find(({ state }) =>
+    ["failed", "cancelled", "exhausted"].includes(state),
+  );
+  if (terminalWorkItem) {
+    return {
+      reason: "workflow-terminal-before-merge-approval",
+      workItem: {
+        id: terminalWorkItem.id,
+        state: terminalWorkItem.state,
+        lastError: terminalWorkItem.lastError,
+        blockedReason: terminalWorkItem.blockedReason,
+      },
+      nextAction: value.status.nextAction,
+    };
+  }
+
+  if (["blocked", "abandoned", "resolve-manual-required"].includes(
+    value.status.nextAction.kind,
+  )) {
+    return {
+      reason: "product-terminal-before-merge-approval",
+      nextAction: value.status.nextAction,
+      workItems: value.status.workItems.map((item) => ({
+        id: item.id,
+        state: item.state,
+        lastError: item.lastError,
+        blockedReason: item.blockedReason,
+      })),
+      providerAttempts: value.status.providerAttempts.map((attempt) => ({
+        attemptKey: attempt.attemptKey,
+        state: attempt.state,
+      })),
+    };
+  }
+  return null;
 }
 
 pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
@@ -953,6 +1039,27 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         })],
       });
 
+      /*
+       * `preview` consumes an execution PLAN (schema, packetHash, sidecarHash,
+       * bundleHash, policy), not a bare execution policy. Build it from the
+       * bundle the compile step just produced so the three hashes come from
+       * that bundle rather than being hand-copied, and so the per-task
+       * ownedPaths/allowedWriteRoots are derived from admitted custody. The
+       * route selection is exactly what the packet fixture's routes intended.
+       */
+      const plan = createCccPrdProductExecutionPlan({
+        bundle: compiled.values[0] as Parameters<
+          typeof createCccPrdProductExecutionPlan
+        >[0]["bundle"],
+        route: {
+          providerId: "vertical-fixture-provider",
+          modelId: "vertical-fixture-model",
+          transport: "cli",
+          cliAdapterId: "ccc-product-vertical-fixture",
+        },
+      });
+      await writeFile(packet.policyPath, `${JSON.stringify(plan, null, 2)}\n`);
+
       const common = [
         packet.packetRoot,
         packet.manifestPath,
@@ -1112,6 +1219,8 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         )),
         (value) => value.status.nextAction.kind === "approve-merge",
         "exact merge approval hold",
+        undefined,
+        mergeApprovalTerminalDiagnostic,
       );
       const campaignSourceCommit =
         mergeHold.status.proofs[0]?.attempts[0]?.sourceCommit;
@@ -1129,6 +1238,11 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
               success: true,
               exitCode: 0,
               stdoutTail: expect.stringContaining("NEGATIVE_CONTROL_PASS"),
+              warnings: expect.arrayContaining([
+                expect.stringMatching(
+                  process.platform === "linux" ? /bubblewrap/iu : /sandbox-exec/iu,
+                ),
+              ]),
             }),
           })],
         }),

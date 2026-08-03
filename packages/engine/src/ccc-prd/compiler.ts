@@ -481,6 +481,381 @@ function detectDependencyCycle(
   return undefined;
 }
 
+type CccPrdDeclarationMap = Map<string, Record<string, unknown>>;
+
+const PRODUCT_GRAPH_UNSUPPORTED = "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED";
+const PRODUCT_TASK_OWNERSHIP_OVERLAP = "CCC_PRD_PRODUCT_TASK_OWNERSHIP_OVERLAP";
+const PRODUCT_TASK_CUSTODY_MISSING = "CCC_PRD_PRODUCT_TASK_CUSTODY_MISSING";
+const PRODUCT_PROTECTED_ACTION_SHARED = "CCC_PRD_PRODUCT_PROTECTED_ACTION_SHARED";
+
+function declaredStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => isNonEmptyString(item));
+}
+
+// Same containment rule as packages/core/src/ccc-campaign/canonical.ts
+// pathContains: a path owns itself and everything beneath it.
+function ownedPathsOverlap(left: string, right: string): boolean {
+  return left === right
+    || left.startsWith(`${right}/`)
+    || right.startsWith(`${left}/`);
+}
+
+/**
+ * M1 product-graph admission.
+ *
+ * The supported product route runs a campaign as a strictly ordered sequence of
+ * tasks, so it admits exactly one shape: a single declared workflow whose tasks
+ * are all declared, referenced, and imported; with exactly one entry and one
+ * terminal; ordered by a dependency relation that is a total order (a single
+ * linear chain) and is mirrored exactly by the declared dependency edges; over
+ * tasks whose owned paths never overlap and whose live-execution authority is
+ * never shared.
+ *
+ * A one-task workflow with no edges is the degenerate chain and stays admitted
+ * exactly as it was before multi-task support existed.
+ *
+ * Two invariants here are not restatements of the generic reference checks
+ * above, and both close real runtime holes:
+ *
+ *   - `edges` and `dependencyTaskIds` must describe the same relation. The
+ *     importer persists dependency rows from `edges`, while the cycle check
+ *     here and the core execution policy read `dependencyTaskIds`. If the two
+ *     disagree, the order that gets persisted is not the order that was
+ *     admitted.
+ *   - No two tasks may share a live-execution protected action. The provider
+ *     controller resolves a task's live-execution permit by action id
+ *     (selectCccCampaignDeclaredLiveExecutionAction), so a shared id lets one
+ *     task's operator approval release live execution for another task.
+ */
+function productGraphAdmissionDiagnostics(
+  collections: {
+    tasks: CccPrdDeclarationMap;
+    edges: CccPrdDeclarationMap;
+    workflows: CccPrdDeclarationMap;
+    protectedActions: CccPrdDeclarationMap;
+  },
+  taskIntents: Record<string, unknown>[],
+  edgeIntents: Record<string, unknown>[],
+  workflowIntent: Record<string, unknown>,
+  workItemIntent: Record<string, unknown>,
+): CccPrdDiagnostic[] {
+  const diagnostics: CccPrdDiagnostic[] = [];
+  const refuse = (code: string, message: string) => {
+    diagnostics.push(diagnostic(code, message));
+  };
+  const list = (values: readonly string[]) => (values.length === 0 ? "none" : values.join(", "));
+
+  const workflows = [...collections.workflows.values()];
+  const workflow = workflows[0];
+  if (workflows.length !== 1 || !workflow) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `supported product path requires exactly one declared workflow; received ${workflows.length}`,
+    );
+    return diagnostics;
+  }
+  const workflowId = String(workflow.id);
+  if (workflowIntent.entityId !== workflowId || workItemIntent.entityId !== workflowId) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `supported product path requires the imported workflow and work item to reference declared workflow ${workflowId}`,
+    );
+    return diagnostics;
+  }
+
+  // Declared tasks, workflow membership, and task import intents must describe
+  // the same set: a stray on any side is a task the runtime would either never
+  // schedule or never persist.
+  const declaredTaskIds = [...collections.tasks.keys()].sort(compareCccPrdCodeUnits);
+  const workflowTaskIds = declaredStrings(workflow.taskIds);
+  const workflowTaskIdSet = new Set(workflowTaskIds);
+  const importedTaskIds = taskIntents.map((intent) => String(intent.entityId));
+  const importedTaskIdSet = new Set(importedTaskIds);
+
+  const unreferenced = declaredTaskIds.filter((id) => !workflowTaskIdSet.has(id));
+  if (unreferenced.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `declared tasks ${list(unreferenced)} are not referenced by workflow ${workflowId}`,
+    );
+  }
+  const undeclared = workflowTaskIds.filter((id) => !collections.tasks.has(id));
+  if (undeclared.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `workflow ${workflowId} references undeclared tasks ${list(undeclared)}`,
+    );
+  }
+  if (workflowTaskIdSet.size !== workflowTaskIds.length) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `workflow ${workflowId} lists a task more than once`,
+    );
+  }
+  const unimported = declaredTaskIds.filter((id) => !importedTaskIdSet.has(id));
+  if (unimported.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `declared tasks ${list(unimported)} have no task import intent`,
+    );
+  }
+  const importedStrays = [...importedTaskIdSet]
+    .filter((id) => !collections.tasks.has(id))
+    .sort(compareCccPrdCodeUnits);
+  if (importedStrays.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `task import intents reference undeclared tasks ${list(importedStrays)}`,
+    );
+  }
+  if (importedTaskIdSet.size !== importedTaskIds.length) {
+    refuse(PRODUCT_GRAPH_UNSUPPORTED, "a task is imported more than once");
+  }
+  const foreignWorkflow = declaredTaskIds
+    .filter((id) => collections.tasks.get(id)!.workflowId !== workflowId);
+  if (foreignWorkflow.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `tasks ${list(foreignWorkflow)} do not belong to workflow ${workflowId}`,
+    );
+  }
+
+  const entryTaskIds = declaredStrings(workflow.entryTaskIds);
+  const terminalTaskIds = declaredStrings(workflow.terminalTaskIds);
+  if (entryTaskIds.length !== 1) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `workflow ${workflowId} must declare exactly one entry task; received ${list(entryTaskIds)}`,
+    );
+  }
+  if (terminalTaskIds.length !== 1) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `workflow ${workflowId} must declare exactly one terminal task; received ${list(terminalTaskIds)}`,
+    );
+  }
+
+  // Every task in a multi-task chain runs in its own isolated worktree, so each
+  // needs its own declared custody. Constrained authoring already refuses this
+  // (validateTaskCustodyProvenance in authoring.ts), but an unconstrained or
+  // hand-edited sidecar reaches here without it, and core then throws at
+  // product-policy generation. Refuse it at admission instead of deferring a
+  // certain failure to a later, less legible stage.
+  //
+  // Deliberately scoped to N > 1: the single-task route has always admitted
+  // packets that declare no custody, so requiring it for N === 1 would change
+  // an already-admitted shape.
+  if (declaredTaskIds.length > 1) {
+    for (const id of declaredTaskIds) {
+      const task = collections.tasks.get(id)!;
+      for (const field of ["ownedPaths", "allowedWriteRoots"] as const) {
+        if (declaredStrings(task[field]).length > 0) continue;
+        refuse(
+          PRODUCT_TASK_CUSTODY_MISSING,
+          `task ${id} declares no ${field}; every task in a multi-task chain must declare its own ${field}`,
+        );
+      }
+    }
+  }
+
+  // Ownership and live-execution authority are per-pair facts about the
+  // declared task set, so they are checked even when the ordering above is
+  // already broken.
+  const ownership = declaredTaskIds.map((id) => ({
+    id,
+    paths: declaredStrings(collections.tasks.get(id)!.ownedPaths),
+  }));
+  for (let left = 0; left < ownership.length; left += 1) {
+    for (let right = left + 1; right < ownership.length; right += 1) {
+      for (const leftPath of ownership[left]!.paths) {
+        for (const rightPath of ownership[right]!.paths) {
+          if (!ownedPathsOverlap(leftPath, rightPath)) continue;
+          refuse(
+            PRODUCT_TASK_OWNERSHIP_OVERLAP,
+            `tasks ${ownership[left]!.id} and ${ownership[right]!.id} own overlapping paths ${leftPath} and ${rightPath}; the supported product path requires disjoint ownership for every task pair, including dependency-ordered pairs`,
+          );
+        }
+      }
+    }
+  }
+
+  const liveExecutionActionIds = new Set(
+    [...collections.protectedActions.values()]
+      .filter((action) => action.kind === "live_execution")
+      .map((action) => String(action.id)),
+  );
+  const liveExecutionClaimants = new Map<string, string[]>();
+  for (const id of declaredTaskIds) {
+    for (const actionId of declaredStrings(collections.tasks.get(id)!.protectedActionIds)) {
+      if (!liveExecutionActionIds.has(actionId)) continue;
+      liveExecutionClaimants.set(actionId, [...(liveExecutionClaimants.get(actionId) ?? []), id]);
+    }
+  }
+  for (const actionId of [...liveExecutionClaimants.keys()].sort(compareCccPrdCodeUnits)) {
+    const claimants = liveExecutionClaimants.get(actionId)!;
+    if (claimants.length < 2) continue;
+    refuse(
+      PRODUCT_PROTECTED_ACTION_SHARED,
+      `tasks ${list(claimants)} each reference live-execution protected action ${actionId}; one operator approval would release live execution for every task that shares it`,
+    );
+  }
+
+  // The ordering analysis below reads predecessor and successor counts over the
+  // workflow's task set. Computing it over a set already proven inconsistent
+  // reports positions that do not exist, so stop here instead.
+  if (diagnostics.some(({ code }) => code === PRODUCT_GRAPH_UNSUPPORTED)) return diagnostics;
+
+  const dependencies = new Map(declaredTaskIds.map((id) => [
+    id,
+    declaredStrings(collections.tasks.get(id)!.dependencyTaskIds)
+      .filter((dependencyId) => collections.tasks.has(dependencyId)),
+  ]));
+  const successors = new Map(declaredTaskIds.map((id) => [id, [] as string[]]));
+  let relationCount = 0;
+  for (const [id, dependencyIds] of dependencies) {
+    relationCount += dependencyIds.length;
+    for (const dependencyId of dependencyIds) successors.get(dependencyId)!.push(id);
+  }
+
+  const branchingPredecessors = declaredTaskIds.filter((id) => dependencies.get(id)!.length > 1);
+  if (branchingPredecessors.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `tasks ${list(branchingPredecessors)} declare more than one predecessor; the supported product path admits only a single linear chain`,
+    );
+  }
+  const branchingSuccessors = declaredTaskIds.filter((id) => successors.get(id)!.length > 1);
+  if (branchingSuccessors.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `tasks ${list(branchingSuccessors)} are the predecessor of more than one task; the supported product path admits only a single linear chain`,
+    );
+  }
+  if (relationCount !== declaredTaskIds.length - 1) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `a ${declaredTaskIds.length}-task chain requires exactly ${declaredTaskIds.length - 1} dependency relation(s); received ${relationCount}`,
+    );
+  }
+
+  const chainHeads = declaredTaskIds.filter((id) => dependencies.get(id)!.length === 0);
+  const chainTails = declaredTaskIds.filter((id) => successors.get(id)!.length === 0);
+  if (chainHeads.length !== 1) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `the task dependency chain must start at exactly one task with no predecessor; received ${list(chainHeads)}`,
+    );
+  } else if (entryTaskIds.length === 1 && entryTaskIds[0] !== chainHeads[0]) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `workflow ${workflowId} declares entry task ${entryTaskIds[0]} but the dependency chain starts at ${chainHeads[0]}`,
+    );
+  }
+  if (chainTails.length !== 1) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `the task dependency chain must end at exactly one task with no successor; received ${list(chainTails)}`,
+    );
+  } else if (terminalTaskIds.length === 1 && terminalTaskIds[0] !== chainTails[0]) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `workflow ${workflowId} declares terminal task ${terminalTaskIds[0]} but the dependency chain ends at ${chainTails[0]}`,
+    );
+  }
+
+  // Walking the chain proves connectivity: disjoint chains satisfy every local
+  // count above. The visited guard keeps a cycle from looping forever here;
+  // the cycle itself is reported by the shared dependency-cycle check.
+  if (chainHeads.length === 1 && branchingSuccessors.length === 0) {
+    const visited = new Set<string>();
+    let cursor: string | undefined = chainHeads[0];
+    while (cursor !== undefined && !visited.has(cursor)) {
+      visited.add(cursor);
+      cursor = successors.get(cursor)![0];
+    }
+    const unreachable = declaredTaskIds.filter((id) => !visited.has(id));
+    if (unreachable.length > 0) {
+      refuse(
+        PRODUCT_GRAPH_UNSUPPORTED,
+        `tasks ${list(unreachable)} are not reachable from entry task ${chainHeads[0]}`,
+      );
+    }
+  }
+
+  // Compare the two orderings structurally rather than through an encoded
+  // pair key: dependent -> set of its dependencies, on both sides.
+  const relationsByDependent = new Map<string, Set<string>>();
+  for (const [id, dependencyIds] of dependencies) {
+    if (dependencyIds.length > 0) relationsByDependent.set(id, new Set(dependencyIds));
+  }
+  const declaredEdges = [...collections.edges.values()];
+  const edgesByDependent = new Map<string, Set<string>>();
+  for (const edge of declaredEdges) {
+    const dependent = String(edge.fromTaskId);
+    edgesByDependent.set(
+      dependent,
+      (edgesByDependent.get(dependent) ?? new Set<string>()).add(String(edge.toTaskId)),
+    );
+  }
+  const relationsAbsentFrom = (
+    left: Map<string, Set<string>>,
+    right: Map<string, Set<string>>,
+  ): string[] => {
+    const absent: string[] = [];
+    for (const [dependent, dependencyIds] of left) {
+      for (const dependencyId of dependencyIds) {
+        if (right.get(dependent)?.has(dependencyId) === true) continue;
+        absent.push(`${dependent} depends on ${dependencyId}`);
+      }
+    }
+    return absent.sort(compareCccPrdCodeUnits);
+  };
+
+  const edgelessRelations = relationsAbsentFrom(relationsByDependent, edgesByDependent);
+  if (edgelessRelations.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `task dependencies ${edgelessRelations.join("; ")} have no declared dependency edge`,
+    );
+  }
+  const undeclaredRelations = relationsAbsentFrom(edgesByDependent, relationsByDependent);
+  if (undeclaredRelations.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `dependency edges ${undeclaredRelations.join("; ")} are not declared as task dependencies`,
+    );
+  }
+  const distinctEdgeCount = [...edgesByDependent.values()]
+    .reduce((total, dependencyIds) => total + dependencyIds.size, 0);
+  if (declaredEdges.length !== distinctEdgeCount) {
+    refuse(PRODUCT_GRAPH_UNSUPPORTED, "a task dependency is declared by more than one dependency edge");
+  }
+
+  const importedEdgeIds = new Set(edgeIntents.map((intent) => String(intent.entityId)));
+  const unimportedEdges = declaredEdges
+    .map((edge) => String(edge.id))
+    .filter((id) => !importedEdgeIds.has(id))
+    .sort(compareCccPrdCodeUnits);
+  if (unimportedEdges.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `declared dependency edges ${list(unimportedEdges)} have no dependency edge import intent`,
+    );
+  }
+  const strayEdgeIntents = [...importedEdgeIds]
+    .filter((id) => !collections.edges.has(id))
+    .sort(compareCccPrdCodeUnits);
+  if (strayEdgeIntents.length > 0) {
+    refuse(
+      PRODUCT_GRAPH_UNSUPPORTED,
+      `dependency edge import intents reference undeclared edges ${list(strayEdgeIntents)}`,
+    );
+  }
+
+  return diagnostics;
+}
+
 function validateSidecar(
   sidecar: CccPrdSidecar,
   custody: ReturnType<typeof readCccPrdPacketCustody>,
@@ -756,6 +1131,8 @@ function validateSidecar(
         "documentIds",
         "artifactIds",
         "protectedActionIds",
+        "ownedPaths",
+        "allowedWriteRoots",
         "spans",
       ],
       diagnostics,
@@ -980,37 +1357,13 @@ function validateSidecar(
     && workflowIntents.length === 1
     && workItemIntents.length === 1
   ) {
-    const taskIntents = intentsByType.get("task") ?? [];
-    const declaredWorkflows = [...collections.workflows.values()];
-    const declaredTasks = [...collections.tasks.values()];
-    const workflow = declaredWorkflows[0];
-    const task = declaredTasks[0];
-    const taskId = task?.id;
-    const workflowId = workflow?.id;
-    const exactTaskReference = (value: unknown): boolean => (
-      Array.isArray(value)
-      && value.length === 1
-      && value[0] === taskId
-    );
-    if (
-      declaredWorkflows.length !== 1
-      || declaredTasks.length !== 1
-      || taskIntents.length !== 1
-      || !workflow
-      || !task
-      || workflowIntents[0]!.entityId !== workflowId
-      || workItemIntents[0]!.entityId !== workflowId
-      || taskIntents[0]!.entityId !== taskId
-      || task.workflowId !== workflowId
-      || !exactTaskReference(workflow.taskIds)
-      || !exactTaskReference(workflow.entryTaskIds)
-      || !exactTaskReference(workflow.terminalTaskIds)
-    ) {
-      diagnostics.push(diagnostic(
-        "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED",
-        "supported product path currently requires exactly one declared workflow containing exactly one declared and imported task; multi-task campaign integration is not yet supported",
-      ));
-    }
+    diagnostics.push(...productGraphAdmissionDiagnostics(
+      collections,
+      intentsByType.get("task") ?? [],
+      intentsByType.get("dependency_edge") ?? [],
+      workflowIntents[0]!,
+      workItemIntents[0]!,
+    ));
   }
 
   if (input.requireMaterialCoverage || sidecar.materialCoverage !== undefined) {

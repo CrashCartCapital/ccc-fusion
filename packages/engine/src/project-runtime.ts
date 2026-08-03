@@ -35,6 +35,12 @@ export interface RuntimeMetrics {
 export interface ProjectRuntimeConfig {
   /** Unique project ID (e.g., "proj_abc123") */
   projectId: string;
+  /**
+   * Unique boot identity issued only after ProjectEngineManager acquires the
+   * machine-local singleton. When present, campaign leases use this identity
+   * and startup may safely park uncertain effects owned by a prior boot.
+   */
+  engineInstanceId?: string;
   /** Absolute path to the project working directory */
   workingDirectory: string;
   /** Execution isolation mode */

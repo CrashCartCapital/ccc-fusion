@@ -40,6 +40,41 @@ type DiscoveryResult = {
   }>;
 };
 
+type CorpusManifest = {
+  schema: "ccc-prd.corpus-manifest.v1";
+  activeProjectsRoot: string;
+  summary: {
+    projectCount: number;
+    selectedCount: number;
+    ambiguousCount: number;
+    noPrdCount: number;
+    readyForIntakeCount: number;
+    blockingQuestionCount: number;
+  };
+  projects: Array<{
+    project: string;
+    projectRoot: string;
+    candidateCount: number;
+    selection:
+      | {
+          kind: "selected";
+          selectedPrdPath: string;
+          projectRelativePath: string;
+          sourceSha256: string;
+          sourceBytes: number;
+          version: string | null;
+          status: string | null;
+          intakeContract: {
+            readyForIntake: boolean;
+            blockingQuestions: Array<{ code: string; message: string }>;
+            advisories: Array<{ code: string; message: string }>;
+          };
+        }
+      | { kind: "ambiguous"; candidatePaths: string[]; reason: string }
+      | { kind: "none" };
+  }>;
+};
+
 type FreezeResult = {
   schema: "ccc-prd.freeze-result.v1";
   rootDir: string;
@@ -69,10 +104,18 @@ type FreezeResult = {
 
 const ccc = engine as typeof engine & {
   discoverCccPrdCandidates(input: { activeProjectsRoot: string }): DiscoveryResult;
+  buildCccPrdCorpusManifest(input: { activeProjectsRoot: string }): CorpusManifest;
   freezeCccPrdPacket(input: {
     activeProjectsRoot: string;
     selectedPrdPath: string;
     outputDir: string;
+    operatorContext?: {
+      schema: "ccc-prd.operator-context.v1";
+      targetRepository: { path: string; baseCommit: string };
+      taskCustody: { ownedPaths: string[]; allowedWriteRoots: string[] };
+      writeRootPurpose: string;
+      bounds: { maxRequests: number; maxDurationMs: number; maxConcurrency: number };
+    };
   }): FreezeResult;
 };
 
@@ -110,6 +153,88 @@ function expectIntakeError(run: () => unknown, code: string): void {
 }
 
 describe("CCC PRD discovery", () => {
+  it("builds a deterministic private-safe corpus manifest without copying PRD text", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const readyBytes = Buffer.from([
+      "# Alpha PRD",
+      "Target repository: /workspace/alpha",
+      `Baseline commit: ${"a".repeat(40)}`,
+      "Allowed write roots: src/alpha",
+      "## Acceptance behavior and expected proof",
+      "Proof: task verify",
+      "## Protected actions",
+      "None.",
+      "TOP SECRET PAYLOAD MUST NOT LEAK",
+    ].join("\n"));
+    const readyPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      readyBytes,
+    );
+    const blockedPath = write(
+      activeProjectsRoot,
+      "beta/PRJ-HUM-beta-PRD-v2.0.0.md",
+      "# Beta PRD\n\n## Requirements\n\n- Make beta work.\n",
+    );
+    write(activeProjectsRoot, "gamma/.keep", "");
+
+    const first = ccc.buildCccPrdCorpusManifest({ activeProjectsRoot });
+    const second = ccc.buildCccPrdCorpusManifest({ activeProjectsRoot });
+
+    expect(second).toEqual(first);
+    expect(first).toMatchObject({
+      schema: "ccc-prd.corpus-manifest.v1",
+      activeProjectsRoot: resolve(activeProjectsRoot),
+      summary: {
+        projectCount: 3,
+        selectedCount: 2,
+        ambiguousCount: 0,
+        noPrdCount: 1,
+        readyForIntakeCount: 1,
+        blockingQuestionCount: 6,
+      },
+      projects: [
+        {
+          project: "alpha",
+          candidateCount: 1,
+          selection: {
+            kind: "selected",
+            selectedPrdPath: resolve(readyPath),
+            projectRelativePath: "PRJ-HUM-alpha-PRD-v1.0.0.md",
+            sourceSha256: sha256(readyBytes),
+            sourceBytes: readyBytes.byteLength,
+            version: "1.0.0",
+            intakeContract: { readyForIntake: true, blockingQuestions: [] },
+          },
+        },
+        {
+          project: "beta",
+          candidateCount: 1,
+          selection: {
+            kind: "selected",
+            selectedPrdPath: resolve(blockedPath),
+            projectRelativePath: "PRJ-HUM-beta-PRD-v2.0.0.md",
+            version: "2.0.0",
+            intakeContract: {
+              readyForIntake: false,
+              blockingQuestions: expect.arrayContaining([
+                expect.objectContaining({ code: "CCC_PRD_TARGET_REPOSITORY_REQUIRED" }),
+              ]),
+            },
+          },
+        },
+        {
+          project: "gamma",
+          candidateCount: 0,
+          selection: { kind: "none" },
+        },
+      ],
+    });
+    expect(JSON.stringify(first)).not.toContain("TOP SECRET PAYLOAD");
+    expect(readFileSync(readyPath).equals(readyBytes)).toBe(true);
+  });
+
   it("treats root-level portfolio notes as context rather than project PRDs", () => {
     const root = fixtureRoot();
     const activeProjectsRoot = join(root, "active");
@@ -220,7 +345,7 @@ describe("CCC PRD discovery", () => {
     expect(first.projects[1]!.selection).toEqual({
       kind: "ambiguous",
       candidatePaths: [resolve(betaA), resolve(betaB)],
-      reason: "multiple current PRD candidates share the highest project-local semver/status score",
+      reason: "multiple current PRD candidates share the highest project-local authority, stage, version, location, and status score",
     });
     expect(first.projects[2]!.selection).toEqual({ kind: "none" });
   });
@@ -258,9 +383,437 @@ describe("CCC PRD discovery", () => {
       selectedPrdPath: resolve(selectedPrdPath),
     });
   });
+
+  it("excludes workflow artifacts and hidden staging files from current-PRD discovery", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "neo/prd-v0.5.0/260712-neo-PRODPRD-v0.5.0.md",
+      [
+        "---",
+        "status: frozen",
+        "version: v0.5.0",
+        "---",
+        "# Neo PROD PRD v0.5.0",
+      ].join("\n"),
+    );
+    const artifact = [
+      "---",
+      "status: final",
+      "version: v99.0.0",
+      "---",
+      "# Generated PRD candidate",
+    ].join("\n");
+    write(activeProjectsRoot, "neo/prd-v0.4.0/iterations/r1/candidate.md", artifact);
+    write(activeProjectsRoot, "neo/runs/run-1/generated-prd.md", artifact);
+    write(activeProjectsRoot, "neo/fixtures/sample-prd.md", artifact);
+    write(activeProjectsRoot, "neo/_prompts/review-prd.md", artifact);
+    write(activeProjectsRoot, "neo/_templates/tmp_questions.md", artifact);
+    write(activeProjectsRoot, "neo/brainstorming-1/design-prd.md", artifact);
+    write(activeProjectsRoot, "neo/eval-prompts/evaluate-prd.md", artifact);
+    write(activeProjectsRoot, "neo/staging/generated-prd-v99.0.0.md", artifact);
+    write(activeProjectsRoot, "neo/prd-v0.5.0/.staging-PRD-v99.0.0.md", artifact);
+
+    const result = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+
+    expect(result.projects[0]?.candidates.map((candidate) => candidate.projectRelativePath)).toEqual([
+      "prd-v0.5.0/260712-neo-PRODPRD-v0.5.0.md",
+    ]);
+    expect(result.projects[0]?.selection).toEqual({
+      kind: "selected",
+      selectedPrdPath: resolve(selectedPrdPath),
+    });
+    expect(result.projects[0]?.candidates[0]?.score.status).toBe(4);
+  });
+
+  it("excludes underscore-prefixed portfolio support directories from project discovery", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    write(
+      activeProjectsRoot,
+      "_project-explainers/REF-HUM-Current-PRD-Explainers-v7.2.3.md",
+      [
+        "---",
+        "status: active",
+        "version: 7.2.3",
+        "---",
+        "# Current PRD explainers",
+      ].join("\n"),
+    );
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-AI-alpha-PRD-v1.0.0.md",
+      "# Alpha PRD v1.0.0",
+    );
+
+    const result = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+
+    expect(result.projects.map((project) => project.project)).toEqual(["alpha"]);
+    expect(result.projects[0]?.selection).toEqual({
+      kind: "selected",
+      selectedPrdPath: resolve(selectedPrdPath),
+    });
+  });
+
+  it("prefers a version-root PRD over same-version execution-packet copies", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const prd = [
+      "---",
+      "status: active",
+      "version: 7.2.3",
+      "---",
+      "# DuckLake PRD v7.2.3",
+    ].join("\n");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "lab/prd-v7.2.3/260708-DuckLake-PRD-v7.2.3.md",
+      prd,
+    );
+    write(
+      activeProjectsRoot,
+      "lab/prd-v7.2.3/REF-AI-DuckLake-v7.2.3-SourceCoverageLedger.md",
+      [
+        "---",
+        "status: final",
+        "version: 7.2.3",
+        "---",
+        "# DuckLake PRD Source Coverage Ledger v7.2.3",
+      ].join("\n"),
+    );
+    write(
+      activeProjectsRoot,
+      "lab/autonomous-execution-v7.2.3/spec-authority-r2/260708-DuckLake-PRD-v7.2.3.md",
+      prd,
+    );
+    write(
+      activeProjectsRoot,
+      "lab/autonomous-execution-v7.2.3/spec-authority-r3/260708-DuckLake-PRD-v7.2.3.md",
+      prd,
+    );
+
+    const result = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+
+    expect(result.projects[0]?.selection).toEqual({
+      kind: "selected",
+      selectedPrdPath: resolve(selectedPrdPath),
+    });
+  });
+
+  it.each([
+    ["v0.8.x", "PRODPRD-atm-v0.8.4.md", "0.8.4"],
+    ["prd-v0.4.x", "sru-prd-v0.4.0.md", "0.4.0"],
+    ["v0.8.2", "hermes-PRODPRD-v0.8.2.md", "0.8.2"],
+  ])("recognizes %s as a project-local PRD version root", (directory, filename, version) => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      `alpha/${directory}/${filename}`,
+      [
+        "---",
+        "status: active",
+        `version: ${version}`,
+        "---",
+        `# Alpha PRD v${version}`,
+      ].join("\n"),
+    );
+    write(
+      activeProjectsRoot,
+      `alpha/execution/spec-authority/${filename}`,
+      [
+        "---",
+        "status: final",
+        `version: ${version}`,
+        "---",
+        `# Alpha PRD v${version}`,
+      ].join("\n"),
+    );
+
+    const result = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+
+    expect(result.projects[0]?.selection).toEqual({
+      kind: "selected",
+      selectedPrdPath: resolve(selectedPrdPath),
+    });
+    expect(result.projects[0]?.candidates.find(
+      (candidate) => candidate.path === resolve(selectedPrdPath),
+    )?.score.signal).toBe(3);
+  });
+
+  it("surfaces a repo-bound project contract with goals, acceptance, and stop gates", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "plaid/PRJ-AI-PlaidReadMCP.md",
+      [
+        "---",
+        "type: prj",
+        "status: active",
+        "repo: /workspace/plaid-read-mcp",
+        "---",
+        "# Plaid Read MCP",
+        "## Goals",
+        "- Expose six bounded reads.",
+        "## Non-goals",
+        "- No writes.",
+        "## Acceptance criteria",
+        "- task verify passes.",
+        "## Stop gates",
+        "- Stop before live credentials.",
+        "## Binding decisions",
+        "- Python >=3.12 is required.",
+      ].join("\n"),
+    );
+    const outputDir = join(root, "out", "unversioned-project-contract");
+
+    const result = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+    const frozen = ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+    });
+
+    expect(result.projects[0]?.selection).toEqual({
+      kind: "selected",
+      selectedPrdPath: resolve(selectedPrdPath),
+    });
+    expect(result.projects[0]?.candidates[0]?.version).toBeNull();
+    expect(frozen.packet.sourceVersion).toBe("unversioned");
+  });
+
+  it("prefers a downstream production PRD over its newer source UFPRD", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "skill/v0.1/v0.1.6-SkillPipeline-PRODPRD.md",
+      [
+        "---",
+        "status: draft",
+        "source_ufprd: '[[skill-ufprd-v0.3]]'",
+        "prd_stage: production-draft",
+        "prd_version: v0.1.6",
+        "---",
+        "# Skill Pipeline Production PRD v0.1.6",
+      ].join("\n"),
+    );
+    const sourceUfprdPath = write(
+      activeProjectsRoot,
+      "skill/ufprd/skill-ufprd-v0.3.md",
+      [
+        "---",
+        "status: draft",
+        "version: v0.3",
+        "---",
+        "# Skill Pipeline UFPRD v0.3",
+        "This source is input to the production PRD transition.",
+      ].join("\n"),
+    );
+
+    const result = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+
+    expect(result.projects[0]?.candidates.map((candidate) => candidate.path)).toContain(
+      resolve(sourceUfprdPath),
+    );
+    expect(result.projects[0]?.selection).toEqual({
+      kind: "selected",
+      selectedPrdPath: resolve(selectedPrdPath),
+    });
+  });
 });
 
 describe("CCC PRD packet freeze", () => {
+  it("renders reviewed operator facts into the atomic frozen packet without changing the PRD", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      [
+        "# Alpha PRD",
+        "",
+        "## Requirement and proof",
+        "",
+        "Change src/value.txt. Acceptance: task verify succeeds. Proof: task verify.",
+        "",
+        "## Protected actions",
+        "",
+        "Merge refs/heads/main requires human approval.",
+        "",
+      ].join("\n"),
+    );
+    const sourceBefore = readFileSync(selectedPrdPath);
+    const outputDir = join(root, "out", "guided");
+    const targetRepository = join(root, "target");
+
+    const frozen = ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+      operatorContext: {
+        schema: "ccc-prd.operator-context.v1",
+        targetRepository: {
+          path: targetRepository,
+          baseCommit: "a".repeat(40),
+        },
+        taskCustody: {
+          ownedPaths: ["src/value.txt"],
+          allowedWriteRoots: ["src/value.txt"],
+        },
+        writeRootPurpose: "implement the reviewed Alpha requirement",
+        bounds: {
+          maxRequests: 3,
+          maxDurationMs: 120000,
+          maxConcurrency: 1,
+        },
+      },
+    });
+
+    const contextPath = join(
+      outputDir,
+      "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+    );
+    const context = readFileSync(contextPath, "utf8");
+    const manifest = JSON.parse(readFileSync(frozen.manifestPath, "utf8")) as {
+      entries: Array<Record<string, unknown>>;
+    };
+    const receipt = JSON.parse(readFileSync(frozen.receiptPath, "utf8")) as {
+      entries: Array<Record<string, unknown>>;
+    };
+
+    expect(readFileSync(selectedPrdPath)).toEqual(sourceBefore);
+    expect(frozen.packet.fileCount).toBe(2);
+    expect(context).toContain("Target repository: " + targetRepository);
+    expect(context).toContain("Baseline commit: " + "a".repeat(40));
+    expect(context).toContain("Task owned path: src/value.txt");
+    expect(context).toContain("Task allowed write root: src/value.txt");
+    expect(context).toContain("Allowed write root: " + join(targetRepository, ".fusion"));
+    expect(context).toContain(
+      "Allowed write root purpose: Fusion-managed campaign state and artifacts",
+    );
+    expect(context).toContain("Allowed write root: " + join(targetRepository, "src/value.txt"));
+    expect(context).toContain("Maximum requests: 3");
+    expect(manifest.entries).toContainEqual(expect.objectContaining({
+      relative_path: "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+      role: "support",
+      authoritative: true,
+      sha256: sha256(context),
+    }));
+    expect(receipt.entries).toContainEqual(expect.objectContaining({
+      originPath: "operator-context://ccc-prd.operator-context.v1",
+      relativePath: "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+      authoritative: true,
+    }));
+    expect(readCccPrdPacketCustody({
+      rootDir: outputDir,
+      manifestPath: frozen.manifestPath,
+    }).packetHash).toBe(frozen.packet.packetHash);
+  });
+
+  it("refuses contradictory operator context with zero freeze residue", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      "# Alpha PRD\n\n- Target repository: /already/decided\n",
+    );
+    const outputDir = join(root, "out", "conflict");
+
+    expectIntakeError(() => ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+      operatorContext: {
+        schema: "ccc-prd.operator-context.v1",
+        targetRepository: {
+          path: "/different/target",
+          baseCommit: "a".repeat(40),
+        },
+        taskCustody: {
+          ownedPaths: ["src"],
+          allowedWriteRoots: ["src"],
+        },
+        writeRootPurpose: "implementation",
+        bounds: {
+          maxRequests: 3,
+          maxDurationMs: 120000,
+          maxConcurrency: 1,
+        },
+      },
+    }), "CCC_PRD_OPERATOR_CONTEXT_CONFLICT");
+    expect(existsSync(outputDir)).toBe(false);
+  });
+
+  it("refuses escaping guided task custody with zero freeze residue", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/PRJ-HUM-alpha-PRD-v1.0.0.md",
+      "# Alpha PRD\n\nChange the admitted source file.\n",
+    );
+    const outputDir = join(root, "out", "escaping-context");
+
+    expectIntakeError(() => ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+      operatorContext: {
+        schema: "ccc-prd.operator-context.v1",
+        targetRepository: {
+          path: join(root, "target"),
+          baseCommit: "a".repeat(40),
+        },
+        taskCustody: {
+          ownedPaths: ["../outside"],
+          allowedWriteRoots: ["../outside"],
+        },
+        writeRootPurpose: "implementation",
+        bounds: {
+          maxRequests: 3,
+          maxDurationMs: 120000,
+          maxConcurrency: 1,
+        },
+      },
+    }), "CCC_PRD_OPERATOR_CONTEXT_INVALID");
+    expect(existsSync(outputDir)).toBe(false);
+  });
+
+  it("allows explicit operator selection of a PRD omitted from automatic artifact discovery", () => {
+    const root = fixtureRoot();
+    const activeProjectsRoot = join(root, "active");
+    const selectedPrdPath = write(
+      activeProjectsRoot,
+      "alpha/runs/review/PRJ-AI-alpha-PRD-v1.0.0.md",
+      [
+        "---",
+        "status: active",
+        "version: 1.0.0",
+        "---",
+        "# Alpha PRD",
+        "## Source Set",
+        "- [[support]]",
+      ].join("\n"),
+    );
+    write(activeProjectsRoot, "alpha/runs/review/support.md", "# Support");
+    const outputDir = join(root, "out", "explicit-artifact-selection");
+
+    const discovery = ccc.discoverCccPrdCandidates({ activeProjectsRoot });
+    const frozen = ccc.freezeCccPrdPacket({
+      activeProjectsRoot,
+      selectedPrdPath,
+      outputDir,
+    });
+
+    expect(discovery.projects[0]?.selection).toEqual({ kind: "none" });
+    expect(frozen.packet.fileCount).toBe(2);
+    expect(frozen.unresolvedReferences).toEqual([]);
+  });
+
   it("resolves vault-qualified references that remain inside the selected project", () => {
     const root = fixtureRoot();
     const activeProjectsRoot = join(root, "active");

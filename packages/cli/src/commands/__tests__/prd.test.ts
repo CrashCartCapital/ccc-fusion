@@ -1,7 +1,11 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
+import {
+  MAX_OPERATOR_CONTEXT_BYTES,
+  readBoundedPrdStdin,
+} from "../prd-stdin.js";
 import { runPrdCommand } from "../prd.js";
 import {
   cleanupPacketRoots,
@@ -14,7 +18,75 @@ const bootstrapProofAdmission = () => bootstrapCccCampaignProofAdmissionHost({
   builtRootPath: join(repoRoot, "packages/cli/dist"),
 });
 
+async function createExecutionPlan(
+  packet: ReturnType<typeof createPacketRoot>,
+  name = "execution-plan.json",
+): Promise<string> {
+  const outputPath = join(packet.root, name);
+  const output: string[] = [];
+  const exit = await runPrdCommand([
+    "policy",
+    packet.root,
+    packet.manifest,
+    packet.sidecar,
+    packet.target,
+    packet.base,
+    outputPath,
+    "--provider",
+    "deterministic-fake",
+    "--model",
+    "fixture-v2",
+    "--transport",
+    "pi",
+  ], { write: (line) => output.push(line) });
+  expect(exit, output.join("\n")).toBe(0);
+  return outputPath;
+}
+
 describe("prd command exit contract", () => {
+  it("stops reading typed operator context as soon as the byte limit is crossed", async () => {
+    let chunksRead = 0;
+    async function* chunks(): AsyncGenerator<Buffer> {
+      chunksRead += 1;
+      yield Buffer.alloc(MAX_OPERATOR_CONTEXT_BYTES, "a");
+      chunksRead += 1;
+      yield Buffer.from("b");
+      chunksRead += 1;
+      yield Buffer.from("c");
+    }
+
+    await expect(readBoundedPrdStdin(chunks())).rejects.toMatchObject({
+      code: "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+      message: "typed operator context exceeds 262144 bytes",
+    });
+    expect(chunksRead).toBe(2);
+  });
+
+  it("refuses malformed typed operator context before calling packet freeze", async () => {
+    const freeze = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      [
+        "freeze",
+        "/vault/active",
+        "/vault/active/alpha/PRD-v1.0.0.md",
+        "/tmp/frozen-alpha",
+        "--context-stdin",
+      ],
+      {
+        write: (line) => output.push(line),
+        readStdin: async () => "{",
+      },
+      { freezeCccPrdPacket: freeze },
+    )).toBe(1);
+    expect(freeze).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_OPERATOR_CONTEXT_INVALID" }],
+    });
+  });
+
   it("returns usage exit 2 before any compiler or filesystem work", async () => {
     const output: string[] = [];
     expect(await runPrdCommand(["compile"], { write: (line) => output.push(line) })).toBe(2);
@@ -22,13 +94,19 @@ describe("prd command exit contract", () => {
       [
         "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
         "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+        "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
+        "       fn prd corpus <active-projects-root>",
         "       fn prd discover <active-projects-root>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
+        "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
+        "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin",
+        "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
+        "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path> (mutually exclusive with --provider/--model/--transport/--cli-adapter; exactly one form required)",
         "       fn prd template",
         "       fn prd lint <prd-path>",
         "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
-        "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]",
-        "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
+        "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]",
+        "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
         "       fn prd <inspect|reconcile> <idempotency-key> [--project <id|name>]",
         "       fn prd status <idempotency-key> [--project <id|name>]",
         "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
@@ -109,6 +187,260 @@ describe("prd command exit contract", () => {
       selectedPrdPath: "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
       outputDir: "/tmp/frozen-alpha",
     });
+
+    const operatorContext = {
+      schema: "ccc-prd.operator-context.v1" as const,
+      targetRepository: {
+        path: "/workspace/alpha",
+        baseCommit: "d".repeat(40),
+      },
+      taskCustody: {
+        ownedPaths: ["src/alpha", "tests/alpha"],
+        allowedWriteRoots: ["src/alpha", "tests/alpha"],
+      },
+      writeRootPurpose: "implement and verify Alpha",
+      bounds: {
+        maxRequests: 4,
+        maxDurationMs: 120000,
+        maxConcurrency: 2,
+      },
+    };
+    expect(await runPrdCommand(
+      [
+        "freeze",
+        "/vault/active",
+        "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+        "/tmp/frozen-alpha",
+        "--target",
+        "/workspace/alpha",
+        "--base",
+        "d".repeat(40),
+        "--owned-path",
+        "src/alpha",
+        "--owned-path",
+        "tests/alpha",
+        "--write-root",
+        "src/alpha",
+        "--write-root",
+        "tests/alpha",
+        "--write-purpose",
+        "implement and verify Alpha",
+        "--max-requests",
+        "4",
+        "--max-duration-ms",
+        "120000",
+        "--max-concurrency",
+        "2",
+      ],
+      { write: () => undefined },
+      { freezeCccPrdPacket: freeze },
+    )).toBe(0);
+    expect(freeze).toHaveBeenLastCalledWith({
+      activeProjectsRoot: "/vault/active",
+      selectedPrdPath: "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+      outputDir: "/tmp/frozen-alpha",
+      operatorContext,
+    });
+
+    expect(await runPrdCommand(
+      [
+        "freeze",
+        "/vault/active",
+        "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+        "/tmp/frozen-alpha",
+        "--context-stdin",
+      ],
+      {
+        write: () => undefined,
+        readStdin: async () => JSON.stringify(operatorContext),
+      },
+      { freezeCccPrdPacket: freeze },
+    )).toBe(0);
+    expect(freeze).toHaveBeenLastCalledWith({
+      activeProjectsRoot: "/vault/active",
+      selectedPrdPath: "/vault/active/alpha/PRJ-HUM-Alpha-PRD-v2.0.0.md",
+      outputDir: "/tmp/frozen-alpha",
+      operatorContext,
+    });
+  });
+
+  it("prints the read-only corpus manifest through the normal CLI", async () => {
+    const manifest = {
+      schema: "ccc-prd.corpus-manifest.v1",
+      activeProjectsRoot: "/vault/active",
+      summary: {
+        projectCount: 1,
+        selectedCount: 1,
+        ambiguousCount: 0,
+        noPrdCount: 0,
+        readyForIntakeCount: 0,
+        blockingQuestionCount: 2,
+      },
+      projects: [],
+    };
+    const buildCorpus = vi.fn(() => manifest);
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      ["corpus", "/vault/active"],
+      { write: (line) => output.push(line) },
+      { buildCccPrdCorpusManifest: buildCorpus } as never,
+    )).toBe(0);
+    expect(JSON.parse(output[0]!)).toEqual(manifest);
+    expect(buildCorpus).toHaveBeenCalledWith({ activeProjectsRoot: "/vault/active" });
+  });
+
+  it("writes a non-executable understanding review through one bounded native adapter", async () => {
+    const packet = createPacketRoot();
+    const reviewPath = join(packet.root, "understanding-review.json");
+    const review = {
+      schema: "ccc-prd.understanding-review.v1",
+      kind: "understanding-review",
+      executable: false,
+      requirements: [{ id: "REQ-REVIEW", statement: "Understand the PRD." }],
+      proofs: [],
+      tasks: [],
+      implementationContext: {
+        approvalStatus: "unapproved",
+        targetRepository: { path: null, baseCommit: null },
+        bounds: {
+          maxRequests: null,
+          maxDurationMs: null,
+          maxConcurrency: null,
+        },
+        admittedWriteRoots: [],
+        missingFacts: [{
+          code: "CCC_PRD_TARGET_REPOSITORY_REQUIRED",
+          question: "Which target repository should this PRD change?",
+        }],
+      },
+      coverage: {
+        inventoryCount: 2,
+        dispositionCount: 1,
+        dispositions: [],
+        missing: [{ id: "MAT-1", title: "Unmapped section" }],
+        conflicts: [],
+      },
+      review: {
+        ambiguities: [],
+        unresolvedDecisions: [],
+        exceptions: [],
+        protectedActions: [],
+      },
+    };
+    const understand = vi.fn(async () => review);
+    const adapter = {
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(),
+    };
+    const createAdapter = vi.fn(() => adapter);
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "understand",
+      packet.root,
+      packet.manifest,
+      reviewPath,
+      "--provider",
+      "loopback",
+      "--model",
+      "fixture",
+      "--max-duration-ms",
+      "30000",
+      "--max-prompt-bytes",
+      "1000000",
+      "--max-response-bytes",
+      "262144",
+      "--max-review-items",
+      "8",
+    ], { write: (line) => output.push(line) }, {
+      bootstrapProofAdmission: async () => ({}) as never,
+      createNativeCccPrdAuthoringAdapter: createAdapter,
+      understandCccPrdPacket: understand,
+    } as never)).toBe(0);
+
+    expect(createAdapter).toHaveBeenCalledWith({
+      provider: "loopback",
+      model: "fixture",
+      maxDurationMs: 30000,
+      maxPromptBytes: 1000000,
+      maxResponseBytes: 262144,
+      mode: "understanding",
+    });
+    expect(understand).toHaveBeenCalledWith({
+      rootDir: packet.root,
+      manifestPath: packet.manifest,
+      adapter,
+      maxReviewItems: 8,
+      workflowExtensionRegistry: {},
+    });
+    expect(JSON.parse(readFileSync(reviewPath, "utf8"))).toEqual(review);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      ...review,
+      reviewPath,
+    });
+    expect(JSON.parse(output[0]!).executable).toBe(false);
+  });
+
+  it("generates a hash-bound execution plan without operator-authored policy JSON", async () => {
+    const packet = createPacketRoot();
+    const authorOutput: string[] = [];
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: (line) => authorOutput.push(line) },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+
+    const executionPlanPath = join(packet.root, "execution-plan.json");
+    const output: string[] = [];
+    const policyExit = await runPrdCommand(
+      [
+        "policy",
+        packet.root,
+        packet.manifest,
+        packet.sidecar,
+        packet.target,
+        packet.base,
+        executionPlanPath,
+        "--provider",
+        "deterministic-fake",
+        "--model",
+        "fixture-v2",
+        "--transport",
+        "pi",
+      ],
+      { write: (line) => output.push(line) },
+      { bootstrapProofAdmission },
+    );
+    expect(policyExit, output.join("\n")).toBe(0);
+
+    expect(existsSync(executionPlanPath)).toBe(true);
+    expect(JSON.parse(readFileSync(executionPlanPath, "utf8"))).toMatchObject({
+      schema: "ccc-prd.execution-plan.v1",
+      packetHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      sidecarHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      bundleHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      policy: {
+        schema: "ccc-campaign.execution-policy.v2",
+        routes: [{
+          taskId: "TASK-CLI-001",
+          providerId: "deterministic-fake",
+          modelId: "fixture-v2",
+          transport: "pi",
+          executor: "model",
+          toolMode: "coding",
+          worktreeMode: "isolated",
+          ownedPaths: ["src/task-1"],
+          allowedWriteRoots: ["src/task-1"],
+          commitPolicy: "required",
+        }],
+      },
+    });
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "execution-plan",
+      path: executionPlanPath,
+    });
   });
 
   it("prints the optional intake template and lints implementation-changing facts without rewriting the PRD", async () => {
@@ -167,24 +499,22 @@ describe("prd command exit contract", () => {
       { write: (line) => authorOutput.push(line) },
       { bootstrapProofAdmission },
     )).toBe(0);
-    const policyPath = join(packet.root, "execution-policy.json");
-    writeFileSync(policyPath, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [
-        {
-          taskId: "TASK-CLI-001",
-          providerId: "deterministic-fake",
-          modelId: "fixture-v2",
-          transport: "pi",
-          executor: "model",
-          toolMode: "coding",
-          worktreeMode: "isolated",
-          ownedPaths: ["src/task-1"],
-          allowedWriteRoots: ["src/task-1"],
-          commitPolicy: "required",
-        },
-      ],
-    }));
+    const policyPath = join(packet.root, "execution-plan.json");
+    expect(await runPrdCommand([
+      "policy",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      packet.target,
+      packet.base,
+      policyPath,
+      "--provider",
+      "deterministic-fake",
+      "--model",
+      "fixture-v2",
+      "--transport",
+      "pi",
+    ], { write: () => undefined })).toBe(0);
     const layer = {};
     const store = { getAsyncLayer: vi.fn(() => layer) };
     const context = {
@@ -209,11 +539,20 @@ describe("prd command exit contract", () => {
       replayed: false,
     }));
     const closeProjectStore = vi.fn(async () => undefined);
+    const inspectVerifierConfinementReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "sandbox-exec" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "verifier confinement readiness probe executed successfully",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      detail: "test-injected ready confinement",
+    }));
     const dependencies = {
       resolveProject: vi.fn(async () => context),
       closeProjectStore,
       readTargetHead: vi.fn(async () => packet.base),
       importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness,
     };
     const common = [
       packet.root,
@@ -247,6 +586,13 @@ describe("prd command exit contract", () => {
         expect.objectContaining({ id: "TASK-CLI-001" }),
       ],
       proofs: [expect.objectContaining({ id: "PF-CLI-001" })],
+      verifierConfinement: {
+        ready: true,
+        backend: "sandbox-exec",
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"],
+      },
     });
     expect(preview.confirmationDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(closeProjectStore).toHaveBeenCalledTimes(1);
@@ -273,6 +619,162 @@ describe("prd command exit contract", () => {
       }),
     }));
     expect(closeProjectStore).toHaveBeenCalledTimes(2);
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows extracted PRD work and actionable verifier guidance when confinement is unavailable", async () => {
+    const packet = createPacketRoot();
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: () => undefined },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+    const policyPath = await createExecutionPlan(packet);
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store: { getAsyncLayer: vi.fn(() => ({})) },
+    };
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      [
+        "preview",
+        packet.root,
+        packet.manifest,
+        packet.sidecar,
+        policyPath,
+        packet.target,
+        packet.base,
+      ],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => context),
+        closeProjectStore: vi.fn(async () => undefined),
+        readTargetHead: vi.fn(async () => packet.base),
+        inspectVerifierConfinementReadiness: vi.fn(async () => ({
+          ready: false,
+          backend: "bubblewrap" as const,
+          code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+          message: "trusted bubblewrap confinement is unavailable",
+          trustedPaths: ["/usr/bin/bwrap", "/bin/bwrap"] as const,
+          detail: "private runner detail must not reach operator output",
+        })),
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const preview = JSON.parse(output[0]!);
+    expect(preview).toMatchObject({
+      kind: "preview",
+      requirements: [expect.objectContaining({ id: "CF-CLI-001" })],
+      tasks: [expect.objectContaining({ id: "TASK-CLI-001" })],
+      verifierConfinement: {
+        ready: false,
+        backend: "bubblewrap",
+        code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+        safeState: "The frozen PRD preview is intact; no campaign, approval, provider effect, or source change was created.",
+        decisionOwner: "Fusion host or CI runner operator",
+        consequence: "Campaign import and live execution remain blocked because exact requirement proof cannot run safely.",
+        recoveryOptions: [
+          "Provision and functionally verify the trusted verifier confinement backend on this host.",
+          "Keep the packet as a review-only preview until confinement is ready.",
+        ],
+        nextSafeAction: "Repair the trusted verifier confinement backend, then rerun fn prd preview before import.",
+      },
+    });
+    expect(output[0]).not.toContain("private runner detail");
+  });
+
+  it("refuses import before project or importer residue when readiness has no admitted backend", async () => {
+    const packet = createPacketRoot();
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: () => undefined },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+    const policyPath = await createExecutionPlan(packet);
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store: { getAsyncLayer: vi.fn(() => ({})) },
+    };
+    const resolveProject = vi.fn(async () => context);
+    const importBundle = vi.fn();
+    const inspectVerifierConfinementReadiness = vi.fn()
+      .mockResolvedValueOnce({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })
+      .mockResolvedValueOnce({
+        ready: true,
+        backend: "native" as never,
+        code: "VERIFIER_CONFINEMENT_INVALID_RESULT",
+        message: "readiness result named an unadmitted backend",
+        trustedPaths: [] as const,
+        detail: "private runner detail must not reach operator output",
+      });
+    const dependencies = {
+      resolveProject,
+      closeProjectStore: vi.fn(async () => undefined),
+      readTargetHead: vi.fn(async () => packet.base),
+      importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness,
+    };
+    const common = [
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      policyPath,
+      packet.target,
+      packet.base,
+    ];
+    const previewOutput: string[] = [];
+    expect(await runPrdCommand(
+      ["preview", ...common],
+      { write: (line) => previewOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(0);
+    const preview = JSON.parse(previewOutput[0]!) as {
+      confirmationDigest: string;
+    };
+    const importOutput: string[] = [];
+
+    expect(await runPrdCommand(
+      ["import", ...common, "operator-key", "--confirm", preview.confirmationDigest],
+      { write: (line) => importOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(JSON.parse(importOutput[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+        message: "Exact requirement verification is unavailable: readiness result named an unadmitted backend",
+      }],
+      safeState: "This import created no campaign rows, staging files, approvals, provider effects, or source changes.",
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence: "The PRD packet remains reviewable, but Fusion cannot safely import or execute it on this host.",
+      approvalExpiresAt: null,
+      recoveryOptions: [
+        "Provision and functionally verify the trusted verifier confinement backend at one trusted system path.",
+        "Keep the frozen packet unchanged and rerun preview after the host is repaired.",
+      ],
+      nextSafeAction: "Repair verifier confinement, rerun fn prd preview, then issue a fresh import confirmation.",
+    });
+    expect(importOutput[0]).not.toContain("private runner detail");
+    expect(resolveProject).toHaveBeenCalledTimes(1);
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(2);
   });
 
   it("recomputes preview identity and refuses a stale confirmation before import residue", async () => {
@@ -282,24 +784,7 @@ describe("prd command exit contract", () => {
       { write: () => undefined },
       { bootstrapProofAdmission },
     )).toBe(0);
-    const policyPath = join(packet.root, "execution-policy.json");
-    writeFileSync(policyPath, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [
-        {
-          taskId: "TASK-CLI-001",
-          providerId: "deterministic-fake",
-          modelId: "fixture-v2",
-          transport: "pi",
-          executor: "model",
-          toolMode: "coding",
-          worktreeMode: "isolated",
-          ownedPaths: ["src/task-1"],
-          allowedWriteRoots: ["src/task-1"],
-          commitPolicy: "required",
-        },
-      ],
-    }));
+    const policyPath = await createExecutionPlan(packet);
     const importBundle = vi.fn();
     const closeProjectStore = vi.fn(async () => undefined);
     const context = {
@@ -1014,6 +1499,11 @@ describe("prd command exit contract", () => {
     const controllerToken =
       "ccc-provider-controller-00000000-0000-4000-8000-000000000001";
     const evidenceDigest = "7".repeat(64);
+    const workItemFence = {
+      workItemId: "work-item-1",
+      runId: "ccc-prd:import-1",
+      attempt: 2,
+    } as const;
     const binding = {
       projectId: "project-1",
       importId: "import-1",
@@ -1042,17 +1532,18 @@ describe("prd command exit contract", () => {
       dispatchKey: "dispatch-1",
       attemptOrdinal: 1,
       requestCount: 1,
+      workItemFence,
       state: "dispatched_unknown",
       binding,
     } as const;
     const workItem = {
-      id: "work-item-1",
-      runId: "ccc-prd:import-1",
-      taskId: "FN-entry",
+      id: workItemFence.workItemId,
+      runId: workItemFence.runId,
+      taskId: "FN-1",
       nodeId: "node-provider",
       kind: "task",
       state: "manual-required",
-      attempt: 2,
+      attempt: workItemFence.attempt,
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
@@ -1447,6 +1938,153 @@ describe("prd command exit contract", () => {
     });
   });
 
+  it("keeps live-execution approval issued and work parked when verifier confinement is unavailable", async () => {
+    const confirmation = "8".repeat(64);
+    const approval = {
+      id: "approval-live-1",
+      status: "issued",
+      taskId: "TASK-coding",
+      runId: "RUN-product",
+      requester: {
+        actorId: "ccc-campaign-runtime",
+        actorType: "agent",
+        actorName: "CCC Campaign Runtime",
+      },
+      targetAction: {
+        category: "command_execution",
+        action: "ACTION-live",
+        summary: "Run the admitted coding provider",
+        resourceType: "ccc-campaign-live_execution",
+        resourceId: "provider://fixture/TASK-coding",
+        context: {
+          protectedActionKind: "live_execution",
+          operatorDecision: "approve_live_execution",
+        },
+      },
+      requestedAt: "2026-07-31T00:00:00.000Z",
+      createdAt: "2026-07-31T00:00:00.000Z",
+      updatedAt: "2026-07-31T00:00:00.000Z",
+      campaign: {
+        binding: {
+          projectId: "project-1",
+          importId: "import-1",
+          campaignId: "campaign-1",
+          taskId: "TASK-coding",
+          actionId: "ACTION-live",
+          actionTarget: "provider://fixture/TASK-coding",
+          idempotencyKey: "operator-key",
+          packetHash: "a".repeat(64),
+          sidecarHash: "b".repeat(64),
+          bundleHash: "c".repeat(64),
+          targetRepository: "/tmp/product-target",
+          targetBase: "d".repeat(40),
+          providerId: "fixture",
+          modelId: "fixture-v2",
+          transport: "cli",
+          manifestHash: "e".repeat(64),
+          bindingHash: "f".repeat(64),
+        },
+        notBeforeAt: "2026-07-31T00:00:00.000Z",
+        expiresAt: "2026-07-31T01:00:00.000Z",
+      },
+    };
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const status = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-1",
+      import: {
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        state: "active",
+        runnable: true,
+      },
+      tasks: [],
+      workItems: [workItem],
+      proofs: [],
+      orphanProofAttempts: [],
+      approvals: [approval],
+      landing: { intents: [], terminals: [] },
+      nextAction: {
+        kind: "approve-execution",
+        reason: "Approve exact live execution.",
+      },
+    };
+    const transitionWorkflowWorkItem = vi.fn();
+    const context = {
+      projectId: "project-1",
+      projectPath: "/tmp/product-target",
+      projectName: "Fixture",
+      isRegistered: true,
+      store: {
+        getAsyncLayer: () => ({}),
+        transitionWorkflowWorkItem,
+      },
+    };
+    const approveExecution = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      ["approve-execution", "operator-key", "approval-live-1", "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => context),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => status),
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: vi.fn(async () => ({
+          ready: true,
+          backend: "native" as never,
+          code: "VERIFIER_CONFINEMENT_INVALID_RESULT",
+          message: "readiness result named an unadmitted backend",
+          trustedPaths: [] as const,
+          detail: "private runner detail must not reach operator output",
+        })),
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    const refusal = JSON.parse(output[0]!);
+    expect(refusal).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+        message: "Exact requirement verification is unavailable: readiness result named an unadmitted backend",
+      }],
+      safeState: "Approval approval-live-1 remains issued and workflow work-item-1 remains manual-required; this command started no provider, source, or proof effect.",
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence: "Live coding cannot start because Fusion could not prove exact requirement tests can run under enforced confinement.",
+      approvalExpiresAt: "2026-07-31T01:00:00.000Z",
+      recoveryOptions: [
+        "Repair and functionally verify the trusted verifier confinement backend before this approval expires.",
+        "If the approval expires, request a fresh exact live-execution approval after the host is ready.",
+        "Stop the campaign with a fresh status digest if the operator does not want to continue.",
+      ],
+      nextSafeAction: "Repair verifier confinement, rerun fn prd status operator-key, then submit a still-current exact approval.",
+    });
+    expect(JSON.stringify(refusal.verifierConfinement)).not.toContain(
+      "no campaign",
+    );
+    expect(output[0]).not.toContain("private runner detail");
+    expect(approveExecution).not.toHaveBeenCalled();
+    expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
+  });
+
   it("claims exact live-execution approval and requeues only its parked imported work item", async () => {
     const confirmation = "8".repeat(64);
     const approval = {
@@ -1563,6 +2201,13 @@ describe("prd command exit contract", () => {
       .mockResolvedValueOnce(before)
       .mockResolvedValueOnce(after);
     const approveExecution = vi.fn(async () => after.approvals[0]);
+    const inspectVerifierConfinementReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "sandbox-exec" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "verifier confinement readiness probe executed successfully",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+    }));
     const output: string[] = [];
 
     expect(await runPrdCommand(
@@ -1574,6 +2219,7 @@ describe("prd command exit contract", () => {
         inspectCccPrdProductStatus: inspectStatus,
         computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
         approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness,
       },
       { projectName: "fixture" },
     )).toBe(0);
@@ -1609,5 +2255,6 @@ describe("prd command exit contract", () => {
       approval: { status: "claimed" },
       status: { nextAction: { kind: "wait-for-runtime" } },
     });
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(1);
   });
 });

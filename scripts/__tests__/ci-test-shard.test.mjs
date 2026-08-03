@@ -627,9 +627,30 @@ test("U6: buildShardCommands emits per-lane `run <lane>`, plain `test`, and virt
   const plain = commands.find((c) => c.kind === "plain");
   const virtual = commands.find((c) => c.kind === "virtual");
   const lane = commands.find((c) => c.kind === "dashboard-lane");
-  assert.deepEqual(plain.args, ["--filter", "@fusion/core", "test"]);
+  assert.deepEqual(plain.args, [
+    "--filter",
+    "@fusion/core",
+    "--workspace-concurrency=1",
+    "test",
+  ]);
   assert.deepEqual(virtual.args, ["--filter", "@fusion/engine", "test", "--shard=1/2"]);
   assert.deepEqual(lane.args, ["--filter", "@fusion/dashboard", "run", "test:quality:api"]);
+});
+
+test("plain shard commands bind pnpm workspace concurrency to the admitted budget", () => {
+  const commands = buildShardCommands([
+    { name: "@fusion/core", weight: 1 },
+    { name: "@runfusion/fusion", weight: 1 },
+  ], { workspaceConcurrency: 1 });
+
+  assert.deepEqual(commands[0].args, [
+    "--filter",
+    "@fusion/core",
+    "--filter",
+    "@runfusion/fusion",
+    "--workspace-concurrency=1",
+    "test",
+  ]);
 });
 
 test("U6: --dry-run prints planned commands and per-shard weight for all 4 shards", () => {

@@ -97,6 +97,62 @@ function hasSourceBoundRows(value: unknown): boolean {
   });
 }
 
+function sourceQuoteContainsCanonicalPath(
+  reference: CccPrdSourceReferenceProposal,
+  path: string,
+): boolean {
+  const isPathCharacter = (value: string | undefined): boolean => (
+    typeof value === "string" && /[A-Za-z0-9._/-]/u.test(value)
+  );
+  let index = reference.exactQuote.indexOf(path);
+  while (index !== -1) {
+    const before = index > 0 ? reference.exactQuote[index - 1] : undefined;
+    const afterIndex = index + path.length;
+    const after = afterIndex < reference.exactQuote.length
+      ? reference.exactQuote[afterIndex]
+      : undefined;
+    if (!isPathCharacter(before) && !isPathCharacter(after)) return true;
+    index = reference.exactQuote.indexOf(path, index + 1);
+  }
+  return false;
+}
+
+function validateTaskCustodyProvenance(
+  proposal: CccPrdAuthoringProposal,
+): CccPrdDiagnostic[] {
+  const diagnostics: CccPrdDiagnostic[] = [];
+  for (const task of proposal.tasks) {
+    for (const [field, paths] of [
+      ["ownedPaths", task.ownedPaths],
+      ["allowedWriteRoots", task.allowedWriteRoots],
+    ] as const) {
+      if (
+        !Array.isArray(paths)
+        || paths.length === 0
+        || paths.some((path) => typeof path !== "string" || path.length === 0 || path !== path.trim())
+      ) {
+        diagnostics.push({
+          code: "CCC_PRD_TASK_CUSTODY_REQUIRED",
+          message: "task " + task.id + " requires non-empty source-owned " + field,
+        });
+        continue;
+      }
+      for (const path of paths) {
+        if (!task.sourceRefs.some((reference) =>
+          sourceQuoteContainsCanonicalPath(reference, path)
+        )) {
+          diagnostics.push({
+            code: "CCC_PRD_TASK_CUSTODY_PROVENANCE_REQUIRED",
+            message: "task " + task.id + " " + field + " path " + path
+              + " is absent from its exact source evidence",
+          });
+        }
+      }
+    }
+  }
+  return diagnostics;
+}
+
 function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal {
   if (!isPlainRecord(value) || value.schema !== CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION) return false;
   const collections = [
@@ -283,22 +339,72 @@ function bindingFromAbsoluteSpan(
 function findFactBindingInSource(
   value: string | number,
   sourceBytes: Map<string, Buffer>,
+  labels: readonly string[],
 ): CccPrdImplementationFactBinding | undefined {
   const needle = Buffer.from(String(value), "utf8");
   if (needle.byteLength === 0) return undefined;
+
   for (const [sourcePath, source] of sourceBytes) {
-    const byteStart = source.indexOf(needle);
-    if (byteStart >= 0) {
-      return bindingFromAbsoluteSpan(
-        value,
-        sourceBytes,
-        sourcePath,
-        byteStart,
-        byteStart + needle.byteLength,
-      );
+    const sourceText = source.toString("utf8");
+    const lines = sourceText.split("\n");
+    let byteCursor = 0;
+    let fence: "```" | "~~~" | null = null;
+    for (const rawLine of lines) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      const trimmed = line.trimStart();
+      if (fence) {
+        if (trimmed.startsWith(fence)) fence = null;
+        byteCursor += Buffer.byteLength(rawLine, "utf8") + 1;
+        continue;
+      }
+      if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
+        fence = trimmed.startsWith("```") ? "```" : "~~~";
+        byteCursor += Buffer.byteLength(rawLine, "utf8") + 1;
+        continue;
+      }
+      const leading = line.match(/^\s*(?:[-*+]\s+)?(?:#{1,6}\s+)?/u)?.[0] ?? "";
+      const normalized = line.slice(leading.length).trimEnd();
+      const lower = normalized.toLowerCase();
+      for (const label of labels) {
+        const prefix = label.toLowerCase() + ":";
+        if (!lower.startsWith(prefix)) continue;
+        let valueOffset = prefix.length;
+        while (/\s/u.test(normalized[valueOffset] ?? "")) valueOffset += 1;
+        if (normalized.slice(valueOffset) !== String(value)) continue;
+        const byteStart = byteCursor + Buffer.byteLength(
+          line.slice(0, leading.length + valueOffset),
+          "utf8",
+        );
+        return bindingFromAbsoluteSpan(
+          value,
+          sourceBytes,
+          sourcePath,
+          byteStart,
+          byteStart + needle.byteLength,
+        );
+      }
+      byteCursor += Buffer.byteLength(rawLine, "utf8") + 1;
     }
   }
-  return undefined;
+
+  let uniqueMatch: { sourcePath: string; byteStart: number } | undefined;
+  for (const [sourcePath, source] of sourceBytes) {
+    let byteStart = source.indexOf(needle);
+    while (byteStart >= 0) {
+      if (uniqueMatch) return undefined;
+      uniqueMatch = { sourcePath, byteStart };
+      byteStart = source.indexOf(needle, byteStart + 1);
+    }
+  }
+  return uniqueMatch
+    ? bindingFromAbsoluteSpan(
+      value,
+      sourceBytes,
+      uniqueMatch.sourcePath,
+      uniqueMatch.byteStart,
+      uniqueMatch.byteStart + needle.byteLength,
+    )
+    : undefined;
 }
 
 function findFactBindingInEntitySpans(
@@ -334,8 +440,9 @@ function requireTopLevelBinding(
   code: string,
   message: string,
   value: string | number,
+  labels: readonly string[],
 ): CccPrdImplementationFactBinding {
-  const binding = findFactBindingInSource(value, sourceBytes);
+  const binding = findFactBindingInSource(value, sourceBytes, labels);
   if (binding) return binding;
   diagnostics.push({ code, message });
   return { value, spans: [] };
@@ -369,6 +476,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
         "CCC_PRD_TARGET_REPOSITORY_PROVENANCE_REQUIRED",
         "Target repository must be stated in an admitted PRD source or reviewed operator-decision source; CLI flags alone are not source facts.",
         input.facts.targetRepository.path,
+        ["Target repository", "Target repository path", "Repository target"],
       ),
       baseCommit: requireTopLevelBinding(
         diagnostics,
@@ -376,6 +484,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
         "CCC_PRD_BASELINE_PROVENANCE_REQUIRED",
         "Baseline commit must be stated in an admitted PRD source or reviewed operator-decision source; CLI flags alone are not source facts.",
         input.facts.targetRepository.baseCommit,
+        ["Baseline", "Base commit", "Baseline commit", "Frozen baseline commit"],
       ),
     },
     bounds: {
@@ -385,6 +494,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
         "CCC_PRD_EXECUTION_BOUND_PROVENANCE_REQUIRED",
         `Execution bound maxRequests=${input.facts.bounds.maxRequests} must be stated in an admitted PRD source or reviewed operator-decision source.`,
         input.facts.bounds.maxRequests,
+        ["Max requests", "Maximum requests"],
       ),
       maxDurationMs: requireTopLevelBinding(
         diagnostics,
@@ -392,6 +502,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
         "CCC_PRD_EXECUTION_BOUND_PROVENANCE_REQUIRED",
         `Execution bound maxDurationMs=${input.facts.bounds.maxDurationMs} must be stated in an admitted PRD source or reviewed operator-decision source.`,
         input.facts.bounds.maxDurationMs,
+        ["Max duration ms", "Maximum duration in milliseconds"],
       ),
       maxConcurrency: requireTopLevelBinding(
         diagnostics,
@@ -399,6 +510,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
         "CCC_PRD_EXECUTION_BOUND_PROVENANCE_REQUIRED",
         `Execution bound maxConcurrency=${input.facts.bounds.maxConcurrency} must be stated in an admitted PRD source or reviewed operator-decision source.`,
         input.facts.bounds.maxConcurrency,
+        ["Max concurrency", "Maximum concurrency"],
       ),
     },
     admittedWriteRoots: input.facts.admittedWriteRoots.map((root) => ({
@@ -408,6 +520,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
         "CCC_PRD_ALLOWED_WRITE_ROOT_PROVENANCE_REQUIRED",
         `Allowed write root ${root.path} must be stated in an admitted PRD source or reviewed operator-decision source.`,
         root.path,
+        ["Allowed write root", "Admitted write root"],
       ),
       purpose: requireTopLevelBinding(
         diagnostics,
@@ -415,6 +528,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
         "CCC_PRD_ALLOWED_WRITE_ROOT_PURPOSE_PROVENANCE_REQUIRED",
         `Allowed write root purpose ${root.purpose} must be stated in an admitted PRD source or reviewed operator-decision source.`,
         root.purpose,
+        ["Allowed write root purpose", "Admitted write purpose"],
       ),
     })),
     nonGoals: input.facts.nonGoals.map((nonGoal) => requireTopLevelBinding(
@@ -423,6 +537,7 @@ export function computeCccPrdImplementationFactProvenance(input: {
       "CCC_PRD_NON_GOAL_PROVENANCE_REQUIRED",
       `Non-goal must be stated in an admitted PRD source or reviewed operator-decision source: ${nonGoal}`,
       nonGoal,
+      ["Non-goal", "Non goal", "Out of scope"],
     )),
     requirements: input.facts.requirements.map((requirement) => ({
       id: requirement.id,
@@ -698,6 +813,10 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       return malformed(`authoring adapter ${input.adapter.id} returned a task protected-action ID that is empty or not trimmed`);
     }
     if (input.constraints) {
+      const taskCustodyDiagnostics = validateTaskCustodyProvenance(proposalValue);
+      if (taskCustodyDiagnostics.length > 0) {
+        return { kind: "refusal", diagnostics: taskCustodyDiagnostics };
+      }
       if (
         canonicalCccPrdJson(proposalValue.targetRepository)
         !== canonicalCccPrdJson(input.constraints.targetRepository)

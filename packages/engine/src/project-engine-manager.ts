@@ -14,6 +14,7 @@
  */
 
 import { realpathSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 import type {
   CentralCore,
@@ -520,7 +521,10 @@ export class ProjectEngineManager {
     this.externalEngines.delete(projectId);
 
     const engine = new ProjectEngine(
-      runtimeConfig,
+      {
+        ...runtimeConfig,
+        engineInstanceId: randomUUID(),
+      },
       this.centralCore,
       engineOptions,
     );

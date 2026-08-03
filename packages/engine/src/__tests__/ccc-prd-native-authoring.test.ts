@@ -16,6 +16,7 @@ import {
   computeCccPrdProofDefinitionSha256,
   deriveWorkflowExtensionHostProvenance,
   type CccPrdAuthoringProposal,
+  type CustomProvider,
   type WorkflowProofAdmissionExtensionContribution,
 } from "@fusion/core";
 import {
@@ -25,6 +26,9 @@ import {
   createNativeCccPrdAuthoringAdapter,
   type CccPrdNativeAuthoringTransport,
 } from "../ccc-prd/native-authoring-adapter.js";
+import {
+  understandCccPrdPacket,
+} from "../ccc-prd/understanding.js";
 
 const sourceFixture = new URL("./fixtures/ccc-prd-canaries/ccc-lab-super-r2/", import.meta.url);
 const sourceManifestPath = new URL("manifest.json", sourceFixture).pathname;
@@ -97,6 +101,17 @@ function buildReviewedOperatorDecisions(input: CccPrdAuthoringProposal): {
       `Protected action target: ${action.target}`,
     ].join("\n"),
   ]));
+  const taskCustodySections = new Map(input.tasks.map((task) => {
+    const taskRoot = ".fusion/tasks/" + task.id.toLowerCase();
+    return [
+      task.id,
+      [
+        "## Reviewed task custody: " + task.id,
+        "Owned path: " + taskRoot,
+        "Allowed write root: " + taskRoot,
+      ].join("\n"),
+    ];
+  }));
   const alternateRequirement = input.requirements[0]!;
   const alternateRequirementSection = [
     `## Alternate reviewed requirement evidence: ${alternateRequirement.id}`,
@@ -116,6 +131,18 @@ function buildReviewedOperatorDecisions(input: CccPrdAuthoringProposal): {
     ...action,
     sourceRefs: sourceReference(protectedActionSections.get(action.id)!),
   }));
+  reviewedProposal.tasks = reviewedProposal.tasks.map((task) => {
+    const taskRoot = ".fusion/tasks/" + task.id.toLowerCase();
+    return {
+      ...task,
+      ownedPaths: [taskRoot],
+      allowedWriteRoots: [taskRoot],
+      sourceRefs: [
+        ...task.sourceRefs,
+        ...sourceReference(taskCustodySections.get(task.id)!),
+      ],
+    };
+  });
   return {
     content: [
       "# Reviewed Operator Decisions",
@@ -123,6 +150,7 @@ function buildReviewedOperatorDecisions(input: CccPrdAuthoringProposal): {
       ...requirementSections.values(),
       ...proofSections.values(),
       ...protectedActionSections.values(),
+      ...taskCustodySections.values(),
       alternateRequirementSection,
       "",
     ].join("\n\n"),
@@ -213,6 +241,33 @@ async function authorCccPrdPacket(
   });
 }
 
+/*
+FNXC:CCCAuthoringEgress 2026-08-01-17:40:
+The native authoring adapter resolves its selected provider through the
+configured custom-provider list and refuses any route outside the ccc-fusion
+loopback boundary before a prompt exists. Declare the loopback providers these
+adapter ids already claimed so the suite exercises the admitted route; the
+refusal behavior itself is proved in ccc-authoring-egress.test.ts.
+*/
+const loopbackAuthoringProviders: CustomProvider[] = [
+  {
+    id: "ccc-loopback-authoring",
+    name: "Loopback Authoring",
+    apiType: "openai-compatible",
+    baseUrl: "http://127.0.0.1:7443/v1",
+    apiKey: "synthetic-never-read",
+    models: [{ id: "fixture-model", name: "Fixture" }],
+  },
+  {
+    id: "ccc-loopback-understanding",
+    name: "Loopback Understanding",
+    apiType: "openai-compatible",
+    baseUrl: "http://127.0.0.1:7444/v1",
+    apiKey: "synthetic-never-read",
+    models: [{ id: "fixture-model", name: "Fixture" }],
+  },
+];
+
 function nativeAdapter(
   transport: CccPrdNativeAuthoringTransport,
   overrides: Partial<{
@@ -228,10 +283,98 @@ function nativeAdapter(
     maxPromptBytes: overrides.maxPromptBytes ?? 1_000_000,
     maxResponseBytes: overrides.maxResponseBytes ?? 256_000,
     transport,
+    customProviders: loopbackAuthoringProviders,
   });
 }
 
 describe("CCC PRD native authoring adapter", () => {
+  it("refuses the old three-requirement extraction when the frozen packet is materially much deeper", async () => {
+    const reviewProposal = structuredClone(proposal);
+    reviewProposal.targetRepository = { path: "", baseCommit: "" };
+    reviewProposal.bounds = {
+      maxRequests: 0,
+      maxDurationMs: 0,
+      maxConcurrency: 0,
+    };
+    reviewProposal.admittedWriteRoots = [];
+    const generate = vi.fn<CccPrdNativeAuthoringTransport>(async (request) => ({
+      text: canonicalCccPrdJson(reviewProposal),
+      provider: request.provider,
+      model: request.model,
+    }));
+    const adapter = createNativeCccPrdAuthoringAdapter({
+      provider: "loopback-understanding",
+      model: "fixture-model",
+      maxDurationMs: 5_000,
+      maxPromptBytes: 1_000_000,
+      maxResponseBytes: 256_000,
+      mode: "understanding",
+      transport: generate,
+      customProviders: loopbackAuthoringProviders,
+    });
+
+    const result = await understandCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter,
+      maxReviewItems: 8,
+      workflowExtensionRegistry: await proofAdmissionRegistry(),
+    });
+
+    expect(result.kind, JSON.stringify(result)).toBe("refusal");
+    expect(generate).toHaveBeenCalledTimes(1);
+    expect(generate.mock.calls[0]![0].prompt).toContain("review-only");
+    expect(generate.mock.calls[0]![0].prompt).toContain("empty string");
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: [expect.objectContaining({
+        code: "CCC_PRD_UNDERSTANDING_IMPLAUSIBLY_SHALLOW",
+      })],
+    });
+  });
+
+  it("refuses an understanding result with zero requirements", async () => {
+    const emptyProposal = structuredClone(proposal);
+    emptyProposal.requirements = [];
+    emptyProposal.proofs = [];
+    emptyProposal.tasks = [];
+    emptyProposal.edges = [];
+    emptyProposal.workflows = [];
+    emptyProposal.documents = [];
+    emptyProposal.artifacts = [];
+    emptyProposal.importIntents = [];
+    emptyProposal.protectedActions = [];
+    const adapter = createNativeCccPrdAuthoringAdapter({
+      provider: "loopback-understanding",
+      model: "fixture-model",
+      maxDurationMs: 5_000,
+      maxPromptBytes: 1_000_000,
+      maxResponseBytes: 256_000,
+      mode: "understanding",
+      transport: async (request) => ({
+        text: canonicalCccPrdJson(emptyProposal),
+        provider: request.provider,
+        model: request.model,
+      }),
+      customProviders: loopbackAuthoringProviders,
+    });
+
+    const result = await understandCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter,
+      maxReviewItems: 8,
+      workflowExtensionRegistry: await proofAdmissionRegistry(),
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: [expect.objectContaining({
+        code: "CCC_PRD_UNDERSTANDING_ZERO_REQUIREMENTS",
+      })],
+    });
+  });
+
   it("generates a traceable candidate from unchanged packet bytes through one bounded native request", async () => {
     const generate = vi.fn<CccPrdNativeAuthoringTransport>(async (request) => ({
       text: canonicalCccPrdJson(proposal),
@@ -295,6 +438,33 @@ describe("CCC PRD native authoring adapter", () => {
         definitionSha256: computeCccPrdProofDefinitionSha256(proof),
       });
     }
+  });
+
+  it("refuses task custody paths that are not present in task-specific source evidence", async () => {
+    const invented = structuredClone(proposal);
+    invented.tasks[0] = {
+      ...invented.tasks[0]!,
+      ownedPaths: ["src/invented"],
+      allowedWriteRoots: ["src/invented"],
+    };
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(invented),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([expect.objectContaining({
+        code: "CCC_PRD_TASK_CUSTODY_PROVENANCE_REQUIRED",
+      })]),
+    });
   });
 
   it("refuses authoring when the fixed native proof admission entry is missing", async () => {

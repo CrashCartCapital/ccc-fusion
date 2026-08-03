@@ -25,12 +25,19 @@ describe("prd built CLI user contract", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model>");
     expect(result.stdout).toContain("fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>");
+    expect(result.stdout).toContain("fn prd understand <root-dir> <manifest-path> <review-output>");
+    expect(result.stdout).toContain("fn prd corpus <active-projects-root>");
     expect(result.stdout).toContain("fn prd discover <active-projects-root>");
     expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>");
+    expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository>");
+    expect(result.stdout).toContain("fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin");
     expect(result.stdout).toContain("fn prd template");
     expect(result.stdout).toContain("fn prd lint <prd-path>");
+    expect(result.stdout).toContain("fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path>");
     expect(result.stdout).toContain("fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>");
     expect(result.stdout).toContain("fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>");
+    expect(result.stdout).toContain("fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path>");
+    expect(result.stdout).toContain("fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path>");
     expect(result.stdout).toContain("fn prd status <idempotency-key>");
     expect(result.stdout).toContain("fn prd pause <idempotency-key> --confirm <status-digest>");
     expect(result.stdout).toContain("fn prd resume <idempotency-key> --confirm <status-digest>");
@@ -75,6 +82,26 @@ version: 2.0.0
       }],
     });
 
+    const corpus = runFn(["prd", "corpus", activeProjectsRoot]);
+    expect(corpus.status, `${corpus.stdout}\n${corpus.stderr}`).toBe(0);
+    expect(JSON.parse(corpus.stdout)).toMatchObject({
+      schema: "ccc-prd.corpus-manifest.v1",
+      summary: {
+        projectCount: 1,
+        selectedCount: 1,
+      },
+      projects: [{
+        project: "alpha",
+        selection: {
+          kind: "selected",
+          selectedPrdPath,
+          sourceSha256: sha256(sourceBefore),
+          sourceBytes: sourceBefore.byteLength,
+        },
+      }],
+    });
+    expect(corpus.stdout).not.toContain("# Alpha Product Requirements");
+
     const frozen = runFn([
       "prd",
       "freeze",
@@ -96,6 +123,42 @@ version: 2.0.0
     });
     expect(existsSync(join(outputDir, "manifest.json"))).toBe(true);
     expect(existsSync(join(outputDir, "freeze-receipt.json"))).toBe(true);
+    expect(readFileSync(selectedPrdPath).equals(sourceBefore)).toBe(true);
+
+    const guidedOutputDir = join(packet.root, "frozen-alpha-guided");
+    const guidedTarget = join(packet.root, "guided-target");
+    const guided = runFn([
+      "prd",
+      "freeze",
+      activeProjectsRoot,
+      selectedPrdPath,
+      guidedOutputDir,
+      "--target",
+      guidedTarget,
+      "--base",
+      "d".repeat(40),
+      "--owned-path",
+      "src/alpha",
+      "--write-root",
+      "src/alpha",
+      "--write-purpose",
+      "implement Alpha",
+      "--max-requests",
+      "3",
+      "--max-duration-ms",
+      "120000",
+      "--max-concurrency",
+      "1",
+    ]);
+    expect(guided.status, guided.stdout + guided.stderr).toBe(0);
+    expect(JSON.parse(guided.stdout)).toMatchObject({
+      schema: "ccc-prd.freeze-result.v1",
+      packet: { fileCount: 3 },
+    });
+    expect(readFileSync(join(
+      guidedOutputDir,
+      "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
+    ), "utf8")).toContain("Target repository: " + guidedTarget);
     expect(readFileSync(selectedPrdPath).equals(sourceBefore)).toBe(true);
   });
 
@@ -196,27 +259,27 @@ version: 2.0.0
   it("preserves a product refusal exit code after embedded PostgreSQL cleanup", async () => {
     const packet = createPacketRoot();
     const home = join(packet.root, "home");
-    const policy = join(packet.root, "execution-policy.json");
+    const policy = join(packet.root, "execution-plan.json");
     mkdirSync(home);
     execFileSync("/usr/bin/git", ["init", "-q"], { cwd: packet.root });
     expect(runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]).status).toBe(0);
-    writeFileSync(policy, JSON.stringify({
-      schema: "ccc-campaign.execution-policy.v2",
-      routes: [
-        {
-          taskId: "TASK-CLI-001",
-          providerId: "deterministic-fake",
-          modelId: "fixture-v2",
-          transport: "pi",
-          executor: "model",
-          toolMode: "coding",
-          worktreeMode: "isolated",
-          ownedPaths: ["src/task-1"],
-          allowedWriteRoots: ["src/task-1"],
-          commitPolicy: "required",
-        },
-      ],
-    }));
+    const generated = runFn([
+      "prd",
+      "policy",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      packet.target,
+      packet.base,
+      policy,
+      "--provider",
+      "deterministic-fake",
+      "--model",
+      "fixture-v2",
+      "--transport",
+      "pi",
+    ]);
+    expect(generated.status, generated.stdout + generated.stderr).toBe(0);
 
     const result = await runFnAsync(
       [

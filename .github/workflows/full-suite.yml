@@ -129,6 +129,10 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # All four self-hosted runners share one 8-CPU/31-GiB Docker VM. Two
+      # shards at a time keeps the matrix parallel without recreating the
+      # observed cross-container OOM pressure from four simultaneous shards.
+      max-parallel: 2
       matrix:
         shard: [1, 2, 3, 4]
 
@@ -182,11 +186,11 @@ jobs:
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4
         env:
-          # Each shard shares one PostgreSQL service. Keep the default Vitest
-          # lane at three workers while allowing two package lanes so DB and
-          # real-git integration tests retain scheduling headroom.
-          FUSION_TEST_TOTAL_WORKERS: "6"
-          FUSION_TEST_CONCURRENCY: "2"
+          # One package lane with four Vitest workers per active shard. With
+          # matrix max-parallel=2 this bounds the shared VM to eight test
+          # workers plus service containers and runner overhead.
+          FUSION_TEST_TOTAL_WORKERS: "4"
+          FUSION_TEST_CONCURRENCY: "1"
           FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
 
@@ -288,8 +292,17 @@ jobs:
   # proof host prepared above; slow tests retain their non-empty assertion.
   test-slow:
     name: Product route + engine slow
-    runs-on: [self-hosted, linux, ARM64, ccc-fusion]
-    needs: prepare-test-artifacts
+    # Runs the verifier-confinement readiness probe and the serialized product
+    # acceptance, so it needs the bwrap-capable runner lane (see pr-checks.yml
+    # gate job for the rationale).
+    runs-on: [self-hosted, linux, ARM64, ccc-fusion-bwrap]
+    # This host pool shares one Docker VM. Wait for every shard to release its
+    # test workers and PostgreSQL service before starting the heavyweight
+    # product route and engine-slow lane.
+    needs: [prepare-test-artifacts, test-shards]
+    # Preserve the independent product-route signal even when a shard is red,
+    # while still refusing to run after cancellation or missing build output.
+    if: ${{ !cancelled() && needs.prepare-test-artifacts.result == 'success' }}
     # FNXC:FixPgTestsAndCi 2026-07-14-00:00:
     # Provision a PostgreSQL service container so reliability-interaction test
     # helpers (which now require a PG-backed TaskStore after SQLite removal
@@ -347,6 +360,22 @@ jobs:
 
       - name: Seed artifact hash-cache
         run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
+
+      # Same toolchain contract as the pr-checks gate job: the readiness probe
+      # fails closed without Go Task on PATH and bubblewrap at /usr/bin/bwrap.
+      - name: Install verifier toolchain (Go Task + bubblewrap)
+        run: |
+          npm install -g --prefix "$RUNNER_TEMP/go-task" @go-task/cli@3.52.0
+          echo "$RUNNER_TEMP/go-task/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/go-task/bin/task" --version
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo -n apt-get update -qq
+            sudo -n apt-get install -y -qq bubblewrap
+          fi
+          bwrap --version
+
+      - name: Verifier confinement readiness
+        run: node scripts/check-verifier-confinement.mjs
 
       - name: Run serialized product-route acceptance
         run: pnpm --filter @fusion/engine test:product-route

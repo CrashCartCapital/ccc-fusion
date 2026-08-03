@@ -15,8 +15,11 @@ import {
 import { PermanentError } from "./engine-errors.js";
 import {
   MAX_TIMEOUT_SEC,
+  inspectVerifierConfinementReadiness,
+  isVerifierConfinementReady,
   runVerificationCommand,
   type RunVerificationOptions,
+  type VerifierConfinementReadiness,
   type VerificationResult,
 } from "./run-verification-tool.js";
 import type {
@@ -91,6 +94,7 @@ export interface CreateCccCampaignProofSuiteHandlerInput {
   store: ProofExecutionStore;
   proofAttempts?: CccCampaignProofAttemptApi;
   runVerification?: (options: RunVerificationOptions) => Promise<VerificationResult>;
+  inspectVerifierConfinementReadiness?: () => Promise<VerifierConfinementReadiness>;
 }
 
 type GitSnapshot = Readonly<{
@@ -472,6 +476,8 @@ export function createCccCampaignProofSuiteHandler(
 ): WorkflowNodeHandler {
   const proofAttempts = input.proofAttempts ?? defaultProofAttempts();
   const runVerification = input.runVerification ?? runVerificationCommand;
+  const inspectConfinementReadiness = input.inspectVerifierConfinementReadiness
+    ?? inspectVerifierConfinementReadiness;
 
   return async (node, context): Promise<WorkflowNodeResult> => {
     if (node.config?.cccProofSuite !== true) {
@@ -549,6 +555,13 @@ export function createCccCampaignProofSuiteHandler(
       campaigns,
     );
     const timeoutMs = verificationTimeoutMs(campaign, context);
+    const confinementReadiness = await inspectConfinementReadiness();
+    if (!isVerifierConfinementReady(confinementReadiness)) {
+      proofRefusal(
+        `CCC campaign verifier confinement is unavailable (${confinementReadiness.code}): ${confinementReadiness.message}`,
+        "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      );
+    }
 
     for (const proofId of proofIds) {
       context.signal?.throwIfAborted();

@@ -1,10 +1,12 @@
 # CCC Fusion PRD Product Vertical Slice
 
-**Status:** locally proven on the clean integrated tree; not live or deployed
+**Status:** disposable product path locally proven; current real ccc-fusion packet blocked before freeze; not live or deployed
 **Plan path:** `docs/plans/2026-07-30-ccc-fusion-prd-product-vertical-slice.md`
 **Accepted base:** `1dd173311fbf7c16f85213066cc881fc959a2a2c`
 **Accepted base tree:** `ec30f36368d72b756640793374541636e307e696`
-**Implementation worktree:** `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/prd-product-vertical-slice`
+**Current local tracking baseline:** `origin/main` at `79b0ec3d0a27d7393de1b74d17762ad37648eadf`, tree `13ecd8f17fc96e6fddf179fd5d521d166f82e490` (local fact only; no fetch performed)
+**Current code-bearing evidence commit:** `a818c215a0df490b1f125055d7ad1251a240b6c2`, tree `6209506501395fbffb7cb9a3287c63f955962dfb`
+**Implementation worktree:** `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/prd-product-postmerge-fix5`
 **Product target:** one supported CLI-first operator journey, with the dashboard consuming the same contracts after the spine is proven
 
 ## Outcome
@@ -13,14 +15,21 @@ A normal operator can freeze a Markdown PRD packet, review a hash-bound semantic
 
 ## Baseline evidence
 
-- Local `origin/main` is the accepted product lineage at `1dd173311fbf7c16f85213066cc881fc959a2a2c`; the dirty shared checkout is inspection-only and is not an implementation baseline.
-- `pnpm verify:ccc-prd-product` passed all 18 exact checks on the clean integrated tree and proved the repository HEAD, tree, and porcelain status were unchanged from start to finish.
-- `pnpm verify:fast` passed all 18 static/typecheck/build/boot-smoke steps on the clean integrated tree, including built `fn --help` and a real `/api/health` 200 response.
-- `node scripts/run-ccc-pg-proof.mjs --wave 6` passed the exact six-command PostgreSQL inventory on the clean integrated tree: 416 passed (69 + 53 + 95 + 139 + 54 + 6), with zero missing, skipped, extra, timed-out, or force-killed tests.
-- `pnpm test:gate`, bound explicitly to an owned disposable PostgreSQL service, passed PostgreSQL 10/10, engine 299/299, and CLI 65/65 on the clean integrated tree.
-- `pnpm lint`, `pnpm typecheck`, `pnpm build`, and `git diff --check` passed on the same integrated bytes.
+- Local `origin/main` at `79b0ec3d0a27d7393de1b74d17762ad37648eadf` is the current local tracking baseline. The dirty shared checkout remains inspection-only and is not an implementation baseline.
+- `pnpm verify:ccc-prd-product` passed all 18 exact checks on clean commit `a818c215a0df490b1f125055d7ad1251a240b6c2`, tree `6209506501395fbffb7cb9a3287c63f955962dfb`, and proved repository HEAD, tree, and porcelain status were unchanged from start to finish.
+- `node scripts/run-ccc-pg-proof.mjs --wave 6` passed the exact six-command PostgreSQL inventory on the same clean commit: 425 passed (77 + 54 + 95 + 139 + 54 + 6), with zero missing, skipped, extra, duplicate, timed-out, or force-killed tests.
+- `pnpm test:gate`, bound explicitly to a separately owned disposable PostgreSQL service, passed engine core 299/299, PostgreSQL gate 10/10, PRD safety groups 8/8 + 64 passed with 2 declared skips + 16/16 + 7/7, and CI-shape 79/79; the service and data root were removed on success.
+- Core and engine typechecks, focused engine tests 74/74, proof-runner policy self-tests, targeted lint, and `git diff --check` passed on the repair bytes before the clean exact-tree acceptance runs.
 - No external provider or production infrastructure was authorized or called. The supported path is locally proven, not live or deployed.
 - No fetch was performed. The remote-tracking ref is a local fact, not proof of current GitHub state.
+
+## Current real-PRD boundary
+
+The normal built CLI selected `/Users/ryanpappal/01_VAULT/KnR-Vault/00_MAIN/01_ActiveProjects/ccc-fusion/PRJ-AI-ccc-fusion-PRD-v0.1.md` as the current ccc-fusion PRD. `fn prd lint` refused intake because the document does not machine-declare the target repository, exact current baseline, allowed paths, or exact executable proof. Those are implementation-changing facts and cannot be invented from prose.
+
+`fn prd freeze` then refused before writing a packet because the PRD declares `REF-HUM-OrchestratorForkSecondOpinion-2026-07-23` as authority but no current non-archive Markdown file resolves that name. The project-local Phase 3 ledger says this note and `REF-HUM-MultiProviderAgentOrchestratorLandscape-2026-07-22` were moved under `_archive/`; the active mission explicitly forbids reading archive-like paths. The scratch output root remained empty, no campaign or import was created, and neither the vault nor a target repository changed.
+
+This is a precise authority block, not permission to bypass provenance. A real ccc-fusion campaign requires one of three explicit operator decisions: approve an exact successor PRD in the vault with current target/base/path/proof fields and repaired authority links; authorize reading the two exact archived authority notes so a successor proposal can be built without changing the original; or select a different implementation-ready current PRD and target repository. Until then, the disposable path is `locally proven`, the current real-PRD path is `blocked`, and product completion remains unclaimed.
 
 ## Approach decision
 
@@ -36,16 +45,30 @@ The dashboard remains the first-class operator experience, but building it befor
 
 A developer-written glue script would not be the supported product route and would create a second control plane. The exact-tree acceptance script may provision disposable resources and invoke the normal CLI/engine; it may not import, mutate campaign state, create the implementation commit, or mark proof results directly.
 
+## 2026-07-31 completion correction: remove operator-authored glue
+
+Fresh review at commit `60ec7595320abbfa9b71845de24a6a2740f98691`, tree `b71ee1c9aa05d26b08e20a8e4d647c74c114ac31`, found two remaining product gaps hidden by the disposable acceptance harness. The harness writes `ccc-campaign.execution-policy.v2` itself, and current PRDs cannot add missing target/base/path authority without a manually authored companion. Those are test-driver inputs, not a complete normal-person journey.
+
+The accepted correction is dependency ordered:
+
+1. Add source-bound task custody to the semantic sidecar. Product-authored tasks may carry separate `ownedPaths` and `allowedWriteRoots`; the normal product route refuses empty, escaping, out-of-bound, or source-uncited values. Existing compatibility sidecars may omit them, but they cannot use automatic product policy generation.
+2. Add `ccc-prd.execution-plan.v1`, a product-owned envelope around the existing strict `ccc-campaign.execution-policy.v2`. The envelope binds `packetHash`, `sidecarHash`, and `bundleHash` to the generated routes. A normal `fn prd policy` command recompiles the packet, creates one coding/isolated/commit-required route per task from source-bound task custody plus an operator-selected provider/model/transport, validates it through the existing v2 parser, and writes canonical bytes atomically. Raw v2 JSON remains compatibility-only and is not the supported product input.
+3. Preserve the difference between concurrency ownership and filesystem permission. `ownedPaths` identify the exclusive semantic surface for a task; `allowedWriteRoots` identify the declared directories or files the executor may write, and every allowed root must remain inside both task ownership and the PRD-wide admitted roots. The generator never substitutes all global roots or invents a task split.
+4. Add a guided operator-context intake mode. Fusion renders deterministic supplemental Markdown inside the packet staging transaction from explicit operator answers, hashes it as an authoritative companion, and leaves the original PRD untouched. Supplemental authority may fill missing transient implementation facts; it may not silently contradict or expand an existing PRD decision. A contradiction or omitted implementation-changing fact remains an understandable unresolved question with zero output residue. Automation may use the same typed stdin contract; handwritten Markdown or JSON is not required.
+5. Treat route readiness as execution-host evidence. Preview shows the selected route and the readiness evidence currently available, but an importer-host binary or credential probe is not sufficient. The actual campaign runtime must re-check adapter, provider, and tool readiness on the dispatch host before reserving an external effect and persist a clear blocker when unavailable. No special fake-provider bypass is admitted into production.
+
+The first implementation slice is task custody plus the generated, hash-bound execution plan because it removes the largest current developer-glue dependency. The guided operator-context packet follows on the same spine. Both must enter the built CLI and exact-tree acceptance command before they count as product capability.
+
 ## Audit-finding disposition ledger
 
 | July 30 finding | Disposition | Current evidence | Acceptance requirement |
 |---|---|---|---|
-| The shared checkout lacked the accepted product while local `origin/main` contained it. | Adopt | The accepted isolated worktree starts at local `origin/main` commit `1dd173311fbf7c16f85213066cc881fc959a2a2c`, tree `ec30f36368d72b756640793374541636e307e696`; the dirty shared checkout remains inspection-only. | Final proof names the integrated commit/tree and reruns all gates there. No local remote-tracking ref is described as live GitHub proof. |
+| The shared checkout lacked the accepted product while local `origin/main` contained it. | Adopt | The current isolated worktree descends from local `origin/main` commit `79b0ec3d0a27d7393de1b74d17762ad37648eadf`, tree `13ecd8f17fc96e6fddf179fd5d521d166f82e490`; the dirty shared checkout remains inspection-only. | Final proof names the integrated commit/tree and reruns all gates there. No local remote-tracking ref is described as live GitHub proof. |
 | The transactional importer had no normal operator caller. | Adopt | `fn prd preview`, confirmation-bound `import`, `inspect`, `reconcile`, and redacted `status` call the production compiler/import/status services. | The exact acceptance command must invoke the built CLI and prove rejected provenance leaves no database or filesystem residue. |
 | Imported tasks defaulted to read-only thinking rather than coding custody. | Adopt | Product policy v2 requires coding tool mode, isolated worktrees, owned paths, route-scoped write roots, provider/model/transport, and required commits; importer and runtime tests exercise the production preparation seam. | A real runtime provider must change one admitted file in the acquired worktree; the fenced controller must create the required commit and refuse dirty, unchanged, wrong-branch, filtered, or foreign-path output. |
 | Proof admission checked declarations but did not execute tests. | Adopt with modification | Admission remains an explicit pre-dispatch trust check. A separate durable proof-attempt service now runs every declared command against the exact campaign commit and records terminal evidence. | A planted defect must produce a fresh `proved_failed` receipt; a corrected campaign commit must produce a fresh `committed` receipt; landing must reject every stale or mismatched receipt. |
 | Real-PRD canaries extracted only three requirements and did not change target code. | Adopt | Historical fixtures are treated only as intake leads; they are not product completion evidence. | Build a current three-packet manifest, report omissions/questions/coverage, run one approved live authoring experiment, and keep private vault bytes out of Git. The product acceptance route must change disposable target source. |
-| The broad campaign gate and PostgreSQL proof were not fresh. | Adopt | On the integrated implementation bytes, `pnpm test:gate` passed PostgreSQL 10/10, engine 299/299, and CLI 65/65; Wave 6 passed its exact 416-test inventory. | Rerun the exact product acceptance on the clean integrated commit; stale baseline runs do not close this item. |
+| The broad campaign gate and PostgreSQL proof were not fresh. | Adopt | On clean commit `a818c215a`, `pnpm test:gate` passed its current engine, PostgreSQL, PRD-safety, and CI-shape groups; Wave 6 passed its exact 425-test inventory with no missing, skipped, extra, duplicate, timed-out, or force-killed checks. | Rerun the exact product acceptance on the clean integrated commit; stale baseline runs do not close this item. |
 | Documentation overstated import/runtime completeness. | Adopt | This plan separates designed, implemented, tested, locally proven, live, and deployed states and identifies the remaining real-runtime/acceptance work. | Update operator documentation only after the built CLI/runtime acceptance is fresh-green; do not claim live provider or deployment proof. |
 | A unified campaign-admission helper may be unused while runtime-specific gates exist. | Defer | Current product safety is enforced at the narrower work-item lease, provider-attempt, proof-attempt, approval, path, and Git-CAS seams. Centralization is not required for the shortest vertical slice. | Every supported execution route must reach those exact gates. Remove or consolidate the compatibility helper only in a separately proved cleanup; do not weaken a runtime-specific fence to make the helper appear authoritative. |
 
@@ -306,11 +329,11 @@ The deterministic provider is acceptance infrastructure, not the product path. I
 
 **Current local corpus evidence (2026-07-31)**
 
-- The built `fn prd discover` command scanned the current `00_MAIN/01_ActiveProjects` tree without archive or protected-path reads: 10 project-local selections, 2 explicit ambiguities, and 12 projects with no candidate. It selected `ccc-fusion/PRJ-AI-ccc-fusion-PRD-v0.1.md` over a same-version conversion report by the explicit PRD filename signal; it did not trust the portfolio tracker as lineage authority.
-- Three representative packets froze outside the vault with exact source receipts and no vault writes: agentic-trade-management packet `a471dfedad47a8df0783c92ed35285b76a3515fcb847f06a69f83b73f281f5f5` (3 files, 343,953 bytes, 5 unresolved ordinary references), ccc-quant-engine packet `ecc8b600ee4a93d3aa95242005d6c24d0572f7adde906d43a9ebfcd7e7049403` (1 file, 135,219 bytes, no unresolved references), and ccc-quant-wiki packet `3d9a2a2ad481ab14a594e9e2c0075d85de99050b9a08c68d2323baca73f9b5ad` (5 files, 156,952 bytes, 6 unresolved ordinary references). Unresolved missing, outside-project, or archive links are reported but never read or silently invented.
-- Two meaningful negative controls refused atomically with no output directory: the current ccc-fusion PRD declares a missing authority document, and the selected ccc-lab v7.2.3 PRD declares a source unavailable in the active project tree. Explicit authority remains fail-closed.
-- The optional intake-contract linter reports understandable implementation questions without rewriting source. All 10 current selections still lack an explicit exact target repository, 40-hex baseline, and allowed write roots under this contract; packet-specific gaps also include acceptance behavior, expected proof, or protected actions. Those facts must come from Ryan or an authoritative source before native authoring; the product does not infer them from folder names.
-- State is `locally proven` for discovery, freeze, custody, unresolved-reference reporting, lint/template output, and refusal residue. Requirement/task/proof extraction on these real packets remains `blocked` pending one operator-authorized live authoring route plus explicit target/baseline/path decisions; fixture proposals remain only `tested`.
+- On 2026-07-31 the rebuilt `fn prd discover` command scanned the current `00_MAIN/01_ActiveProjects` tree without archive or protected-path reads: 23 project directories, 12 project-local selections, zero ambiguities, and 11 projects with no candidate. It selected ccc-autocode-neo PRODPRD v0.5.0, kept Plaid Read MCP unversioned instead of misreading Python 3.12, selected the downstream Skill Hook Authoring production PRD v0.1.6 over its newer UFPRD v0.3 input, and selected `ccc-fusion/PRJ-AI-ccc-fusion-PRD-v0.1.md` over a same-version conversion report. The portfolio tracker was not treated as lineage authority.
+- Three representative packets freshly froze outside the vault with exact source receipts and no vault writes: agentic-trade-management packet `a471dfedad47a8df0783c92ed35285b76a3515fcb847f06a69f83b73f281f5f5` (3 files, 343,953 bytes, 5 unresolved ordinary references), ccc-quant-engine packet `ecc8b600ee4a93d3aa95242005d6c24d0572f7adde906d43a9ebfcd7e7049403` (1 file, 135,219 bytes, no unresolved references), and ccc-quant-wiki packet `3d9a2a2ad481ab14a594e9e2c0075d85de99050b9a08c68d2323baca73f9b5ad` (5 files, 156,952 bytes, 6 unresolved ordinary references). Unresolved missing, outside-project, or archive links are reported but never read or silently invented.
+- Two meaningful negative controls freshly refused atomically with no output directory: the current ccc-fusion PRD declares missing authority `REF-HUM-OrchestratorForkSecondOpinion-2026-07-23`, and the selected ccc-lab v7.2.3 PRD declares a v6.5.0 source unavailable in the active project tree. Explicit authority remains fail-closed.
+- The optional intake-contract linter reports understandable implementation questions without rewriting source. All 12 current selections lack an exact target repository, 40-hex baseline, and allowed write roots in the PRD text; 3 also lack acceptance behavior, 6 lack expected proof, and 11 lack protected-action declarations. A source PRD may remain unchanged when an authoritative operator context supplies those facts to the sidecar; the product does not infer them from folder names.
+- State is `locally proven` for discovery, freeze, custody, unresolved-reference reporting, lint/template output, and refusal residue. Requirement/task/proof extraction on these real packets remains `blocked` until one approved native authoring route and an authoritative target/baseline/path context are supplied; fixture proposals remain only `tested`.
 
 ## Pre-mortem
 

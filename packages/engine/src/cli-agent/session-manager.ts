@@ -1611,6 +1611,7 @@ export class CliSessionManager {
         dispatchKey: policy.dispatchKey,
         attemptOrdinal: candidate.attemptOrdinal,
         requestCount: candidate.requestCount,
+        workItemFence: candidate.workItemFence,
         state: "dispatched_unknown",
         binding: candidate.binding,
       }),

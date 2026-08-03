@@ -478,6 +478,98 @@ async function assertExactCommittedProofReceipts(
   }
 }
 
+export type CccCampaignLandingTaskCommit = Readonly<{ taskId: string; commit: string }>;
+
+/**
+ * Verify, against real Git history, that the commit about to be landed contains
+ * every campaign task's recorded commit.
+ *
+ * Landing sources exactly one branch and builds a single-parent commit, so
+ * "every task's work is in there" is otherwise inherited entirely from the
+ * proof gate's own ancestry loop. This is the independent second check: it
+ * consults the object graph rather than a receipt, so a bypassed, mis-scoped,
+ * or wrongly-attributed proof cannot by itself publish a commit that silently
+ * drops an earlier task's work. An empty set is a refusal, not a pass — a
+ * campaign with no verifiable task commits must never land vacuously.
+ */
+export async function assertCccCampaignLandingIntegratesTaskCommits(
+  snapshot: Readonly<{ gitBinary: string; targetRoot: string }>,
+  landingSourceCommit: string,
+  taskCommits: readonly CccCampaignLandingTaskCommit[],
+): Promise<void> {
+  /*
+   * An empty set is a NO-OP, not a refusal. This gate owns exactly one
+   * question — "is each recorded task commit contained in what we are landing?"
+   * — and deliberately does not own "does this campaign have receipts at all",
+   * which `assertExactCommittedProofReceipts` already refuses authoritatively.
+   * Refusing here would preempt that gate's precise diagnosis with a vaguer one
+   * on every single-task campaign, whose only recorded commit is the landing
+   * task's own and is therefore excluded upstream.
+   */
+  if (taskCommits.length === 0) return;
+  if (!isObjectId(landingSourceCommit)) {
+    throw new Error(
+      `CCC campaign Git landing source commit ${landingSourceCommit} is not a canonical Git object ID`,
+    );
+  }
+  for (const { taskId, commit } of taskCommits) {
+    if (!isObjectId(commit)) {
+      throw new Error(
+        `CCC campaign Git landing campaign task ${taskId} commit ${commit} is not a canonical Git object ID`,
+      );
+    }
+    try {
+      await runControlledCccCampaignGit(
+        snapshot,
+        ["merge-base", "--is-ancestor", commit, landingSourceCommit],
+      );
+    } catch {
+      throw new Error(
+        `CCC campaign Git landing source commit ${landingSourceCommit} does not integrate campaign task ${taskId} commit ${commit}`,
+      );
+    }
+  }
+}
+
+/**
+ * The commit every OTHER campaign task durably recorded, taken from committed
+ * proof-attempt receipts.
+ *
+ * Deriving this from live working branches was wrong: branch liveness is not
+ * part of the landing model. An imported campaign always carries task entities
+ * that never execute (a dependent terminal task, for one), and a task that did
+ * execute may have had its branch collected before landing — neither is
+ * evidence that work went missing. A committed receipt, by contrast, is durable
+ * proof that a specific task's work existed at a specific commit.
+ *
+ * The landing task itself is excluded on purpose: `assertExactCommittedProofReceipts`
+ * already pins its receipts to exactly `prepared.sourceCommit`, so including it
+ * here would only preempt that gate's sharper diagnosis with a vaguer one. This
+ * gate covers precisely the gap that gate cannot see — the OTHER tasks in a
+ * multi-task campaign.
+ */
+async function recordedCampaignTaskCommits(
+  store: TaskStore,
+  context: CccCampaignTaskContext,
+): Promise<readonly CccCampaignLandingTaskCommit[]> {
+  const layer = store.getAsyncLayer();
+  if (!layer) throw new Error("CCC campaign Git landing task ancestry check requires PostgreSQL");
+  const attempts = postgresSchema.project.cccCampaignProofAttempts;
+  const rows = await layer.db
+    .select({ taskId: attempts.taskId, sourceCommit: attempts.sourceCommit })
+    .from(attempts)
+    .where(drizzleSql`${attempts.projectId} = ${context.projectId}
+      AND ${attempts.importId} = ${context.importId}
+      AND ${attempts.campaignId} = ${context.campaignId}
+      AND ${attempts.taskId} <> ${context.taskId}
+      AND ${attempts.state} = 'committed'`);
+  const distinct = new Map<string, CccCampaignLandingTaskCommit>();
+  for (const { taskId, sourceCommit } of rows) {
+    distinct.set(`${taskId} ${sourceCommit}`, Object.freeze({ taskId, commit: sourceCommit }));
+  }
+  return Object.freeze([...distinct.values()]);
+}
+
 async function moveTargetToForeignCommit(prepared: PreparedCccCampaignGitObjects): Promise<void> {
   await runControlledCccCampaignGit(
     prepared.postObjectSnapshot,
@@ -636,6 +728,18 @@ export async function campaignGitLandingRequiredResult(
     ? preparedFromIntent(preparedBase, intentMetadata)
     : preparedBase;
   const intent = intentMetadata ?? metadataFromPrepared(prepared);
+  /*
+   * Defense in depth, independent of the proof gate: the landed tree is taken
+   * from `sourceCommit`, so every commit another campaign task durably recorded
+   * must already be an ancestor of it. The prepared commit itself is
+   * deliberately re-parented onto the target base, which is why the source
+   * commit — not `commitObject` — is the meaningful ancestry target here.
+   */
+  await assertCccCampaignLandingIntegratesTaskCommits(
+    prepared.postObjectSnapshot,
+    prepared.sourceCommit,
+    await recordedCampaignTaskCommits(store, context),
+  );
   const approvalInput = {
     authorityStore,
     rootDir: targetRoot,

@@ -42,6 +42,13 @@ type ProviderAttemptRequest = Readonly<{
   providerId: string;
   modelId: string;
   transport: "pi" | "cli" | "workflow";
+  workItemFence: WorkItemFence;
+}>;
+
+type WorkItemFence = Readonly<{
+  workItemId: string;
+  runId: string;
+  attempt: number;
 }>;
 
 type ProviderAttemptTransition = Readonly<{
@@ -60,6 +67,7 @@ type ProviderAttemptScope = Readonly<{
   dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
+  workItemFence: WorkItemFence | null;
   state: "reserved" | "dispatched_unknown" | "committed" | "proved_failed";
   terminal?:
     | Readonly<{ kind: "not-dispatched"; state: "proved_failed" }>
@@ -221,14 +229,60 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       providerId: route.providerId ?? "deterministic-fake",
       modelId: route.modelId ?? "fixture-v1",
       transport: route.transport ?? "pi",
+      workItemFence: {
+        workItemId: `work-item-${turnKey}`,
+        runId: `run-${turnKey}`,
+        attempt: 1,
+      },
     };
+  }
+
+  function legacyAttemptKey(
+    campaign: Awaited<ReturnType<typeof context>>["campaign"],
+    taskId: string,
+    semanticTaskId: string,
+    turnKey: string,
+    dispatchKey: string,
+  ): string {
+    return `ccc-provider-attempt-${createHash("sha256")
+      .update(`ccc-provider-attempt/v2\\0${canonicalCccPrdJson({
+        projectId: campaign.projectId,
+        importId: campaign.importId,
+        campaignId: campaign.campaignId,
+        taskId,
+        semanticTaskId,
+        turnKey,
+        dispatchKey,
+      })}`, "utf8")
+      .digest("hex")}`;
+  }
+
+  function v3AttemptKey(
+    campaign: Awaited<ReturnType<typeof context>>["campaign"],
+    taskId: string,
+    semanticTaskId: string,
+    input: Pick<ProviderAttemptRequest, "turnKey" | "dispatchKey" | "workItemFence">,
+  ): string {
+    return `ccc-provider-attempt-${createHash("sha256")
+      .update(`ccc-provider-attempt/v3\\0${canonicalCccPrdJson({
+        projectId: campaign.projectId,
+        importId: campaign.importId,
+        campaignId: campaign.campaignId,
+        taskId,
+        semanticTaskId,
+        turnKey: input.turnKey,
+        dispatchKey: input.dispatchKey,
+        workItemFence: input.workItemFence,
+      })}`, "utf8")
+      .digest("hex")}`;
   }
 
   async function auditRows() {
     return h.layer().db.execute(sql`
       SELECT timestamp, mutation_type, campaign_provider_id, campaign_model_id,
         campaign_transport, campaign_packet_hash, campaign_sidecar_hash,
-        campaign_bundle_hash, campaign_manifest_hash, campaign_binding_hash
+        campaign_bundle_hash, campaign_manifest_hash, campaign_binding_hash,
+        metadata
       FROM project.run_audit_events
       WHERE mutation_type LIKE 'ccc-campaign:provider-attempt:%'
       ORDER BY timestamp ASC
@@ -249,6 +303,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     const mutable = scope as unknown as {
       state: string;
       turnKey: string;
+      workItemFence: { workItemId: string; runId: string; attempt: number };
       binding: {
         providerId: string;
         modelId: string;
@@ -259,6 +314,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     for (const mutate of [
       () => { mutable.state = "committed"; },
       () => { mutable.turnKey = "turn-mutated"; },
+      () => { mutable.workItemFence.attempt += 1; },
       () => { mutable.binding.providerId = "provider-mutated"; },
       () => { mutable.binding.modelId = "model-mutated"; },
       () => { mutable.binding.actionTarget = `${h.rootDir()}-mutated`; },
@@ -307,6 +363,14 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     expect(first.taskId).toBe(taskId);
     expect(first.semanticTaskId).toBe(campaign.semanticTaskId);
     expect(first.campaignDeadlineAt).toBe(campaign.campaignDeadlineAt);
+    expect(first.workItemFence).toEqual(input.workItemFence);
+    expect(Object.isFrozen(first.workItemFence)).toBe(true);
+    expect(first.attemptKey).toBe(v3AttemptKey(
+      campaign,
+      taskId,
+      campaign.semanticTaskId,
+      input,
+    ));
     expect(first.attemptOrdinal).toBe(1);
     expect(first.requestCount).toBe(1);
     expect(await persistedRequestCount(campaign.importId)).toBe(1);
@@ -332,6 +396,10 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       campaign_bundle_hash: campaign.bundleHash,
       campaign_manifest_hash: campaign.manifestHash,
       campaign_binding_hash: first.binding.bindingHash,
+      metadata: expect.objectContaining({
+        schema: "ccc-campaign.provider-attempt.v4",
+        workItemFence: input.workItemFence,
+      }),
     });
   });
 
@@ -344,6 +412,26 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       UPDATE project.run_audit_events
       SET metadata = jsonb_set(metadata, '{attemptOrdinal}', '2'::jsonb)
       WHERE metadata->>'attemptKey' = ${reserved.attemptKey}
+    `);
+
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: reserved.attemptKey }))
+      .rejects.toMatchObject({ code: "CCC_CAMPAIGN_CONTEXT_REFUSED" });
+  });
+
+  it("refuses provider-attempt stages whose persisted work-item fence drifted", async () => {
+    const { taskId } = await context("fence-stage-custody");
+    const store = api(h.store());
+    const reserved = await store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-fence-stage-custody"));
+    await dispatch(store, {
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+    await h.layer().db.execute(sql`
+      UPDATE project.run_audit_events
+      SET metadata = jsonb_set(metadata, '{workItemFence,attempt}', '2'::jsonb)
+      WHERE metadata->>'attemptKey' = ${reserved.attemptKey}
+        AND mutation_type = 'ccc-campaign:provider-attempt:dispatched'
     `);
 
     await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: reserved.attemptKey }))
@@ -389,6 +477,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
     expect.soft(Object.isFrozen(reserved)).toBe(true);
     expect.soft(Object.isFrozen(reserved.binding)).toBe(true);
+    expect.soft(Object.isFrozen(reserved.workItemFence)).toBe(true);
     expect.soft(JSON.stringify(reserved)).toBe(reservedBytes);
 
     const dispatched = await dispatch(store, transition);
@@ -398,6 +487,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
 
     expect.soft(Object.isFrozen(dispatched)).toBe(true);
     expect.soft(Object.isFrozen(dispatched.binding)).toBe(true);
+    expect.soft(Object.isFrozen(dispatched.workItemFence)).toBe(true);
     expect.soft(JSON.stringify(dispatched)).toBe(dispatchedBytes);
 
     const restarted = api(new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }));
@@ -455,6 +545,78 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     await expect(store.reserveCccProviderAttempt(request(taskId, h.rootDir(), "turn-route", { modelId: "fixture-v2" })))
       .rejects.toMatchObject({ code: "CCC_PROVIDER_ATTEMPT_COLLISION" });
     expect(await auditRows()).toHaveLength(1);
+    expect(await persistedRequestCount(campaign.importId)).toBe(1);
+  });
+
+  it("collision-refuses a changed work-item fence for one logical provider effect without another audit or request", async () => {
+    const { taskId, campaign } = await context("fence-collision");
+    const store = api(h.store());
+    const input = request(taskId, h.rootDir(), "turn-fence-collision");
+    const first = await store.reserveCccProviderAttempt(input);
+
+    await expect(store.reserveCccProviderAttempt({
+      ...input,
+      workItemFence: { ...input.workItemFence, attempt: input.workItemFence.attempt + 1 },
+    })).rejects.toMatchObject({ code: "CCC_PROVIDER_ATTEMPT_COLLISION" });
+
+    expect(await auditRows()).toHaveLength(1);
+    expect(await persistedRequestCount(campaign.importId)).toBe(1);
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: first.attemptKey }))
+      .resolves.toMatchObject({ workItemFence: input.workItemFence });
+  });
+
+  it("reads exact legacy-v2 history as explicitly unfenced and blocks a v3 reservation for the same logical effect", async () => {
+    const { taskId, semanticTaskId, campaign } = await context("legacy-v2-visible");
+    const store = api(h.store());
+    const input = request(taskId, h.rootDir(), "turn-legacy-v2-visible");
+    const current = await store.reserveCccProviderAttempt(input);
+    await dispatch(store, {
+      taskId,
+      attemptKey: current.attemptKey,
+      controllerToken: current.controllerToken,
+    });
+    await store.reconcileCccProviderAttempt({
+      taskId,
+      attemptKey: current.attemptKey,
+      controllerToken: current.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "8".repeat(64),
+      observerId: "legacy-v2-visible",
+    });
+    const legacyKey = legacyAttemptKey(
+      campaign,
+      taskId,
+      semanticTaskId,
+      input.turnKey,
+      input.dispatchKey,
+    );
+    await h.layer().db.execute(sql`
+      UPDATE project.run_audit_events
+      SET run_id = ${`ccc-provider-attempt:${legacyKey}`},
+        campaign_event_key = ${legacyKey} || ':' || split_part(mutation_type, ':', 3),
+        metadata = (metadata - 'workItemFence') || jsonb_build_object(
+          'schema', 'ccc-campaign.provider-attempt.v2',
+          'attemptKey', to_jsonb(${legacyKey}::text)
+        )
+      WHERE metadata->>'attemptKey' = ${current.attemptKey}
+    `);
+
+    const restarted = api(new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }));
+    await expect(restarted.inspectCccProviderAttempt({ taskId, attemptKey: legacyKey }))
+      .resolves.toMatchObject({
+        attemptKey: legacyKey,
+        state: "committed",
+        workItemFence: null,
+        terminal: { kind: "reconciled", state: "committed" },
+      });
+    await expect(restarted.beginCccProviderAttemptDispatch({
+      taskId,
+      attemptKey: legacyKey,
+      controllerToken: current.controllerToken,
+    })).rejects.toMatchObject({ code: "CCC_PROVIDER_ATTEMPT_STATE_REFUSED" });
+    await expect(restarted.reserveCccProviderAttempt(input))
+      .rejects.toMatchObject({ code: "CCC_PROVIDER_ATTEMPT_COLLISION" });
+    expect(await auditRows()).toHaveLength(3);
     expect(await persistedRequestCount(campaign.importId)).toBe(1);
   });
 
@@ -683,6 +845,37 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     });
     await expect(h.store().inspectCccCampaignActionLease(taskId, action)).resolves.toMatchObject({
       lease: { approvalRequestId: issued.id, claimToken },
+    });
+    expect(await auditRows()).toHaveLength(auditsBefore.length);
+  });
+
+  it("refuses a drifted work-item fence before terminal settlement or approval consumption", async () => {
+    const { taskId, action, issued, claimToken } = await protectedContext("settlement-fence-drift");
+    const store = api(h.store());
+    const reservation = request(taskId, action.actionTarget, "turn-settlement-fence-drift", {
+      actionId: action.actionId,
+      transport: "pi",
+    });
+    const attempt = await store.reserveCccProviderAttempt(reservation);
+    await dispatch(store, { taskId, attemptKey: attempt.attemptKey, controllerToken: attempt.controllerToken });
+    const auditsBefore = await auditRows();
+
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...attempt,
+      workItemFence: {
+        ...reservation.workItemFence,
+        attempt: reservation.workItemFence.attempt + 1,
+      },
+      outcome: "committed",
+      evidenceDigest: "9".repeat(64),
+      observerId: "settlement-fence-drift",
+    })).rejects.toThrow(/settlement immutable identity mismatch/i);
+
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: attempt.attemptKey }))
+      .resolves.toMatchObject({ state: "dispatched_unknown", workItemFence: attempt.workItemFence });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({
+      status: "claimed",
+      campaign: { claimToken },
     });
     expect(await auditRows()).toHaveLength(auditsBefore.length);
   });

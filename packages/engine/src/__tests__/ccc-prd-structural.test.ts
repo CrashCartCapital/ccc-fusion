@@ -64,8 +64,14 @@ const roots: string[] = [];
 const digest = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const target = "/tmp/ccc-prd-candidate-target";
 const base = "a".repeat(40);
+const taskOneCustodyLine =
+  "- Task owned path: tasks/one; Task allowed write root: tasks/one";
+const taskTwoCustodyLine =
+  "- Task owned path: tasks/two; Task allowed write root: tasks/two";
 const source = [
   "# Small packet",
+  taskOneCustodyLine,
+  taskTwoCustodyLine,
   "- `REQ-2`: second requirement",
   "- `REQ-1`: first requirement",
   "while true DEFERRED delete publish",
@@ -82,6 +88,8 @@ const productSource = [
   "- Max duration ms: 30000",
   "- Max concurrency: 2",
   "- Non-goal: live execution",
+  taskOneCustodyLine,
+  taskTwoCustodyLine,
   `- Protected action: deletion ${target}/retired delete publish`,
   secondRequirementLine,
   firstRequirementLine,
@@ -175,6 +183,8 @@ function proposal() {
         id: "TASK-2",
         title: "Second task",
         description: "Implement second requirement",
+        ownedPaths: ["tasks/two"],
+        allowedWriteRoots: ["tasks/two"],
         accountableProducer: "worker-2",
         requirementIds: ["REQ-2"],
         dependencyTaskIds: ["TASK-1"],
@@ -183,12 +193,17 @@ function proposal() {
         documentIds: [],
         artifactIds: ["ARTIFACT-1"],
         protectedActionIds: ["ACTION-1"],
-        sourceRefs: ref("second requirement"),
+        sourceRefs: [
+          ...ref("second requirement"),
+          ...ref(taskTwoCustodyLine),
+        ],
       },
       {
         id: "TASK-1",
         title: "First task",
         description: "Implement first requirement",
+        ownedPaths: ["tasks/one"],
+        allowedWriteRoots: ["tasks/one"],
         accountableProducer: "worker-1",
         requirementIds: ["REQ-1"],
         dependencyTaskIds: [],
@@ -197,7 +212,10 @@ function proposal() {
         documentIds: ["DOCUMENT-1"],
         artifactIds: [],
         protectedActionIds: [],
-        sourceRefs: ref("first requirement"),
+        sourceRefs: [
+          ...ref("first requirement"),
+          ...ref(taskOneCustodyLine),
+        ],
       },
     ],
     edges: [{
@@ -285,7 +303,10 @@ function productProposal(): ReturnType<typeof proposal> {
   candidate.requirements.find(({ id }) => id === "REQ-2")!.sourceRefs = ref(secondRequirementLine);
   candidate.proofs.find(({ id }) => id === "PROOF-1")!.sourceRefs = ref(firstRequirementLine);
   candidate.proofs.find(({ id }) => id === "PROOF-2")!.sourceRefs = ref(secondRequirementLine);
-  candidate.tasks[0]!.sourceRefs = ref(firstRequirementLine);
+  candidate.tasks[0]!.sourceRefs = [
+    ...ref(firstRequirementLine),
+    ...ref(taskOneCustodyLine),
+  ];
   candidate.workflows[0]!.sourceRefs = ref("Small packet");
   candidate.artifacts[0]!.sourceRefs = ref(firstRequirementLine);
   candidate.protectedActions[0]!.sourceRefs = ref(`Protected action: deletion ${target}/retired delete publish`);
@@ -465,6 +486,44 @@ describe("ccc-prd structural sidecar", () => {
     expect(result.kind, JSON.stringify(result)).toBe("bundle");
     expect(result.implementationFactProvenance).toEqual(authored.sidecar.implementationFactProvenance);
     expect(result.bundleHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("binds an ambiguous scalar implementation fact to its labeled declaration", async () => {
+    const labeledSource = productSource
+      .replace("# Small packet", "# Small packet\nversion: 1")
+      .replace("- Max requests: 4", "- Max requests: 1");
+    const input = packet(labeledSource);
+    const candidate = productProposal();
+    candidate.bounds.maxRequests = 1;
+    const constraints = productConstraints();
+    constraints.bounds.maxRequests = 1;
+
+    const authored = await author(input, candidate, constraints);
+    const provenance = authored.sidecar.implementationFactProvenance as {
+      bounds: {
+        maxRequests: {
+          value: number;
+          spans: Array<{ path: string; byteStart: number; byteEnd: number }>;
+        };
+      };
+    };
+    const declaration = "- Max requests: 1";
+    const expectedStart = Buffer.byteLength(
+      labeledSource.slice(
+        0,
+        labeledSource.indexOf(declaration) + "- Max requests: ".length,
+      ),
+      "utf8",
+    );
+
+    expect(provenance.bounds.maxRequests).toEqual({
+      value: 1,
+      spans: [expect.objectContaining({
+        path: "source.md",
+        byteStart: expectedStart,
+        byteEnd: expectedStart + 1,
+      })],
+    });
   });
 
   it("refuses a fact value that appears in source but outside the entity cited span", async () => {

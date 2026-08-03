@@ -4,6 +4,7 @@ import {
   readConsumedCccCampaignApprovalCustodyWithinTransaction,
   selectCccCampaignDeclaredLiveExecutionAction,
   type CccCampaignAuthorityStore,
+  type CccCampaignWorkItemFence,
   type CccCampaignProviderControllerDecision,
   type CccCampaignProviderDispatchInput,
   type CccProviderAttemptScope,
@@ -58,9 +59,13 @@ type CccCampaignProviderAttemptBindingInput = Readonly<{
   layer: AsyncDataLayer;
   rootDir: string;
   authorityStore: CccCampaignAuthorityStore;
+  /** Sealed graph task that owns the active workflow work-item fence. */
+  originTaskId: string;
   semanticTaskId: string;
   nativeTaskId?: string;
   turnKey: string;
+  workItemFence: CccCampaignWorkItemFence;
+  workItemLeaseOwner: string;
   /** PI binds exact resolved route; scoped workflow binds its native transport and extension identity. */
   expectedRoute: Readonly<{ transport: "workflow"; workflowExtensionId: string }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>;
   signal?: AbortSignal;
@@ -78,6 +83,7 @@ export function createCccCampaignProviderAttemptBinding(
 export async function createCccCampaignProviderAttemptBinding(
   input: CccCampaignProviderAttemptBindingInput & Readonly<{ workflowProviderBinding?: boolean }>,
 ): Promise<CccProviderAttemptBinding | CccCampaignWorkflowProviderBinding> {
+  const workItemLeaseOwner = requireCccCampaignWorkItemLeaseOwner(input.workItemLeaseOwner);
   const rootDir = await realpath(input.rootDir);
   const nativeTaskId = input.nativeTaskId ?? input.semanticTaskId;
   const context = await input.layer.transaction((tx) =>
@@ -141,10 +147,13 @@ export async function createCccCampaignProviderAttemptBinding(
           layer: input.layer,
           authorityStore: input.authorityStore,
           rootDir,
+          originTaskId: input.originTaskId,
           taskId: context.taskId,
           approvalRequestId: approvalCustody.approvalRequestId,
           claimToken: approvalCustody.claimToken,
           ...dispatch,
+          workItemFence: input.workItemFence,
+          workItemLeaseOwner,
         },
       });
     },
@@ -184,4 +193,11 @@ export async function createCccCampaignProviderAttemptBinding(
     });
   }
   return Object.freeze({ turnKey: input.turnKey, controller });
+}
+
+export function requireCccCampaignWorkItemLeaseOwner(value: unknown): string {
+  if (typeof value !== "string" || !CANONICAL_IDENTIFIER_PATTERN.test(value)) {
+    throw new Error("CCC campaign workflow work-item lease owner is invalid");
+  }
+  return value;
 }

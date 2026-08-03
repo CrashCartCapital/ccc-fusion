@@ -3,14 +3,16 @@
  *
  * Acquires two independent guards before the engine subsystems start:
  *
- *   1. A lockfile under `<workingDir>/.fusion/engine.lock` via `proper-lockfile`.
- *      Uses OS-level link()/atomic-rename semantics; auto-released on process
- *      death; stale locks are recovered after `STALE_MS` of no `mtime` updates.
- *
- *   2. A loopback listener on a per-project address. On POSIX this is a Unix
+ *   1. A loopback listener on a per-project address. On POSIX this is a Unix
  *      domain socket under `os.tmpdir()`; on Windows it is a named pipe under
  *      `\\.\pipe\`. Node's `net.Server.listen(path)` abstracts both. If the
  *      address is already bound, another engine is live.
+ *
+ *   2. A lockfile under `<workingDir>/.fusion/engine.lock` via `proper-lockfile`.
+ *      Uses OS-level link()/atomic-rename semantics and heartbeat updates.
+ *      Crash residue is retried only after this process owns the canonical
+ *      loopback address, so a live engine cannot lose exclusivity to a stale
+ *      mtime decision.
  *
  * Together the two guards cover the failure modes the other one misses:
  *   - Lockfile alone: file locks can survive an `rm -rf .fusion`.
@@ -27,9 +29,16 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import lockfile from "proper-lockfile";
 
-const STALE_MS = 30_000;
-const UPDATE_MS = 10_000;
+const STALE_MS = 5_000;
+const UPDATE_MS = 1_000;
 const PROBE_TIMEOUT_MS = 500;
+const LOCK_RETRY_OPTIONS = {
+  retries: 24,
+  factor: 1,
+  minTimeout: 250,
+  maxTimeout: 250,
+  randomize: false,
+} as const;
 
 export interface EngineSingletonLock {
   /** Idempotent release of both the lockfile and the loopback listener. */
@@ -98,7 +107,7 @@ async function acquireLockfile(
   const release = await lockfile.lock(path, {
     stale: STALE_MS,
     update: UPDATE_MS,
-    retries: 0,
+    retries: LOCK_RETRY_OPTIONS,
     realpath: false,
     onCompromised,
   });
@@ -188,14 +197,14 @@ export async function acquireEngineSingleton(
   const socketPath = computeEngineSocketPath(projectId);
   try {
     try {
-      lock = await acquireLockfile(workingDir, onCompromised);
-    } catch (err) {
-      throw new EngineAlreadyRunningError(projectId, "lockfile", err);
-    }
-    try {
       server = await bindLoopback(socketPath);
     } catch (err) {
       throw new EngineAlreadyRunningError(projectId, "socket", err);
+    }
+    try {
+      lock = await acquireLockfile(workingDir, onCompromised);
+    } catch (err) {
+      throw new EngineAlreadyRunningError(projectId, "lockfile", err);
     }
   } catch (err) {
     if (server) {

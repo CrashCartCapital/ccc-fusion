@@ -159,28 +159,41 @@ describe("ccc-prd import intent descendants", () => {
     );
   });
 
-  it("refuses a multi-task graph on the current supported product path", () => {
-    const input = packet(() => undefined);
+  // This oracle is a three-task linear chain (TASK-CATALOG-BOOTSTRAP ->
+  // TASK-CANONICAL-WRITE-BOUNDARY -> TASK-KERNEL-TRANSACTION). M1 admits that
+  // graph SHAPE, so no shape diagnostic may be raised against it.
+  //
+  // It still refuses under requireMaterialCoverage for its own shallow
+  // extraction and coverage defects, and now also for per-task custody: this
+  // legacy fixture declares no ownedPaths or allowedWriteRoots on any task,
+  // which a multi-task chain requires (one diagnostic per task per field, so
+  // three tasks x two fields = six). That is a real defect in the fixture, not
+  // a shape refusal.
+  it("no longer refuses a multi-task chain for its graph shape", () => {
     for (const result of [
       ccc.validateCccPrdPacket({
-        ...input,
+        ...packet(() => undefined),
         requireMaterialCoverage: true,
       }),
       ccc.compileCccPrdPacket({
-        ...input,
+        ...packet(() => undefined),
         requireMaterialCoverage: true,
       }),
     ]) {
-      expect(result).toMatchObject({
-        diagnostics: expect.arrayContaining([
-          expect.objectContaining({
-            code: "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED",
-            message: expect.stringContaining(
-              "multi-task campaign integration is not yet supported",
-            ),
-          }),
-        ]),
-      });
+      const codes = (result.diagnostics ?? []).map(({ code }) => code);
+      expect(codes).not.toContain("CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED");
+      expect(codes).not.toContain("CCC_PRD_PRODUCT_TASK_OWNERSHIP_OVERLAP");
+      expect(codes).not.toContain("CCC_PRD_PRODUCT_PROTECTED_ACTION_SHARED");
+      expect([...new Set(codes)].sort()).toEqual([
+        "CCC_PRD_EXTRACTION_IMPLAUSIBLY_SHALLOW",
+        "CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_REQUIRED",
+        "CCC_PRD_MATERIAL_COVERAGE_REQUIRED",
+        "CCC_PRD_MATERIAL_SECTION_UNDISPOSITIONED",
+        "CCC_PRD_PRODUCT_TASK_CUSTODY_MISSING",
+        "CCC_PRD_SOURCE_REQUIREMENT_UNDISPOSITIONED",
+      ]);
+      expect(codes.filter((code) => code === "CCC_PRD_PRODUCT_TASK_CUSTODY_MISSING"))
+        .toHaveLength(6);
     }
   });
 });

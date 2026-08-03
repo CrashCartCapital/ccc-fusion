@@ -406,9 +406,74 @@ type CccResponseIdentitySession = AgentSession & {
 class CccCustomProviderEgressPolicyViolationError extends Error {
   readonly code = "CCC_CUSTOM_PROVIDER_EGRESS_POLICY_VIOLATION";
 
-  constructor(public readonly selection: "primary" | "fallback") {
-    super(`ccc-fusion ${selection} custom-provider base URL rejected by loopback policy`);
+  constructor(
+    public readonly selection: "primary" | "fallback",
+    public readonly providerKey: string,
+    reason: string,
+  ) {
+    super(`ccc-fusion ${selection} provider ${providerKey} is outside the admitted transport set: ${reason}`);
     this.name = "CccCustomProviderEgressPolicyViolationError";
+  }
+}
+
+/*
+FNXC:CCCEgressAllowlist 2026-08-01-19:05:
+The ccc-fusion profile admits exactly two transport shapes, and this set is the
+record of the second one. A configured custom provider is admitted only when its
+base URL matches the loopback policy (CF-DIV-002). A provider key listed here is
+admitted with no URL check because it names a child-process CLI bridge that has
+no HTTP base URL to validate: it reuses the operator's already-authenticated
+session, and CF-DIV-001's env-key stripping is what contains it instead.
+
+`pi-claude-cli` is the vendored Claude Code CLI bridge. provider-auth.ts
+classifies it as a CLI provider (excluded from the API-key catalog because it
+has no key to store), and the ProviderAuth note below in this file separates it
+from pi-ai's built-in `anthropic` provider precisely on this axis: `anthropic`
+speaks HTTP to a remote `/v1` whether authenticated by OAuth or by raw key,
+while `pi-claude-cli/<model>` runs the vendored CLI as a child process.
+
+`droid-cli` has the same structural shape but no ccc-fusion call site or
+admitted campaign route anywhere in the repo, so it stays out. This is an
+admission record, not a capability list -- add a member only with evidence that
+ccc-fusion actually routes through it.
+
+Every other provider key fails closed, including built-in cloud HTTP routes such
+as `anthropic`, `openai`, and `openrouter`. Before this set existed, a key that
+resolved to no configured custom provider was silently skipped, so any built-in
+cloud route bypassed the loopback boundary entirely.
+*/
+export const CCC_ADMITTED_NON_HTTP_TRANSPORTS: ReadonlySet<string> = new Set([
+  "pi-claude-cli",
+]);
+
+/*
+FNXC:CCCCampaignFallback 2026-08-01-17:10:
+The ccc-fusion profile pins one admitted provider/model route per session, and a
+campaign turn seals that route into a provider attempt binding. A
+settings-derived fallback is a different wire identity, so the pi seam refuses
+the swap rather than re-pinning the expected-identity marker onto it. The
+refusal carries the sealed turn key so an operator can tie it back to the
+attempt; the underlying provider failure stays in the message and in `cause` so
+downstream failure classification is unchanged.
+*/
+class CccFallbackRefusedError extends Error {
+  readonly code = "CCC_FALLBACK_REFUSED";
+
+  constructor(
+    readonly triggerPoint: "session-creation" | "prompt-time",
+    readonly sealedRoute: string,
+    readonly refusedFallback: string,
+    readonly turnKey: string | undefined,
+    underlying: unknown,
+  ) {
+    const reason = underlying instanceof Error ? underlying.message : String(underlying);
+    super(
+      `ccc-fusion refused the ${triggerPoint} model fallback`
+      + (turnKey ? ` for provider attempt turn ${turnKey}` : "")
+      + `: sealed route ${sealedRoute} failed and ${refusedFallback} is outside the admitted route: ${reason}`,
+      { cause: underlying },
+    );
+    this.name = "CccFallbackRefusedError";
   }
 }
 
@@ -423,12 +488,20 @@ function assertCccCustomProviderEgress(
   ] as const;
   for (const [selection, providerKey] of selections) {
     if (!providerKey) continue;
+    if (CCC_ADMITTED_NON_HTTP_TRANSPORTS.has(providerKey)) continue;
     const provider = providers.find(
       (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
     );
-    if (!provider) continue;
-    if (!validateCccLoopbackHttpUrl(provider.baseUrl).ok) {
-      throw new CccCustomProviderEgressPolicyViolationError(selection);
+    if (!provider) {
+      throw new CccCustomProviderEgressPolicyViolationError(
+        selection,
+        providerKey,
+        "provider resolves to no configured custom provider and is not an admitted non-HTTP transport",
+      );
+    }
+    const validation = validateCccLoopbackHttpUrl(provider.baseUrl);
+    if (!validation.ok) {
+      throw new CccCustomProviderEgressPolicyViolationError(selection, providerKey, validation.reason);
     }
   }
 }
@@ -560,6 +633,25 @@ function cccProviderAttemptStreamFailure(error: unknown): Error {
   return new Error("ccc-fusion provider attempt stream failed");
 }
 
+/*
+FNXC:CccEffectiveRouteRoundTrip 2026-08-02-00:00:
+`reconcileCccProviderAttempt` records the submitted effective-route receipt into
+the terminal evidence it returns, so the reconciled terminal carries an
+`effectiveRoute` key whenever this transport submitted one. It persists the
+receipt fields only: `fallbackReason` is an input-only refusal probe (a non-null
+value is rejected outright as unadmitted campaign fallback) and is validated then
+dropped rather than recorded. Project the submitted receipt the same way so the
+terminal comparison stays an EXACT round-trip check — the store must return
+precisely the evidence this transport handed it, receipt included — instead of
+refusing the receipt it was designed to persist.
+*/
+function persistedCccProviderAttemptEffectiveRoute(
+  submitted: NonNullable<CccProviderAttemptSubmittedReconciliation["effectiveRoute"]>,
+): Record<string, unknown> {
+  const { fallbackReason: _fallbackReason, ...persisted } = submitted;
+  return persisted;
+}
+
 function assertCccProviderAttemptReconciledScope(
   requested: CccProviderAttemptSubmittedReconciliation,
   observed: CccProviderAttemptScope,
@@ -599,6 +691,9 @@ function assertCccProviderAttemptReconciledScope(
     state: "committed",
     evidenceDigest: requested.evidenceDigest,
     observerId: requested.observerId,
+    ...(requested.effectiveRoute
+      ? { effectiveRoute: persistedCccProviderAttemptEffectiveRoute(requested.effectiveRoute) }
+      : {}),
   };
   if (canonicalCccPrdJson(observed.terminal) !== canonicalCccPrdJson(expectedTerminal)) {
     throw new Error("ccc-fusion provider attempt reconciliation terminal evidence mismatch");
@@ -747,6 +842,12 @@ function createCccProviderAttemptControlledStream(input: {
                   : new Error("ccc-fusion provider attempt did not observe a terminal done event");
               }
               assertCccProviderAttemptDoneMatchesResult(terminalDoneEvent, result);
+              // pi-ai's Usage type is non-optional, but transports that predate this
+              // receipt wiring can still hand back a result without it; an all-zero
+              // usage is indistinguishable from "never populated" and must not be
+              // reported as a real receipt.
+              const usage = result.usage;
+              const hasUsage = usage != null && !(usage.input === 0 && usage.output === 0);
               const reconciliation: CccProviderAttemptSubmittedReconciliation = {
                 ...scope,
                 outcome: "committed" as const,
@@ -757,6 +858,15 @@ function createCccProviderAttemptControlledStream(input: {
                   message: result,
                 }),
                 observerId: "pi",
+                effectiveRoute: {
+                  effectiveProvider: result.provider,
+                  effectiveModel: result.responseModel ?? result.model,
+                  usage: hasUsage ? { inputTokens: usage.input, outputTokens: usage.output } : null,
+                  cost: hasUsage
+                    ? { amountUsd: usage.cost.total, source: "pi-ai" }
+                    : { kind: "unknown" as const, reason: "no-usage-in-stream" },
+                  receiptSource: hasUsage ? "stream-usage" as const : "none" as const,
+                },
               };
               const reconciledScope = await input.binding.controller.reconcile(reconciliation);
               assertCccProviderAttemptReconciledScope(reconciliation, reconciledScope);
@@ -3436,6 +3546,18 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     });
   };
 
+  const cccFallbackRefused = options.profile === CCC_FUSION_PROFILE;
+  const makeCccFallbackRefusedError = (
+    triggerPoint: "session-creation" | "prompt-time",
+    underlying: unknown,
+  ): CccFallbackRefusedError => new CccFallbackRefusedError(
+    triggerPoint,
+    modelDescription(selectedModel),
+    modelDescription(fallbackModel),
+    cccProviderAttemptBinding?.turnKey,
+    underlying,
+  );
+
   const emitFallbackUsed = async (
     triggerPoint: "session-creation" | "prompt-time",
     primaryFailure: unknown,
@@ -3481,9 +3603,16 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     sessionResult = await createSessionWithModel(selectedModel);
     piLog.log(`Session created successfully (model=${selectedModel ? `${selectedModel.provider}/${selectedModel.id}` : "default"})`);
   } catch (err: any) {
-    if (!fallbackModel || !selectedModel || !hasDistinctFallback || !isRetryableModelSelectionError(err?.message || "")) {
+    const wouldSwapToFallback = Boolean(
+      fallbackModel && selectedModel && hasDistinctFallback && isRetryableModelSelectionError(err?.message || ""),
+    );
+    if (!wouldSwapToFallback) {
       piLog.error(`Session creation failed: ${err.message}`);
       throw err;
+    }
+    if (cccFallbackRefused) {
+      piLog.error(`Session creation failed: ${err.message}`);
+      throw makeCccFallbackRefusedError("session-creation", err);
     }
     piLog.warn(`Primary model failed (${err.message}), trying fallback`);
     usingFallback = true;
@@ -3661,6 +3790,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       }
       if (!hasDistinctFallback) {
         throw makeFallbackExhaustedError("prompt-time", 1, err);
+      }
+      if (cccFallbackRefused) {
+        throw makeCccFallbackRefusedError("prompt-time", err);
       }
 
       usingFallback = true;

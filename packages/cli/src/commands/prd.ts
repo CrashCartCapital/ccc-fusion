@@ -14,15 +14,18 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
+  createCccPrdProductExecutionPlan,
   importCccPrdBundle,
   inspectCccCampaignProofAttempt,
   inspectCccPrdImport,
   inspectCccPrdProductStatus,
-  parseCccCampaignProductExecutionPolicy,
+  parseCccPrdProductExecutionPlan,
   reconcileCccPrdImport,
   settleCccCampaignProofAttempt,
   type ApprovalRequest,
   type CccCampaignProductExecutionPolicy,
+  type CccPrdProductExecutionPlan,
+  type CccPrdProductExecutionRouteSelection,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringConstraints,
   type CccPrdAuthoringProposal,
@@ -41,9 +44,14 @@ import {
   resolveProject,
   type ProjectContext,
 } from "../project-context.js";
+import {
+  MAX_OPERATOR_CONTEXT_BYTES,
+  readBoundedPrdStdin,
+} from "./prd-stdin.js";
 
 export type PrdCommandIo = {
   write(line: string): void;
+  readStdin?(): Promise<string>;
 };
 
 type Compiler = {
@@ -69,7 +77,15 @@ type Compiler = {
     maxDurationMs: number;
     maxPromptBytes: number;
     maxResponseBytes: number;
+    mode?: "execution" | "understanding";
   }): CccPrdAuthoringAdapter;
+  understandCccPrdPacket(input: {
+    rootDir: string;
+    manifestPath: string;
+    adapter: CccPrdAuthoringAdapter;
+    maxReviewItems: number;
+    workflowExtensionRegistry: WorkflowExtensionRegistry;
+  }): Promise<engine.CccPrdUnderstandingResult>;
   compileCccPrdPacket(input: {
     rootDir: string;
     manifestPath: string;
@@ -94,19 +110,24 @@ type Compiler = {
 };
 
 const compiler = engine as typeof engine & Compiler;
+export type VerifierConfinementReadiness = engine.VerifierConfinementReadiness;
 export type PrdCommandDependencies = {
   bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
+  buildCccPrdCorpusManifest?: typeof engine.buildCccPrdCorpusManifest;
+  createNativeCccPrdAuthoringAdapter?: typeof engine.createNativeCccPrdAuthoringAdapter;
   discoverCccPrdCandidates?: typeof engine.discoverCccPrdCandidates;
   freezeCccPrdPacket?: typeof engine.freezeCccPrdPacket;
   resolveProject?: (projectName?: string) => Promise<ProjectContext>;
   closeProjectStore?: (context: ProjectContext) => Promise<void>;
   readTargetHead?: (targetRoot: string) => Promise<string>;
   importCccPrdBundle?: typeof importCccPrdBundle;
+  inspectVerifierConfinementReadiness?: typeof engine.inspectVerifierConfinementReadiness;
   inspectCccPrdImport?: typeof inspectCccPrdImport;
   reconcileCccPrdImport?: typeof reconcileCccPrdImport;
   inspectCccPrdProductStatus?: typeof inspectCccPrdProductStatus;
   inspectCccCampaignProofAttempt?: typeof inspectCccCampaignProofAttempt;
   settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
+  understandCccPrdPacket?: typeof engine.understandCccPrdPacket;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
   approveCccCampaignLiveExecution?: typeof engine.approveCccCampaignLiveExecution;
@@ -121,13 +142,19 @@ export type PrdCommandContext = {
 const usage = [
   "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
   "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
+  "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
+  "       fn prd corpus <active-projects-root>",
   "       fn prd discover <active-projects-root>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
+  "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
+  "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin",
+  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
+  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path> (mutually exclusive with --provider/--model/--transport/--cli-adapter; exactly one form required)",
   "       fn prd template",
   "       fn prd lint <prd-path>",
   "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
-  "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]",
-  "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
+  "       fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]",
+  "       fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]",
   "       fn prd <inspect|reconcile> <idempotency-key> [--project <id|name>]",
   "       fn prd status <idempotency-key> [--project <id|name>]",
   "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
@@ -261,6 +288,27 @@ type GeneratedAuthorArgs = {
   maxResponseBytes: number;
 };
 
+type GeneratedUnderstandingArgs = {
+  rootDir: string;
+  manifestPath: string;
+  outputPath: string;
+  provider: string;
+  model: string;
+  maxDurationMs: number;
+  maxPromptBytes: number;
+  maxResponseBytes: number;
+  maxReviewItems: number;
+};
+
+const generatedUnderstandingFlags = [
+  "--provider",
+  "--model",
+  "--max-duration-ms",
+  "--max-prompt-bytes",
+  "--max-response-bytes",
+  "--max-review-items",
+] as const;
+
 const generatedAuthorFlags = [
   "--target",
   "--base",
@@ -351,6 +399,66 @@ function parseGeneratedAuthorArgs(args: string[]): GeneratedAuthorArgs | undefin
   };
 }
 
+function parseGeneratedUnderstandingArgs(
+  args: string[],
+): GeneratedUnderstandingArgs | undefined {
+  const [subcommand, rootDir, manifestPath, outputPath, ...options] = args;
+  if (
+    subcommand !== "understand"
+    || !rootDir
+    || !manifestPath
+    || !outputPath
+    || options.length !== generatedUnderstandingFlags.length * 2
+  ) {
+    return undefined;
+  }
+  const values = new Map<string, string>();
+  for (let index = 0; index < options.length; index += 2) {
+    const flag = options[index];
+    const value = options[index + 1];
+    if (
+      !flag
+      || !generatedUnderstandingFlags.includes(
+        flag as (typeof generatedUnderstandingFlags)[number],
+      )
+      || values.has(flag)
+      || !value
+      || value.startsWith("--")
+    ) {
+      return undefined;
+    }
+    values.set(flag, value);
+  }
+  const provider = values.get("--provider");
+  const model = values.get("--model");
+  const maxDurationMs = parsePositiveInteger(values.get("--max-duration-ms"));
+  const maxPromptBytes = parsePositiveInteger(values.get("--max-prompt-bytes"));
+  const maxResponseBytes = parsePositiveInteger(values.get("--max-response-bytes"));
+  const maxReviewItems = parseNonNegativeInteger(values.get("--max-review-items"));
+  if (
+    !provider
+    || !model
+    || !maxDurationMs
+    || !maxPromptBytes
+    || !maxResponseBytes
+    || maxReviewItems === undefined
+    || values.size !== generatedUnderstandingFlags.length
+  ) {
+    return undefined;
+  }
+  return {
+    rootDir,
+    manifestPath,
+    outputPath,
+    provider,
+    model,
+    maxDurationMs,
+    maxPromptBytes,
+    maxResponseBytes,
+    maxReviewItems,
+  };
+}
+
 function writeSidecarAtomically(
   rootDir: string,
   manifestPath: string,
@@ -366,6 +474,383 @@ function writeSidecarAtomically(
     renameSync(temporaryPath, output);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+type ProductPolicyCommonArgs = {
+  rootDir: string;
+  manifestPath: string;
+  sidecarPath: string;
+  expectedTarget: string;
+  expectedBase: string;
+  outputPath: string;
+};
+
+type ProductPolicyArgs = ProductPolicyCommonArgs & (
+  | {
+    routeSelection: "single";
+    providerId: string;
+    modelId: string;
+    transport: "pi" | "cli";
+    cliAdapterId?: string;
+  }
+  | {
+    routeSelection: "routes-file";
+    routesFilePath: string;
+  }
+);
+
+const PRODUCT_POLICY_FLAGS = [
+  "--provider",
+  "--model",
+  "--transport",
+  "--cli-adapter",
+  "--routes-file",
+] as const;
+
+const PRODUCT_POLICY_ROUTE_SELECTION_MESSAGE =
+  "fn prd policy requires exactly one route selection: --provider/--model/--transport [--cli-adapter] for a single route applied to every task, or --routes-file <path> for one route per task; provide exactly one form, not both and not neither.";
+
+type ProductPolicyParseResult =
+  | { kind: "usage" }
+  | { kind: "route-selection-invalid" }
+  | { kind: "parsed"; value: ProductPolicyArgs };
+
+function parseProductPolicyArgs(args: string[]): ProductPolicyParseResult {
+  const [
+    subcommand,
+    rootDir,
+    manifestPath,
+    sidecarPath,
+    expectedTarget,
+    expectedBase,
+    outputPath,
+    ...options
+  ] = args;
+  if (
+    subcommand !== "policy"
+    || !rootDir
+    || !manifestPath
+    || !sidecarPath
+    || !expectedTarget
+    || !expectedBase
+    || !outputPath
+    || !/^[0-9a-f]{40}$/.test(expectedBase)
+    || options.length % 2 !== 0
+  ) {
+    return { kind: "usage" };
+  }
+  const values = new Map<string, string>();
+  for (let index = 0; index < options.length; index += 2) {
+    const flag = options[index];
+    const value = options[index + 1];
+    if (
+      !flag
+      || !PRODUCT_POLICY_FLAGS.includes(flag as (typeof PRODUCT_POLICY_FLAGS)[number])
+      || !value
+      || value.startsWith("--")
+      || values.has(flag)
+    ) {
+      return { kind: "usage" };
+    }
+    values.set(flag, value);
+  }
+
+  const routesFilePath = values.get("--routes-file");
+  const providerId = values.get("--provider");
+  const modelId = values.get("--model");
+  const transport = values.get("--transport");
+  const cliAdapterId = values.get("--cli-adapter");
+  const hasRoutesFile = routesFilePath !== undefined;
+  const hasSingleFlag = providerId !== undefined
+    || modelId !== undefined
+    || transport !== undefined
+    || cliAdapterId !== undefined;
+
+  if (hasRoutesFile === hasSingleFlag) {
+    return { kind: "route-selection-invalid" };
+  }
+
+  const common: ProductPolicyCommonArgs = {
+    rootDir,
+    manifestPath,
+    sidecarPath,
+    expectedTarget,
+    expectedBase,
+    outputPath,
+  };
+
+  if (hasRoutesFile) {
+    return {
+      kind: "parsed",
+      value: { ...common, routeSelection: "routes-file", routesFilePath: routesFilePath! },
+    };
+  }
+
+  if (
+    !providerId
+    || !modelId
+    || (transport !== "pi" && transport !== "cli")
+    || (transport === "cli" && !cliAdapterId)
+    || (transport === "pi" && cliAdapterId)
+    || values.size !== (transport === "cli" ? 4 : 3)
+  ) {
+    return { kind: "usage" };
+  }
+  return {
+    kind: "parsed",
+    value: {
+      ...common,
+      routeSelection: "single",
+      providerId,
+      modelId,
+      transport,
+      ...(cliAdapterId ? { cliAdapterId } : {}),
+    },
+  };
+}
+
+const CCC_PRD_ROUTES_BY_TASK_SCHEMA = "ccc-prd.routes-by-task.v1" as const;
+const PRODUCT_POLICY_ROUTE_ENTRY_PI_KEYS = new Set(["providerId", "modelId", "transport"]);
+const PRODUCT_POLICY_ROUTE_ENTRY_CLI_KEYS = new Set([
+  "providerId",
+  "modelId",
+  "transport",
+  "cliAdapterId",
+]);
+
+function readProductPolicyRoutesFile(
+  rootDir: string,
+  routesFilePath: string,
+): Record<string, CccPrdProductExecutionRouteSelection> {
+  let resolvedPath: string;
+  try {
+    resolvedPath = resolveAuthorInput(rootDir, routesFilePath);
+  } catch (error) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_READ_FAILED",
+      `routes file ${routesFilePath} could not be admitted: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(resolvedPath, "utf8");
+  } catch (error) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_READ_FAILED",
+      `routes file ${routesFilePath} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_READ_FAILED",
+      `routes file ${routesFilePath} is not valid JSON`,
+    );
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} must contain one JSON object`,
+    );
+  }
+  const document = value as Record<string, unknown>;
+  const extraTopKeys = Object.keys(document).filter((key) => key !== "schema" && key !== "routes");
+  if (extraTopKeys.length > 0) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} has unknown top-level fields: ${extraTopKeys.join(", ")}`,
+    );
+  }
+  if (document.schema !== CCC_PRD_ROUTES_BY_TASK_SCHEMA) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} must declare schema ${CCC_PRD_ROUTES_BY_TASK_SCHEMA}`,
+    );
+  }
+  if (
+    !document.routes
+    || typeof document.routes !== "object"
+    || Array.isArray(document.routes)
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} routes field must be an object keyed by task id`,
+    );
+  }
+  const routesRaw = document.routes as Record<string, unknown>;
+  const taskIds = Object.keys(routesRaw);
+  if (taskIds.length === 0) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} routes must declare at least one task route`,
+    );
+  }
+  const routesByTaskId: Record<string, CccPrdProductExecutionRouteSelection> = {};
+  for (const taskId of taskIds) {
+    const entry = routesRaw[taskId];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} must be an object`,
+      );
+    }
+    const route = entry as Record<string, unknown>;
+    const transport = route.transport;
+    const allowedKeys = transport === "cli"
+      ? PRODUCT_POLICY_ROUTE_ENTRY_CLI_KEYS
+      : PRODUCT_POLICY_ROUTE_ENTRY_PI_KEYS;
+    const unknownKeys = Object.keys(route).filter((key) => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} has unknown fields: ${unknownKeys.join(", ")}`,
+      );
+    }
+    const providerId = route.providerId;
+    const modelId = route.modelId;
+    const cliAdapterId = route.cliAdapterId;
+    if (
+      typeof providerId !== "string"
+      || providerId.length === 0
+      || typeof modelId !== "string"
+      || modelId.length === 0
+      || (transport !== "pi" && transport !== "cli")
+      || (transport === "cli" && (typeof cliAdapterId !== "string" || cliAdapterId.length === 0))
+      || (transport === "pi" && cliAdapterId !== undefined)
+    ) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} must declare providerId, modelId, and transport pi|cli (cliAdapterId is required only for cli transport)`,
+      );
+    }
+    routesByTaskId[taskId] = {
+      providerId,
+      modelId,
+      transport,
+      ...(transport === "cli" ? { cliAdapterId: cliAdapterId as string } : {}),
+    };
+  }
+  return routesByTaskId;
+}
+
+function writeExecutionPlanAtomically(
+  input: ProductPolicyArgs,
+  plan: CccPrdProductExecutionPlan,
+): string {
+  const root = realpathSync(input.rootDir);
+  const output = resolve(input.outputPath);
+  const relativeOutput = relative(resolve(input.rootDir), output);
+  if (isEscaping(relativeOutput) || isProtected(relativeOutput)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PATH_ESCAPE",
+      "execution-plan output is outside the admitted packet root",
+    );
+  }
+  const parent = realpathSync(dirname(output));
+  const canonicalRelative = relative(root, parent);
+  if (isEscaping(canonicalRelative) || isProtected(canonicalRelative)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PATH_ESCAPE",
+      "execution-plan output parent is outside the admitted packet root",
+    );
+  }
+  if (existsSync(output)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_EXECUTION_PLAN_OUTPUT_EXISTS",
+      "execution-plan output already exists",
+    );
+  }
+  const protectedPaths = authorProtectedPaths(
+    input.rootDir,
+    input.manifestPath,
+    input.sidecarPath,
+  );
+  if (protectedPaths.has(output)) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_EXECUTION_PLAN_TARGET_PROTECTED",
+      "execution-plan output overlaps an admitted input",
+    );
+  }
+  const temporaryRoot = mkdtempSync(join(root, ".fusion-prd-tmp-"));
+  const temporaryPath = join(temporaryRoot, "execution-plan.json");
+  try {
+    writeFileSync(
+      temporaryPath,
+      canonicalCccPrdJson(plan) + "\n",
+      { encoding: "utf8", flag: "wx" },
+    );
+    renameSync(temporaryPath, output);
+    return output;
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
+async function runProductPolicyCommand(
+  args: string[],
+  io: PrdCommandIo,
+): Promise<number> {
+  const parsed = parseProductPolicyArgs(args);
+  if (parsed.kind === "usage") {
+    io.write(usage);
+    return 2;
+  }
+  if (parsed.kind === "route-selection-invalid") {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_POLICY_ROUTE_SELECTION_INVALID",
+      PRODUCT_POLICY_ROUTE_SELECTION_MESSAGE,
+    );
+  }
+  const input = parsed.value;
+  try {
+    const compiled = compileProductBundle({
+      rootDir: input.rootDir,
+      manifestPath: input.manifestPath,
+      sidecarPath: input.sidecarPath,
+      expectedTarget: input.expectedTarget,
+      expectedBase: input.expectedBase,
+    });
+    if (compiled.kind === "refusal") {
+      io.write(JSON.stringify(compiled));
+      return 1;
+    }
+    const plan = input.routeSelection === "routes-file"
+      ? createCccPrdProductExecutionPlan({
+        bundle: compiled,
+        routesByTaskId: readProductPolicyRoutesFile(input.rootDir, input.routesFilePath),
+      })
+      : createCccPrdProductExecutionPlan({
+        bundle: compiled,
+        route: {
+          providerId: input.providerId,
+          modelId: input.modelId,
+          transport: input.transport,
+          ...(input.cliAdapterId ? { cliAdapterId: input.cliAdapterId } : {}),
+        },
+      });
+    const outputPath = writeExecutionPlanAtomically(input, plan);
+    const bytes = readFileSync(outputPath);
+    io.write(JSON.stringify({
+      kind: "execution-plan",
+      path: outputPath,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      packetHash: plan.packetHash,
+      sidecarHash: plan.sidecarHash,
+      bundleHash: plan.bundleHash,
+      routeCount: plan.policy.routes.length,
+    }));
+    return 0;
+  } catch (error) {
+    const detail = error as { code?: unknown; message?: unknown };
+    return writeProductRefusal(
+      io,
+      typeof detail.code === "string" ? detail.code : "CCC_PRD_EXECUTION_PLAN_FAILED",
+      typeof detail.message === "string" ? detail.message : "CCC PRD execution plan failed",
+    );
   }
 }
 
@@ -471,6 +956,105 @@ async function runGeneratedAuthor(
   return 0;
 }
 
+async function runGeneratedUnderstanding(
+  input: GeneratedUnderstandingArgs,
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+): Promise<number> {
+  let outputPath: string;
+  try {
+    outputPath = resolveAuthorOutput(
+      input.rootDir,
+      input.manifestPath,
+      input.manifestPath,
+      input.outputPath,
+    );
+    if (existsSync(outputPath)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_UNDERSTANDING_OUTPUT_EXISTS",
+        "understanding review output already exists",
+      );
+    }
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_UNDERSTANDING_ADMISSION_FAILED",
+      error instanceof Error
+        ? error.message
+        : "understanding review request could not be admitted",
+    );
+  }
+
+  let adapter: CccPrdAuthoringAdapter;
+  try {
+    adapter = (
+      dependencies.createNativeCccPrdAuthoringAdapter
+      ?? compiler.createNativeCccPrdAuthoringAdapter
+    )({
+      provider: input.provider,
+      model: input.model,
+      maxDurationMs: input.maxDurationMs,
+      maxPromptBytes: input.maxPromptBytes,
+      maxResponseBytes: input.maxResponseBytes,
+      mode: "understanding",
+    });
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_UNDERSTANDING_ADMISSION_FAILED",
+      error instanceof Error
+        ? error.message
+        : "native understanding adapter could not be created",
+    );
+  }
+
+  let workflowExtensionRegistry: WorkflowExtensionRegistry;
+  try {
+    workflowExtensionRegistry = await (
+      dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost
+    )();
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_PROOF_ADMISSION_BOOTSTRAP_FAILED",
+      error instanceof Error
+        ? error.message
+        : "fixed proof-admission host could not be bootstrapped",
+    );
+  }
+
+  const result = await (
+    dependencies.understandCccPrdPacket ?? compiler.understandCccPrdPacket
+  )({
+    rootDir: input.rootDir,
+    manifestPath: input.manifestPath,
+    adapter,
+    maxReviewItems: input.maxReviewItems,
+    workflowExtensionRegistry,
+  });
+  if (result.kind === "refusal") {
+    io.write(JSON.stringify(result));
+    return 1;
+  }
+  try {
+    writeSidecarAtomically(
+      input.rootDir,
+      input.manifestPath,
+      input.manifestPath,
+      outputPath,
+      result,
+    );
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_UNDERSTANDING_WRITE_FAILED",
+      error instanceof Error ? error.message : "understanding review could not be written",
+    );
+  }
+  io.write(JSON.stringify({ ...result, reviewPath: outputPath }));
+  return 0;
+}
+
 const CCC_PRD_PRODUCT_PREVIEW_SCHEMA = "ccc-prd.product-preview.v1" as const;
 
 class PrdProductCommandError extends Error {
@@ -504,6 +1088,66 @@ function writeProductRefusal(
     ],
     nextSafeAction:
       "Run fn prd status <idempotency-key> and follow its fresh operator controls; do not blindly retry an uncertain effect.",
+  }));
+  return 1;
+}
+
+function writeVerifierConfinementImportRefusal(
+  io: PrdCommandIo,
+  readiness: VerifierConfinementReadiness,
+): number {
+  const backend = verifierConfinementBackendLabel(readiness);
+  io.write(JSON.stringify({
+    kind: "refusal",
+    diagnostics: [{
+      code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      message: `Exact requirement verification is unavailable: ${readiness.message}`,
+    }],
+    verifierConfinement: sanitizedVerifierConfinementReadiness(readiness),
+    safeState:
+      "This import created no campaign rows, staging files, approvals, provider effects, or source changes.",
+    decisionOwner: "Fusion host or CI runner operator",
+    consequence:
+      "The PRD packet remains reviewable, but Fusion cannot safely import or execute it on this host.",
+    approvalExpiresAt: null,
+    recoveryOptions: [
+      `Provision and functionally verify ${backend} at one trusted system path.`,
+      "Keep the frozen packet unchanged and rerun preview after the host is repaired.",
+    ],
+    nextSafeAction:
+      "Repair verifier confinement, rerun fn prd preview, then issue a fresh import confirmation.",
+  }));
+  return 1;
+}
+
+function writeVerifierConfinementExecutionRefusal(
+  io: PrdCommandIo,
+  readiness: VerifierConfinementReadiness,
+  approval: Pick<CccPrdProductApprovalStatus, "id" | "status" | "campaign">,
+  workItem: Readonly<{ id: string; state: string }>,
+  idempotencyKey: string,
+): number {
+  const backend = verifierConfinementBackendLabel(readiness);
+  io.write(JSON.stringify({
+    kind: "refusal",
+    diagnostics: [{
+      code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      message: `Exact requirement verification is unavailable: ${readiness.message}`,
+    }],
+    verifierConfinement: sanitizedVerifierConfinementReadiness(readiness),
+    safeState:
+      `Approval ${approval.id} remains ${approval.status} and workflow ${workItem.id} remains ${workItem.state}; this command started no provider, source, or proof effect.`,
+    decisionOwner: "Fusion host or CI runner operator",
+    consequence:
+      "Live coding cannot start because Fusion could not prove exact requirement tests can run under enforced confinement.",
+    approvalExpiresAt: approval.campaign.expiresAt,
+    recoveryOptions: [
+      `Repair and functionally verify ${backend} before this approval expires.`,
+      "If the approval expires, request a fresh exact live-execution approval after the host is ready.",
+      "Stop the campaign with a fresh status digest if the operator does not want to continue.",
+    ],
+    nextSafeAction:
+      `Repair verifier confinement, rerun fn prd status ${idempotencyKey}, then submit a still-current exact approval.`,
   }));
   return 1;
 }
@@ -547,13 +1191,83 @@ function runIntakeContractCommand(
   }
 }
 
-function runIntakePacketCommand(
+function parseGuidedFreezeContext(
+  options: string[],
+): engine.CccPrdOperatorContext | undefined {
+  if (options.length === 0 || options.length % 2 !== 0) return undefined;
+  const ownedPaths: string[] = [];
+  const allowedWriteRoots: string[] = [];
+  const values = new Map<string, string>();
+  const accepted = new Set([
+    "--target",
+    "--base",
+    "--owned-path",
+    "--write-root",
+    "--write-purpose",
+    "--max-requests",
+    "--max-duration-ms",
+    "--max-concurrency",
+  ]);
+  for (let index = 0; index < options.length; index += 2) {
+    const flag = options[index];
+    const value = options[index + 1];
+    if (!flag || !value || !accepted.has(flag) || value.startsWith("--")) {
+      return undefined;
+    }
+    if (flag === "--owned-path") {
+      ownedPaths.push(value);
+      continue;
+    }
+    if (flag === "--write-root") {
+      allowedWriteRoots.push(value);
+      continue;
+    }
+    if (values.has(flag)) return undefined;
+    values.set(flag, value);
+  }
+  const maxRequests = parsePositiveInteger(values.get("--max-requests"));
+  const maxDurationMs = parsePositiveInteger(values.get("--max-duration-ms"));
+  const maxConcurrency = parsePositiveInteger(values.get("--max-concurrency"));
+  const target = values.get("--target");
+  const baseCommit = values.get("--base");
+  const writeRootPurpose = values.get("--write-purpose");
+  if (
+    !target
+    || !baseCommit
+    || !writeRootPurpose
+    || ownedPaths.length === 0
+    || allowedWriteRoots.length === 0
+    || !maxRequests
+    || !maxDurationMs
+    || !maxConcurrency
+    || values.size !== 6
+  ) {
+    return undefined;
+  }
+  return engine.parseCccPrdOperatorContext({
+    schema: engine.CCC_PRD_OPERATOR_CONTEXT_SCHEMA_VERSION,
+    targetRepository: { path: target, baseCommit },
+    taskCustody: { ownedPaths, allowedWriteRoots },
+    writeRootPurpose,
+    bounds: { maxRequests, maxDurationMs, maxConcurrency },
+  });
+}
+
+async function runIntakePacketCommand(
   args: string[],
   io: PrdCommandIo,
   dependencies: PrdCommandDependencies,
-): number {
-  const [subcommand, activeProjectsRoot, selectedPrdPath, outputDir] = args;
+): Promise<number> {
+  const [subcommand, activeProjectsRoot, selectedPrdPath, outputDir, ...options] = args;
   try {
+    if (subcommand === "corpus" && args.length === 2 && activeProjectsRoot) {
+      io.write(JSON.stringify(
+        (dependencies.buildCccPrdCorpusManifest ?? engine.buildCccPrdCorpusManifest)({
+          activeProjectsRoot,
+        }),
+      ));
+      return 0;
+    }
     if (subcommand === "discover" && args.length === 2 && activeProjectsRoot) {
       io.write(JSON.stringify(
         (dependencies.discoverCccPrdCandidates ?? engine.discoverCccPrdCandidates)({
@@ -564,16 +1278,48 @@ function runIntakePacketCommand(
     }
     if (
       subcommand === "freeze"
-      && args.length === 4
       && activeProjectsRoot
       && selectedPrdPath
       && outputDir
     ) {
+      let operatorContext: engine.CccPrdOperatorContext | undefined;
+      if (options.length === 1 && options[0] === "--context-stdin") {
+        if (!io.readStdin) {
+          throw new PrdProductCommandError(
+            "CCC_PRD_OPERATOR_CONTEXT_STDIN_UNAVAILABLE",
+            "typed operator context stdin is unavailable",
+          );
+        }
+        const contextJson = await io.readStdin();
+        if (Buffer.byteLength(contextJson, "utf8") > MAX_OPERATOR_CONTEXT_BYTES) {
+          throw new PrdProductCommandError(
+            "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+            "typed operator context exceeds " + MAX_OPERATOR_CONTEXT_BYTES + " bytes",
+          );
+        }
+        let value: unknown;
+        try {
+          value = JSON.parse(contextJson) as unknown;
+        } catch {
+          throw new PrdProductCommandError(
+            "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+            "typed operator context stdin must contain one JSON object",
+          );
+        }
+        operatorContext = engine.parseCccPrdOperatorContext(value);
+      } else if (options.length > 0) {
+        operatorContext = parseGuidedFreezeContext(options);
+        if (!operatorContext) {
+          io.write(usage);
+          return 2;
+        }
+      }
       io.write(JSON.stringify(
         (dependencies.freezeCccPrdPacket ?? engine.freezeCccPrdPacket)({
           activeProjectsRoot,
           selectedPrdPath,
           outputDir,
+          ...(operatorContext ? { operatorContext } : {}),
         }),
       ));
       return 0;
@@ -623,23 +1369,23 @@ async function readTargetHead(targetRoot: string): Promise<string> {
 
 function readProductExecutionPolicy(
   rootDir: string,
-  policyPath: string,
+  executionPlanPath: string,
   bundle: CccPrdSemanticBundle,
 ): CccCampaignProductExecutionPolicy {
   let value: unknown;
   try {
     value = JSON.parse(
-      readFileSync(resolveAuthorInput(rootDir, policyPath), "utf8"),
+      readFileSync(resolveAuthorInput(rootDir, executionPlanPath), "utf8"),
     ) as unknown;
   } catch (error) {
     throw new PrdProductCommandError(
       "CCC_PRD_EXECUTION_POLICY_READ_FAILED",
       error instanceof Error
-        ? `execution policy could not be read: ${error.message}`
-        : `execution policy could not be read: ${policyPath}`,
+        ? "execution plan could not be read: " + error.message
+        : "execution plan could not be read: " + executionPlanPath,
     );
   }
-  return parseCccCampaignProductExecutionPolicy(value, bundle);
+  return parseCccPrdProductExecutionPlan(value, bundle).policy;
 }
 
 function assertProductBundleComplete(bundle: CccPrdSemanticBundle): void {
@@ -708,9 +1454,52 @@ function productConfirmationDigest(
     .digest("hex");
 }
 
+function operatorVerifierConfinementReadiness(
+  readiness: VerifierConfinementReadiness,
+) {
+  const operatorReadiness = sanitizedVerifierConfinementReadiness(readiness);
+  if (engine.isVerifierConfinementReady(readiness)) return operatorReadiness;
+  return {
+    ...operatorReadiness,
+    safeState:
+      "The frozen PRD preview is intact; no campaign, approval, provider effect, or source change was created.",
+    decisionOwner: "Fusion host or CI runner operator",
+    consequence:
+      "Campaign import and live execution remain blocked because exact requirement proof cannot run safely.",
+    recoveryOptions: [
+      "Provision and functionally verify the trusted verifier confinement backend on this host.",
+      "Keep the packet as a review-only preview until confinement is ready.",
+    ],
+    nextSafeAction:
+      "Repair the trusted verifier confinement backend, then rerun fn prd preview before import.",
+  };
+}
+
+function sanitizedVerifierConfinementReadiness(
+  readiness: VerifierConfinementReadiness,
+) {
+  const { detail: _detail, ...operatorReadiness } = readiness;
+  return {
+    ...operatorReadiness,
+    ready: engine.isVerifierConfinementReady(readiness),
+    backend: engine.isAdmittedVerifierConfinementBackend(readiness.backend)
+      ? readiness.backend
+      : null,
+  };
+}
+
+function verifierConfinementBackendLabel(
+  readiness: VerifierConfinementReadiness,
+): string {
+  return engine.isAdmittedVerifierConfinementBackend(readiness.backend)
+    ? readiness.backend
+    : "the trusted verifier confinement backend";
+}
+
 function productPreview(
   identity: ReturnType<typeof productPreviewIdentity>,
   bundle: CccPrdSemanticBundle,
+  verifierConfinement: VerifierConfinementReadiness,
 ) {
   return {
     kind: "preview" as const,
@@ -726,6 +1515,9 @@ function productPreview(
     bounds: bundle.bounds,
     nonGoals: bundle.nonGoals,
     materialCoverage: bundle.materialCoverage,
+    verifierConfinement: operatorVerifierConfinementReadiness(
+      verifierConfinement,
+    ),
   };
 }
 
@@ -802,7 +1594,7 @@ async function runProductPacketCommand(
     rootDir,
     manifestPath,
     sidecarPath,
-    executionPolicyPath,
+    executionPlanPath,
     expectedTarget,
     expectedBase,
     idempotencyKey,
@@ -815,7 +1607,7 @@ async function runProductPacketCommand(
     !rootDir
     || !manifestPath
     || !sidecarPath
-    || !executionPolicyPath
+    || !executionPlanPath
     || !expectedTarget
     || !expectedBase
     || !/^[0-9a-f]{40}$/.test(expectedBase)
@@ -848,7 +1640,7 @@ async function runProductPacketCommand(
       return 1;
     }
     bundle = compiled;
-    executionPolicy = readProductExecutionPolicy(rootDir, executionPolicyPath, bundle);
+    executionPolicy = readProductExecutionPolicy(rootDir, executionPlanPath, bundle);
   } catch (error) {
     const detail = error as { code?: unknown; message?: unknown };
     return writeProductRefusal(
@@ -856,6 +1648,14 @@ async function runProductPacketCommand(
       typeof detail.code === "string" ? detail.code : "CCC_PRD_PRODUCT_PREFLIGHT_FAILED",
       typeof detail.message === "string" ? detail.message : "CCC PRD product preflight failed",
     );
+  }
+
+  const verifierConfinement = await (
+    dependencies.inspectVerifierConfinementReadiness
+    ?? compiler.inspectVerifierConfinementReadiness
+  )();
+  if (importing && !engine.isVerifierConfinementReady(verifierConfinement)) {
+    return writeVerifierConfinementImportRefusal(io, verifierConfinement);
   }
 
   return withPrdProject(io, dependencies, commandContext, async (project) => {
@@ -886,7 +1686,7 @@ async function runProductPacketCommand(
       bundle,
       executionPolicy,
     });
-    const currentPreview = productPreview(identity, bundle);
+    const currentPreview = productPreview(identity, bundle, verifierConfinement);
     if (preview) {
       io.write(JSON.stringify(currentPreview));
       return 0;
@@ -1194,6 +1994,19 @@ async function runProductControlCommand(
     }
     if (approvingExecution) {
       const workItem = exactLiveExecutionWorkItem(status);
+      const verifierConfinement = await (
+        dependencies.inspectVerifierConfinementReadiness
+        ?? compiler.inspectVerifierConfinementReadiness
+      )();
+      if (!engine.isVerifierConfinementReady(verifierConfinement)) {
+        return writeVerifierConfinementExecutionRefusal(
+          io,
+          verifierConfinement,
+          approval,
+          workItem,
+          idempotencyKey,
+        );
+      }
       const approved = await (
         dependencies.approveCccCampaignLiveExecution
         ?? engine.approveCccCampaignLiveExecution
@@ -1945,7 +2758,16 @@ function exactProviderResolutionContext(
       `provider attempt ${attemptKey} no longer matches one imported task route`,
     );
   }
-  const workItems = status.workItems;
+  if (attempt.workItemFence === null) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_FENCE_MISSING",
+      `provider attempt ${attemptKey} predates exact work-item fencing and requires campaign stop or direct evidence review`,
+    );
+  }
+  const workItems = status.workItems.filter((workItem) =>
+    workItem.id === attempt.workItemFence!.workItemId
+    && workItem.runId === attempt.workItemFence!.runId
+    && workItem.attempt === attempt.workItemFence!.attempt);
   if (workItems.length !== 1) {
     throw new PrdProductCommandError(
       "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_MISSING",
@@ -1958,8 +2780,6 @@ function exactProviderResolutionContext(
     workItem.kind !== "task"
     || workItem.runId !== expectedRunId
     || workItem.stableWorkflowRunId !== expectedRunId
-    || !Number.isSafeInteger(workItem.attempt)
-    || workItem.attempt < 0
     || workItem.state !== "manual-required"
     || workItem.leaseOwner !== null
     || workItem.leaseExpiresAt !== null
@@ -2186,11 +3006,25 @@ async function runProviderResolutionCommand(
 
 export async function runPrdCommand(
   args: string[],
-  io: PrdCommandIo = { write: (line) => console.log(line) },
+  io: PrdCommandIo = {
+    write: (line) => console.log(line),
+    readStdin: () => readBoundedPrdStdin(process.stdin),
+  },
   dependencies: PrdCommandDependencies = {},
   commandContext: PrdCommandContext = {},
 ): Promise<number> {
-  if (args[0] === "discover" || args[0] === "freeze") {
+  if (args[0] === "understand") {
+    const parsed = parseGeneratedUnderstandingArgs(args);
+    if (!parsed) {
+      io.write(usage);
+      return 2;
+    }
+    return runGeneratedUnderstanding(parsed, io, dependencies);
+  }
+  if (args[0] === "policy") {
+    return runProductPolicyCommand(args, io);
+  }
+  if (args[0] === "corpus" || args[0] === "discover" || args[0] === "freeze") {
     return runIntakePacketCommand(args, io, dependencies);
   }
   if (args[0] === "template" || args[0] === "lint") {

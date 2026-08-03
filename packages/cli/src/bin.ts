@@ -306,19 +306,29 @@ Usage:
                                       Generate a traceable candidate sidecar from an admitted packet through native bounded authoring
   fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output>
                                       Compatibility fixture authoring path for deterministic tests
+  fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>
+                                      Extract a cited, non-executable review before implementation facts are approved
+  fn prd corpus <active-projects-root>
+                                      Build a private-safe current-PRD manifest with hashes and blocking questions
   fn prd discover <active-projects-root>
                                       Select the current PRD inside each project using project-local lineage
   fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>
                                       Freeze the selected PRD and recursive support packet outside its source tree
+  fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>
+                                      Freeze with reviewed operator facts; repeat owned/write path flags as needed
+  fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin
+                                      Read the same typed operator-context contract from standard input
+  fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]
+                                      Generate a hash-bound coding route plan without hand-written policy JSON
   fn prd template                     Print the optional future-PRD intake template
   fn prd lint <prd-path>              Report missing implementation facts without rewriting the PRD
   fn prd validate <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Validate custody and semantics; emit diagnostics only
   fn prd compile <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>
                                       Compile a validated sidecar into the complete deterministic semantic bundle
-  fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> [--project <id|name>]
+  fn prd preview <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> [--project <id|name>]
                                       Show the exact hash-bound product import, coding routes, paths, proof, and approval contract
-  fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-policy-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]
+  fn prd import <root-dir> <manifest-path> <sidecar-path> <execution-plan-path> <expected-target> <expected-base> <idempotency-key> --confirm <preview-digest> [--project <id|name>]
                                       Recheck the preview identity and transactionally admit the campaign
   fn prd inspect <idempotency-key> [--project <id|name>]
                                       Inspect durable PRD import and recovery state

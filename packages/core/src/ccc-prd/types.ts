@@ -87,6 +87,19 @@ export type CccPrdTask = {
   documentIds: string[];
   artifactIds: string[];
   protectedActionIds: string[];
+  /**
+   * Target-relative semantic ownership used to prevent concurrently runnable
+   * coding tasks from claiming the same source surface. Legacy sidecars may
+   * omit this; the supported product policy generator requires it.
+   */
+  ownedPaths?: string[];
+  /**
+   * Target-relative filesystem scopes the coding executor may write. Every
+   * root must stay inside both task ownership and PRD-wide admitted roots.
+   * Legacy sidecars may omit this; the supported product policy generator
+   * requires it.
+   */
+  allowedWriteRoots?: string[];
   spans: CccPrdSourceSpan[];
 };
 

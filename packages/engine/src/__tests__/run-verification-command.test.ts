@@ -20,6 +20,7 @@ import {
   MAX_TIMEOUT_SEC,
   createRunVerificationTool,
   detectMarathonVerification,
+  inspectVerifierConfinementReadiness,
   normalizeVerificationCommand,
   runVerificationCommand,
   __testOnlyBuildVerificationSandboxLaunch,
@@ -164,6 +165,34 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
   });
 
   describeVerifierHost("tool verification budgets and marathon caps", () => {
+    it("keeps the raw verifier command out of tool lifecycle logs", async () => {
+      const privatePath = join(tempDir, "private-tool-log-token");
+      const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+      const tool = createRunVerificationTool({
+        worktreePath: tempDir,
+        rootDir: workspaceRoot,
+        taskId: "FN-VERIFIER-LOG-PRIVACY",
+        recordActivity: vi.fn(),
+        onVerificationStart: vi.fn(),
+        onVerificationEnd: vi.fn(),
+        log,
+      });
+
+      const result = await tool.execute("call-private-command", {
+        command: `exit 0 # ${privatePath}`,
+        scope: "package",
+      });
+
+      expect(result.details).toEqual(expect.objectContaining({ success: true }));
+      const lifecycleLogs = [
+        ...log.info.mock.calls.flat(),
+        ...log.warn.mock.calls.flat(),
+        ...log.error.mock.calls.flat(),
+      ].map(String).join("\n");
+      expect(lifecycleLogs).toContain("cmd=verifier command (");
+      expect(lifecycleLogs).not.toContain(privatePath);
+    });
+
     it("uses the project verification timeout default when provided", async () => {
       const onVerificationStart = vi.fn();
       const tool = createRunVerificationTool({
@@ -441,6 +470,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
         LANG: "C",
         LC_ALL: "C",
         DATABASE_URL: "postgresql://fusion:planted-password@127.0.0.1/fusion",
+        PGPASSWORD: "postgres",
         OPENAI_API_KEY: "planted-openai-key-7db561e55b65",
         MCPJUNGLE_TOKEN: "planted-broker-token-7db561e55b65",
         AWS_SECRET_ACCESS_KEY: "planted-provider-secret-7db561e55b65",
@@ -465,6 +495,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
           "GIT_TERMINAL_PROMPT",
           "GCM_INTERACTIVE",
           "DATABASE_URL",
+          "PGPASSWORD",
           "OPENAI_API_KEY",
           "MCPJUNGLE_TOKEN",
           "AWS_SECRET_ACCESS_KEY",
@@ -487,7 +518,9 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
         const childEnv = JSON.parse(result.stdout) as Record<string, string>;
 
         expect(result.success).toBe(true);
-        expect(childEnv.PATH).toBe(process.env.PATH);
+        expect(childEnv.PATH).toBe(
+          process.env.PATH?.split(plantedEnv.PGPASSWORD).join("[REDACTED]"),
+        );
         expect(childEnv.LANG).toBe("C");
         expect(childEnv.LC_ALL).toBe("C");
         expect(childEnv.CI).toBe("1");
@@ -495,6 +528,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
         expect(childEnv.GIT_TERMINAL_PROMPT).toBe("0");
         expect(childEnv.GCM_INTERACTIVE).toBe("never");
         expect(childEnv).not.toHaveProperty("DATABASE_URL");
+        expect(childEnv).not.toHaveProperty("PGPASSWORD");
         expect(childEnv).not.toHaveProperty("OPENAI_API_KEY");
         expect(childEnv).not.toHaveProperty("MCPJUNGLE_TOKEN");
         expect(childEnv).not.toHaveProperty("AWS_SECRET_ACCESS_KEY");
@@ -558,6 +592,84 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
   });
 
   describe("verifier confinement", () => {
+    itVerifierHost("functionally proves the real verifier confinement backend can execute an isolated no-op", async () => {
+      const readiness = await inspectVerifierConfinementReadiness();
+
+      expect(readiness).toEqual(expect.objectContaining({
+        ready: true,
+        backend: process.platform === "darwin" ? "sandbox-exec" : "bubblewrap",
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: expect.stringMatching(/ready|executed/i),
+      }));
+      expect(readiness.trustedPaths).toContain(
+        process.platform === "darwin" ? "/usr/bin/sandbox-exec" : "/usr/bin/bwrap",
+      );
+      expect(readiness.detail).toMatch(
+        process.platform === "darwin" ? /sandbox-exec/i : /bubblewrap/i,
+      );
+    });
+
+    itVerifierHost("keeps the expanded verifier sandbox policy out of supervisor diagnostics", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      const result = await runVerificationCommand({
+        command: "exit 0",
+        cwd: tempDir,
+        timeoutMs: 30_000,
+        onHeartbeat: vi.fn(),
+        onLine: vi.fn(),
+      });
+
+      expect(result.success).toBe(true);
+      const logs = errorSpy.mock.calls.flat().map(String).join("\n");
+      expect(logs).toContain(
+        `command=${process.platform === "darwin" ? "/usr/bin/sandbox-exec" : "/usr/bin/bwrap"}`,
+      );
+      expect(logs).not.toContain("(version 1)");
+      expect(logs).not.toContain("(subpath");
+    });
+
+    itVerifierHost("keeps raw verifier commands out of failure and timeout diagnostics", async () => {
+      const privatePath = join(tempDir, "private-operator-path-token");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      try {
+        const failed = await runVerificationCommand({
+          command: `exit 17 # ${privatePath}`,
+          cwd: tempDir,
+          timeoutMs: 30_000,
+          onHeartbeat: vi.fn(),
+        });
+        const timedOut = await runVerificationCommand({
+          command: `sleep 2 # ${privatePath}`,
+          cwd: tempDir,
+          timeoutMs: 50,
+          onHeartbeat: vi.fn(),
+        });
+
+        expect(failed.success).toBe(false);
+        expect(timedOut.timedOut).toBe(true);
+        const logs = warnSpy.mock.calls.flat().map(String).join("\n");
+        expect(logs).toContain("[fn_run_verification]");
+        expect(logs).not.toContain(privatePath);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    itUnsupportedLinux("reports a functional readiness failure when Linux confinement cannot execute", async () => {
+      const readiness = await inspectVerifierConfinementReadiness();
+
+      expect(readiness).toEqual(expect.objectContaining({
+        ready: false,
+        backend: "bubblewrap",
+        code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+        message: expect.stringMatching(/unavailable|failed/i),
+        trustedPaths: ["/usr/bin/bwrap", "/bin/bwrap"],
+        detail: expect.stringMatching(/bubblewrap|bwrap|namespace|sandbox/i),
+      }));
+    });
+
     it("never trusts a PATH-prepended verifier sandbox executable", () => {
       const fakeBin = mkdtempSync(join(tempDir, "fusion-verifier-fake-bwrap-"));
       const fakeBwrap = join(fakeBin, "bwrap");
@@ -839,6 +951,28 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
   });
 
   describeVerifierHost("timeouts", () => {
+    itPosix("aborts a spawned verifier process group before its hard timeout", async () => {
+      const controller = new AbortController();
+      const onLine = vi.fn((line: string) => {
+        if (line.includes("verifier-started")) controller.abort();
+      });
+      const result = await runVerificationCommand({
+        command: "echo verifier-started; sleep 2",
+        cwd: tempDir,
+        timeoutMs: 10_000,
+        onHeartbeat: vi.fn(),
+        onLine,
+        signal: controller.signal,
+      });
+
+      expect(onLine).toHaveBeenCalledWith(expect.stringContaining("verifier-started"));
+      expect(result.success).toBe(false);
+      expect(result.timedOut).toBe(false);
+      expect(result.killed).toBe(true);
+      expect(result.durationMs).toBeLessThan(1_500);
+      expect(result.warnings).toContain("Verification aborted by caller signal");
+    });
+
     itPosix("times out and kills a quiet long-running process group", async () => {
       const onHeartbeat = vi.fn();
       const opts: RunVerificationOptions = {
@@ -1084,16 +1218,24 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
     });
 
     itPosix("executes commands with allowlisted locale variables (POSIX shell)", async () => {
-      const result = await runVerificationCommand({
-        command: "echo $LANG",
-        cwd: tempDir,
-        timeoutMs: 30000,
-        onHeartbeat: vi.fn(),
-      });
+      // A minimal host (for example a slim container runner) may set no locale
+      // variable at all, so stub LANG and assert the exact value round-trips —
+      // this proves allowlist passthrough deterministically instead of
+      // assuming the ambient environment.
+      vi.stubEnv("LANG", "C.UTF-8");
+      try {
+        const result = await runVerificationCommand({
+          command: "echo $LANG",
+          cwd: tempDir,
+          timeoutMs: 30000,
+          onHeartbeat: vi.fn(),
+        });
 
-      expect(result.success).toBe(true);
-      // Should have output (LANG is part of the deterministic allowlist).
-      expect(result.stdout.trim().length).toBeGreaterThan(0);
+        expect(result.success).toBe(true);
+        expect(result.stdout.trim()).toBe("C.UTF-8");
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
   });
 });

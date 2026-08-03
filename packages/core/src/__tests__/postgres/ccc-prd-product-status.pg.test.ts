@@ -179,6 +179,22 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       imported.importId,
       source.tasks[0]!.id,
     );
+    const [workItem] = await h.store().listWorkflowWorkItemsForTask(taskId, {
+      kinds: ["task"],
+    });
+    if (!workItem) throw new Error("missing provider-attempt work item");
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: "runtime-provider-owner",
+        leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+      },
+    );
     const reserved = await h.store().reserveCccProviderAttempt({
       taskId,
       actionId: taskId,
@@ -188,11 +204,20 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       providerId: "deterministic-fake",
       modelId: "fixture-v2",
       transport: "pi",
+      workItemFence: {
+        workItemId: claimedWorkItem.id,
+        runId: claimedWorkItem.runId,
+        attempt: claimedWorkItem.attempt,
+      },
     });
     await h.store().beginCccProviderAttemptDispatch({
       taskId,
       attemptKey: reserved.attemptKey,
       controllerToken: reserved.controllerToken,
+    });
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      leaseExpiresAt: "2000-01-01T00:00:00.000Z",
     });
 
     const status = await inspectCccPrdProductStatus({
@@ -207,6 +232,11 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         semanticTaskId: source.tasks[0]!.id,
         turnKey: "turn-product-status-provider-unknown",
         dispatchKey: "dispatch-product-status-provider-unknown",
+        workItemFence: {
+          workItemId: claimedWorkItem.id,
+          runId: claimedWorkItem.runId,
+          attempt: claimedWorkItem.attempt,
+        },
         state: "dispatched_unknown",
         binding: {
           providerId: "deterministic-fake",
@@ -221,6 +251,141 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     });
     expect(JSON.stringify(status)).not.toContain(reserved.controllerToken);
     expect(JSON.stringify(status)).not.toContain("controllerToken");
+
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-provider-unknown",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      workItems: [{
+        id: claimedWorkItem.id,
+        state: "running",
+        leaseOwner: "runtime-provider-owner",
+      }],
+      providerAttempts: [{
+        attemptKey: reserved.attemptKey,
+        state: "dispatched_unknown",
+      }],
+      nextAction: {
+        kind: "wait-for-runtime",
+        reason: expect.stringContaining("still owned by the runtime"),
+      },
+    });
+
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "running",
+      leaseOwner: "runtime-provider-owner",
+      leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+      attempt: claimedWorkItem.attempt + 1,
+    });
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-provider-unknown",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      workItems: [{
+        id: claimedWorkItem.id,
+        state: "running",
+        leaseOwner: "runtime-provider-owner",
+        leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+        attempt: claimedWorkItem.attempt + 1,
+      }],
+      nextAction: {
+        kind: "resolve-manual-required",
+        reason: expect.stringContaining(reserved.attemptKey),
+      },
+    });
+  });
+
+  it("does not let one runtime-owned provider attempt hide separate manual work", async () => {
+    const source = createCccPrdImportTestBundle(
+      h.rootDir(),
+      "product-status-mixed-uncertainty",
+    );
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-mixed-uncertainty",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const taskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const runningWorkItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-mixed-uncertainty`,
+    );
+    if (!runningWorkItem) throw new Error("missing mixed-uncertainty work item");
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      runningWorkItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: runningWorkItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: runningWorkItem.attempt + 1,
+        leaseOwner: "runtime-mixed-uncertainty-owner",
+        leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+      },
+    );
+    const reserved = await h.store().reserveCccProviderAttempt({
+      taskId,
+      actionId: taskId,
+      actionTarget: h.rootDir(),
+      turnKey: "turn-product-status-mixed-uncertainty",
+      dispatchKey: "dispatch-product-status-mixed-uncertainty",
+      providerId: "deterministic-fake",
+      modelId: "fixture-v2",
+      transport: "pi",
+      workItemFence: {
+        workItemId: claimedWorkItem.id,
+        runId: claimedWorkItem.runId,
+        attempt: claimedWorkItem.attempt,
+      },
+    });
+    await h.store().beginCccProviderAttemptDispatch({
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+    const manualWorkItemId = `${imported.importId}--WORK-separate-manual-effect`;
+    await h.store().upsertWorkflowWorkItem({
+      id: manualWorkItemId,
+      runId: claimedWorkItem.runId,
+      stableWorkflowRunId: claimedWorkItem.stableWorkflowRunId,
+      taskId,
+      nodeId: "separate-manual-effect",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "separate external effect is uncertain",
+      blockedReason: "operator reconciliation required",
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-mixed-uncertainty",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      providerAttempts: [{
+        attemptKey: reserved.attemptKey,
+        state: "dispatched_unknown",
+      }],
+      nextAction: {
+        kind: "resolve-manual-required",
+        reason: expect.stringContaining(manualWorkItemId),
+      },
+    });
   });
 
   it("projects exact live-execution approval and returns to runtime waiting after requeue", async () => {
@@ -356,6 +521,159 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       }],
       nextAction: { kind: "wait-for-runtime" },
     });
+  });
+
+  it("explains a verifier-confinement manual stop without calling it an uncertain effect", async () => {
+    const source = createCccPrdImportTestBundle(
+      h.rootDir(),
+      "product-status-verifier-manual",
+    );
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-verifier-manual",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-verifier-manual`,
+    );
+    if (!workItem) throw new Error("missing verifier-manual work item");
+    const verifierUnavailable =
+      "ccc-permanent:CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE";
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: verifierUnavailable,
+      blockedReason: verifierUnavailable,
+      waitReason: null,
+    });
+
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-verifier-manual",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    expect(status?.nextAction).toMatchObject({
+      kind: "blocked",
+      reason: "Verifier confinement is unavailable, so exact requirement proof cannot run safely.",
+      diagnostic: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      safeState: `Workflow work item ${workItem.id} is parked manual-required; no proof attempt or Git landing effect is assumed.`,
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence: "Campaign execution cannot continue until a trusted verifier sandbox passes its functional readiness probe.",
+      recoveryOptions: [
+        "Repair the trusted bubblewrap or sandbox-exec backend without enabling native fallback.",
+        "After readiness passes, explicitly requeue the parked work item; do not blindly retry an uncertain effect.",
+        "Stop the campaign if the operator does not want to continue, preserving receipts and worktree state.",
+      ],
+      nextSafeAction: "Run the verifier-confinement readiness check on the execution host, then inspect campaign status again.",
+    });
+    expect(status?.nextAction.kind).not.toBe("resolve-manual-required");
+  });
+
+  it("prefers sanitized verifier recovery over a generic failed-work-item message for historical receipts", async () => {
+    const source = createCccPrdImportTestBundle(
+      h.rootDir(),
+      "product-status-verifier-history",
+    );
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-verifier-history",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const terminalTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks.at(-1)!.id,
+    );
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-verifier-history`,
+    );
+    if (!workItem) throw new Error("missing verifier-history work item");
+    const proofWorkItem = {
+      ...workItem,
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    };
+    await h.store().upsertWorkflowWorkItem(proofWorkItem);
+    const proof = source.proofs[0]!;
+    const reserved = await reserveCccCampaignProofAttempt({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      taskId: terminalTaskId,
+      proofId: proof.id,
+      sourceCommit: SOURCE_COMMIT,
+      sourceTree: SOURCE_TREE,
+      workItemFence: {
+        workItemId: proofWorkItem.id,
+        runId: proofWorkItem.runId,
+        attempt: proofWorkItem.attempt,
+      },
+    });
+    await beginCccCampaignProofAttemptDispatch({
+      layer: h.layer(),
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+    await settleCccCampaignProofAttempt({
+      layer: h.layer(),
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+      result: {
+        success: false,
+        exitCode: null,
+        durationMs: 2,
+        stdout: "",
+        stderr:
+          "bubblewrap is required for verifier confinement on Linux (not-installed-at-trusted-system-path); refusing to run verification natively. PRIVATE_ARBITRARY_STDERR",
+        timedOut: false,
+        killed: false,
+        warnings: [],
+        changedPathsSha256: createHash("sha256")
+          .update(JSON.stringify([]), "utf8")
+          .digest("hex"),
+        negativeControlLabel: "verifier-confinement-unavailable",
+      },
+    });
+    await h.store().upsertWorkflowWorkItem({
+      ...proofWorkItem,
+      state: "failed",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "verifier returned a terminal failure",
+      blockedReason: "proof did not pass",
+      waitReason: null,
+    });
+
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-verifier-history",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    expect(status?.nextAction).toMatchObject({
+      kind: "blocked",
+      reason: `Verifier confinement was unavailable for proof ${proof.id}; the infrastructure failure receipt is preserved and is not a product-test failure.`,
+      diagnostic: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+      safeState: `Proof attempt ${reserved.attemptKey} remains proved_failed at commit ${SOURCE_COMMIT}; workflow ${workItem.id} is failed and no Git landing is recorded.`,
+      decisionOwner: "Fusion host or CI runner operator",
+      consequence: "The campaign-created commit is preserved, but it has no passing requirement proof and cannot proceed to merge approval.",
+      recoveryOptions: [
+        "Repair the trusted bubblewrap or sandbox-exec backend without enabling native fallback.",
+        "After readiness passes, explicitly requeue the failed work item and execute a fresh proof attempt bound to the preserved commit.",
+        "Retain this failed receipt as infrastructure evidence; never relabel it as a planted-defect or product-test result.",
+      ],
+      nextSafeAction: "Run the verifier-confinement readiness check on the execution host, then explicitly requeue proof for the preserved source commit.",
+    });
+    expect(JSON.stringify(status?.nextAction)).not.toContain(
+      "PRIVATE_ARBITRARY_STDERR",
+    );
+    expect(status?.nextAction.reason).not.toContain("ended as failed");
   });
 
   it("returns a deterministic, redacted, import-scoped operator snapshot", async () => {

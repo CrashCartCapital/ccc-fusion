@@ -26,8 +26,21 @@ import {
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
 } from "@fusion/core";
+import {
+  CCC_PRD_OPERATOR_CONTEXT_ORIGIN,
+  CCC_PRD_OPERATOR_CONTEXT_SOURCE_PATH,
+  CccPrdOperatorContextError,
+  assertCccPrdOperatorContextCompatible,
+  renderCccPrdOperatorContextMarkdown,
+  type CccPrdOperatorContext,
+} from "./operator-context.js";
+import {
+  lintCccPrdIntakeMarkdown,
+  type CccPrdIntakeLintResult,
+} from "./intake-contract.js";
 
 const DISCOVERY_SCHEMA = "ccc-prd.discovery.v1" as const;
+const CORPUS_MANIFEST_SCHEMA = "ccc-prd.corpus-manifest.v1" as const;
 const FREEZE_RESULT_SCHEMA = "ccc-prd.freeze-result.v1" as const;
 const FREEZE_RECEIPT_SCHEMA = "ccc-prd.freeze-receipt.v1" as const;
 const MAX_PACKET_FILES = 128;
@@ -43,6 +56,16 @@ const ARCHIVE_SEGMENTS = new Set([
   "_sources",
   "_lame",
 ]);
+const DISCOVERY_ARTIFACT_SEGMENTS = new Set([
+  "_prompts",
+  "_templates",
+  "eval-prompts",
+  "fixtures",
+  "iterations",
+  "runs",
+  "staging",
+]);
+const DISCOVERY_SUPPORT_PROJECTS = new Set(["_project-explainers"]);
 const RETIRED_STATUS = new Set([
   "archived",
   "deprecated",
@@ -77,6 +100,10 @@ export type CccPrdDiscoveryCandidate = {
   score: CccPrdDiscoveryCandidateScore;
 };
 
+type RankedCccPrdDiscoveryCandidate = CccPrdDiscoveryCandidate & {
+  selectionStage: "implementation" | "upstream";
+};
+
 export type CccPrdProjectDiscovery = {
   project: string;
   projectRoot: string;
@@ -91,6 +118,39 @@ export type CccPrdDiscoveryResult = {
   schema: typeof DISCOVERY_SCHEMA;
   activeProjectsRoot: string;
   projects: CccPrdProjectDiscovery[];
+};
+
+export type CccPrdCorpusProject = {
+  project: string;
+  projectRoot: string;
+  candidateCount: number;
+  selection:
+    | {
+        kind: "selected";
+        selectedPrdPath: string;
+        projectRelativePath: string;
+        sourceSha256: string;
+        sourceBytes: number;
+        version: string | null;
+        status: string | null;
+        intakeContract: CccPrdIntakeLintResult;
+      }
+    | { kind: "ambiguous"; candidatePaths: string[]; reason: string }
+    | { kind: "none" };
+};
+
+export type CccPrdCorpusManifest = {
+  schema: typeof CORPUS_MANIFEST_SCHEMA;
+  activeProjectsRoot: string;
+  summary: {
+    projectCount: number;
+    selectedCount: number;
+    ambiguousCount: number;
+    noPrdCount: number;
+    readyForIntakeCount: number;
+    blockingQuestionCount: number;
+  };
+  projects: CccPrdCorpusProject[];
 };
 
 export type CccPrdFreezeReceiptEntry = {
@@ -350,12 +410,29 @@ function parseSemver(...values: Array<string | undefined>): [number, number, num
   return null;
 }
 
+function parsePrdSemver(
+  frontmatter: Map<string, string>,
+  name: string,
+  text: string,
+): [number, number, number] | null {
+  const prdHeading = /^#{1,2}\s+.*(?:\bPRD\b|product requirements?)[^\r\n]*$/imu.exec(
+    text.slice(0, 16_384),
+  )?.[0];
+  return parseSemver(
+    frontmatter.get("version"),
+    frontmatter.get("prd_version"),
+    name,
+    prdHeading,
+  );
+}
+
 function statusScore(status: string | null): number {
   switch (status?.toLowerCase()) {
     case "accepted":
     case "approved":
     case "current":
     case "final":
+    case "frozen":
       return 4;
     case "active":
     case "ready":
@@ -375,7 +452,22 @@ function statusScore(status: string | null): number {
 function candidateFromMarkdown(
   file: IndexedMarkdown,
   admittedBytes?: Buffer,
-): CccPrdDiscoveryCandidate | null {
+  mode: "discovery" | "explicit" = "discovery",
+): RankedCccPrdDiscoveryCandidate | null {
+  const pathSegments = file.projectRelativePath.split("/").filter(Boolean);
+  if (
+    mode === "discovery"
+    && pathSegments.some((segment) => {
+      const lower = segment.toLowerCase();
+      return (
+        segment.startsWith(".")
+        || DISCOVERY_ARTIFACT_SEGMENTS.has(lower)
+        || /^brainstorming(?:[-_.].*)?$/u.test(lower)
+        || /^staging(?:[-_.].*)?$/u.test(lower)
+      );
+    })
+  ) return null;
+
   const bytes = admittedBytes ?? readFileSync(file.path);
   const text = bytes.toString("utf8");
   const frontmatter = parseFrontmatter(text);
@@ -383,18 +475,39 @@ function candidateFromMarkdown(
   if (status && RETIRED_STATUS.has(status.toLowerCase())) return null;
 
   const name = basename(file.path);
-  const filenameSignal = /(?:^|[-_.])prd(?:[-_.]|$)/i.test(name);
+  const filenameSignal = /(?:^|[-_.])(?:prod|uf)?prd(?:[-_.]|$)/i.test(name);
   const type = frontmatter.get("type")?.toLowerCase();
   const tagSignal = /(?:^|[\s,[\]-])prd(?:$|[\s,\]])/i.test(frontmatter.get("tags") ?? "");
   const headingSignal = /^#{1,2}\s+.*(?:\bPRD\b|product requirements?)/im.test(text.slice(0, 16_384));
-  const metadataSignal = type === "prd" || type === "product-requirements";
+  const repoBoundProjectContract = (
+    type === "prj"
+    && Boolean(frontmatter.get("repo"))
+    && /^#{1,3}\s+goals?\s*$/imu.test(text)
+    && /^#{1,3}\s+acceptance(?:\s+criteria|\s+behavior)?\s*$/imu.test(text)
+    && /^#{1,3}\s+(?:stop gates?|non-goals?)\s*$/imu.test(text)
+  );
+  const metadataSignal = (
+    type === "prd"
+    || type === "product-requirements"
+    || repoBoundProjectContract
+  );
   if (!filenameSignal && !tagSignal && !headingSignal && !metadataSignal) return null;
 
-  const semver = parseSemver(
-    frontmatter.get("version"),
-    frontmatter.get("prd_version"),
-    name,
-    text.slice(0, 4_096),
+  const semver = parsePrdSemver(frontmatter, name, text);
+  const versionDirectoryMatch = pathSegments.length === 2
+    ? /^(?:prd[-_.]?)?v?(\d+)\.(\d+)(?:\.(\d+|x))?$/iu.exec(pathSegments[0]!)
+    : null;
+  const versionRootSignal = Boolean(
+    filenameSignal
+    && semver
+    && versionDirectoryMatch
+    && semver[0] === Number(versionDirectoryMatch[1])
+    && semver[1] === Number(versionDirectoryMatch[2])
+    && (
+      !versionDirectoryMatch[3]
+      || versionDirectoryMatch[3].toLowerCase() === "x"
+      || semver[2] === Number(versionDirectoryMatch[3])
+    ),
   );
   return {
     path: file.path,
@@ -404,15 +517,23 @@ function candidateFromMarkdown(
     score: {
       semver,
       status: statusScore(status),
-      signal: filenameSignal ? 2 : 1,
+      signal: versionRootSignal ? 3 : (filenameSignal || metadataSignal) ? 2 : 1,
     },
+    selectionStage: /(?:^|[-_.])ufprd(?:[-_.]|$)/iu.test(name)
+      ? "upstream"
+      : "implementation",
   };
 }
 
 function compareCandidateScore(
-  left: CccPrdDiscoveryCandidate,
-  right: CccPrdDiscoveryCandidate,
+  left: RankedCccPrdDiscoveryCandidate,
+  right: RankedCccPrdDiscoveryCandidate,
 ): number {
+  const authorityDifference = Number(left.score.signal >= 2) - Number(right.score.signal >= 2);
+  if (authorityDifference !== 0) return authorityDifference;
+  const stageDifference = Number(left.selectionStage === "implementation")
+    - Number(right.selectionStage === "implementation");
+  if (stageDifference !== 0) return stageDifference;
   if (left.score.semver && !right.score.semver) return 1;
   if (!left.score.semver && right.score.semver) return -1;
   if (left.score.semver && right.score.semver) {
@@ -421,13 +542,13 @@ function compareCandidateScore(
       if (difference !== 0) return difference;
     }
   }
-  const statusDifference = left.score.status - right.score.status;
-  if (statusDifference !== 0) return statusDifference;
-  return left.score.signal - right.score.signal;
+  const signalDifference = left.score.signal - right.score.signal;
+  if (signalDifference !== 0) return signalDifference;
+  return left.score.status - right.score.status;
 }
 
 function projectSelection(
-  candidates: CccPrdDiscoveryCandidate[],
+  candidates: RankedCccPrdDiscoveryCandidate[],
 ): CccPrdProjectDiscovery["selection"] {
   if (candidates.length === 0) return { kind: "none" };
   let highest = candidates[0]!;
@@ -441,7 +562,7 @@ function projectSelection(
     return {
       kind: "ambiguous",
       candidatePaths: ties,
-      reason: "multiple current PRD candidates share the highest project-local semver/status score",
+      reason: "multiple current PRD candidates share the highest project-local authority, stage, version, location, and status score",
     };
   }
   return { kind: "selected", selectedPrdPath: highest.path };
@@ -459,17 +580,20 @@ export function discoverCccPrdCandidates(input: {
     const entries = readdirSync(activeProjectsRoot, { withFileTypes: true })
       .sort((left, right) => compareCccPrdCodeUnits(left.name, right.name));
     for (const entry of entries) {
-      if (segmentKind(entry.name)) continue;
+      if (
+        segmentKind(entry.name)
+        || DISCOVERY_SUPPORT_PROJECTS.has(entry.name.toLowerCase())
+      ) continue;
       const projectRoot = join(activeProjectsRoot, entry.name);
       const stat = lstatSync(projectRoot);
       if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
       const candidates = walkMarkdown(projectRoot)
         .map((file) => candidateFromMarkdown(file))
-        .filter((candidate): candidate is CccPrdDiscoveryCandidate => candidate !== null);
+        .filter((candidate): candidate is RankedCccPrdDiscoveryCandidate => candidate !== null);
       projects.push({
         project: entry.name,
         projectRoot,
-        candidates,
+        candidates: candidates.map(({ selectionStage: _selectionStage, ...candidate }) => candidate),
         selection: projectSelection(candidates),
       });
     }
@@ -479,6 +603,86 @@ export function discoverCccPrdCandidates(input: {
       error,
       "CCC_PRD_DISCOVERY_FAILED",
       "CCC PRD discovery failed",
+    );
+  }
+}
+
+export function buildCccPrdCorpusManifest(input: {
+  activeProjectsRoot: string;
+}): CccPrdCorpusManifest {
+  try {
+    const discovery = discoverCccPrdCandidates(input);
+    let selectedCount = 0;
+    let ambiguousCount = 0;
+    let noPrdCount = 0;
+    let readyForIntakeCount = 0;
+    let blockingQuestionCount = 0;
+    const projects: CccPrdCorpusProject[] = discovery.projects.map((project) => {
+      const common = {
+        project: project.project,
+        projectRoot: project.projectRoot,
+        candidateCount: project.candidates.length,
+      };
+      if (project.selection.kind === "none") {
+        noPrdCount += 1;
+        return { ...common, selection: project.selection };
+      }
+      if (project.selection.kind === "ambiguous") {
+        ambiguousCount += 1;
+        return { ...common, selection: project.selection };
+      }
+
+      const selectedPrdPath = project.selection.selectedPrdPath;
+      const candidate = project.candidates.find(
+        (entry) => entry.path === selectedPrdPath,
+      );
+      if (!candidate) {
+        return refuse(
+          "CCC_PRD_CORPUS_SELECTION_INVALID",
+          `selected PRD disappeared from its discovery inventory: ${selectedPrdPath}`,
+        );
+      }
+      const bytes = readFileSync(candidate.path);
+      const intakeContract = lintCccPrdIntakeMarkdown({
+        sourcePath: candidate.path,
+        markdown: bytes.toString("utf8"),
+      });
+      selectedCount += 1;
+      if (intakeContract.readyForIntake) readyForIntakeCount += 1;
+      blockingQuestionCount += intakeContract.blockingQuestions.length;
+      return {
+        ...common,
+        selection: {
+          kind: "selected",
+          selectedPrdPath: candidate.path,
+          projectRelativePath: candidate.projectRelativePath,
+          sourceSha256: sha256(bytes),
+          sourceBytes: bytes.byteLength,
+          version: candidate.version,
+          status: candidate.status,
+          intakeContract,
+        },
+      };
+    });
+
+    return {
+      schema: CORPUS_MANIFEST_SCHEMA,
+      activeProjectsRoot: discovery.activeProjectsRoot,
+      summary: {
+        projectCount: projects.length,
+        selectedCount,
+        ambiguousCount,
+        noPrdCount,
+        readyForIntakeCount,
+        blockingQuestionCount,
+      },
+      projects,
+    };
+  } catch (error) {
+    return asIntakeError(
+      error,
+      "CCC_PRD_CORPUS_MANIFEST_FAILED",
+      "CCC PRD corpus manifest failed",
     );
   }
 }
@@ -799,7 +1003,7 @@ function collectPacketSources(
     "selected PRD",
     MAX_PACKET_BYTES,
   );
-  if (!candidateFromMarkdown(selected, selectedAdmissionBytes)) {
+  if (!candidateFromMarkdown(selected, selectedAdmissionBytes, "explicit")) {
     return refuse(
       "CCC_PRD_INTAKE_SOURCE_INVALID",
       `selected Markdown file is not a current PRD candidate: ${selectedRelativePath}`,
@@ -888,11 +1092,10 @@ function collectPacketSources(
   const selectedBytes = bytesByPath.get(selectedPrdPath)!;
   const selectedText = selectedBytes.toString("utf8");
   const selectedFrontmatter = parseFrontmatter(selectedText);
-  const semver = parseSemver(
-    selectedFrontmatter.get("version"),
-    selectedFrontmatter.get("prd_version"),
+  const semver = parsePrdSemver(
+    selectedFrontmatter,
     basename(selectedPrdPath),
-    selectedText.slice(0, 4_096),
+    selectedText,
   );
   const sources = [...queued.values()]
     .map(({ source, authoritative }): PacketSource => {
@@ -979,6 +1182,7 @@ export function freezeCccPrdPacket(input: {
   activeProjectsRoot: string;
   selectedPrdPath: string;
   outputDir: string;
+  operatorContext?: CccPrdOperatorContext;
 }): CccPrdFreezeResult {
   const activeProjectsRoot = canonicalDirectory(
     input.activeProjectsRoot,
@@ -1033,7 +1237,55 @@ export function freezeCccPrdPacket(input: {
     );
   }
 
-  const manifestEntries = collected.sources.map((source) => ({
+  let sources = [...collected.sources];
+  let totalBytes = collected.totalBytes;
+  if (input.operatorContext) {
+    try {
+      const rendered = renderCccPrdOperatorContextMarkdown(input.operatorContext);
+      assertCccPrdOperatorContextCompatible({
+        context: rendered.context,
+        sources: collected.sources.map((source) => ({
+          path: source.projectRelativePath,
+          markdown: source.bytes.toString("utf8"),
+          authoritative: source.authoritative,
+        })),
+      });
+      const contextBytes = Buffer.from(rendered.markdown, "utf8");
+      if (sources.length >= MAX_PACKET_FILES) {
+        return refuse(
+          "CCC_PRD_INTAKE_FILE_LIMIT",
+          "packet has no remaining file slot for reviewed operator context",
+        );
+      }
+      if (totalBytes + contextBytes.byteLength > MAX_PACKET_BYTES) {
+        return refuse(
+          "CCC_PRD_INTAKE_BYTE_LIMIT",
+          "packet plus reviewed operator context exceeds the source byte limit",
+        );
+      }
+      sources.push({
+        path: CCC_PRD_OPERATOR_CONTEXT_ORIGIN,
+        projectRelativePath: CCC_PRD_OPERATOR_CONTEXT_SOURCE_PATH,
+        bytes: contextBytes,
+        authoritative: true,
+        role: "support",
+      });
+      sources = sources.sort((left, right) =>
+        compareCccPrdCodeUnits(left.projectRelativePath, right.projectRelativePath));
+      totalBytes += contextBytes.byteLength;
+    } catch (error) {
+      if (error instanceof CccPrdOperatorContextError) {
+        return refuse(error.code, error.message);
+      }
+      return asIntakeError(
+        error,
+        "CCC_PRD_OPERATOR_CONTEXT_INVALID",
+        "reviewed operator context is invalid",
+      );
+    }
+  }
+
+  const manifestEntries = sources.map((source) => ({
     relative_path: `sources/${source.projectRelativePath}`,
     role: source.role,
     sha256: sha256(source.bytes),
@@ -1046,7 +1298,7 @@ export function freezeCccPrdPacket(input: {
   };
   const manifestBytes = Buffer.from(`${canonicalCccPrdJson(manifest)}\n`, "utf8");
   const manifestSha256 = sha256(manifestBytes);
-  const authoritativeSources = collected.sources
+  const authoritativeSources = sources
     .filter((source) => source.authoritative)
     .map((source) => ({
       path: `sources/${source.projectRelativePath}`,
@@ -1062,7 +1314,7 @@ export function freezeCccPrdPacket(input: {
 
   const manifestPath = join(outputDir, "manifest.json");
   const receiptPath = join(outputDir, "freeze-receipt.json");
-  const receiptEntries: CccPrdFreezeReceiptEntry[] = collected.sources.map((source) => ({
+  const receiptEntries: CccPrdFreezeReceiptEntry[] = sources.map((source) => ({
     originPath: source.path,
     frozenPath: join(outputDir, "sources", ...source.projectRelativePath.split("/")),
     relativePath: `sources/${source.projectRelativePath}`,
@@ -1099,8 +1351,8 @@ export function freezeCccPrdPacket(input: {
       manifestSha256,
       packetHash,
       receiptSha256,
-      fileCount: collected.sources.length,
-      totalBytes: collected.totalBytes,
+      fileCount: sources.length,
+      totalBytes,
       unresolvedReferenceCount: collected.unresolvedReferences.length,
       project,
       selectedPrdPath,
@@ -1114,7 +1366,7 @@ export function freezeCccPrdPacket(input: {
     createdParents = createOutputParent(outputDir);
     const outputParent = dirname(outputDir);
     stageDir = mkdtempSync(join(outputParent, `.${basename(outputDir)}.stage-`));
-    for (const source of collected.sources) {
+    for (const source of sources) {
       const destination = join(
         stageDir,
         "sources",

@@ -974,7 +974,14 @@ describe("CCC campaign local Git observation", () => {
           parent: number;
           descendant: number;
         };
-        await delay(6_200);
+        // The production timeout plus TERM/KILL confirmation budget is 6s.
+        // Poll for the actual settled signal with bounded scheduler headroom
+        // instead of assuming one fixed sleep always resumes on time under a
+        // concurrent suite.
+        const inspectionDeadline = Date.now() + 8_000;
+        while (!settled && Date.now() < inspectionDeadline) {
+          await delay(10);
+        }
         observation = {
           settledBeforeExternalCleanup: settled,
           parentAlive: isProcessAlive(pids.parent),
@@ -989,6 +996,14 @@ describe("CCC campaign local Git observation", () => {
               // The exact scratch process may have exited between probe and cleanup.
             }
           }
+        }
+        const cleanupDeadline = Date.now() + 1_000;
+        while (
+          pids
+          && (isProcessAlive(pids.parent) || isProcessAlive(pids.descendant))
+          && Date.now() < cleanupDeadline
+        ) {
+          await delay(10);
         }
       }
 

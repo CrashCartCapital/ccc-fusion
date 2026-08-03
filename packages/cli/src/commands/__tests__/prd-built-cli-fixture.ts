@@ -88,6 +88,8 @@ export function createPacketRoot() {
     "Maximum requests: 1",
     "Maximum duration in milliseconds: 30000",
     "Maximum concurrency: 1",
+    "Task owned path: src/task-1",
+    "Task allowed write root: src/task-1",
     `Admitted write root: ${target}/src/task-1`,
     "Admitted write purpose: fixture projection",
     "Non-goal: live provider call",
@@ -144,7 +146,7 @@ export function createPacketRoot() {
     requirements: [{ id: "CF-CLI-001", statement: "Generate a traceable sidecar.", acceptance: "Sidecar has source spans and proof IDs.", accountableProducer: "fixture", dependencies: [], proofIds: ["PF-CLI-001"], sourceRefs, confidence: "high" }],
     proofs: [{ id: "PF-CLI-001", requirementIds: ["CF-CLI-001"], command: "pnpm test", positiveOracle: "exit 0", negativeControls: ["missing sidecar refuses"], sourceRefs: proofSourceRefs, confidence: "high" }],
     tasks: [
-      { id: "TASK-CLI-001", title: "Author sidecar", description: "Generate the candidate sidecar.", accountableProducer: "fixture", requirementIds: ["CF-CLI-001"], dependencyTaskIds: [], proofIds: ["PF-CLI-001"], workflowId: "WORKFLOW-CLI-001", documentIds: ["DOCUMENT-CLI-001"], artifactIds: [], protectedActionIds: [], sourceRefs: taskSourceRefs },
+      { id: "TASK-CLI-001", title: "Author sidecar", description: "Generate the candidate sidecar.", accountableProducer: "fixture", requirementIds: ["CF-CLI-001"], dependencyTaskIds: [], proofIds: ["PF-CLI-001"], workflowId: "WORKFLOW-CLI-001", documentIds: ["DOCUMENT-CLI-001"], artifactIds: [], protectedActionIds: [], ownedPaths: ["src/task-1"], allowedWriteRoots: ["src/task-1"], sourceRefs: taskSourceRefs },
     ],
     edges: [],
     workflows: [{ id: "WORKFLOW-CLI-001", title: "CLI workflow", taskIds: ["TASK-CLI-001"], entryTaskIds: ["TASK-CLI-001"], terminalTaskIds: ["TASK-CLI-001"], sourceRefs }],

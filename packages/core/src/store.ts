@@ -1050,6 +1050,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         dispatchKey: input.dispatchKey,
         attemptOrdinal: input.attemptOrdinal,
         requestCount: input.requestCount,
+        workItemFence: input.workItemFence,
         binding: input.binding,
       };
       const persistedIdentity = {
@@ -1062,6 +1063,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
         dispatchKey: initial.dispatchKey,
         attemptOrdinal: initial.attemptOrdinal,
         requestCount: initial.requestCount,
+        workItemFence: initial.workItemFence,
         binding: initial.binding,
       };
       if (canonicalCccPrdJson(submittedIdentity) !== canonicalCccPrdJson(persistedIdentity)) {

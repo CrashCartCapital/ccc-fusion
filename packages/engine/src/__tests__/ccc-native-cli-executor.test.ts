@@ -38,6 +38,18 @@ vi.mock("../cli-agent/task-session.js", async (importOriginal) => {
   };
 });
 
+const EXECUTION_FENCE = Object.freeze({
+  workItemId: "wi-cli-binding-red",
+  leaseOwner: "native-cli-worker",
+  attempt: 1,
+  runId: "FN-6226-run",
+});
+const WORK_ITEM_FENCE = Object.freeze({
+  workItemId: EXECUTION_FENCE.workItemId,
+  runId: EXECUTION_FENCE.runId,
+  attempt: EXECUTION_FENCE.attempt,
+});
+
 type ExecutorPrivate = {
   resolveMcpServers: (agentId?: string) => Promise<unknown[]>;
   runGraphCustomNode: (node: unknown, nodeTask: unknown, settings: unknown, columnBinding: unknown, graphContext: unknown, executionContext: unknown) => Promise<unknown>;
@@ -144,6 +156,7 @@ function createPermitScope(
     attemptOrdinal: 1,
     requestCount: 1,
     state: "dispatched_unknown",
+    workItemFence: WORK_ITEM_FENCE,
     binding,
   }) satisfies CccProviderAttemptScope;
 }
@@ -338,11 +351,7 @@ function createHarness(
   });
   const resolveMcpServersSpy = vi.spyOn(executorPrivate, "resolveMcpServers").mockImplementation(resolveMcpServers);
 
-  const executionFence = Object.freeze({
-    workItemId: "wi-cli-binding-red",
-    attempt: 1,
-    runId: "FN-6226-run",
-  });
+  const executionFence = EXECUTION_FENCE;
   const execution = Object.freeze({
     originTaskId: "FN-6226",
     semanticTaskId: "REQ-9",
@@ -484,6 +493,7 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         attemptOrdinal: 1,
         requestCount: 1,
         state: "dispatched_unknown",
+        workItemFence: WORK_ITEM_FENCE,
         binding: h.authorityBinding,
       });
       expect(h.reconcile).toHaveBeenCalledTimes(0);
@@ -617,6 +627,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         controllerToken: permitScope.controllerToken,
         outcome: "committed",
         observerId: "ccc-native-cli-observer.v1",
+        effectiveRoute: {
+          effectiveProvider: h.route.providerId,
+          effectiveModel: h.route.modelId,
+          usage: null,
+          cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+          receiptSource: "none",
+        },
       }));
     } finally {
       h.resolveMcpServersSpy.mockRestore();
@@ -838,6 +855,8 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       terminationReason: "crashed",
       cancellationState: null,
     });
+    // Pre-provider failure never dispatched, so it must not carry an effectiveRoute claim.
+    expect(h.reconcile.mock.calls.at(0)?.[0]).not.toHaveProperty("effectiveRoute");
     expect(h.sequence).toEqual([
       "pty-preflight",
       "resolver",
@@ -1023,6 +1042,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       observerId: "ccc-native-cli-observer.v1",
       terminationReason: "completed",
       cancellationState: null,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     });
     expect(Object.isFrozen(h.reconcile.mock.calls.at(0)?.[0])).toBe(true);
     expect(h.settleCccProviderAttemptAndFence).not.toHaveBeenCalled();
@@ -1146,6 +1172,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       observerId: "ccc-native-cli-observer.v1",
       terminationReason: "completed",
       cancellationState: null,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     });
     expect(h.settleCccProviderAttemptAndFence).not.toHaveBeenCalled();
   });
@@ -1261,6 +1294,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       observerId: "ccc-native-cli-observer.v1",
       terminationReason: "completed",
       cancellationState: null,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     });
     expect(releaseCccNativeCli).toHaveBeenCalledTimes(0);
   });
@@ -1380,6 +1420,13 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       outcome,
       terminationReason,
       cancellationState,
+      effectiveRoute: {
+        effectiveProvider: h.route.providerId,
+        effectiveModel: h.route.modelId,
+        usage: null,
+        cost: { kind: "unknown", reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+        receiptSource: "none",
+      },
     }));
   });
 
@@ -1424,10 +1471,16 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
       }),
     },
     {
-      name: "requestCount not one",
+      /*
+       * requestCount is the campaign-wide reservation counter, so a later campaign
+       * task legitimately dispatches with requestCount > 1 (core mints it together
+       * with attemptOrdinal). What must never dispatch is a scope whose counter and
+       * ordinal disagree — that is a permit that no longer describes one request.
+       */
+      name: "requestCount diverging from attemptOrdinal",
       createScope: ({ scope }) => Object.freeze({
         ...scope,
-        attemptOrdinal: 2,
+        attemptOrdinal: 1,
         requestCount: 2,
       }),
     },

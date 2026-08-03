@@ -1,3 +1,14 @@
+/*
+FNXC:CCCAdmissionAuthority 2026-08-01-17:30:
+DEPRECATED — designed unification helper, never wired into production. No
+provider-capable call site invokes admitCccCampaignAction; the authoritative
+admission enforcement for campaign execution is
+cli-agent/ccc-native-cli-production-resolver.ts (wired in cli-agent/runtime.ts)
+plus the per-seam route/identity checks in provider-attempt, store, binding,
+and workflow-graph-executor. Do not write new policy against this module and do
+not treat its checks as runtime-enforced. Removal is operator-approval-gated;
+until then this module exists only for its focused unit tests.
+*/
 import {
   assertCccCampaignAuthorityBinding,
   assertCccCampaignActionLease,

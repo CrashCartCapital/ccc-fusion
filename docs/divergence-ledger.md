@@ -8,17 +8,19 @@ This file tracks **what** diverges between ccc-fusion and upstream [Runfusion/Fu
 
 ## CF-DIV-001 — Subscription-only Claude/Codex launch profiles
 
-ccc-fusion pins CLI-agent child processes to subscription-authenticated Claude Code / Codex launches instead of accepting arbitrary API-key or base-URL overrides. Before a child process spawns, the engine requires an explicit subscription-readiness preflight and strips a fixed set of forbidden env keys (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, Bedrock/Vertex switches, etc.) so a launched agent can never silently fall back to a raw-key or third-party-routed provider.
+ccc-fusion pins CLI-agent child processes toward subscription-authenticated Claude Code / Codex launches instead of accepting arbitrary API-key or base-URL overrides. The enforced part is env hygiene: before a child process spawns, the engine strips a fixed set of forbidden env keys (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, Bedrock/Vertex switches, etc.) so a launched agent cannot inherit a raw-key or third-party-routed billing path from the parent environment. The subscription-readiness check itself is a caller-supplied structural assertion (`subscriptionReady: true` at the call sites); it neither probes live auth nor reads credentials, so it documents intent rather than proving an authenticated subscription session exists.
 
-- **Status:** active divergence — maintained.
+- **Status:** active divergence — maintained. Enforced: env-key stripping. Advisory: subscription-readiness assertion (no live auth probe).
 - **Owning surfaces:** `packages/engine/src/cli-agent/ccc-subscription-policy.ts`
 
 ## CF-DIV-002 — Exact OmniRoute transport
 
 Any loopback HTTP transport ccc-fusion admits for provider/tool routing must match one exact shape: literal `http://127.0.0.1:<port>/<path>` with an explicit positive port, no hostname aliases, no IPv6, no userinfo, and no query/hash suffix. This is stricter than upstream Fusion's general transport handling and matches the single admitted local-gateway shape ccc-fusion routes through.
 
-- **Status:** active divergence — maintained.
-- **Owning surfaces:** `packages/engine/src/ccc-loopback-policy.ts`
+That loopback shape governs configured custom providers. Because a provider selection under the ccc-fusion profile is not always a custom provider, the profile now resolves every selection — primary and fallback alike — against exactly two admitted transports: a configured custom provider, whose base URL must satisfy the loopback shape above, or a non-HTTP subscription transport enumerated in `CCC_ADMITTED_NON_HTTP_TRANSPORTS` (`packages/engine/src/pi.ts`), which currently holds only the `pi-claude-cli` child-process bridge. An enumerated transport skips URL validation because it has no HTTP base URL to validate; CF-DIV-001's env-key stripping is what contains it. Every other provider selection — including pi-ai's built-in cloud HTTP routes such as `anthropic`, `openai`, and `openrouter` — now fails closed with `CCC_CUSTOM_PROVIDER_EGRESS_POLICY_VIOLATION` before the model registry, the session, or any provider dispatch exists. Previously a selection that resolved to no configured custom provider was skipped rather than refused, so a built-in cloud route bypassed the boundary entirely. The fallback selection is validated too, because an unresolvable primary promotes the fallback to the session's selected model.
+
+- **Status:** active divergence — maintained. Fail-closed provider admission added 2026-08-01.
+- **Owning surfaces:** `packages/engine/src/ccc-loopback-policy.ts`, `packages/engine/src/pi.ts` (`CCC_ADMITTED_NON_HTTP_TRANSPORTS`, `assertCccCustomProviderEgress`)
 
 ## CF-DIV-003 — Cancellation/effect durability
 
@@ -52,8 +54,10 @@ Campaign execution runs inside a native, admission-gated proof/enforcement layer
 
 Merge and admission decisions for imported campaign tasks distinguish "ordinary" task custody from "campaign" custody and route campaign-owned tasks through dedicated conflict/authority checks (task drift, provider drift, route drift, action drift, git base/target drift, dirty tree) rather than the general-purpose merge path. This is the manual-intervention surface: an admission refusal names the exact drift reason instead of silently proceeding or silently discarding operator scope.
 
-- **Status:** active divergence — maintained.
-- **Owning surfaces:** `packages/engine/src/ccc-campaign-merge-control.ts`, `packages/engine/src/ccc-campaign-admission.ts`
+The production admission enforcement for campaign execution lives in `packages/engine/src/cli-agent/ccc-native-cli-production-resolver.ts` (wired in `cli-agent/runtime.ts`) plus per-seam route/identity checks in provider-attempt, store, binding, and workflow-graph-executor code. `packages/engine/src/ccc-campaign-admission.ts` is a designed-but-unwired unification helper with no production call site; it is marked deprecated in-source and must not be cited as a live gate.
+
+- **Status:** active divergence — maintained. Live enforcement: merge-control + native CLI production resolver + per-seam checks. `ccc-campaign-admission.ts`: deprecated, unwired.
+- **Owning surfaces:** `packages/engine/src/ccc-campaign-merge-control.ts`, `packages/engine/src/cli-agent/ccc-native-cli-production-resolver.ts`
 
 ## CF-DIV-008 — Shallow operator brand and CLI alias
 

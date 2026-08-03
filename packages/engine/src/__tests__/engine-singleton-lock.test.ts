@@ -1,4 +1,11 @@
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
@@ -91,6 +98,21 @@ describe("engine-singleton-lock", () => {
 
     const lock = await acquireEngineSingleton(id, workDir);
     acquired.push(lock);
+    expect(existsSync(lock.lockFilePath)).toBe(true);
+  });
+
+  it("recovers a recent orphan lock after winning the canonical socket", async () => {
+    const id = uniqueProjectId("crash-restart");
+    const lockPath = computeEngineLockFilePath(workDir);
+    mkdirSync(join(workDir, ".fusion"), { recursive: true });
+    writeFileSync(lockPath, "");
+    mkdirSync(`${lockPath}.lock`);
+    const crashedAt = new Date(Date.now() - 10_000);
+    utimesSync(`${lockPath}.lock`, crashedAt, crashedAt);
+
+    const lock = await acquireEngineSingleton(id, workDir);
+    acquired.push(lock);
+
     expect(existsSync(lock.lockFilePath)).toBe(true);
   });
 

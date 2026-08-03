@@ -74,6 +74,7 @@ import { isRepoLanded } from "./workspace-land-predicate.js";
 import { findAlreadyMergedTaskCommit, getCommitTaskOwnership } from "./already-merged-detector.js";
 import { getTaskCompletionBlockerForStore } from "./task-completion.js";
 import { shouldReclaimWedgedMerge } from "./merge-reclaim-policy.js";
+import { CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON } from "./ccc-campaign-startup-recovery.js";
 
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { isAiMergeContainerDir, resolveAiMergeRootPath, resolveLegacyAiMergeRootPath, resolveWorktreesDir } from "./worktree-paths.js";
@@ -1370,6 +1371,32 @@ export class SelfHealingManager {
       signal.metadata,
     );
     return true;
+  }
+
+  private async isCccCampaignUncertainEffectParked(
+    taskId: string,
+  ): Promise<boolean> {
+    const listWorkflowWorkItemsForTask =
+      this.store.listWorkflowWorkItemsForTask;
+    if (typeof listWorkflowWorkItemsForTask !== "function") return false;
+    try {
+      const workItems = await listWorkflowWorkItemsForTask.call(
+        this.store,
+        taskId,
+        { kinds: ["task"] },
+      );
+      return workItems.some((workItem) =>
+        workItem.state === "manual-required"
+        && workItem.lastError
+          === CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON
+        && workItem.blockedReason
+          === CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON);
+    } catch (error) {
+      log.warn(
+        `[self-healing] preserving ${taskId}: unable to exclude a parked CCC campaign uncertain effect (${error instanceof Error ? error.message : String(error)})`,
+      );
+      return true;
+    }
   }
 
   // ── Lifecycle ───────────────────────────────────────────────────────
@@ -3679,6 +3706,12 @@ export class SelfHealingManager {
       for (const task of candidates) {
         if (!task.branch || !task.worktree) continue;
         if (task.userPaused) continue;
+        if (await this.isCccCampaignUncertainEffectParked(task.id)) {
+          log.log(
+            `[self-healing] preserving ${task.id} branch/worktree while a CCC campaign uncertain effect awaits operator resolution`,
+          );
+          continue;
+        }
         const liveExecutionSignal = this.getFalsePositiveRequeueSignal(task, {
           executingIds,
           activeHeartbeatTaskIds: activeTaskIds,

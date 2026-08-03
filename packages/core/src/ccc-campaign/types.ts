@@ -10,6 +10,10 @@ export const CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION =
   "ccc-campaign.execution-policy.v1" as const;
 export const CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION =
   "ccc-campaign.execution-policy.v2" as const;
+export const CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION =
+  "ccc-campaign.execution-policy.v3" as const;
+export const CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION =
+  "ccc-prd.execution-plan.v1" as const;
 /** @deprecated Use the version-specific execution-policy constant. */
 export const CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION =
   CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION;
@@ -20,8 +24,14 @@ export const CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION =
 
 export type CccCampaignTransport = "pi" | "cli" | "workflow";
 
-export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
+export const CCC_PROVIDER_ATTEMPT_V2_SCHEMA_VERSION =
   "ccc-campaign.provider-attempt.v2" as const;
+export const CCC_PROVIDER_ATTEMPT_V3_SCHEMA_VERSION =
+  "ccc-campaign.provider-attempt.v3" as const;
+export const CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION =
+  "ccc-campaign.provider-attempt.v4" as const;
+export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
+  CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION;
 export const CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION =
   "ccc-campaign.proof-attempt.v1" as const;
 
@@ -33,11 +43,13 @@ export type CccCampaignProofAttemptState =
 
 export type CccCampaignProofAttemptScope = "task" | "campaign";
 
-export type CccCampaignProofWorkItemFence = Readonly<{
+export type CccCampaignWorkItemFence = Readonly<{
   workItemId: string;
   runId: string;
   attempt: number;
 }>;
+
+export type CccCampaignProofWorkItemFence = CccCampaignWorkItemFence;
 
 export type CccCampaignProofExecutionResultInput = Readonly<{
   success: boolean;
@@ -149,6 +161,7 @@ export type CccProviderAttemptRequest = Readonly<{
   providerId: string;
   modelId: string;
   transport: CccCampaignTransport;
+  workItemFence: CccCampaignWorkItemFence;
 }>;
 
 export type CccProviderAttemptTransition = Readonly<{
@@ -157,10 +170,56 @@ export type CccProviderAttemptTransition = Readonly<{
   controllerToken: string;
 }>;
 
+/**
+ * Terminal-evidence receipt fields (effective-route-and-usage-cost substrate).
+ * Requested identity lives in the route/binding; these fields record what the
+ * transport actually did, at settlement time only. Additive to the v3 terminal
+ * shape and versioned under {@link CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION}.
+ */
+export type CccProviderAttemptUsage = Readonly<{
+  inputTokens: number;
+  outputTokens: number;
+}>;
+
+export type CccProviderAttemptCostClaim = Readonly<{ amountUsd: number; source: string }>;
+export type CccProviderAttemptCostUnknown = Readonly<{ kind: "unknown"; reason: string }>;
+export type CccProviderAttemptCost = CccProviderAttemptCostClaim | CccProviderAttemptCostUnknown;
+
+export type CccProviderAttemptReceiptSource = "stream-usage" | "provider-api" | "none";
+
+/** The validated, persisted shape: what the transport actually used. */
+export type CccProviderAttemptEffectiveRoute = Readonly<{
+  effectiveProvider: string;
+  effectiveModel: string;
+  effectiveReasoningEffort?: string;
+  effectiveServiceTier?: string;
+  usage: CccProviderAttemptUsage | null;
+  cost: CccProviderAttemptCost;
+  receiptSource: CccProviderAttemptReceiptSource;
+}>;
+
+/**
+ * The raw settlement input shape. `fallbackReason` exists only so a caller
+ * that still believes fallback happened is refused explicitly; campaign
+ * fallback is not an admitted behavior right now, so it must be null/absent
+ * and is never persisted.
+ */
+export type CccProviderAttemptEffectiveRouteInput = Readonly<{
+  effectiveProvider: string;
+  effectiveModel: string;
+  effectiveReasoningEffort?: string;
+  effectiveServiceTier?: string;
+  fallbackReason?: string | null;
+  usage: CccProviderAttemptUsage | null;
+  cost: CccProviderAttemptCost;
+  receiptSource: CccProviderAttemptReceiptSource;
+}>;
+
 export type CccProviderAttemptReconciliation = CccProviderAttemptTransition & Readonly<{
   outcome: Extract<CccProviderAttemptState, "committed" | "proved_failed">;
   evidenceDigest: string;
   observerId: string;
+  effectiveRoute?: CccProviderAttemptEffectiveRouteInput;
 }>;
 
 export type CccProviderAttemptTerminalEvidence =
@@ -170,6 +229,7 @@ export type CccProviderAttemptTerminalEvidence =
     state: Extract<CccProviderAttemptState, "committed" | "proved_failed">;
     evidenceDigest: string;
     observerId: string;
+    effectiveRoute?: CccProviderAttemptEffectiveRoute;
   }>;
 
 export type CccProviderAttemptScope = Readonly<{
@@ -182,6 +242,7 @@ export type CccProviderAttemptScope = Readonly<{
   dispatchKey: string;
   attemptOrdinal: number;
   requestCount: number;
+  workItemFence: CccCampaignWorkItemFence | null;
   state: CccProviderAttemptState;
   terminal?: CccProviderAttemptTerminalEvidence;
   binding: Readonly<CccCampaignAuthorityBinding>;
@@ -190,7 +251,7 @@ export type CccProviderAttemptScope = Readonly<{
 /** Full immutable persisted identity required to settle a native provider attempt. */
 export type CccProviderAttemptSettlementInput = CccProviderAttemptReconciliation & Pick<
   CccProviderAttemptScope,
-  "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "binding"
+  "semanticTaskId" | "campaignDeadlineAt" | "turnKey" | "dispatchKey" | "attemptOrdinal" | "requestCount" | "workItemFence" | "binding"
 >;
 
 export type CccProviderAttemptDispatchDecision =
@@ -316,6 +377,88 @@ export type CccCampaignExecutionPolicy = {
 export type CccCampaignProductExecutionPolicy = CccCampaignExecutionPolicy & {
   schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION;
   routes: CccCampaignProductExecutionRoute[];
+};
+
+/**
+ * Routing-contract v3 per-task metadata. Additive to the v2 product route
+ * shape; a v3 route is never accepted where a v2 route is expected and vice
+ * versa (versions are parsed and rejected exactly, never migrated silently).
+ */
+export type CccCampaignRouteReasoningEffort =
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "max"
+  | "not-applicable";
+
+export type CccCampaignRouteServiceTier = "standard" | "priority" | "flex" | "default";
+
+export type CccCampaignRouteAccessTier =
+  | "subscription"
+  | "free"
+  | "plan"
+  | "metered"
+  | "unknown";
+
+export type CccCampaignRouteSensitivityClass =
+  | "private-vault"
+  | "sanitized"
+  | "synthetic"
+  | "public";
+
+export type CccCampaignRouteEgressPolicy =
+  | Readonly<{ kind: "loopback-only" }>
+  | Readonly<{ kind: "allowlisted"; providers: string[] }>;
+
+export type CccCampaignRouteLimits = Readonly<{
+  maxRequests: number;
+  maxDurationMs: number;
+  maxConcurrency: number;
+  maxResponseTokens?: number;
+  /** Forbidden on receipt-incapable transports (e.g. cli); see limits parsing. */
+  maxSpendUsd?: number;
+}>;
+
+/**
+ * "ordered" fallback is intentionally not modeled as data yet; the v3 parser
+ * rejects it with a not-yet-supported error rather than accepting a shape it
+ * cannot enforce.
+ */
+export type CccCampaignRouteFallbackPolicy = Readonly<{ kind: "forbidden" }>;
+
+export type CccCampaignProductExecutionRouteV3 = CccCampaignProductExecutionRoute & {
+  routeProfileId: string;
+  taskArchetype: string;
+  reasoningEffort: CccCampaignRouteReasoningEffort;
+  serviceTier: CccCampaignRouteServiceTier;
+  accessTier: CccCampaignRouteAccessTier;
+  sensitivityClass: CccCampaignRouteSensitivityClass;
+  egressPolicy: CccCampaignRouteEgressPolicy;
+  limits: CccCampaignRouteLimits;
+  fallbackPolicy: CccCampaignRouteFallbackPolicy;
+  catalogDigest: string | null;
+  decidedAt: string;
+};
+
+export type CccCampaignProductExecutionPolicyV3 = {
+  schema: typeof CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION;
+  routes: CccCampaignProductExecutionRouteV3[];
+};
+
+export type CccPrdProductExecutionRouteSelection = {
+  providerId: string;
+  modelId: string;
+  transport: "pi" | "cli";
+  cliAdapterId?: string;
+};
+
+export type CccPrdProductExecutionPlan = {
+  schema: typeof CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION;
+  packetHash: string;
+  sidecarHash: string;
+  bundleHash: string;
+  policy: CccCampaignProductExecutionPolicy;
 };
 
 export type CccCampaignManifest = {

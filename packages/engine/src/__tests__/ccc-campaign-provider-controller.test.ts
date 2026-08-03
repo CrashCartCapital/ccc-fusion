@@ -24,10 +24,13 @@ import { createCccCampaignProviderAttemptBinding, preDispatchCccCampaignProvider
 
 const snapshot = Object.freeze({ targetRoot: "/tmp/target", expectedBaseObject: "a".repeat(40), head: "a".repeat(40), gitDir: "/tmp/target/.git", gitCommonDir: "/tmp/target/.git", gitBinary: "/usr/bin/git", headDescendsFromExpectedBase: true, dirty: false, physicalIdentity: {} });
 const recheckedSnapshot = Object.freeze({ ...snapshot, expectedBaseObject: "b".repeat(40), head: "c".repeat(40) });
+const workItemFence = Object.freeze({ workItemId: "work-item-1", runId: "run-1", attempt: 1 });
+const workItemLeaseOwner = "provider-worker-1";
 const preDispatch = Object.freeze({
   layer: {},
   rootDir: "/tmp/store",
   authorityStore: {},
+  originTaskId: "TASK-ORIGIN",
   taskId: "TASK-1",
   approvalRequestId: "approval-1",
   claimToken: "claim-1",
@@ -36,12 +39,15 @@ const preDispatch = Object.freeze({
   providerId: "provider-1",
   modelId: "model-1",
   transport: "pi",
+  workItemFence,
+  workItemLeaseOwner,
 }) as never;
 
 const action = Object.freeze({ actionId: "ACTION-1", actionTarget: "target", requireProtected: true });
 const authority = Object.freeze({ bindingHash: "binding-hash" });
 const semanticTaskId = "TASK-1";
 const nativeTaskId = "FN-1";
+const originTaskId = "FN-ORIGIN";
 const lease = Object.freeze({
   binding: authority,
   lease: Object.freeze({ bindingHash: authority.bindingHash, actionId: action.actionId, actionTarget: action.actionTarget, approvalRequestId: "approval-1", claimToken: "claim-1" }),
@@ -64,7 +70,7 @@ function bindingInput(route: Readonly<{ transport: "pi" | "workflow" | "cli"; pr
   };
   return {
     authorityStore,
-    input: { layer: { transaction: async (fn: (tx: unknown) => unknown) => fn({}) }, rootDir: "/tmp/target", authorityStore, semanticTaskId, nativeTaskId, turnKey: "turn-1", expectedRoute } as never,
+    input: { layer: { transaction: async (fn: (tx: unknown) => unknown) => fn({}) }, rootDir: "/tmp/target", authorityStore, originTaskId, semanticTaskId, nativeTaskId, turnKey: "turn-1", workItemFence, workItemLeaseOwner, expectedRoute } as never,
   };
 }
 
@@ -99,6 +105,7 @@ describe("CCC campaign provider controller", () => {
       providerId: "provider-1",
       modelId: "model-1",
       transport: "pi",
+      originTaskId: "TASK-ORIGIN",
     }));
     expect(snapshot).toEqual(expect.objectContaining({ head: "a".repeat(40) }));
   });
@@ -197,13 +204,27 @@ describe("CCC campaign provider controller", () => {
     expect(effects.core).not.toHaveBeenCalled();
   });
 
-  it("preserves the actual matching Pi route into core", async () => {
+  it("Task provider-fence RED: injects the sealed work-item fence after provider-controlled Pi dispatch fields", async () => {
     effects.git.mockResolvedValue(snapshot);
     effects.core.mockResolvedValue({ kind: "dispatch-permit" });
     const { input } = bindingInput({ transport: "pi", providerId: "provider-1", modelId: "model-1" }, { transport: "pi", providerId: "provider-1", modelId: "model-1" });
     const binding = await createCccCampaignProviderAttemptBinding(input);
-    await expect(binding.controller.preDispatch(dispatch)).resolves.toEqual({ kind: "dispatch-permit" });
-    expect(effects.core).toHaveBeenCalledWith(expect.objectContaining({ ...dispatch, taskId: nativeTaskId }));
+    const providerChosenFence = Object.freeze({ workItemId: "provider-chosen", runId: "provider-run", attempt: 99 });
+    await expect(binding.controller.preDispatch({
+      ...dispatch,
+      workItemFence: providerChosenFence,
+      workItemLeaseOwner: "provider-chosen-owner",
+    } as never))
+      .resolves.toEqual({ kind: "dispatch-permit" });
+    expect(effects.core).toHaveBeenCalledWith(expect.objectContaining({
+      ...dispatch,
+      originTaskId,
+      taskId: nativeTaskId,
+      workItemFence,
+      workItemLeaseOwner,
+    }));
+    expect(effects.core.mock.calls[0]?.[0]?.workItemFence).toBe(workItemFence);
+    expect(effects.core.mock.calls[0]?.[0]?.workItemLeaseOwner).toBe(workItemLeaseOwner);
   });
 
   it("Task 6 P1 RED: refuses a reconciliation whose submitted turn is not the binding's sealed turn", async () => {

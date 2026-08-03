@@ -44,7 +44,11 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout.trim();
 }
 
-function route(taskId: string, shape: ExecutorShape): CccCampaignProductExecutionRoute {
+function route(
+  taskId: string,
+  shape: ExecutorShape,
+  writeRoot = "src/task-0",
+): CccCampaignProductExecutionRoute {
   return {
     taskId,
     providerId: "deterministic-fake",
@@ -53,8 +57,8 @@ function route(taskId: string, shape: ExecutorShape): CccCampaignProductExecutio
     executor: shape,
     toolMode: "coding",
     worktreeMode: "isolated",
-    ownedPaths: ["src/task-0"],
-    allowedWriteRoots: ["src/task-0"],
+    ownedPaths: [writeRoot],
+    allowedWriteRoots: [writeRoot],
     commitPolicy: "required",
     ...(shape === "cli-agent" ? { cliAdapterId: "test-cli-adapter" } : {}),
   };
@@ -65,6 +69,7 @@ function campaignContext(
   rootDir: string,
   baseCommit: string,
   executionRoute: CccCampaignProductExecutionRoute,
+  policyRoutes: readonly CccCampaignProductExecutionRoute[] = [executionRoute],
 ): CccCampaignTaskContext {
   return {
     schema: "ccc-campaign.context.v1",
@@ -90,7 +95,7 @@ function campaignContext(
     protectedActions: [],
     executionPolicy: {
       schema: "ccc-campaign.execution-policy.v2",
-      routes: [executionRoute],
+      routes: [...policyRoutes],
     },
     route: executionRoute,
     requestCount: 0,
@@ -444,5 +449,267 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
       value: "passed",
       contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
     });
+  });
+
+  /*
+   * Chained M1 campaign tasks.
+   *
+   * A multi-task import links native tasks through `dependencies` and the
+   * executor forks a successor's worktree directly from its predecessor's tip
+   * (executor.ts:9272-9299) so the campaign proof gate's per-task ancestry loop
+   * holds. That makes the frozen campaign base the WRONG reference for a
+   * successor: its worktree legitimately starts at the predecessor's campaign
+   * commit, and every check that compares against the frozen base is either too
+   * strict (refuses a legitimate successor) or too weak (accepts a successor
+   * that committed nothing of its own).
+   */
+  const CHAIN_IMPORT_ID = "0123456789abcdef01234567";
+
+  type ChainFixture = {
+    baseCommit: string;
+    commitA: string;
+    rootDir: string;
+    store: TaskStore;
+    taskA: TaskDetail;
+    taskB: TaskDetail;
+    worktreeA: string;
+    worktreeB: string;
+  };
+
+  async function chainFixture(): Promise<ChainFixture> {
+    const scratch = await mkdtemp(join(tmpdir(), "fusion-ccc-required-commit-chain-"));
+    scratchRoots.push(scratch);
+    const rootDir = join(scratch, "target");
+    const worktreeA = join(scratch, "task-a-worktree");
+    const worktreeB = join(scratch, "task-b-worktree");
+    const taskAId = "TASK-chain-a";
+    const taskBId = "TASK-chain-b";
+    const branchA = "fusion/task-chain-a";
+    const branchB = "fusion/task-chain-b";
+
+    await mkdir(rootDir, { recursive: true });
+    await git(rootDir, "init", "-b", "main");
+    await git(rootDir, "config", "user.email", "test@example.com");
+    await git(rootDir, "config", "user.name", "Test User");
+    await writeFile(join(rootDir, "README.md"), "base\n", "utf8");
+    await git(rootDir, "add", "--", "README.md");
+    await git(rootDir, "commit", "-m", "base");
+    const baseCommit = await git(rootDir, "rev-parse", "HEAD");
+
+    // Predecessor: its own worktree from the frozen base, with its campaign commit.
+    await git(rootDir, "worktree", "add", "-b", branchA, worktreeA, baseCommit);
+    await mkdir(join(worktreeA, "src", "task-a"), { recursive: true });
+    await writeFile(join(worktreeA, "src", "task-a", "result.txt"), "a\n", "utf8");
+    await git(worktreeA, "add", "--", "src/task-a/result.txt");
+    await git(worktreeA, "commit", "-m", `ccc-fusion campaign ${taskAId}`);
+    const commitA = await git(worktreeA, "rev-parse", "HEAD");
+
+    // Successor: forked from the predecessor's tip, exactly as the executor does.
+    await git(rootDir, "worktree", "add", "-b", branchB, worktreeB, commitA);
+    await mkdir(join(worktreeB, "src", "task-b"), { recursive: true });
+
+    const routeA = route(taskAId, "model", "src/task-a");
+    const routeB = route(taskBId, "model", "src/task-b");
+    const policyRoutes = [routeA, routeB];
+
+    const taskA = {
+      id: taskAId,
+      title: "Chain predecessor",
+      description: "First task in the serial campaign chain.",
+      column: "in-review",
+      lineageId: `ccc-prd:${CHAIN_IMPORT_ID}:${taskAId}`,
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      worktree: worktreeA,
+      branch: branchA,
+      baseCommitSha: baseCommit,
+      modelProvider: routeA.providerId,
+      modelId: routeA.modelId,
+      customFields: { cccFusionProfile: "ccc-fusion" },
+      createdAt: "2026-07-30T00:00:00.000Z",
+      updatedAt: "2026-07-30T00:00:00.000Z",
+    } as TaskDetail;
+    const taskB = {
+      ...taskA,
+      id: taskBId,
+      title: "Chain successor",
+      description: "Second task in the serial campaign chain.",
+      column: "in-progress",
+      lineageId: `ccc-prd:${CHAIN_IMPORT_ID}:${taskBId}`,
+      dependencies: [taskAId],
+      worktree: worktreeB,
+      branch: branchB,
+    } as TaskDetail;
+
+    const tasks = new Map([[taskAId, taskA], [taskBId, taskB]]);
+    const contexts = new Map([
+      [taskAId, campaignContext(taskAId, rootDir, baseCommit, routeA, policyRoutes)],
+      [taskBId, campaignContext(taskBId, rootDir, baseCommit, routeB, policyRoutes)],
+    ]);
+    const store = {
+      on: vi.fn(),
+      getTask: vi.fn(async (id: string) => tasks.get(id)),
+      getCccCampaignContextForTask: vi.fn(async (id: string) => contexts.get(id) ?? null),
+      assertCccCampaignWorkflowLeaseFence: vi.fn(async () => undefined),
+    } as unknown as TaskStore;
+
+    return { baseCommit, commitA, rootDir, store, taskA, taskB, worktreeA, worktreeB };
+  }
+
+  async function runSuccessfulChainNode(
+    h: ChainFixture,
+    task: TaskDetail,
+  ): Promise<WorkflowNodeResult> {
+    const executor = new TaskExecutor(h.store, h.rootDir);
+    const successfulResult: WorkflowNodeResult = {
+      outcome: "success",
+      value: "passed",
+      contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
+    };
+    vi.spyOn(executor as never, "runGraphCustomNode" as never)
+      .mockResolvedValue(successfulResult as never);
+    return executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(
+      node("model"),
+      task,
+      {},
+      sealedExecutionContext(task),
+    );
+  }
+
+  it("commits a chained successor's dirty change when its worktree starts at the predecessor's tip", async () => {
+    const h = await chainFixture();
+    await writeFile(join(h.worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
+
+    await expect(runSuccessfulChainNode(h, h.taskB)).resolves.toEqual({
+      outcome: "success",
+      value: "passed",
+      contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
+    });
+
+    const successorHead = await git(h.worktreeB, "rev-parse", "HEAD");
+    expect(successorHead).not.toBe(h.commitA);
+    expect(await git(h.worktreeB, "status", "--porcelain=v1")).toBe("");
+    // The successor's own commit changes only its own admitted root.
+    expect(
+      await git(
+        h.worktreeB,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        h.commitA,
+        successorHead,
+      ),
+    ).toBe("src/task-b/result.txt");
+    expect(await git(h.worktreeB, "log", "-1", "--pretty=%s")).toBe(
+      `ccc-fusion campaign ${h.taskB.id}`,
+    );
+  });
+
+  it("refuses a chained successor that produced no campaign-created commit of its own", async () => {
+    const h = await chainFixture();
+
+    await expect(runSuccessfulChainNode(h, h.taskB)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining("no campaign-created commit"),
+    });
+    expect(await git(h.worktreeB, "rev-parse", "HEAD")).toBe(h.commitA);
+  });
+
+  it("names the predecessor and its campaign commit when refusing a chained successor", async () => {
+    const h = await chainFixture();
+
+    await expect(runSuccessfulChainNode(h, h.taskB)).rejects.toMatchObject({
+      message: expect.stringContaining(h.commitA),
+    });
+    await expect(runSuccessfulChainNode(h, h.taskB)).rejects.toMatchObject({
+      message: expect.stringContaining(h.taskA.id),
+    });
+  });
+
+  it("refuses a chained successor whose worktree does not start at the predecessor's commit", async () => {
+    const h = await chainFixture();
+    // Model a successor wrongly forked from the frozen base: dirty, off-chain.
+    await git(h.rootDir, "worktree", "remove", "--force", h.worktreeB);
+    await git(h.rootDir, "branch", "-D", h.taskB.branch as string);
+    await git(h.rootDir, "worktree", "add", "-b", h.taskB.branch as string, h.worktreeB, h.baseCommit);
+    await mkdir(join(h.worktreeB, "src", "task-b"), { recursive: true });
+    await writeFile(join(h.worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
+
+    await expect(runSuccessfulChainNode(h, h.taskB)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining("uncommitted changes"),
+    });
+    expect(await git(h.worktreeB, "rev-parse", "HEAD")).toBe(h.baseCommit);
+    expect(await git(h.worktreeB, "diff", "--cached", "--name-only")).toBe("");
+  });
+
+  it("refuses a chained successor whose predecessor campaign commit cannot be derived", async () => {
+    const h = await chainFixture();
+    h.taskA.worktree = join(h.rootDir, "..", "worktree-that-does-not-exist");
+    h.taskA.branch = undefined;
+    await writeFile(join(h.worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
+
+    await expect(runSuccessfulChainNode(h, h.taskB)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining(h.taskA.id),
+    });
+    expect(await git(h.worktreeB, "rev-parse", "HEAD")).toBe(h.commitA);
+    expect(await git(h.worktreeB, "diff", "--cached", "--name-only")).toBe("");
+  });
+
+  it("refuses a campaign task that declares more than one dependency predecessor", async () => {
+    const h = await chainFixture();
+    h.taskB.dependencies = [h.taskA.id, "TASK-chain-other"];
+    await writeFile(join(h.worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
+
+    await expect(runSuccessfulChainNode(h, h.taskB)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining("exactly one"),
+    });
+    expect(await git(h.worktreeB, "rev-parse", "HEAD")).toBe(h.commitA);
+  });
+
+  it("accepts the chain entry task against the frozen base", async () => {
+    const h = await chainFixture();
+
+    await expect(runSuccessfulChainNode(h, h.taskA)).resolves.toEqual({
+      outcome: "success",
+      value: "passed",
+      contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
+    });
+  });
+
+  it("keeps imported-lineage entry-task no-commit refusal identical", async () => {
+    const h = await fixture();
+    h.task.lineageId = `ccc-prd:${CHAIN_IMPORT_ID}:${h.task.id}`;
+
+    await expect(runSuccessfulNode(h)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining("campaign-created commit"),
+    });
+  });
+
+  it("keeps imported-lineage entry-task commit creation identical", async () => {
+    const h = await fixture();
+    h.task.lineageId = `ccc-prd:${CHAIN_IMPORT_ID}:${h.task.id}`;
+    await writeFile(
+      join(h.worktree, "src", "task-0", "result.txt"),
+      "result\n",
+      "utf8",
+    );
+
+    await expect(runSuccessfulNode(h)).resolves.toEqual({
+      outcome: "success",
+      value: "passed",
+      contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
+    });
+    expect(await git(h.worktree, "rev-parse", "HEAD")).not.toBe(h.baseCommit);
   });
 });

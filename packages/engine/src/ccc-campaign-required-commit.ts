@@ -7,6 +7,7 @@ import type {
   TaskDetail,
   TaskStore,
 } from "@fusion/core";
+import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
 import type {
   WorkflowNodeExecutionContext,
@@ -470,6 +471,148 @@ async function assertPersistedBranchAtHead(
   }
 }
 
+/*
+FNXC:CccCampaignChainedRequiredCommit 2026-08-01-00:00:
+A serial campaign chain forks each successor's worktree from its predecessor's tip
+(executor.ts:9272-9299), so a successor's worktree legitimately STARTS at the
+predecessor's campaign commit rather than the frozen campaign base. Comparing a
+successor against the frozen base is wrong in both directions: it refuses a
+legitimate successor whose agent left its change uncommitted, and it accepts a
+successor that created no commit at all (the predecessor's commit already moved
+HEAD off the frozen base). Every such comparison must use the task's OWN start.
+*/
+type ExpectedStartCommit = Readonly<{
+  commit: string;
+  reference: "frozen-base" | "predecessor-commit";
+  predecessorTaskId?: string;
+}>;
+
+function describeExpectedStart(expected: ExpectedStartCommit): string {
+  return expected.reference === "frozen-base"
+    ? "the frozen campaign base"
+    : `the campaign commit of dependency predecessor ${expected.predecessorTaskId}`;
+}
+
+function expectedStartDetails(
+  expected: ExpectedStartCommit,
+): Record<string, unknown> {
+  return {
+    expectedStartCommit: expected.commit,
+    expectedStartReference: expected.reference,
+    ...(expected.predecessorTaskId === undefined
+      ? {}
+      : { predecessorTaskId: expected.predecessorTaskId }),
+  };
+}
+
+/** Resolves a revision without refusing, so callers can name what was missing. */
+async function optionalGitObject(
+  cwd: string,
+  revision: string,
+): Promise<string | null> {
+  try {
+    const { stdout } = await execFile(
+      "git",
+      ["-C", cwd, ...CONTROLLER_GIT_CONFIG, "rev-parse", "--verify", `${revision}^{commit}`],
+      {
+        encoding: "utf8",
+        env: scrubGitEnvironment(),
+        maxBuffer: MAX_GIT_OUTPUT_BYTES,
+        timeout: GIT_TIMEOUT_MS,
+      },
+    );
+    const object = stdout.trim();
+    return GIT_OBJECT_ID.test(object) ? object : null;
+  } catch {
+    return null;
+  }
+}
+
+/*
+The proof gate's per-task commit ladder (ccc-campaign-proof-execution.ts:236-269):
+isolated worktree HEAD, then the recorded merge commit, then the persisted branch.
+This walks the same durable sources but falls through a source that no longer
+resolves instead of refusing on it, because a disposed predecessor worktree still
+has an authoritative branch ref. Exhausting the ladder is a refusal: a task that
+declares a predecessor must never silently fall back to the frozen base.
+*/
+async function derivePredecessorCampaignCommit(
+  targetRoot: string,
+  taskId: string,
+  predecessor: TaskDetail,
+): Promise<string> {
+  if (typeof predecessor.worktree === "string" && predecessor.worktree.length > 0) {
+    const predecessorWorktree = await realpath(predecessor.worktree)
+      .catch(() => undefined);
+    const commit = predecessorWorktree === undefined
+      ? null
+      : await optionalGitObject(predecessorWorktree, "HEAD");
+    if (commit) return commit;
+  }
+  const mergeCommit = predecessor.mergeDetails?.commitSha;
+  if (typeof mergeCommit === "string" && GIT_OBJECT_ID.test(mergeCommit)) {
+    const commit = await optionalGitObject(targetRoot, mergeCommit);
+    if (commit) return commit;
+  }
+  if (typeof predecessor.branch === "string" && predecessor.branch.length > 0) {
+    const commit = await optionalGitObject(
+      targetRoot,
+      `refs/heads/${predecessor.branch}`,
+    );
+    if (commit) return commit;
+  }
+  refusal(
+    `CCC campaign required-commit task ${taskId} cannot derive the campaign commit of its dependency predecessor ${predecessor.id} from durable state`,
+    {
+      taskId,
+      predecessorTaskId: predecessor.id,
+      predecessorWorktree: predecessor.worktree,
+      predecessorBranch: predecessor.branch,
+      predecessorMergeCommit: predecessor.mergeDetails?.commitSha,
+    },
+  );
+}
+
+/** Mirrors the executor's chain gating exactly (executor.ts:9272-9299). */
+async function resolveExpectedStartCommit(
+  store: RequiredCommitStore,
+  targetRoot: string,
+  task: TaskDetail,
+  frozenBase: string,
+): Promise<ExpectedStartCommit> {
+  const frozenStart: ExpectedStartCommit = {
+    commit: frozenBase,
+    reference: "frozen-base",
+  };
+  if (!isImportedCccCampaignTask(task)) return frozenStart;
+  const dependencies = (task.dependencies ?? []).filter((id): id is string =>
+    typeof id === "string" && id.length > 0);
+  if (dependencies.length === 0) return frozenStart;
+  if (dependencies.length > 1) {
+    refusal(
+      `CCC campaign required-commit task ${task.id} declares ${dependencies.length} dependency predecessors (${dependencies.join(", ")}); serial campaign execution requires exactly one`,
+      { taskId: task.id, dependencies },
+    );
+  }
+  const predecessorTaskId = dependencies[0]!;
+  const predecessor = await store.getTask(predecessorTaskId).catch(() => undefined);
+  if (!predecessor || predecessor.id !== predecessorTaskId) {
+    refusal(
+      `CCC campaign required-commit task ${task.id} cannot load its dependency predecessor ${predecessorTaskId}`,
+      { taskId: task.id, predecessorTaskId },
+    );
+  }
+  return {
+    commit: await derivePredecessorCampaignCommit(
+      targetRoot,
+      task.id,
+      predecessor,
+    ),
+    reference: "predecessor-commit",
+    predecessorTaskId,
+  };
+}
+
 async function assertBaseAncestor(
   worktreeRoot: string,
   base: string,
@@ -573,6 +716,7 @@ async function createControllerOwnedCommit(
 
 async function inspectRequiredCommit(
   rootDir: string,
+  store: RequiredCommitStore,
   task: TaskDetail,
   campaign: CccCampaignTaskContext,
   assertFence: () => Promise<void>,
@@ -601,6 +745,13 @@ async function inspectRequiredCommit(
     );
   }
 
+  const expectedStart = await resolveExpectedStartCommit(
+    store,
+    targetRoot,
+    task,
+    frozenBase,
+  );
+
   const worktreeRoot = await assertRegisteredIsolatedWorktree(targetRoot, task);
   const [initialHead, resolvedBase] = await Promise.all([
     gitObject(worktreeRoot, "HEAD"),
@@ -617,9 +768,15 @@ async function inspectRequiredCommit(
 
   const canonicalRoots = canonicalAllowedWriteRoots(task.id, campaign);
   const initialStatus = await readWorktreeStatus(worktreeRoot, task.id);
-  if (initialStatus.length > 0 && initialHead !== frozenBase) {
+  if (initialStatus.length > 0 && initialHead !== expectedStart.commit) {
     refusal(
-      `CCC campaign required-commit task ${task.id} worktree has uncommitted changes`,
+      `CCC campaign required-commit task ${task.id} worktree has uncommitted changes at HEAD ${initialHead}, which is not its expected start commit ${expectedStart.commit} (${describeExpectedStart(expectedStart)})`,
+      {
+        taskId: task.id,
+        head: initialHead,
+        frozenBase,
+        ...expectedStartDetails(expectedStart),
+      },
     );
   }
   if (initialStatus.length > 0) {
@@ -639,15 +796,23 @@ async function inspectRequiredCommit(
     );
   }
   const head = await gitObject(worktreeRoot, "HEAD");
-  if (head === frozenBase) {
+  if (head === expectedStart.commit) {
     refusal(
-      `CCC campaign required-commit task ${task.id} has no campaign-created commit`,
-      { head, frozenBase },
+      `CCC campaign required-commit task ${task.id} has no campaign-created commit: HEAD is still its expected start commit ${expectedStart.commit} (${describeExpectedStart(expectedStart)})`,
+      { taskId: task.id, head, frozenBase, ...expectedStartDetails(expectedStart) },
     );
   }
   await assertBaseAncestor(worktreeRoot, frozenBase, head);
   await assertPersistedBranchAtHead(worktreeRoot, task, head);
 
+  /*
+  Diff from this task's OWN start, not the frozen base: a chained successor's
+  frozen-base diff also contains every predecessor's paths, which the successor's
+  route never admits, so a frozen-base comparison refuses each legitimate
+  successor for its predecessor's work. The campaign-wide frozen-base diff is the
+  proof gate's job, against the union of route roots
+  (ccc-campaign-proof-execution.ts:328-360).
+  */
   const changedPaths = (
     await git(worktreeRoot, [
       "diff",
@@ -655,7 +820,7 @@ async function inspectRequiredCommit(
       "-z",
       "--no-renames",
       "--diff-filter=ACDMRTUXB",
-      frozenBase,
+      expectedStart.commit,
       head,
       "--",
     ])
@@ -665,7 +830,8 @@ async function inspectRequiredCommit(
     .map((path) => canonicalGitPath(path, "commit"));
   if (changedPaths.length === 0) {
     refusal(
-      `CCC campaign required-commit task ${task.id} campaign-created commit has no changed paths`,
+      `CCC campaign required-commit task ${task.id} campaign-created commit has no changed paths since its expected start commit ${expectedStart.commit} (${describeExpectedStart(expectedStart)})`,
+      { taskId: task.id, head, ...expectedStartDetails(expectedStart) },
     );
   }
   assertPathsWithinAllowedRoots(task.id, changedPaths, canonicalRoots);
@@ -699,5 +865,11 @@ export async function enforceCccCampaignRequiredCommitAfterNode(
   const assertFence = () =>
     assertLiveWorkItemFence(input.store, taskId, input.executionContext!);
   await assertFence();
-  await inspectRequiredCommit(input.rootDir, task, campaign, assertFence);
+  await inspectRequiredCommit(
+    input.rootDir,
+    input.store,
+    task,
+    campaign,
+    assertFence,
+  );
 }

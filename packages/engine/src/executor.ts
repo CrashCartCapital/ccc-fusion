@@ -28,6 +28,7 @@ import {
   isImportedCccCampaignTask,
   isImportedCccCampaignWorkItem,
 } from "./ccc-campaign-routing.js";
+import { PermanentError } from "./engine-errors.js";
 import { matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
 import {
   requireCccCampaignLiveExecutionApproval,
@@ -81,7 +82,10 @@ import { createWorkflowRuntimePrimitiveProvider } from "./workflow-runtime-primi
 import { WorkflowCustomNodeExecutionService } from "./workflow-custom-node-execution.js";
 import { WorkflowReviewService } from "./workflow-review-service.js";
 import { WorkflowPlanningService } from "./workflow-planning-service.js";
-import { createCccCampaignProviderAttemptBinding } from "./ccc-campaign-provider-controller.js";
+import {
+  createCccCampaignProviderAttemptBinding,
+  requireCccCampaignWorkItemLeaseOwner,
+} from "./ccc-campaign-provider-controller.js";
 import type { WorkflowNodeProviderControllerResolverInput } from "./workflow-graph-executor.js";
 import {
   buildPlanVerifiedMessage,
@@ -7788,16 +7792,28 @@ export class TaskExecutor {
   public createCccCampaignWorkflowNodeProviderControllerResolver() {
     return async (input: WorkflowNodeProviderControllerResolverInput) => {
       const turnKey = input.execution.providerAttemptTurnKey;
-      if (!turnKey) throw new Error("CCC workflow provider controller requires sealed provider attempt turn identity");
+      const executionFence = input.execution.executionFence;
+      if (!turnKey || !executionFence) {
+        throw new Error("CCC workflow provider controller requires sealed provider attempt turn and work-item fence identity");
+      }
+      const workItemFence = Object.freeze({
+        workItemId: executionFence.workItemId,
+        runId: executionFence.runId,
+        attempt: executionFence.attempt,
+      });
+      const workItemLeaseOwner = requireCccCampaignWorkItemLeaseOwner(executionFence.leaseOwner);
       const layer = this.store.getAsyncLayer();
       if (!layer) throw new Error("CCC workflow provider controller requires PostgreSQL TaskStore");
       const binding = await createCccCampaignProviderAttemptBinding({
         layer,
         rootDir: this.rootDir,
         authorityStore: this.store,
+        originTaskId: input.execution.originTaskId,
         semanticTaskId: input.execution.semanticTaskId,
         nativeTaskId: input.execution.nativeTaskId,
         turnKey,
+        workItemFence,
+        workItemLeaseOwner,
         expectedRoute: Object.freeze({
           transport: "workflow" as const,
           workflowExtensionId: input.extensionId,
@@ -7816,18 +7832,28 @@ export class TaskExecutor {
     signal?: AbortSignal;
   }) {
     const turnKey = input.execution.providerAttemptTurnKey;
-    if (!turnKey || !input.provider || !input.modelId) {
-      throw new Error("CCC workflow model node requires sealed turn identity and resolved provider/model before PI session creation");
+    const executionFence = input.execution.executionFence;
+    if (!turnKey || !executionFence || !input.provider || !input.modelId) {
+      throw new Error("CCC workflow model node requires sealed turn and work-item fence identity plus resolved provider/model before PI session creation");
     }
+    const workItemFence = Object.freeze({
+      workItemId: executionFence.workItemId,
+      runId: executionFence.runId,
+      attempt: executionFence.attempt,
+    });
+    const workItemLeaseOwner = requireCccCampaignWorkItemLeaseOwner(executionFence.leaseOwner);
     const layer = this.store.getAsyncLayer();
     if (!layer) throw new Error("CCC workflow model node requires PostgreSQL TaskStore");
     return createCccCampaignProviderAttemptBinding({
       layer,
       rootDir: this.rootDir,
       authorityStore: this.store,
+      originTaskId: input.execution.originTaskId,
       semanticTaskId: input.execution.semanticTaskId,
       nativeTaskId: input.execution.nativeTaskId,
       turnKey,
+      workItemFence,
+      workItemLeaseOwner,
       expectedRoute: Object.freeze({ providerId: input.provider, modelId: input.modelId, transport: "pi" as const }),
       signal: input.signal,
     });
@@ -9232,6 +9258,46 @@ export class TaskExecutor {
     }
   }
 
+  /*
+  FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+  A multi-task campaign import links its native tasks through `dependencies` and M1 executes that
+  chain serially, but the importer never writes `executionStartBranch`. Without an explicit start
+  point every task worktree is created from the integration branch (worktree-acquisition.ts:265-270),
+  so a successor's branch does not contain its predecessor's commit and the campaign proof gate's
+  per-task ancestry loop (ccc-campaign-proof-execution.ts:317-326) refuses the whole campaign.
+  An unresolvable predecessor is a REFUSAL, never an integration-branch fallback: falling back
+  silently produces a worktree whose history is missing prior task work, and the defect would
+  resurface much later as an opaque proof-integration failure with no pointer back to this choice.
+  */
+  private async resolveCccCampaignChainedStartBranch(task: TaskDetail): Promise<string | null> {
+    if (!isImportedCccCampaignTask(task)) return null;
+    const dependencies = (task.dependencies ?? []).filter((id): id is string =>
+      typeof id === "string" && id.length > 0);
+    if (dependencies.length === 0) return null;
+    if (dependencies.length > 1) {
+      throw new PermanentError(
+        `CCC campaign task ${task.id} declares ${dependencies.length} dependency predecessors (${dependencies.join(", ")}); serial campaign execution requires exactly one`,
+        "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+      );
+    }
+    const predecessorId = dependencies[0]!;
+    const predecessor = await this.store.getTask(predecessorId).catch(() => null);
+    if (!predecessor) {
+      throw new PermanentError(
+        `CCC campaign task ${task.id} cannot load its dependency predecessor ${predecessorId}`,
+        "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+      );
+    }
+    const branch = resolveTaskWorkingBranch(predecessor);
+    if (await this.resolveWorktreeStartPoint(branch, task.id) === null) {
+      throw new PermanentError(
+        `CCC campaign task ${task.id} predecessor ${predecessorId} has no resolvable working branch "${branch}"`,
+        "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+      );
+    }
+    return branch;
+  }
+
   private async prepareGraphNodeExecution(
     node: WorkflowIrNode,
     nodeTask: TaskDetail,
@@ -9241,9 +9307,13 @@ export class TaskExecutor {
     if (!requirement.requiresWorktree) return;
     const live = await this.store.getTask(nodeTask.id);
     if (live.worktree && existsSync(live.worktree)) return;
-    const taskForAcquisition = live.worktree
+    const chainedStartBranch = await this.resolveCccCampaignChainedStartBranch(live);
+    const acquisitionBase = live.worktree
       ? ({ ...live, worktree: undefined, sessionFile: undefined } as TaskDetail)
       : live;
+    const taskForAcquisition = chainedStartBranch
+      ? ({ ...acquisitionBase, executionStartBranch: chainedStartBranch } as TaskDetail)
+      : acquisitionBase;
     if (live.worktree) {
       /*
       FNXC:WorkflowExecution 2026-06-29-15:28:
@@ -9784,6 +9854,27 @@ export class TaskExecutor {
     const contextPatch: Record<string, unknown> = {};
     if (typeof stepOutput === "string") contextPatch.output = stepOutput;
     if (typeof stepNotes === "string" && stepNotes) contextPatch.notes = stepNotes;
+    /*
+     * FNXC:WorkflowStepDiagnosis 2026-08-02-00:00:
+     * A step that FAILS WITHOUT THROWING reports its cause only as
+     * `outcome.error`, and the node result below carries just a routing `value`
+     * (`"failed"`). That string was the sole surviving trace: `graphFailureReason`
+     * (workflow-task-runtime) falls back to `workflow-node-failed:<node>:failed`,
+     * the work item records that as `lastError`, and the operator gets a terminal
+     * failure with no reason and no step rows — the silent-failure signature that
+     * hid a fail-closed campaign refusal ("provider attempt reconciliation
+     * terminal evidence mismatch") behind a bare `failed`. `executeNodeWithRetries`
+     * already publishes thrown-exception text under `node:<id>:error`, so record
+     * the non-throwing equivalent on the same key: `graphFailureReason` then
+     * prefers it (`workflow-node-error:<node>:<cause>`) and
+     * `synthesizeNonVerdictFailureOutput` can surface it as the step's `output`.
+     * Scoped to genuine non-verdict failures so reviewer verdicts, which own their
+     * own routing and feedback, are untouched.
+     */
+    const stepError = (outcome as { error?: string }).error;
+    if (!outcome.success && !verdict && typeof stepError === "string" && stepError.trim()) {
+      contextPatch[`node:${node.id}:error`] = stepError.trim();
+    }
     if (cfg.summaryTarget === "task" && typeof stepOutput === "string" && stepOutput.trim()) {
       /*
        * FNXC:WorkflowCompletion 2026-06-29-11:09:
@@ -9975,6 +10066,7 @@ export class TaskExecutor {
           semanticTaskId: execution.semanticTaskId,
           nativeTaskId: execution.nativeTaskId,
           authorityBindingHash: binding.authorityBindingHash,
+          executionFence,
         });
         if (preDispatchDecision.reason === "terminal") {
           if (heldScope.state !== "committed" && heldScope.state !== "proved_failed") {
@@ -10013,6 +10105,15 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
+          // Honest "this is what we launched" identity, not an independent
+          // confirmation — the CLI adapter has no usage/cost telemetry.
+          effectiveRoute: {
+            effectiveProvider: binding.route.providerId,
+            effectiveModel: binding.route.modelId,
+            usage: null,
+            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+            receiptSource: "none" as const,
+          },
         })), {
           permitScope: heldScope,
           observation,
@@ -10026,6 +10127,7 @@ export class TaskExecutor {
         semanticTaskId: execution.semanticTaskId,
         nativeTaskId: execution.nativeTaskId,
         authorityBindingHash: binding.authorityBindingHash,
+        executionFence,
       });
       fencedCliConfig = Object.freeze({
         ...resolvedConfig,
@@ -10231,6 +10333,15 @@ export class TaskExecutor {
           observerId: CCC_NATIVE_CLI_OBSERVER_ID,
           terminationReason: observation.outcome === "committed" ? "completed" : cancelled ? "killed" : "crashed",
           cancellationState: cancelled ? "CANCELLED" : null,
+          // Honest "this is what we launched" identity, not an independent
+          // confirmation — the CLI adapter has no usage/cost telemetry.
+          effectiveRoute: {
+            effectiveProvider: nativeCliBinding.route.providerId,
+            effectiveModel: nativeCliBinding.route.modelId,
+            usage: null,
+            cost: { kind: "unknown" as const, reason: "cli-adapter-observes-no-usage-or-identity-telemetry" },
+            receiptSource: "none" as const,
+          },
         })), {
           permitScope: nativeCliPermitScope,
           observation,
@@ -18575,8 +18686,17 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         tools: toolMode,
         defaultProvider: provider,
         defaultModelId: modelId,
-        fallbackProvider: executorFallback.provider,
-        fallbackModelId: executorFallback.modelId,
+        /*
+         * FNXC:CCCCampaignFallback 2026-08-01-17:10:
+         * A sealed CCC campaign attempt binds exactly one provider/model route.
+         * The executor's settings-derived fallback pair is outside that route,
+         * so it is never offered to a campaign-bound session; pi refuses the
+         * swap independently for any ccc-fusion session that still receives one.
+         */
+        ...(cccProviderAttemptBinding ? {} : {
+          fallbackProvider: executorFallback.provider,
+          fallbackModelId: executorFallback.modelId,
+        }),
         fallbackThinkingLevel: workflowStepFallbackThinkingLevel,
         defaultThinkingLevel: workflowStepThinkingLevel,
         runAuditor: createRunAuditor(this.store, this.getRunContextFor(task.id)),
@@ -19160,6 +19280,21 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     if (startPoint) {
       const resolved = await this.resolveWorktreeStartPoint(startPoint, taskId);
       if (resolved === null) {
+        /*
+        FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+        Backstop for the chained-worktree refusal. Clearing the base branch and proceeding from
+        HEAD is correct for ordinary tasks, but for an imported campaign task it would drop the
+        predecessor's commits out of the successor's history without any signal, so refuse here
+        too — this path is reachable if the predecessor branch disappears between preparation and
+        creation.
+        */
+        const campaignTask = await this.store.getTask(taskId).catch(() => null);
+        if (campaignTask && isImportedCccCampaignTask(campaignTask)) {
+          throw new PermanentError(
+            `CCC campaign task ${taskId} worktree base ref "${startPoint}" is unresolvable; refusing the integration-branch fallback`,
+            "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+          );
+        }
         // Stored baseBranch no longer exists (e.g., upstream dep merged and branch
         // deleted while this task sat queued/stuck). Clear it on the task so any
         // subsequent retry branches from the default base, and proceed from HEAD.
@@ -19187,7 +19322,21 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     // Fall-soft: any failure in this path falls back to the legacy behavior
     // so we don't break worktree creation for setups where the squash flow
     // can't run (no main branch resolvable, network down, etc.).
-    const squashImport = resolvedStartPoint
+    /*
+    FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+    Campaign exemption from the squash-import rewrite above. A chained campaign successor is
+    handed its predecessor's branch as the start point on purpose
+    (resolveCccCampaignChainedStartBranch); squash-importing it would rebase the successor onto
+    the frozen base and re-apply the predecessor's content as a NEW commit, so the predecessor's
+    tip stops being an ancestor of the successor and the campaign proof gate's per-task ancestry
+    loop (ccc-campaign-proof-execution.ts:317-326) refuses the whole campaign. True ancestry IS
+    the campaign model, so fork straight from the chain branch. Content leakage — the defect the
+    squash rewrite prevents — is not reachable here: campaign tasks land as one campaign, not as
+    independently squash-merged siblings. The exemption is deliberately narrow: it applies only
+    when the start point is exactly the chain branch this task's own predecessor resolves to.
+    */
+    const chainedCampaignBase = await this.usesCccCampaignChainedStartBranch(taskId, startPoint);
+    const squashImport = resolvedStartPoint && !chainedCampaignBase
       ? await this.planSquashImportFromDep(taskId, resolvedStartPoint, startPoint)
       : null;
     const initialStartPoint = squashImport ? squashImport.mainBase : resolvedStartPoint;
@@ -19226,11 +19375,20 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         // start from origin/main + local main both, so divergence only matters
         // if the user actively skips this setting. Best-effort: failures here
         // don't abort task setup.
-        await this.rebaseNewWorktreeOntoRemote(result.path, result.branch, taskId).catch((err: unknown) => {
-          executorLog.warn(
-            `Post-create worktree rebase failed for ${taskId} (continuing): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
+        /*
+        FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
+        Same ancestry reason as the squash exemption: rebasing a chained campaign successor onto
+        the remote default branch replays the predecessor's commits under new SHAs, which breaks
+        `merge-base --is-ancestor <predecessor> <successor>` just as effectively as the squash
+        rewrite would. Leave the chain intact.
+        */
+        if (!chainedCampaignBase) {
+          await this.rebaseNewWorktreeOntoRemote(result.path, result.branch, taskId).catch((err: unknown) => {
+            executorLog.warn(
+              `Post-create worktree rebase failed for ${taskId} (continuing): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        }
         return result;
       } catch (error: unknown) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -19264,6 +19422,27 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
 
   private quoteShellArg(value: string): string {
     return `'${value.replace(/'/g, "'\\''")}'`;
+  }
+
+  /**
+   * True when `startPoint` is exactly the chain branch this imported CCC
+   * campaign task's dependency predecessor resolves to — i.e. the base was
+   * chosen by `resolveCccCampaignChainedStartBranch`, not by ordinary dep
+   * inheritance. Callers use it to keep the campaign chain's true ancestry.
+   *
+   * Never refuses on its own: an unresolvable chain is already a refusal at
+   * preparation time, so a failure to prove the exemption here just falls back
+   * to the ordinary dep-base handling rather than inventing a new failure mode.
+   */
+  private async usesCccCampaignChainedStartBranch(
+    taskId: string,
+    startPoint: string | undefined,
+  ): Promise<boolean> {
+    if (!startPoint) return false;
+    const task = await this.store.getTask(taskId).catch(() => null);
+    if (!task || !isImportedCccCampaignTask(task)) return false;
+    const chainedStartBranch = await this.resolveCccCampaignChainedStartBranch(task).catch(() => null);
+    return chainedStartBranch !== null && chainedStartBranch === startPoint;
   }
 
   /**
