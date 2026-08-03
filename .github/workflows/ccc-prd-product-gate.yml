@@ -106,5 +106,17 @@ jobs:
       - name: Verifier confinement readiness
         run: node scripts/check-verifier-confinement.mjs
 
+      # FUSION_PRODUCT_TIMEOUT_MS overrides the script's internal poll
+      # timeout (scripts/ccc-prd-product-acceptance.mjs:66, default 120_000,
+      # unchanged for local/dev use). This runner is slower than the dev
+      # hardware that default was calibrated on: two isolated runs (no other
+      # bwrap-lane job active either time) both hit
+      # CCC_PRODUCT_POLL_TIMEOUT: verifier process reached post-dispatch
+      # cutpoint at the 120s mark --
+      # https://github.com/CrashCartCapital/ccc-fusion/actions/runs/30856906922/job/91829936007
+      # and job 91841475110 on the same run (rerun attempt). 600s still stays
+      # well inside the job's own 45-minute timeout-minutes backstop above.
       - name: CCC PRD product acceptance gate
         run: pnpm verify:ccc-prd-product
+        env:
+          FUSION_PRODUCT_TIMEOUT_MS: "600000"
