@@ -80,7 +80,7 @@ import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-stora
 import { refreshFusionModelRegistry } from "./model-registry-refresh.js";
 import { piLog, extensionsLog } from "./logger.js";
 import { readCustomProviders } from "./custom-providers.js";
-import { buildCustomProviderModels } from "./custom-provider-registry.js";
+import { buildCustomProviderModels, resolveCustomProviderApiKey } from "./custom-provider-registry.js";
 import {
   buildGateRejection,
   evaluateAgentActionGate,
@@ -3021,7 +3021,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       modelRegistry.registerProvider(registryKey, {
         baseUrl: provider.baseUrl,
         api,
-        apiKey: provider.apiKey,
+        apiKey: resolveCustomProviderApiKey(provider),
         models: buildCustomProviderModels(provider, api),
       });
       piLog.log(`Registered custom provider "${provider.name}" (key=${registryKey}, id=${provider.id})`);

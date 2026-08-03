@@ -2386,6 +2386,17 @@ async function main() {
         console.log(HELP);
         process.exit(1);
     }
+    /*
+     * FNXC:ConfigVersioning 2026-08-03-10:40:
+     * Task #7: a settings-write command (e.g. `fn provider add`) lazily starts
+     * an embedded-PostgreSQL revision layer whose shutdown handle nothing else
+     * reaches. Close it here so the process exits on its own instead of
+     * hanging until an external `gtimeout` kills it. A no-op for commands that
+     * never opened one, and for serve/daemon/dashboard this only runs once
+     * their own long-running call has already returned (i.e. after shutdown).
+     */
+    const { closeDirectGlobalRevisionLayers } = await import("@fusion/core");
+    await closeDirectGlobalRevisionLayers();
   } catch (err) {
     console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
     const { isPostgresUniqueError, ProjectPartitionRekeyError, FUSION_NON_RETRYABLE_EXIT_CODE } = await import("@fusion/core");

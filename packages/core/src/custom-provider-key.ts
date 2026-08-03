@@ -1,6 +1,6 @@
 import type { CustomProvider } from "./types.js";
 
-function slugifyProviderName(name: string): string {
+export function slugifyProviderName(name: string): string {
   return name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")

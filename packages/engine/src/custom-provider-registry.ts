@@ -7,6 +7,7 @@ is now a thin re-export shim of this module; its observable behavior is unchange
 */
 import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
 import { refreshFusionModelRegistry, type RefreshableModelRegistry } from "./model-registry-refresh.js";
+import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
 
 interface ModelRegistryLike extends RefreshableModelRegistry {
   registerProvider: (name: string, config: {
@@ -113,13 +114,33 @@ export function buildCustomProviderModels(
   }));
 }
 
+/*
+FNXC:ProviderAuth 2026-08-03-11:15:
+Task #8: pi-coding-agent's provider composer (composeApiKeyAuth) always builds
+an API-key auth resolver for a non-OAuth provider, but that resolver returns no
+credential when neither a stored credential nor a configured `apiKey` string
+exists -- every dispatch then throws "Provider is not configured", even for a
+loopback backend (oMLX, ollama, llama.cpp, ...) that never reads the
+Authorization header at all. There is no "explicitly keyless" resolution path
+in that library; the only way to avoid the throw is to hand it *some*
+resolvable string. Fabricate a non-secret sentinel for a keyless LOOPBACK
+provider only -- a keyless remote provider keeps pi's real "not configured"
+refusal, since that is very likely a genuine missing credential.
+*/
+export const CCC_LOOPBACK_NO_AUTH_REQUIRED_API_KEY = "ccc-fusion-loopback-no-auth-required";
+
+export function resolveCustomProviderApiKey(provider: CustomProvider): string | undefined {
+  if (provider.apiKey) return provider.apiKey;
+  return validateCccLoopbackHttpUrl(provider.baseUrl).ok ? CCC_LOOPBACK_NO_AUTH_REQUIRED_API_KEY : undefined;
+}
+
 function toProviderConfig(provider: CustomProvider) {
   const api = resolveApiType(provider.apiType);
 
   return {
     baseUrl: provider.baseUrl,
     api,
-    apiKey: provider.apiKey,
+    apiKey: resolveCustomProviderApiKey(provider),
     models: buildCustomProviderModels(provider, api),
   };
 }
