@@ -37,6 +37,9 @@ const expectedChecks = Object.freeze([
   "guided-operator-context-frozen",
   "planted-defect-rejected",
   "native-local-understanding-review",
+  "understanding-fast-lane-preserved",
+  "chunked-understanding-complete-coverage",
+  "chunked-understanding-compile-gates",
   "native-local-authoring",
   "frozen-packet-validated",
   "product-owned-execution-plan",
@@ -692,6 +695,82 @@ async function stopNativeAuthoringServer(server) {
   await new Promise((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   });
+}
+
+/*
+Chunks run serially (design D-2), so a POST arrives, is answered, and the
+next chunk's POST does not begin until the response completes -- a plain
+FIFO queue of response bodies is therefore a faithful fake for the chunked
+lane, unlike startNativeAuthoringServer's single fixed response.
+*/
+async function startChunkedFragmentServer(fragmentTextsInOrder) {
+  const requests = [];
+  const queue = [...fragmentTextsInOrder];
+  const server = createHttpServer((request, response) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      const rawBody = Buffer.concat(chunks).toString("utf8");
+      let body;
+      try {
+        body = rawBody.length > 0 ? JSON.parse(rawBody) : {};
+      } catch (error) {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+        return;
+      }
+      requests.push({ method: request.method, url: request.url, headers: request.headers, body });
+      if (request.method === "GET" && request.url === "/v1/models") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          object: "list",
+          data: [{ id: "chunked-fixture-model", object: "model", owned_by: "ccc-product-authoring" }],
+        }));
+        return;
+      }
+      if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "not found" }));
+        return;
+      }
+      const fragmentText = queue.shift();
+      if (fragmentText === undefined) {
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: "CCC_PRODUCT_CHUNKED_FIXTURE_EXHAUSTED" }));
+        return;
+      }
+      response.writeHead(200, {
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        "content-type": "text/event-stream",
+      });
+      response.write(`data: ${JSON.stringify({
+        id: "chatcmpl-ccc-product-chunk",
+        object: "chat.completion.chunk",
+        model: "chunked-fixture-model",
+        choices: [{ index: 0, delta: { role: "assistant", content: fragmentText }, finish_reason: null }],
+      })}\n\n`);
+      response.write(`data: ${JSON.stringify({
+        id: "chatcmpl-ccc-product-chunk",
+        object: "chat.completion.chunk",
+        model: "chunked-fixture-model",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      })}\n\n`);
+      response.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert(
+    address && typeof address === "object",
+    "CCC_PRODUCT_CHUNKED_SERVER_ADDRESS_INVALID",
+    JSON.stringify(address),
+  );
+  return { server, baseUrl: `http://127.0.0.1:${address.port}/v1`, requests };
 }
 
 async function assertExactImplementationFactProvenance(
@@ -2322,6 +2401,11 @@ async function main() {
           models: [{
             id: "vertical-authoring-model",
             name: "Vertical Authoring Model",
+            // Design §8 finding 4: a fail-closed verbatimCapable gate would
+            // otherwise refuse both frozen native checks with zero POSTs.
+            // This is fixture setup (the disposable loopback server does
+            // return verbatim quotes), not a claim about a real model.
+            verbatimCapable: true,
           }],
         }],
       }, null, 2)}\n`);
@@ -2408,6 +2492,16 @@ async function main() {
       "CCC_PRODUCT_NATIVE_UNDERSTANDING_REVIEW_INVALID",
       JSON.stringify(understood),
     );
+    // Design §7: `lane` is a direct statement of intent in the CLI's JSON
+    // wrapper -- not an inference from POST count, which would silently
+    // pass if a future two-chunk plan happened to make one call -- and it
+    // must never leak into the persisted sidecar (CccPrdUnderstandingReview
+    // and its on-disk schema stay exactly as they are today).
+    assert(
+      understood.lane === "single" && storedUnderstanding.lane === undefined,
+      "CCC_PRODUCT_UNDERSTANDING_FAST_LANE_NOT_PRESERVED",
+      JSON.stringify({ lane: understood.lane, storedHasLane: "lane" in storedUnderstanding }),
+    );
     assert(
       understandingRequests.length === 1
         && understandingRequests[0].url === "/v1/chat/completions"
@@ -2458,8 +2552,215 @@ async function main() {
       executableValidationRefusal:
         "CCC_PRD_UNKNOWN_SIDECAR_SCHEMA",
     });
+    ledger.pass("understanding-fast-lane-preserved", {
+      lane: understood.lane,
+      requestCount: understandingRequests.length,
+      laneOmittedFromStoredArtifact: !("lane" in storedUnderstanding),
+    });
     await stopNativeAuthoringServer(authoringServer);
     authoringServer = undefined;
+
+    // chunked-understanding-compile-gates (design §9): a two-heading
+    // disposable packet, forced onto the chunked lane, run through the
+    // compile-side coverage gates with requireMaterialCoverage set
+    // (compiler.ts:1376-1448). This check alone would have caught findings
+    // 2 and 10 from the design's own adversarial review -- without
+    // requireMaterialCoverage the early return at compiler.ts:1391
+    // exercises only the two always-on materialCoverage conditions.
+    const chunkedPacketRoot = path.join(tempRoot, "chunked-packet");
+    await mkdir(chunkedPacketRoot, { recursive: true });
+    const chunkedSourceRelativePath = "source.md";
+    const chunkedSourceText = [
+      "# Alpha",
+      "- REQ-1: alpha requirement text.",
+      "",
+      "# Beta",
+      "- REQ-2: beta requirement text.",
+    ].join("\n") + "\n";
+    await writeFile(
+      path.join(chunkedPacketRoot, chunkedSourceRelativePath),
+      chunkedSourceText,
+    );
+    const chunkedManifestPath = path.join(chunkedPacketRoot, "manifest.json");
+    await writeFile(chunkedManifestPath, JSON.stringify({
+      schema: "ccc-prd.packet.v1",
+      source_version: "chunked-gate-fixture",
+      entries: [{
+        relative_path: chunkedSourceRelativePath,
+        role: "root",
+        authoritative: true,
+        sha256: sha256(chunkedSourceText),
+      }],
+    }));
+    const alphaFragment = JSON.stringify({
+      schema: "ccc-prd.authoring-proposal-fragment.v1",
+      authorityRoles: [], requirements: [{
+        id: "REQ-1",
+        statement: "alpha requirement",
+        acceptance: "alpha acceptance",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: chunkedSourceRelativePath, exactQuote: "- REQ-1: alpha requirement text." }],
+      }], proofs: [], tasks: [{
+        id: "TASK-ALPHA",
+        title: "Ship alpha",
+        description: "Implement alpha",
+        accountableProducer: "team-a",
+        requirementIds: ["REQ-1"],
+        dependencyTaskIds: [],
+        proofIds: [],
+        workflowId: "",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: [],
+        ownedPaths: ["src/alpha.ts"],
+        allowedWriteRoots: ["src/alpha.ts"],
+        sourceRefs: [{ path: chunkedSourceRelativePath, exactQuote: "# Alpha\n- REQ-1: alpha requirement text." }],
+      }], edges: [], workflows: [], documents: [], artifacts: [], importIntents: [],
+      protectedActions: [], unresolvedDecisions: [], ambiguities: [], exceptions: [],
+    });
+    const betaFragment = JSON.stringify({
+      schema: "ccc-prd.authoring-proposal-fragment.v1",
+      authorityRoles: [], requirements: [{
+        id: "REQ-2",
+        statement: "beta requirement",
+        acceptance: "beta acceptance",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: chunkedSourceRelativePath, exactQuote: "- REQ-2: beta requirement text." }],
+      }], proofs: [], tasks: [{
+        id: "TASK-BETA",
+        title: "Ship beta",
+        description: "Implement beta",
+        accountableProducer: "team-a",
+        requirementIds: ["REQ-2"],
+        dependencyTaskIds: [],
+        proofIds: [],
+        workflowId: "",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: [],
+        ownedPaths: ["src/beta.ts"],
+        allowedWriteRoots: ["src/beta.ts"],
+        sourceRefs: [{ path: chunkedSourceRelativePath, exactQuote: "# Beta\n- REQ-2: beta requirement text." }],
+      }], edges: [], workflows: [], documents: [], artifacts: [], importIntents: [],
+      protectedActions: [], unresolvedDecisions: [], ambiguities: [], exceptions: [],
+    });
+    const chunkedServer = await startChunkedFragmentServer([alphaFragment, betaFragment]);
+    let chunkedAuthoringServer = chunkedServer.server;
+    await configureNativeAuthoring(chunkedServer.baseUrl);
+    const chunkedReviewPath = path.join(chunkedPacketRoot, "understanding-review.json");
+    const chunkedUnderstood = jsonOutput(
+      await prd([
+        "understand",
+        chunkedPacketRoot,
+        chunkedManifestPath,
+        chunkedReviewPath,
+        "--provider",
+        "ccc-product-authoring",
+        "--model",
+        "vertical-authoring-model",
+        "--max-duration-ms",
+        "120000",
+        "--max-prompt-bytes",
+        "262144",
+        "--max-response-bytes",
+        "262144",
+        "--max-review-items",
+        "8",
+        "--lane",
+        "chunked",
+      ]),
+      "prd native chunked understand",
+    );
+    await stopNativeAuthoringServer(chunkedAuthoringServer);
+    chunkedAuthoringServer = undefined;
+    assert(
+      chunkedUnderstood.kind === "understanding-review"
+        && chunkedUnderstood.lane === "chunked"
+        && chunkedUnderstood.coverage?.missing?.length === 0
+        && chunkedUnderstood.coverage?.conflicts?.length === 0
+        && chunkedUnderstood.requirements?.length === 2
+        && chunkedUnderstood.tasks?.length === 2,
+      "CCC_PRODUCT_CHUNKED_UNDERSTANDING_INVALID",
+      JSON.stringify(chunkedUnderstood),
+    );
+    ledger.pass("chunked-understanding-complete-coverage", {
+      lane: chunkedUnderstood.lane,
+      inventoryCount: chunkedUnderstood.coverage.inventoryCount,
+      dispositionCount: chunkedUnderstood.coverage.dispositionCount,
+      missingCount: chunkedUnderstood.coverage.missing.length,
+      conflictCount: chunkedUnderstood.coverage.conflicts.length,
+    });
+
+    // The chunked understanding review carries the ccc-prd.understanding-review.v1
+    // schema by design (so it can never be silently compiled as executable),
+    // so exercising the compile-side coverage gates means transplanting the
+    // SAME material data (requirements/tasks/materialCoverage) into a
+    // sidecar-shaped object with target/bounds populated -- the coverage
+    // math (compiler.ts:1376-1448) reads only requirements/tasks/
+    // materialCoverage/custody, never the executable-approval fields.
+    const chunkedSidecarPath = path.join(chunkedPacketRoot, "chunked.sidecar.json");
+    await writeFile(chunkedSidecarPath, JSON.stringify({
+      schema: "ccc-prd.sidecar.v1",
+      sourceVersion: chunkedUnderstood.sourceVersion,
+      orderedSources: chunkedUnderstood.orderedSources,
+      provenance: chunkedUnderstood.provenance,
+      authorityRoles: chunkedUnderstood.authorityRoles,
+      requirements: chunkedUnderstood.requirements,
+      proofs: chunkedUnderstood.proofs,
+      tasks: chunkedUnderstood.tasks,
+      edges: chunkedUnderstood.edges,
+      workflows: chunkedUnderstood.workflows,
+      documents: chunkedUnderstood.documents,
+      artifacts: chunkedUnderstood.artifacts,
+      importIntents: chunkedUnderstood.proposedImportIntents,
+      protectedActions: chunkedUnderstood.protectedActions,
+      bounds: { maxRequests: 4, maxDurationMs: 30000, maxConcurrency: 2 },
+      admittedWriteRoots: [{ path: targetRoot, purpose: "chunked gate fixture" }],
+      targetRepository: { path: targetRoot, baseCommit: targetBase },
+      nonGoals: chunkedUnderstood.nonGoals,
+      unresolvedDecisions: chunkedUnderstood.unresolvedDecisions,
+      ambiguities: chunkedUnderstood.ambiguities,
+      exceptions: chunkedUnderstood.exceptions,
+      confidence: chunkedUnderstood.confidence,
+      materialCoverage: chunkedUnderstood.coverage.dispositions,
+    }));
+    const chunkedCompileGates = jsonOutput(
+      await prd([
+        "validate",
+        chunkedPacketRoot,
+        chunkedManifestPath,
+        chunkedSidecarPath,
+        targetRoot,
+        targetBase,
+      ], [0, 1]),
+      "prd validate chunked sidecar",
+    );
+    const chunkedCompileGateCodes = new Set([
+      "CCC_PRD_MATERIAL_COVERAGE_REQUIRED",
+      "CCC_PRD_MATERIAL_COVERAGE_INVALID",
+      "CCC_PRD_MATERIAL_SECTION_UNDISPOSITIONED",
+      "CCC_PRD_SOURCE_REQUIREMENT_UNDISPOSITIONED",
+      "CCC_PRD_EXTRACTION_IMPLAUSIBLY_SHALLOW",
+    ]);
+    const chunkedCoverageDiagnostics = (chunkedCompileGates.diagnostics ?? []).filter(
+      ({ code }) => chunkedCompileGateCodes.has(code),
+    );
+    assert(
+      chunkedCoverageDiagnostics.length === 0,
+      "CCC_PRODUCT_CHUNKED_COMPILE_GATES_FAILED",
+      JSON.stringify({ diagnostics: chunkedCompileGates.diagnostics }),
+    );
+    ledger.pass("chunked-understanding-compile-gates", {
+      requireMaterialCoverage: true,
+      clearedDiagnosticCodes: [...chunkedCompileGateCodes],
+      allDiagnostics: chunkedCompileGates.diagnostics ?? [],
+    });
 
     const nativeAuthoring = await startNativeAuthoringServer(proposalText);
     authoringServer = nativeAuthoring.server;
