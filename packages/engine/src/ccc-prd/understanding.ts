@@ -1,20 +1,42 @@
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
+  canonicalCccPrdJson,
+  type CccPrdAdmittedWriteRoot,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringReview,
+  type CccPrdConfidence,
   type CccPrdDiagnostic,
+  type CccPrdExecutionBounds,
   type CccPrdMaterialCoverageItem,
   type CccPrdSidecar,
+  type CccPrdTargetRepository,
+  type CustomProvider,
   type WorkflowExtensionRegistry,
 } from "@fusion/core";
 import { authorCccPrdPacket } from "./authoring.js";
+import type { CccPrdAnchorLimits } from "./anchor-resolver.js";
+import type { CccPrdChunkPolicy } from "./chunk-planner.js";
+import { runCccPrdChunkedUnderstanding } from "./chunk-orchestrator.js";
 import { readCccPrdPacketCustody } from "./custody.js";
-import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
+import {
+  classifyCccPrdLane,
+  type CccPrdLaneClassifierPolicy,
+  type CccPrdRequestedLane,
+} from "./lane-classifier.js";
+import { analyzeCccPrdMaterialCoverage, computeCccPrdMaterialInventory } from "./material-coverage.js";
+import type { CccPrdNativeAuthoringTransport } from "./native-authoring-adapter.js";
 
 export const CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION =
   "ccc-prd.understanding-review.v1" as const;
 
 type CoverageInventoryItem = Omit<CccPrdMaterialCoverageItem, "disposition">;
+
+const sha256 = (value: Buffer | string): string => createHash("sha256").update(value).digest("hex");
+
+function hasStringCode(value: unknown): value is Error & { code: string } {
+  return value instanceof Error && typeof (value as { code?: unknown }).code === "string";
+}
 
 const SHALLOW_INVENTORY_THRESHOLD = 8;
 const SHALLOW_REQUIREMENT_THRESHOLD = 4;
@@ -81,6 +103,30 @@ export type UnderstandCccPrdInput = {
   adapter: CccPrdAuthoringAdapter;
   maxReviewItems: number;
   workflowExtensionRegistry: WorkflowExtensionRegistry;
+  /**
+   * Design §7 (D-3). Defaults to "single", which reproduces today's
+   * single-shot-only behavior byte-for-byte -- an existing caller that
+   * never passes this field (including the frozen acceptance-gate fixture)
+   * is completely unaffected. Only "auto" or "chunked" reach the classifier
+   * and the chunked pipeline, and those require the transport-config
+   * fields below.
+   */
+  requestedLane?: CccPrdRequestedLane;
+  laneClassifierPolicy?: Partial<CccPrdLaneClassifierPolicy>;
+  contextWindow?: number;
+  reservedOutputTokens?: number;
+  /** Required only when requestedLane is "auto" or "chunked". */
+  provider?: string;
+  model?: string;
+  maxDurationMs?: number;
+  maxPromptBytes?: number;
+  maxResponseBytes?: number;
+  maxChunkAttempts?: number;
+  chunkPolicy?: Partial<CccPrdChunkPolicy>;
+  anchorLimits?: CccPrdAnchorLimits;
+  /** Test-only seam; production omits it and uses the real transport. */
+  chunkTransport?: CccPrdNativeAuthoringTransport;
+  customProviders?: CustomProvider[];
 };
 
 export type CccPrdUnderstandingResult =
@@ -105,7 +151,11 @@ function inventoryItem(
 }
 
 function implementationContext(
-  sidecar: CccPrdSidecar,
+  sidecar: {
+    targetRepository: CccPrdTargetRepository;
+    bounds: CccPrdExecutionBounds;
+    admittedWriteRoots: CccPrdAdmittedWriteRoot[];
+  },
 ): CccPrdUnderstandingReview["implementationContext"] {
   const targetPath = sidecar.targetRepository.path.trim();
   const baseCommit = sidecar.targetRepository.baseCommit.trim();
@@ -150,18 +200,12 @@ function implementationContext(
   };
 }
 
-export async function understandCccPrdPacket(
+/** Byte-to-token heuristic used for the lane classifier's context-fit check, matching the corpus-diversity-matrix's own bytes/4 approximation. */
+const BYTES_PER_TOKEN_ESTIMATE = 4;
+
+async function runSingleShotUnderstanding(
   input: UnderstandCccPrdInput,
 ): Promise<CccPrdUnderstandingResult> {
-  if (!Number.isSafeInteger(input.maxReviewItems) || input.maxReviewItems < 0) {
-    return {
-      kind: "refusal",
-      diagnostics: [{
-        code: "CCC_PRD_UNDERSTANDING_REVIEW_BOUND_INVALID",
-        message: "understanding review maximum must be a non-negative safe integer",
-      }],
-    };
-  }
   const authored = await authorCccPrdPacket({
     rootDir: input.rootDir,
     manifestPath: input.manifestPath,
@@ -265,4 +309,173 @@ export async function understandCccPrdPacket(
     },
     review: authored.review,
   };
+}
+
+async function runChunkedUnderstanding(
+  input: UnderstandCccPrdInput,
+): Promise<CccPrdUnderstandingResult> {
+  if (!input.provider || !input.model || !input.maxDurationMs || !input.maxPromptBytes || !input.maxResponseBytes) {
+    return {
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_CHUNK_TRANSPORT_CONFIG_REQUIRED",
+        message: "chunked understanding requires provider, model, maxDurationMs, maxPromptBytes, and maxResponseBytes",
+      }],
+    };
+  }
+
+  let chunkResult: Awaited<ReturnType<typeof runCccPrdChunkedUnderstanding>>;
+  try {
+    chunkResult = await runCccPrdChunkedUnderstanding({
+      rootDir: input.rootDir,
+      manifestPath: input.manifestPath,
+      mode: "understanding",
+      provider: input.provider,
+      model: input.model,
+      maxDurationMs: input.maxDurationMs,
+      maxPromptBytes: input.maxPromptBytes,
+      maxResponseBytes: input.maxResponseBytes,
+      maxReviewItems: input.maxReviewItems,
+      maxChunkAttempts: input.maxChunkAttempts,
+      chunkPolicy: input.chunkPolicy,
+      anchorLimits: input.anchorLimits,
+      transport: input.chunkTransport,
+      customProviders: input.customProviders,
+    });
+  } catch (error) {
+    // Never an uncaught rejection: chunk-plan/verification/assembly refusals
+    // raise CccPrdCustodyError, and route-admission failures (transport
+    // identity drift, egress/verbatimCapable violations) raise their own
+    // named-code Error subclasses -- both keep their specific code so an
+    // operator sees e.g. CCC_PRD_ROUTE_NOT_VERBATIM_CAPABLE, not an opaque
+    // wrapper. Anything else falls back to a generic failure code with the
+    // original message preserved, mirroring authorCccPrdPacket's catch-all
+    // (authoring.ts:1056-1063).
+    if (hasStringCode(error)) {
+      return { kind: "refusal", diagnostics: [{ code: error.code, message: error.message }] };
+    }
+    return {
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_CHUNKED_UNDERSTANDING_FAILED",
+        message: error instanceof Error ? error.message : "chunked understanding failed",
+      }],
+    };
+  }
+
+  const { assembled } = chunkResult;
+  if (assembled.requirements.length === 0) {
+    return {
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_UNDERSTANDING_ZERO_REQUIREMENTS",
+        message: "understanding extracted zero requirements from the frozen PRD packet",
+      }],
+    };
+  }
+  const reviewCount = assembled.ambiguities.length
+    + assembled.unresolvedDecisions.length
+    + assembled.exceptions.length
+    + assembled.protectedActions.length;
+  if (reviewCount > input.maxReviewItems) {
+    return {
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_AUTHORING_REVIEW_UNBOUNDED",
+        message: `understanding review count ${reviewCount} exceeds admitted maximum ${input.maxReviewItems}`,
+      }],
+    };
+  }
+
+  const custody = readCccPrdPacketCustody(input);
+  // assembleCccPrdChunkedUnderstanding already refuses internally on any
+  // non-empty missing/conflicts (CCC_PRD_UNDERSTANDING_COVERAGE_INCOMPLETE /
+  // _CONFLICTED), so by construction every material item is dispositioned
+  // and neither conflicted -- the shallow-floor gate is structurally
+  // unreachable here (design §4 "Interaction with IMPLAUSIBLY_SHALLOW").
+  return {
+    schema: CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
+    kind: "understanding-review",
+    executable: false,
+    sourceVersion: custody.sourceVersion,
+    orderedSources: custody.sources,
+    provenance: {
+      authoringAdapterId: "fusion-native-chunked-understanding-v1",
+      authoringModel: `${input.provider}/${input.model}`,
+      proposalHash: sha256(canonicalCccPrdJson(assembled)),
+      packetHash: custody.packetHash,
+    },
+    authorityRoles: assembled.authorityRoles,
+    requirements: assembled.requirements,
+    proofs: assembled.proofs,
+    tasks: assembled.tasks,
+    edges: assembled.edges,
+    workflows: assembled.workflows,
+    documents: assembled.documents,
+    artifacts: assembled.artifacts,
+    proposedImportIntents: assembled.importIntents,
+    protectedActions: assembled.protectedActions,
+    nonGoals: assembled.nonGoals,
+    assumptions: [],
+    ambiguities: assembled.ambiguities,
+    exceptions: assembled.exceptions,
+    unresolvedDecisions: assembled.unresolvedDecisions,
+    confidence: assembled.confidence,
+    implementationContext: implementationContext(assembled),
+    coverage: {
+      inventoryCount: assembled.materialCoverage.length,
+      dispositionCount: assembled.materialCoverage.length,
+      dispositions: assembled.materialCoverage,
+      missing: [],
+      conflicts: [],
+    },
+    review: {
+      ambiguities: assembled.ambiguities,
+      unresolvedDecisions: assembled.unresolvedDecisions,
+      exceptions: assembled.exceptions,
+      protectedActions: assembled.protectedActions,
+    },
+  };
+}
+
+export async function understandCccPrdPacket(
+  input: UnderstandCccPrdInput,
+): Promise<CccPrdUnderstandingResult> {
+  if (!Number.isSafeInteger(input.maxReviewItems) || input.maxReviewItems < 0) {
+    return {
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_UNDERSTANDING_REVIEW_BOUND_INVALID",
+        message: "understanding review maximum must be a non-negative safe integer",
+      }],
+    };
+  }
+
+  const requestedLane = input.requestedLane ?? "single";
+  if (requestedLane === "single") {
+    return runSingleShotUnderstanding(input);
+  }
+
+  const custody = readCccPrdPacketCustody(input);
+  const totals = custody.sources
+    .filter((source) => source.authoritative)
+    .reduce((accumulator, source) => {
+      const bytes = custody.sourceBytes.get(source.path)!;
+      const items = computeCccPrdMaterialInventory(source.path, bytes);
+      return { items: accumulator.items + items.length, bytes: accumulator.bytes + bytes.byteLength };
+    }, { items: 0, bytes: 0 });
+
+  const classification = classifyCccPrdLane({
+    totalInventoryItems: totals.items,
+    totalAuthoritativeBytes: totals.bytes,
+    estimatedPromptTokens: Math.ceil(totals.bytes / BYTES_PER_TOKEN_ESTIMATE),
+    reservedOutputTokens: input.reservedOutputTokens ?? 0,
+    contextWindow: input.contextWindow ?? Number.MAX_SAFE_INTEGER,
+    requestedLane,
+    policy: input.laneClassifierPolicy,
+  });
+
+  return classification.lane === "single"
+    ? runSingleShotUnderstanding(input)
+    : runChunkedUnderstanding(input);
 }
