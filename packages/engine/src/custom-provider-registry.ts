@@ -83,6 +83,12 @@ export function buildCustomProviderModels(
   const supportsDeveloperRole = provider.supportsDeveloperRole === true;
   const anthropicPromptCaching = provider.anthropicPromptCaching === true;
 
+  // Settings JSON is hand-editable, so a declared limit is honored only when it
+  // is a positive safe integer; anything else falls back to the historical
+  // default rather than poisoning the registry with NaN or zero caps.
+  const declaredLimit = (value: unknown, fallback: number): number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+
   return (provider.models ?? []).map((model) => ({
     id: model.id,
     name: model.name,
@@ -94,8 +100,8 @@ export function buildCustomProviderModels(
       cacheRead: 0,
       cacheWrite: 0,
     },
-    contextWindow: 128000,
-    maxTokens: 16384,
+    contextWindow: declaredLimit(model.contextWindow, 128000),
+    maxTokens: declaredLimit(model.maxTokens, 16384),
     ...(api === "openai-completions"
       ? {
           compat: {
