@@ -191,8 +191,13 @@ export interface CustomProvider {
    * its historical defaults (maxTokens 16384, contextWindow 128000); declare
    * them when the backend's real window differs, or long structured responses
    * truncate with finish reason "length".
+   *
+   * `verbatimCapable` is a declared operator assertion, not a measurement
+   * (design D-4): absent means unknown means not admitted for quote-bearing
+   * CCC PRD work (extraction routes must declare capability rather than
+   * auto-detecting the model architecture behind an OpenAI-compatible URL).
    */
-  models?: { id: string; name: string; maxTokens?: number; contextWindow?: number }[];
+  models?: { id: string; name: string; maxTokens?: number; contextWindow?: number; verbatimCapable?: boolean }[];
 }
 
 export interface WorkflowStepInput {
