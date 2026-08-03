@@ -724,7 +724,7 @@ async function startChunkedFragmentServer(fragmentTextsInOrder) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
           object: "list",
-          data: [{ id: "chunked-fixture-model", object: "model", owned_by: "ccc-product-authoring" }],
+          data: [{ id: "vertical-authoring-model", object: "model", owned_by: "ccc-product-authoring" }],
         }));
         return;
       }
@@ -747,13 +747,13 @@ async function startChunkedFragmentServer(fragmentTextsInOrder) {
       response.write(`data: ${JSON.stringify({
         id: "chatcmpl-ccc-product-chunk",
         object: "chat.completion.chunk",
-        model: "chunked-fixture-model",
+        model: "vertical-authoring-model",
         choices: [{ index: 0, delta: { role: "assistant", content: fragmentText }, finish_reason: null }],
       })}\n\n`);
       response.write(`data: ${JSON.stringify({
         id: "chatcmpl-ccc-product-chunk",
         object: "chat.completion.chunk",
-        model: "chunked-fixture-model",
+        model: "vertical-authoring-model",
         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
       })}\n\n`);
