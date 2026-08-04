@@ -210,6 +210,51 @@ function implementationContext(
 /** Byte-to-token heuristic used for the lane classifier's context-fit check, matching the corpus-diversity-matrix's own bytes/4 approximation. */
 const BYTES_PER_TOKEN_ESTIMATE = 4;
 
+export type ShallowExtractionAnalysis = {
+  inventory: unknown[];
+  coverage: unknown[];
+  requirementInventoryCount: number;
+  requirementDispositionCount: number;
+};
+
+/**
+ * The understanding depth gate is a floor, not a completeness check
+ * (understanding.ts, design §0/§4): it refuses only when material or
+ * explicit-requirement disposition falls under threshold. On the chunked
+ * lane this is structurally unreachable in normal operation --
+ * assembleCccPrdChunkedUnderstanding already refuses on any non-empty
+ * missing/conflicts, so a successfully assembled chunked result always has
+ * inventory === coverage (100% dispositioned), and the ratio check can
+ * never trip. It is still wired into the chunked path as a tripwire: "if
+ * it ever fires there, that is the alarm that planner and scorer
+ * diverged" (design §4).
+ */
+export function describeCccPrdShallowExtractionRefusal(
+  analysis: ShallowExtractionAnalysis,
+): CccPrdDiagnostic | null {
+  const overallExtractionIsShallow =
+    analysis.inventory.length >= SHALLOW_INVENTORY_THRESHOLD
+    && analysis.coverage.length * MINIMUM_OVERALL_DISPOSITION_DENOMINATOR
+      < analysis.inventory.length * MINIMUM_OVERALL_DISPOSITION_NUMERATOR;
+  const requirementExtractionIsShallow =
+    analysis.requirementInventoryCount >= SHALLOW_REQUIREMENT_THRESHOLD
+    && analysis.requirementDispositionCount
+      * MINIMUM_REQUIREMENT_DISPOSITION_DENOMINATOR
+      < analysis.requirementInventoryCount
+        * MINIMUM_REQUIREMENT_DISPOSITION_NUMERATOR;
+  if (!overallExtractionIsShallow && !requirementExtractionIsShallow) return null;
+  return {
+    code: "CCC_PRD_UNDERSTANDING_IMPLAUSIBLY_SHALLOW",
+    message: [
+      "understanding coverage is too shallow to trust",
+      `material inventory=${analysis.inventory.length}`,
+      `material dispositions=${analysis.coverage.length}`,
+      `explicit requirement inventory=${analysis.requirementInventoryCount}`,
+      `explicit requirement dispositions=${analysis.requirementDispositionCount}`,
+    ].join("; "),
+  };
+}
+
 async function runSingleShotUnderstanding(
   input: UnderstandCccPrdInput,
 ): Promise<CccPrdUnderstandingResult> {
@@ -256,30 +301,14 @@ async function runSingleShotUnderstanding(
   const requirementDispositionCount = analysis.coverage.filter(
     ({ materialKind }) => materialKind === "requirement",
   ).length;
-  const overallExtractionIsShallow =
-    analysis.inventory.length >= SHALLOW_INVENTORY_THRESHOLD
-    && analysis.coverage.length * MINIMUM_OVERALL_DISPOSITION_DENOMINATOR
-      < analysis.inventory.length * MINIMUM_OVERALL_DISPOSITION_NUMERATOR;
-  const requirementExtractionIsShallow =
-    requirementInventoryCount >= SHALLOW_REQUIREMENT_THRESHOLD
-    && requirementDispositionCount
-      * MINIMUM_REQUIREMENT_DISPOSITION_DENOMINATOR
-      < requirementInventoryCount
-        * MINIMUM_REQUIREMENT_DISPOSITION_NUMERATOR;
-  if (overallExtractionIsShallow || requirementExtractionIsShallow) {
-    return {
-      kind: "refusal",
-      diagnostics: [{
-        code: "CCC_PRD_UNDERSTANDING_IMPLAUSIBLY_SHALLOW",
-        message: [
-          "understanding coverage is too shallow to trust",
-          `material inventory=${analysis.inventory.length}`,
-          `material dispositions=${analysis.coverage.length}`,
-          `explicit requirement inventory=${requirementInventoryCount}`,
-          `explicit requirement dispositions=${requirementDispositionCount}`,
-        ].join("; "),
-      }],
-    };
+  const shallowRefusal = describeCccPrdShallowExtractionRefusal({
+    inventory: analysis.inventory,
+    coverage: analysis.coverage,
+    requirementInventoryCount,
+    requirementDispositionCount,
+  });
+  if (shallowRefusal) {
+    return { kind: "refusal", diagnostics: [shallowRefusal] };
   }
   return {
     lane: "single",
@@ -399,8 +428,22 @@ async function runChunkedUnderstanding(
   // assembleCccPrdChunkedUnderstanding already refuses internally on any
   // non-empty missing/conflicts (CCC_PRD_UNDERSTANDING_COVERAGE_INCOMPLETE /
   // _CONFLICTED), so by construction every material item is dispositioned
-  // and neither conflicted -- the shallow-floor gate is structurally
-  // unreachable here (design §4 "Interaction with IMPLAUSIBLY_SHALLOW").
+  // and neither conflicted here -- inventory === coverage numerically, and
+  // this check can never trip in normal operation. It still runs, as a
+  // tripwire: "if it ever fires there, that is the alarm that planner and
+  // scorer diverged" (design §4 "Interaction with IMPLAUSIBLY_SHALLOW").
+  const requirementDispositionsForShallowCheck = assembled.materialCoverage.filter(
+    ({ materialKind }) => materialKind === "requirement",
+  ).length;
+  const chunkedShallowRefusal = describeCccPrdShallowExtractionRefusal({
+    inventory: assembled.materialCoverage,
+    coverage: assembled.materialCoverage,
+    requirementInventoryCount: requirementDispositionsForShallowCheck,
+    requirementDispositionCount: requirementDispositionsForShallowCheck,
+  });
+  if (chunkedShallowRefusal) {
+    return { kind: "refusal", diagnostics: [chunkedShallowRefusal] };
+  }
   return {
     lane: "chunked",
     schema: CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
