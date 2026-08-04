@@ -1,15 +1,29 @@
 name: CCC PRD Product Acceptance (non-blocking)
 
 # Wires `pnpm verify:ccc-prd-product` (scripts/ccc-prd-product-acceptance.mjs)
-# into CI so the canonical product acceptance ledger runs on every PR instead
+# into CI so the canonical product acceptance ledger can run on demand instead
 # of only locally/manually. This is a NEW, separate workflow — it does not
 # touch pr-checks.yml's required job set (Lint, Typecheck, Build, Gate), so
-# this job is automatically NOT a required status check. Branch protection is
-# untouched; a red run here is information, not a merge stopper.
+# this job is not and never was a required status check.
+#
+# DISPATCH-ONLY, NOT wired to pull_request: three runs on this runner all hit
+# the identical failure signature, ruling out flake or job contention:
+#   - https://github.com/CrashCartCapital/ccc-fusion/actions/runs/30856906922/job/91829936007
+#     (120s default poll timeout)
+#   - job 91841475110, same run (rerun attempt, runner exclusive, 120s)
+#   - https://github.com/CrashCartCapital/ccc-fusion/actions/runs/30861839426/job/91845282837
+#     (600s override via FUSION_PRODUCT_TIMEOUT_MS below -- ran far longer and
+#     still failed identically; the diagnostic tail at expiry shows only the
+#     CLI's own idle background self-healing maintenance loop cycling, with no
+#     visible verifier-specific activity -- a functional failure, not a slow
+#     runner needing more budget)
+# All three: CCC_PRODUCT_POLL_TIMEOUT: verifier process reached post-dispatch
+# cutpoint. Known failing at the product acceptance step on this runner
+# pending verifier-dispatch diagnosis; tracked by the campaign ledger. Run via
+# workflow_dispatch only until that diagnosis lands and this trigger is
+# revisited.
 
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch: {}
 
 concurrency:
@@ -108,14 +122,11 @@ jobs:
 
       # FUSION_PRODUCT_TIMEOUT_MS overrides the script's internal poll
       # timeout (scripts/ccc-prd-product-acceptance.mjs:66, default 120_000,
-      # unchanged for local/dev use). This runner is slower than the dev
-      # hardware that default was calibrated on: two isolated runs (no other
-      # bwrap-lane job active either time) both hit
-      # CCC_PRODUCT_POLL_TIMEOUT: verifier process reached post-dispatch
-      # cutpoint at the 120s mark --
-      # https://github.com/CrashCartCapital/ccc-fusion/actions/runs/30856906922/job/91829936007
-      # and job 91841475110 on the same run (rerun attempt). 600s still stays
-      # well inside the job's own 45-minute timeout-minutes backstop above.
+      # unchanged for local/dev use). Raised here to rule out "needs more
+      # time" before concluding functional failure -- see the three-run
+      # evidence trail in this file's header. 600s still stays well inside
+      # the job's own 45-minute timeout-minutes backstop above, and still
+      # fails identically, so this knob is not (by itself) the fix.
       - name: CCC PRD product acceptance gate
         run: pnpm verify:ccc-prd-product
         env:
