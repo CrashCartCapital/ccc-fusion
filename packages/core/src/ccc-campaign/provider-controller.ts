@@ -167,25 +167,6 @@ export async function atomicReserveCccCampaignProviderDispatch(
     ) {
       throw new Error("CCC campaign local Git snapshot does not match locked campaign custody");
     }
-    const workItems = await tx
-      .select({ id: schema.project.workflowWorkItems.id })
-      .from(schema.project.workflowWorkItems)
-      .where(and(
-        eq(schema.project.workflowWorkItems.projectId, context.projectId),
-        eq(schema.project.workflowWorkItems.id, workItemFence.workItemId),
-        eq(schema.project.workflowWorkItems.taskId, originTaskId),
-        eq(schema.project.workflowWorkItems.runId, workItemFence.runId),
-        eq(schema.project.workflowWorkItems.attempt, workItemFence.attempt),
-        eq(schema.project.workflowWorkItems.state, "running"),
-        eq(schema.project.workflowWorkItems.leaseOwner, workItemLeaseOwner),
-        sql`${schema.project.workflowWorkItems.leaseExpiresAt} IS NOT NULL
-          AND ${schema.project.workflowWorkItems.leaseExpiresAt}::timestamptz > clock_timestamp()`,
-      ))
-      .limit(1)
-      .for("update");
-    if (workItems.length !== 1) {
-      throw new Error(`CCC campaign workflow work-item fence refused ${workItemFence.workItemId}`);
-    }
     const action = selectCccCampaignDeclaredLiveExecutionAction(
       context.protectedActions,
       context.protectedActionIds,
@@ -214,6 +195,37 @@ export async function atomicReserveCccCampaignProviderDispatch(
         workItemFence,
       },
     });
+    if (reserved.state === "reserved") {
+      /*
+       * Only a brand-new attempt reservation needs a live, currently-running
+       * workflow work-item lease: reserveCccProviderAttempt's attemptKey is
+       * derived from workItemFence and it re-validates that exact fence via
+       * assertReservationReplay on every replay, so an already-reserved
+       * attempt (dispatched_unknown/proved_failed/committed) stays correctly
+       * fenced to its original caller even after the work item has left
+       * "running" (settled terminal, or a crash-recovery restart whose lease
+       * expired before the held closure could be rehydrated).
+       */
+      const workItems = await tx
+        .select({ id: schema.project.workflowWorkItems.id })
+        .from(schema.project.workflowWorkItems)
+        .where(and(
+          eq(schema.project.workflowWorkItems.projectId, context.projectId),
+          eq(schema.project.workflowWorkItems.id, workItemFence.workItemId),
+          eq(schema.project.workflowWorkItems.taskId, originTaskId),
+          eq(schema.project.workflowWorkItems.runId, workItemFence.runId),
+          eq(schema.project.workflowWorkItems.attempt, workItemFence.attempt),
+          eq(schema.project.workflowWorkItems.state, "running"),
+          eq(schema.project.workflowWorkItems.leaseOwner, workItemLeaseOwner),
+          sql`${schema.project.workflowWorkItems.leaseExpiresAt} IS NOT NULL
+            AND ${schema.project.workflowWorkItems.leaseExpiresAt}::timestamptz > clock_timestamp()`,
+        ))
+        .limit(1)
+        .for("update");
+      if (workItems.length !== 1) {
+        throw new Error(`CCC campaign workflow work-item fence refused ${workItemFence.workItemId}`);
+      }
+    }
     switch (reserved.state) {
       case "reserved":
         await assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
