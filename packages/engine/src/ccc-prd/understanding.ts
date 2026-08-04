@@ -5,7 +5,6 @@ import {
   type CccPrdAdmittedWriteRoot,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringReview,
-  type CccPrdConfidence,
   type CccPrdDiagnostic,
   type CccPrdExecutionBounds,
   type CccPrdMaterialCoverageItem,
