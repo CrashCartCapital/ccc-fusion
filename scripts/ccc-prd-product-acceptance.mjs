@@ -63,7 +63,7 @@ const expectedChecks = Object.freeze([
   "terminal-restart-recovery",
 ]);
 const commandTimeoutMs = 180_000;
-const productTimeoutMs = 120_000;
+const productTimeoutMs = Number(process.env.FUSION_PRODUCT_TIMEOUT_MS ?? 120_000);
 const shutdownTimeoutMs = 15_000;
 const proofCutpointMarkerName = "ccc-proof-cutpoint.marker.json";
 
