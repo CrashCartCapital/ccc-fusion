@@ -324,6 +324,90 @@ describe("withRateLimitRetry", () => {
     }
   });
 
+  // spec §4.2 R-F3, §7 T-9 (rate-limit-retry half): immediateFirstRetry
+  // defaults OFF because the utility has no transport concept and cannot
+  // itself know which call is gateway-routed — this is the corrected Rev-3
+  // ruling, NOT the earlier Rev-2 "default ON for gateway transports" text.
+  it("immediateFirstRetry defaults to OFF — first retry still waits the full exponential delay unless explicitly enabled", async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("RESOURCE_EXHAUSTED"))
+      .mockResolvedValueOnce("ok");
+
+    const delays: number[] = [];
+    vi.spyOn(Math, "random").mockReturnValue(0.5); // jitter = 0
+
+    const promise = withRateLimitRetry(fn, {
+      baseDelayMs: 30_000,
+      maxDelayMs: 120_000,
+      onRetry: (_attempt, delayMs) => delays.push(delayMs),
+    });
+
+    await vi.advanceTimersByTimeAsync(31_000);
+    const result = await promise;
+
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([30_000]); // full base delay, not a 0-2s immediate retry
+
+    vi.spyOn(Math, "random").mockRestore();
+  });
+
+  // spec §4.2 R-F3, §7 T-9 (rate-limit-retry half): with the option
+  // explicitly enabled by the caller (the located agy/gateway call site, once
+  // R-F10 resolves), the first retry after a RESOURCE_EXHAUSTED failure fires
+  // almost immediately instead of waiting the full base delay, and does not
+  // consume a maxRetries attempt — a second consecutive failure still gets
+  // the full 30s first ladder rung, not a shortened one.
+  it("with immediateFirstRetry explicitly enabled by the caller, a second consecutive RESOURCE_EXHAUSTED falls into the 30s/60s/120s ladder only after one immediate 0-2s jittered retry", async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("RESOURCE_EXHAUSTED"))
+      .mockRejectedValueOnce(new Error("RESOURCE_EXHAUSTED"))
+      .mockResolvedValueOnce("recovered");
+
+    const delays: number[] = [];
+    vi.spyOn(Math, "random").mockReturnValue(0.5); // jitter midpoint -> deterministic
+
+    const promise = withRateLimitRetry(fn, {
+      immediateFirstRetry: true,
+      baseDelayMs: 30_000,
+      maxDelayMs: 120_000,
+      onRetry: (_attempt, delayMs) => delays.push(delayMs),
+    });
+
+    // Immediate retry window: 0-2s jittered, mocked Math.random=0.5 -> 1000ms.
+    await vi.advanceTimersByTimeAsync(1_100);
+    // First real ladder rung after the immediate retry: base * 2^0 = 30s,
+    // not 60s — proves the immediate retry did not consume a maxRetries attempt.
+    await vi.advanceTimersByTimeAsync(31_000);
+
+    const result = await promise;
+
+    expect(result).toBe("recovered");
+    expect(fn).toHaveBeenCalledTimes(3); // initial + immediate retry + 1 ladder retry
+    expect(delays).toEqual([1_000, 30_000]);
+
+    vi.spyOn(Math, "random").mockRestore();
+  });
+
+  // Immediate retry must respect an already-aborted signal exactly like the
+  // exponential branch does, rather than sleeping and relying on sleep()'s
+  // own abort rejection (which would still throw, but after firing onRetry).
+  it("does not fire the immediate retry if the abort signal is already aborted", async () => {
+    const fn = vi.fn().mockRejectedValue(new Error("RESOURCE_EXHAUSTED"));
+    const onRetry = vi.fn();
+    const ac = new AbortController();
+    ac.abort(new Error("Already cancelled"));
+
+    await expect(
+      withRateLimitRetry(fn, { immediateFirstRetry: true, signal: ac.signal, onRetry }),
+    ).rejects.toThrow("RESOURCE_EXHAUSTED");
+
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
   it("cancels transient-auth retry sleep when abort signal fires", async () => {
     const authErr = new Error(
       '401 {"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}',

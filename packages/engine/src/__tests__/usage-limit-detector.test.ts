@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { isUsageLimitError, UsageLimitPauser, checkSessionError } from "../usage-limit-detector.js";
+import { classifyThrownError, RateLimitError } from "../engine-errors.js";
 
 // ── isUsageLimitError classification tests ───────────────────────────
 
@@ -70,6 +71,45 @@ describe("isUsageLimitError", () => {
   it("returns false for generic error messages", () => {
     expect(isUsageLimitError("Something went wrong")).toBe(false);
     expect(isUsageLimitError("Unexpected token in JSON")).toBe(false);
+  });
+
+  // T-9 (usage-limit-detector half, spec §4.2 R-F4 / §7): Gemini's
+  // RESOURCE_EXHAUSTED status name is a real provider quota-exhaustion
+  // signal missing from USAGE_LIMIT_PATTERNS. The message below deliberately
+  // contains no other matching substring (no "429", "quota", etc.) so this
+  // pins the literal string itself, not an incidental existing pattern.
+  it("RESOURCE_EXHAUSTED is classified as a usage-limit error", () => {
+    expect(isUsageLimitError("RESOURCE_EXHAUSTED")).toBe(true);
+    expect(isUsageLimitError("Gemini CLI error: RESOURCE_EXHAUSTED — please retry after backoff")).toBe(true);
+  });
+
+  // T-9c (N-F6, spec §4.2/§7): the RESOURCE_EXHAUSTED pattern addition reads
+  // bare in isUsageLimitError, so it changes classification repo-wide, not
+  // just for the agy/OmniRoute lane. This is the intended, disclosed outcome
+  // (RESOURCE_EXHAUSTED is the same quota-exhaustion class as the existing
+  // "quota"/"billing" patterns), pinned against the two mechanisms every
+  // repo-wide consumer actually routes through:
+  //  - UsageLimitPauser call sites (executor.ts:13462,15486; triage.ts:2013;
+  //    merger.ts:11025) all gate on `isUsageLimitError(errorMessage)` directly.
+  //  - retry-with-backoff.ts's non-retry gate (:272) is
+  //    `classified instanceof RateLimitError || isUsageLimitError(classified.message)`;
+  //    classifyThrownError (engine-errors.ts:228) reclassifies any
+  //    isUsageLimitError-true message into a RateLimitError, so proving that
+  //    reclassification proves the exact condition retry-with-backoff checks.
+  it("RESOURCE_EXHAUSTED is classified as a usage-limit error and is therefore eligible for UsageLimitPauser parking and excluded from retry-with-backoff.ts's local retry path, exactly like an existing 'quota' message", () => {
+    // Deliberately free of any other matching substring (no "429", "quota",
+    // "credit", "billing", "rate limit", etc.) — an earlier draft of this
+    // test embedded "quota window exceeded" here and passed for the wrong
+    // reason (the pre-existing /quota/i pattern), which this comment flags
+    // so the mistake isn't repeated.
+    const resourceExhausted = "Gemini CLI error: RESOURCE_EXHAUSTED — please retry after backoff";
+    const existingQuotaMessage = "quota exceeded for this billing period";
+
+    expect(isUsageLimitError(resourceExhausted)).toBe(true);
+    expect(isUsageLimitError(resourceExhausted)).toBe(isUsageLimitError(existingQuotaMessage));
+
+    const classified = classifyThrownError(new Error(resourceExhausted));
+    expect(classified).toBeInstanceOf(RateLimitError);
   });
 });
 
