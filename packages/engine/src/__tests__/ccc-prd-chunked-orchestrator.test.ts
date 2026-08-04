@@ -7,6 +7,7 @@ import {
   CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION,
   type CustomProvider,
 } from "@fusion/core";
+import { buildCccPrdChunkPrompt } from "../ccc-prd/chunk-authoring-adapter.js";
 import { understandCccPrdPacket } from "../ccc-prd/understanding.js";
 import type { CccPrdNativeAuthoringTransport } from "../ccc-prd/native-authoring-adapter.js";
 
@@ -69,6 +70,29 @@ function fragment(overrides: Record<string, unknown>): Record<string, unknown> {
     ...overrides,
   };
 }
+
+describe("buildCccPrdChunkPrompt", () => {
+  it("renders the mandatory fragment schema in the exact field contract", () => {
+    const prompt = buildCccPrdChunkPrompt({
+      mode: "understanding",
+      packetHash: "packet-hash",
+      sourceVersion: "source-version",
+      chunkPlanHash: "chunk-plan-hash",
+      chunkId: "doc.md#0",
+      chunkOrdinal: 0,
+      chunkCount: 1,
+      packetHeader: [],
+      sourcePath: "doc.md",
+      sliceByteStart: 0,
+      sliceByteEnd: 0,
+      sliceSha256: "slice-hash",
+      materialItems: [],
+      slice: "",
+    });
+
+    expect(prompt).toContain(`  \"schema\": \"${CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION}\",`);
+  });
+});
 
 describe("understandCccPrdPacket -- chunked lane end to end", () => {
   it("runs a real two-chunk plan through a fake transport and assembles a valid review", async () => {
