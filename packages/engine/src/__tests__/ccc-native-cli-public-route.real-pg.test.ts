@@ -492,7 +492,8 @@ pgDescribe("CCC native CLI public workflow route (real PostgreSQL)", () => {
           {},
           {
             leaseOwner: `public-cli-first-${suffix}`,
-            leaseDurationMs: 150,
+            // Must outlast the real dispatch chain's fresh-lease liveness check (not just PTY spawn); renewal below is deliberately a no-op so it still expires once disposed.
+            leaseDurationMs: 5_000,
             kinds: ["task"],
           },
         );
