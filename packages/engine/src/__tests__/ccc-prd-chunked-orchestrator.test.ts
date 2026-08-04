@@ -112,7 +112,7 @@ describe("buildCccPrdChunkPrompt", () => {
     });
 
     expect(prompt).toContain(
-      "Per material item, task disposition and unresolved-decision disposition are mutually exclusive: never include the same materialItemId in a task row and an unresolvedDecisions row; if an item is unresolved, omit it from task rows.",
+      "Use one coverage disposition per material item: supporting requirement, proof, and workflow rows may share a materialItemId, but never put the same materialItemId in any task row (including an explicit deferral/out-of-scope row) and any unresolvedDecisions row; if unresolved, omit it from tasks.",
     );
   });
 });
