@@ -95,6 +95,7 @@ export function buildCccPrdChunkPrompt(
     "Every task must return non-empty ownedPaths and allowedWriteRoots arrays using canonical target-relative paths. Each path must occur literally in that task's exact source quote.",
     "Disposition every material item listed in this chunk. Map it to a task when implemented; otherwise cite an explicit source deferral/out-of-scope statement or return a source-bound unresolved question. Never guess a missing decision.",
     "List the chunk-plan item IDs each row claims to disposition in that row's materialItemIds field.",
+    "Per material item, task disposition and unresolved-decision disposition are mutually exclusive: never include the same materialItemId in a task row and an unresolvedDecisions row; if an item is unresolved, omit it from task rows.",
     "Return exactly these arrays: authorityRoles, requirements, proofs, tasks, edges, workflows, documents, artifacts, importIntents, protectedActions, unresolvedDecisions, ambiguities, exceptions.",
     "The exact field contract, with every key name mandatory (enumerated values are written with |; all other values are strings unless shown as numbers; every source-bound row carries its citations under \"sourceRefs\"):",
     "{",

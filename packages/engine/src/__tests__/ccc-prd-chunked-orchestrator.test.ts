@@ -92,6 +92,29 @@ describe("buildCccPrdChunkPrompt", () => {
 
     expect(prompt).toContain(`  \"schema\": \"${CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION}\",`);
   });
+
+  it("requires per-material task and unresolved-decision dispositions to be mutually exclusive", () => {
+    const prompt = buildCccPrdChunkPrompt({
+      mode: "understanding",
+      packetHash: "packet-hash",
+      sourceVersion: "source-version",
+      chunkPlanHash: "chunk-plan-hash",
+      chunkId: "doc.md#0",
+      chunkOrdinal: 0,
+      chunkCount: 1,
+      packetHeader: [],
+      sourcePath: "doc.md",
+      sliceByteStart: 0,
+      sliceByteEnd: 0,
+      sliceSha256: "slice-hash",
+      materialItems: [],
+      slice: "",
+    });
+
+    expect(prompt).toContain(
+      "Per material item, task disposition and unresolved-decision disposition are mutually exclusive: never include the same materialItemId in a task row and an unresolvedDecisions row; if an item is unresolved, omit it from task rows.",
+    );
+  });
 });
 
 describe("understandCccPrdPacket -- chunked lane end to end", () => {
