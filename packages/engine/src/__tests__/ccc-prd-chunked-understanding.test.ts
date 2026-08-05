@@ -381,11 +381,19 @@ describe("runCccPrdChunkAttempt", () => {
 
 describe("checkCccPrdChunkReviewBudget", () => {
   it("test 32: running review-row total refuses mid-run at the offending chunk", () => {
-    expect(() => checkCccPrdChunkReviewBudget({
-      chunkOrdinal: 3,
-      runningReviewItemCount: 5,
-      maxReviewItems: 4,
-    })).toThrow(CccPrdCustodyError);
+    let thrown: unknown;
+    try {
+      checkCccPrdChunkReviewBudget({
+        chunkOrdinal: 3,
+        runningReviewItemCount: 5,
+        maxReviewItems: 4,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(CccPrdCustodyError);
+    expect((thrown as CccPrdCustodyError).code).toBe("CCC_PRD_CHUNK_REVIEW_BUDGET_EXCEEDED");
 
     expect(() => checkCccPrdChunkReviewBudget({
       chunkOrdinal: 3,
