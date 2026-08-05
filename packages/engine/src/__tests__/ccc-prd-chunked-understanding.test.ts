@@ -41,6 +41,25 @@ function fixture() {
 }
 
 describe("verifyCccPrdChunkFragment", () => {
+  it("refuses a malformed fragment shape with CCC_PRD_CHUNK_FRAGMENT_INVALID", () => {
+    const { fullSourceBytes, sliceBounds } = fixture();
+
+    const outcome = verifyCccPrdChunkFragment({
+      fragment: {},
+      sourcePath: SOURCE_PATH,
+      fullSourceBytes,
+      sliceBounds,
+      assignedMaterialItemIds: [],
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe("CCC_PRD_CHUNK_FRAGMENT_INVALID");
+      expect(outcome.violations.length).toBeGreaterThan(0);
+      expect(outcome.retryEligible).toBe(true);
+    }
+  });
+
   it("test 23: a fragment emitting only requirements fails chunk coverage (requirements alone never disposition)", () => {
     const { fullSourceBytes, sliceBounds } = fixture();
     const fragment = baseFragment({
