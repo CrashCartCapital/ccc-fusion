@@ -1,6 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { CustomProvider } from "@fusion/core";
+import { understandCccPrdPacket } from "@fusion/engine";
+import type { CccPrdNativeAuthoringTransport } from "@fusion/engine";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
 import {
   MAX_OPERATOR_CONTEXT_BYTES,
@@ -54,6 +58,25 @@ async function runPrdJson(
   commandContext?: Parameters<typeof runPrdCommand>[3],
 ): Promise<number> {
   return runPrdCommand([...args, "--json"], io, dependencies, commandContext);
+}
+
+/** Recursive content-hash snapshot of a packet root, used to prove a run left zero residue. */
+function snapshotPacketRoot(root: string): Record<string, string> {
+  const files: Record<string, string> = {};
+  const walk = (dir: string, prefix: string) => {
+    for (const name of readdirSync(dir).sort()) {
+      const absolute = join(dir, name);
+      const relative = prefix ? `${prefix}/${name}` : name;
+      const stat = statSync(absolute);
+      if (stat.isDirectory()) {
+        walk(absolute, relative);
+      } else {
+        files[relative] = createHash("sha256").update(readFileSync(absolute)).digest("hex");
+      }
+    }
+  };
+  walk(root, "");
+  return files;
 }
 
 describe("prd command exit contract", () => {
@@ -402,6 +425,131 @@ describe("prd command exit contract", () => {
       reviewPath,
     });
     expect(JSON.parse(output[0]!).executable).toBe(false);
+  });
+
+  it("test 44: a real chunked-lane mid-run failure through the CLI caller leaves the packet root byte-identical", async () => {
+    const packet = createPacketRoot();
+    const content = [
+      "# Alpha",
+      "- REQ-1: alpha requirement text.",
+      "",
+      "# Beta",
+      "- REQ-2: beta requirement text.",
+    ].join("\n") + "\n";
+    // Overwrite the fixture's single-chunk content with a two-heading packet
+    // so the chunk planner (chunk-planner.ts) produces exactly two chunks --
+    // one per top-level heading -- and a second-chunk failure is reachable.
+    writeFileSync(join(packet.root, "packet.md"), content);
+    writeFileSync(packet.manifest, JSON.stringify({
+      schema: "ccc-prd.packet.v1",
+      source_version: "chunked-caller-residue-test",
+      entries: [{
+        relative_path: "packet.md",
+        role: "root",
+        authoritative: true,
+        sha256: createHash("sha256").update(content).digest("hex"),
+      }],
+    }));
+
+    const alphaFragment = {
+      schema: "ccc-prd.authoring-proposal-fragment.v1",
+      authorityRoles: [],
+      requirements: [{
+        id: "REQ-1",
+        statement: "alpha requirement",
+        acceptance: "alpha acceptance",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: "packet.md", exactQuote: "- REQ-1: alpha requirement text." }],
+      }],
+      proofs: [],
+      tasks: [{
+        id: "TASK-ALPHA",
+        title: "Ship alpha",
+        description: "Implement alpha",
+        accountableProducer: "team-a",
+        requirementIds: ["REQ-1"],
+        dependencyTaskIds: [],
+        proofIds: [],
+        workflowId: "",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: [],
+        ownedPaths: ["src/alpha.ts"],
+        allowedWriteRoots: ["src/alpha.ts"],
+        sourceRefs: [{ path: "packet.md", exactQuote: "# Alpha\n- REQ-1: alpha requirement text." }],
+      }],
+      edges: [],
+      workflows: [],
+      documents: [],
+      artifacts: [],
+      importIntents: [],
+      protectedActions: [],
+      unresolvedDecisions: [],
+      ambiguities: [],
+      exceptions: [],
+    };
+
+    let transportCallCount = 0;
+    const chunkTransport: CccPrdNativeAuthoringTransport = async ({ provider, model }) => {
+      transportCallCount += 1;
+      if (transportCallCount === 1) {
+        return { text: JSON.stringify(alphaFragment), provider, model };
+      }
+      throw new Error("simulated transport failure: chunk 2 network drop");
+    };
+    const verbatimCapableProviders: CustomProvider[] = [{
+      id: "ccc-loopback-chunked",
+      name: "Loopback Chunked",
+      apiType: "openai-compatible",
+      baseUrl: "http://127.0.0.1:7999/v1",
+      apiKey: "synthetic-never-read",
+      models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: true }],
+    }];
+
+    const reviewPath = join(packet.root, "understanding-review.json");
+    const output: string[] = [];
+
+    const before = snapshotPacketRoot(packet.root);
+    const exit = await runPrdCommand(
+      [
+        "understand", packet.root, packet.manifest, reviewPath,
+        "--provider", "loopback-chunked",
+        "--model", "fixture-model",
+        "--max-duration-ms", "5000",
+        "--max-prompt-bytes", "1000000",
+        "--max-response-bytes", "262144",
+        "--max-review-items", "8",
+        "--lane", "chunked",
+      ],
+      { write: (line) => output.push(line) },
+      {
+        bootstrapProofAdmission: async () => ({}) as never,
+        createNativeCccPrdAuthoringAdapter: () => ({
+          id: "unused",
+          generateCandidate: async () => { throw new Error("single-shot path must not run"); },
+        }) as never,
+        // The CALLER path under test (prd.ts's runGeneratedUnderstanding) --
+        // this wrapper runs the REAL engine chunk orchestrator (not a
+        // mocked refusal), only supplying the test-only transport seam
+        // (chunk-orchestrator.ts's `transport` option) so the second chunk
+        // fails mid-flight through the real pipeline.
+        understandCccPrdPacket: (input) => understandCccPrdPacket({
+          ...input,
+          chunkTransport,
+          customProviders: verbatimCapableProviders,
+        }),
+      } as never,
+    );
+    const after = snapshotPacketRoot(packet.root);
+
+    expect(transportCallCount, output.join("\n")).toBe(2);
+    expect(exit, output.join("\n")).toBe(1);
+    expect(JSON.parse(output[0]!).kind).toBe("refusal");
+    expect(existsSync(reviewPath)).toBe(false);
+    expect(after).toEqual(before);
   });
 
   describe("fn prd understand -- optionalUnderstandingFlags (design §6)", () => {
