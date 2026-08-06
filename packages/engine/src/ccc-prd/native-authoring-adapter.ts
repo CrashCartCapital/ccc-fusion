@@ -254,7 +254,10 @@ export const fusionModelRuntimeAuthoringTransport: CccPrdNativeAuthoringTranspor
       {
         signal: controller.signal,
         temperature: 0,
-        maxTokens: Math.max(1, Math.min(model.maxTokens, request.maxResponseBytes)),
+        // maxTokens is a TOKEN budget; it must come from the registered
+        // model's own token limit, never from request.maxResponseBytes
+        // (a BYTE count -- used only by the response-size guards below).
+        maxTokens: Math.max(1, model.maxTokens),
         timeoutMs: request.maxDurationMs,
         maxRetries: 0,
       },
