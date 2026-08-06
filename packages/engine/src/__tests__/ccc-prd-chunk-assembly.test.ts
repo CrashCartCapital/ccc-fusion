@@ -348,7 +348,9 @@ describe("assembleCccPrdChunkedUnderstanding", () => {
   });
 
   it("test 40: assembled conflicts non-empty refuses", () => {
-    const text = ["# Deferred Alpha", "This work is deferred to a later phase."].join("\n") + "\n";
+    // The heading has to DECLARE deferral outright, not merely mention it: only
+    // a pure disposition heading disposes its section (material-coverage.ts).
+    const text = ["# Deferred Work", "This work is deferred to a later phase."].join("\n") + "\n";
     const bytes = Buffer.from(text, "utf8");
 
     const fragment: CccPrdResolvedChunkFragment = {

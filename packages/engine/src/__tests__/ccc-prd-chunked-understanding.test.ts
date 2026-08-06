@@ -183,8 +183,10 @@ describe("verifyCccPrdChunkFragment", () => {
   });
 
   it("test 26: an assigned item landing in conflicts refuses at chunk scope", () => {
+    // The heading has to DECLARE deferral outright, not merely mention it: only
+    // a pure disposition heading disposes its section (material-coverage.ts).
     const text = [
-      "# Deferred Alpha",
+      "# Deferred Work",
       "This work is deferred to a later phase.",
     ].join("\n") + "\n";
     const fullSourceBytes = Buffer.from(text, "utf8");
@@ -211,7 +213,7 @@ describe("verifyCccPrdChunkFragment", () => {
         protectedActionIds: [],
         ownedPaths: ["src/x.ts"],
         allowedWriteRoots: ["src/x.ts"],
-        sourceRefs: [{ path: SOURCE_PATH, exactQuote: "# Deferred Alpha\nThis work is deferred to a later phase." }],
+        sourceRefs: [{ path: SOURCE_PATH, exactQuote: "# Deferred Work\nThis work is deferred to a later phase." }],
       }],
     });
 
@@ -226,6 +228,40 @@ describe("verifyCccPrdChunkFragment", () => {
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) {
       expect(outcome.code).toBe("CCC_PRD_CHUNK_MATERIAL_CONFLICTED");
+    }
+  });
+
+  it("test 26b: names the offending material item by heading, not just its hash", () => {
+    // This violation is fed back to the model as a retry instruction, so it has
+    // to name something findable in the source. "MAT-<sha256 prefix>" is not.
+    const text = [
+      "# Alpha",
+      "- REQ-1: alpha must ship a health endpoint.",
+    ].join("\n") + "\n";
+    const fullSourceBytes = Buffer.from(text, "utf8");
+    const sliceBounds = { byteStart: 0, byteEnd: fullSourceBytes.byteLength };
+    const sectionItemId = analyzeCccPrdMaterialCoverage({
+      sourceBytes: new Map([[SOURCE_PATH, fullSourceBytes]]),
+      requirements: [],
+      tasks: [],
+      unresolvedDecisions: [],
+    }).inventory.find((item) => item.materialKind === "section")!.id;
+
+    const outcome = verifyCccPrdChunkFragment({
+      fragment: baseFragment({}),
+      sourcePath: SOURCE_PATH,
+      fullSourceBytes,
+      sliceBounds,
+      assignedMaterialItemIds: [sectionItemId],
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe("CCC_PRD_CHUNK_MATERIAL_UNDISPOSITIONED");
+      expect(outcome.violations).toHaveLength(1);
+      expect(outcome.violations[0]).toContain("Alpha");
+      // The stable id stays as a secondary identifier for machine correlation.
+      expect(outcome.violations[0]).toContain(sectionItemId);
     }
   });
 

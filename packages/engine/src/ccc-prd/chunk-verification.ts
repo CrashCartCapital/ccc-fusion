@@ -20,6 +20,7 @@ import {
 } from "./authoring.js";
 import { CccPrdCustodyError } from "./custody.js";
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
+import { stripOutermostJsonFence } from "./native-authoring-adapter.js";
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -197,8 +198,23 @@ function resolveChunkFragmentSpans(
 
 export type CccPrdChunkCoverageViolation = {
   materialItemId: string;
+  /**
+   * The heading (or requirement id) the item came from. `materialItemId` is a
+   * truncated sha256 and means nothing to the model this violation is handed
+   * back to as a retry instruction, so carry something findable in the source.
+   */
+  title: string;
+  headingPath: string[];
   reason: "undispositioned" | "conflicted";
 };
+
+/** Section items already end their headingPath with their own title; requirement items do not. */
+function describeCccPrdMaterialItem(violation: CccPrdChunkCoverageViolation): string {
+  const path = violation.headingPath.at(-1) === violation.title
+    ? violation.headingPath
+    : [...violation.headingPath, violation.title];
+  return path.length > 0 ? path.join(" > ") : violation.title;
+}
 
 /**
  * §3 step 5: runs the REAL scorer at chunk scope. A requirement alone never
@@ -223,12 +239,19 @@ export function checkCccPrdChunkCoverage(input: {
   });
   const covered = new Set(analysis.coverage.map((item) => item.id));
   const conflicted = new Set(analysis.conflicts.map((item) => item.id));
+  const byId = new Map(analysis.inventory.map((item) => [item.id, item]));
   const violations: CccPrdChunkCoverageViolation[] = [];
   for (const id of input.assignedMaterialItemIds) {
+    const item = byId.get(id);
+    const named = {
+      materialItemId: id,
+      title: item?.title ?? "(unknown material item)",
+      headingPath: item ? [...item.headingPath] : [],
+    };
     if (conflicted.has(id)) {
-      violations.push({ materialItemId: id, reason: "conflicted" });
+      violations.push({ ...named, reason: "conflicted" });
     } else if (!covered.has(id)) {
-      violations.push({ materialItemId: id, reason: "undispositioned" });
+      violations.push({ ...named, reason: "undispositioned" });
     }
   }
   return violations;
@@ -313,7 +336,8 @@ export function verifyCccPrdChunkFragment(
       ok: false,
       code: hasConflict ? "CCC_PRD_CHUNK_MATERIAL_CONFLICTED" : "CCC_PRD_CHUNK_MATERIAL_UNDISPOSITIONED",
       violations: coverageViolations.map((violation) => (
-        `material item ${violation.materialItemId} is ${violation.reason} at chunk scope`
+        `material item "${describeCccPrdMaterialItem(violation)}" (${violation.materialItemId})`
+        + ` is ${violation.reason} at chunk scope`
       )),
       retryEligible: true,
     };
@@ -379,7 +403,7 @@ export async function runCccPrdChunkAttempt(
 
     let parsedFragment: unknown;
     try {
-      parsedFragment = JSON.parse(response.text);
+      parsedFragment = JSON.parse(stripOutermostJsonFence(response.text));
     } catch {
       priorViolations = ["fragment response is not valid JSON"];
       continue;
