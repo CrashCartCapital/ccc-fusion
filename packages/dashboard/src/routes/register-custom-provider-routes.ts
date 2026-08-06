@@ -95,6 +95,35 @@ function assertBaseUrl(value: unknown): string {
   return baseUrl;
 }
 
+/*
+FNXC:ProviderHeaders 2026-08-06-00:00:
+Durability guard. parseCreateBody/parseUpdateBody rebuild the stored provider row from a field
+allowlist, so any field they do not name is ERASED on the next dashboard-side edit -- silently, with
+a 200 response. A `headers` map configured by hand in ~/.fusion/settings.json would survive until
+someone renamed the provider in the UI, at which point the header would vanish and (in the
+motivating case) a semantic response cache would quietly switch back on mid-campaign, replaying
+stale answers into a measurement run. Accept the field in BOTH parsers so an unrelated edit cannot
+drop it.
+*/
+function validateHeaders(value: unknown): Record<string, string> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw badRequest("headers must be an object");
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  for (const [name, headerValue] of entries) {
+    if (typeof headerValue !== "string") {
+      throw badRequest(`headers["${name}"] must be a string`);
+    }
+  }
+
+  return Object.fromEntries(entries as Array<[string, string]>);
+}
+
 /**
  * Validates and normalizes a models array from a request body.
  * Returns undefined if models is omitted, or an array of { id, name } objects.
@@ -159,6 +188,13 @@ function parseCreateBody(body: unknown): Omit<CustomProvider, "id"> {
       throw badRequest("anthropicPromptCaching must be a boolean");
     }
     provider.anthropicPromptCaching = row.anthropicPromptCaching;
+  }
+
+  // FNXC:ProviderHeaders 2026-08-06-00:00: see validateHeaders — omitting this
+  // would erase a configured header map on the next dashboard edit.
+  const headers = validateHeaders(row.headers);
+  if (headers) {
+    provider.headers = headers;
   }
 
   const models = validateModels(row.models);
@@ -590,6 +626,11 @@ function parseUpdateBody(body: unknown): Partial<Omit<CustomProvider, "id">> {
       throw badRequest("anthropicPromptCaching must be a boolean");
     }
     updates.anthropicPromptCaching = row.anthropicPromptCaching;
+  }
+  // FNXC:ProviderHeaders 2026-08-06-00:00: absent `headers` means "leave the stored map alone"
+  // (partial update); an explicit `{}` clears it. Without this branch every UI edit stripped it.
+  if (row.headers !== undefined) {
+    updates.headers = validateHeaders(row.headers);
   }
   if (row.models !== undefined) {
     updates.models = validateModels(row.models);

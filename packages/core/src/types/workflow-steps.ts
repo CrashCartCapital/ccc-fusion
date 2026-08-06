@@ -187,6 +187,23 @@ export interface CustomProvider {
    */
   anthropicPromptCaching?: boolean;
   /**
+   * FNXC:ProviderHeaders 2026-08-06-00:00:
+   * Extra HTTP headers sent on every request to this provider, forwarded verbatim to pi-ai's
+   * provider composer (which already accepts `headers?: ProviderHeaders`). Declared here rather
+   * than smuggled through the bare `JSON.parse(...) as CustomProvider` cast in
+   * `custom-providers.ts`, so the field is type-visible at every boundary that rebuilds a provider
+   * from a field allowlist -- `toProviderConfig` (custom-provider-registry.ts) and the dashboard's
+   * create/update parsers both dropped it silently before it was typed.
+   *
+   * Motivating use: gateway control headers that cannot be expressed in the request body, e.g.
+   * `X-OmniRoute-No-Cache: true` to defeat a semantic response cache that keys on
+   * `temperature: 0`. Values are pass-through; nothing here interprets them.
+   *
+   * Do NOT put credentials here -- use `apiKey`, which is masked in dashboard responses and
+   * excluded from logs. Headers are not treated as secret.
+   */
+  headers?: Record<string, string>;
+  /**
    * Per-model generation limits. When absent, the model registry falls back to
    * its historical defaults (maxTokens 16384, contextWindow 128000); declare
    * them when the backend's real window differs, or long structured responses
