@@ -78,6 +78,25 @@ export class CccPrdRouteNotVerbatimCapableError extends Error {
 }
 
 /*
+Real acceptance run against glm-5.2 (2026-08-05): the model wrapped its whole
+JSON answer in a ```json code fence and JSON.parse threw on the leading
+backtick, hard-failing CCC_PRD_AUTHORING_FAILED. Wrapping JSON in a fence is
+common LLM behavior. Strip ONLY when the entire trimmed response is a single
+outermost fence -- opener (``` optionally + language tag, then a newline) at
+the start and a bare closing ``` at the end -- and only remove those two
+delimiters. This must never become a global backtick/fence removal: a quote
+inside a JSON string value may legitimately contain a fence, and mangling it
+would corrupt the byte-exact quote custody the product exists to guarantee.
+*/
+const OUTERMOST_FENCE_WRAPPER = /^```[^\n`]*\n([\s\S]*)\n```$/u;
+
+export function stripOutermostJsonFence(text: string): string {
+  const trimmed = text.trim();
+  const match = OUTERMOST_FENCE_WRAPPER.exec(trimmed);
+  return match ? match[1]! : text;
+}
+
+/*
 FNXC:CCCAuthoringEgress 2026-08-01-17:40:
 Authoring and understanding serialize every admitted source verbatim into one
 prompt, so the transport target is decided before any corpus bytes exist. Resolve
@@ -334,7 +353,7 @@ export function createNativeCccPrdAuthoringAdapter(
             `CCC PRD authoring response is ${responseBytes} bytes; maximum is ${options.maxResponseBytes}`,
           );
         }
-        const parsed = JSON.parse(response.text) as unknown;
+        const parsed = JSON.parse(stripOutermostJsonFence(response.text)) as unknown;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
           throw new Error("CCC PRD authoring response is not one JSON object");
         }

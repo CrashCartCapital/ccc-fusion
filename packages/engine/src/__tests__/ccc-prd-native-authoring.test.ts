@@ -539,6 +539,29 @@ describe("CCC PRD native authoring adapter", () => {
     });
   });
 
+  /*
+  Real acceptance run against glm-5.2 (2026-08-05): the model wrapped its JSON
+  answer in a ```json code fence and JSON.parse threw on the leading
+  backtick, hard-failing CCC_PRD_AUTHORING_FAILED. Wrapping JSON in a fence is
+  one of the most common LLM behaviors; the transport parse must tolerate an
+  outermost wrapper fence without weakening quote integrity.
+  */
+  it("tolerates a response wholly wrapped in a single code fence", async () => {
+    const fenced = "```json\n" + canonicalCccPrdJson(proposal) + "\n```";
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: fenced,
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result.kind, JSON.stringify(result)).toBe("candidate");
+  });
+
   it("refuses malformed native response text instead of accepting prose", async () => {
     const result = await authorCccPrdPacket({
       rootDir: fixtureRoot,
