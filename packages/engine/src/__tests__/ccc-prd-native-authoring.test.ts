@@ -697,6 +697,29 @@ describe("CCC PRD native authoring adapter", () => {
     expect(prompt).toContain("complete sentence");
   });
 
+  /*
+  Defense in depth alongside the transport-side outermost-fence strip: the
+  prompt already said "no Markdown or commentary", and glm-5.2 still wrapped
+  its answer in a ```json fence anyway, so instruct AND tolerate.
+  */
+  it("instructs the model not to wrap its JSON answer in a code fence", async () => {
+    const generate = vi.fn<CccPrdNativeAuthoringTransport>(async (request) => ({
+      text: canonicalCccPrdJson(proposal),
+      provider: request.provider,
+      model: request.model,
+    }));
+
+    await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(generate),
+      constraints,
+    });
+
+    const prompt = generate.mock.calls[0]![0].prompt;
+    expect(prompt).toContain("code fence");
+  });
+
   it("refuses provider or model identity drift from the native transport", async () => {
     const result = await authorCccPrdPacket({
       rootDir: fixtureRoot,

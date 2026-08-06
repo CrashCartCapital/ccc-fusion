@@ -170,6 +170,7 @@ function buildPrompt(
       ];
   return [
     "Generate exactly one JSON object and no Markdown or commentary.",
+    "Return raw JSON only -- do not wrap the object in a ```json or ``` code fence and do not add any text before or after the object.",
     `The object schema must be ${CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION}.`,
     "Preserve the source packet. Do not execute actions or invent source text.",
     ...modeInstructions,
