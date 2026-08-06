@@ -18,7 +18,7 @@ import {
   SOURCE_BOUND_COLLECTIONS,
   validateTaskCustodyProvenance,
 } from "./authoring.js";
-import { CccPrdCustodyError } from "./custody.js";
+import { CccPrdCustodyError, describeCccPrdQuoteForRejection } from "./custody.js";
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
 import { stripOutermostJsonFence } from "./native-authoring-adapter.js";
 
@@ -114,7 +114,10 @@ export function describeCccPrdChunkQuoteOutsideSliceViolations(
     for (const row of rows) {
       for (const reference of row.sourceRefs) {
         if (sliceBytes.indexOf(Buffer.from(reference.exactQuote, "utf8")) < 0) {
-          violations.push(`${key} ${row.id} quote is absent from its chunk slice`);
+          violations.push(
+            `${key} ${row.id} quote is absent from its chunk slice: `
+            + describeCccPrdQuoteForRejection(reference.exactQuote),
+          );
         }
       }
     }

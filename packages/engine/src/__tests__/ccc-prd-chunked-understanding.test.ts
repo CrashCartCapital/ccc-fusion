@@ -299,6 +299,94 @@ describe("verifyCccPrdChunkFragment", () => {
     }
   });
 
+  /*
+  The retry loop feeds these violation strings back into the next attempt's
+  prompt. A message that names only the row id tells the model which row
+  failed but never which string it got wrong, so every attempt carries
+  identical, information-free feedback. The offending quote must be in the
+  message.
+  */
+  it("test 27b: names the offending quote in the outside-slice violation", () => {
+    const text = ["# Alpha", "First slice text.", "# Beta", "Second slice text."].join("\n") + "\n";
+    const fullSourceBytes = Buffer.from(text, "utf8");
+    const firstSliceEnd = Buffer.byteLength("# Alpha\nFirst slice text.\n");
+    const sliceBounds = { byteStart: 0, byteEnd: firstSliceEnd };
+    const offendingQuote = "Second slice text.";
+
+    const fragment = baseFragment({
+      requirements: [{
+        id: "REQ-1",
+        statement: "x",
+        acceptance: "x",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: SOURCE_PATH, exactQuote: offendingQuote }],
+      }],
+    });
+
+    const outcome = verifyCccPrdChunkFragment({
+      fragment,
+      sourcePath: SOURCE_PATH,
+      fullSourceBytes,
+      sliceBounds,
+      assignedMaterialItemIds: [],
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.violations).toHaveLength(1);
+      // JSON.stringify so escapes and invisible characters survive the message.
+      expect(outcome.violations[0]).toContain(JSON.stringify(offendingQuote));
+      expect(outcome.violations[0]).toContain(
+        `${Buffer.byteLength(offendingQuote, "utf8")} bytes`,
+      );
+    }
+  });
+
+  /*
+  Violations are concatenated into the retry prompt, which has a hard
+  maxPromptBytes ceiling that throws when exceeded. A long quote must be
+  truncated in the message while still reporting its untruncated byte length.
+  */
+  it("test 27c: truncates a long offending quote but reports its full byte length", () => {
+    const longQuote = "Z".repeat(500);
+    const text = ["# Alpha", "First slice text.", "# Beta", longQuote].join("\n") + "\n";
+    const fullSourceBytes = Buffer.from(text, "utf8");
+    const firstSliceEnd = Buffer.byteLength("# Alpha\nFirst slice text.\n");
+    const sliceBounds = { byteStart: 0, byteEnd: firstSliceEnd };
+
+    const fragment = baseFragment({
+      requirements: [{
+        id: "REQ-1",
+        statement: "x",
+        acceptance: "x",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: SOURCE_PATH, exactQuote: longQuote }],
+      }],
+    });
+
+    const outcome = verifyCccPrdChunkFragment({
+      fragment,
+      sourcePath: SOURCE_PATH,
+      fullSourceBytes,
+      sliceBounds,
+      assignedMaterialItemIds: [],
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      const [violation] = outcome.violations;
+      expect(violation).toContain("Z".repeat(200));
+      expect(violation).not.toContain("Z".repeat(201));
+      expect(violation).toContain("500 bytes");
+    }
+  });
+
   it("test 28: refuses a fragment citing another source path", () => {
     const { fullSourceBytes, sliceBounds } = fixture();
     const fragment = baseFragment({

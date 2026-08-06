@@ -42,6 +42,7 @@ import {
 } from "../ccc-campaign-proof-admission.js";
 import {
   CccPrdCustodyError,
+  describeCccPrdQuoteForRejection,
   readCccPrdPacketCustody,
   sortCccPrdById,
 } from "./custody.js";
@@ -749,7 +750,8 @@ function resolveSourceRefs(
     if (byteStart < 0) {
       throw new CccPrdCustodyError(
         "CCC_PRD_SOURCE_QUOTE_MISSING",
-        `authoring proposal quote is absent for ${entityId} in ${reference.path}`,
+        `authoring proposal quote is absent for ${entityId} in ${reference.path}: `
+        + describeCccPrdQuoteForRejection(reference.exactQuote),
       );
     }
     if (source.indexOf(quote, byteStart + 1) >= 0) {

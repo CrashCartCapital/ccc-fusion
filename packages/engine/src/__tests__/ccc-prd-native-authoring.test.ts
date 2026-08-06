@@ -494,6 +494,40 @@ describe("CCC PRD native authoring adapter", () => {
     });
   });
 
+  /*
+  Single-shot counterpart to the chunk lane's outside-slice diagnostic: the
+  custody error message is what a human -- and, via the chunked lane's
+  violations: [error.message] path, the retry prompt -- actually sees, so it
+  must name the quote that was not found, not just the entity id.
+  */
+  it("names the offending quote when a proposal quote is absent from its source", async () => {
+    const missingQuote = "this sentence never appears anywhere in the reviewed decisions source";
+    const broken = JSON.parse(JSON.stringify(proposal)) as CccPrdAuthoringProposal;
+    broken.requirements[0]!.sourceRefs = [{
+      path: broken.requirements[0]!.sourceRefs[0]!.path,
+      exactQuote: missingQuote,
+    }];
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(broken),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_SOURCE_QUOTE_MISSING" }],
+    });
+    const { message } = (result as { diagnostics: Array<{ message: string }> }).diagnostics[0]!;
+    expect(message).toContain(JSON.stringify(missingQuote));
+    expect(message).toContain(`${Buffer.byteLength(missingQuote, "utf8")} bytes`);
+  });
+
   it("refuses authoring when the fixed native proof admission entry is degraded", async () => {
     const workflowExtensionRegistry = await proofAdmissionRegistry();
     workflowExtensionRegistry.degrade(
