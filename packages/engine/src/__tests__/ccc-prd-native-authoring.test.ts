@@ -562,6 +562,36 @@ describe("CCC PRD native authoring adapter", () => {
     expect(result.kind, JSON.stringify(result)).toBe("candidate");
   });
 
+  /*
+  Companion to the fence-tolerance test above: a document/artifact `content`
+  value may legitimately contain its own ``` fence (e.g. quoting a code
+  block). The outermost-wrapper strip must be anchored to the whole response,
+  not a global backtick removal, or it would mangle that embedded fence and
+  corrupt the byte-exact content this product exists to guarantee. This test
+  fails if someone later swaps the anchored strip for a naive global removal.
+  */
+  it("preserves an embedded code fence inside JSON content byte-identical when the whole response is also fence-wrapped", async () => {
+    const embeddedFenceContent = "Example:\n```js\nconst quoted = \"keep this exact\";\n```\nEnd.";
+    const withEmbeddedFence = structuredClone(proposal);
+    withEmbeddedFence.documents[0]!.content = embeddedFenceContent;
+    const fenced = "```json\n" + canonicalCccPrdJson(withEmbeddedFence) + "\n```";
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: fenced,
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result.kind, JSON.stringify(result)).toBe("candidate");
+    if (result.kind !== "candidate") throw new Error("expected candidate");
+    expect(result.sidecar.documents[0]!.content).toBe(embeddedFenceContent);
+  });
+
   it("refuses malformed native response text instead of accepting prose", async () => {
     const result = await authorCccPrdPacket({
       rootDir: fixtureRoot,
