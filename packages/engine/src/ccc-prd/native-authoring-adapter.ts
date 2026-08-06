@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   canonicalCccPrdJson,
@@ -94,6 +98,25 @@ export function stripOutermostJsonFence(text: string): string {
   const trimmed = text.trim();
   const match = OUTERMOST_FENCE_WRAPPER.exec(trimmed);
   return match ? match[1]! : text;
+}
+
+/*
+Defect B (2026-08-05): a JSON.parse failure on the authoring response used to
+surface only V8's SyntaxError message -- which previews roughly a dozen
+characters of the input -- through authoring.ts's catch-all refusal bundle,
+discarding the raw response text entirely. That made the real acceptance-run
+failure against glm-5.2 undiagnosable: we could not see what the model
+actually sent. Persist the raw response to a scratch file ONLY on parse
+failure (never on success -- this is diagnostic volume, not a product
+artifact) and name that path in the thrown error so a future run is
+diagnosable. Written to the OS temp directory, never stdout, never the vault.
+*/
+function persistUnparsableAuthoringResponse(rawResponseText: string): string {
+  const diagnosticsDir = join(tmpdir(), "fusion-ccc-prd-authoring-diagnostics");
+  mkdirSync(diagnosticsDir, { recursive: true });
+  const diagnosticPath = join(diagnosticsDir, `unparsable-response-${randomUUID()}.txt`);
+  writeFileSync(diagnosticPath, rawResponseText, "utf8");
+  return diagnosticPath;
 }
 
 /*
@@ -357,7 +380,17 @@ export function createNativeCccPrdAuthoringAdapter(
             `CCC PRD authoring response is ${responseBytes} bytes; maximum is ${options.maxResponseBytes}`,
           );
         }
-        const parsed = JSON.parse(stripOutermostJsonFence(response.text)) as unknown;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(stripOutermostJsonFence(response.text));
+        } catch (error) {
+          const diagnosticPath = persistUnparsableAuthoringResponse(response.text);
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `CCC PRD authoring response is not valid JSON (${reason}); `
+              + `raw response preserved at ${diagnosticPath} for diagnosis`,
+          );
+        }
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
           throw new Error("CCC PRD authoring response is not one JSON object");
         }
