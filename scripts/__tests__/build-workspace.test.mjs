@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 
 import {
   BUILD_CACHE_VERSION,
+  DEFAULT_BUILD_WORKSPACE_CONCURRENCY,
   PLUGIN_BUILD_GLOBAL_INPUT_PATHS,
   computePluginSourceHash,
   discoverWorkspacePackages,
@@ -14,6 +15,8 @@ import {
   planWorkspaceBuild,
   readPluginBuildCache,
   requiredPluginOutputs,
+  resolveBuildWorkspaceConcurrency,
+  runPlannedBuilds,
   wantsFullCliPackage,
 } from "../build-workspace.mjs";
 
@@ -310,6 +313,67 @@ test("full package mode is a no-op when CLI already planned", () => {
   const result = ensureFullPackageCliPlanned(planned, skipped, { fullPackage: true });
   assert.equal(result.plannedPackages.length, 1);
   assert.equal(result.plannedPackages[0].buildReason, "changed-inputs");
+});
+
+/*
+FNXC:WorkspaceBuild 2026-08-06-00:00:
+Regression coverage for the CI exit-137 build death. pnpm defaults to 4 concurrent workspace
+package builds and nothing in this repo overrode that, so two `tsc` processes started at the same
+timestamp inside a 2560 MiB runner container and the kernel OOM-killed one -- surfacing only as
+exit 137 and a one-word "Killed". Pin the invariant at the point it broke: the spawned pnpm argv
+MUST carry an explicit --workspace-concurrency, defaulting to serial, ahead of the `build` command.
+*/
+test("runPlannedBuilds caps pnpm workspace concurrency at 1 by default", () => {
+  const calls = [];
+  const spawnFn = (command, args, options) => {
+    calls.push({ command, args, options });
+    return { status: 0 };
+  };
+
+  const result = runPlannedBuilds(
+    [{ name: "@fusion/engine" }, { name: "@fusion/plugin-sdk" }],
+    "/repo",
+    spawnFn,
+    { env: {} },
+  );
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "pnpm");
+  assert.ok(
+    calls[0].args.includes("--workspace-concurrency=1"),
+    `expected an explicit workspace-concurrency cap, got: ${calls[0].args.join(" ")}`,
+  );
+  // The flag is a pnpm option, not an argument to the package's build script.
+  assert.ok(
+    calls[0].args.indexOf("--workspace-concurrency=1") < calls[0].args.indexOf("build"),
+    "workspace-concurrency must precede the build command",
+  );
+});
+
+test("runPlannedBuilds honors FUSION_BUILD_WORKSPACE_CONCURRENCY and rejects unusable values", () => {
+  const argvFor = (env) => {
+    const calls = [];
+    runPlannedBuilds([{ name: "@fusion/engine" }], "/repo", (command, args) => {
+      calls.push(args);
+      return { status: 0 };
+    }, { env });
+    return calls[0];
+  };
+
+  assert.ok(argvFor({ FUSION_BUILD_WORKSPACE_CONCURRENCY: "4" }).includes("--workspace-concurrency=4"));
+  // Garbage degrades to the safe serial default rather than being forwarded to pnpm.
+  for (const bad of ["", "0", "-2", "abc", "2.5"]) {
+    assert.ok(
+      argvFor({ FUSION_BUILD_WORKSPACE_CONCURRENCY: bad }).includes("--workspace-concurrency=1"),
+      `expected fallback to serial for ${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test("resolveBuildWorkspaceConcurrency defaults to serial", () => {
+  assert.equal(resolveBuildWorkspaceConcurrency({}), DEFAULT_BUILD_WORKSPACE_CONCURRENCY);
+  assert.equal(DEFAULT_BUILD_WORKSPACE_CONCURRENCY, 1);
 });
 
 test("wantsFullCliPackage matches CLI packaging env rules", () => {
