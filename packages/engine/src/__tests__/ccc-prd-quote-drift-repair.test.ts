@@ -51,14 +51,25 @@
  * measured afterwards say otherwise, and the assertions below now follow the
  * measurements rather than the original hope:
  *
- *   1. Fuzzy matching (tier 2) ships OFF. `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY`
- *      is `{allowFuzzy: false}` because a meaning-INVERTING one-word edit
- *      scores 0.9747 while the innocent word-substitution drift tier 2 exists
- *      to accept scores 0.9449 -- the populations interleave and no threshold
- *      separates them (locator-report.md, POPULATIONS_SEPARABLE=NO). So the two
- *      fixtures that need tier 2 are asserted TWICE: refused under the shipping
- *      default, recovered under an explicit test-local `{allowFuzzy: true}`.
- *      Nothing here turns fuzzy on in production.
+ *   1. Fuzzy matching (tier 2) is ON for real runs, and every fuzzy match is
+ *      FLAGGED. Those two are one decision, not two: a meaning-INVERTING
+ *      one-word edit scores 0.9747 while the innocent word-substitution drift
+ *      tier 2 exists to accept scores 0.9449, so the populations interleave and
+ *      no threshold separates them (locator-report.md,
+ *      POPULATIONS_SEPARABLE=NO). The span still holds true source bytes either
+ *      way -- what a guess can get wrong is the CLAIM built on it, and the flag
+ *      is the only thing that surfaces that for a human. `CccPrdQuoteMatchPolicy`
+ *      is therefore a union with no "fuzzy on, review off" member at all.
+ *
+ *      The switch is scoped to the PIPELINE ENTRY POINT, not to this module:
+ *      `runCccPrdChunkedUnderstanding` defaults to
+ *      `CCC_PRD_RUN_QUOTE_MATCH_POLICY`, while a bare `resolveCccPrdAnchor`
+ *      call -- which is what this suite makes -- still falls back to
+ *      `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY` and stays deterministic-only. That
+ *      is deliberate: a future caller wired straight into the resolver has to
+ *      ask for guessing on purpose. So the two fixtures that need tier 2 are
+ *      asserted TWICE: refused under the bare-resolver fallback, recovered
+ *      under the policy production actually runs.
  *
  *   2. The ~135-character elision is unrecoverable at ANY threshold, and this
  *      is structural rather than a tuning miss. Tier 2 is a minimum-distance
@@ -88,6 +99,7 @@ import { createHash } from "node:crypto";
 import { CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION } from "@fusion/core";
 import { describe, expect, it } from "vitest";
 import {
+  CCC_PRD_RUN_QUOTE_MATCH_POLICY,
   DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY,
   resolveCccPrdAnchor,
   type CccPrdQuoteMatchPolicy,
@@ -346,11 +358,12 @@ const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).dig
 /**
  * What a fixture is measured to do, not what anyone hoped it would do.
  *
- *   deterministic  -- resolves under the SHIPPING DEFAULT policy, using tiers 0
+ *   deterministic  -- resolves under the BARE-RESOLVER fallback, using tiers 0
  *                     and 1 only (byte-exact, then normalization for case,
  *                     whitespace, markdown emphasis and table pipes).
- *   needs-fuzzy    -- refused by the shipping default; resolves only when an
- *                     operator opts in to tier 2 with `{allowFuzzy: true}`.
+ *   needs-fuzzy    -- refused by the bare-resolver fallback; resolves under the
+ *                     policy real runs use, where tier 2 is on and every match
+ *                     it makes is flagged for review.
  *   unrecoverable  -- refused in BOTH switch states, and no threshold recovers
  *                     it. See the elision block for the proof.
  *
@@ -373,13 +386,17 @@ const DISPOSITION_BY_FAILURE_CLASS: Record<QuoteDriftFailureClass, FixtureDispos
 };
 
 /**
- * TEST-LOCAL ONLY. Nothing in production sets `quoteMatchPolicy`, so production
- * runs deterministic-only. This object exists so the two fixtures that need
- * tier 2 can be asserted in the switch state that actually recovers them --
- * enabling fuzzy anywhere outside a test would take on the meaning-inversion
- * exposure documented in the header.
+ * The policy REAL RUNS use, imported rather than hand-built so this suite
+ * cannot drift from what production does. `runCccPrdChunkedUnderstanding`
+ * applies it when no policy is passed, which is what production does.
+ *
+ * Its two fields are welded together: `allowFuzzy: true` with
+ * `recordFuzzyForReview: false` is not a member of `CccPrdQuoteMatchPolicy` and
+ * is refused at runtime as well. Guessing without flagging is the one state
+ * the meaning-inversion measurement rules out --
+ * `ccc-prd-chunked-quote-drift-integration.test.ts` owns that proof.
  */
-const FUZZY_ENABLED: CccPrdQuoteMatchPolicy = { allowFuzzy: true, recordFuzzyForReview: true };
+const FUZZY_ENABLED: CccPrdQuoteMatchPolicy = CCC_PRD_RUN_QUOTE_MATCH_POLICY;
 
 /**
  * Measured similarity of the elision against its own source: 0.7216, below the
@@ -402,8 +419,11 @@ const asCellContent = (row: string): string => row.replace(/^\|\s*/, "").replace
 /**
  * Resolves a quote against a real source excerpt with the whole excerpt as the
  * chunk slice, mirroring how the chunked lane calls the resolver
- * (chunk-verification.ts:136-144). Omitting `quoteMatchPolicy` is what
- * production does, and it means the deterministic-only default.
+ * (chunk-verification.ts:136-144). Omitting `quoteMatchPolicy` here means the
+ * BARE-RESOLVER fallback, which is deterministic-only. Note that this is NOT
+ * what a production run gets: the chunked pipeline supplies
+ * `CCC_PRD_RUN_QUOTE_MATCH_POLICY` at its entry point, so the two paths
+ * deliberately differ and both are asserted below.
  */
 function anchorAgainstSource(quote: string, excerpt: string, quoteMatchPolicy?: CccPrdQuoteMatchPolicy) {
   const source = Buffer.from(excerpt, "utf8");
@@ -537,7 +557,7 @@ describe("ccc-prd quote drift repair: observed corpus failures resolve to true s
     }
   });
 
-  it("the disposition map still matches the measured census, and fuzzy still ships OFF", () => {
+  it("the disposition map still matches the measured census, and both switch defaults hold", () => {
     // If a regenerated fixture block introduces a class this map does not
     // cover, or shifts the counts, this fails loudly rather than silently
     // asserting the wrong disposition for a new fixture.
@@ -551,37 +571,63 @@ describe("ccc-prd quote drift repair: observed corpus failures resolve to true s
     expect(fixturesWithDisposition("needs-fuzzy")).toHaveLength(2);
     expect(fixturesWithDisposition("unrecoverable")).toHaveLength(1);
 
-    // Every test below that omits `quoteMatchPolicy` is asserting the shipping
-    // default. That default is deterministic-only, and it is proven here rather
-    // than assumed, because the whole disposition split depends on it.
+    // Every test below that omits `quoteMatchPolicy` is asserting the
+    // BARE-RESOLVER fallback, which stays deterministic-only so a direct
+    // caller cannot inherit guessing. Proven here rather than assumed, because
+    // the whole disposition split depends on it.
     expect(DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY.allowFuzzy).toBe(false);
+    expect(DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY.recordFuzzyForReview).toBe(false);
+
+    // And the policy real chunked runs get, applied at the pipeline entry
+    // point. Fuzzy is ON, and it is inseparable from flagging every match.
+    expect(CCC_PRD_RUN_QUOTE_MATCH_POLICY.allowFuzzy).toBe(true);
+    expect(CCC_PRD_RUN_QUOTE_MATCH_POLICY.recordFuzzyForReview).toBe(true);
   });
 
   describe.each(fixturesWithDisposition("deterministic"))(
     "$id [$failureClass, $byteDelta byte drift, $lane lane] -- recovered by tiers 0+1",
     (fixture: QuoteDriftFixture) => {
-      itResolvesToTrueSourceBytes(fixture, "shipping default policy");
+      itResolvesToTrueSourceBytes(fixture, "the bare-resolver fallback");
     },
   );
 
   describe.each(fixturesWithDisposition("needs-fuzzy"))(
     "$id [$failureClass, $byteDelta byte drift, $lane lane] -- needs tier 2",
     (fixture: QuoteDriftFixture) => {
-      it("is REFUSED under the shipping default, because tier 2 is off", () => {
-        // Not a bug and not a regression: fuzzy ships off on purpose
-        // (locator-report.md, POPULATIONS_SEPARABLE=NO). A run hitting this
-        // drift class dies, and that is the deliberate trade.
+      it("is REFUSED by the bare-resolver fallback, which never guesses", () => {
+        // Not a bug and not a regression. A direct `resolveCccPrdAnchor` caller
+        // that passes no policy gets deterministic tiers only, on purpose, so
+        // guessing is never something a new call site inherits by accident.
+        // Real runs do not take this path -- see the next test.
         expectRefusal(fixture.modelQuote, fixture.sourceExcerpt, "CCC_PRD_SOURCE_QUOTE_MISSING");
       });
 
-      itResolvesToTrueSourceBytes(fixture, "explicit {allowFuzzy: true}", FUZZY_ENABLED);
+      // Under the policy production runs, this drift RECOVERS to true source
+      // bytes. `skill-hook-authoring-18-other` ("per fixture" where the source
+      // says "for every fixture") is here by operator adjudication: ruled an
+      // acceptable copying slip rather than a rejectable paraphrase, so it
+      // belongs in the positive set and must resolve.
+      itResolvesToTrueSourceBytes(fixture, "the policy real runs use", FUZZY_ENABLED);
+
+      it("arrives FLAGGED, because a recovered guess that nobody sees is the failure mode", () => {
+        // Recovery is only half of it. The span holds true source bytes, so the
+        // citation is right no matter what -- but a claim built on a misread
+        // sentence would then carry a correct-looking citation. The receipt is
+        // where both texts stay side by side for a human to compare.
+        const { receipt } = anchorAgainstSource(fixture.modelQuote, fixture.sourceExcerpt, FUZZY_ENABLED);
+
+        expect(receipt.matchStrategy).toBe("fuzzy");
+        expect(receipt.fuzzyDrift?.requiresReview, `${fixture.id} was guessed and must be flagged`).toBe(true);
+        expect(receipt.fuzzyDrift?.quoteAsModelWrote).toBe(fixture.modelQuote);
+        expect(receipt.fuzzyDrift?.matchedSourceText).toBe(fixture.trueSourceText);
+      });
     },
   );
 
   describe.each(fixturesWithDisposition("unrecoverable"))(
     "$id [$failureClass, $byteDelta byte drift, $lane lane] -- refused at every threshold",
     (fixture: QuoteDriftFixture) => {
-      it("is REFUSED under the shipping default", () => {
+      it("is REFUSED under the bare-resolver fallback", () => {
         expectRefusal(fixture.modelQuote, fixture.sourceExcerpt, "CCC_PRD_SOURCE_QUOTE_MISSING");
       });
 
@@ -697,7 +743,7 @@ describe("ccc-prd quote drift repair: negative controls that must STILL be rejec
     expectRefusal(INVENTED_QUOTE, INVENTED_SOURCE_EXCERPT, "CCC_PRD_SOURCE_QUOTE_MISSING", FUZZY_ENABLED);
   });
 
-  it("refuses the ambiguous drift as ABSENT under the shipping default, where the collision is invisible", () => {
+  it("refuses the ambiguous drift as ABSENT under the bare-resolver fallback, where the collision is invisible", () => {
     // Two real adjacent rows differ only by their ordinal. The quote drops the
     // ordinal, landing exactly one edit from each. With tier 2 off, neither row
     // is ever a candidate, so the honest refusal is "absent" -- the ambiguity

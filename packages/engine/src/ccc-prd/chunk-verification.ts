@@ -9,6 +9,8 @@ import {
   type CccPrdUnresolvedDecision,
 } from "@fusion/core";
 import {
+  cccPrdLocatorOptionsFor,
+  DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY,
   resolveCccPrdAnchor,
   type CccPrdAnchorLimits,
   type CccPrdAnchorReceipt,
@@ -130,20 +132,15 @@ export function describeCccPrdChunkQuoteOutsideSliceViolations(
   sliceBytes: Buffer,
   quoteMatchPolicy?: CccPrdQuoteMatchPolicy,
 ): string[] {
-  const disableFuzzy = quoteMatchPolicy?.allowFuzzy !== true;
+  // Built through the shared choke point rather than by hand, so this gate
+  // cannot be relaxed by a policy that skipped the inseparability check.
+  const options = cccPrdLocatorOptionsFor(quoteMatchPolicy ?? DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY);
+  const disableFuzzy = options.disableFuzzy === true;
   const violations: string[] = [];
   for (const [key, rows] of sourceBoundRows(fragment)) {
     for (const row of rows) {
       for (const reference of row.sourceRefs) {
-        const located = locateCccPrdQuote(sliceBytes, reference.exactQuote, {
-          disableFuzzy,
-          ...(quoteMatchPolicy?.fuzzyThreshold !== undefined
-            ? { fuzzyThreshold: quoteMatchPolicy.fuzzyThreshold }
-            : {}),
-          ...(quoteMatchPolicy?.ambiguityEpsilon !== undefined
-            ? { ambiguityEpsilon: quoteMatchPolicy.ambiguityEpsilon }
-            : {}),
-        });
+        const located = locateCccPrdQuote(sliceBytes, reference.exactQuote, options);
         if (located.kind === "notFound") {
           violations.push(
             `${key} ${row.id} quote is absent from its chunk slice`
@@ -200,24 +197,56 @@ function withoutSourceRefsUsingResolver<T extends SourceBoundRow>(
 }
 
 /**
- * Human-readable lines for every fuzzy match the policy asked to have
- * surfaced. A fuzzy match is the one tier where the emitted span can disagree
- * with the model's stated meaning -- a measured meaning-inverting edit scores
- * 0.9747, above innocent drift at 0.9449 -- so when the operator turns fuzzy
- * on WITH review, each one is rendered with both texts side by side.
+ * One fuzzy match, in the form an operator has to see it: the model's wording
+ * and the source's own wording side by side.
+ *
+ * The span is correct either way -- it always delimits true source bytes -- so
+ * this is not about the citation. It is about the CLAIM the model built on a
+ * sentence it retyped wrong. A meaning-inverting edit scores 0.9747, above the
+ * innocent drift this tier exists to accept at 0.9449, so nothing downstream
+ * can tell those apart. A human reading these two strings can.
  */
-export function describeCccPrdFuzzyQuoteReviewNotices(
+export type CccPrdFuzzyQuoteReviewNotice = {
+  entityId: string;
+  sourcePath: string;
+  /** Locator similarity, 0..1. Deliberately NOT a pass/fail signal -- see the type doc. */
+  similarity: number;
+  quoteAsModelWrote: string;
+  matchedSourceText: string;
+  /** The same facts as one human-readable line, for log and message surfaces. */
+  message: string;
+};
+
+function fuzzyQuoteReviewNotice(receipt: CccPrdAnchorReceipt): CccPrdFuzzyQuoteReviewNotice {
+  const drift = receipt.fuzzyDrift!;
+  return {
+    entityId: receipt.entityId,
+    sourcePath: receipt.sourcePath,
+    similarity: drift.score,
+    quoteAsModelWrote: drift.quoteAsModelWrote,
+    matchedSourceText: drift.matchedSourceText,
+    message: `${receipt.entityId} in ${receipt.sourcePath} was anchored by fuzzy match `
+      + `(similarity ${drift.score.toFixed(4)}); model wrote `
+      + `${describeCccPrdQuoteForRejection(drift.quoteAsModelWrote)} but the span emits `
+      + `${describeCccPrdQuoteForRejection(drift.matchedSourceText)}`,
+  };
+}
+
+/**
+ * Every fuzzy match in the batch, structured.
+ *
+ * The filter is on `fuzzyDrift` being present, NOT on `requiresReview`. Those
+ * are equivalent under the policy union -- fuzzy cannot be enabled without
+ * review recording -- and that is exactly why the weaker predicate is the
+ * right one here: if a receipt ever did arrive with `requiresReview: false`,
+ * filtering on it would silently drop the one match most worth seeing.
+ */
+export function collectCccPrdFuzzyQuoteReviewNotices(
   receipts: readonly CccPrdAnchorReceipt[],
-): string[] {
+): CccPrdFuzzyQuoteReviewNotice[] {
   return receipts
-    .filter((receipt) => receipt.fuzzyDrift?.requiresReview === true)
-    .map((receipt) => {
-      const drift = receipt.fuzzyDrift!;
-      return `${receipt.entityId} in ${receipt.sourcePath} was anchored by fuzzy match `
-        + `(similarity ${drift.score.toFixed(4)}); model wrote `
-        + `${describeCccPrdQuoteForRejection(drift.quoteAsModelWrote)} but the span emits `
-        + `${describeCccPrdQuoteForRejection(drift.matchedSourceText)}`;
-    });
+    .filter((receipt) => receipt.fuzzyDrift !== undefined)
+    .map(fuzzyQuoteReviewNotice);
 }
 
 export type CccPrdResolvedChunkFragment = {
@@ -351,8 +380,8 @@ export type CccPrdChunkVerificationOutcome =
       resolved: CccPrdResolvedChunkFragment;
       /** One per resolved sourceRef, in resolution order. Diagnostic only; nothing here is persisted. */
       anchorReceipts: CccPrdAnchorReceipt[];
-      /** Non-empty only when the policy enabled fuzzy matching WITH review recording. */
-      fuzzyReviewNotices: string[];
+      /** One per quote anchored by GUESSING. Empty whenever every quote matched deterministically. */
+      fuzzyReviewNotices: CccPrdFuzzyQuoteReviewNotice[];
     }
   | { ok: false; code: string; violations: string[]; retryEligible: boolean };
 
@@ -452,7 +481,7 @@ export function verifyCccPrdChunkFragment(
     ok: true,
     resolved,
     anchorReceipts,
-    fuzzyReviewNotices: describeCccPrdFuzzyQuoteReviewNotices(anchorReceipts),
+    fuzzyReviewNotices: collectCccPrdFuzzyQuoteReviewNotices(anchorReceipts),
   };
 }
 
@@ -483,7 +512,7 @@ export type RunCccPrdChunkAttemptInput = {
   onAnchorReceipts?: (input: {
     chunkId: string;
     receipts: CccPrdAnchorReceipt[];
-    fuzzyReviewNotices: string[];
+    fuzzyReviewNotices: CccPrdFuzzyQuoteReviewNotice[];
   }) => void;
   hasConstraints?: boolean;
 };

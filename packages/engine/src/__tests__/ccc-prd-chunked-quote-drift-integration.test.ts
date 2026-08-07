@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION } from "@fusion/core";
 import { describe, expect, it } from "vitest";
 import {
+  CCC_PRD_RUN_QUOTE_MATCH_POLICY,
+  cccPrdLocatorOptionsFor,
   DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY,
   resolveCccPrdAnchor,
   type CccPrdQuoteMatchPolicy,
@@ -44,8 +46,16 @@ import { CccPrdCustodyError } from "../ccc-prd/custody.js";
 
 const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
 
-const FUZZY_SILENT: CccPrdQuoteMatchPolicy = { allowFuzzy: true, recordFuzzyForReview: false };
 const FUZZY_RECORDED: CccPrdQuoteMatchPolicy = { allowFuzzy: true, recordFuzzyForReview: true };
+
+/**
+ * The configuration that must not exist. It is a TYPE ERROR to write this
+ * without the cast -- `CccPrdQuoteMatchPolicy` is a union whose only fuzzy
+ * member has `recordFuzzyForReview: true` -- and the cast is here precisely to
+ * reach past that and prove the RUNTIME guard also refuses it, which is what
+ * protects callers arriving from JSON, plain JavaScript, or a future refactor.
+ */
+const FUZZY_SEPARATED = { allowFuzzy: true, recordFuzzyForReview: false } as unknown as CccPrdQuoteMatchPolicy;
 
 // --- real corpus excerpts ---------------------------------------------------
 
@@ -290,9 +300,20 @@ describe("chunked-lane quote drift fixtures", () => {
     }
   });
 
-  it("the default policy is deterministic-only, so fuzzy is opt-in", () => {
+  it("the bare resolver still defaults to deterministic-only, so a direct caller cannot inherit guessing", () => {
+    // NOT the value real runs use -- see the next test. This fallback stays
+    // strict so a future caller wired straight into anchor-resolver.ts (the
+    // single-shot lane, a script, a new tool) has to ask for fuzzy on purpose.
     expect(DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY.allowFuzzy).toBe(false);
     expect(DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY.recordFuzzyForReview).toBe(false);
+  });
+
+  it("real chunked runs default to fuzzy ON with every match flagged", () => {
+    // The operator decision this suite exists to pin. `chunk-orchestrator.ts`
+    // applies this at runCccPrdChunkedUnderstanding, so a production run that
+    // passes no policy gets exactly this.
+    expect(CCC_PRD_RUN_QUOTE_MATCH_POLICY.allowFuzzy).toBe(true);
+    expect(CCC_PRD_RUN_QUOTE_MATCH_POLICY.recordFuzzyForReview).toBe(true);
   });
 });
 
@@ -301,10 +322,10 @@ describe("chunked-lane quote drift fixtures", () => {
 describe.each(ALL_FIXTURES)(
   "$id [$failureClass, recovered at tier $tier]",
   (fixture: DriftFixture) => {
-    // The deterministic fixtures must hold under the SHIPPING default; the
-    // fuzzy ones are asserted with fuzzy explicitly enabled and are separately
-    // proven to refuse under the default further down.
-    const policy = fixture.tier === "fuzzy" ? FUZZY_SILENT : undefined;
+    // The deterministic fixtures hold under the bare-resolver fallback; the
+    // fuzzy ones are asserted under the policy REAL RUNS use, and are
+    // separately proven to refuse under that strict fallback further down.
+    const policy = fixture.tier === "fuzzy" ? FUZZY_RECORDED : undefined;
 
     it("(a) the resolver returns a span instead of rejecting the quote", () => {
       expect(() => anchor(fixture.modelQuote, fixture.source, policy)).not.toThrow();
@@ -347,9 +368,9 @@ describe.each(ALL_FIXTURES)(
   },
 );
 
-// --- the switch: three reachable states -------------------------------------
+// --- the switch: two reachable states, and the one that must not exist ------
 
-describe("quoteMatchPolicy state 1 of 3: deterministic only (the default)", () => {
+describe("quoteMatchPolicy state 1 of 2: deterministic only (the bare-resolver fallback)", () => {
   it.each(DETERMINISTIC_FIXTURES)("recovers $id without any fuzzy matching", (fixture) => {
     const { span, receipt } = anchor(fixture.modelQuote, fixture.source);
 
@@ -386,38 +407,93 @@ describe("quoteMatchPolicy state 1 of 3: deterministic only (the default)", () =
   });
 });
 
-describe("quoteMatchPolicy state 2 of 3: fuzzy enabled, accepted silently", () => {
-  it.each(FUZZY_FIXTURES)("recovers $id and records the drift without flagging it", (fixture) => {
-    const { span, receipt } = anchor(fixture.modelQuote, fixture.source, FUZZY_SILENT);
+/**
+ * THE STATE THAT MUST NOT EXIST: guessing without flagging.
+ *
+ * The whole case for enabling tier 2 rests on the flag. Measurement is blunt
+ * about why: a meaning-INVERTING edit ("redact every" -> "redact no") scores
+ * 0.9747, HIGHER than the innocent drift the tier must accept at 0.9449,
+ * because byte-wise reversing a requirement is a SMALLER edit than a harmless
+ * rewording. No threshold separates them, and no downstream check can -- the
+ * span holds true source bytes either way, so a claim built on a misreading
+ * would carry a correct-looking citation with nothing pointing at it.
+ *
+ * So `allowFuzzy` and `recordFuzzyForReview` must not be independently
+ * settable. Two mechanisms, tested here as one requirement:
+ *
+ *   1. BY CONSTRUCTION -- `CccPrdQuoteMatchPolicy` is a union with exactly two
+ *      members, and "fuzzy on, review off" is not one of them. Writing it is a
+ *      compile error; `FUZZY_SEPARATED` needs a double cast to exist at all.
+ *   2. LOUDLY AT RUNTIME -- vitest strips types, and a policy can also arrive
+ *      from JSON config or plain JavaScript, so every path that turns a policy
+ *      into locator options asserts it too.
+ *
+ * A future change must not be able to ship guessing without the flag.
+ */
+describe("inseparability: fuzzy matching cannot be enabled without review recording", () => {
+  it("refuses a separated policy at the resolver, before any quote is matched", () => {
+    // Deliberately a quote that would match BYTE-EXACTLY and never reach tier
+    // 2: a misconfiguration that only surfaces on the first drifted quote is a
+    // misconfiguration that ships.
+    const error = caughtError(() => anchor("brainstorm_status: complete", ATM_FRONTMATTER, FUZZY_SEPARATED));
+
+    expect(error).toBeInstanceOf(CccPrdCustodyError);
+    expect((error as CccPrdCustodyError).code).toBe("CCC_PRD_QUOTE_MATCH_POLICY_INSEPARABLE");
+  });
+
+  it("refuses a separated policy at the containment gate too", () => {
+    const [tense] = FUZZY_FIXTURES as [DriftFixture];
+    const error = caughtError(() => gateViolations(tense.modelQuote, tense.source, FUZZY_SEPARATED));
+
+    expect(error).toBeInstanceOf(CccPrdCustodyError);
+    expect((error as CccPrdCustodyError).code).toBe("CCC_PRD_QUOTE_MATCH_POLICY_INSEPARABLE");
+  });
+
+  it("refuses a separated policy through the whole §3 verification pipeline", () => {
+    const [tense] = FUZZY_FIXTURES as [DriftFixture];
+    const error = caughtError(() => verifyFragment(tense.modelQuote, tense.source, FUZZY_SEPARATED));
+
+    expect(error, "the run must die rather than guess in silence").toBeInstanceOf(CccPrdCustodyError);
+    expect((error as CccPrdCustodyError).code).toBe("CCC_PRD_QUOTE_MATCH_POLICY_INSEPARABLE");
+  });
+
+  it("names the reason in the refusal, so whoever hits it learns why the pair is welded", () => {
+    const error = caughtError(() => cccPrdLocatorOptionsFor(FUZZY_SEPARATED)) as CccPrdCustodyError;
+
+    expect(error.message).toContain("recordFuzzyForReview");
+    expect(error.message, "the measured overlap is the whole argument").toContain("0.9747");
+    expect(error.message).toContain("0.9449");
+  });
+
+  it("accepts both legitimate states, so the guard refuses only the separated one", () => {
+    expect(cccPrdLocatorOptionsFor(FUZZY_RECORDED).disableFuzzy).toBe(false);
+    expect(cccPrdLocatorOptionsFor(DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY).disableFuzzy).toBe(true);
+    expect(cccPrdLocatorOptionsFor(CCC_PRD_RUN_QUOTE_MATCH_POLICY).disableFuzzy).toBe(false);
+  });
+
+  it("leaves no fuzzy match unflagged: every shipped policy that allows fuzzy also records it", () => {
+    // Guards the constants themselves rather than the guard. If someone adds a
+    // third exported policy later, this is the assertion that has to be
+    // updated -- deliberately.
+    for (const policy of [DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY, CCC_PRD_RUN_QUOTE_MATCH_POLICY]) {
+      expect(policy.allowFuzzy === policy.recordFuzzyForReview, JSON.stringify(policy)).toBe(true);
+    }
+  });
+});
+
+describe("quoteMatchPolicy state 2 of 2: fuzzy enabled, every match recorded for review", () => {
+  it.each(FUZZY_FIXTURES)("recovers $id and flags the guess on its receipt", (fixture) => {
+    const { span, receipt } = anchor(fixture.modelQuote, fixture.source, FUZZY_RECORDED);
 
     expect(receipt.matchStrategy).toBe("fuzzy");
     expect(sourceTextAtSpan(fixture.source, span)).toBe(fixture.trueSourceText);
     expect(receipt.fuzzyDrift).toBeDefined();
-    // Diagnostics are always recorded; only the review FLAG is policy-driven.
+    // Both texts are kept, because the span records coordinates only -- this
+    // receipt is the sole place the drift stays measurable.
     expect(receipt.fuzzyDrift!.quoteAsModelWrote).toBe(fixture.modelQuote);
     expect(receipt.fuzzyDrift!.matchedSourceText).toBe(fixture.trueSourceText);
     expect(receipt.fuzzyDrift!.score).toBeGreaterThan(0.85);
-    expect(receipt.fuzzyDrift!.requiresReview).toBe(false);
-  });
-
-  it("surfaces no review notices through the verification outcome", () => {
-    const [tense] = FUZZY_FIXTURES as [DriftFixture];
-    const outcome = verifyFragment(tense.modelQuote, tense.source, FUZZY_SILENT);
-
-    expect(outcome.ok).toBe(true);
-    if (!outcome.ok) return;
-    expect(outcome.fuzzyReviewNotices).toEqual([]);
-    expect(outcome.anchorReceipts[0]!.matchStrategy).toBe("fuzzy");
-  });
-});
-
-describe("quoteMatchPolicy state 3 of 3: fuzzy enabled, every match recorded for review", () => {
-  it("flags each fuzzy match on its receipt", () => {
-    const [tense] = FUZZY_FIXTURES as [DriftFixture];
-    const { receipt } = anchor(tense.modelQuote, tense.source, FUZZY_RECORDED);
-
-    expect(receipt.matchStrategy).toBe("fuzzy");
-    expect(receipt.fuzzyDrift!.requiresReview).toBe(true);
+    expect(receipt.fuzzyDrift!.requiresReview, "an unflagged guess is the thing this design forbids").toBe(true);
   });
 
   it("renders a notice naming BOTH the model's quote and the true source text", () => {
@@ -428,14 +504,36 @@ describe("quoteMatchPolicy state 3 of 3: fuzzy enabled, every match recorded for
     if (!outcome.ok) return;
     expect(outcome.fuzzyReviewNotices).toHaveLength(1);
     const notice = outcome.fuzzyReviewNotices[0]!;
-    expect(notice).toContain("REQ-quote-drift");
-    expect(notice).toContain(SOURCE_PATH);
+    expect(notice.entityId).toBe("REQ-quote-drift");
+    expect(notice.sourcePath).toBe(SOURCE_PATH);
     // The whole point of recording: the two texts are side by side, so the
     // one-word difference a similarity score cannot judge stays visible.
-    expect(notice, "the model's wording must survive into the notice")
+    expect(notice.quoteAsModelWrote, "the model's wording must survive into the notice")
       .toContain("structurally redacted every");
-    expect(notice, "the true source wording must survive into the notice")
+    expect(notice.matchedSourceText, "the true source wording must survive into the notice")
       .toContain("structurally redact every");
+    expect(notice.similarity).toBeGreaterThan(0.85);
+    // The same facts as one line, for surfaces that only carry strings.
+    expect(notice.message).toContain("REQ-quote-drift");
+    expect(notice.message).toContain("structurally redacted every");
+    expect(notice.message).toContain("structurally redact every");
+  });
+
+  it("recovers the paraphrase fixture the operator ruled an acceptable copying slip", () => {
+    // skill-hook-authoring-18-other: the model wrote "per fixture" where the
+    // source says "for every fixture". Adjudicated as a copying slip rather
+    // than a rejectable paraphrase, so it must RESOLVE -- and, being a guess,
+    // must still arrive flagged.
+    const paraphrase = FUZZY_FIXTURES.find((fixture) => fixture.id === "skill-hook-authoring-18-other")!;
+    const outcome = verifyFragment(paraphrase.modelQuote, paraphrase.source, CCC_PRD_RUN_QUOTE_MATCH_POLICY);
+
+    expect(outcome.ok, "the operator ruled this fixture recoverable").toBe(true);
+    if (!outcome.ok) return;
+    const span = outcome.resolved.requirements[0]!.spans[0]!;
+    expect(sourceTextAtSpan(paraphrase.source, span)).toBe(paraphrase.trueSourceText);
+    expect(outcome.fuzzyReviewNotices).toHaveLength(1);
+    expect(outcome.fuzzyReviewNotices[0]!.quoteAsModelWrote).toContain("per fixture");
+    expect(outcome.fuzzyReviewNotices[0]!.matchedSourceText).toContain("for every fixture");
   });
 
   it("emits nothing for a deterministic match, which needs no review", () => {
@@ -482,7 +580,7 @@ describe("anchor receipts reach a consumer instead of being dropped", () => {
 
 describe("chunked-lane quote drift: negative controls", () => {
   it("returns notFound for an invented quote, in every switch state", () => {
-    for (const policy of [undefined, FUZZY_SILENT, FUZZY_RECORDED]) {
+    for (const policy of [undefined, DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY, CCC_PRD_RUN_QUOTE_MATCH_POLICY]) {
       const error = caughtError(() => anchor(INVENTED_QUOTE, ROUTE_BENCH, policy));
 
       expect(error).toBeInstanceOf(CccPrdCustodyError);
@@ -503,7 +601,7 @@ describe("chunked-lane quote drift: negative controls", () => {
   it("refuses an ambiguous fuzzy match loudly, naming BOTH candidates with previews", () => {
     let resolved: string | null = null;
     const error = caughtError(() => {
-      const { span } = anchor(AMBIGUOUS_QUOTE, TPL_THESIS_TABLE, FUZZY_SILENT);
+      const { span } = anchor(AMBIGUOUS_QUOTE, TPL_THESIS_TABLE, CCC_PRD_RUN_QUOTE_MATCH_POLICY);
       resolved = sourceTextAtSpan(TPL_THESIS_TABLE, span);
       return resolved;
     });
@@ -537,7 +635,7 @@ describe("chunked-lane quote drift: negative controls", () => {
     // A model can fix this by quoting whatever distinguishes the rows, so the
     // chunk must retry rather than die -- the code has to be in the
     // retry-eligible set alongside the older ambiguity code.
-    const outcome = verifyFragment(AMBIGUOUS_QUOTE, TPL_THESIS_TABLE, FUZZY_SILENT);
+    const outcome = verifyFragment(AMBIGUOUS_QUOTE, TPL_THESIS_TABLE, CCC_PRD_RUN_QUOTE_MATCH_POLICY);
 
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;

@@ -16,7 +16,11 @@ import {
 import { authorCccPrdPacket } from "./authoring.js";
 import type { CccPrdAnchorLimits } from "./anchor-resolver.js";
 import type { CccPrdChunkPolicy } from "./chunk-planner.js";
-import { runCccPrdChunkedUnderstanding } from "./chunk-orchestrator.js";
+import {
+  CCC_PRD_NO_FUZZY_QUOTE_REVIEW,
+  runCccPrdChunkedUnderstanding,
+  type CccPrdQuoteReview,
+} from "./chunk-orchestrator.js";
 import { readCccPrdPacketCustody } from "./custody.js";
 import {
   classifyCccPrdLane,
@@ -129,15 +133,21 @@ export type UnderstandCccPrdInput = {
 };
 
 /**
- * `lane` is carried on the return value only, never on
+ * `lane` and `quoteReview` are carried on the return value only, never on
  * {@link CccPrdUnderstandingReview} itself -- design §7 requires the CLI to
- * emit it in its JSON wrapper "not in the stored artifact, so
+ * emit `lane` in its JSON wrapper "not in the stored artifact, so
  * CccPrdUnderstandingReview and the on-disk schema are unchanged." The CLI
- * strips this field before persisting and re-adds it only to the printed
+ * strips both fields before persisting and re-adds them only to the printed
  * payload.
+ *
+ * `quoteReview` follows `lane` because it is the same kind of fact: something
+ * an operator must SEE about how this run behaved, which has no business in a
+ * frozen artifact schema. It is required rather than optional so no lane can
+ * quietly omit it -- "no quotes were guessed" and "nobody reported" have to
+ * look different.
  */
 export type CccPrdUnderstandingResult =
-  | (CccPrdUnderstandingReview & { lane: "single" | "chunked" })
+  | (CccPrdUnderstandingReview & { lane: "single" | "chunked"; quoteReview: CccPrdQuoteReview })
   | { kind: "refusal"; diagnostics: CccPrdDiagnostic[] };
 
 function positive(value: number): number | null {
@@ -312,6 +322,10 @@ async function runSingleShotUnderstanding(
   }
   return {
     lane: "single",
+    // The single-shot lane resolves quotes byte-exactly (authoring.ts) and
+    // never reaches the fuzzy tier, so it reports "no guessing was possible
+    // here" rather than leaving the field absent.
+    quoteReview: CCC_PRD_NO_FUZZY_QUOTE_REVIEW,
     schema: CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
     kind: "understanding-review",
     executable: false,
@@ -446,6 +460,10 @@ async function runChunkedUnderstanding(
   }
   return {
     lane: "chunked",
+    // Carried out of the pipeline unchanged. This is the only place a reader
+    // learns that N quotes were anchored by guessing and what the source
+    // actually said at each one; the spans themselves record coordinates only.
+    quoteReview: chunkResult.quoteReview,
     schema: CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
     kind: "understanding-review",
     executable: false,

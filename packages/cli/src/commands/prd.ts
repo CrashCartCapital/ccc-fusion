@@ -1140,8 +1140,13 @@ async function runGeneratedUnderstanding(
   }
   // Design §7: `lane` is emitted in this JSON wrapper only, never in the
   // persisted sidecar -- CccPrdUnderstandingReview and its on-disk schema
-  // stay exactly as they are today.
-  const { lane, ...persistedReview } = result;
+  // stay exactly as they are today. `quoteReview` rides the same channel for
+  // the same reason: it reports how THIS run matched quotes, which is an
+  // operator-facing fact about the run rather than part of the frozen
+  // artifact. It is what makes fuzzy matching accountable -- a non-zero
+  // `fuzzyMatchCount` means the run anchored that many quotes by guessing, and
+  // each entry carries the model's wording next to the document's real text.
+  const { lane, quoteReview, ...persistedReview } = result;
   try {
     writeSidecarAtomically(
       input.rootDir,
@@ -1157,7 +1162,7 @@ async function runGeneratedUnderstanding(
       error instanceof Error ? error.message : "understanding review could not be written",
     );
   }
-  io.write(JSON.stringify({ ...persistedReview, reviewPath: outputPath, lane }));
+  io.write(JSON.stringify({ ...persistedReview, reviewPath: outputPath, lane, quoteReview }));
   return 0;
 }
 

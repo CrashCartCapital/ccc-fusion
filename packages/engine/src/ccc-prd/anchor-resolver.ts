@@ -35,6 +35,14 @@ export const DEFAULT_CCC_PRD_ANCHOR_LIMITS: CccPrdAnchorLimits = {
   maxAnchorExtensionBytes: 8192,
 };
 
+/** Threshold overrides, valid in either switch state. */
+type CccPrdQuoteMatchTuning = {
+  /** Overrides the locator's measured default (0.85). Ignored when fuzzy is off. */
+  fuzzyThreshold?: number;
+  /** Overrides the locator's measured default (0.05). */
+  ambiguityEpsilon?: number;
+};
+
 /**
  * How much drift the quote->span locate is allowed to forgive.
  *
@@ -43,41 +51,87 @@ export const DEFAULT_CCC_PRD_ANCHOR_LIMITS: CccPrdAnchorLimits = {
  * are always on: every real drift they recover scored an exact 1.0000 in
  * normalized space, so admitting them costs no discrimination at all.
  *
- * Tier 2 (fuzzy) is a separate, operator-gated decision and DEFAULTS TO OFF.
- * The measurement behind that default is blunt: a meaning-inverting one-word
- * edit ("redact every raw string value" -> "redact no raw string value")
- * scores 0.9747, HIGHER than the innocent word-substitution drift the tier
- * must accept at 0.9449. No threshold separates those populations, so turning
- * fuzzy on trades "the run dies on a retyped sentence" for "a reversed
- * sentence is silently blessed as provenance". That is an operator's call to
- * make, not a default. See `.smoke-scratch/wave6/locator-report.md`.
+ * Tier 2 (fuzzy) is a guess, and the measurement says so bluntly: a
+ * meaning-INVERTING one-word edit ("redact every raw string value" -> "redact
+ * no raw string value") scores 0.9747, HIGHER than the innocent
+ * word-substitution drift the tier must accept at 0.9449. Byte-wise, reversing
+ * a requirement is a SMALLER edit than a harmless rewording, so no threshold
+ * separates those populations. See `.smoke-scratch/wave6/locator-report.md`,
+ * POPULATIONS_SEPARABLE=NO.
  *
- * Three states are reachable:
- *   { allowFuzzy: false }                            deterministic only (DEFAULT)
- *   { allowFuzzy: true,  recordFuzzyForReview: false } fuzzy accepted silently
- *   { allowFuzzy: true,  recordFuzzyForReview: true }  fuzzy accepted, every match
- *                                                      flagged on the receipt for review
+ * The emitted span always holds TRUE source bytes either way, so a recovered
+ * quote's citation stays correct. What a guess can get wrong is the CLAIM
+ * built on it: a misread sentence would then carry a correct-looking citation
+ * with nothing pointing at the misreading. The review flag is the only thing
+ * that makes tier 2 acceptable, which is why this type has exactly TWO
+ * inhabitants and "fuzzy on, review off" is not one of them:
+ *
+ *   { allowFuzzy: false, recordFuzzyForReview: false }  deterministic tiers only
+ *   { allowFuzzy: true,  recordFuzzyForReview: true }   fuzzy on, EVERY match flagged
+ *
+ * `allowFuzzy: true` with `recordFuzzyForReview: false` is a compile error by
+ * construction, and {@link assertCccPrdQuoteMatchPolicy} rejects it at runtime
+ * for callers that reach this type through JSON, `as`, or plain JavaScript.
+ * Do not widen this union back into two independent booleans.
  */
-export type CccPrdQuoteMatchPolicy = {
-  /** Enable tier 2. Off by default; see the type doc for why. */
-  allowFuzzy: boolean;
-  /**
-   * Flag every accepted fuzzy match on its receipt (`fuzzyDrift.requiresReview`)
-   * so a caller can surface the model's quote next to the true source text.
-   * Ignored when `allowFuzzy` is false. Diagnostics are recorded either way;
-   * this only controls whether they are marked as needing an operator's eyes.
-   */
-  recordFuzzyForReview: boolean;
-  /** Overrides the locator's measured default (0.85). Ignored when fuzzy is off. */
-  fuzzyThreshold?: number;
-  /** Overrides the locator's measured default (0.05). */
-  ambiguityEpsilon?: number;
-};
+export type CccPrdQuoteMatchPolicy =
+  | (CccPrdQuoteMatchTuning & { allowFuzzy: false; recordFuzzyForReview: false })
+  | (CccPrdQuoteMatchTuning & { allowFuzzy: true; recordFuzzyForReview: true });
 
+/**
+ * What {@link resolveCccPrdAnchor} falls back to when a caller supplies NO
+ * policy at all: deterministic tiers only.
+ *
+ * This is a library-level fallback, deliberately NOT the value real runs use.
+ * Real chunked CCC-PRD runs get {@link CCC_PRD_RUN_QUOTE_MATCH_POLICY}, which
+ * `chunk-orchestrator.ts` applies at the pipeline entry point. Keeping the
+ * bare-resolver fallback strict means a future caller wired straight into this
+ * module -- the single-shot lane, a new tool, a script -- has to ask for
+ * guessing on purpose instead of inheriting it.
+ */
 export const DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY: CccPrdQuoteMatchPolicy = {
   allowFuzzy: false,
   recordFuzzyForReview: false,
 };
+
+/**
+ * What real chunked CCC-PRD runs use, per operator decision: fuzzy matching
+ * ON, and every fuzzy match flagged for review.
+ *
+ * Applied at `runCccPrdChunkedUnderstanding` (chunk-orchestrator.ts), the
+ * entry point of the chunked pipeline, so it covers every production run
+ * without touching what a direct `resolveCccPrdAnchor` caller gets.
+ *
+ * The two fields are not independently choosable -- see
+ * {@link CccPrdQuoteMatchPolicy}. Turning fuzzy on without review recording is
+ * the one configuration that would let the pipeline guess in silence.
+ */
+export const CCC_PRD_RUN_QUOTE_MATCH_POLICY: CccPrdQuoteMatchPolicy = {
+  allowFuzzy: true,
+  recordFuzzyForReview: true,
+};
+
+/**
+ * Refuses "fuzzy on, review off" at runtime.
+ *
+ * The union type above already makes that state uncompilable, but a policy can
+ * still arrive from JSON config, a plain-JavaScript caller, or a `as
+ * CccPrdQuoteMatchPolicy` cast in a future refactor. Every path that turns a
+ * policy into locator options goes through
+ * {@link cccPrdLocatorOptionsFor}, which calls this, so guessing cannot be
+ * switched on anywhere without the flag that makes it reviewable.
+ */
+export function assertCccPrdQuoteMatchPolicy(policy: CccPrdQuoteMatchPolicy): CccPrdQuoteMatchPolicy {
+  if (policy.allowFuzzy === true && (policy as { recordFuzzyForReview: unknown }).recordFuzzyForReview !== true) {
+    throw new CccPrdCustodyError(
+      "CCC_PRD_QUOTE_MATCH_POLICY_INSEPARABLE",
+      "quote match policy enabled fuzzy matching without recordFuzzyForReview; fuzzy matching may not be "
+        + "switched on unless every fuzzy match is flagged for review, because a meaning-inverting edit scores "
+        + "higher (0.9747) than the innocent drift the tier exists to accept (0.9449) and no threshold separates them",
+    );
+  }
+  return policy;
+}
 
 /** Which locator tier produced the emitted span. */
 export type CccPrdAnchorMatchStrategy = "exact" | "normalized" | "fuzzy";
@@ -250,7 +304,15 @@ function buildSpan(
   };
 }
 
-function locatorOptionsFor(policy: CccPrdQuoteMatchPolicy): LocateCccPrdQuoteOptions {
+/**
+ * The single choke point between a policy and the matcher. Every caller that
+ * needs locator options -- this module's loose-match path and
+ * `chunk-verification.ts`'s containment gate -- goes through here, so the
+ * inseparability check cannot be routed around by building the options object
+ * by hand.
+ */
+export function cccPrdLocatorOptionsFor(policy: CccPrdQuoteMatchPolicy): LocateCccPrdQuoteOptions {
+  assertCccPrdQuoteMatchPolicy(policy);
   const options: LocateCccPrdQuoteOptions = { disableFuzzy: !policy.allowFuzzy };
   if (policy.fuzzyThreshold !== undefined) options.fuzzyThreshold = policy.fuzzyThreshold;
   if (policy.ambiguityEpsilon !== undefined) options.ambiguityEpsilon = policy.ambiguityEpsilon;
@@ -276,7 +338,7 @@ function describeCandidate(source: Buffer, candidate: CccPrdQuoteCandidate): str
  */
 function resolveByLooseMatch(input: ResolveCccPrdAnchorInput): CccPrdAnchorResolution {
   const matchPolicy = input.quoteMatchPolicy ?? DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY;
-  const options = locatorOptionsFor(matchPolicy);
+  const options = cccPrdLocatorOptionsFor(matchPolicy);
 
   let located = locateCccPrdQuote(input.source, input.quote, options);
   if (located.kind === "ambiguous" && input.policy === "select" && input.sliceBounds !== undefined) {
@@ -352,6 +414,14 @@ function resolveByLooseMatch(input: ResolveCccPrdAnchorInput): CccPrdAnchorResol
  * substitution is the point, not a side effect.
  */
 export function resolveCccPrdAnchor(input: ResolveCccPrdAnchorInput): CccPrdAnchorResolution {
+  // Validated up front rather than inside the loose-match path, so a
+  // separated policy is refused even on a run where every quote happens to
+  // match byte-exactly and tier 2 is never reached. A misconfiguration that
+  // only surfaces on the first drifted quote is a misconfiguration that ships.
+  if (input.quoteMatchPolicy !== undefined) {
+    assertCccPrdQuoteMatchPolicy(input.quoteMatchPolicy);
+  }
+
   const quoteBytes = Buffer.from(input.quote, "utf8");
   if (quoteBytes.byteLength === 0) {
     throw new CccPrdCustodyError(

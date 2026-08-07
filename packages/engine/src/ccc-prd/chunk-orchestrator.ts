@@ -2,10 +2,12 @@ import {
   type CccPrdSource,
   type CustomProvider,
 } from "@fusion/core";
-import type {
-  CccPrdAnchorLimits,
-  CccPrdAnchorReceipt,
-  CccPrdQuoteMatchPolicy,
+import {
+  assertCccPrdQuoteMatchPolicy,
+  CCC_PRD_RUN_QUOTE_MATCH_POLICY,
+  type CccPrdAnchorLimits,
+  type CccPrdAnchorReceipt,
+  type CccPrdQuoteMatchPolicy,
 } from "./anchor-resolver.js";
 import {
   buildCccPrdChunkEnvelope,
@@ -18,6 +20,7 @@ import { planCccPrdChunks, type CccPrdChunkPolicy } from "./chunk-planner.js";
 import {
   checkCccPrdChunkReviewBudget,
   runCccPrdChunkAttempt,
+  type CccPrdFuzzyQuoteReviewNotice,
   type CccPrdResolvedChunkFragment,
 } from "./chunk-verification.js";
 import { computeCccPrdMaterialInventory } from "./material-coverage.js";
@@ -38,9 +41,10 @@ export type CccPrdChunkedUnderstandingOptions = {
   anchorLimits?: CccPrdAnchorLimits;
   /**
    * How much quote drift the anchor resolver may forgive. Omitted means
-   * `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY`: exact and normalized matching only,
-   * fuzzy matching OFF. Turning fuzzy on is an operator decision -- see the
-   * `CccPrdQuoteMatchPolicy` doc in anchor-resolver.ts.
+   * `CCC_PRD_RUN_QUOTE_MATCH_POLICY`: fuzzy matching ON, and every fuzzy match
+   * flagged for review. This is the flip point -- see
+   * `runCccPrdChunkedUnderstanding` and the `CccPrdQuoteMatchPolicy` doc in
+   * anchor-resolver.ts for what that trade buys and costs.
    */
   quoteMatchPolicy?: CccPrdQuoteMatchPolicy;
   /** Test-only seam; production omits it and uses the real fusion model runtime transport. */
@@ -51,7 +55,25 @@ export type CccPrdChunkedUnderstandingOptions = {
 export type CccPrdChunkAnchorReceipts = {
   chunkId: string;
   receipts: CccPrdAnchorReceipt[];
-  fuzzyReviewNotices: string[];
+  fuzzyReviewNotices: CccPrdFuzzyQuoteReviewNotice[];
+};
+
+/**
+ * The run-level answer to "which of these quotes did the system GUESS at, and
+ * what did my document actually say?"
+ *
+ * This is the artifact the fuzzy tier is only acceptable with. Nothing here is
+ * persisted -- it rides the return value and the CLI's printed JSON wrapper,
+ * the same way `lane` does (understanding.ts) -- so the on-disk understanding
+ * schema is untouched.
+ */
+export type CccPrdQuoteReview = {
+  /** The policy the run actually ran under, so a reader never has to assume it. */
+  policy: { allowFuzzy: boolean; recordFuzzyForReview: boolean };
+  /** Zero on a clean run. Any other number is a read-these-yourself signal. */
+  fuzzyMatchCount: number;
+  /** The model's wording beside the source's own, one entry per guessed quote. */
+  fuzzyMatches: Array<CccPrdFuzzyQuoteReviewNotice & { chunkId: string }>;
 };
 
 export type CccPrdChunkedUnderstandingResult = {
@@ -66,6 +88,20 @@ export type CccPrdChunkedUnderstandingResult = {
    * verbatim -- and, for fuzzy matches, what the model actually wrote.
    */
   anchorReceipts: CccPrdChunkAnchorReceipts[];
+  /** The operator-facing rollup of {@link anchorReceipts}; see {@link CccPrdQuoteReview}. */
+  quoteReview: CccPrdQuoteReview;
+};
+
+/**
+ * What a lane with no fuzzy tier at all reports. The single-shot lane matches
+ * byte-exactly (authoring.ts) and never reaches `resolveCccPrdAnchor`, so it
+ * has nothing to review -- but it still has to SAY so, or a reader cannot tell
+ * "no guesses" apart from "nobody looked".
+ */
+export const CCC_PRD_NO_FUZZY_QUOTE_REVIEW: CccPrdQuoteReview = {
+  policy: { allowFuzzy: false, recordFuzzyForReview: false },
+  fuzzyMatchCount: 0,
+  fuzzyMatches: [],
 };
 
 /**
@@ -78,6 +114,17 @@ export type CccPrdChunkedUnderstandingResult = {
 export async function runCccPrdChunkedUnderstanding(
   options: CccPrdChunkedUnderstandingOptions,
 ): Promise<CccPrdChunkedUnderstandingResult> {
+  // THE FLIP POINT. Real chunked runs match fuzzily and flag every guess;
+  // omitting the option is what production does, so this default is what
+  // production gets. Scoped here rather than at
+  // DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY on purpose: a bare `resolveCccPrdAnchor`
+  // caller still gets deterministic-only matching and has to opt in
+  // deliberately. An explicitly supplied policy is honoured, but never one
+  // that separates guessing from flagging.
+  const quoteMatchPolicy = assertCccPrdQuoteMatchPolicy(
+    options.quoteMatchPolicy ?? CCC_PRD_RUN_QUOTE_MATCH_POLICY,
+  );
+
   const custody = readCccPrdPacketCustody({ rootDir: options.rootDir, manifestPath: options.manifestPath });
   const authoritativeSources: CccPrdSource[] = custody.sources.filter((source) => source.authoritative);
   const sources = authoritativeSources.map((source) => ({
@@ -159,7 +206,7 @@ export async function runCccPrdChunkedUnderstanding(
       buildPrompt: (priorViolations) => buildCccPrdChunkPrompt(envelope, priorViolations),
       maxChunkAttempts: options.maxChunkAttempts,
       limits: options.anchorLimits,
-      quoteMatchPolicy: options.quoteMatchPolicy,
+      quoteMatchPolicy,
       onAnchorReceipts: (receipts) => anchorReceipts.push(receipts),
     });
 
@@ -181,10 +228,22 @@ export async function runCccPrdChunkedUnderstanding(
     fragments,
   });
 
+  const fuzzyMatches = anchorReceipts.flatMap((chunk) => (
+    chunk.fuzzyReviewNotices.map((notice) => ({ ...notice, chunkId: chunk.chunkId }))
+  ));
+
   return {
     chunkCount: plan.chunkCount,
     chunkPlanHash: plan.chunkPlanHash,
     assembled,
     anchorReceipts,
+    quoteReview: {
+      policy: {
+        allowFuzzy: quoteMatchPolicy.allowFuzzy,
+        recordFuzzyForReview: quoteMatchPolicy.recordFuzzyForReview,
+      },
+      fuzzyMatchCount: fuzzyMatches.length,
+      fuzzyMatches,
+    },
   };
 }
