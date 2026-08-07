@@ -11,7 +11,9 @@ import {
 import {
   resolveCccPrdAnchor,
   type CccPrdAnchorLimits,
+  type CccPrdAnchorReceipt,
   type CccPrdAnchorSliceBounds,
+  type CccPrdQuoteMatchPolicy,
 } from "./anchor-resolver.js";
 import {
   IDENTITY_COLLECTIONS,
@@ -21,6 +23,7 @@ import {
 import { CccPrdCustodyError, describeCccPrdQuoteForRejection } from "./custody.js";
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
 import { stripOutermostJsonFence } from "./native-authoring-adapter.js";
+import { locateCccPrdQuote } from "./quote-locator.js";
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -104,18 +107,47 @@ export function describeCccPrdChunkForeignSourceViolations(
   return violations;
 }
 
-/** §3 step 3: every exactQuote must occur inside the chunk's own slice bytes, not merely somewhere in the file. */
+/**
+ * §3 step 3: every exactQuote must occur inside the chunk's own slice bytes,
+ * not merely somewhere in the file.
+ *
+ * This is a pre-flight predicate: it yields a boolean and a violation string,
+ * never an offset, and nothing is substituted here. It matters only because
+ * `verifyCccPrdChunkFragment` runs it BEFORE span resolution -- a byte-exact
+ * gate here refuses a drifted quote before `resolveCccPrdAnchor` ever gets to
+ * recover it, which would make the resolver's loose locate dead code. So it
+ * asks the same question the resolver will: can the locator find this quote at
+ * all, under the same policy?
+ *
+ * "Ambiguous" deliberately PASSES. The quote is genuinely inside the slice;
+ * which of several regions it means is the resolver's call, and the resolver
+ * refuses it loudly by naming every candidate. Rejecting here instead would
+ * replace that diagnostic with a bare "absent from its chunk slice", which is
+ * both wrong and useless to the retry prompt.
+ */
 export function describeCccPrdChunkQuoteOutsideSliceViolations(
   fragment: CccPrdAuthoringProposalFragment,
   sliceBytes: Buffer,
+  quoteMatchPolicy?: CccPrdQuoteMatchPolicy,
 ): string[] {
+  const disableFuzzy = quoteMatchPolicy?.allowFuzzy !== true;
   const violations: string[] = [];
   for (const [key, rows] of sourceBoundRows(fragment)) {
     for (const row of rows) {
       for (const reference of row.sourceRefs) {
-        if (sliceBytes.indexOf(Buffer.from(reference.exactQuote, "utf8")) < 0) {
+        const located = locateCccPrdQuote(sliceBytes, reference.exactQuote, {
+          disableFuzzy,
+          ...(quoteMatchPolicy?.fuzzyThreshold !== undefined
+            ? { fuzzyThreshold: quoteMatchPolicy.fuzzyThreshold }
+            : {}),
+          ...(quoteMatchPolicy?.ambiguityEpsilon !== undefined
+            ? { ambiguityEpsilon: quoteMatchPolicy.ambiguityEpsilon }
+            : {}),
+        });
+        if (located.kind === "notFound") {
           violations.push(
-            `${key} ${row.id} quote is absent from its chunk slice: `
+            `${key} ${row.id} quote is absent from its chunk slice`
+            + `${disableFuzzy ? " (exact and normalized matching only; fuzzy matching is disabled)" : ""}: `
             + describeCccPrdQuoteForRejection(reference.exactQuote),
           );
         }
@@ -125,24 +157,67 @@ export function describeCccPrdChunkQuoteOutsideSliceViolations(
   return violations;
 }
 
+/**
+ * Everything the per-row resolve needs, plus the `receipts` sink.
+ *
+ * The resolver has always returned a `{span, receipt}` pair and this call site
+ * has always kept the span and dropped the receipt on the floor. That receipt
+ * is now the only surviving record of HOW a quote was matched -- persisted
+ * spans carry coordinates and hashes, never text or strategy -- so it is
+ * collected here and handed back out of `verifyCccPrdChunkFragment`. Nothing
+ * about the persisted artifact changes; this is a diagnostic channel that
+ * already existed and was simply not connected to anything.
+ */
+type ChunkSpanResolutionContext = {
+  sourceBytes: Buffer;
+  sourcePath: string;
+  sliceBounds: CccPrdAnchorSliceBounds;
+  limits: CccPrdAnchorLimits | undefined;
+  quoteMatchPolicy: CccPrdQuoteMatchPolicy | undefined;
+  receipts: CccPrdAnchorReceipt[];
+};
+
 function withoutSourceRefsUsingResolver<T extends SourceBoundRow>(
   input: T,
-  sourceBytes: Buffer,
-  sourcePath: string,
-  sliceBounds: CccPrdAnchorSliceBounds,
-  limits: CccPrdAnchorLimits | undefined,
+  context: ChunkSpanResolutionContext,
 ): Omit<T, "sourceRefs"> & { spans: CccPrdSourceSpan[] } {
   const { sourceRefs, ...value } = input;
-  const spans = sourceRefs.map((reference) => resolveCccPrdAnchor({
-    sourcePath,
-    source: sourceBytes,
-    quote: reference.exactQuote,
-    entityId: input.id,
-    policy: "select",
-    sliceBounds,
-    limits,
-  }).span);
+  const spans = sourceRefs.map((reference) => {
+    const resolution = resolveCccPrdAnchor({
+      sourcePath: context.sourcePath,
+      source: context.sourceBytes,
+      quote: reference.exactQuote,
+      entityId: input.id,
+      policy: "select",
+      sliceBounds: context.sliceBounds,
+      limits: context.limits,
+      quoteMatchPolicy: context.quoteMatchPolicy,
+    });
+    context.receipts.push(resolution.receipt);
+    return resolution.span;
+  });
   return { ...value, spans };
+}
+
+/**
+ * Human-readable lines for every fuzzy match the policy asked to have
+ * surfaced. A fuzzy match is the one tier where the emitted span can disagree
+ * with the model's stated meaning -- a measured meaning-inverting edit scores
+ * 0.9747, above innocent drift at 0.9449 -- so when the operator turns fuzzy
+ * on WITH review, each one is rendered with both texts side by side.
+ */
+export function describeCccPrdFuzzyQuoteReviewNotices(
+  receipts: readonly CccPrdAnchorReceipt[],
+): string[] {
+  return receipts
+    .filter((receipt) => receipt.fuzzyDrift?.requiresReview === true)
+    .map((receipt) => {
+      const drift = receipt.fuzzyDrift!;
+      return `${receipt.entityId} in ${receipt.sourcePath} was anchored by fuzzy match `
+        + `(similarity ${drift.score.toFixed(4)}); model wrote `
+        + `${describeCccPrdQuoteForRejection(drift.quoteAsModelWrote)} but the span emits `
+        + `${describeCccPrdQuoteForRejection(drift.matchedSourceText)}`;
+    });
 }
 
 export type CccPrdResolvedChunkFragment = {
@@ -169,13 +244,10 @@ export type CccPrdResolvedChunkFragment = {
  */
 function resolveChunkFragmentSpans(
   fragment: CccPrdAuthoringProposalFragment,
-  sourceBytes: Buffer,
-  sourcePath: string,
-  sliceBounds: CccPrdAnchorSliceBounds,
-  limits: CccPrdAnchorLimits | undefined,
+  context: ChunkSpanResolutionContext,
 ): CccPrdResolvedChunkFragment {
   const resolve = <T extends SourceBoundRow>(row: T) => (
-    withoutSourceRefsUsingResolver(row, sourceBytes, sourcePath, sliceBounds, limits)
+    withoutSourceRefsUsingResolver(row, context)
   );
   return {
     authorityRoles: fragment.authorityRoles,
@@ -267,12 +339,21 @@ export type CccPrdChunkVerificationInput = {
   sliceBounds: CccPrdAnchorSliceBounds;
   assignedMaterialItemIds: string[];
   limits?: CccPrdAnchorLimits;
+  /** Defaults to `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY` (deterministic tiers only). */
+  quoteMatchPolicy?: CccPrdQuoteMatchPolicy;
   /** Task custody (§3 step 6) only runs when execution-mode constraints are present. */
   hasConstraints?: boolean;
 };
 
 export type CccPrdChunkVerificationOutcome =
-  | { ok: true; resolved: CccPrdResolvedChunkFragment }
+  | {
+      ok: true;
+      resolved: CccPrdResolvedChunkFragment;
+      /** One per resolved sourceRef, in resolution order. Diagnostic only; nothing here is persisted. */
+      anchorReceipts: CccPrdAnchorReceipt[];
+      /** Non-empty only when the policy enabled fuzzy matching WITH review recording. */
+      fuzzyReviewNotices: string[];
+    }
   | { ok: false; code: string; violations: string[]; retryEligible: boolean };
 
 /**
@@ -295,25 +376,34 @@ export function verifyCccPrdChunkFragment(
   }
 
   const sliceBytes = input.fullSourceBytes.subarray(input.sliceBounds.byteStart, input.sliceBounds.byteEnd);
-  const outsideSliceViolations = describeCccPrdChunkQuoteOutsideSliceViolations(fragment, sliceBytes);
+  const outsideSliceViolations = describeCccPrdChunkQuoteOutsideSliceViolations(
+    fragment,
+    sliceBytes,
+    input.quoteMatchPolicy,
+  );
   if (outsideSliceViolations.length > 0) {
     return { ok: false, code: "CCC_PRD_CHUNK_QUOTE_OUTSIDE_SLICE", violations: outsideSliceViolations, retryEligible: true };
   }
 
+  const anchorReceipts: CccPrdAnchorReceipt[] = [];
   let resolved: CccPrdResolvedChunkFragment;
   try {
-    resolved = resolveChunkFragmentSpans(
-      fragment,
-      input.fullSourceBytes,
-      input.sourcePath,
-      input.sliceBounds,
-      input.limits,
-    );
+    resolved = resolveChunkFragmentSpans(fragment, {
+      sourceBytes: input.fullSourceBytes,
+      sourcePath: input.sourcePath,
+      sliceBounds: input.sliceBounds,
+      limits: input.limits,
+      quoteMatchPolicy: input.quoteMatchPolicy,
+      receipts: anchorReceipts,
+    });
   } catch (error) {
     if (error instanceof CccPrdCustodyError) {
       const retryEligibleCodes = new Set([
         "CCC_PRD_SOURCE_QUOTE_MISSING",
         "CCC_PRD_ANCHOR_AMBIGUOUS_INTENT",
+        // A loose match that landed on two indistinguishable regions. The model
+        // can fix this by quoting whatever distinguishes them, so it retries.
+        "CCC_PRD_ANCHOR_QUOTE_AMBIGUOUS_MATCH",
       ]);
       return {
         ok: false,
@@ -358,7 +448,12 @@ export function verifyCccPrdChunkFragment(
     }
   }
 
-  return { ok: true, resolved };
+  return {
+    ok: true,
+    resolved,
+    anchorReceipts,
+    fuzzyReviewNotices: describeCccPrdFuzzyQuoteReviewNotices(anchorReceipts),
+  };
 }
 
 export type CccPrdChunkAttemptTransport = (input: {
@@ -378,6 +473,18 @@ export type RunCccPrdChunkAttemptInput = {
   buildPrompt: (priorViolations: string[]) => string;
   maxChunkAttempts?: number;
   limits?: CccPrdAnchorLimits;
+  /** Defaults to `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY` (deterministic tiers only). */
+  quoteMatchPolicy?: CccPrdQuoteMatchPolicy;
+  /**
+   * Receives the anchor receipts of the attempt that succeeded, so how each
+   * quote was matched reaches a caller instead of being discarded. Called once,
+   * only on success; failed attempts resolve no spans worth reporting.
+   */
+  onAnchorReceipts?: (input: {
+    chunkId: string;
+    receipts: CccPrdAnchorReceipt[];
+    fuzzyReviewNotices: string[];
+  }) => void;
   hasConstraints?: boolean;
 };
 
@@ -419,9 +526,17 @@ export async function runCccPrdChunkAttempt(
       sliceBounds: input.sliceBounds,
       assignedMaterialItemIds: input.assignedMaterialItemIds,
       limits: input.limits,
+      quoteMatchPolicy: input.quoteMatchPolicy,
       hasConstraints: input.hasConstraints,
     });
-    if (outcome.ok) return outcome.resolved;
+    if (outcome.ok) {
+      input.onAnchorReceipts?.({
+        chunkId: input.chunkId,
+        receipts: outcome.anchorReceipts,
+        fuzzyReviewNotices: outcome.fuzzyReviewNotices,
+      });
+      return outcome.resolved;
+    }
     if (!outcome.retryEligible) {
       throw new CccPrdCustodyError(outcome.code, outcome.violations.join("; "));
     }

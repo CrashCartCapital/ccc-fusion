@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { createCccPrdSpanFromBytes, type CccPrdSourceSpan } from "@fusion/core";
 import { CccPrdCustodyError } from "./custody.js";
+import {
+  locateCccPrdQuote,
+  type CccPrdQuoteCandidate,
+  type CccPrdQuoteNormalization,
+  type LocateCccPrdQuoteOptions,
+} from "./quote-locator.js";
 
 const NEWLINE = 0x0a;
 
@@ -29,12 +35,79 @@ export const DEFAULT_CCC_PRD_ANCHOR_LIMITS: CccPrdAnchorLimits = {
   maxAnchorExtensionBytes: 8192,
 };
 
+/**
+ * How much drift the quote->span locate is allowed to forgive.
+ *
+ * Tiers 0 and 1 of `quote-locator.ts` (exact bytes, then a normalized
+ * projection covering case, whitespace, markdown emphasis, and table pipes)
+ * are always on: every real drift they recover scored an exact 1.0000 in
+ * normalized space, so admitting them costs no discrimination at all.
+ *
+ * Tier 2 (fuzzy) is a separate, operator-gated decision and DEFAULTS TO OFF.
+ * The measurement behind that default is blunt: a meaning-inverting one-word
+ * edit ("redact every raw string value" -> "redact no raw string value")
+ * scores 0.9747, HIGHER than the innocent word-substitution drift the tier
+ * must accept at 0.9449. No threshold separates those populations, so turning
+ * fuzzy on trades "the run dies on a retyped sentence" for "a reversed
+ * sentence is silently blessed as provenance". That is an operator's call to
+ * make, not a default. See `.smoke-scratch/wave6/locator-report.md`.
+ *
+ * Three states are reachable:
+ *   { allowFuzzy: false }                            deterministic only (DEFAULT)
+ *   { allowFuzzy: true,  recordFuzzyForReview: false } fuzzy accepted silently
+ *   { allowFuzzy: true,  recordFuzzyForReview: true }  fuzzy accepted, every match
+ *                                                      flagged on the receipt for review
+ */
+export type CccPrdQuoteMatchPolicy = {
+  /** Enable tier 2. Off by default; see the type doc for why. */
+  allowFuzzy: boolean;
+  /**
+   * Flag every accepted fuzzy match on its receipt (`fuzzyDrift.requiresReview`)
+   * so a caller can surface the model's quote next to the true source text.
+   * Ignored when `allowFuzzy` is false. Diagnostics are recorded either way;
+   * this only controls whether they are marked as needing an operator's eyes.
+   */
+  recordFuzzyForReview: boolean;
+  /** Overrides the locator's measured default (0.85). Ignored when fuzzy is off. */
+  fuzzyThreshold?: number;
+  /** Overrides the locator's measured default (0.05). */
+  ambiguityEpsilon?: number;
+};
+
+export const DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY: CccPrdQuoteMatchPolicy = {
+  allowFuzzy: false,
+  recordFuzzyForReview: false,
+};
+
+/** Which locator tier produced the emitted span. */
+export type CccPrdAnchorMatchStrategy = "exact" | "normalized" | "fuzzy";
+
+/**
+ * Recorded for every tier-2 match. `quoteAsModelWrote` and `matchedSourceText`
+ * sit side by side deliberately: the span carries only coordinates, so this
+ * receipt is the ONLY place the drift between what the model claimed and what
+ * the source actually says stays measurable.
+ */
+export type CccPrdAnchorFuzzyDrift = {
+  quoteAsModelWrote: string;
+  matchedSourceText: string;
+  score: number;
+  requiresReview: boolean;
+};
+
 export type CccPrdAnchorReceipt = {
+  entityId: string;
+  sourcePath: string;
+  matchStrategy: CccPrdAnchorMatchStrategy;
+  /** Normalizations whose removal would have broken the match. Empty for "exact". */
+  appliedNormalizations: CccPrdQuoteNormalization[];
+  /** Byte-EXACT occurrences of the model's quote. Zero whenever a looser tier won. */
   fileWideOccurrenceCount: number;
   inSliceCandidateCount: number;
   extensionAttempted: boolean;
   extensionStepsUsed: number;
   survivingCandidateByteStarts: number[];
+  fuzzyDrift?: CccPrdAnchorFuzzyDrift;
 };
 
 export type CccPrdAnchorResolution = {
@@ -51,6 +124,8 @@ export type ResolveCccPrdAnchorInput = {
   /** Required for policy "select"; ignored for "strict". */
   sliceBounds?: CccPrdAnchorSliceBounds;
   limits?: CccPrdAnchorLimits;
+  /** Defaults to `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY` (deterministic tiers only). */
+  quoteMatchPolicy?: CccPrdQuoteMatchPolicy;
 };
 
 function findAllOccurrences(source: Buffer, needle: Buffer): number[] {
@@ -151,24 +226,130 @@ function extendCandidateUntilUnique(
   return { resolved: false, stepsUsed: steps };
 }
 
+/**
+ * The substitution point. `byteEnd` is the end of the MATCHED SOURCE REGION,
+ * never `byteStart + modelQuote.byteLength`, and `excerptSha256` hashes the
+ * bytes actually sitting between those bounds rather than the model's bytes.
+ *
+ * For a byte-exact match the two are identical, so this is a no-op there. For
+ * a looser match it is the whole repair: `compiler.ts:409` recomputes
+ * `sha256(source.subarray(span.byteStart, span.byteEnd))` and rejects any
+ * disagreement as CCC_PRD_SOURCE_SPAN_STALE, so hashing the model's drifted
+ * bytes here would make every recovered quote fail at compile time. Loosening
+ * the match and substituting true source bytes are one change, not two.
+ */
 function buildSpan(
   sourcePath: string,
   source: Buffer,
   byteStart: number,
-  quoteBytes: Buffer,
+  byteEnd: number,
 ): CccPrdSourceSpan {
   return {
-    ...createCccPrdSpanFromBytes(sourcePath, source, byteStart, byteStart + quoteBytes.byteLength),
-    excerptSha256: sha256(quoteBytes),
+    ...createCccPrdSpanFromBytes(sourcePath, source, byteStart, byteEnd),
+    excerptSha256: sha256(source.subarray(byteStart, byteEnd)),
+  };
+}
+
+function locatorOptionsFor(policy: CccPrdQuoteMatchPolicy): LocateCccPrdQuoteOptions {
+  const options: LocateCccPrdQuoteOptions = { disableFuzzy: !policy.allowFuzzy };
+  if (policy.fuzzyThreshold !== undefined) options.fuzzyThreshold = policy.fuzzyThreshold;
+  if (policy.ambiguityEpsilon !== undefined) options.ambiguityEpsilon = policy.ambiguityEpsilon;
+  return options;
+}
+
+function describeCandidate(source: Buffer, candidate: CccPrdQuoteCandidate): string {
+  return `line ${lineNumberAt(source, candidate.byteStart)} `
+    + `(bytes ${candidate.byteStart}-${candidate.byteEnd}, similarity ${candidate.score.toFixed(4)}): `
+    + candidate.preview;
+}
+
+/**
+ * Runs when the model's bytes occur NOWHERE in the source verbatim -- the case
+ * that used to be a flat CCC_PRD_SOURCE_QUOTE_MISSING. Two full corpus runs
+ * showed this is almost never a fabricated quote; it is a real sentence the
+ * model retyped with small drift. The locator finds where that sentence really
+ * lives and `buildSpan` emits the source's own bytes from there.
+ *
+ * Slice scoping mirrors the byte-exact path above rather than pre-empting it:
+ * a single file-wide hit is accepted wherever it lands, and the slice is only
+ * brought in to break a tie the whole file could not.
+ */
+function resolveByLooseMatch(input: ResolveCccPrdAnchorInput): CccPrdAnchorResolution {
+  const matchPolicy = input.quoteMatchPolicy ?? DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY;
+  const options = locatorOptionsFor(matchPolicy);
+
+  let located = locateCccPrdQuote(input.source, input.quote, options);
+  if (located.kind === "ambiguous" && input.policy === "select" && input.sliceBounds !== undefined) {
+    const scoped = locateCccPrdQuote(input.source, input.quote, {
+      ...options,
+      searchBounds: input.sliceBounds,
+    });
+    if (scoped.kind !== "notFound") located = scoped;
+  }
+
+  if (located.kind === "notFound") {
+    throw new CccPrdCustodyError(
+      "CCC_PRD_SOURCE_QUOTE_MISSING",
+      `anchor quote is absent for ${input.entityId} in ${input.sourcePath}`,
+    );
+  }
+
+  if (located.kind === "ambiguous") {
+    // Naming both is the point. Picking one would fabricate the model's intent,
+    // which is precisely the failure loose matching must not introduce, and the
+    // previews are what let the next authoring attempt disambiguate.
+    const named = located.candidates
+      .map((candidate, index) => `candidate ${index + 1} at ${describeCandidate(input.source, candidate)}`)
+      .join("; ");
+    throw new CccPrdCustodyError(
+      "CCC_PRD_ANCHOR_QUOTE_AMBIGUOUS_MATCH",
+      `anchor quote for ${input.entityId} in ${input.sourcePath} matches `
+        + `${located.candidates.length} indistinguishable source regions; `
+        + `quote it verbatim including whatever distinguishes them -- ${named}`,
+    );
+  }
+
+  const receipt: CccPrdAnchorReceipt = {
+    entityId: input.entityId,
+    sourcePath: input.sourcePath,
+    matchStrategy: located.kind,
+    appliedNormalizations: located.kind === "normalized" ? located.appliedStrategies : [],
+    fileWideOccurrenceCount: 0,
+    inSliceCandidateCount: 1,
+    extensionAttempted: false,
+    extensionStepsUsed: 0,
+    survivingCandidateByteStarts: [located.byteStart],
+  };
+  if (located.kind === "fuzzy") {
+    receipt.fuzzyDrift = {
+      quoteAsModelWrote: input.quote,
+      matchedSourceText: input.source.subarray(located.byteStart, located.byteEnd).toString("utf8"),
+      score: located.score,
+      requiresReview: matchPolicy.recordFuzzyForReview,
+    };
+  }
+
+  return {
+    span: buildSpan(input.sourcePath, input.source, located.byteStart, located.byteEnd),
+    receipt,
   };
 }
 
 /**
- * Pure, deterministic anchor resolution (design §5). No model involvement,
- * no invented bytes: the emitted span is always exactly the caller's quote
- * bytes. Extension is used only to decide WHICH file-wide occurrence a
- * non-unique quote refers to when policy is "select" -- it never widens the
- * emitted span.
+ * Pure, deterministic anchor resolution (design §5). No model involvement and
+ * no invented bytes: the emitted span always delimits REAL SOURCE BYTES, and
+ * `source.subarray(span.byteStart, span.byteEnd)` is what the quote resolves
+ * to for every downstream consumer.
+ *
+ * The byte-exact path is unchanged and still runs first, so a quote the model
+ * copied faithfully resolves exactly as it always did -- including extension,
+ * which decides WHICH file-wide occurrence a non-unique quote means when
+ * policy is "select" and never widens the emitted span.
+ *
+ * Only when the model's bytes occur nowhere at all does the looser locate run
+ * (see `resolveByLooseMatch`). There the emitted span is the source's own text
+ * at the matched position, which will differ from the caller's quote -- that
+ * substitution is the point, not a side effect.
  */
 export function resolveCccPrdAnchor(input: ResolveCccPrdAnchorInput): CccPrdAnchorResolution {
   const quoteBytes = Buffer.from(input.quote, "utf8");
@@ -181,16 +362,22 @@ export function resolveCccPrdAnchor(input: ResolveCccPrdAnchorInput): CccPrdAnch
 
   const occurrences = findAllOccurrences(input.source, quoteBytes);
   if (occurrences.length === 0) {
-    throw new CccPrdCustodyError(
-      "CCC_PRD_SOURCE_QUOTE_MISSING",
-      `anchor quote is absent for ${input.entityId} in ${input.sourcePath}`,
-    );
+    return resolveByLooseMatch(input);
   }
 
   if (occurrences.length === 1) {
     return {
-      span: buildSpan(input.sourcePath, input.source, occurrences[0]!, quoteBytes),
+      span: buildSpan(
+        input.sourcePath,
+        input.source,
+        occurrences[0]!,
+        occurrences[0]! + quoteBytes.byteLength,
+      ),
       receipt: {
+        entityId: input.entityId,
+        sourcePath: input.sourcePath,
+        matchStrategy: "exact",
+        appliedNormalizations: [],
         fileWideOccurrenceCount: 1,
         inSliceCandidateCount: 1,
         extensionAttempted: false,
@@ -219,8 +406,17 @@ export function resolveCccPrdAnchor(input: ResolveCccPrdAnchorInput): CccPrdAnch
 
   if (inSlice.length === 1) {
     return {
-      span: buildSpan(input.sourcePath, input.source, inSlice[0]!, quoteBytes),
+      span: buildSpan(
+        input.sourcePath,
+        input.source,
+        inSlice[0]!,
+        inSlice[0]! + quoteBytes.byteLength,
+      ),
       receipt: {
+        entityId: input.entityId,
+        sourcePath: input.sourcePath,
+        matchStrategy: "exact",
+        appliedNormalizations: [],
         fileWideOccurrenceCount: occurrences.length,
         inSliceCandidateCount: 1,
         extensionAttempted: false,
@@ -256,8 +452,17 @@ export function resolveCccPrdAnchor(input: ResolveCccPrdAnchorInput): CccPrdAnch
 
   const winner = survivors[0]!;
   return {
-    span: buildSpan(input.sourcePath, input.source, winner.candidateStart, quoteBytes),
+    span: buildSpan(
+      input.sourcePath,
+      input.source,
+      winner.candidateStart,
+      winner.candidateStart + quoteBytes.byteLength,
+    ),
     receipt: {
+      entityId: input.entityId,
+      sourcePath: input.sourcePath,
+      matchStrategy: "exact",
+      appliedNormalizations: [],
       fileWideOccurrenceCount: occurrences.length,
       inSliceCandidateCount: inSlice.length,
       extensionAttempted: true,

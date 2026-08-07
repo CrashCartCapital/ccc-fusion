@@ -2,7 +2,11 @@ import {
   type CccPrdSource,
   type CustomProvider,
 } from "@fusion/core";
-import type { CccPrdAnchorLimits } from "./anchor-resolver.js";
+import type {
+  CccPrdAnchorLimits,
+  CccPrdAnchorReceipt,
+  CccPrdQuoteMatchPolicy,
+} from "./anchor-resolver.js";
 import {
   buildCccPrdChunkEnvelope,
   buildCccPrdChunkPrompt,
@@ -32,15 +36,36 @@ export type CccPrdChunkedUnderstandingOptions = {
   maxChunkAttempts?: number;
   chunkPolicy?: Partial<CccPrdChunkPolicy>;
   anchorLimits?: CccPrdAnchorLimits;
+  /**
+   * How much quote drift the anchor resolver may forgive. Omitted means
+   * `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY`: exact and normalized matching only,
+   * fuzzy matching OFF. Turning fuzzy on is an operator decision -- see the
+   * `CccPrdQuoteMatchPolicy` doc in anchor-resolver.ts.
+   */
+  quoteMatchPolicy?: CccPrdQuoteMatchPolicy;
   /** Test-only seam; production omits it and uses the real fusion model runtime transport. */
   transport?: CccPrdNativeAuthoringTransport;
   customProviders?: CustomProvider[];
+};
+
+export type CccPrdChunkAnchorReceipts = {
+  chunkId: string;
+  receipts: CccPrdAnchorReceipt[];
+  fuzzyReviewNotices: string[];
 };
 
 export type CccPrdChunkedUnderstandingResult = {
   chunkCount: number;
   chunkPlanHash: string;
   assembled: CccPrdAssembledUnderstanding;
+  /**
+   * How every quote in the run was matched, per chunk. Purely diagnostic: no
+   * persisted structure, provenance hash, or exact-key allowlist sees it. It
+   * exists because the span format records coordinates only, so this is the
+   * one place a reviewer can see that a quote was recovered rather than found
+   * verbatim -- and, for fuzzy matches, what the model actually wrote.
+   */
+  anchorReceipts: CccPrdChunkAnchorReceipts[];
 };
 
 /**
@@ -89,6 +114,7 @@ export async function runCccPrdChunkedUnderstanding(
   );
 
   const fragments: Array<{ chunkOrdinal: number; resolved: CccPrdResolvedChunkFragment }> = [];
+  const anchorReceipts: CccPrdChunkAnchorReceipts[] = [];
   let runningReviewItemCount = 0;
 
   for (const chunk of plan.chunks) {
@@ -133,6 +159,8 @@ export async function runCccPrdChunkedUnderstanding(
       buildPrompt: (priorViolations) => buildCccPrdChunkPrompt(envelope, priorViolations),
       maxChunkAttempts: options.maxChunkAttempts,
       limits: options.anchorLimits,
+      quoteMatchPolicy: options.quoteMatchPolicy,
+      onAnchorReceipts: (receipts) => anchorReceipts.push(receipts),
     });
 
     fragments.push({ chunkOrdinal: chunk.chunkOrdinal, resolved });
@@ -157,5 +185,6 @@ export async function runCccPrdChunkedUnderstanding(
     chunkCount: plan.chunkCount,
     chunkPlanHash: plan.chunkPlanHash,
     assembled,
+    anchorReceipts,
   };
 }
