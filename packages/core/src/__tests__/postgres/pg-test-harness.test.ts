@@ -81,11 +81,17 @@ describe("PostgreSQL test availability", () => {
       );
       await chmod(executablePath, 0o755);
 
+      // The per-attempt subprocess budget must not be the thing under test.
+      // `undefined` inherits probePsqlReady's own default, so this follows the
+      // production value instead of pinning a second one. A hardcoded 500ms
+      // failed here: spawning a freshly written shim out of a vitest fork
+      // worker costs 500-1300ms on macOS, so BOTH attempts died with ETIMEDOUT
+      // and the retry path this test exists to cover never ran.
       expect(
         probePsqlReady(
           "postgresql://127.0.0.1:1",
           root,
-          500,
+          undefined,
           2,
           0,
         ),
