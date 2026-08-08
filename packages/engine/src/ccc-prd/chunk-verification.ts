@@ -1,5 +1,6 @@
 import {
   CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION,
+  CCC_PRD_PROTECTED_ACTION_KINDS,
   normalizeProtectedAction,
   type CccPrdAuthoringProposalFragment,
   type CccPrdRequirement,
@@ -84,6 +85,35 @@ export function describeCccPrdChunkFragmentShapeViolations(value: unknown): stri
     });
     if (badIndex >= 0) {
       violations.push(`${key}[${badIndex}].sourceRefs must be a non-empty array of {path, exactQuote} objects`);
+    }
+  }
+  /*
+   * A protected-action kind outside the legal 8 used to reach
+   * normalizeProtectedAction in packages/core, which throws a bare Error.
+   * packages/core does not import the engine's error class, so the catch
+   * around span resolution declined it and it escaped the chunk loop --
+   * killing the document over a mislabelled row. Catching it here, in the
+   * shape gate, makes it an ordinary retry-eligible fragment violation.
+   */
+  const protectedActions = value.protectedActions;
+  if (Array.isArray(protectedActions)) {
+    const legal = CCC_PRD_PROTECTED_ACTION_KINDS as readonly unknown[];
+    const badKinds = [...new Set(
+      protectedActions
+        .filter((entry) => isPlainRecord(entry))
+        .map((entry) => (entry as Record<string, unknown>).kind)
+        .filter((kind) => !legal.includes(kind))
+        .map((kind) => (typeof kind === "string" ? JSON.stringify(kind) : String(kind))),
+    )];
+    if (badKinds.length > 0) {
+      violations.push(
+        `protectedActions kind ${badKinds.join(", ")} is not a protected action kind. `
+          + `Use exactly one of: ${CCC_PRD_PROTECTED_ACTION_KINDS.join(", ")}. `
+          + "A protected action is one an operator must approve because it is irreversible, "
+          + "outward-facing, or spends money or authority; ordinary work such as creating a file, "
+          + "adding a test, or writing documentation is not protected, so omit the row rather than "
+          + "inventing a kind for it.",
+      );
     }
   }
   return violations;

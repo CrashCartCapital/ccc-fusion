@@ -21,6 +21,16 @@ const decisions: Record<CccPrdProtectedActionKind, CccPrdOperatorDecision> = {
   upstream_write: "approve_upstream_write",
 };
 
+/**
+ * The legal protected-action kinds, derived from `decisions` so the two cannot
+ * drift. Every one of them names an action an operator must approve because it
+ * is irreversible, outward-facing, or spends money or authority -- which is
+ * why ordinary work such as creating a file has no entry here and should not
+ * acquire one.
+ */
+export const CCC_PRD_PROTECTED_ACTION_KINDS: readonly CccPrdProtectedActionKind[] =
+  Object.keys(decisions) as CccPrdProtectedActionKind[];
+
 export function compareCccPrdCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -164,7 +174,14 @@ export function normalizeProtectedAction(input: {
   spans?: CccPrdSourceSpan[];
 }): CccPrdProtectedActionIntent {
   const operatorDecision = decisions[input.kind as CccPrdProtectedActionKind];
-  if (!operatorDecision) throw new Error(`unknown protected action kind: ${input.kind}`);
+  if (!operatorDecision) {
+    // Naming only the bad kind leaves a caller (or a model being asked to
+    // retry) with nothing to correct against, so carry the legal set too.
+    throw new Error(
+      `unknown protected action kind: ${input.kind}; allowed kinds are `
+        + CCC_PRD_PROTECTED_ACTION_KINDS.join(", "),
+    );
+  }
   return {
     id: input.id ?? `protected-action:${input.kind}:${input.target}`,
     kind: input.kind as CccPrdProtectedActionKind,

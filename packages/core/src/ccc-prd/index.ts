@@ -1,5 +1,6 @@
 export {
   canonicalCccPrdJson,
+  CCC_PRD_PROTECTED_ACTION_KINDS,
   compareCccPrdCodeUnits,
   computeCccPrdProofDefinitionSha256,
   computeCccPrdSemanticBundleSha256,
