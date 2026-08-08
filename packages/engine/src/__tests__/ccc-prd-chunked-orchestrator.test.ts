@@ -260,6 +260,115 @@ describe("understandCccPrdPacket -- chunked lane end to end", () => {
     expect(result.executable).toBe(false);
   });
 
+  /**
+   * Audit finding F9, the only one that killed the whole RUN on model output.
+   * `proposalHash: sha256(canonicalCccPrdJson(assembled))` sat after the catch
+   * that guards the chunk pipeline. The fragment shape gate validates each
+   * row's id and sourceRefs but never enumerates or strips unknown fields, and
+   * withoutSourceRefsUsingResolver spreads `...value`, so every field the model
+   * invented survives into `assembled`. `JSON.parse("1e999")` is Infinity, and
+   * canonicalCccPrdJson rejects any non-finite number -- with a bare Error,
+   * thrown outside the guard. No refusal bundle, no diagnostic code, nothing
+   * to read afterwards.
+   */
+  it("refuses with a diagnostic code when a model-invented field carries a non-finite number", async () => {
+    const content = [
+      "# Alpha",
+      "- REQ-1: alpha requirement text.",
+      "",
+      "# Beta",
+      "- REQ-2: beta requirement text.",
+    ].join("\n") + "\n";
+    const { rootDir, manifestPath } = packet(content);
+
+    const task = (suffix: string, heading: string): Record<string, unknown> => ({
+      id: `TASK-${suffix.toUpperCase()}`,
+      title: `Ship ${suffix}`,
+      description: `Implement ${suffix}`,
+      accountableProducer: "team-a",
+      requirementIds: [`REQ-${suffix === "alpha" ? "1" : "2"}`],
+      dependencyTaskIds: [],
+      proofIds: [],
+      workflowId: "",
+      documentIds: [],
+      artifactIds: [],
+      protectedActionIds: [],
+      ownedPaths: [`src/${suffix}.ts`],
+      allowedWriteRoots: [`src/${suffix}.ts`],
+      sourceRefs: [{ path: "source.md", exactQuote: heading }],
+    });
+
+    const alphaFragment = fragment({
+      requirements: [{
+        id: "REQ-1",
+        statement: "alpha requirement",
+        acceptance: "alpha acceptance",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: "source.md", exactQuote: "- REQ-1: alpha requirement text." }],
+        // A field no part of the contract asks for -- exactly what the shape
+        // gate lets through today.
+        estimatedEffortHours: "__NON_FINITE__",
+      }],
+      tasks: [task("alpha", "# Alpha\n- REQ-1: alpha requirement text.")],
+    });
+    const betaFragment = fragment({
+      requirements: [{
+        id: "REQ-2",
+        statement: "beta requirement",
+        acceptance: "beta acceptance",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: "source.md", exactQuote: "- REQ-2: beta requirement text." }],
+      }],
+      tasks: [task("beta", "# Beta\n- REQ-2: beta requirement text.")],
+    });
+
+    // JSON.stringify cannot emit a non-finite literal, so splice one in the way
+    // a model would: an oversized numeric literal that JSON.parse turns into
+    // Infinity.
+    const alphaText = JSON.stringify(alphaFragment).replace("\"__NON_FINITE__\"", "1e999");
+    expect((JSON.parse(alphaText) as {
+      requirements: Array<{ estimatedEffortHours: number }>;
+    }).requirements[0]!.estimatedEffortHours).toBe(Infinity);
+
+    const responses = [alphaText, JSON.stringify(betaFragment)];
+    let callIndex = 0;
+    const transport: CccPrdNativeAuthoringTransport = async ({ provider, model }) => {
+      const text = responses[callIndex]!;
+      callIndex += 1;
+      return { text, provider, model };
+    };
+
+    const result = await understandCccPrdPacket({
+      rootDir,
+      manifestPath,
+      adapter: { id: "unused-single-shot-adapter", generateCandidate: async () => { throw new Error("single-shot path must not run"); } },
+      maxReviewItems: 8,
+      workflowExtensionRegistry: undefined as never,
+      requestedLane: "chunked",
+      provider: "loopback-chunked",
+      model: "fixture-model",
+      maxDurationMs: 5_000,
+      maxPromptBytes: 1_000_000,
+      maxResponseBytes: 256_000,
+      chunkTransport: transport,
+      customProviders: VERBATIM_CAPABLE_PROVIDERS,
+    });
+
+    expect(result.kind).toBe("refusal");
+    if (result.kind !== "refusal") return;
+    expect(result.diagnostics[0]?.code).toBe("CCC_PRD_UNDERSTANDING_NOT_CANONICALIZABLE");
+    // Naming the offending field and value is the difference between a
+    // diagnosable run and a silent one.
+    expect(result.diagnostics[0]?.message).toContain("estimatedEffortHours");
+    expect(result.diagnostics[0]?.message).toContain("Infinity");
+  });
+
   it("refuses zero-transport-call when the route is not declared verbatim-capable", async () => {
     const content = ["# Alpha", "- REQ-1: alpha requirement text."].join("\n") + "\n";
     const { rootDir, manifestPath } = packet(content);

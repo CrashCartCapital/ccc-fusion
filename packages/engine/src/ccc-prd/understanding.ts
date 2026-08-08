@@ -458,6 +458,35 @@ async function runChunkedUnderstanding(
   if (chunkedShallowRefusal) {
     return { kind: "refusal", diagnostics: [chunkedShallowRefusal] };
   }
+
+  /*
+   * This hash used to be computed inline in the returned provenance block --
+   * after the catch above, so outside every guard in this function, and
+   * understandCccPrdPacket has no try/catch of its own either. The fragment
+   * shape gate validates each row's id and sourceRefs but never enumerates or
+   * strips unknown fields, and withoutSourceRefsUsingResolver spreads
+   * `...value`, so every field the model invented survives into `assembled`.
+   * `JSON.parse("1e999")` is Infinity, and canonicalCccPrdJson rejects any
+   * non-finite number, cycle, or non-plain object with a bare Error. One
+   * oversized numeric literal therefore killed the entire run and left no
+   * refusal bundle and no diagnostic code at all -- strictly worse than a
+   * fatal-with-a-code. Guarded, with a code, and the underlying message names
+   * the offending path and value.
+   */
+  let proposalHash: string;
+  try {
+    proposalHash = sha256(canonicalCccPrdJson(assembled));
+  } catch (error) {
+    return {
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_UNDERSTANDING_NOT_CANONICALIZABLE",
+        message: "assembled understanding cannot be canonicalized for hashing: "
+          + (error instanceof Error ? error.message : String(error)),
+      }],
+    };
+  }
+
   return {
     lane: "chunked",
     // Carried out of the pipeline unchanged. This is the only place a reader
@@ -472,7 +501,7 @@ async function runChunkedUnderstanding(
     provenance: {
       authoringAdapterId: "fusion-native-chunked-understanding-v1",
       authoringModel: `${input.provider}/${input.model}`,
-      proposalHash: sha256(canonicalCccPrdJson(assembled)),
+      proposalHash,
       packetHash: custody.packetHash,
     },
     authorityRoles: assembled.authorityRoles,
