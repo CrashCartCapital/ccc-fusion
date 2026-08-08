@@ -57,6 +57,16 @@ const CHUNK_FRAGMENT_ROW_TEMPLATE_LINES: readonly string[] = [
 ];
 
 /**
+ * How many accumulated violations a repair prompt carries. `priorViolations`
+ * is otherwise unbounded -- runCccPrdChunkAttempt feeds the whole violation
+ * array of attempt N into the prompt of attempt N+1 -- so a chunk that fails
+ * with dozens of undispositioned material items can build a repair prompt that
+ * trips the `maxPromptBytes` ceiling below, making the recovery mechanism
+ * itself the fatal step. authoring.ts caps its equivalent list at the same 8.
+ */
+const MAX_PROMPT_PRIOR_VIOLATIONS = 8;
+
+/**
  * Builds the per-chunk prompt (design §2's edit table applied to
  * buildPrompt): fragment schema, chunk envelope payload instead of full
  * `orderedSources`, the quote-scope line restricting quotes to the slice,
@@ -105,7 +115,14 @@ export function buildCccPrdChunkPrompt(
     ...(priorViolations.length > 0
       ? [
           "The previous attempt on this chunk failed these checks; fix every one before returning your next answer:",
-          ...priorViolations.map((violation) => `- ${violation}`),
+          ...priorViolations.slice(0, MAX_PROMPT_PRIOR_VIOLATIONS).map((violation) => `- ${violation}`),
+          ...(priorViolations.length > MAX_PROMPT_PRIOR_VIOLATIONS
+            ? [
+                `- (+${priorViolations.length - MAX_PROMPT_PRIOR_VIOLATIONS} more violations omitted to keep this prompt`
+                  + " within budget; the same class of fault applies to them, so fix the ones above and apply the same"
+                  + " correction throughout)",
+              ]
+            : []),
         ]
       : []),
     canonicalCccPrdJson({

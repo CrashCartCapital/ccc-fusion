@@ -115,6 +115,47 @@ describe("buildCccPrdChunkPrompt", () => {
       "Use one coverage disposition per material item: supporting requirement, proof, and workflow rows may share a materialItemId, but never put the same materialItemId in any task row (including an explicit deferral/out-of-scope row) and any unresolvedDecisions row; if unresolved, omit it from tasks.",
     );
   });
+
+  /**
+   * The repair prompt must not be the thing that kills the document it is
+   * repairing. `priorViolations` is unbounded in the chunk lane, so a chunk
+   * that fails with dozens of undispositioned material items can accumulate a
+   * violation list large enough to trip the `maxPromptBytes` ceiling at
+   * chunk-authoring-adapter.ts, aborting the retry instead of running it.
+   * authoring.ts caps its equivalent list at 8; so does this one.
+   */
+  it("truncates an over-long prior-violation list instead of growing the repair prompt without bound", () => {
+    const envelope = {
+      mode: "understanding" as const,
+      packetHash: "packet-hash",
+      sourceVersion: "source-version",
+      chunkPlanHash: "chunk-plan-hash",
+      chunkId: "doc.md#0",
+      chunkOrdinal: 0,
+      chunkCount: 1,
+      packetHeader: [],
+      sourcePath: "doc.md",
+      sliceByteStart: 0,
+      sliceByteEnd: 0,
+      sliceSha256: "slice-hash",
+      materialItems: [],
+      slice: "",
+    };
+    const violations = Array.from(
+      { length: 60 },
+      (_, index) => `violation ${index} ${"x".repeat(400)}`,
+    );
+
+    const capped = buildCccPrdChunkPrompt(envelope, violations);
+    const eight = buildCccPrdChunkPrompt(envelope, violations.slice(0, 8));
+
+    expect(capped).toContain("violation 7 ");
+    expect(capped).not.toContain("violation 8 ");
+    expect(capped).toContain("(+52 more violations omitted");
+    // 52 withheld violations of 400+ bytes each would add >20KB; the cap keeps
+    // the growth to the one-line suffix.
+    expect(Buffer.byteLength(capped, "utf8") - Buffer.byteLength(eight, "utf8")).toBeLessThan(200);
+  });
 });
 
 describe("understandCccPrdPacket -- chunked lane end to end", () => {
