@@ -19,6 +19,16 @@ import {
 import { validateCccLoopbackHttpUrl } from "../ccc-loopback-policy.js";
 import { registerCustomProviders } from "../custom-provider-registry.js";
 import { readCustomProviders } from "../custom-providers.js";
+import { CccPrdRepairableModelOutputError } from "./custody.js";
+
+/**
+ * Shared tail of every "you produced too much output" rejection. The retry
+ * loop puts this straight in the next prompt, so it has to say what to do
+ * differently, not just that a bound was passed. Callers append the bound.
+ */
+export const SMALLER_ANSWER_INSTRUCTION =
+  "Return a smaller answer: emit fewer rows and shorter description/content fields so the complete "
+  + "JSON object fits within";
 
 export type CccPrdNativeAuthoringTransportRequest = {
   provider: string;
@@ -291,15 +301,21 @@ export const fusionModelRuntimeAuthoringTransport: CccPrdNativeAuthoringTranspor
       streamedTextBytes += Buffer.byteLength(event.delta, "utf8");
       if (streamedTextBytes > request.maxResponseBytes) {
         controller.abort();
-        throw new Error(
-          `CCC PRD authoring response exceeded ${request.maxResponseBytes} bytes`,
+        throw new CccPrdRepairableModelOutputError(
+          "CCC_PRD_AUTHORING_RESPONSE_OVERSIZED",
+          `CCC PRD authoring response exceeded ${request.maxResponseBytes} bytes while streaming. `
+            + `${SMALLER_ANSWER_INSTRUCTION} ${request.maxResponseBytes} bytes.`,
         );
       }
     }
     const response = await stream.result();
     if (response.stopReason !== "stop") {
-      throw new Error(
-        `CCC PRD authoring transport ended with ${response.stopReason}: ${response.errorMessage ?? "incomplete response"}`,
+      throw new CccPrdRepairableModelOutputError(
+        "CCC_PRD_AUTHORING_RESPONSE_TRUNCATED",
+        `CCC PRD authoring response was cut off before it finished: the model stopped with `
+          + `"${response.stopReason}" (${response.errorMessage ?? "incomplete response"}). `
+          + "Return a smaller answer: emit fewer rows and shorter description/content fields so the "
+          + "complete JSON object fits inside the model's own output-token limit.",
       );
     }
     const text = response.content
@@ -307,8 +323,10 @@ export const fusionModelRuntimeAuthoringTransport: CccPrdNativeAuthoringTranspor
       .map((entry) => entry.text)
       .join("");
     if (Buffer.byteLength(text, "utf8") > request.maxResponseBytes) {
-      throw new Error(
-        `CCC PRD authoring response exceeded ${request.maxResponseBytes} bytes`,
+      throw new CccPrdRepairableModelOutputError(
+        "CCC_PRD_AUTHORING_RESPONSE_OVERSIZED",
+        `CCC PRD authoring response exceeded ${request.maxResponseBytes} bytes. `
+          + `${SMALLER_ANSWER_INSTRUCTION} ${request.maxResponseBytes} bytes.`,
       );
     }
     return {

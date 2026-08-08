@@ -22,7 +22,11 @@ import {
   SOURCE_BOUND_COLLECTIONS,
   validateTaskCustodyProvenance,
 } from "./authoring.js";
-import { CccPrdCustodyError, describeCccPrdQuoteForRejection } from "./custody.js";
+import {
+  CccPrdCustodyError,
+  CccPrdRepairableModelOutputError,
+  describeCccPrdQuoteForRejection,
+} from "./custody.js";
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
 import { stripOutermostJsonFence } from "./native-authoring-adapter.js";
 import { locateCccPrdQuote } from "./quote-locator.js";
@@ -532,7 +536,23 @@ export async function runCccPrdChunkAttempt(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const prompt = input.buildPrompt(priorViolations);
-    const response = await input.transport({ prompt, attempt });
+    let response: { provider: string; model: string; text: string };
+    try {
+      response = await input.transport({ prompt, attempt });
+    } catch (error) {
+      // Output-size faults -- truncation at the model's token ceiling, a
+      // response past maxResponseBytes -- reach this await from inside the
+      // transport, which no other try/catch in this loop covers. They used to
+      // escape and kill the document; running out of output room is the most
+      // likely thing a large chunk does, and "you produced too much" is an
+      // instruction a retry can act on. Anything not self-declared repairable
+      // (identity drift, egress policy, infra timeouts) still escapes.
+      if (error instanceof CccPrdRepairableModelOutputError) {
+        priorViolations = [error.message];
+        continue;
+      }
+      throw error;
+    }
     if (response.provider !== input.expectedProvider || response.model !== input.expectedModel) {
       throw new Error(
         `CCC PRD chunk authoring transport identity drifted: expected ${input.expectedProvider}/${input.expectedModel}, `

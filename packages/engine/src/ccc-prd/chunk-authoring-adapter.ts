@@ -3,10 +3,12 @@ import { CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION, canonicalCccPrdJson
 import { getHomeDir } from "../auth-storage.js";
 import { readCustomProviders } from "../custom-providers.js";
 import type { CccPrdChunkAttemptTransport } from "./chunk-verification.js";
+import { CccPrdRepairableModelOutputError } from "./custody.js";
 import {
   assertCccPrdAuthoringLoopbackEgress,
   assertCccPrdRouteVerbatimCapable,
   fusionModelRuntimeAuthoringTransport,
+  SMALLER_ANSWER_INSTRUCTION,
   type CccPrdNativeAuthoringMode,
   type CccPrdNativeAuthoringTransport,
 } from "./native-authoring-adapter.js";
@@ -234,8 +236,10 @@ export function createCccPrdChunkTransportCaller(
       ]);
       const responseBytes = Buffer.byteLength(response.text, "utf8");
       if (responseBytes > options.maxResponseBytes) {
-        throw new Error(
-          `CCC PRD chunk authoring response is ${responseBytes} bytes; maximum is ${options.maxResponseBytes}`,
+        throw new CccPrdRepairableModelOutputError(
+          "CCC_PRD_CHUNK_RESPONSE_OVERSIZED",
+          `CCC PRD chunk authoring response is ${responseBytes} bytes; maximum is ${options.maxResponseBytes}. `
+            + `${SMALLER_ANSWER_INSTRUCTION} ${options.maxResponseBytes} bytes.`,
         );
       }
       return response;

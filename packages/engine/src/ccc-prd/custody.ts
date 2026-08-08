@@ -42,6 +42,29 @@ export class CccPrdCustodyError extends Error {
   }
 }
 
+/**
+ * A fault the model itself can correct on the next attempt -- it produced
+ * something slightly outside the expected shape or budget, not something
+ * unrecoverable.
+ *
+ * Repairability in this pipeline has been a property of WHERE an error is
+ * thrown (an implicit allowlist of call sites that happen to sit inside a
+ * try/catch) rather than of WHAT went wrong, which is why identical faults get
+ * opposite verdicts in different modules. This carries the verdict on the
+ * error itself so a distant handler does not have to infer it from the throw
+ * site. `message` is handed straight to the retry prompt, so it must name the
+ * offending value and, where one exists, the allowed alternative -- a
+ * rejection the model cannot act on only buys one more identical attempt.
+ */
+export class CccPrdRepairableModelOutputError extends CccPrdCustodyError {
+  readonly retryEligible = true;
+
+  constructor(code: string, message: string) {
+    super(code, message);
+    this.name = "CccPrdRepairableModelOutputError";
+  }
+}
+
 export type CccPrdPacketCustody = {
   rootDir: string;
   manifestPath: string;
