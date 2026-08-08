@@ -73,6 +73,15 @@ const terminalScope: CccProviderAttemptScope = Object.freeze({
   attemptOrdinal: 1,
   requestCount: 1,
   state: "committed",
+  // TERMINAL_SCOPE_KEYS requires an exact key set, and workItemFence joined it in
+  // 3f139a99c without this fixture being updated. The release validator derives its
+  // sealed permit-scope fence from this same object, so the fence only has to be a
+  // frozen, canonical workItemId/runId/attempt triple to be self-consistent.
+  workItemFence: Object.freeze({
+    workItemId: "ccc-native-cli-lifecycle-work-item",
+    runId: "ccc-native-cli-lifecycle-run",
+    attempt: 1,
+  }),
   binding: authorityBinding,
   terminal: Object.freeze({
     kind: "reconciled",

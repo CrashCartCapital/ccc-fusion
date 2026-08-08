@@ -25,6 +25,16 @@ export type {
   CccPrdUnderstandingReview,
   UnderstandCccPrdInput,
 } from "./understanding.js";
+// Quote matching. `CccPrdQuoteReview` is the operator-facing half: it rides
+// the understanding result and the CLI's printed JSON wrapper, never the
+// persisted sidecar, and it is what makes fuzzy matching accountable.
+export {
+  CCC_PRD_RUN_QUOTE_MATCH_POLICY,
+  DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY,
+} from "./anchor-resolver.js";
+export type { CccPrdQuoteMatchPolicy } from "./anchor-resolver.js";
+export type { CccPrdFuzzyQuoteReviewNotice } from "./chunk-verification.js";
+export type { CccPrdQuoteReview } from "./chunk-orchestrator.js";
 export { compileCccPrdPacket, validateCccPrdPacket, validateNeoCandidate } from "./compiler.js";
 export type { CompileCccPrdInput } from "./compiler.js";
 export {

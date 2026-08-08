@@ -591,3 +591,43 @@ describe("fn provider add -- per-model token limits", () => {
     expect(persisted()).toEqual([]);
   });
 });
+
+describe("fn provider add -- declared verbatim capability (design D-4)", () => {
+  it("test 51: --verbatim-capable stamps every model entry", async () => {
+    const code = await run([
+      "add",
+      "--name", "Local",
+      "--base-url", LOOPBACK_BASE_URL,
+      "--model", "big-model",
+      "--model", "small-model",
+      "--verbatim-capable",
+    ]);
+
+    expect(code).toBe(0);
+    const providers = persisted();
+    expect(providers[0]!.models).toEqual([
+      { id: "big-model", name: "big-model", verbatimCapable: true },
+      { id: "small-model", name: "small-model", verbatimCapable: true },
+    ]);
+  });
+
+  it("stores no verbatimCapable field when the flag is absent", async () => {
+    await run(["add", "--name", "Local", "--base-url", LOOPBACK_BASE_URL, "--model", "m"]);
+
+    const providers = persisted();
+    expect(providers[0]!.models).toEqual([{ id: "m", name: "m" }]);
+  });
+
+  it("test 51b: fails without --model instead of silently dropping the flag", async () => {
+    const code = await run([
+      "add",
+      "--name", "Local",
+      "--base-url", LOOPBACK_BASE_URL,
+      "--verbatim-capable",
+    ]);
+
+    expect(code).toBe(1);
+    expect(output()).toContain("--model");
+    expect(persisted()).toEqual([]);
+  });
+});

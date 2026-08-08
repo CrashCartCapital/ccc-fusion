@@ -3,7 +3,7 @@ import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { seedDashboardProviders } from "../provider-registration.js";
-import { registerCustomProviders } from "../custom-provider-registry.js";
+import { registerCustomProviders, reregisterCustomProviders } from "../custom-provider-registry.js";
 
 /*
 FNXC:ProviderRegistration 2026-07-07-00:00:
@@ -346,6 +346,141 @@ describe("registerCustomProviders anthropicPromptCaching opt-in (FN-7689)", () =
     const [, config] = call as [string, { api: string; models: Array<{ compat?: Record<string, unknown> }> }];
     expect(config.api).toBe("openai-responses");
     expect(config.models[0].compat).toBeUndefined();
+  });
+});
+
+/*
+FNXC:ProviderHeaders 2026-08-06-00:00:
+Regression coverage for the SILENT-DROP failure in `toProviderConfig`: it rebuilt the pi provider
+config from a four-field whitelist (baseUrl/api/apiKey/models), so a `headers` map configured in
+~/.fusion/settings.json vanished with no error and no warning. Nothing downstream was at fault --
+pi's provider composer already accepts `headers` -- which is exactly why the bug was invisible: the
+config looked valid at every layer, it was simply missing a field.
+
+The symptom that made it matter: measurement dispatch goes through a local gateway whose semantic
+response cache keys on `temperature: 0` (which the authoring adapter hardcodes), so identical
+re-runs replayed a stale cached answer. The opt-out is per-request (`X-OmniRoute-No-Cache: true`)
+and header-only, so it could not reach the wire at all while the whitelist stood.
+
+These assertions pin the FORWARDING, not the specific header -- the invariant is "a configured
+headers map survives toProviderConfig verbatim", which is what the whitelist violated.
+*/
+describe("registerCustomProviders headers forwarding", () => {
+  it("forwards a configured headers map verbatim into the registered provider config", () => {
+    const modelRegistry = makeModelRegistry();
+    const provider = customProvider({
+      headers: { "X-OmniRoute-No-Cache": "true", "X-Trace-Id": "acceptance-run-7" },
+    });
+
+    registerCustomProviders(modelRegistry, [provider], vi.fn());
+
+    expect(modelRegistry.registerProvider).toHaveBeenCalledWith(
+      "acme-ai",
+      expect.objectContaining({
+        headers: { "X-OmniRoute-No-Cache": "true", "X-Trace-Id": "acceptance-run-7" },
+      }),
+    );
+  });
+
+  it("omits headers entirely when none are configured", () => {
+    const modelRegistry = makeModelRegistry();
+
+    registerCustomProviders(modelRegistry, [customProvider()], vi.fn());
+
+    const call = modelRegistry.registerProvider.mock.calls.find(([key]: [string]) => key === "acme-ai");
+    expect(call).toBeDefined();
+    const [, config] = call as [string, Record<string, unknown>];
+    expect(config).not.toHaveProperty("headers");
+  });
+
+  it("treats a header change as a provider change so the gateway is not left on a stale config", async () => {
+    /*
+    `providersDiffer` compares JSON.stringify(toProviderConfig(...)). Before the fix both sides
+    stringified identically regardless of headers, so flipping the cache-bypass header on an
+    already-registered provider was a no-op re-registration -- the old header set stayed live.
+    */
+    const modelRegistry = makeModelRegistry();
+    const before = [customProvider()];
+    const after = [customProvider({ headers: { "X-OmniRoute-No-Cache": "true" } })];
+
+    await registerCustomProviders(modelRegistry, before, vi.fn());
+    modelRegistry.registerProvider.mockClear();
+    await reregisterCustomProviders(modelRegistry, before, after, vi.fn());
+
+    expect(modelRegistry.registerProvider).toHaveBeenCalledWith(
+      "acme-ai",
+      expect.objectContaining({ headers: { "X-OmniRoute-No-Cache": "true" } }),
+    );
+  });
+});
+
+/*
+FNXC:ProviderHeaders 2026-08-06-00:00:
+Symptom-based acceptance: assert the configured header is on the ACTUAL outgoing HTTP request, not
+merely present in the provider config. Config-shape assertions cannot prove this -- they show the
+field reaches pi, not that pi puts it on the wire, and those are genuinely different things here.
+
+Two non-obvious facts about pi make this test the shape it is, both established by capturing real
+requests rather than reading the source:
+  - pi's provider composer BLANKS model headers at composition time (`applyExtension` sets
+    `headers: undefined` on every model), so the composed model NEVER carries them. Asserting on
+    `model.headers` would fail even when the wire is correct.
+  - They are re-resolved per request by `ModelRuntime.getAuth()`, which merges the provider's
+    configured headers into `auth.headers`; pi-ai applies that as `options.headers`.
+So the test must route through `getAuth()`. An earlier version of this test hand-built
+`{ apiKey: "test-key" }` and skipped `getAuth()` entirely -- it failed against a WORKING fix, which
+is precisely the false negative this comment exists to prevent. Corollary worth knowing: any
+dispatch path that hand-builds options and bypasses getAuth() will not carry these headers.
+*/
+describe("headers symptom verification: configured headers reach the outgoing request", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends X-OmniRoute-No-Cache on the wire for a provider configured with headers", async () => {
+    const runtime = await ModelRuntime.create({
+      credentials: { read: async () => undefined, list: async () => [], modify: async (_id: any, fn: any) => fn(undefined), delete: async () => undefined },
+      modelsPath: null,
+      allowModelNetwork: false,
+    } as any);
+    const modelRegistry = new ModelRegistry(runtime);
+
+    const provider = customProvider({
+      id: "bb0e8400-e29b-41d4-a716-4466554400aa",
+      name: "OmniRoute Measurement",
+      baseUrl: "http://127.0.0.1:8092/v1",
+      headers: { "X-OmniRoute-No-Cache": "true" },
+      models: [{ id: "minimax-m3", name: "MiniMax M3" }],
+    });
+    await registerCustomProviders(modelRegistry as any, [provider], vi.fn());
+
+    const registryKey = customProviderRegistryKey(provider, [provider]);
+    const model = modelRegistry.find(registryKey, "minimax-m3");
+    expect(model).toBeDefined();
+
+    // The real dispatch path resolves auth (and with it, configured headers) before streaming.
+    const resolved: any = await (runtime as any).getAuth(model);
+    expect(resolved?.auth?.headers).toEqual({ "X-OmniRoute-No-Cache": "true" });
+
+    let capturedHeaders: Record<string, string> | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init?: { headers?: HeadersInit }) => {
+      capturedHeaders = Object.fromEntries(new Headers(init?.headers).entries());
+      return new Response(
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }));
+
+    await completeSimple(model!, {
+      systemPrompt: "You are a helpful assistant.",
+      messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
+    } as any, { apiKey: resolved?.auth?.apiKey, headers: resolved?.auth?.headers } as any);
+
+    expect(capturedHeaders).toBeDefined();
+    // Header names are case-insensitive; `new Headers` lowercases them.
+    expect(capturedHeaders).toEqual(
+      expect.objectContaining({ "x-omniroute-no-cache": "true" }),
+    );
   });
 });
 

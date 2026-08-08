@@ -37,7 +37,7 @@ describe("prd native authoring descendant contract", () => {
     const isolatedHome = join(packet.root, "home");
     mkdirSync(join(isolatedHome, ".pi", "fusion"), { recursive: true });
     const address = server.address() as AddressInfo;
-    writeFileSync(join(isolatedHome, ".pi", "fusion", "settings.json"), JSON.stringify({ customProviders: [{ id: "550e8400-e29b-41d4-a716-446655440003", name: "Loopback Understanding", apiType: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "LOCAL_FIXTURE_KEY", models: [{ id: "fixture-model", name: "Fixture Model" }] }] }));
+    writeFileSync(join(isolatedHome, ".pi", "fusion", "settings.json"), JSON.stringify({ customProviders: [{ id: "550e8400-e29b-41d4-a716-446655440003", name: "Loopback Understanding", apiType: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "LOCAL_FIXTURE_KEY", models: [{ id: "fixture-model", name: "Fixture Model", verbatimCapable: true }] }] }));
     const reviewPath = join(packet.root, "understanding-review.json");
 
     try {
@@ -96,7 +96,7 @@ describe("prd native authoring descendant contract", () => {
     const isolatedHome = join(packet.root, "home");
     mkdirSync(join(isolatedHome, ".pi", "fusion"), { recursive: true });
     const address = server.address() as AddressInfo;
-    writeFileSync(join(isolatedHome, ".pi", "fusion", "settings.json"), JSON.stringify({ customProviders: [{ id: "550e8400-e29b-41d4-a716-446655440003", name: "Loopback Authoring", apiType: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "LOCAL_FIXTURE_KEY", models: [{ id: "fixture-model", name: "Fixture Model" }] }] }));
+    writeFileSync(join(isolatedHome, ".pi", "fusion", "settings.json"), JSON.stringify({ customProviders: [{ id: "550e8400-e29b-41d4-a716-446655440003", name: "Loopback Authoring", apiType: "openai-compatible", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKey: "LOCAL_FIXTURE_KEY", models: [{ id: "fixture-model", name: "Fixture Model", verbatimCapable: true }] }] }));
 
     try {
       const author = await runFnAsync([

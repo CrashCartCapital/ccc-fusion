@@ -14,6 +14,8 @@ interface ModelRegistryLike extends RefreshableModelRegistry {
     baseUrl: string;
     api: string;
     apiKey?: string;
+    /** FNXC:ProviderHeaders 2026-08-06-00:00: extra request headers; see toProviderConfig. */
+    headers?: Record<string, string>;
     models: Array<{
       id: string;
       name: string;
@@ -134,14 +136,55 @@ export function resolveCustomProviderApiKey(provider: CustomProvider): string | 
   return validateCccLoopbackHttpUrl(provider.baseUrl).ok ? CCC_LOOPBACK_NO_AUTH_REQUIRED_API_KEY : undefined;
 }
 
+/*
+FNXC:ProviderHeaders 2026-08-06-00:00:
+This function is the ONLY boundary between a `CustomProvider` read out of
+~/.fusion/settings.json and the provider config handed to pi-coding-agent's
+model registry, and it rebuilt that config from a fixed field whitelist. A
+configured `headers` map was therefore dropped SILENTLY here -- no error, no
+warning -- even though every layer downstream already preserves it and pi
+itself accepts it (`headers?: ProviderHeaders` on its provider composer). The
+break was ours alone.
+
+The concrete failure this caused: measurement runs dispatch through a local
+OmniRoute gateway whose semantic cache treats `temperature: 0` as the
+cacheability predicate, and our authoring adapter hardcodes exactly that. Every
+first attempt is byte-identical across runs, so a re-run replayed a STALE
+cached answer instead of exercising the new code -- silently serving pre-fix
+results and invalidating the whole acceptance run. The only way to opt out is a
+per-request header (`X-OmniRoute-No-Cache: true`), which could not reach the
+wire while this whitelist existed.
+
+Forward headers verbatim: pass-through, not interpretation. Emit the key only
+when a non-empty map is configured so an unconfigured provider's config stays
+byte-identical to before -- `providersDiffer` compares these configs by
+JSON.stringify, and a header edit must count as a change requiring
+re-registration (which is why it is inside the spread).
+
+How this actually reaches the wire -- traced empirically, because the obvious
+reading of the pi source is wrong twice over:
+  1. pi's provider composer BLANKS model headers at composition time
+     (`applyExtension` sets `headers: undefined` on every model unconditionally),
+     so the composed `model.headers` is always undefined and stamping headers
+     onto our `models` entries changes nothing by itself.
+  2. They are re-resolved per request by `ModelRuntime.getAuth()`, which merges
+     the provider's configured headers into `auth.headers`; pi-ai then applies
+     that as `options.headers` on the outgoing request.
+So the provider-level key below is both necessary AND sufficient -- verified by
+disabling it and watching the header vanish from a captured request. Note this
+means a dispatch path that hand-builds options and skips `getAuth()` will NOT
+carry these headers.
+*/
 function toProviderConfig(provider: CustomProvider) {
   const api = resolveApiType(provider.apiType);
+  const headers = provider.headers;
 
   return {
     baseUrl: provider.baseUrl,
     api,
     apiKey: resolveCustomProviderApiKey(provider),
     models: buildCustomProviderModels(provider, api),
+    ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
   };
 }
 

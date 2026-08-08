@@ -385,10 +385,51 @@ describe("Workspace bootstrap script contract", () => {
   const dashboardPkg = loadPackageJson("dashboard");
 
   it("makes root test changed-only while keeping explicit full-suite and CI-shard commands", () => {
+    // `test` and `test:ci:shard` stay pinned as literals on purpose: each is a
+    // bare script path with no flags, so the only thing that can drift is the
+    // path itself — which is exactly the contract worth pinning.
     expect(rootPkg.scripts?.test).toBe("node scripts/test-changed.mjs");
-    expect(rootPkg.scripts?.["test:full"]).toBe("node scripts/test-changed.mjs --full --no-cache && pnpm --filter @fusion/engine test:slow");
-    expect(rootPkg.scripts?.["test:full"]).not.toContain("pnpm build");
     expect(rootPkg.scripts?.["test:ci:shard"]).toBe("node scripts/ci-test-shard.mjs");
+
+    // `test:full` is deliberately NOT pinned to a literal. It is a multi-phase
+    // shell command line that is expected to keep evolving (phases added, the
+    // chaining operator changed), and package.json is its source of truth. A
+    // verbatim `toBe` here made every legitimate edit to that command look like
+    // a test regression, and the cheap way out is always to re-paste the new
+    // string — which guarantees the same failure on the next edit.
+    //
+    // That bug class — a pinned literal outranked by a moving source of truth —
+    // fired four separate times in one day in this repo: this assertion, a
+    // fixture missing a newly required key, an allowlist keyed on file:line, and
+    // a partial mock missing a real method. The other three together aborted the
+    // recursive test run and left roughly 24,000 tests unexecuted for weeks. So
+    // assert the properties that actually matter and let the text move.
+    const testFull = rootPkg.scripts?.["test:full"];
+    expect(typeof testFull).toBe("string");
+
+    // Drives the changed-file runner in full, uncached mode.
+    expect(testFull).toContain("scripts/test-changed.mjs");
+    expect(testFull).toContain("--full");
+    expect(testFull).toContain("--no-cache");
+
+    // Still reaches the engine slow lane, which the changed-file runner skips.
+    expect(testFull).toMatch(/--filter\s+@fusion\/engine\s+test:slow/);
+
+    // Never builds; building is verify:workspace's job, not the test lane's.
+    expect(testFull).not.toContain("pnpm build");
+
+    // Must not continue past a failing phase without aggregating the failure.
+    // `&&` chaining propagates a nonzero status on its own. Any other separator
+    // does not: `a; b` and `a || b` both report only the last command's status,
+    // so a red first phase reads as success. Those forms are only safe when the
+    // script accumulates a status and exits with it.
+    const usesNonAndSequencing = /;|\|\|/.test(testFull);
+    const aggregatesExitCode =
+      /status=0/.test(testFull) && /exit \$status/.test(testFull);
+    expect(
+      usesNonAndSequencing && !aggregatesExitCode,
+      `test:full sequences phases without && and without aggregating their exit codes, so a failing phase would report success: ${testFull}`,
+    ).toBe(false);
   });
 
   it("defines verify:workspace in lint -> test:full -> build order", () => {

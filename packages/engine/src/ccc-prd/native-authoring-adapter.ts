@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   canonicalCccPrdJson,
@@ -64,6 +68,57 @@ export class CccPrdAuthoringEgressPolicyViolationError extends Error {
   }
 }
 
+export class CccPrdRouteNotVerbatimCapableError extends Error {
+  readonly code = "CCC_PRD_ROUTE_NOT_VERBATIM_CAPABLE";
+
+  constructor(providerKey: string, model: string) {
+    super(
+      `CCC PRD quote-bearing work refuses ${providerKey}/${model}: verbatimCapable is not declared. `
+        + "Absent means unknown means not admitted (design D-4) -- register with "
+        + "`fn provider add --verbatim-capable` once the route is confirmed to copy quotes byte-exact.",
+    );
+    this.name = "CccPrdRouteNotVerbatimCapableError";
+  }
+}
+
+/*
+Real acceptance run against glm-5.2 (2026-08-05): the model wrapped its whole
+JSON answer in a ```json code fence and JSON.parse threw on the leading
+backtick, hard-failing CCC_PRD_AUTHORING_FAILED. Wrapping JSON in a fence is
+common LLM behavior. Strip ONLY when the entire trimmed response is a single
+outermost fence -- opener (``` optionally + language tag, then a newline) at
+the start and a bare closing ``` at the end -- and only remove those two
+delimiters. This must never become a global backtick/fence removal: a quote
+inside a JSON string value may legitimately contain a fence, and mangling it
+would corrupt the byte-exact quote custody the product exists to guarantee.
+*/
+const OUTERMOST_FENCE_WRAPPER = /^```[^\n`]*\n([\s\S]*)\n```$/u;
+
+export function stripOutermostJsonFence(text: string): string {
+  const trimmed = text.trim();
+  const match = OUTERMOST_FENCE_WRAPPER.exec(trimmed);
+  return match ? match[1]! : text;
+}
+
+/*
+Defect B (2026-08-05): a JSON.parse failure on the authoring response used to
+surface only V8's SyntaxError message -- which previews roughly a dozen
+characters of the input -- through authoring.ts's catch-all refusal bundle,
+discarding the raw response text entirely. That made the real acceptance-run
+failure against glm-5.2 undiagnosable: we could not see what the model
+actually sent. Persist the raw response to a scratch file ONLY on parse
+failure (never on success -- this is diagnostic volume, not a product
+artifact) and name that path in the thrown error so a future run is
+diagnosable. Written to the OS temp directory, never stdout, never the vault.
+*/
+function persistUnparsableAuthoringResponse(rawResponseText: string): string {
+  const diagnosticsDir = join(tmpdir(), "fusion-ccc-prd-authoring-diagnostics");
+  mkdirSync(diagnosticsDir, { recursive: true });
+  const diagnosticPath = join(diagnosticsDir, `unparsable-response-${randomUUID()}.txt`);
+  writeFileSync(diagnosticPath, rawResponseText, "utf8");
+  return diagnosticPath;
+}
+
 /*
 FNXC:CCCAuthoringEgress 2026-08-01-17:40:
 Authoring and understanding serialize every admitted source verbatim into one
@@ -75,7 +130,7 @@ inheriting that provider's own remote route. The refusal deliberately names only
 the provider key and the policy reason — never the base URL, credential, or any
 source text — so a refusal log cannot become the leak it just prevented.
 */
-function assertCccPrdAuthoringLoopbackEgress(
+export function assertCccPrdAuthoringLoopbackEgress(
   providerKey: string,
   providers: CustomProvider[],
 ): void {
@@ -91,6 +146,29 @@ function assertCccPrdAuthoringLoopbackEgress(
   const validation = validateCccLoopbackHttpUrl(provider.baseUrl);
   if (!validation.ok) {
     throw new CccPrdAuthoringEgressPolicyViolationError(providerKey, validation.reason);
+  }
+}
+
+/*
+Design §8 / D-4: verbatimCapable is a declared operator assertion, not a
+measurement -- the product cannot see the architecture behind an
+OpenAI-compatible URL, so MoE disqualification (D3) is enforced by
+declaration. Absent means unknown means not admitted for quote-bearing work.
+Required for BOTH modes (execution and understanding), since both emit
+sourceRefs. Checked before a single corpus byte is serialized, alongside the
+egress assertion.
+*/
+export function assertCccPrdRouteVerbatimCapable(
+  providerKey: string,
+  model: string,
+  providers: CustomProvider[],
+): void {
+  const provider = providers.find(
+    (candidate) => customProviderRegistryKey(candidate, providers) === providerKey,
+  );
+  const modelEntry = provider?.models?.find((entry) => entry.id === model);
+  if (!modelEntry?.verbatimCapable) {
+    throw new CccPrdRouteNotVerbatimCapableError(providerKey, model);
   }
 }
 
@@ -115,6 +193,7 @@ function buildPrompt(
       ];
   return [
     "Generate exactly one JSON object and no Markdown or commentary.",
+    "Return raw JSON only -- do not wrap the object in a ```json or ``` code fence and do not add any text before or after the object.",
     `The object schema must be ${CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION}.`,
     "Preserve the source packet. Do not execute actions or invent source text.",
     ...modeInstructions,
@@ -198,7 +277,10 @@ export const fusionModelRuntimeAuthoringTransport: CccPrdNativeAuthoringTranspor
       {
         signal: controller.signal,
         temperature: 0,
-        maxTokens: Math.max(1, Math.min(model.maxTokens, request.maxResponseBytes)),
+        // maxTokens is a TOKEN budget; it must come from the registered
+        // model's own token limit, never from request.maxResponseBytes
+        // (a BYTE count -- used only by the response-size guards below).
+        maxTokens: Math.max(1, model.maxTokens),
         timeoutMs: request.maxDurationMs,
         maxRetries: 0,
       },
@@ -257,6 +339,7 @@ export function createNativeCccPrdAuthoringAdapter(
     model: `${options.provider}/${options.model}`,
     async generateCandidate(request): Promise<CccPrdAuthoringProposal> {
       assertCccPrdAuthoringLoopbackEgress(options.provider, configuredProviders);
+      assertCccPrdRouteVerbatimCapable(options.provider, options.model, configuredProviders);
       const prompt = buildPrompt(request, mode);
       const promptBytes = Buffer.byteLength(prompt, "utf8");
       if (promptBytes > options.maxPromptBytes) {
@@ -297,7 +380,17 @@ export function createNativeCccPrdAuthoringAdapter(
             `CCC PRD authoring response is ${responseBytes} bytes; maximum is ${options.maxResponseBytes}`,
           );
         }
-        const parsed = JSON.parse(response.text) as unknown;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(stripOutermostJsonFence(response.text));
+        } catch (error) {
+          const diagnosticPath = persistUnparsableAuthoringResponse(response.text);
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `CCC PRD authoring response is not valid JSON (${reason}); `
+              + `raw response preserved at ${diagnosticPath} for diagnosis`,
+          );
+        }
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
           throw new Error("CCC PRD authoring response is not one JSON object");
         }
