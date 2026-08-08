@@ -37,6 +37,10 @@ function createExecutor(rootDir: string): TaskExecutor {
     }),
     updateTask: vi.fn().mockResolvedValue(undefined),
     logEntry: vi.fn().mockResolvedValue(undefined),
+    // createWorktree consults the store to decide whether a task is an imported
+    // CCC campaign task with a chained start branch. These FN-8370 fixtures are
+    // plain tasks that exist in no store, so "not found" is the honest answer.
+    getTask: vi.fn().mockResolvedValue(null),
   };
   return new TaskExecutor(store as any, rootDir);
 }
