@@ -47,6 +47,28 @@ export type CccPrdChunkedUnderstandingOptions = {
    * anchor-resolver.ts for what that trade buys and costs.
    */
   quoteMatchPolicy?: CccPrdQuoteMatchPolicy;
+  /**
+   * Receives the run's quote review after every chunk that completes, so the
+   * flags reach the caller as they happen instead of only on the return value.
+   *
+   * This exists because the return value is not reachable on a failed
+   * document. Every refusal in this pipeline is a throw -- chunk attempts
+   * exhausted, review budget blown, assembly coverage incomplete -- and a throw
+   * unwinds this function's frame, taking the receipt accumulator with it. A
+   * document that guessed at three quotes in chunks 1-5 and then died at chunk
+   * 6 reported nothing at all, which is exactly the condition fuzzy matching
+   * was made conditional on never happening.
+   *
+   * The caller owns the variable this writes into, so it outlives the throw by
+   * construction -- no module-level state to leak between concurrent runs, and
+   * no receipts bolted onto an error object whose type we do not control (this
+   * pipeline throws CccPrdCustodyError, route-admission Error subclasses, and
+   * bare Errors alike).
+   *
+   * Each call carries the complete cumulative review, not a delta, so a caller
+   * only ever has to keep the most recent one.
+   */
+  onQuoteReviewProgress?: (review: CccPrdQuoteReview) => void;
   /** Test-only seam; production omits it and uses the real fusion model runtime transport. */
   transport?: CccPrdNativeAuthoringTransport;
   customProviders?: CustomProvider[];
@@ -103,6 +125,31 @@ export const CCC_PRD_NO_FUZZY_QUOTE_REVIEW: CccPrdQuoteReview = {
   fuzzyMatchCount: 0,
   fuzzyMatches: [],
 };
+
+/**
+ * Rolls per-chunk receipts up into the operator-facing review.
+ *
+ * Deliberately the single producer of that shape: the successful return value
+ * and the progress snapshot a failed run is reported from both come from here,
+ * so a refusal and a success can never show a reader two different renderings
+ * of the same fact.
+ */
+function summarizeCccPrdQuoteReview(
+  policy: CccPrdQuoteMatchPolicy,
+  chunks: readonly CccPrdChunkAnchorReceipts[],
+): CccPrdQuoteReview {
+  const fuzzyMatches = chunks.flatMap((chunk) => (
+    chunk.fuzzyReviewNotices.map((notice) => ({ ...notice, chunkId: chunk.chunkId }))
+  ));
+  return {
+    policy: {
+      allowFuzzy: policy.allowFuzzy,
+      recordFuzzyForReview: policy.recordFuzzyForReview,
+    },
+    fuzzyMatchCount: fuzzyMatches.length,
+    fuzzyMatches,
+  };
+}
 
 /**
  * Runs the full chunked-lane pipeline against real custody: plan -> per-chunk
@@ -207,7 +254,14 @@ export async function runCccPrdChunkedUnderstanding(
       maxChunkAttempts: options.maxChunkAttempts,
       limits: options.anchorLimits,
       quoteMatchPolicy,
-      onAnchorReceipts: (receipts) => anchorReceipts.push(receipts),
+      // Reported to the caller the moment the chunk's receipts land, not at
+      // the end of the loop: everything after this point in the iteration
+      // (review budget) and every later chunk can throw, and a throw is
+      // precisely the case this channel exists to survive.
+      onAnchorReceipts: (receipts) => {
+        anchorReceipts.push(receipts);
+        options.onQuoteReviewProgress?.(summarizeCccPrdQuoteReview(quoteMatchPolicy, anchorReceipts));
+      },
     });
 
     fragments.push({ chunkOrdinal: chunk.chunkOrdinal, resolved });
@@ -228,22 +282,11 @@ export async function runCccPrdChunkedUnderstanding(
     fragments,
   });
 
-  const fuzzyMatches = anchorReceipts.flatMap((chunk) => (
-    chunk.fuzzyReviewNotices.map((notice) => ({ ...notice, chunkId: chunk.chunkId }))
-  ));
-
   return {
     chunkCount: plan.chunkCount,
     chunkPlanHash: plan.chunkPlanHash,
     assembled,
     anchorReceipts,
-    quoteReview: {
-      policy: {
-        allowFuzzy: quoteMatchPolicy.allowFuzzy,
-        recordFuzzyForReview: quoteMatchPolicy.recordFuzzyForReview,
-      },
-      fuzzyMatchCount: fuzzyMatches.length,
-      fuzzyMatches,
-    },
+    quoteReview: summarizeCccPrdQuoteReview(quoteMatchPolicy, anchorReceipts),
   };
 }

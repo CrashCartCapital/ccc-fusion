@@ -145,10 +145,19 @@ export type UnderstandCccPrdInput = {
  * frozen artifact schema. It is required rather than optional so no lane can
  * quietly omit it -- "no quotes were guessed" and "nobody reported" have to
  * look different.
+ *
+ * On the refusal it is OPTIONAL, and that asymmetry is deliberate. A failed
+ * document still has to report the quotes its completed chunks guessed at --
+ * that is the whole point, and a refusal is the only output such a run ever
+ * produces -- but most refusals come from lanes and stages where no quote was
+ * ever matched (bad review bound, missing transport config, the whole
+ * single-shot lane). Printing an empty review on all of them would bury the
+ * one that means something. Present therefore means "this run guessed, here is
+ * what it guessed at"; absent means there is nothing to review.
  */
 export type CccPrdUnderstandingResult =
   | (CccPrdUnderstandingReview & { lane: "single" | "chunked"; quoteReview: CccPrdQuoteReview })
-  | { kind: "refusal"; diagnostics: CccPrdDiagnostic[] };
+  | { kind: "refusal"; diagnostics: CccPrdDiagnostic[]; quoteReview?: CccPrdQuoteReview };
 
 function positive(value: number): number | null {
   return Number.isSafeInteger(value) && value > 0 ? value : null;
@@ -362,6 +371,26 @@ async function runSingleShotUnderstanding(
   };
 }
 
+/**
+ * Attaches the run's quote review to a refusal, but only when the run actually
+ * guessed at something.
+ *
+ * A refusal is everything an operator gets for a failed document, so any quote
+ * the completed chunks recovered by guessing has to ride out on it. A review
+ * reporting zero guesses is left off entirely: on the success path the empty
+ * review is meaningful (it distinguishes "clean run" from "nobody looked"), but
+ * on a failure it would print on nearly every refusal the pipeline emits and
+ * train readers to skip the field that matters.
+ */
+function refusal(
+  diagnostics: CccPrdDiagnostic[],
+  quoteReview: CccPrdQuoteReview | undefined,
+): CccPrdUnderstandingResult {
+  return quoteReview && quoteReview.fuzzyMatchCount > 0
+    ? { kind: "refusal", diagnostics, quoteReview }
+    : { kind: "refusal", diagnostics };
+}
+
 async function runChunkedUnderstanding(
   input: UnderstandCccPrdInput,
 ): Promise<CccPrdUnderstandingResult> {
@@ -374,6 +403,15 @@ async function runChunkedUnderstanding(
       }],
     };
   }
+
+  /*
+   * Lives HERE, in the caller's frame, on purpose. The receipts it mirrors are
+   * accumulated inside runCccPrdChunkedUnderstanding, and every refusal that
+   * pipeline produces is a throw -- so its own accumulator is unreachable by
+   * the time the catch below runs. Holding the latest snapshot out here is what
+   * makes a guess made in chunk 1 survive a document that dies at chunk 6.
+   */
+  let observedQuoteReview: CccPrdQuoteReview | undefined;
 
   let chunkResult: Awaited<ReturnType<typeof runCccPrdChunkedUnderstanding>>;
   try {
@@ -392,6 +430,7 @@ async function runChunkedUnderstanding(
       anchorLimits: input.anchorLimits,
       transport: input.chunkTransport,
       customProviders: input.customProviders,
+      onQuoteReviewProgress: (review) => { observedQuoteReview = review; },
     });
   } catch (error) {
     // Never an uncaught rejection: chunk-plan/verification/assembly refusals
@@ -402,40 +441,49 @@ async function runChunkedUnderstanding(
     // wrapper. Anything else falls back to a generic failure code with the
     // original message preserved, mirroring authorCccPrdPacket's catch-all
     // (authoring.ts:1056-1063).
+    //
+    // Both refusals carry the quote review observed before the throw. Which
+    // error killed the run says nothing about whether earlier chunks guessed,
+    // so the flags ride out either way.
     if (hasStringCode(error)) {
-      return { kind: "refusal", diagnostics: [{ code: error.code, message: error.message }] };
+      return refusal([{ code: error.code, message: error.message }], observedQuoteReview);
     }
-    return {
-      kind: "refusal",
-      diagnostics: [{
+    return refusal(
+      [{
         code: "CCC_PRD_CHUNKED_UNDERSTANDING_FAILED",
         message: error instanceof Error ? error.message : "chunked understanding failed",
       }],
-    };
+      observedQuoteReview,
+    );
   }
 
   const { assembled } = chunkResult;
+  // Past the throw, the pipeline's own rollup is authoritative and complete;
+  // the progress snapshot was only ever a stand-in for a value that never
+  // arrived. Every refusal below is still a failed document, so each one
+  // reports the guesses the run made on its way here.
+  const quoteReview = chunkResult.quoteReview;
   if (assembled.requirements.length === 0) {
-    return {
-      kind: "refusal",
-      diagnostics: [{
+    return refusal(
+      [{
         code: "CCC_PRD_UNDERSTANDING_ZERO_REQUIREMENTS",
         message: "understanding extracted zero requirements from the frozen PRD packet",
       }],
-    };
+      quoteReview,
+    );
   }
   const reviewCount = assembled.ambiguities.length
     + assembled.unresolvedDecisions.length
     + assembled.exceptions.length
     + assembled.protectedActions.length;
   if (reviewCount > input.maxReviewItems) {
-    return {
-      kind: "refusal",
-      diagnostics: [{
+    return refusal(
+      [{
         code: "CCC_PRD_AUTHORING_REVIEW_UNBOUNDED",
         message: `understanding review count ${reviewCount} exceeds admitted maximum ${input.maxReviewItems}`,
       }],
-    };
+      quoteReview,
+    );
   }
 
   const custody = readCccPrdPacketCustody(input);
@@ -456,7 +504,7 @@ async function runChunkedUnderstanding(
     requirementDispositionCount: requirementDispositionsForShallowCheck,
   });
   if (chunkedShallowRefusal) {
-    return { kind: "refusal", diagnostics: [chunkedShallowRefusal] };
+    return refusal([chunkedShallowRefusal], quoteReview);
   }
 
   /*
@@ -477,14 +525,14 @@ async function runChunkedUnderstanding(
   try {
     proposalHash = sha256(canonicalCccPrdJson(assembled));
   } catch (error) {
-    return {
-      kind: "refusal",
-      diagnostics: [{
+    return refusal(
+      [{
         code: "CCC_PRD_UNDERSTANDING_NOT_CANONICALIZABLE",
         message: "assembled understanding cannot be canonicalized for hashing: "
           + (error instanceof Error ? error.message : String(error)),
       }],
-    };
+      quoteReview,
+    );
   }
 
   return {
@@ -492,7 +540,7 @@ async function runChunkedUnderstanding(
     // Carried out of the pipeline unchanged. This is the only place a reader
     // learns that N quotes were anchored by guessing and what the source
     // actually said at each one; the spans themselves record coordinates only.
-    quoteReview: chunkResult.quoteReview,
+    quoteReview,
     schema: CCC_PRD_UNDERSTANDING_REVIEW_SCHEMA_VERSION,
     kind: "understanding-review",
     executable: false,

@@ -1135,7 +1135,19 @@ async function runGeneratedUnderstanding(
     ...(input.maxChunkAttempts !== undefined ? { maxChunkAttempts: input.maxChunkAttempts } : {}),
   });
   if (result.kind === "refusal") {
-    io.write(JSON.stringify(result));
+    // A refusal is the ONLY thing an operator reads for a failed document, so
+    // it carries `quoteReview` beside its diagnostics -- same key, same shape,
+    // same printed JSON channel as the success path at the bottom of this
+    // function. The chunks that completed before the failure may well have
+    // anchored quotes by guessing, and guessing in silence is the one thing
+    // fuzzy matching was never allowed to do. Re-emitted explicitly rather
+    // than left to ride along inside `result`, so a later refactor that
+    // reshapes the refusal payload has to make an actual decision about these
+    // flags instead of dropping them by accident. The field is absent when the
+    // run guessed at nothing -- see CccPrdUnderstandingResult for why a
+    // failure stays quiet where a success reports its empty review.
+    const { quoteReview, ...refusalPayload } = result;
+    io.write(JSON.stringify(quoteReview ? { ...refusalPayload, quoteReview } : refusalPayload));
     return 1;
   }
   // Design §7: `lane` is emitted in this JSON wrapper only, never in the
