@@ -61,7 +61,7 @@
     "test:coverage:cli": "pnpm --filter @runfusion/fusion exec vitest run --silent=passed-only --reporter=dot --coverage",
     "test:coverage:dashboard": "pnpm --filter @fusion/dashboard exec vitest run --silent=passed-only --reporter=dot --coverage",
     "test:slow-cli": "pnpm --filter @runfusion/fusion test:slow-cli",
-    "typecheck": "pnpm -r --filter=!@fusion/desktop --filter=!@fusion/mobile typecheck",
+    "typecheck": "pnpm --filter @fusion/core build && pnpm --filter @fusion/engine build && pnpm -r --workspace-concurrency=1 --filter=!@fusion/desktop --filter=!@fusion/mobile typecheck",
     "i18n:extract": "i18next-cli extract",
     "i18n:sync": "i18next-cli sync",
     "i18n:types": "i18next-cli types",

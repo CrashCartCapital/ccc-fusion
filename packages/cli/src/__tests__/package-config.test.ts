@@ -23,6 +23,11 @@ function loadRootPackageJson(): any {
   return JSON.parse(readFileSync(path, "utf-8"));
 }
 
+function loadWorkspaceJson(...pathParts: string[]): any {
+  const path = join(workspaceRoot, ...pathParts);
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
 function loadCliPrepackScript(): string {
   const path = join(workspaceRoot, "packages", "cli", "scripts", "prepare-publish-manifest.mjs");
   return readFileSync(path, "utf-8");
@@ -383,6 +388,37 @@ describe("Scoped @fusion/* packages publishing config", () => {
 describe("Workspace bootstrap script contract", () => {
   const rootPkg = loadRootPackageJson();
   const dashboardPkg = loadPackageJson("dashboard");
+
+  it("builds core and engine declarations before serial workspace typechecking", () => {
+    expect(rootPkg.scripts?.typecheck).toBe(
+      "pnpm --filter @fusion/core build && pnpm --filter @fusion/engine build && pnpm -r --workspace-concurrency=1 --filter=!@fusion/desktop --filter=!@fusion/mobile typecheck",
+    );
+
+    const baseConfig = readFileSync(join(workspaceRoot, "tsconfig.base.json"), "utf-8");
+    expect(baseConfig).toMatch(/"declaration"\s*:\s*true/);
+    expect(baseConfig).toMatch(/"declarationMap"\s*:\s*true/);
+  });
+
+  it("resolves dashboard and CLI workspace dependencies through built declarations", () => {
+    const expectedDeclarationPaths = {
+      "@fusion/core": ["../core/dist/index.d.ts"],
+      "@fusion/core/*": ["../core/dist/*.d.ts"],
+      "@fusion/engine": ["../engine/dist/index.d.ts"],
+      "@fusion/engine/*": ["../engine/dist/*.d.ts"],
+    };
+    const configs = [
+      ["dashboard server", loadWorkspaceJson("packages", "dashboard", "tsconfig.json")],
+      ["dashboard app", loadWorkspaceJson("packages", "dashboard", "tsconfig.app.json")],
+      ["CLI", loadWorkspaceJson("packages", "cli", "tsconfig.json")],
+    ] as const;
+
+    for (const [label, config] of configs) {
+      expect(
+        config.compilerOptions?.paths,
+        `${label} must consume core and engine declaration output instead of loading their source trees`,
+      ).toMatchObject(expectedDeclarationPaths);
+    }
+  });
 
   it("makes root test changed-only while keeping explicit full-suite and CI-shard commands", () => {
     // `test` and `test:ci:shard` stay pinned as literals on purpose: each is a

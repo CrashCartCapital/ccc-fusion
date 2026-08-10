@@ -8,6 +8,10 @@
     "noEmit": true,
     "types": ["vitest/globals", "@testing-library/jest-dom", "node", "vite/client"],
     "paths": {
+      "@fusion/core": ["../core/dist/index.d.ts"],
+      "@fusion/core/*": ["../core/dist/*.d.ts"],
+      "@fusion/engine": ["../engine/dist/index.d.ts"],
+      "@fusion/engine/*": ["../engine/dist/*.d.ts"],
       "node-pty": ["./src/types/node-pty/index.d.ts"],
       "@fusion/dashboard/app/components/TaskCard": ["./app/components/TaskCard.tsx"],
       "@fusion/dashboard/app/components/ViewHeader": ["./app/components/ViewHeader.tsx"],
