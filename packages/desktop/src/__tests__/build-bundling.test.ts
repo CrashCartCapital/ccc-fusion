@@ -44,6 +44,18 @@ describe("desktop Electron main bundling", () => {
     expect(workspaceTools).toContain("fusion-plugin-omp-runtime");
   });
 
+  it("builds dashboard runtime plugins serially within the desktop packaging memory budget", async () => {
+    const workspaceTools = await readDesktopFile("scripts/workspace-tools.ts");
+    const buildRuntimePlugins = workspaceTools.match(
+      /export async function buildDashboardRuntimePlugins\(\): Promise<void> \{[\s\S]*?\n\}/,
+    )?.[0];
+
+    expect(buildRuntimePlugins).toBeDefined();
+    expect(buildRuntimePlugins).toContain("for (const relativePath of DASHBOARD_RUNTIME_PLUGIN_PACKAGES)");
+    expect(buildRuntimePlugins).toContain("await buildPackage(relativePath)");
+    expect(buildRuntimePlugins).not.toContain("Promise.all");
+  });
+
   it("externalizes production main-process packages so updater CJS deps are not bundled into ESM", async () => {
     const buildScript = await readDesktopFile("scripts/build.ts");
     const mainBuildBlock = buildScript.match(/entryPoints: \[join\(packageRoot, "src", "main\.ts"\)\],[\s\S]*?logLevel: "info",/m)?.[0];

@@ -114,7 +114,9 @@ export const DASHBOARD_RUNTIME_PLUGIN_PACKAGES = [
 
 export async function buildDashboardRuntimePlugins(): Promise<void> {
   await buildPackage("packages/plugin-sdk");
-  await Promise.all(DASHBOARD_RUNTIME_PLUGIN_PACKAGES.map((relativePath) => buildPackage(relativePath)));
+  for (const relativePath of DASHBOARD_RUNTIME_PLUGIN_PACKAGES) {
+    await buildPackage(relativePath);
+  }
 }
 
 export async function buildDashboard(): Promise<void> {
