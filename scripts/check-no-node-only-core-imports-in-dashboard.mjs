@@ -76,7 +76,7 @@ function codeMask(source) {
 }
 
 function moduleFromSpecifier(specifier) {
-  const relative = /(?:^|\/)core\/src\/([^/?#]+)$/.exec(specifier);
+  const relative = /(?:^|\/)core\/src\/([^?#]+)$/.exec(specifier);
   if (relative) return { module: relative[1].replace(/\.(?:[cm]?[jt]sx?)$/, ""), isRelative: true };
   const subpath = /^@fusion\/core\/([^/?#]+)$/.exec(specifier);
   return subpath ? { module: subpath[1], isRelative: false } : null;
