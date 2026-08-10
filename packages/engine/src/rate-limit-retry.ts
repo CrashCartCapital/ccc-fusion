@@ -55,6 +55,25 @@ export interface RateLimitRetryOptions {
   /** Upper bound on backoff delay in milliseconds (default: 120 000 — 2 min). */
   maxDelayMs?: number;
   /**
+   * When true, the first retry after a rate-limit/usage-limit error fires
+   * almost immediately (0–2 s jittered) instead of waiting the full
+   * exponential delay — the measured `agy` 429 self-healed on the very next
+   * call with no wait (report §8.3). Ahead of, and separate from, the
+   * exponential curve: consumed at most once per call and does not advance
+   * `maxRetries`, mirroring how the transient-auth budget below is kept
+   * separate.
+   *
+   * FNXC:Phase3RoutingSlice1 2026-08-03:
+   * Defaults `false` for every caller. `RateLimitRetryOptions` has no
+   * transport concept, so the utility itself cannot know which call is
+   * gateway-routed — a transport-conditional default is not implementable
+   * here without threading a transport parameter through every call site.
+   * The one caller that knows it is gateway/agy-routed opts in explicitly
+   * (spec 2026-08-03 phase3-routing §4.2 R-F3; that call site is itself
+   * pending R-F10, so no existing call site sets this yet).
+   */
+  immediateFirstRetry?: boolean;
+  /**
    * Called before each retry with the attempt number (1-based) and the
    * computed delay. Use this to log retry activity to the task and agent logs.
    */
@@ -98,12 +117,14 @@ export async function withRateLimitRetry<T>(
     maxRetries = 3,
     baseDelayMs = 30_000,
     maxDelayMs = 120_000,
+    immediateFirstRetry = false,
     onRetry,
     signal,
   } = options;
 
   let lastError: Error | undefined;
   let authRetries = 0;
+  let usedImmediateRetry = false;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -137,6 +158,33 @@ export async function withRateLimitRetry<T>(
         onRetry?.(authRetries, delay, error);
 
         await sleep(delay, signal);
+        continue;
+      }
+
+      /*
+      FNXC:Phase3RoutingSlice1 2026-08-03:
+      One immediate jittered (0-2s) retry, ahead of and separate from the
+      exponential curve below — same "don't consume a rate-limit attempt"
+      shape as the transient-auth branch above (attempt-- so the next
+      exponential rung still starts at baseDelayMs, not 2x it). Gated on a
+      one-shot flag rather than a budget: at most once per call, regardless
+      of maxRetries (mirrors the auth branch's placement ahead of the
+      maxRetries check, so immediateFirstRetry still fires even when
+      maxRetries is 0).
+      */
+      if (immediateFirstRetry && !usedImmediateRetry) {
+        usedImmediateRetry = true;
+
+        if (signal?.aborted) {
+          throw lastError;
+        }
+
+        const immediateDelay = Math.round(Math.random() * 2000); // 0-2 s, full jitter
+
+        onRetry?.(attempt + 1, immediateDelay, error);
+
+        await sleep(immediateDelay, signal);
+        attempt--; // don't consume a rate-limit attempt for the immediate retry
         continue;
       }
 

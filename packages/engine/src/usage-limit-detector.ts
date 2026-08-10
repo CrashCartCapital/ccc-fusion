@@ -35,6 +35,13 @@ const USAGE_LIMIT_PATTERNS: RegExp[] = [
   /billing/i,
   /\bcredit/i,
   /insufficient.*(quota|credit|balance|fund)/i,
+  // spec 2026-08-03 phase3-routing §4.2 R-F4/N-F6: Gemini's status name for
+  // the same quota-exhaustion class the patterns above already catch under
+  // other providers' vocabulary. Reads bare here, so this is intentionally
+  // repo-wide (UsageLimitPauser parking, RateLimitError reclassification,
+  // retry-with-backoff.ts non-retry, heartbeat "usage-limit" outcome) — see
+  // T-9c.
+  /RESOURCE_EXHAUSTED/i,
 ];
 
 /**

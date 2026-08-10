@@ -52,7 +52,7 @@ test("planned commands are targeted package-scoped vitest invocations", () => {
   const manifest = loadManifest(DEFAULT_MANIFEST_PATH, { rootDir: repoRoot });
   const commands = planCommands(manifest);
 
-  assert.deepEqual(commands.map((command) => command.package), ["@fusion/core", "@fusion/dashboard", "@fusion/engine"]);
+  assert.deepEqual(commands.map((command) => command.package), ["@fusion/core", "@fusion/engine"]);
   for (const command of commands) {
     assert.equal(command.command, "pnpm");
     assert.deepEqual(command.args.slice(0, 5), ["--filter", command.package, "exec", "vitest", "run"]);
