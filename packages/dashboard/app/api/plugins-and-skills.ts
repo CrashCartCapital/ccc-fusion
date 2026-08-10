@@ -16,7 +16,7 @@ import type {
   ToggleSkillResult,
   SkillContent,
   SkillFileContent,
-} from "@fusion/dashboard";
+} from "../../src/skills-adapter.js";
 import { api } from "./client.js";
 import { withProjectId } from "./health.js";
 import { dedupe } from "./dedupe.js";
@@ -275,4 +275,3 @@ export async function fetchSkillFileContent(skillId: string, relativePath: strin
   );
   return response.file;
 }
-

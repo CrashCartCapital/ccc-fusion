@@ -12,7 +12,7 @@ import {
   fetchSkillContent,
   fetchSkillFileContent,
 } from "../api";
-import type { DiscoveredSkill, CatalogEntry, SkillContent, SkillFileContent } from "@fusion/dashboard";
+import type { DiscoveredSkill, CatalogEntry, SkillContent, SkillFileContent } from "../../src/skills-adapter.js";
 
 /*
 FNXC:Skills 2026-06-23-04:15:

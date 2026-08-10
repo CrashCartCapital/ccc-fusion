@@ -14,10 +14,10 @@ import {
   TASK_PRIORITIES,
   getErrorMessage,
 } from "@fusion/core";
-import { resolveEffectiveAutoMerge } from "../../../core/src/task-merge";
-// FNXC:PlannerOversight 2026-07-04-00:00: the dashboard's vite alias for "@fusion/core"
-// resolves only to ../core/src/types.ts (see packages/dashboard/vite.config.ts), so shared helpers
-// should be read from the package barrel to stay compatible with the browser-safe module map.
+import { resolveEffectiveAutoMerge } from "@fusion/core/task-merge";
+// FNXC:PlannerOversight 2026-07-04-00:00: the dashboard's broad Vite alias for "@fusion/core"
+// resolves only to ../core/src/types.ts, so shared helpers use explicit browser-safe subpath
+// aliases defined in packages/dashboard/vite.config.ts.
 import { addressPrFeedback, fetchTaskDetail, uploadAttachment, fetchMission, fetchAgent, rebuildTaskSpec, refreshPrStatus, fetchWorkflowSettingValues, type WorkflowFieldDefinition, type RevertTaskOptions, type RevertTaskResult } from "../api";
 import { GitHubBadge } from "./GitHubBadge";
 import { GitLabBadge } from "./GitLabBadge";

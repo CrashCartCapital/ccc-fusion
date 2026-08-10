@@ -1,4 +1,4 @@
-import type { Task } from "../../../core/src/types";
+import type { Task } from "@fusion/core/types";
 
 /**
  * FNXC:PlanReviewReplan 2026-07-15-12:15:

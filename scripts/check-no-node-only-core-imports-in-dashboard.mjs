@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /*
 FNXC:DashboardBrowserSafeCore 2026-07-16-12:00:
-Dashboard browser code must value-import only confirmed browser-safe @fusion/core leaves.
-The package-root Vite alias resolves to types.ts, while relative core/src imports bypass that
-alias and can pull Node-only dependencies such as node:crypto into the client bundle.
+Dashboard browser code must import core leaves through confirmed browser-safe @fusion/core subpaths.
+The package-root Vite alias resolves to types.ts, while relative core/src imports bypass the
+explicit subpath aliases and can pull core source into client build and typecheck graphs.
 Keep the dated allowlist limited to leaves whose transitive dependencies were reviewed.
 */
 import { readFileSync } from "node:fs";
@@ -77,9 +77,9 @@ function codeMask(source) {
 
 function moduleFromSpecifier(specifier) {
   const relative = /(?:^|\/)core\/src\/([^/?#]+)$/.exec(specifier);
-  if (relative) return relative[1].replace(/\.(?:[cm]?[jt]sx?)$/, "");
+  if (relative) return { module: relative[1].replace(/\.(?:[cm]?[jt]sx?)$/, ""), isRelative: true };
   const subpath = /^@fusion\/core\/([^/?#]+)$/.exec(specifier);
-  return subpath?.[1] ?? null;
+  return subpath ? { module: subpath[1], isRelative: false } : null;
 }
 
 /*
@@ -129,8 +129,10 @@ export function scanFileContent(content, filePath, { allowlist } = {}) {
     const clause = fromMatch?.[3] ?? "";
     const specifier = fromMatch?.[5] ?? sideEffectMatch?.[2] ?? dynamicSpecifierAt(content, keywordMatch.index);
     if (!specifier) continue;
-    const module = moduleFromSpecifier(specifier);
-    if (!module || safeModules.has(module) || isTypeOnly(kind, typeKeyword, clause)) continue;
+    const coreImport = moduleFromSpecifier(specifier);
+    if (!coreImport) continue;
+    const { module, isRelative } = coreImport;
+    if (!isRelative && (safeModules.has(module) || isTypeOnly(kind, typeKeyword, clause))) continue;
     const { lineNumber, line } = lineAt(content, keywordMatch.index);
     matches.push({ type: "node-only-core-import", filePath, lineNumber, line, specifier, module });
   }
@@ -150,8 +152,8 @@ export function scanTrackedFiles(files = listTrackedTargets(), { allowlist, read
 
 export function formatFailureMessage(matches) {
   return [
-    "[check-no-node-only-core-imports-in-dashboard] found a dashboard browser value import outside the browser-safe core allowlist.",
-    "Dashboard browser code may value-import only reviewed core leaves; use near-duplicate-canonical.ts instead of near-duplicate.ts.",
+    "[check-no-node-only-core-imports-in-dashboard] found a relative core source import or a dashboard browser value import outside the browser-safe core allowlist.",
+    "Dashboard browser code must use reviewed @fusion/core/<leaf> subpaths; use near-duplicate-canonical instead of near-duplicate.",
     `After verifying transitive dependencies contain no Node-only modules, add a dated entry to ${ALLOWLIST_PATH}.`,
     ...matches.map(({ filePath, lineNumber, line }) => `${filePath}:${lineNumber}: import: ${line}`),
   ].join("\n");
