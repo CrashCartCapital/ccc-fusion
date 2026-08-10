@@ -224,6 +224,22 @@ describe("check-no-node-only-core-imports-in-dashboard", () => {
     }
   });
 
+  it("keeps reviewed package subpath aliases ahead of broad core aliases in Vitest configs", () => {
+    for (const configPath of [
+      "packages/dashboard/vitest.config.ts",
+      "plugins/fusion-plugin-dependency-graph/vitest.config.ts",
+    ]) {
+      const config = readFileSync(configPath, "utf8");
+      const spreadIndex = config.indexOf("...browserSafeCoreAliases");
+      const broadAliasIndex = config.indexOf('"@fusion/core"');
+
+      assert.notEqual(spreadIndex, -1, `${configPath} must spread browserSafeCoreAliases`);
+      assert.notEqual(broadAliasIndex, -1, `${configPath} must keep its broad @fusion/core alias`);
+      assert.ok(spreadIndex < broadAliasIndex, `${configPath} must place browserSafeCoreAliases before @fusion/core`);
+      assert.ok(config.includes("dashboard-browser-safe-core-modules.json"), `${configPath} must read the reviewed allowlist`);
+    }
+  });
+
   it("ignores comment and string mentions of a forbidden specifier", () => {
     const source = [
       '// import { TaskStore } from "../../../core/src/store";',

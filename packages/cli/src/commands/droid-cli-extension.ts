@@ -57,7 +57,7 @@ export function resolveDroidCliExtensionFromModuleUrl(
   // holds the staged extension. Walk up a few levels to also catch nested
   // layouts (e.g. dist/commands/foo.js) without hard-coding depth.
   const here = dirname(fileURLToPath(moduleUrl));
-  for (const rel of ["droid-cli", "../droid-cli", "../../droid-cli"]) {
+  for (const rel of ["droid-cli", "../droid-cli", "../../droid-cli", "../../../droid-cli"]) {
     const candidate = resolve(here, rel, "package.json");
     if (existsSync(candidate)) {
       pkgJsonPath = candidate;

@@ -36,6 +36,16 @@ describe("desktop Electron main bundling", () => {
     expect(serverRuntimeBuild).not.toContain('runWorkspaceBin("vite"');
   });
 
+  it("keeps the desktop unit-test prebuild on dashboard server artifacts", async () => {
+    const testScript = await readDesktopFile("scripts/test.ts");
+
+    expect(testScript).toContain("buildDashboardServerRuntime()");
+    expect(testScript).toContain('join(dashboardRoot, "src", "registry-manifest.json")');
+    expect(testScript).toContain('join(dashboardRoot, "dist", "registry-manifest.json")');
+    expect(testScript).not.toContain("buildDashboard()");
+    expect(testScript).not.toContain("buildDashboardClient()");
+  });
+
   it("builds every dashboard-static runtime plugin including omp before packaging", async () => {
     /*
      * FNXC:DesktopOmpPlugin 2026-07-14-18:55:
