@@ -135,6 +135,16 @@ export default defineConfig({
       Add a new browser leaf only after its full dependency graph is reviewed and it has a dated entry in scripts/lib/dashboard-browser-safe-core-modules.json.
       */
       "@fusion/core/detect-content-language": resolve(__dirname, "../core/src/detect-content-language.ts"),
+      "@fusion/core/types": resolve(__dirname, "../core/src/types.ts"),
+      "@fusion/core/near-duplicate-canonical": resolve(__dirname, "../core/src/near-duplicate-canonical.ts"),
+      "@fusion/core/task-merge": resolve(__dirname, "../core/src/task-merge.ts"),
+      "@fusion/core/model-pricing": resolve(__dirname, "../core/src/model-pricing.ts"),
+      "@fusion/core/mobile-nav-primary-items": resolve(__dirname, "../core/src/mobile-nav-primary-items.ts"),
+      "@fusion/core/active-merge-status": resolve(__dirname, "../core/src/active-merge-status.ts"),
+      "@fusion/core/settings-schema": resolve(__dirname, "../core/src/settings-schema.ts"),
+      "@fusion/core/session-advisor": resolve(__dirname, "../core/src/session-advisor.ts"),
+      "@fusion/core/blocker-fanout": resolve(__dirname, "../core/src/blocker-fanout.ts"),
+      "@fusion/core/live-agent-count": resolve(__dirname, "../core/src/live-agent-count.ts"),
       "@fusion/core": resolve(__dirname, "../core/src/types.ts"),
       "@fusion/dashboard/app/components/TaskCard": resolve(__dirname, "app/components/TaskCard.tsx"),
       // FNXC:PluginBuild 2026-06-22-03:50: Bundled plugin source can import the dashboard's shared ViewHeader through the package export; Vite needs the same source alias during dashboard builds so plugin UI normalization does not fail only in CI merge builds.
