@@ -65,6 +65,18 @@ describe("desktop Electron main bundling", () => {
     expect(buildRuntimePlugins).not.toContain("Promise.all");
   });
 
+  it("retries transient directory races while clearing the desktop deploy stage", async () => {
+    const workspaceTools = await readDesktopFile("scripts/workspace-tools.ts");
+    const stageDesktopDeploy = workspaceTools.match(
+      /export async function stageDesktopDeploy\(\): Promise<void> \{[\s\S]*?\n\}/,
+    )?.[0];
+
+    expect(stageDesktopDeploy).toBeDefined();
+    expect(stageDesktopDeploy).toContain(
+      "await rm(desktopDeployDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })",
+    );
+  });
+
   it("externalizes production main-process packages so updater CJS deps are not bundled into ESM", async () => {
     const buildScript = await readDesktopFile("scripts/build.ts");
     const mainBuildBlock = buildScript.match(/entryPoints: \[join\(packageRoot, "src", "main\.ts"\)\],[\s\S]*?logLevel: "info",/m)?.[0];

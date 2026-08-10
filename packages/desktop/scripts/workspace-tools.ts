@@ -249,7 +249,7 @@ export async function verifyEmbeddedPostgresPayloads(
 
 export async function stageDesktopDeploy(): Promise<void> {
   console.log("[desktop:build] Staging complete production closure via pnpm deploy...");
-  await rm(desktopDeployDir, { recursive: true, force: true });
+  await rm(desktopDeployDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   await runPnpm(
     ["--filter", "@fusion/desktop", "deploy", "--prod", "--legacy", "--config.node-linker=hoisted", desktopDeployDir],
     workspaceRoot,
