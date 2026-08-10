@@ -1,7 +1,7 @@
 import { build } from "esbuild";
 import { cp, mkdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { buildCore, buildDashboard, buildDashboardClient, buildEngine, desktopDeployDir, packageRoot, stageDesktopDeploy, workspaceRoot } from "./workspace-tools";
+import { buildCore, buildDashboardClient, buildDashboardServerRuntime, buildEngine, desktopDeployDir, packageRoot, stageDesktopDeploy, workspaceRoot } from "./workspace-tools";
 const dashboardRoot = join(workspaceRoot, "packages", "dashboard");
 const dashboardClientDir = join(dashboardRoot, "dist", "client");
 const dashboardRegistryManifestSource = join(dashboardRoot, "src", "registry-manifest.json");
@@ -36,7 +36,7 @@ async function ensureDashboardBuild(): Promise<void> {
   // Build the dashboard server dist and copy registry-manifest.json here so the packaged
   // embedded runtime never depends on a separate `@fusion/dashboard build` workflow step.
   console.log("[desktop:build] Building dashboard server runtime...");
-  await buildDashboard();
+  await buildDashboardServerRuntime();
   await cp(dashboardRegistryManifestSource, dashboardRegistryManifestDist);
 
   console.log("[desktop:build] Building dashboard client for file:// desktop loading...");

@@ -119,11 +119,16 @@ export async function buildDashboardRuntimePlugins(): Promise<void> {
   }
 }
 
-export async function buildDashboard(): Promise<void> {
+export async function buildDashboardServerRuntime(): Promise<void> {
   const dashboardRoot = resolve(workspaceRoot, "packages", "dashboard");
   await buildDashboardRuntimePlugins();
-  await runWorkspaceBin("vite", ["build"], dashboardRoot);
   await runWorkspaceBin("tsc", [], dashboardRoot);
+}
+
+export async function buildDashboard(): Promise<void> {
+  const dashboardRoot = resolve(workspaceRoot, "packages", "dashboard");
+  await buildDashboardServerRuntime();
+  await runWorkspaceBin("vite", ["build"], dashboardRoot);
   // FNXC:DesktopBuild 2026-07-01-11:45:
   // Desktop release and test paths call this helper directly instead of the dashboard package script, so copy the Node-read registry manifest beside server dist here as the shared build invariant.
   await cp(resolve(dashboardRoot, "src", "registry-manifest.json"), resolve(dashboardRoot, "dist", "registry-manifest.json"));

@@ -18,13 +18,22 @@ async function readDesktopFile(relativePath: string): Promise<string> {
 }
 
 describe("desktop Electron main bundling", () => {
-  it("builds dashboard server artifacts and registry manifest from the desktop release build path", async () => {
+  it("builds dashboard server artifacts without running the client Vite build twice", async () => {
     const buildScript = await readDesktopFile("scripts/build.ts");
+    const workspaceTools = await readDesktopFile("scripts/workspace-tools.ts");
 
-    expect(buildScript).toContain("buildDashboard()");
+    expect(buildScript).toContain("buildDashboardServerRuntime()");
     expect(buildScript).toContain("dashboardRegistryManifestSource");
     expect(buildScript).toContain("dashboardRegistryManifestDist");
     expect(buildScript).toContain("await cp(dashboardRegistryManifestSource, dashboardRegistryManifestDist)");
+    expect(workspaceTools).toContain("export async function buildDashboardServerRuntime()");
+
+    const serverRuntimeBuild = workspaceTools.match(
+      /export async function buildDashboardServerRuntime\(\): Promise<void> \{[\s\S]*?\n\}/,
+    )?.[0];
+    expect(serverRuntimeBuild).toBeDefined();
+    expect(serverRuntimeBuild).toContain('runWorkspaceBin("tsc"');
+    expect(serverRuntimeBuild).not.toContain('runWorkspaceBin("vite"');
   });
 
   it("builds every dashboard-static runtime plugin including omp before packaging", async () => {
