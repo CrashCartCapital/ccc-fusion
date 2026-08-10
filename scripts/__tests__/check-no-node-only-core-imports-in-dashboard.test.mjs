@@ -39,6 +39,12 @@ describe("check-no-node-only-core-imports-in-dashboard", () => {
     assert.equal(violations(nested).length, 1);
   });
 
+  it("flags nested package value imports", () => {
+    const nested = 'import { schema } from "@fusion/core/postgres/schema";';
+
+    assert.equal(violations(nested).length, 1);
+  });
+
   it("flags whole-statement and inline type-only relative core imports", () => {
     const wholeStatement = 'import type { Foo } from "../../../core/src/near-duplicate-canonical";';
     const inlineSpecifier = 'import { type Foo } from "../../../core/src/near-duplicate-canonical";';
