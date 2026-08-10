@@ -631,16 +631,48 @@ describe("prd command exit contract", () => {
       expect(code).toBe(2);
     });
 
-    it("rejects --chunk-journal and --resume as not-yet-implemented, distinctly from an unknown flag", async () => {
+    it.each([
+      ["--chunk-journal", "/tmp/journal.json"],
+      ["--resume", "/tmp/journal.json"],
+    ])("rejects %s as not-yet-implemented, distinctly from an unknown flag", async (flag, value) => {
       const packet = createPacketRoot();
       const reviewPath = join(packet.root, "understanding-review.json");
       const output: string[] = [];
       const code = await runPrdCommand(
-        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags(["--chunk-journal", "/tmp/journal.json"])],
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags([flag, value])],
         { write: (line) => output.push(line) },
       );
       expect(code).toBe(2);
-      expect(output.join("\n")).toContain("not yet implemented");
+      expect(output).toEqual([
+        `${flag} is not yet implemented (the chunked understanding resume journal does not exist in this build)`,
+      ]);
+    });
+
+    it.each([
+      ["--chunk-journal", "/tmp/journal.json"],
+      ["--resume", "/tmp/journal.json"],
+    ])("rejects %s explicitly before generic option-count handling", async (flag, value) => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const output: string[] = [];
+      const code = await runPrdCommand(
+        [
+          "understand",
+          packet.root,
+          packet.manifest,
+          reviewPath,
+          ...requiredFlags([
+            "--lane", "chunked",
+            "--max-chunk-attempts", "3",
+            flag, value,
+          ]),
+        ],
+        { write: (line) => output.push(line) },
+      );
+      expect(code).toBe(2);
+      expect(output).toEqual([
+        `${flag} is not yet implemented (the chunked understanding resume journal does not exist in this build)`,
+      ]);
     });
 
     it("rejects an invalid --lane value", async () => {

@@ -484,7 +484,18 @@ function parseGeneratedUnderstandingArgs(
     || !rootDir
     || !manifestPath
     || !outputPath
-    || options.length % 2 !== 0
+  ) {
+    return undefined;
+  }
+  const notYetImplementedFlag = options.find((option) =>
+    notYetImplementedUnderstandingFlags.includes(
+      option as (typeof notYetImplementedUnderstandingFlags)[number],
+    ));
+  if (notYetImplementedFlag) {
+    return { error: `${notYetImplementedFlag} is not yet implemented (the chunked understanding resume journal does not exist in this build)` };
+  }
+  if (
+    options.length % 2 !== 0
     || options.length < requiredCount * 2
     || options.length > (requiredCount + optionalCount) * 2
   ) {
@@ -496,9 +507,6 @@ function parseGeneratedUnderstandingArgs(
     const value = options[index + 1];
     if (!flag || !value || value.startsWith("--")) {
       return undefined;
-    }
-    if (notYetImplementedUnderstandingFlags.includes(flag as never)) {
-      return { error: `${flag} is not yet implemented (the chunked understanding resume journal does not exist in this build)` };
     }
     const isRequired = generatedUnderstandingFlags.includes(flag as (typeof generatedUnderstandingFlags)[number]);
     const isOptional = optionalUnderstandingFlags.includes(flag as (typeof optionalUnderstandingFlags)[number]);
