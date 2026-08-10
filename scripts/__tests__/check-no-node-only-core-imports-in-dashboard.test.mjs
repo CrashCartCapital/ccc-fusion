@@ -57,6 +57,13 @@ describe("check-no-node-only-core-imports-in-dashboard", () => {
     assert.equal(violations(nested).length, 1);
   });
 
+  it("flags package value imports whose dot segments escape the core prefix", () => {
+    const source = 'import { TaskStore } from "@fusion/core/../store";';
+
+    assertParseValid([source]);
+    assert.equal(violations(source).length, 1);
+  });
+
   it("flags whole-statement and inline type-only relative core imports", () => {
     const wholeStatement = 'import type { Foo } from "../../../core/src/near-duplicate-canonical";';
     const inlineSpecifier = 'import { type Foo } from "../../../core/src/near-duplicate-canonical";';

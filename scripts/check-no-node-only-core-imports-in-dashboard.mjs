@@ -45,6 +45,11 @@ export function validateAllowlist(entries) {
 
 function moduleFromSpecifier(specifier, filePath) {
   const withoutSuffix = specifier.replace(/[?#].*$/, "");
+  const packagePrefix = "@fusion/core/";
+  if (withoutSuffix.startsWith(packagePrefix)) {
+    return { module: posix.normalize(withoutSuffix.slice(packagePrefix.length)), isRelative: false };
+  }
+
   const normalized = posix.normalize(withoutSuffix);
 
   if (normalized.startsWith("./") || normalized.startsWith("../")) {
@@ -57,10 +62,7 @@ function moduleFromSpecifier(specifier, filePath) {
     }
   }
 
-  const packagePrefix = "@fusion/core/";
-  return normalized.startsWith(packagePrefix)
-    ? { module: normalized.slice(packagePrefix.length), isRelative: false }
-    : null;
+  return null;
 }
 
 function importIsTypeOnly(node) {
