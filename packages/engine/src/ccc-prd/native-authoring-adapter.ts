@@ -309,13 +309,19 @@ export const fusionModelRuntimeAuthoringTransport: CccPrdNativeAuthoringTranspor
       }
     }
     const response = await stream.result();
-    if (response.stopReason !== "stop") {
+    if (response.stopReason === "length") {
       throw new CccPrdRepairableModelOutputError(
         "CCC_PRD_AUTHORING_RESPONSE_TRUNCATED",
         `CCC PRD authoring response was cut off before it finished: the model stopped with `
           + `"${response.stopReason}" (${response.errorMessage ?? "incomplete response"}). `
           + "Return a smaller answer: emit fewer rows and shorter description/content fields so the "
           + "complete JSON object fits inside the model's own output-token limit.",
+      );
+    }
+    if (response.stopReason !== "stop") {
+      throw new Error(
+        `CCC PRD authoring response did not complete: the model stopped with `
+          + `"${response.stopReason}" (${response.errorMessage ?? "incomplete response"}).`,
       );
     }
     const text = response.content

@@ -153,6 +153,77 @@ describe("transport output-size faults are repairable, not fatal", () => {
     }
   });
 
+  it.each([
+    {
+      label: "tool request",
+      providerFinishReason: "tool_calls",
+      expectedStopReason: "toolUse",
+      expectedDetail: "incomplete response",
+    },
+    {
+      label: "provider error",
+      providerFinishReason: "content_filter",
+      expectedStopReason: "error",
+      expectedDetail: "Provider finish_reason: content_filter",
+    },
+  ])("keeps a $label strict and non-repairable", async ({
+    providerFinishReason,
+    expectedStopReason,
+    expectedDetail,
+  }) => {
+    const { server } = await startModelServer([
+      { content: "partial output" },
+      { finishReason: providerFinishReason },
+    ]);
+    const controller = new AbortController();
+    try {
+      const fault = await rejectionOf(fusionModelRuntimeAuthoringTransport({
+        provider: "repairable-faults-wire",
+        model: "test-model",
+        prompt: "Hi",
+        maxDurationMs: 10_000,
+        maxResponseBytes: 65_536,
+        signal: controller.signal,
+      }));
+
+      expect(fault.code).not.toBe("CCC_PRD_AUTHORING_RESPONSE_TRUNCATED");
+      expect(fault.retryEligible).toBeUndefined();
+      expect(fault.message).toContain(expectedStopReason);
+      expect(fault.message).toContain(expectedDetail);
+      expect(fault.message).not.toContain("fewer rows");
+      expect(fault.message).not.toContain("output-token limit");
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it("keeps caller cancellation strict and non-repairable", async () => {
+    const { server } = await startModelServer([
+      { content: "unused" },
+      { finishReason: "stop" },
+    ]);
+    const controller = new AbortController();
+    controller.abort(new Error("operator cancelled authoring"));
+    try {
+      const fault = await rejectionOf(fusionModelRuntimeAuthoringTransport({
+        provider: "repairable-faults-wire",
+        model: "test-model",
+        prompt: "Hi",
+        maxDurationMs: 10_000,
+        maxResponseBytes: 65_536,
+        signal: controller.signal,
+      }));
+
+      expect(fault.code).not.toBe("CCC_PRD_AUTHORING_RESPONSE_TRUNCATED");
+      expect(fault.retryEligible).toBeUndefined();
+      expect(fault.message).toContain("aborted");
+      expect(fault.message).not.toContain("fewer rows");
+      expect(fault.message).not.toContain("output-token limit");
+    } finally {
+      await closeServer(server);
+    }
+  });
+
   it("classifies an oversized streamed response as repairable and names the byte count and the bound", async () => {
     const { server } = await startModelServer([
       { content: "x".repeat(200) },
