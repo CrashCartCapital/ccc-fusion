@@ -63,6 +63,8 @@ jobs:
 
       - name: Typecheck
         run: pnpm typecheck
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
 
   build:
     name: Build
@@ -77,6 +79,8 @@ jobs:
 
       - name: Build
         run: pnpm build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
 
   # The only merge-blocking TEST signal (R3). Runs the boot smoke (the app
   # starts and serves) plus the curated engine-core suite, the focused CCC PRD

@@ -297,6 +297,31 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(compositeAction.inputs?.["install-args"]?.default).toBe("--frozen-lockfile");
   });
 
+  it("caps memory only on the standalone Typecheck and Build command steps", () => {
+    const heapLimit = "--max-old-space-size=1664";
+    const typecheckStep = (workflow.jobs?.typecheck?.steps ?? []).find(
+      (step: any) => step.name === "Typecheck" && step.run === "pnpm typecheck",
+    );
+    const buildStep = (workflow.jobs?.build?.steps ?? []).find(
+      (step: any) => step.name === "Build" && step.run === "pnpm build",
+    );
+
+    expect(typecheckStep?.env?.NODE_OPTIONS).toBe(heapLimit);
+    expect(buildStep?.env?.NODE_OPTIONS).toBe(heapLimit);
+    expect(workflow.env?.NODE_OPTIONS).toBeUndefined();
+    expect(workflow.jobs?.typecheck?.env?.NODE_OPTIONS).toBeUndefined();
+    expect(workflow.jobs?.build?.env?.NODE_OPTIONS).toBeUndefined();
+
+    for (const jobName of ["lint", "gate"]) {
+      const job = workflow.jobs?.[jobName];
+      expect(job?.env?.NODE_OPTIONS, `${jobName} must not receive the build heap cap`).toBeUndefined();
+      expect(
+        (job?.steps ?? []).every((step: any) => step.env?.NODE_OPTIONS === undefined),
+        `${jobName} steps must not receive the build heap cap`,
+      ).toBe(true);
+    }
+  });
+
   it("keeps lint as install + lint only, without Bun/setup build coupling", () => {
     const lintSteps = workflow.jobs?.lint?.steps ?? [];
     expect(
