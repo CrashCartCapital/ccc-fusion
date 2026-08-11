@@ -97,8 +97,14 @@ type Compiler = {
     maxDurationMs?: number;
     maxPromptBytes?: number;
     maxResponseBytes?: number;
+    contextWindow?: number;
+    reservedOutputTokens?: number;
     maxChunkAttempts?: number;
   }): Promise<engine.CccPrdUnderstandingResult>;
+  resolveCustomProviderModelLimits(
+    providerKey: string,
+    modelId: string,
+  ): engine.CustomProviderModelLimits;
   compileCccPrdPacket(input: {
     rootDir: string;
     manifestPath: string;
@@ -141,6 +147,7 @@ export type PrdCommandDependencies = {
   inspectCccCampaignProofAttempt?: typeof inspectCccCampaignProofAttempt;
   settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
   understandCccPrdPacket?: typeof engine.understandCccPrdPacket;
+  resolveCustomProviderModelLimits?: typeof engine.resolveCustomProviderModelLimits;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
   approveCccCampaignLiveExecution?: typeof engine.approveCccCampaignLiveExecution;
@@ -1084,6 +1091,22 @@ async function runGeneratedUnderstanding(
     );
   }
 
+  let routeLimits: engine.CustomProviderModelLimits;
+  try {
+    routeLimits = (
+      dependencies.resolveCustomProviderModelLimits
+      ?? compiler.resolveCustomProviderModelLimits
+    )(input.provider, input.model);
+  } catch (error) {
+    return writeProductRefusal(
+      io,
+      "CCC_PRD_UNDERSTANDING_ADMISSION_FAILED",
+      error instanceof Error
+        ? error.message
+        : "selected understanding provider model limits could not be resolved",
+    );
+  }
+
   let adapter: CccPrdAuthoringAdapter;
   try {
     adapter = (
@@ -1140,6 +1163,8 @@ async function runGeneratedUnderstanding(
     maxDurationMs: input.maxDurationMs,
     maxPromptBytes: input.maxPromptBytes,
     maxResponseBytes: input.maxResponseBytes,
+    contextWindow: routeLimits.contextWindow,
+    reservedOutputTokens: routeLimits.maxTokens,
     ...(input.maxChunkAttempts !== undefined ? { maxChunkAttempts: input.maxChunkAttempts } : {}),
   });
   if (result.kind === "refusal") {

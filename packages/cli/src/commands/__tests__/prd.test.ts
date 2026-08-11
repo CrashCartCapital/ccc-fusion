@@ -373,6 +373,10 @@ describe("prd command exit contract", () => {
       generateCandidate: vi.fn(),
     };
     const createAdapter = vi.fn(() => adapter);
+    const resolveCustomProviderModelLimits = vi.fn(() => ({
+      contextWindow: 65_536,
+      maxTokens: 32_768,
+    }));
     const output: string[] = [];
 
     expect(await runPrdCommand([
@@ -395,9 +399,11 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       bootstrapProofAdmission: async () => ({}) as never,
       createNativeCccPrdAuthoringAdapter: createAdapter,
+      resolveCustomProviderModelLimits,
       understandCccPrdPacket: understand,
     } as never)).toBe(0);
 
+    expect(resolveCustomProviderModelLimits).toHaveBeenCalledWith("loopback", "fixture");
     expect(createAdapter).toHaveBeenCalledWith({
       provider: "loopback",
       model: "fixture",
@@ -418,6 +424,8 @@ describe("prd command exit contract", () => {
       maxDurationMs: 30000,
       maxPromptBytes: 1000000,
       maxResponseBytes: 262144,
+      contextWindow: 65536,
+      reservedOutputTokens: 32768,
     });
     expect(JSON.parse(readFileSync(reviewPath, "utf8"))).toEqual(review);
     expect(JSON.parse(output[0]!)).toMatchObject({
@@ -425,6 +433,56 @@ describe("prd command exit contract", () => {
       reviewPath,
     });
     expect(JSON.parse(output[0]!).executable).toBe(false);
+  });
+
+  it("refuses understanding admission when the selected provider model limits cannot be resolved", async () => {
+    const packet = createPacketRoot();
+    const reviewPath = join(packet.root, "understanding-review.json");
+    const output: string[] = [];
+    const resolveCustomProviderModelLimits = vi.fn(() => {
+      throw new Error("CCC custom provider model is not configured: loopback/missing");
+    });
+    const createAdapter = vi.fn();
+    const bootstrap = vi.fn(async () => ({}) as never);
+    const understand = vi.fn();
+
+    const exit = await runPrdCommand([
+      "understand",
+      packet.root,
+      packet.manifest,
+      reviewPath,
+      "--provider",
+      "loopback",
+      "--model",
+      "missing",
+      "--max-duration-ms",
+      "30000",
+      "--max-prompt-bytes",
+      "1000000",
+      "--max-response-bytes",
+      "262144",
+      "--max-review-items",
+      "8",
+    ], { write: (line) => output.push(line) }, {
+      bootstrapProofAdmission: bootstrap,
+      createNativeCccPrdAuthoringAdapter: createAdapter,
+      resolveCustomProviderModelLimits,
+      understandCccPrdPacket: understand,
+    } as never);
+
+    expect(exit).toBe(1);
+    expect(resolveCustomProviderModelLimits).toHaveBeenCalledWith("loopback", "missing");
+    expect(createAdapter).not.toHaveBeenCalled();
+    expect(bootstrap).not.toHaveBeenCalled();
+    expect(understand).not.toHaveBeenCalled();
+    expect(existsSync(reviewPath)).toBe(false);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_UNDERSTANDING_ADMISSION_FAILED",
+        message: "CCC custom provider model is not configured: loopback/missing",
+      }],
+    });
   });
 
   it("test 44: a real chunked-lane mid-run failure through the CLI caller leaves the packet root byte-identical", async () => {
@@ -531,6 +589,10 @@ describe("prd command exit contract", () => {
           id: "unused",
           generateCandidate: async () => { throw new Error("single-shot path must not run"); },
         }) as never,
+        resolveCustomProviderModelLimits: () => ({
+          contextWindow: 128_000,
+          maxTokens: 16_384,
+        }),
         // The CALLER path under test (prd.ts's runGeneratedUnderstanding) --
         // this wrapper runs the REAL engine chunk orchestrator (not a
         // mocked refusal), only supplying the test-only transport seam
@@ -575,6 +637,10 @@ describe("prd command exit contract", () => {
         {
           bootstrapProofAdmission: async () => ({}) as never,
           createNativeCccPrdAuthoringAdapter: vi.fn(() => ({ id: "x", generateCandidate: vi.fn() })) as never,
+          resolveCustomProviderModelLimits: () => ({
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          }),
           understandCccPrdPacket: understand,
         } as never,
       );
@@ -593,6 +659,10 @@ describe("prd command exit contract", () => {
         {
           bootstrapProofAdmission: async () => ({}) as never,
           createNativeCccPrdAuthoringAdapter: vi.fn(() => ({ id: "x", generateCandidate: vi.fn() })) as never,
+          resolveCustomProviderModelLimits: () => ({
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          }),
           understandCccPrdPacket: understand,
         } as never,
       );

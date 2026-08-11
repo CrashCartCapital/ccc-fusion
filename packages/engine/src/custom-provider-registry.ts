@@ -8,6 +8,8 @@ is now a thin re-export shim of this module; its observable behavior is unchange
 import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
 import { refreshFusionModelRegistry, type RefreshableModelRegistry } from "./model-registry-refresh.js";
 import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
+import { readCustomProviders } from "./custom-providers.js";
+import { getHomeDir } from "./auth-storage.js";
 
 interface ModelRegistryLike extends RefreshableModelRegistry {
   registerProvider: (name: string, config: {
@@ -32,6 +34,8 @@ interface ModelRegistryLike extends RefreshableModelRegistry {
   }) => void;
   refresh: () => unknown;
 }
+
+export type CustomProviderModelLimits = { contextWindow: number; maxTokens: number };
 
 /*
 FNXC:CustomProviders 2026-07-08-00:00:
@@ -114,6 +118,30 @@ export function buildCustomProviderModels(
         }
       : {}),
   }));
+}
+
+export function resolveCustomProviderModelLimits(
+  providerKey: string,
+  modelId: string,
+  customProviders?: CustomProvider[],
+): CustomProviderModelLimits {
+  const providers = customProviders ?? readCustomProviders(getHomeDir());
+  const provider = providers.find((candidate) =>
+    customProviderRegistryKey(candidate, providers) === providerKey);
+  if (!provider) {
+    throw new Error(`CCC custom provider is not configured: ${providerKey}`);
+  }
+
+  const api = resolveApiType(provider.apiType);
+  const model = buildCustomProviderModels(provider, api).find((candidate) => candidate.id === modelId);
+  if (!model) {
+    throw new Error(`CCC custom provider model is not configured: ${providerKey}/${modelId}`);
+  }
+
+  return {
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+  };
 }
 
 /*
