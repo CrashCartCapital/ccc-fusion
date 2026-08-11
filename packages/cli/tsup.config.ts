@@ -341,7 +341,7 @@ function runWorkspaceCommand(command: string, args: string[], cwd: string, timeo
   });
 }
 
-async function ensureDesktopRuntimeAssetsBuilt() {
+export async function ensureDesktopRuntimeAssetsBuilt() {
   if (existsSync(desktopRuntimeSrc)) {
     return;
   }

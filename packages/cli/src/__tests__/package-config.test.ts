@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { builtinModules } from "node:module";
+import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
 import { applyPrepackTransform } from "../../scripts/prepare-publish-manifest.mjs";
 
@@ -241,7 +242,7 @@ describe("CLI package.json publishing config", () => {
     expect(prepackScript).toContain('delete devDependencies["@fusion-plugin-examples/roadmap"]');
   });
 
-  it("runs package tsup configs serially without reducing full package contents", () => {
+  it("preflights Desktop runtime before running package tsup configs serially", () => {
     const scripts = pkg.scripts ?? {};
     const serialBuild = scripts["build:tsup:serial"];
 
@@ -250,9 +251,51 @@ describe("CLI package.json publishing config", () => {
       "cross-env FUSION_CLI_FULL_PACKAGE=1 pnpm run build:tsup:serial",
     );
     expect(serialBuild).toBe(
-      "cross-env FUSION_CLI_TSUP_CONFIG=cli tsup && cross-env FUSION_CLI_TSUP_CONFIG=proof-admission tsup && cross-env FUSION_CLI_TSUP_CONFIG=plugin-sdk tsup",
+      "tsx scripts/ensure-desktop-runtime.ts && cross-env FUSION_CLI_TSUP_CONFIG=cli tsup && cross-env FUSION_CLI_TSUP_CONFIG=proof-admission tsup && cross-env FUSION_CLI_TSUP_CONFIG=plugin-sdk tsup",
     );
     expect(serialBuild).not.toContain("FUSION_CLI_FULL_PACKAGE=0");
+  });
+
+  it("runs the Desktop preflight only for full-package modes while retaining the tsup fallback", async () => {
+    const preflightPath = join(
+      workspaceRoot,
+      "packages",
+      "cli",
+      "scripts",
+      "ensure-desktop-runtime.ts",
+    );
+    expect(
+      existsSync(preflightPath),
+      "CLI serial packaging requires the Desktop preflight entrypoint",
+    ).toBe(true);
+
+    const { runDesktopRuntimePreflight } = await import(pathToFileURL(preflightPath).href);
+    const ensureCalls: string[] = [];
+    const ensureDesktopRuntime = async () => {
+      ensureCalls.push("ensure");
+    };
+
+    expect(await runDesktopRuntimePreflight({}, ensureDesktopRuntime)).toBe(false);
+    expect(await runDesktopRuntimePreflight({ CI: "true" }, ensureDesktopRuntime)).toBe(true);
+    expect(
+      await runDesktopRuntimePreflight(
+        { CI: "true", FUSION_CLI_FULL_PACKAGE: "0" },
+        ensureDesktopRuntime,
+      ),
+    ).toBe(false);
+    expect(
+      await runDesktopRuntimePreflight(
+        { FUSION_CLI_FULL_PACKAGE: "1" },
+        ensureDesktopRuntime,
+      ),
+    ).toBe(true);
+    expect(ensureCalls).toEqual(["ensure", "ensure"]);
+
+    const tsupRaw = readFileSync(
+      join(workspaceRoot, "packages", "cli", "tsup.config.ts"),
+      "utf-8",
+    );
+    expect(tsupRaw).toContain("await ensureDesktopRuntimeAssetsBuilt();");
   });
 
   // Generalized guard derived from tsup.config.ts. Any non-builtin module

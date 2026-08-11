@@ -53,7 +53,7 @@
     "postpack": "node ./scripts/prepare-publish-manifest.mjs postpack",
     "build": "pnpm run build:tsup:serial",
     "build:package": "cross-env FUSION_CLI_FULL_PACKAGE=1 pnpm run build:tsup:serial",
-    "build:tsup:serial": "cross-env FUSION_CLI_TSUP_CONFIG=cli tsup && cross-env FUSION_CLI_TSUP_CONFIG=proof-admission tsup && cross-env FUSION_CLI_TSUP_CONFIG=plugin-sdk tsup",
+    "build:tsup:serial": "tsx scripts/ensure-desktop-runtime.ts && cross-env FUSION_CLI_TSUP_CONFIG=cli tsup && cross-env FUSION_CLI_TSUP_CONFIG=proof-admission tsup && cross-env FUSION_CLI_TSUP_CONFIG=plugin-sdk tsup",
     "build:exe": "bun run build.ts",
     "build:exe:all": "bun run build.ts --all",
     "typecheck": "tsc --noEmit",
