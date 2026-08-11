@@ -668,7 +668,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
       (step: any) => step.name === "Build or validate test artifacts",
     );
 
-    expect(buildStep?.env?.NODE_OPTIONS).toBe("--max-old-space-size=1664");
+    expect(buildStep?.env?.NODE_OPTIONS).toBe("--max-old-space-size=1792");
     expect(workflow.env?.NODE_OPTIONS).toBeUndefined();
     expect(prepareJob?.env?.NODE_OPTIONS).toBeUndefined();
   });
