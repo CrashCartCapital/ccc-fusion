@@ -203,6 +203,7 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
 
     expect(cachedSetup?.if).toBe("${{ inputs.skip-install != 'true' }}");
     expect(uncachedSetup?.if).toBe("${{ inputs.skip-install == 'true' }}");
+    expect(uncachedSetup?.with?.["package-manager-cache"]).toBe(false);
     expect(uncachedSetup?.with?.["node-version"]).toBe("${{ inputs.node-version }}");
     expect(uncachedSetup?.with?.["registry-url"]).toBe("${{ inputs.registry-url }}");
   });

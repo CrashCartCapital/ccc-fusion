@@ -36,6 +36,7 @@ runs:
       uses: actions/setup-node@v5
       with:
         node-version: ${{ inputs.node-version }}
+        package-manager-cache: false
         registry-url: ${{ inputs.registry-url }}
 
     # Do NOT cache the linked node_modules tree. pnpm builds node_modules from
