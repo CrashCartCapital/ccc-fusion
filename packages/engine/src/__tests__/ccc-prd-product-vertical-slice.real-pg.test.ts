@@ -915,6 +915,8 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         models: [{
           id: "vertical-authoring-model",
           name: "Vertical Authoring Model",
+          // Byte-exact echo fixture: it must preserve the proposal text verbatim.
+          verbatimCapable: true,
         }],
       };
       const authoringSettings = new GlobalSettingsStore(

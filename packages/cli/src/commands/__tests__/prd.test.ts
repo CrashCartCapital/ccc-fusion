@@ -1170,6 +1170,13 @@ describe("prd command exit contract", () => {
       store: { getAsyncLayer: () => ({}) },
     };
     const output: string[] = [];
+    const inspectVerifierConfinementReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "sandbox-exec" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "verifier confinement readiness probe executed successfully",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+    }));
     expect(await runPrdJson(
       [
         "import",
@@ -1189,6 +1196,7 @@ describe("prd command exit contract", () => {
         closeProjectStore,
         readTargetHead: vi.fn(async () => packet.base),
         importCccPrdBundle: importBundle,
+        inspectVerifierConfinementReadiness,
       },
       { projectName: "fixture" },
     )).toBe(1);
@@ -1198,6 +1206,7 @@ describe("prd command exit contract", () => {
     });
     expect(importBundle).not.toHaveBeenCalled();
     expect(closeProjectStore).toHaveBeenCalledTimes(1);
+    expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(1);
   });
 
   it("refuses product preview/import when implementation facts are not source-bound before import residue", async () => {

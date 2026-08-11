@@ -579,18 +579,61 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(workflow.jobs?.["test-inventory-guard"]).toBeDefined();
   });
 
-  it("gives each PostgreSQL-backed job a random host port", () => {
-    for (const [jobName, stepName] of [
-      ["test-shards", "Test (deterministic shard)"],
-      ["test-slow", "Run engine-slow with non-empty-execution assertion"],
-    ]) {
-      const job = workflow.jobs?.[jobName];
-      expect(job?.services?.postgres?.ports).toEqual(["5432/tcp"]);
-      const postgresStep = (job?.steps ?? []).find((step: any) => step.name === stepName);
-      expect(postgresStep?.env?.FUSION_PG_TEST_URL_BASE).toContain(
-        "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
-      );
-    }
+  it("keeps deterministic shards on random host-port PostgreSQL routing", () => {
+    const shardJob = workflow.jobs?.["test-shards"];
+    const shardTestStep = (shardJob?.steps ?? []).find(
+      (step: { name?: string }) => step.name === "Test (deterministic shard)",
+    );
+
+    expect(shardJob?.services?.postgres?.ports).toEqual(["5432/tcp"]);
+    expect(shardTestStep?.env?.FUSION_PG_TEST_URL_BASE).toContain(
+      "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
+    );
+  });
+
+  it("routes the slow PostgreSQL service directly through the runner container network", () => {
+    const slowJob = workflow.jobs?.["test-slow"];
+    const slowSteps = slowJob?.steps ?? [];
+    const seedIndex = slowSteps.findIndex(
+      (step: { name?: string }) => step.name === "Seed artifact hash-cache",
+    );
+    const routeIndex = slowSteps.findIndex(
+      (step: { id?: string }) => step.id === "postgres-route",
+    );
+    const productIndex = slowSteps.findIndex(
+      (step: { name?: string }) => step.name === "Run serialized product-route acceptance",
+    );
+    const engineSlowIndex = slowSteps.findIndex(
+      (step: { name?: string }) => step.name === "Run engine-slow with non-empty-execution assertion",
+    );
+    const routeStep = slowSteps[routeIndex];
+    const productStep = slowSteps[productIndex];
+    const engineSlowStep = slowSteps[engineSlowIndex];
+
+    expect(slowJob?.services?.postgres?.ports).toBeUndefined();
+    expect(routeIndex).toBeGreaterThan(seedIndex);
+    expect(routeIndex).toBeLessThan(productIndex);
+    expect(routeStep?.name).toBe("Route PostgreSQL service on runner network");
+    expect(routeStep?.run).toContain('runner_container_id="$(hostname)"');
+    expect(routeStep?.run).toContain("${{ job.services.postgres.id }}");
+    expect(routeStep?.run).toContain("docker inspect");
+    expect(routeStep?.run).toContain("sort");
+    expect(routeStep?.run).toContain("head -n 1");
+    expect(routeStep?.run).toContain("docker network connect");
+    expect(routeStep?.run).toContain("psql -X -w");
+    expect(routeStep?.run).toContain("SELECT 1");
+    expect(routeStep?.run).toContain("PGCONNECT_TIMEOUT");
+    expect(routeStep?.run).toContain('echo "host=${postgres_ip}" >> "$GITHUB_OUTPUT"');
+    expect(routeStep?.env?.PGPASSWORD).toBe("postgres");
+    expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).not.toContain("host.docker.internal");
+    expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).toBe(
+      "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:5432",
+    );
+    expect(engineSlowStep?.env?.FUSION_PG_TEST_URL_BASE).not.toContain("host.docker.internal");
+    expect(engineSlowStep?.env?.FUSION_PG_TEST_URL_BASE).toBe(
+      "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:5432",
+    );
+    expect(engineSlowIndex).toBeGreaterThan(productIndex);
   });
 
   it("caps full-suite fan-out to the measured shared-runner resource budget", () => {
@@ -642,12 +685,12 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
   it("runs product-route real-PG acceptance in the serialized engine job", () => {
     const slowJob = workflow.jobs?.["test-slow"];
     const productStep = (slowJob?.steps ?? []).find(
-      (step: any) => step.name === "Run serialized product-route acceptance",
+      (step: { name?: string }) => step.name === "Run serialized product-route acceptance",
     );
 
     expect(productStep?.run).toBe("pnpm --filter @fusion/engine test:product-route");
-    expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).toContain(
-      "host.docker.internal:${{ job.services.postgres.ports[5432] }}",
+    expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).toBe(
+      "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:5432",
     );
     expect(productStep?.env?.PGPASSWORD).toBe("postgres");
   });
