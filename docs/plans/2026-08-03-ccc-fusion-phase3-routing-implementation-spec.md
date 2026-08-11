@@ -1,5 +1,7 @@
 # ccc-fusion Phase 3 — OmniRoute Routing / Quota / Receipts Implementation Spec
 
+> **Historical routing note:** This file is retained as 2026-08-03 measured-design evidence. Its worker-role defaults are superseded by [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md): routine CCC-Fusion workers should primarily use OmniRoute MiniMax M3 and GLM 5.2, with escalation based on evidence. Keep this file for quota, receipt, identity, and exactness evidence, not current worker-compute policy.
+
 - **Date:** 2026-08-03
 - **Session:** Phase 3 SPEC WRITER (autonomous campaign)
 - **Input (authoritative):** `docs/plans/2026-08-03-omniroute-routing-experiment-report.md` (302-request measured campaign, N=302 gateway + 50 `agy` CLI calls, ACCEPTED)

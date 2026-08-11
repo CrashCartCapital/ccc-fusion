@@ -1,5 +1,7 @@
 # Stage 4 — real-PRD understanding, review-only (2026-08-02)
 
+> **Historical note:** This file is retained as review-only evidence over real vault PRDs. It is not a current implementation plan. For current CCC-Fusion direction and defaults, start with [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md) and the [plans index](./README.md).
+
 One sentence: the product's discover → freeze → understand ladder ran against Ryan's real vault PRDs for the first time with a real local model, over a loopback-only route, with zero vault writes and zero hosted-provider egress.
 
 ## Route and egress posture

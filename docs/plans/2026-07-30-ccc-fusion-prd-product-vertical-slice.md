@@ -1,5 +1,7 @@
 # CCC Fusion PRD Product Vertical Slice
 
+> **Historical note:** This file is retained as design and execution evidence. For current CCC-Fusion direction and defaults, start with [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md) and the [plans index](./README.md). Do not treat this file as current authority where it conflicts with those documents.
+
 **Status:** disposable product path locally proven; current real ccc-fusion packet blocked before freeze; not live or deployed
 **Plan path:** `docs/plans/2026-07-30-ccc-fusion-prd-product-vertical-slice.md`
 **Accepted base:** `1dd173311fbf7c16f85213066cc881fc959a2a2c`

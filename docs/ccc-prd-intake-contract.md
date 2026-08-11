@@ -37,6 +37,14 @@ Repeat the owned-path and write-root flags for additional task custody. Automati
 
 Fusion validates the typed values, compares them with explicit labeled facts in every authoritative source, renders deterministic Markdown at sources/__fusion__/REF-HUM-FusionOperatorContext.md, and includes its bytes in the packet manifest, hash, and freeze receipt. A conflict, escaping path, incomplete context, oversized input, or invalid bound refuses before the output directory is published. The original PRD bytes remain unchanged. The companion records the reviewed source-write roots separately from Fusion's fixed target-local .fusion state-and-artifact root; coding tasks receive only their own reviewed roots. This companion can supply target, baseline, task custody, write-root purpose, and execution bounds; it cannot replace requirements, acceptance behavior, expected proof, non-goals, protected actions, or other missing product decisions.
 
+## Current vs. target campaign shape
+
+Today's supported CCC PRD product route is still conservative: it can freeze, compile, preview, and import hash-bound campaign material, and the chunked understanding path remains serial unless a newer proof says otherwise. Do not read a requested execution bound as proof that arbitrary campaign-DAG parallelism is implemented.
+
+The target campaign model is dependency-driven. A future campaign packet may describe multiple independent roots, successors, and multi-predecessor joins, but Fusion must admit and run that only when the planner, importer, scheduler, ownership leases, worker isolation, restart behavior, and verification gates have passing tests on the same tree. Chunk extraction and coding-campaign execution are separate layers: serial chunk extraction can feed a parallel campaign plan without making the extraction itself parallel.
+
+The `--max-concurrency` value is an explicit safety envelope for one admitted run. It is not a permanent product worker ceiling, and it is not allowed to be "unlimited" in a packet. Larger parallel campaigns should be unlocked by empirical capacity evidence: hardware headroom, provider quota, worktree/storage limits, write-root collision checks, and final verification throughput.
+
 ## Recommended structure
 
 The template also recommends product outcome, requirements with stable IDs, constraints and dependencies, non-goals, risks, and open questions. These sections improve extraction quality but do not replace source citations, material-section coverage, or compiler validation.

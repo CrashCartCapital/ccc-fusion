@@ -1,5 +1,7 @@
 # D2 — chunked extraction with deterministic anchoring (design, 2026-08-03, rev 2)
 
+> **Historical design note:** This file remains evidence for serial chunk extraction and deterministic anchoring. It is not evidence that CCC campaign-level DAG parallelism is implemented. For current product direction, start with [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md) and the [plans index](./README.md).
+
 Design resolution for the two ceilings Stage 4 measured: models cannot copy 48 quotes byte-exact *and* disposition 88 material blocks inside one bounded response, and a sentence that occurs twice verbatim cannot be anchored uniquely by any prompt. This document is bird's-eye and mid-level. Granular particulars — exact constant values where a range is given, file layout, function signatures, fixture bytes — are the implementer's call.
 
 **Revision 2** answers an adversarial review that rejected rev 1 with five blockers and eight majors. Every finding is addressed; the mapping is in the CHANGELOG at the end.

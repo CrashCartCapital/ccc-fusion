@@ -930,6 +930,12 @@ Messaging is available in dashboard mailbox UI and CLI. In dashboard Mailbox →
 
 Agent-backed dashboard chat sessions (including plugin-runtime agents such as Hermes/OpenClaw/Paperclip) also expose mailbox tools (`fn_send_message`, `fn_read_messages`) when a `MessageStore` is wired for that project. Model-only chats without an attached agent do not expose these tools.
 
+### CCC-Fusion campaign coordination
+
+CCC-Fusion's fork-specific product contract lives in [CCC-Fusion Product Contract](./ccc-fusion-product.md). For campaign work, durable mail is a coordination channel between the main orchestrator, domain orchestrators, and leaf workers. It can carry blockers, research findings, handoff notes, and context requests, but it is not proof by itself. Proof still comes from source, tests, logs, git state, database state, and runtime checks.
+
+The CCC-Fusion target is dependency-ready fanout, not a low fixed worker count. Work should serialize only where atomic ownership overlaps, such as the same file, symbol, module, package boundary, or shared interface. Independent research, verification, logging, ingestion, UI, or integration-prep work should be able to proceed in parallel when the dependency graph and resource gates allow it.
+
 ### Dashboard Chat workspace tools
 
 Dashboard Chat, Chat Room responders, and task-detail Planner Chat run at the interactive project checkout with coding workspace tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Use them for user-directed file changes and shell investigation. When a durable agent is bound, its permanent-agent permission policy still governs file writes/deletes and command execution; unbound model Chat has no durable-principal policy gate. Chat must keep the checkout branch sticky: inspect Git freely, but do not use `git checkout` or `git switch` unless the operator explicitly requests it.
@@ -1162,6 +1168,8 @@ Behavior:
   - `maxSpawnedAgentsPerParent` (default 5)
   - `maxSpawnedAgentsGlobal` (default 20)
 - Child sessions terminate when parent task ends
+
+For CCC-Fusion campaigns, these values are current runtime settings, not the product's desired ceiling. The desired ceiling is empirical: dispatch every dependency-ready, non-overlapping task that the host, provider routes, verification lanes, and integration path can handle safely. Raising that ceiling requires measured capacity proof, not just changing the defaults.
 
 ### Approval-governance relationship (FN-3973)
 

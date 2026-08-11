@@ -1,5 +1,7 @@
 # PRD Corpus Diversity Matrix — 2026-08-03
 
+> **Historical evidence note:** This file is retained as corpus-diversity evidence. It is not a current implementation plan. For current CCC-Fusion direction and defaults, start with [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md) and the [plans index](./README.md).
+
 One sentence: this measures the 12 real vault PRD packets Stage 4 discovery actually selected, along the format axes an anchor-resolver has to survive, so Phase 1's gate can be pinned on packets chosen for *measured* diversity rather than convenience.
 
 ## 0. Method and provenance
