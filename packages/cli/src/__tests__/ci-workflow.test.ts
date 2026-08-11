@@ -591,7 +591,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     );
   });
 
-  it("preflights the slow PostgreSQL service through a localhost random port", () => {
+  it("preflights the slow PostgreSQL service through a fail-closed host resolver", () => {
     const slowJob = workflow.jobs?.["test-slow"];
     const slowSteps = slowJob?.steps ?? [];
     const seedIndex = slowSteps.findIndex(
@@ -615,24 +615,27 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(routeIndex).toBeLessThan(productIndex);
     expect(routeStep?.name).toBe("Verify PostgreSQL service on runner host network");
     expect(routeStep?.run).toContain("${{ job.services.postgres.ports[5432] }}");
-    expect(routeStep?.run).toContain("127.0.0.1:${postgres_port}");
+    expect(routeStep?.run).toContain('candidate_hosts=("127.0.0.1" "host.docker.internal")');
+    expect(routeStep?.run).toContain("/proc/net/route");
+    expect(routeStep?.run).toContain("selected_host=");
     expect(routeStep?.run).toContain("psql -X -w");
     expect(routeStep?.run).toContain("SELECT 1");
-    expect(routeStep?.run).toContain("PGCONNECT_TIMEOUT");
+    expect(routeStep?.run).toContain("PGCONNECT_TIMEOUT=5");
+    expect(routeStep?.run).toContain('echo "host=${selected_host}" >> "$GITHUB_OUTPUT"');
+    expect(routeStep?.run).toContain('if [ -z "$selected_host" ]');
+    expect(routeStep?.run).toContain("exit 1");
+    expect(routeStep?.run).toContain("No reachable PostgreSQL service host candidate");
     expect(routeStep?.run).not.toContain("docker inspect");
     expect(routeStep?.run).not.toContain("docker network connect");
     expect(routeStep?.run).not.toContain("hostname");
-    expect(routeStep?.run).not.toContain("GITHUB_OUTPUT");
     expect(routeStep?.env?.PGPASSWORD).toBe("postgres");
     expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).not.toContain("host.docker.internal");
-    expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).not.toContain("steps.postgres-route.outputs.host");
     expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).toBe(
-      "postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}",
+      "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:${{ job.services.postgres.ports[5432] }}",
     );
     expect(engineSlowStep?.env?.FUSION_PG_TEST_URL_BASE).not.toContain("host.docker.internal");
-    expect(engineSlowStep?.env?.FUSION_PG_TEST_URL_BASE).not.toContain("steps.postgres-route.outputs.host");
     expect(engineSlowStep?.env?.FUSION_PG_TEST_URL_BASE).toBe(
-      "postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}",
+      "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:${{ job.services.postgres.ports[5432] }}",
     );
     expect(engineSlowIndex).toBeGreaterThan(productIndex);
   });
@@ -645,7 +648,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     );
 
     expect(shardJob?.strategy?.["max-parallel"]).toBe(2);
-    expect(testStep?.env?.FUSION_TEST_TOTAL_WORKERS).toBe("2");
+    expect(testStep?.env?.FUSION_TEST_TOTAL_WORKERS).toBe("1");
     expect(testStep?.env?.FUSION_TEST_CONCURRENCY).toBe("1");
     expect(workflow.jobs?.["test-slow"]?.needs).toEqual([
       "prepare-test-artifacts",
@@ -691,7 +694,7 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
 
     expect(productStep?.run).toBe("pnpm --filter @fusion/engine test:product-route");
     expect(productStep?.env?.FUSION_PG_TEST_URL_BASE).toBe(
-      "postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}",
+      "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:${{ job.services.postgres.ports[5432] }}",
     );
     expect(productStep?.env?.PGPASSWORD).toBe("postgres");
   });
