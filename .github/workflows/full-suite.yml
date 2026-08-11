@@ -43,6 +43,13 @@ jobs:
 
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup-node-pnpm
+        with:
+          # This producer already publishes the dist corpus. Saving its 659 MB
+          # pnpm store can exhaust the job budget on the self-hosted uplink.
+          skip-install: "true"
+
+      - name: Install dependencies without pnpm store upload
+        run: pnpm install --frozen-lockfile
 
       - name: Compute dist source hash
         id: dist-hash
