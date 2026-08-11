@@ -787,6 +787,57 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     });
   });
 
+  it("campaign work items carry an explicit transient-retry budget on every executable node", async () => {
+    // 2026-08-11 top-down audit, Lane A: without config.maxRetries the engine
+    // falls back to a single total attempt (workflow-task-runtime.ts), so one
+    // transient provider error terminal-failed a campaign work item. Operator
+    // decision 2026-08-11: campaign work items default to 3 attempts.
+    const suffix = "transient-retry-budget";
+    const key = "idem-transient-retry-budget";
+    const initial = bundle(h.rootDir(), suffix);
+    const landingTask = initial.tasks[1]!;
+    const mergeAction = {
+      id: `ACTION-merge-${suffix}`,
+      kind: "merge" as const,
+      target: "refs/heads/main",
+      operatorDecision: "approve_merge" as const,
+      requiresOperatorDecision: true as const,
+      spans: [landingTask.spans[0]!],
+    };
+    const semanticBundle = rehashBundle({
+      ...initial,
+      tasks: initial.tasks.map((task) => task.id === landingTask.id
+        ? { ...task, protectedActionIds: [mergeAction.id] }
+        : task),
+      protectedActions: [mergeAction],
+    });
+
+    const imported = await importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: semanticBundle,
+      executionPolicy: productExecutionPolicy(semanticBundle),
+    });
+    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--WF-${suffix}`);
+    const ir = stored?.ir as {
+      nodes: Array<{ id: string; kind: string; config?: Record<string, unknown> }>;
+    };
+    const taskNodes = ir.nodes.filter((node) =>
+      node.kind === "prompt" && node.config?.seam !== "merge");
+    const proofNode = ir.nodes.find((node) => node.config?.cccProofSuite === true);
+    const mergeNode = ir.nodes.find((node) => node.config?.seam === "merge");
+    expect(taskNodes).toHaveLength(semanticBundle.tasks.length);
+    for (const node of taskNodes) {
+      expect(node.config?.maxRetries).toBe(3);
+    }
+    expect(proofNode?.config?.maxRetries).toBe(3);
+    expect(mergeNode?.config?.maxRetries).toBe(3);
+    // Topology nodes execute no provider work; they must not carry a budget.
+    for (const node of ir.nodes.filter(({ kind }) =>
+      kind === "start" || kind === "end" || kind === "split" || kind === "join")) {
+      expect(node.config?.maxRetries).toBeUndefined();
+    }
+  });
+
   it("product v2 CLI route projects stable adapter settings without persisted subscription readiness", async () => {
     const suffix = "product-v2-cli-settings";
     const key = "idem-product-v2-cli-settings";
@@ -1107,6 +1158,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
             cccPrdTaskId: `TASK-${suffix}`,
             cccNativeTaskId: entryNativeTaskId,
             gateMode: "gate",
+            maxRetries: 3,
           },
         },
         {
@@ -1118,6 +1170,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
             cccPrdTaskId: `TASK-terminal-${suffix}`,
             cccNativeTaskId: terminalNativeTaskId,
             gateMode: "gate",
+            maxRetries: 3,
           },
         },
         { id: "end", kind: "end" },
