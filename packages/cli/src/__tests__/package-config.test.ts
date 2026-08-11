@@ -241,6 +241,20 @@ describe("CLI package.json publishing config", () => {
     expect(prepackScript).toContain('delete devDependencies["@fusion-plugin-examples/roadmap"]');
   });
 
+  it("runs package tsup configs serially without reducing full package contents", () => {
+    const scripts = pkg.scripts ?? {};
+    const serialBuild = scripts["build:tsup:serial"];
+
+    expect(scripts.build).toBe("pnpm run build:tsup:serial");
+    expect(scripts["build:package"]).toBe(
+      "cross-env FUSION_CLI_FULL_PACKAGE=1 pnpm run build:tsup:serial",
+    );
+    expect(serialBuild).toBe(
+      "cross-env FUSION_CLI_TSUP_CONFIG=cli tsup && cross-env FUSION_CLI_TSUP_CONFIG=proof-admission tsup && cross-env FUSION_CLI_TSUP_CONFIG=plugin-sdk tsup",
+    );
+    expect(serialBuild).not.toContain("FUSION_CLI_FULL_PACKAGE=0");
+  });
+
   // Generalized guard derived from tsup.config.ts. Any non-builtin module
   // marked `external` MUST be a runtime dep (so `npm install @runfusion/fusion`
   // can resolve it after publish), and any module pulled in via `noExternal`

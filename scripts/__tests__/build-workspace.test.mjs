@@ -295,6 +295,24 @@ test("root package build script points at the workspace build wrapper", () => {
   assert.equal(rootPackage.scripts.build, "node scripts/build-workspace.mjs");
 });
 
+test("real CLI serial tsup build is recognized as bundled output only", () => {
+  const packages = discoverWorkspacePackages(path.resolve("."));
+  const cli = packageByName(packages, "@runfusion/fusion");
+
+  assert.ok(cli, "expected to discover @runfusion/fusion");
+  assert.ok(cli.requiredOutputs.includes("packages/cli/dist/bin.js"));
+  assert.ok(cli.requiredOutputs.includes("packages/cli/dist/extension.js"));
+  assert.equal(
+    cli.requiredOutputs.includes("packages/cli/dist/commands/chat.js"),
+    false,
+    `serial tsup CLI build must not be treated as tsc source mirroring: ${cli.requiredOutputs.join(", ")}`,
+  );
+  assert.ok(
+    cli.requiredOutputs.length < 20,
+    `serial tsup CLI build should require only canonical bundled outputs, got ${cli.requiredOutputs.length}: ${cli.requiredOutputs.join(", ")}`,
+  );
+});
+
 test("full package mode force-includes CLI even when content-hash would skip it", () => {
   const skipped = [
     { name: "@runfusion/fusion", isPlugin: false, buildReason: "unchanged", sourceHash: "abc" },
