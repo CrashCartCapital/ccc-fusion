@@ -626,6 +626,19 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(prepareJob?.env?.NODE_OPTIONS).toBeUndefined();
   });
 
+  it("does not upload the pnpm store cache from the artifact producer", () => {
+    const prepareSteps = workflow.jobs?.["prepare-test-artifacts"]?.steps ?? [];
+    const setupIndex = prepareSteps.findIndex(
+      (step: any) => step.uses === "./.github/actions/setup-node-pnpm",
+    );
+    const installIndex = prepareSteps.findIndex(
+      (step: any) => step.run === "pnpm install --frozen-lockfile",
+    );
+
+    expect(prepareSteps[setupIndex]?.with?.["skip-install"]).toBe("true");
+    expect(installIndex).toBe(setupIndex + 1);
+  });
+
   it("runs product-route real-PG acceptance in the serialized engine job", () => {
     const slowJob = workflow.jobs?.["test-slow"];
     const productStep = (slowJob?.steps ?? []).find(
