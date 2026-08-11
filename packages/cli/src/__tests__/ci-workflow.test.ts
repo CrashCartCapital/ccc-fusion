@@ -194,6 +194,10 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(content).not.toContain("ubuntu-latest");
   });
 
+  it("keeps the Gate timeout bounded for cold constrained runners", () => {
+    expect(workflow.jobs?.gate?.["timeout-minutes"]).toBe(25);
+  });
+
   it("does not enable setup-node pnpm cache when dependency install is skipped", () => {
     const setupNodeSteps = (compositeAction.runs?.steps ?? []).filter(
       (step: any) => step.uses === "actions/setup-node@v5",
