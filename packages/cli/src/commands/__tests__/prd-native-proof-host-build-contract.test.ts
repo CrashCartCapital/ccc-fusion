@@ -65,7 +65,13 @@ describe("CCC native proof host build contract", () => {
       'join(cccCampaignProofAdmissionManifestDest, "manifest.json")',
     );
     expect(proofConfig).not.toContain("banner:");
-    expect(config).toMatch(
+    expect(config).toContain("function selectCliTsupConfigs");
+    expect(config).toContain('case "cli":');
+    expect(config).toContain('case "proof-admission":');
+    expect(config).toContain('case "plugin-sdk":');
+    expect(config).toMatch(/default:\s*\{\s*throw new Error/u);
+    expect(config).toContain("export default defineConfig(selectCliTsupConfigs());");
+    expect(config).not.toMatch(
       /defineConfig\(\[\s*cliBuildConfig,\s*cccProofAdmissionBuildConfig,\s*pluginSdkBuildConfig,\s*\]\)/u,
     );
   });

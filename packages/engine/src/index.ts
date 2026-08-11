@@ -19,8 +19,10 @@ export {
 } from "./provider-auth.js";
 export {
   resolveApiType,
+  resolveCustomProviderModelLimits,
   registerCustomProviders,
   reregisterCustomProviders,
+  type CustomProviderModelLimits,
 } from "./custom-provider-registry.js";
 export {
   seedDashboardProviders,

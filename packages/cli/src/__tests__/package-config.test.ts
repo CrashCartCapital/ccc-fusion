@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { builtinModules } from "node:module";
+import { pathToFileURL } from "node:url";
 import { parse } from "yaml";
 import { applyPrepackTransform } from "../../scripts/prepare-publish-manifest.mjs";
 
@@ -20,6 +21,11 @@ function loadWorkflowYaml(name: string): any {
 
 function loadRootPackageJson(): any {
   const path = join(workspaceRoot, "package.json");
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function loadWorkspaceJson(...pathParts: string[]): any {
+  const path = join(workspaceRoot, ...pathParts);
   return JSON.parse(readFileSync(path, "utf-8"));
 }
 
@@ -236,6 +242,62 @@ describe("CLI package.json publishing config", () => {
     expect(prepackScript).toContain('delete devDependencies["@fusion-plugin-examples/roadmap"]');
   });
 
+  it("preflights Desktop runtime before running package tsup configs serially", () => {
+    const scripts = pkg.scripts ?? {};
+    const serialBuild = scripts["build:tsup:serial"];
+
+    expect(scripts.build).toBe("pnpm run build:tsup:serial");
+    expect(scripts["build:package"]).toBe(
+      "cross-env FUSION_CLI_FULL_PACKAGE=1 pnpm run build:tsup:serial",
+    );
+    expect(serialBuild).toBe(
+      "tsx scripts/ensure-desktop-runtime.ts && cross-env FUSION_CLI_TSUP_CONFIG=cli tsup && cross-env FUSION_CLI_TSUP_CONFIG=proof-admission tsup && cross-env FUSION_CLI_TSUP_CONFIG=plugin-sdk tsup",
+    );
+    expect(serialBuild).not.toContain("FUSION_CLI_FULL_PACKAGE=0");
+  });
+
+  it("runs the Desktop preflight only for full-package modes while retaining the tsup fallback", async () => {
+    const preflightPath = join(
+      workspaceRoot,
+      "packages",
+      "cli",
+      "scripts",
+      "ensure-desktop-runtime.ts",
+    );
+    expect(
+      existsSync(preflightPath),
+      "CLI serial packaging requires the Desktop preflight entrypoint",
+    ).toBe(true);
+
+    const { runDesktopRuntimePreflight } = await import(pathToFileURL(preflightPath).href);
+    const ensureCalls: string[] = [];
+    const ensureDesktopRuntime = async () => {
+      ensureCalls.push("ensure");
+    };
+
+    expect(await runDesktopRuntimePreflight({}, ensureDesktopRuntime)).toBe(false);
+    expect(await runDesktopRuntimePreflight({ CI: "true" }, ensureDesktopRuntime)).toBe(true);
+    expect(
+      await runDesktopRuntimePreflight(
+        { CI: "true", FUSION_CLI_FULL_PACKAGE: "0" },
+        ensureDesktopRuntime,
+      ),
+    ).toBe(false);
+    expect(
+      await runDesktopRuntimePreflight(
+        { FUSION_CLI_FULL_PACKAGE: "1" },
+        ensureDesktopRuntime,
+      ),
+    ).toBe(true);
+    expect(ensureCalls).toEqual(["ensure", "ensure"]);
+
+    const tsupRaw = readFileSync(
+      join(workspaceRoot, "packages", "cli", "tsup.config.ts"),
+      "utf-8",
+    );
+    expect(tsupRaw).toContain("await ensureDesktopRuntimeAssetsBuilt();");
+  });
+
   // Generalized guard derived from tsup.config.ts. Any non-builtin module
   // marked `external` MUST be a runtime dep (so `npm install @runfusion/fusion`
   // can resolve it after publish), and any module pulled in via `noExternal`
@@ -384,11 +446,106 @@ describe("Workspace bootstrap script contract", () => {
   const rootPkg = loadRootPackageJson();
   const dashboardPkg = loadPackageJson("dashboard");
 
+  it("builds core and engine declarations before serial workspace typechecking", () => {
+    expect(rootPkg.scripts?.typecheck).toBe(
+      "pnpm --filter @fusion/core build && pnpm --filter @fusion/engine build && pnpm -r --workspace-concurrency=1 --filter=!@fusion/desktop --filter=!@fusion/mobile typecheck",
+    );
+
+    const baseConfig = readFileSync(join(workspaceRoot, "tsconfig.base.json"), "utf-8");
+    expect(baseConfig).toMatch(/"declaration"\s*:\s*true/);
+    expect(baseConfig).toMatch(/"declarationMap"\s*:\s*true/);
+  });
+
+  it("resolves dashboard and CLI workspace dependencies through built declarations", () => {
+    const expectedDeclarationPaths = {
+      "@fusion/core": ["../core/dist/index.d.ts"],
+      "@fusion/core/*": ["../core/dist/*.d.ts"],
+      "@fusion/engine": ["../engine/dist/index.d.ts"],
+      "@fusion/engine/*": ["../engine/dist/*.d.ts"],
+    };
+    const configs = [
+      ["dashboard server", loadWorkspaceJson("packages", "dashboard", "tsconfig.json")],
+      ["dashboard app", loadWorkspaceJson("packages", "dashboard", "tsconfig.app.json")],
+      ["CLI", loadWorkspaceJson("packages", "cli", "tsconfig.json")],
+    ] as const;
+
+    for (const [label, config] of configs) {
+      expect(
+        config.compilerOptions?.paths,
+        `${label} must consume core and engine declaration output instead of loading their source trees`,
+      ).toMatchObject(expectedDeclarationPaths);
+    }
+  });
+
+  it("resolves engine core imports through built declarations and excludes production-irrelevant tests", () => {
+    const engineConfig = loadWorkspaceJson("packages", "engine", "tsconfig.json");
+    const paths = engineConfig.compilerOptions?.paths ?? {};
+    const corePaths = Object.fromEntries(
+      Object.entries(paths).filter(([specifier]) =>
+        specifier === "@fusion/core" || specifier.startsWith("@fusion/core/"),
+      ),
+    );
+
+    expect(corePaths).toEqual({
+      "@fusion/core": ["../core/dist/index.d.ts"],
+      "@fusion/core/*": ["../core/dist/*.d.ts"],
+    });
+    expect(paths).toMatchObject({
+      "@fusion/test-utils": ["../core/src/__test-utils__/workspace.ts"],
+      "node-pty": ["./src/types/node-pty/index.d.ts"],
+    });
+    expect(engineConfig.exclude).toEqual([
+      "src/**/*.test.ts",
+      "src/**/__tests__/**/*",
+    ]);
+  });
+
   it("makes root test changed-only while keeping explicit full-suite and CI-shard commands", () => {
+    // `test` and `test:ci:shard` stay pinned as literals on purpose: each is a
+    // bare script path with no flags, so the only thing that can drift is the
+    // path itself — which is exactly the contract worth pinning.
     expect(rootPkg.scripts?.test).toBe("node scripts/test-changed.mjs");
-    expect(rootPkg.scripts?.["test:full"]).toBe("node scripts/test-changed.mjs --full --no-cache && pnpm --filter @fusion/engine test:slow");
-    expect(rootPkg.scripts?.["test:full"]).not.toContain("pnpm build");
     expect(rootPkg.scripts?.["test:ci:shard"]).toBe("node scripts/ci-test-shard.mjs");
+
+    // `test:full` is deliberately NOT pinned to a literal. It is a multi-phase
+    // shell command line that is expected to keep evolving (phases added, the
+    // chaining operator changed), and package.json is its source of truth. A
+    // verbatim `toBe` here made every legitimate edit to that command look like
+    // a test regression, and the cheap way out is always to re-paste the new
+    // string — which guarantees the same failure on the next edit.
+    //
+    // That bug class — a pinned literal outranked by a moving source of truth —
+    // fired four separate times in one day in this repo: this assertion, a
+    // fixture missing a newly required key, an allowlist keyed on file:line, and
+    // a partial mock missing a real method. The other three together aborted the
+    // recursive test run and left roughly 24,000 tests unexecuted for weeks. So
+    // assert the properties that actually matter and let the text move.
+    const testFull = rootPkg.scripts?.["test:full"];
+    expect(typeof testFull).toBe("string");
+
+    // Drives the changed-file runner in full, uncached mode.
+    expect(testFull).toContain("scripts/test-changed.mjs");
+    expect(testFull).toContain("--full");
+    expect(testFull).toContain("--no-cache");
+
+    // Still reaches the engine slow lane, which the changed-file runner skips.
+    expect(testFull).toMatch(/--filter\s+@fusion\/engine\s+test:slow/);
+
+    // Never builds; building is verify:workspace's job, not the test lane's.
+    expect(testFull).not.toContain("pnpm build");
+
+    // Must not continue past a failing phase without aggregating the failure.
+    // `&&` chaining propagates a nonzero status on its own. Any other separator
+    // does not: `a; b` and `a || b` both report only the last command's status,
+    // so a red first phase reads as success. Those forms are only safe when the
+    // script accumulates a status and exits with it.
+    const usesNonAndSequencing = /;|\|\|/.test(testFull);
+    const aggregatesExitCode =
+      /status=0/.test(testFull) && /exit \$status/.test(testFull);
+    expect(
+      usesNonAndSequencing && !aggregatesExitCode,
+      `test:full sequences phases without && and without aggregating their exit codes, so a failing phase would report success: ${testFull}`,
+    ).toBe(false);
   });
 
   it("defines verify:workspace in lint -> test:full -> build order", () => {

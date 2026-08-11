@@ -14,7 +14,7 @@
  * PostgreSQL has no portable whole-database writer lock; the retained fake-timer
  * and mocked-store tests cover retry, error, and close-on-every-exit behavior.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { retryOnLock, LockRetryExhaustedError, DEFAULT_CLI_LOCK_RETRY_MS } from "../../lock-retry.js";
 
@@ -109,6 +109,28 @@ describe("retryOnLock", () => {
  * describes below (lock exhaustion, not-found, close-on-every-exit-path).
  */
 describe("runTaskShow / runTaskMove — mocked-store lock exhaustion, not-found, and teardown (FN-7731)", () => {
+  // FNXC:CliTests 2026-08-07:
+  // task.js pulls a large CLI module graph that Vite transforms once per file.
+  // Measured solo, that one-time cost is ~2950ms and it is billed to whichever
+  // test imports task.js FIRST -- 60% of the default 5s test budget before the
+  // test does any work of its own, which is why this suite timed out under the
+  // loaded package lane while passing standalone. (Proof it is import cost and
+  // not retry logic: these tests use fake timers, and running the SECOND test
+  // alone makes IT cost ~2948ms while the first then costs ~64ms.)
+  // Warm the transform here so the cost lands on the hook budget instead of a
+  // test budget. Mocked exactly as the tests mock it, so no module is
+  // instantiated that a test would not itself load.
+  beforeAll(async () => {
+    vi.doMock("../../project-context.js", () => ({
+      resolveProject: vi.fn(),
+      closeProjectStore: vi.fn(),
+      createLocalStore: vi.fn(),
+    }));
+    await import("../task.js");
+    vi.doUnmock("../../project-context.js");
+    vi.resetModules();
+  });
+
   beforeEach(() => {
     // FNXC:CliBoardMutation 2026-07-19-18:20: mcp-lock-retry installs a
     // per-test @fusion/core factory. Clear it before importing task.js so

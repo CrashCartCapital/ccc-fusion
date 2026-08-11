@@ -8,12 +8,22 @@ import {
   type CccPrdUnresolvedDecision,
 } from "@fusion/core";
 
-type SourceLine = {
+export type CccPrdSourceLine = {
   text: string;
   byteStart: number;
   byteEnd: number;
   contentEnd: number;
   fenced: boolean;
+};
+type SourceLine = CccPrdSourceLine;
+
+export type CccPrdSourceHeading = {
+  index: number;
+  level: number;
+  title: string;
+  headingPath: string[];
+  byteStart: number;
+  contentEnd: number;
 };
 
 type MaterialInventoryItem = Omit<CccPrdMaterialCoverageItem, "disposition"> & {
@@ -39,8 +49,105 @@ type AnalyzeCccPrdMaterialCoverageInput = {
 const REQUIREMENT_TOKEN = /\b((?:REQ|FR|NFR|AC|KTD|BTI)-[A-Z0-9][A-Z0-9._-]*)\b/gu;
 const BULLET_REQUIREMENT = /^\s*[-*+]\s+`?((?:REQ|FR|NFR|AC|KTD|BTI)-[A-Z0-9][A-Z0-9._-]*)`?\s*(?::|—|\|)/u;
 const TABLE_REQUIREMENT = /^\s*\|\s*`?((?:REQ|FR|NFR|AC|KTD|BTI)-[A-Z0-9][A-Z0-9._-]*)`?\s*\|/u;
-const DEFERRED_MARKER = /\b(deferred|postponed|future scope|later phase|not now)\b/iu;
-const OUT_OF_SCOPE_MARKER = /\b(non[- ]goals?|out of scope|not in scope|excluded from scope|will not implement)\b/iu;
+/*
+ * Disposition markers are load-bearing: matching one lets a material item leave
+ * `missing` with no task, requirement, or unresolved decision standing behind
+ * it. A false positive is therefore SILENT under-coverage, while a false
+ * negative only forces a loud `missing` refusal that the chunk retry loop can
+ * recover from -- so this matcher is deliberately biased toward the loud
+ * failure.
+ *
+ * A heading disposes its section only when it declares disposition and nothing
+ * else. "Non-Goals" and "Deferred Items" do; "deferred-decision registry" (a
+ * registry ABOUT deferrals), "Non-Goal Guardrail Requirements" (real
+ * requirements), and "Core Decision And Non-Goals" (in-scope material sharing a
+ * heading) do not. Authors who need to dispose a heading the matcher will not
+ * take -- "Phase 2 Retrieval Deferred" -- tag it explicitly, either as
+ * "Phase 2 Retrieval (Deferred)" or with a `Status: deferred` line in the body.
+ */
+const DISPOSITION_QUALIFIER = "explicitly?|known|current|initial|additional|other|remaining";
+const DISPOSITION_HEAD_NOUN =
+  "items?|work|scopes?|lists?|sections?|notes?|areas?|features?|topics?|decisions?|phases?";
+const DEFERRED_CORE =
+  "deferred|deferrals?|postponed|postponements?|future[\\s-]+scopes?|later[\\s-]+phases?|not[\\s-]+now";
+const OUT_OF_SCOPE_CORE =
+  "non[\\s-]?goals?|out[\\s-]+of[\\s-]+scope|not[\\s-]+in[\\s-]+scope"
+  + "|excluded[\\s-]+from[\\s-]+scope|exclusions?|will[\\s-]+not[\\s-]+(?:be[\\s-]+)?implement(?:ed)?";
+
+/** Anchored end-to-end, so the marker has to BE the phrase rather than sit inside one. */
+function dispositionHeadingMatcher(core: string): RegExp {
+  return new RegExp(
+    `^(?:(?:${DISPOSITION_QUALIFIER})[\\s-]+)*(?:${core})(?:[\\s-]+(?:${DISPOSITION_HEAD_NOUN}))?$`,
+    "iu",
+  );
+}
+
+const DEFERRED_HEADING = dispositionHeadingMatcher(DEFERRED_CORE);
+const OUT_OF_SCOPE_HEADING = dispositionHeadingMatcher(OUT_OF_SCOPE_CORE);
+
+/*
+ * A trailing bare marker ("Phase 2 Retrieval Deferred") reads predicatively and
+ * was tried here, then rejected on corpus evidence: disposition is inherited by
+ * the whole subtree, and in QDB-Agent-Access-And-SQL-Zero.md that H2's subtree
+ * holds the `qdb` SDK layer and every REQ-QDB-* requirement -- the document's
+ * headline deliverable. Honouring it silently deferred ~30 core requirements per
+ * file to rescue one heading. Blast radius beats grammar, so it stays out.
+ */
+/** "A and B", "A & B", "A / B", "A, B" -- coordination, not a single subject. */
+const DISPOSITION_CONJUNCTION = /\s+(?:and|&|\+|or)\s+|\s*[/,;]\s*/iu;
+
+type HeadingDisposition = { deferred: boolean; outOfScope: boolean };
+const NO_DISPOSITION: HeadingDisposition = { deferred: false, outOfScope: false };
+
+/** "3.1 Non-Goals (v2):" -> "Non-Goals" */
+function normalizeDispositionHeading(title: string): string {
+  return title
+    .replace(/^\s*\d+(?:\.\d+)*[.):]?\s+/u, "")
+    .replace(/[([{][^)\]}]*[)\]}]/gu, " ")
+    .replace(/[\s.:;—–-]+$/u, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+/**
+ * Every coordinated conjunct must be a marker. One unmarked conjunct means the
+ * heading also names in-scope material, so the section keeps its coverage duty.
+ */
+function dispositionOfPhrase(phrase: string): HeadingDisposition {
+  const conjuncts = phrase.split(DISPOSITION_CONJUNCTION)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (conjuncts.length === 0) return NO_DISPOSITION;
+  let deferred = false;
+  let outOfScope = false;
+  for (const conjunct of conjuncts) {
+    if (DEFERRED_HEADING.test(conjunct)) deferred = true;
+    else if (OUT_OF_SCOPE_HEADING.test(conjunct)) outOfScope = true;
+    else return NO_DISPOSITION;
+  }
+  return { deferred, outOfScope };
+}
+
+/**
+ * Code is quoted, not asserted. Every corpus hit on the body `Status:` field was
+ * a document DESCRIBING this refusal -- "Refusal on `while true` and
+ * `status: DEFERRED` in prose" -- so a backticked or fenced mention must not
+ * dispose the section that discusses it.
+ */
+function withoutCodeText(text: string): string {
+  return text
+    .replace(/^[ \t]*(?:`{3,}|~{3,})[\s\S]*?^[ \t]*(?:`{3,}|~{3,})[^\n]*$/gmu, " ")
+    .replace(/`[^`\n]*`/gu, " ");
+}
+
+/** A bracketed status tag is an unambiguous declaration and is honoured on its own. */
+function dispositionOfHeading(title: string): HeadingDisposition {
+  for (const group of title.matchAll(/[([{]([^)\]}]*)[)\]}]/gu)) {
+    const tagged = dispositionOfPhrase(normalizeDispositionHeading(group[1] ?? ""));
+    if (tagged.deferred || tagged.outOfScope) return tagged;
+  }
+  return dispositionOfPhrase(normalizeDispositionHeading(title));
+}
 
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -60,7 +167,8 @@ function stableMaterialId(
   return `MAT-${digest}`;
 }
 
-function sourceLines(bytes: Buffer): SourceLine[] {
+/** The line-and-fence walk that both the coverage scorer and the chunk planner read (design §1). */
+export function computeCccPrdSourceLines(bytes: Buffer): CccPrdSourceLine[] {
   const lines: SourceLine[] = [];
   let byteStart = 0;
   let fence: "`" | "~" | undefined;
@@ -84,14 +192,17 @@ function sourceLines(bytes: Buffer): SourceLine[] {
   return lines;
 }
 
-function inventoryForSource(path: string, bytes: Buffer): MaterialInventoryItem[] {
-  const lines = sourceLines(bytes);
-  const headings: Array<{
-    index: number;
-    level: number;
-    title: string;
-    headingPath: string[];
-  }> = [];
+/**
+ * ATX heading walk only (fenced lines skipped, `:97` in the design's
+ * citation); setext headings and any preamble before the first heading are
+ * deliberately invisible here, which is exactly the blind spot the chunk
+ * planner's byte-partition invariant has to cover independently (design §1).
+ */
+export function computeCccPrdSourceHeadings(
+  bytes: Buffer,
+  lines: CccPrdSourceLine[],
+): CccPrdSourceHeading[] {
+  const headings: CccPrdSourceHeading[] = [];
   const headingStack: string[] = [];
   for (const [index, line] of lines.entries()) {
     if (line.fenced) continue;
@@ -106,8 +217,16 @@ function inventoryForSource(path: string, bytes: Buffer): MaterialInventoryItem[
       level,
       title,
       headingPath: headingStack.filter((entry): entry is string => Boolean(entry)),
+      byteStart: line.byteStart,
+      contentEnd: line.contentEnd,
     });
   }
+  return headings;
+}
+
+export function computeCccPrdMaterialInventory(path: string, bytes: Buffer): MaterialInventoryItem[] {
+  const lines = computeCccPrdSourceLines(bytes);
+  const headings = computeCccPrdSourceHeadings(bytes, lines);
 
   const inventory: MaterialInventoryItem[] = [];
   for (const [headingIndex, heading] of headings.entries()) {
@@ -207,7 +326,7 @@ export function analyzeCccPrdMaterialCoverage(
   input: AnalyzeCccPrdMaterialCoverageInput,
 ): CccPrdMaterialCoverageAnalysis {
   const inventory = [...input.sourceBytes.entries()]
-    .flatMap(([path, bytes]) => inventoryForSource(path, bytes));
+    .flatMap(([path, bytes]) => computeCccPrdMaterialInventory(path, bytes));
   const coverage: CccPrdMaterialCoverageItem[] = [];
   const missing: MaterialInventoryItem[] = [];
   const conflicts: MaterialInventoryItem[] = [];
@@ -225,11 +344,22 @@ export function analyzeCccPrdMaterialCoverage(
       overlaps(decision.spans, item)
       || decision.question.includes(item.title)
     ));
-    const dispositionLabel = [...item.headingPath, item.title].join(" ");
-    const explicitlyDeferred = DEFERRED_MARKER.test(dispositionLabel)
-      || /\bstatus\s*:\s*deferred\b/iu.test(item.sourceText);
-    const explicitlyOutOfScope = OUT_OF_SCOPE_MARKER.test(dispositionLabel)
-      || /\bstatus\s*:\s*out[_ -]of[_ -]scope\b/iu.test(item.sourceText);
+    // Each heading on the path is matched on its own. Joining them into one
+    // string let any ancestor's passing mention of a marker dispose the whole
+    // subtree, and let phrases form across the join seam -- "# Roadmap Later"
+    // above "## Phase 2 delivery" read as "later phase".
+    let headingDeferred = false;
+    let headingOutOfScope = false;
+    for (const segment of [...item.headingPath, item.title]) {
+      const disposition = dispositionOfHeading(segment);
+      headingDeferred ||= disposition.deferred;
+      headingOutOfScope ||= disposition.outOfScope;
+    }
+    const declaredText = withoutCodeText(item.sourceText);
+    const explicitlyDeferred = headingDeferred
+      || /\bstatus\s*:\s*deferred\b/iu.test(declaredText);
+    const explicitlyOutOfScope = headingOutOfScope
+      || /\bstatus\s*:\s*out[_ -]of[_ -]scope\b/iu.test(declaredText);
 
     if (
       (matchingTasks.length > 0 && (explicitlyDeferred || explicitlyOutOfScope || matchingUnresolved.length > 0))

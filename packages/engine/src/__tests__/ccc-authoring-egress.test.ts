@@ -45,7 +45,9 @@ function provider(overrides: Partial<CustomProvider> = {}): CustomProvider {
     apiType: "openai-compatible",
     baseUrl: "http://127.0.0.1:7443/v1",
     apiKey: "synthetic-never-read",
-    models: [{ id: "fixture-model", name: "Fixture" }],
+    // verbatimCapable: true is fixture setup (design §8 finding 4) -- this
+    // suite proves egress ordering, not the capability gate itself.
+    models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: true }],
     ...overrides,
   } as CustomProvider;
 }
@@ -162,5 +164,78 @@ describe("CCC PRD authoring transports are loopback-only", () => {
     ).resolves.toEqual({});
     expect(transport).toHaveBeenCalledTimes(1);
     expect(transport.mock.calls[0]![0].prompt).toContain(SECRET_QUOTE);
+  });
+});
+
+describe("CCC PRD quote-bearing work requires a declared verbatim-capable route (design D-4)", () => {
+  it("test 49: an undeclared route refuses with zero transport calls", async () => {
+    const transport = vi.fn<CccPrdNativeAuthoringTransport>();
+    // No `verbatimCapable` on the model entry at all -- absent means unknown.
+    const undeclared: CustomProvider = {
+      ...provider(),
+      models: [{ id: "fixture-model", name: "Fixture" }],
+    };
+
+    let failure: unknown;
+    try {
+      await adapter(transport, [undeclared], { mode: "understanding" }).generateCandidate(request() as never);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({ code: "CCC_PRD_ROUTE_NOT_VERBATIM_CAPABLE" });
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it("an explicit verbatimCapable: false refuses identically to absent", async () => {
+    const transport = vi.fn<CccPrdNativeAuthoringTransport>();
+    const declaredFalse: CustomProvider = {
+      ...provider(),
+      models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: false }],
+    };
+
+    let failure: unknown;
+    try {
+      await adapter(transport, [declaredFalse], { mode: "understanding" }).generateCandidate(request() as never);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({ code: "CCC_PRD_ROUTE_NOT_VERBATIM_CAPABLE" });
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it("test 50: a declared verbatim-capable route is admitted", async () => {
+    const transport = vi.fn<CccPrdNativeAuthoringTransport>(async (input) => ({
+      text: "{}",
+      provider: input.provider,
+      model: input.model,
+    }));
+
+    await expect(
+      adapter(transport, [provider()], { mode: "understanding" }).generateCandidate(request() as never),
+    ).resolves.toEqual({});
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+
+  it("the refusal names only the provider key and model, never the base URL or source text", async () => {
+    const transport = vi.fn<CccPrdNativeAuthoringTransport>();
+    const undeclared: CustomProvider = {
+      ...provider(),
+      models: [{ id: "fixture-model", name: "Fixture" }],
+    };
+
+    let failure: unknown;
+    try {
+      await adapter(transport, [undeclared], { mode: "understanding" }).generateCandidate(request() as never);
+    } catch (error) {
+      failure = error;
+    }
+
+    const message = failure instanceof Error ? failure.message : String(failure);
+    expect(message).toContain("loopback-authoring");
+    expect(message).toContain("fixture-model");
+    expect(message).not.toContain("127.0.0.1");
+    expect(message).not.toContain(SECRET_QUOTE);
   });
 });

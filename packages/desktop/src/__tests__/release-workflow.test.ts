@@ -76,6 +76,19 @@ describe("desktop release workflow wiring", () => {
     expect(advisoryPackaging).toContain("pnpm --filter @fusion/core test:embedded-postgres");
   });
 
+  it("caps memory only on the advisory desktop production-closure build step", async () => {
+    const advisoryPackaging = await readRepoFile(".github/workflows/desktop-packaging.yml");
+
+    expect(advisoryPackaging.match(/NODE_OPTIONS:/g)).toHaveLength(1);
+    expect(advisoryPackaging).toContain(`
+      - name: Build desktop package (stages the production deploy closure)
+        if: steps.changes.outputs.relevant == 'true'
+        run: pnpm --filter @fusion/desktop build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
+`);
+  });
+
   it("inspects Linux AppImage unpacked trees for embedded Postgres packaging", async () => {
     /*
      * FNXC:DesktopEmbeddedPostgres 2026-07-15-00:20:

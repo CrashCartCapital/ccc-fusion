@@ -20,10 +20,10 @@ import {
   resolveEffectivePlannerOversightLevel,
   getErrorMessage,
 } from "@fusion/core";
-import { resolveTaskSessionAdvisorEnabled } from "../../../core/src/session-advisor";
-import { isNearDuplicateCanonicalInactive } from "../../../core/src/near-duplicate-canonical";
+import { resolveTaskSessionAdvisorEnabled } from "@fusion/core/session-advisor";
+import { isNearDuplicateCanonicalInactive } from "@fusion/core/near-duplicate-canonical";
 import { getRevertOfId, findOpenUndoTaskForSource } from "../utils/taskRevert";
-import { resolveEffectiveAutoMerge } from "../../../core/src/task-merge";
+import { resolveEffectiveAutoMerge } from "@fusion/core/task-merge";
 import { uploadAttachment, deleteAttachment, updateTask, repairOverlapBlocker, pauseTask, unpauseTask, fetchTaskDetail, fetchTaskVerificationRequest, fetchSettings, fetchTaskEffectiveSettings, fetchGlobalSettings, requestSpecRevision, rebuildTaskSpec, approvePlan, rejectPlan, refineTask, fetchWorkflowResults, assignTask, fetchAgents, fetchAgent, refreshPrStatus, fetchBoardWorkflows, updateTaskCustomFields, summarizeTitle, fetchWorkflowSettingValues, nudgeOverseer, stopOverseer, explainOverseer, fetchModels, fetchNodes, api } from "../api";
 import type { RevertTaskOptions, RevertTaskResult, ModelInfo, NodeInfo } from "../api";
 import type { BoardWorkflowsPayload, WorkflowFieldDefinition, CustomFieldRejection } from "../api";

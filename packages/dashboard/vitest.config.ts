@@ -23,6 +23,15 @@ const curatedSkipList: { entries: { file: string; reason: string }[] } = JSON.pa
 const skipListDashboardGlobs = curatedSkipList.entries
   .map((entry) => entry.file.replace(/^packages\/dashboard\//, ""))
   .filter((file) => file.length > 0);
+const browserSafeCoreModules: { modules: { module: string }[] } = JSON.parse(
+  readFileSync(resolve(__dirname, "../../scripts/lib/dashboard-browser-safe-core-modules.json"), "utf8"),
+);
+const browserSafeCoreAliases = Object.fromEntries(
+  browserSafeCoreModules.modules.map(({ module }) => [
+    `@fusion/core/${module}`,
+    resolve(__dirname, `../core/src/${module}.ts`),
+  ]),
+);
 
 const qualityAppFoundationApiTests = [
   // API-client regressions are numerous but lightweight; keep them in their
@@ -505,7 +514,7 @@ export default defineConfig({
       FNXC:GitHubImportTranslate 2026-07-15-09:30:
       Must precede the `@fusion/core` alias: Vite string aliases match by PREFIX, so the broader key would rewrite this subpath to `index.ts/detect-content-language` and fail to resolve.
       */
-      "@fusion/core/detect-content-language": resolve(__dirname, "../core/src/detect-content-language.ts"),
+      ...browserSafeCoreAliases,
       "@fusion/core": resolve(__dirname, "../core/src/index.ts"),
       "@fusion/engine": resolve(__dirname, "../engine/src/index.ts"),
       "@fusion/plugin-sdk": resolve(__dirname, "../plugin-sdk/src/index.ts"),

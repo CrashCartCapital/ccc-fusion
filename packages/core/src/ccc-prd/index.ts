@@ -1,5 +1,6 @@
 export {
   canonicalCccPrdJson,
+  CCC_PRD_PROTECTED_ACTION_KINDS,
   compareCccPrdCodeUnits,
   computeCccPrdProofDefinitionSha256,
   computeCccPrdSemanticBundleSha256,
@@ -22,6 +23,7 @@ export {
   inspectCccPrdProductStatus,
 } from "./product-status.js";
 export {
+  CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION,
   CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
   CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
@@ -36,6 +38,7 @@ export type {
   CccPrdAuthoringAdapter,
   CccPrdAuthoringConstraints,
   CccPrdAuthoringProposal,
+  CccPrdAuthoringProposalFragment,
   CccPrdAuthoringRequest,
   CccPrdAuthoringResult,
   CccPrdAuthoringReview,

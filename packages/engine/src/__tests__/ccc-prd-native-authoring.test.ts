@@ -249,6 +249,14 @@ loopback boundary before a prompt exists. Declare the loopback providers these
 adapter ids already claimed so the suite exercises the admitted route; the
 refusal behavior itself is proved in ccc-authoring-egress.test.ts.
 */
+/*
+Design §8 finding 4: a fail-closed verbatimCapable gate would otherwise
+refuse every fixture call in this suite with zero POSTs, since none of them
+exercise the capability-refusal path itself (that is
+ccc-authoring-egress.test.ts's job, mirroring how the loopback-egress
+refusal is proved there and not here). verbatimCapable: true here is
+fixture setup, not a claim about a real model.
+*/
 const loopbackAuthoringProviders: CustomProvider[] = [
   {
     id: "ccc-loopback-authoring",
@@ -256,7 +264,7 @@ const loopbackAuthoringProviders: CustomProvider[] = [
     apiType: "openai-compatible",
     baseUrl: "http://127.0.0.1:7443/v1",
     apiKey: "synthetic-never-read",
-    models: [{ id: "fixture-model", name: "Fixture" }],
+    models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: true }],
   },
   {
     id: "ccc-loopback-understanding",
@@ -264,7 +272,7 @@ const loopbackAuthoringProviders: CustomProvider[] = [
     apiType: "openai-compatible",
     baseUrl: "http://127.0.0.1:7444/v1",
     apiKey: "synthetic-never-read",
-    models: [{ id: "fixture-model", name: "Fixture" }],
+    models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: true }],
   },
 ];
 
@@ -486,6 +494,40 @@ describe("CCC PRD native authoring adapter", () => {
     });
   });
 
+  /*
+  Single-shot counterpart to the chunk lane's outside-slice diagnostic: the
+  custody error message is what a human -- and, via the chunked lane's
+  violations: [error.message] path, the retry prompt -- actually sees, so it
+  must name the quote that was not found, not just the entity id.
+  */
+  it("names the offending quote when a proposal quote is absent from its source", async () => {
+    const missingQuote = "this sentence never appears anywhere in the reviewed decisions source";
+    const broken = JSON.parse(JSON.stringify(proposal)) as CccPrdAuthoringProposal;
+    broken.requirements[0]!.sourceRefs = [{
+      path: broken.requirements[0]!.sourceRefs[0]!.path,
+      exactQuote: missingQuote,
+    }];
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: canonicalCccPrdJson(broken),
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_SOURCE_QUOTE_MISSING" }],
+    });
+    const { message } = (result as { diagnostics: Array<{ message: string }> }).diagnostics[0]!;
+    expect(message).toContain(JSON.stringify(missingQuote));
+    expect(message).toContain(`${Buffer.byteLength(missingQuote, "utf8")} bytes`);
+  });
+
   it("refuses authoring when the fixed native proof admission entry is degraded", async () => {
     const workflowExtensionRegistry = await proofAdmissionRegistry();
     workflowExtensionRegistry.degrade(
@@ -529,6 +571,59 @@ describe("CCC PRD native authoring adapter", () => {
       kind: "refusal",
       diagnostics: [{ code: "CCC_PRD_PROOF_ADMISSION_IDENTITY" }],
     });
+  });
+
+  /*
+  Real acceptance run against glm-5.2 (2026-08-05): the model wrapped its JSON
+  answer in a ```json code fence and JSON.parse threw on the leading
+  backtick, hard-failing CCC_PRD_AUTHORING_FAILED. Wrapping JSON in a fence is
+  one of the most common LLM behaviors; the transport parse must tolerate an
+  outermost wrapper fence without weakening quote integrity.
+  */
+  it("tolerates a response wholly wrapped in a single code fence", async () => {
+    const fenced = "```json\n" + canonicalCccPrdJson(proposal) + "\n```";
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: fenced,
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result.kind, JSON.stringify(result)).toBe("candidate");
+  });
+
+  /*
+  Companion to the fence-tolerance test above: a document/artifact `content`
+  value may legitimately contain its own ``` fence (e.g. quoting a code
+  block). The outermost-wrapper strip must be anchored to the whole response,
+  not a global backtick removal, or it would mangle that embedded fence and
+  corrupt the byte-exact content this product exists to guarantee. This test
+  fails if someone later swaps the anchored strip for a naive global removal.
+  */
+  it("preserves an embedded code fence inside JSON content byte-identical when the whole response is also fence-wrapped", async () => {
+    const embeddedFenceContent = "Example:\n```js\nconst quoted = \"keep this exact\";\n```\nEnd.";
+    const withEmbeddedFence = structuredClone(proposal);
+    withEmbeddedFence.documents[0]!.content = embeddedFenceContent;
+    const fenced = "```json\n" + canonicalCccPrdJson(withEmbeddedFence) + "\n```";
+
+    const result = await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(async (request) => ({
+        text: fenced,
+        provider: request.provider,
+        model: request.model,
+      })),
+      constraints,
+    });
+
+    expect(result.kind, JSON.stringify(result)).toBe("candidate");
+    if (result.kind !== "candidate") throw new Error("expected candidate");
+    expect(result.sidecar.documents[0]!.content).toBe(embeddedFenceContent);
   });
 
   it("refuses malformed native response text instead of accepting prose", async () => {
@@ -634,6 +729,29 @@ describe("CCC PRD native authoring adapter", () => {
     // unless told to quote at sentence length (CCC_PRD_SOURCE_QUOTE_AMBIGUOUS).
     expect(prompt).toContain("verbatim");
     expect(prompt).toContain("complete sentence");
+  });
+
+  /*
+  Defense in depth alongside the transport-side outermost-fence strip: the
+  prompt already said "no Markdown or commentary", and glm-5.2 still wrapped
+  its answer in a ```json fence anyway, so instruct AND tolerate.
+  */
+  it("instructs the model not to wrap its JSON answer in a code fence", async () => {
+    const generate = vi.fn<CccPrdNativeAuthoringTransport>(async (request) => ({
+      text: canonicalCccPrdJson(proposal),
+      provider: request.provider,
+      model: request.model,
+    }));
+
+    await authorCccPrdPacket({
+      rootDir: fixtureRoot,
+      manifestPath,
+      adapter: nativeAdapter(generate),
+      constraints,
+    });
+
+    const prompt = generate.mock.calls[0]![0].prompt;
+    expect(prompt).toContain("code fence");
   });
 
   it("refuses provider or model identity drift from the native transport", async () => {

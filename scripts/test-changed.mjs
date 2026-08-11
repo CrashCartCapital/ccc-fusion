@@ -1721,7 +1721,23 @@ export async function main(argv = process.argv.slice(2)) {
 
   if (plan.mode === "full") {
     // Explicit opt-in only ("forced": --full / FUSION_TEST_FULL=1).
-    await runMaybeIsolated("pnpm", [`-r`, `--workspace-concurrency=${workspaceConcurrency}`, "test", ...forwardedArgs], {
+    //
+    // FNXC:TestInfrastructure 2026-08-07-00:00: `--no-bail` is load-bearing here.
+    // pnpm's recursive run defaults to bailing on the first failing package, and
+    // because engine sorts before its reverse-dependents (cli, dashboard, desktop,
+    // droid-cli), three long-standing engine failures aborted the sweep with
+    // ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL and those four packages never executed at
+    // all. The familiar "14081 passed / 3 failed" headline therefore described 7 of
+    // 12 packages while ~40% of the suite was dark. Measured on pnpm 10.33.0 with a
+    // 3-package a<-b<-c chain: plain `-r` skips c entirely; `-r --no-bail` runs all
+    // three, prints "Summary: N fails, M passes", and STILL exits 1 via
+    // ERR_PNPM_RECURSIVE_FAIL. `pnpm run --help` claims --no-bail "will exit with a
+    // 0 exit code even if the script fails" -- that text does not match 10.33.0's
+    // recursive-run behavior. Re-verify the exit code before trusting a pnpm bump;
+    // an honest nonzero exit is the whole point of running the sweep this way.
+    // This is the local opt-in sweep only. CI never reaches this branch (it runs
+    // `pnpm test:ci:shard`), so fail-fast CI behavior is untouched.
+    await runMaybeIsolated("pnpm", [`-r`, "--no-bail", `--workspace-concurrency=${workspaceConcurrency}`, "test", ...forwardedArgs], {
       env: isolatedHomeEnv,
       onBeforeAfterCheck: cleanupIsolatedHome,
       budgetMs: FULL_SUITE_BUDGET_MS,

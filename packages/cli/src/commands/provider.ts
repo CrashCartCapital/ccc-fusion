@@ -203,7 +203,7 @@ function singleValue(parsed: ParsedFlags, flag: string): string | undefined {
  */
 function parseModelSpec(
   spec: string,
-): { id: string; name: string; maxTokens?: number; contextWindow?: number } {
+): { id: string; name: string; maxTokens?: number; contextWindow?: number; verbatimCapable?: boolean } {
   let id = "";
   let name: string | undefined;
 
@@ -344,7 +344,7 @@ async function runProviderAdd(args: string[], deps: ProviderCommandDeps): Promis
   const parsed = parseFlags(
     args,
     ["--name", "--base-url", "--api-type", "--model", "--max-tokens", "--context-window"],
-    ["--api-key-stdin", "--allow-remote"],
+    ["--api-key-stdin", "--allow-remote", "--verbatim-capable"],
   );
   if (parsed.positionals.length > 0) {
     fail(`unexpected argument ${parsed.positionals[0]}`);
@@ -386,9 +386,18 @@ async function runProviderAdd(args: string[], deps: ProviderCommandDeps): Promis
   if ((maxTokens !== undefined || contextWindow !== undefined) && models.length === 0) {
     fail("--max-tokens/--context-window apply to model entries; pass at least one --model");
   }
+  // Design D-4: verbatimCapable is a declared operator assertion, stamped
+  // onto every model of this registration exactly as --max-tokens /
+  // --context-window are, and failing the same way when passed without
+  // --model. Absent means unknown means not admitted for quote-bearing work.
+  const verbatimCapable = parsed.booleans.has("--verbatim-capable");
+  if (verbatimCapable && models.length === 0) {
+    fail("--verbatim-capable applies to model entries; pass at least one --model");
+  }
   for (const model of models) {
     if (maxTokens !== undefined) model.maxTokens = maxTokens;
     if (contextWindow !== undefined) model.contextWindow = contextWindow;
+    if (verbatimCapable) model.verbatimCapable = true;
   }
 
   let apiKey: string | undefined;
@@ -523,7 +532,7 @@ async function runProviderRemove(args: string[], deps: ProviderCommandDeps): Pro
 
 const USAGE = `Usage:
   fn provider list [--json]
-  fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--max-tokens <n>] [--context-window <n>] [--api-key-stdin] [--allow-remote]
+  fn provider add --name <name> --base-url <url> [--api-type <type>] [--model <id>[:<name>]]... [--max-tokens <n>] [--context-window <n>] [--verbatim-capable] [--api-key-stdin] [--allow-remote]
   fn provider remove <registry-key|id> [--yes]`;
 
 /**

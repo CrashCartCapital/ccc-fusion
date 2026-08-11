@@ -276,7 +276,7 @@ import type {
   SkillContent,
   SkillFileEntry,
   SkillFileContent,
-} from "@fusion/dashboard";
+} from "../../src/skills-adapter.js";
 export type {
   DiscoveredSkill,
   CatalogEntry,

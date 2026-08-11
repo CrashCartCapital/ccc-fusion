@@ -1,6 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { CustomProvider } from "@fusion/core";
+import { understandCccPrdPacket } from "@fusion/engine";
+import type { CccPrdNativeAuthoringTransport } from "@fusion/engine";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
 import {
   MAX_OPERATOR_CONTEXT_BYTES,
@@ -56,6 +60,25 @@ async function runPrdJson(
   return runPrdCommand([...args, "--json"], io, dependencies, commandContext);
 }
 
+/** Recursive content-hash snapshot of a packet root, used to prove a run left zero residue. */
+function snapshotPacketRoot(root: string): Record<string, string> {
+  const files: Record<string, string> = {};
+  const walk = (dir: string, prefix: string) => {
+    for (const name of readdirSync(dir).sort()) {
+      const absolute = join(dir, name);
+      const relative = prefix ? `${prefix}/${name}` : name;
+      const stat = statSync(absolute);
+      if (stat.isDirectory()) {
+        walk(absolute, relative);
+      } else {
+        files[relative] = createHash("sha256").update(readFileSync(absolute)).digest("hex");
+      }
+    }
+  };
+  walk(root, "");
+  return files;
+}
+
 describe("prd command exit contract", () => {
   it("stops reading typed operator context as soon as the byte limit is crossed", async () => {
     let chunksRead = 0;
@@ -107,7 +130,7 @@ describe("prd command exit contract", () => {
       [
         "usage: fn prd author <root-dir> <manifest-path> <sidecar-output> --target <repository> --base <40-hex-commit> --provider <provider> --model <model> --max-requests <n> --max-duration-ms <n> --max-concurrency <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
         "       fn prd author <root-dir> <manifest-path> <proposal-path> <sidecar-output> (deterministic compatibility fixture)",
-        "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n>",
+        "       fn prd understand <root-dir> <manifest-path> <review-output> --provider <provider> --model <model> --max-duration-ms <n> --max-prompt-bytes <n> --max-response-bytes <n> --max-review-items <n> [--lane auto|single|chunked] [--max-chunk-attempts <n>]",
         "       fn prd corpus <active-projects-root>",
         "       fn prd discover <active-projects-root>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
@@ -350,6 +373,10 @@ describe("prd command exit contract", () => {
       generateCandidate: vi.fn(),
     };
     const createAdapter = vi.fn(() => adapter);
+    const resolveCustomProviderModelLimits = vi.fn(() => ({
+      contextWindow: 65_536,
+      maxTokens: 32_768,
+    }));
     const output: string[] = [];
 
     expect(await runPrdCommand([
@@ -372,9 +399,11 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       bootstrapProofAdmission: async () => ({}) as never,
       createNativeCccPrdAuthoringAdapter: createAdapter,
+      resolveCustomProviderModelLimits,
       understandCccPrdPacket: understand,
     } as never)).toBe(0);
 
+    expect(resolveCustomProviderModelLimits).toHaveBeenCalledWith("loopback", "fixture");
     expect(createAdapter).toHaveBeenCalledWith({
       provider: "loopback",
       model: "fixture",
@@ -389,6 +418,14 @@ describe("prd command exit contract", () => {
       adapter,
       maxReviewItems: 8,
       workflowExtensionRegistry: {},
+      requestedLane: "auto",
+      provider: "loopback",
+      model: "fixture",
+      maxDurationMs: 30000,
+      maxPromptBytes: 1000000,
+      maxResponseBytes: 262144,
+      contextWindow: 65536,
+      reservedOutputTokens: 32768,
     });
     expect(JSON.parse(readFileSync(reviewPath, "utf8"))).toEqual(review);
     expect(JSON.parse(output[0]!)).toMatchObject({
@@ -396,6 +433,329 @@ describe("prd command exit contract", () => {
       reviewPath,
     });
     expect(JSON.parse(output[0]!).executable).toBe(false);
+  });
+
+  it("refuses understanding admission when the selected provider model limits cannot be resolved", async () => {
+    const packet = createPacketRoot();
+    const reviewPath = join(packet.root, "understanding-review.json");
+    const output: string[] = [];
+    const resolveCustomProviderModelLimits = vi.fn(() => {
+      throw new Error("CCC custom provider model is not configured: loopback/missing");
+    });
+    const createAdapter = vi.fn();
+    const bootstrap = vi.fn(async () => ({}) as never);
+    const understand = vi.fn();
+
+    const exit = await runPrdCommand([
+      "understand",
+      packet.root,
+      packet.manifest,
+      reviewPath,
+      "--provider",
+      "loopback",
+      "--model",
+      "missing",
+      "--max-duration-ms",
+      "30000",
+      "--max-prompt-bytes",
+      "1000000",
+      "--max-response-bytes",
+      "262144",
+      "--max-review-items",
+      "8",
+    ], { write: (line) => output.push(line) }, {
+      bootstrapProofAdmission: bootstrap,
+      createNativeCccPrdAuthoringAdapter: createAdapter,
+      resolveCustomProviderModelLimits,
+      understandCccPrdPacket: understand,
+    } as never);
+
+    expect(exit).toBe(1);
+    expect(resolveCustomProviderModelLimits).toHaveBeenCalledWith("loopback", "missing");
+    expect(createAdapter).not.toHaveBeenCalled();
+    expect(bootstrap).not.toHaveBeenCalled();
+    expect(understand).not.toHaveBeenCalled();
+    expect(existsSync(reviewPath)).toBe(false);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_UNDERSTANDING_ADMISSION_FAILED",
+        message: "CCC custom provider model is not configured: loopback/missing",
+      }],
+    });
+  });
+
+  it("test 44: a real chunked-lane mid-run failure through the CLI caller leaves the packet root byte-identical", async () => {
+    const packet = createPacketRoot();
+    const content = [
+      "# Alpha",
+      "- REQ-1: alpha requirement text.",
+      "",
+      "# Beta",
+      "- REQ-2: beta requirement text.",
+    ].join("\n") + "\n";
+    // Overwrite the fixture's single-chunk content with a two-heading packet
+    // so the chunk planner (chunk-planner.ts) produces exactly two chunks --
+    // one per top-level heading -- and a second-chunk failure is reachable.
+    writeFileSync(join(packet.root, "packet.md"), content);
+    writeFileSync(packet.manifest, JSON.stringify({
+      schema: "ccc-prd.packet.v1",
+      source_version: "chunked-caller-residue-test",
+      entries: [{
+        relative_path: "packet.md",
+        role: "root",
+        authoritative: true,
+        sha256: createHash("sha256").update(content).digest("hex"),
+      }],
+    }));
+
+    const alphaFragment = {
+      schema: "ccc-prd.authoring-proposal-fragment.v1",
+      authorityRoles: [],
+      requirements: [{
+        id: "REQ-1",
+        statement: "alpha requirement",
+        acceptance: "alpha acceptance",
+        accountableProducer: "team-a",
+        dependencies: [],
+        proofIds: [],
+        confidence: "high",
+        sourceRefs: [{ path: "packet.md", exactQuote: "- REQ-1: alpha requirement text." }],
+      }],
+      proofs: [],
+      tasks: [{
+        id: "TASK-ALPHA",
+        title: "Ship alpha",
+        description: "Implement alpha",
+        accountableProducer: "team-a",
+        requirementIds: ["REQ-1"],
+        dependencyTaskIds: [],
+        proofIds: [],
+        workflowId: "",
+        documentIds: [],
+        artifactIds: [],
+        protectedActionIds: [],
+        ownedPaths: ["src/alpha.ts"],
+        allowedWriteRoots: ["src/alpha.ts"],
+        sourceRefs: [{ path: "packet.md", exactQuote: "# Alpha\n- REQ-1: alpha requirement text." }],
+      }],
+      edges: [],
+      workflows: [],
+      documents: [],
+      artifacts: [],
+      importIntents: [],
+      protectedActions: [],
+      unresolvedDecisions: [],
+      ambiguities: [],
+      exceptions: [],
+    };
+
+    let transportCallCount = 0;
+    const chunkTransport: CccPrdNativeAuthoringTransport = async ({ provider, model }) => {
+      transportCallCount += 1;
+      if (transportCallCount === 1) {
+        return { text: JSON.stringify(alphaFragment), provider, model };
+      }
+      throw new Error("simulated transport failure: chunk 2 network drop");
+    };
+    const verbatimCapableProviders: CustomProvider[] = [{
+      id: "ccc-loopback-chunked",
+      name: "Loopback Chunked",
+      apiType: "openai-compatible",
+      baseUrl: "http://127.0.0.1:7999/v1",
+      apiKey: "synthetic-never-read",
+      models: [{ id: "fixture-model", name: "Fixture", verbatimCapable: true }],
+    }];
+
+    const reviewPath = join(packet.root, "understanding-review.json");
+    const output: string[] = [];
+
+    const before = snapshotPacketRoot(packet.root);
+    const exit = await runPrdCommand(
+      [
+        "understand", packet.root, packet.manifest, reviewPath,
+        "--provider", "loopback-chunked",
+        "--model", "fixture-model",
+        "--max-duration-ms", "5000",
+        "--max-prompt-bytes", "1000000",
+        "--max-response-bytes", "262144",
+        "--max-review-items", "8",
+        "--lane", "chunked",
+      ],
+      { write: (line) => output.push(line) },
+      {
+        bootstrapProofAdmission: async () => ({}) as never,
+        createNativeCccPrdAuthoringAdapter: () => ({
+          id: "unused",
+          generateCandidate: async () => { throw new Error("single-shot path must not run"); },
+        }) as never,
+        resolveCustomProviderModelLimits: () => ({
+          contextWindow: 128_000,
+          maxTokens: 16_384,
+        }),
+        // The CALLER path under test (prd.ts's runGeneratedUnderstanding) --
+        // this wrapper runs the REAL engine chunk orchestrator (not a
+        // mocked refusal), only supplying the test-only transport seam
+        // (chunk-orchestrator.ts's `transport` option) so the second chunk
+        // fails mid-flight through the real pipeline.
+        understandCccPrdPacket: (input) => understandCccPrdPacket({
+          ...input,
+          chunkTransport,
+          customProviders: verbatimCapableProviders,
+        }),
+      } as never,
+    );
+    const after = snapshotPacketRoot(packet.root);
+
+    expect(transportCallCount, output.join("\n")).toBe(2);
+    expect(exit, output.join("\n")).toBe(1);
+    expect(JSON.parse(output[0]!).kind).toBe("refusal");
+    expect(existsSync(reviewPath)).toBe(false);
+    expect(after).toEqual(before);
+  });
+
+  describe("fn prd understand -- optionalUnderstandingFlags (design §6)", () => {
+    const requiredFlags = (extra: string[] = []) => [
+      "--provider", "loopback",
+      "--model", "fixture",
+      "--max-duration-ms", "30000",
+      "--max-prompt-bytes", "1000000",
+      "--max-response-bytes", "262144",
+      "--max-review-items", "8",
+      ...extra,
+    ];
+
+    it("test 53: accepts the required flags plus --lane chunked", async () => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const understand = vi.fn(async () => ({ kind: "refusal", diagnostics: [] }) as never);
+      const output: string[] = [];
+
+      await runPrdCommand(
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags(["--lane", "chunked"])],
+        { write: (line) => output.push(line) },
+        {
+          bootstrapProofAdmission: async () => ({}) as never,
+          createNativeCccPrdAuthoringAdapter: vi.fn(() => ({ id: "x", generateCandidate: vi.fn() })) as never,
+          resolveCustomProviderModelLimits: () => ({
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          }),
+          understandCccPrdPacket: understand,
+        } as never,
+      );
+
+      expect(understand).toHaveBeenCalledWith(expect.objectContaining({ requestedLane: "chunked" }));
+    });
+
+    it("test 53b: accepts the required flags plus --max-chunk-attempts", async () => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const understand = vi.fn(async () => ({ kind: "refusal", diagnostics: [] }) as never);
+
+      await runPrdCommand(
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags(["--max-chunk-attempts", "3"])],
+        { write: () => {} },
+        {
+          bootstrapProofAdmission: async () => ({}) as never,
+          createNativeCccPrdAuthoringAdapter: vi.fn(() => ({ id: "x", generateCandidate: vi.fn() })) as never,
+          resolveCustomProviderModelLimits: () => ({
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          }),
+          understandCccPrdPacket: understand,
+        } as never,
+      );
+
+      expect(understand).toHaveBeenCalledWith(expect.objectContaining({ maxChunkAttempts: 3 }));
+    });
+
+    it("test 54: rejects an unknown flag rather than silently dropping it", async () => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const output: string[] = [];
+      const code = await runPrdCommand(
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags(["--not-a-real-flag", "x"])],
+        { write: (line) => output.push(line) },
+      );
+      expect(code).toBe(2);
+    });
+
+    it("test 54b: rejects a duplicate flag", async () => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const code = await runPrdCommand(
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags(["--lane", "single", "--lane", "chunked"])],
+        { write: () => {} },
+      );
+      expect(code).toBe(2);
+    });
+
+    it("test 54c: rejects an odd arg count", async () => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const code = await runPrdCommand(
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags(["--lane"])],
+        { write: () => {} },
+      );
+      expect(code).toBe(2);
+    });
+
+    it.each([
+      ["--chunk-journal", "/tmp/journal.json"],
+      ["--resume", "/tmp/journal.json"],
+    ])("rejects %s as not-yet-implemented, distinctly from an unknown flag", async (flag, value) => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const output: string[] = [];
+      const code = await runPrdCommand(
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags([flag, value])],
+        { write: (line) => output.push(line) },
+      );
+      expect(code).toBe(2);
+      expect(output).toEqual([
+        `${flag} is not yet implemented (the chunked understanding resume journal does not exist in this build)`,
+      ]);
+    });
+
+    it.each([
+      ["--chunk-journal", "/tmp/journal.json"],
+      ["--resume", "/tmp/journal.json"],
+    ])("rejects %s explicitly before generic option-count handling", async (flag, value) => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const output: string[] = [];
+      const code = await runPrdCommand(
+        [
+          "understand",
+          packet.root,
+          packet.manifest,
+          reviewPath,
+          ...requiredFlags([
+            "--lane", "chunked",
+            "--max-chunk-attempts", "3",
+            flag, value,
+          ]),
+        ],
+        { write: (line) => output.push(line) },
+      );
+      expect(code).toBe(2);
+      expect(output).toEqual([
+        `${flag} is not yet implemented (the chunked understanding resume journal does not exist in this build)`,
+      ]);
+    });
+
+    it("rejects an invalid --lane value", async () => {
+      const packet = createPacketRoot();
+      const reviewPath = join(packet.root, "understanding-review.json");
+      const output: string[] = [];
+      const code = await runPrdCommand(
+        ["understand", packet.root, packet.manifest, reviewPath, ...requiredFlags(["--lane", "bogus"])],
+        { write: (line) => output.push(line) },
+      );
+      expect(code).toBe(2);
+      expect(output.join("\n")).toContain("--lane must be one of");
+    });
   });
 
   it("generates a hash-bound execution plan without operator-authored policy JSON", async () => {

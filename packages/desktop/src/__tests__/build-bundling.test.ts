@@ -18,13 +18,32 @@ async function readDesktopFile(relativePath: string): Promise<string> {
 }
 
 describe("desktop Electron main bundling", () => {
-  it("builds dashboard server artifacts and registry manifest from the desktop release build path", async () => {
+  it("builds dashboard server artifacts without running the client Vite build twice", async () => {
     const buildScript = await readDesktopFile("scripts/build.ts");
+    const workspaceTools = await readDesktopFile("scripts/workspace-tools.ts");
 
-    expect(buildScript).toContain("buildDashboard()");
+    expect(buildScript).toContain("buildDashboardServerRuntime()");
     expect(buildScript).toContain("dashboardRegistryManifestSource");
     expect(buildScript).toContain("dashboardRegistryManifestDist");
     expect(buildScript).toContain("await cp(dashboardRegistryManifestSource, dashboardRegistryManifestDist)");
+    expect(workspaceTools).toContain("export async function buildDashboardServerRuntime()");
+
+    const serverRuntimeBuild = workspaceTools.match(
+      /export async function buildDashboardServerRuntime\(\): Promise<void> \{[\s\S]*?\n\}/,
+    )?.[0];
+    expect(serverRuntimeBuild).toBeDefined();
+    expect(serverRuntimeBuild).toContain('runWorkspaceBin("tsc"');
+    expect(serverRuntimeBuild).not.toContain('runWorkspaceBin("vite"');
+  });
+
+  it("keeps the desktop unit-test prebuild on dashboard server artifacts", async () => {
+    const testScript = await readDesktopFile("scripts/test.ts");
+
+    expect(testScript).toContain("buildDashboardServerRuntime()");
+    expect(testScript).toContain('join(dashboardRoot, "src", "registry-manifest.json")');
+    expect(testScript).toContain('join(dashboardRoot, "dist", "registry-manifest.json")');
+    expect(testScript).not.toContain("buildDashboard()");
+    expect(testScript).not.toContain("buildDashboardClient()");
   });
 
   it("builds every dashboard-static runtime plugin including omp before packaging", async () => {
@@ -42,6 +61,30 @@ describe("desktop Electron main bundling", () => {
     expect(workspaceTools).toContain("buildDashboardRuntimePlugins");
     expect(workspaceTools).toContain("DASHBOARD_RUNTIME_PLUGIN_PACKAGES");
     expect(workspaceTools).toContain("fusion-plugin-omp-runtime");
+  });
+
+  it("builds dashboard runtime plugins serially within the desktop packaging memory budget", async () => {
+    const workspaceTools = await readDesktopFile("scripts/workspace-tools.ts");
+    const buildRuntimePlugins = workspaceTools.match(
+      /export async function buildDashboardRuntimePlugins\(\): Promise<void> \{[\s\S]*?\n\}/,
+    )?.[0];
+
+    expect(buildRuntimePlugins).toBeDefined();
+    expect(buildRuntimePlugins).toContain("for (const relativePath of DASHBOARD_RUNTIME_PLUGIN_PACKAGES)");
+    expect(buildRuntimePlugins).toContain("await buildPackage(relativePath)");
+    expect(buildRuntimePlugins).not.toContain("Promise.all");
+  });
+
+  it("retries transient directory races while clearing the desktop deploy stage", async () => {
+    const workspaceTools = await readDesktopFile("scripts/workspace-tools.ts");
+    const stageDesktopDeploy = workspaceTools.match(
+      /export async function stageDesktopDeploy\(\): Promise<void> \{[\s\S]*?\n\}/,
+    )?.[0];
+
+    expect(stageDesktopDeploy).toBeDefined();
+    expect(stageDesktopDeploy).toContain(
+      "await rm(desktopDeployDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })",
+    );
   });
 
   it("externalizes production main-process packages so updater CJS deps are not bundled into ESM", async () => {

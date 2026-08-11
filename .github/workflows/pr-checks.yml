@@ -63,6 +63,8 @@ jobs:
 
       - name: Typecheck
         run: pnpm typecheck
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
 
   build:
     name: Build
@@ -77,6 +79,8 @@ jobs:
 
       - name: Build
         run: pnpm build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
 
   # The only merge-blocking TEST signal (R3). Runs the boot smoke (the app
   # starts and serves) plus the curated engine-core suite, the focused CCC PRD
@@ -115,8 +119,9 @@ jobs:
           --health-retries 10
     # The gate's value is speed; without a job timeout a hung build or
     # deadlocked vitest worker blocks every PR for GitHub's default 6 hours.
-    # Expected runtime is ~3-5 min.
-    timeout-minutes: 15
+    # Expected warm runtime is ~3-5 min, but cold or constrained self-hosted
+    # runners can spend longer in dependency setup; keep a bounded backstop.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4

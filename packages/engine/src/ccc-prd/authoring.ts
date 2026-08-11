@@ -42,6 +42,7 @@ import {
 } from "../ccc-campaign-proof-admission.js";
 import {
   CccPrdCustodyError,
+  describeCccPrdQuoteForRejection,
   readCccPrdPacketCustody,
   sortCccPrdById,
 } from "./custody.js";
@@ -102,7 +103,7 @@ function sourceQuoteContainsCanonicalPath(
   return false;
 }
 
-function validateTaskCustodyProvenance(
+export function validateTaskCustodyProvenance(
   proposal: CccPrdAuthoringProposal,
 ): CccPrdDiagnostic[] {
   const diagnostics: CccPrdDiagnostic[] = [];
@@ -248,7 +249,7 @@ function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal
   return describeProposalShapeViolations(value).length === 0;
 }
 
-const IDENTITY_COLLECTIONS = [
+export const IDENTITY_COLLECTIONS = [
   "authorityRoles",
   "requirements",
   "proofs",
@@ -264,7 +265,7 @@ const IDENTITY_COLLECTIONS = [
   "exceptions",
 ] as const;
 
-const SOURCE_BOUND_COLLECTIONS = [
+export const SOURCE_BOUND_COLLECTIONS = [
   "requirements",
   "proofs",
   "tasks",
@@ -330,7 +331,7 @@ function hasWellFormedProtectedActionIds(proposal: CccPrdAuthoringProposal): boo
   ));
 }
 
-function compareSourceSpans(left: CccPrdSourceSpan, right: CccPrdSourceSpan): number {
+export function compareSourceSpans(left: CccPrdSourceSpan, right: CccPrdSourceSpan): number {
   return compareCodeUnits(left.path, right.path)
     || left.byteStart - right.byteStart
     || left.byteEnd - right.byteEnd
@@ -749,7 +750,8 @@ function resolveSourceRefs(
     if (byteStart < 0) {
       throw new CccPrdCustodyError(
         "CCC_PRD_SOURCE_QUOTE_MISSING",
-        `authoring proposal quote is absent for ${entityId} in ${reference.path}`,
+        `authoring proposal quote is absent for ${entityId} in ${reference.path}: `
+        + describeCccPrdQuoteForRejection(reference.exactQuote),
       );
     }
     if (source.indexOf(quote, byteStart + 1) >= 0) {

@@ -42,6 +42,29 @@ export class CccPrdCustodyError extends Error {
   }
 }
 
+/**
+ * A fault the model itself can correct on the next attempt -- it produced
+ * something slightly outside the expected shape or budget, not something
+ * unrecoverable.
+ *
+ * Repairability in this pipeline has been a property of WHERE an error is
+ * thrown (an implicit allowlist of call sites that happen to sit inside a
+ * try/catch) rather than of WHAT went wrong, which is why identical faults get
+ * opposite verdicts in different modules. This carries the verdict on the
+ * error itself so a distant handler does not have to infer it from the throw
+ * site. `message` is handed straight to the retry prompt, so it must name the
+ * offending value and, where one exists, the allowed alternative -- a
+ * rejection the model cannot act on only buys one more identical attempt.
+ */
+export class CccPrdRepairableModelOutputError extends CccPrdCustodyError {
+  readonly retryEligible = true;
+
+  constructor(code: string, message: string) {
+    super(code, message);
+    this.name = "CccPrdRepairableModelOutputError";
+  }
+}
+
 export type CccPrdPacketCustody = {
   rootDir: string;
   manifestPath: string;
@@ -271,4 +294,35 @@ export function readCccPrdPacketCustody(input: {
 
 export function sortCccPrdById<T extends { id: string }>(values: T[]): T[] {
   return [...values].sort((left, right) => compareCccPrdCodeUnits(left.id, right.id));
+}
+
+/**
+ * Character budget for the quote excerpt carried in a quote-rejection
+ * message. Quote-rejection messages are fed back into the next authoring
+ * attempt's prompt, which enforces a hard maxPromptBytes ceiling, so the
+ * excerpt is bounded rather than unbounded. 200 characters covers a full
+ * sentence -- the quote length the prompt asks for -- and renders to roughly
+ * 210 bytes for the ASCII quotes these documents actually produce.
+ */
+export const CCC_PRD_QUOTE_EXCERPT_CHARS = 200;
+
+/**
+ * Renders a model-supplied quote for a rejection message.
+ *
+ * The quote is JSON-escaped so whitespace, newlines, and invisible or
+ * non-ASCII characters stay visible to whoever (or whatever) reads the
+ * message -- a near-miss quote differing by one non-breaking space is
+ * indistinguishable from an exact match otherwise. The untruncated byte
+ * length is always reported, so a truncated excerpt still says how much was
+ * withheld and byte-level differences remain diagnosable.
+ *
+ * Truncation is applied to the raw quote rather than to the escaped output,
+ * which keeps the rendered form a well-formed JSON string instead of one cut
+ * through the middle of an escape sequence.
+ */
+export function describeCccPrdQuoteForRejection(quote: string): string {
+  const byteLength = Buffer.byteLength(quote, "utf8");
+  const truncated = quote.length > CCC_PRD_QUOTE_EXCERPT_CHARS;
+  const excerpt = truncated ? quote.slice(0, CCC_PRD_QUOTE_EXCERPT_CHARS) : quote;
+  return `${JSON.stringify(excerpt)}${truncated ? " [truncated]" : ""} (${byteLength} bytes)`;
 }

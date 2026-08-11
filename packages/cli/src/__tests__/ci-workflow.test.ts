@@ -194,6 +194,24 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(content).not.toContain("ubuntu-latest");
   });
 
+  it("keeps the Gate timeout bounded for cold constrained runners", () => {
+    expect(workflow.jobs?.gate?.["timeout-minutes"]).toBe(25);
+  });
+
+  it("does not enable setup-node pnpm cache when dependency install is skipped", () => {
+    const setupNodeSteps = (compositeAction.runs?.steps ?? []).filter(
+      (step: any) => step.uses === "actions/setup-node@v5",
+    );
+    const cachedSetup = setupNodeSteps.find((step: any) => step.with?.cache === "pnpm");
+    const uncachedSetup = setupNodeSteps.find((step: any) => step.with?.cache === undefined);
+
+    expect(cachedSetup?.if).toBe("${{ inputs.skip-install != 'true' }}");
+    expect(uncachedSetup?.if).toBe("${{ inputs.skip-install == 'true' }}");
+    expect(uncachedSetup?.with?.["package-manager-cache"]).toBe(false);
+    expect(uncachedSetup?.with?.["node-version"]).toBe("${{ inputs.node-version }}");
+    expect(uncachedSetup?.with?.["registry-url"]).toBe("${{ inputs.registry-url }}");
+  });
+
   it("contains no shard matrix or full-suite invocation (demoted to full-suite.yml)", () => {
     expect(workflow.jobs?.["test-shards"]).toBeUndefined();
     expect(workflow.jobs?.["test-slow"]).toBeUndefined();
@@ -295,6 +313,31 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(content).not.toContain("run: pnpm install\n");
     expect(content).not.toContain("--no-frozen-lockfile");
     expect(compositeAction.inputs?.["install-args"]?.default).toBe("--frozen-lockfile");
+  });
+
+  it("caps memory only on the standalone Typecheck and Build command steps", () => {
+    const heapLimit = "--max-old-space-size=1664";
+    const typecheckStep = (workflow.jobs?.typecheck?.steps ?? []).find(
+      (step: any) => step.name === "Typecheck" && step.run === "pnpm typecheck",
+    );
+    const buildStep = (workflow.jobs?.build?.steps ?? []).find(
+      (step: any) => step.name === "Build" && step.run === "pnpm build",
+    );
+
+    expect(typecheckStep?.env?.NODE_OPTIONS).toBe(heapLimit);
+    expect(buildStep?.env?.NODE_OPTIONS).toBe(heapLimit);
+    expect(workflow.env?.NODE_OPTIONS).toBeUndefined();
+    expect(workflow.jobs?.typecheck?.env?.NODE_OPTIONS).toBeUndefined();
+    expect(workflow.jobs?.build?.env?.NODE_OPTIONS).toBeUndefined();
+
+    for (const jobName of ["lint", "gate"]) {
+      const job = workflow.jobs?.[jobName];
+      expect(job?.env?.NODE_OPTIONS, `${jobName} must not receive the build heap cap`).toBeUndefined();
+      expect(
+        (job?.steps ?? []).every((step: any) => step.env?.NODE_OPTIONS === undefined),
+        `${jobName} steps must not receive the build heap cap`,
+      ).toBe(true);
+    }
   });
 
   it("keeps lint as install + lint only, without Bun/setup build coupling", () => {

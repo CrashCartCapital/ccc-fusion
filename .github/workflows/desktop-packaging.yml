@@ -70,6 +70,8 @@ jobs:
       - name: Build desktop package (stages the production deploy closure)
         if: steps.changes.outputs.relevant == 'true'
         run: pnpm --filter @fusion/desktop build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
 
       # FNXC:DesktopEmbeddedPostgres 2026-07-14-09:39:
       # The advisory Linux packaging lane also executes the real bundled

@@ -114,14 +114,21 @@ export const DASHBOARD_RUNTIME_PLUGIN_PACKAGES = [
 
 export async function buildDashboardRuntimePlugins(): Promise<void> {
   await buildPackage("packages/plugin-sdk");
-  await Promise.all(DASHBOARD_RUNTIME_PLUGIN_PACKAGES.map((relativePath) => buildPackage(relativePath)));
+  for (const relativePath of DASHBOARD_RUNTIME_PLUGIN_PACKAGES) {
+    await buildPackage(relativePath);
+  }
+}
+
+export async function buildDashboardServerRuntime(): Promise<void> {
+  const dashboardRoot = resolve(workspaceRoot, "packages", "dashboard");
+  await buildDashboardRuntimePlugins();
+  await runWorkspaceBin("tsc", [], dashboardRoot);
 }
 
 export async function buildDashboard(): Promise<void> {
   const dashboardRoot = resolve(workspaceRoot, "packages", "dashboard");
-  await buildDashboardRuntimePlugins();
+  await buildDashboardServerRuntime();
   await runWorkspaceBin("vite", ["build"], dashboardRoot);
-  await runWorkspaceBin("tsc", [], dashboardRoot);
   // FNXC:DesktopBuild 2026-07-01-11:45:
   // Desktop release and test paths call this helper directly instead of the dashboard package script, so copy the Node-read registry manifest beside server dist here as the shared build invariant.
   await cp(resolve(dashboardRoot, "src", "registry-manifest.json"), resolve(dashboardRoot, "dist", "registry-manifest.json"));
@@ -242,7 +249,7 @@ export async function verifyEmbeddedPostgresPayloads(
 
 export async function stageDesktopDeploy(): Promise<void> {
   console.log("[desktop:build] Staging complete production closure via pnpm deploy...");
-  await rm(desktopDeployDir, { recursive: true, force: true });
+  await rm(desktopDeployDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   await runPnpm(
     ["--filter", "@fusion/desktop", "deploy", "--prod", "--legacy", "--config.node-linker=hoisted", desktopDeployDir],
     workspaceRoot,

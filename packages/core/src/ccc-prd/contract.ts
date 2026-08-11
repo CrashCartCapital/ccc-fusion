@@ -21,45 +21,64 @@ const decisions: Record<CccPrdProtectedActionKind, CccPrdOperatorDecision> = {
   upstream_write: "approve_upstream_write",
 };
 
+/**
+ * The legal protected-action kinds, derived from `decisions` so the two cannot
+ * drift. Every one of them names an action an operator must approve because it
+ * is irreversible, outward-facing, or spends money or authority -- which is
+ * why ordinary work such as creating a file has no entry here and should not
+ * acquire one.
+ */
+export const CCC_PRD_PROTECTED_ACTION_KINDS: readonly CccPrdProtectedActionKind[] =
+  Object.keys(decisions) as CccPrdProtectedActionKind[];
+
 export function compareCccPrdCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function canonicalJson(value: unknown, seen: Set<object>): string {
+/*
+Every rejection here names the JSON path that caused it, and the value where
+one is printable. These fire on model-authored content that reached assembly
+with fields nobody enumerated -- an oversized numeric literal in a field the
+model invented is Infinity after JSON.parse -- so "numbers must be finite" with
+no location leaves a whole run undiagnosable.
+*/
+function canonicalJson(value: unknown, seen: Set<object>, path: string): string {
   if (value === null) return "null";
   if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("CCC PRD canonical JSON numbers must be finite");
+    if (!Number.isFinite(value)) {
+      throw new Error(`CCC PRD canonical JSON numbers must be finite (at ${path}: ${String(value)})`);
+    }
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
-    if (seen.has(value)) throw new Error("CCC PRD canonical JSON must not contain cycles");
+    if (seen.has(value)) throw new Error(`CCC PRD canonical JSON must not contain cycles (at ${path})`);
     seen.add(value);
-    const result = `[${value.map((entry) => canonicalJson(entry, seen)).join(",")}]`;
+    const result = `[${value.map((entry, index) => canonicalJson(entry, seen, `${path}[${index}]`)).join(",")}]`;
     seen.delete(value);
     return result;
   }
   if (typeof value === "object") {
     const object = value as object;
-    if (seen.has(object)) throw new Error("CCC PRD canonical JSON must not contain cycles");
+    if (seen.has(object)) throw new Error(`CCC PRD canonical JSON must not contain cycles (at ${path})`);
     const prototype = Object.getPrototypeOf(object);
     if (prototype !== Object.prototype && prototype !== null) {
-      throw new Error("CCC PRD canonical JSON values must be plain objects");
+      throw new Error(`CCC PRD canonical JSON values must be plain objects (at ${path})`);
     }
     seen.add(object);
     const result = `{${Object.entries(value as Record<string, unknown>)
       .sort(([left], [right]) => compareCccPrdCodeUnits(left, right))
-      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry, seen)}`)
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry, seen, `${path}.${key}`)}`)
       .join(",")}}`;
     seen.delete(object);
     return result;
   }
-  throw new Error("CCC PRD canonical JSON values must be JSON-compatible");
+  throw new Error(`CCC PRD canonical JSON values must be JSON-compatible (at ${path}: ${typeof value})`);
 }
 
 export function canonicalCccPrdJson(value: unknown): string {
-  return canonicalJson(value, new Set<object>());
+  return canonicalJson(value, new Set<object>(), "$");
 }
 
 function sha256CanonicalCccPrdJson(value: unknown): string {
@@ -164,7 +183,14 @@ export function normalizeProtectedAction(input: {
   spans?: CccPrdSourceSpan[];
 }): CccPrdProtectedActionIntent {
   const operatorDecision = decisions[input.kind as CccPrdProtectedActionKind];
-  if (!operatorDecision) throw new Error(`unknown protected action kind: ${input.kind}`);
+  if (!operatorDecision) {
+    // Naming only the bad kind leaves a caller (or a model being asked to
+    // retry) with nothing to correct against, so carry the legal set too.
+    throw new Error(
+      `unknown protected action kind: ${input.kind}; allowed kinds are `
+        + CCC_PRD_PROTECTED_ACTION_KINDS.join(", "),
+    );
+  }
   return {
     id: input.id ?? `protected-action:${input.kind}:${input.target}`,
     kind: input.kind as CccPrdProtectedActionKind,

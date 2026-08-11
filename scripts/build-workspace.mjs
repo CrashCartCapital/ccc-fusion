@@ -428,6 +428,38 @@ export function planWorkspaceBuild({ rootDir = repoRoot, packages = discoverWork
 }
 
 /**
+ * FNXC:WorkspaceBuild 2026-08-06-00:00:
+ * Resolve how many workspace package builds pnpm may run at once.
+ *
+ * The failure this exists to prevent: CI runner containers are hard-capped at 2560 MiB, and pnpm's
+ * DEFAULT workspace concurrency is 4. Nothing in this repo set that value anywhere -- no .npmrc
+ * exists, pnpm-workspace.yaml has no concurrency key, and package.json's "pnpm" block only carries
+ * ignoredBuiltDependencies/onlyBuiltDependencies. So `packages/engine build$ tsc` and
+ * `packages/plugin-sdk build$ tsc` launched at the IDENTICAL timestamp; two tsc processes cannot
+ * share 2.5 GiB, the kernel OOM-killed one, and the build died with exit 137 and a one-word
+ * "Killed" -- no stack, nothing pointing at memory.
+ *
+ * Default to 1 (strictly serial) because that is the only value that is safe at the CI memory cap,
+ * and a green slow build beats a fast one that dies. Keep it OVERRIDABLE rather than hardcoded so a
+ * developer on a 64 GB workstation can still parallelize:
+ *   FUSION_BUILD_WORKSPACE_CONCURRENCY=4 pnpm build
+ * Garbage or non-positive values fall back to the safe default rather than being forwarded to pnpm,
+ * so a typo degrades to "slow" and never back to "OOM-killed".
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {number}
+ */
+export const DEFAULT_BUILD_WORKSPACE_CONCURRENCY = 1;
+
+export function resolveBuildWorkspaceConcurrency(env = process.env) {
+  const raw = env.FUSION_BUILD_WORKSPACE_CONCURRENCY;
+  if (raw === undefined || raw === "") return DEFAULT_BUILD_WORKSPACE_CONCURRENCY;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) return DEFAULT_BUILD_WORKSPACE_CONCURRENCY;
+  return parsed;
+}
+
+/**
  * Build all planned packages through pnpm filters so each package's existing
  * build script and workspace dependency behavior remain intact.
  *
@@ -439,7 +471,18 @@ export function planWorkspaceBuild({ rootDir = repoRoot, packages = discoverWork
 export function runPlannedBuilds(plannedPackages, rootDir, spawnFn = spawnSync, { fullPackage = false, env = process.env } = {}) {
   if (plannedPackages.length === 0) return { status: 0, packageNames: [] };
   const packageNames = plannedPackages.map((pkg) => pkg.name);
-  const args = [...packageNames.flatMap((name) => ["--filter", name]), "build"];
+  /*
+   * FNXC:WorkspaceBuild 2026-08-06-00:00:
+   * See resolveBuildWorkspaceConcurrency -- without this flag pnpm defaults to 4 concurrent
+   * package builds and the CI runner's 2560 MiB cap OOM-kills a tsc (exit 137). The flag must
+   * precede the `build` command so pnpm parses it as its own option rather than forwarding it to
+   * the package script. Mirrors the existing `--workspace-concurrency=1` on root test:coverage.
+   */
+  const args = [
+    `--workspace-concurrency=${resolveBuildWorkspaceConcurrency(env)}`,
+    ...packageNames.flatMap((name) => ["--filter", name]),
+    "build",
+  ];
   /*
    * FNXC:WorkspaceBuild 2026-07-02-15:10:
    * On Windows `pnpm` resolves to a `.cmd` shim; Node refuses to spawn .cmd/.bat without a

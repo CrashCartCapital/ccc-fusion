@@ -341,7 +341,7 @@ function runWorkspaceCommand(command: string, args: string[], cwd: string, timeo
   });
 }
 
-async function ensureDesktopRuntimeAssetsBuilt() {
+export async function ensureDesktopRuntimeAssetsBuilt() {
   if (existsSync(desktopRuntimeSrc)) {
     return;
   }
@@ -734,8 +734,27 @@ const pluginSdkBuildConfig = {
   outDir: "dist",
 };
 
-export default defineConfig([
-  cliBuildConfig,
-  cccProofAdmissionBuildConfig,
-  pluginSdkBuildConfig,
-]);
+function selectCliTsupConfigs(env: NodeJS.ProcessEnv = process.env) {
+  switch (env.FUSION_CLI_TSUP_CONFIG) {
+    case undefined:
+    case "":
+      return [
+        cliBuildConfig,
+        cccProofAdmissionBuildConfig,
+        pluginSdkBuildConfig,
+      ];
+    case "cli":
+      return [cliBuildConfig];
+    case "proof-admission":
+      return [cccProofAdmissionBuildConfig];
+    case "plugin-sdk":
+      return [pluginSdkBuildConfig];
+    default: {
+      throw new Error(
+        `[tsup] Unknown FUSION_CLI_TSUP_CONFIG "${env.FUSION_CLI_TSUP_CONFIG}". Expected one of: cli, proof-admission, plugin-sdk.`,
+      );
+    }
+  }
+}
+
+export default defineConfig(selectCliTsupConfigs());
