@@ -3,7 +3,7 @@
  * Operational retention must delete only rows older than the cutoff in the bound project. Newer rows and equally old rows owned by another project must survive the same maintenance pass.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import * as schema from "../../postgres/schema/index.js";
 import { pruneOperationalLogsAsync } from "../../task-store/async-maintenance.js";
 import {
@@ -107,6 +107,79 @@ pgDescribe("PostgreSQL operational maintenance", () => {
     expect((await h.adminDb().select().from(schema.project.runAuditEvents).where(inArray(schema.project.runAuditEvents.id, ["audit-old", "audit-new"]))).map((row) => row.id)).toEqual(["audit-new"]);
     expect((await h.adminDb().select().from(schema.project.agentRuns).where(inArray(schema.project.agentRuns.id, ["agent-run-old", "agent-run-new", "agent-run-active"]))).map((row) => row.id).sort()).toEqual(["agent-run-active", "agent-run-new"]);
     expect((await h.adminDb().select().from(schema.project.agentConfigRevisions).where(inArray(schema.project.agentConfigRevisions.id, ["revision-old", "revision-newest"]))).map((row) => row.id)).toEqual(["revision-newest"]);
+  });
+
+  it("never prunes campaign-bound run-audit receipts, however old", async () => {
+    /*
+    FNXC:PostgresRetention 2026-08-11:
+    CCC campaign receipts (provider attempts, effects, landing audits) live in
+    project.run_audit_events with a campaign binding and carry the campaign
+    task's task_id, so the ordinary task-scoped retention DELETE matched them
+    and campaign proof history silently expired after the retention window.
+    Operator decision 2026-08-11: campaign-bound rows are NEVER pruned by this
+    maintenance job. The canonical campaign-bound marker is campaign_import_id
+    (the binding check constraint makes campaign columns all-or-nothing, and
+    campaign_import_id is the FK linkage to project.ccc_prd_imports).
+    */
+    const old = new Date(Date.now() - 10 * 86_400_000).toISOString();
+    const recent = new Date().toISOString();
+    const projectId = h.layer().projectId?.trim() || "__legacy_unscoped__";
+    const task = await h.store().createTask({ description: "Campaign retention owner task" });
+    // Seed the FK parent import row. The retention pruner never reads the
+    // jsonb payloads, so they stay minimal.
+    await h.adminDb().execute(sql`
+      INSERT INTO project.ccc_prd_imports (
+        project_id, idempotency_key, import_id, identity_hash, bundle_hash,
+        packet_hash, sidecar_hash, source_version, target_repository,
+        target_base, root_dir, staging_relative_path, state, canonical_bundle,
+        transaction_witness, projection_digest, created_at, updated_at,
+        execution_policy, campaign_manifest, campaign_manifest_hash,
+        campaign_started_at, campaign_deadline_at
+      ) VALUES (
+        ${projectId}, 'retention-idempotency', 'retention-import', 'identity-hash', 'bundle-hash',
+        'packet-hash', 'sidecar-hash', 'v1', 'https://example.invalid/repo.git',
+        'main', '/tmp/retention-import', 'staging', 'prepared', '{}'::jsonb,
+        '{}'::jsonb, 'projection-digest', ${old}, ${old},
+        '{}'::jsonb, '{}'::jsonb, 'manifest-hash',
+        ${old}, ${recent}
+      )
+    `);
+    const campaignBinding = {
+      campaignProjectId: projectId,
+      campaignImportId: "retention-import",
+      campaignId: "retention-campaign",
+      campaignTaskId: task.id,
+      campaignActionId: "PA-retention",
+      campaignActionTarget: "refs/heads/main",
+      campaignIdempotencyKey: "retention-idempotency",
+      campaignPacketHash: "packet-hash",
+      campaignSidecarHash: "sidecar-hash",
+      campaignBundleHash: "bundle-hash",
+      campaignTargetRepository: "https://example.invalid/repo.git",
+      campaignTargetBase: "main",
+      campaignProviderId: "deterministic-fake",
+      campaignModelId: "fixture-v1",
+      campaignTransport: "pi",
+      campaignManifestHash: "manifest-hash",
+      campaignBindingHash: "binding-hash",
+      campaignEventKey: "retention-event-1",
+    };
+    await h.adminDb().insert(schema.project.runAuditEvents).values([
+      { projectId, id: "retention-ordinary-old", timestamp: old, taskId: task.id, agentId: "retention-agent", runId: "run", domain: "task", mutationType: "test", target: task.id },
+      { projectId, id: "retention-ordinary-new", timestamp: recent, taskId: task.id, agentId: "retention-agent", runId: "run", domain: "task", mutationType: "test", target: task.id },
+      { projectId, id: "retention-receipt-old", timestamp: old, taskId: task.id, agentId: "retention-agent", runId: "run", domain: "ccc-campaign", mutationType: "ccc-campaign:provider-attempt:requested", target: task.id, ...campaignBinding },
+    ]);
+
+    const result = await pruneOperationalLogsAsync({ ...h.layer(), projectId }, 86_400_000);
+
+    expect(result.deletedByTable.runAuditEvents).toBe(1);
+    const remaining = (await h.adminDb()
+      .select({ id: schema.project.runAuditEvents.id })
+      .from(schema.project.runAuditEvents)
+      .where(inArray(schema.project.runAuditEvents.id, ["retention-ordinary-old", "retention-ordinary-new", "retention-receipt-old"])))
+      .map((row) => row.id)
+      .sort();
+    expect(remaining).toEqual(["retention-ordinary-new", "retention-receipt-old"]);
   });
 
   it("warns before using the legacy project sentinel and reports camelCase metric keys", async () => {

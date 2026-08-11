@@ -81,10 +81,20 @@ export async function pruneOperationalLogsAsync(
   /*
   FNXC:PostgresRetention 2026-07-14-18:12:
   Legacy run-audit and heartbeat rows do not carry project_id. Scope deletion through their owning task/agent instead; taskless audit rows remain retained because their project cannot be proven, which is safer than cross-project deletion.
+
+  FNXC:PostgresRetention 2026-08-11:
+  CCC campaign receipts (provider attempts, effects, landing audits) share this
+  table with a campaign binding and carry the campaign task's task_id, so the
+  task-scoped DELETE matched them and campaign proof history silently expired
+  after the retention window. Operator decision 2026-08-11: campaign-bound rows
+  are NEVER pruned by this maintenance job. campaign_import_id is the canonical
+  marker — the binding check constraint makes campaign columns all-or-nothing,
+  and it is the FK linkage to project.ccc_prd_imports.
   */
   await count("runAuditEvents", sql`
     DELETE FROM project.run_audit_events AS events
     WHERE events.timestamp < ${cutoff}
+      AND events.campaign_import_id IS NULL
       AND events.task_id IN (
         SELECT id FROM project.tasks WHERE project_id = ${projectId}
       )
