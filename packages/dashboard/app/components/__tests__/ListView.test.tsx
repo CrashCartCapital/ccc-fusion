@@ -219,6 +219,7 @@ vi.mock("../../hooks/useConfirm", () => ({
 
 const mockAddToast = vi.fn();
 const TEST_PROJECT_ID = "proj-123";
+const FRESH_PLANNER_ACTIVITY_NOW_MS = Date.parse("2026-08-11T00:00:00.000Z");
 const scopedStorageKey = (key: string) => scopedKey(key, TEST_PROJECT_ID);
 
 function mountCssForBadgeTests() {
@@ -470,12 +471,13 @@ describe("ListView", () => {
 
   it("renders the active Planning badge for a fresh status-null triage card in grouped mobile cards", () => {
     const viewportSpy = mockMobileViewport();
+    const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(FRESH_PLANNER_ACTIVITY_NOW_MS);
     try {
       renderListView({
         tasks: [createMockTask({
           id: "FN-8300-mobile",
           status: null as any,
-          recentAgentActivityAt: new Date().toISOString(),
+          recentAgentActivityAt: new Date(FRESH_PLANNER_ACTIVITY_NOW_MS).toISOString(),
         })],
       });
 
@@ -483,18 +485,20 @@ describe("ListView", () => {
       expect(card).toHaveClass("agent-active");
       expect(within(card).getByLabelText("Planning")).toHaveClass("list-status-badge", "pulsing");
     } finally {
+      dateNowSpy.mockRestore();
       viewportSpy.mockRestore();
     }
   });
 
   it("renders the active Planning badge for a fresh status-null triage card in desktop table rows", () => {
     const viewportSpy = mockDesktopViewport();
+    const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(FRESH_PLANNER_ACTIVITY_NOW_MS);
     try {
       renderListView({
         tasks: [createMockTask({
           id: "FN-8300-desktop",
           status: null as any,
-          recentAgentActivityAt: new Date().toISOString(),
+          recentAgentActivityAt: new Date(FRESH_PLANNER_ACTIVITY_NOW_MS).toISOString(),
         })],
       });
 
@@ -502,6 +506,7 @@ describe("ListView", () => {
       expect(row).toHaveClass("agent-active");
       expect(within(row).getByLabelText("Planning")).toHaveClass("list-status-badge", "pulsing");
     } finally {
+      dateNowSpy.mockRestore();
       viewportSpy.mockRestore();
     }
   });

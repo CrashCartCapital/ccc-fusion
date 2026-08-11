@@ -35,6 +35,8 @@ const OPERATOR: ApprovalRequestActorSnapshot = Object.freeze({
   actorName: "Live Execution Test Operator",
 });
 
+const LIVE_EXECUTION_APPROVAL_TEST_WINDOW_MS = 60_000;
+
 type LiveExecutionApprovalApi = Readonly<{
   issueCccCampaignLiveExecutionApproval(input: Readonly<{
     store: ReturnType<ReturnType<typeof createSharedPgTaskStoreTestHarness>["store"]>;
@@ -149,6 +151,10 @@ pgTest("CCC campaign live-execution approval", () => {
             : [];
     const bundle = rehashCccPrdImportTestBundle({
       ...source,
+      bounds: {
+        ...source.bounds,
+        maxDurationMs: LIVE_EXECUTION_APPROVAL_TEST_WINDOW_MS,
+      },
       targetRepository: { path: rootDir, baseCommit },
       tasks: source.tasks.map((task) => {
         if (task.id === firstTask.id) {
@@ -183,6 +189,10 @@ pgTest("CCC campaign live-execution approval", () => {
     });
     if (!productStatus) throw new Error("missing live-execution product status");
     expect(productStatus.import.importId).toBe(imported.importId);
+    expect(
+      Date.parse(productStatus.import.campaignDeadlineAt)
+        - Date.parse(productStatus.import.campaignStartedAt),
+    ).toBe(LIVE_EXECUTION_APPROVAL_TEST_WINDOW_MS);
     const nativeBySemantic = new Map(
       productStatus.tasks.map(({ semanticTaskId, nativeTaskId }) => [
         semanticTaskId,

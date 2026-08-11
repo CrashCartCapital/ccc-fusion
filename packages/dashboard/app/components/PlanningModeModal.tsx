@@ -1,7 +1,7 @@
 import "./PlanningModeModal.css";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { useState, useCallback, useEffect, useRef, useMemo, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Task, PlanningQuestion, PlanningSummary, TaskPriority, ThinkingLevel } from "@fusion/core";
@@ -698,7 +698,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     if (isCommentEditorOpen) commentInputRef.current?.focus();
   }, [isCommentEditorOpen]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (isMobile && workspaceQuestion) {
       setMobileWorkspaceTab("question");
     }

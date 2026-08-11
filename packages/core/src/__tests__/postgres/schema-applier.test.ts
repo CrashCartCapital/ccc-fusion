@@ -1756,6 +1756,9 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
         releaseMigration();
         await holder;
       }
+      // The first attempt intentionally uses a short session timeout; the retry
+      // should exercise the normal no-timeout migration path after the holder releases.
+      await schemaSql`SET lock_timeout = 0`;
       expect((await applySchemaBaseline(schemaDb, { pluginHooks: [] })).applied).toBe(true);
     } finally {
       releaseMigration();
