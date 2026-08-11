@@ -16,6 +16,14 @@ For a full walkthrough (installation, onboarding, first task, and daily workflow
 
 ## Documentation Index
 
+### CCC-Fusion Fork
+
+| Guide | Description |
+|---|---|
+| [CCC-Fusion Product Contract](./ccc-fusion-product.md) | Current fork-specific goals, worker compute, campaign parallelism, proof states, data boundaries, operator experience, and delivery authority |
+| [CCC PRD Intake Contract](./ccc-prd-intake-contract.md) | Current conservative packet intake plus the boundary between implemented serial extraction and target campaign-DAG execution |
+| [CCC-Fusion Plans Index](./plans/README.md) | Current repo-local direction and visibly historical plan/evidence records |
+
 ### Getting Started
 | Guide | Description |
 |---|---|

@@ -658,7 +658,11 @@ fn skills install firebase/agent-skills               # Install agent skills
 
 ## ccc-fusion
 
-This repository is **ccc-fusion**, CrashCartCapital's acceptance-hardening fork of [Runfusion/Fusion](https://github.com/Runfusion/Fusion). It adds a PRD campaign system (deterministic packet compiler, transactional PostgreSQL import, fail-closed proof admission, sealed provider dispatch), on top of upstream Fusion.
+This repository is **ccc-fusion**, CrashCartCapital's acceptance-hardening fork of [Runfusion/Fusion](https://github.com/Runfusion/Fusion). Its product contract is to turn unchanged PRD packets into recoverable, proof-gated coding campaigns on top of upstream Fusion.
+
+The canonical fork-specific product note is [`docs/ccc-fusion-product.md`](./docs/ccc-fusion-product.md). It separates product intent from current code truth, including the PRD campaign target, OmniRoute-first worker compute, dependency-ready fanout, proof states, data boundaries, and delivery authority.
+
+Current code already inherits and extends important Fusion substrate: PostgreSQL task state, worktrees, dependencies, scheduler gates, inter-agent messaging, audit logs, approvals, dashboard surfaces, CLI recovery, and the Pi/custom-provider path. High-parallel CCC campaign orchestration, empirical model/chunk-size learning, a first-class OpenCode worker harness, and a dedicated terminal delivery agent remain targets until proved on the exact runtime path.
 
 The fork is intentionally **shallow-branded**: internal package/env/bin identifiers (`@fusion/*`, `@runfusion/fusion`, `FUSION_*`, the `fn`/`fusion` bins) keep their upstream names on purpose (CF-018) so upstream diffs stay mergeable. Only the operator-facing surface says `ccc-fusion` — an alias CLI at [`scripts/ccc-fusion`](./scripts/ccc-fusion) that execs the same built CLI entrypoint as `fn`/`fusion`.
 

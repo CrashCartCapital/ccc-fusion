@@ -1,5 +1,7 @@
 # OmniRoute Routing Experiment — Measured Report
 
+> **Historical evidence note:** This report is retained as measured evidence from 2026-08-03. Its older model-role recommendations are superseded by [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md). MiniMax M3 exactness risks remain evidence to test and route around; they are not a permanent product exclusion.
+
 - **Date:** 2026-08-03
 - **Session:** E ("OmniRoute experimenter"), Phase 3
 - **Target:** OmniRoute v3.8.48, `http://127.0.0.1:8092`, 13 connections, 10 combos

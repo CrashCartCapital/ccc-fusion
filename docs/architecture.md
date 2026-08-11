@@ -14,6 +14,12 @@ Actionable terminal task updates are classified into bounded reasons such as a n
 
 Fusion is an AI-orchestrated task board. It takes tasks through a structured lifecycle (`planning → todo → in-progress → in-review → done → archived`) and automates planning, execution, review, merge, and operational recovery.
 
+### ccc-fusion product layer
+
+This repository is also the `ccc-fusion` fork. Its fork-specific product contract is [CCC-Fusion Product Contract](./ccc-fusion-product.md). That contract defines the target PRD-to-recoverable-campaign behavior, OmniRoute-first worker compute policy, dependency-ready fanout model, proof-state language, data boundaries, and delivery authority rules.
+
+The product layer should reuse the architecture below rather than invent a second control plane. Current Fusion foundations include PostgreSQL task state, worktrees, dependencies, scheduler gates, inter-agent messaging, approvals, run audit, dashboard surfaces, CLI recovery, and the Pi/custom-provider path. CCC-specific high-parallel campaign orchestration, empirical model/chunk-size learning, a first-class OpenCode worker harness, and a dedicated terminal delivery agent remain targets until source, tests, installed runtime, and real-use evidence prove them.
+
 At a high level, Fusion is split into:
 - **Core domain + persistence** (`@fusion/core`)
 - **Execution engine** (`@fusion/engine`)

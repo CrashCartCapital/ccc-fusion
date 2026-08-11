@@ -1,5 +1,7 @@
 # ccc-fusion PRD v0.2 — successor proposal (draft, lives outside the vault)
 
+> **Historical note:** This file is retained as a proposal/evidence record. For current CCC-Fusion direction and defaults, start with [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md) and the [plans index](./README.md). Do not treat this file as current authority where it conflicts with those documents.
+
 **Status:** proposal only. The vault original (`PRJ-AI-ccc-fusion-PRD-v0.1.md`) is untouched and stays human-authoritative. This document exists because the product's own intake refuses v0.1, and repairing that requires operator decisions that only Ryan can make. Nothing here changes the vault; approving it is a separate explicit act.
 
 **Provenance of this proposal:** built on 2026-08-02 under the operator-approved option (b) from `docs/plans/2026-07-30-ccc-fusion-prd-product-vertical-slice.md` — read exactly the two archived authority notes so a successor proposal can be built without changing the original. Exactly two archive files were read, nothing else:

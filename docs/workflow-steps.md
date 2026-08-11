@@ -348,6 +348,17 @@ The **step-inversion** track makes task *steps* themselves workflow-modelable. T
 
 Parallelism is opt-in *per step by the planner*, not asserted by the workflow author. A step depends on the previous step unless its PROMPT.md heading carries a `(depends: N,M)` annotation listing the 1-indexed steps it actually depends on — e.g. `### Step 3 (depends: 1): Title`. An explicit empty list (`### Step 3 (depends:): Title` or `json-steps` `"depends": []`) means the step has no dependencies and can be scheduled as an independent root. An absent annotation/key is different: it remains the legacy previous-step dependency, so an unannotated plan is fully sequential regardless of `mode`. Annotate **conservatively**: only mark a step independent when it genuinely does not read or modify the prior step's output, or heavily-overlapping "independent" steps will loop integrate→conflict→rework until the budget exhausts.
 
+#### CCC campaign DAG is a separate target
+
+The workflow IR already has general graph primitives such as `split`, `join`, `foreach`, dependency annotations, and worktree-isolated parallel step execution. Those primitives do not by themselves prove that the CCC PRD campaign path imports and runs arbitrary campaign DAGs.
+
+Keep two layers separate:
+
+- **Chunk extraction:** D2 chunked understanding is intentionally serial until order-independent assembly, zero-residue failure behavior, restart/resume behavior, and acceptance tests prove a parallel chunk path.
+- **Campaign execution:** the target CCC campaign scheduler should run every dependency-ready implementation or research task that can be isolated by ownership leases and resource pools.
+
+The target is no arbitrary permanent worker ceiling. Concurrency should be bounded per run by empirical capacity: available hardware, provider quota, worktree/storage pressure, write-root conflicts, and build/typecheck/test throughput.
+
 #### `step-review` node & rework edges
 
 `step-review` (`{ type: "plan" | "code", model? }`, legal only inside a foreach template) runs the reviewer against the current instance's step and maps the verdict to outcome edges: `outcome:approve` (marks the step done), `outcome:revise` (typically a rework edge — revise in place, no reset), `outcome:rethink` (a rework edge whose traversal first triggers reset-to-baseline: git reset + session rewind + step→pending), `outcome:unavailable` (bounded retry then route). The validator requires `approve` and `revise` routed; `rethink` defaults to the revise target with reset semantics. Verdict authority is single-writer — review nodes inside `split` branches are advisory-only.

@@ -1,5 +1,7 @@
 # CCC routing-contract waves — session record 2026-08-01/02
 
+> **Historical note:** This file is retained as an accepted-commit/session evidence record. It predates the current worker-compute and campaign-DAG direction. Start with [2026-08-11 product direction](./2026-08-11-ccc-fusion-product-direction.md) and the [plans index](./README.md) before using this file for planning.
+
 Controller: native Claude Fable 5 parent; writer children on native Sonnet 5 / Opus 5 subscription routes. Baseline at session start: `4e1108844855f2820bf88bc156c0a26e669c38c9` (fresh `pnpm verify:ccc-prd-product` PASS). Every commit below was accepted only against parent-rerun tests on the exact tree; the full acceptance gate was rerun and PASSED after each wave (`b72c78043`, `dba2c62a8`, `44a46e41e`).
 
 ## Accepted commits
