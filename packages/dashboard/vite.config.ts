@@ -212,6 +212,7 @@ export default defineConfig({
     cssCodeSplit: true,
     sourcemap: false,
     assetsInlineLimit: 4096,
+    reportCompressedSize: false,
     rollupOptions: {
       output: {
         entryFileNames: "assets/[name]-[hash].js",
