@@ -1015,19 +1015,11 @@ async function assertExactImplementationFactProvenance(
 
 async function buildCurrentCli(ledger) {
   const startedAt = Date.now();
-  const builds = [
-    ["@fusion/core", "build"],
-    ["@fusion/engine", "build"],
-    ["@fusion/dashboard", "build"],
-    ["@runfusion/fusion", "build"],
-  ];
-  for (const [workspace, script] of builds) {
-    process.stdout.write(`ccc-prd-product-acceptance: building ${workspace}\n`);
-    await run("pnpm", ["--filter", workspace, script], {
-      cwd: repoRoot,
-      timeoutMs: 300_000,
-    });
-  }
+  process.stdout.write("ccc-prd-product-acceptance: building current workspace outputs\n");
+  await run("pnpm", ["build"], {
+    cwd: repoRoot,
+    timeoutMs: 300_000,
+  });
   const outputs = [
     "packages/core/dist/index.js",
     "packages/engine/dist/cli-agent/task-session.js",

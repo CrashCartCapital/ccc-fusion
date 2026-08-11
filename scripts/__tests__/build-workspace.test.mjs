@@ -81,6 +81,20 @@ function writePluginDist(root, dir = "plugins/fusion-plugin-alpha") {
   writeFileSync(path.join(root, dir, "dist", "index.js"), "export const alpha = 1;\n");
 }
 
+function extractFunctionSource(source, name) {
+  const start = source.indexOf(`async function ${name}(`);
+  assert.notEqual(start, -1, `expected to find ${name}`);
+  const bodyStart = source.indexOf("{", start);
+  assert.notEqual(bodyStart, -1, `expected to find ${name} body`);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`expected to close ${name} body`);
+}
+
 test("discovers workspace packages and classifies plugin directories", () => {
   withWorkspace((root) => {
     const packages = discoverWorkspacePackages(root);
@@ -293,6 +307,28 @@ test("root package build script points at the workspace build wrapper", () => {
   const rootPackage = JSON.parse(readFileSync(path.resolve("package.json"), "utf8"));
 
   assert.equal(rootPackage.scripts.build, "node scripts/build-workspace.mjs");
+});
+
+test("CCC product acceptance builds the current CLI through the root workspace build", () => {
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+  const buildCurrentCli = extractFunctionSource(source, "buildCurrentCli");
+
+  assert.match(
+    buildCurrentCli,
+    /await run\(\s*"pnpm",\s*\[\s*"build"\s*\],\s*\{\s*cwd: repoRoot,\s*timeoutMs: 300_000,\s*\}\s*\)/,
+  );
+  assert.doesNotMatch(
+    buildCurrentCli,
+    /"@fusion\/dashboard"/,
+    "product acceptance must not bypass the root workspace build with a direct dashboard build",
+  );
+  assert.match(
+    buildCurrentCli,
+    /packages\/dashboard\/dist\/routes\/cli-agent-hooks\.js/,
+    "dashboard server output assertion must remain part of the current-build proof",
+  );
+  assert.match(buildCurrentCli, /CCC_PRODUCT_STALE_DASHBOARD_BUILD/);
+  assert.match(buildCurrentCli, /body\.type === "agent-turn-complete"/);
 });
 
 test("real CLI serial tsup build is recognized as bundled output only", () => {
