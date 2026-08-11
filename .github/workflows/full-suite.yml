@@ -77,6 +77,8 @@ jobs:
 
       - name: Build or validate test artifacts
         run: node scripts/ensure-test-artifacts.mjs
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
 
       - name: Assert prepared artifacts are complete
         run: node scripts/ensure-test-artifacts.mjs --assert-artifacts-present

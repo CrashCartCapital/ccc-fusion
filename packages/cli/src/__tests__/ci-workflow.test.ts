@@ -615,6 +615,17 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     expect(slowCondition).not.toContain("needs.test-shards.result");
   });
 
+  it("caps the artifact bootstrap heap without widening the whole full suite", () => {
+    const prepareJob = workflow.jobs?.["prepare-test-artifacts"];
+    const buildStep = (prepareJob?.steps ?? []).find(
+      (step: any) => step.name === "Build or validate test artifacts",
+    );
+
+    expect(buildStep?.env?.NODE_OPTIONS).toBe("--max-old-space-size=1664");
+    expect(workflow.env?.NODE_OPTIONS).toBeUndefined();
+    expect(prepareJob?.env?.NODE_OPTIONS).toBeUndefined();
+  });
+
   it("runs product-route real-PG acceptance in the serialized engine job", () => {
     const slowJob = workflow.jobs?.["test-slow"];
     const productStep = (slowJob?.steps ?? []).find(
