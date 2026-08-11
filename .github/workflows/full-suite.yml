@@ -195,10 +195,10 @@ jobs:
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4
         env:
-          # One package lane with four Vitest workers per active shard. With
-          # matrix max-parallel=2 this bounds the shared VM to eight test
+          # One package lane with two Vitest workers per active shard. With
+          # matrix max-parallel=2 this bounds the shared VM to four test
           # workers plus service containers and runner overhead.
-          FUSION_TEST_TOTAL_WORKERS: "4"
+          FUSION_TEST_TOTAL_WORKERS: "2"
           FUSION_TEST_CONCURRENCY: "1"
           FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
@@ -323,6 +323,8 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
         options: >-
           --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
           --health-interval 5s
@@ -384,67 +386,32 @@ jobs:
       - name: Verifier confinement readiness
         run: node scripts/check-verifier-confinement.mjs
 
-      - name: Route PostgreSQL service on runner network
+      - name: Verify PostgreSQL service on runner host network
         id: postgres-route
         run: |
           set -euo pipefail
 
-          runner_container_id="$(hostname)"
-          postgres_container_id="${{ job.services.postgres.id }}"
-          runner_network="$(
-            docker inspect \
-              --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' \
-              "$runner_container_id" |
-              sort |
-              head -n 1
-          )"
-
-          if [ -z "$runner_network" ]; then
-            echo "Unable to resolve a Docker network for runner container ${runner_container_id}" >&2
-            exit 1
-          fi
-
-          if [ -z "$postgres_container_id" ]; then
-            echo "GitHub did not expose the PostgreSQL service container id" >&2
-            exit 1
-          fi
-
-          if [ "$(
-            docker inspect \
-              --format "{{if index .NetworkSettings.Networks \"${runner_network}\"}}connected{{end}}" \
-              "$postgres_container_id"
-          )" != "connected" ]; then
-            docker network connect "$runner_network" "$postgres_container_id"
-          fi
-
-          postgres_ip="$(
-            docker inspect \
-              --format "{{(index .NetworkSettings.Networks \"${runner_network}\").IPAddress}}" \
-              "$postgres_container_id"
-          )"
-
-          if [ -z "$postgres_ip" ]; then
-            echo "Unable to resolve PostgreSQL service IP on Docker network ${runner_network}" >&2
+          postgres_port="${{ job.services.postgres.ports[5432] }}"
+          if [ -z "$postgres_port" ]; then
+            echo "GitHub did not expose the PostgreSQL service host port" >&2
             exit 1
           fi
 
           PGCONNECT_TIMEOUT=5 psql -X -w \
-            "postgresql://postgres@${postgres_ip}:5432/postgres?sslmode=disable" \
+            "postgresql://postgres@127.0.0.1:${postgres_port}/postgres?sslmode=disable" \
             -v ON_ERROR_STOP=1 \
             -c "SELECT 1"
-
-          echo "host=${postgres_ip}" >> "$GITHUB_OUTPUT"
         env:
           PGPASSWORD: "postgres"
 
       - name: Run serialized product-route acceptance
         run: pnpm --filter @fusion/engine test:product-route
         env:
-          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:5432"
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
 
       - name: Run engine-slow with non-empty-execution assertion
         run: node scripts/assert-engine-slow-nonempty.mjs
         env:
-          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:5432"
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
