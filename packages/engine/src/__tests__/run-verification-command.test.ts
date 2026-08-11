@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
@@ -750,6 +751,50 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       } finally {
         if (!("error" in launch)) launch.cleanup();
         rmSync(repoRoot, { recursive: true, force: true });
+      }
+    });
+
+    itPosix("read-only mounts the canonical npm global task package root on Linux", async () => {
+      const repoRoot = mkdtempSync(join(tempDir, "fusion-verifier-linux-task-repo-"));
+      const globalRoot = mkdtempSync(join(tempDir, "fusion-verifier-linux-task-global-"));
+      const cwd = join(repoRoot, "packages", "target");
+      const fakeBin = join(globalRoot, "bin");
+      const taskPackageRoot = join(globalRoot, "lib", "node_modules", "@go-task", "cli");
+      const taskExecutable = join(taskPackageRoot, "run-task.js");
+      mkdirSync(join(repoRoot, ".git"), { recursive: true });
+      mkdirSync(cwd, { recursive: true });
+      mkdirSync(fakeBin, { recursive: true });
+      mkdirSync(taskPackageRoot, { recursive: true });
+      writeFileSync(taskExecutable, "#!/bin/sh\nexit 0\n", "utf8");
+      chmodSync(taskExecutable, 0o755);
+      symlinkSync("../lib/node_modules/@go-task/cli/run-task.js", join(fakeBin, "task"));
+
+      const launch = await __testOnlyBuildVerificationSandboxLaunch(
+        {
+          command: "task verify:vertical",
+          cwd,
+          childEnv: {
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          },
+        },
+        {
+          platform: "linux",
+          bubblewrap: { available: true, path: "/usr/bin/bwrap", version: "0.9.0" },
+        },
+      );
+
+      try {
+        expect("error" in launch).toBe(false);
+        if ("error" in launch) return;
+        expect(launch.args).toEqual(expect.arrayContaining([
+          "--ro-bind",
+          realpathSync(taskPackageRoot),
+          realpathSync(taskPackageRoot),
+        ]));
+      } finally {
+        if (!("error" in launch)) launch.cleanup();
+        rmSync(repoRoot, { recursive: true, force: true });
+        rmSync(globalRoot, { recursive: true, force: true });
       }
     });
 
