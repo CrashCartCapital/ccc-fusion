@@ -194,6 +194,19 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(content).not.toContain("ubuntu-latest");
   });
 
+  it("does not enable setup-node pnpm cache when dependency install is skipped", () => {
+    const setupNodeSteps = (compositeAction.runs?.steps ?? []).filter(
+      (step: any) => step.uses === "actions/setup-node@v5",
+    );
+    const cachedSetup = setupNodeSteps.find((step: any) => step.with?.cache === "pnpm");
+    const uncachedSetup = setupNodeSteps.find((step: any) => step.with?.cache === undefined);
+
+    expect(cachedSetup?.if).toBe("${{ inputs.skip-install != 'true' }}");
+    expect(uncachedSetup?.if).toBe("${{ inputs.skip-install == 'true' }}");
+    expect(uncachedSetup?.with?.["node-version"]).toBe("${{ inputs.node-version }}");
+    expect(uncachedSetup?.with?.["registry-url"]).toBe("${{ inputs.registry-url }}");
+  });
+
   it("contains no shard matrix or full-suite invocation (demoted to full-suite.yml)", () => {
     expect(workflow.jobs?.["test-shards"]).toBeUndefined();
     expect(workflow.jobs?.["test-slow"]).toBeUndefined();

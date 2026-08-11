@@ -24,10 +24,18 @@ runs:
       uses: pnpm/action-setup@v4
 
     - name: Setup Node.js
+      if: ${{ inputs.skip-install != 'true' }}
       uses: actions/setup-node@v5
       with:
         node-version: ${{ inputs.node-version }}
         cache: pnpm
+        registry-url: ${{ inputs.registry-url }}
+
+    - name: Setup Node.js without pnpm cache
+      if: ${{ inputs.skip-install == 'true' }}
+      uses: actions/setup-node@v5
+      with:
+        node-version: ${{ inputs.node-version }}
         registry-url: ${{ inputs.registry-url }}
 
     # Do NOT cache the linked node_modules tree. pnpm builds node_modules from
