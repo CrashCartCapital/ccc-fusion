@@ -420,6 +420,29 @@ describe("Workspace bootstrap script contract", () => {
     }
   });
 
+  it("resolves engine core imports through built declarations and excludes production-irrelevant tests", () => {
+    const engineConfig = loadWorkspaceJson("packages", "engine", "tsconfig.json");
+    const paths = engineConfig.compilerOptions?.paths ?? {};
+    const corePaths = Object.fromEntries(
+      Object.entries(paths).filter(([specifier]) =>
+        specifier === "@fusion/core" || specifier.startsWith("@fusion/core/"),
+      ),
+    );
+
+    expect(corePaths).toEqual({
+      "@fusion/core": ["../core/dist/index.d.ts"],
+      "@fusion/core/*": ["../core/dist/*.d.ts"],
+    });
+    expect(paths).toMatchObject({
+      "@fusion/test-utils": ["../core/src/__test-utils__/workspace.ts"],
+      "node-pty": ["./src/types/node-pty/index.d.ts"],
+    });
+    expect(engineConfig.exclude).toEqual([
+      "src/**/*.test.ts",
+      "src/**/__tests__/**/*",
+    ]);
+  });
+
   it("makes root test changed-only while keeping explicit full-suite and CI-shard commands", () => {
     // `test` and `test:ci:shard` stay pinned as literals on purpose: each is a
     // bare script path with no flags, so the only thing that can drift is the
