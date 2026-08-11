@@ -99,7 +99,7 @@ test("ensureTestArtifacts builds only missing packages", () => {
   assert.deepEqual(built, ["@fusion-plugin-examples/openclaw-runtime"]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "pnpm");
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion-plugin-examples/openclaw-runtime", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion-plugin-examples/openclaw-runtime", "build"]);
 });
 
 test("detectMissingArtifacts flags @fusion/dashboard when dist/index.js is missing", () => {
@@ -134,7 +134,7 @@ test("ensureTestArtifacts rebuilds @fusion/dashboard when its dist is missing", 
   assert.deepEqual(built, ["@fusion/dashboard"]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "pnpm");
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion/dashboard", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion/dashboard", "build"]);
 });
 
 test("detectMissingArtifacts flags @fusion/engine when dist/index.js is missing", () => {
@@ -155,7 +155,7 @@ test("ensureTestArtifacts rebuilds @fusion/engine when dist is missing", () => {
   assert.deepEqual(built, ["@fusion/engine"]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "pnpm");
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion/engine", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion/engine", "build"]);
 });
 
 test("detectMissingArtifacts flags dependency-graph when dist/dashboard-view.js is missing", () => {
@@ -179,7 +179,7 @@ test("ensureTestArtifacts rebuilds dependency-graph for incomplete dist artifact
   assert.deepEqual(built, ["@fusion-plugin-examples/dependency-graph"]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "pnpm");
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion-plugin-examples/dependency-graph", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion-plugin-examples/dependency-graph", "build"]);
 });
 
 test("detectMissingArtifacts flags hermes when dist/index.js exists but dist/cli-spawn.js is missing", () => {
@@ -200,7 +200,7 @@ test("ensureTestArtifacts rebuilds hermes for incomplete dist artifacts", () => 
   assert.deepEqual(built, ["@fusion-plugin-examples/hermes-runtime"]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "pnpm");
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion-plugin-examples/hermes-runtime", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion-plugin-examples/hermes-runtime", "build"]);
 });
 
 test("detectMissingArtifacts flags openclaw when dist/index.js exists but transitive files are missing", () => {
@@ -224,7 +224,7 @@ test("ensureTestArtifacts rebuilds openclaw for incomplete dist artifacts", () =
   assert.deepEqual(built, ["@fusion-plugin-examples/openclaw-runtime"]);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "pnpm");
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion-plugin-examples/openclaw-runtime", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion-plugin-examples/openclaw-runtime", "build"]);
 });
 
 function createStaleFsForPackage({ sourceDir, artifactPathFragment }, { artifactMtime = 1000, sourceMtime = 2000 } = {}) {
@@ -348,7 +348,7 @@ test("ensureTestArtifacts invokes rebuild command for stale package", () => {
 
   assert.ok(built.includes("@fusion-plugin-examples/hermes-runtime"));
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion-plugin-examples/hermes-runtime", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion-plugin-examples/hermes-runtime", "build"]);
 });
 
 test("ensureTestArtifacts writes detailed FN-4232/FN-4605 remediation block to stderr on rebuild failure", () => {
@@ -417,6 +417,22 @@ test("ensureTestArtifacts triggers a single pnpm invocation covering the full re
   }
 });
 
+test("ensureTestArtifacts serializes filtered rebuilds for bounded-memory runners", () => {
+  const calls = [];
+
+  ensureTestArtifacts(
+    "/repo",
+    (cmd, args, cwd) => calls.push({ cmd, args, cwd }),
+    () => false,
+  );
+
+  assert.equal(calls.length, 1);
+  const concurrencyArg = calls[0].args.indexOf("--workspace-concurrency=1");
+  const firstFilter = calls[0].args.indexOf("--filter");
+  assert.ok(concurrencyArg >= 0, `expected serial workspace build, got: ${calls[0].args.join(" ")}`);
+  assert.ok(concurrencyArg < firstFilter, "workspace concurrency must be a pnpm option before filters");
+});
+
 test("ensureTestArtifacts rebuilds only dependency-graph when only dashboard-view dist is missing", () => {
   const calls = [];
   const built = ensureTestArtifacts(
@@ -427,7 +443,7 @@ test("ensureTestArtifacts rebuilds only dependency-graph when only dashboard-vie
 
   assert.deepEqual(built, ["@fusion-plugin-examples/dependency-graph"]);
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].args, ["--filter", "@fusion-plugin-examples/dependency-graph", "build"]);
+  assert.deepEqual(calls[0].args, ["--workspace-concurrency=1", "--filter", "@fusion-plugin-examples/dependency-graph", "build"]);
 });
 
 test("ensureTestArtifacts remediation labels missing artifact paths", () => {

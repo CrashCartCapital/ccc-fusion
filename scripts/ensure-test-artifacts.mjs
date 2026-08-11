@@ -463,8 +463,9 @@ export function ensureTestArtifacts(
 
   const names = missingOrStale.map((pkg) => pkg.name);
   console.log(`[test-bootstrap] rebuilding workspace dist artifacts (missing or stale): ${names.join(", ")}`);
+  const buildArgs = ["--workspace-concurrency=1", ...names.flatMap((name) => ["--filter", name]), "build"];
   if (runFn === run) {
-    runFn("pnpm", [...names.flatMap((name) => ["--filter", name]), "build"], resolvedRootDir, {
+    runFn("pnpm", buildArgs, resolvedRootDir, {
       ...runOptions,
       pkgEntries: missingOrStale,
       existsFn,
@@ -472,7 +473,7 @@ export function ensureTestArtifacts(
       readdirFn,
     });
   } else {
-    runFn("pnpm", [...names.flatMap((name) => ["--filter", name]), "build"], resolvedRootDir);
+    runFn("pnpm", buildArgs, resolvedRootDir);
   }
 
   // Build succeeded (the real runner exits the process on failure, so reaching
