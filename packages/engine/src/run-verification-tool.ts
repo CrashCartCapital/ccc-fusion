@@ -416,7 +416,7 @@ function verificationRuntimeReadPaths(childEnv: NodeJS.ProcessEnv): string[] {
   for (const pathEntry of (childEnv.PATH ?? "").split(process.platform === "win32" ? ";" : ":")) {
     if (!pathEntry || !existsSync(pathEntry)) continue;
     paths.push(pathEntry);
-    for (const executable of ["node", "pnpm", "git", "sh"]) {
+    for (const executable of ["node", "pnpm", "git", "sh", "task"]) {
       const candidate = join(pathEntry, executable);
       if (!existsSync(candidate)) continue;
       const canonicalExecutable = maybeRealpath(candidate);
