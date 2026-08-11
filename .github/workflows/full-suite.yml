@@ -195,10 +195,10 @@ jobs:
       - name: Test (deterministic shard)
         run: pnpm test:ci:shard --shard ${{ matrix.shard }} --total 4
         env:
-          # One package lane with two Vitest workers per active shard. With
-          # matrix max-parallel=2 this bounds the shared VM to four test
+          # One package lane with one Vitest worker per active shard. With
+          # matrix max-parallel=2 this bounds the shared VM to two test
           # workers plus service containers and runner overhead.
-          FUSION_TEST_TOTAL_WORKERS: "2"
+          FUSION_TEST_TOTAL_WORKERS: "1"
           FUSION_TEST_CONCURRENCY: "1"
           FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
@@ -397,21 +397,40 @@ jobs:
             exit 1
           fi
 
-          PGCONNECT_TIMEOUT=5 psql -X -w \
-            "postgresql://postgres@127.0.0.1:${postgres_port}/postgres?sslmode=disable" \
-            -v ON_ERROR_STOP=1 \
-            -c "SELECT 1"
+          candidate_hosts=("127.0.0.1" "host.docker.internal")
+          gateway_hex="$(awk '$2 == "00000000" && $3 != "00000000" { print $3; exit }' /proc/net/route)"
+          if [[ "$gateway_hex" =~ ^[0-9A-Fa-f]{8}$ ]]; then
+            candidate_hosts+=("$((16#${gateway_hex:6:2})).$((16#${gateway_hex:4:2})).$((16#${gateway_hex:2:2})).$((16#${gateway_hex:0:2}))")
+          fi
+
+          selected_host=""
+          for candidate_host in "${candidate_hosts[@]}"; do
+            if PGCONNECT_TIMEOUT=5 psql -X -w \
+              "postgresql://postgres@${candidate_host}:${postgres_port}/postgres?sslmode=disable" \
+              -v ON_ERROR_STOP=1 \
+              -c "SELECT 1"; then
+              selected_host="$candidate_host"
+              break
+            fi
+          done
+
+          if [ -z "$selected_host" ]; then
+            echo "No reachable PostgreSQL service host candidate" >&2
+            exit 1
+          fi
+
+          echo "host=${selected_host}" >> "$GITHUB_OUTPUT"
         env:
           PGPASSWORD: "postgres"
 
       - name: Run serialized product-route acceptance
         run: pnpm --filter @fusion/engine test:product-route
         env:
-          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}"
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
 
       - name: Run engine-slow with non-empty-execution assertion
         run: node scripts/assert-engine-slow-nonempty.mjs
         env:
-          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}"
+          FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@${{ steps.postgres-route.outputs.host }}:${{ job.services.postgres.ports[5432] }}"
           PGPASSWORD: "postgres"
