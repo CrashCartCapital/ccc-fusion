@@ -64,11 +64,56 @@ const expectedChecks = Object.freeze([
   "git-landing-restart-no-repeated-effect",
   "controlled-landing",
   "terminal-restart-recovery",
+  "fanout-campaign-import-admitted",
+  "fanout-join-execution-proved",
 ]);
 const commandTimeoutMs = 180_000;
 const productTimeoutMs = Number(process.env.FUSION_PRODUCT_TIMEOUT_MS ?? 120_000);
 const shutdownTimeoutMs = 15_000;
 const proofCutpointMarkerName = "ccc-proof-cutpoint.marker.json";
+
+// The series-parallel lane: TASK-FAN-A -> {TASK-FAN-B, TASK-FAN-C} ->
+// TASK-FAN-D. One owned file per task, planted "pending" at the frozen
+// baseline; the join task's worktree history must merge BOTH branch commits
+// before the campaign-wide proof can see all four final values at once.
+const fanTasks = Object.freeze([
+  Object.freeze({
+    taskId: "TASK-FAN-A",
+    requirementId: "REQ-FAN-A",
+    actionId: "ACTION-FAN-A-LIVE",
+    file: "src/fan-a.txt",
+    value: "alpha",
+    dependencyTaskIds: Object.freeze([]),
+    role: "entry",
+  }),
+  Object.freeze({
+    taskId: "TASK-FAN-B",
+    requirementId: "REQ-FAN-B",
+    actionId: "ACTION-FAN-B-LIVE",
+    file: "src/fan-b.txt",
+    value: "beta",
+    dependencyTaskIds: Object.freeze(["TASK-FAN-A"]),
+    role: "branch",
+  }),
+  Object.freeze({
+    taskId: "TASK-FAN-C",
+    requirementId: "REQ-FAN-C",
+    actionId: "ACTION-FAN-C-LIVE",
+    file: "src/fan-c.txt",
+    value: "gamma",
+    dependencyTaskIds: Object.freeze(["TASK-FAN-A"]),
+    role: "branch",
+  }),
+  Object.freeze({
+    taskId: "TASK-FAN-D",
+    requirementId: "REQ-FAN-D",
+    actionId: "ACTION-FAN-D-LIVE",
+    file: "src/fan-d.txt",
+    value: "delta-joined",
+    dependencyTaskIds: Object.freeze(["TASK-FAN-B", "TASK-FAN-C"]),
+    role: "join",
+  }),
+]);
 
 class AcceptanceLedger {
   constructor(expected) {
@@ -1194,6 +1239,34 @@ async function initializeTarget(
       "",
     ].join("\n"),
   );
+  for (const { file } of fanTasks) {
+    await writeFile(path.join(targetRoot, file), "pending\n");
+  }
+  await writeFile(
+    path.join(targetRoot, "verify-fanout.cjs"),
+    [
+      "const fs = require('node:fs');",
+      `const expectations = ${JSON.stringify(
+        fanTasks.map(({ file, value }) => ({ file, value })),
+      )};`,
+      "const planted = 'pending';",
+      "const rejectsPlanted = expectations.every(({ value }) => planted !== value);",
+      "if (!rejectsPlanted) {",
+      "  console.error('FANOUT_NEGATIVE_CONTROL_FAIL');",
+      "  process.exit(2);",
+      "}",
+      "console.log('FANOUT_NEGATIVE_CONTROL_PASS: planted pending fan values are rejected');",
+      "for (const { file, value } of expectations) {",
+      "  const current = fs.readFileSync(file, 'utf8').trim();",
+      "  if (current !== value) {",
+      "    console.error(`FANOUT_POSITIVE_ORACLE_FAIL:${file}:${current}`);",
+      "    process.exit(1);",
+      "  }",
+      "}",
+      "console.log('FANOUT_POSITIVE_ORACLE_PASS: fan-out campaign values are joined');",
+      "",
+    ].join("\n"),
+  );
   await writeFile(
     path.join(targetRoot, "Taskfile.yml"),
     [
@@ -1203,6 +1276,9 @@ async function initializeTarget(
       "  verify:vertical:",
       "    cmds:",
       "      - node verify.cjs",
+      "  verify:fanout:",
+      "    cmds:",
+      "      - node verify-fanout.cjs",
       "",
     ].join("\n"),
   );
@@ -1220,8 +1296,10 @@ async function initializeTarget(
     "--",
     ".gitignore",
     "Taskfile.yml",
+    ...fanTasks.map(({ file }) => file),
     "src/second.txt",
     "src/value.txt",
+    "verify-fanout.cjs",
     "verify.cjs",
   );
   await git(targetRoot, "commit", "-q", "-m", "frozen product baseline");
@@ -1783,6 +1861,375 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   };
 }
 
+/**
+ * Freeze and propose the series-parallel packet: TASK-FAN-A ->
+ * {TASK-FAN-B, TASK-FAN-C} -> TASK-FAN-D. A separate active-projects root and
+ * packet root keep the vertical-slice packet byte-identical; the base commit
+ * is whatever the target's main points at when the lane starts (the landed
+ * vertical campaign), because fresh entry worktrees fork from the integration
+ * branch and the frozen base must match them.
+ */
+async function createFanoutPacket(
+  packetRoot,
+  projectsRoot,
+  targetRoot,
+  targetBase,
+  env,
+) {
+  const projectName = "fanout-slice";
+  const projectRoot = path.join(projectsRoot, projectName);
+  const prdFileName = "PRJ-HUM-CCCProductFanoutSlice-PRD-v1.0.0.md";
+  const prdSourcePath = path.join(projectRoot, prdFileName);
+  const supportRelativePath = "support/REF-HUM-FanoutVerifier.md";
+  const supportSourcePath = path.join(projectRoot, supportRelativePath);
+
+  const statementFor = (fanTask) => {
+    if (fanTask.role === "entry") {
+      return `Change ${fanTask.file} from pending to ${fanTask.value} in an isolated worktree.`;
+    }
+    if (fanTask.role === "join") {
+      return `Change ${fanTask.file} from pending to ${fanTask.value} in a join worktree whose history merges both parallel branch commits.`;
+    }
+    return `Change ${fanTask.file} from pending to ${fanTask.value} in a parallel isolated worktree that already contains the entry task's commit.`;
+  };
+  const acceptanceFor = (fanTask) =>
+    `The exact verifier node verify-fanout.cjs must reject the planted pending value and accept the corrected ${fanTask.value} value.`;
+  const requirementLineFor = (fanTask) => {
+    const parts = [
+      `- ${fanTask.requirementId}: ${statementFor(fanTask)}`,
+      `Acceptance: ${acceptanceFor(fanTask)}`,
+      "Proof command: task verify:fanout.",
+    ];
+    if (fanTask.role === "entry") {
+      parts.push(
+        "Positive oracle: The verifier prints FANOUT_POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
+        "Negative control: The same verifier exits nonzero for the frozen planted pending values.",
+      );
+    }
+    return parts.join(" ");
+  };
+  const requirementLines = fanTasks.map(requirementLineFor);
+  const liveActionLineFor = (fanTask) =>
+    `- Protected action: live_execution provider://openai/${fanTask.taskId} requires explicit human approval.`;
+  const liveActionLines = fanTasks.map(liveActionLineFor);
+  const mergeActionLine =
+    "- Protected action: merge refs/heads/main requires separate explicit human approval.";
+  const nonGoalText = "Modify any path outside the four admitted task write roots.";
+  const nonGoalLine = `- Non-goal: ${nonGoalText}`;
+  const supportingContextLine =
+    "[[support/REF-HUM-FanoutVerifier]] documents the disposable fan-out verifier.";
+  const prd = [
+    "---",
+    "type: prd",
+    "status: active",
+    "version: 1.0.0",
+    "---",
+    "",
+    "# CCC Fusion Product Fan-Out Slice",
+    "",
+    "## Implementation contract",
+    "",
+    nonGoalLine,
+    "",
+    "## Protected actions",
+    "",
+    ...liveActionLines,
+    mergeActionLine,
+    "",
+    "## Requirement and proof",
+    "",
+    ...requirementLines,
+    "",
+    "## Supporting context",
+    "",
+    supportingContextLine,
+    "",
+  ].join("\n");
+  const support = [
+    "# Fan-out verifier",
+    "",
+    "The owned verifier reads all four fan files and accepts only their joined values.",
+    "",
+  ].join("\n");
+  await mkdir(path.dirname(supportSourcePath), { recursive: true });
+  await writeFile(prdSourcePath, prd);
+  await writeFile(supportSourcePath, support);
+
+  const maxRequests = String(fanTasks.length);
+  const maxDurationMs = "240000";
+  const frozen = jsonOutput(
+    await run(
+      process.execPath,
+      [
+        cliBin,
+        "prd",
+        "freeze",
+        projectsRoot,
+        prdSourcePath,
+        packetRoot,
+        "--target",
+        targetRoot,
+        "--base",
+        targetBase,
+        ...fanTasks.flatMap(({ file }) => ["--owned-path", file]),
+        ...fanTasks.flatMap(({ file }) => ["--write-root", file]),
+        "--write-purpose",
+        "disposable product acceptance repository",
+        "--max-requests",
+        maxRequests,
+        "--max-duration-ms",
+        maxDurationMs,
+        "--max-concurrency",
+        "1",
+      ],
+      { cwd: targetRoot, env },
+    ),
+    "prd fanout freeze",
+  );
+  assert(
+    frozen.schema === "ccc-prd.freeze-result.v1"
+    && frozen.packet?.fileCount === 3
+    && frozen.packet?.unresolvedReferenceCount === 0
+    && frozen.unresolvedReferences?.length === 0,
+    "CCC_PRODUCT_FANOUT_FREEZE_FAILED",
+    JSON.stringify(frozen),
+  );
+
+  const manifestPath = frozen.manifestPath;
+  const proposalPath = path.join(packetRoot, "authoring-proposal.json");
+  const sidecarPath = path.join(packetRoot, "candidate.sidecar.json");
+  const executionPlanPath = path.join(packetRoot, "execution-plan.json");
+  const frozenPrdRelativePath = `sources/${prdFileName}`;
+  const frozenContextRelativePath =
+    "sources/__fusion__/REF-HUM-FusionOperatorContext.md";
+  const contextRef = (exactQuote) => ({
+    path: frozenContextRelativePath,
+    exactQuote,
+  });
+  const prdRef = (exactQuote) => ({
+    path: frozenPrdRelativePath,
+    exactQuote,
+  });
+  const fusionStateWriteRoot = path.join(targetRoot, ".fusion");
+  const custodyRefsFor = (fanTask) => [
+    contextRef(`- Task owned path: ${fanTask.file}`),
+    contextRef(`- Task allowed write root: ${fanTask.file}`),
+    contextRef(`- Allowed write root: ${path.join(targetRoot, fanTask.file)}`),
+  ];
+  const entryImplementationRefs = [
+    contextRef(`- Target repository: ${targetRoot}`),
+    contextRef(`- Baseline commit: ${targetBase}`),
+    contextRef(`- Allowed write root: ${fusionStateWriteRoot}`),
+    contextRef(
+      "- Allowed write root purpose: Fusion-managed campaign state and artifacts",
+    ),
+    contextRef(
+      "- Allowed write root purpose: disposable product acceptance repository",
+    ),
+    contextRef(`- Maximum requests: ${maxRequests}`),
+    contextRef(`- Maximum duration in milliseconds: ${maxDurationMs}`),
+    contextRef("- Maximum concurrency: 1"),
+  ];
+  const requirementLineByTaskId = new Map(
+    fanTasks.map((fanTask, index) => [fanTask.taskId, requirementLines[index]]),
+  );
+  const requirementIdByTaskId = new Map(
+    fanTasks.map((fanTask) => [fanTask.taskId, fanTask.requirementId]),
+  );
+  const edges = fanTasks.flatMap((fanTask) =>
+    fanTask.dependencyTaskIds.map((dependencyTaskId) => ({
+      id: `EDGE-FAN-${fanTask.taskId.slice("TASK-FAN-".length)}-${dependencyTaskId.slice("TASK-FAN-".length)}`,
+      fromTaskId: fanTask.taskId,
+      toTaskId: dependencyTaskId,
+      kind: "depends_on",
+    })));
+  const proposal = {
+    schema: "ccc-prd.authoring-proposal.v1",
+    authorityRoles: [
+      {
+        id: "AUTHORITY-FANOUT",
+        role: "root",
+        sourcePaths: [frozenPrdRelativePath],
+        accountableProducer: "product-owner",
+      },
+      {
+        id: "AUTHORITY-FANOUT-CONTEXT",
+        role: "support",
+        sourcePaths: [frozenContextRelativePath],
+        accountableProducer: "operator",
+      },
+    ],
+    requirements: fanTasks.map((fanTask) => ({
+      id: fanTask.requirementId,
+      statement: statementFor(fanTask),
+      acceptance: acceptanceFor(fanTask),
+      accountableProducer: "campaign-coding-agent",
+      dependencies: fanTask.dependencyTaskIds.map((taskId) =>
+        requirementIdByTaskId.get(taskId)),
+      proofIds: ["PROOF-FANOUT"],
+      sourceRefs: [prdRef(requirementLineByTaskId.get(fanTask.taskId))],
+      confidence: "high",
+    })),
+    proofs: [{
+      id: "PROOF-FANOUT",
+      requirementIds: fanTasks.map(({ requirementId }) => requirementId),
+      command: "task verify:fanout",
+      positiveOracle:
+        "The verifier prints FANOUT_POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
+      negativeControls: [
+        "The same verifier exits nonzero for the frozen planted pending values.",
+      ],
+      sourceRefs: [prdRef(requirementLineByTaskId.get("TASK-FAN-A"))],
+      confidence: "high",
+    }],
+    tasks: fanTasks.map((fanTask) => ({
+      id: fanTask.taskId,
+      title: `Implement the admitted ${fanTask.file} change`,
+      description:
+        `Edit only ${fanTask.file} so the exact fan-out verifier passes; the Fusion controller creates the campaign commit.`,
+      ownedPaths: [fanTask.file],
+      allowedWriteRoots: [fanTask.file],
+      accountableProducer: "campaign-coding-agent",
+      requirementIds: [fanTask.requirementId],
+      dependencyTaskIds: [...fanTask.dependencyTaskIds],
+      proofIds: ["PROOF-FANOUT"],
+      workflowId: "WORKFLOW-FANOUT",
+      documentIds: [],
+      artifactIds: [],
+      protectedActionIds: fanTask.role === "join"
+        ? [fanTask.actionId, "ACTION-FAN-MERGE"]
+        : [fanTask.actionId],
+      sourceRefs: [
+        ...(fanTask.role === "entry" ? entryImplementationRefs : []),
+        ...custodyRefsFor(fanTask),
+        prdRef(nonGoalLine),
+        prdRef(requirementLineByTaskId.get(fanTask.taskId)),
+        prdRef(liveActionLineFor(fanTask)),
+        ...(fanTask.role === "join" ? [prdRef(mergeActionLine)] : []),
+        ...(fanTask.role === "entry" ? [prdRef(supportingContextLine)] : []),
+      ],
+    })),
+    // Edges must mirror dependencyTaskIds exactly (fromTaskId = dependent):
+    // the compiler reads dependencyTaskIds for ordering while the importer
+    // persists dependency rows from edges.
+    edges,
+    workflows: [{
+      id: "WORKFLOW-FANOUT",
+      title: "CCC Fusion product fan-out slice",
+      taskIds: fanTasks.map(({ taskId }) => taskId),
+      entryTaskIds: ["TASK-FAN-A"],
+      terminalTaskIds: ["TASK-FAN-D"],
+      sourceRefs: [prdRef(requirementLineByTaskId.get("TASK-FAN-A"))],
+    }],
+    documents: [],
+    artifacts: [],
+    importIntents: [
+      ...fanTasks.map((fanTask) => ({
+        id: `IMPORT-FAN-${fanTask.taskId.slice("TASK-FAN-".length)}-TASK`,
+        entityType: "task",
+        entityId: fanTask.taskId,
+        operation: "create",
+        target: "project.tasks",
+      })),
+      ...edges.map((edge) => ({
+        id: `IMPORT-${edge.id}`,
+        entityType: "dependency_edge",
+        entityId: edge.id,
+        operation: "create",
+        target: "project.tasks.dependencies",
+      })),
+      {
+        id: "IMPORT-FANOUT-WORKFLOW",
+        entityType: "workflow",
+        entityId: "WORKFLOW-FANOUT",
+        operation: "create",
+        target: "project.workflow_work_items",
+      },
+      {
+        id: "IMPORT-FANOUT-WORK-ITEM",
+        entityType: "work_item",
+        entityId: "WORKFLOW-FANOUT",
+        operation: "create",
+        target: "project.workflow_work_items",
+      },
+      {
+        id: "IMPORT-FANOUT-CAMPAIGN",
+        entityType: "campaign",
+        entityId: "CAMPAIGN-FANOUT",
+        operation: "create",
+        target: "project.missions",
+      },
+      {
+        id: "IMPORT-FANOUT-SOURCE",
+        entityType: "source",
+        entityId: "SOURCE-FANOUT",
+        operation: "create",
+        target: "project.ccc_prd_import_sources",
+      },
+      {
+        id: "IMPORT-FANOUT-AUDIT",
+        entityType: "run_audit",
+        entityId: "CAMPAIGN-FANOUT",
+        operation: "create",
+        target: "project.run_audit_events",
+      },
+    ],
+    protectedActions: [
+      ...fanTasks.map((fanTask) => ({
+        id: fanTask.actionId,
+        kind: "live_execution",
+        target: `provider://openai/${fanTask.taskId}`,
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_live_execution",
+        sourceRefs: [prdRef(liveActionLineFor(fanTask))],
+      })),
+      {
+        id: "ACTION-FAN-MERGE",
+        kind: "merge",
+        target: "refs/heads/main",
+        requiresOperatorDecision: true,
+        operatorDecision: "approve_merge",
+        sourceRefs: [prdRef(mergeActionLine)],
+      },
+    ],
+    bounds: {
+      // One dispatch per task; the audit history bound is (maxRequests * 3) + 1
+      // rows, so four is the smallest budget that admits the diamond.
+      maxRequests: Number(maxRequests),
+      maxDurationMs: Number(maxDurationMs),
+      maxConcurrency: 1,
+    },
+    admittedWriteRoots: [
+      {
+        path: fusionStateWriteRoot,
+        purpose: "Fusion-managed campaign state and artifacts",
+      },
+      ...fanTasks.map((fanTask) => ({
+        path: path.join(targetRoot, fanTask.file),
+        purpose: "disposable product acceptance repository",
+      })),
+    ],
+    targetRepository: { path: targetRoot, baseCommit: targetBase },
+    nonGoals: [nonGoalText],
+    unresolvedDecisions: [],
+    ambiguities: [],
+    exceptions: [],
+    confidence: "high",
+  };
+  await writeFile(proposalPath, `${JSON.stringify(proposal, null, 2)}\n`);
+  return {
+    manifestPath,
+    proposalPath,
+    sidecarPath,
+    executionPlanPath,
+    freeze: {
+      packetHash: frozen.packet.packetHash,
+      manifestSha256: frozen.packet.manifestSha256,
+      fileCount: frozen.packet.fileCount,
+    },
+  };
+}
+
 async function writeFakeCodex(fakeBin) {
   await mkdir(fakeBin, { recursive: true });
   const fakeCodexPath = path.join(fakeBin, "codex");
@@ -1830,9 +2277,10 @@ async function writeFakeCodex(fakeBin) {
       "  handled = true;",
       // The sealed prompt is per task, so the required facts are per task too.
       // The branch key is the task's own allowed-write-root block rather than
-      // its id, because one semantic task id is a prefix of the other.
+      // its id, because one semantic task id is a prefix of the other. The
+      // non-goal sentence is per profile because the vertical packet admits
+      // two write roots while the fan-out packet admits four.
       "  const sharedPromptFacts = [",
-      "    'Modify any path outside the two admitted task write roots.',",
       "    'Do not run git add, git commit, or mutate Git refs',",
       "  ];",
       "  const taskProfiles = [",
@@ -1841,6 +2289,7 @@ async function writeFakeCodex(fakeBin) {
       "      editPath: 'src/second.txt',",
       "      editContent: 'second-good\\n',",
       "      facts: [",
+      "        'Modify any path outside the two admitted task write roots.',",
       "        'Semantic task: TASK-VERTICAL-SECOND\\nAccountable producer:',",
       "        'Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task\\u0027s commit.',",
       "        'The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.',",
@@ -1853,12 +2302,29 @@ async function writeFakeCodex(fakeBin) {
       "      editPath: 'src/value.txt',",
       "      editContent: 'good\\n',",
       "      facts: [",
+      "        'Modify any path outside the two admitted task write roots.',",
       "        'Semantic task: TASK-VERTICAL\\nAccountable producer:',",
       "        'Change src/value.txt from bad to good in an isolated worktree.',",
       "        'The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.',",
       "        'ACTION-VERTICAL-LIVE: live_execution on provider://openai/TASK-VERTICAL; requires human decision approve_live_execution.',",
       "      ],",
       "    },",
+      ...fanTasks.map((fanTask) => [
+        "    {",
+        `      marker: 'Allowed write roots:\\n- ${fanTask.file}',`,
+        `      editPath: ${JSON.stringify(fanTask.file)},`,
+        `      editContent: ${JSON.stringify(`${fanTask.value}\n`)},`,
+        "      facts: [",
+        "        'Modify any path outside the four admitted task write roots.',",
+        `        'Semantic task: ${fanTask.taskId}\\nAccountable producer:',`,
+        `        'Change ${fanTask.file} from pending to ${fanTask.value}',`,
+        `        '${fanTask.actionId}: live_execution on provider://openai/${fanTask.taskId}; requires human decision approve_live_execution.',`,
+        ...(fanTask.role === "join"
+          ? ["        'requires human decision approve_merge',"]
+          : []),
+        "      ],",
+        "    },",
+      ].join("\n")),
       "  ];",
       "  const profile = taskProfiles.find((candidate) => injectedPrompt.includes(candidate.marker));",
       "  if (!profile) {",
@@ -4856,6 +5322,483 @@ async function main() {
       },
       nextAction: recovered.status.nextAction,
     });
+
+    // ---- Series-parallel fan-out lane -------------------------------------
+    // TASK-FAN-A -> {TASK-FAN-B, TASK-FAN-C} -> TASK-FAN-D through the SAME
+    // packet -> authoring -> validate -> policy -> preview -> import -> serve
+    // harness as the vertical campaign, in the same target repo under its own
+    // idempotency key. The lane ends with the operator stop control at the
+    // merge hold: landing collisions with the vertical lane's reflog proofs
+    // are structurally impossible because this campaign never lands.
+    await stopServe(restartedServer);
+    restartedServer = undefined;
+
+    // Fresh entry worktrees fork from the integration branch, so the frozen
+    // base for this campaign is the landed vertical commit main points at now.
+    const fanoutBase = landedCommit;
+    const fanoutPacketRoot = path.join(tempRoot, "packet-fanout");
+    const fanoutProjectsRoot = path.join(tempRoot, "active-projects-fanout");
+    const fanoutPacket = await createFanoutPacket(
+      fanoutPacketRoot,
+      fanoutProjectsRoot,
+      targetRoot,
+      fanoutBase,
+      env,
+    );
+
+    const fanoutProposalText = await readFile(fanoutPacket.proposalPath, "utf8");
+    const fanoutAuthoring = await startNativeAuthoringServer(fanoutProposalText);
+    authoringServer = fanoutAuthoring.server;
+    await configureNativeAuthoring(fanoutAuthoring.baseUrl);
+    const fanoutAuthored = jsonOutput(
+      await prd([
+        "author",
+        fanoutPacketRoot,
+        fanoutPacket.manifestPath,
+        fanoutPacket.sidecarPath,
+        "--target",
+        targetRoot,
+        "--base",
+        fanoutBase,
+        "--provider",
+        "ccc-product-authoring",
+        "--model",
+        "vertical-authoring-model",
+        "--max-requests",
+        "2",
+        "--max-duration-ms",
+        "120000",
+        "--max-concurrency",
+        "1",
+        "--max-prompt-bytes",
+        "262144",
+        "--max-response-bytes",
+        "262144",
+        "--max-review-items",
+        "8",
+      ]),
+      "prd fanout author",
+    );
+    assert(
+      fanoutAuthored.kind === "candidate",
+      "CCC_PRODUCT_FANOUT_AUTHORING_FAILED",
+      JSON.stringify(fanoutAuthored),
+    );
+    await stopNativeAuthoringServer(authoringServer);
+    authoringServer = undefined;
+
+    // Authoring configuration rewrote the isolated HOME settings file, and the
+    // diamond needs capacity for four simultaneous custody worktrees, so the
+    // settings are re-imported before the lane's serve. maxConcurrent stays at
+    // 1: the fan-out proof is about graph shape and join ancestry, not about
+    // parallel scheduling.
+    const fanoutSettingsPath = path.join(fanoutPacketRoot, "settings.json");
+    await writeFile(fanoutSettingsPath, `${JSON.stringify({
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      global: {
+        experimentalFeatures: { cliAgentExecutor: true },
+      },
+      project: {
+        maxConcurrent: 1,
+        maxWorktrees: 8,
+        pollIntervalMs: 500,
+        worktreesDir: worktreesRoot,
+      },
+    }, null, 2)}\n`);
+    await run(
+      process.execPath,
+      [
+        cliBin,
+        "settings",
+        "import",
+        fanoutSettingsPath,
+        "--scope",
+        "both",
+        "--merge",
+        "--yes",
+      ],
+      { cwd: targetRoot, env, timeoutMs: 240_000 },
+    );
+
+    const fanoutPacketArgs = [
+      fanoutPacketRoot,
+      fanoutPacket.manifestPath,
+      fanoutPacket.sidecarPath,
+      fanoutPacket.executionPlanPath,
+      targetRoot,
+      fanoutBase,
+    ];
+    const fanoutValidated = jsonOutput(
+      await prd([
+        "validate",
+        fanoutPacketRoot,
+        fanoutPacket.manifestPath,
+        fanoutPacket.sidecarPath,
+        targetRoot,
+        fanoutBase,
+      ]),
+      "prd fanout validate",
+    );
+    const fanoutCompiled = jsonOutput(
+      await prd([
+        "compile",
+        fanoutPacketRoot,
+        fanoutPacket.manifestPath,
+        fanoutPacket.sidecarPath,
+        targetRoot,
+        fanoutBase,
+      ]),
+      "prd fanout compile",
+    );
+    assert(
+      fanoutValidated.kind === "diagnostics" && fanoutValidated.valid === true,
+      "CCC_PRODUCT_FANOUT_PACKET_VALIDATION_FAILED",
+      JSON.stringify(fanoutValidated),
+    );
+    exactArray(
+      fanoutCompiled.tasks?.map(({ id }) => id),
+      fanTasks.map(({ taskId }) => taskId),
+      "CCC_PRODUCT_FANOUT_TASK_SET_DRIFT",
+    );
+
+    const fanoutRoutesPath = path.join(fanoutPacketRoot, "routes.json");
+    await writeFile(
+      fanoutRoutesPath,
+      `${JSON.stringify({
+        schema: "ccc-prd.routes-by-task.v1",
+        routes: Object.fromEntries(fanTasks.map((fanTask, index) => [
+          fanTask.taskId,
+          {
+            providerId: "openai",
+            modelId: index % 2 === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra",
+            transport: "cli",
+            cliAdapterId: "codex",
+          },
+        ])),
+      }, null, 2)}\n`,
+    );
+    const fanoutPlan = jsonOutput(
+      await prd([
+        "policy",
+        fanoutPacketRoot,
+        fanoutPacket.manifestPath,
+        fanoutPacket.sidecarPath,
+        targetRoot,
+        fanoutBase,
+        fanoutPacket.executionPlanPath,
+        "--routes-file",
+        fanoutRoutesPath,
+      ]),
+      "prd fanout policy",
+    );
+    assert(
+      fanoutPlan.kind === "execution-plan"
+      && fanoutPlan.routeCount === fanTasks.length,
+      "CCC_PRODUCT_FANOUT_EXECUTION_PLAN_INVALID",
+      JSON.stringify(fanoutPlan),
+    );
+
+    const fanoutPreview = jsonOutput(
+      await prd(["preview", ...fanoutPacketArgs]),
+      "prd fanout preview",
+    );
+    assert(
+      fanoutPreview.kind === "preview"
+      && /^[0-9a-f]{64}$/u.test(fanoutPreview.confirmationDigest),
+      "CCC_PRODUCT_FANOUT_PREVIEW_INVALID",
+      JSON.stringify(fanoutPreview),
+    );
+
+    const fanoutKey = `${idempotencyKey}-fanout`;
+    const fanoutImported = jsonOutput(
+      await prd([
+        "import",
+        ...fanoutPacketArgs,
+        fanoutKey,
+        "--confirm",
+        fanoutPreview.confirmationDigest,
+      ]),
+      "prd fanout import",
+    );
+    assert(
+      fanoutImported.kind === "imported"
+      && fanoutImported.result?.state === "active"
+      && fanoutImported.result?.runnable === true,
+      "CCC_PRODUCT_FANOUT_IMPORT_NOT_RUNNABLE",
+      JSON.stringify(fanoutImported),
+    );
+    ledger.pass("fanout-campaign-import-admitted", {
+      importId: fanoutImported.result.importId,
+      idempotencyKey: fanoutKey,
+      baseCommit: fanoutBase,
+      graph: {
+        entry: "TASK-FAN-A",
+        branches: ["TASK-FAN-B", "TASK-FAN-C"],
+        join: "TASK-FAN-D",
+        edges: 4,
+      },
+      packetHash: fanoutPacket.freeze.packetHash,
+      routeCount: fanoutPlan.routeCount,
+    });
+
+    const readFanoutStatus = async () => readStatusFor(fanoutKey);
+    server = await startServe(targetRoot, env, port);
+
+    // Live execution stays per task in a fan-out campaign: the single work
+    // item parks once per task, in dependency order, and each park carries its
+    // own approval bound to its own native task.
+    const fanoutApprovalTrail = [];
+    for (let holdIndex = 0; holdIndex < fanTasks.length; holdIndex += 1) {
+      const parked = await awaitParkedLiveExecutionApproval(
+        `fanout live execution approval ${holdIndex + 1} of ${fanTasks.length}`,
+        readFanoutStatus,
+        fanoutApprovalTrail.map(({ approvalRequestId }) => approvalRequestId),
+      );
+      const fanoutApproved = jsonOutput(
+        await prd([
+          "approve-execution",
+          fanoutKey,
+          parked.confirmation.approvalRequestId,
+          "--confirm",
+          parked.confirmation.confirmation,
+        ]),
+        `approve fanout execution ${holdIndex + 1}`,
+      );
+      assert(
+        fanoutApproved.kind === "execution-approved"
+        && fanoutApproved.approval?.status === "claimed",
+        "CCC_PRODUCT_FANOUT_EXECUTION_APPROVAL_FAILED",
+        JSON.stringify({ holdIndex, fanoutApproved }),
+      );
+      fanoutApprovalTrail.push({
+        approvalRequestId: parked.confirmation.approvalRequestId,
+        taskId: parked.confirmation.taskId,
+      });
+    }
+
+    const fanoutMergeHold = await poll(
+      "fanout merge approval hold",
+      readFanoutStatus,
+      (value) => value.status?.nextAction?.kind === "approve-merge",
+      async () => ({
+        serve: tail(server.output()),
+        status: await readFanoutStatus(),
+      }),
+    );
+    const fanoutStatusTasks = Object.fromEntries(fanTasks.map((fanTask) => [
+      fanTask.taskId,
+      taskFor(fanoutMergeHold.status, fanTask.taskId),
+    ]));
+    const fanoutNativeIds = Object.fromEntries(
+      Object.entries(fanoutStatusTasks).map(([semanticTaskId, statusTask]) => [
+        semanticTaskId,
+        statusTask.nativeTaskId,
+      ]),
+    );
+    // Every task was approved exactly once; the entry task parked first and
+    // the join task parked last, proving dependency-ordered dispatch.
+    exactArray(
+      fanoutApprovalTrail.map(({ taskId }) => taskId).sort(),
+      Object.values(fanoutNativeIds).sort(),
+      "CCC_PRODUCT_FANOUT_APPROVAL_TASK_SET_DRIFT",
+    );
+    assert(
+      fanoutApprovalTrail[0].taskId === fanoutNativeIds["TASK-FAN-A"]
+      && fanoutApprovalTrail[fanTasks.length - 1].taskId
+        === fanoutNativeIds["TASK-FAN-D"]
+      && new Set(
+        fanoutApprovalTrail.map(({ approvalRequestId }) => approvalRequestId),
+      ).size === fanTasks.length,
+      "CCC_PRODUCT_FANOUT_APPROVAL_ORDER_INVALID",
+      JSON.stringify({ fanoutApprovalTrail, fanoutNativeIds }),
+    );
+
+    // Route custody per task: disjoint single-file ownership end to end.
+    for (const fanTask of fanTasks) {
+      const statusTask = fanoutStatusTasks[fanTask.taskId];
+      assert(
+        statusTask.route?.executor === "cli-agent"
+        && statusTask.route?.toolMode === "coding"
+        && statusTask.route?.worktreeMode === "isolated",
+        "CCC_PRODUCT_FANOUT_ROUTE_DRIFT",
+        JSON.stringify({ taskId: fanTask.taskId, route: statusTask.route }),
+      );
+      exactArray(
+        statusTask.route.ownedPaths,
+        [fanTask.file],
+        "CCC_PRODUCT_FANOUT_OWNED_PATH_DRIFT",
+      );
+    }
+
+    // The join ancestry proof: each branch worktree HEAD descends from the
+    // entry commit but NOT from its sibling branch, and the join task's HEAD
+    // descends from BOTH branches — a real merged fork-join, not a disguised
+    // chain.
+    const fanoutHeads = {};
+    for (const fanTask of fanTasks) {
+      const statusTask = fanoutStatusTasks[fanTask.taskId];
+      assert(
+        typeof statusTask.worktree === "string" && statusTask.worktree.length > 0,
+        "CCC_PRODUCT_FANOUT_WORKTREE_MISSING",
+        JSON.stringify({ taskId: fanTask.taskId }),
+      );
+      fanoutHeads[fanTask.taskId] = await git(
+        await realpath(statusTask.worktree),
+        "rev-parse",
+        "HEAD",
+      );
+    }
+    const ancestor = async (base, head) => {
+      const result = await run(
+        "/usr/bin/git",
+        ["merge-base", "--is-ancestor", base, head],
+        { cwd: targetRoot, allowedExitCodes: [0, 1] },
+      );
+      return result.code === 0;
+    };
+    const fanoutAncestry = {
+      entryIntoBranchB: await ancestor(
+        fanoutHeads["TASK-FAN-A"],
+        fanoutHeads["TASK-FAN-B"],
+      ),
+      entryIntoBranchC: await ancestor(
+        fanoutHeads["TASK-FAN-A"],
+        fanoutHeads["TASK-FAN-C"],
+      ),
+      branchBIntoJoin: await ancestor(
+        fanoutHeads["TASK-FAN-B"],
+        fanoutHeads["TASK-FAN-D"],
+      ),
+      branchCIntoJoin: await ancestor(
+        fanoutHeads["TASK-FAN-C"],
+        fanoutHeads["TASK-FAN-D"],
+      ),
+      branchBIntoBranchC: await ancestor(
+        fanoutHeads["TASK-FAN-B"],
+        fanoutHeads["TASK-FAN-C"],
+      ),
+      branchCIntoBranchB: await ancestor(
+        fanoutHeads["TASK-FAN-C"],
+        fanoutHeads["TASK-FAN-B"],
+      ),
+    };
+    assert(
+      fanoutAncestry.entryIntoBranchB
+      && fanoutAncestry.entryIntoBranchC
+      && fanoutAncestry.branchBIntoJoin
+      && fanoutAncestry.branchCIntoJoin
+      && !fanoutAncestry.branchBIntoBranchC
+      && !fanoutAncestry.branchCIntoBranchB,
+      "CCC_PRODUCT_FANOUT_JOIN_ANCESTRY_REFUSED",
+      JSON.stringify({ fanoutHeads, fanoutAncestry }),
+    );
+
+    // One campaign-wide proof bound to the join task's commit, whose diff
+    // against the fan-out frozen base is exactly the four owned files with
+    // both branches' work present.
+    const fanoutProof = fanoutMergeHold.status.proofs[0];
+    assert(
+      fanoutMergeHold.status.proofs.length === 1
+      && fanoutProof.definition.id === "PROOF-FANOUT"
+      && fanoutProof.attempts.length === 1,
+      "CCC_PRODUCT_FANOUT_PROOF_SET_INVALID",
+      JSON.stringify(fanoutMergeHold.status.proofs),
+    );
+    const fanoutAttempt = fanoutProof.attempts[0];
+    const fanoutSourceCommit = fanoutAttempt.sourceCommit;
+    assert(
+      fanoutSourceCommit === fanoutHeads["TASK-FAN-D"]
+      && fanoutAttempt.state === "committed"
+      && fanoutAttempt.result?.success === true
+      && fanoutAttempt.result?.exitCode === 0
+      && fanoutAttempt.result?.stdoutTail?.includes(
+        "FANOUT_NEGATIVE_CONTROL_PASS: planted pending fan values are rejected",
+      )
+      && fanoutAttempt.result?.stdoutTail?.includes(
+        "FANOUT_POSITIVE_ORACLE_PASS: fan-out campaign values are joined",
+      ),
+      "CCC_PRODUCT_FANOUT_PROOF_INVALID",
+      JSON.stringify({ fanoutAttempt, joinHead: fanoutHeads["TASK-FAN-D"] }),
+    );
+    exactArray(
+      (await git(
+        targetRoot,
+        "diff",
+        "--name-only",
+        fanoutBase,
+        fanoutSourceCommit,
+      )).split("\n").filter(Boolean),
+      fanTasks.map(({ file }) => file),
+      "CCC_PRODUCT_FANOUT_MUTATION_SCOPE_DRIFT",
+    );
+    for (const fanTask of fanTasks) {
+      assert(
+        await git(targetRoot, "show", `${fanoutSourceCommit}:${fanTask.file}`)
+          === fanTask.value,
+        "CCC_PRODUCT_FANOUT_COMMIT_CONTENT_INVALID",
+        JSON.stringify({ taskId: fanTask.taskId, file: fanTask.file }),
+      );
+    }
+    assert(
+      fanoutMergeHold.status.workItems.length === 1
+      && fanoutMergeHold.status.workItems[0].state === "manual-required"
+      && fanoutMergeHold.status.workItems[0].lastError
+        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === landedCommit,
+      "CCC_PRODUCT_FANOUT_LANDED_WITHOUT_APPROVAL",
+      JSON.stringify({
+        workItems: fanoutMergeHold.status.workItems,
+        mainHead: await git(targetRoot, "rev-parse", "refs/heads/main"),
+      }),
+    );
+
+    // End the lane with the operator stop control: the fan-out proof is about
+    // graph execution, and never landing keeps the vertical lane's landing and
+    // reflog evidence authoritative.
+    const fanoutStopControl = fanoutMergeHold.operatorControls?.find(
+      ({ action }) => action === "stop",
+    );
+    assert(
+      fanoutStopControl?.allowed === true
+      && /^[0-9a-f]{64}$/u.test(fanoutStopControl.confirmation),
+      "CCC_PRODUCT_FANOUT_STOP_CONFIRMATION_MISSING",
+      JSON.stringify(fanoutMergeHold.operatorControls),
+    );
+    const fanoutStopped = jsonOutput(
+      await prd([
+        "stop",
+        fanoutKey,
+        "--reason",
+        "Fan-out acceptance lane stops at the merge hold with its join proof committed.",
+        "--confirm",
+        fanoutStopControl.confirmation,
+      ]),
+      "prd fanout stop",
+    );
+    assert(
+      fanoutStopped.kind === "campaign-stopped"
+      && fanoutStopped.result?.workItemState === "cancelled"
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === landedCommit,
+      "CCC_PRODUCT_FANOUT_STOP_FAILED",
+      JSON.stringify(fanoutStopped),
+    );
+    ledger.pass("fanout-join-execution-proved", {
+      importId: fanoutImported.result.importId,
+      approvals: fanoutApprovalTrail,
+      nativeTaskIds: fanoutNativeIds,
+      heads: fanoutHeads,
+      ancestry: fanoutAncestry,
+      sourceCommit: fanoutSourceCommit,
+      mutationPaths: fanTasks.map(({ file }) => file),
+      proofAttemptKey: fanoutAttempt.attemptKey,
+      proofResult: fanoutAttempt.result,
+      stopped: fanoutStopped.result,
+      mainHeadStill: landedCommit,
+    });
+
+    await stopServe(server);
+    server = undefined;
 
     const repositoryEnd = await repositorySnapshot();
     assertRepositoryUnchanged(repositoryStart, repositoryEnd);
