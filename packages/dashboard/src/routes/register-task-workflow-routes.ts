@@ -73,6 +73,7 @@ import {
   createAiUndoTask,
   prepareRevertPrBranch,
   prepareWorkspaceRevertPrBranches,
+  isCccCampaignTask,
   isInReviewMissingWorktreeSessionStartFailure,
   // FN-8004 follow-up: shared with SelfHealingManager.recoverStaleMergingStatus so the manual
   // Retry gate and the automatic sweep agree on when a merge-active stamp is orphaned.
@@ -87,6 +88,7 @@ import { resolveNativeStructurePreview } from "../native-structure-preview.js";
 import { isBackwardMoveBlockedByOpenPr, PR_OPEN_BLOCKS_MOVE_BACK_MESSAGE } from "./register-pull-requests-routes.js";
 import { computePlanApprovalFingerprint, isWorkspaceTask, type RunAuditEventInput } from "@fusion/core";
 import { ApiError, badRequest, conflict, notFound } from "../api-error.js";
+import { cccCampaignTaskMutationConflict, registerCccCampaignTaskMutationGuard } from "./ccc-campaign-task-guard.js";
 import type { ApiRoutesContext } from "./types.js";
 import { deriveAutoTaskBranch, derivePerTaskBranch, getBranchSelectionMode, resolveBranchSelection } from "./branch-selection.js";
 import { isDaemonAuthActive } from "../auth-middleware.js";
@@ -686,6 +688,17 @@ interface TaskWorkflowRouteDeps {
 
 export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWorkflowRouteDeps): void {
   const { router, options, getProjectContext, rethrowAsApiError } = ctx;
+
+  /*
+  FNXC:CccCampaignTaskGuard 2026-08-11-00:00 (top-down audit, Lane A):
+  MUST stay the first `/tasks` registration in the app. This registrar is the
+  first one createApiRoutes mounts that touches `/tasks` paths, and Express
+  matches layers in registration order, so registering the guard here fronts
+  every per-task mutation route — including `/tasks/:id/pr/*` and
+  `/tasks/:taskId/workflow` routes added by later registrars. See
+  ccc-campaign-task-guard.ts for the custody rationale.
+  */
+  registerCccCampaignTaskMutationGuard(ctx);
   const {
     runtimeLogger,
     upload,
@@ -2888,8 +2901,31 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
   router.post("/tasks/archive-all-done", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);
-      const archived = await scopedStore.archiveAllDone();
-      res.json({ archived });
+      /*
+      FNXC:CccCampaignTaskGuard 2026-08-11-00:00 (top-down audit, Lane A):
+      This bulk route has no `:id`, so the per-task custody middleware cannot
+      cover it. Campaign-custody tasks sitting in `done` are EXCLUDED (not a
+      whole-request 409) mirroring the approvals surface's list-exclusion
+      posture — refusing the entire sweep would block archiving ordinary done
+      cards whenever any campaign card is done. The skipped ids are reported
+      additively so the exclusion is observable, and the store's archiveAllDone
+      fast path is preserved verbatim when no campaign task is in `done`.
+      */
+      const doneTasks = await scopedStore.listTasks({ slim: true, column: "done" });
+      const skippedCccCampaignTaskIds = doneTasks
+        .filter((task) => isCccCampaignTask(task))
+        .map((task) => task.id);
+      if (skippedCccCampaignTaskIds.length === 0) {
+        const archived = await scopedStore.archiveAllDone();
+        res.json({ archived });
+        return;
+      }
+      const archived = await Promise.all(
+        doneTasks
+          .filter((task) => !isCccCampaignTask(task))
+          .map((task) => scopedStore.archiveTask(task.id, { cleanup: true })),
+      );
+      res.json({ archived, skippedCccCampaignTaskIds });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         throw err;
@@ -2994,6 +3030,23 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
           }
           throw err;
         }
+      }
+
+      /*
+      FNXC:CccCampaignTaskGuard 2026-08-11-00:00 (top-down audit, Lane A):
+      Bulk model updates name their targets explicitly, so unlike
+      archive-all-done a campaign task here is a DELIBERATE selection — refuse
+      the whole request (naming the offending ids) rather than silently
+      updating a subset. Campaign task model routes are pinned by the admitted
+      execution policy; rewriting them from the dashboard would desynchronize
+      the sealed route the campaign controller dispatches.
+      */
+      const cccCampaignTaskIds = taskIds.filter((taskId: string) => {
+        const task = tasksById.get(taskId);
+        return Boolean(task && isCccCampaignTask(task));
+      });
+      if (cccCampaignTaskIds.length > 0) {
+        throw cccCampaignTaskMutationConflict(cccCampaignTaskIds);
       }
 
       // Build update payload (only include fields that were explicitly provided)

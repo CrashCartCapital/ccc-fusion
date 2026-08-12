@@ -304,6 +304,10 @@ export {
   type WorkflowTaskRuntimeResult,
 } from "./workflow-task-runtime.js";
 export {
+  isCccCampaignTask,
+  isImportedCccCampaignTask,
+} from "./ccc-campaign-routing.js";
+export {
   CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,

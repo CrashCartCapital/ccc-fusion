@@ -2195,6 +2195,8 @@ describe("POST /tasks/:id/spec/revise", () => {
     writeFileSync(join(taskDir, "PROMPT.md"), "# stale spec\n");
 
     (store.getTask as ReturnType<typeof vi.fn>)
+      // First read: ccc-campaign task mutation guard custody check.
+      .mockResolvedValueOnce(triageTask)
       .mockResolvedValueOnce(triageTask)
       .mockResolvedValueOnce(updatedTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
@@ -2442,6 +2444,8 @@ describe("POST /tasks/:id/spec/rebuild", () => {
     writeFileSync(join(taskDir, "PROMPT.md"), "# stale spec\n");
 
     (store.getTask as ReturnType<typeof vi.fn>)
+      // First read: ccc-campaign task mutation guard custody check.
+      .mockResolvedValueOnce(triageTask)
       .mockResolvedValueOnce(triageTask)
       .mockResolvedValueOnce(updatedTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
@@ -2524,6 +2528,8 @@ describe("POST /tasks/:id/spec/rebuild", () => {
     const updatedTask = { ...todoTask, status: "needs-replan" as const };
     selectWorkflow([{ id: "todo" }, { id: "in-review" }]);
     (store.getTask as ReturnType<typeof vi.fn>)
+      // First read: ccc-campaign task mutation guard custody check.
+      .mockResolvedValueOnce(todoTask)
       .mockResolvedValueOnce(todoTask)
       .mockResolvedValueOnce(updatedTask);
     (store.updateTask as ReturnType<typeof vi.fn>).mockResolvedValue(updatedTask);
