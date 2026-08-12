@@ -5364,16 +5364,20 @@ async function main() {
         "ccc-product-authoring",
         "--model",
         "vertical-authoring-model",
+        // The author command's bounds flags are the ADMITTED campaign bounds
+        // and must byte-match the proposal's bounds (authoring refuses with
+        // CCC_PRD_AUTHORING_BOUNDS_DRIFT otherwise).
         "--max-requests",
-        "2",
+        "4",
         "--max-duration-ms",
-        "120000",
+        "240000",
         "--max-concurrency",
         "1",
         "--max-prompt-bytes",
         "262144",
         "--max-response-bytes",
         "262144",
+        // 4 live-execution actions + 1 merge action = 5 review items.
         "--max-review-items",
         "8",
       ]),
