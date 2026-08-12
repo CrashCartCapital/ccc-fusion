@@ -2760,7 +2760,9 @@ describe("POST /tasks/:id/review/address", () => {
     };
     const movedTask = { ...taskAfterAddressing, column: "in-progress", status: null, sessionFile: null, assignedAgentId: null };
     mockReviewerBlockLogs();
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithoutPersistedItems).mockResolvedValueOnce(taskAfterAddressing);
+    // First getTask read is the ccc-campaign task mutation guard's custody check
+    // (ccc-campaign-task-guard.ts); the handler's own reads follow it.
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithoutPersistedItems).mockResolvedValueOnce(taskWithoutPersistedItems).mockResolvedValueOnce(taskAfterAddressing);
     (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
 
@@ -2789,7 +2791,7 @@ describe("POST /tasks/:id/review/address", () => {
       log: [{ timestamp: fallbackTimestamp, action: "plan review Step 2: RETHINK - revise the approach" }],
     };
     (store.getAgentLogs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithFallbackLog).mockResolvedValueOnce(taskWithFallbackLog);
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithFallbackLog).mockResolvedValueOnce(taskWithFallbackLog).mockResolvedValueOnce(taskWithFallbackLog);
     (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [{ id: fallbackItemId, source: "reviewer-agent", summary: "plan review RETHINK", body: "revise the approach" }] }), { "Content-Type": "application/json" });
@@ -2818,7 +2820,7 @@ describe("POST /tasks/:id/review/address", () => {
         addressing: [],
       },
     };
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithPrReview).mockResolvedValueOnce(taskWithPrReview);
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(taskWithPrReview).mockResolvedValueOnce(taskWithPrReview).mockResolvedValueOnce(taskWithPrReview);
     (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/review/address", JSON.stringify({ selectedItems: [{ id: "ri-1", source: "pr-review", summary: "Fix tests", body: "Fix tests", filePath: "src/a.ts", lineNumber: 4 }] }), { "Content-Type": "application/json" });
@@ -2931,7 +2933,7 @@ describe("POST /tasks/:id/pr/address-feedback", () => {
     };
     const afterSteering = { ...inReviewTask, steeringComments: [{ id: "sc-1", body: "x", author: "user", createdAt: "2026-06-28T00:00:00.000Z" }] };
     const movedTask = { ...afterSteering, column: "in-progress", status: null, error: null, sessionFile: null };
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(inReviewTask).mockResolvedValueOnce(afterSteering);
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(inReviewTask).mockResolvedValueOnce(inReviewTask).mockResolvedValueOnce(afterSteering);
     (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
     (store.moveTask as ReturnType<typeof vi.fn>).mockResolvedValue(movedTask);
 
@@ -2971,7 +2973,7 @@ describe("POST /tasks/:id/pr/address-feedback", () => {
     } as any);
     const activeRunSpy = vi.spyOn(AgentStore.prototype, "getActiveHeartbeatRun").mockResolvedValue(null);
     (store.getFusionDir as ReturnType<typeof vi.fn>).mockReturnValue("/fake/root/.fusion");
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(task).mockResolvedValueOnce(task);
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(task).mockResolvedValueOnce(task).mockResolvedValueOnce(task);
     (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
 
     try {
@@ -3015,7 +3017,7 @@ describe("POST /tasks/:id/pr/address-feedback", () => {
       sessionFile: "active.json",
       prInfos: [linkedPr],
     };
-    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(task).mockResolvedValueOnce(task);
+    (store.getTask as ReturnType<typeof vi.fn>).mockResolvedValueOnce(task).mockResolvedValueOnce(task).mockResolvedValueOnce(task);
     (store.addSteeringComment as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sc-1" });
 
     const res = await REQUEST(buildApp(), "POST", "/api/tasks/FN-001/pr/address-feedback", "{}", { "Content-Type": "application/json" });
