@@ -418,6 +418,94 @@ pgDescribe("CCC campaign provider controller (PostgreSQL)", () => {
     expect(after.requestCount).toBe(before.requestCount);
   });
 
+  async function commitAndConsumeFirstTurn(
+    f: Awaited<ReturnType<typeof fixture>>,
+    suffix: string,
+  ) {
+    const first = await atomicReserveCccCampaignProviderDispatch(input(f, suffix));
+    expect(first).toMatchObject({ kind: "dispatch-permit" });
+    await h.store().reconcileCccProviderAttempt({
+      taskId: first.scope.taskId,
+      attemptKey: first.scope.attemptKey,
+      controllerToken: first.scope.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "a".repeat(64),
+      observerId: "provider-observer-committed",
+    });
+    await consumeCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: f.taskId,
+      action: { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate", requireProtected: true },
+      actor: worker,
+      runId: `consume-${suffix}`,
+      claimToken: f.claimToken,
+    });
+    return first;
+  }
+
+  it("permits a follow-on turn in the same fenced visit after the first committed turn consumed the approval", async () => {
+    const f = await fixture("follow-on");
+    await commitAndConsumeFirstTurn(f, "follow-on");
+    const second = await atomicReserveCccCampaignProviderDispatch({
+      ...input(f, "follow-on"),
+      turnKey: "turn-follow-on-2",
+      dispatchKey: "dispatch-follow-on-2",
+    });
+    expect(second).toMatchObject({
+      kind: "dispatch-permit",
+      scope: { binding: { actionId: "ACTION-LIVE-EXECUTION" }, workItemFence: f.workItemFence },
+    });
+    expect(await counts()).toEqual({ attempts: 5, requestCount: 2 });
+  });
+
+  it("refuses a consumed-approval reservation with no committed attempt in the same work-item fence", async () => {
+    const f = await fixture("consumed-no-commit");
+    await consumeCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: f.taskId,
+      action: { actionId: "ACTION-LIVE-EXECUTION", actionTarget: "ccc-lab-super:pre-live-provider-gate", requireProtected: true },
+      actor: worker,
+      runId: "consume-no-commit",
+      claimToken: f.claimToken,
+    });
+    await expect(atomicReserveCccCampaignProviderDispatch(input(f, "consumed-no-commit"))).rejects.toThrow(/claimed/i);
+    expect(await counts()).toEqual({ attempts: 0, requestCount: 0 });
+  });
+
+  it("refuses a follow-on consumed reservation under a different work-item fence attempt", async () => {
+    const f = await fixture("follow-on-refenced");
+    await commitAndConsumeFirstTurn(f, "follow-on-refenced");
+    await h.layer().db.execute(sql`
+      UPDATE project.workflow_work_items SET attempt = ${f.workItemFence.attempt + 1}
+      WHERE id = ${f.workItemFence.workItemId}
+    `);
+    await expect(atomicReserveCccCampaignProviderDispatch({
+      ...input(f, "follow-on-refenced"),
+      turnKey: "turn-follow-on-refenced-2",
+      dispatchKey: "dispatch-follow-on-refenced-2",
+      workItemFence: { ...f.workItemFence, attempt: f.workItemFence.attempt + 1 },
+    })).rejects.toThrow(/claimed/i);
+    expect(await counts()).toEqual({ attempts: 3, requestCount: 1 });
+  });
+
+  it("refuses a follow-on consumed reservation outside the approval dispatch window", async () => {
+    const f = await fixture("follow-on-expired");
+    await commitAndConsumeFirstTurn(f, "follow-on-expired");
+    await h.layer().db.execute(sql`
+      UPDATE project.approval_requests
+      SET not_before_at = ${new Date(Date.now() - 60_000).toISOString()}, expires_at = ${new Date(Date.now() - 1_000).toISOString()}
+      WHERE id = ${f.issued.id}
+    `);
+    await expect(atomicReserveCccCampaignProviderDispatch({
+      ...input(f, "follow-on-expired"),
+      turnKey: "turn-follow-on-expired-2",
+      dispatchKey: "dispatch-follow-on-expired-2",
+    })).rejects.toThrow(/window/i);
+    expect(await counts()).toEqual({ attempts: 3, requestCount: 1 });
+  });
+
   it("refuses a task without imported campaign custody instead of treating it as ordinary", async () => {
     await expect(atomicReserveCccCampaignProviderDispatch({
       layer: h.layer(),

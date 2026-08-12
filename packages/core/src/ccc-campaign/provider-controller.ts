@@ -1,13 +1,14 @@
 import {
   assertActiveClaimedCccCampaignApprovalWithinTransaction,
   assertClaimedCccCampaignApprovalWithinTransaction,
+  assertConsumedCccCampaignApprovalForFollowOnDispatchWithinTransaction,
   assertConsumedCccCampaignApprovalWithinTransaction,
   type AssertActiveClaimedCccCampaignApprovalInput,
 } from "../async-approval-request-store.js";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import { and, eq, sql } from "drizzle-orm";
 import * as schema from "../postgres/schema/index.js";
-import { beginCccProviderAttemptDispatch, reserveCccProviderAttempt } from "./provider-attempt.js";
+import { beginCccProviderAttemptDispatch, listCccProviderAttemptsForCampaign, reserveCccProviderAttempt } from "./provider-attempt.js";
 import { loadCccCampaignContextForTask, type CccCampaignAuthorityStore } from "./store.js";
 import type { CccPrdProtectedActionIntent } from "../ccc-prd/types.js";
 import type {
@@ -228,7 +229,36 @@ export async function atomicReserveCccCampaignProviderDispatch(
     }
     switch (reserved.state) {
       case "reserved":
-        await assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
+        try {
+          await assertActiveClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
+        } catch (activeClaimError) {
+          /*
+           * Follow-on turn custody: settlement consumes the live-execution
+           * approval on the session's first committed terminal, so a later
+           * turn of the same fenced node visit can never present an active
+           * claim. Accept exact consumed custody instead, but only when this
+           * same work-item fence already owns a committed attempt for this
+           * action — that committed attempt's settlement is what consumed
+           * the claim, so the operator's one approval keeps covering exactly
+           * the session it authorized and nothing else.
+           */
+          const attempts = await listCccProviderAttemptsForCampaign({
+            layer: input.layer,
+            rootDir: input.rootDir,
+            taskId: context.taskId,
+            tx,
+          });
+          const sessionCommitted = attempts.some((scope) =>
+            scope.state === "committed"
+            && scope.binding.actionId === action.actionId
+            && scope.binding.actionTarget === action.actionTarget
+            && scope.workItemFence !== null
+            && scope.workItemFence.workItemId === workItemFence.workItemId
+            && scope.workItemFence.runId === workItemFence.runId
+            && scope.workItemFence.attempt === workItemFence.attempt);
+          if (!sessionCommitted) throw activeClaimError;
+          await assertConsumedCccCampaignApprovalForFollowOnDispatchWithinTransaction(tx, approvalInput);
+        }
         break;
       case "dispatched_unknown":
       case "proved_failed":

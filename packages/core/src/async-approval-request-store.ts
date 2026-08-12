@@ -1055,6 +1055,30 @@ export async function assertConsumedCccCampaignApprovalWithinTransaction(
 }
 
 /**
+ * Re-derive exact consumed custody for a follow-on provider dispatch inside
+ * the same approved session. Settlement consumes the claim on the session's
+ * first committed terminal, so a later turn of that fenced node visit can
+ * never present an active claim; it rides the consumed approval instead,
+ * still bounded by the approval's dispatch window. Callers must separately
+ * prove a committed attempt exists under the exact same work-item fence
+ * before trusting this custody for a new reservation.
+ */
+export async function assertConsumedCccCampaignApprovalForFollowOnDispatchWithinTransaction(
+  tx: DbTransaction,
+  input: AssertConsumedCccCampaignApprovalInput,
+): Promise<ConsumedCccCampaignApproval> {
+  const result = await assertTerminalCccCampaignApprovalWithinTransaction(tx, input, "consumed");
+  const campaign = result.approval.campaign!;
+  const nowAt = requireCanonicalTimestamp(await dbNow(tx), "database clock");
+  const notBeforeAt = requireCanonicalTimestamp(campaign.notBeforeAt, "not-before");
+  const approvalExpiresAt = requireCanonicalTimestamp(campaign.expiresAt, "expiry");
+  if (nowAt < notBeforeAt || nowAt >= approvalExpiresAt) {
+    throw new Error(`CCC campaign approval ${result.binding.actionId} is outside its active provider-dispatch window`);
+  }
+  return result;
+}
+
+/**
  * Re-derive the only approval identity that can replay a committed provider
  * attempt. Unlike the assertion above, this exposes no caller-provided
  * approval ID or token, so an engine restart cannot forge terminal custody.
