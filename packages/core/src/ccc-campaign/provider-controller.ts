@@ -257,7 +257,22 @@ export async function atomicReserveCccCampaignProviderDispatch(
             && scope.workItemFence.runId === workItemFence.runId
             && scope.workItemFence.attempt === workItemFence.attempt);
           if (!sessionCommitted) throw activeClaimError;
-          await assertConsumedCccCampaignApprovalForFollowOnDispatchWithinTransaction(tx, approvalInput);
+          try {
+            await assertConsumedCccCampaignApprovalForFollowOnDispatchWithinTransaction(tx, approvalInput);
+          } catch (consumedError) {
+            /*
+             * The active-claim assert can fail for reasons other than
+             * consumption (identity drift, token mismatch). When consumed
+             * custody also refuses, surface the original active-claim
+             * diagnosis — it names the real root cause — and keep the
+             * consumed refusal as its cause, except for the window refusal,
+             * which is this path's own accurate diagnosis.
+             */
+            if (consumedError instanceof Error && /provider-dispatch window/.test(consumedError.message)) {
+              throw consumedError;
+            }
+            throw activeClaimError;
+          }
         }
         break;
       case "dispatched_unknown":
