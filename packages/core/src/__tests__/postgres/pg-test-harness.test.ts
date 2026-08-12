@@ -17,6 +17,11 @@ import {
   probePsqlReady,
 } from "../../__test-utils__/pg-test-availability.js";
 import {
+  ensurePgGateTarget,
+  PgGateSetupError,
+  type PgGateProvisionedServer,
+} from "../../__test-utils__/pg-gate-global-setup.js";
+import {
   createTaskStoreForTest,
   PG_AVAILABLE,
   type PgTestHarness,
@@ -161,6 +166,165 @@ describe("PostgreSQL test availability", () => {
       }
     },
   );
+});
+
+/*
+ * FNXC:PgHonestGate 2026-08-11:
+ * The merge gate's PostgreSQL lanes (vitest.pg.config.ts) must never go green
+ * while silently skipping their tests. ensurePgGateTarget is the single
+ * decision point: it either proves a usable target, provisions a disposable
+ * embedded PostgreSQL, or fails loudly with an actionable message. These unit
+ * tests drive the decision matrix with injected fakes; the real embedded boot
+ * is proven by running `pnpm test:gate` without a local PostgreSQL.
+ */
+describe("PostgreSQL gate setup (no-silent-skip contract)", () => {
+  function fakeServer(urlBase: string): PgGateProvisionedServer & {
+    shutdownCalls: number;
+  } {
+    const server = {
+      urlBase,
+      shutdownCalls: 0,
+      async shutdown() {
+        server.shutdownCalls += 1;
+      },
+    };
+    return server;
+  }
+
+  it("refuses FUSION_PG_TEST_SKIP=1 instead of skipping gate coverage", async () => {
+    let provisionCalls = 0;
+    await expect(
+      ensurePgGateTarget(
+        { FUSION_PG_TEST_SKIP: "1" },
+        {
+          hasPsql: () => true,
+          probe: () => true,
+          provisionEmbedded: async () => {
+            provisionCalls += 1;
+            return fakeServer("postgresql://unused");
+          },
+        },
+      ),
+    ).rejects.toThrow(PgGateSetupError);
+    await expect(
+      ensurePgGateTarget({ FUSION_PG_TEST_SKIP: "1" }, { hasPsql: () => true, probe: () => true }),
+    ).rejects.toThrow(/FUSION_PG_TEST_SKIP/);
+    expect(provisionCalls).toBe(0);
+  });
+
+  it("refuses to run without a psql client and names the remedy", async () => {
+    let provisionCalls = 0;
+    await expect(
+      ensurePgGateTarget(
+        {},
+        {
+          hasPsql: () => false,
+          probe: () => true,
+          provisionEmbedded: async () => {
+            provisionCalls += 1;
+            return fakeServer("postgresql://unused");
+          },
+        },
+      ),
+    ).rejects.toThrow(/psql/);
+    expect(provisionCalls).toBe(0);
+  });
+
+  it("uses a usable configured target without provisioning", async () => {
+    const env: NodeJS.ProcessEnv = {
+      FUSION_PG_TEST_URL_BASE: "postgresql://postgres:postgres@configured:5433",
+    };
+    const probedUrls: string[] = [];
+    let provisionCalls = 0;
+    const result = await ensurePgGateTarget(env, {
+      hasPsql: () => true,
+      probe: (baseUrl) => {
+        probedUrls.push(baseUrl);
+        return true;
+      },
+      provisionEmbedded: async () => {
+        provisionCalls += 1;
+        return fakeServer("postgresql://unused");
+      },
+    });
+    expect(result.provisioned).toBeNull();
+    expect(env.FUSION_PG_TEST_URL_BASE).toBe(
+      "postgresql://postgres:postgres@configured:5433",
+    );
+    expect(probedUrls).toEqual(["postgresql://postgres:postgres@configured:5433"]);
+    expect(provisionCalls).toBe(0);
+  });
+
+  it("refuses an explicitly configured but unusable target instead of substituting a server", async () => {
+    let provisionCalls = 0;
+    await expect(
+      ensurePgGateTarget(
+        { FUSION_PG_TEST_URL_BASE: "postgresql://postgres@configured:5433" },
+        {
+          hasPsql: () => true,
+          probe: () => false,
+          provisionEmbedded: async () => {
+            provisionCalls += 1;
+            return fakeServer("postgresql://unused");
+          },
+        },
+      ),
+    ).rejects.toThrow(/FUSION_PG_TEST_URL_BASE/);
+    expect(provisionCalls).toBe(0);
+  });
+
+  it("provisions embedded PostgreSQL when the default target is unusable", async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const embedded = fakeServer("postgresql://postgres:password@localhost:54329");
+    const probedUrls: string[] = [];
+    const result = await ensurePgGateTarget(env, {
+      hasPsql: () => true,
+      probe: (baseUrl) => {
+        probedUrls.push(baseUrl);
+        return baseUrl === embedded.urlBase;
+      },
+      provisionEmbedded: async () => embedded,
+    });
+    expect(result.provisioned).toBe(embedded);
+    expect(env.FUSION_PG_TEST_URL_BASE).toBe(embedded.urlBase);
+    expect(probedUrls).toEqual([
+      "postgresql://localhost:5432",
+      embedded.urlBase,
+    ]);
+    expect(embedded.shutdownCalls).toBe(0);
+  });
+
+  it("shuts down and fails loudly when the provisioned server is still unusable", async () => {
+    const embedded = fakeServer("postgresql://postgres:password@localhost:54329");
+    await expect(
+      ensurePgGateTarget(
+        {},
+        {
+          hasPsql: () => true,
+          probe: () => false,
+          provisionEmbedded: async () => embedded,
+        },
+      ),
+    ).rejects.toThrow(/embedded/i);
+    expect(embedded.shutdownCalls).toBe(1);
+  });
+
+  it("wraps a provisioning failure in an actionable message", async () => {
+    await expect(
+      ensurePgGateTarget(
+        {},
+        {
+          hasPsql: () => true,
+          probe: () => false,
+          provisionEmbedded: async () => {
+            throw new Error("initdb exploded");
+          },
+        },
+      ),
+    ).rejects.toThrow(
+      /initdb exploded[\s\S]*(start a local PostgreSQL|FUSION_PG_TEST_URL_BASE)/i,
+    );
+  });
 });
 
 testDescribe("createTaskStoreForTest (PG fixture helper)", () => {

@@ -29,7 +29,7 @@ a small fraction of it and rarely run 6-at-once.
 */
 const PG_MAX_WORKERS = 4;
 
-export default mergeConfig(
+const merged = mergeConfig(
   baseConfig,
   defineConfig({
     test: {
@@ -38,3 +38,22 @@ export default mergeConfig(
     },
   }),
 );
+
+/*
+FNXC:PgHonestGate 2026-08-11:
+REPLACE (never append to) the base globalSetup for the gate's PostgreSQL
+lanes. pg-gate-global-setup runs the no-silent-skip decision — refuse
+FUSION_PG_TEST_SKIP=1, refuse an unusable explicitly configured target, or
+provision a disposable embedded PostgreSQL — BEFORE delegating to the shared
+vitest-teardown setup, so the canonical availability publication sees the
+final FUSION_PG_TEST_URL_BASE. mergeConfig concatenates globalSetup arrays,
+which would run the base setup first with the wrong (pre-provisioning)
+environment and mark the lane skipped; the explicit assignment below keeps
+ordering owned by the pg-gate setup, which calls the base setup itself.
+*/
+merged.test = {
+  ...merged.test,
+  globalSetup: ["./src/__test-utils__/pg-gate-global-setup.ts"],
+};
+
+export default merged;
