@@ -569,6 +569,20 @@ function nativeWorkflowProofJoinNodeId(workflowId: string): string {
   return `ccc-proof-join-${sha256(workflowId).slice(0, 24)}`;
 }
 
+/*
+ * Total invocation cap for campaign work items on engine-classified transient
+ * failures (operator decision 2026-08-11). The engine resolves
+ * `node.config.maxRetries` as the total attempt budget and falls back to a
+ * single attempt when absent (workflow-task-runtime.ts), so one transient
+ * provider error used to terminal-fail a campaign work item. Emitting the
+ * budget on every executable node keeps it provenance-visible in the stored
+ * IR and the admitted irHash instead of hiding it in an engine default; only
+ * TransientError failures consume attempts, and PermanentError still parks
+ * the work item manual-required on the first classification. The engine-side
+ * hard cap of 10 attempts is unchanged.
+ */
+const CCC_CAMPAIGN_WORK_ITEM_MAX_RETRIES = 3;
+
 function nativeWorkflowIr(
   bundle: CccPrdSemanticBundle,
   workflow: CccPrdWorkflow,
@@ -619,6 +633,7 @@ function nativeWorkflowIr(
         cccPrdTaskId: task.id,
         cccNativeTaskId: nativeCccPrdTaskId(task.id, nativeTaskIds),
         gateMode: "gate",
+        maxRetries: CCC_CAMPAIGN_WORK_ITEM_MAX_RETRIES,
         ...(productExecution
           ? {
             cccExecutionPromptSchema: executionPrompt!.schema,
@@ -734,6 +749,7 @@ function nativeWorkflowIr(
           cccNativeTaskId: nativeCccPrdTaskId(proofTaskId, nativeTaskIds),
           gateMode: "gate",
           toolMode: "readonly",
+          maxRetries: CCC_CAMPAIGN_WORK_ITEM_MAX_RETRIES,
         },
       }] : []),
       ...(mergeLanding ? [{
@@ -743,6 +759,7 @@ function nativeWorkflowIr(
           seam: "merge",
           cccPrdTaskId: mergeLanding.taskId,
           cccNativeTaskId: nativeCccPrdTaskId(mergeLanding.taskId, nativeTaskIds),
+          maxRetries: CCC_CAMPAIGN_WORK_ITEM_MAX_RETRIES,
         },
       }] : []),
       { id: "end", kind: "end" },
