@@ -14,10 +14,13 @@ import {
 } from "../ccc-campaign-proof-admission.js";
 
 /*
-M1 admits a multi-task product graph only when it is a single linear chain of
-tasks with disjoint ownership and unshared live-execution authority. These tests
-own that admission boundary: every refusal below is a shape the runtime cannot
-execute safely, and every admission below is a shape it can.
+The product route admits a multi-task graph only when it is a series-parallel
+(fork-join) task graph — one entry, one terminal, every fork reconverging on a
+single matching join — with disjoint ownership and unshared live-execution
+authority. Linear chains are the degenerate case and stay admitted exactly as
+M1 admitted them. These tests own that admission boundary: every refusal below
+is a shape the runtime cannot execute safely, and every admission below is a
+shape it can.
 
 Fixture shapes mirror ccc-prd-structural.test.ts's `proposal()` /
 `productProposal()` pair (same ids, custody-line style, import-intent set) so the
@@ -86,7 +89,7 @@ const requirementLines = ORDINALS.map((ordinal, index) => requirementLine(index 
 const deletionActionLine = `- Protected action: deletion ${target}/retired delete publish`;
 const liveActionLine = `- Protected action: live_execution ${target}/live-gate requires approval`;
 
-const productSource = [
+const sourceFor = (taskCustodyLines: readonly string[], taskRequirementLines: readonly string[]) => [
   "# Small packet",
   `- Target repository: ${target}`,
   `- Baseline commit: ${base}`,
@@ -96,11 +99,21 @@ const productSource = [
   "- Max duration ms: 30000",
   "- Max concurrency: 2",
   "- Non-goal: live execution",
-  ...custodyLines,
+  ...taskCustodyLines,
   deletionActionLine,
   liveActionLine,
-  ...requirementLines,
+  ...taskRequirementLines,
 ].join("\n");
+
+const productSource = sourceFor(custodyLines, requirementLines);
+
+// Four-task material for the fan-out/join shape: same line grammar as the
+// three-task packet, one more custody line and requirement each.
+const FAN_ORDINALS = ["first", "second", "third", "fourth"] as const;
+const FAN_OWNED = ["one", "two", "three", "four"] as const;
+const fanCustodyLines = FAN_OWNED.map(custodyLine);
+const fanRequirementLines = FAN_ORDINALS.map((ordinal, index) => requirementLine(index + 1, ordinal));
+const fanOutSource = sourceFor(fanCustodyLines, fanRequirementLines);
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -256,6 +269,131 @@ function threeTaskChainProposal() {
   };
 }
 
+/**
+ * TASK-1 -> {TASK-2, TASK-3} -> TASK-4: the smallest fork-join. One entry, one
+ * terminal, two parallel branches that reconverge, pairwise-disjoint ownership,
+ * and edges that mirror dependencyTaskIds exactly. This is the shape v0.3
+ * series-parallel campaigns are made of.
+ */
+function fanOutJoinProposal() {
+  const dependencyIdsFor = (index: number): string[] => {
+    if (index === 1) return [];
+    if (index === 4) return ["TASK-2", "TASK-3"];
+    return ["TASK-1"];
+  };
+  const taskFor = (index: number) => ({
+    id: `TASK-${index}`,
+    title: `${FAN_ORDINALS[index - 1]} task`,
+    description: `Implement ${FAN_ORDINALS[index - 1]} requirement`,
+    ownedPaths: [`tasks/${FAN_OWNED[index - 1]}`],
+    allowedWriteRoots: [`tasks/${FAN_OWNED[index - 1]}`],
+    accountableProducer: `worker-${index}`,
+    requirementIds: [`REQ-${index}`],
+    dependencyTaskIds: dependencyIdsFor(index),
+    proofIds: [`PROOF-${index}`],
+    workflowId: "WORKFLOW-1",
+    documentIds: index === 1 ? ["DOCUMENT-1"] : [],
+    artifactIds: index === 4 ? ["ARTIFACT-1"] : [],
+    // Live execution on the entry task, deletion on the join task; nothing
+    // is shared across branches.
+    protectedActionIds: index === 1 ? ["ACTION-2"] : index === 4 ? ["ACTION-1"] : [],
+    sourceRefs: [
+      ...ref(fanRequirementLines[index - 1]!),
+      ...ref(fanCustodyLines[index - 1]!),
+    ],
+  });
+
+  return {
+    schema: "ccc-prd.authoring-proposal.v1",
+    authorityRoles: [{
+      id: "authority-root",
+      role: "root",
+      sourcePaths: ["source.md"],
+      accountableProducer: "packet-owner",
+    }],
+    requirements: [4, 3, 2, 1].map((index) => ({
+      id: `REQ-${index}`,
+      statement: `${FAN_ORDINALS[index - 1]} requirement`,
+      acceptance: `${FAN_ORDINALS[index - 1]} proof passes`,
+      accountableProducer: `worker-${index}`,
+      dependencies: dependencyIdsFor(index).map((id) => id.replace("TASK-", "REQ-")),
+      proofIds: [`PROOF-${index}`],
+      sourceRefs: ref(fanRequirementLines[index - 1]!),
+      confidence: "high",
+    })),
+    proofs: [4, 3, 2, 1].map((index) => ({
+      id: `PROOF-${index}`,
+      requirementIds: [`REQ-${index}`],
+      command: `task prove:${FAN_ORDINALS[index - 1]}`,
+      positiveOracle: `exit 0 and ${FAN_ORDINALS[index - 1]} assertion observed`,
+      negativeControls: [`mutated ${FAN_ORDINALS[index - 1]} declaration refuses`],
+      sourceRefs: ref(fanRequirementLines[index - 1]!),
+      confidence: "high",
+    })),
+    tasks: [4, 3, 2, 1].map(taskFor),
+    edges: [
+      { id: "EDGE-1", fromTaskId: "TASK-2", toTaskId: "TASK-1", kind: "depends_on" },
+      { id: "EDGE-2", fromTaskId: "TASK-3", toTaskId: "TASK-1", kind: "depends_on" },
+      { id: "EDGE-3", fromTaskId: "TASK-4", toTaskId: "TASK-2", kind: "depends_on" },
+      { id: "EDGE-4", fromTaskId: "TASK-4", toTaskId: "TASK-3", kind: "depends_on" },
+    ],
+    workflows: [{
+      id: "WORKFLOW-1",
+      title: "Packet workflow",
+      taskIds: ["TASK-1", "TASK-2", "TASK-3", "TASK-4"],
+      entryTaskIds: ["TASK-1"],
+      terminalTaskIds: ["TASK-4"],
+      sourceRefs: ref("Small packet"),
+    }],
+    documents: [{
+      id: "DOCUMENT-1",
+      taskId: "TASK-1",
+      key: "plan",
+      title: "Plan",
+      content: "Implement the first requirement.",
+      sourceRefs: ref(fanRequirementLines[0]!),
+    }],
+    artifacts: [{
+      id: "ARTIFACT-1",
+      taskId: "TASK-4",
+      type: "proof",
+      title: "Fourth proof",
+      mimeType: "text/plain",
+      content: "task prove:fourth",
+      sourceRefs: ref(fanRequirementLines[3]!),
+    }],
+    importIntents: [
+      { id: "IMPORT-TASK-1", entityType: "task", entityId: "TASK-1", operation: "create", target: "project.tasks" },
+      { id: "IMPORT-TASK-2", entityType: "task", entityId: "TASK-2", operation: "create", target: "project.tasks" },
+      { id: "IMPORT-TASK-3", entityType: "task", entityId: "TASK-3", operation: "create", target: "project.tasks" },
+      { id: "IMPORT-TASK-4", entityType: "task", entityId: "TASK-4", operation: "create", target: "project.tasks" },
+      { id: "IMPORT-EDGE-1", entityType: "dependency_edge", entityId: "EDGE-1", operation: "create", target: "project.tasks.dependencies" },
+      { id: "IMPORT-EDGE-2", entityType: "dependency_edge", entityId: "EDGE-2", operation: "create", target: "project.tasks.dependencies" },
+      { id: "IMPORT-EDGE-3", entityType: "dependency_edge", entityId: "EDGE-3", operation: "create", target: "project.tasks.dependencies" },
+      { id: "IMPORT-EDGE-4", entityType: "dependency_edge", entityId: "EDGE-4", operation: "create", target: "project.tasks.dependencies" },
+      { id: "IMPORT-WORKFLOW", entityType: "workflow", entityId: "WORKFLOW-1", operation: "create", target: "project.workflow_work_items" },
+      { id: "IMPORT-WORK-ITEM", entityType: "work_item", entityId: "WORKFLOW-1", operation: "create", target: "project.workflow_work_items" },
+      { id: "IMPORT-DOCUMENT", entityType: "document", entityId: "DOCUMENT-1", operation: "create", target: "project.task_documents" },
+      { id: "IMPORT-ARTIFACT", entityType: "artifact", entityId: "ARTIFACT-1", operation: "create", target: "project.artifacts" },
+      { id: "IMPORT-CAMPAIGN", entityType: "campaign", entityId: "CAMPAIGN-1", operation: "create", target: "project.missions" },
+      { id: "IMPORT-SOURCE", entityType: "source", entityId: "SOURCE-1", operation: "create", target: "project.ccc_prd_import_sources" },
+      { id: "IMPORT-AUDIT", entityType: "run_audit", entityId: "CAMPAIGN-1", operation: "create", target: "project.run_audit_events" },
+    ],
+    protectedActions: [
+      { id: "ACTION-1", kind: "deletion", target: `${target}/retired`, sourceRefs: ref(deletionActionLine) },
+      { id: "ACTION-2", kind: "live_execution", target: `${target}/live-gate`, sourceRefs: ref(liveActionLine) },
+    ],
+    bounds: { maxRequests: 4, maxDurationMs: 30_000, maxConcurrency: 2 },
+    admittedWriteRoots: [{ path: `${target}/tasks`, purpose: "task projection" }],
+    targetRepository: { path: target, baseCommit: base },
+    nonGoals: ["live execution"],
+    unresolvedDecisions: [],
+    ambiguities: [],
+    exceptions: [],
+    confidence: "high",
+  };
+}
+
 /** TASK-1 -> TASK-2, with the third requirement dispositioned onto TASK-2. */
 function twoTaskChainProposal(): ReturnType<typeof threeTaskChainProposal> {
   const candidate = structuredClone(threeTaskChainProposal());
@@ -332,8 +470,9 @@ async function proofAdmissionRegistry(
 
 async function author(
   candidate: ReturnType<typeof threeTaskChainProposal>,
+  content = productSource,
 ): Promise<CompileInput> {
-  const input = packet();
+  const input = packet(content);
   const result = await ccc.authorCccPrdPacket({
     rootDir: input.root,
     manifestPath: input.manifestPath,
@@ -404,6 +543,44 @@ describe("ccc-prd multi-task product graph admission", () => {
     it("is deterministic across repeated compiles of the same chain", async () => {
       const input = await author(threeTaskChainProposal());
       expect(ccc.compileCccPrdPacket(input)).toEqual(ccc.compileCccPrdPacket(input));
+    });
+
+    it("compiles a two-branch fan-out/join graph", async () => {
+      const input = await author(fanOutJoinProposal(), fanOutSource);
+      const result = ccc.compileCccPrdPacket(input);
+      expect(result.kind, JSON.stringify(result.diagnostics)).toBe("bundle");
+      expect((result.tasks as Array<{ id: string }>).map(({ id }) => id))
+        .toEqual(["TASK-1", "TASK-2", "TASK-3", "TASK-4"]);
+      expect((result.edges as Array<{ id: string }>).map(({ id }) => id))
+        .toEqual(["EDGE-1", "EDGE-2", "EDGE-3", "EDGE-4"]);
+    });
+
+    it("is deterministic across repeated compiles of the same fan-out/join graph", async () => {
+      const input = await author(fanOutJoinProposal(), fanOutSource);
+      expect(ccc.compileCccPrdPacket(input)).toEqual(ccc.compileCccPrdPacket(input));
+    });
+
+    // Supersedes the former "refuses a diamond fan-out rather than a chain"
+    // posture: a transitive shortcut edge (TASK-1 -> TASK-3 alongside
+    // TASK-1 -> TASK-2 -> TASK-3) is a fork-join with one empty branch. The
+    // importer synthesizes exactly that split/join IR and core's
+    // validateParallelism admits it, so refusing it here would make admission
+    // stricter than the runtime for no safety reason. Deliberate decision:
+    // transitive shortcuts are admitted.
+    it("admits a transitive dependency shortcut as a fork-join with an empty branch", async () => {
+      const input = mutate(await author(threeTaskChainProposal()), (sidecar) => {
+        sidecar.tasks.find(({ id }) => id === "TASK-3")!.dependencyTaskIds = ["TASK-2", "TASK-1"];
+        sidecar.edges.push({ id: "EDGE-3", fromTaskId: "TASK-3", toTaskId: "TASK-1", kind: "depends_on" });
+        sidecar.importIntents.push({
+          id: "IMPORT-EDGE-3",
+          entityType: "dependency_edge",
+          entityId: "EDGE-3",
+          operation: "create",
+          target: "project.tasks.dependencies",
+        });
+      });
+      const result = ccc.compileCccPrdPacket(input);
+      expect(result.kind, JSON.stringify(result.diagnostics)).toBe("bundle");
     });
 
     // Per-task custody is required only once a chain has more than one task.
@@ -487,9 +664,13 @@ describe("ccc-prd multi-task product graph admission", () => {
         },
       },
       {
-        label: "a diamond fan-out rather than a chain",
+        // Supersedes "a diamond fan-out rather than a chain": this mutation
+        // makes TASK-2 and TASK-3 both depend on TASK-1 and nothing depend on
+        // them, so the fan-out never reconverges and the graph has two ends.
+        // Series-parallel admission still requires exactly one terminal.
+        label: "a fan-out whose branches never reconverge",
         expected: "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED",
-        names: ["TASK-1"],
+        names: ["TASK-2", "TASK-3"],
         mutator: (sidecar: MutableSidecar) => {
           sidecar.tasks.find(({ id }) => id === "TASK-3")!.dependencyTaskIds = ["TASK-1"];
           sidecar.edges.find(({ id }) => id === "EDGE-2")!.toTaskId = "TASK-1";
@@ -505,6 +686,18 @@ describe("ccc-prd multi-task product graph admission", () => {
           sidecar.importIntents = sidecar.importIntents.filter(
             ({ entityType }) => entityType !== "dependency_edge",
           );
+        },
+      },
+      {
+        // Previously refused implicitly by the exact N-1 relation count; the
+        // series-parallel rules must keep refusing it explicitly, or the
+        // persisted task row would carry a duplicated dependency the runtime
+        // never admitted.
+        label: "a dependency declared twice by the same task",
+        expected: "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED",
+        names: ["TASK-2"],
+        mutator: (sidecar: MutableSidecar) => {
+          sidecar.tasks.find(({ id }) => id === "TASK-2")!.dependencyTaskIds = ["TASK-1", "TASK-1"];
         },
       },
       {
@@ -573,6 +766,33 @@ describe("ccc-prd multi-task product graph admission", () => {
         .map(({ message }) => message)
         .join(" | ");
       for (const name of names) expect(named).toContain(name);
+    });
+
+    // A cross-link between two parallel branches (TASK-3 depending on TASK-2
+    // while both sit between the same fork and join) is not series-parallel:
+    // the synthesized split/join IR would fail core's validateParallelism at
+    // import time. Admission must refuse it first, legibly.
+    it("refuses a cross-link between parallel branches", async () => {
+      const input = mutate(await author(fanOutJoinProposal(), fanOutSource), (sidecar) => {
+        sidecar.tasks.find(({ id }) => id === "TASK-3")!.dependencyTaskIds = ["TASK-1", "TASK-2"];
+        sidecar.edges.push({ id: "EDGE-5", fromTaskId: "TASK-3", toTaskId: "TASK-2", kind: "depends_on" });
+        sidecar.importIntents.push({
+          id: "IMPORT-EDGE-5",
+          entityType: "dependency_edge",
+          entityId: "EDGE-5",
+          operation: "create",
+          target: "project.tasks.dependencies",
+        });
+      });
+      const diagnostics = diagnosticsFor(input);
+      const messages = diagnostics
+        .filter(({ code }) => code === "CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED")
+        .map(({ message }) => message)
+        .join(" | ");
+      expect(diagnostics.map(({ code }) => code)).toContain("CCC_PRD_PRODUCT_GRAPH_UNSUPPORTED");
+      expect(messages).toContain("series-parallel");
+      // Core names the fork whose branches fail to reconverge on one join.
+      expect(messages).toContain("split 'split:TASK-1' branches converge on more than one join");
     });
 
     // Once a chain has more than one task, each runs in its own isolated

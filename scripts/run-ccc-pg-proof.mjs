@@ -271,10 +271,16 @@ const expectedWave5CoreImportNames = [
   "CCC PRD import public surface > exports the import, inspection, and reconciliation entry points",
   "CCC PRD import public surface > uses canonical semantic content, not a fixed fixture literal, for bundle identity",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: imports explicit split join topology for a dependency diamond",
+  // Deliberate re-freeze (series-parallel fork-join campaigns): this shared
+  // inventory covers the wave-5 AND wave-6 runs of ccc-prd-import.pg.test.ts.
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 imports a fan-out join campaign: split join IR, proof barrier, and multi-predecessor dependencies",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > Task 6 RED: attaches each workflow transport route extension to its semantic prompt node",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 allocates durable native task ids without rewriting semantic custody",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 rolls native task allocation back with the importer transaction",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 RED: projects coding custody and a final proof barrier before human landing",
+  // Deliberate re-freeze repairing pre-existing main-side drift: this test
+  // landed in PR #34 (99634833f) without the matching inventory append.
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > campaign work items carry an explicit transient-retry budget on every executable node",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 CLI route projects stable adapter settings without persisted subscription readiness",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 activation schedules planning continuations through import and reconcile",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > product v2 refuses proof execution without one explicit integration terminal",

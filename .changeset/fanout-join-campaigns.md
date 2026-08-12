@@ -1,0 +1,7 @@
+---
+"@runfusion/fusion": minor
+---
+
+summary: CCC campaigns now run series-parallel task graphs: fork into parallel branches and join them back with a real merge.
+category: feature
+dev: Fan-in join tasks (more than one dependency predecessor) no longer refuse with "serial campaign execution requires exactly one". The executor builds a controller-owned join base branch (`fusion/<taskid>-ccc-join-base`) merging every predecessor's result branch in deterministic task-id order inside a disposable scratch worktree; predecessor branches are never mutated and a genuine merge conflict parks the work item manual-required with `ccc-permanent:CCC_CAMPAIGN_JOIN_MERGE_CONFLICT` (never auto-resolved), riding the campaign-needs-decision notification funnel. The required-commit fence verifies a join task against the join base tip and refuses when it lost any predecessor's campaign commit. Compiler admission replaces the linear-chain refusals with series-parallel validation delegated to the same core IR parallelism rules the importer enforces; non-series-parallel graphs (cross-links, unmatched splits, multiple terminals) still refuse loudly. Guided next-action now surfaces an issued live-execution approval before a claimed-but-unconsumed one, so concurrently parked branches cannot walk the operator in a circle. Single-predecessor chains are byte-identical. The product acceptance ledger grows 33 -> 35 with a two-branch fan-out/join campaign proven end to end (import, four per-task approvals, git join ancestry, one proof bound to the join commit).

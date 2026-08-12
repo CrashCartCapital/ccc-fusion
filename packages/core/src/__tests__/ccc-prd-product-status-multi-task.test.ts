@@ -334,4 +334,69 @@ describe("productNextAction multi-task live-execution holds", () => {
 
     expect(action.kind).not.toBe("approve-execution");
   });
+
+  /*
+  RED (fan-out): concurrent branches can leave one branch's approval CLAIMED
+  but unconsumed (its dispatch was aborted when the sibling branch parked)
+  while the sibling's approval is still ISSUED. Sorting purely by requestedAt
+  then guides the operator at the claimed approval forever — approve-execution
+  on it is an idempotent no-op replay, the resumed run re-parks on the
+  unapproved sibling, and the campaign livelocks. The actionable ISSUED
+  approval must outrank a claimed one regardless of issuance order.
+  */
+  it("guides at the ISSUED sibling approval, not an earlier claimed-but-unconsumed one", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [
+        approval({ id: "approval-1", taskId: "task-1", status: "consumed" }),
+        // Branch C parked first: approved by the operator, claimed by the
+        // runtime, then its dispatch was aborted before consumption.
+        approval({
+          id: "approval-3",
+          taskId: "task-3",
+          status: "claimed",
+          requestedAt: "2026-08-01T01:00:00.000Z",
+        }),
+        // Branch B is the one actually waiting on the operator.
+        approval({
+          id: "approval-2",
+          taskId: "task-2",
+          status: "issued",
+          requestedAt: "2026-08-01T01:00:01.000Z",
+        }),
+      ],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "approve-execution",
+      approvalRequestId: "approval-2",
+      approvalStatus: "issued",
+    });
+  });
+
+  it("still guides at the earliest claimed approval when nothing is issued (crash-recovery replay)", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [
+        approval({
+          id: "approval-3",
+          taskId: "task-3",
+          status: "claimed",
+          requestedAt: "2026-08-01T02:00:00.000Z",
+        }),
+        approval({
+          id: "approval-2",
+          taskId: "task-2",
+          status: "claimed",
+          requestedAt: "2026-08-01T01:00:00.000Z",
+        }),
+      ],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "approve-execution",
+      approvalRequestId: "approval-2",
+      approvalStatus: "claimed",
+    });
+  });
 });

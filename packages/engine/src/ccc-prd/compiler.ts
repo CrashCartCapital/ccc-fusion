@@ -12,6 +12,7 @@ import {
   createCccPrdSpanFromBytes,
   createRefusalBundle,
   normalizeProtectedAction,
+  parseWorkflowIr,
   type CccPrdDiagnostic,
   type CccPrdProof,
   type CccPrdRefusalBundle,
@@ -19,6 +20,9 @@ import {
   type CccPrdSidecar,
   type CccPrdSourceSpan,
   type CccPrdValidationResult,
+  type WorkflowIr,
+  type WorkflowIrEdge,
+  type WorkflowIrNode,
 } from "@fusion/core";
 import {
   CccPrdCustodyError,
@@ -502,18 +506,93 @@ function ownedPathsOverlap(left: string, right: string): boolean {
 }
 
 /**
- * M1 product-graph admission.
+ * Series-parallel topology admission, delegated to core.
  *
- * The supported product route runs a campaign as a strictly ordered sequence of
- * tasks, so it admits exactly one shape: a single declared workflow whose tasks
- * are all declared, referenced, and imported; with exactly one entry and one
- * terminal; ordered by a dependency relation that is a total order (a single
- * linear chain) and is mirrored exactly by the declared dependency edges; over
- * tasks whose owned paths never overlap and whose live-execution authority is
- * never shared.
+ * Mirrors the importer's split/join synthesis (nativeWorkflowIr in
+ * packages/core/src/ccc-prd/importer.ts): one node per task, a split node
+ * after every task with more than one successor, a join node before every
+ * task with more than one predecessor, dependency edges rewired through them.
+ * The synthesized shape is then run through core's `parseWorkflowIr`, whose
+ * `validateParallelism` is exactly the validator the importer's real IR must
+ * pass inside the import transaction. Delegating keeps a single definition of
+ * "series-parallel" and guarantees admission is at least as strict as import:
+ * a topology admitted here cannot later explode at import time as a
+ * WorkflowIrError.
  *
- * A one-task workflow with no edges is the degenerate chain and stays admitted
- * exactly as it was before multi-task support existed.
+ * Node ids are the task ids themselves (splits/joins as `split:<taskId>` /
+ * `join:<taskId>`) so a core refusal message names tasks legibly. Returns the
+ * core violation message, or undefined when the topology is series-parallel.
+ */
+function seriesParallelTopologyViolation(
+  taskIds: readonly string[],
+  successors: ReadonlyMap<string, readonly string[]>,
+  entryTaskId: string,
+  terminalTaskId: string,
+): string | undefined {
+  const predecessorCounts = new Map<string, number>(taskIds.map((id) => [id, 0]));
+  for (const targets of successors.values()) {
+    for (const to of targets) predecessorCounts.set(to, (predecessorCounts.get(to) ?? 0) + 1);
+  }
+  const splitTaskIds = new Set(taskIds.filter((id) => (successors.get(id)?.length ?? 0) > 1));
+  const joinTaskIds = new Set(taskIds.filter((id) => (predecessorCounts.get(id) ?? 0) > 1));
+  const splitNodeId = (taskId: string) => `split:${taskId}`;
+  const joinNodeId = (taskId: string) => `join:${taskId}`;
+
+  const nodes: WorkflowIrNode[] = [
+    { id: "start", kind: "start" },
+    ...taskIds.map((id): WorkflowIrNode => ({ id, kind: "prompt", config: { name: id } })),
+    ...[...splitTaskIds].map((id): WorkflowIrNode => ({ id: splitNodeId(id), kind: "split" })),
+    ...[...joinTaskIds].map((id): WorkflowIrNode => ({
+      id: joinNodeId(id),
+      kind: "join",
+      config: { mode: "all" },
+    })),
+    { id: "end", kind: "end" },
+  ];
+  const edges: WorkflowIrEdge[] = [{ from: "start", to: entryTaskId, condition: "success" }];
+  for (const [from, targets] of successors) {
+    for (const to of targets) {
+      edges.push({
+        from: splitTaskIds.has(from) ? splitNodeId(from) : from,
+        to: joinTaskIds.has(to) ? joinNodeId(to) : to,
+        condition: "success",
+      });
+    }
+  }
+  for (const id of splitTaskIds) edges.push({ from: id, to: splitNodeId(id), condition: "success" });
+  for (const id of joinTaskIds) edges.push({ from: joinNodeId(id), to: id, condition: "success" });
+  edges.push({ from: terminalTaskId, to: "end", condition: "success" });
+
+  const ir: WorkflowIr = {
+    version: "v2",
+    name: "ccc-prd-product-graph-admission",
+    columns: [],
+    nodes,
+    edges,
+  };
+  try {
+    parseWorkflowIr(ir);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/**
+ * Product-graph admission.
+ *
+ * The supported product route runs a campaign as a series-parallel (fork-join)
+ * task graph, so it admits: a single declared workflow whose tasks are all
+ * declared, referenced, and imported; with exactly one entry and one terminal;
+ * ordered by an acyclic dependency relation whose forks and joins are properly
+ * matched (validated against the same core semantics the importer's
+ * synthesized split/join IR must pass at import time) and that is mirrored
+ * exactly by the declared dependency edges; over tasks whose owned paths never
+ * overlap and whose live-execution authority is never shared.
+ *
+ * A one-task workflow with no edges is the degenerate graph and stays admitted
+ * exactly as it was before multi-task support existed, and every linear chain
+ * M1 admitted remains admitted unchanged.
  *
  * Two invariants here are not restatements of the generic reference checks
  * above, and both close real runtime holes:
@@ -706,79 +785,92 @@ function productGraphAdmissionDiagnostics(
   // reports positions that do not exist, so stop here instead.
   if (diagnostics.some(({ code }) => code === PRODUCT_GRAPH_UNSUPPORTED)) return diagnostics;
 
-  const dependencies = new Map(declaredTaskIds.map((id) => [
-    id,
-    declaredStrings(collections.tasks.get(id)!.dependencyTaskIds)
-      .filter((dependencyId) => collections.tasks.has(dependencyId)),
-  ]));
+  // A duplicated dependency declaration was previously refused implicitly by
+  // the exact N-1 relation count; series-parallel admission must keep refusing
+  // it explicitly, or the importer would persist a duplicated dependency row
+  // the runtime never admitted. Topology below runs on the distinct relation.
+  const duplicateDependencyDeclarers: string[] = [];
+  const dependencies = new Map(declaredTaskIds.map((id) => {
+    const declared = declaredStrings(collections.tasks.get(id)!.dependencyTaskIds)
+      .filter((dependencyId) => collections.tasks.has(dependencyId));
+    const distinct = [...new Set(declared)];
+    if (distinct.length !== declared.length) duplicateDependencyDeclarers.push(id);
+    return [id, distinct] as const;
+  }));
   const successors = new Map(declaredTaskIds.map((id) => [id, [] as string[]]));
-  let relationCount = 0;
   for (const [id, dependencyIds] of dependencies) {
-    relationCount += dependencyIds.length;
     for (const dependencyId of dependencyIds) successors.get(dependencyId)!.push(id);
   }
-
-  const branchingPredecessors = declaredTaskIds.filter((id) => dependencies.get(id)!.length > 1);
-  if (branchingPredecessors.length > 0) {
+  if (duplicateDependencyDeclarers.length > 0) {
     refuse(
       PRODUCT_GRAPH_UNSUPPORTED,
-      `tasks ${list(branchingPredecessors)} declare more than one predecessor; the supported product path admits only a single linear chain`,
-    );
-  }
-  const branchingSuccessors = declaredTaskIds.filter((id) => successors.get(id)!.length > 1);
-  if (branchingSuccessors.length > 0) {
-    refuse(
-      PRODUCT_GRAPH_UNSUPPORTED,
-      `tasks ${list(branchingSuccessors)} are the predecessor of more than one task; the supported product path admits only a single linear chain`,
-    );
-  }
-  if (relationCount !== declaredTaskIds.length - 1) {
-    refuse(
-      PRODUCT_GRAPH_UNSUPPORTED,
-      `a ${declaredTaskIds.length}-task chain requires exactly ${declaredTaskIds.length - 1} dependency relation(s); received ${relationCount}`,
+      `tasks ${list(duplicateDependencyDeclarers)} declare the same dependency more than once`,
     );
   }
 
-  const chainHeads = declaredTaskIds.filter((id) => dependencies.get(id)!.length === 0);
-  const chainTails = declaredTaskIds.filter((id) => successors.get(id)!.length === 0);
-  if (chainHeads.length !== 1) {
+  const graphHeads = declaredTaskIds.filter((id) => dependencies.get(id)!.length === 0);
+  const graphTails = declaredTaskIds.filter((id) => successors.get(id)!.length === 0);
+  if (graphHeads.length !== 1) {
     refuse(
       PRODUCT_GRAPH_UNSUPPORTED,
-      `the task dependency chain must start at exactly one task with no predecessor; received ${list(chainHeads)}`,
+      `the task dependency graph must start at exactly one task with no predecessor; received ${list(graphHeads)}`,
     );
-  } else if (entryTaskIds.length === 1 && entryTaskIds[0] !== chainHeads[0]) {
+  } else if (entryTaskIds.length === 1 && entryTaskIds[0] !== graphHeads[0]) {
     refuse(
       PRODUCT_GRAPH_UNSUPPORTED,
-      `workflow ${workflowId} declares entry task ${entryTaskIds[0]} but the dependency chain starts at ${chainHeads[0]}`,
+      `workflow ${workflowId} declares entry task ${entryTaskIds[0]} but the dependency graph starts at ${graphHeads[0]}`,
     );
   }
-  if (chainTails.length !== 1) {
+  if (graphTails.length !== 1) {
     refuse(
       PRODUCT_GRAPH_UNSUPPORTED,
-      `the task dependency chain must end at exactly one task with no successor; received ${list(chainTails)}`,
+      `the task dependency graph must end at exactly one task with no successor; received ${list(graphTails)}`,
     );
-  } else if (terminalTaskIds.length === 1 && terminalTaskIds[0] !== chainTails[0]) {
+  } else if (terminalTaskIds.length === 1 && terminalTaskIds[0] !== graphTails[0]) {
     refuse(
       PRODUCT_GRAPH_UNSUPPORTED,
-      `workflow ${workflowId} declares terminal task ${terminalTaskIds[0]} but the dependency chain ends at ${chainTails[0]}`,
+      `workflow ${workflowId} declares terminal task ${terminalTaskIds[0]} but the dependency graph ends at ${graphTails[0]}`,
     );
   }
 
-  // Walking the chain proves connectivity: disjoint chains satisfy every local
-  // count above. The visited guard keeps a cycle from looping forever here;
-  // the cycle itself is reported by the shared dependency-cycle check.
-  if (chainHeads.length === 1 && branchingSuccessors.length === 0) {
+  // Reachability from the single entry proves connectivity: disjoint
+  // components satisfy every local count above. The visited guard keeps a
+  // cycle from looping forever here; the cycle itself is reported by the
+  // shared dependency-cycle check.
+  if (graphHeads.length === 1) {
     const visited = new Set<string>();
-    let cursor: string | undefined = chainHeads[0];
-    while (cursor !== undefined && !visited.has(cursor)) {
+    const frontier: string[] = [graphHeads[0]!];
+    while (frontier.length > 0) {
+      const cursor = frontier.pop()!;
+      if (visited.has(cursor)) continue;
       visited.add(cursor);
-      cursor = successors.get(cursor)![0];
+      frontier.push(...successors.get(cursor)!);
     }
     const unreachable = declaredTaskIds.filter((id) => !visited.has(id));
     if (unreachable.length > 0) {
       refuse(
         PRODUCT_GRAPH_UNSUPPORTED,
-        `tasks ${list(unreachable)} are not reachable from entry task ${chainHeads[0]}`,
+        `tasks ${list(unreachable)} are not reachable from entry task ${graphHeads[0]}`,
+      );
+    }
+  }
+
+  // With the local counts sound, validate the fork-join structure itself by
+  // delegating to core (see seriesParallelTopologyViolation): every fork must
+  // reconverge on a single matching join, nested forks included. Skipped when
+  // an ordering diagnostic already fired above, because the synthesized shape
+  // of an unsound graph would only report positions that do not exist.
+  if (!diagnostics.some(({ code }) => code === PRODUCT_GRAPH_UNSUPPORTED)) {
+    const violation = seriesParallelTopologyViolation(
+      declaredTaskIds,
+      successors,
+      graphHeads[0]!,
+      graphTails[0]!,
+    );
+    if (violation !== undefined) {
+      refuse(
+        PRODUCT_GRAPH_UNSUPPORTED,
+        `the task dependency graph is not a supported series-parallel (fork-join) shape: ${violation}`,
       );
     }
   }

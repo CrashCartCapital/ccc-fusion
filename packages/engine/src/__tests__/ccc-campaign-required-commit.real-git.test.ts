@@ -12,6 +12,7 @@ import type {
   TaskStore,
   WorkflowIrNode,
 } from "@fusion/core";
+import { ensureCccCampaignJoinBaseBranch } from "../ccc-campaign-join-base.js";
 import { TaskExecutor } from "../executor.js";
 import type {
   WorkflowNodeExecutionContext,
@@ -662,7 +663,7 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     expect(await git(h.worktreeB, "diff", "--cached", "--name-only")).toBe("");
   });
 
-  it("refuses a campaign task that declares more than one dependency predecessor", async () => {
+  it("refuses a join successor whose declared predecessor row cannot be loaded", async () => {
     const h = await chainFixture();
     h.taskB.dependencies = [h.taskA.id, "TASK-chain-other"];
     await writeFile(join(h.worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
@@ -670,9 +671,254 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     await expect(runSuccessfulChainNode(h, h.taskB)).rejects.toMatchObject({
       name: "PermanentError",
       code: REFUSAL_CODE,
-      message: expect.stringContaining("exactly one"),
+      message: expect.stringContaining("TASK-chain-other"),
     });
     expect(await git(h.worktreeB, "rev-parse", "HEAD")).toBe(h.commitA);
+  });
+
+  /*
+   * Fan-in join tasks (series-parallel campaigns). A join task declares more
+   * than one dependency predecessor and its worktree starts from the merged
+   * join base branch the executor built (ccc-campaign-join-base.ts). The
+   * expected start commit is that join base tip — which must itself contain
+   * EVERY predecessor's campaign commit, or the campaign silently lost a
+   * branch's work.
+   */
+  type JoinFixture = {
+    baseCommit: string;
+    commitB: string;
+    commitC: string;
+    joinBranch: string;
+    joinTip: string;
+    rootDir: string;
+    store: TaskStore;
+    taskB: TaskDetail;
+    taskC: TaskDetail;
+    taskD: TaskDetail;
+    worktreeD: string;
+  };
+
+  async function joinFixture(): Promise<JoinFixture> {
+    const scratch = await mkdtemp(join(tmpdir(), "fusion-ccc-required-commit-join-"));
+    scratchRoots.push(scratch);
+    const rootDir = join(scratch, "target");
+    const worktreeB = join(scratch, "task-b-worktree");
+    const worktreeC = join(scratch, "task-c-worktree");
+    const worktreeD = join(scratch, "task-d-worktree");
+    const taskBId = "TASK-join-b";
+    const taskCId = "TASK-join-c";
+    const taskDId = "TASK-join-d";
+    const branchB = "fusion/task-join-b";
+    const branchC = "fusion/task-join-c";
+    const branchD = "fusion/task-join-d";
+
+    await mkdir(rootDir, { recursive: true });
+    await git(rootDir, "init", "-b", "main");
+    await git(rootDir, "config", "user.email", "test@example.com");
+    await git(rootDir, "config", "user.name", "Test User");
+    await writeFile(join(rootDir, "README.md"), "base\n", "utf8");
+    await git(rootDir, "add", "--", "README.md");
+    await git(rootDir, "commit", "-m", "base");
+    const baseCommit = await git(rootDir, "rev-parse", "HEAD");
+
+    // Two parallel branch tasks, each with its own campaign commit.
+    await git(rootDir, "worktree", "add", "-b", branchB, worktreeB, baseCommit);
+    await mkdir(join(worktreeB, "src", "task-b"), { recursive: true });
+    await writeFile(join(worktreeB, "src", "task-b", "result.txt"), "b\n", "utf8");
+    await git(worktreeB, "add", "--", "src/task-b/result.txt");
+    await git(worktreeB, "commit", "-m", `ccc-fusion campaign ${taskBId}`);
+    const commitB = await git(worktreeB, "rev-parse", "HEAD");
+
+    await git(rootDir, "worktree", "add", "-b", branchC, worktreeC, baseCommit);
+    await mkdir(join(worktreeC, "src", "task-c"), { recursive: true });
+    await writeFile(join(worktreeC, "src", "task-c", "result.txt"), "c\n", "utf8");
+    await git(worktreeC, "add", "--", "src/task-c/result.txt");
+    await git(worktreeC, "commit", "-m", `ccc-fusion campaign ${taskCId}`);
+    const commitC = await git(worktreeC, "rev-parse", "HEAD");
+
+    // The executor's join base: merge of both predecessor branches.
+    const joinBranch = await ensureCccCampaignJoinBaseBranch({
+      rootDir,
+      taskId: taskDId,
+      predecessors: [
+        { taskId: taskBId, branch: branchB },
+        { taskId: taskCId, branch: branchC },
+      ],
+    });
+    const joinTip = await git(rootDir, "rev-parse", `refs/heads/${joinBranch}`);
+
+    // The join task's worktree forks from the join base tip.
+    await git(rootDir, "worktree", "add", "-b", branchD, worktreeD, joinTip);
+    await mkdir(join(worktreeD, "src", "task-d"), { recursive: true });
+
+    const routeB = route(taskBId, "model", "src/task-b");
+    const routeC = route(taskCId, "model", "src/task-c");
+    const routeD = route(taskDId, "model", "src/task-d");
+    const policyRoutes = [routeB, routeC, routeD];
+
+    const common = {
+      steps: [],
+      currentStep: 0,
+      log: [],
+      baseCommitSha: baseCommit,
+      customFields: { cccFusionProfile: "ccc-fusion" },
+      createdAt: "2026-07-30T00:00:00.000Z",
+      updatedAt: "2026-07-30T00:00:00.000Z",
+    };
+    const taskB = {
+      ...common,
+      id: taskBId,
+      title: "Join predecessor B",
+      description: "First parallel branch task.",
+      column: "in-review",
+      lineageId: `ccc-prd:${CHAIN_IMPORT_ID}:${taskBId}`,
+      dependencies: [],
+      worktree: worktreeB,
+      branch: branchB,
+      modelProvider: routeB.providerId,
+      modelId: routeB.modelId,
+    } as TaskDetail;
+    const taskC = {
+      ...common,
+      id: taskCId,
+      title: "Join predecessor C",
+      description: "Second parallel branch task.",
+      column: "in-review",
+      lineageId: `ccc-prd:${CHAIN_IMPORT_ID}:${taskCId}`,
+      dependencies: [],
+      worktree: worktreeC,
+      branch: branchC,
+      modelProvider: routeC.providerId,
+      modelId: routeC.modelId,
+    } as TaskDetail;
+    const taskD = {
+      ...common,
+      id: taskDId,
+      title: "Join task",
+      description: "Fan-in join task depending on both branches.",
+      column: "in-progress",
+      lineageId: `ccc-prd:${CHAIN_IMPORT_ID}:${taskDId}`,
+      dependencies: [taskBId, taskCId],
+      worktree: worktreeD,
+      branch: branchD,
+      modelProvider: routeD.providerId,
+      modelId: routeD.modelId,
+    } as TaskDetail;
+
+    const tasks = new Map([[taskBId, taskB], [taskCId, taskC], [taskDId, taskD]]);
+    const contexts = new Map([
+      [taskBId, campaignContext(taskBId, rootDir, baseCommit, routeB, policyRoutes)],
+      [taskCId, campaignContext(taskCId, rootDir, baseCommit, routeC, policyRoutes)],
+      [taskDId, campaignContext(taskDId, rootDir, baseCommit, routeD, policyRoutes)],
+    ]);
+    const store = {
+      on: vi.fn(),
+      getTask: vi.fn(async (id: string) => tasks.get(id)),
+      getCccCampaignContextForTask: vi.fn(async (id: string) => contexts.get(id) ?? null),
+      assertCccCampaignWorkflowLeaseFence: vi.fn(async () => undefined),
+    } as unknown as TaskStore;
+
+    return {
+      baseCommit,
+      commitB,
+      commitC,
+      joinBranch,
+      joinTip,
+      rootDir,
+      store,
+      taskB,
+      taskC,
+      taskD,
+      worktreeD,
+    };
+  }
+
+  async function runSuccessfulJoinNode(
+    h: JoinFixture,
+    task: TaskDetail,
+  ): Promise<WorkflowNodeResult> {
+    const executor = new TaskExecutor(h.store, h.rootDir);
+    const successfulResult: WorkflowNodeResult = {
+      outcome: "success",
+      value: "passed",
+      contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
+    };
+    vi.spyOn(executor as never, "runGraphCustomNode" as never)
+      .mockResolvedValue(successfulResult as never);
+    return executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(
+      node("model"),
+      task,
+      {},
+      sealedExecutionContext(task),
+    );
+  }
+
+  it("commits a join successor's dirty change when its worktree starts at the merged join base", async () => {
+    const h = await joinFixture();
+    await writeFile(join(h.worktreeD, "src", "task-d", "result.txt"), "d\n", "utf8");
+
+    await expect(runSuccessfulJoinNode(h, h.taskD)).resolves.toEqual({
+      outcome: "success",
+      value: "passed",
+      contextPatch: { modifiedFiles: ["untrusted-node-projection.txt"] },
+    });
+
+    const joinHead = await git(h.worktreeD, "rev-parse", "HEAD");
+    expect(joinHead).not.toBe(h.joinTip);
+    expect(await git(h.worktreeD, "status", "--porcelain=v1")).toBe("");
+    // The join task's own commit changes only its own admitted root — the
+    // predecessors' work arrived through the join base merge, not this diff.
+    expect(
+      await git(
+        h.worktreeD,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        h.joinTip,
+        joinHead,
+      ),
+    ).toBe("src/task-d/result.txt");
+    // Both predecessors' campaign commits are ancestors of the join HEAD.
+    await git(h.worktreeD, "merge-base", "--is-ancestor", h.commitB, joinHead);
+    await git(h.worktreeD, "merge-base", "--is-ancestor", h.commitC, joinHead);
+  });
+
+  it("refuses a join successor that produced no campaign-created commit of its own", async () => {
+    const h = await joinFixture();
+
+    await expect(runSuccessfulJoinNode(h, h.taskD)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining("no campaign-created commit"),
+    });
+    expect(await git(h.worktreeD, "rev-parse", "HEAD")).toBe(h.joinTip);
+  });
+
+  it("refuses a join successor whose join base branch is unresolvable", async () => {
+    const h = await joinFixture();
+    await git(h.rootDir, "branch", "-D", h.joinBranch);
+    await writeFile(join(h.worktreeD, "src", "task-d", "result.txt"), "d\n", "utf8");
+
+    await expect(runSuccessfulJoinNode(h, h.taskD)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining(h.joinBranch),
+    });
+    expect(await git(h.worktreeD, "rev-parse", "HEAD")).toBe(h.joinTip);
+    expect(await git(h.worktreeD, "diff", "--cached", "--name-only")).toBe("");
+  });
+
+  it("refuses a join successor whose join base is missing a predecessor's campaign commit", async () => {
+    const h = await joinFixture();
+    // Corrupt the join base: point it at just one predecessor's tip.
+    await git(h.rootDir, "branch", "-f", h.joinBranch, h.commitB);
+    await writeFile(join(h.worktreeD, "src", "task-d", "result.txt"), "d\n", "utf8");
+
+    await expect(runSuccessfulJoinNode(h, h.taskD)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringContaining(h.taskC.id),
+    });
   });
 
   it("accepts the chain entry task against the frozen base", async () => {

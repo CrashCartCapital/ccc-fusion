@@ -156,6 +156,76 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
   }
 
+  /**
+   * TASK-<suffix> -> {TASK-<suffix>-B, TASK-<suffix>-C} -> TASK-terminal-<suffix>:
+   * the base two-task bundle reshaped into the smallest fan-out/join. Ids stay
+   * derivable from the suffix so tests can address every task without
+   * threading the bundle around.
+   */
+  function fanOutJoinBundle(suffix: string): CccPrdSemanticBundle {
+    const base = bundle(h.rootDir(), suffix);
+    const [taskA, taskD] = base.tasks;
+    expect(taskA).toBeDefined();
+    expect(taskD).toBeDefined();
+    const workflow = base.workflows[0]!;
+    const taskB = {
+      ...taskD!,
+      id: `TASK-${suffix}-B`,
+      title: "Diamond branch B",
+      description: "First parallel branch.",
+      dependencyTaskIds: [taskA!.id],
+      documentIds: [],
+      artifactIds: [],
+    };
+    const taskC = {
+      ...taskD!,
+      id: `TASK-${suffix}-C`,
+      title: "Diamond branch C",
+      description: "Second parallel branch.",
+      dependencyTaskIds: [taskA!.id],
+      documentIds: [],
+      artifactIds: [],
+    };
+    return rehashBundle({
+      ...base,
+      tasks: [
+        { ...taskA!, dependencyTaskIds: [] },
+        { ...taskB, workflowId: workflow.id },
+        { ...taskC, workflowId: workflow.id },
+        { ...taskD!, dependencyTaskIds: [taskB.id, taskC.id] },
+      ],
+      edges: [
+        { id: `EDGE-${suffix}-B-A`, fromTaskId: taskB.id, toTaskId: taskA!.id, kind: "depends_on" },
+        { id: `EDGE-${suffix}-C-A`, fromTaskId: taskC.id, toTaskId: taskA!.id, kind: "depends_on" },
+        { id: `EDGE-${suffix}-D-B`, fromTaskId: taskD!.id, toTaskId: taskB.id, kind: "depends_on" },
+        { id: `EDGE-${suffix}-D-C`, fromTaskId: taskD!.id, toTaskId: taskC.id, kind: "depends_on" },
+      ],
+      workflows: [{
+        ...workflow,
+        taskIds: [taskA!.id, taskB.id, taskC.id, taskD!.id],
+        entryTaskIds: [taskA!.id],
+        terminalTaskIds: [taskD!.id],
+      }],
+      importIntents: [
+        ...base.importIntents.filter((intent) => intent.entityType !== "task" && intent.entityType !== "dependency_edge"),
+        ...[taskA!.id, taskB.id, taskC.id, taskD!.id].map((entityId) => ({
+          id: entityId,
+          entityType: "task" as const,
+          entityId,
+          operation: "create" as const,
+          target: h.rootDir(),
+        })),
+        ...[`EDGE-${suffix}-B-A`, `EDGE-${suffix}-C-A`, `EDGE-${suffix}-D-B`, `EDGE-${suffix}-D-C`].map((entityId) => ({
+          id: entityId,
+          entityType: "dependency_edge" as const,
+          entityId,
+          operation: "create" as const,
+          target: h.rootDir(),
+        })),
+      ],
+    });
+  }
+
   async function assertNoExternalEffects() {
     const receiptRows = (await h.layer().db.execute(sql`
       SELECT count(*)::int AS count
@@ -467,74 +537,18 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it("Task 6 RED: imports explicit split join topology for a dependency diamond", async () => {
     const suffix = "task6-diamond";
     const key = "idem-task6-diamond";
-    const base = bundle(h.rootDir(), suffix);
-    const [taskA, taskD] = base.tasks;
-    expect(taskA).toBeDefined();
-    expect(taskD).toBeDefined();
-    const workflow = base.workflows[0]!;
-    const taskB = {
-      ...taskD!,
-      id: `TASK-${suffix}-B`,
-      title: "Diamond branch B",
-      description: "First parallel branch.",
-      dependencyTaskIds: [taskA!.id],
-      documentIds: [],
-      artifactIds: [],
-    };
-    const taskC = {
-      ...taskD!,
-      id: `TASK-${suffix}-C`,
-      title: "Diamond branch C",
-      description: "Second parallel branch.",
-      dependencyTaskIds: [taskA!.id],
-      documentIds: [],
-      artifactIds: [],
-    };
-    const diamond = rehashBundle({
-      ...base,
-      tasks: [
-        { ...taskA!, dependencyTaskIds: [] },
-        { ...taskB, workflowId: workflow.id },
-        { ...taskC, workflowId: workflow.id },
-        { ...taskD!, dependencyTaskIds: [taskB.id, taskC.id] },
-      ],
-      edges: [
-        { id: `EDGE-${suffix}-B-A`, fromTaskId: taskB.id, toTaskId: taskA!.id, kind: "depends_on" },
-        { id: `EDGE-${suffix}-C-A`, fromTaskId: taskC.id, toTaskId: taskA!.id, kind: "depends_on" },
-        { id: `EDGE-${suffix}-D-B`, fromTaskId: taskD!.id, toTaskId: taskB.id, kind: "depends_on" },
-        { id: `EDGE-${suffix}-D-C`, fromTaskId: taskD!.id, toTaskId: taskC.id, kind: "depends_on" },
-      ],
-      workflows: [{
-        ...workflow,
-        taskIds: [taskA!.id, taskB.id, taskC.id, taskD!.id],
-        entryTaskIds: [taskA!.id],
-        terminalTaskIds: [taskD!.id],
-      }],
-      importIntents: [
-        ...base.importIntents.filter((intent) => intent.entityType !== "task" && intent.entityType !== "dependency_edge"),
-        ...[taskA!.id, taskB.id, taskC.id, taskD!.id].map((entityId) => ({
-          id: entityId,
-          entityType: "task" as const,
-          entityId,
-          operation: "create" as const,
-          target: h.rootDir(),
-        })),
-        ...[`EDGE-${suffix}-B-A`, `EDGE-${suffix}-C-A`, `EDGE-${suffix}-D-B`, `EDGE-${suffix}-D-C`].map((entityId) => ({
-          id: entityId,
-          entityType: "dependency_edge" as const,
-          entityId,
-          operation: "create" as const,
-          target: h.rootDir(),
-        })),
-      ],
-    });
+    const diamond = fanOutJoinBundle(suffix);
+    const idA = `TASK-${suffix}`;
+    const idB = `TASK-${suffix}-B`;
+    const idC = `TASK-${suffix}-C`;
+    const idD = `TASK-terminal-${suffix}`;
 
     const imported = await importCccPrdBundle({
       ...request(suffix, key),
       bundle: diamond,
       executionPolicy: executionPolicy(diamond),
     });
-    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--${workflow.id}`);
+    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--WF-${suffix}`);
     const ir = stored?.ir as {
       version: string;
       columns: unknown[];
@@ -548,14 +562,88 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(ir.columns).toEqual([]);
     expect(split).toBeDefined();
     expect(join).toBeDefined();
-    expect(ir.edges).toContainEqual({ from: taskNodeId(taskA!.id), to: split!.id, condition: "success" });
-    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(taskB.id), condition: "success" });
-    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(taskC.id), condition: "success" });
-    expect(ir.edges).toContainEqual({ from: taskNodeId(taskB.id), to: join!.id, condition: "success" });
-    expect(ir.edges).toContainEqual({ from: taskNodeId(taskC.id), to: join!.id, condition: "success" });
-    expect(ir.edges).toContainEqual({ from: join!.id, to: taskNodeId(taskD!.id), condition: "success" });
-    expect(ir.edges).not.toContainEqual({ from: taskNodeId(taskB.id), to: taskNodeId(taskD!.id), condition: "success" });
-    expect(ir.edges).not.toContainEqual({ from: taskNodeId(taskC.id), to: taskNodeId(taskD!.id), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(idA), to: split!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(idB), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(idC), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(idB), to: join!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(idC), to: join!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: join!.id, to: taskNodeId(idD), condition: "success" });
+    expect(ir.edges).not.toContainEqual({ from: taskNodeId(idB), to: taskNodeId(idD), condition: "success" });
+    expect(ir.edges).not.toContainEqual({ from: taskNodeId(idC), to: taskNodeId(idD), condition: "success" });
+  });
+
+  it("product v2 imports a fan-out join campaign: split join IR, proof barrier, and multi-predecessor dependencies", async () => {
+    const suffix = "product-v2-fanout-join";
+    const key = "idem-product-v2-fanout-join";
+    const fanOut = fanOutJoinBundle(suffix);
+    const policy = productExecutionPolicy(fanOut);
+    const idA = `TASK-${suffix}`;
+    const idB = `TASK-${suffix}-B`;
+    const idC = `TASK-${suffix}-C`;
+    const idD = `TASK-terminal-${suffix}`;
+
+    const imported = await importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: fanOut,
+      executionPolicy: policy,
+    });
+
+    // Stored product IR: the fan-out is explicit split/join topology and the
+    // single terminal still lands on the proof suite barrier before end.
+    const stored = await h.store().getWorkflowDefinition(`${imported.importId}--WF-${suffix}`);
+    const ir = stored?.ir as {
+      version: string;
+      nodes: Array<{ id: string; kind: string; config?: Record<string, unknown> }>;
+      edges: Array<{ from: string; to: string }>;
+    };
+    const taskNodeId = (taskId: string) => `ccc-task-${createHash("sha256").update(taskId).digest("hex").slice(0, 24)}`;
+    const split = ir.nodes.find((node) => node.kind === "split");
+    const join = ir.nodes.find((node) => node.kind === "join");
+    const proofGate = ir.nodes.find((node) => node.kind === "gate" && node.config?.cccProofSuite === true);
+    expect(split).toMatchObject({ config: { cccPrdTaskId: idA } });
+    expect(join).toMatchObject({ config: { mode: "all", cccPrdTaskId: idD } });
+    expect(proofGate).toBeDefined();
+    expect(ir.edges).toContainEqual({ from: "start", to: taskNodeId(idA), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(idA), to: split!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(idB), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: split!.id, to: taskNodeId(idC), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(idB), to: join!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(idC), to: join!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: join!.id, to: taskNodeId(idD), condition: "success" });
+    expect(ir.edges).toContainEqual({ from: taskNodeId(idD), to: proofGate!.id, condition: "success" });
+    expect(ir.edges).toContainEqual({ from: proofGate!.id, to: "end", condition: "success" });
+    expect(ir.edges).not.toContainEqual({ from: taskNodeId(idB), to: taskNodeId(idD), condition: "success" });
+    expect(ir.edges).not.toContainEqual({ from: taskNodeId(idC), to: taskNodeId(idD), condition: "success" });
+
+    // The join task's native row persists BOTH predecessors: this is the
+    // dependency shape the runtime's chained-start resolution reads.
+    const taskEntities = (await h.layer().db.execute(sql`
+      SELECT entity_id, native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${imported.importId}
+        AND entity_type = 'task'
+      ORDER BY ordinal
+    `)) as unknown as Array<{ entity_id: string; native_id: string }>;
+    const nativeBySemantic = new Map(
+      taskEntities.map(({ entity_id, native_id }) => [entity_id, native_id]),
+    );
+    expect([...nativeBySemantic.keys()].sort()).toEqual([idA, idB, idC, idD].sort());
+    await expect(h.store().getTask(nativeBySemantic.get(idD)!)).resolves.toMatchObject({
+      dependencies: [nativeBySemantic.get(idB)!, nativeBySemantic.get(idC)!],
+    });
+    await expect(h.store().getTask(nativeBySemantic.get(idB)!)).resolves.toMatchObject({
+      dependencies: [nativeBySemantic.get(idA)!],
+    });
+    await expect(h.store().getTask(nativeBySemantic.get(idC)!)).resolves.toMatchObject({
+      dependencies: [nativeBySemantic.get(idA)!],
+    });
+
+    // One held work item, entering at the fan-out's entry task.
+    await expect(h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-${suffix}`,
+    )).resolves.toMatchObject({
+      taskId: nativeBySemantic.get(idA)!,
+    });
   });
 
   it("Task 6 RED: attaches each workflow transport route extension to its semantic prompt node", async () => {

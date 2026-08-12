@@ -7,6 +7,7 @@ import type {
   TaskDetail,
   TaskStore,
 } from "@fusion/core";
+import { cccCampaignJoinBaseBranchName } from "./ccc-campaign-join-base.js";
 import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
 import type {
@@ -483,14 +484,17 @@ HEAD off the frozen base). Every such comparison must use the task's OWN start.
 */
 type ExpectedStartCommit = Readonly<{
   commit: string;
-  reference: "frozen-base" | "predecessor-commit";
+  reference: "frozen-base" | "predecessor-commit" | "join-base-commit";
   predecessorTaskId?: string;
+  predecessorTaskIds?: readonly string[];
 }>;
 
 function describeExpectedStart(expected: ExpectedStartCommit): string {
-  return expected.reference === "frozen-base"
-    ? "the frozen campaign base"
-    : `the campaign commit of dependency predecessor ${expected.predecessorTaskId}`;
+  if (expected.reference === "frozen-base") return "the frozen campaign base";
+  if (expected.reference === "join-base-commit") {
+    return `the merged join base of dependency predecessors ${(expected.predecessorTaskIds ?? []).join(", ")}`;
+  }
+  return `the campaign commit of dependency predecessor ${expected.predecessorTaskId}`;
 }
 
 function expectedStartDetails(
@@ -502,6 +506,9 @@ function expectedStartDetails(
     ...(expected.predecessorTaskId === undefined
       ? {}
       : { predecessorTaskId: expected.predecessorTaskId }),
+    ...(expected.predecessorTaskIds === undefined
+      ? {}
+      : { predecessorTaskIds: [...expected.predecessorTaskIds] }),
   };
 }
 
@@ -573,7 +580,36 @@ async function derivePredecessorCampaignCommit(
   );
 }
 
-/** Mirrors the executor's chain gating exactly (executor.ts:9272-9299). */
+/** True when `base` is an ancestor of `head`, without refusing on its own. */
+async function optionalIsAncestor(
+  cwd: string,
+  base: string,
+  head: string,
+): Promise<boolean> {
+  try {
+    await execFile(
+      "git",
+      ["-C", cwd, ...CONTROLLER_GIT_CONFIG, "merge-base", "--is-ancestor", base, head],
+      {
+        env: scrubGitEnvironment(),
+        maxBuffer: MAX_GIT_OUTPUT_BYTES,
+        timeout: GIT_TIMEOUT_MS,
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Mirrors the executor's chain gating exactly (resolveCccCampaignChainedStartBranch):
+ * a single predecessor starts at that predecessor's campaign commit; a fan-in
+ * join task starts at the controller-owned join base branch that merged every
+ * predecessor branch (ccc-campaign-join-base.ts) — and that join base must
+ * still contain every predecessor's campaign commit, or a branch's work was
+ * silently lost before the join task ran.
+ */
 async function resolveExpectedStartCommit(
   store: RequiredCommitStore,
   targetRoot: string,
@@ -589,10 +625,50 @@ async function resolveExpectedStartCommit(
     typeof id === "string" && id.length > 0);
   if (dependencies.length === 0) return frozenStart;
   if (dependencies.length > 1) {
-    refusal(
-      `CCC campaign required-commit task ${task.id} declares ${dependencies.length} dependency predecessors (${dependencies.join(", ")}); serial campaign execution requires exactly one`,
-      { taskId: task.id, dependencies },
-    );
+    const predecessorTaskIds = [...dependencies].sort();
+    const predecessors: TaskDetail[] = [];
+    for (const predecessorTaskId of predecessorTaskIds) {
+      const predecessor = await store.getTask(predecessorTaskId).catch(() => undefined);
+      if (!predecessor || predecessor.id !== predecessorTaskId) {
+        refusal(
+          `CCC campaign required-commit task ${task.id} cannot load its dependency predecessor ${predecessorTaskId}`,
+          { taskId: task.id, predecessorTaskId },
+        );
+      }
+      predecessors.push(predecessor);
+    }
+    const joinBranch = cccCampaignJoinBaseBranchName(task.id);
+    const joinTip = await optionalGitObject(targetRoot, `refs/heads/${joinBranch}`);
+    if (joinTip === null) {
+      refusal(
+        `CCC campaign required-commit task ${task.id} declares ${dependencies.length} dependency predecessors but its join base branch "${joinBranch}" is unresolvable`,
+        { taskId: task.id, joinBranch, predecessorTaskIds },
+      );
+    }
+    for (const predecessor of predecessors) {
+      const predecessorCommit = await derivePredecessorCampaignCommit(
+        targetRoot,
+        task.id,
+        predecessor,
+      );
+      if (!(await optionalIsAncestor(targetRoot, predecessorCommit, joinTip))) {
+        refusal(
+          `CCC campaign required-commit task ${task.id} join base "${joinBranch}" does not contain the campaign commit of dependency predecessor ${predecessor.id}`,
+          {
+            taskId: task.id,
+            joinBranch,
+            joinTip,
+            predecessorTaskId: predecessor.id,
+            predecessorCommit,
+          },
+        );
+      }
+    }
+    return {
+      commit: joinTip,
+      reference: "join-base-commit",
+      predecessorTaskIds,
+    };
   }
   const predecessorTaskId = dependencies[0]!;
   const predecessor = await store.getTask(predecessorTaskId).catch(() => undefined);
