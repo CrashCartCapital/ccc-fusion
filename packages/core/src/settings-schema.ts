@@ -174,6 +174,15 @@ export const DEFAULT_GLOBAL_SETTINGS = {
     "fallback-used",
     "memory-dreams-processed",
     "token-budget",
+    /*
+    FNXC:CampaignNotifications 2026-08-11-00:00:
+    getSettings() merges these defaults, so the effective ntfy allowlist is this
+    concrete list, not the engine's DEFAULT_NTFY_EVENTS fallback. Without these
+    two entries the CCC campaign operator pings would be dead on arrival for a
+    stock config that merely enables ntfy + topic.
+    */
+    "campaign-needs-decision",
+    "campaign-failed",
   ],
   ntfyDashboardHost: undefined,
   taskTokenBudget: undefined,

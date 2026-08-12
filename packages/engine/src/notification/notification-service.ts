@@ -9,6 +9,7 @@ import type {
   NotificationProvider,
   Settings,
   Task,
+  WorkflowWorkItem,
 } from "@fusion/core";
 import { DASHBOARD_USER_ID, NotificationDispatcher } from "@fusion/core";
 import { DEFAULT_NTFY_EVENTS, buildNtfyClickUrl, formatTaskIdentifier } from "../notifier.js";
@@ -17,6 +18,7 @@ import { classifyTransientMergeError } from "../transient-merge-error-classifier
 import { NtfyNotificationProvider } from "./ntfy-provider.js";
 import { WebhookNotificationProvider } from "./webhook-provider.js";
 import { describeTaskWedge, type TaskWedgeDescriptor } from "./task-wedge-notification.js";
+import { classifyCccCampaignWorkItemNotification } from "./campaign-work-item-notifications.js";
 
 export interface NotificationServiceOptions {
   /** Project identifier for notification deep links */
@@ -39,6 +41,9 @@ interface NotificationServiceStoreEvents {
   "task:updated": [task: Task];
   "task:merged": [result: MergeResult];
   "settings:updated": [payload: { settings: Settings; previous: Settings }];
+  // FNXC:CampaignNotifications 2026-08-11-00:00: store-level funnel for CCC
+  // campaign parks and terminal failures (see campaign-work-item-notifications.ts).
+  "workitem:transitioned": [workItem: WorkflowWorkItem];
 }
 
 interface NotificationServiceStore {
@@ -147,6 +152,7 @@ export class NotificationService {
     this.store.on("task:updated", this.handleTaskUpdated);
     this.store.on("task:merged", this.handleTaskMerged);
     this.store.on("settings:updated", this.handleSettingsUpdated);
+    this.store.on("workitem:transitioned", this.handleWorkItemTransitioned);
     this.options.messageStore?.on("message:sent", this.handleMessageSent);
     this.started = true;
     this.chatStore?.on("chat:room:message:added", this.handleRoomMessageAdded);
@@ -164,6 +170,7 @@ export class NotificationService {
       this.store.off("task:updated", this.handleTaskUpdated);
       this.store.off("task:merged", this.handleTaskMerged);
       this.store.off("settings:updated", this.handleSettingsUpdated);
+      this.store.off("workitem:transitioned", this.handleWorkItemTransitioned);
       if (typeof this.options.messageStore?.off === "function") {
         this.options.messageStore.off("message:sent", this.handleMessageSent);
       }
@@ -548,6 +555,50 @@ export class NotificationService {
       this.createTaskPayload(result.task, "merged"),
     );
   };
+
+  private handleWorkItemTransitioned = (workItem: WorkflowWorkItem): void => {
+    void this.handleWorkItemTransitionedAsync(workItem);
+  };
+
+  /*
+  FNXC:CampaignNotifications 2026-08-11-00:00:
+  The two CCC campaign operator pings (operator decision, 2026-08-11 audit,
+  Lane A), fed by the store-level `workitem:transitioned` funnel:
+    - campaign-needs-decision: manual-required park with a ccc-* reason
+      (startup recovery, provider-dispatch permanent parks, merge-approval waits).
+    - campaign-failed: terminal failed/exhausted campaign work.
+  Payloads are machine facts only — identifiers, state, attempt, and the
+  bounded ccc reason code. Never prompt text, receipts content, or arbitrary
+  error strings (run-audit metadata rules apply to notification payloads too).
+  The dedupe key is work item + state, so re-parks/replays of the same state
+  never re-ping through the existing once-only dispatch machinery.
+  */
+  private async handleWorkItemTransitionedAsync(workItem: WorkflowWorkItem): Promise<void> {
+    const notification = classifyCccCampaignWorkItemNotification(workItem);
+    if (!notification) {
+      return;
+    }
+
+    if (!this.notificationsEnabled) {
+      await this.refreshNotificationState("workitem:transitioned");
+      if (!this.notificationsEnabled) {
+        return;
+      }
+    }
+
+    this.maybeNotify(workItem.taskId, notification.event, {
+      taskId: workItem.taskId,
+      event: notification.event,
+      metadata: {
+        notificationDedupeKey: `ccc-campaign:${workItem.id}:${workItem.state}`,
+        workItemId: workItem.id,
+        runId: workItem.runId,
+        state: workItem.state,
+        attempt: workItem.attempt,
+        ...(notification.reasonCode ? { reasonCode: notification.reasonCode } : {}),
+      },
+    });
+  }
 
   private handleSettingsUpdated = async (data: { settings: Settings; previous: Settings }): Promise<void> => {
     const { settings, previous } = data;

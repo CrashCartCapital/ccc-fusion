@@ -161,6 +161,10 @@ describe("NotificationDispatcher", () => {
       "fallback-used",
       "memory-dreams-processed",
       "token-budget",
+      // FNXC:CampaignNotifications 2026-08-11-00:00: deliberate default addition —
+      // the two CCC campaign operator pings must deliver on a stock ntfy config.
+      "campaign-needs-decision",
+      "campaign-failed",
     ]);
     expect(DEFAULT_GLOBAL_SETTINGS.notificationProviders).toEqual([]);
     expect(DEFAULT_GLOBAL_SETTINGS.failureNotificationDelayMs).toBe(30000);

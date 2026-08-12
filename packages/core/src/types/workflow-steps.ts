@@ -109,7 +109,17 @@ export type NtfyNotificationEvent =
   | "message:room"
   | "oauth-token-expired"
   | "task-created"
-  | "workflow-notify";
+  | "workflow-notify"
+  /*
+   * FNXC:CampaignNotifications 2026-08-11-00:00:
+   * CCC campaign operator pings (2026-08-11 audit, Lane A): a campaign work item
+   * parked manual-required with a ccc-* reason needs an operator decision; a
+   * campaign work item reaching terminal failed/exhausted needs operator triage.
+   * Exactly these two events by operator decision — payloads carry machine facts
+   * only (identifiers, state, bounded ccc reason code).
+   */
+  | "campaign-needs-decision"
+  | "campaign-failed";
 
 /** Known notification event types. Providers may support additional custom events. */
 export const NOTIFICATION_EVENTS = [
@@ -137,6 +147,9 @@ export const NOTIFICATION_EVENTS = [
   "oauth-token-expired",
   "task-created",
   "workflow-notify",
+  // FNXC:CampaignNotifications 2026-08-11-00:00: the two CCC campaign operator pings.
+  "campaign-needs-decision",
+  "campaign-failed",
 ] as const;
 
 /** Notification event type. Known events plus provider-specific custom events. */
