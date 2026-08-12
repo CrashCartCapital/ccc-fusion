@@ -193,6 +193,95 @@ describe("CCC campaign chained task worktree base", () => {
     expect(capturedStartPoint(createWorktree)).not.toBe("fusion/fn-2001");
     expect(createWorktree).toHaveBeenCalledTimes(1);
   });
+
+  /*
+   * Fan-in join tasks (series-parallel campaigns). A join task declares more
+   * than one dependency predecessor; its worktree must start from a
+   * controller-owned branch that merges EVERY predecessor's result branch
+   * (deterministic order), or the campaign proof gate's per-task ancestry loop
+   * refuses the whole campaign. The merge mechanics live in
+   * ccc-campaign-join-base.ts (real-git tested); here the executor's CHOICE is
+   * pinned: which branch it asks for, in what predecessor order, and that the
+   * join base becomes the worktree start point.
+   */
+  function mockJoinBase(executor: TaskExecutor): ReturnType<typeof vi.fn> {
+    const ensureJoinBase = vi.fn(async (task: { id: string }) =>
+      `fusion/${task.id.toLowerCase()}-ccc-join-base`);
+    (executor as never as { ensureCccCampaignJoinBaseBranch: unknown })
+      .ensureCccCampaignJoinBaseBranch = ensureJoinBase;
+    return ensureJoinBase;
+  }
+
+  it("creates a join task's worktree from the merged join base of its predecessors", async () => {
+    const { store, executor, createWorktree } = makeHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-B"),
+        branch: "fusion/fn-1001",
+        column: "in-review",
+      }),
+      "FN-1003": taskRow({
+        lineageId: campaignLineage("TASK-C"),
+        branch: "fusion/fn-1003",
+        column: "in-review",
+      }),
+      "FN-1004": taskRow({
+        lineageId: campaignLineage("TASK-D"),
+        // Deliberately unsorted: the executor must order by task id.
+        dependencies: ["FN-1003", "FN-1001"],
+      }),
+    }, ["fusion/fn-1001", "fusion/fn-1003", "main"]);
+    const ensureJoinBase = mockJoinBase(executor);
+
+    await prepare(executor, store, codingNode("TASK-D"), "FN-1004");
+
+    expect(capturedStartPoint(createWorktree)).toBe("fusion/fn-1004-ccc-join-base");
+    expect(ensureJoinBase).toHaveBeenCalledTimes(1);
+    expect(ensureJoinBase.mock.calls[0]![1]).toEqual([
+      { taskId: "FN-1001", branch: "fusion/fn-1001" },
+      { taskId: "FN-1003", branch: "fusion/fn-1003" },
+    ]);
+  });
+
+  it("refuses a join task when any predecessor working branch is unresolvable", async () => {
+    const { store, executor, createWorktree } = makeHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-B"),
+        branch: "fusion/fn-1001",
+      }),
+      "FN-1003": taskRow({
+        lineageId: campaignLineage("TASK-C"),
+        branch: "fusion/fn-1003",
+      }),
+      "FN-1004": taskRow({
+        lineageId: campaignLineage("TASK-D"),
+        dependencies: ["FN-1001", "FN-1003"],
+      }),
+    }, ["fusion/fn-1001", "main"]); // FN-1003's branch is absent
+    const ensureJoinBase = mockJoinBase(executor);
+
+    await expect(prepare(executor, store, codingNode("TASK-D"), "FN-1004"))
+      .rejects.toThrow(/FN-1003/);
+    expect(ensureJoinBase).not.toHaveBeenCalled();
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
+
+  it("refuses a join task when a predecessor row cannot be loaded", async () => {
+    const { store, executor, createWorktree } = makeHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-B"),
+        branch: "fusion/fn-1001",
+      }),
+      "FN-1004": taskRow({
+        lineageId: campaignLineage("TASK-D"),
+        dependencies: ["FN-1001", "FN-9999"],
+      }),
+    }, ["fusion/fn-1001", "main"]);
+    mockJoinBase(executor);
+
+    await expect(prepare(executor, store, codingNode("TASK-D"), "FN-1004"))
+      .rejects.toThrow(/FN-9999/);
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
 });
 
 /**
@@ -323,5 +412,37 @@ describe("CCC campaign chained task worktree creation base", () => {
 
     expect(capturedCreationBase(tryCreateWorktree)).toBe(FROZEN_BASE);
     expect(squashImportDepIntoWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  it("forks a join campaign task directly from its merged join base", async () => {
+    // Same ancestry rule as the single-predecessor chain: squash-importing or
+    // rebasing the merged join base replays predecessor commits under new SHAs
+    // and breaks `merge-base --is-ancestor` for BOTH branches at once.
+    const joinBase = "fusion/fn-4003-ccc-join-base";
+    const { executor, tryCreateWorktree, squashImportDepIntoWorktree, rebaseNewWorktreeOntoRemote } = makeSquashHarness({
+      "FN-4001": taskRow({
+        lineageId: campaignLineage("TASK-B"),
+        branch: "fusion/fn-4001",
+        column: "in-review",
+      }),
+      "FN-4002": taskRow({
+        lineageId: campaignLineage("TASK-C"),
+        branch: "fusion/fn-4002",
+        column: "in-review",
+      }),
+      "FN-4003": taskRow({
+        lineageId: campaignLineage("TASK-D"),
+        dependencies: ["FN-4001", "FN-4002"],
+      }),
+    }, ["fusion/fn-4001", "fusion/fn-4002", joinBase, "main"]);
+    const ensureJoinBase = vi.fn(async () => joinBase);
+    (executor as never as { ensureCccCampaignJoinBaseBranch: unknown })
+      .ensureCccCampaignJoinBaseBranch = ensureJoinBase;
+
+    await createWorktreeFor(executor, "FN-4003", "fusion/fn-4003", joinBase);
+
+    expect(capturedCreationBase(tryCreateWorktree)).toBe(`sha-for-${joinBase}`);
+    expect(squashImportDepIntoWorktree).not.toHaveBeenCalled();
+    expect(rebaseNewWorktreeOntoRemote).not.toHaveBeenCalled();
   });
 });

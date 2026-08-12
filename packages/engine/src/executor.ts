@@ -118,6 +118,10 @@ import {
   VERIFICATION_LOG_MAX_CHARS,
   type VerificationResult,
 } from "./verification-utils.js";
+import {
+  ensureCccCampaignJoinBaseBranch,
+  type CccCampaignJoinBasePredecessor,
+} from "./ccc-campaign-join-base.js";
 import { canonicalFusionBranchName, canonicalStepInstanceBranchName, generateWorktreeName, resolveTaskWorkingBranch } from "./worktree-names.js";
 import { resolveTaskWorktreePath, resolveWorktreesDir } from "./worktree-paths.js";
 import { Type, type Static } from "@earendil-works/pi-ai";
@@ -9275,10 +9279,36 @@ export class TaskExecutor {
       typeof id === "string" && id.length > 0);
     if (dependencies.length === 0) return null;
     if (dependencies.length > 1) {
-      throw new PermanentError(
-        `CCC campaign task ${task.id} declares ${dependencies.length} dependency predecessors (${dependencies.join(", ")}); serial campaign execution requires exactly one`,
-        "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
-      );
+      /*
+      FNXC:CccCampaignJoinWorktrees 2026-08-12-00:00:
+      A fan-in join task (series-parallel campaign) starts from a controller-owned
+      branch that merges EVERY predecessor's result branch — starting from any single
+      predecessor drops the sibling branches' history and the campaign proof gate's
+      per-task ancestry loop refuses the whole campaign at proof time. Predecessors
+      are ordered by native task id so the merge is deterministic across retries and
+      crash-resume; the merge itself (scratch worktree, conflict refusal, idempotent
+      reuse) lives in ccc-campaign-join-base.ts.
+      */
+      const orderedPredecessorIds = [...dependencies].sort();
+      const predecessors: CccCampaignJoinBasePredecessor[] = [];
+      for (const predecessorId of orderedPredecessorIds) {
+        const predecessor = await this.store.getTask(predecessorId).catch(() => null);
+        if (!predecessor) {
+          throw new PermanentError(
+            `CCC campaign task ${task.id} cannot load its dependency predecessor ${predecessorId}`,
+            "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+          );
+        }
+        const predecessorBranch = resolveTaskWorkingBranch(predecessor);
+        if (await this.resolveWorktreeStartPoint(predecessorBranch, task.id) === null) {
+          throw new PermanentError(
+            `CCC campaign task ${task.id} predecessor ${predecessorId} has no resolvable working branch "${predecessorBranch}"`,
+            "CCC_CAMPAIGN_CHAINED_WORKTREE_REFUSED",
+          );
+        }
+        predecessors.push({ taskId: predecessorId, branch: predecessorBranch });
+      }
+      return await this.ensureCccCampaignJoinBaseBranch(task, predecessors);
     }
     const predecessorId = dependencies[0]!;
     const predecessor = await this.store.getTask(predecessorId).catch(() => null);
@@ -9296,6 +9326,21 @@ export class TaskExecutor {
       );
     }
     return branch;
+  }
+
+  /**
+   * Thin seam over the join-base merge mechanics so worktree-choice unit tests
+   * can pin the executor's decision without shelling out to git.
+   */
+  private async ensureCccCampaignJoinBaseBranch(
+    task: TaskDetail,
+    predecessors: readonly CccCampaignJoinBasePredecessor[],
+  ): Promise<string> {
+    return await ensureCccCampaignJoinBaseBranch({
+      rootDir: this.rootDir,
+      taskId: task.id,
+      predecessors,
+    });
   }
 
   private async prepareGraphNodeExecution(
