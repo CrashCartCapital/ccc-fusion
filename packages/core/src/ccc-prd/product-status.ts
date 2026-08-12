@@ -860,13 +860,20 @@ export function productNextAction(
     degraded to `blocked` while a claimable approval was sitting unclaimed. Match on the
     approval's own identity instead and surface the earliest unconsumed one, so the operator is
     walked through the holds in the order the runtime issued them.
+
+    An ISSUED approval always outranks a CLAIMED one. Concurrent fan-out branches can leave one
+    branch's approval claimed but unconsumed (its dispatch was aborted when the sibling branch
+    parked); approve-execution on that claimed approval is an idempotent replay, so guiding at it
+    while a sibling still waits ISSUED walks the operator in a circle. Claimed-only guidance
+    remains for crash recovery, where the replay is exactly what re-queues the work item.
     */
     const approval = input.approvals
       .filter((candidate) =>
         input.liveExecutionActionIds.has(candidate.actionId)
         && (candidate.status === "issued" || candidate.status === "claimed"))
       .sort((left, right) =>
-        left.requestedAt.localeCompare(right.requestedAt)
+        Number(left.status === "claimed") - Number(right.status === "claimed")
+        || left.requestedAt.localeCompare(right.requestedAt)
         || left.createdAt.localeCompare(right.createdAt)
         || left.id.localeCompare(right.id))[0];
     if (approval) {
