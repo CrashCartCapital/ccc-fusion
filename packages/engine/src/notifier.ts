@@ -44,6 +44,10 @@ export const DEFAULT_NTFY_EVENTS: readonly NtfyNotificationEvent[] = [
   "message:agent-to-agent",
   "message:room",
   "oauth-token-expired",
+  // FNXC:CampaignNotifications 2026-08-11-00:00: CCC campaign operator pings are
+  // escalation events; defaults must not silently filter them once ntfy is enabled.
+  "campaign-needs-decision",
+  "campaign-failed",
 ] as const;
 
 export interface NtfyNotificationConfigInput {

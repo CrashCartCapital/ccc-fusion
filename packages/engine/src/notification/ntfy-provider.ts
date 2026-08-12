@@ -45,7 +45,9 @@ type SupportedNtfyEvent =
   | "message:agent-to-user"
   | "message:agent-to-agent"
   | "message:room"
-  | "oauth-token-expired";
+  | "oauth-token-expired"
+  | "campaign-needs-decision"
+  | "campaign-failed";
 
 const SUPPORTED_EVENTS = new Set<SupportedNtfyEvent>([
   "in-review",
@@ -63,6 +65,9 @@ const SUPPORTED_EVENTS = new Set<SupportedNtfyEvent>([
   "message:agent-to-agent",
   "message:room",
   "oauth-token-expired",
+  // FNXC:CampaignNotifications 2026-08-11-00:00: the two CCC campaign operator pings.
+  "campaign-needs-decision",
+  "campaign-failed",
 ]);
 
 export function resolveParticipantLabel(
@@ -200,6 +205,17 @@ export class NtfyNotificationProvider implements NotificationProvider {
       ? payload.metadata.providerName
       : providerId;
 
+    // FNXC:CampaignNotifications 2026-08-11-00:00: bounded machine facts for campaign pings.
+    const campaignWorkItemLabel = typeof payload.metadata?.workItemId === "string"
+      ? payload.metadata.workItemId
+      : "unknown";
+    const campaignStateLabel = typeof payload.metadata?.state === "string"
+      ? payload.metadata.state
+      : "unknown";
+    const campaignReasonSuffix = typeof payload.metadata?.reasonCode === "string"
+      ? ` (${payload.metadata.reasonCode})`
+      : "";
+
     const contentByEvent: Record<SupportedNtfyEvent, { title: string; message: string; priority: "default" | "high" }> = {
       "in-review": {
         title: `Task ${taskId} completed`,
@@ -291,6 +307,22 @@ export class NtfyNotificationProvider implements NotificationProvider {
       "oauth-token-expired": {
         title: "OAuth token expired",
         message: `Your ${providerName} OAuth token has expired — please re-authenticate`,
+        priority: "high",
+      },
+      /*
+      FNXC:CampaignNotifications 2026-08-11-00:00:
+      Campaign pings render machine facts only: work item id, state, and the
+      bounded ccc-* reason code from the classifier. Never task titles, prompt
+      text, receipts content, or arbitrary error strings.
+      */
+      "campaign-needs-decision": {
+        title: `Campaign decision needed for ${taskId}`,
+        message: `Work item ${campaignWorkItemLabel} parked ${campaignStateLabel}${campaignReasonSuffix} and is waiting for an operator decision`,
+        priority: "high",
+      },
+      "campaign-failed": {
+        title: `Campaign work failed for ${taskId}`,
+        message: `Work item ${campaignWorkItemLabel} reached terminal state ${campaignStateLabel}${campaignReasonSuffix}`,
         priority: "high",
       },
     };

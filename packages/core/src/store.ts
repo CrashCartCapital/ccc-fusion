@@ -190,6 +190,17 @@ export interface TaskStoreEvents {
   }];
   "artifact:registered": [artifact: Artifact];
   "artifact:updated": [artifact: Artifact];
+  /*
+   * FNXC:CampaignNotifications 2026-08-11-00:00:
+   * Emitted after a successful transaction-free transitionWorkflowWorkItem with
+   * the persisted row. The store method is the single funnel every engine
+   * transition passes through (startup recovery parks, provider-dispatch parks,
+   * workflow runtime terminal states), so listeners such as the engine
+   * NotificationService can observe campaign parks and terminal failures
+   * without hooking scattered call sites. Transactions are excluded: a
+   * caller-owned tx can still roll back after the transition resolves.
+   */
+  "workitem:transitioned": [workItem: WorkflowWorkItem];
   "agent:log": [entry: AgentLogEntry];
   "merger:autostashOrphans": [data: {
     rootDir: string;
@@ -1762,7 +1773,20 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     return replaceActiveTaskWorkflowContinuationImpl(this, input);
   }
   async transitionWorkflowWorkItem( id: string, state: WorkflowWorkItemState, patch: WorkflowWorkItemTransitionPatch = {}, tx?: import("./postgres/data-layer.js").DbTransaction, ): Promise<WorkflowWorkItem> {
-    return transitionWorkflowWorkItemImpl(this, id, state, patch, tx);
+    const workItem = await transitionWorkflowWorkItemImpl(this, id, state, patch, tx);
+    // FNXC:CampaignNotifications 2026-08-11-00:00: notify listeners only for
+    // transaction-free transitions (a caller-owned tx can still roll back), and
+    // never let a listener failure break the durable state transition.
+    if (!tx) {
+      try {
+        this.emit("workitem:transitioned", workItem);
+      } catch (error) {
+        storeLog.warn(
+          `workitem:transitioned listener failed for ${workItem.id} (${state}): ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    return workItem;
   }
 
   /**
