@@ -2332,6 +2332,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
           ...implementationRefs,
           ...nonGoalRefs,
           ...sourceRefs,
+          ...valueTaskProofRefs,
           ...liveActionRefs,
           ...supportingRefs,
         ],
@@ -2357,6 +2358,8 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         sourceRefs: [
           ...secondImplementationRefs,
           ...secondSourceRefs,
+          ...secondTaskProofRefs,
+          ...integratedProofRefs,
           ...secondLiveActionRefs,
           ...mergeActionRefs,
         ],
