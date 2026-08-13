@@ -18,7 +18,7 @@ import {
   type CccCampaignProductExecutionPolicy,
 } from "@fusion/core";
 import {
-  createCccPrdImportTestBundle,
+  createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
 } from "../../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import {
@@ -77,7 +77,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     suffix: string,
     transport: "pi" | "cli" = "pi",
   ) {
-    const source = createCccPrdImportTestBundle(h.rootDir(), suffix);
+    const source = createCccPrdImportTestProductBundle(h.rootDir(), suffix);
     const basePolicy =
       createCccPrdImportTestProductExecutionPolicy(source);
     const entrySemanticTaskId = source.workflows[0]!.entryTaskIds[0]!;

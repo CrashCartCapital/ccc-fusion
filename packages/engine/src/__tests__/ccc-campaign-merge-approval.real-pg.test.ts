@@ -13,7 +13,7 @@ import {
   type CccPrdSemanticBundle,
 } from "@fusion/core";
 import {
-  createCccPrdImportTestBundle,
+  createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
@@ -59,7 +59,7 @@ async function admittedMergeBundle(
   baseCommit: string,
   suffix: string,
 ): Promise<CccPrdSemanticBundle> {
-  const source = createCccPrdImportTestBundle(rootDir, suffix);
+  const source = createCccPrdImportTestProductBundle(rootDir, suffix);
   const terminalTask = source.tasks[1]!;
   const mergeAction = {
     id: `ACTION-${suffix}-MERGE`,

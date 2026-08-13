@@ -15,7 +15,10 @@ import { beforeAll, beforeEach, afterAll, afterEach, describe, expect, it } from
 import { sql } from "drizzle-orm";
 import type { CccPrdSemanticBundle } from "../../ccc-prd/index.js";
 import {
+  createCccCampaignManifest,
+  hashCccCampaignManifest,
   canonicalCccPrdJson,
+  CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
   importCccPrdBundle,
   inspectCccPrdImport,
   reconcileCccPrdImport,
@@ -37,8 +40,10 @@ import {
   createCccPrdImportTestExecutionPolicy as executionPolicy,
   createCccPrdImportTestProductExecutionPolicy as productExecutionPolicy,
   createCccPrdImportTestBundle as bundle,
+  createCccPrdImportTestProductBundle as productBundle,
   rehashCccPrdImportTestBundle as rehashBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
+import { buildCccPrdProjection } from "../../ccc-prd/projection.js";
 
 const pgTest = pgDescribe;
 
@@ -144,7 +149,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   }
 
   function request(suffix = "base", key = "idem-base", checkpoint?: FailureCheckpoint) {
-    const semanticBundle = bundle(h.rootDir(), suffix);
+    const semanticBundle = productBundle(h.rootDir(), suffix);
     return {
       bundle: semanticBundle,
       executionPolicy: executionPolicy(semanticBundle),
@@ -188,6 +193,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
     return rehashBundle({
       ...base,
+      bounds: { ...base.bounds, maxRequests: 4 },
       tasks: [
         { ...taskA!, dependencyTaskIds: [] },
         { ...taskB, workflowId: workflow.id },
@@ -649,7 +655,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it("Task 6 RED: attaches each workflow transport route extension to its semantic prompt node", async () => {
     const suffix = "task6-workflow-extension";
     const key = "idem-task6-workflow-extension";
-    const semanticBundle = bundle(h.rootDir(), suffix);
+    const semanticBundle = productBundle(h.rootDir(), suffix);
     const workflowExtensionId = "plugin:ccc-campaign:provider-dispatch";
     registerWorkflowProviderExtension(workflowExtensionId);
     const imported = await importCccPrdBundle({
@@ -678,7 +684,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it("product v2 allocates durable native task ids without rewriting semantic custody", async () => {
     const suffix = "product-v2-native-task-ids";
     const key = "idem-product-v2-native-task-ids";
-    const semanticBundle = bundle(h.rootDir(), suffix);
+    const semanticBundle = productBundle(h.rootDir(), suffix);
     const policy = productExecutionPolicy(semanticBundle);
 
     const imported = await importCccPrdBundle({
@@ -758,7 +764,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it("product v2 rolls native task allocation back with the importer transaction", async () => {
     const suffix = "product-v2-native-task-rollback";
     const key = "idem-product-v2-native-task-rollback";
-    const semanticBundle = bundle(h.rootDir(), suffix);
+    const semanticBundle = productBundle(h.rootDir(), suffix);
 
     await expect(importCccPrdBundle({
       ...request(suffix, key, "task"),
@@ -774,10 +780,140 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     await expect(h.store().listTasks()).resolves.toEqual([]);
   });
 
+  it("RED-S1-import: refuses fresh product v2 imports below the provider-task request floor before mutation", async () => {
+    const suffix = "product-v2-request-floor";
+    const key = "idem-product-v2-request-floor";
+    const semanticBundle = rehashBundle({
+      ...bundle(h.rootDir(), suffix),
+      bounds: { maxRequests: 1, maxDurationMs: 60_000, maxConcurrency: 1 },
+    });
+
+    await expect(importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: semanticBundle,
+      executionPolicy: productExecutionPolicy(semanticBundle),
+    })).rejects.toMatchObject({
+      code: CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+      message:
+        "CCC PRD product import maxRequests 1 is below the provider-task floor 2",
+    });
+
+    await expect(inspectCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toBeNull();
+    expect(await h.store().listTasks()).toEqual([]);
+    const importRows = await h.layer().db.execute(sql`
+      SELECT import_id
+      FROM project.ccc_prd_imports
+      WHERE idempotency_key = ${key}
+    `) as unknown as Array<{ import_id: string }>;
+    expect(importRows).toEqual([]);
+  });
+
+  it("RED-S1-import: replays exact legacy product v2 rows even when persisted below the provider-task request floor", async () => {
+    const suffix = "product-v2-request-floor-legacy";
+    const key = "idem-product-v2-request-floor-legacy";
+    const initialBundle = productBundle(h.rootDir(), suffix);
+    const initialPolicy = productExecutionPolicy(initialBundle);
+    await expect(importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: initialBundle,
+      executionPolicy: initialPolicy,
+      failureInjection: { checkpoint: "before_activation" },
+    })).rejects.toMatchObject({ code: "CCC_PRD_IMPORT_INJECTED_FAILURE" });
+    const seeded = await inspectCccPrdImport({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    if (!seeded) throw new Error("missing prepared legacy seed");
+    const imported = seeded;
+    const legacyBundle = rehashBundle({
+      ...initialBundle,
+      bounds: { maxRequests: 1, maxDurationMs: 60_000, maxConcurrency: 1 },
+    });
+    const legacyPolicy = productExecutionPolicy(legacyBundle);
+    const [persistedImport] = await h.layer().db.execute(sql`
+      SELECT campaign_started_at, created_at
+      FROM project.ccc_prd_imports
+      WHERE idempotency_key = ${key}
+    `) as unknown as Array<{ campaign_started_at: string; created_at: string }>;
+    if (!persistedImport) throw new Error("missing seeded import row");
+    const manifest = createCccCampaignManifest({
+      projectId: "__legacy_unscoped__",
+      importId: imported.importId,
+      idempotencyKey: key,
+      campaignId: `CAMPAIGN-${suffix}`,
+      bundle: legacyBundle,
+      executionPolicy: legacyPolicy,
+      targetRepositoryPath: imported.targetRepository,
+      campaignStartedAt: persistedImport.campaign_started_at,
+    });
+    const manifestHash = hashCccCampaignManifest(manifest);
+    const taskEntities = await h.layer().db.execute(sql`
+      SELECT entity_id, native_id
+      FROM project.ccc_prd_import_entities
+      WHERE import_id = ${imported.importId}
+        AND entity_type = 'task'
+    `) as unknown as Array<{ entity_id: string; native_id: string }>;
+    const projection = buildCccPrdProjection({
+      bundle: legacyBundle,
+      executionPolicy: legacyPolicy,
+      importId: imported.importId,
+      identityHash: manifestHash,
+      campaignId: `CAMPAIGN-${suffix}`,
+      now: persistedImport.created_at,
+      nativeTaskIds: new Map(taskEntities.map(({ entity_id, native_id }) => [
+        entity_id,
+        native_id,
+      ])),
+    });
+    const projectionDigest = createHash("sha256")
+      .update(canonicalCccPrdJson(projection), "utf8")
+      .digest("hex");
+
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET canonical_bundle = ${canonicalCccPrdJson(legacyBundle)}::jsonb,
+          bundle_hash = ${legacyBundle.bundleHash},
+          execution_policy = ${canonicalCccPrdJson(legacyPolicy)}::jsonb,
+          campaign_manifest = ${canonicalCccPrdJson(manifest)}::jsonb,
+          campaign_manifest_hash = ${manifestHash},
+          identity_hash = ${manifestHash},
+          campaign_deadline_at = ${manifest.campaignDeadlineAt},
+          projection_digest = ${projectionDigest},
+          updated_at = ${new Date().toISOString()}
+      WHERE idempotency_key = ${key}
+    `);
+    await rm(resolve(h.rootDir(), imported.stagingRelativePath), {
+      recursive: true,
+      force: true,
+    });
+    await rm(join(h.rootDir(), ".fusion", "tasks"), {
+      recursive: true,
+      force: true,
+    });
+    await rm(join(h.rootDir(), ".fusion", "artifacts"), {
+      recursive: true,
+      force: true,
+    });
+
+    await expect(importCccPrdBundle({
+      ...request(suffix, key),
+      bundle: legacyBundle,
+      executionPolicy: legacyPolicy,
+    })).resolves.toMatchObject({
+      replayed: true,
+      importId: imported.importId,
+    });
+  });
+
   it("product v2 RED: projects coding custody and a final proof barrier before human landing", async () => {
     const suffix = "product-v2-coding-proof";
     const key = "idem-product-v2-coding-proof";
-    const initial = bundle(h.rootDir(), suffix);
+    const initial = productBundle(h.rootDir(), suffix);
     const landingTask = initial.tasks[1]!;
     const mergeAction = {
       id: `ACTION-merge-${suffix}`,
@@ -789,6 +925,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
     const semanticBundle = rehashBundle({
       ...initial,
+      bounds: { ...initial.bounds, maxRequests: initial.tasks.length },
       tasks: initial.tasks.map((task) => task.id === landingTask.id
         ? { ...task, protectedActionIds: [mergeAction.id] }
         : task),
@@ -894,6 +1031,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
     const semanticBundle = rehashBundle({
       ...initial,
+      bounds: { ...initial.bounds, maxRequests: initial.tasks.length },
       tasks: initial.tasks.map((task) => task.id === landingTask.id
         ? { ...task, protectedActionIds: [mergeAction.id] }
         : task),
@@ -929,7 +1067,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
   it("product v2 CLI route projects stable adapter settings without persisted subscription readiness", async () => {
     const suffix = "product-v2-cli-settings";
     const key = "idem-product-v2-cli-settings";
-    const semanticBundle = bundle(h.rootDir(), suffix);
+    const semanticBundle = productBundle(h.rootDir(), suffix);
     const policy = productExecutionPolicy(semanticBundle);
     const cliPolicy = {
       ...policy,
@@ -967,7 +1105,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
 
   it("product v2 activation schedules planning continuations through import and reconcile", async () => {
     const importedSuffix = "product-v2-planning-import";
-    const importedBundle = bundle(h.rootDir(), importedSuffix);
+    const importedBundle = productBundle(h.rootDir(), importedSuffix);
     const importedPlanning = await importCccPrdBundle({
       ...request(importedSuffix, "idem-product-v2-planning-import"),
       bundle: importedBundle,
@@ -983,7 +1121,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
 
     const reconciledSuffix = "product-v2-planning-reconcile";
     const reconciledKey = "idem-product-v2-planning-reconcile";
-    const reconciledBundle = bundle(h.rootDir(), reconciledSuffix);
+    const reconciledBundle = productBundle(h.rootDir(), reconciledSuffix);
     await expect(importCccPrdBundle({
       ...request(reconciledSuffix, reconciledKey, "before_activation"),
       bundle: reconciledBundle,
@@ -1023,6 +1161,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
     const ambiguous = rehashBundle({
       ...initial,
+      bounds: { ...initial.bounds, maxRequests: 3 },
       tasks: [...initial.tasks, extraTerminal],
       workflows: initial.workflows.map((workflow) => ({
         ...workflow,
@@ -1149,6 +1288,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
     const ambiguousLanding = rehashBundle({
       ...mergeBundle,
+      bounds: { ...mergeBundle.bounds, maxRequests: 3 },
       tasks: [...mergeBundle.tasks, extraTerminal],
       workflows: mergeBundle.workflows.map((workflow) => ({
         ...workflow,

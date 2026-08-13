@@ -215,3 +215,24 @@ export function createCccPrdImportTestBundle(
     confidence: "high",
   });
 }
+
+export function withCccPrdImportTestProductRequestFloor(
+  source: CccPrdSemanticBundle,
+): CccPrdSemanticBundle {
+  return rehashCccPrdImportTestBundle({
+    ...source,
+    bounds: {
+      ...source.bounds,
+      maxRequests: Math.max(source.bounds.maxRequests, source.tasks.length),
+    },
+  });
+}
+
+export function createCccPrdImportTestProductBundle(
+  targetRoot: string,
+  suffix = "base",
+): CccPrdSemanticBundle {
+  return withCccPrdImportTestProductRequestFloor(
+    createCccPrdImportTestBundle(targetRoot, suffix),
+  );
+}

@@ -339,14 +339,21 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
   async function importCampaign(
     suffix: string,
     registerScoped?: (scenario: ReturnType<typeof createJoinedLocalCampaignScenario>) => unknown,
+    options: Readonly<{ maxRequests?: number }> = {},
   ) {
     const rootDir = h.rootDir();
     const mainAtStart = initializeDisposableGitRoot(rootDir);
     const scenario = createJoinedLocalCampaignScenario(rootDir, suffix, mainAtStart);
     const scoped = registerScoped?.(scenario);
     await bootstrapCccCampaignProofAdmissionHost({ builtRootPath: ENGINE_DIST_ROOT });
+    const campaignBundle = options.maxRequests === undefined
+      ? scenario.bundle
+      : rehashCccPrdImportTestBundle({
+          ...scenario.bundle,
+          bounds: { ...scenario.bundle.bounds, maxRequests: options.maxRequests },
+        });
     const imported = await importCccPrdBundle({
-      bundle: await admitBundle(scenario.bundle),
+      bundle: await admitBundle(campaignBundle),
       idempotencyKey: suffix,
       store: h.store(),
       layer: h.layer(),
@@ -477,6 +484,92 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
         h.store().clearWorkflowRunBranches(taskId, keepRunId),
     };
   }
+
+  it("parks exact campaign-global request exhaustion before another provider dispatch", async () => {
+    const fixture = await importCampaign(
+      "local-request-budget-exhausted",
+      (scenario) => installScopedProvider(scenario, "complete"),
+      { maxRequests: 1 },
+    );
+    const { campaign, rootDir, scenario } = fixture;
+    await issueAndClaimAll(
+      scenario,
+      fixture.nativeTaskIds,
+      "local-request-budget-exhausted",
+    );
+    const taskAContext = await h.store().getCccCampaignContextForTask(
+      fixture.nativeTaskIds.a,
+    );
+    if (!taskAContext) throw new Error("missing task A campaign context");
+    const spent = await h.store().reserveCccProviderAttempt({
+      taskId: fixture.nativeTaskIds.a,
+      actionId: scenario.actions.liveExecution.a.actionId,
+      actionTarget: scenario.actions.liveExecution.a.actionTarget,
+      turnKey: "ccc-provider-turn-budget-fixture",
+      dispatchKey: "pi-stream:budget-fixture",
+      providerId: taskAContext.route.providerId,
+      modelId: taskAContext.route.modelId,
+      transport: taskAContext.route.transport,
+      workItemFence: {
+        workItemId: campaign.id,
+        runId: campaign.runId,
+        attempt: 1,
+      },
+    });
+    await h.store().proveCccProviderAttemptNotDispatched({
+      taskId: fixture.nativeTaskIds.a,
+      attemptKey: spent.attemptKey,
+      controllerToken: spent.controllerToken,
+    });
+
+    const pi = configurePiBottomRuntime({});
+    const executor = new TaskExecutor(h.store(), rootDir);
+    const settings = await h.store().getSettings();
+    const runtime = new WorkflowTaskRuntime({
+      store: h.store(),
+      primitives: executor.createAuthoritativeWorkflowPrimitives(settings),
+      runCustomNode: executor.createAuthoritativeWorkflowCustomNodeRunner(settings),
+      resolveNodeProviderController:
+        executor.createCccCampaignWorkflowNodeProviderControllerResolver(),
+      branchPersistence: storeBackedBranchPersistence(),
+    });
+
+    const processed = await processDueWorkflowWorkItem(h.store(), runtime, settings, {
+      leaseOwner: "local-budget-processor",
+      leaseDurationMs: 60_000,
+      kinds: ["task"],
+      campaignRequired: true,
+      exactCandidate: {
+        id: campaign.id,
+        runId: campaign.runId,
+        attempt: campaign.attempt,
+      },
+    });
+
+    expect(processed).toMatchObject({
+      runtime: {
+        disposition: "manual-required",
+        outcome: "failure",
+        reason: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      },
+    });
+    await expect(h.store().getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({
+      state: "manual-required",
+      attempt: 1,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+    });
+    expect(pi.modelCalls).toEqual([]);
+    const attemptEvents = (await queryRunAuditEvents(h.layer().db, {
+      taskId: fixture.nativeTaskIds.a,
+      domain: "database",
+    })).filter((event) =>
+      event.mutationType.startsWith("ccc-campaign:provider-attempt:"));
+    expect(attemptEvents.map((event) => event.mutationType).sort()).toEqual([
+      "ccc-campaign:provider-attempt:reserved",
+      "ccc-campaign:provider-attempt:terminal",
+    ]);
+  });
 
   it("runs legacy v1 mixed-provider work but fails closed before Git landing without executed proof receipts", async () => {
     const fixture = await importCampaign("local-acceptance", (scenario) => installScopedProvider(scenario, "complete"));

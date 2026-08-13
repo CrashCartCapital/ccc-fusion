@@ -36,6 +36,7 @@ import {
   resolveCccPrdProductStatusProviderAttemptAnchorTaskId,
   type CccPrdProductApprovalStatus,
   type CccPrdProductNextActionInput,
+  type CccPrdProductProofAttemptStatus,
   type CccPrdProductTaskStatus,
   type CccPrdProductWorkItemStatus,
 } from "../ccc-prd/product-status.js";
@@ -172,6 +173,8 @@ describe("providerAttemptStatusesForCampaign multi-task surfacing", () => {
  */
 const LIVE_EXECUTION_APPROVAL_REQUIRED_REASON =
   "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+const REQUEST_BUDGET_EXHAUSTED_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED";
 const LIVE_EXECUTION_ACTION_ID = "ccc:live-execution";
 
 function workItem(
@@ -240,28 +243,80 @@ const routedTask = {
 } as const;
 
 function nextActionInput(
-  overrides: Partial<{
-    workItems: readonly CccPrdProductWorkItemStatus[];
-    approvals: readonly CccPrdProductApprovalStatus[];
-    taskStatuses: readonly CccPrdProductTaskStatus[];
-  }> = {},
+  overrides: Partial<Pick<CccPrdProductNextActionInput,
+    | "workItems"
+    | "approvals"
+    | "taskStatuses"
+    | "requestBudget"
+    | "proofs"
+    | "orphanProofAttempts"
+    | "providerAttempts"
+    | "providerAttemptHistoryConsistent"
+  >> = {},
 ): CccPrdProductNextActionInput {
   return {
     row: { state: "active", runnable: 1 } as unknown as CccPrdProductNextActionInput["row"],
+    requestBudget: overrides.requestBudget ?? {
+      scope: "campaign-global",
+      maximum: 24,
+      used: 0,
+      remaining: 24,
+      providerTasks: 2,
+      deterministicMinimum: 2,
+      headroomAboveMinimum: 22,
+      completionAdequacy: "unproven",
+    },
     taskStatuses: overrides.taskStatuses ?? [
       taskStatus({ nativeTaskId: "task-1", semanticTaskId: "TASK-1", ordinal: 0, route: routedTask }),
       taskStatus({ nativeTaskId: "task-2", semanticTaskId: "TASK-2", ordinal: 1, route: routedTask }),
     ],
     workItems: overrides.workItems ?? [],
-    proofs: [],
-    orphanProofAttempts: [],
-    providerAttempts: [],
+    proofs: overrides.proofs ?? [],
+    orphanProofAttempts: overrides.orphanProofAttempts ?? [],
+    providerAttempts: overrides.providerAttempts ?? [],
+    providerAttemptHistoryConsistent:
+      overrides.providerAttemptHistoryConsistent ?? true,
     approvals: overrides.approvals ?? [],
     landingIntents: [],
     landingMaterializations: [],
     landingTerminals: [],
     liveExecutionActionIds: new Set([LIVE_EXECUTION_ACTION_ID]),
     mergeActionIds: new Set(["ccc:merge"]),
+  };
+}
+
+function proofAttempt(
+  state: CccPrdProductProofAttemptStatus["state"],
+  overrides: Partial<CccPrdProductProofAttemptStatus> = {},
+): CccPrdProductProofAttemptStatus {
+  return {
+    attemptKey: "ccc-proof-attempt-1",
+    importId: "import-1",
+    campaignId: "campaign-1",
+    taskId: "task-1",
+    semanticTaskId: "TASK-1",
+    proofId: "PROOF-1",
+    packetHash: "0".repeat(64),
+    sidecarHash: "1".repeat(64),
+    bundleHash: "2".repeat(64),
+    manifestHash: "3".repeat(64),
+    campaignBindingHash: "4".repeat(64),
+    targetRepository: "org/repo",
+    targetBase: "main",
+    sourceCommit: "5".repeat(40),
+    sourceTree: "6".repeat(40),
+    definitionSha256: "7".repeat(64),
+    commandSha256: "8".repeat(64),
+    workItemId: "work-item-1",
+    runId: "run-1",
+    workItemAttempt: 1,
+    state,
+    result: null,
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+    dispatchedAt: null,
+    settledAt: null,
+    ...overrides,
   };
 }
 
@@ -397,6 +452,95 @@ describe("productNextAction multi-task live-execution holds", () => {
       kind: "approve-execution",
       approvalRequestId: "approval-2",
       approvalStatus: "claimed",
+    });
+  });
+});
+
+describe("productNextAction request-budget custody precedence", () => {
+  const exhaustedBudget = {
+    scope: "campaign-global" as const,
+    maximum: 2,
+    used: 2,
+    remaining: 0,
+    providerTasks: 2,
+    deterministicMinimum: 2,
+    headroomAboveMinimum: 0,
+    completionAdequacy: "unproven" as const,
+  };
+  const budgetWorkItem = workItem({
+    id: "budget-work-item",
+    state: "manual-required",
+    lastError: REQUEST_BUDGET_EXHAUSTED_REASON,
+    blockedReason: REQUEST_BUDGET_EXHAUSTED_REASON,
+  });
+
+  it("RED-S1-status: a reserved proof outranks fresh-import budget recovery", () => {
+    const reserved = proofAttempt("reserved", {
+      workItemId: "proof-work-item",
+      runId: "proof-run",
+      workItemAttempt: 3,
+    });
+    const action = productNextAction(nextActionInput({
+      requestBudget: exhaustedBudget,
+      workItems: [budgetWorkItem],
+      proofs: [{
+        definition: {} as never,
+        definitionSha256: reserved.definitionSha256,
+        attempts: [reserved],
+      }],
+    }));
+
+    expect(action).toEqual({
+      kind: "resolve-manual-required",
+      reason: `Proof attempt ${reserved.attemptKey} is reserved and has unresolved proof custody.`,
+    });
+  });
+
+  it("RED-S1-status: an exact live lease owns a reserved proof before budget recovery", () => {
+    const reserved = proofAttempt("reserved", {
+      workItemId: "proof-work-item",
+      runId: "proof-run",
+      workItemAttempt: 3,
+    });
+    const action = productNextAction(nextActionInput({
+      requestBudget: exhaustedBudget,
+      workItems: [
+        budgetWorkItem,
+        workItem({
+          id: reserved.workItemId,
+          runId: reserved.runId,
+          state: "running",
+          attempt: reserved.workItemAttempt,
+          leaseOwner: "proof-runtime",
+          leaseExpiresAt: "2999-08-01T00:00:00.000Z",
+          lastError: null,
+          blockedReason: null,
+        }),
+      ],
+      proofs: [{
+        definition: {} as never,
+        definitionSha256: reserved.definitionSha256,
+        attempts: [reserved],
+      }],
+    }));
+
+    expect(action).toEqual({
+      kind: "wait-for-runtime",
+      reason:
+        "Campaign provider/proof work is reserved or in flight and still owned by the runtime.",
+    });
+  });
+
+  it("RED-S1-status: orphan proof custody outranks fresh-import budget recovery", () => {
+    const action = productNextAction(nextActionInput({
+      requestBudget: exhaustedBudget,
+      workItems: [budgetWorkItem],
+      orphanProofAttempts: [proofAttempt("proved_failed")],
+    }));
+
+    expect(action).toEqual({
+      kind: "blocked",
+      reason: "Persisted campaign custody is missing a task, route, or declared proof.",
     });
   });
 });

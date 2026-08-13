@@ -29,6 +29,7 @@ import {
   isImportedCccCampaignWorkItem,
 } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
+import { CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE } from "@fusion/core";
 import { matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
 import {
   requireCccCampaignLiveExecutionApproval,
@@ -9979,6 +9980,23 @@ export class TaskExecutor {
     if (!outcome.success && !verdict && typeof stepError === "string" && stepError.trim()) {
       contextPatch[`node:${node.id}:error`] = stepError.trim();
     }
+    const stepFailureValue = (outcome as WorkflowStepOutcome).failureValue;
+    if (
+      !outcome.success
+      && stepFailureValue === `ccc-permanent:${CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE}`
+      && Boolean(sealedExecution?.executionFence)
+      && Object.isFrozen(sealedExecution?.executionFence)
+    ) {
+      /*
+       * FNXC:CCCCampaignBudget 2026-08-12-21:00:
+       * Pi retains provider failures as strings. A sealed campaign restores the
+       * typed PermanentError before this workflow-step layer, so carry its
+       * stable classification through the non-throwing step outcome as graph
+       * context. Without this, WorkflowTaskRuntime sees only node-error text
+       * and terminally fails instead of parking the immutable campaign.
+       */
+      contextPatch[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY] = stepFailureValue;
+    }
     if (cfg.summaryTarget === "task" && typeof stepOutput === "string" && stepOutput.trim()) {
       /*
        * FNXC:WorkflowCompletion 2026-06-29-11:09:
@@ -10012,7 +10030,7 @@ export class TaskExecutor {
      */
     return {
       outcome: outcome.success || !blocking || (malformed && !fencedBlockingCccSemanticGate) ? "success" : "failure",
-      value: (outcome as WorkflowStepOutcome).failureValue ?? verdict ?? (outcome.success ? "passed" : advisoryFailureValue),
+      value: stepFailureValue ?? verdict ?? (outcome.success ? "passed" : advisoryFailureValue),
       ...(Object.keys(contextPatch).length > 0 ? { contextPatch } : {}),
     };
   }
@@ -19081,6 +19099,22 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         // cannot disappear from operator cost totals.
         await accumulateSessionTokenUsage(this.store, task.id, session, { agentId: task.assignedAgentId ?? undefined, role: "executor" });
         try { session.dispose(); } catch { /* best-effort */ }
+        if (
+          err instanceof PermanentError
+          && (
+            cccCampaignImplementation
+            || (
+              cccProviderAttemptBinding !== undefined
+              && err.code === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE
+            )
+          )
+        ) {
+          return {
+            success: false,
+            error: err.message,
+            failureValue: `ccc-permanent:${err.code}`,
+          };
+        }
         if ((err instanceof ReadonlyViolationError) || ((err as { code?: string } | null)?.code === "READONLY_VIOLATION")) {
           const violation = err as ReadonlyViolationError;
           const deniedTool = violation.toolName || "unknown";

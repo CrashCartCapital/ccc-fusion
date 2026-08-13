@@ -20,6 +20,9 @@ import { allocateCommittedTaskIdsInTransaction } from "../task-store/async-alloc
 import type { Task } from "../types.js";
 import { createCccCampaignManifest, hashCccCampaignManifest, parseCccCampaignExecutionPolicy } from "../ccc-campaign/canonical.js";
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
+import {
+  CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+} from "../ccc-campaign/request-budget.js";
 import type { CccCampaignExecutionPolicy, CccCampaignManifest } from "../ccc-campaign/types.js";
 import { canonicalCccPrdJson } from "./contract.js";
 import {
@@ -1186,6 +1189,19 @@ function persistedCampaignIdentity(row: ImportRow): CccCampaignImportIdentity {
   }
 }
 
+function assertFreshProductRequestBudgetFloor(
+  bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignExecutionPolicy,
+): void {
+  if (executionPolicy.schema !== "ccc-campaign.execution-policy.v2") return;
+  const providerTaskCount = executionPolicy.routes.length;
+  if (bundle.bounds.maxRequests >= providerTaskCount) return;
+  throw new CccPrdImportError(
+    CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+    `CCC PRD product import maxRequests ${bundle.bounds.maxRequests} is below the provider-task floor ${providerTaskCount}`,
+  );
+}
+
 async function prepareDatabaseImport(
   input: ImportCccPrdBundleInput,
   executionPolicy: CccCampaignExecutionPolicy,
@@ -1228,6 +1244,7 @@ async function prepareDatabaseImport(
         }
         return { row: existing, created: false };
       }
+      assertFreshProductRequestBudgetFloor(bundle, executionPolicy);
 
       const recorder: ImportTransactionWitnessRecorder = {
         transactionId: randomUUID(),

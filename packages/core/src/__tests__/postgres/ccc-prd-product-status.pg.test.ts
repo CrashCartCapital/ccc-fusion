@@ -8,6 +8,7 @@ import {
   claimCccCampaignApproval,
   consumeCccCampaignApprovalWithinTransaction,
   createCccCampaignAuthorityBinding,
+  CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
   importCccPrdBundle,
   issueCccCampaignApproval,
   recordRunAuditEventWithinTransaction,
@@ -15,7 +16,7 @@ import {
   settleCccCampaignProofAttempt,
 } from "../../index.js";
 import {
-  createCccPrdImportTestBundle,
+  createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
@@ -42,7 +43,6 @@ const MERGE_APPROVAL_REQUIRED =
   "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
 const LIVE_EXECUTION_APPROVAL_REQUIRED =
   "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
-
 function withMergeAction(source: CccPrdSemanticBundle): CccPrdSemanticBundle {
   const terminalTask = source.tasks.at(-1)!;
   return rehashCccPrdImportTestBundle({
@@ -114,7 +114,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   }
 
   it("reports an operator-stopped campaign as abandoned while preserving uncertainty", async () => {
-    const source = createCccPrdImportTestBundle(
+    const source = createCccPrdImportTestProductBundle(
       h.rootDir(),
       "product-status-stopped",
     );
@@ -163,7 +163,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("surfaces redacted provider uncertainty as an exact operator decision", async () => {
-    const source = createCccPrdImportTestBundle(
+    const source = createCccPrdImportTestProductBundle(
       h.rootDir(),
       "product-status-provider-unknown",
     );
@@ -304,7 +304,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("does not let one runtime-owned provider attempt hide separate manual work", async () => {
-    const source = createCccPrdImportTestBundle(
+    const source = createCccPrdImportTestProductBundle(
       h.rootDir(),
       "product-status-mixed-uncertainty",
     );
@@ -390,7 +390,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
 
   it("projects exact live-execution approval and returns to runtime waiting after requeue", async () => {
     const source = withLiveExecutionAction(
-      createCccPrdImportTestBundle(h.rootDir(), "product-status-live"),
+      createCccPrdImportTestProductBundle(h.rootDir(), "product-status-live"),
     );
     const imported = await importCccPrdBundle({
       bundle: source,
@@ -524,7 +524,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("explains a verifier-confinement manual stop without calling it an uncertain effect", async () => {
-    const source = createCccPrdImportTestBundle(
+    const source = createCccPrdImportTestProductBundle(
       h.rootDir(),
       "product-status-verifier-manual",
     );
@@ -574,8 +574,498 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     expect(status?.nextAction.kind).not.toBe("resolve-manual-required");
   });
 
+  it("RED-S1-status: explains campaign-global request-budget exhaustion without suggesting a retry", async () => {
+    const source = rehashCccPrdImportTestBundle({
+      ...createCccPrdImportTestProductBundle(
+        h.rootDir(),
+        "product-status-request-budget",
+      ),
+      bounds: {
+        maxRequests: 5,
+        maxDurationMs: 120_000,
+        maxConcurrency: 5,
+      },
+    });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-request-budget",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget`,
+    );
+    if (!workItem) throw new Error("missing request-budget work item");
+    const taskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: "runtime-request-budget-owner",
+        leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+      },
+    );
+    for (let ordinal = 1; ordinal <= 5; ordinal += 1) {
+      const reservation = await h.store().reserveCccProviderAttempt({
+        taskId,
+        actionId: taskId,
+        actionTarget: h.rootDir(),
+        turnKey: `turn-product-status-request-budget-${ordinal}`,
+        dispatchKey: `dispatch-product-status-request-budget-${ordinal}`,
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        workItemFence: {
+          workItemId: claimedWorkItem.id,
+          runId: claimedWorkItem.runId,
+          attempt: claimedWorkItem.attempt,
+        },
+      });
+      await h.store().proveCccProviderAttemptNotDispatched({
+        taskId,
+        attemptKey: reservation.attemptKey,
+        controllerToken: reservation.controllerToken,
+      });
+    }
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+
+    expect(status?.nextAction).toEqual({
+      kind: "blocked",
+      reason:
+        "The campaign-global provider request budget is exhausted; this immutable import cannot resume.",
+      diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      safeState:
+        `Workflow work item ${workItem.id} is parked manual-required after using 5 of 5 first-time provider-attempt reservation slots; the refused next slot was not reserved or dispatched. Existing attempts, commits, worktrees, and receipts remain preserved.`,
+      decisionOwner: "Campaign operator",
+      consequence:
+        "The same immutable import cannot resume, prove, or land because its sealed request cap cannot be raised.",
+      recoveryOptions: [
+        "Retain the exhausted import and its receipts as immutable evidence; do not retry or requeue it.",
+        "Create a fresh source-bound packet, preview, and import with a larger campaign-global maxRequests value.",
+        "Treat prior task commits as evidence only; integrating those bytes into a new base requires separate authorization and proof.",
+      ],
+      nextSafeAction:
+        "Create and confirm a fresh sealed import with a larger campaign-global request cap.",
+    });
+    expect(status?.nextAction.kind).not.toBe("resolve-manual-required");
+    expect(status?.import.requestBudget).toEqual({
+      scope: "campaign-global",
+      maximum: 5,
+      used: 5,
+      remaining: 0,
+      providerTasks: 2,
+      deterministicMinimum: 2,
+      headroomAboveMinimum: 3,
+      completionAdequacy: "unproven",
+    });
+  });
+
+  it("RED-S1-status: provider uncertainty dominates budget exhaustion until reconciliation", async () => {
+    const source = rehashCccPrdImportTestBundle({
+      ...createCccPrdImportTestProductBundle(
+        h.rootDir(),
+        "product-status-request-budget-unknown",
+      ),
+      bounds: {
+        maxRequests: 5,
+        maxDurationMs: 120_000,
+        maxConcurrency: 5,
+      },
+    });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-request-budget-unknown",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-unknown`,
+    );
+    if (!workItem) throw new Error("missing request-budget-unknown work item");
+    const taskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: "runtime-request-budget-unknown-owner",
+        leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+      },
+    );
+    const reserved = await h.store().reserveCccProviderAttempt({
+      taskId,
+      actionId: taskId,
+      actionTarget: h.rootDir(),
+      turnKey: "turn-product-status-request-budget-unknown",
+      dispatchKey: "dispatch-product-status-request-budget-unknown",
+      providerId: "deterministic-fake",
+      modelId: "fixture-v2",
+      transport: "pi",
+      workItemFence: {
+        workItemId: claimedWorkItem.id,
+        runId: claimedWorkItem.runId,
+        attempt: claimedWorkItem.attempt,
+      },
+    });
+    await h.store().beginCccProviderAttemptDispatch({
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+    for (let ordinal = 2; ordinal <= 5; ordinal += 1) {
+      const filler = await h.store().reserveCccProviderAttempt({
+        taskId,
+        actionId: taskId,
+        actionTarget: h.rootDir(),
+        turnKey: `turn-product-status-request-budget-unknown-${ordinal}`,
+        dispatchKey: `dispatch-product-status-request-budget-unknown-${ordinal}`,
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        workItemFence: {
+          workItemId: claimedWorkItem.id,
+          runId: claimedWorkItem.runId,
+          attempt: claimedWorkItem.attempt,
+        },
+      });
+      await h.store().proveCccProviderAttemptNotDispatched({
+        taskId,
+        attemptKey: filler.attemptKey,
+        controllerToken: filler.controllerToken,
+      });
+    }
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-unknown",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "resolve-manual-required",
+        reason: expect.stringContaining(reserved.attemptKey),
+      },
+    });
+
+    await h.store().reconcileCccProviderAttempt({
+      ...reserved,
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+      outcome: "proved_failed",
+      evidenceDigest: "1".repeat(64),
+      observerId: "product-status-request-budget-unknown",
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-unknown",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+        safeState: expect.stringContaining("first-time provider-attempt reservation slots"),
+      },
+    });
+  });
+
+  it("RED-S1-status: reserved provider custody dominates exact budget exhaustion advice", async () => {
+    const source = rehashCccPrdImportTestBundle({
+      ...createCccPrdImportTestProductBundle(
+        h.rootDir(),
+        "product-status-request-budget-reserved",
+      ),
+      bounds: {
+        maxRequests: 5,
+        maxDurationMs: 120_000,
+        maxConcurrency: 5,
+      },
+    });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-request-budget-reserved",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-reserved`,
+    );
+    if (!workItem) throw new Error("missing request-budget-reserved work item");
+    const taskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: "runtime-request-budget-reserved-owner",
+        leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+      },
+    );
+    const reserved = await h.store().reserveCccProviderAttempt({
+      taskId,
+      actionId: taskId,
+      actionTarget: h.rootDir(),
+      turnKey: "turn-product-status-request-budget-reserved",
+      dispatchKey: "dispatch-product-status-request-budget-reserved",
+      providerId: "deterministic-fake",
+      modelId: "fixture-v2",
+      transport: "pi",
+      workItemFence: {
+        workItemId: claimedWorkItem.id,
+        runId: claimedWorkItem.runId,
+        attempt: claimedWorkItem.attempt,
+      },
+    });
+    for (let ordinal = 2; ordinal <= 5; ordinal += 1) {
+      await h.store().reserveCccProviderAttempt({
+        taskId,
+        actionId: taskId,
+        actionTarget: h.rootDir(),
+        turnKey: `turn-product-status-request-budget-reserved-${ordinal}`,
+        dispatchKey: `dispatch-product-status-request-budget-reserved-${ordinal}`,
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        workItemFence: {
+          workItemId: claimedWorkItem.id,
+          runId: claimedWorkItem.runId,
+          attempt: claimedWorkItem.attempt,
+        },
+      });
+    }
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-reserved",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "resolve-manual-required",
+        reason: expect.stringContaining(reserved.attemptKey),
+      },
+    });
+
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "running",
+      leaseOwner: "runtime-request-budget-reserved-owner",
+      leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+    });
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-reserved",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "wait-for-runtime",
+        reason: expect.stringContaining("still owned by the runtime"),
+      },
+    });
+  });
+
+  it("RED-S1-status: refuses budget-exhaustion advice when the marker outruns the persisted counter", async () => {
+    const source = rehashCccPrdImportTestBundle({
+      ...createCccPrdImportTestProductBundle(
+        h.rootDir(),
+        "product-status-request-budget-counter-drift",
+      ),
+      bounds: {
+        maxRequests: 5,
+        maxDurationMs: 120_000,
+        maxConcurrency: 5,
+      },
+    });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-request-budget-counter-drift",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-counter-drift`,
+    );
+    if (!workItem) throw new Error("missing request-budget-counter-drift work item");
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-counter-drift",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+        safeState: expect.stringContaining("0 of 5 first-time provider-attempt reservation slots"),
+      },
+    });
+  });
+
+  it("RED-S1-status: treats request-budget counter overshoot as custody drift", async () => {
+    const source = rehashCccPrdImportTestBundle({
+      ...createCccPrdImportTestProductBundle(
+        h.rootDir(),
+        "product-status-request-budget-overshoot",
+      ),
+      bounds: {
+        maxRequests: 2,
+        maxDurationMs: 120_000,
+        maxConcurrency: 2,
+      },
+    });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-request-budget-overshoot",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-overshoot`,
+    );
+    if (!workItem) throw new Error("missing request-budget-overshoot work item");
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET request_count = 3
+      WHERE import_id = ${imported.importId}
+    `);
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-overshoot",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+        safeState: expect.stringContaining("3 of 2 first-time provider-attempt reservation slots"),
+      },
+    });
+  });
+
+  it("RED-S1-status: treats an at-limit counter with missing attempt history as custody drift", async () => {
+    const source = createCccPrdImportTestProductBundle(
+      h.rootDir(),
+      "product-status-request-budget-ledger-drift",
+    );
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      idempotencyKey: "product-status-request-budget-ledger-drift",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-ledger-drift`,
+    );
+    if (!workItem) throw new Error("missing request-budget-ledger-drift work item");
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET request_count = ${source.bounds.maxRequests}
+      WHERE import_id = ${imported.importId}
+    `);
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-ledger-drift",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+        safeState: expect.stringContaining("does not match the provider-attempt ledger"),
+      },
+    });
+  });
+
   it("prefers sanitized verifier recovery over a generic failed-work-item message for historical receipts", async () => {
-    const source = createCccPrdImportTestBundle(
+    const source = createCccPrdImportTestProductBundle(
       h.rootDir(),
       "product-status-verifier-history",
     );
@@ -678,7 +1168,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
 
   it("returns a deterministic, redacted, import-scoped operator snapshot", async () => {
     const source = withMergeAction(
-      createCccPrdImportTestBundle(h.rootDir(), "product-status"),
+      createCccPrdImportTestProductBundle(h.rootDir(), "product-status"),
     );
     const imported = await importCccPrdBundle({
       bundle: source,
@@ -688,7 +1178,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       layer: h.layer(),
       rootDir: h.rootDir(),
     });
-    const other = createCccPrdImportTestBundle(h.rootDir(), "product-status-other");
+    const other = createCccPrdImportTestProductBundle(h.rootDir(), "product-status-other");
     await importCccPrdBundle({
       bundle: other,
       executionPolicy: createCccPrdImportTestProductExecutionPolicy(other),

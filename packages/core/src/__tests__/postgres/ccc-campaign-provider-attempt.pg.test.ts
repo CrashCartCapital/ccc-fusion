@@ -651,6 +651,37 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     expect(await persistedRequestCount(campaign.importId)).toBe(2);
   });
 
+  it("enforces maxRequests as one campaign-global budget across semantic tasks", async () => {
+    const { taskId: firstTaskId, campaign } = await context("global-max-requests", {
+      maxRequests: 1, maxDurationMs: 60_000, maxConcurrency: 1,
+    });
+    const secondTaskId = await nativeTaskIdForImport(
+      campaign.importId,
+      "TASK-terminal-global-max-requests",
+    );
+    const store = api(h.store());
+
+    const first = await store.reserveCccProviderAttempt(
+      request(firstTaskId, h.rootDir(), "turn-first-task"),
+    );
+    await store.proveCccProviderAttemptNotDispatched({
+      taskId: firstTaskId,
+      attemptKey: first.attemptKey,
+      controllerToken: first.controllerToken,
+    });
+
+    const auditCountBeforeRefusal = (await auditRows()).length;
+    await expect(store.reserveCccProviderAttempt(
+      request(secondTaskId, h.rootDir(), "turn-second-task"),
+    )).rejects.toMatchObject({
+      code: "CCC_PROVIDER_ATTEMPT_LIMIT_REFUSED",
+      reason: "max-requests",
+    });
+
+    expect(await persistedRequestCount(campaign.importId)).toBe(1);
+    expect(await auditRows()).toHaveLength(auditCountBeforeRefusal);
+  });
+
   it("allocates the next ordinal after a terminal attempt without accepting caller ordinal", async () => {
     const { taskId, campaign } = await context("ordinal", {
       maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1,

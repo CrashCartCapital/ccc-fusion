@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { join, resolve } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  canonicalCccPrdJson,
+  CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+} from "@fusion/core";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
 import { runPrdCommand } from "../prd.js";
 import { repoRoot } from "./prd-built-cli-fixture.js";
@@ -280,6 +284,62 @@ async function authorTwoTaskSidecar(
   }
 }
 
+async function createBelowFloorExecutionPlan() {
+  const packet = createTwoTaskPacketRoot();
+  await authorTwoTaskSidecar(packet);
+  const routesPath = join(packet.root, "routes.json");
+  writeFileSync(routesPath, JSON.stringify({
+    schema: "ccc-prd.routes-by-task.v1",
+    routes: {
+      [TASK_A_ID]: { providerId: "provider-x", modelId: "model-x", transport: "pi" },
+      [TASK_B_ID]: { providerId: "provider-y", modelId: "model-y", transport: "pi" },
+    },
+  }));
+  const executionPlanPath = join(packet.root, "execution-plan.json");
+  const policyOutput: string[] = [];
+  const exit = await runPrdCommand([
+    "policy",
+    packet.root,
+    packet.manifest,
+    packet.sidecar,
+    packet.target,
+    packet.base,
+    executionPlanPath,
+    "--routes-file",
+    routesPath,
+  ], { write: (line) => policyOutput.push(line) });
+  if (exit !== 0) {
+    throw new Error(`below-floor execution plan failed (exit ${exit}): ${policyOutput.join("\n")}`);
+  }
+  return { packet, executionPlanPath };
+}
+
+function confirmationDigestForExecutionPlan(
+  packet: ReturnType<typeof createTwoTaskPacketRoot>,
+  executionPlanPath: string,
+  projectId: string,
+  projectPath: string,
+): string {
+  const plan = JSON.parse(readFileSync(executionPlanPath, "utf8")) as {
+    bundleHash: string;
+    packetHash: string;
+    sidecarHash: string;
+    policy: unknown;
+  };
+  return createHash("sha256").update(canonicalCccPrdJson({
+    schema: "ccc-prd.product-preview.v1",
+    projectId,
+    projectPath: resolve(projectPath),
+    bundleHash: plan.bundleHash,
+    packetHash: plan.packetHash,
+    sidecarHash: plan.sidecarHash,
+    targetRepository: resolve(packet.target),
+    targetBase: packet.base,
+    targetHead: packet.base,
+    executionPolicy: plan.policy,
+  }), "utf8").digest("hex");
+}
+
 describe("fn prd policy --routes-file (per-task route selection)", () => {
   it("wires distinct per-task provider/model/transport routes from a routes file into the execution plan", async () => {
     const packet = createTwoTaskPacketRoot();
@@ -335,6 +395,185 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     expect(routeA!.providerId).not.toBe(routeB!.providerId);
     expect(routeA!.modelId).not.toBe(routeB!.modelId);
     expect(JSON.parse(output[0]!)).toMatchObject({ kind: "execution-plan", routeCount: 2 });
+  });
+
+  it("refuses preview before host or project work when the campaign request cap is below its provider-task floor", async () => {
+    const { packet, executionPlanPath } = await createBelowFloorExecutionPlan();
+    const inspectVerifierConfinementReadiness = vi.fn();
+    const resolveProject = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "preview",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      executionPlanPath,
+      packet.target,
+      packet.base,
+      "--json",
+    ], { write: (line) => output.push(line) }, {
+      inspectVerifierConfinementReadiness,
+      resolveProject,
+    })).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+        message:
+          "campaign maxRequests 1 is below the deterministic provider-task floor 2",
+      }],
+    });
+    expect(inspectVerifierConfinementReadiness).not.toHaveBeenCalled();
+    expect(resolveProject).not.toHaveBeenCalled();
+  });
+
+  it("delegates a below-floor import to core so an exact persisted replay can succeed", async () => {
+    const { packet, executionPlanPath } = await createBelowFloorExecutionPlan();
+    const projectId = "project-below-floor-replay";
+    const projectPath = resolve(packet.target);
+    const layer = {};
+    const store = { getAsyncLayer: vi.fn(() => layer) };
+    const confirmationDigest = confirmationDigestForExecutionPlan(
+      packet,
+      executionPlanPath,
+      projectId,
+      projectPath,
+    );
+    const importCccPrdBundle = vi.fn(async () => ({
+      importId: "import-existing-below-floor",
+      idempotencyKey: "operator-replay-key",
+      bundleHash: "b".repeat(64),
+      identityHash: "i".repeat(64),
+      targetRepository: packet.target,
+      targetBase: packet.base,
+      state: "active" as const,
+      runnable: true,
+      stagingRelativePath: ".fusion/ccc-prd-import-staging/import-existing-below-floor",
+      transactionWitness: { transactionId: "tx-replay", writerClasses: [] },
+      directCounts: {
+        campaigns: 1,
+        tasks: 2,
+        dependencyEdges: 1,
+        workflows: 1,
+        documents: 1,
+        artifacts: 1,
+        sources: 1,
+        workItems: 1,
+        runAudits: 1,
+      },
+      replayed: true,
+    }));
+    const closeProjectStore = vi.fn(async () => undefined);
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "import",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      executionPlanPath,
+      packet.target,
+      packet.base,
+      "operator-replay-key",
+      "--confirm",
+      confirmationDigest,
+      "--json",
+    ], { write: (line) => output.push(line) }, {
+      inspectVerifierConfinementReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
+      resolveProject: vi.fn(async () => ({
+        projectId,
+        projectPath,
+        projectName: "Below-floor replay",
+        isRegistered: true,
+        store,
+      })),
+      closeProjectStore,
+      readTargetHead: vi.fn(async () => packet.base),
+      importCccPrdBundle,
+    })).toBe(0);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "imported",
+      confirmationDigest,
+      result: {
+        importId: "import-existing-below-floor",
+        replayed: true,
+      },
+    });
+    expect(importCccPrdBundle).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyKey: "operator-replay-key",
+      layer,
+      store,
+    }));
+    expect(closeProjectStore).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates core's stable refusal for a fresh below-floor import", async () => {
+    const { packet, executionPlanPath } = await createBelowFloorExecutionPlan();
+    const projectId = "project-below-floor-fresh";
+    const projectPath = resolve(packet.target);
+    const layer = {};
+    const store = { getAsyncLayer: vi.fn(() => layer) };
+    const confirmationDigest = confirmationDigestForExecutionPlan(
+      packet,
+      executionPlanPath,
+      projectId,
+      projectPath,
+    );
+    const coreRefusal = Object.assign(
+      new Error("CCC PRD product import maxRequests 1 is below the provider-task floor 2"),
+      { code: CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR },
+    );
+    const importCccPrdBundle = vi.fn(async () => {
+      throw coreRefusal;
+    });
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "import",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      executionPlanPath,
+      packet.target,
+      packet.base,
+      "operator-fresh-key",
+      "--confirm",
+      confirmationDigest,
+      "--json",
+    ], { write: (line) => output.push(line) }, {
+      inspectVerifierConfinementReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
+      resolveProject: vi.fn(async () => ({
+        projectId,
+        projectPath,
+        projectName: "Below-floor fresh import",
+        isRegistered: true,
+        store,
+      })),
+      closeProjectStore: vi.fn(async () => undefined),
+      readTargetHead: vi.fn(async () => packet.base),
+      importCccPrdBundle,
+    })).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+        message: "CCC PRD product import maxRequests 1 is below the provider-task floor 2",
+      }],
+    });
+    expect(importCccPrdBundle).toHaveBeenCalledTimes(1);
   });
 
   it("refuses when the routes file omits a declared task, surfacing the core missing/extra message", async () => {

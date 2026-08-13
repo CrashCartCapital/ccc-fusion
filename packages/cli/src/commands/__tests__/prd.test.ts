@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CustomProvider } from "@fusion/core";
+import { canonicalCccPrdJson, type CustomProvider } from "@fusion/core";
 import { understandCccPrdPacket } from "@fusion/engine";
 import type { CccPrdNativeAuthoringTransport } from "@fusion/engine";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
@@ -947,12 +947,29 @@ describe("prd command exit contract", () => {
     )).toBe(0);
     const preview = JSON.parse(previewOutput[0]!) as {
       kind: string;
+      schema: string;
       confirmationDigest: string;
       projectId: string;
+      projectPath: string;
       bundleHash: string;
+      packetHash: string;
+      sidecarHash: string;
+      targetRepository: string;
+      targetBase: string;
+      targetHead: string;
+      executionPolicy: unknown;
       requirements: unknown[];
       tasks: unknown[];
       proofs: unknown[];
+      requestBudget: {
+        scope: string;
+        maximum: number;
+        providerTasks: number;
+        deterministicMinimum: number;
+        headroomAboveMinimum: number;
+        completionAdequacy: string;
+        explanation: string;
+      };
     };
     expect(preview).toMatchObject({
       kind: "preview",
@@ -962,6 +979,16 @@ describe("prd command exit contract", () => {
         expect.objectContaining({ id: "TASK-CLI-001" }),
       ],
       proofs: [expect.objectContaining({ id: "PF-CLI-001" })],
+      requestBudget: {
+        scope: "campaign-global",
+        maximum: 1,
+        providerTasks: 1,
+        deterministicMinimum: 1,
+        headroomAboveMinimum: 0,
+        completionAdequacy: "unproven",
+        explanation:
+          "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+      },
       verifierConfinement: {
         ready: true,
         backend: "sandbox-exec",
@@ -971,6 +998,18 @@ describe("prd command exit contract", () => {
       },
     });
     expect(preview.confirmationDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(preview.confirmationDigest).toBe(createHash("sha256").update(canonicalCccPrdJson({
+      schema: preview.schema,
+      projectId: preview.projectId,
+      projectPath: preview.projectPath,
+      bundleHash: preview.bundleHash,
+      packetHash: preview.packetHash,
+      sidecarHash: preview.sidecarHash,
+      targetRepository: preview.targetRepository,
+      targetBase: preview.targetBase,
+      targetHead: preview.targetHead,
+      executionPolicy: preview.executionPolicy,
+    }), "utf8").digest("hex"));
     expect(closeProjectStore).toHaveBeenCalledTimes(1);
 
     const importOutput: string[] = [];

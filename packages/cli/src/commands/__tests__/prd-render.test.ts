@@ -36,6 +36,16 @@ function mergeHoldStatus() {
         lastError: null,
         campaignId: "campaign-1",
         campaignDeadlineAt: "2026-07-31T02:00:00.000Z",
+        requestBudget: {
+          scope: "campaign-global",
+          maximum: 24,
+          used: 7,
+          remaining: 17,
+          providerTasks: 2,
+          deterministicMinimum: 2,
+          headroomAboveMinimum: 22,
+          completionAdequacy: "unproven",
+        },
       },
       tasks: [{
         ordinal: 1,
@@ -310,6 +320,25 @@ describe("human product status rendering", () => {
     expect(text).toContain("340");
   });
 
+  it("renders the campaign-global request budget as reservation-slot accounting without implying per-task quotas", () => {
+    const text = renderOperatorPayload(mergeHoldStatus()).join("\n");
+
+    expect(text).toContain("Request budget (campaign-global)");
+    expect(text).toContain("maximum reservation slots: 24");
+    expect(text).toContain("used reservation slots: 7");
+    expect(text).toContain("remaining reservation slots: 17");
+    expect(text).toContain("provider tasks: 2");
+    expect(text).toContain("static admission floor: 2");
+    expect(text).toContain("headroom above floor: 22");
+    expect(text).toContain("completion adequacy: unproven");
+    expect(text).toContain(
+      "Reservation-slot accounting: each first-time provider-attempt reservation spends one slot; exact idempotent replay is free, while proved-not-dispatched and unknown attempts remain spent.",
+    );
+    expect(text).toContain(
+      "Slots are campaign-global and are not reserved per task; earlier tasks may exhaust the cap.",
+    );
+  });
+
   it("never renders a claim token or controller token", () => {
     const text = renderOperatorPayload(mergeHoldStatus()).join("\n");
 
@@ -392,6 +421,16 @@ describe("human preview rendering", () => {
     proofs: [{ id: "PROOF-exact" }],
     requirements: [{ id: "REQ-1" }],
     admittedWriteRoots: ["src"],
+    requestBudget: {
+      scope: "campaign-global",
+      maximum: 7,
+      providerTasks: 2,
+      deterministicMinimum: 2,
+      headroomAboveMinimum: 5,
+      completionAdequacy: "unproven",
+      explanation:
+        "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+    },
     verifierConfinement: { ready: true, backend: "bwrap", message: "confinement ready" },
   };
 
@@ -412,6 +451,15 @@ describe("human preview rendering", () => {
       `fn prd import /tmp/packet /tmp/packet/manifest.json /tmp/packet/sidecar.json /tmp/packet/execution-plan.json /tmp/product-target ${"d".repeat(40)} ccc-prd-11111111-2222-3333-4444-555555555555 --confirm ${"f".repeat(64)}`,
     ));
     expect(lines.join("\n")).toContain("confinement ready");
+    expect(lines.join("\n")).toContain("Request budget (campaign-global)");
+    expect(lines.join("\n")).toContain("maximum reservation slots: 7");
+    expect(lines.join("\n")).toContain("provider tasks: 2");
+    expect(lines.join("\n")).toContain("static admission floor: 2");
+    expect(lines.join("\n")).toContain("headroom above floor: 5");
+    expect(lines.join("\n")).toContain("completion adequacy: unproven");
+    expect(lines.join("\n")).toContain(
+      "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+    );
     expect(jsonObjectLines(lines)).toEqual([]);
   });
 

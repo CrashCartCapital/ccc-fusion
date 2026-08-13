@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   canonicalCccPrdJson,
   createCccPrdProductExecutionPlan,
@@ -1625,6 +1626,35 @@ function productConfirmationDigest(
     .digest("hex");
 }
 
+function productRequestBudget(
+  bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignProductExecutionPolicy,
+) {
+  const providerTasks = executionPolicy.routes.length;
+  return {
+    scope: "campaign-global" as const,
+    maximum: bundle.bounds.maxRequests,
+    providerTasks,
+    deterministicMinimum: providerTasks,
+    headroomAboveMinimum: bundle.bounds.maxRequests - providerTasks,
+    completionAdequacy: "unproven" as const,
+    explanation:
+      "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+  };
+}
+
+function assertProductRequestBudgetFloor(
+  bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignProductExecutionPolicy,
+): void {
+  const budget = productRequestBudget(bundle, executionPolicy);
+  if (budget.maximum >= budget.deterministicMinimum) return;
+  throw new PrdProductCommandError(
+    CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+    `campaign maxRequests ${budget.maximum} is below the deterministic provider-task floor ${budget.deterministicMinimum}`,
+  );
+}
+
 function operatorVerifierConfinementReadiness(
   readiness: VerifierConfinementReadiness,
 ) {
@@ -1684,6 +1714,7 @@ function productPreview(
     protectedActions: bundle.protectedActions,
     admittedWriteRoots: bundle.admittedWriteRoots,
     bounds: bundle.bounds,
+    requestBudget: productRequestBudget(bundle, identity.executionPolicy),
     nonGoals: bundle.nonGoals,
     materialCoverage: bundle.materialCoverage,
     verifierConfinement: operatorVerifierConfinementReadiness(
@@ -1813,6 +1844,7 @@ async function runProductPacketCommand(
     }
     bundle = compiled;
     executionPolicy = readProductExecutionPolicy(rootDir, executionPlanPath, bundle);
+    if (preview) assertProductRequestBudgetFloor(bundle, executionPolicy);
   } catch (error) {
     const detail = error as { code?: unknown; message?: unknown };
     return writeProductRefusal(

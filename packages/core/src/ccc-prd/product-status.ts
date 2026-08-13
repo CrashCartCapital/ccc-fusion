@@ -18,6 +18,10 @@ import {
   assertCccCampaignAuthorityBinding,
 } from "../ccc-campaign/canonical.js";
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
+import {
+  CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
+  CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+} from "../ccc-campaign/request-budget.js";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
 import {
@@ -247,6 +251,7 @@ export type CccPrdProductStatus = Readonly<{
     campaignId: string;
     campaignStartedAt: string;
     campaignDeadlineAt: string;
+    requestBudget: CccPrdProductRequestBudgetStatus;
     state: string;
     runnable: boolean;
     lastError: string | null;
@@ -277,6 +282,17 @@ export type CccPrdProductStatus = Readonly<{
     recoveryOptions?: readonly string[];
     nextSafeAction?: string;
   }>;
+}>;
+
+export type CccPrdProductRequestBudgetStatus = Readonly<{
+  scope: "campaign-global";
+  maximum: number;
+  used: number;
+  remaining: number;
+  providerTasks: number;
+  deterministicMinimum: number;
+  headroomAboveMinimum: number;
+  completionAdequacy: "unproven";
 }>;
 
 export type InspectCccPrdProductStatusInput = Readonly<{
@@ -601,6 +617,8 @@ function hasLiveRuntimeLease(item: CccPrdProductWorkItemStatus): boolean {
 
 export type CccPrdProductNextActionInput = Readonly<{
   row: ProductImportRow;
+  requestBudget: CccPrdProductRequestBudgetStatus;
+  providerAttemptHistoryConsistent?: boolean;
   taskStatuses: readonly CccPrdProductTaskStatus[];
   workItems: readonly CccPrdProductWorkItemStatus[];
   proofs: readonly CccPrdProductProofStatus[];
@@ -633,12 +651,21 @@ export function productNextAction(
         `Workflow work item ${operatorStopped.id} was terminally stopped by the operator; worktrees, approvals, proof receipts, and any uncertain-effect evidence remain preserved for review.`,
     };
   }
-  const unknownProofs = input.proofs
-    .flatMap((proof) => proof.attempts)
+  const proofAttempts = [
+    ...input.proofs.flatMap((proof) => proof.attempts),
+    ...input.orphanProofAttempts,
+  ];
+  const reservedProofs = proofAttempts
+    .filter((attempt) => attempt.state === "reserved");
+  const unknownProofs = proofAttempts
     .filter((attempt) => attempt.state === "dispatched_unknown");
+  const reservedProviders = input.providerAttempts
+    .filter((attempt) => attempt.state === "reserved");
   const unknownProviders = input.providerAttempts
     .filter((attempt) => attempt.state === "dispatched_unknown");
+  const reservedProof = reservedProofs[0];
   const unknownProof = unknownProofs[0];
+  const reservedProvider = reservedProviders[0];
   const unknownProvider = unknownProviders[0];
   const liveExecutionApprovalWorkItem = input.workItems.find((item) =>
     item.state === "manual-required"
@@ -652,6 +679,10 @@ export function productNextAction(
       CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON
     && item.blockedReason ===
       CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON);
+  const requestBudgetExhaustionWorkItem = input.workItems.find((item) =>
+    item.state === "manual-required"
+    && item.lastError === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
+    && item.blockedReason === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON);
   if (verifierConfinementWorkItem) {
     return {
       kind: "blocked",
@@ -675,13 +706,24 @@ export function productNextAction(
   const uncertainManualWorkItem = input.workItems.find((item) =>
     item.state === "manual-required"
     && item.lastError !== CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON
+    && item.lastError !== CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
     && item.id !== liveExecutionApprovalWorkItem?.id);
   // Only an unexpired lease matching the full persisted work-item fence proves
   // that the runtime still owns an uncertain effect. Task identity alone is
   // insufficient because a later retry can reuse the same task and item ID.
   const runningWorkOwnsAllUnknownEffects =
     uncertainManualWorkItem === undefined
-    && (unknownProofs.length + unknownProviders.length) > 0
+    && (
+      reservedProofs.length
+      + unknownProofs.length
+      + unknownProviders.length
+      + reservedProviders.length
+    ) > 0
+    && reservedProofs.every((attempt) => input.workItems.some((item) =>
+      hasLiveRuntimeLease(item)
+      && item.id === attempt.workItemId
+      && item.runId === attempt.runId
+      && item.attempt === attempt.workItemAttempt))
     && unknownProofs.every((attempt) => input.workItems.some((item) =>
       hasLiveRuntimeLease(item)
       && item.id === attempt.workItemId
@@ -692,22 +734,38 @@ export function productNextAction(
         hasLiveRuntimeLease(item)
         && item.id === attempt.workItemFence!.workItemId
         && item.runId === attempt.workItemFence!.runId
+        && item.attempt === attempt.workItemFence!.attempt))
+    && reservedProviders.every((attempt) => attempt.workItemFence !== null
+      && input.workItems.some((item) =>
+        hasLiveRuntimeLease(item)
+        && item.id === attempt.workItemFence!.workItemId
+        && item.runId === attempt.workItemFence!.runId
         && item.attempt === attempt.workItemFence!.attempt));
   if (runningWorkOwnsAllUnknownEffects) {
     return {
       kind: "wait-for-runtime",
       reason:
-        "Campaign external work is in flight and still owned by the runtime.",
+        "Campaign provider/proof work is reserved or in flight and still owned by the runtime.",
     };
   }
-  if (unknownProof || unknownProvider || uncertainManualWorkItem) {
+  if (
+    reservedProof
+    || unknownProof
+    || reservedProvider
+    || unknownProvider
+    || uncertainManualWorkItem
+  ) {
     return {
       kind: "resolve-manual-required",
       reason: uncertainManualWorkItem
         ? `Workflow work item ${uncertainManualWorkItem.id} requires an operator decision.`
-        : unknownProof
-          ? `Proof attempt ${unknownProof.attemptKey} has an uncertain external effect.`
-          : `Provider attempt ${unknownProvider!.attemptKey} has an uncertain external effect.`,
+        : reservedProof
+          ? `Proof attempt ${reservedProof.attemptKey} is reserved and has unresolved proof custody.`
+          : unknownProof
+            ? `Proof attempt ${unknownProof.attemptKey} has an uncertain external effect.`
+            : reservedProvider
+              ? `Provider attempt ${reservedProvider.attemptKey} is reserved and has unresolved provider custody.`
+              : `Provider attempt ${unknownProvider!.attemptKey} has an uncertain external effect.`,
     };
   }
   if (
@@ -717,6 +775,63 @@ export function productNextAction(
     return {
       kind: "blocked",
       reason: "Persisted campaign custody is missing a task, route, or declared proof.",
+    };
+  }
+  if (
+    requestBudgetExhaustionWorkItem
+    && (
+      input.requestBudget.used !== input.requestBudget.maximum
+      || input.providerAttemptHistoryConsistent === false
+    )
+  ) {
+    const driftDetail = input.providerAttemptHistoryConsistent === false
+      ? `${input.requestBudget.used} of ${input.requestBudget.maximum} first-time provider-attempt reservation slots are persisted as consumed, but that counter does not match the provider-attempt ledger`
+      : `${input.requestBudget.used} of ${input.requestBudget.maximum} first-time provider-attempt reservation slots are persisted as consumed`;
+    return {
+      kind: "blocked",
+      reason:
+        "Request-budget exhaustion custody is inconsistent with the persisted reservation-slot counter.",
+      diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+      safeState:
+        `Workflow work item ${requestBudgetExhaustionWorkItem.id} is parked manual-required for request-budget exhaustion, but ${driftDetail}.`,
+      decisionOwner: "Fusion database operator",
+      consequence:
+        "Campaign status cannot prove true budget exhaustion until the marker and counter are reconciled.",
+      recoveryOptions: [
+        "Inspect campaign provider-attempt rows and the import request_count in the same database snapshot.",
+        "Reconcile missing receipts or repair the persisted marker; do not requeue the campaign from this inconsistent state.",
+      ],
+      nextSafeAction:
+        "Run a read-only custody audit for the import row and provider-attempt ledger.",
+    };
+  }
+  /*
+  FNXC:CCCCampaignRequestBudgetStatus 2026-08-12-21:10:
+  A sealed campaign cannot raise its request cap in place. Surface exhaustion
+  as a terminal recovery path before the generic manual-required classifier so
+  operators are never told to retry an immutable import against the same cap.
+  Reserved or dispatched-unknown provider/proof attempts still dominate this
+  advice because their runtime custody must be reconciled before budget finality
+  is safe.
+  */
+  if (requestBudgetExhaustionWorkItem) {
+    return {
+      kind: "blocked",
+      reason:
+        "The campaign-global provider request budget is exhausted; this immutable import cannot resume.",
+      diagnostic: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
+      safeState:
+        `Workflow work item ${requestBudgetExhaustionWorkItem.id} is parked manual-required after using ${input.requestBudget.used} of ${input.requestBudget.maximum} first-time provider-attempt reservation slots; the refused next slot was not reserved or dispatched. Existing attempts, commits, worktrees, and receipts remain preserved.`,
+      decisionOwner: "Campaign operator",
+      consequence:
+        "The same immutable import cannot resume, prove, or land because its sealed request cap cannot be raised.",
+      recoveryOptions: [
+        "Retain the exhausted import and its receipts as immutable evidence; do not retry or requeue it.",
+        "Create a fresh source-bound packet, preview, and import with a larger campaign-global maxRequests value.",
+        "Treat prior task commits as evidence only; integrating those bytes into a new base requires separate authorization and proof.",
+      ],
+      nextSafeAction:
+        "Create and confirm a fresh sealed import with a larger campaign-global request cap.",
     };
   }
   const failedWorkItem = input.workItems.find((item) =>
@@ -1001,15 +1116,6 @@ export async function inspectCccPrdProductStatus(
         },
       };
     });
-    const providerAttempts = providerAttemptStatusesForCampaign(
-      await listCccProviderAttemptsForCampaign({
-        layer: input.layer,
-        rootDir,
-        taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
-        tx,
-      }),
-    );
-
     const campaignRunId = `ccc-prd:${row.importId}`;
     const workItemRows = await tx
       .select()
@@ -1324,8 +1430,50 @@ export async function inspectCccPrdProductStatus(
         .filter((action) => action.kind === "live_execution")
         .map((action) => action.id),
     );
+    const providerTasks = custody.executionPolicy.routes.length;
+    const requestBudget: CccPrdProductRequestBudgetStatus = {
+      scope: "campaign-global",
+      maximum: custody.manifest.bounds.maxRequests,
+      used: row.requestCount,
+      remaining: Math.max(
+        0,
+        custody.manifest.bounds.maxRequests - row.requestCount,
+      ),
+      providerTasks,
+      deterministicMinimum: providerTasks,
+      headroomAboveMinimum:
+        custody.manifest.bounds.maxRequests - providerTasks,
+      completionAdequacy: "unproven",
+    };
+    let providerAttempts: readonly CccPrdProductProviderAttemptStatus[] = [];
+    let providerAttemptHistoryConsistent = true;
+    try {
+      providerAttempts = providerAttemptStatusesForCampaign(
+        await listCccProviderAttemptsForCampaign({
+          layer: input.layer,
+          rootDir,
+          taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
+          tx,
+        }),
+      );
+    } catch (error) {
+      const hasBudgetExhaustionMarker = workItems.some((item) =>
+        item.state === "manual-required"
+        && item.lastError === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
+        && item.blockedReason === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON);
+      if (
+        !(error instanceof CccCampaignContextError)
+        || !error.message.includes("request count")
+        || !hasBudgetExhaustionMarker
+      ) {
+        throw error;
+      }
+      providerAttemptHistoryConsistent = false;
+    }
     const nextAction = productNextAction({
       row,
+      requestBudget,
+      providerAttemptHistoryConsistent,
       taskStatuses,
       workItems,
       proofs,
@@ -1357,6 +1505,7 @@ export async function inspectCccPrdProductStatus(
         campaignId: custody.manifest.campaignId,
         campaignStartedAt: custody.manifest.campaignStartedAt,
         campaignDeadlineAt: custody.manifest.campaignDeadlineAt,
+        requestBudget,
         state: row.state,
         runnable: row.runnable === 1,
         lastError: row.lastError,

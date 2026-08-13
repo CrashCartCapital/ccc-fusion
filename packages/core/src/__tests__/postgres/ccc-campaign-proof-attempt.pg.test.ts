@@ -10,6 +10,7 @@ import {
 } from "../../index.js";
 import {
   createCccPrdImportTestBundle,
+  createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
@@ -48,7 +49,7 @@ pgDescribe("CCC campaign proof-attempt receipts (PostgreSQL)", () => {
   }
 
   async function campaign(suffix: string) {
-    const source = createCccPrdImportTestBundle(h.rootDir(), suffix);
+    const source = createCccPrdImportTestProductBundle(h.rootDir(), suffix);
     const imported = await importCccPrdBundle({
       bundle: source,
       idempotencyKey: `proof-attempt-${suffix}`,
@@ -227,6 +228,7 @@ pgDescribe("CCC campaign proof-attempt receipts (PostgreSQL)", () => {
     };
     const source = rehashCccPrdImportTestBundle({
       ...initial,
+      bounds: { ...initial.bounds, maxRequests: initial.tasks.length },
       requirements: initial.requirements.map((requirement) => ({
         ...requirement,
         proofIds: [firstProof.id, secondProof.id],

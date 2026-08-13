@@ -347,6 +347,7 @@ function statusBody(
   }
   field(lines, 1, "campaign deadline", importRecord.campaignDeadlineAt);
   field(lines, 1, "last error", importRecord.lastError);
+  requestBudgetLines(lines, asRecord(importRecord.requestBudget));
 
   nextActionLines(lines, asRecord(status.nextAction));
   taskLines(lines, asList(status.tasks));
@@ -717,6 +718,29 @@ function verifierConfinementLines(
   prose(lines, 1, "Next safe action", confinement.nextSafeAction);
 }
 
+function requestBudgetLines(
+  lines: string[],
+  budget: Record<string, unknown> | null,
+): void {
+  if (!budget) return;
+  const scope = asScalar(budget.scope);
+  lines.push(`Request budget${scope === null ? "" : ` (${scope})`}`);
+  field(lines, 1, "maximum reservation slots", budget.maximum);
+  field(lines, 1, "used reservation slots", budget.used);
+  field(lines, 1, "remaining reservation slots", budget.remaining);
+  field(lines, 1, "provider tasks", budget.providerTasks);
+  field(lines, 1, "static admission floor", budget.deterministicMinimum);
+  field(lines, 1, "headroom above floor", budget.headroomAboveMinimum);
+  field(lines, 1, "completion adequacy", budget.completionAdequacy);
+  lines.push(
+    `${pad(1)}Reservation-slot accounting: each first-time provider-attempt reservation spends one slot; exact idempotent replay is free, while proved-not-dispatched and unknown attempts remain spent.`,
+  );
+  lines.push(
+    `${pad(1)}Slots are campaign-global and are not reserved per task; earlier tasks may exhaust the cap.`,
+  );
+  prose(lines, 1, "Meaning", budget.explanation);
+}
+
 function refusalLines(payload: Record<string, unknown>): string[] {
   const lines: string[] = ["Refused. Fusion did not complete this operation."];
   diagnosticLines(lines, asList(payload.diagnostics));
@@ -755,6 +779,7 @@ function previewLines(
   );
   bulletList(lines, 1, "admitted write roots", preview.admittedWriteRoots);
   bulletList(lines, 1, "non-goals", preview.nonGoals);
+  requestBudgetLines(lines, asRecord(preview.requestBudget));
   verifierConfinementLines(lines, asRecord(preview.verifierConfinement));
 
   const digest = asScalar(preview.confirmationDigest);

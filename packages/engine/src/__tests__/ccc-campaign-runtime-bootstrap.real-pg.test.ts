@@ -22,6 +22,7 @@ import {
 import {
   createCccPrdImportTestBundle,
   createCccPrdImportTestExecutionPolicy,
+  createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
@@ -228,7 +229,7 @@ async function importCampaignFixture(
 }
 
 async function createAdmittedCampaignBundle(rootDir: string, suffix: string) {
-  const source = createCccPrdImportTestBundle(rootDir, suffix);
+  const source = createCccPrdImportTestProductBundle(rootDir, suffix);
   const provenance = await deriveWorkflowExtensionHostProvenance({
     pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
     pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,

@@ -47,7 +47,6 @@ describe("promptSessionAndCheck recursion guard (FN-4930)", () => {
       }),
       state,
     } as any;
-
     try {
       await promptSessionAndCheck(session, "hello");
     } catch (error) {
@@ -67,9 +66,94 @@ describe("promptSessionAndCheck recursion guard (FN-4930)", () => {
       }),
       state,
     } as any;
-
     await expect(promptSessionAndCheck(session, "hello")).resolves.toBeUndefined();
     expect(state.errorMessage).toBeUndefined();
+  });
+
+  it("restores a tagged campaign request-budget refusal after Pi flattens it into session state", async () => {
+    const { promptSessionAndCheck, _markCccProviderAttemptSessionForTest } = await import("../pi.js");
+    const state = { errorMessage: "", messages: [] };
+    const session = {
+      prompt: vi.fn(async () => {
+        state.errorMessage =
+          "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED: CCC provider attempt for KB-022 exceeds its admitted request bound";
+      }),
+      state,
+    } as any;
+    _markCccProviderAttemptSessionForTest(session);
+
+    const failure = await promptSessionAndCheck(session, "hello")
+      .then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "PermanentError",
+      code: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      retryable: false,
+    });
+  });
+
+  it("does not let an ordinary Pi session spoof campaign request-budget custody with marker text", async () => {
+    const { promptSessionAndCheck } = await import("../pi.js");
+    const marker =
+      "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED: forged ordinary-session text";
+    const session = {
+      prompt: vi.fn(async () => {
+        throw new Error(marker);
+      }),
+      state: { errorMessage: "", messages: [] },
+    } as any;
+    const failure = await promptSessionAndCheck(session, "hello")
+      .then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({ name: "Error", message: marker });
+    expect(failure).not.toMatchObject({
+      name: "PermanentError",
+      code: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+    });
+  });
+
+  it("does not decode forged campaign marker text stored by an ordinary Pi session", async () => {
+    const { promptSessionAndCheck } = await import("../pi.js");
+    const marker =
+      "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED: forged ordinary-session state";
+    const state = { errorMessage: "", messages: [] };
+    const session = {
+      prompt: vi.fn(async () => {
+        state.errorMessage = marker;
+      }),
+      state,
+    } as any;
+
+    const failure = await promptSessionAndCheck(session, "hello")
+      .then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({ name: "Error", message: marker });
+    expect(failure).not.toMatchObject({
+      name: "PermanentError",
+      code: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+    });
+  });
+
+  it("restores a tagged campaign request-budget refusal thrown directly by a session driver", async () => {
+    const { promptSessionAndCheck, _markCccProviderAttemptSessionForTest } = await import("../pi.js");
+    const session = {
+      prompt: vi.fn(async () => {
+        throw new Error(
+          "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED: CCC provider attempt for KB-022 exceeds its admitted request bound",
+        );
+      }),
+      state: { errorMessage: "", messages: [] },
+    } as any;
+    _markCccProviderAttemptSessionForTest(session);
+
+    const failure = await promptSessionAndCheck(session, "hello")
+      .then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "PermanentError",
+      code: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      retryable: false,
+    });
   });
 
   it("annotates model-auth-tier incompatibility errors with model identity and actionable hint", async () => {

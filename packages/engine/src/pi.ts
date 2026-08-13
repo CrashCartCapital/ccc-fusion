@@ -88,6 +88,7 @@ import {
   type AgentActionGateContext,
 } from "./agent-action-gate.js";
 import { resolvePermanentAgentToolDecision } from "./permanent-agent-gating.js";
+import { decodeCccCampaignPermanentSessionError } from "./ccc-campaign-runtime-errors.js";
 import type { SystemPromptLayers } from "./prompt-layers.js";
 import type {
   CccEffectReceiptBinder,
@@ -371,6 +372,13 @@ function clearSessionStateError(session: AgentSession): void {
 }
 
 const CCC_EXPECTED_RESPONSE_MODEL = "__fusionCccExpectedResponseModel";
+const cccProviderAttemptSessions = new WeakSet<object>();
+
+/** Test seam for the string-only Pi failure boundary. Production marks only
+ * sessions created from a validated provider-attempt binding below. */
+export function _markCccProviderAttemptSessionForTest(session: AgentSession): void {
+  cccProviderAttemptSessions.add(session as unknown as object);
+}
 
 /**
  * An owned CCC transport is not considered closed when AbortController merely
@@ -969,14 +977,26 @@ function safePreviewJson(value: unknown): string {
 
 export async function promptSessionAndCheck(session: AgentSession, prompt: string, options?: unknown): Promise<void> {
   clearSessionStateError(session);
-  if (options === undefined) {
-    await session.prompt(prompt);
-  } else {
-    await (session.prompt as any)(prompt, options);
+  try {
+    if (options === undefined) {
+      await session.prompt(prompt);
+    } else {
+      await (session.prompt as any)(prompt, options);
+    }
+  } catch (error) {
+    const campaignRefusal = cccProviderAttemptSessions.has(session as unknown as object) && error instanceof Error
+      ? decodeCccCampaignPermanentSessionError(error.message)
+      : null;
+    if (campaignRefusal) throw campaignRefusal;
+    throw error;
   }
 
   const stateError = getSessionStateError(session);
   if (stateError) {
+    const campaignRefusal = cccProviderAttemptSessions.has(session as unknown as object)
+      ? decodeCccCampaignPermanentSessionError(stateError)
+      : null;
+    if (campaignRefusal) throw campaignRefusal;
     // pi-coding-agent swallows its own exceptions into state.errorMessage
     // without preserving a stack. When the message looks like a generic
     // TypeError (undefined/null property access), dump the session transcript
@@ -3479,6 +3499,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
 
     try {
       const result = await createAgentSession(createSessionOptions);
+      if (cccProviderAttemptBinding) {
+        cccProviderAttemptSessions.add(result.session as unknown as object);
+      }
       if (mcpToolset) {
         const sessionWithDispose = result.session as AgentSession & { dispose?: () => void | Promise<void> };
         const originalDispose = typeof sessionWithDispose.dispose === "function"

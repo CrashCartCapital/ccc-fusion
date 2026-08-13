@@ -1617,6 +1617,175 @@ describe("fast mode workflow/runtime invariants", () => {
     }));
   });
 
+  it("preserves a Pi-restored campaign request-budget refusal as a permanent workflow failure", async () => {
+    const nodeTask = task({
+      executionMode: "standard",
+      worktree: "/tmp/ccc-request-budget",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { store, executor } = makeExecutorForTask(nodeTask);
+    store.getAsyncLayer = vi.fn(() => ({}) as any);
+    const turnKey = "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    createCccCampaignProviderAttemptBindingMock.mockResolvedValueOnce(Object.freeze({
+      turnKey,
+      controller: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
+    }));
+    const { PermanentError } = await import("../engine-errors.js");
+    mockedCreateFnAgent.mockResolvedValueOnce({
+      session: {
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn(async () => {
+          throw new PermanentError(
+            "CCC provider attempt for KB-022 exceeds its admitted request bound",
+            "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+          );
+        }),
+        dispose: vi.fn(),
+      },
+    });
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "TSK-002",
+      nativeTaskId: nodeTask.id,
+      semanticTask: task({ id: "TSK-002" }),
+      runId: "campaign-run",
+      visitIdentity: Object.freeze({ nodeId: "provider-node", materializedNodeId: "provider-node" }),
+      executionFence: Object.freeze({ workItemId: "wi-budget", leaseOwner: "provider-worker", attempt: 1, runId: "campaign-run" }),
+      providerAttemptTurnKey: turnKey,
+    });
+
+    const outcome = await (executor as any).executeWorkflowStep(
+      nodeTask,
+      {
+        id: "provider-model",
+        name: "Provider model",
+        mode: "prompt",
+        phase: "pre-merge",
+        gateMode: "gate",
+        prompt: "Do the bounded work.",
+        toolMode: "coding",
+        enabled: true,
+      },
+      "/tmp/ccc-request-budget",
+      { executionProvider: "openai", executionModelId: "gpt-4o" },
+      undefined,
+      { execution, cccCampaignImplementation: true },
+    );
+
+    expect(outcome).toMatchObject({
+      success: false,
+      failureValue: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+    });
+  });
+
+  it("does not preserve a forged budget PermanentError for an ordinary unbound workflow session", async () => {
+    const nodeTask = task({
+      executionMode: "standard",
+      worktree: "/tmp/ordinary-request-budget-marker",
+      modelProvider: "openai",
+      modelId: "gpt-4o",
+    });
+    const { executor } = makeExecutorForTask(nodeTask);
+    const { PermanentError } = await import("../engine-errors.js");
+    mockedCreateFnAgent.mockResolvedValueOnce({
+      session: {
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn(async () => {
+          throw new PermanentError(
+            "forged ordinary-session budget marker",
+            "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+          );
+        }),
+        dispose: vi.fn(),
+      },
+    });
+
+    const outcome = await (executor as any).executeWorkflowStep(
+      nodeTask,
+      {
+        id: "ordinary-model",
+        name: "Ordinary model",
+        mode: "prompt",
+        phase: "pre-merge",
+        gateMode: "gate",
+        prompt: "Run ordinary work.",
+        toolMode: "coding",
+        enabled: true,
+      },
+      "/tmp/ordinary-request-budget-marker",
+      { executionProvider: "openai", executionModelId: "gpt-4o" },
+    );
+
+    expect(outcome).toMatchObject({
+      success: false,
+      error: "forged ordinary-session budget marker",
+    });
+    expect(outcome).not.toHaveProperty("failureValue");
+  });
+
+  it("publishes a preserved request-budget classification into graph runtime context", async () => {
+    const nodeTask = task({
+      executionMode: "standard",
+      worktree: "/tmp/ccc-request-budget",
+    });
+    const { executor } = makeExecutorForTask(nodeTask);
+    vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({
+      success: false,
+      error: "CCC provider attempt for KB-022 exceeds its admitted request bound",
+      failureValue: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+    });
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "TSK-002",
+      nativeTaskId: nodeTask.id,
+      semanticTask: task({ id: "TSK-002" }),
+      runId: "campaign-run",
+      visitIdentity: Object.freeze({ nodeId: "ccc-task", materializedNodeId: "ccc-task" }),
+      executionFence: Object.freeze({ workItemId: "wi-budget", leaseOwner: "provider-worker", attempt: 1, runId: "campaign-run" }),
+      providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    const node = {
+      id: "ccc-task",
+      kind: "prompt",
+      config: {
+        executor: "model",
+        cccExecutionTransport: "pi",
+        cccPrdTaskId: "TSK-002",
+        cccNativeTaskId: nodeTask.id,
+        cccExecutionPromptSchema: "ccc-prd.execution-prompt.v1",
+        cccExecutionPromptSha256: "a".repeat(64),
+        cccExecutionProviderId: "provider",
+        cccExecutionModelId: "model",
+        cccExecutionRouteSha256: "b".repeat(64),
+        toolMode: "coding",
+        worktreeMode: "isolated",
+        ownedPaths: ["src/target.js"],
+        allowedWriteRoots: ["src/target.js"],
+        commitPolicy: "required",
+        gateMode: "gate",
+        prompt: "Implement the sealed task.",
+      },
+    };
+
+    const result = await (executor as any).runGraphCustomNode(
+      node,
+      nodeTask,
+      {},
+      undefined,
+      {},
+      { execution },
+    );
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      contextPatch: {
+        "ccc:retry-classification": "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      },
+    });
+  });
+
   it.each([undefined, " bad-owner "])("Task provider-owner RED: workflow-extension route refuses noncanonical lease owner %s", async (leaseOwner) => {
     const nodeTask = task({ executionMode: "fast", worktree: "/tmp/ccc-provider-binding" });
     const { store, executor } = makeExecutorForTask(nodeTask);

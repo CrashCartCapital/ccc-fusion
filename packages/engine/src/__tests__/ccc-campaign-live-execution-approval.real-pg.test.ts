@@ -14,7 +14,7 @@ import {
   type WorkflowIrNode,
 } from "@fusion/core";
 import {
-  createCccPrdImportTestBundle,
+  createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
@@ -114,7 +114,7 @@ pgTest("CCC campaign live-execution approval", () => {
   async function importFixture(suffix: string, mode: FixtureMode = "live") {
     const rootDir = h.rootDir();
     const baseCommit = await initializeGitRoot(rootDir);
-    const source = createCccPrdImportTestBundle(rootDir, suffix);
+    const source = createCccPrdImportTestProductBundle(rootDir, suffix);
     const firstTask = source.tasks[0]!;
     const secondTask = source.tasks[1]!;
     const firstLiveAction = {
