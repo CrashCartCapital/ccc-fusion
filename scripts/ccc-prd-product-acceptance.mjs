@@ -4320,17 +4320,17 @@ async function main() {
       JSON.stringify(validated),
     );
     exactArray(
-      compiled.requirements?.map(({ id }) => id),
+      compiled.requirements?.map(({ id }) => id).sort(),
       ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       "CCC_PRODUCT_REQUIREMENT_SET_DRIFT",
     );
     exactArray(
-      compiled.tasks?.map(({ id }) => id),
+      compiled.tasks?.map(({ id }) => id).sort(),
       ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
       "CCC_PRODUCT_TASK_SET_DRIFT",
     );
     exactArray(
-      compiled.proofs?.map(({ id }) => id),
+      compiled.proofs?.map(({ id }) => id).sort(),
       [
         "PROOF-VERTICAL-INTEGRATED",
         "PROOF-VERTICAL-SECOND-TASK",
