@@ -426,6 +426,22 @@ describe("CCC PRD semantic-proof controller custody", () => {
     })).resolves.toHaveLength(1);
   });
 
+  it("RED-S5-candidate-set-order: admits the exact candidate set independent of Task argv order", async () => {
+    const f = await fixture();
+    const proof = {
+      ...f.proof,
+      candidateInputs: [...f.proof.candidateInputs].reverse(),
+    };
+
+    await expect(hydrateCccPrdSemanticProofV2Custody({
+      repositoryRoot: f.root,
+      baseCommit: f.baseCommit,
+      proofs: [proof],
+      modelWriteRoots: ["src", "test"],
+      toolchainPaths: f.toolchainPaths,
+    })).resolves.toHaveLength(1);
+  });
+
   it("RED-S5-multi-target-taskfile-negative: refuses unsafe behavior hidden in an unselected target", async () => {
     const f = await fixture({
       additionalTaskfileLines: [

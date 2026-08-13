@@ -223,6 +223,74 @@ describe("CCC semantic-proof admission and materialization", () => {
     }
   });
 
+  it("RED-S5-runtime-candidate-set-order: materializes the exact candidate set independent of Task argv order", async () => {
+    const fixture = await createGitFixture();
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
+    roots.push(outputRoot);
+    const taskfile = [
+      "version: '3'",
+      "tasks:",
+      "  verify:slugify:",
+      "    cmds:",
+      "      - node verify/slugify.mjs src/slugify.js src/other.js",
+      "  verify:other:",
+      "    cmds:",
+      "      - node verify/other.mjs src/other.js",
+      "",
+    ].join("\n");
+    await writeFile(join(fixture.repository, "Taskfile.yml"), taskfile);
+    await execFile("git", ["-C", fixture.repository, "add", "Taskfile.yml"]);
+    await execFile("git", ["-C", fixture.repository, "commit", "-m", "bind two proof candidates"]);
+    const baseCommit = (await execFile(
+      "git",
+      ["-C", fixture.repository, "rev-parse", "HEAD"],
+    )).stdout.trim();
+    const taskOid = (await execFile(
+      "git",
+      ["-C", fixture.repository, "rev-parse", `${baseCommit}:Taskfile.yml`],
+    )).stdout.trim();
+    await writeFile(
+      join(fixture.repository, "src", "slugify.js"),
+      "export const slugify = () => 'candidate-two';\n",
+    );
+    await execFile("git", ["-C", fixture.repository, "add", "src/slugify.js"]);
+    await execFile("git", ["-C", fixture.repository, "commit", "-m", "second candidate"]);
+    const sourceCommit = (await execFile(
+      "git",
+      ["-C", fixture.repository, "rev-parse", "HEAD"],
+    )).stdout.trim();
+    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const nodeIdentity = await executableIdentity(process.execPath);
+    const definition = proof({
+      ...fixture,
+      taskOid,
+      taskIdentity,
+      nodeIdentity,
+      linkedRuntime: await inspectCccSemanticProofLinkedRuntime({
+        task: taskIdentity,
+        node: nodeIdentity,
+        proofHost: { id: "fusion-native-semantic-proof-v2", ...nodeIdentity },
+      }),
+    });
+    definition.verifierClosure[0] = {
+      ...definition.verifierClosure[0]!,
+      baseGitBlobOid: taskOid,
+      sha256: sha256(taskfile),
+    };
+    definition.candidateInputs = ["src/other.js", "src/slugify.js"];
+
+    await expect(admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit,
+      sourceCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    })).resolves.toMatchObject({
+      candidateInputsSha256: computeCccPrdCandidateInputsSha256(definition.candidateInputs),
+    });
+  });
+
   it("RED-S5-closure-git-custody: refuses verifier closure inside a model-owned root", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));

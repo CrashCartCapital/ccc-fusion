@@ -310,7 +310,8 @@ function verifyTaskfile(
   const candidates = tokens.slice(2);
   if (
     candidates.length !== proof.candidateInputs.length
-    || candidates.some((path, index) => path !== proof.candidateInputs[index])
+    || computeCccPrdCandidateInputsSha256(candidates)
+      !== computeCccPrdCandidateInputsSha256(proof.candidateInputs)
   ) {
     throw new Error("CCC semantic-proof Task target candidate arguments differ from declared inputs");
   }

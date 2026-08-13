@@ -9,6 +9,7 @@ import { isAlias, isMap, isScalar, isSeq, parseDocument, type Node, type Pair } 
 import { resolveGitBinary } from "../git-binary.js";
 import {
   canonicalCccPrdJson,
+  computeCccPrdCandidateInputsSha256,
   computeCccPrdProofDefinitionSha256,
   computeCccPrdProofExecutionToolchainSha256,
   computeCccPrdProofV2AdmissionDigests,
@@ -287,7 +288,8 @@ function verifyTaskfile(bytes: Buffer, proof: CccPrdProofV2): void {
   const candidates = tokens.slice(2);
   if (
     candidates.length !== proof.candidateInputs.length
-    || candidates.some((path, index) => path !== proof.candidateInputs[index])
+    || computeCccPrdCandidateInputsSha256(candidates)
+      !== computeCccPrdCandidateInputsSha256(proof.candidateInputs)
   ) {
     custodyRefusal("CCC semantic-proof Task target candidate arguments differ from declared inputs");
   }
