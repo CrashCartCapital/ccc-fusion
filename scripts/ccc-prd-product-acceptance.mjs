@@ -4103,6 +4103,9 @@ async function main() {
     const generationRequests = nativeAuthoring.requests.filter(
       ({ method }) => method === "POST",
     );
+    const generationPrompt = (generationRequests[0]?.body?.messages ?? [])
+      .map((message) => typeof message?.content === "string" ? message.content : "")
+      .join("\n");
     assert(
       generationRequests.length === 1
         && generationRequests[0].url === "/v1/chat/completions"
@@ -4110,19 +4113,19 @@ async function main() {
         && generationRequests[0].body?.stream === true
         && generationRequests[0].headers?.authorization
           === `Bearer ${loopbackAuthoringApiKey}`
-        && JSON.stringify(generationRequests[0].body?.messages).includes(
+        && generationPrompt.includes(
           "Every implementation-changing fact must be source-bound",
         )
-        && JSON.stringify(generationRequests[0].body?.messages).includes(
+        && generationPrompt.includes(
           "CCC Fusion Product Vertical Slice",
         )
-        && JSON.stringify(generationRequests[0].body?.messages).includes(
+        && generationPrompt.includes(
           "Fusion Reviewed Operator Context",
         )
-        && JSON.stringify(generationRequests[0].body?.messages).includes(
+        && generationPrompt.includes(
           '"schema": "ccc-prd.authoring-proposal.v2"',
         )
-        && JSON.stringify(generationRequests[0].body?.messages).includes(
+        && generationPrompt.includes(
           '"acceptanceClauses"',
         ),
       "CCC_PRODUCT_NATIVE_AUTHORING_REQUEST_INVALID",
