@@ -475,6 +475,36 @@ function proofAttemptLines(
     const attemptKey = asScalar(attempt.attemptKey) ?? "(unidentified attempt)";
     const state = asScalar(attempt.state) ?? "unknown state";
     lines.push(`${pad(depth)}${attemptKey} - state ${state}`);
+    const contractVersion = asScalar(attempt.attemptContractVersion);
+    field(lines, depth + 1, "attempt contract", contractVersion);
+    field(lines, depth + 1, "proof phase", attempt.phase);
+    field(lines, depth + 1, "verifier closure digest", attempt.verifierClosureSha256);
+    field(lines, depth + 1, "candidate inputs digest", attempt.candidateInputsSha256);
+    field(lines, depth + 1, "execution toolchain digest", attempt.executionToolchainSha256);
+    if (contractVersion === "v2") {
+      const envelope = asRecord(attempt.terminalEnvelope);
+      if (envelope) {
+        const kind = asScalar(envelope.kind) ?? "unknown";
+        lines.push(`${pad(depth + 1)}terminal envelope: ${kind}`);
+        if (kind === "verified") {
+          lines.push(
+            `${pad(depth + 2)}verified verdict: ${envelope.passed === true ? "passed" : "failed"}`,
+          );
+        } else {
+          field(lines, depth + 2, "refusal code", envelope.code);
+        }
+      }
+      const evidence = asRecord(attempt.proofEvidence);
+      if (evidence) {
+        lines.push(
+          `${pad(depth + 1)}semantic evidence: ${evidence.passed === true ? "passed" : "failed"}`,
+        );
+      }
+      field(lines, depth + 1, "terminal envelope digest", attempt.terminalEnvelopeSha256);
+      field(lines, depth + 1, "semantic evidence digest", attempt.proofEvidenceSha256);
+      field(lines, depth + 1, "settled at", attempt.settledAt);
+      continue;
+    }
     const result = asRecord(attempt.result);
     if (result) {
       const verdict = result.success === true ? "passed" : "failed";

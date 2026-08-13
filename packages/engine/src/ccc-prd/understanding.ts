@@ -8,6 +8,9 @@ import {
   type CccPrdDiagnostic,
   type CccPrdExecutionBounds,
   type CccPrdMaterialCoverageItem,
+  type CccPrdProofV1,
+  type CccPrdProofV2,
+  type CccPrdSemanticProofContractVersion,
   type CccPrdSidecar,
   type CccPrdTargetRepository,
   type CustomProvider,
@@ -106,6 +109,8 @@ export type UnderstandCccPrdInput = {
   adapter: CccPrdAuthoringAdapter;
   maxReviewItems: number;
   workflowExtensionRegistry: WorkflowExtensionRegistry;
+  /** Omission preserves the frozen v1 proposal/fragment contract. */
+  semanticProofContract?: CccPrdSemanticProofContractVersion;
   /**
    * Design §7 (D-3). Defaults to "single", which reproduces today's
    * single-shot-only behavior byte-for-byte -- an existing caller that
@@ -282,6 +287,7 @@ async function runSingleShotUnderstanding(
     manifestPath: input.manifestPath,
     adapter: input.adapter,
     workflowExtensionRegistry: input.workflowExtensionRegistry,
+    semanticProofContract: input.semanticProofContract,
   });
   if (authored.kind === "refusal") return authored;
   if (authored.sidecar.requirements.length === 0) {
@@ -425,6 +431,7 @@ async function runChunkedUnderstanding(
       maxPromptBytes: input.maxPromptBytes,
       maxResponseBytes: input.maxResponseBytes,
       maxReviewItems: input.maxReviewItems,
+      semanticProofContract: input.semanticProofContract,
       maxChunkAttempts: input.maxChunkAttempts,
       chunkPolicy: input.chunkPolicy,
       anchorLimits: input.anchorLimits,
@@ -554,7 +561,9 @@ async function runChunkedUnderstanding(
     },
     authorityRoles: assembled.authorityRoles,
     requirements: assembled.requirements,
-    proofs: assembled.proofs,
+    proofs: input.semanticProofContract === "v2"
+      ? assembled.proofs as CccPrdProofV2[]
+      : assembled.proofs as CccPrdProofV1[],
     tasks: assembled.tasks,
     edges: assembled.edges,
     workflows: assembled.workflows,

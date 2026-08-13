@@ -69,7 +69,7 @@ const allowlist: AllowlistEntry[] = [
   { file: "src/merger.ts", line: 10189, primitive: "execSync", signature: "const squashIsEmpty = execSync(", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 10223, primitive: "execSync", signature: "const squashIsEmpty = execSync(", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 10410, primitive: "execSync", signature: "execSync(\"git reset --merge\", { cwd: rootDir, stdio: \"pipe\" });", reason: SHORT_GIT_PLUMBING },
-  { file: "src/executor.ts", line: 17823, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${task.baseCommitSha} HEAD`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/executor.ts", line: 17945, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${task.baseCommitSha} HEAD`, {", reason: SHORT_GIT_PLUMBING },
 ];
 
 function scanSource(file: string, source: string): ShelloutSite[] {

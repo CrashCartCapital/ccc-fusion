@@ -161,8 +161,11 @@ describe("CCC PRD discovery", () => {
       "Target repository: /workspace/alpha",
       `Baseline commit: ${"a".repeat(40)}`,
       "Allowed write roots: src/alpha",
-      "## Acceptance behavior and expected proof",
-      "Proof: task verify",
+      "### Requirement REQ-001",
+      "#### Acceptance clauses",
+      "- [AC-REQ-001-001] Alpha produces the declared observable result.",
+      "## Expected proof",
+      "The verifier command task verify:alpha passes only for the accepted clause.",
       "## Protected actions",
       "None.",
       "TOP SECRET PAYLOAD MUST NOT LEAK",
@@ -192,7 +195,7 @@ describe("CCC PRD discovery", () => {
         ambiguousCount: 0,
         noPrdCount: 1,
         readyForIntakeCount: 1,
-        blockingQuestionCount: 6,
+        blockingQuestionCount: 8,
       },
       projects: [
         {

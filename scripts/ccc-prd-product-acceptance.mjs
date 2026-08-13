@@ -41,6 +41,8 @@ const expectedChecks = Object.freeze([
   "chunked-understanding-complete-coverage",
   "chunked-understanding-compile-gates",
   "native-local-authoring",
+  "semantic-v2-authority-contract",
+  "legacy-v1-readable-fresh-product-refused",
   "frozen-packet-validated",
   "product-owned-execution-plan",
   "per-task-route-profiles",
@@ -53,12 +55,14 @@ const expectedChecks = Object.freeze([
   "campaign-import-admitted",
   "import-restart-recovery",
   "live-execution-human-hold",
-  "second-task-live-execution-hold",
+  "single-campaign-execution-authorization",
+  "task-phase-proofs-committed",
   "coding-route-and-worktree-custody",
   "chained-task-worktree-custody",
   "campaign-created-commit",
   "commit-bound-proof-executed",
   "integrated-proof-over-two-commits",
+  "final-integrated-proof-committed",
   "merge-human-hold",
   "operator-readable-status",
   "git-landing-restart-no-repeated-effect",
@@ -71,6 +75,7 @@ const commandTimeoutMs = 180_000;
 const productTimeoutMs = Number(process.env.FUSION_PRODUCT_TIMEOUT_MS ?? 120_000);
 const shutdownTimeoutMs = 15_000;
 const proofCutpointMarkerName = "ccc-proof-cutpoint.marker.json";
+const proofCutpointCandidateValue = "good-proof-cutpoint";
 
 // The series-parallel lane: TASK-FAN-A -> {TASK-FAN-B, TASK-FAN-C} ->
 // TASK-FAN-D. One owned file per task, planted "pending" at the frozen
@@ -114,6 +119,115 @@ const fanTasks = Object.freeze([
     role: "join",
   }),
 ]);
+
+const fanoutClauseIdFor = (fanTask) =>
+  `AC-${fanTask.requirementId}-001`;
+const fanoutTaskProofIdFor = (fanTask) =>
+  `PROOF-${fanTask.taskId.slice("TASK-".length)}-TASK`;
+const fanoutTaskProofCommandFor = (fanTask) =>
+  `task verify:${fanTask.taskId.slice("TASK-".length).toLowerCase()}`;
+
+const semanticProofPlaceholderSha256 = "0".repeat(64);
+const semanticProofPlaceholderGitOid = "0".repeat(40);
+const executableSha256ByCanonicalPath = new Map();
+
+async function executableSha256(canonicalPath) {
+  if (!executableSha256ByCanonicalPath.has(canonicalPath)) {
+    executableSha256ByCanonicalPath.set(
+      canonicalPath,
+      sha256(await readFile(canonicalPath)),
+    );
+  }
+  return executableSha256ByCanonicalPath.get(canonicalPath);
+}
+
+function semanticProofProposal(input) {
+  return {
+    schema: "ccc-prd.proof.v2",
+    id: input.id,
+    requirementIds: [...input.requirementIds],
+    clauseIds: [...input.clauseIds],
+    phases: [...input.phases],
+    command: input.command,
+    positiveOracle: input.positiveOracle,
+    positiveCases: input.positiveCases.map((entry) => ({ ...entry })),
+    negativeControls: input.negativeControls.map((entry) => ({ ...entry })),
+    verifierClosure: [
+      {
+        role: "task_runner",
+        path: "Taskfile.yml",
+        baseGitBlobOid: semanticProofPlaceholderGitOid,
+        sha256: semanticProofPlaceholderSha256,
+      },
+      {
+        role: "harness",
+        path: input.harnessPath,
+        baseGitBlobOid: semanticProofPlaceholderGitOid,
+        sha256: semanticProofPlaceholderSha256,
+      },
+    ],
+    candidateInputs: [...input.candidateInputs],
+    // The model must return the complete v2 shape, but none of these values
+    // carry authority. Normal CLI authoring replaces them with direct
+    // controller observations before admission and persistence.
+    executionToolchain: {
+      task: {
+        executablePath: "/model-untrusted/task",
+        executableSha256: semanticProofPlaceholderSha256,
+        version: "model-untrusted",
+        versionOutputSha256: semanticProofPlaceholderSha256,
+      },
+      node: {
+        executablePath: "/model-untrusted/node",
+        executableSha256: semanticProofPlaceholderSha256,
+        version: "model-untrusted",
+        versionOutputSha256: semanticProofPlaceholderSha256,
+      },
+      proofHost: {
+        id: "model-untrusted-proof-host",
+        executablePath: "/model-untrusted/proof-host",
+        executableSha256: semanticProofPlaceholderSha256,
+        version: "model-untrusted",
+        versionOutputSha256: semanticProofPlaceholderSha256,
+      },
+      linkedRuntime: [],
+    },
+    sourceRefs: input.sourceRefs.map((entry) => ({ ...entry })),
+    confidence: "high",
+  };
+}
+
+function legacyV1ProposalFromV2(proposal) {
+  return {
+    ...proposal,
+    schema: "ccc-prd.authoring-proposal.v1",
+    requirements: proposal.requirements.map((requirement) => {
+      const {
+        acceptanceClauses: _acceptanceClauses,
+        acceptanceDispositions: _acceptanceDispositions,
+        ...legacyRequirement
+      } = requirement;
+      return legacyRequirement;
+    }),
+    proofs: proposal.proofs.map((proof) => {
+      const {
+        schema: _schema,
+        clauseIds: _clauseIds,
+        phases: _phases,
+        positiveCases: _positiveCases,
+        verifierClosure: _verifierClosure,
+        candidateInputs: _candidateInputs,
+        executionToolchain: _executionToolchain,
+        negativeControls,
+        ...legacyProof
+      } = proof;
+      return {
+        ...legacyProof,
+        negativeControls: negativeControls.map(({ description }) => description),
+      };
+    }),
+  };
+}
 
 class AcceptanceLedger {
   constructor(expected) {
@@ -173,6 +287,63 @@ function sha256(value) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function canonicalJson(value) {
+  const normalize = (candidate) => {
+    if (Array.isArray(candidate)) return candidate.map(normalize);
+    if (candidate && typeof candidate === "object") {
+      return Object.fromEntries(
+        Object.keys(candidate).sort().map((key) => [key, normalize(candidate[key])]),
+      );
+    }
+    return candidate;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function finalProofReceiptProjection(receipt) {
+  return {
+    attemptKey: receipt.attemptKey,
+    attemptContractVersion: receipt.attemptContractVersion,
+    phase: receipt.phase,
+    taskId: receipt.taskId,
+    semanticTaskId: receipt.semanticTaskId,
+    proofId: receipt.proofId,
+    packetHash: receipt.packetHash,
+    sidecarHash: receipt.sidecarHash,
+    bundleHash: receipt.bundleHash,
+    manifestHash: receipt.manifestHash,
+    campaignBindingHash: receipt.campaignBindingHash,
+    targetRepository: receipt.targetRepository,
+    targetBase: receipt.targetBase,
+    sourceCommit: receipt.sourceCommit,
+    sourceTree: receipt.sourceTree,
+    definitionSha256: receipt.definitionSha256,
+    commandSha256: receipt.commandSha256,
+    workItemId: receipt.workItemId,
+    runId: receipt.runId,
+    workItemAttempt: receipt.workItemAttempt,
+    verifierClosureSha256: receipt.verifierClosureSha256,
+    candidateInputsSha256: receipt.candidateInputsSha256,
+    executionToolchainSha256: receipt.executionToolchainSha256,
+    terminalEnvelopeSha256: receipt.terminalEnvelopeSha256,
+    proofEvidenceSha256: receipt.proofEvidenceSha256,
+  };
+}
+
+function finalProofReceiptSetSha256(sourceCommit, sourceTree, receipts) {
+  return sha256(canonicalJson({
+    schema: "ccc-campaign.final-proof-receipt-set.v2",
+    phase: "final_integrated",
+    sourceCommit,
+    sourceTree,
+    receipts: receipts.map(finalProofReceiptProjection),
+  }));
+}
+
+function changedPathsSha256(paths) {
+  return sha256(JSON.stringify([...paths].sort()));
+}
+
 function assert(condition, code, detail) {
   if (!condition) {
     throw new Error(`${code}: ${detail}`);
@@ -221,6 +392,215 @@ function exactArray(actual, expected, code) {
     JSON.stringify(actual) === JSON.stringify(expected),
     code,
     `expected ${JSON.stringify(expected)}, received ${JSON.stringify(actual)}`,
+  );
+}
+
+function assertExactAcceptanceClauseGrammar(source, proposal, code) {
+  const lines = source.split("\n");
+  const expectedClauseLines = [];
+  for (const requirement of proposal.requirements ?? []) {
+    assert(
+      requirement.acceptanceClauses?.length === 1,
+      code,
+      JSON.stringify({
+        requirementId: requirement.id,
+        acceptanceClauses: requirement.acceptanceClauses,
+      }),
+    );
+    const clause = requirement.acceptanceClauses[0];
+    const headingIndex = lines.indexOf(`### Requirement ${requirement.id}`);
+    const clauseLine = `- [${clause.id}] ${clause.text}`;
+    assert(
+      headingIndex >= 0
+      && lines[headingIndex + 2] === "#### Acceptance clauses"
+      && lines[headingIndex + 3] === clauseLine
+      && lines[headingIndex + 4] === "#### Proof declaration",
+      code,
+      JSON.stringify({
+        requirementId: requirement.id,
+        headingIndex,
+        observed: lines.slice(headingIndex, headingIndex + 5),
+        expectedClauseLine: clauseLine,
+      }),
+    );
+    expectedClauseLines.push(clauseLine);
+  }
+  exactArray(
+    lines.filter((line) => /^- \[AC-[A-Z0-9-]+\] /u.test(line)),
+    expectedClauseLines,
+    code,
+  );
+}
+
+function exactProofStatus(status, proofId) {
+  const matches = (status.proofs ?? []).filter(
+    ({ definition }) => definition.id === proofId,
+  );
+  assert(
+    matches.length === 1,
+    "CCC_PRODUCT_EXACT_PROOF_STATUS_MISSING",
+    JSON.stringify({
+      proofId,
+      matches: matches.length,
+      observed: (status.proofs ?? []).map(({ definition }) => definition.id),
+    }),
+  );
+  return matches[0];
+}
+
+function assertPassingSemanticProofAttempt(attempt, expected, code) {
+  const evidence = attempt?.proofEvidence;
+  const envelope = attempt?.terminalEnvelope;
+  const expectedClauses = [...expected.clauseIds].sort().map((clauseId) => ({
+    clauseId,
+    passed: true,
+  }));
+  const expectedCases = [...expected.caseIds].sort().map((caseId) => ({
+    caseId,
+    passed: true,
+  }));
+  const expectedControls = [...expected.controlIds].sort().map((controlId) => ({
+    controlId,
+    passed: true,
+  }));
+  const expectedChangedPathsSha256 = changedPathsSha256(
+    expected.mutationPaths,
+  );
+  assert(
+    attempt?.attemptContractVersion === "v2"
+    && attempt.phase === expected.phase
+    && attempt.state === "committed"
+    && attempt.sourceCommit === expected.sourceCommit
+    && attempt.sourceTree === expected.sourceTree
+    && attempt.result?.success === true
+    && attempt.result?.exitCode === 0
+    && attempt.result?.changedPathsSha256 === expectedChangedPathsSha256
+    && /^[0-9a-f]{64}$/u.test(attempt.verifierClosureSha256 ?? "")
+    && /^[0-9a-f]{64}$/u.test(attempt.candidateInputsSha256 ?? "")
+    && /^[0-9a-f]{64}$/u.test(attempt.executionToolchainSha256 ?? "")
+    && /^[0-9a-f]{64}$/u.test(attempt.terminalEnvelopeSha256 ?? "")
+    && /^[0-9a-f]{64}$/u.test(attempt.proofEvidenceSha256 ?? "")
+    && envelope?.schema === "ccc-prd.proof-terminal-envelope.v2"
+    && envelope.kind === "verified"
+    && envelope.proofId === expected.proofId
+    && envelope.phase === expected.phase
+    && envelope.sourceCommit === expected.sourceCommit
+    && envelope.sourceTree === expected.sourceTree
+    && envelope.passed === true
+    && envelope.evidenceSha256 === attempt.proofEvidenceSha256
+    && canonicalJson(envelope.evidence) === canonicalJson(evidence)
+    && sha256(canonicalJson(envelope)) === attempt.terminalEnvelopeSha256
+    && sha256(canonicalJson(evidence)) === attempt.proofEvidenceSha256
+    && envelope.exitCode === 0
+    && envelope.timedOut === false
+    && envelope.killed === false
+    && envelope.changedPathsSha256 === expectedChangedPathsSha256
+    && evidence?.schema === "ccc-prd.proof-evidence.v2"
+    && evidence.proofId === expected.proofId
+    && evidence.phase === expected.phase
+    && evidence.sourceCommit === expected.sourceCommit
+    && evidence.sourceTree === expected.sourceTree
+    && evidence.passed === true
+    && JSON.stringify(evidence.clauseResults) === JSON.stringify(expectedClauses)
+    && JSON.stringify(evidence.positiveCaseResults) === JSON.stringify(expectedCases)
+    && JSON.stringify(evidence.negativeControlResults)
+      === JSON.stringify(expectedControls)
+    && new Date(attempt.settledAt).getTime()
+      >= new Date(attempt.dispatchedAt).getTime(),
+    code,
+    JSON.stringify({ attempt, expected }),
+  );
+}
+
+async function assertControllerHydratedProofCustody(input) {
+  const {
+    proof,
+    targetRoot,
+    targetBase,
+    command,
+    phase,
+    harnessPath,
+    candidateInputs,
+  } = input;
+  const expectedClosure = [
+    { role: "task_runner", path: "Taskfile.yml" },
+    { role: "harness", path: harnessPath },
+  ];
+  assert(
+    proof?.schema === "ccc-prd.proof.v2"
+    && proof.command === command
+    && JSON.stringify(proof.phases) === JSON.stringify([phase])
+    && JSON.stringify(proof.candidateInputs) === JSON.stringify(candidateInputs)
+    && JSON.stringify(
+      proof.verifierClosure?.map(({ role, path: closurePath }) => ({
+        role,
+        path: closurePath,
+      })),
+    ) === JSON.stringify(expectedClosure),
+    "CCC_PRODUCT_CONTROLLER_HYDRATED_PROOF_SHAPE_DRIFT",
+    JSON.stringify({ proof, expectedClosure, command, phase, candidateInputs }),
+  );
+  for (const [index, closure] of proof.verifierClosure.entries()) {
+    const expected = expectedClosure[index];
+    const absolutePath = path.join(targetRoot, expected.path);
+    const metadata = await stat(absolutePath);
+    const baseGitBlobOid = await git(
+      targetRoot,
+      "rev-parse",
+      `${targetBase}:${expected.path}`,
+    );
+    assert(
+      metadata.isFile()
+      && closure.baseGitBlobOid === baseGitBlobOid
+      && closure.sha256 === sha256(await readFile(absolutePath))
+      && !candidateInputs.some((candidateInput) =>
+        expected.path === candidateInput
+        || expected.path.startsWith(`${candidateInput}/`)
+        || candidateInput.startsWith(`${expected.path}/`)),
+      "CCC_PRODUCT_CONTROLLER_HYDRATED_CLOSURE_DRIFT",
+      JSON.stringify({ closure, expected, baseGitBlobOid }),
+    );
+  }
+  const toolchainEntries = Object.entries(proof.executionToolchain ?? {});
+  exactArray(
+    toolchainEntries.map(([toolName]) => toolName).sort(),
+    ["linkedRuntime", "node", "proofHost", "task"],
+    "CCC_PRODUCT_CONTROLLER_HYDRATED_TOOLCHAIN_SET_DRIFT",
+  );
+  for (const toolName of ["task", "node", "proofHost"]) {
+    const tool = proof.executionToolchain?.[toolName];
+    const canonicalExecutable = await realpath(tool.executablePath);
+    assert(
+      tool.executablePath === canonicalExecutable
+      && tool.executableSha256 === await executableSha256(canonicalExecutable)
+      && typeof tool.version === "string"
+      && tool.version.length > 0
+      && /^[0-9a-f]{64}$/u.test(tool.versionOutputSha256 ?? ""),
+      "CCC_PRODUCT_CONTROLLER_HYDRATED_TOOLCHAIN_DRIFT",
+      JSON.stringify({ toolName, tool, canonicalExecutable }),
+    );
+  }
+  assert(
+    Array.isArray(proof.executionToolchain?.linkedRuntime)
+    && proof.executionToolchain.linkedRuntime.every((entry) =>
+      entry.platform === "darwin"
+      && typeof entry.loaderRole === "string"
+      && typeof entry.loaderPath === "string"
+      && typeof entry.requestedPath === "string"
+      && typeof entry.canonicalPath === "string"
+      && /^[0-9a-f]{64}$/u.test(entry.sha256 ?? "")),
+    "CCC_PRODUCT_CONTROLLER_HYDRATED_LINKED_RUNTIME_DRIFT",
+    JSON.stringify({ linkedRuntime: proof.executionToolchain?.linkedRuntime }),
+  );
+  const proofHost = proof.executionToolchain?.proofHost;
+  const expectedProofHost = await realpath(
+    path.join(repoRoot, "packages/cli/dist/bin.js"),
+  );
+  assert(
+    proofHost?.id === "fusion-cli-semantic-proof-host.v1"
+    && proofHost.executablePath === expectedProofHost,
+    "CCC_PRODUCT_CONTROLLER_HYDRATED_PROOF_HOST_DRIFT",
+    JSON.stringify({ proofHost, expectedProofHost }),
   );
 }
 
@@ -373,6 +753,94 @@ async function embeddedPostgresConnectionUrl(isolatedHome) {
     shutdownTimeoutMs,
   );
   return `postgresql://postgres:password@localhost:${observed.port}/fusion`;
+}
+
+async function readCampaignAuditRows(
+  isolatedHome,
+  projectId,
+  campaignImportId,
+) {
+  const sql = postgres(
+    await embeddedPostgresConnectionUrl(isolatedHome),
+    {
+      connect_timeout: 10,
+      idle_timeout: 30,
+      max: 1,
+      onnotice: () => undefined,
+    },
+  );
+  try {
+    return await sql`
+      SELECT
+        id,
+        timestamp,
+        task_id,
+        mutation_type,
+        metadata
+      FROM project.run_audit_events
+      WHERE project_id = ${projectId}
+        AND campaign_import_id = ${campaignImportId}
+      ORDER BY timestamp, id
+    `;
+  } finally {
+    await sql.end({ timeout: 2 });
+  }
+}
+
+function assertOrderedInstants(left, right, code, detail) {
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  assert(
+    Number.isFinite(leftMs)
+      && Number.isFinite(rightMs)
+      && leftMs <= rightMs,
+    code,
+    JSON.stringify({ left, right, ...detail }),
+  );
+}
+
+function exactProviderDispatchAudit(rows, semanticTaskId) {
+  const matches = rows.filter((row) =>
+    row.mutation_type === "ccc-campaign:provider-attempt:dispatched"
+    && row.metadata?.semanticTaskId === semanticTaskId);
+  assert(
+    matches.length === 1,
+    "CCC_PRODUCT_PROVIDER_DISPATCH_AUDIT_NOT_EXACT",
+    JSON.stringify({ semanticTaskId, matches }),
+  );
+  return matches[0];
+}
+
+function assertLandingFinalProofCustody(rows, expectedCustody, expectedPhases) {
+  const landingRows = rows.filter(({ mutation_type }) =>
+    mutation_type.startsWith("ccc-campaign-git-landing:"));
+  assert(
+    landingRows.length === expectedPhases.length,
+    "CCC_PRODUCT_LANDING_PROOF_CUSTODY_COUNT_DRIFT",
+    JSON.stringify({ landingRows, expectedPhases }),
+  );
+  const landingByPhase = Object.fromEntries(
+    landingRows.map((row) => [
+      row.mutation_type.slice("ccc-campaign-git-landing:".length),
+      row,
+    ]),
+  );
+  exactArray(
+    Object.keys(landingByPhase).sort(),
+    [...expectedPhases].sort(),
+    "CCC_PRODUCT_LANDING_PROOF_CUSTODY_PHASE_DRIFT",
+  );
+  for (const phase of expectedPhases) {
+    const metadata = landingByPhase[phase]?.metadata;
+    assert(
+      metadata?.schema === "ccc-campaign.git-landing.intent.v3"
+      && canonicalJson(metadata.finalProofCustody)
+        === canonicalJson(expectedCustody),
+      "CCC_PRODUCT_LANDING_FINAL_PROOF_CUSTODY_DRIFT",
+      JSON.stringify({ phase, metadata, expectedCustody }),
+    );
+  }
+  return landingByPhase;
 }
 
 async function armGitLandingTerminalCutpoint(isolatedHome, marker) {
@@ -838,9 +1306,11 @@ async function assertExactImplementationFactProvenance(
       && Array.isArray(provenance.requirements)
       && provenance.requirements.length === 2
       && Array.isArray(provenance.proofs)
-      && provenance.proofs.length === 1
-      && Array.isArray(provenance.proofs[0]?.negativeControls)
-      && provenance.proofs[0].negativeControls.length === 1
+      && provenance.proofs.length === 3
+      && provenance.proofs.every(
+        (proof) => Array.isArray(proof.negativeControls)
+          && proof.negativeControls.length === 1,
+      )
       && Array.isArray(provenance.protectedActions)
       && provenance.protectedActions.length === 3,
     "CCC_PRODUCT_IMPLEMENTATION_FACT_PROVENANCE_CARDINALITY",
@@ -853,7 +1323,11 @@ async function assertExactImplementationFactProvenance(
   );
   exactArray(
     provenance.proofs.map(({ id }) => id),
-    ["PROOF-VERTICAL"],
+    [
+      "PROOF-VERTICAL-INTEGRATED",
+      "PROOF-VERTICAL-SECOND-TASK",
+      "PROOF-VERTICAL-VALUE-TASK",
+    ],
     "CCC_PRODUCT_IMPLEMENTATION_FACT_PROOF_DRIFT",
   );
   exactArray(
@@ -869,6 +1343,12 @@ async function assertExactImplementationFactProvenance(
   );
   const actionBindings = new Map(
     provenance.protectedActions.map((action) => [action.id, action]),
+  );
+  const requirementBindings = new Map(
+    provenance.requirements.map((requirement) => [requirement.id, requirement]),
+  );
+  const proofBindings = new Map(
+    provenance.proofs.map((proof) => [proof.id, proof]),
   );
   const bindings = [
     ["targetRepository.path", provenance.targetRepository?.path, expected.targetRoot],
@@ -912,25 +1392,59 @@ async function assertExactImplementationFactProvenance(
       "Modify any path outside the two admitted task write roots.",
     ],
     [
-      "requirements[0].acceptance",
-      provenance.requirements[0]?.acceptance,
-      "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
+      "requirements[REQ-VERTICAL].acceptance",
+      requirementBindings.get("REQ-VERTICAL")?.acceptance,
+      "The trusted verifier accepts src/value.txt only when its candidate value is good.",
     ],
     [
-      "requirements[1].acceptance",
-      provenance.requirements[1]?.acceptance,
-      "The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
-    ],
-    ["proofs[0].command", provenance.proofs[0]?.command, "task verify:vertical"],
-    [
-      "proofs[0].positiveOracle",
-      provenance.proofs[0]?.positiveOracle,
-      "The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
+      "requirements[REQ-VERTICAL-SECOND].acceptance",
+      requirementBindings.get("REQ-VERTICAL-SECOND")?.acceptance,
+      "The trusted verifier accepts src/second.txt only when its candidate value is second-good.",
     ],
     [
-      "proofs[0].negativeControls[0]",
-      provenance.proofs[0]?.negativeControls?.[0],
-      "The same verifier exits nonzero for the frozen planted bad value.",
+      "proofs[PROOF-VERTICAL-VALUE-TASK].command",
+      proofBindings.get("PROOF-VERTICAL-VALUE-TASK")?.command,
+      "task verify:vertical-value",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-VALUE-TASK].positiveOracle",
+      proofBindings.get("PROOF-VERTICAL-VALUE-TASK")?.positiveOracle,
+      "The baseline-owned harness emits passing canonical evidence for the admitted value clause.",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-VALUE-TASK].negativeControls[0]",
+      proofBindings.get("PROOF-VERTICAL-VALUE-TASK")?.negativeControls?.[0],
+      "The baseline-owned harness rejects the frozen planted bad value.",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-SECOND-TASK].command",
+      proofBindings.get("PROOF-VERTICAL-SECOND-TASK")?.command,
+      "task verify:vertical-second",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-SECOND-TASK].positiveOracle",
+      proofBindings.get("PROOF-VERTICAL-SECOND-TASK")?.positiveOracle,
+      "The baseline-owned harness emits passing canonical evidence for the admitted second-value clause.",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-SECOND-TASK].negativeControls[0]",
+      proofBindings.get("PROOF-VERTICAL-SECOND-TASK")?.negativeControls?.[0],
+      "The baseline-owned harness rejects the frozen planted pending value.",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-INTEGRATED].command",
+      proofBindings.get("PROOF-VERTICAL-INTEGRATED")?.command,
+      "task verify:vertical-integrated",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-INTEGRATED].positiveOracle",
+      proofBindings.get("PROOF-VERTICAL-INTEGRATED")?.positiveOracle,
+      "The baseline-owned harness emits passing canonical evidence for both admitted clauses on one integrated commit.",
+    ],
+    [
+      "proofs[PROOF-VERTICAL-INTEGRATED].negativeControls[0]",
+      proofBindings.get("PROOF-VERTICAL-INTEGRATED")?.negativeControls?.[0],
+      "The baseline-owned harness rejects the frozen planted bad and pending values.",
     ],
     [
       "protectedActions[ACTION-VERTICAL-LIVE].kind",
@@ -1177,7 +1691,7 @@ async function buildCurrentCli(ledger) {
 
 async function initializeTarget(
   targetRoot,
-  { proofCutpointActivation, proofCutpointToken },
+  { proofCutpointToken },
 ) {
   await mkdir(path.join(targetRoot, "src"), { recursive: true });
   await writeFile(
@@ -1191,10 +1705,10 @@ async function initializeTarget(
     [
       "const fs = require('node:fs');",
       "const path = require('node:path');",
-      `const cutpointActivation = ${JSON.stringify(proofCutpointActivation)};`,
       `const cutpointToken = ${JSON.stringify(proofCutpointToken)};`,
       `const cutpointMarkerName = ${JSON.stringify(proofCutpointMarkerName)};`,
-      "if (fs.existsSync(cutpointActivation)) {",
+      "const candidates = Object.fromEntries(process.argv.slice(2).map(candidate => [candidate, fs.readFileSync(candidate, 'utf8').trim()]));",
+      `if (Object.values(candidates).includes(${JSON.stringify(proofCutpointCandidateValue)})) {`,
       "  const home = process.env.HOME;",
       "  if (!home) {",
       "    console.error('PROOF_CUTPOINT_HOME_MISSING');",
@@ -1217,24 +1731,33 @@ async function initializeTarget(
       "  console.log('PROOF_CUTPOINT_READY');",
       "  setInterval(() => {}, 1000);",
       "} else {",
-      "  const value = fs.readFileSync('src/value.txt', 'utf8').trim();",
-      "  const second = fs.readFileSync('src/second.txt', 'utf8').trim();",
-      "  const accepts = candidate => candidate === 'good';",
-      "  const acceptsSecond = candidate => candidate === 'second-good';",
-      "  if (accepts('bad') || acceptsSecond('pending')) {",
-      "    console.error('NEGATIVE_CONTROL_FAIL');",
-      "    process.exit(2);",
-      "  }",
-      "  console.log('NEGATIVE_CONTROL_PASS: planted bad and pending values are rejected');",
-      "  if (!accepts(value)) {",
-      "    console.error(`POSITIVE_ORACLE_FAIL:${value}`);",
-      "    process.exit(1);",
-      "  }",
-      "  if (!acceptsSecond(second)) {",
-      "    console.error(`POSITIVE_ORACLE_FAIL:${second}`);",
-      "    process.exit(1);",
-      "  }",
-      "  console.log('POSITIVE_ORACLE_PASS: campaign values are good');",
+      "  const proofId = process.env.CCC_PROOF_ID;",
+      "  const definitions = {",
+      "    'PROOF-VERTICAL-INTEGRATED': {",
+      "      clauses: { 'AC-REQ-VERTICAL-001': candidates['src/value.txt'] === 'good', 'AC-REQ-VERTICAL-SECOND-001': candidates['src/second.txt'] === 'second-good' },",
+      "      cases: { 'CASE-VERTICAL-INTEGRATED': candidates['src/value.txt'] === 'good' && candidates['src/second.txt'] === 'second-good' },",
+      "      controls: { 'CONTROL-VERTICAL-INTEGRATED': 'bad' !== 'good' && 'pending' !== 'second-good' },",
+      "    },",
+      "    'PROOF-VERTICAL-SECOND-TASK': {",
+      "      clauses: { 'AC-REQ-VERTICAL-SECOND-001': candidates['src/second.txt'] === 'second-good' },",
+      "      cases: { 'CASE-VERTICAL-SECOND': candidates['src/second.txt'] === 'second-good' },",
+      "      controls: { 'CONTROL-VERTICAL-PENDING': 'pending' !== 'second-good' },",
+      "    },",
+      "    'PROOF-VERTICAL-VALUE-TASK': {",
+      "      clauses: { 'AC-REQ-VERTICAL-001': candidates['src/value.txt'] === 'good' },",
+      "      cases: { 'CASE-VERTICAL-VALUE': candidates['src/value.txt'] === 'good' },",
+      "      controls: { 'CONTROL-VERTICAL-BAD': 'bad' !== 'good' },",
+      "    },",
+      "  };",
+      "  const definition = definitions[proofId];",
+      "  if (!definition) { console.error(`UNKNOWN_PROOF:${proofId}`); process.exit(3); }",
+      "  const clauseResults = Object.entries(definition.clauses).sort(([left], [right]) => left.localeCompare(right)).map(([clauseId, passed]) => ({ clauseId, passed }));",
+      "  const negativeControlResults = Object.entries(definition.controls).sort(([left], [right]) => left.localeCompare(right)).map(([controlId, passed]) => ({ controlId, passed }));",
+      "  const positiveCaseResults = Object.entries(definition.cases).sort(([left], [right]) => left.localeCompare(right)).map(([caseId, passed]) => ({ caseId, passed }));",
+      "  const passed = [...clauseResults, ...negativeControlResults, ...positiveCaseResults].every(result => result.passed);",
+      "  const evidence = { clauseResults, negativeControlResults, passed, phase: process.env.CCC_PROOF_PHASE, positiveCaseResults, proofId, schema: 'ccc-prd.proof-evidence.v2', sourceCommit: process.env.CCC_PROOF_SOURCE_COMMIT, sourceTree: process.env.CCC_PROOF_SOURCE_TREE };",
+      "  process.stdout.write(`${JSON.stringify(evidence)}\\n`);",
+      "  process.exitCode = passed ? 0 : 1;",
       "}",
       "",
     ].join("\n"),
@@ -1246,24 +1769,36 @@ async function initializeTarget(
     path.join(targetRoot, "verify-fanout.cjs"),
     [
       "const fs = require('node:fs');",
-      `const expectations = ${JSON.stringify(
-        fanTasks.map(({ file, value }) => ({ file, value })),
-      )};`,
-      "const planted = 'pending';",
-      "const rejectsPlanted = expectations.every(({ value }) => planted !== value);",
-      "if (!rejectsPlanted) {",
-      "  console.error('FANOUT_NEGATIVE_CONTROL_FAIL');",
-      "  process.exit(2);",
-      "}",
-      "console.log('FANOUT_NEGATIVE_CONTROL_PASS: planted pending fan values are rejected');",
-      "for (const { file, value } of expectations) {",
-      "  const current = fs.readFileSync(file, 'utf8').trim();",
-      "  if (current !== value) {",
-      "    console.error(`FANOUT_POSITIVE_ORACLE_FAIL:${file}:${current}`);",
-      "    process.exit(1);",
-      "  }",
-      "}",
-      "console.log('FANOUT_POSITIVE_ORACLE_PASS: fan-out campaign values are joined');",
+      `const expectations = ${JSON.stringify(Object.fromEntries(
+        fanTasks.map(({ taskId, requirementId, file, value }) => [
+          `PROOF-${taskId.slice("TASK-".length)}-TASK`,
+          {
+            clauses: [`AC-${requirementId}-001`],
+            cases: [`CASE-${taskId.slice("TASK-".length)}`],
+            controls: [`CONTROL-${taskId.slice("TASK-".length)}-PENDING`],
+            files: [{ file, value }],
+          },
+        ]),
+      ))};`,
+      `const integrated = ${JSON.stringify({
+        clauses: fanTasks.map(({ requirementId }) => `AC-${requirementId}-001`),
+        cases: ["CASE-FANOUT-INTEGRATED"],
+        controls: ["CONTROL-FANOUT-INTEGRATED-PENDING"],
+        files: fanTasks.map(({ file, value }) => ({ file, value })),
+      })};`,
+      "const candidates = Object.fromEntries(process.argv.slice(2).map(candidate => [candidate, fs.readFileSync(candidate, 'utf8').trim()]));",
+      "const proofId = process.env.CCC_PROOF_ID;",
+      "const definition = proofId === 'PROOF-FANOUT-INTEGRATED' ? integrated : expectations[proofId];",
+      "if (!definition) { console.error(`UNKNOWN_PROOF:${proofId}`); process.exit(3); }",
+      "const filePassed = Object.fromEntries(definition.files.map(({ file, value }) => [file, candidates[file] === value]));",
+      "const allFilesPassed = Object.values(filePassed).every(Boolean);",
+      "const clauseResults = definition.clauses.map((clauseId, index) => ({ clauseId, passed: definition.files.length === 1 ? allFilesPassed : filePassed[definition.files[index].file] })).sort((left, right) => left.clauseId.localeCompare(right.clauseId));",
+      "const negativeControlResults = definition.controls.map(controlId => ({ controlId, passed: definition.files.every(({ value }) => value !== 'pending') })).sort((left, right) => left.controlId.localeCompare(right.controlId));",
+      "const positiveCaseResults = definition.cases.map(caseId => ({ caseId, passed: allFilesPassed })).sort((left, right) => left.caseId.localeCompare(right.caseId));",
+      "const passed = [...clauseResults, ...negativeControlResults, ...positiveCaseResults].every(result => result.passed);",
+      "const evidence = { clauseResults, negativeControlResults, passed, phase: process.env.CCC_PROOF_PHASE, positiveCaseResults, proofId, schema: 'ccc-prd.proof-evidence.v2', sourceCommit: process.env.CCC_PROOF_SOURCE_COMMIT, sourceTree: process.env.CCC_PROOF_SOURCE_TREE };",
+      "process.stdout.write(`${JSON.stringify(evidence)}\\n`);",
+      "process.exitCode = passed ? 0 : 1;",
       "",
     ].join("\n"),
   );
@@ -1273,12 +1808,15 @@ async function initializeTarget(
       "version: '3'",
       "",
       "tasks:",
-      "  verify:vertical:",
+      "  verify:vertical-value:",
       "    cmds:",
-      "      - node verify.cjs",
-      "  verify:fanout:",
+      "      - node verify.cjs src/value.txt",
+      "  verify:vertical-second:",
       "    cmds:",
-      "      - node verify-fanout.cjs",
+      "      - node verify.cjs src/second.txt",
+      "  verify:vertical-integrated:",
+      "    cmds:",
+      "      - node verify.cjs src/value.txt src/second.txt",
       "",
     ].join("\n"),
   );
@@ -1306,6 +1844,36 @@ async function initializeTarget(
   return await git(targetRoot, "rev-parse", "HEAD");
 }
 
+async function initializeFanoutProofBaseline(targetRoot) {
+  const targetLines = fanTasks.flatMap((fanTask) => [
+    `  verify:${fanTask.taskId.slice("TASK-".length).toLowerCase()}:`,
+    "    cmds:",
+    `      - node verify-fanout.cjs ${fanTask.file}`,
+  ]);
+  await writeFile(
+    path.join(targetRoot, "Taskfile.yml"),
+    [
+      "version: '3'",
+      "",
+      "tasks:",
+      ...targetLines,
+      "  verify:fanout-integrated:",
+      "    cmds:",
+      `      - node verify-fanout.cjs ${fanTasks.map(({ file }) => file).join(" ")}`,
+      "",
+    ].join("\n"),
+  );
+  await git(targetRoot, "add", "--", "Taskfile.yml");
+  await git(
+    targetRoot,
+    "commit",
+    "-q",
+    "-m",
+    "Install baseline-owned fan-out semantic verifier target map",
+  );
+  return await git(targetRoot, "rev-parse", "HEAD");
+}
+
 async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const activeProjectsRoot = path.join(path.dirname(packetRoot), "active-projects");
   const projectName = "vertical-slice";
@@ -1314,18 +1882,37 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const prdSourcePath = path.join(projectRoot, prdFileName);
   const supportRelativePath = "support/REF-HUM-VerticalVerifier.md";
   const supportSourcePath = path.join(projectRoot, supportRelativePath);
-  const requirementLine = [
-    "- REQ-VERTICAL: Change src/value.txt from bad to good in an isolated worktree.",
-    "Acceptance: The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
-    "Proof command: task verify:vertical.",
-    "Positive oracle: The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
-    "Negative control: The same verifier exits nonzero for the frozen planted bad value.",
-  ].join(" ");
-  const secondRequirementLine = [
-    "- REQ-VERTICAL-SECOND: Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task's commit.",
-    "Acceptance: The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
-    "Proof command: task verify:vertical.",
-  ].join(" ");
+  const requirementStatement =
+    "Change src/value.txt from bad to good in an isolated worktree.";
+  const secondRequirementStatement =
+    "Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task's commit.";
+  const acceptanceText =
+    "The trusted verifier accepts src/value.txt only when its candidate value is good.";
+  const secondAcceptanceText =
+    "The trusted verifier accepts src/second.txt only when its candidate value is second-good.";
+  const acceptanceClauseId = "AC-REQ-VERTICAL-001";
+  const secondAcceptanceClauseId = "AC-REQ-VERTICAL-SECOND-001";
+  const valueTaskPositiveOracle =
+    "The baseline-owned harness emits passing canonical evidence for the admitted value clause.";
+  const valueTaskNegativeControl =
+    "The baseline-owned harness rejects the frozen planted bad value.";
+  const secondTaskPositiveOracle =
+    "The baseline-owned harness emits passing canonical evidence for the admitted second-value clause.";
+  const secondTaskNegativeControl =
+    "The baseline-owned harness rejects the frozen planted pending value.";
+  const integratedPositiveOracle =
+    "The baseline-owned harness emits passing canonical evidence for both admitted clauses on one integrated commit.";
+  const integratedNegativeControl =
+    "The baseline-owned harness rejects the frozen planted bad and pending values.";
+  const valueTaskProofLine =
+    `For this task, the verifier command task verify:vertical-value establishes the clause. Positive oracle: ${valueTaskPositiveOracle} Negative control: ${valueTaskNegativeControl}`;
+  const secondTaskProofLine =
+    `For this task, the verifier command task verify:vertical-second establishes the clause. Positive oracle: ${secondTaskPositiveOracle} Negative control: ${secondTaskNegativeControl}`;
+  const integratedProofLine =
+    `For the combined result, the verifier command task verify:vertical-integrated establishes every admitted clause. Positive oracle: ${integratedPositiveOracle} Negative control: ${integratedNegativeControl}`;
+  const requirementLine = `Requirement statement: ${requirementStatement}`;
+  const secondRequirementLine =
+    `Requirement statement: ${secondRequirementStatement}`;
   const targetRepositoryLine = "- Target repository: " + targetRoot;
   const baselineLine = "- Baseline commit: " + targetBase;
   const taskOwnedPathLine = "- Task owned path: src/value.txt";
@@ -1379,8 +1966,23 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "",
     "## Requirement and proof",
     "",
+    "### Requirement REQ-VERTICAL",
     requirementLine,
+    "#### Acceptance clauses",
+    `- [${acceptanceClauseId}] ${acceptanceText}`,
+    "#### Proof declaration",
+    valueTaskProofLine,
+    "",
+    "### Requirement REQ-VERTICAL-SECOND",
     secondRequirementLine,
+    "#### Acceptance clauses",
+    `- [${secondAcceptanceClauseId}] ${secondAcceptanceText}`,
+    "#### Proof declaration",
+    secondTaskProofLine,
+    "",
+    "## Final integrated proof",
+    "",
+    integratedProofLine,
     "",
     "## Supporting context",
     "",
@@ -1522,14 +2124,21 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const frozenPrdRelativePath = `sources/${prdFileName}`;
   const frozenContextRelativePath =
     "sources/__fusion__/REF-HUM-FusionOperatorContext.md";
-  const sourceRefs = [{
+  const prdRef = (exactQuote) => ({
     path: frozenPrdRelativePath,
-    exactQuote: requirementLine,
-  }];
-  const secondSourceRefs = [{
-    path: frozenPrdRelativePath,
-    exactQuote: secondRequirementLine,
-  }];
+    exactQuote,
+  });
+  const sourceRefs = [
+    prdRef(requirementLine),
+    prdRef(acceptanceText),
+  ];
+  const secondSourceRefs = [
+    prdRef(secondRequirementLine),
+    prdRef(secondAcceptanceText),
+  ];
+  const valueTaskProofRefs = [prdRef(valueTaskProofLine)];
+  const secondTaskProofRefs = [prdRef(secondTaskProofLine)];
+  const integratedProofRefs = [prdRef(integratedProofLine)];
   const implementationRefs = [
     targetRepositoryLine,
     baselineLine,
@@ -1579,7 +2188,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     exactQuote: supportingContextLine,
   }];
   const proposal = {
-    schema: "ccc-prd.authoring-proposal.v1",
+    schema: "ccc-prd.authoring-proposal.v2",
     authorityRoles: [
       {
         id: "AUTHORITY-VERTICAL",
@@ -1597,41 +2206,112 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     requirements: [
       {
         id: "REQ-VERTICAL",
-        statement:
-          "Change src/value.txt from bad to good in an isolated worktree.",
-        acceptance:
-          "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.",
+        statement: requirementStatement,
+        acceptance: acceptanceText,
+        acceptanceClauses: [{
+          id: acceptanceClauseId,
+          requirementId: "REQ-VERTICAL",
+          text: acceptanceText,
+          proofIds: [
+            "PROOF-VERTICAL-INTEGRATED",
+            "PROOF-VERTICAL-VALUE-TASK",
+          ],
+          sourceRefs: [prdRef(acceptanceText)],
+        }],
+        acceptanceDispositions: [],
         accountableProducer: "campaign-coding-agent",
         dependencies: [],
-        proofIds: ["PROOF-VERTICAL"],
+        proofIds: [
+          "PROOF-VERTICAL-INTEGRATED",
+          "PROOF-VERTICAL-VALUE-TASK",
+        ],
         sourceRefs,
         confidence: "high",
       },
       {
         id: "REQ-VERTICAL-SECOND",
-        statement:
-          "Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task's commit.",
-        acceptance:
-          "The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.",
+        statement: secondRequirementStatement,
+        acceptance: secondAcceptanceText,
+        acceptanceClauses: [{
+          id: secondAcceptanceClauseId,
+          requirementId: "REQ-VERTICAL-SECOND",
+          text: secondAcceptanceText,
+          proofIds: [
+            "PROOF-VERTICAL-INTEGRATED",
+            "PROOF-VERTICAL-SECOND-TASK",
+          ],
+          sourceRefs: [prdRef(secondAcceptanceText)],
+        }],
+        acceptanceDispositions: [],
         accountableProducer: "campaign-coding-agent",
         dependencies: ["REQ-VERTICAL"],
-        proofIds: ["PROOF-VERTICAL"],
+        proofIds: [
+          "PROOF-VERTICAL-INTEGRATED",
+          "PROOF-VERTICAL-SECOND-TASK",
+        ],
         sourceRefs: secondSourceRefs,
         confidence: "high",
       },
     ],
-    proofs: [{
-      id: "PROOF-VERTICAL",
-      requirementIds: ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
-      command: "task verify:vertical",
-      positiveOracle:
-        "The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
-      negativeControls: [
-        "The same verifier exits nonzero for the frozen planted bad value.",
-      ],
-      sourceRefs,
-      confidence: "high",
-    }],
+    proofs: [
+      semanticProofProposal({
+        id: "PROOF-VERTICAL-VALUE-TASK",
+        requirementIds: ["REQ-VERTICAL"],
+        clauseIds: [acceptanceClauseId],
+        phases: ["task"],
+        command: "task verify:vertical-value",
+        positiveOracle: valueTaskPositiveOracle,
+        positiveCases: [{
+          id: "CASE-VERTICAL-VALUE",
+          description: valueTaskPositiveOracle,
+        }],
+        negativeControls: [{
+          id: "CONTROL-VERTICAL-BAD",
+          description: valueTaskNegativeControl,
+        }],
+        harnessPath: "verify.cjs",
+        candidateInputs: ["src/value.txt"],
+        sourceRefs: valueTaskProofRefs,
+      }),
+      semanticProofProposal({
+        id: "PROOF-VERTICAL-SECOND-TASK",
+        requirementIds: ["REQ-VERTICAL-SECOND"],
+        clauseIds: [secondAcceptanceClauseId],
+        phases: ["task"],
+        command: "task verify:vertical-second",
+        positiveOracle: secondTaskPositiveOracle,
+        positiveCases: [{
+          id: "CASE-VERTICAL-SECOND",
+          description: secondTaskPositiveOracle,
+        }],
+        negativeControls: [{
+          id: "CONTROL-VERTICAL-PENDING",
+          description: secondTaskNegativeControl,
+        }],
+        harnessPath: "verify.cjs",
+        candidateInputs: ["src/second.txt"],
+        sourceRefs: secondTaskProofRefs,
+      }),
+      semanticProofProposal({
+        id: "PROOF-VERTICAL-INTEGRATED",
+        requirementIds: ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
+        clauseIds: [acceptanceClauseId, secondAcceptanceClauseId],
+        phases: ["final_integrated"],
+        command: "task verify:vertical-integrated",
+        positiveOracle: integratedPositiveOracle,
+        positiveCases: [{
+          id: "CASE-VERTICAL-INTEGRATED",
+          description: integratedPositiveOracle,
+        }],
+        negativeControls: [{
+          id: "CONTROL-VERTICAL-INTEGRATED",
+          description: integratedNegativeControl,
+        }],
+        harnessPath: "verify.cjs",
+        candidateInputs: ["src/value.txt", "src/second.txt"],
+        sourceRefs: integratedProofRefs,
+      }),
+    ],
     tasks: [
       {
         id: "TASK-VERTICAL",
@@ -1643,7 +2323,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         accountableProducer: "campaign-coding-agent",
         requirementIds: ["REQ-VERTICAL"],
         dependencyTaskIds: [],
-        proofIds: ["PROOF-VERTICAL"],
+        proofIds: ["PROOF-VERTICAL-VALUE-TASK"],
         workflowId: "WORKFLOW-VERTICAL",
         documentIds: [],
         artifactIds: [],
@@ -1666,7 +2346,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         accountableProducer: "campaign-coding-agent",
         requirementIds: ["REQ-VERTICAL-SECOND"],
         dependencyTaskIds: ["TASK-VERTICAL"],
-        proofIds: ["PROOF-VERTICAL"],
+        proofIds: ["PROOF-VERTICAL-SECOND-TASK"],
         workflowId: "WORKFLOW-VERTICAL",
         documentIds: [],
         artifactIds: [],
@@ -1893,22 +2573,22 @@ async function createFanoutPacket(
     return `Change ${fanTask.file} from pending to ${fanTask.value} in a parallel isolated worktree that already contains the entry task's commit.`;
   };
   const acceptanceFor = (fanTask) =>
-    `The exact verifier node verify-fanout.cjs must reject the planted pending value and accept the corrected ${fanTask.value} value.`;
-  const requirementLineFor = (fanTask) => {
-    const parts = [
-      `- ${fanTask.requirementId}: ${statementFor(fanTask)}`,
-      `Acceptance: ${acceptanceFor(fanTask)}`,
-      "Proof command: task verify:fanout.",
-    ];
-    if (fanTask.role === "entry") {
-      parts.push(
-        "Positive oracle: The verifier prints FANOUT_POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
-        "Negative control: The same verifier exits nonzero for the frozen planted pending values.",
-      );
-    }
-    return parts.join(" ");
-  };
+    `The trusted verifier accepts ${fanTask.file} only when its candidate value is ${fanTask.value}.`;
+  const taskPositiveOracleFor = (fanTask) =>
+    `The baseline-owned harness emits passing canonical evidence for ${fanTask.file}.`;
+  const taskNegativeControlFor = (fanTask) =>
+    `The baseline-owned harness rejects the frozen planted pending value for ${fanTask.file}.`;
+  const requirementLineFor = (fanTask) =>
+    `Requirement statement: ${statementFor(fanTask)}`;
+  const taskProofLineFor = (fanTask) =>
+    `For this task, the verifier command ${fanoutTaskProofCommandFor(fanTask)} establishes the clause. Positive oracle: ${taskPositiveOracleFor(fanTask)} Negative control: ${taskNegativeControlFor(fanTask)}`;
   const requirementLines = fanTasks.map(requirementLineFor);
+  const integratedPositiveOracle =
+    "The baseline-owned harness emits passing canonical evidence for all four fan-out clauses on the joined commit.";
+  const integratedNegativeControl =
+    "The baseline-owned harness rejects all frozen planted pending fan-out values.";
+  const integratedProofLine =
+    `For the joined result, the verifier command task verify:fanout-integrated establishes every admitted clause. Positive oracle: ${integratedPositiveOracle} Negative control: ${integratedNegativeControl}`;
   const liveActionLineFor = (fanTask) =>
     `- Protected action: live_execution provider://openai/${fanTask.taskId} requires explicit human approval.`;
   const liveActionLines = fanTasks.map(liveActionLineFor);
@@ -1938,7 +2618,18 @@ async function createFanoutPacket(
     "",
     "## Requirement and proof",
     "",
-    ...requirementLines,
+    ...fanTasks.flatMap((fanTask, index) => [
+      `### Requirement ${fanTask.requirementId}`,
+      requirementLines[index],
+      "#### Acceptance clauses",
+      `- [${fanoutClauseIdFor(fanTask)}] ${acceptanceFor(fanTask)}`,
+      "#### Proof declaration",
+      taskProofLineFor(fanTask),
+      "",
+    ]),
+    "## Final integrated proof",
+    "",
+    integratedProofLine,
     "",
     "## Supporting context",
     "",
@@ -2033,6 +2724,9 @@ async function createFanoutPacket(
   const requirementLineByTaskId = new Map(
     fanTasks.map((fanTask, index) => [fanTask.taskId, requirementLines[index]]),
   );
+  const taskProofLineByTaskId = new Map(
+    fanTasks.map((fanTask) => [fanTask.taskId, taskProofLineFor(fanTask)]),
+  );
   const requirementIdByTaskId = new Map(
     fanTasks.map((fanTask) => [fanTask.taskId, fanTask.requirementId]),
   );
@@ -2044,7 +2738,7 @@ async function createFanoutPacket(
       kind: "depends_on",
     })));
   const proposal = {
-    schema: "ccc-prd.authoring-proposal.v1",
+    schema: "ccc-prd.authoring-proposal.v2",
     authorityRoles: [
       {
         id: "AUTHORITY-FANOUT",
@@ -2063,25 +2757,64 @@ async function createFanoutPacket(
       id: fanTask.requirementId,
       statement: statementFor(fanTask),
       acceptance: acceptanceFor(fanTask),
+      acceptanceClauses: [{
+        id: fanoutClauseIdFor(fanTask),
+        requirementId: fanTask.requirementId,
+        text: acceptanceFor(fanTask),
+        proofIds: ["PROOF-FANOUT-INTEGRATED", fanoutTaskProofIdFor(fanTask)],
+        sourceRefs: [prdRef(acceptanceFor(fanTask))],
+      }],
+      acceptanceDispositions: [],
       accountableProducer: "campaign-coding-agent",
       dependencies: fanTask.dependencyTaskIds.map((taskId) =>
         requirementIdByTaskId.get(taskId)),
-      proofIds: ["PROOF-FANOUT"],
-      sourceRefs: [prdRef(requirementLineByTaskId.get(fanTask.taskId))],
+      proofIds: ["PROOF-FANOUT-INTEGRATED", fanoutTaskProofIdFor(fanTask)],
+      sourceRefs: [
+        prdRef(requirementLineByTaskId.get(fanTask.taskId)),
+        prdRef(acceptanceFor(fanTask)),
+      ],
       confidence: "high",
     })),
-    proofs: [{
-      id: "PROOF-FANOUT",
-      requirementIds: fanTasks.map(({ requirementId }) => requirementId),
-      command: "task verify:fanout",
-      positiveOracle:
-        "The verifier prints FANOUT_POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
-      negativeControls: [
-        "The same verifier exits nonzero for the frozen planted pending values.",
-      ],
-      sourceRefs: [prdRef(requirementLineByTaskId.get("TASK-FAN-A"))],
-      confidence: "high",
-    }],
+    proofs: [
+      ...fanTasks.map((fanTask) => semanticProofProposal({
+        id: fanoutTaskProofIdFor(fanTask),
+        requirementIds: [fanTask.requirementId],
+        clauseIds: [fanoutClauseIdFor(fanTask)],
+        phases: ["task"],
+        command: fanoutTaskProofCommandFor(fanTask),
+        positiveOracle: taskPositiveOracleFor(fanTask),
+        positiveCases: [{
+          id: `CASE-${fanTask.taskId.slice("TASK-".length)}`,
+          description: taskPositiveOracleFor(fanTask),
+        }],
+        negativeControls: [{
+          id: `CONTROL-${fanTask.taskId.slice("TASK-".length)}-PENDING`,
+          description: taskNegativeControlFor(fanTask),
+        }],
+        harnessPath: "verify-fanout.cjs",
+        candidateInputs: [fanTask.file],
+        sourceRefs: [prdRef(taskProofLineByTaskId.get(fanTask.taskId))],
+      })),
+      semanticProofProposal({
+        id: "PROOF-FANOUT-INTEGRATED",
+        requirementIds: fanTasks.map(({ requirementId }) => requirementId),
+        clauseIds: fanTasks.map(fanoutClauseIdFor),
+        phases: ["final_integrated"],
+        command: "task verify:fanout-integrated",
+        positiveOracle: integratedPositiveOracle,
+        positiveCases: [{
+          id: "CASE-FANOUT-INTEGRATED",
+          description: integratedPositiveOracle,
+        }],
+        negativeControls: [{
+          id: "CONTROL-FANOUT-INTEGRATED-PENDING",
+          description: integratedNegativeControl,
+        }],
+        harnessPath: "verify-fanout.cjs",
+        candidateInputs: fanTasks.map(({ file }) => file),
+        sourceRefs: [prdRef(integratedProofLine)],
+      }),
+    ],
     tasks: fanTasks.map((fanTask) => ({
       id: fanTask.taskId,
       title: `Implement the admitted ${fanTask.file} change`,
@@ -2092,7 +2825,7 @@ async function createFanoutPacket(
       accountableProducer: "campaign-coding-agent",
       requirementIds: [fanTask.requirementId],
       dependencyTaskIds: [...fanTask.dependencyTaskIds],
-      proofIds: ["PROOF-FANOUT"],
+      proofIds: [fanoutTaskProofIdFor(fanTask)],
       workflowId: "WORKFLOW-FANOUT",
       documentIds: [],
       artifactIds: [],
@@ -2249,7 +2982,11 @@ async function writeFakeCodex(fakeBin) {
       "const cutpointInvocationLog = "
         + JSON.stringify(path.join(fakeBin, "provider-cutpoint.invocations.jsonl"))
         + ";",
+      "const proofCutpointActivation = "
+        + JSON.stringify(path.join(fakeBin, "proof-cutpoint.activate"))
+        + ";",
       "const cutpointActive = Boolean(cutpointActivation && fs.existsSync(cutpointActivation));",
+      "const proofCutpointActive = Boolean(proofCutpointActivation && fs.existsSync(proofCutpointActivation));",
       "if (cutpointActive && cutpointInvocationLog) {",
       "  fs.appendFileSync(cutpointInvocationLog, JSON.stringify({ pid: process.pid, cwd: process.cwd(), executable: process.argv[1] }) + '\\n');",
       "}",
@@ -2292,7 +3029,9 @@ async function writeFakeCodex(fakeBin) {
       "        'Modify any path outside the two admitted task write roots.',",
       "        'Semantic task: TASK-VERTICAL-SECOND\\nAccountable producer:',",
       "        'Change src/second.txt from pending to second-good in a chained isolated worktree that already contains the first task\\u0027s commit.',",
-      "        'The exact verifier node verify.cjs must reject the planted pending value and accept the corrected second-good value.',",
+      "        'The trusted verifier accepts src/second.txt only when its candidate value is second-good.',",
+      "        'Command: task verify:vertical-second',",
+      "        '- CONTROL-VERTICAL-PENDING: The baseline-owned harness rejects the frozen planted pending value.',",
       "        'ACTION-VERTICAL-SECOND-LIVE: live_execution on provider://openai/TASK-VERTICAL-SECOND; requires human decision approve_live_execution.',",
       "        'requires human decision approve_merge',",
       "      ],",
@@ -2305,7 +3044,9 @@ async function writeFakeCodex(fakeBin) {
       "        'Modify any path outside the two admitted task write roots.',",
       "        'Semantic task: TASK-VERTICAL\\nAccountable producer:',",
       "        'Change src/value.txt from bad to good in an isolated worktree.',",
-      "        'The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.',",
+      "        'The trusted verifier accepts src/value.txt only when its candidate value is good.',",
+      "        'Command: task verify:vertical-value',",
+      "        '- CONTROL-VERTICAL-BAD: The baseline-owned harness rejects the frozen planted bad value.',",
       "        'ACTION-VERTICAL-LIVE: live_execution on provider://openai/TASK-VERTICAL; requires human decision approve_live_execution.',",
       "      ],",
       "    },",
@@ -2318,6 +3059,9 @@ async function writeFakeCodex(fakeBin) {
         "        'Modify any path outside the four admitted task write roots.',",
         `        'Semantic task: ${fanTask.taskId}\\nAccountable producer:',`,
         `        'Change ${fanTask.file} from pending to ${fanTask.value}',`,
+        `        'The trusted verifier accepts ${fanTask.file} only when its candidate value is ${fanTask.value}.',`,
+        `        'Command: ${fanoutTaskProofCommandFor(fanTask)}',`,
+        `        '- CONTROL-${fanTask.taskId.slice("TASK-".length)}-PENDING: The baseline-owned harness rejects the frozen planted pending value for ${fanTask.file}.',`,
         `        '${fanTask.actionId}: live_execution on provider://openai/${fanTask.taskId}; requires human decision approve_live_execution.',`,
         ...(fanTask.role === "join"
           ? ["        'requires human decision approve_merge',"]
@@ -2348,7 +3092,8 @@ async function writeFakeCodex(fakeBin) {
       "    setInterval(() => {}, 1000);",
       "    return;",
       "  }",
-      "  fs.writeFileSync(profile.editPath, profile.editContent);",
+      `  const editContent = proofCutpointActive && profile.editPath === 'src/value.txt' ? ${JSON.stringify(`${proofCutpointCandidateValue}\n`)} : profile.editContent;`,
+      "  fs.writeFileSync(profile.editPath, editContent);",
       "  const payload = JSON.stringify({",
       "    type: 'agent-turn-complete',",
       "    'thread-id': `acceptance-${process.pid}`,",
@@ -2531,42 +3276,29 @@ async function readOwnedProofCutpointMarkers(token) {
   const canonicalTmp = await realpath(tmpdir());
   const scratchEntries = await readdir(canonicalTmp, { withFileTypes: true });
   const markers = [];
-  for (const scratchEntry of scratchEntries) {
+  for (const executionEntry of scratchEntries) {
     if (
-      !scratchEntry.isDirectory()
-      || !scratchEntry.name.startsWith("fusion-verifier-sandbox-")
+      !executionEntry.isDirectory()
+      || !executionEntry.name.startsWith("ccc-semantic-proof-execution-")
     ) {
       continue;
     }
-    const scratchRoot = path.join(canonicalTmp, scratchEntry.name);
-    let homeEntries;
-    try {
-      homeEntries = await readdir(scratchRoot, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const homeEntry of homeEntries) {
-      if (
-        !homeEntry.isDirectory()
-        || (
-          homeEntry.name !== "home"
-          && !homeEntry.name.startsWith("home-")
-        )
-      ) {
-        continue;
-      }
-      const home = path.join(scratchRoot, homeEntry.name);
-      const markerPath = path.join(home, proofCutpointMarkerName);
-      if (!await pathExists(markerPath)) continue;
-      const marker = JSON.parse(await readFile(markerPath, "utf8"));
-      if (marker?.token !== token) continue;
-      markers.push(Object.freeze({
-        ...marker,
-        scratchRoot,
-        home,
-        markerPath,
-      }));
-    }
+    const executionRoot = path.join(canonicalTmp, executionEntry.name);
+    const proofRoot = path.join(executionRoot, "proof");
+    const scratchRoot = path.join(executionRoot, "scratch");
+    const home = path.join(scratchRoot, "home");
+    const markerPath = path.join(home, proofCutpointMarkerName);
+    if (!await pathExists(markerPath)) continue;
+    const marker = JSON.parse(await readFile(markerPath, "utf8"));
+    if (marker?.token !== token) continue;
+    markers.push(Object.freeze({
+      ...marker,
+      executionRoot,
+      proofRoot,
+      scratchRoot,
+      home,
+      markerPath,
+    }));
   }
   return markers.sort((left, right) => left.pid - right.pid);
 }
@@ -2574,7 +3306,7 @@ async function readOwnedProofCutpointMarkers(token) {
 async function terminateOwnedProofCutpointProcess(
   marker,
   token,
-  expectedWorktree,
+  expectedProofRoot,
 ) {
   const expectedTitle = `cccp-${token.slice(0, 8)}`;
   assert(
@@ -2583,9 +3315,13 @@ async function terminateOwnedProofCutpointProcess(
       && Number.isSafeInteger(marker.pid)
       && marker.pid > 1
       && typeof marker.cwd === "string"
-      && await realpath(marker.cwd) === expectedWorktree,
+      && await realpath(marker.cwd) === expectedProofRoot
+      && await realpath(marker.proofRoot) === expectedProofRoot
+      && path.dirname(expectedProofRoot) === marker.executionRoot
+      && marker.scratchRoot === path.join(marker.executionRoot, "scratch")
+      && marker.home === path.join(marker.scratchRoot, "home"),
     "CCC_PRODUCT_PROOF_CUTPOINT_MARKER_INVALID",
-    JSON.stringify({ marker, expectedWorktree }),
+    JSON.stringify({ marker, expectedProofRoot }),
   );
   const inspected = await run(
     "/bin/ps",
@@ -2618,7 +3354,7 @@ async function terminateOwnedProofCutpointProcess(
 
 async function cleanupOwnedProofCutpointMarkers(token) {
   const markers = await readOwnedProofCutpointMarkers(token);
-  const removableScratchRoots = new Set();
+  const removableExecutionRoots = new Set();
   for (const marker of markers) {
     const inspected = await run(
       "/bin/ps",
@@ -2626,7 +3362,7 @@ async function cleanupOwnedProofCutpointMarkers(token) {
       { allowedExitCodes: [0, 1] },
     );
     if (inspected.code === 1) {
-      removableScratchRoots.add(marker.scratchRoot);
+      removableExecutionRoots.add(marker.executionRoot);
       continue;
     }
     const expectedTitle = `cccp-${token.slice(0, 8)}`;
@@ -2649,11 +3385,11 @@ async function cleanupOwnedProofCutpointMarkers(token) {
         undefined,
         shutdownTimeoutMs,
       );
-      removableScratchRoots.add(marker.scratchRoot);
+      removableExecutionRoots.add(marker.executionRoot);
     }
   }
-  for (const scratchRoot of removableScratchRoots) {
-    await rm(scratchRoot, { recursive: true, force: true });
+  for (const executionRoot of removableExecutionRoots) {
+    await rm(executionRoot, { recursive: true, force: true });
   }
 }
 
@@ -2707,10 +3443,69 @@ async function main() {
     );
     ownedProofCutpointToken = randomUUID().replaceAll("-", "").slice(0, 16);
     const targetBase = await initializeTarget(targetRoot, {
-      proofCutpointActivation,
       proofCutpointToken: ownedProofCutpointToken,
     });
+    exactArray(
+      (await git(targetRoot, "ls-tree", "--name-only", targetBase))
+        .split("\n")
+        .filter(Boolean),
+      [
+        ".gitignore",
+        "Taskfile.yml",
+        "src",
+        "verify-fanout.cjs",
+        "verify.cjs",
+      ],
+      "CCC_PRODUCT_BASELINE_PROOF_CLOSURE_SET_DRIFT",
+    );
+    const expectedVerticalTaskfile = [
+      "version: '3'",
+      "",
+      "tasks:",
+      "  verify:vertical-value:",
+      "    cmds:",
+      "      - node verify.cjs src/value.txt",
+      "  verify:vertical-second:",
+      "    cmds:",
+      "      - node verify.cjs src/second.txt",
+      "  verify:vertical-integrated:",
+      "    cmds:",
+      "      - node verify.cjs src/value.txt src/second.txt",
+    ].join("\n");
+    const verticalTaskfileAtBase = await git(
+      targetRoot,
+      "show",
+      `${targetBase}:Taskfile.yml`,
+    );
+    assert(
+      verticalTaskfileAtBase === expectedVerticalTaskfile,
+      "CCC_PRODUCT_BASELINE_TASKFILE_CONTRACT_DRIFT",
+      verticalTaskfileAtBase,
+    );
     const packet = await createPacket(packetRoot, targetRoot, targetBase, env);
+    const redSemanticProposal = JSON.parse(
+      await readFile(packet.proposalPath, "utf8"),
+    );
+    const redSemanticSource = await readFile(
+      path.join(packetRoot, packet.sourcePath),
+      "utf8",
+    );
+    assertExactAcceptanceClauseGrammar(
+      redSemanticSource,
+      redSemanticProposal,
+      "CCC_PRODUCT_SEMANTIC_V2_SOURCE_CLAUSE_GRAMMAR_INVALID",
+    );
+    assert(
+      redSemanticProposal.schema === "ccc-prd.authoring-proposal.v2"
+      && redSemanticSource.includes("- [AC-REQ-VERTICAL-001] "),
+      "CCC_PRODUCT_SEMANTIC_V2_AUTHORITY_MISSING",
+      JSON.stringify({
+        proposalSchema: redSemanticProposal.schema,
+        exactClausePresent: redSemanticSource.includes(
+          "- [AC-REQ-VERTICAL-001] ",
+        ),
+      }),
+    );
     ledger.pass("current-prd-corpus-manifest", packet.corpus);
     ledger.pass("current-prd-discovered-and-frozen", {
       discovery: packet.discovery,
@@ -2722,20 +3517,41 @@ async function main() {
     });
     const idempotencyKey = `ccc-product-${randomUUID()}`;
 
-    const planted = await run(process.execPath, ["verify.cjs"], {
+    const targetBaseTree = await git(targetRoot, "rev-parse", `${targetBase}^{tree}`);
+    const planted = await run(
+      process.execPath,
+      ["verify.cjs", "src/value.txt", "src/second.txt"],
+      {
       cwd: targetRoot,
-      env,
+      env: {
+        ...env,
+        CCC_PROOF_ID: "PROOF-VERTICAL-INTEGRATED",
+        CCC_PROOF_PHASE: "final_integrated",
+        CCC_PROOF_SOURCE_COMMIT: targetBase,
+        CCC_PROOF_SOURCE_TREE: targetBaseTree,
+      },
       allowedExitCodes: [1],
-    });
+      },
+    );
+    const plantedEvidence = JSON.parse(planted.stdout.trim());
     assert(
-      planted.stderr.includes("POSITIVE_ORACLE_FAIL:bad"),
+      plantedEvidence.schema === "ccc-prd.proof-evidence.v2"
+      && plantedEvidence.proofId === "PROOF-VERTICAL-INTEGRATED"
+      && plantedEvidence.phase === "final_integrated"
+      && plantedEvidence.passed === false
+      && plantedEvidence.clauseResults.every(({ passed }) => passed === false)
+      && plantedEvidence.negativeControlResults.every(
+        ({ passed }) => passed === true,
+      ),
       "CCC_PRODUCT_NEGATIVE_CONTROL_MISSING",
-      tail(planted.stderr),
+      planted.stdout,
     );
     ledger.pass("planted-defect-rejected", {
       exitCode: planted.code,
-      stderrSha256: sha256(planted.stderr),
-      signature: "POSITIVE_ORACLE_FAIL:bad",
+      stdoutSha256: sha256(planted.stdout),
+      proofId: plantedEvidence.proofId,
+      clauseResults: plantedEvidence.clauseResults,
+      negativeControlResults: plantedEvidence.negativeControlResults,
     });
 
     // Both admitted files stay at their planted values until the campaign is
@@ -2759,29 +3575,23 @@ async function main() {
       return found[0];
     };
 
-    // A chained campaign parks once per task. The guided `nextAction`
-    // projection selects the earliest unconsumed live-execution approval by the
-    // approval's own identity, so a chained task's hold is walked exactly like
-    // the entry task's, and the reason names the held task whenever it differs
-    // from the work item's pinned entry task
-    // (packages/core/src/ccc-prd/product-status.ts:854-882).
-    //
-    // Both surfaces must agree before the canary claims anything: the guided
-    // next action must be `approve-execution` naming the same approval that the
-    // operator-visible confirmation list reports as issued. Requiring the
-    // agreement here means every parked hold proves the guided operator path,
-    // not just the confirmation list.
-    const awaitParkedLiveExecutionApproval = async (
+    // Semantic-v2 campaigns expose exactly one sealed launch decision. The
+    // child approval rows remain visible only as diagnostic member receipts;
+    // they never carry confirmations and cannot be spent directly.
+    const awaitSealedExecutionAuthorization = async (
       label,
       readKeyStatus,
-      alreadyApprovedRequestIds,
+      expectedMemberCount,
     ) => {
-      const issuedFor = (value) =>
-        (value.liveExecutionApprovalConfirmations ?? []).find(
-          ({ approvalRequestId, status }) =>
-            status === "issued"
-            && !alreadyApprovedRequestIds.includes(approvalRequestId),
-        );
+      const issuedFor = (value) => {
+        const authorization = value.status?.executionAuthorization;
+        const confirmation = value.liveExecutionAuthorizationConfirmation;
+        return authorization?.status === "issued"
+          && confirmation?.status === "issued"
+          && confirmation.authorizationId === authorization.authorizationId
+          ? { authorization, confirmation }
+          : null;
+      };
       const hold = await poll(
         label,
         readKeyStatus,
@@ -2792,30 +3602,61 @@ async function main() {
             && value.status.workItems[0]?.lastError
               === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
             && Boolean(pending)
+            && value.status.executionAuthorizationMode === "sealed_bundle_v1"
+            && value.status.executionAuthorization?.members?.length
+              === expectedMemberCount
             && value.status.nextAction?.kind === "approve-execution"
-            && value.status.nextAction.approvalRequestId
-              === pending.approvalRequestId;
+            && value.status.nextAction.executionAuthorizationId
+              === pending.authorization.authorizationId;
         },
         async () => ({
           serve: tail(server.output()),
           status: await readKeyStatus(),
         }),
       );
-      const confirmation = issuedFor(hold);
+      const pending = issuedFor(hold);
+      const authorization = pending?.authorization;
+      const confirmation = pending?.confirmation;
       const nextAction = hold.status.nextAction;
+      const childApprovalIds = authorization?.members?.map(
+        ({ approvalRequestId }) => approvalRequestId,
+      ) ?? [];
       assert(
-        confirmation
+        authorization
+        && confirmation
         && /^[0-9a-f]{64}$/u.test(confirmation.confirmation)
+        && /^ccc-execution-authorization-[0-9a-f]{64}$/u.test(
+          authorization.authorizationId,
+        )
+        && authorization.members.length === expectedMemberCount
+        // This is the import-global request counter observed at issuance, not
+        // the number of authorized members. A fresh sealed campaign starts at
+        // zero and each member later spends against the normal request budget.
+        && authorization.expectedRequestCount === 0
+        && new Set(childApprovalIds).size === expectedMemberCount
+        && childApprovalIds.every((approvalRequestId) =>
+          hold.status.approvals.some(({ id }) => id === approvalRequestId))
+        && (hold.liveExecutionApprovalConfirmations ?? []).length === 0
         && nextAction?.kind === "approve-execution"
-        && nextAction.approvalRequestId === confirmation.approvalRequestId,
-        "CCC_PRODUCT_PARKED_LIVE_EXECUTION_APPROVAL_MISSING",
+        && nextAction.executionAuthorizationId
+          === authorization.authorizationId
+        && nextAction.executionAuthorizationStatus === "issued",
+        "CCC_PRODUCT_SEALED_EXECUTION_AUTHORIZATION_MISSING",
         JSON.stringify({
           label,
           nextAction,
-          confirmations: hold.liveExecutionApprovalConfirmations,
+          authorization,
+          parentConfirmation: confirmation,
+          childConfirmations: hold.liveExecutionApprovalConfirmations,
         }),
       );
-      return { hold, confirmation, nextAction };
+      return {
+        hold,
+        authorization,
+        confirmation,
+        childApprovalIds,
+        nextAction,
+      };
     };
 
     // The operator loop prints human-readable prose by default, so every
@@ -2869,7 +3710,9 @@ async function main() {
       }, null, 2)}\n`);
     };
 
-    const understandingProposal = JSON.parse(proposalText);
+    const understandingProposal = legacyV1ProposalFromV2(
+      JSON.parse(proposalText),
+    );
     understandingProposal.targetRepository = { path: "", baseCommit: "" };
     understandingProposal.bounds = {
       maxRequests: 0,
@@ -3275,6 +4118,12 @@ async function main() {
         )
         && JSON.stringify(generationRequests[0].body?.messages).includes(
           "Fusion Reviewed Operator Context",
+        )
+        && JSON.stringify(generationRequests[0].body?.messages).includes(
+          '"schema": "ccc-prd.authoring-proposal.v2"',
+        )
+        && JSON.stringify(generationRequests[0].body?.messages).includes(
+          '"acceptanceClauses"',
         ),
       "CCC_PRODUCT_NATIVE_AUTHORING_REQUEST_INVALID",
       JSON.stringify(generationRequests),
@@ -3282,6 +4131,80 @@ async function main() {
     const authoredSidecar = JSON.parse(
       await readFile(packet.sidecarPath, "utf8"),
     );
+    const authoredProofsById = new Map(
+      (authoredSidecar.proofs ?? []).map((proof) => [proof.id, proof]),
+    );
+    const semanticProofIds = [
+      "PROOF-VERTICAL-INTEGRATED",
+      "PROOF-VERTICAL-SECOND-TASK",
+      "PROOF-VERTICAL-VALUE-TASK",
+    ];
+    const semanticClauses = (authoredSidecar.requirements ?? []).flatMap(
+      ({ acceptanceClauses = [] }) => acceptanceClauses,
+    );
+    assert(
+      authoredSidecar.schema === "ccc-prd.sidecar.v2"
+      && semanticClauses.length === 2
+      && semanticClauses.some(({ id }) => id === "AC-REQ-VERTICAL-001")
+      && semanticClauses.some(
+        ({ id }) => id === "AC-REQ-VERTICAL-SECOND-001",
+      )
+      && semanticProofIds.every((id) => {
+        const proof = authoredProofsById.get(id);
+        return proof?.schema === "ccc-prd.proof.v2"
+          && proof.admission?.schema === "ccc-prd.proof-admission.v2"
+          && proof.verifierClosure?.some(({ role, path, baseGitBlobOid, sha256: digest }) =>
+            role === "task_runner"
+            && path === "Taskfile.yml"
+            && baseGitBlobOid !== semanticProofPlaceholderGitOid
+            && digest !== semanticProofPlaceholderSha256)
+          && proof.verifierClosure?.some(({ role, path }) =>
+            role === "harness" && path === "verify.cjs")
+          && proof.executionToolchain?.proofHost?.id
+            === "fusion-cli-semantic-proof-host.v1"
+          && proof.executionToolchain.proofHost.executablePath
+            !== "/model-untrusted/proof-host";
+      })
+      && authoredProofsById.get("PROOF-VERTICAL-VALUE-TASK")?.phases?.[0]
+        === "task"
+      && authoredProofsById.get("PROOF-VERTICAL-SECOND-TASK")?.phases?.[0]
+        === "task"
+      && authoredProofsById.get("PROOF-VERTICAL-INTEGRATED")?.phases?.[0]
+        === "final_integrated",
+      "CCC_PRODUCT_SEMANTIC_V2_AUTHORITY_INVALID",
+      JSON.stringify({
+        schema: authoredSidecar.schema,
+        clauses: semanticClauses,
+        proofs: authoredSidecar.proofs,
+      }),
+    );
+    await assertControllerHydratedProofCustody({
+      proof: authoredProofsById.get("PROOF-VERTICAL-VALUE-TASK"),
+      targetRoot,
+      targetBase,
+      command: "task verify:vertical-value",
+      phase: "task",
+      harnessPath: "verify.cjs",
+      candidateInputs: ["src/value.txt"],
+    });
+    await assertControllerHydratedProofCustody({
+      proof: authoredProofsById.get("PROOF-VERTICAL-SECOND-TASK"),
+      targetRoot,
+      targetBase,
+      command: "task verify:vertical-second",
+      phase: "task",
+      harnessPath: "verify.cjs",
+      candidateInputs: ["src/second.txt"],
+    });
+    await assertControllerHydratedProofCustody({
+      proof: authoredProofsById.get("PROOF-VERTICAL-INTEGRATED"),
+      targetRoot,
+      targetBase,
+      command: "task verify:vertical-integrated",
+      phase: "final_integrated",
+      harnessPath: "verify.cjs",
+      candidateInputs: ["src/value.txt", "src/second.txt"],
+    });
     assert(
       authoredSidecar.provenance?.authoringAdapterId
         === "fusion-native-model-runtime-v1"
@@ -3347,6 +4270,20 @@ async function main() {
       implementationFactProvenance,
     };
     ledger.pass("native-local-authoring", nativeAuthoringEvidence);
+    ledger.pass("semantic-v2-authority-contract", {
+      sidecarSchema: authoredSidecar.schema,
+      clauseIds: semanticClauses.map(({ id }) => id).sort(),
+      proofIds: semanticProofIds,
+      taskPhaseProofIds: [
+        "PROOF-VERTICAL-SECOND-TASK",
+        "PROOF-VERTICAL-VALUE-TASK",
+      ],
+      finalIntegratedProofId: "PROOF-VERTICAL-INTEGRATED",
+      controllerHydrated: true,
+      exactSourceAcceptanceClauseGrammar: true,
+      verifierClosurePaths: ["Taskfile.yml", "verify.cjs"],
+      modelPlaceholderAuthorityDiscarded: true,
+    });
     await stopNativeAuthoringServer(authoringServer);
     authoringServer = undefined;
     const validated = jsonOutput(
@@ -3388,8 +4325,17 @@ async function main() {
     );
     exactArray(
       compiled.proofs?.map(({ id }) => id),
-      ["PROOF-VERTICAL"],
+      [
+        "PROOF-VERTICAL-INTEGRATED",
+        "PROOF-VERTICAL-SECOND-TASK",
+        "PROOF-VERTICAL-VALUE-TASK",
+      ],
       "CCC_PRODUCT_PROOF_SET_DRIFT",
+    );
+    assert(
+      compiled.schema === "ccc-prd.bundle.v2",
+      "CCC_PRODUCT_SEMANTIC_BUNDLE_VERSION_DRIFT",
+      compiled.schema,
     );
     ledger.pass("frozen-packet-validated", {
       packetHash: compiled.sourceHash,
@@ -3397,8 +4343,70 @@ async function main() {
       bundleHash: compiled.bundleHash,
       requirementIds: ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       taskIds: ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
-      proofIds: ["PROOF-VERTICAL"],
+      proofIds: [
+        "PROOF-VERTICAL-INTEGRATED",
+        "PROOF-VERTICAL-SECOND-TASK",
+        "PROOF-VERTICAL-VALUE-TASK",
+      ],
     });
+
+    // Compatibility is intentionally asymmetric: v1 remains parseable for
+    // inspection and exact persisted replay, but the normal product commands
+    // must not let it mint a fresh secure campaign.
+    const legacyProposalPath = path.join(packetRoot, "legacy-v1-proposal.json");
+    const legacySidecarPath = path.join(packetRoot, "legacy-v1-sidecar.json");
+    const legacyExecutionPlanPath = path.join(
+      packetRoot,
+      "legacy-v1-execution-plan.json",
+    );
+    await writeFile(
+      legacyProposalPath,
+      `${JSON.stringify(
+        legacyV1ProposalFromV2(JSON.parse(proposalText)),
+        null,
+        2,
+      )}\n`,
+    );
+    const legacyAuthored = jsonOutput(
+      await prd([
+        "author",
+        packetRoot,
+        packet.manifestPath,
+        legacyProposalPath,
+        legacySidecarPath,
+      ]),
+      "prd legacy v1 proposal-file author",
+    );
+    const legacyValidated = jsonOutput(
+      await prd([
+        "validate",
+        packetRoot,
+        packet.manifestPath,
+        legacySidecarPath,
+        targetRoot,
+        targetBase,
+      ]),
+      "prd legacy v1 validate",
+    );
+    const legacyCompiled = jsonOutput(
+      await prd([
+        "compile",
+        packetRoot,
+        packet.manifestPath,
+        legacySidecarPath,
+        targetRoot,
+        targetBase,
+      ]),
+      "prd legacy v1 compile",
+    );
+    assert(
+      legacyAuthored.kind === "candidate"
+      && legacyValidated.kind === "diagnostics"
+      && legacyValidated.valid === true
+      && legacyCompiled.schema === "ccc-prd.bundle.v1",
+      "CCC_PRODUCT_LEGACY_V1_READABILITY_DRIFT",
+      JSON.stringify({ legacyAuthored, legacyValidated, legacyCompiled }),
+    );
 
     // One route profile per task, selected through the product's own
     // routes-by-task file rather than a single flag set broadcast to every
@@ -3426,6 +4434,36 @@ async function main() {
         routes: routeProfiles,
       }, null, 2)}\n`,
     );
+    const legacyFreshPolicy = jsonOutput(
+      await prd([
+        "policy",
+        packetRoot,
+        packet.manifestPath,
+        legacySidecarPath,
+        targetRoot,
+        targetBase,
+        legacyExecutionPlanPath,
+        "--routes-file",
+        routesFilePath,
+      ], [1]),
+      "prd legacy v1 fresh product policy",
+    );
+    assert(
+      legacyFreshPolicy.kind === "refusal"
+      && legacyFreshPolicy.diagnostics?.some(
+        ({ code }) => code === "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+      )
+      && !await pathExists(legacyExecutionPlanPath),
+      "CCC_PRODUCT_LEGACY_V1_FRESH_PRODUCT_ACCEPTED",
+      JSON.stringify(legacyFreshPolicy),
+    );
+    ledger.pass("legacy-v1-readable-fresh-product-refused", {
+      legacySidecarSchema: "ccc-prd.sidecar.v1",
+      legacyBundleSchema: legacyCompiled.schema,
+      readable: true,
+      freshProductDiagnostic: "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+      freshExecutionPlanCreated: false,
+    });
     const generatedExecutionPlan = jsonOutput(
       await prd([
         "policy",
@@ -3453,6 +4491,7 @@ async function main() {
         && generatedExecutionPlan.sha256 === sha256(executionPlanBytes)
         && generatedExecutionPlan.routeCount === 2
         && executionPlan.schema === "ccc-prd.execution-plan.v1"
+        && executionPlan.policy?.schema === "ccc-campaign.execution-policy.v2"
         && executionPlan.packetHash === compiled.sourceHash
         && executionPlan.sidecarHash === compiled.sidecarHash
         && executionPlan.bundleHash === compiled.bundleHash
@@ -3852,40 +4891,25 @@ async function main() {
     const readProviderCutpointStatus = async () =>
       readStatusFor(providerCutpointKey);
     server = await startServe(targetRoot, env, port);
-    const providerApprovalHold = await poll(
+    const providerAuthorizationHold = await awaitSealedExecutionAuthorization(
       "provider cutpoint execution approval",
       readProviderCutpointStatus,
-      (value) => value.status?.nextAction?.kind === "approve-execution",
-      async () => ({
-        serve: tail(server.output()),
-        status: await readProviderCutpointStatus(),
-      }),
-    );
-    const providerLiveConfirmation =
-      providerApprovalHold.liveExecutionApprovalConfirmations?.find(
-        ({ approvalRequestId, status }) =>
-          approvalRequestId
-            === providerApprovalHold.status.nextAction.approvalRequestId
-          && status === "issued",
-      );
-    assert(
-      providerLiveConfirmation
-      && /^[0-9a-f]{64}$/u.test(providerLiveConfirmation.confirmation),
-      "CCC_PRODUCT_PROVIDER_CUTPOINT_APPROVAL_MISSING",
-      JSON.stringify(providerApprovalHold.liveExecutionApprovalConfirmations),
+      2,
     );
     const providerExecutionApproved = jsonOutput(
       await prd([
         "approve-execution",
         providerCutpointKey,
-        providerLiveConfirmation.approvalRequestId,
+        providerAuthorizationHold.authorization.authorizationId,
         "--confirm",
-        providerLiveConfirmation.confirmation,
+        providerAuthorizationHold.confirmation.confirmation,
       ]),
       "approve provider-cutpoint execution",
     );
     assert(
       providerExecutionApproved.kind === "execution-approved"
+      && providerExecutionApproved.executionAuthorizationId
+        === providerAuthorizationHold.authorization.authorizationId
       && providerExecutionApproved.approval?.status === "claimed",
       "CCC_PRODUCT_PROVIDER_CUTPOINT_APPROVAL_FAILED",
       JSON.stringify(providerExecutionApproved),
@@ -4068,76 +5092,28 @@ async function main() {
     const readProofCutpointStatus = async () =>
       readStatusFor(proofCutpointKey);
     server = await startServe(targetRoot, env, port);
-    const proofApprovalHold = await poll(
+    const proofAuthorizationHold = await awaitSealedExecutionAuthorization(
       "proof cutpoint execution approval",
       readProofCutpointStatus,
-      (value) => value.status?.nextAction?.kind === "approve-execution",
-      async () => ({
-        serve: tail(server.output()),
-        status: await readProofCutpointStatus(),
-      }),
-    );
-    const proofLiveConfirmation =
-      proofApprovalHold.liveExecutionApprovalConfirmations?.find(
-        ({ approvalRequestId, status }) =>
-          approvalRequestId
-            === proofApprovalHold.status.nextAction.approvalRequestId
-          && status === "issued",
-      );
-    assert(
-      proofLiveConfirmation
-      && /^[0-9a-f]{64}$/u.test(proofLiveConfirmation.confirmation),
-      "CCC_PRODUCT_PROOF_CUTPOINT_APPROVAL_MISSING",
-      JSON.stringify(proofApprovalHold.liveExecutionApprovalConfirmations),
+      2,
     );
     const proofExecutionApproved = jsonOutput(
       await prd([
         "approve-execution",
         proofCutpointKey,
-        proofLiveConfirmation.approvalRequestId,
+        proofAuthorizationHold.authorization.authorizationId,
         "--confirm",
-        proofLiveConfirmation.confirmation,
+        proofAuthorizationHold.confirmation.confirmation,
       ]),
       "approve proof-cutpoint execution",
     );
     assert(
       proofExecutionApproved.kind === "execution-approved"
+      && proofExecutionApproved.executionAuthorizationId
+        === proofAuthorizationHold.authorization.authorizationId
       && proofExecutionApproved.approval?.status === "claimed",
       "CCC_PRODUCT_PROOF_CUTPOINT_APPROVAL_FAILED",
       JSON.stringify(proofExecutionApproved),
-    );
-    // One proof runs after the terminal task, so both tasks must be approved
-    // and executed before the verifier is dispatched at all. The single work
-    // item parks a second time with its own distinct approval request.
-    const proofSecondApproval = await awaitParkedLiveExecutionApproval(
-      "proof cutpoint second-task execution approval",
-      readProofCutpointStatus,
-      [proofLiveConfirmation.approvalRequestId],
-    );
-    const proofSecondLiveConfirmation = proofSecondApproval.confirmation;
-    assert(
-      proofSecondLiveConfirmation.approvalRequestId
-        !== proofLiveConfirmation.approvalRequestId,
-      "CCC_PRODUCT_PROOF_CUTPOINT_SECOND_APPROVAL_MISSING",
-      JSON.stringify(
-        proofSecondApproval.hold.liveExecutionApprovalConfirmations,
-      ),
-    );
-    const proofSecondExecutionApproved = jsonOutput(
-      await prd([
-        "approve-execution",
-        proofCutpointKey,
-        proofSecondLiveConfirmation.approvalRequestId,
-        "--confirm",
-        proofSecondLiveConfirmation.confirmation,
-      ]),
-      "approve proof-cutpoint second-task execution",
-    );
-    assert(
-      proofSecondExecutionApproved.kind === "execution-approved"
-      && proofSecondExecutionApproved.approval?.status === "claimed",
-      "CCC_PRODUCT_PROOF_CUTPOINT_SECOND_APPROVAL_FAILED",
-      JSON.stringify(proofSecondExecutionApproved),
     );
     const proofMarkersAtDispatch = await poll(
       "verifier process reached post-dispatch cutpoint",
@@ -4150,47 +5126,74 @@ async function main() {
       }),
     );
     const proofMarker = proofMarkersAtDispatch[0];
-    const canonicalProofWorktree = await realpath(proofMarker.cwd);
-    const proofWorktreeRelative = path.relative(
-      await realpath(worktreesRoot),
-      canonicalProofWorktree,
-    );
+    const canonicalProofRoot = await realpath(proofMarker.cwd);
     assert(
-      proofWorktreeRelative.length > 0
-      && proofWorktreeRelative !== ".."
-      && !proofWorktreeRelative.startsWith(`..${path.sep}`)
-      && !path.isAbsolute(proofWorktreeRelative),
-      "CCC_PRODUCT_PROOF_CUTPOINT_WORKTREE_INVALID",
-      JSON.stringify({ proofMarker, worktreesRoot }),
+      canonicalProofRoot === await realpath(proofMarker.proofRoot)
+      && path.basename(canonicalProofRoot) === "proof"
+      && path.basename(proofMarker.executionRoot)
+        .startsWith("ccc-semantic-proof-execution-")
+      && proofMarker.home
+        === path.join(proofMarker.executionRoot, "scratch", "home"),
+      "CCC_PRODUCT_PROOF_CUTPOINT_SANDBOX_INVALID",
+      JSON.stringify({ proofMarker, canonicalProofRoot }),
     );
     const proofDispatchStatus = await poll(
       "durable proof dispatch receipt",
       readProofCutpointStatus,
-      (value) =>
-        value.status?.providerAttempts?.length === 2
-        && value.status.providerAttempts.every(
-          ({ state }) => state === "committed",
-        )
-        && value.status?.proofs?.length === 1
-        && value.status.proofs[0]?.attempts?.length === 1
-        && value.status.proofs[0].attempts[0]?.state
-          === "dispatched_unknown",
+      (value) => {
+        const valueTaskProof = value.status?.proofs?.find(
+          ({ definition }) =>
+            definition.id === "PROOF-VERTICAL-VALUE-TASK",
+        );
+        return value.status?.providerAttempts?.length === 1
+          && value.status.providerAttempts[0]?.state === "committed"
+          && value.status?.proofs?.length === 3
+          && valueTaskProof?.attempts?.length === 1
+          && valueTaskProof.attempts[0]?.attemptContractVersion === "v2"
+          && valueTaskProof.attempts[0]?.phase === "task"
+          && valueTaskProof.attempts[0]?.state === "dispatched_unknown";
+      },
       async () => ({
         serve: tail(server.output()),
         status: await readProofCutpointStatus(),
       }),
     );
-    const proofAttempt =
-      proofDispatchStatus.status.proofs[0].attempts[0];
+    const proofAttempt = proofDispatchStatus.status.proofs.find(
+      ({ definition }) => definition.id === "PROOF-VERTICAL-VALUE-TASK",
+    ).attempts[0];
+    const proofCutpointTask = taskFor(
+      proofDispatchStatus.status,
+      "TASK-VERTICAL",
+    );
+    const canonicalProofTaskWorktree = await realpath(
+      proofCutpointTask.worktree,
+    );
+    const proofTaskWorktreeRelative = path.relative(
+      await realpath(worktreesRoot),
+      canonicalProofTaskWorktree,
+    );
+    assert(
+      canonicalProofTaskWorktree !== canonicalProofRoot
+      && proofTaskWorktreeRelative.length > 0
+      && proofTaskWorktreeRelative !== ".."
+      && !proofTaskWorktreeRelative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(proofTaskWorktreeRelative),
+      "CCC_PRODUCT_PROOF_CUTPOINT_WORKTREE_INVALID",
+      JSON.stringify({
+        proofTaskWorktree: canonicalProofTaskWorktree,
+        proofRoot: canonicalProofRoot,
+        worktreesRoot,
+      }),
+    );
     const proofSourceCommit = proofAttempt.sourceCommit;
     assert(
       /^[0-9a-f]{40}$/u.test(proofSourceCommit)
       && proofSourceCommit !== targetBase
       && await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
       && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
-        === "good"
+        === proofCutpointCandidateValue
       && await git(targetRoot, "show", `${proofSourceCommit}:src/second.txt`)
-        === "second-good",
+        === "pending",
       "CCC_PRODUCT_PROOF_CUTPOINT_SOURCE_COMMIT_INVALID",
       JSON.stringify({ proofAttempt, targetBase }),
     );
@@ -4201,7 +5204,7 @@ async function main() {
       await terminateOwnedProofCutpointProcess(
         proofMarker,
         proofCutpointToken,
-        canonicalProofWorktree,
+        canonicalProofRoot,
       );
     server = await startServe(targetRoot, env, port);
     const recoveredProofCutpoint = await poll(
@@ -4217,25 +5220,28 @@ async function main() {
       }),
       180_000,
     );
-    const recoveredProofAttempt =
-      recoveredProofCutpoint.status.proofs[0]?.attempts[0];
-    // The proof is dispatched from the terminal task's worktree, so recovery
-    // must preserve that task's custody specifically.
+    const recoveredProofAttempt = recoveredProofCutpoint.status.proofs.find(
+      ({ definition }) => definition.id === "PROOF-VERTICAL-VALUE-TASK",
+    )?.attempts[0];
+    // A task-phase proof runs immediately after its owning task. Recovery must
+    // therefore preserve the first task's exact worktree, before the chained
+    // task has dispatched at all.
     const recoveredProofTask = taskFor(
       recoveredProofCutpoint.status,
-      "TASK-VERTICAL-SECOND",
+      "TASK-VERTICAL",
     );
     assert(
       recoveredProofAttempt?.attemptKey === proofAttempt.attemptKey
       && recoveredProofAttempt.state === "dispatched_unknown"
-      && recoveredProofCutpoint.status.providerAttempts.length === 2
-      && recoveredProofCutpoint.status.providerAttempts.every(
-        ({ state }) => state === "committed",
-      )
+      && recoveredProofAttempt.attemptContractVersion === "v2"
+      && recoveredProofAttempt.phase === "task"
+      && recoveredProofCutpoint.status.providerAttempts.length === 1
+      && recoveredProofCutpoint.status.providerAttempts[0]?.state
+        === "committed"
       && typeof recoveredProofTask?.worktree === "string"
       && await pathExists(recoveredProofTask.worktree)
       && await realpath(recoveredProofTask.worktree)
-        === canonicalProofWorktree,
+        === canonicalProofTaskWorktree,
       "CCC_PRODUCT_PROOF_UNCERTAINTY_NOT_PRESERVED",
       JSON.stringify(recoveredProofCutpoint.status),
     );
@@ -4249,9 +5255,9 @@ async function main() {
     assert(
       await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
       && await git(targetRoot, "show", `${proofSourceCommit}:src/value.txt`)
-        === "good"
+        === proofCutpointCandidateValue
       && await git(targetRoot, "show", `${proofSourceCommit}:src/second.txt`)
-        === "second-good",
+        === "pending",
       "CCC_PRODUCT_PROOF_CUTPOINT_CHANGED_TARGET",
       await git(targetRoot, "status", "--porcelain"),
     );
@@ -4281,78 +5287,86 @@ async function main() {
         },
       }),
     );
-    const proofResolutionPreview = jsonOutput(
+    const refusedProofResolution = jsonOutput(
       await prd([
         "resolve-proof",
         proofCutpointKey,
         proofAttempt.attemptKey,
         proofResolutionPath,
-      ]),
-      "preview proof-cutpoint resolution",
+      ], [1]),
+      "refuse semantic-v2 proof-cutpoint resolution",
     );
     assert(
-      proofResolutionPreview.kind === "proof-resolution-preview"
-      && proofResolutionPreview.outcome === "proved_failed"
-      && /^[0-9a-f]{64}$/u.test(proofResolutionPreview.confirmation),
-      "CCC_PRODUCT_PROOF_RESOLUTION_PREVIEW_INVALID",
-      JSON.stringify(proofResolutionPreview),
+      refusedProofResolution.kind === "refusal"
+      && refusedProofResolution.diagnostics?.some(
+        ({ code }) => code === "CCC_PRD_PROOF_RESOLUTION_V2_REFUSED",
+      ),
+      "CCC_PRODUCT_SEMANTIC_PROOF_RESOLUTION_NOT_REFUSED",
+      JSON.stringify(refusedProofResolution),
     );
-    const proofResolved = jsonOutput(
+    const statusAfterResolutionRefusal = await readProofCutpointStatus();
+    const refusedAttempt = statusAfterResolutionRefusal.status.proofs.find(
+      ({ definition }) => definition.id === "PROOF-VERTICAL-VALUE-TASK",
+    )?.attempts[0];
+    assert(
+      refusedAttempt?.attemptKey === proofAttempt.attemptKey
+      && refusedAttempt.state === "dispatched_unknown"
+      && statusAfterResolutionRefusal.status.workItems[0]?.state
+        === "manual-required",
+      "CCC_PRODUCT_SEMANTIC_PROOF_RESOLUTION_LEFT_RESIDUE",
+      JSON.stringify(statusAfterResolutionRefusal.status),
+    );
+    const proofStopControl = statusAfterResolutionRefusal.operatorControls?.find(
+      ({ action }) => action === "stop",
+    );
+    assert(
+      proofStopControl?.allowed === true
+      && /^[0-9a-f]{64}$/u.test(proofStopControl.confirmation),
+      "CCC_PRODUCT_PROOF_CUTPOINT_STOP_MISSING",
+      JSON.stringify(statusAfterResolutionRefusal.operatorControls),
+    );
+    const proofStopped = jsonOutput(
       await prd([
-        "resolve-proof",
+        "stop",
         proofCutpointKey,
-        proofAttempt.attemptKey,
-        proofResolutionPath,
+        "--reason",
+        "Acceptance canary preserves one uncertain semantic verifier effect; manual result fabrication is forbidden.",
         "--confirm",
-        proofResolutionPreview.confirmation,
+        proofStopControl.confirmation,
       ]),
-      "settle proof-cutpoint resolution",
+      "stop semantic-v2 proof-cutpoint campaign",
     );
     assert(
-      proofResolved.kind === "proof-resolved"
-      && proofResolved.attempt?.state === "proved_failed",
-      "CCC_PRODUCT_PROOF_RESOLUTION_FAILED",
-      JSON.stringify(proofResolved),
-    );
-    const replayedProofResolution = await poll(
-      "terminal proof receipt replay without verifier rerun",
-      readProofCutpointStatus,
-      (value) =>
-        value.status?.proofs?.[0]?.attempts?.[0]?.state === "proved_failed"
-        && value.status?.workItems?.[0]?.state === "failed"
-        && value.status.workItems[0].leaseOwner === null
-        && value.status.workItems[0].leaseExpiresAt === null,
-      async () => ({
-        serve: tail(server.output()),
-        status: await readProofCutpointStatus(),
-      }),
+      proofStopped.kind === "campaign-stopped"
+      && proofStopped.result?.workItemState === "cancelled"
+      && proofStopped.status?.nextAction?.kind === "abandoned"
+      && proofStopped.status?.proofs?.find(
+        ({ definition }) => definition.id === "PROOF-VERTICAL-VALUE-TASK",
+      )?.attempts[0]?.state === "dispatched_unknown",
+      "CCC_PRODUCT_PROOF_CUTPOINT_STOP_FAILED",
+      JSON.stringify(proofStopped),
     );
     exactArray(
       (await readOwnedProofCutpointMarkers(proofCutpointToken))
         .map(({ pid }) => pid),
       [proofMarker.pid],
-      "CCC_PRODUCT_PROOF_EFFECT_RERUN_DURING_SETTLEMENT",
+      "CCC_PRODUCT_PROOF_EFFECT_RERUN_DURING_REFUSAL",
     );
     assert(
-      replayedProofResolution.status.nextAction?.kind === "blocked"
-      && replayedProofResolution.status.nextAction.reason.includes(
-        "ended as failed",
-      )
-      && replayedProofResolution.operatorControls?.every(
-        ({ allowed }) => allowed === false,
-      )
-      && await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
-      && await pathExists(canonicalProofWorktree),
-      "CCC_PRODUCT_PROOF_CUTPOINT_TERMINAL_SETTLEMENT_INVALID",
+      await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
+      && await pathExists(canonicalProofRoot)
+      && await pathExists(canonicalProofTaskWorktree),
+      "CCC_PRODUCT_PROOF_CUTPOINT_ABANDONMENT_INVALID",
       JSON.stringify({
-        nextAction: replayedProofResolution.status.nextAction,
-        operatorControls: replayedProofResolution.operatorControls,
+        nextAction: proofStopped.status.nextAction,
+        operatorControls: proofStopped.operatorControls,
         targetHead: await git(
           targetRoot,
           "rev-parse",
           "refs/heads/main",
         ),
-        worktree: canonicalProofWorktree,
+        proofRoot: canonicalProofRoot,
+        taskWorktree: canonicalProofTaskWorktree,
       }),
     );
     ledger.pass("proof-dispatch-restart-manual-required", {
@@ -4360,17 +5374,17 @@ async function main() {
       crashedServePid: crashedProofServer.child.pid,
       verifierPid: proofMarker.pid,
       verifierProcessCommand: proofProcessCommand,
-      proofAttemptBeforeResolution: recoveredProofAttempt,
-      proofAttemptAfterResolution:
-        replayedProofResolution.status.proofs[0].attempts[0],
+      proofAttemptBeforeRefusal: recoveredProofAttempt,
+      proofAttemptAfterRefusal: refusedAttempt,
+      manualResolutionDiagnostic: "CCC_PRD_PROOF_RESOLUTION_V2_REFUSED",
       recoveredWorkItem: recoveredProofCutpoint.status.workItems[0],
       recoveredNextAction: recoveredProofCutpoint.status.nextAction,
-      terminalWorkItem: replayedProofResolution.status.workItems[0],
-      terminalNextAction: replayedProofResolution.status.nextAction,
-      terminalOperatorControls:
-        replayedProofResolution.operatorControls,
+      stoppedWorkItem: proofStopped.status.workItems[0],
+      stoppedNextAction: proofStopped.status.nextAction,
       invocationCount: proofMarkersAtDispatch.length,
       sourceCommit: proofSourceCommit,
+      proofRoot: canonicalProofRoot,
+      taskWorktree: canonicalProofTaskWorktree,
       targetHead: targetBase,
     });
     await stopServe(server);
@@ -4422,12 +5436,12 @@ async function main() {
       await prd(["inspect", idempotencyKey]),
       "prd import inspection after restart",
     );
-    const postImportRestart = await poll(
+    const mainAuthorizationHold = await awaitSealedExecutionAuthorization(
       "live execution approval hold after import restart",
       readStatus,
-      (value) => value.status?.nextAction?.kind === "approve-execution",
-      async () => ({ serve: tail(server.output()), status: await readStatus() }),
+      2,
     );
+    const postImportRestart = mainAuthorizationHold.hold;
     const restartedTask = taskFor(postImportRestart.status, "TASK-VERTICAL");
     const restartedSecondTask = taskFor(
       postImportRestart.status,
@@ -4490,7 +5504,7 @@ async function main() {
       nextAction: postImportRestart.status.nextAction,
     });
 
-    const liveHold = postImportRestart;
+    const liveHold = mainAuthorizationHold.hold;
     assert(
       liveHold.status.workItems.length === 1
       && liveHold.status.workItems[0].state === "manual-required"
@@ -4505,32 +5519,70 @@ async function main() {
       "CCC_PRODUCT_EXECUTED_BEFORE_APPROVAL",
       await git(targetRoot, "status", "--porcelain"),
     );
-    const liveConfirmation = liveHold.liveExecutionApprovalConfirmations?.find(
-      ({ approvalRequestId, status }) =>
-        approvalRequestId === liveHold.status.nextAction.approvalRequestId
-        && status === "issued",
-    );
+    const liveAuthorization = mainAuthorizationHold.authorization;
+    const liveConfirmation = mainAuthorizationHold.confirmation;
     assert(
-      liveConfirmation
-      && /^[0-9a-f]{64}$/.test(liveConfirmation.confirmation)
-      && liveConfirmation.taskId === restartedTask.nativeTaskId,
+      /^[0-9a-f]{64}$/.test(liveConfirmation.confirmation)
+      && liveAuthorization.members[0]?.nativeTaskId
+        === restartedTask.nativeTaskId
+      && liveAuthorization.members[0]?.semanticTaskId === "TASK-VERTICAL"
+      && liveAuthorization.members[1]?.nativeTaskId
+        === restartedSecondTask.nativeTaskId
+      && liveAuthorization.members[1]?.semanticTaskId
+        === "TASK-VERTICAL-SECOND",
       "CCC_PRODUCT_LIVE_CONFIRMATION_MISSING",
-      JSON.stringify(liveHold.liveExecutionApprovalConfirmations),
+      JSON.stringify(liveAuthorization),
     );
     ledger.pass("live-execution-human-hold", {
-      approvalRequestId: liveConfirmation.approvalRequestId,
+      executionAuthorizationId: liveAuthorization.authorizationId,
       expiresAt: liveConfirmation.expiresAt,
-      taskId: liveConfirmation.taskId,
-      semanticTaskId: "TASK-VERTICAL",
+      memberCount: liveAuthorization.members.length,
+      childApprovalIds: mainAuthorizationHold.childApprovalIds,
+      childConfirmations: liveHold.liveExecutionApprovalConfirmations,
       targetHead: targetBase,
       workItemState: liveHold.status.workItems[0].state,
     });
 
+    // Diagnostic child approval IDs are intentionally not spendable in sealed
+    // mode, even when paired with the correct parent confirmation digest.
+    const refusedChildApprovals = [];
+    for (const childApprovalId of mainAuthorizationHold.childApprovalIds) {
+      const refusal = jsonOutput(
+        await prd([
+          "approve-execution",
+          idempotencyKey,
+          childApprovalId,
+          "--confirm",
+          liveConfirmation.confirmation,
+        ], [1]),
+        `refuse diagnostic child execution approval ${childApprovalId}`,
+      );
+      assert(
+        refusal.kind === "refusal"
+        && refusal.diagnostics?.some(
+          ({ code }) => code === "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+        ),
+        "CCC_PRODUCT_CHILD_EXECUTION_APPROVAL_ACCEPTED",
+        JSON.stringify({ childApprovalId, refusal }),
+      );
+      refusedChildApprovals.push({
+        childApprovalId,
+        diagnostic: "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+      });
+    }
+    const statusAfterChildRefusal = await readStatus();
+    assert(
+      statusAfterChildRefusal.status.executionAuthorization?.status
+        === "issued"
+      && statusAfterChildRefusal.status.providerAttempts.length === 0,
+      "CCC_PRODUCT_CHILD_EXECUTION_APPROVAL_LEFT_RESIDUE",
+      JSON.stringify(statusAfterChildRefusal.status),
+    );
     const executionApproved = jsonOutput(
       await prd([
         "approve-execution",
         idempotencyKey,
-        liveConfirmation.approvalRequestId,
+        liveAuthorization.authorizationId,
         "--confirm",
         liveConfirmation.confirmation,
       ]),
@@ -4538,114 +5590,23 @@ async function main() {
     );
     assert(
       executionApproved.kind === "execution-approved"
+      && executionApproved.executionAuthorizationId
+        === liveAuthorization.authorizationId
       && executionApproved.approval?.status === "claimed",
       "CCC_PRODUCT_EXECUTION_APPROVAL_FAILED",
       JSON.stringify(executionApproved),
     );
 
-    // Live execution is authorized per task, not per campaign: the one work
-    // item parks a second time before the chained task may run, carrying its
-    // own approval request bound to its own task.
-    const secondLiveApproval = await awaitParkedLiveExecutionApproval(
-      "second-task live execution approval hold",
-      readStatus,
-      [liveConfirmation.approvalRequestId],
-    );
-    const secondLiveHold = secondLiveApproval.hold;
-    const secondLiveConfirmation = secondLiveApproval.confirmation;
-    const secondGuidedNextAction = secondLiveApproval.nextAction;
-    const firstApprovalAfterSecondPark =
-      secondLiveHold.liveExecutionApprovalConfirmations?.find(
-        ({ approvalRequestId }) =>
-          approvalRequestId === liveConfirmation.approvalRequestId,
-      );
-    assert(
-      secondLiveHold.status.workItems.length === 1
-      && secondLiveHold.status.workItems[0].state === "manual-required"
-      && secondLiveHold.status.workItems[0].lastError
-        === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
-      && /^[0-9a-f]{64}$/.test(secondLiveConfirmation.confirmation)
-      && secondLiveConfirmation.approvalRequestId
-        !== liveConfirmation.approvalRequestId
-      && secondLiveConfirmation.taskId === restartedSecondTask.nativeTaskId
-      && secondLiveConfirmation.taskId !== liveConfirmation.taskId
-      && firstApprovalAfterSecondPark?.status === "consumed",
-      "CCC_PRODUCT_SECOND_LIVE_EXECUTION_HOLD_INVALID",
-      JSON.stringify({
-        workItems: secondLiveHold.status.workItems,
-        confirmations: secondLiveHold.liveExecutionApprovalConfirmations,
-      }),
-    );
-    // The guided operator path must route to the chained task's own approval,
-    // not merely leave it discoverable in the confirmation list, and must name
-    // the held task because it differs from the work item's pinned entry task.
-    assert(
-      secondGuidedNextAction.kind === "approve-execution"
-      && secondGuidedNextAction.approvalRequestId
-        === secondLiveConfirmation.approvalRequestId
-      && secondGuidedNextAction.approvalStatus === "issued"
-      && secondGuidedNextAction.reason.includes(
-        ` for campaign task ${restartedSecondTask.nativeTaskId}`,
-      ),
-      "CCC_PRODUCT_SECOND_LIVE_EXECUTION_GUIDED_ACTION_INVALID",
-      JSON.stringify({
-        nextAction: secondGuidedNextAction,
-        expectedApprovalRequestId: secondLiveConfirmation.approvalRequestId,
-        chainedNativeTaskId: restartedSecondTask.nativeTaskId,
-        workItemTaskId: secondLiveHold.status.workItems[0].taskId,
-      }),
-    );
-    assert(
-      await git(targetRoot, "rev-parse", "refs/heads/main") === targetBase
-      && await plantedSourcesIntact(),
-      "CCC_PRODUCT_SECOND_TASK_EXECUTED_BEFORE_APPROVAL",
-      await git(targetRoot, "status", "--porcelain"),
-    );
-    ledger.pass("second-task-live-execution-hold", {
-      workItemCount: secondLiveHold.status.workItems.length,
-      workItemState: secondLiveHold.status.workItems[0].state,
-      approvals: [
-        {
-          approvalRequestId: liveConfirmation.approvalRequestId,
-          taskId: liveConfirmation.taskId,
-          semanticTaskId: "TASK-VERTICAL",
-        },
-        {
-          approvalRequestId: secondLiveConfirmation.approvalRequestId,
-          taskId: secondLiveConfirmation.taskId,
-          semanticTaskId: "TASK-VERTICAL-SECOND",
-        },
-      ],
-      distinctApprovalRequestIds: true,
-      distinctTaskIds: true,
-      firstApprovalStatusAtSecondPark: firstApprovalAfterSecondPark.status,
-      guidedNextAction: {
-        kind: secondGuidedNextAction.kind,
-        approvalRequestId: secondGuidedNextAction.approvalRequestId,
-        approvalStatus: secondGuidedNextAction.approvalStatus,
-        reason: secondGuidedNextAction.reason,
-      },
-      guidedActionNamesChainedTask: restartedSecondTask.nativeTaskId,
-      workItemTaskId: secondLiveHold.status.workItems[0].taskId,
-      targetHead: targetBase,
+    ledger.pass("single-campaign-execution-authorization", {
+      executionAuthorizationId: liveAuthorization.authorizationId,
+      authorizationDigest: liveAuthorization.authorizationDigest,
+      memberSetHash: liveAuthorization.memberSetHash,
+      expectedRequestCount: liveAuthorization.expectedRequestCount,
+      members: liveAuthorization.members,
+      childApprovalRefusals: refusedChildApprovals,
+      approvalCalls: 1,
+      statusAfterApproval: executionApproved.approval.status,
     });
-
-    const secondExecutionApproved = jsonOutput(
-      await prd([
-        "approve-execution",
-        idempotencyKey,
-        secondLiveConfirmation.approvalRequestId,
-        "--confirm",
-        secondLiveConfirmation.confirmation,
-      ]),
-      "approve second-task execution",
-    );
-    assert(
-      secondExecutionApproved.kind === "execution-approved"
-      && secondExecutionApproved.approval?.status === "claimed",
-      "CCC_PRODUCT_SECOND_EXECUTION_APPROVAL_FAILED",
-      JSON.stringify(secondExecutionApproved),
-    );
 
     const mergeHold = await poll(
       "merge approval hold",
@@ -4655,9 +5616,35 @@ async function main() {
     );
     const task = taskFor(mergeHold.status, "TASK-VERTICAL");
     const secondTask = taskFor(mergeHold.status, "TASK-VERTICAL-SECOND");
+    const verticalProviderAttempts = mergeHold.status.providerAttempts;
+    exactArray(
+      verticalProviderAttempts.map(({ semanticTaskId }) => semanticTaskId),
+      ["TASK-VERTICAL", "TASK-VERTICAL-SECOND"],
+      "CCC_PRODUCT_SEALED_AUTHORIZATION_PROVIDER_SET_DRIFT",
+    );
     assert(
-      mergeHold.status.tasks.length === 2
-      && task.semanticTaskId === "TASK-VERTICAL"
+      mergeHold.status.executionAuthorization?.authorizationId
+        === liveAuthorization.authorizationId
+      && mergeHold.status.executionAuthorization?.status === "settled"
+      && mergeHold.liveExecutionApprovalConfirmations?.length === 0
+      && verticalProviderAttempts.every(({ state }) => state === "committed")
+      && JSON.stringify(verticalProviderAttempts.map(
+        ({ attemptOrdinal }) => attemptOrdinal,
+      )) === JSON.stringify([1, 2])
+      && JSON.stringify(verticalProviderAttempts.map(
+        ({ requestCount }) => requestCount,
+      )) === JSON.stringify([1, 2])
+      && mergeHold.status.tasks.length === 2,
+      "CCC_PRODUCT_SEALED_AUTHORIZATION_NOT_SETTLED",
+      JSON.stringify({
+        executionAuthorization: mergeHold.status.executionAuthorization,
+        liveExecutionApprovalConfirmations:
+          mergeHold.liveExecutionApprovalConfirmations,
+        providerAttempts: verticalProviderAttempts,
+      }),
+    );
+    assert(
+      task.semanticTaskId === "TASK-VERTICAL"
       && task.route?.providerId === "openai"
       && task.route?.modelId === "gpt-5.6-sol"
       && task.route?.transport === "cli"
@@ -4844,16 +5831,40 @@ async function main() {
       maxWorktrees: 2,
     });
 
-    const proof = mergeHold.status.proofs[0];
+    const valueTaskProof = exactProofStatus(
+      mergeHold.status,
+      "PROOF-VERTICAL-VALUE-TASK",
+    );
+    const secondTaskProof = exactProofStatus(
+      mergeHold.status,
+      "PROOF-VERTICAL-SECOND-TASK",
+    );
+    const integratedProof = exactProofStatus(
+      mergeHold.status,
+      "PROOF-VERTICAL-INTEGRATED",
+    );
     assert(
-      mergeHold.status.proofs.length === 1
-      && proof.definition.id === "PROOF-VERTICAL"
-      && proof.attempts.length === 1,
+      mergeHold.status.proofs.length === 3
+      && valueTaskProof.attempts.length === 1
+      && secondTaskProof.attempts.length === 1
+      && integratedProof.attempts.length === 1,
       "CCC_PRODUCT_PROOF_SET_INVALID",
       JSON.stringify(mergeHold.status.proofs),
     );
-    const attempt = proof.attempts[0];
-    const sourceCommit = attempt.sourceCommit;
+    const valueTaskAttempt = valueTaskProof.attempts[0];
+    const secondTaskAttempt = secondTaskProof.attempts[0];
+    const integratedAttempt = integratedProof.attempts[0];
+    const sourceCommit = integratedAttempt.sourceCommit;
+    const firstTaskTree = await git(
+      targetRoot,
+      "rev-parse",
+      `${firstTaskCommit}^{tree}`,
+    );
+    const secondTaskTree = await git(
+      targetRoot,
+      "rev-parse",
+      `${secondTaskCommit}^{tree}`,
+    );
     assert(
       /^[0-9a-f]{40}$/.test(sourceCommit) && sourceCommit !== targetBase,
       "CCC_PRODUCT_CAMPAIGN_COMMIT_INVALID",
@@ -4885,60 +5896,127 @@ async function main() {
       targetHeadStill: targetBase,
     });
 
-    assert(
-      attempt.state === "committed"
-      && attempt.result?.success === true
-      && attempt.result?.exitCode === 0
-      && attempt.result?.stdoutTail?.includes("NEGATIVE_CONTROL_PASS")
-      && attempt.result?.stdoutTail?.includes("POSITIVE_ORACLE_PASS")
-      && attempt.sourceTree
-        === await git(targetRoot, "rev-parse", `${sourceCommit}^{tree}`)
-      && new Date(attempt.createdAt).getTime()
-        >= new Date(mergeHold.status.import.createdAt).getTime()
-      && new Date(attempt.settledAt).getTime()
-        >= new Date(attempt.dispatchedAt).getTime(),
-      "CCC_PRODUCT_EXECUTED_PROOF_INVALID_OR_STALE",
-      JSON.stringify(attempt),
+    assertPassingSemanticProofAttempt(valueTaskAttempt, {
+      proofId: "PROOF-VERTICAL-VALUE-TASK",
+      phase: "task",
+      sourceCommit: firstTaskCommit,
+      sourceTree: firstTaskTree,
+      clauseIds: ["AC-REQ-VERTICAL-001"],
+      caseIds: ["CASE-VERTICAL-VALUE"],
+      controlIds: ["CONTROL-VERTICAL-BAD"],
+      mutationPaths: ["src/value.txt"],
+    }, "CCC_PRODUCT_VALUE_TASK_PROOF_INVALID");
+    assertPassingSemanticProofAttempt(secondTaskAttempt, {
+      proofId: "PROOF-VERTICAL-SECOND-TASK",
+      phase: "task",
+      sourceCommit: secondTaskCommit,
+      sourceTree: secondTaskTree,
+      clauseIds: ["AC-REQ-VERTICAL-SECOND-001"],
+      caseIds: ["CASE-VERTICAL-SECOND"],
+      controlIds: ["CONTROL-VERTICAL-PENDING"],
+      mutationPaths: ["src/second.txt"],
+    }, "CCC_PRODUCT_SECOND_TASK_PROOF_INVALID");
+    assertPassingSemanticProofAttempt(integratedAttempt, {
+      proofId: "PROOF-VERTICAL-INTEGRATED",
+      phase: "final_integrated",
+      sourceCommit: secondTaskCommit,
+      sourceTree: secondTaskTree,
+      clauseIds: [
+        "AC-REQ-VERTICAL-001",
+        "AC-REQ-VERTICAL-SECOND-001",
+      ],
+      caseIds: ["CASE-VERTICAL-INTEGRATED"],
+      controlIds: ["CONTROL-VERTICAL-INTEGRATED"],
+      mutationPaths: ["src/second.txt", "src/value.txt"],
+    }, "CCC_PRODUCT_FINAL_INTEGRATED_PROOF_INVALID");
+    const verticalCampaignAudit = await readCampaignAuditRows(
+      isolatedHome,
+      mergeHold.status.projectId,
+      imported.result.importId,
     );
+    const secondTaskDispatch = exactProviderDispatchAudit(
+      verticalCampaignAudit,
+      "TASK-VERTICAL-SECOND",
+    );
+    assertOrderedInstants(
+      valueTaskAttempt.settledAt,
+      secondTaskDispatch.timestamp,
+      "CCC_PRODUCT_SECOND_TASK_RELEASED_BEFORE_TASK_PROOF",
+      {
+        settledProofAttemptKey: valueTaskAttempt.attemptKey,
+        dependentProviderAttemptKey: secondTaskDispatch.metadata.attemptKey,
+      },
+    );
+    assertOrderedInstants(
+      secondTaskAttempt.settledAt,
+      integratedAttempt.dispatchedAt,
+      "CCC_PRODUCT_FINAL_PROOF_RELEASED_BEFORE_TASK_PROOF",
+      {
+        settledProofAttemptKey: secondTaskAttempt.attemptKey,
+        finalProofAttemptKey: integratedAttempt.attemptKey,
+      },
+    );
+    const proofAttempts = [
+      valueTaskAttempt,
+      secondTaskAttempt,
+      integratedAttempt,
+    ];
     assert(
-      attempt.packetHash === mergeHold.status.import.packetHash
-      && attempt.sidecarHash === mergeHold.status.import.sidecarHash
-      && attempt.bundleHash === mergeHold.status.import.bundleHash
-      && attempt.manifestHash === mergeHold.status.import.manifestHash,
+      proofAttempts.every((attempt) =>
+        attempt.packetHash === mergeHold.status.import.packetHash
+        && attempt.sidecarHash === mergeHold.status.import.sidecarHash
+        && attempt.bundleHash === mergeHold.status.import.bundleHash
+        && attempt.manifestHash === mergeHold.status.import.manifestHash)
+      && valueTaskAttempt.semanticTaskId === "TASK-VERTICAL"
+      && secondTaskAttempt.semanticTaskId === "TASK-VERTICAL-SECOND"
+      && integratedAttempt.semanticTaskId === "TASK-VERTICAL-SECOND",
       "CCC_PRODUCT_PROOF_PROVENANCE_MISMATCH",
-      JSON.stringify(attempt),
+      JSON.stringify(proofAttempts),
     );
+    ledger.pass("task-phase-proofs-committed", {
+      proofs: [valueTaskProof, secondTaskProof].map(({ definition, attempts }) => ({
+        proofId: definition.id,
+        phase: attempts[0].phase,
+        attemptKey: attempts[0].attemptKey,
+        sourceCommit: attempts[0].sourceCommit,
+        terminalEnvelopeSha256: attempts[0].terminalEnvelopeSha256,
+        proofEvidenceSha256: attempts[0].proofEvidenceSha256,
+      })),
+      distinctSourceCommits:
+        valueTaskAttempt.sourceCommit !== secondTaskAttempt.sourceCommit,
+      executionOrder: {
+        valueTaskProofSettledAt: valueTaskAttempt.settledAt,
+        secondTaskProviderDispatchedAt: secondTaskDispatch.timestamp,
+        secondTaskProofSettledAt: secondTaskAttempt.settledAt,
+        finalIntegratedProofDispatchedAt: integratedAttempt.dispatchedAt,
+      },
+    });
     ledger.pass("commit-bound-proof-executed", {
-      attemptKey: attempt.attemptKey,
+      attemptKey: integratedAttempt.attemptKey,
       sourceCommit,
-      sourceTree: attempt.sourceTree,
-      definitionSha256: attempt.definitionSha256,
-      commandSha256: attempt.commandSha256,
-      result: attempt.result,
-      dispatchedAt: attempt.dispatchedAt,
-      settledAt: attempt.settledAt,
+      sourceTree: integratedAttempt.sourceTree,
+      definitionSha256: integratedAttempt.definitionSha256,
+      commandSha256: integratedAttempt.commandSha256,
+      terminalEnvelopeSha256: integratedAttempt.terminalEnvelopeSha256,
+      proofEvidenceSha256: integratedAttempt.proofEvidenceSha256,
+      dispatchedAt: integratedAttempt.dispatchedAt,
+      settledAt: integratedAttempt.settledAt,
     });
 
-    // One campaign-wide proof covers both tasks: a single attempt bound to a
-    // single source commit, taken from the terminal task's worktree, whose
-    // diff against the frozen base is exactly the two owned files.
+    // The final_integrated receipt is deliberately separate from both task
+    // receipts and is bound to the terminal task's combined commit.
     assert(
-      mergeHold.status.proofs.length === 1
-      && proof.attempts.length === 1
-      && sourceCommit === secondTaskCommit
-      && attempt.result?.stdoutTail?.includes(
-        "NEGATIVE_CONTROL_PASS: planted bad and pending values are rejected",
-      )
-      && attempt.result?.stdoutTail?.includes(
-        "POSITIVE_ORACLE_PASS: campaign values are good",
-      ),
+      sourceCommit === secondTaskCommit
+      && integratedProof.definition.phases?.length === 1
+      && integratedProof.definition.phases[0] === "final_integrated"
+      && valueTaskProof.definition.phases?.[0] === "task"
+      && secondTaskProof.definition.phases?.[0] === "task",
       "CCC_PRODUCT_INTEGRATED_PROOF_INVALID",
       JSON.stringify({
         proofCount: mergeHold.status.proofs.length,
-        attemptCount: proof.attempts.length,
         sourceCommit,
         secondTaskCommit,
-        result: attempt.result,
+        integratedProof,
       }),
     );
     exactArray(
@@ -4949,16 +6027,29 @@ async function main() {
       "CCC_PRODUCT_INTEGRATED_PROOF_SCOPE_DRIFT",
     );
     ledger.pass("integrated-proof-over-two-commits", {
-      proofId: proof.definition.id,
+      proofId: integratedProof.definition.id,
       proofCount: mergeHold.status.proofs.length,
-      attemptCount: proof.attempts.length,
-      attemptKey: attempt.attemptKey,
+      attemptCount: integratedProof.attempts.length,
+      attemptKey: integratedAttempt.attemptKey,
       sourceCommit,
       firstTaskCommit,
       secondTaskCommit,
       integratedMutationPaths: ["src/second.txt", "src/value.txt"],
-      command: proof.definition.command,
-      result: attempt.result,
+      command: integratedProof.definition.command,
+      terminalEnvelope: integratedAttempt.terminalEnvelope,
+    });
+    ledger.pass("final-integrated-proof-committed", {
+      proofId: integratedProof.definition.id,
+      phase: integratedAttempt.phase,
+      attemptKey: integratedAttempt.attemptKey,
+      sourceCommit: integratedAttempt.sourceCommit,
+      sourceTree: integratedAttempt.sourceTree,
+      terminalEnvelopeSha256: integratedAttempt.terminalEnvelopeSha256,
+      proofEvidenceSha256: integratedAttempt.proofEvidenceSha256,
+      clauseResults: integratedAttempt.proofEvidence.clauseResults,
+      positiveCaseResults: integratedAttempt.proofEvidence.positiveCaseResults,
+      negativeControlResults:
+        integratedAttempt.proofEvidence.negativeControlResults,
     });
 
     const mergeConfirmation = mergeHold.mergeApprovalConfirmations?.find(
@@ -4966,12 +6057,35 @@ async function main() {
         approvalRequestId === mergeHold.status.nextAction.approvalRequestId
         && status === "issued",
     );
+    const mergeApproval = mergeHold.status.approvals.find(
+      ({ id }) => id === mergeConfirmation?.approvalRequestId,
+    );
+    const [mergeProofPrefix, mergeProofCommit, mergeProofTree,
+      finalReceiptSetSha256, mergeProofExtra] =
+      String(mergeApproval?.runId ?? "").split(":");
+    const expectedFinalReceiptSetSha256 = finalProofReceiptSetSha256(
+      sourceCommit,
+      integratedAttempt.sourceTree,
+      [integratedAttempt],
+    );
+    const expectedFinalProofCustody = {
+      schema: "ccc-campaign.final-proof-custody.v2",
+      sourceCommit,
+      sourceTree: integratedAttempt.sourceTree,
+      finalReceiptSetSha256: expectedFinalReceiptSetSha256,
+    };
     assert(
       mergeHold.status.workItems[0].state === "manual-required"
       && mergeHold.status.workItems[0].lastError
         === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
       && mergeConfirmation
-      && /^[0-9a-f]{64}$/.test(mergeConfirmation.confirmation),
+      && /^[0-9a-f]{64}$/.test(mergeConfirmation.confirmation)
+      && mergeApproval?.campaign?.binding?.actionTarget === "refs/heads/main"
+      && mergeProofPrefix === "ccc-merge-proof-v2"
+      && mergeProofCommit === sourceCommit
+      && mergeProofTree === integratedAttempt.sourceTree
+      && finalReceiptSetSha256 === expectedFinalReceiptSetSha256
+      && mergeProofExtra === undefined,
       "CCC_PRODUCT_MERGE_HOLD_INVALID",
       JSON.stringify(mergeHold),
     );
@@ -4980,7 +6094,14 @@ async function main() {
       expiresAt: mergeConfirmation.expiresAt,
       sourceCommit,
       targetHead: targetBase,
-      proofAttemptKey: attempt.attemptKey,
+      proofAttemptKey: integratedAttempt.attemptKey,
+      proofPhase: integratedAttempt.phase,
+      proofEvidenceSha256: integratedAttempt.proofEvidenceSha256,
+      terminalEnvelopeSha256: integratedAttempt.terminalEnvelopeSha256,
+      finalProofCustody: {
+        ...expectedFinalProofCustody,
+        recomputedFromAttemptKey: integratedAttempt.attemptKey,
+      },
     });
 
     // The same merge hold, read the way an operator reads it: prose only, and
@@ -5137,6 +6258,15 @@ async function main() {
       "CCC_PRODUCT_GIT_LANDING_CRASH_STATE_NOT_DURABLE",
       JSON.stringify(interruptedLanding.status),
     );
+    assertLandingFinalProofCustody(
+      await readCampaignAuditRows(
+        isolatedHome,
+        interruptedLanding.status.projectId,
+        imported.result.importId,
+      ),
+      expectedFinalProofCustody,
+      ["intent", "checkout-materialized"],
+    );
 
     const landingServerBeforeRestart = server;
     await stopServe(landingServerBeforeRestart);
@@ -5228,6 +6358,15 @@ async function main() {
       "CCC_PRODUCT_LANDING_RECEIPTS_INVALID",
       JSON.stringify(merged.status.landing),
     );
+    const landedAuditByPhase = assertLandingFinalProofCustody(
+      await readCampaignAuditRows(
+        isolatedHome,
+        merged.status.projectId,
+        imported.result.importId,
+      ),
+      expectedFinalProofCustody,
+      ["intent", "checkout-materialized", "terminal"],
+    );
     const reflogAfterRecovery = (
       await git(
         targetRoot,
@@ -5280,6 +6419,12 @@ async function main() {
       refEffectCount: reflogAfterRecovery.length - reflogBeforeLanding.length,
       landingBeforeRecovery: interruptedLanding.status.landing,
       landingAfterRecovery: merged.status.landing,
+      landingFinalProofCustody: Object.fromEntries(
+        Object.entries(landedAuditByPhase).map(([phase, row]) => [
+          phase,
+          row.metadata.finalProofCustody,
+        ]),
+      ),
     });
     ledger.pass("controlled-landing", {
       targetBase,
@@ -5303,7 +6448,8 @@ async function main() {
     );
     assert(
       await git(targetRoot, "rev-parse", "refs/heads/main") === landedCommit
-      && recovered.status.proofs[0].attempts.length === 1
+      && recovered.status.proofs.length === 3
+      && recovered.status.proofs.every(({ attempts }) => attempts.length === 1)
       && recovered.status.landing.intents.length === 1
       && recovered.status.landing.materializations.length === 1
       && recovered.status.landing.terminals.length === 1
@@ -5314,7 +6460,11 @@ async function main() {
     );
     ledger.pass("terminal-restart-recovery", {
       targetHead: landedCommit,
-      proofAttempts: recovered.status.proofs[0].attempts.length,
+      proofAttempts: recovered.status.proofs.map(({ definition, attempts }) => ({
+        proofId: definition.id,
+        attemptKey: attempts[0].attemptKey,
+        phase: attempts[0].phase,
+      })),
       landingReceiptCounts: {
         intents: recovered.status.landing.intents.length,
         materializations: recovered.status.landing.materializations.length,
@@ -5333,9 +6483,19 @@ async function main() {
     await stopServe(restartedServer);
     restartedServer = undefined;
 
-    // Fresh entry worktrees fork from the integration branch, so the frozen
-    // base for this campaign is the landed vertical commit main points at now.
-    const fanoutBase = landedCommit;
+    // Fresh entry worktrees fork from a new frozen baseline whose Taskfile
+    // declares one strict controller-owned target per fan task plus a separate
+    // final_integrated target. That closure is committed before packet freeze
+    // and remains outside every model-owned write root.
+    const fanoutBase = await initializeFanoutProofBaseline(targetRoot);
+    assert(
+      fanoutBase !== landedCommit
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === fanoutBase
+      && await git(targetRoot, "diff", "--name-only", landedCommit, fanoutBase)
+        === "Taskfile.yml",
+      "CCC_PRODUCT_FANOUT_PROOF_BASELINE_INVALID",
+      JSON.stringify({ landedCommit, fanoutBase }),
+    );
     const fanoutPacketRoot = path.join(tempRoot, "packet-fanout");
     const fanoutProjectsRoot = path.join(tempRoot, "active-projects-fanout");
     const fanoutPacket = await createFanoutPacket(
@@ -5347,6 +6507,20 @@ async function main() {
     );
 
     const fanoutProposalText = await readFile(fanoutPacket.proposalPath, "utf8");
+    const fanoutProposal = JSON.parse(fanoutProposalText);
+    const fanoutFrozenSourcePath =
+      fanoutProposal.requirements[0]?.acceptanceClauses?.[0]
+        ?.sourceRefs?.[0]?.path;
+    assert(
+      typeof fanoutFrozenSourcePath === "string",
+      "CCC_PRODUCT_FANOUT_SOURCE_CLAUSE_REFERENCE_MISSING",
+      JSON.stringify(fanoutProposal.requirements),
+    );
+    assertExactAcceptanceClauseGrammar(
+      await readFile(path.join(fanoutPacketRoot, fanoutFrozenSourcePath), "utf8"),
+      fanoutProposal,
+      "CCC_PRODUCT_FANOUT_SOURCE_CLAUSE_GRAMMAR_INVALID",
+    );
     const fanoutAuthoring = await startNativeAuthoringServer(fanoutProposalText);
     authoringServer = fanoutAuthoring.server;
     await configureNativeAuthoring(fanoutAuthoring.baseUrl);
@@ -5388,6 +6562,59 @@ async function main() {
       "CCC_PRODUCT_FANOUT_AUTHORING_FAILED",
       JSON.stringify(fanoutAuthored),
     );
+    const fanoutAuthoredSidecar = JSON.parse(
+      await readFile(fanoutPacket.sidecarPath, "utf8"),
+    );
+    const fanoutSemanticProofIds = [
+      ...fanTasks.map(fanoutTaskProofIdFor),
+      "PROOF-FANOUT-INTEGRATED",
+    ].sort();
+    assert(
+      fanoutAuthoredSidecar.schema === "ccc-prd.sidecar.v2"
+      && fanoutAuthoredSidecar.requirements?.flatMap(
+        ({ acceptanceClauses = [] }) => acceptanceClauses,
+      ).length === fanTasks.length
+      && fanoutAuthoredSidecar.proofs?.length === fanTasks.length + 1
+      && fanoutAuthoredSidecar.proofs.every((proof) =>
+        proof.schema === "ccc-prd.proof.v2"
+        && proof.admission?.schema === "ccc-prd.proof-admission.v2"
+        && proof.executionToolchain?.proofHost?.id
+          === "fusion-cli-semantic-proof-host.v1"
+        && proof.verifierClosure?.some(({ role, path: closurePath }) =>
+          role === "task_runner" && closurePath === "Taskfile.yml")
+        && proof.verifierClosure?.some(({ role, path: closurePath }) =>
+          role === "harness" && closurePath === "verify-fanout.cjs")),
+      "CCC_PRODUCT_FANOUT_SEMANTIC_AUTHORITY_INVALID",
+      JSON.stringify(fanoutAuthoredSidecar),
+    );
+    exactArray(
+      fanoutAuthoredSidecar.proofs.map(({ id }) => id).sort(),
+      fanoutSemanticProofIds,
+      "CCC_PRODUCT_FANOUT_SEMANTIC_PROOF_SET_DRIFT",
+    );
+    const fanoutAuthoredProofsById = new Map(
+      fanoutAuthoredSidecar.proofs.map((proof) => [proof.id, proof]),
+    );
+    for (const fanTask of fanTasks) {
+      await assertControllerHydratedProofCustody({
+        proof: fanoutAuthoredProofsById.get(fanoutTaskProofIdFor(fanTask)),
+        targetRoot,
+        targetBase: fanoutBase,
+        command: fanoutTaskProofCommandFor(fanTask),
+        phase: "task",
+        harnessPath: "verify-fanout.cjs",
+        candidateInputs: [fanTask.file],
+      });
+    }
+    await assertControllerHydratedProofCustody({
+      proof: fanoutAuthoredProofsById.get("PROOF-FANOUT-INTEGRATED"),
+      targetRoot,
+      targetBase: fanoutBase,
+      command: "task verify:fanout-integrated",
+      phase: "final_integrated",
+      harnessPath: "verify-fanout.cjs",
+      candidateInputs: fanTasks.map(({ file }) => file),
+    });
     await stopNativeAuthoringServer(authoringServer);
     authoringServer = undefined;
 
@@ -5465,6 +6692,16 @@ async function main() {
       fanTasks.map(({ taskId }) => taskId),
       "CCC_PRODUCT_FANOUT_TASK_SET_DRIFT",
     );
+    exactArray(
+      fanoutCompiled.proofs?.map(({ id }) => id).sort(),
+      fanoutSemanticProofIds,
+      "CCC_PRODUCT_FANOUT_PROOF_SET_DRIFT",
+    );
+    assert(
+      fanoutCompiled.schema === "ccc-prd.bundle.v2",
+      "CCC_PRODUCT_FANOUT_BUNDLE_VERSION_DRIFT",
+      fanoutCompiled.schema,
+    );
 
     const fanoutRoutesPath = path.join(fanoutPacketRoot, "routes.json");
     await writeFile(
@@ -5496,9 +6733,15 @@ async function main() {
       ]),
       "prd fanout policy",
     );
+    const fanoutExecutionPlan = JSON.parse(
+      await readFile(fanoutPacket.executionPlanPath, "utf8"),
+    );
     assert(
       fanoutPlan.kind === "execution-plan"
-      && fanoutPlan.routeCount === fanTasks.length,
+      && fanoutPlan.routeCount === fanTasks.length
+      && fanoutExecutionPlan.schema === "ccc-prd.execution-plan.v1"
+      && fanoutExecutionPlan.policy?.schema
+        === "ccc-campaign.execution-policy.v2",
       "CCC_PRODUCT_FANOUT_EXECUTION_PLAN_INVALID",
       JSON.stringify(fanoutPlan),
     );
@@ -5549,37 +6792,64 @@ async function main() {
     const readFanoutStatus = async () => readStatusFor(fanoutKey);
     server = await startServe(targetRoot, env, port);
 
-    // Live execution stays per task in a fan-out campaign: the single work
-    // item parks once per task, in dependency order, and each park carries its
-    // own approval bound to its own native task.
-    const fanoutApprovalTrail = [];
-    for (let holdIndex = 0; holdIndex < fanTasks.length; holdIndex += 1) {
-      const parked = await awaitParkedLiveExecutionApproval(
-        `fanout live execution approval ${holdIndex + 1} of ${fanTasks.length}`,
-        readFanoutStatus,
-        fanoutApprovalTrail.map(({ approvalRequestId }) => approvalRequestId),
-      );
-      const fanoutApproved = jsonOutput(
+    // One parent decision seals all four exact fan-out members. Every child ID
+    // remains diagnostic only and is independently refused by the CLI.
+    const fanoutAuthorizationHold = await awaitSealedExecutionAuthorization(
+      "fanout sealed execution authorization",
+      readFanoutStatus,
+      fanTasks.length,
+    );
+    const fanoutAuthorization = fanoutAuthorizationHold.authorization;
+    const fanoutChildRefusals = [];
+    for (const childApprovalId of fanoutAuthorizationHold.childApprovalIds) {
+      const refusal = jsonOutput(
         await prd([
           "approve-execution",
           fanoutKey,
-          parked.confirmation.approvalRequestId,
+          childApprovalId,
           "--confirm",
-          parked.confirmation.confirmation,
-        ]),
-        `approve fanout execution ${holdIndex + 1}`,
+          fanoutAuthorizationHold.confirmation.confirmation,
+        ], [1]),
+        `refuse fanout diagnostic child ${childApprovalId}`,
       );
       assert(
-        fanoutApproved.kind === "execution-approved"
-        && fanoutApproved.approval?.status === "claimed",
-        "CCC_PRODUCT_FANOUT_EXECUTION_APPROVAL_FAILED",
-        JSON.stringify({ holdIndex, fanoutApproved }),
+        refusal.kind === "refusal"
+        && refusal.diagnostics?.some(
+          ({ code }) => code === "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+        ),
+        "CCC_PRODUCT_FANOUT_CHILD_APPROVAL_ACCEPTED",
+        JSON.stringify({ childApprovalId, refusal }),
       );
-      fanoutApprovalTrail.push({
-        approvalRequestId: parked.confirmation.approvalRequestId,
-        taskId: parked.confirmation.taskId,
+      fanoutChildRefusals.push({
+        childApprovalId,
+        diagnostic: "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
       });
     }
+    const fanoutPreApprovalStatus = await readFanoutStatus();
+    assert(
+      fanoutPreApprovalStatus.status.executionAuthorization?.status === "issued"
+      && fanoutPreApprovalStatus.status.providerAttempts.length === 0,
+      "CCC_PRODUCT_FANOUT_CHILD_REFUSAL_LEFT_RESIDUE",
+      JSON.stringify(fanoutPreApprovalStatus.status),
+    );
+    const fanoutApproved = jsonOutput(
+      await prd([
+        "approve-execution",
+        fanoutKey,
+        fanoutAuthorization.authorizationId,
+        "--confirm",
+        fanoutAuthorizationHold.confirmation.confirmation,
+      ]),
+      "approve fanout sealed execution",
+    );
+    assert(
+      fanoutApproved.kind === "execution-approved"
+      && fanoutApproved.executionAuthorizationId
+        === fanoutAuthorization.authorizationId
+      && fanoutApproved.approval?.status === "claimed",
+      "CCC_PRODUCT_FANOUT_EXECUTION_APPROVAL_FAILED",
+      JSON.stringify(fanoutApproved),
+    );
 
     const fanoutMergeHold = await poll(
       "fanout merge approval hold",
@@ -5600,22 +6870,47 @@ async function main() {
         statusTask.nativeTaskId,
       ]),
     );
-    // Every task was approved exactly once; the entry task parked first and
-    // the join task parked last, proving dependency-ordered dispatch.
+    const fanoutProviderAttempts = fanoutMergeHold.status.providerAttempts;
     exactArray(
-      fanoutApprovalTrail.map(({ taskId }) => taskId).sort(),
-      Object.values(fanoutNativeIds).sort(),
+      fanoutProviderAttempts
+        .map(({ semanticTaskId }) => semanticTaskId)
+        .sort(),
+      fanTasks.map(({ taskId }) => taskId).sort(),
+      "CCC_PRODUCT_FANOUT_PROVIDER_TASK_SET_DRIFT",
+    );
+    exactArray(
+      fanoutProviderAttempts.map(({ attemptOrdinal }) => attemptOrdinal).sort(
+        (left, right) => left - right,
+      ),
+      [1, 2, 3, 4],
+      "CCC_PRODUCT_FANOUT_PROVIDER_ATTEMPT_ORDINAL_DRIFT",
+    );
+    exactArray(
+      fanoutProviderAttempts.map(({ requestCount }) => requestCount).sort(
+        (left, right) => left - right,
+      ),
+      [1, 2, 3, 4],
+      "CCC_PRODUCT_FANOUT_PROVIDER_REQUEST_COUNT_DRIFT",
+    );
+    // The parent member order is frozen packet order and names every native
+    // task exactly once; there is no second operator hold during execution.
+    exactArray(
+      fanoutAuthorization.members.map(({ semanticTaskId }) => semanticTaskId),
+      fanTasks.map(({ taskId }) => taskId),
       "CCC_PRODUCT_FANOUT_APPROVAL_TASK_SET_DRIFT",
     );
     assert(
-      fanoutApprovalTrail[0].taskId === fanoutNativeIds["TASK-FAN-A"]
-      && fanoutApprovalTrail[fanTasks.length - 1].taskId
-        === fanoutNativeIds["TASK-FAN-D"]
-      && new Set(
-        fanoutApprovalTrail.map(({ approvalRequestId }) => approvalRequestId),
-      ).size === fanTasks.length,
+      fanoutAuthorization.members.every((member) =>
+        fanoutNativeIds[member.semanticTaskId] === member.nativeTaskId)
+      && new Set(fanoutAuthorizationHold.childApprovalIds).size
+        === fanTasks.length
+      && fanoutMergeHold.status.executionAuthorization?.authorizationId
+        === fanoutAuthorization.authorizationId
+      && fanoutMergeHold.status.executionAuthorization?.status === "settled"
+      && fanoutMergeHold.liveExecutionApprovalConfirmations?.length === 0
+      && fanoutProviderAttempts.every(({ state }) => state === "committed"),
       "CCC_PRODUCT_FANOUT_APPROVAL_ORDER_INVALID",
-      JSON.stringify({ fanoutApprovalTrail, fanoutNativeIds }),
+      JSON.stringify({ fanoutAuthorization, fanoutNativeIds }),
     );
 
     // Route custody per task: disjoint single-file ownership end to end.
@@ -5653,6 +6948,70 @@ async function main() {
         "HEAD",
       );
     }
+    const fanoutTaskDeltas = {};
+    for (const fanTask of fanTasks) {
+      const statusTask = fanoutStatusTasks[fanTask.taskId];
+      assert(
+        /^[0-9a-f]{40}$/u.test(statusTask.baseCommit ?? "")
+        && statusTask.baseCommit === fanoutBase,
+        "CCC_PRODUCT_FANOUT_TASK_BASE_DRIFT",
+        JSON.stringify({
+          taskId: fanTask.taskId,
+          expectedBase: fanoutBase,
+          observedBase: statusTask.baseCommit,
+        }),
+      );
+      const commitLine = (
+        await git(
+          targetRoot,
+          "rev-list",
+          "--parents",
+          "-n",
+          "1",
+          fanoutHeads[fanTask.taskId],
+        )
+      ).split(" ");
+      assert(
+        commitLine.length === 2
+        && commitLine[0] === fanoutHeads[fanTask.taskId],
+        "CCC_PRODUCT_FANOUT_TASK_COMMIT_SHAPE_DRIFT",
+        JSON.stringify({ taskId: fanTask.taskId, commitLine }),
+      );
+      const executionStartCommit = commitLine[1];
+      const expectedExecutionStart = fanTask.taskId === "TASK-FAN-A"
+        ? fanoutBase
+        : fanTask.taskId === "TASK-FAN-D"
+          ? executionStartCommit
+          : fanoutHeads["TASK-FAN-A"];
+      assert(
+        executionStartCommit === expectedExecutionStart,
+        "CCC_PRODUCT_FANOUT_EXECUTION_START_DRIFT",
+        JSON.stringify({
+          taskId: fanTask.taskId,
+          executionStartCommit,
+          expectedExecutionStart,
+        }),
+      );
+      const mutationPaths = (await git(
+        targetRoot,
+        "diff",
+        "--name-only",
+        executionStartCommit,
+        fanoutHeads[fanTask.taskId],
+      )).split("\n").filter(Boolean);
+      exactArray(
+        mutationPaths,
+        [fanTask.file],
+        "CCC_PRODUCT_FANOUT_TASK_MUTATION_SCOPE_DRIFT",
+      );
+      fanoutTaskDeltas[fanTask.taskId] = {
+        frozenBaseCommit: statusTask.baseCommit,
+        executionStartCommit,
+        headCommit: fanoutHeads[fanTask.taskId],
+        mutationPaths,
+        changedPathsSha256: changedPathsSha256(mutationPaths),
+      };
+    }
     const ancestor = async (base, head) => {
       const result = await run(
         "/usr/bin/git",
@@ -5686,6 +7045,14 @@ async function main() {
         fanoutHeads["TASK-FAN-C"],
         fanoutHeads["TASK-FAN-B"],
       ),
+      branchBIntoJoinBase: await ancestor(
+        fanoutHeads["TASK-FAN-B"],
+        fanoutTaskDeltas["TASK-FAN-D"].executionStartCommit,
+      ),
+      branchCIntoJoinBase: await ancestor(
+        fanoutHeads["TASK-FAN-C"],
+        fanoutTaskDeltas["TASK-FAN-D"].executionStartCommit,
+      ),
     };
     assert(
       fanoutAncestry.entryIntoBranchB
@@ -5693,37 +7060,124 @@ async function main() {
       && fanoutAncestry.branchBIntoJoin
       && fanoutAncestry.branchCIntoJoin
       && !fanoutAncestry.branchBIntoBranchC
-      && !fanoutAncestry.branchCIntoBranchB,
+      && !fanoutAncestry.branchCIntoBranchB
+      && fanoutAncestry.branchBIntoJoinBase
+      && fanoutAncestry.branchCIntoJoinBase,
       "CCC_PRODUCT_FANOUT_JOIN_ANCESTRY_REFUSED",
       JSON.stringify({ fanoutHeads, fanoutAncestry }),
     );
 
-    // One campaign-wide proof bound to the join task's commit, whose diff
-    // against the fan-out frozen base is exactly the four owned files with
-    // both branches' work present.
-    const fanoutProof = fanoutMergeHold.status.proofs[0];
+    // Every fan task has its own task-phase receipt, followed by a distinct
+    // final_integrated receipt bound to the join commit.
+    const fanoutTaskProofReceipts = [];
+    const fanoutTaskProofAttempts = {};
     assert(
-      fanoutMergeHold.status.proofs.length === 1
-      && fanoutProof.definition.id === "PROOF-FANOUT"
-      && fanoutProof.attempts.length === 1,
+      fanoutMergeHold.status.proofs.length === fanTasks.length + 1
+      && fanoutMergeHold.status.proofs.every(
+        ({ attempts }) => attempts.length === 1,
+      ),
       "CCC_PRODUCT_FANOUT_PROOF_SET_INVALID",
       JSON.stringify(fanoutMergeHold.status.proofs),
     );
+    for (const fanTask of fanTasks) {
+      const taskProof = exactProofStatus(
+        fanoutMergeHold.status,
+        fanoutTaskProofIdFor(fanTask),
+      );
+      const taskAttempt = taskProof.attempts[0];
+      const taskTree = await git(
+        targetRoot,
+        "rev-parse",
+        `${fanoutHeads[fanTask.taskId]}^{tree}`,
+      );
+      assertPassingSemanticProofAttempt(taskAttempt, {
+        proofId: fanoutTaskProofIdFor(fanTask),
+        phase: "task",
+        sourceCommit: fanoutHeads[fanTask.taskId],
+        sourceTree: taskTree,
+        clauseIds: [fanoutClauseIdFor(fanTask)],
+        caseIds: [`CASE-${fanTask.taskId.slice("TASK-".length)}`],
+        controlIds: [
+          `CONTROL-${fanTask.taskId.slice("TASK-".length)}-PENDING`,
+        ],
+        mutationPaths: [fanTask.file],
+      }, "CCC_PRODUCT_FANOUT_TASK_PROOF_INVALID");
+      fanoutTaskProofAttempts[fanTask.taskId] = taskAttempt;
+      fanoutTaskProofReceipts.push({
+        taskId: fanTask.taskId,
+        proofId: taskProof.definition.id,
+        attemptKey: taskAttempt.attemptKey,
+        sourceCommit: taskAttempt.sourceCommit,
+        sourceTree: taskAttempt.sourceTree,
+        changedPathsSha256: taskAttempt.terminalEnvelope.changedPathsSha256,
+        terminalEnvelopeSha256: taskAttempt.terminalEnvelopeSha256,
+        proofEvidenceSha256: taskAttempt.proofEvidenceSha256,
+        dispatchedAt: taskAttempt.dispatchedAt,
+        settledAt: taskAttempt.settledAt,
+      });
+    }
+    const fanoutProof = exactProofStatus(
+      fanoutMergeHold.status,
+      "PROOF-FANOUT-INTEGRATED",
+    );
     const fanoutAttempt = fanoutProof.attempts[0];
     const fanoutSourceCommit = fanoutAttempt.sourceCommit;
-    assert(
-      fanoutSourceCommit === fanoutHeads["TASK-FAN-D"]
-      && fanoutAttempt.state === "committed"
-      && fanoutAttempt.result?.success === true
-      && fanoutAttempt.result?.exitCode === 0
-      && fanoutAttempt.result?.stdoutTail?.includes(
-        "FANOUT_NEGATIVE_CONTROL_PASS: planted pending fan values are rejected",
-      )
-      && fanoutAttempt.result?.stdoutTail?.includes(
-        "FANOUT_POSITIVE_ORACLE_PASS: fan-out campaign values are joined",
-      ),
-      "CCC_PRODUCT_FANOUT_PROOF_INVALID",
-      JSON.stringify({ fanoutAttempt, joinHead: fanoutHeads["TASK-FAN-D"] }),
+    const fanoutSourceTree = await git(
+      targetRoot,
+      "rev-parse",
+      `${fanoutSourceCommit}^{tree}`,
+    );
+    assertPassingSemanticProofAttempt(fanoutAttempt, {
+      proofId: "PROOF-FANOUT-INTEGRATED",
+      phase: "final_integrated",
+      sourceCommit: fanoutHeads["TASK-FAN-D"],
+      sourceTree: fanoutSourceTree,
+      clauseIds: fanTasks.map(fanoutClauseIdFor),
+      caseIds: ["CASE-FANOUT-INTEGRATED"],
+      controlIds: ["CONTROL-FANOUT-INTEGRATED-PENDING"],
+      mutationPaths: fanTasks.map(({ file }) => file),
+    }, "CCC_PRODUCT_FANOUT_FINAL_INTEGRATED_PROOF_INVALID");
+    const fanoutCampaignAudit = await readCampaignAuditRows(
+      isolatedHome,
+      fanoutMergeHold.status.projectId,
+      fanoutImported.result.importId,
+    );
+    const fanoutProviderDispatches = Object.fromEntries(
+      fanTasks.map((fanTask) => [
+        fanTask.taskId,
+        exactProviderDispatchAudit(fanoutCampaignAudit, fanTask.taskId),
+      ]),
+    );
+    for (const dependencyTaskId of ["TASK-FAN-B", "TASK-FAN-C"]) {
+      assertOrderedInstants(
+        fanoutTaskProofAttempts["TASK-FAN-A"].settledAt,
+        fanoutProviderDispatches[dependencyTaskId].timestamp,
+        "CCC_PRODUCT_FANOUT_DEPENDENT_RELEASED_BEFORE_TASK_PROOF",
+        {
+          prerequisiteTaskId: "TASK-FAN-A",
+          dependentTaskId: dependencyTaskId,
+        },
+      );
+    }
+    for (const prerequisiteTaskId of ["TASK-FAN-B", "TASK-FAN-C"]) {
+      assertOrderedInstants(
+        fanoutTaskProofAttempts[prerequisiteTaskId].settledAt,
+        fanoutProviderDispatches["TASK-FAN-D"].timestamp,
+        "CCC_PRODUCT_FANOUT_JOIN_RELEASED_BEFORE_BRANCH_PROOF",
+        {
+          prerequisiteTaskId,
+          dependentTaskId: "TASK-FAN-D",
+        },
+      );
+    }
+    assertOrderedInstants(
+      fanoutTaskProofAttempts["TASK-FAN-D"].settledAt,
+      fanoutAttempt.dispatchedAt,
+      "CCC_PRODUCT_FANOUT_FINAL_PROOF_RELEASED_BEFORE_JOIN_PROOF",
+      {
+        prerequisiteTaskId: "TASK-FAN-D",
+        finalProofAttemptKey: fanoutAttempt.attemptKey,
+      },
     );
     exactArray(
       (await git(
@@ -5744,12 +7198,37 @@ async function main() {
         JSON.stringify({ taskId: fanTask.taskId, file: fanTask.file }),
       );
     }
+    const fanoutMergeConfirmation =
+      fanoutMergeHold.mergeApprovalConfirmations?.find(
+        ({ approvalRequestId, status }) =>
+          approvalRequestId === fanoutMergeHold.status.nextAction.approvalRequestId
+          && status === "issued",
+      );
+    const fanoutMergeApproval = fanoutMergeHold.status.approvals.find(
+      ({ id }) => id === fanoutMergeConfirmation?.approvalRequestId,
+    );
+    const [fanoutProofPrefix, fanoutProofCommit, fanoutProofTree,
+      fanoutReceiptSetSha256, fanoutProofExtra] =
+      String(fanoutMergeApproval?.runId ?? "").split(":");
+    const expectedFanoutReceiptSetSha256 = finalProofReceiptSetSha256(
+      fanoutSourceCommit,
+      fanoutSourceTree,
+      [fanoutAttempt],
+    );
     assert(
       fanoutMergeHold.status.workItems.length === 1
       && fanoutMergeHold.status.workItems[0].state === "manual-required"
       && fanoutMergeHold.status.workItems[0].lastError
         === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
-      && await git(targetRoot, "rev-parse", "refs/heads/main") === landedCommit,
+      && fanoutMergeConfirmation
+      && fanoutMergeApproval?.campaign?.binding?.actionTarget
+        === "refs/heads/main"
+      && fanoutProofPrefix === "ccc-merge-proof-v2"
+      && fanoutProofCommit === fanoutSourceCommit
+      && fanoutProofTree === fanoutSourceTree
+      && fanoutReceiptSetSha256 === expectedFanoutReceiptSetSha256
+      && fanoutProofExtra === undefined
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === fanoutBase,
       "CCC_PRODUCT_FANOUT_LANDED_WITHOUT_APPROVAL",
       JSON.stringify({
         workItems: fanoutMergeHold.status.workItems,
@@ -5783,22 +7262,64 @@ async function main() {
     assert(
       fanoutStopped.kind === "campaign-stopped"
       && fanoutStopped.result?.workItemState === "cancelled"
-      && await git(targetRoot, "rev-parse", "refs/heads/main") === landedCommit,
+      && await git(targetRoot, "rev-parse", "refs/heads/main") === fanoutBase,
       "CCC_PRODUCT_FANOUT_STOP_FAILED",
       JSON.stringify(fanoutStopped),
     );
     ledger.pass("fanout-join-execution-proved", {
       importId: fanoutImported.result.importId,
-      approvals: fanoutApprovalTrail,
+      executionAuthorization: {
+        authorizationId: fanoutAuthorization.authorizationId,
+        memberSetHash: fanoutAuthorization.memberSetHash,
+        members: fanoutAuthorization.members,
+        approvalCalls: 1,
+        statusAtMerge: fanoutMergeHold.status.executionAuthorization.status,
+        providerAttempts: fanoutProviderAttempts.map((attempt) => ({
+          attemptKey: attempt.attemptKey,
+          semanticTaskId: attempt.semanticTaskId,
+          attemptOrdinal: attempt.attemptOrdinal,
+          requestCount: attempt.requestCount,
+          state: attempt.state,
+        })),
+      },
+      childApprovalRefusals: fanoutChildRefusals,
       nativeTaskIds: fanoutNativeIds,
       heads: fanoutHeads,
+      taskDeltas: fanoutTaskDeltas,
       ancestry: fanoutAncestry,
       sourceCommit: fanoutSourceCommit,
+      exactSourceAcceptanceClauseGrammar: true,
       mutationPaths: fanTasks.map(({ file }) => file),
+      taskProofReceipts: fanoutTaskProofReceipts,
+      proofBeforeDependentDispatch: {
+        entryProofSettledAt:
+          fanoutTaskProofAttempts["TASK-FAN-A"].settledAt,
+        branchDispatches: ["TASK-FAN-B", "TASK-FAN-C"].map((taskId) => ({
+          taskId,
+          dispatchedAt: fanoutProviderDispatches[taskId].timestamp,
+        })),
+        branchProofs: ["TASK-FAN-B", "TASK-FAN-C"].map((taskId) => ({
+          taskId,
+          settledAt: fanoutTaskProofAttempts[taskId].settledAt,
+        })),
+        joinDispatchedAt: fanoutProviderDispatches["TASK-FAN-D"].timestamp,
+        joinProofSettledAt: fanoutTaskProofAttempts["TASK-FAN-D"].settledAt,
+        finalIntegratedDispatchedAt: fanoutAttempt.dispatchedAt,
+      },
       proofAttemptKey: fanoutAttempt.attemptKey,
-      proofResult: fanoutAttempt.result,
+      finalIntegratedProofReceipt: {
+        phase: fanoutAttempt.phase,
+        terminalEnvelopeSha256: fanoutAttempt.terminalEnvelopeSha256,
+        proofEvidenceSha256: fanoutAttempt.proofEvidenceSha256,
+      },
+      mergeApprovalFinalProofCustody: {
+        sourceCommit: fanoutProofCommit,
+        sourceTree: fanoutProofTree,
+        finalReceiptSetSha256: fanoutReceiptSetSha256,
+        recomputedFromAttemptKey: fanoutAttempt.attemptKey,
+      },
       stopped: fanoutStopped.result,
-      mainHeadStill: landedCommit,
+      mainHeadStill: fanoutBase,
     });
 
     await stopServe(server);
@@ -5813,10 +7334,10 @@ async function main() {
       startedAt: startedAt.toISOString(),
       completedAt: new Date().toISOString(),
       productBoundary:
-        "Frozen reviewed PRD packet through native local authoring and normal built CLI/serve coding, proof, recovery, and exact merge approval.",
+        "Fresh semantic-v2 PRD packet through controller-hydrated native authoring, one sealed execution authorization, task and final_integrated proof receipts, recovery, and proof-bound merge approval.",
       authoringBoundary: nativeAuthoringEvidence,
       fixtureBoundary:
-        "native local authoring was exercised through one OpenAI-compatible loopback SSE request with a sanitized deterministic model response; no proposal-file compatibility argument, secret, or live external provider was used.",
+        "Fresh v2 authoring used one OpenAI-compatible loopback SSE request with a sanitized deterministic model response and no proposal-file bypass; proposal-file was used only to prove legacy-v1 readability plus fresh-product refusal. No secret or live external provider was used.",
       repository: {
         start: repositoryStart,
         end: repositoryEnd,
@@ -5826,6 +7347,7 @@ async function main() {
         baseCommit: targetBase,
         campaignCommit: sourceCommit,
         landedCommit,
+        fanoutBase,
       },
       exactChecks: checks,
     };

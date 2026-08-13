@@ -342,6 +342,35 @@ describe("human product status rendering", () => {
     expect(text).toContain("ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED");
   });
 
+  it("RED-S5-RENDER-V2: renders phase and semantic envelope/evidence digests without a generic-result verdict", () => {
+    const payload = mergeHoldStatus();
+    const attempt = payload.status.proofs[0]!.attempts[0]! as Record<string, unknown>;
+    Object.assign(attempt, {
+      attemptContractVersion: "v2",
+      phase: "final_integrated",
+      verifierClosureSha256: "1".repeat(64),
+      candidateInputsSha256: "2".repeat(64),
+      executionToolchainSha256: "3".repeat(64),
+      terminalEnvelope: {
+        kind: "verified",
+        passed: true,
+      },
+      terminalEnvelopeSha256: "4".repeat(64),
+      proofEvidence: { passed: true },
+      proofEvidenceSha256: "5".repeat(64),
+      result: { success: false, exitCode: 17 },
+    });
+
+    const text = renderOperatorPayload(payload).join("\n");
+    expect(text).toContain("attempt contract: v2");
+    expect(text).toContain("proof phase: final_integrated");
+    expect(text).toContain(`terminal envelope digest: ${"4".repeat(64)}`);
+    expect(text).toContain(`semantic evidence digest: ${"5".repeat(64)}`);
+    expect(text).toContain("verified verdict: passed");
+    expect(text).toContain("semantic evidence: passed");
+    expect(text).not.toContain("result: failed, exit code 17");
+  });
+
   it("prints the ready-to-paste approve-merge command beside the merge digest", () => {
     const lines = renderOperatorPayload(mergeHoldStatus());
 

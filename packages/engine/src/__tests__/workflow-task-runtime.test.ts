@@ -101,6 +101,56 @@ function selectedProofSuiteIr(): WorkflowIr {
   };
 }
 
+function selectedFinalProofPhaseIr(): WorkflowIr {
+  const ir = selectedProofSuiteIr();
+  return {
+    ...ir,
+    version: "v2",
+    columns: [],
+    name: "selected-final-proof-phase",
+    nodes: ir.nodes.map((node) => node.id === "proof-suite"
+      ? {
+        ...node,
+        config: {
+          ...node.config,
+          cccProofPhase: "final_integrated",
+        },
+      }
+      : node),
+  };
+}
+
+function selectedTaskProofGateIr(): WorkflowIr {
+  return {
+    version: "v2",
+    name: "selected-task-proof-gate",
+    columns: [],
+    nodes: [
+      { id: "start", kind: "start" },
+      { id: "implementation", kind: "prompt", config: { prompt: "implement" } },
+      {
+        id: "task-proof",
+        kind: "gate",
+        config: {
+          cccProofGate: true,
+          cccProofPhase: "task",
+          cccProofIds: ["PROOF-1"],
+          cccPrdTaskId: "TASK-1",
+          cccNativeTaskId: task.id,
+        },
+      },
+      { id: "downstream", kind: "prompt", config: { prompt: "dependent" } },
+      { id: "end", kind: "end" },
+    ],
+    edges: [
+      { from: "start", to: "implementation", condition: "success" },
+      { from: "implementation", to: "task-proof", condition: "success" },
+      { from: "task-proof", to: "downstream", condition: "success" },
+      { from: "downstream", to: "end", condition: "success" },
+    ],
+  };
+}
+
 function campaignProofContext(
   taskId: string,
   semanticTaskId = taskId === nativeSemanticTaskId ? "TASK-SEMANTIC" : taskId,
@@ -244,6 +294,139 @@ describe("WorkflowTaskRuntime", () => {
         "node:proof-suite:value": "ccc-proof-suite-execution-unwired",
       },
     });
+  });
+
+  it("RED-S5-task-gate-release: refuses a CCC task-proof gate when its execution handler is unwired", async () => {
+    const prompt = vi.fn(async () => ({ outcome: "success" as const }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-TASK-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedTaskProofGateIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: { prompt },
+    });
+
+    const result = await runtime.run(task, flagOff, { deferCompletionSummary: true });
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      context: {
+        "node:task-proof:value": "ccc-proof-suite-execution-unwired",
+      },
+    });
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(prompt.mock.calls[0]![0]).toMatchObject({ id: "implementation" });
+  });
+
+  it("RED-S5-task-gate-release: does not invoke a dependent node until the task proof gate passes", async () => {
+    let passTaskGate: ((result: WorkflowNodeResult) => void) | undefined;
+    const taskGatePending = new Promise<WorkflowNodeResult>((resolve) => {
+      passTaskGate = resolve;
+    });
+    const prompt = vi.fn(async () => ({ outcome: "success" as const }));
+    const runCccProofSuite = vi.fn(() => taskGatePending);
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-TASK-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedTaskProofGateIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: { prompt },
+      runCccProofSuite,
+    });
+
+    const run = runtime.run(task, flagOff, { deferCompletionSummary: true });
+    await vi.waitFor(() => expect(runCccProofSuite).toHaveBeenCalledTimes(1));
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(prompt.mock.calls[0]![0]).toMatchObject({ id: "implementation" });
+
+    passTaskGate!({ outcome: "success" });
+    await expect(run).resolves.toMatchObject({ disposition: "completed", outcome: "success" });
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect(prompt.mock.calls[1]![0]).toMatchObject({ id: "downstream" });
+  });
+
+  it("RED-S5-task-gate-release: task proof failure makes zero downstream calls", async () => {
+    const prompt = vi.fn(async () => ({ outcome: "success" as const }));
+    const runCccProofSuite = vi.fn(async () => ({
+      outcome: "failure" as const,
+      value: "task-proof-failed",
+    }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-TASK-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedTaskProofGateIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: { prompt },
+      runCccProofSuite,
+    });
+
+    const result = await runtime.run(task, flagOff, { deferCompletionSummary: true });
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      context: { "node:task-proof:value": "task-proof-failed" },
+    });
+    expect(runCccProofSuite).toHaveBeenCalledTimes(1);
+    expect(runCccProofSuite.mock.calls[0]![0]).toMatchObject({
+      config: {
+        cccProofGate: true,
+        cccProofPhase: "task",
+        cccProofIds: ["PROOF-1"],
+        cccPrdTaskId: "TASK-1",
+        cccNativeTaskId: task.id,
+      },
+    });
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(prompt.mock.calls[0]![0]).toMatchObject({ id: "implementation" });
+  });
+
+  it("RED-S5-task-gate-release: dispatches a unified final proof-phase marker", async () => {
+    const runCccProofSuite = vi.fn(async () => ({ outcome: "success" as const }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-FINAL-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedFinalProofPhaseIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      runCccProofSuite,
+    });
+
+    await expect(runtime.run(task, flagOff, { deferCompletionSummary: true })).resolves.toMatchObject({
+      disposition: "completed",
+      outcome: "success",
+    });
+    expect(runCccProofSuite).toHaveBeenCalledTimes(1);
+  });
+
+  it("RED-S5-task-gate-release: dispatches a unified proof-phase marker without a legacy boolean", async () => {
+    const ir = selectedFinalProofPhaseIr();
+    const proofNode = ir.nodes.find((node) => node.id === "proof-suite")!;
+    delete proofNode.config!.cccProofSuite;
+    const runCccProofSuite = vi.fn(async () => ({ outcome: "success" as const }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-UNIFIED-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      runCccProofSuite,
+    });
+
+    await expect(runtime.run(task, flagOff, { deferCompletionSummary: true })).resolves.toMatchObject({
+      disposition: "completed",
+      outcome: "success",
+    });
+    expect(runCccProofSuite).toHaveBeenCalledTimes(1);
   });
 
   it("parks an uncertain CCC proof-suite dispatch for manual reconciliation", async () => {

@@ -21,6 +21,7 @@ import {
   pgDescribe,
 } from "../../__test-utils__/pg-test-harness.js";
 import {
+  admitCccPrdImportTestProductBundle,
   createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
@@ -66,7 +67,7 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
       operatorDecision: "approve_live_execution" as const,
       spans: [task.spans[0]!],
     }));
-    const bundle = rehashCccPrdImportTestBundle({
+    const legacy = rehashCccPrdImportTestBundle({
       ...source,
       bounds: {
         ...source.bounds,
@@ -80,6 +81,8 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
       })),
       protectedActions: actions,
     });
+    const admitted = await admitCccPrdImportTestProductBundle(legacy, suffix);
+    const bundle = admitted.bundle;
     const imported = await importCccPrdBundle({
       bundle,
       executionPolicy: createCccPrdImportTestProductExecutionPolicy(bundle),
@@ -87,6 +90,7 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
+      semanticProofToolchainPaths: admitted.semanticProofToolchainPaths,
     });
     const rows = await h.layer().db.execute(sql`
       SELECT entity_id, native_id

@@ -3,7 +3,8 @@ import {
   computeCccPrdSemanticBundleSha256,
 } from "../ccc-prd/contract.js";
 import {
-  CCC_PRD_BUNDLE_SCHEMA_VERSION,
+  CCC_PRD_BUNDLE_V1_SCHEMA_VERSION,
+  CCC_PRD_BUNDLE_V2_SCHEMA_VERSION,
   type CccPrdSemanticBundle,
 } from "../ccc-prd/types.js";
 import {
@@ -91,7 +92,10 @@ function storedBundle(value: unknown): CccPrdSemanticBundle {
   if (
     !isRecord(value)
     || value.kind !== "bundle"
-    || value.schema !== CCC_PRD_BUNDLE_SCHEMA_VERSION
+    || (
+      value.schema !== CCC_PRD_BUNDLE_V1_SCHEMA_VERSION
+      && value.schema !== CCC_PRD_BUNDLE_V2_SCHEMA_VERSION
+    )
     || !Array.isArray(value.tasks)
     || !Array.isArray(value.proofs)
     || !Array.isArray(value.protectedActions)

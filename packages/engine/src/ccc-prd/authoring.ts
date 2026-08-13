@@ -1,14 +1,20 @@
 import { createHash } from "node:crypto";
 import {
-  CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION,
+  CCC_PRD_AUTHORING_PROPOSAL_V1_SCHEMA_VERSION,
+  CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION,
   CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
+  CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   canonicalCccPrdJson,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
   createCccPrdSpanFromBytes,
   createRefusalBundle,
+  CccPrdSemanticProofCustodyError,
   getWorkflowExtensionRegistry,
+  hydrateCccPrdSemanticProofV2Custody,
   normalizeProtectedAction,
   type CccPrdAuthoringAdapter,
   type CccPrdAuthoringConstraints,
@@ -20,16 +26,22 @@ import {
   type CccPrdImplementationFactProvenance,
   type CccPrdProposalArtifact,
   type CccPrdProposalDocument,
-  type CccPrdProposalProof,
+  type CccPrdProofV2,
+  type CccPrdProofV1,
   type CccPrdProposalProtectedAction,
-  type CccPrdProposalRequirement,
   type CccPrdProposalReviewItem,
   type CccPrdProposalTask,
   type CccPrdProposalUnresolvedDecision,
   type CccPrdProposalWorkflow,
   type CccPrdSourceReferenceProposal,
   type CccPrdSourceSpan,
+  type CccPrdSemanticProofContractVersion,
+  type CccPrdSemanticProofToolchainPaths,
   type CccPrdSidecar,
+  type CccPrdSidecarV1,
+  type CccPrdSidecarV2,
+  type CccPrdRequirementV1,
+  type CccPrdRequirementV2,
   type CccPrdTargetRepository,
   type WorkflowExtensionRegistry,
 } from "@fusion/core";
@@ -51,6 +63,10 @@ import {
   isWellFormedProtectedActionId,
 } from "./protected-action-ids.js";
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
+import {
+  reconcileCccPrdAcceptanceClauseManifest,
+  reconcileCccPrdAcceptanceProofCoverage,
+} from "./acceptance-clauses.js";
 
 export type AuthorCccPrdInput = {
   rootDir: string;
@@ -59,6 +75,14 @@ export type AuthorCccPrdInput = {
   constraints?: CccPrdAuthoringConstraints;
   previousSidecar?: CccPrdSidecar;
   workflowExtensionRegistry?: WorkflowExtensionRegistry;
+  /** Omission preserves the frozen v1 authoring contract. */
+  semanticProofContract?: CccPrdSemanticProofContractVersion;
+  /**
+   * Explicit executable-author custody. A v2 proposal without this remains
+   * review-only and receives no proof admission; model-emitted OIDs, hashes,
+   * and executable identities are never executable authority.
+   */
+  semanticProofToolchainPaths?: CccPrdSemanticProofToolchainPaths;
 };
 
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
@@ -81,6 +105,13 @@ function hasIdentifiedRows(value: unknown): boolean {
   return Array.isArray(value) && value.every((entry) => (
     isPlainRecord(entry) && typeof entry.id === "string" && entry.id.length > 0
   ));
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
 }
 
 function sourceQuoteContainsCanonicalPath(
@@ -145,13 +176,19 @@ failed this gate three ways at once, and the bare "wrong proposal schema or
 shape" message left the operator blind. Enumerate the violations (first
 offending row per collection) so the refusal can name them.
 */
-function describeProposalShapeViolations(value: unknown): string[] {
+function describeProposalShapeViolations(
+  value: unknown,
+  semanticProofContract: CccPrdSemanticProofContractVersion = "v1",
+): string[] {
   if (!isPlainRecord(value)) {
     return ["proposal is not a JSON object"];
   }
   const violations: string[] = [];
-  if (value.schema !== CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION) {
-    violations.push(`schema must be "${CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION}"`);
+  const expectedSchema = semanticProofContract === "v2"
+    ? CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+    : CCC_PRD_AUTHORING_PROPOSAL_V1_SCHEMA_VERSION;
+  if (value.schema !== expectedSchema) {
+    violations.push(`schema must be "${expectedSchema}"`);
   }
   const collections = [
     "authorityRoles",
@@ -233,6 +270,42 @@ function describeProposalShapeViolations(value: unknown): string[] {
       );
     }
   }
+  if (semanticProofContract === "v2") {
+    const requirements = value.requirements;
+    if (Array.isArray(requirements)) {
+      const badIndex = requirements.findIndex((entry) => !(
+        isPlainRecord(entry)
+        && Array.isArray(entry.acceptanceClauses)
+        && Array.isArray(entry.acceptanceDispositions)
+      ));
+      if (badIndex >= 0) {
+        violations.push(
+          `requirements[${badIndex}] must carry acceptanceClauses and acceptanceDispositions arrays`,
+        );
+      }
+    }
+    const proofs = value.proofs;
+    if (Array.isArray(proofs)) {
+      const badIndex = proofs.findIndex((entry) => !(
+        isPlainRecord(entry)
+        && entry.schema === "ccc-prd.proof.v2"
+        && Array.isArray(entry.clauseIds)
+        && Array.isArray(entry.phases)
+        && Array.isArray(entry.positiveCases)
+        && Array.isArray(entry.negativeControls)
+        && Array.isArray(entry.verifierClosure)
+        && Array.isArray(entry.candidateInputs)
+        && isPlainRecord(entry.executionToolchain)
+        && exactKeys(entry.executionToolchain, ["task", "node", "proofHost", "linkedRuntime"])
+        && Array.isArray(entry.executionToolchain.linkedRuntime)
+      ));
+      if (badIndex >= 0) {
+        violations.push(
+          `proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape, including executionToolchain task/node/proofHost/linkedRuntime`,
+        );
+      }
+    }
+  }
   if (!isPlainRecord(value.bounds)) {
     violations.push("bounds must be an object with maxRequests, maxDurationMs, maxConcurrency");
   }
@@ -245,8 +318,11 @@ function describeProposalShapeViolations(value: unknown): string[] {
   return violations;
 }
 
-function validateProposalShape(value: unknown): value is CccPrdAuthoringProposal {
-  return describeProposalShapeViolations(value).length === 0;
+function validateProposalShape(
+  value: unknown,
+  semanticProofContract: CccPrdSemanticProofContractVersion = "v1",
+): value is CccPrdAuthoringProposal {
+  return describeProposalShapeViolations(value, semanticProofContract).length === 0;
 }
 
 export const IDENTITY_COLLECTIONS = [
@@ -304,7 +380,7 @@ type ImplementationFacts = {
     id: string;
     command: string;
     positiveOracle: string;
-    negativeControls: string[];
+    negativeControls: Array<string | { description: string }>;
     spans?: CccPrdSourceSpan[];
   }>;
   protectedActions: Array<{
@@ -610,14 +686,19 @@ export function computeCccPrdImplementationFactProvenance(input: {
         proof.positiveOracle,
         proof.spans ?? [],
       ),
-      negativeControls: proof.negativeControls.map((negativeControl) => requireEntityBinding(
-        diagnostics,
-        input.sourceBytes,
-        "CCC_PRD_NEGATIVE_CONTROL_PROVENANCE_REQUIRED",
-        `Negative control for proof ${proof.id} must be stated inside that proof's cited source span: ${negativeControl}`,
-        negativeControl,
-        proof.spans ?? [],
-      )),
+      negativeControls: proof.negativeControls.map((negativeControl) => {
+        const value = typeof negativeControl === "string"
+          ? negativeControl
+          : negativeControl.description;
+        return requireEntityBinding(
+          diagnostics,
+          input.sourceBytes,
+          "CCC_PRD_NEGATIVE_CONTROL_PROVENANCE_REQUIRED",
+          `Negative control for proof ${proof.id} must be stated inside that proof's cited source span: ${value}`,
+          value,
+          proof.spans ?? [],
+        );
+      }),
     })),
     protectedActions: input.facts.protectedActions.map((action) => ({
       id: action.id,
@@ -787,8 +868,8 @@ function mapProposal(
   proposal: CccPrdAuthoringProposal,
   sourceBytes: Map<string, Buffer>,
 ): {
-  requirements: ReturnType<typeof withoutSourceRefs<CccPrdProposalRequirement>>[];
-  proofs: ReturnType<typeof withoutSourceRefs<CccPrdProposalProof>>[];
+  requirements: CccPrdRequirementV1[] | CccPrdRequirementV2[];
+  proofs: CccPrdProofV1[] | CccPrdProofV2[];
   tasks: ReturnType<typeof withoutSourceRefs<CccPrdProposalTask>>[];
   workflows: ReturnType<typeof withoutSourceRefs<CccPrdProposalWorkflow>>[];
   documents: ReturnType<typeof withoutSourceRefs<CccPrdProposalDocument>>[];
@@ -798,9 +879,42 @@ function mapProposal(
   exceptions: ReturnType<typeof withoutSourceRefs<CccPrdProposalReviewItem>>[];
   protectedActions: ReturnType<typeof normalizeProtectedAction>[];
 } {
+  const requirements = proposal.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+    ? (() => {
+        const reconciled = reconcileCccPrdAcceptanceClauseManifest({
+          sourceBytes,
+          requirements: proposal.requirements,
+        }).requirements;
+        reconcileCccPrdAcceptanceProofCoverage({
+          requirements: reconciled,
+          proofs: proposal.proofs,
+        });
+        const acceptanceByRequirement = new Map(
+          reconciled.map((entry) => [entry.requirementId, entry]),
+        );
+        return sortCccPrdById(proposal.requirements.map((value): CccPrdRequirementV2 => {
+          const mapped = withoutSourceRefs(value, sourceBytes);
+          const acceptance = acceptanceByRequirement.get(value.id)!;
+          return {
+            ...mapped,
+            acceptanceClauses: acceptance.acceptanceClauses,
+            acceptanceDispositions: acceptance.acceptanceDispositions,
+          };
+        }));
+      })()
+    : sortCccPrdById(proposal.requirements.map((value): CccPrdRequirementV1 => (
+        withoutSourceRefs(value, sourceBytes)
+      )));
+  const proofs = proposal.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+    ? sortCccPrdById(proposal.proofs.map((value): CccPrdProofV2 => (
+        withoutSourceRefs(value, sourceBytes)
+      )))
+    : sortCccPrdById(proposal.proofs.map((value): CccPrdProofV1 => (
+        withoutSourceRefs(value, sourceBytes)
+      )));
   return {
-    requirements: sortCccPrdById(proposal.requirements.map((value) => withoutSourceRefs(value, sourceBytes))),
-    proofs: sortCccPrdById(proposal.proofs.map((value) => withoutSourceRefs(value, sourceBytes))),
+    requirements,
+    proofs,
     tasks: sortCccPrdById(proposal.tasks.map((value) => {
       const mappedTask = withoutSourceRefs(value, sourceBytes);
       return {
@@ -830,6 +944,7 @@ function mapProposal(
 
 export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccPrdAuthoringResult> {
   try {
+    const semanticProofContract = input.semanticProofContract ?? "v1";
     const custody = readCccPrdPacketCustody(input);
     for (const [path, bytes] of custody.sourceBytes) {
       if (!Buffer.from(bytes.toString("utf8"), "utf8").equals(bytes)) {
@@ -848,9 +963,10 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       })),
       ...(input.constraints ? { constraints: input.constraints } : {}),
       ...(input.previousSidecar ? { previousSidecar: input.previousSidecar } : {}),
+      ...(input.semanticProofContract ? { semanticProofContract: input.semanticProofContract } : {}),
     });
-    if (!validateProposalShape(proposalValue)) {
-      const violations = describeProposalShapeViolations(proposalValue);
+    if (!validateProposalShape(proposalValue, semanticProofContract)) {
+      const violations = describeProposalShapeViolations(proposalValue, semanticProofContract);
       const shown = violations.slice(0, 8).join("; ");
       const suffix = violations.length > 8 ? ` (+${violations.length - 8} more)` : "";
       return malformed(
@@ -910,6 +1026,28 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
       });
     }
     const mapped = mapProposal(proposalValue, custody.sourceBytes);
+    let controllerOwnedV2Proofs: CccPrdProofV2[] | undefined;
+    if (
+      proposalValue.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+      && input.semanticProofToolchainPaths
+    ) {
+      if (!input.constraints) {
+        return createRefusalBundle({
+          code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+          message: "executable semantic-proof authoring requires controller-admitted target and bounds",
+        });
+      }
+      controllerOwnedV2Proofs = await hydrateCccPrdSemanticProofV2Custody({
+        repositoryRoot: input.constraints.targetRepository.path,
+        baseCommit: input.constraints.targetRepository.baseCommit,
+        proofs: mapped.proofs as CccPrdProofV2[],
+        modelWriteRoots: mapped.tasks.flatMap((task) => [
+          ...(task.ownedPaths ?? []),
+          ...(task.allowedWriteRoots ?? []),
+        ]),
+        toolchainPaths: input.semanticProofToolchainPaths,
+      });
+    }
     let implementationFactProvenance: CccPrdImplementationFactProvenance | undefined;
     if (input.constraints) {
       const computedProvenance = computeCccPrdImplementationFactProvenance({
@@ -990,51 +1128,96 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
         message: `fixed proof-admission provenance changed during re-verification: ${CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID}`,
       });
     }
-    const stampedProofs = mapped.proofs.map((proof) => ({
-      ...proof,
-      admission: {
-        schema: CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
-        pluginId: proofAdmissionBinding.pluginId,
-        pluginVersion: proofAdmissionBinding.pluginVersion,
-        extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
-        proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
-        extensionRootRelativeSource: proofAdmissionBinding.extensionRootRelativeSource,
-        extensionSourceSha256: proofAdmissionBinding.extensionSourceSha256,
-        extensionManifestSha256: proofAdmissionBinding.extensionManifestSha256,
-        definitionSha256: computeCccPrdProofDefinitionSha256(proof),
-      },
-    }));
-    const proposalHash = sha256(canonicalCccPrdJson(proposalValue));
-    const sidecarWithoutCoverage: CccPrdSidecar = {
-      schema: CCC_PRD_SIDECAR_SCHEMA_VERSION,
-      sourceVersion: custody.sourceVersion,
-      orderedSources: custody.sources,
-      provenance: {
-        authoringAdapterId: input.adapter.id,
-        ...(input.adapter.model ? { authoringModel: input.adapter.model } : {}),
-        proposalHash,
-        packetHash: custody.packetHash,
-      },
-      authorityRoles: sortCccPrdById(proposalValue.authorityRoles),
-      requirements: mapped.requirements,
-      proofs: stampedProofs,
-      tasks: mapped.tasks,
-      edges: sortCccPrdById(proposalValue.edges),
-      workflows: mapped.workflows,
-      documents: mapped.documents,
-      artifacts: mapped.artifacts,
-      importIntents: sortCccPrdById(proposalValue.importIntents),
-      protectedActions: mapped.protectedActions,
-      bounds: proposalValue.bounds,
-      admittedWriteRoots: [...proposalValue.admittedWriteRoots],
-      targetRepository: proposalValue.targetRepository,
-      nonGoals: [...proposalValue.nonGoals],
-      unresolvedDecisions: mapped.unresolvedDecisions,
-      ambiguities: mapped.ambiguities,
-      exceptions: mapped.exceptions,
-      confidence: proposalValue.confidence,
-      ...(implementationFactProvenance ? { implementationFactProvenance } : {}),
+    const admissionIdentity = {
+      pluginId: proofAdmissionBinding.pluginId,
+      pluginVersion: proofAdmissionBinding.pluginVersion,
+      extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+      proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+      extensionRootRelativeSource: proofAdmissionBinding.extensionRootRelativeSource,
+      extensionSourceSha256: proofAdmissionBinding.extensionSourceSha256,
+      extensionManifestSha256: proofAdmissionBinding.extensionManifestSha256,
     };
+    const stampedProofs = proposalValue.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+      ? controllerOwnedV2Proofs?.map((proof): CccPrdProofV2 => ({
+          ...proof,
+          admission: {
+            schema: CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
+            ...admissionIdentity,
+            definitionSha256: computeCccPrdProofDefinitionSha256(proof),
+            ...computeCccPrdProofV2AdmissionDigests(proof),
+          },
+        })) ?? mapped.proofs as CccPrdProofV2[]
+      : (mapped.proofs as CccPrdProofV1[]).map((proof): CccPrdProofV1 => ({
+          ...proof,
+          admission: {
+            schema: CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+            ...admissionIdentity,
+            definitionSha256: computeCccPrdProofDefinitionSha256(proof),
+          },
+        }));
+    const proposalHash = sha256(canonicalCccPrdJson(proposalValue));
+    const sidecarWithoutCoverage: CccPrdSidecar = proposalValue.schema
+      === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+      ? {
+          schema: CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+          sourceVersion: custody.sourceVersion,
+          orderedSources: custody.sources,
+          provenance: {
+            authoringAdapterId: input.adapter.id,
+            ...(input.adapter.model ? { authoringModel: input.adapter.model } : {}),
+            proposalHash,
+            packetHash: custody.packetHash,
+          },
+          authorityRoles: sortCccPrdById(proposalValue.authorityRoles),
+          requirements: mapped.requirements as CccPrdRequirementV2[],
+          proofs: stampedProofs as CccPrdProofV2[],
+          tasks: mapped.tasks,
+          edges: sortCccPrdById(proposalValue.edges),
+          workflows: mapped.workflows,
+          documents: mapped.documents,
+          artifacts: mapped.artifacts,
+          importIntents: sortCccPrdById(proposalValue.importIntents),
+          protectedActions: mapped.protectedActions,
+          bounds: proposalValue.bounds,
+          admittedWriteRoots: [...proposalValue.admittedWriteRoots],
+          targetRepository: proposalValue.targetRepository,
+          nonGoals: [...proposalValue.nonGoals],
+          unresolvedDecisions: mapped.unresolvedDecisions,
+          ambiguities: mapped.ambiguities,
+          exceptions: mapped.exceptions,
+          confidence: proposalValue.confidence,
+          ...(implementationFactProvenance ? { implementationFactProvenance } : {}),
+        } satisfies CccPrdSidecarV2
+      : {
+          schema: CCC_PRD_SIDECAR_SCHEMA_VERSION,
+          sourceVersion: custody.sourceVersion,
+          orderedSources: custody.sources,
+          provenance: {
+            authoringAdapterId: input.adapter.id,
+            ...(input.adapter.model ? { authoringModel: input.adapter.model } : {}),
+            proposalHash,
+            packetHash: custody.packetHash,
+          },
+          authorityRoles: sortCccPrdById(proposalValue.authorityRoles),
+          requirements: mapped.requirements as CccPrdRequirementV1[],
+          proofs: stampedProofs as CccPrdProofV1[],
+          tasks: mapped.tasks,
+          edges: sortCccPrdById(proposalValue.edges),
+          workflows: mapped.workflows,
+          documents: mapped.documents,
+          artifacts: mapped.artifacts,
+          importIntents: sortCccPrdById(proposalValue.importIntents),
+          protectedActions: mapped.protectedActions,
+          bounds: proposalValue.bounds,
+          admittedWriteRoots: [...proposalValue.admittedWriteRoots],
+          targetRepository: proposalValue.targetRepository,
+          nonGoals: [...proposalValue.nonGoals],
+          unresolvedDecisions: mapped.unresolvedDecisions,
+          ambiguities: mapped.ambiguities,
+          exceptions: mapped.exceptions,
+          confidence: proposalValue.confidence,
+          ...(implementationFactProvenance ? { implementationFactProvenance } : {}),
+        } satisfies CccPrdSidecarV1;
     const materialCoverage = analyzeCccPrdMaterialCoverage({
       sourceBytes: custody.sourceBytes,
       requirements: sidecarWithoutCoverage.requirements,
@@ -1057,6 +1240,9 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
     };
   } catch (error) {
     if (error instanceof CccPrdCustodyError) {
+      return createRefusalBundle({ code: error.code, message: error.message });
+    }
+    if (error instanceof CccPrdSemanticProofCustodyError) {
       return createRefusalBundle({ code: error.code, message: error.message });
     }
     return createRefusalBundle({

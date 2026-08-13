@@ -1059,12 +1059,34 @@ export function createCccCampaignManifest(
       startedAt + input.bundle.bounds.maxDurationMs,
     ).toISOString(),
     admittedWriteRoots: input.bundle.admittedWriteRoots.map((root) => ({ ...root })),
-    proofs: input.bundle.proofs.map((proof) => ({
-      ...proof,
-      requirementIds: [...proof.requirementIds],
-      negativeControls: [...proof.negativeControls],
-      spans: proof.spans.map((span) => ({ ...span })),
-    })),
+    proofs: input.bundle.proofs.map((proof) => (
+      proof.schema === "ccc-prd.proof.v2"
+        ? {
+          ...proof,
+          requirementIds: [...proof.requirementIds],
+          clauseIds: [...proof.clauseIds],
+          phases: [...proof.phases],
+          positiveCases: proof.positiveCases.map((proofCase) => ({ ...proofCase })),
+          negativeControls: proof.negativeControls.map((control) => ({ ...control })),
+          verifierClosure: proof.verifierClosure.map((entry) => ({ ...entry })),
+          candidateInputs: [...proof.candidateInputs],
+          executionToolchain: {
+            task: { ...proof.executionToolchain.task },
+            node: { ...proof.executionToolchain.node },
+            proofHost: { ...proof.executionToolchain.proofHost },
+            linkedRuntime: proof.executionToolchain.linkedRuntime.map((entry) => ({ ...entry })),
+          },
+          spans: proof.spans.map((span) => ({ ...span })),
+          ...(proof.admission ? { admission: { ...proof.admission } } : {}),
+        }
+        : {
+          ...proof,
+          requirementIds: [...proof.requirementIds],
+          negativeControls: [...proof.negativeControls],
+          spans: proof.spans.map((span) => ({ ...span })),
+          ...(proof.admission ? { admission: { ...proof.admission } } : {}),
+        }
+    )),
     protectedActions: input.bundle.protectedActions.map((action) => ({
       ...action,
       spans: action.spans.map((span) => ({ ...span })),

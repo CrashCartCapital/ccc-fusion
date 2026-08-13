@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import type {
   CccPrdProof,
+  CccPrdProofV2,
   WorkflowProofAdmissionEvaluatorInput,
   WorkflowProofAdmissionEvaluatorResult,
   WorkflowProofAdmissionExtensionContribution,
 } from "@fusion/core";
 
-const CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION = "ccc-prd.proof-admission.v1" as const;
 const WORKFLOW_EXTENSION_SCHEMA_VERSION = 1 as const;
+const CCC_PRD_PROOF_V2_SCHEMA_VERSION = "ccc-prd.proof.v2" as const;
 
 export const CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID = "fusion-native" as const;
 export const CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION = "1.0.0" as const;
@@ -109,36 +110,112 @@ function canonicalCccPrdJson(value: unknown): string {
   return serialize(value, new Set<object>());
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function sortedStrings(values: readonly string[]): string[] {
+  return [...values].sort(compareCodeUnits);
+}
+
+function sortByCanonicalValue<T>(values: readonly T[]): T[] {
+  return [...values].sort((left, right) => compareCodeUnits(
+    canonicalCccPrdJson(left),
+    canonicalCccPrdJson(right),
+  ));
+}
+
+/*
+ * The fixed proof-admission entry is loaded from custodied bytes and is
+ * deliberately self-contained: its provenance gate permits only node:crypto.
+ * Keep this projection byte-equivalent to the public core helper and pin that
+ * equivalence in the admission tests; importing @fusion/core here would make
+ * the trusted evaluator depend on ambient workspace/package resolution.
+ */
 function computeCccPrdProofDefinitionSha256(proof: CccPrdProof): string {
-  return createHash("sha256").update(canonicalCccPrdJson({
-    id: proof.id,
-    requirementIds: proof.requirementIds,
-    command: proof.command,
-    positiveOracle: proof.positiveOracle,
-    negativeControls: proof.negativeControls,
-    spans: proof.spans,
-    confidence: proof.confidence,
-  }), "utf8").digest("hex");
+  const schema = (proof as { schema?: unknown }).schema;
+  let projection: unknown;
+  if (schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION) {
+    const semanticProof = proof as CccPrdProofV2;
+    projection = {
+      schema: semanticProof.schema,
+      id: semanticProof.id,
+      requirementIds: sortedStrings(semanticProof.requirementIds),
+      clauseIds: sortedStrings(semanticProof.clauseIds),
+      phases: sortedStrings(semanticProof.phases),
+      command: semanticProof.command,
+      positiveOracle: semanticProof.positiveOracle,
+      positiveCases: sortByCanonicalValue(semanticProof.positiveCases),
+      negativeControls: sortByCanonicalValue(semanticProof.negativeControls),
+      verifierClosure: sortByCanonicalValue(semanticProof.verifierClosure),
+      candidateInputs: sortedStrings(semanticProof.candidateInputs),
+      executionToolchain: semanticProof.executionToolchain,
+      spans: sortByCanonicalValue(semanticProof.spans),
+      confidence: semanticProof.confidence,
+    };
+  } else {
+    if (schema !== undefined) {
+      throw new Error(`unsupported CCC PRD proof schema: ${String(schema)}`);
+    }
+    projection = {
+      id: proof.id,
+      requirementIds: proof.requirementIds,
+      command: proof.command,
+      positiveOracle: proof.positiveOracle,
+      negativeControls: proof.negativeControls,
+      spans: proof.spans,
+      confidence: proof.confidence,
+    };
+  }
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(projection), "utf8")
+    .digest("hex");
 }
 
 function cloneAndFreezeCccPrdProof(
   proof: Readonly<CccPrdProof>,
 ): Readonly<CccPrdProof> {
-  const sealedProof: CccPrdProof = {
-    id: proof.id,
-    requirementIds: [...proof.requirementIds],
-    command: proof.command,
-    positiveOracle: proof.positiveOracle,
-    negativeControls: [...proof.negativeControls],
-    spans: proof.spans.map((span) => Object.freeze({ ...span })),
-    confidence: proof.confidence,
-    ...(proof.admission
-      ? { admission: Object.freeze({ ...proof.admission }) }
-      : {}),
-  };
+  const sealedProof: CccPrdProof = proof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION
+    ? {
+      ...proof,
+      requirementIds: [...proof.requirementIds],
+      clauseIds: [...proof.clauseIds],
+      phases: [...proof.phases],
+      positiveCases: proof.positiveCases.map((entry) => Object.freeze({ ...entry })),
+      negativeControls: proof.negativeControls.map((entry) => Object.freeze({ ...entry })),
+      verifierClosure: proof.verifierClosure.map((entry) => Object.freeze({ ...entry })),
+      candidateInputs: [...proof.candidateInputs],
+      executionToolchain: Object.freeze({
+        task: Object.freeze({ ...proof.executionToolchain.task }),
+        node: Object.freeze({ ...proof.executionToolchain.node }),
+        proofHost: Object.freeze({ ...proof.executionToolchain.proofHost }),
+        linkedRuntime: proof.executionToolchain.linkedRuntime.map((entry) =>
+          Object.freeze({ ...entry })),
+      }),
+      spans: proof.spans.map((span) => Object.freeze({ ...span })),
+      ...(proof.admission ? { admission: Object.freeze({ ...proof.admission }) } : {}),
+    }
+    : {
+      id: proof.id,
+      requirementIds: [...proof.requirementIds],
+      command: proof.command,
+      positiveOracle: proof.positiveOracle,
+      negativeControls: [...proof.negativeControls],
+      spans: proof.spans.map((span) => Object.freeze({ ...span })),
+      confidence: proof.confidence,
+      ...(proof.admission ? { admission: Object.freeze({ ...proof.admission }) } : {}),
+    };
   Object.freeze(sealedProof.requirementIds);
   Object.freeze(sealedProof.negativeControls);
   Object.freeze(sealedProof.spans);
+  if (sealedProof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION) {
+    Object.freeze(sealedProof.clauseIds);
+    Object.freeze(sealedProof.phases);
+    Object.freeze(sealedProof.positiveCases);
+    Object.freeze(sealedProof.verifierClosure);
+    Object.freeze(sealedProof.candidateInputs);
+    Object.freeze(sealedProof.executionToolchain.linkedRuntime);
+  }
   return Object.freeze(sealedProof);
 }
 
@@ -230,9 +307,12 @@ export async function evaluateCccCampaignProofAdmission(
 
   const definitionSha256 = computeCccPrdProofDefinitionSha256(input.proof);
   const admission = input.proof.admission;
+  const expectedAdmissionSchema = input.proof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION
+    ? "ccc-prd.proof-admission.v2"
+    : "ccc-prd.proof-admission.v1";
   if (
     !admission
-    || admission.schema !== CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION
+    || admission.schema !== expectedAdmissionSchema
     || admission.pluginId !== CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID
     || admission.pluginVersion !== CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION
     || admission.extensionId !== CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID
@@ -265,6 +345,39 @@ export async function evaluateCccCampaignProofAdmission(
   }
 
   const { command, positiveOracle, negativeControls } = input.proof;
+  if (input.proof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION) {
+    if (admission.schema !== "ccc-prd.proof-admission.v2") {
+      return fail("semantic proof v2 admission schema is inconsistent");
+    }
+    if (
+      !isAdmissibleTaskVerifyDeclaration(command)
+      || !isBoundedNonblankText(positiveOracle, MAX_PROOF_ORACLE_LENGTH)
+      || input.proof.clauseIds.length === 0
+      || input.proof.phases.length === 0
+      || input.proof.positiveCases.length === 0
+      || input.proof.negativeControls.length === 0
+      || input.proof.negativeControls.length > MAX_PROOF_NEGATIVE_CONTROLS
+      || input.proof.positiveCases.some((entry) => (
+        !isBoundedNonblankText(entry.id, MAX_PROOF_REQUIREMENT_ID_LENGTH)
+        || !isBoundedNonblankText(entry.description, MAX_PROOF_ORACLE_LENGTH)
+      ))
+      || input.proof.negativeControls.some((entry) => (
+        !isBoundedNonblankText(entry.id, MAX_PROOF_REQUIREMENT_ID_LENGTH)
+        || !isBoundedNonblankText(entry.description, MAX_PROOF_NEGATIVE_CONTROL_LENGTH)
+      ))
+      || !LOWER_HEX_SHA256_PATTERN.test(admission.verifierClosureSha256)
+      || !LOWER_HEX_SHA256_PATTERN.test(admission.candidateInputsSha256)
+      || !LOWER_HEX_SHA256_PATTERN.test(admission.executionToolchainSha256)
+    ) {
+      return fail("unsupported semantic proof v2 binding declaration");
+    }
+    input.signal.throwIfAborted();
+    return Object.freeze({
+      outcome: "pass",
+      evaluatedInputSha256,
+      summary: "semantic proof v2 declaration is admissible; command not executed",
+    });
+  }
   const isSelfCheck = command === CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK.command;
   if (
     (isSelfCheck && (

@@ -14,6 +14,8 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
+  CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+  assertCccPrdSemanticProofV2Custody,
   canonicalCccPrdJson,
   createCccPrdProductExecutionPlan,
   importCccPrdBundle,
@@ -35,11 +37,13 @@ import {
   type CccPrdProductApprovalStatus,
   type CccPrdProductStatus,
   type CccPrdSemanticBundle,
+  type CccPrdSemanticProofToolchainPaths,
   type CccPrdSidecar,
   type WorkflowExtensionRegistry,
 } from "@fusion/core";
 import * as engine from "@fusion/engine";
 import { bootstrapCccCampaignProofAdmissionHost } from "./ccc-native-proof-host.js";
+import { resolveCccPrdSemanticProofToolchainPaths } from "./ccc-semantic-proof-toolchain.js";
 import {
   closeProjectStore,
   resolveProject,
@@ -77,6 +81,8 @@ type Compiler = {
     constraints?: CccPrdAuthoringConstraints;
     previousSidecar?: CccPrdSidecar;
     workflowExtensionRegistry?: WorkflowExtensionRegistry;
+    semanticProofContract?: "v1" | "v2";
+    semanticProofToolchainPaths?: CccPrdSemanticProofToolchainPaths;
   }): Promise<{ kind: "candidate"; sidecar: unknown; review: unknown } | { kind: "refusal" }>;
   createNativeCccPrdAuthoringAdapter(input: {
     provider: string;
@@ -132,6 +138,7 @@ type Compiler = {
 const compiler = engine as typeof engine & Compiler;
 export type VerifierConfinementReadiness = engine.VerifierConfinementReadiness;
 export type PrdCommandDependencies = {
+  authorCccPrdPacket?: typeof engine.authorCccPrdPacket;
   bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
   buildCccPrdCorpusManifest?: typeof engine.buildCccPrdCorpusManifest;
   createNativeCccPrdAuthoringAdapter?: typeof engine.createNativeCccPrdAuthoringAdapter;
@@ -149,6 +156,8 @@ export type PrdCommandDependencies = {
   settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
   understandCccPrdPacket?: typeof engine.understandCccPrdPacket;
   resolveCustomProviderModelLimits?: typeof engine.resolveCustomProviderModelLimits;
+  resolveSemanticProofToolchainPaths?: () => CccPrdSemanticProofToolchainPaths;
+  assertSemanticProofV2Custody?: typeof assertCccPrdSemanticProofV2Custody;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
   approveCccCampaignLiveExecution?: typeof engine.approveCccCampaignLiveExecution;
@@ -306,7 +315,10 @@ function resolveAuthorOutput(
       !existing
       || typeof existing !== "object"
       || Array.isArray(existing)
-      || (existing as { schema?: unknown }).schema !== CCC_PRD_SIDECAR_SCHEMA_VERSION
+      || (
+        (existing as { schema?: unknown }).schema !== CCC_PRD_SIDECAR_SCHEMA_VERSION
+        && (existing as { schema?: unknown }).schema !== CCC_PRD_SIDECAR_V2_SCHEMA_VERSION
+      )
     ) {
       throw new Error(`CCC_PRD_SIDECAR_TARGET_OCCUPIED: existing output is not a versioned sidecar: ${outputPath}`);
     }
@@ -925,6 +937,12 @@ async function runProductPolicyCommand(
       io.write(JSON.stringify(compiled));
       return 1;
     }
+    if (compiled.schema !== "ccc-prd.bundle.v2") {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+        "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+      );
+    }
     const plan = input.routeSelection === "routes-file"
       ? createCccPrdProductExecutionPlan({
         bundle: compiled,
@@ -964,7 +982,7 @@ async function runProductPolicyCommand(
 async function runGeneratedAuthor(
   input: GeneratedAuthorArgs,
   io: PrdCommandIo,
-  bootstrapProofAdmission: () => Promise<WorkflowExtensionRegistry>,
+  dependencies: PrdCommandDependencies,
 ): Promise<number> {
   let outputPath: string;
   let previousSidecar: CccPrdSidecar | undefined;
@@ -989,9 +1007,31 @@ async function runGeneratedAuthor(
     return 1;
   }
 
+  let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths;
+  try {
+    semanticProofToolchainPaths = (
+      dependencies.resolveSemanticProofToolchainPaths
+      ?? resolveCccPrdSemanticProofToolchainPaths
+    )();
+  } catch (error) {
+    io.write(JSON.stringify({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+        message: error instanceof Error
+          ? error.message
+          : "semantic-proof toolchain identity could not be resolved",
+      }],
+    }));
+    return 1;
+  }
+
   let adapter: ReturnType<Compiler["createNativeCccPrdAuthoringAdapter"]>;
   try {
-    adapter = compiler.createNativeCccPrdAuthoringAdapter({
+    adapter = (
+      dependencies.createNativeCccPrdAuthoringAdapter
+      ?? compiler.createNativeCccPrdAuthoringAdapter
+    )({
       provider: input.provider,
       model: input.model,
       maxDurationMs: input.maxDurationMs,
@@ -1011,7 +1051,9 @@ async function runGeneratedAuthor(
 
   let workflowExtensionRegistry: WorkflowExtensionRegistry;
   try {
-    workflowExtensionRegistry = await bootstrapProofAdmission();
+    workflowExtensionRegistry = await (
+      dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost
+    )();
   } catch (error) {
     io.write(JSON.stringify({
       kind: "refusal",
@@ -1025,13 +1067,17 @@ async function runGeneratedAuthor(
     return 1;
   }
 
-  const result = await compiler.authorCccPrdPacket({
+  const result = await (
+    dependencies.authorCccPrdPacket ?? compiler.authorCccPrdPacket
+  )({
     rootDir: input.rootDir,
     manifestPath: input.manifestPath,
     adapter,
     constraints: input.constraints,
     ...(previousSidecar ? { previousSidecar } : {}),
     workflowExtensionRegistry,
+    semanticProofContract: "v2",
+    semanticProofToolchainPaths,
   });
   if (result.kind === "refusal") {
     io.write(JSON.stringify(result));
@@ -1835,6 +1881,7 @@ async function runProductPacketCommand(
 
   let bundle: CccPrdSemanticBundle;
   let executionPolicy: CccCampaignProductExecutionPolicy;
+  let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths | undefined;
   try {
     const compiled = compileProductBundle({
       rootDir,
@@ -1848,8 +1895,20 @@ async function runProductPacketCommand(
       return 1;
     }
     bundle = compiled;
+    if (preview && bundle.schema !== "ccc-prd.bundle.v2") {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+        "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+      );
+    }
     executionPolicy = readProductExecutionPolicy(rootDir, executionPlanPath, bundle);
     if (preview) assertProductRequestBudgetFloor(bundle, executionPolicy);
+    if (bundle.schema === "ccc-prd.bundle.v2") {
+      semanticProofToolchainPaths = (
+        dependencies.resolveSemanticProofToolchainPaths
+        ?? resolveCccPrdSemanticProofToolchainPaths
+      )();
+    }
   } catch (error) {
     const detail = error as { code?: unknown; message?: unknown };
     return writeProductRefusal(
@@ -1892,6 +1951,40 @@ async function runProductPacketCommand(
         "CCC_PRD_TARGET_HEAD_DRIFT",
         `target HEAD ${targetHead} does not match frozen base ${bundle.targetRepository.baseCommit}`,
       );
+    }
+    if (bundle.schema === "ccc-prd.bundle.v2") {
+      await (
+        dependencies.assertSemanticProofV2Custody
+        ?? assertCccPrdSemanticProofV2Custody
+      )({
+        repositoryRoot: project.projectPath,
+        baseCommit: bundle.targetRepository.baseCommit,
+        proofs: bundle.proofs,
+        modelWriteRoots: executionPolicy.routes.flatMap((route) => [
+          ...(route.ownedPaths ?? []),
+          ...(route.allowedWriteRoots ?? []),
+        ]),
+        toolchainPaths: semanticProofToolchainPaths!,
+      });
+    } else {
+      const inspected = await (
+        dependencies.inspectCccPrdImport ?? inspectCccPrdImport
+      )({
+        idempotencyKey: idempotencyKey!,
+        layer,
+        rootDir: project.projectPath,
+      });
+      if (
+        !inspected
+        || inspected.bundleHash !== bundle.bundleHash
+        || resolve(inspected.targetRepository) !== resolve(project.projectPath)
+        || inspected.targetBase !== bundle.targetRepository.baseCommit
+      ) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+          "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+        );
+      }
     }
     const identity = productPreviewIdentity({
       projectId: project.projectId,
@@ -1937,6 +2030,7 @@ async function runProductPacketCommand(
       store: project.store,
       layer,
       rootDir: project.projectPath,
+      ...(semanticProofToolchainPaths ? { semanticProofToolchainPaths } : {}),
     });
     writeOperatorValue(io, commandContext, {
       kind: "imported",
@@ -2705,6 +2799,15 @@ function exactProofResolutionContext(
   }
   const attempt = matches[0]!;
   if (
+    "attemptContractVersion" in attempt
+    && attempt.attemptContractVersion === "v2"
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_V2_REFUSED",
+      `semantic proof v2 attempt ${attemptKey} can only be settled by the trusted verifier controller; manual result fabrication is disabled`,
+    );
+  }
+  if (
     attempt.importId !== status.import.importId
     || attempt.packetHash !== status.import.packetHash
     || attempt.sidecarHash !== status.import.sidecarHash
@@ -3429,7 +3532,7 @@ export async function runPrdCommand(
     return runGeneratedAuthor(
       generatedAuthor,
       io,
-      dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost,
+      dependencies,
     );
   }
 
@@ -3464,14 +3567,42 @@ export async function runPrdCommand(
       }));
       return 1;
     }
-    const result = await compiler.authorCccPrdPacket({
+    let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths | undefined;
+    if (proposal.schema === "ccc-prd.authoring-proposal.v2") {
+      try {
+        semanticProofToolchainPaths = (
+          dependencies.resolveSemanticProofToolchainPaths
+          ?? resolveCccPrdSemanticProofToolchainPaths
+        )();
+      } catch (error) {
+        io.write(JSON.stringify({
+          kind: "refusal",
+          diagnostics: [{
+            code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+            message: error instanceof Error
+              ? error.message
+              : "semantic-proof toolchain identity could not be resolved",
+          }],
+        }));
+        return 1;
+      }
+    }
+    const result = await (dependencies.authorCccPrdPacket ?? compiler.authorCccPrdPacket)({
       rootDir,
       manifestPath,
       adapter: {
         id: "local-deterministic-fixture",
-        model: "proposal-file-v1",
+        model: proposal.schema === "ccc-prd.authoring-proposal.v2"
+          ? "proposal-file-v2"
+          : "proposal-file-v1",
         generateCandidate: async () => proposal,
       },
+      ...(proposal.schema === "ccc-prd.authoring-proposal.v2"
+        ? {
+          semanticProofContract: "v2" as const,
+          semanticProofToolchainPaths: semanticProofToolchainPaths!,
+        }
+        : {}),
       constraints: {
         targetRepository: proposal.targetRepository,
         bounds: proposal.bounds,

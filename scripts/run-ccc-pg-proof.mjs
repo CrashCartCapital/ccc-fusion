@@ -257,6 +257,17 @@ const expectedWave5CliNames = [
   "prd command exit contract > claims exact merge approval, lands, and settles only its parked imported work item",
   "prd command exit contract > keeps live-execution approval issued and work parked when verifier confinement is unavailable",
   "prd command exit contract > claims exact live-execution approval and requeues only its parked imported work item",
+  "prd command exit contract > RED-S4-executable-author: generated author explicitly requests semantic v2 with controller toolchain custody",
+  "prd command exit contract > refuses generated executable authoring before model setup when controller toolchain custody is unavailable",
+  "prd command exit contract > RED-S4-product-preview-v1: refuses a fresh legacy semantic packet before toolchain or project access",
+  "prd command exit contract > RED-S5-product-preview-fabricated-custody: refuses changed controller executable bytes before the executable can run",
+  "prd command exit contract > RED-S4-exact-legacy-replay: reaches core replay without resolving semantic-v2 toolchain custody",
+  "prd command exit contract > shows one sealed execution-authorization confirmation while retaining child diagnostics",
+  "prd command exit contract > emits no live execution confirmation after the sealed authorization settles",
+  "prd command exit contract > emits no child execution confirmations when sealed parent custody is missing",
+  "prd command exit contract > RED-S5-RESOLVE-V2: refuses manual fabrication for semantic proof v2 attempts",
+  "prd command exit contract > claims one sealed execution authorization by parent ID and requeues the parked campaign",
+  "prd command exit contract > refuses a diagnostic child approval ID when a sealed parent authorization exists",
 ];
 const expectedWave5CoreContractNames = [
   "ccc-prd public schema > normalizes each protected action to a specific operator decision",
@@ -328,6 +339,10 @@ const expectedWave5CoreImportNames = [
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a symlink escape through the owned .fusion/ccc-prd-import-staging root without external writes",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a dangling symlink at an existing canonical artifact path",
   "CCC PRD import-owned PostgreSQL/filesystem unit of work > refuses a byte-identical symlink at an existing canonical task directory",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > RED-S4-fresh-product-v1: refuses a fresh legacy semantic bundle before any import mutation",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > RED-S4-stale-v1-replay: a vanished replay row cannot become a fresh import after preflight",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > RED-S1-import: refuses fresh product v2 imports below the provider-task request floor before mutation",
+  "CCC PRD import-owned PostgreSQL/filesystem unit of work > RED-S1-import: replays exact legacy product v2 rows even when persisted below the provider-task request floor",
 ];
 const expectedWave5CoreMigrationNames = [
   "CCC PRD import migration registry > keeps migration 0035 immutable and registers every custody table",
@@ -363,6 +378,9 @@ const expectedWave5EngineContractNames = [
   "ccc-prd structural sidecar > refuses manifest, sidecar, and symlinked-ancestor escapes before reads",
   "ccc-prd structural sidecar > does not infer actions, deferred state, or loops from prose",
   "ccc-prd structural sidecar > validates with diagnostics only and never returns a bundle",
+  "ccc-prd structural sidecar > RED-S5-v2-proposal-toolchain-shape: refuses proof executionToolchain without linkedRuntime",
+  "ccc-prd structural sidecar > RED-S5-review-only-v2: does not stamp model-fabricated Git and toolchain identities as executable admission",
+  "ccc-prd structural sidecar > refuses a proof command that appears outside the proof's cited source span",
 ];
 const expectedWave5EngineImportNames = [
   "CCC PRD imported workflow execution > claims the imported runnable item through the fenced full-graph processor",
@@ -446,6 +464,10 @@ const expectedWave6CampaignPgNames = [
   "CCC campaign provider controller (PostgreSQL) > refuses a task without imported campaign custody instead of treating it as ordinary",
   "CCC campaign provider controller (PostgreSQL) > refuses missing, ambiguous, and wrong-kind live-execution declarations before provider-attempt writes",
   "CCC campaign provider controller (PostgreSQL) > refuses missing, foreign, or duplicate task protected-action IDs before provider-attempt writes",
+  "CCC campaign provider controller (PostgreSQL) > permits a follow-on turn in the same fenced visit after the first committed turn consumed the approval",
+  "CCC campaign provider controller (PostgreSQL) > refuses a consumed-approval reservation with no committed attempt in the same work-item fence",
+  "CCC campaign provider controller (PostgreSQL) > refuses a follow-on consumed reservation under a different work-item fence attempt",
+  "CCC campaign provider controller (PostgreSQL) > refuses a follow-on consumed reservation outside the approval dispatch window",
 ];
 // Wave 5 and Wave 6 execute the same importer test file. One shared closed
 // inventory prevents either proof wrapper from silently drifting behind it.
@@ -546,6 +568,7 @@ const expectedWave6EngineDefaultNames = [
   "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: stale owner or attempt cannot publish campaign success",
   "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: campaign summary is written only after terminal CAS using a freshly reloaded task",
   "processDueWorkflowWorkItem symbol lock renewal > Task 3 RED: durable cancellation after runtime success is reported truthfully",
+  "CCC campaign provider controller > tags campaign-global request exhaustion so Pi can restore permanent refusal custody",
 ];
 const expectedWave6CampaignExecProofGitNames = [
   "CCC campaign local Git observation > returns a frozen physical snapshot for a clean descendant checkout",
@@ -661,6 +684,8 @@ const expectedWave6CampaignExecProofGitNames = [
   "CCC campaign proof workflow admission > blocks a passing evaluator when its native audit receipt cannot persist",
   "CCC campaign proof workflow admission > audits and refuses the native binding self-check before any task execution can follow",
   "CCC campaign proof workflow admission > does not require proofs for orchestration-only nodes",
+  "CCC native campaign proof admission > keeps the self-contained evaluator byte-identical to core's semantic-v2 definition hash",
+  "CCC campaign proof workflow admission > RED-S5-phase-admission: admits only the exact proof set declared for each semantic-v2 phase",
 ];
 const expectedWave6RealAcceptanceNames = [
   "Task 5 native CCC campaign Git landing > branches from merger-ai before legacy landing and binds the structured campaign marker",
@@ -706,6 +731,7 @@ const expectedWave6RealAcceptanceNames = [
   "CCC campaign deterministic Git object primitives > refuses a target branch checked out by more than one sibling worktree",
   "Task 6 local CCC campaign acceptance (real PostgreSQL) > runs legacy v1 mixed-provider work but fails closed before Git landing without executed proof receipts",
   "Task 6 local CCC campaign acceptance (real PostgreSQL) > durably cancels an admitted scoped-provider branch through the real graph signal and never redispatches it after restart",
+  "Task 6 local CCC campaign acceptance (real PostgreSQL) > parks exact campaign-global request exhaustion before another provider dispatch",
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 5 RED: mixed due queue preserves ordinary dispatch and claims campaign work only through the fenced processor",
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > product v2 RED: the in-process campaign runtime prepares coding nodes before provider dispatch",
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > product v2 RED: a restarted claim parks mutated imported IR before any graph or provider effect",
@@ -718,6 +744,14 @@ const expectedWave6RealAcceptanceNames = [
   "Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime > Task 6 P1 RED: refuses a cross-wired same-task settlement before consuming its approval",
   "Task 6 real PostgreSQL: a user cancellation wins before a first-run CCC terminal result can publish work > keeps Todo/userPaused and no workflow task work across a fresh store restart",
 ];
+const expectedWave6RealRuntimeBootstrapNames = expectedWave6RealAcceptanceNames.filter((name) =>
+  name.startsWith("Task 5 RED: bootstraps one fixed proof host and one authoritative campaign runtime >")
+  || name.startsWith("Task 6 real PostgreSQL: a user cancellation wins before a first-run CCC terminal result can publish work >"));
+const expectedWave6RealGitIntegrationNames = expectedWave6RealAcceptanceNames.filter((name) =>
+  name.startsWith("Task 5 native CCC campaign Git landing")
+  || name.startsWith("CCC campaign deterministic Git object primitives >"));
+const expectedWave6RealLocalAcceptanceNames = expectedWave6RealAcceptanceNames.filter((name) =>
+  name.startsWith("Task 6 local CCC campaign acceptance (real PostgreSQL) >"));
 const expectedWave6ProtectedActionCanonicalNames = [
   "ccc-prd protected-action canonical ordering > authors duplicate-free, canonically sorted task protected-action IDs from an unsorted proposal",
   "ccc-prd protected-action canonical ordering > refuses a hand-edited sidecar whose task protected-action IDs are not canonically sorted",
@@ -725,6 +759,76 @@ const expectedWave6ProtectedActionCanonicalNames = [
   "ccc-prd protected-action canonical ordering > accepts a sidecar whose task protected-action IDs are already canonical",
   "ccc-prd protected-action canonical ordering > refuses a hand-edited sidecar whose task protected-action ID is not trimmed, even as an already-canonical single-entry list",
   "ccc-prd protected-action canonical ordering > refuses authoring a proposal whose task protected-action ID is not trimmed, even as an already-canonical single-entry list",
+];
+
+/*
+FNXC:CccWave6SemanticProofAndAuthorization 2026-08-13-00:00:
+Semantic-v2 proof persistence, its schema upgrade, the one-parent execution
+authorization, proof-bound merge, and public crash-recovery paths are part of
+the production campaign boundary. Keep them in closed named inventories so a
+green Wave 6 report cannot silently omit, skip, or rename one of these gates.
+*/
+const expectedWave6SemanticPersistenceNames = [
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-DEADLINE-RESERVE: refuses v2 reservation after the database campaign deadline with zero attempt rows",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-DEADLINE-REPLAY: returns an exact existing v2 reservation after the deadline without creating another row",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-DEADLINE-BEGIN: refuses v2 begin after the database campaign deadline and leaves the reservation byte-for-byte unadvanced",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-DEADLINE-SETTLE: permits exact v2 settlement after the database campaign deadline once dispatch is durable",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-DEADLINE-LEGACY: preserves v1 reservation and dispatch replay after its original campaign deadline",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-LEGACY: omitted contract version preserves the v1 key and result contract",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-PHASE-IDENTITY: v2 hashes phase and the exact work-item fence while same-phase replay is stable",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-CONSTRAINTS: PostgreSQL rejects version, phase, lifecycle, and same-phase identity drift",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > RED-S5-TERMINAL-REPLAY: timeout, no output, malformed output, and verified failure replay exactly",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > persists reserved -> dispatched_unknown -> terminal proof separately from definition admission",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > commits a passing receipt and refuses settlement with the wrong controller",
+  "CCC campaign proof-attempt receipts (PostgreSQL) > reserves every campaign proof on the final integration task even when task-local proof ids differ",
+  "CCC campaign semantic-proof v2 migration registry > RED-S5-PARITY: registers 0040 as the explicit schema ceiling",
+  "CCC campaign semantic-proof v2 migration 0039 to 0040 > RED-S5-PARITY: preserves a terminal v1 row and matches the fresh constrained schema",
+  "CCC campaign execution-authorization migration registry > Slice 2 RED: registers migration 0039 and both aggregate custody tables",
+  "CCC campaign execution-authorization migration 0038 to 0039 > Slice 2 RED: upgrades once with fresh parity, exact FKs, forced RLS, policy, trigger, and grants",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S2-persistence: either task issues one parent and one claim atomically unlocks every exact child",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S2-child-bypass: a sealed child cannot be claimed or denied outside its parent transition",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S2-ledger-custody: parent issuance refuses a request counter with no exact reservation history",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S2-unresolved-custody: parent issuance refuses an unresolved reservation even when its counter is consistent",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S2-unknown-dispatch-custody: parent issuance refuses an unresolved dispatched effect",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S2-rollback: an intermediate child-claim fault rolls back the parent, children, and every lease",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-concurrency: distinct parent claim tokens race to one coherent winner",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-lock-order: issue replay holding the import cannot deadlock a concurrent parent claim",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-attempt-fence: a changed work-item attempt does not invalidate the immutable parent",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-member-drift: persisted member drift refuses claim before any child or lease mutation",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-claim-cas: changed request count refuses the first parent claim without mutating any child",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S2-restart: claimed issue replay survives an advanced request counter and a restarted authority store",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-no-effect: terminal cancellation closes every unopened child and settles the parent without inventing an effect",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-upstream-failure: one consumed child plus one unopened downstream child settles as partial no-effect",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-deadline: restart-safe closure uses the database deadline when work is otherwise nonterminal",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-race: provider settlement and no-effect closure converge on one terminal outcome per child",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-opened: any durable reservation prevents an authorized child from being misclassified as unopened",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-opened-lifecycles: every actual reserved or terminal provider-attempt lifecycle remains opened",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-unknown-effect: an unresolved effect receipt rolls back every proposed no-effect closure",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-manual-custody: a generic manual hold cannot close claimed children as proven no-effect",
+  "CCC sealed execution authorization (PostgreSQL) > RED-S3-terminal-reason: a terminal state without a durable reason cannot prove no-effect closure",
+];
+const expectedWave6ExecutionAndMergeNames = [
+  "CCC campaign live-execution approval > issues one immutable, idempotent, redacted approval without execution side effects",
+  "CCC campaign live-execution approval > issues one sealed parent from either task and one claim atomically unlocks both exact children",
+  "CCC campaign live-execution approval > requires an exact claimed live-execution lease without exposing or performing the effect",
+  "CCC campaign live-execution approval > parks the authoritative coding runner before provider dispatch until exact live approval is claimed",
+  "CCC campaign live-execution approval > refuses missing and non-live declared actions",
+  "CCC campaign live-execution approval > refuses the wrong protected-action kind as live execution",
+  "CCC campaign live-execution approval > refuses a wrong parent identifier and a stale digest before any claim",
+  "CCC campaign live-execution approval > claims only the exact live-execution lease and returns no hidden claim material",
+  "CCC campaign product merge approval > RED-S5-MERGE-PHASE: task-phase proof cannot issue merge approval",
+  "CCC campaign product merge approval > RED-S5-MERGE-BINDING: final proof binds approval to exact commit, tree, and receipt digest",
+  "CCC campaign product merge approval > RED-S5-MERGE-DRIFT: source drift after issuance refuses before approval claim",
+  "CCC campaign product merge approval > RED-S5-MERGE-PREMUTATION: claimed approval refuses receipt drift before Git mutation",
+  "CCC campaign product merge approval > RED-S5-MERGE-LANDING: lands and replays only the approval-bound final receipt custody",
+  "CCC campaign product merge approval > issues one exact redacted human merge approval and leaves the target ref unchanged",
+  "CCC campaign product merge approval > parks the product graph at an issued approval without invoking the merge requester",
+  "CCC campaign product merge approval > rejects a stale or mistyped human confirmation before claiming authority or touching Git",
+];
+const expectedWave6CliRecoveryNames = [
+  "CCC PRD normal CLI recovery path (PostgreSQL) > previews and settles one uncertain proof from strict external evidence, then requeues only its exact work item",
+  "CCC PRD normal CLI recovery path (PostgreSQL) > previews and settles one uncertain PI provider attempt as proved-failed durably, then requeues only its exact work item",
+  "CCC PRD normal CLI recovery path (PostgreSQL) > refuses generic settlement for an uncertain CLI provider attempt and preserves its fence-owned state",
 ];
 
 function assertionName(assertion) {
@@ -947,6 +1051,26 @@ function selfTestSupervisorMarkerPolicy() {
 }
 selfTestSupervisorMarkerPolicy();
 
+/*
+FNXC:CccWave6PerCommandTimeout 2026-08-13-07:15:
+The expanded real-PostgreSQL/real-Git integration inventory legitimately runs
+past the ordinary Wave 6 child ceiling. Prove that only that exact shard gets
+the larger bounded budget and that an explicitly larger global budget is never
+silently reduced.
+*/
+function selfTestPerCommandTimeoutPolicy() {
+  assert.equal(resolveCommandTimeoutMs(6, "campaign-real-pg-runtime-bootstrap", 240_000), 240_000);
+  assert.equal(resolveCommandTimeoutMs(6, "campaign-real-pg-git-integration", 240_000), 600_000);
+  assert.equal(resolveCommandTimeoutMs(5, "campaign-real-pg-git-integration", 120_000), 120_000);
+  assert.equal(resolveCommandTimeoutMs(6, "campaign-real-pg-git-integration", 900_000), 900_000);
+  assert.equal(sumCommandTimeoutMs([
+    { timeoutMs: 240_000 },
+    { timeoutMs: 600_000 },
+    { timeoutMs: 240_000 },
+  ]), 1_080_000);
+}
+selfTestPerCommandTimeoutPolicy();
+
 if (runnerPolicySelfTest) {
   await selfTestStopSettlementPolicy();
   console.log("CCC proof-runner policy self-tests passed");
@@ -1080,10 +1204,24 @@ const wave6Commands = [
     machineResults: true,
   },
   {
-    id: "campaign-real-pg-git-acceptance",
-    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts", "src/__tests__/ccc-campaign-git-integration.real-pg.test.ts", "src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    id: "campaign-real-pg-runtime-bootstrap",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-runtime-bootstrap.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
     vitestArgs: ["--reporter=json"],
-    expectedNames: expectedWave6RealAcceptanceNames,
+    expectedNames: expectedWave6RealRuntimeBootstrapNames,
+    machineResults: true,
+  },
+  {
+    id: "campaign-real-pg-git-integration",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-git-integration.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6RealGitIntegrationNames,
+    machineResults: true,
+  },
+  {
+    id: "campaign-real-pg-local-acceptance",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-local-acceptance.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6RealLocalAcceptanceNames,
     machineResults: true,
   },
   /*
@@ -1101,9 +1239,41 @@ const wave6Commands = [
     expectedNames: expectedWave6ProtectedActionCanonicalNames,
     machineResults: true,
   },
+  {
+    id: "ccc-semantic-proof-authorization-persistence",
+    command: ["pnpm", "--filter", "@fusion/core", "exec", "vitest", "run", "src/__tests__/postgres/ccc-campaign-proof-attempt.pg.test.ts", "src/__tests__/postgres/ccc-campaign-semantic-proof-v2-migration.pg.test.ts", "src/__tests__/postgres/ccc-campaign-execution-authorization-migration.pg.test.ts", "src/__tests__/postgres/ccc-campaign-execution-authorization.pg.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6SemanticPersistenceNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-parent-authorization-proof-bound-merge",
+    command: ["pnpm", "--filter", "@fusion/engine", "exec", "vitest", "run", "src/__tests__/ccc-campaign-live-execution-approval.real-pg.test.ts", "src/__tests__/ccc-campaign-merge-approval.real-pg.test.ts", "--project=engine-default", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6ExecutionAndMergeNames,
+    machineResults: true,
+  },
+  {
+    id: "ccc-cli-recovery-real-pg",
+    command: ["pnpm", "--filter", "@runfusion/fusion", "exec", "vitest", "run", "src/commands/__tests__/prd-recovery.real-pg.test.ts", "--silent=passed-only", "--reporter=dot"],
+    vitestArgs: ["--reporter=json"],
+    expectedNames: expectedWave6CliRecoveryNames,
+    machineResults: true,
+  },
 ];
-const commands = selectedWave === 6 ? wave6Commands : selectedWave === 5 ? wave5Commands : wave4Commands;
-for (const command of commands) assertMachineResultInventory(command);
+const selectedCommands = selectedWave === 6 ? wave6Commands : selectedWave === 5 ? wave5Commands : wave4Commands;
+for (const command of selectedCommands) assertMachineResultInventory(command);
+
+function resolveCommandTimeoutMs(wave, commandId, fallbackMs) {
+  const minimumMs = wave === 6 && commandId === "campaign-real-pg-git-integration"
+    ? 600_000
+    : fallbackMs;
+  return Math.max(fallbackMs, minimumMs);
+}
+
+function sumCommandTimeoutMs(commands) {
+  return commands.reduce((total, command) => total + command.timeoutMs, 0);
+}
 
 function positiveBudget(name, fallback) {
   const value = process.env[name] === undefined ? fallback : Number(process.env[name]);
@@ -1114,11 +1284,11 @@ function positiveBudget(name, fallback) {
 /*
 FNXC:CccWave6ChildTimeout 2026-07-27-00:00:
 Wave 6's real-PostgreSQL/real-Git acceptance group boots an embedded
-PostgreSQL cold inside the child alongside real Git object work; the Wave 4/5
-120s default has headroom on this box (group 5 alone measured well under a
-minute against the disposable proof service) but embedded-PG cold boot under
-contention can run slower, so the W6 default is raised to 240s. This does not
-loosen the Wave 4/5 defaults or budgets.
+PostgreSQL cold inside the child alongside real Git object work. The expanded
+semantic-v2 Git integration inventory now drives that exact shard past 240s
+under a cold disposable proof database, so only that command gets a 600s
+minimum. Ordinary Wave 6 commands retain the 240s fail-fast budget, and Wave
+4/5 retain 120s.
 */
 const budgetPrefix = selectedWave === 6 ? "CCC_W6" : selectedWave === 5 ? "CCC_W5" : "CCC_W4";
 const childTimeoutMsDefault = selectedWave === 6 ? 240_000 : 120_000;
@@ -1127,6 +1297,10 @@ const childTerminateGraceMs = positiveBudget(`${budgetPrefix}_CHILD_TERMINATE_GR
 const postgresStopBudgetMs = positiveBudget(`${budgetPrefix}_PG_STOP_TIMEOUT_MS`, 10_000);
 const parentShutdownMarginMs = positiveBudget(`${budgetPrefix}_PARENT_SHUTDOWN_MARGIN_MS`, 3_000);
 const proofDatabase = `ccc_wave${selectedWave}_proof`;
+const commands = selectedCommands.map((command) => ({
+  ...command,
+  timeoutMs: resolveCommandTimeoutMs(selectedWave, command.id, childTimeoutMs),
+}));
 
 const supervisor = `
   import { EmbeddedPostgresLifecycle } from ${JSON.stringify(join(repoRoot, "packages/core/src/postgres/embedded-lifecycle.ts"))};
@@ -1145,12 +1319,11 @@ const supervisor = `
   });
   const commands = JSON.parse(process.env.CCC_PROOF_COMMANDS);
   const results = [];
-  const timeoutMs = Number(process.env.CCC_PROOF_CHILD_TIMEOUT_MS ?? 120000);
   const terminateGraceMs = Number(process.env.CCC_PROOF_CHILD_TERMINATE_GRACE_MS ?? 2000);
   const stopTimeoutMs = Number(process.env.CCC_PROOF_PG_STOP_TIMEOUT_MS ?? 10000);
   let activeTerminate = null;
   let interrupted = null;
-  const run = (cmd, args, env) => new Promise((resolve, reject) => {
+  const run = (cmd, args, env, timeoutMs) => new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd: process.env.CCC_PROOF_REPO_ROOT, env, stdio: ["ignore", "ignore", "ignore"] });
     let settled = false;
     let timedOut = false;
@@ -1188,8 +1361,8 @@ const supervisor = `
       const args = entry.machineResults
         ? [...entry.command.slice(1), ...entry.vitestArgs, "--outputFile", outputFile]
         : entry.command.slice(1);
-      const outcome = await run(entry.command[0], args, { ...process.env, FUSION_PG_TEST_URL_BASE: url.href.slice(0, -1) });
-      results.push({ id: entry.id, command: entry.command, ...outcome, outputFile });
+      const outcome = await run(entry.command[0], args, { ...process.env, FUSION_PG_TEST_URL_BASE: url.href.slice(0, -1) }, entry.timeoutMs);
+      results.push({ id: entry.id, command: entry.command, timeoutMs: entry.timeoutMs, ...outcome, outputFile });
       if (interrupted || outcome.code !== 0) break;
     }
   } finally {
@@ -1272,7 +1445,10 @@ child.stderr.on("data", (chunk) => { stderr += String(chunk); });
 let forwardedSignal = null;
 let parentForceKillTimer = null;
 const parentSignalBoundMs = childTerminateGraceMs + postgresStopBudgetMs + parentShutdownMarginMs;
-const parentNormalBoundMs = commands.length * childTimeoutMs + childTerminateGraceMs + postgresStopBudgetMs + parentShutdownMarginMs;
+const parentNormalBoundMs = sumCommandTimeoutMs(commands)
+  + childTerminateGraceMs
+  + postgresStopBudgetMs
+  + parentShutdownMarginMs;
 let parentNormalTimeout = null;
 const forwardSignal = (signal) => {
   forwardedSignal ??= signal;

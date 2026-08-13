@@ -25,6 +25,12 @@ import {
   type TaskStore,
 } from "@fusion/core";
 import { matchesCccCampaignMergeControl } from "./ccc-campaign-merge-control.js";
+import {
+  deriveCccCampaignFinalProofCustodyForCurrentSource,
+  encodeCccCampaignMergeProofRunId,
+  parseCccCampaignMergeProofRunId,
+  type CccCampaignFinalProofCustody,
+} from "./ccc-campaign-git-landing.js";
 import { PermanentError } from "./engine-errors.js";
 import { runAiMerge } from "./merger-ai.js";
 
@@ -170,13 +176,30 @@ export async function issueCccCampaignMergeApproval(
     );
   }
   const context = await exactCampaignContext(input.store, input.taskId);
+  let finalProofCustody: CccCampaignFinalProofCustody | null;
+  try {
+    finalProofCustody = await deriveCccCampaignFinalProofCustodyForCurrentSource(
+      input.store,
+      context,
+      input.rootDir,
+    );
+  } catch (error) {
+    throw new PermanentError(
+      "CCC campaign merge approval requires an exact passing final_integrated proof receipt set",
+      "CCC_CAMPAIGN_MERGE_PROOF_CUSTODY_REFUSED",
+      undefined,
+      error instanceof Error ? error : undefined,
+    );
+  }
   return issuePersistedCccCampaignApproval(layer, {
     authorityStore: input.store,
     rootDir: input.rootDir,
     taskId: input.taskId,
     action: exactMergeAction(context),
     requester: MERGE_APPROVAL_REQUESTER,
-    runId: input.runId,
+    runId: finalProofCustody
+      ? encodeCccCampaignMergeProofRunId(finalProofCustody)
+      : input.runId,
     notBeforeAt: context.campaignStartedAt,
     expiresAt: context.campaignDeadlineAt,
   });
@@ -194,8 +217,20 @@ export function computeCccCampaignMergeApprovalConfirmation(
   if (!approval.campaign) {
     throw new TypeError("CCC campaign merge approval confirmation requires campaign custody");
   }
-  return createHash("sha256")
-    .update(canonicalCccPrdJson({
+  const finalProofCustody = parseCccCampaignMergeProofRunId(approval.runId);
+  const confirmation = finalProofCustody
+    ? {
+      schema: "ccc-campaign.merge-approval-confirmation.v2",
+      approvalRequestId: approval.id,
+      taskId: approval.taskId ?? null,
+      runId: approval.runId ?? null,
+      targetAction: approval.targetAction,
+      binding: approval.campaign.binding,
+      finalProofCustody,
+      notBeforeAt: approval.campaign.notBeforeAt,
+      expiresAt: approval.campaign.expiresAt,
+    }
+    : {
       schema: "ccc-campaign.merge-approval-confirmation.v1",
       approvalRequestId: approval.id,
       taskId: approval.taskId ?? null,
@@ -204,7 +239,9 @@ export function computeCccCampaignMergeApprovalConfirmation(
       binding: approval.campaign.binding,
       notBeforeAt: approval.campaign.notBeforeAt,
       expiresAt: approval.campaign.expiresAt,
-    }), "utf8")
+    };
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(confirmation), "utf8")
     .digest("hex");
 }
 
@@ -216,6 +253,39 @@ function exactConfirmation(provided: string, expected: string): boolean {
     Buffer.from(provided, "hex"),
     Buffer.from(expected, "hex"),
   );
+}
+
+async function assertCurrentSemanticMergeProofCustody(
+  store: CampaignAuthorityStore,
+  rootDir: string,
+  context: CccCampaignTaskContext,
+  approval: ApprovalRequest,
+): Promise<void> {
+  if (!context.proofs.some((proof) => proof.schema === "ccc-prd.proof.v2")) {
+    return;
+  }
+  const approvedCustody = parseCccCampaignMergeProofRunId(approval.runId);
+  try {
+    const currentCustody = await deriveCccCampaignFinalProofCustodyForCurrentSource(
+      store,
+      context,
+      rootDir,
+    );
+    if (
+      !approvedCustody
+      || !currentCustody
+      || canonicalCccPrdJson(approvedCustody) !== canonicalCccPrdJson(currentCustody)
+    ) {
+      throw new Error("CCC campaign merge proof custody drifted after approval issuance");
+    }
+  } catch (error) {
+    throw new PermanentError(
+      "CCC campaign merge approval no longer matches the exact passing final_integrated proof custody",
+      "CCC_CAMPAIGN_MERGE_PROOF_CUSTODY_REFUSED",
+      undefined,
+      error instanceof Error ? error : undefined,
+    );
+  }
 }
 
 function assertExactApprovalBinding(
@@ -272,6 +342,12 @@ export async function approveCccCampaignMerge(
   }
 
   if (approval.status === "issued") {
+    await assertCurrentSemanticMergeProofCustody(
+      input.store,
+      input.rootDir,
+      context,
+      approval,
+    );
     try {
       approval = await claimCccCampaignApproval(layer, {
         authorityStore: input.store,

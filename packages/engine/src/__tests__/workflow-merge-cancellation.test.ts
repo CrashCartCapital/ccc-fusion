@@ -147,6 +147,10 @@ describe("workflow merge cancellation", () => {
           transport: "native",
         },
         executionPolicy: { schema: "ccc-campaign.execution-policy.v2" },
+        // This cancellation regression exercises the persisted legacy proof
+        // lane. Keep the semantic-proof contract explicit so the production
+        // merge gate does not mistake an incomplete mock for semantic v2.
+        proofs: [],
         protectedActionIds: [mergeAction.id],
         protectedActions: [mergeAction],
         activeActionLeases: {},

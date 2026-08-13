@@ -8,6 +8,7 @@ import {
   issueCccCampaignApprovalWithinTransaction,
 } from "../async-approval-request-store.js";
 import { canonicalCccPrdJson } from "../ccc-prd/contract.js";
+import type { CccPrdExecutionPrompt } from "../ccc-prd/types.js";
 import type { CccCampaignAuthorityStore } from "./store.js";
 import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
@@ -39,7 +40,7 @@ export type CccCampaignExecutionAuthorizationMemberIdentityInput = Readonly<{
   providerId: string;
   modelId: string;
   transport: CccCampaignTransport;
-  promptSchema: "ccc-prd.execution-prompt.v1";
+  promptSchema: CccPrdExecutionPrompt["schema"];
   promptSha256: string;
   routeSha256: string;
   bindingHash: string;
@@ -180,7 +181,10 @@ function canonicalMember(
   if (!(["pi", "cli", "workflow"] as const).includes(input.transport)) {
     throw new TypeError("CCC execution authorization member transport is invalid");
   }
-  if (input.promptSchema !== "ccc-prd.execution-prompt.v1") {
+  if (
+    input.promptSchema !== "ccc-prd.execution-prompt.v1"
+    && input.promptSchema !== "ccc-prd.execution-prompt.v2"
+  ) {
     throw new TypeError("CCC execution authorization member prompt schema is invalid");
   }
   const canonical = {
@@ -514,7 +518,7 @@ function executionAuthorizationFromRows(
       providerId: row.providerId,
       modelId: row.modelId,
       transport: row.transport as CccCampaignTransport,
-      promptSchema: row.promptSchema as "ccc-prd.execution-prompt.v1",
+      promptSchema: row.promptSchema as CccPrdExecutionPrompt["schema"],
       promptSha256: row.promptSha256,
       routeSha256: row.routeSha256,
       bindingHash: row.bindingHash,

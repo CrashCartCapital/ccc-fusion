@@ -3,25 +3,44 @@ import { and, eq, sql } from "drizzle-orm";
 import {
   canonicalCccPrdJson,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
 } from "../ccc-prd/contract.js";
 import type { AsyncDataLayer, DbTransaction } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
 import { createCccCampaignAuthorityBinding } from "./canonical.js";
+import {
+  reconstructCccCampaignCustody,
+  type ReconstructedCccCampaignCustody,
+} from "./custody.js";
 import { loadCccCampaignContextForTask } from "./store.js";
 import {
   CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
+  CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V1,
+  CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2,
+  CCC_CAMPAIGN_PROOF_ATTEMPT_V2_SCHEMA_VERSION,
+  CCC_PRD_PROOF_EVIDENCE_V2_SCHEMA_VERSION,
+  CCC_PRD_PROOF_TERMINAL_ENVELOPE_V2_SCHEMA_VERSION,
   CccCampaignContextError,
   CccCampaignProofAttemptCollisionError,
   CccCampaignProofAttemptIdentityError,
+  CccCampaignProofAttemptLimitError,
   CccCampaignProofAttemptStateError,
   type CccCampaignProofAttempt,
   type CccCampaignProofAttemptDispatchDecision,
   type CccCampaignProofAttemptScope,
+  type CccCampaignProofAttemptContractVersion,
   type CccCampaignProofExecutionResult,
   type CccCampaignProofExecutionResultInput,
+  type CccCampaignProofEvidenceClauseResult,
+  type CccCampaignProofEvidenceNegativeControlResult,
+  type CccCampaignProofEvidencePositiveCaseResult,
+  type CccCampaignProofEvidenceV2,
+  type CccCampaignProofExecutionRefusalCode,
+  type CccCampaignProofTerminalEnvelopeV2,
   type CccCampaignProofWorkItemFence,
   type CccCampaignTaskContext,
 } from "./types.js";
+import type { CccPrdProofPhase, CccPrdProofV2 } from "../ccc-prd/types.js";
 
 const ATTEMPT_KEY_PATTERN = /^ccc-proof-attempt-[0-9a-f]{64}$/;
 const CONTROLLER_TOKEN_PATTERN = /^ccc-proof-controller-[0-9a-f-]{36}$/;
@@ -32,6 +51,20 @@ const OUTPUT_TAIL_CHARS = 8_000;
 const MAX_WARNINGS = 64;
 const MAX_WARNING_CHARS = 2_000;
 const MAX_NEGATIVE_CONTROL_LABEL_CHARS = 512;
+const MAX_PROOF_EVIDENCE_BYTES = 131_072;
+const MAX_TERMINAL_ENVELOPE_BYTES = 262_144;
+const MAX_PROOF_EVIDENCE_RESULTS = 4_096;
+
+const EXECUTION_REFUSAL_CODES: ReadonlySet<CccCampaignProofExecutionRefusalCode> =
+  new Set([
+    "timeout",
+    "killed",
+    "no_output",
+    "malformed_output",
+    "output_over_limit",
+    "spawn_refused",
+    "sandbox_refused",
+  ]);
 
 type ProofAttemptRow =
   typeof schema.project.cccCampaignProofAttempts.$inferSelect;
@@ -41,15 +74,41 @@ type TransactionalInput = Readonly<{
   tx?: DbTransaction;
 }>;
 
-export type ReserveCccCampaignProofAttemptInput = TransactionalInput & Readonly<{
+type CccCampaignProofEvidenceExpectedSets = Readonly<{
+  clauseIds: readonly string[];
+  positiveCaseIds: readonly string[];
+  negativeControlIds: readonly string[];
+}>;
+
+type ReserveCccCampaignProofAttemptCommonInput = TransactionalInput & Readonly<{
   rootDir: string;
   taskId: string;
   proofId: string;
-  scope?: CccCampaignProofAttemptScope;
   sourceCommit: string;
   sourceTree: string;
   workItemFence: CccCampaignProofWorkItemFence;
 }>;
+
+export type ReserveCccCampaignProofAttemptInput =
+  ReserveCccCampaignProofAttemptCommonInput
+  & (
+    | Readonly<{
+      attemptContractVersion?: typeof CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V1;
+      scope?: CccCampaignProofAttemptScope;
+      phase?: never;
+      verifierClosureSha256?: never;
+      candidateInputsSha256?: never;
+      executionToolchainSha256?: never;
+    }>
+    | Readonly<{
+      attemptContractVersion: typeof CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2;
+      phase: CccPrdProofPhase;
+      scope?: never;
+      verifierClosureSha256: string;
+      candidateInputsSha256: string;
+      executionToolchainSha256: string;
+    }>
+  );
 
 export type TransitionCccCampaignProofAttemptInput = TransactionalInput & Readonly<{
   attemptKey: string;
@@ -58,7 +117,16 @@ export type TransitionCccCampaignProofAttemptInput = TransactionalInput & Readon
 
 export type SettleCccCampaignProofAttemptInput =
   TransitionCccCampaignProofAttemptInput
-  & Readonly<{ result: CccCampaignProofExecutionResultInput }>;
+  & (
+    | Readonly<{
+      result: CccCampaignProofExecutionResultInput;
+      terminalEnvelope?: never;
+    }>
+    | Readonly<{
+      result?: never;
+      terminalEnvelope: CccCampaignProofTerminalEnvelopeV2;
+    }>
+  );
 
 export type InspectCccCampaignProofAttemptInput = TransactionalInput & Readonly<{
   attemptKey: string;
@@ -79,6 +147,49 @@ function projectIdFor(layer: AsyncDataLayer): string {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype
+      || Object.getPrototypeOf(value) === null);
+}
+
+function requireExactKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (canonicalCccPrdJson(actual) !== canonicalCccPrdJson(expected)) {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt ${label} has unknown or missing fields`,
+    );
+  }
+}
+
+function requireBoundedCanonicalJson(
+  value: unknown,
+  label: string,
+  maximumBytes: number,
+): string {
+  let canonical: string;
+  try {
+    canonical = canonicalCccPrdJson(value);
+  } catch {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt ${label} must be canonical JSON`,
+    );
+  }
+  if (Buffer.byteLength(canonical, "utf8") > maximumBytes) {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt ${label} exceeds its canonical JSON byte limit`,
+    );
+  }
+  return canonical;
 }
 
 function requireCanonicalText(
@@ -190,6 +301,459 @@ function requireBoolean(value: unknown, label: string): boolean {
   return value;
 }
 
+function requireAttemptContractVersion(
+  value: unknown,
+): CccCampaignProofAttemptContractVersion {
+  if (value === undefined || value === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V1) {
+    return CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V1;
+  }
+  if (value === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2) {
+    return CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2;
+  }
+  throw new CccCampaignProofAttemptIdentityError(
+    "CCC campaign proof attempt contract version must be v1 or v2",
+  );
+}
+
+function requireProofPhase(value: unknown): CccPrdProofPhase {
+  if (value === "task" || value === "final_integrated") return value;
+  throw new CccCampaignProofAttemptIdentityError(
+    "CCC campaign proof attempt phase must be task or final_integrated",
+  );
+}
+
+function requireEvidenceResults<T extends Record<string, unknown>>(
+  value: unknown,
+  kind: "clause" | "positive case" | "negative control",
+  idKey: "clauseId" | "caseId" | "controlId",
+): readonly T[] {
+  if (!Array.isArray(value) || value.length > MAX_PROOF_EVIDENCE_RESULTS) {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt evidence ${kind} results must be a bounded array`,
+    );
+  }
+  const identifiers = new Set<string>();
+  const results = value.map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw new CccCampaignProofAttemptIdentityError(
+        `CCC campaign proof attempt evidence ${kind} result ${index} must be an object`,
+      );
+    }
+    requireExactKeys(entry, [idKey, "passed"], `evidence ${kind} result ${index}`);
+    const identifier = requireIdentifier(
+      entry[idKey],
+      `evidence ${kind} result ${index} ${idKey}`,
+    );
+    if (identifiers.has(identifier)) {
+      throw new CccCampaignProofAttemptIdentityError(
+        `CCC campaign proof attempt evidence ${kind} result IDs must be unique`,
+      );
+    }
+    identifiers.add(identifier);
+    return Object.freeze({
+      [idKey]: identifier,
+      passed: requireBoolean(entry.passed, `evidence ${kind} result ${index} passed`),
+    }) as unknown as T;
+  });
+  const canonical = [...results].sort((left, right) => {
+    const leftId = left[idKey] as string;
+    const rightId = right[idKey] as string;
+    return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+  });
+  if (canonicalCccPrdJson(results) !== canonicalCccPrdJson(canonical)) {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt evidence ${kind} results must be canonically ordered`,
+    );
+  }
+  return Object.freeze(results);
+}
+
+function prepareProofEvidenceV2(input: unknown): CccCampaignProofEvidenceV2 {
+  if (!isRecord(input)) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt v2 evidence must be an object",
+    );
+  }
+  requireExactKeys(input, [
+    "schema",
+    "proofId",
+    "phase",
+    "sourceCommit",
+    "sourceTree",
+    "passed",
+    "clauseResults",
+    "positiveCaseResults",
+    "negativeControlResults",
+  ], "v2 proof evidence");
+  if (input.schema !== CCC_PRD_PROOF_EVIDENCE_V2_SCHEMA_VERSION) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt evidence schema must be ccc-prd.proof-evidence.v2",
+    );
+  }
+  const clauseResults = requireEvidenceResults<CccCampaignProofEvidenceClauseResult>(
+    input.clauseResults,
+    "clause",
+    "clauseId",
+  );
+  const positiveCaseResults =
+    requireEvidenceResults<CccCampaignProofEvidencePositiveCaseResult>(
+      input.positiveCaseResults,
+      "positive case",
+      "caseId",
+    );
+  const negativeControlResults =
+    requireEvidenceResults<CccCampaignProofEvidenceNegativeControlResult>(
+      input.negativeControlResults,
+      "negative control",
+      "controlId",
+    );
+  if (
+    clauseResults.length
+      + positiveCaseResults.length
+      + negativeControlResults.length
+    === 0
+  ) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt evidence must contain at least one result",
+    );
+  }
+  const passed = requireBoolean(input.passed, "evidence passed");
+  const computedPassed = [
+    ...clauseResults,
+    ...positiveCaseResults,
+    ...negativeControlResults,
+  ].every((result) => result.passed);
+  if (passed !== computedPassed) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt evidence aggregate result is inconsistent",
+    );
+  }
+  const evidence = Object.freeze({
+    schema: CCC_PRD_PROOF_EVIDENCE_V2_SCHEMA_VERSION,
+    proofId: requireIdentifier(input.proofId, "evidence proof ID"),
+    phase: requireProofPhase(input.phase),
+    sourceCommit: requireGitObject(input.sourceCommit, "evidence source commit"),
+    sourceTree: requireGitObject(input.sourceTree, "evidence source tree"),
+    passed,
+    clauseResults,
+    positiveCaseResults,
+    negativeControlResults,
+  });
+  requireBoundedCanonicalJson(
+    evidence,
+    "v2 proof evidence",
+    MAX_PROOF_EVIDENCE_BYTES,
+  );
+  return evidence;
+}
+
+function prepareTerminalEnvelopeV2(input: unknown): CccCampaignProofTerminalEnvelopeV2 {
+  if (!isRecord(input)) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt v2 terminal envelope must be an object",
+    );
+  }
+  const commonKeys = [
+    "schema",
+    "kind",
+    "proofId",
+    "phase",
+    "sourceCommit",
+    "sourceTree",
+    "exitCode",
+    "durationMs",
+    "stdoutSha256",
+    "stderrSha256",
+    "changedPathsSha256",
+    "stdoutTail",
+    "stderrTail",
+    "timedOut",
+    "killed",
+    "warnings",
+  ] as const;
+  const kind = input.kind;
+  requireExactKeys(
+    input,
+    kind === "verified"
+      ? [...commonKeys, "passed", "evidence", "evidenceSha256"]
+      : kind === "execution_refused"
+        ? [...commonKeys, "code"]
+        : commonKeys,
+    "v2 terminal envelope",
+  );
+  if (input.schema !== CCC_PRD_PROOF_TERMINAL_ENVELOPE_V2_SCHEMA_VERSION) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt terminal envelope schema must be ccc-prd.proof-terminal-envelope.v2",
+    );
+  }
+  const stdoutTail = typeof input.stdoutTail === "string"
+    ? input.stdoutTail
+    : (() => {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt terminal stdout tail must be a string",
+      );
+    })();
+  const stderrTail = typeof input.stderrTail === "string"
+    ? input.stderrTail
+    : (() => {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt terminal stderr tail must be a string",
+      );
+    })();
+  if (stdoutTail.length > OUTPUT_TAIL_CHARS || stderrTail.length > OUTPUT_TAIL_CHARS) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt terminal output tail exceeds its limit",
+    );
+  }
+  if (!Array.isArray(input.warnings) || input.warnings.length > MAX_WARNINGS) {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt warnings must contain at most ${MAX_WARNINGS} strings`,
+    );
+  }
+  const warnings = Object.freeze(input.warnings.map((warning, index) =>
+    requireCanonicalText(warning, `terminal warning ${index}`, MAX_WARNING_CHARS)));
+  const common = {
+    schema: CCC_PRD_PROOF_TERMINAL_ENVELOPE_V2_SCHEMA_VERSION,
+    proofId: requireIdentifier(input.proofId, "terminal proof ID"),
+    phase: requireProofPhase(input.phase),
+    sourceCommit: requireGitObject(input.sourceCommit, "terminal source commit"),
+    sourceTree: requireGitObject(input.sourceTree, "terminal source tree"),
+    exitCode: requireExitCode(input.exitCode),
+    durationMs: requireNonNegativeSafeInteger(input.durationMs, "terminal durationMs"),
+    stdoutSha256: requireSha256(input.stdoutSha256, "terminal stdout digest"),
+    stderrSha256: requireSha256(input.stderrSha256, "terminal stderr digest"),
+    changedPathsSha256: requireSha256(
+      input.changedPathsSha256,
+      "terminal changed-path digest",
+    ),
+    stdoutTail,
+    stderrTail,
+    timedOut: requireBoolean(input.timedOut, "terminal timedOut"),
+    killed: requireBoolean(input.killed, "terminal killed"),
+    warnings,
+  } as const;
+  let envelope: CccCampaignProofTerminalEnvelopeV2;
+  if (kind === "verified") {
+    const evidence = prepareProofEvidenceV2(input.evidence);
+    const evidenceSha256 = requireSha256(
+      input.evidenceSha256,
+      "terminal evidence digest",
+    );
+    if (sha256(canonicalCccPrdJson(evidence)) !== evidenceSha256) {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt terminal evidence digest does not match canonical evidence",
+      );
+    }
+    const passed = requireBoolean(input.passed, "terminal verified passed");
+    if (
+      passed !== evidence.passed
+      || common.proofId !== evidence.proofId
+      || common.phase !== evidence.phase
+      || common.sourceCommit !== evidence.sourceCommit
+      || common.sourceTree !== evidence.sourceTree
+    ) {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt terminal evidence identity is inconsistent",
+      );
+    }
+    if (common.timedOut || common.killed || (passed && common.exitCode !== 0)) {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt verified terminal has inconsistent process facts",
+      );
+    }
+    envelope = Object.freeze({
+      ...common,
+      kind: "verified",
+      passed,
+      evidence,
+      evidenceSha256,
+    });
+  } else if (kind === "execution_refused") {
+    if (
+      typeof input.code !== "string"
+      || !EXECUTION_REFUSAL_CODES.has(input.code as CccCampaignProofExecutionRefusalCode)
+    ) {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt execution refusal code is unsupported",
+      );
+    }
+    const code = input.code as CccCampaignProofExecutionRefusalCode;
+    if (
+      (code === "timeout" && !common.timedOut)
+      || (code === "killed" && !common.killed)
+      || (
+        code === "no_output"
+        && (
+          common.stdoutSha256 !== sha256("")
+          || common.stdoutTail !== ""
+        )
+      )
+    ) {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt execution refusal contradicts its process facts",
+      );
+    }
+    envelope = Object.freeze({
+      ...common,
+      kind: "execution_refused",
+      code,
+    });
+  } else {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt terminal envelope kind is unsupported",
+    );
+  }
+  requireBoundedCanonicalJson(
+    envelope,
+    "v2 terminal envelope",
+    MAX_TERMINAL_ENVELOPE_BYTES,
+  );
+  return envelope;
+}
+
+function canonicalExpectedIdentifiers(
+  value: unknown,
+  label: string,
+): readonly string[] {
+  if (!Array.isArray(value) || value.length > MAX_PROOF_EVIDENCE_RESULTS) {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt ${label} must be a bounded identifier array`,
+    );
+  }
+  const identifiers = value.map((entry, index) =>
+    requireIdentifier(entry, `${label}[${index}]`));
+  const sorted = [...identifiers].sort();
+  if (new Set(identifiers).size !== identifiers.length) {
+    throw new CccCampaignProofAttemptIdentityError(
+      `CCC campaign proof attempt ${label} must be unique`,
+    );
+  }
+  return Object.freeze(sorted);
+}
+
+function assertExactEvidenceSets(
+  evidence: CccCampaignProofEvidenceV2,
+  expected: CccCampaignProofEvidenceExpectedSets,
+): void {
+  const observed = {
+    clauseIds: evidence.clauseResults.map(({ clauseId }) => clauseId),
+    positiveCaseIds: evidence.positiveCaseResults.map(({ caseId }) => caseId),
+    negativeControlIds: evidence.negativeControlResults.map(({ controlId }) => controlId),
+  };
+  if (!sameCanonicalValue(observed, expected)) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt evidence does not exactly match expected result sets",
+    );
+  }
+}
+
+async function expectedEvidenceSetsForAttempt(
+  tx: DbTransaction,
+  attempt: CccCampaignProofAttempt,
+): Promise<CccCampaignProofEvidenceExpectedSets> {
+  const { bundle } = await campaignCustodyForAttempt(tx, attempt);
+  const matches = bundle.proofs.filter(({ id }) => id === attempt.proofId);
+  if (matches.length !== 1 || matches[0]!.schema !== "ccc-prd.proof.v2") {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt cannot resolve one admitted semantic proof definition",
+    );
+  }
+  const proof = matches[0] as CccPrdProofV2;
+  const digests = computeCccPrdProofV2AdmissionDigests(proof);
+  if (
+    attempt.phase === undefined
+    || !proof.phases.includes(attempt.phase)
+    || computeCccPrdProofDefinitionSha256(proof) !== attempt.definitionSha256
+    || proof.command !== attempt.command
+    || sha256(proof.command) !== attempt.commandSha256
+    || digests.verifierClosureSha256 !== attempt.verifierClosureSha256
+    || digests.candidateInputsSha256 !== attempt.candidateInputsSha256
+    || digests.executionToolchainSha256 !== attempt.executionToolchainSha256
+    || proof.admission?.schema !== "ccc-prd.proof-admission.v2"
+    || proof.admission.definitionSha256 !== attempt.definitionSha256
+    || proof.admission.verifierClosureSha256 !== attempt.verifierClosureSha256
+    || proof.admission.candidateInputsSha256 !== attempt.candidateInputsSha256
+    || proof.admission.executionToolchainSha256 !== attempt.executionToolchainSha256
+  ) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt semantic proof custody does not match its reservation",
+    );
+  }
+  return Object.freeze({
+    clauseIds: canonicalExpectedIdentifiers(proof.clauseIds, "expected clause IDs"),
+    positiveCaseIds: canonicalExpectedIdentifiers(
+      proof.positiveCases.map(({ id }) => id),
+      "expected positive-case IDs",
+    ),
+    negativeControlIds: canonicalExpectedIdentifiers(
+      proof.negativeControls.map(({ id }) => id),
+      "expected negative-control IDs",
+    ),
+  });
+}
+
+async function campaignCustodyForAttempt(
+  tx: DbTransaction,
+  attempt: CccCampaignProofAttempt,
+): Promise<ReconstructedCccCampaignCustody> {
+  const rows = await tx
+    .select({
+      projectId: schema.project.cccPrdImports.projectId,
+      importId: schema.project.cccPrdImports.importId,
+      idempotencyKey: schema.project.cccPrdImports.idempotencyKey,
+      identityHash: schema.project.cccPrdImports.identityHash,
+      bundleHash: schema.project.cccPrdImports.bundleHash,
+      packetHash: schema.project.cccPrdImports.packetHash,
+      sidecarHash: schema.project.cccPrdImports.sidecarHash,
+      sourceVersion: schema.project.cccPrdImports.sourceVersion,
+      targetRepository: schema.project.cccPrdImports.targetRepository,
+      targetBase: schema.project.cccPrdImports.targetBase,
+      canonicalBundle: schema.project.cccPrdImports.canonicalBundle,
+      executionPolicy: schema.project.cccPrdImports.executionPolicy,
+      campaignManifest: schema.project.cccPrdImports.campaignManifest,
+      campaignManifestHash: schema.project.cccPrdImports.campaignManifestHash,
+      campaignStartedAt: schema.project.cccPrdImports.campaignStartedAt,
+      campaignDeadlineAt: schema.project.cccPrdImports.campaignDeadlineAt,
+    })
+    .from(schema.project.cccPrdImports)
+    .where(and(
+      eq(schema.project.cccPrdImports.projectId, attempt.projectId),
+      eq(schema.project.cccPrdImports.importId, attempt.importId),
+    ))
+    .limit(2);
+  if (rows.length !== 1) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt cannot resolve one persisted campaign custody record",
+    );
+  }
+  let custody: ReconstructedCccCampaignCustody;
+  try {
+    custody = reconstructCccCampaignCustody(rows[0]!);
+  } catch {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt persisted campaign custody is missing or drifted",
+    );
+  }
+  const { bundle, manifest, manifestHash } = custody;
+  if (
+    manifest.projectId !== attempt.projectId
+    || manifest.importId !== attempt.importId
+    || bundle.schema !== "ccc-prd.bundle.v2"
+    || bundle.bundleHash !== attempt.bundleHash
+    || bundle.sourceHash !== attempt.packetHash
+    || bundle.sidecarHash !== attempt.sidecarHash
+    || manifestHash !== attempt.manifestHash
+    || manifest.campaignId !== attempt.campaignId
+    || manifest.targetRepository.path !== attempt.targetRepository
+    || manifest.targetRepository.baseCommit !== attempt.targetBase
+  ) {
+    throw new CccCampaignProofAttemptIdentityError(
+      "CCC campaign proof attempt v2 custody does not match its reserved identity",
+    );
+  }
+  return custody;
+}
+
 function assertCanonicalTimestamp(value: unknown, label: string): string {
   if (
     typeof value !== "string"
@@ -253,8 +817,57 @@ function attemptFromRow(row: ProofAttemptRow): CccCampaignProofAttempt {
     );
   }
   const terminal = row.state === "committed" || row.state === "proved_failed";
+  const attemptContractVersion = requireAttemptContractVersion(row.attemptContractVersion);
+  const v2 = attemptContractVersion === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2;
+  let terminalEnvelope: CccCampaignProofTerminalEnvelopeV2 | undefined;
+  let terminalEnvelopeSha256: string | undefined;
+  let proofEvidence: CccCampaignProofEvidenceV2 | undefined;
+  let proofEvidenceSha256: string | undefined;
+  if (v2 && terminal) {
+    terminalEnvelope = prepareTerminalEnvelopeV2(row.terminalEnvelope);
+    terminalEnvelopeSha256 = requireSha256(
+      row.terminalEnvelopeSha256,
+      "stored terminal-envelope digest",
+    );
+    if (sha256(canonicalCccPrdJson(terminalEnvelope)) !== terminalEnvelopeSha256) {
+      throw new CccCampaignContextError(
+        `CCC campaign proof attempt ${row.attemptKey} terminal-envelope digest drifted`,
+      );
+    }
+    if (terminalEnvelope.kind === "verified") {
+      proofEvidence = terminalEnvelope.evidence;
+      proofEvidenceSha256 = terminalEnvelope.evidenceSha256;
+      if (
+        !sameCanonicalValue(row.proofEvidence, proofEvidence)
+        || row.proofEvidenceSha256 !== proofEvidenceSha256
+      ) {
+        throw new CccCampaignContextError(
+          `CCC campaign proof attempt ${row.attemptKey} parsed evidence drifted`,
+        );
+      }
+    } else if (row.proofEvidence !== null || row.proofEvidenceSha256 !== null) {
+      throw new CccCampaignContextError(
+        `CCC campaign proof attempt ${row.attemptKey} refusal fabricated parsed evidence`,
+      );
+    }
+  } else if (
+    v2
+    && (
+      row.terminalEnvelope !== null
+      || row.terminalEnvelopeSha256 !== null
+      || row.proofEvidence !== null
+      || row.proofEvidenceSha256 !== null
+    )
+  ) {
+    throw new CccCampaignContextError(
+      `CCC campaign proof attempt ${row.attemptKey} has premature terminal evidence`,
+    );
+  }
   const attempt: CccCampaignProofAttempt = {
-    schema: CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
+    schema: v2
+      ? CCC_CAMPAIGN_PROOF_ATTEMPT_V2_SCHEMA_VERSION
+      : CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
+    attemptContractVersion,
     attemptKey: requireAttemptKey(row.attemptKey),
     controllerToken: requireControllerToken(row.controllerToken),
     projectId: row.projectId,
@@ -284,8 +897,34 @@ function attemptFromRow(row: ProofAttemptRow): CccCampaignProofAttempt {
     workItemId: row.workItemId,
     runId: row.runId,
     workItemAttempt: row.workItemAttempt,
+    ...(v2
+      ? {
+        phase: requireProofPhase(row.phase),
+        verifierClosureSha256: requireSha256(
+          row.verifierClosureSha256,
+          "stored verifier-closure digest",
+        ),
+        candidateInputsSha256: requireSha256(
+          row.candidateInputsSha256,
+          "stored candidate-input digest",
+        ),
+        executionToolchainSha256: requireSha256(
+          row.executionToolchainSha256,
+          "stored execution-toolchain digest",
+        ),
+      }
+      : {}),
     state: row.state,
     ...(terminal ? { result: terminalResult(row) } : {}),
+    ...(terminalEnvelope
+      ? {
+        terminalEnvelope,
+        terminalEnvelopeSha256,
+        ...(proofEvidence
+          ? { proofEvidence, proofEvidenceSha256 }
+          : {}),
+      }
+      : {}),
     createdAt: assertCanonicalTimestamp(row.createdAt, "createdAt"),
     updatedAt: assertCanonicalTimestamp(row.updatedAt, "updatedAt"),
     ...(row.dispatchedAt
@@ -301,6 +940,7 @@ function attemptFromRow(row: ProofAttemptRow): CccCampaignProofAttempt {
 function immutableAttemptIdentity(attempt: CccCampaignProofAttempt): Record<string, unknown> {
   return {
     schema: attempt.schema,
+    attemptContractVersion: attempt.attemptContractVersion,
     attemptKey: attempt.attemptKey,
     projectId: attempt.projectId,
     importId: attempt.importId,
@@ -323,6 +963,14 @@ function immutableAttemptIdentity(attempt: CccCampaignProofAttempt): Record<stri
     workItemId: attempt.workItemId,
     runId: attempt.runId,
     workItemAttempt: attempt.workItemAttempt,
+    ...(attempt.attemptContractVersion === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2
+      ? {
+        phase: attempt.phase,
+        verifierClosureSha256: attempt.verifierClosureSha256,
+        candidateInputsSha256: attempt.candidateInputsSha256,
+        executionToolchainSha256: attempt.executionToolchainSha256,
+      }
+      : {}),
   };
 }
 
@@ -354,7 +1002,25 @@ function attemptKeyFor(input: {
   proofId: string;
   sourceCommit: string;
   definitionSha256: string;
+  attemptContractVersion: CccCampaignProofAttemptContractVersion;
+  phase?: CccPrdProofPhase;
+  workItemFence: CccCampaignProofWorkItemFence;
 }): string {
+  if (input.attemptContractVersion === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2) {
+    return `ccc-proof-attempt-${sha256(canonicalCccPrdJson({
+      schema: CCC_CAMPAIGN_PROOF_ATTEMPT_V2_SCHEMA_VERSION,
+      attemptContractVersion: input.attemptContractVersion,
+      projectId: input.context.projectId,
+      importId: input.context.importId,
+      campaignId: input.context.campaignId,
+      semanticTaskId: input.context.semanticTaskId,
+      proofId: input.proofId,
+      phase: input.phase,
+      sourceCommit: input.sourceCommit,
+      definitionSha256: input.definitionSha256,
+      workItemFence: input.workItemFence,
+    }))}`;
+  }
   return `ccc-proof-attempt-${sha256(canonicalCccPrdJson({
     schema: CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
     projectId: input.context.projectId,
@@ -372,6 +1038,19 @@ async function databaseNow(tx: DbTransaction): Promise<string> {
     SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS now
   `) as unknown as Array<{ now: string }>;
   return assertCanonicalTimestamp(rows[0]?.now, "database clock");
+}
+
+function assertBeforeCampaignDeadline(
+  campaignDeadlineAt: string,
+  databaseTimestamp: string,
+): void {
+  const deadline = assertCanonicalTimestamp(campaignDeadlineAt, "campaign deadline");
+  if (Date.parse(databaseTimestamp) >= Date.parse(deadline)) {
+    throw new CccCampaignProofAttemptLimitError(
+      "deadline",
+      "CCC campaign proof deadline has expired",
+    );
+  }
 }
 
 async function selectAttempt(
@@ -491,11 +1170,18 @@ async function withinWriteTransaction<T>(
 export async function reserveCccCampaignProofAttempt(
   input: ReserveCccCampaignProofAttemptInput,
 ): Promise<CccCampaignProofAttempt> {
+  const attemptContractVersion = requireAttemptContractVersion(
+    input.attemptContractVersion,
+  );
+  const v2 = attemptContractVersion === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2;
+  const phase = v2 ? requireProofPhase(input.phase) : undefined;
   const taskId = requireIdentifier(input.taskId, "task ID");
   const proofId = requireIdentifier(input.proofId, "proof ID");
   const sourceCommit = requireGitObject(input.sourceCommit, "source commit");
   const sourceTree = requireGitObject(input.sourceTree, "source tree");
-  const scope = input.scope ?? "task";
+  const scope = v2
+    ? (phase === "task" ? "task" : "campaign")
+    : input.scope ?? "task";
   if (scope !== "task" && scope !== "campaign") {
     throw new CccCampaignProofAttemptIdentityError(
       "CCC campaign proof attempt scope must be task or campaign",
@@ -510,6 +1196,15 @@ export async function reserveCccCampaignProofAttempt(
     input.workItemFence?.attempt,
     "work-item attempt",
   );
+  const verifierClosureSha256 = v2
+    ? requireSha256(input.verifierClosureSha256, "verifier-closure digest")
+    : undefined;
+  const candidateInputsSha256 = v2
+    ? requireSha256(input.candidateInputsSha256, "candidate-input digest")
+    : undefined;
+  const executionToolchainSha256 = v2
+    ? requireSha256(input.executionToolchainSha256, "execution-toolchain digest")
+    : undefined;
   return withinWriteTransaction(input, async (tx) => {
     const context = await loadCccCampaignContextForTask(
       input.layer,
@@ -524,6 +1219,38 @@ export async function reserveCccCampaignProofAttempt(
       );
     }
     const proof = proofForContext(context, proofId, scope);
+    if (!v2 && proof.schema === "ccc-prd.proof.v2") {
+      throw new CccCampaignProofAttemptIdentityError(
+        `CCC campaign semantic proof v2 ${proofId} requires proof-attempt contract v2`,
+      );
+    }
+    if (v2) {
+      if (proof.schema !== "ccc-prd.proof.v2") {
+        throw new CccCampaignProofAttemptIdentityError(
+          `CCC campaign proof ${proofId} is not admitted under the semantic proof v2 contract`,
+        );
+      }
+      if (!proof.phases.includes(phase!)) {
+        throw new CccCampaignProofAttemptIdentityError(
+          `CCC campaign proof ${proofId} does not admit phase ${phase}`,
+        );
+      }
+      const expectedDigests = computeCccPrdProofV2AdmissionDigests(proof);
+      if (
+        verifierClosureSha256 !== expectedDigests.verifierClosureSha256
+        || candidateInputsSha256 !== expectedDigests.candidateInputsSha256
+        || executionToolchainSha256 !== expectedDigests.executionToolchainSha256
+        || !proof.admission
+        || proof.admission.schema !== "ccc-prd.proof-admission.v2"
+        || proof.admission.verifierClosureSha256 !== verifierClosureSha256
+        || proof.admission.candidateInputsSha256 !== candidateInputsSha256
+        || proof.admission.executionToolchainSha256 !== executionToolchainSha256
+      ) {
+        throw new CccCampaignProofAttemptIdentityError(
+          `CCC campaign proof ${proofId} v2 custody digests do not match immutable admission`,
+        );
+      }
+    }
     const definitionSha256 = computeCccPrdProofDefinitionSha256(proof);
     const command = requireCanonicalText(proof.command, `proof ${proofId} command`);
     const commandSha256 = sha256(command);
@@ -536,11 +1263,17 @@ export async function reserveCccCampaignProofAttempt(
       proofId,
       sourceCommit,
       definitionSha256,
+      attemptContractVersion,
+      phase,
+      workItemFence: { workItemId, runId, attempt: workItemAttempt },
     });
     const now = await databaseNow(tx);
     const controllerToken = `ccc-proof-controller-${randomUUID()}`;
     const candidate: CccCampaignProofAttempt = Object.freeze({
-      schema: CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
+      schema: v2
+        ? CCC_CAMPAIGN_PROOF_ATTEMPT_V2_SCHEMA_VERSION
+        : CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION,
+      attemptContractVersion,
       attemptKey,
       controllerToken,
       projectId: context.projectId,
@@ -564,10 +1297,38 @@ export async function reserveCccCampaignProofAttempt(
       workItemId,
       runId,
       workItemAttempt,
+      ...(v2
+        ? {
+          phase,
+          verifierClosureSha256,
+          candidateInputsSha256,
+          executionToolchainSha256,
+        }
+        : {}),
       state: "reserved",
       createdAt: now,
       updatedAt: now,
     });
+    const replay = await selectAttempt(
+      tx,
+      context.projectId,
+      attemptKey,
+      true,
+    );
+    if (replay) {
+      if (
+        !sameCanonicalValue(
+          immutableAttemptIdentity(replay),
+          immutableAttemptIdentity(candidate),
+        )
+      ) {
+        throw new CccCampaignProofAttemptCollisionError(
+          `CCC campaign proof attempt ${attemptKey} collides with changed immutable identity`,
+        );
+      }
+      return replay;
+    }
+    if (v2) assertBeforeCampaignDeadline(context.campaignDeadlineAt, now);
     await tx
       .insert(schema.project.cccCampaignProofAttempts)
       .values({
@@ -594,6 +1355,11 @@ export async function reserveCccCampaignProofAttempt(
         workItemId: candidate.workItemId,
         runId: candidate.runId,
         workItemAttempt: candidate.workItemAttempt,
+        attemptContractVersion: candidate.attemptContractVersion,
+        phase: candidate.phase ?? null,
+        verifierClosureSha256: candidate.verifierClosureSha256 ?? null,
+        candidateInputsSha256: candidate.candidateInputsSha256 ?? null,
+        executionToolchainSha256: candidate.executionToolchainSha256 ?? null,
         state: candidate.state,
         createdAt: candidate.createdAt,
         updatedAt: candidate.updatedAt,
@@ -644,7 +1410,14 @@ export async function beginCccCampaignProofAttemptDispatch(
     if (attempt.state !== "reserved") {
       return Object.freeze({ kind: "terminal", attempt });
     }
+    const v2Custody = attempt.attemptContractVersion
+      === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2
+      ? await campaignCustodyForAttempt(tx, attempt)
+      : undefined;
     const now = await databaseNow(tx);
+    if (v2Custody) {
+      assertBeforeCampaignDeadline(v2Custody.manifest.campaignDeadlineAt, now);
+    }
     const updated = await tx
       .update(schema.project.cccCampaignProofAttempts)
       .set({
@@ -676,7 +1449,6 @@ export async function settleCccCampaignProofAttempt(
 ): Promise<CccCampaignProofAttempt> {
   const attemptKey = requireAttemptKey(input.attemptKey);
   const controllerToken = requireControllerToken(input.controllerToken);
-  const result = prepareTerminalResult(input.result);
   return withinWriteTransaction(input, async (tx) => {
     const projectId = projectIdFor(input.layer);
     const attempt = await selectAttempt(tx, projectId, attemptKey, true);
@@ -686,7 +1458,59 @@ export async function settleCccCampaignProofAttempt(
       );
     }
     assertController(attempt, controllerToken);
-    if (attempt.result) {
+    const v2 = attempt.attemptContractVersion === CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2;
+    const rawResult = "result" in input ? input.result : undefined;
+    const rawEnvelope = "terminalEnvelope" in input ? input.terminalEnvelope : undefined;
+    if (v2 && rawResult !== undefined) {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt v2 cannot settle through the legacy result contract; a v2 terminal envelope is required",
+      );
+    }
+    if (!v2 && rawEnvelope !== undefined) {
+      throw new CccCampaignProofAttemptIdentityError(
+        "CCC campaign proof attempt v1 cannot acquire a v2 terminal envelope",
+      );
+    }
+    const terminalEnvelope = v2
+      ? prepareTerminalEnvelopeV2(rawEnvelope)
+      : undefined;
+    const result: CccCampaignProofExecutionResult = v2
+      ? Object.freeze({
+        success: terminalEnvelope!.kind === "verified" && terminalEnvelope!.passed,
+        exitCode: terminalEnvelope!.exitCode,
+        durationMs: terminalEnvelope!.durationMs,
+        stdoutSha256: terminalEnvelope!.stdoutSha256,
+        stderrSha256: terminalEnvelope!.stderrSha256,
+        changedPathsSha256: terminalEnvelope!.changedPathsSha256,
+        stdoutTail: terminalEnvelope!.stdoutTail,
+        stderrTail: terminalEnvelope!.stderrTail,
+        timedOut: terminalEnvelope!.timedOut,
+        killed: terminalEnvelope!.killed,
+        warnings: terminalEnvelope!.warnings,
+      } satisfies CccCampaignProofExecutionResult)
+      : prepareTerminalResult(rawResult as CccCampaignProofExecutionResultInput);
+    if (v2) {
+      if (
+        terminalEnvelope!.proofId !== attempt.proofId
+        || terminalEnvelope!.phase !== attempt.phase
+        || terminalEnvelope!.sourceCommit !== attempt.sourceCommit
+        || terminalEnvelope!.sourceTree !== attempt.sourceTree
+      ) {
+        throw new CccCampaignProofAttemptIdentityError(
+          "CCC campaign proof attempt v2 terminal envelope does not match reserved identity",
+        );
+      }
+      const expectedEvidence = await expectedEvidenceSetsForAttempt(tx, attempt);
+      if (terminalEnvelope!.kind === "verified") {
+        assertExactEvidenceSets(terminalEnvelope!.evidence, expectedEvidence);
+      }
+      if (attempt.terminalEnvelope) {
+        if (sameCanonicalValue(attempt.terminalEnvelope, terminalEnvelope)) return attempt;
+        throw new CccCampaignProofAttemptCollisionError(
+          `CCC campaign proof attempt ${attemptKey} terminal envelope collides with persisted evidence`,
+        );
+      }
+    } else if (attempt.result) {
       if (sameCanonicalValue(attempt.result, result)) return attempt;
       throw new CccCampaignProofAttemptCollisionError(
         `CCC campaign proof attempt ${attemptKey} terminal result collides with persisted evidence`,
@@ -699,6 +1523,15 @@ export async function settleCccCampaignProofAttempt(
     }
     const now = await databaseNow(tx);
     const state = result.success ? "committed" : "proved_failed";
+    const terminalEnvelopeSha256 = terminalEnvelope
+      ? sha256(canonicalCccPrdJson(terminalEnvelope))
+      : null;
+    const proofEvidence = terminalEnvelope?.kind === "verified"
+      ? terminalEnvelope.evidence
+      : null;
+    const proofEvidenceSha256 = terminalEnvelope?.kind === "verified"
+      ? terminalEnvelope.evidenceSha256
+      : null;
     const updated = await tx
       .update(schema.project.cccCampaignProofAttempts)
       .set({
@@ -715,6 +1548,10 @@ export async function settleCccCampaignProofAttempt(
         warnings: [...result.warnings],
         changedPathsSha256: result.changedPathsSha256 ?? null,
         negativeControlLabel: result.negativeControlLabel ?? null,
+        terminalEnvelope: terminalEnvelope ?? null,
+        terminalEnvelopeSha256,
+        proofEvidence,
+        proofEvidenceSha256,
         settledAt: now,
         updatedAt: now,
       })
@@ -764,8 +1601,26 @@ export async function listCccCampaignProofAttemptsForCommit(
       ));
     return Object.freeze(rows
       .map(attemptFromRow)
-      .sort((left, right) =>
-        left.proofId < right.proofId ? -1 : left.proofId > right.proofId ? 1 : 0));
+      .sort((left, right) => {
+        const textPairs = [
+          [left.proofId, right.proofId],
+          [left.attemptContractVersion, right.attemptContractVersion],
+          [left.phase ?? "", right.phase ?? ""],
+          [left.workItemId, right.workItemId],
+          [left.runId, right.runId],
+        ] as const;
+        for (const [leftValue, rightValue] of textPairs) {
+          if (leftValue !== rightValue) return leftValue < rightValue ? -1 : 1;
+        }
+        if (left.workItemAttempt !== right.workItemAttempt) {
+          return left.workItemAttempt - right.workItemAttempt;
+        }
+        return left.attemptKey < right.attemptKey
+          ? -1
+          : left.attemptKey > right.attemptKey
+            ? 1
+            : 0;
+      }));
   };
   if (input.tx) return select(input.tx);
   return input.layer.transaction(select);

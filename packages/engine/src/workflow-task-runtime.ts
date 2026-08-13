@@ -945,7 +945,10 @@ export class WorkflowTaskRuntime {
     const handlers = { ...defaultHandlers, ...(this.deps.handlers ?? {}) };
     const ordinaryGate = handlers.gate;
     handlers.gate = (node, context) => {
-      if (node.config?.cccProofSuite !== true) {
+      const isCccProofGate = node.config?.cccProofSuite === true
+        || node.config?.cccProofGate === true
+        || node.config?.cccProofPhase !== undefined;
+      if (!isCccProofGate) {
         return ordinaryGate(node, context);
       }
       if (!this.deps.runCccProofSuite) {

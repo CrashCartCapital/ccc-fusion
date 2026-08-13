@@ -5,11 +5,13 @@ import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import {
   beginCccCampaignProofAttemptDispatch,
+  canonicalCccPrdJson,
   claimCccCampaignApproval,
   claimCccCampaignExecutionAuthorization,
   consumeCccCampaignApprovalWithinTransaction,
   createCccCampaignAuthorityBinding,
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+  computeCccPrdProofV2AdmissionDigests,
   importCccPrdBundle,
   issueCccCampaignApproval,
   issueCccCampaignExecutionAuthorization,
@@ -18,6 +20,7 @@ import {
   settleCccCampaignProofAttempt,
 } from "../../index.js";
 import {
+  admitCccPrdImportTestProductBundle,
   createCccPrdImportTestProductBundle,
   createCccPrdImportTestExecutionPolicy,
   createCccPrdImportTestProductExecutionPolicy,
@@ -125,19 +128,34 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     return rows[0]!.native_id;
   }
 
-  it("reports an operator-stopped campaign as abandoned while preserving uncertainty", async () => {
-    const source = createCccPrdImportTestProductBundle(
-      h.rootDir(),
-      "product-status-stopped",
+  async function importAdmittedProduct(
+    suffix: string,
+    idempotencyKey: string,
+    transform: (source: CccPrdSemanticBundle) => CccPrdSemanticBundle =
+      (source) => source,
+  ) {
+    const admitted = await admitCccPrdImportTestProductBundle(
+      transform(createCccPrdImportTestProductBundle(h.rootDir(), suffix)),
+      suffix,
     );
+    const source = admitted.bundle;
     const imported = await importCccPrdBundle({
       bundle: source,
       executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-stopped",
+      semanticProofToolchainPaths: admitted.semanticProofToolchainPaths,
+      idempotencyKey,
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
     });
+    return { imported, source };
+  }
+
+  it("reports an operator-stopped campaign as abandoned while preserving uncertainty", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-stopped",
+      "product-status-stopped",
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-stopped`,
     );
@@ -175,18 +193,10 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("surfaces redacted provider uncertainty as an exact operator decision", async () => {
-    const source = createCccPrdImportTestProductBundle(
-      h.rootDir(),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-provider-unknown",
       "product-status-provider-unknown",
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-provider-unknown",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const taskId = await nativeTaskIdForImport(
       imported.importId,
       source.tasks[0]!.id,
@@ -316,18 +326,10 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("does not let one runtime-owned provider attempt hide separate manual work", async () => {
-    const source = createCccPrdImportTestProductBundle(
-      h.rootDir(),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-mixed-uncertainty",
       "product-status-mixed-uncertainty",
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-mixed-uncertainty",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const taskId = await nativeTaskIdForImport(
       imported.importId,
       source.tasks[0]!.id,
@@ -401,17 +403,11 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("projects one redacted sealed execution authorization and returns to runtime waiting after requeue", async () => {
-    const source = withLiveExecutionAction(
-      createCccPrdImportTestProductBundle(h.rootDir(), "product-status-live"),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-live",
+      "product-status-live",
+      withLiveExecutionAction,
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-live",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const codingTaskId = await nativeTaskIdForImport(
       imported.importId,
       source.tasks[0]!.id,
@@ -620,18 +616,10 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("explains a verifier-confinement manual stop without calling it an uncertain effect", async () => {
-    const source = createCccPrdImportTestProductBundle(
-      h.rootDir(),
+    const { imported } = await importAdmittedProduct(
+      "product-status-verifier-manual",
       "product-status-verifier-manual",
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-verifier-manual",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-verifier-manual`,
     );
@@ -671,25 +659,18 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("RED-S1-status: explains campaign-global request-budget exhaustion without suggesting a retry", async () => {
-    const source = rehashCccPrdImportTestBundle({
-      ...createCccPrdImportTestProductBundle(
-        h.rootDir(),
-        "product-status-request-budget",
-      ),
-      bounds: {
-        maxRequests: 5,
-        maxDurationMs: 120_000,
-        maxConcurrency: 5,
-      },
-    });
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-request-budget",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget",
+      "product-status-request-budget",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-request-budget`,
     );
@@ -780,25 +761,18 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("RED-S1-status: provider uncertainty dominates budget exhaustion until reconciliation", async () => {
-    const source = rehashCccPrdImportTestBundle({
-      ...createCccPrdImportTestProductBundle(
-        h.rootDir(),
-        "product-status-request-budget-unknown",
-      ),
-      bounds: {
-        maxRequests: 5,
-        maxDurationMs: 120_000,
-        maxConcurrency: 5,
-      },
-    });
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-request-budget-unknown",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget-unknown",
+      "product-status-request-budget-unknown",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-request-budget-unknown`,
     );
@@ -906,25 +880,18 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("RED-S1-status: reserved provider custody dominates exact budget exhaustion advice", async () => {
-    const source = rehashCccPrdImportTestBundle({
-      ...createCccPrdImportTestProductBundle(
-        h.rootDir(),
-        "product-status-request-budget-reserved",
-      ),
-      bounds: {
-        maxRequests: 5,
-        maxDurationMs: 120_000,
-        maxConcurrency: 5,
-      },
-    });
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-request-budget-reserved",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget-reserved",
+      "product-status-request-budget-reserved",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-request-budget-reserved`,
     );
@@ -1017,25 +984,18 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("RED-S1-status: refuses budget-exhaustion advice when the marker outruns the persisted counter", async () => {
-    const source = rehashCccPrdImportTestBundle({
-      ...createCccPrdImportTestProductBundle(
-        h.rootDir(),
-        "product-status-request-budget-counter-drift",
-      ),
-      bounds: {
-        maxRequests: 5,
-        maxDurationMs: 120_000,
-        maxConcurrency: 5,
-      },
-    });
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-request-budget-counter-drift",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
+    const { imported } = await importAdmittedProduct(
+      "product-status-request-budget-counter-drift",
+      "product-status-request-budget-counter-drift",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-request-budget-counter-drift`,
     );
@@ -1064,25 +1024,18 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("RED-S1-status: treats request-budget counter overshoot as custody drift", async () => {
-    const source = rehashCccPrdImportTestBundle({
-      ...createCccPrdImportTestProductBundle(
-        h.rootDir(),
-        "product-status-request-budget-overshoot",
-      ),
-      bounds: {
-        maxRequests: 2,
-        maxDurationMs: 120_000,
-        maxConcurrency: 2,
-      },
-    });
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-request-budget-overshoot",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
+    const { imported } = await importAdmittedProduct(
+      "product-status-request-budget-overshoot",
+      "product-status-request-budget-overshoot",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 2,
+          maxDurationMs: 120_000,
+          maxConcurrency: 2,
+        },
+      }),
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-request-budget-overshoot`,
     );
@@ -1116,18 +1069,10 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("RED-S1-status: treats an at-limit counter with missing attempt history as custody drift", async () => {
-    const source = createCccPrdImportTestProductBundle(
-      h.rootDir(),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget-ledger-drift",
       "product-status-request-budget-ledger-drift",
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-request-budget-ledger-drift",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-request-budget-ledger-drift`,
     );
@@ -1167,7 +1112,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     );
     const imported = await importCccPrdBundle({
       bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
       idempotencyKey: "product-status-verifier-history",
       store: h.store(),
       layer: h.layer(),
@@ -1263,26 +1208,15 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("returns a deterministic, redacted, import-scoped operator snapshot", async () => {
-    const source = withMergeAction(
-      createCccPrdImportTestProductBundle(h.rootDir(), "product-status"),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status",
+      "product-status-primary",
+      withMergeAction,
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-primary",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
-    const other = createCccPrdImportTestProductBundle(h.rootDir(), "product-status-other");
-    await importCccPrdBundle({
-      bundle: other,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(other),
-      idempotencyKey: "product-status-other",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
+    await importAdmittedProduct(
+      "product-status-other",
+      "product-status-other",
+    );
 
     await expect(inspectCccPrdProductStatus({
       idempotencyKey: "missing",
@@ -1335,7 +1269,25 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         },
       ],
       proofs: [{
-        definition: { id: "PROOF-product-status", command: "pnpm test" },
+        definition: {
+          id: "PROOF-final-product-status",
+          command: "task verify:integrated",
+          phases: ["final_integrated"],
+        },
+        attempts: [],
+      }, {
+        definition: {
+          id: "PROOF-v2-product-status-0",
+          command: "task verify:task-0",
+          phases: ["task"],
+        },
+        attempts: [],
+      }, {
+        definition: {
+          id: "PROOF-v2-product-status-1",
+          command: "task verify:task-1",
+          phases: ["task"],
+        },
         attempts: [],
       }],
       landing: { intents: [], terminals: [] },
@@ -1400,11 +1352,14 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     });
 
     const proof = source.proofs[0]!;
+    const proofCustody = computeCccPrdProofV2AdmissionDigests(proof);
     const reserved = await reserveCccCampaignProofAttempt({
       layer: h.layer(),
       rootDir: h.rootDir(),
       taskId: terminalTaskId,
       proofId: proof.id,
+      attemptContractVersion: "v2",
+      phase: "final_integrated",
       sourceCommit: SOURCE_COMMIT,
       sourceTree: SOURCE_TREE,
       workItemFence: {
@@ -1412,30 +1367,65 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         runId: workItem.runId,
         attempt: 3,
       },
+      ...proofCustody,
     });
     await beginCccCampaignProofAttemptDispatch({
       layer: h.layer(),
       attemptKey: reserved.attemptKey,
       controllerToken: reserved.controllerToken,
     });
+    const evidence = {
+      schema: "ccc-prd.proof-evidence.v2" as const,
+      proofId: proof.id,
+      phase: "final_integrated" as const,
+      sourceCommit: SOURCE_COMMIT,
+      sourceTree: SOURCE_TREE,
+      passed: true,
+      clauseResults: proof.clauseIds.map((clauseId) => ({
+        clauseId,
+        passed: true,
+      })),
+      positiveCaseResults: proof.positiveCases.map(({ id: caseId }) => ({
+        caseId,
+        passed: true,
+      })),
+      negativeControlResults: proof.negativeControls.map(({ id: controlId }) => ({
+        controlId,
+        passed: true,
+      })),
+    };
+    const evidenceJson = canonicalCccPrdJson(evidence);
+    const evidenceSha256 = createHash("sha256")
+      .update(evidenceJson, "utf8")
+      .digest("hex");
+    const terminalEnvelope = {
+      schema: "ccc-prd.proof-terminal-envelope.v2" as const,
+      kind: "verified" as const,
+      proofId: proof.id,
+      phase: "final_integrated" as const,
+      sourceCommit: SOURCE_COMMIT,
+      sourceTree: SOURCE_TREE,
+      exitCode: 0,
+      durationMs: 19,
+      stdoutSha256: evidenceSha256,
+      stderrSha256: createHash("sha256").update("", "utf8").digest("hex"),
+      changedPathsSha256: createHash("sha256")
+        .update(canonicalCccPrdJson(["src/task-1"]), "utf8")
+        .digest("hex"),
+      stdoutTail: evidenceJson,
+      stderrTail: "",
+      timedOut: false,
+      killed: false,
+      warnings: ["fixture warning"],
+      passed: true,
+      evidence,
+      evidenceSha256,
+    };
     await settleCccCampaignProofAttempt({
       layer: h.layer(),
       attemptKey: reserved.attemptKey,
       controllerToken: reserved.controllerToken,
-      result: {
-        success: true,
-        exitCode: 0,
-        durationMs: 19,
-        stdout: "one passing verifier\n",
-        stderr: "",
-        timedOut: false,
-        killed: false,
-        warnings: ["fixture warning"],
-        changedPathsSha256: createHash("sha256")
-          .update(JSON.stringify(["src/task-1"]), "utf8")
-          .digest("hex"),
-        negativeControlLabel: "planted-defect-failed",
-      },
+      terminalEnvelope,
     });
 
     const campaign = await h.store().getCccCampaignContextForTask(terminalTaskId);
@@ -1479,6 +1469,8 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         definitionSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
         attempts: [{
           attemptKey: reserved.attemptKey,
+          attemptContractVersion: "v2",
+          phase: "final_integrated",
           state: "committed",
           sourceCommit: SOURCE_COMMIT,
           sourceTree: SOURCE_TREE,
@@ -1493,15 +1485,29 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
             durationMs: 19,
             stdoutSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
             stderrSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
-            stdoutTail: "one passing verifier\n",
+            stdoutTail: evidenceJson,
             stderrTail: "",
             timedOut: false,
             killed: false,
             warnings: ["fixture warning"],
             changedPathsSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
-            negativeControlLabel: "planted-defect-failed",
+            negativeControlLabel: null,
           },
+          terminalEnvelope: expect.objectContaining({
+            kind: "verified",
+            passed: true,
+            evidenceSha256,
+          }),
+          terminalEnvelopeSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+          proofEvidence: evidence,
+          proofEvidenceSha256: evidenceSha256,
         }],
+      }, {
+        definition: { id: "PROOF-v2-product-status-0" },
+        attempts: [],
+      }, {
+        definition: { id: "PROOF-v2-product-status-1" },
+        attempts: [],
       }],
       approvals: [{
         status: "issued",

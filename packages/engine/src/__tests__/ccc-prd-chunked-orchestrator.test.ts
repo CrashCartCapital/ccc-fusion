@@ -116,6 +116,33 @@ describe("buildCccPrdChunkPrompt", () => {
     );
   });
 
+  it("RED-S4-v2-chunk-prompt: carries the packet-wide semantic contract into every fragment", () => {
+    const prompt = buildCccPrdChunkPrompt({
+      mode: "understanding",
+      semanticProofContract: "v2",
+      packetHash: "packet-hash",
+      sourceVersion: "source-version",
+      chunkPlanHash: "chunk-plan-hash",
+      chunkId: "doc.md#0",
+      chunkOrdinal: 0,
+      chunkCount: 1,
+      packetHeader: [],
+      sourcePath: "doc.md",
+      sliceByteStart: 0,
+      sliceByteEnd: 0,
+      sliceSha256: "slice-hash",
+      materialItems: [],
+      slice: "",
+    } as never);
+
+    expect(prompt).toContain('"schema": "ccc-prd.authoring-proposal-fragment.v2"');
+    expect(prompt).toContain('"acceptanceClauses"');
+    expect(prompt).toContain('"acceptanceDispositions"');
+    expect(prompt).toContain('"clauseIds"');
+    expect(prompt).toContain("clause IDs and text must be copied exactly from the source grammar");
+    expect(prompt).toContain("fuzzy quote recovery never applies to acceptance clauses");
+  });
+
   /**
    * The repair prompt must not be the thing that kills the document it is
    * repairing. `priorViolations` is unbounded in the chunk lane, so a chunk

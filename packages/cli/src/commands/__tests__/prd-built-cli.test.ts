@@ -172,7 +172,7 @@ version: 2.0.0
     expect(template.status, `${template.stdout}\n${template.stderr}`).toBe(0);
     expect(JSON.parse(template.stdout)).toMatchObject({
       kind: "prd-intake-template",
-      schema: "ccc-prd.intake-contract.v1",
+      schema: "ccc-prd.intake-contract.v2",
     });
 
     const packet = createPacketRoot();
@@ -182,7 +182,7 @@ version: 2.0.0
     const lint = runFn(["prd", "lint", prdPath]);
     expect(lint.status, `${lint.stdout}\n${lint.stderr}`).toBe(1);
     expect(JSON.parse(lint.stdout)).toMatchObject({
-      schema: "ccc-prd.intake-contract.v1",
+      schema: "ccc-prd.intake-contract.v2",
       optionalContract: true,
       readyForIntake: false,
       blockingQuestions: expect.arrayContaining([
@@ -262,7 +262,7 @@ version: 2.0.0
   });
 
   it("preserves a product refusal exit code after embedded PostgreSQL cleanup", async () => {
-    const packet = createPacketRoot();
+    const packet = createPacketRoot({ semanticV2: true });
     const home = join(packet.root, "home");
     const policy = join(packet.root, "execution-plan.json");
     mkdirSync(home);

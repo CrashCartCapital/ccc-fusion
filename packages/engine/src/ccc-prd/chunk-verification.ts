@@ -1,9 +1,18 @@
 import {
   CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION,
+  CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V2_SCHEMA_VERSION,
   CCC_PRD_PROTECTED_ACTION_KINDS,
   normalizeProtectedAction,
   type CccPrdAuthoringProposalFragment,
+  type CccPrdAuthoringProposalFragmentV1,
+  type CccPrdAuthoringProposalFragmentV2,
+  type CccPrdProof,
+  type CccPrdProofV1,
+  type CccPrdProofV2,
   type CccPrdRequirement,
+  type CccPrdRequirementV1,
+  type CccPrdRequirementV2,
+  type CccPrdSemanticProofContractVersion,
   type CccPrdSourceReferenceProposal,
   type CccPrdSourceSpan,
   type CccPrdTask,
@@ -31,6 +40,7 @@ import {
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
 import { stripOutermostJsonFence } from "./native-authoring-adapter.js";
 import { locateCccPrdQuote } from "./quote-locator.js";
+import { stampCccPrdAcceptanceClauseLinks } from "./acceptance-clauses.js";
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -49,13 +59,43 @@ function hasIdentifiedRows(value: unknown): boolean {
 }
 
 /** Mirrors authoring.ts's `describeProposalShapeViolations`, scoped to the fragment's 13 collections (design §2: no bounds/targetRepository/admittedWriteRoots/nonGoals/confidence at chunk scope). */
-export function describeCccPrdChunkFragmentShapeViolations(value: unknown): string[] {
+export function describeCccPrdChunkFragmentShapeViolations(
+  value: unknown,
+  semanticProofContract: CccPrdSemanticProofContractVersion = "v1",
+): string[] {
   if (!isPlainRecord(value)) {
     return ["fragment is not a JSON object"];
   }
   const violations: string[] = [];
-  if (value.schema !== CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION) {
-    violations.push(`schema must be "${CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION}"`);
+  const expectedSchema = semanticProofContract === "v2"
+    ? CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V2_SCHEMA_VERSION
+    : CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION;
+  if (value.schema !== expectedSchema) {
+    violations.push(`schema must be "${expectedSchema}"`);
+  }
+  if (semanticProofContract === "v2") {
+    const requirements = value.requirements;
+    if (Array.isArray(requirements)) {
+      const badIndex = requirements.findIndex((entry) => !isPlainRecord(entry)
+        || !Array.isArray(entry.acceptanceClauses)
+        || !Array.isArray(entry.acceptanceDispositions));
+      if (badIndex >= 0) {
+        violations.push(`requirements[${badIndex}] must carry acceptanceClauses and acceptanceDispositions arrays`);
+      }
+    }
+    const proofs = value.proofs;
+    if (Array.isArray(proofs)) {
+      const badIndex = proofs.findIndex((entry) => !isPlainRecord(entry)
+        || entry.schema !== "ccc-prd.proof.v2"
+        || !Array.isArray(entry.clauseIds)
+        || !Array.isArray(entry.phases)
+        || !Array.isArray(entry.positiveCases)
+        || !Array.isArray(entry.negativeControls)
+        || !Array.isArray(entry.verifierClosure)
+        || !Array.isArray(entry.candidateInputs)
+        || !isPlainRecord(entry.executionToolchain));
+      if (badIndex >= 0) violations.push(`proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape`);
+    }
   }
   for (const key of IDENTITY_COLLECTIONS) {
     if (!hasArray(value, key)) violations.push(`${key} must be an array`);
@@ -286,7 +326,7 @@ export function collectCccPrdFuzzyQuoteReviewNotices(
 export type CccPrdResolvedChunkFragment = {
   authorityRoles: CccPrdAuthoringProposalFragment["authorityRoles"];
   requirements: CccPrdRequirement[];
-  proofs: ReturnType<typeof withoutSourceRefsUsingResolver<CccPrdAuthoringProposalFragment["proofs"][number]>>[];
+  proofs: CccPrdProof[];
   tasks: CccPrdTask[];
   edges: CccPrdAuthoringProposalFragment["edges"];
   workflows: ReturnType<typeof withoutSourceRefsUsingResolver<CccPrdAuthoringProposalFragment["workflows"][number]>>[];
@@ -312,10 +352,58 @@ function resolveChunkFragmentSpans(
   const resolve = <T extends SourceBoundRow>(row: T) => (
     withoutSourceRefsUsingResolver(row, context)
   );
+  const requirements: CccPrdRequirement[] = fragment.schema
+    === CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V2_SCHEMA_VERSION
+    ? (() => {
+        const typed = fragment as CccPrdAuthoringProposalFragmentV2;
+        const stamped = stampCccPrdAcceptanceClauseLinks({
+          sourcePath: context.sourcePath,
+          sourceBytes: context.sourceBytes,
+          requirements: typed.requirements,
+        });
+        for (const entry of stamped.requirements) {
+          for (const declaration of [
+            ...entry.acceptanceClauses,
+            ...entry.acceptanceDispositions,
+          ]) {
+            if (
+              declaration.span.byteStart < context.sliceBounds.byteStart
+              || declaration.span.byteEnd > context.sliceBounds.byteEnd
+            ) {
+              throw new CccPrdCustodyError(
+                "CCC_PRD_CHUNK_QUOTE_OUTSIDE_SLICE",
+                `acceptance declaration for requirement ${entry.requirementId} is outside its chunk slice`,
+              );
+            }
+          }
+        }
+        const acceptanceByRequirement = new Map(
+          stamped.requirements.map((entry) => [entry.requirementId, entry]),
+        );
+        return typed.requirements.map((requirement): CccPrdRequirementV2 => {
+          const acceptance = acceptanceByRequirement.get(requirement.id)!;
+          return {
+            ...withoutSourceRefsUsingResolver(requirement, context),
+            acceptanceClauses: acceptance.acceptanceClauses,
+            acceptanceDispositions: acceptance.acceptanceDispositions,
+          };
+        });
+      })()
+    : (fragment as CccPrdAuthoringProposalFragmentV1).requirements.map(
+        (requirement): CccPrdRequirementV1 => withoutSourceRefsUsingResolver(requirement, context),
+      );
+  const proofs: CccPrdProof[] = fragment.schema
+    === CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V2_SCHEMA_VERSION
+    ? (fragment as CccPrdAuthoringProposalFragmentV2).proofs.map(
+        (proof): CccPrdProofV2 => withoutSourceRefsUsingResolver(proof, context),
+      )
+    : (fragment as CccPrdAuthoringProposalFragmentV1).proofs.map(
+        (proof): CccPrdProofV1 => withoutSourceRefsUsingResolver(proof, context),
+      );
   return {
     authorityRoles: fragment.authorityRoles,
-    requirements: fragment.requirements.map(resolve),
-    proofs: fragment.proofs.map(resolve),
+    requirements,
+    proofs,
     tasks: fragment.tasks.map(resolve),
     edges: fragment.edges,
     workflows: fragment.workflows.map(resolve),
@@ -401,6 +489,8 @@ export type CccPrdChunkVerificationInput = {
   fullSourceBytes: Buffer;
   sliceBounds: CccPrdAnchorSliceBounds;
   assignedMaterialItemIds: string[];
+  /** Omission preserves the frozen v1 fragment contract. */
+  semanticProofContract?: CccPrdSemanticProofContractVersion;
   limits?: CccPrdAnchorLimits;
   /** Defaults to `DEFAULT_CCC_PRD_QUOTE_MATCH_POLICY` (deterministic tiers only). */
   quoteMatchPolicy?: CccPrdQuoteMatchPolicy;
@@ -427,7 +517,10 @@ export type CccPrdChunkVerificationOutcome =
 export function verifyCccPrdChunkFragment(
   input: CccPrdChunkVerificationInput,
 ): CccPrdChunkVerificationOutcome {
-  const shapeViolations = describeCccPrdChunkFragmentShapeViolations(input.fragment);
+  const shapeViolations = describeCccPrdChunkFragmentShapeViolations(
+    input.fragment,
+    input.semanticProofContract,
+  );
   if (shapeViolations.length > 0) {
     return { ok: false, code: "CCC_PRD_CHUNK_FRAGMENT_INVALID", violations: shapeViolations, retryEligible: true };
   }
@@ -463,6 +556,7 @@ export function verifyCccPrdChunkFragment(
     if (error instanceof CccPrdCustodyError) {
       const retryEligibleCodes = new Set([
         "CCC_PRD_SOURCE_QUOTE_MISSING",
+        "CCC_PRD_CHUNK_QUOTE_OUTSIDE_SLICE",
         "CCC_PRD_ANCHOR_AMBIGUOUS_INTENT",
         // A loose match that landed on two indistinguishable regions. The model
         // can fix this by quoting whatever distinguishes them, so it retries.
@@ -530,6 +624,7 @@ export type RunCccPrdChunkAttemptInput = {
   fullSourceBytes: Buffer;
   sliceBounds: CccPrdAnchorSliceBounds;
   assignedMaterialItemIds: string[];
+  semanticProofContract?: CccPrdSemanticProofContractVersion;
   expectedProvider: string;
   expectedModel: string;
   transport: CccPrdChunkAttemptTransport;
@@ -604,6 +699,7 @@ export async function runCccPrdChunkAttempt(
       fullSourceBytes: input.fullSourceBytes,
       sliceBounds: input.sliceBounds,
       assignedMaterialItemIds: input.assignedMaterialItemIds,
+      semanticProofContract: input.semanticProofContract,
       limits: input.limits,
       quoteMatchPolicy: input.quoteMatchPolicy,
       hasConstraints: input.hasConstraints,

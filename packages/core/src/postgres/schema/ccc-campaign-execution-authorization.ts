@@ -214,7 +214,7 @@ export const cccCampaignExecutionAuthorizationMembers =
       ),
       check(
         "ccc_campaign_execution_auth_members_prompt_schema_check",
-        sql`${t.promptSchema} = 'ccc-prd.execution-prompt.v1'`,
+        sql`${t.promptSchema} IN ('ccc-prd.execution-prompt.v1', 'ccc-prd.execution-prompt.v2')`,
       ),
       check(
         "ccc_campaign_execution_authorization_members_hashes_check",

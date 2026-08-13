@@ -15,8 +15,10 @@ import {
   type WorkflowIrNode,
 } from "@fusion/core";
 import {
+  admitCccPrdImportTestProductBundle,
   createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
+  rehashCccPrdImportTestProductBundleV2,
   rehashCccPrdImportTestBundle,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import {
@@ -153,7 +155,7 @@ pgTest("CCC campaign live-execution approval", () => {
         : mode === "missing-action"
           ? [secondLiveAction]
           : [firstLiveAction, secondLiveAction];
-    const bundle = rehashCccPrdImportTestBundle({
+    const legacy = rehashCccPrdImportTestBundle({
       ...source,
       bounds: {
         ...source.bounds,
@@ -177,6 +179,19 @@ pgTest("CCC campaign live-execution approval", () => {
       }),
       protectedActions,
     });
+    const admitted = await admitCccPrdImportTestProductBundle(legacy, suffix);
+    const bundle = mode === "missing-action" || mode === "wrong-action"
+      ? rehashCccPrdImportTestProductBundleV2({
+        ...admitted.bundle,
+        tasks: admitted.bundle.tasks.map((task) => {
+          if (task.id !== firstTask.id) return task;
+          return {
+            ...task,
+            protectedActionIds: mode === "missing-action" ? [] : [wrongAction.id],
+          };
+        }),
+      })
+      : admitted.bundle;
     const imported = await importCccPrdBundle({
       bundle,
       executionPolicy: createCccPrdImportTestProductExecutionPolicy(bundle),
@@ -184,6 +199,7 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       layer: h.layer(),
       rootDir,
+      semanticProofToolchainPaths: admitted.semanticProofToolchainPaths,
     });
     const idempotencyKey = `live-execution-approval-${suffix}`;
     const productStatus = await inspectCccPrdProductStatus({

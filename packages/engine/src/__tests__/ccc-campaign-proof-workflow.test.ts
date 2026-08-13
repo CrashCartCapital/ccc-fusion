@@ -4,13 +4,16 @@ import { join } from "node:path";
 import {
   CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
   WORKFLOW_EXTENSION_SCHEMA_VERSION,
   WorkflowExtensionRegistry,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
   deriveWorkflowExtensionHostProvenance,
   getWorkflowExtensionHostProvenanceBinding,
   type CccCampaignTaskContext,
   type CccPrdProof,
+  type CccPrdProofV2,
   type RunAuditEventInput,
   type TaskDetail,
   type WorkflowProofAdmissionEvaluator,
@@ -298,6 +301,85 @@ describe("CCC campaign proof workflow admission", () => {
     expect(recordFencedAudit).toHaveBeenCalledTimes(2);
     expect(recordFencedAudit.mock.calls.map(([input]) => input.event.metadata?.proofId))
       .toEqual(proofIds);
+  });
+
+  it("RED-S5-phase-admission: admits only the exact proof set declared for each semantic-v2 phase", async () => {
+    const evaluate: WorkflowProofAdmissionEvaluator = vi.fn(async ({ inputSha256 }) => ({
+      outcome: "pass",
+      evaluatedInputSha256: inputSha256,
+      summary: "semantic proof definition admitted; command not executed",
+    }));
+    const fixture = await proofFixture(evaluate);
+    const taskProof = semanticV2Proof(fixture.proof, {
+      id: "PROOF-TASK",
+      phases: ["task"],
+    });
+    const finalProof = semanticV2Proof(fixture.proof, {
+      id: "PROOF-FINAL",
+      phases: ["final_integrated"],
+    });
+    const catalog = [taskProof, finalProof];
+    const origin = {
+      ...campaignContext("TASK-ORIGIN", "TASK-ORIGIN", [taskProof.id], taskProof),
+      proofs: catalog,
+    };
+    const nodeContext = {
+      ...campaignContext("TASK-NODE", "TASK-NODE", [taskProof.id], taskProof),
+      proofs: catalog,
+    };
+    const recordFencedAudit = vi.fn(async (input: FencedAuditInput) => input.event);
+    const admit = createCccCampaignProofNodeAdmission({
+      store: {
+        getCccCampaignContextForTask: vi.fn(async (taskId: string) => {
+          if (taskId === origin.taskId) return origin;
+          if (taskId === nodeContext.taskId) return nodeContext;
+          return null;
+        }),
+        recordFencedCccCampaignProofAudit: recordFencedAudit,
+      },
+      originTaskId: origin.taskId,
+      fence: proofFence(),
+      registry: fixture.registry,
+    });
+
+    await admit({
+      id: "task-proof-gate",
+      kind: "gate",
+      config: {
+        cccProofGate: true,
+        cccProofPhase: "task",
+        cccProofIds: [taskProof.id],
+        cccPrdTaskId: nodeContext.semanticTaskId,
+      },
+    }, new AbortController().signal);
+    await admit({
+      id: "final-proof-suite",
+      kind: "gate",
+      config: {
+        cccProofSuite: true,
+        cccProofPhase: "final_integrated",
+        cccProofIds: [finalProof.id],
+        cccPrdTaskId: nodeContext.semanticTaskId,
+      },
+    }, new AbortController().signal);
+
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(recordFencedAudit.mock.calls.map(([input]) => input.event.metadata?.proofId))
+      .toEqual([taskProof.id, finalProof.id]);
+
+    await expect(admit({
+      id: "drifted-task-proof-gate",
+      kind: "gate",
+      config: {
+        cccProofGate: true,
+        cccProofPhase: "task",
+        cccProofIds: [finalProof.id],
+        cccPrdTaskId: nodeContext.semanticTaskId,
+      },
+    }, new AbortController().signal)).rejects.toMatchObject({
+      code: "CCC_PROOF_ADMISSION_REFUSED",
+    });
+    expect(evaluate).toHaveBeenCalledTimes(2);
   });
 
   it("admits a fixture with exact admission binding and sealed execution provenance", async () => {
@@ -820,6 +902,68 @@ async function proofFixture(evaluate: WorkflowProofAdmissionEvaluator): Promise<
     evaluate,
   }, provenance);
   return { proof, registry, entryPath };
+}
+
+function semanticV2Proof(
+  legacyProof: CccPrdProof,
+  input: Pick<CccPrdProofV2, "id" | "phases">,
+): CccPrdProofV2 {
+  const definition: CccPrdProofV2 = {
+    schema: "ccc-prd.proof.v2",
+    id: input.id,
+    requirementIds: ["REQ-1"],
+    clauseIds: ["AC-REQ-1-001"],
+    phases: [...input.phases],
+    command: "task verify:fixture",
+    positiveOracle: "the exact accepted behavior passes",
+    positiveCases: [{ id: "POS-1", description: "accepted behavior passes" }],
+    negativeControls: [{ id: "NEG-1", description: "known-bad behavior fails" }],
+    verifierClosure: [{
+      role: "task_runner",
+      path: "Taskfile.yml",
+      baseGitBlobOid: repeated("1", 40),
+      sha256: repeated("2", 64),
+    }, {
+      role: "harness",
+      path: "verify/fixture.mjs",
+      baseGitBlobOid: repeated("3", 40),
+      sha256: repeated("4", 64),
+    }],
+    candidateInputs: ["src/fixture.js"],
+    executionToolchain: {
+      task: {
+        executablePath: "/usr/local/bin/task",
+        executableSha256: repeated("5", 64),
+        version: "task fixture",
+        versionOutputSha256: repeated("6", 64),
+      },
+      node: {
+        executablePath: "/usr/local/bin/node",
+        executableSha256: repeated("7", 64),
+        version: "node fixture",
+        versionOutputSha256: repeated("8", 64),
+      },
+      proofHost: {
+        id: "proof-host-fixture",
+        executablePath: "/usr/local/bin/proof-host",
+        executableSha256: repeated("9", 64),
+        version: "proof host fixture",
+        versionOutputSha256: repeated("a", 64),
+      },
+      linkedRuntime: [],
+    },
+    spans: [],
+    confidence: "high",
+  };
+  return {
+    ...definition,
+    admission: {
+      ...legacyProof.admission!,
+      schema: CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
+      definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+      ...computeCccPrdProofV2AdmissionDigests(definition),
+    },
+  };
 }
 
 function repeated(character: string, count: number): string {

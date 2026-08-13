@@ -17,6 +17,16 @@ import {
 const ENGINE_ENTRY = REQUIRED_BUILD_PACKAGES.find((pkg) => pkg.name === "@fusion/engine");
 const CLI_ENTRY = REQUIRED_BUILD_PACKAGES.find((pkg) => pkg.name === "@runfusion/fusion");
 
+test("CLI artifact custody includes the standalone semantic proof host source", () => {
+  assert.ok(CLI_ENTRY);
+  assert.ok(
+    CLI_ENTRY.staleAgainstGlobs.some(
+      ({ sourcePath }) => sourcePath === "packages/cli/ccc-semantic-proof-host.mjs",
+    ),
+    "proof-host source changes must invalidate the bundled CLI proof artifact",
+  );
+});
+
 /**
  * A git stub that returns a fixed blob sha for engine src, and reports it as a
  * git work tree. Lets us drive the content-hash cache deterministically.
@@ -118,6 +128,7 @@ test("registry includes CLI artifacts required by clean-checkout tests", () => {
     "packages/cli/dist/plugins/fusion-native-proof-admission/manifest.json",
   ]);
   assert.deepEqual(packageSourceInputs(CLI_ENTRY), [
+    "packages/cli/ccc-semantic-proof-host.mjs",
     "packages/cli/src",
     "packages/engine/src",
   ]);

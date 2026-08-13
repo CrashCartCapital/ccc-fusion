@@ -10,15 +10,20 @@ import type {
 import {
   assertActiveClaimedCccCampaignApprovalWithinTransaction,
   assertClaimedCccCampaignApprovalWithinTransaction,
+  canonicalCccPrdJson,
+  compareCccPrdCodeUnits,
   consumeCccCampaignApprovalWithinTransaction,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
   createCccCampaignAuthorityBinding,
   drizzleSql,
+  getApprovalRequest,
   listCccCampaignProofAttemptsForCommit,
   postgresSchema,
   queryRunAuditEvents,
   recordRunAuditEventWithinTransaction,
   type CccCampaignAuthorityBinding,
+  type CccCampaignProofAttempt,
 } from "@fusion/core";
 import { createCccCampaignMergeControl } from "./ccc-campaign-merge-control.js";
 import {
@@ -44,9 +49,20 @@ const LANDING_DOMAIN = "git";
 const LANDING_TIMESTAMP = "2026-07-26T00:00:00.000Z";
 const COMMIT_TIMESTAMP = "2026-07-26T00:00:00Z";
 const MERGE_APPROVAL_REQUIRED = "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
+export const CCC_CAMPAIGN_FINAL_PROOF_CUSTODY_SCHEMA_VERSION =
+  "ccc-campaign.final-proof-custody.v2" as const;
+export const CCC_CAMPAIGN_MERGE_PROOF_RUN_ID_PREFIX =
+  "ccc-merge-proof-v2" as const;
 
 type LandingAuditEvent = Awaited<ReturnType<typeof queryRunAuditEvents>>[number];
 type ApprovalTransaction = Parameters<typeof assertActiveClaimedCccCampaignApprovalWithinTransaction>[0];
+
+export type CccCampaignFinalProofCustody = Readonly<{
+  schema: typeof CCC_CAMPAIGN_FINAL_PROOF_CUSTODY_SCHEMA_VERSION;
+  sourceCommit: string;
+  sourceTree: string;
+  finalReceiptSetSha256: string;
+}>;
 
 export type CccCampaignGitLandingFault =
   | "after-objects-before-intent"
@@ -79,8 +95,7 @@ type ApprovalInput = Readonly<{
   claimToken: string;
 }>;
 
-type IntentMetadata = Readonly<{
-  schema: "ccc-campaign.git-landing.intent.v2";
+type IntentMetadataBase = Readonly<{
   expectedBaseObject: string;
   sourceRef: string;
   targetRef: string;
@@ -96,6 +111,15 @@ type IntentMetadata = Readonly<{
   identity: CccCampaignGitCommitIdentity;
   message: string;
 }>;
+
+type IntentMetadata =
+  | Readonly<IntentMetadataBase & {
+    schema: "ccc-campaign.git-landing.intent.v2";
+  }>
+  | Readonly<IntentMetadataBase & {
+    schema: "ccc-campaign.git-landing.intent.v3";
+    finalProofCustody: CccCampaignFinalProofCustody;
+  }>;
 
 function requireMergeAction(context: CccCampaignTaskContext): MergeAction {
   const assigned = new Set(context.protectedActionIds);
@@ -140,9 +164,11 @@ function eventKey(context: CccCampaignTaskContext, action: MergeAction, phase: L
   return `ccc-git-landing/${context.projectId}/${context.importId}/${context.taskId}/${action.actionId}/${phase}`;
 }
 
-function metadataFromPrepared(prepared: PreparedCccCampaignGitObjects): IntentMetadata {
-  return Object.freeze({
-    schema: "ccc-campaign.git-landing.intent.v2",
+function metadataFromPrepared(
+  prepared: PreparedCccCampaignGitObjects,
+  finalProofCustody: CccCampaignFinalProofCustody | null,
+): IntentMetadata {
+  const metadata = {
     expectedBaseObject: prepared.expectedTarget,
     sourceRef: prepared.sourceRef,
     targetRef: prepared.targetRef,
@@ -157,7 +183,17 @@ function metadataFromPrepared(prepared: PreparedCccCampaignGitObjects): IntentMe
     custodyIdentity: prepared.custodyIdentity,
     identity: prepared.identity,
     message: prepared.message,
-  });
+  };
+  return finalProofCustody
+    ? Object.freeze({
+      schema: "ccc-campaign.git-landing.intent.v3",
+      ...metadata,
+      finalProofCustody,
+    })
+    : Object.freeze({
+      schema: "ccc-campaign.git-landing.intent.v2",
+      ...metadata,
+    });
 }
 
 function preparedFromIntent(
@@ -193,7 +229,13 @@ function preparedFromIntent(
 
 function readIntentMetadata(event: LandingAuditEvent | undefined): IntentMetadata | null {
   const metadata = event?.metadata as Partial<IntentMetadata> | null | undefined;
-  if (!metadata || metadata.schema !== "ccc-campaign.git-landing.intent.v2") return null;
+  if (
+    !metadata
+    || ![
+      "ccc-campaign.git-landing.intent.v2",
+      "ccc-campaign.git-landing.intent.v3",
+    ].includes(metadata.schema ?? "")
+  ) return null;
   if (
     !isObjectId(metadata.expectedBaseObject)
     || !isGitRef(metadata.sourceRef)
@@ -210,6 +252,8 @@ function readIntentMetadata(event: LandingAuditEvent | undefined): IntentMetadat
     || !isCommitIdentity(metadata.identity)
     || typeof metadata.message !== "string"
     || metadata.message.length === 0
+    || (metadata.schema === "ccc-campaign.git-landing.intent.v3"
+      && !isFinalProofCustody(metadata.finalProofCustody))
   ) {
     throw new Error("CCC campaign Git landing audit metadata is malformed");
   }
@@ -328,6 +372,12 @@ function sha256CanonicalStrings(values: readonly string[]): string {
     .digest("hex");
 }
 
+function sha256CanonicalValue(value: unknown): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(value), "utf8")
+    .digest("hex");
+}
+
 type ImportedWorkflowWorkItemFence = Readonly<{
   id: string;
   runId: string;
@@ -338,7 +388,7 @@ async function requireImportedWorkflowWorkItemFence(
   store: TaskStore,
   context: CccCampaignTaskContext,
   tx: ApprovalTransaction | undefined,
-  allowSucceeded: boolean,
+  mode: "issuance" | "landing" | "replay",
 ): Promise<ImportedWorkflowWorkItemFence> {
   const layer = store.getAsyncLayer();
   if (!layer) throw new Error("CCC campaign Git landing work-item fence check requires PostgreSQL");
@@ -375,18 +425,22 @@ async function requireImportedWorkflowWorkItemFence(
   const workItem = rows[0]!;
   const expectedRunId = `ccc-prd:${context.importId}`;
   const hasNoLiveLease = workItem.leaseOwner === null && workItem.leaseExpiresAt === null;
+  const hasCompleteLiveLease = workItem.leaseOwner !== null && workItem.leaseExpiresAt !== null;
   const isParkedForMergeApproval = workItem.state === "manual-required"
     && workItem.lastError === MERGE_APPROVAL_REQUIRED
     && workItem.blockedReason === MERGE_APPROVAL_REQUIRED;
-  const isPostLandingSuccess = allowSucceeded && workItem.state === "succeeded";
+  const isIssuanceRuntime = mode === "issuance"
+    && workItem.state === "running"
+    && hasCompleteLiveLease;
+  const isPostLandingSuccess = mode === "replay" && workItem.state === "succeeded";
   if (
     workItem.kind !== "task"
     || workItem.runId !== expectedRunId
     || workItem.stableWorkflowRunId !== expectedRunId
     || !Number.isSafeInteger(workItem.attempt)
     || workItem.attempt < 1
-    || !hasNoLiveLease
-    || (!isParkedForMergeApproval && !isPostLandingSuccess)
+    || (!isIssuanceRuntime && !hasNoLiveLease)
+    || (!isParkedForMergeApproval && !isPostLandingSuccess && !isIssuanceRuntime)
   ) {
     throw new Error(
       "CCC campaign Git landing requires the exact imported workflow work item parked for merge approval",
@@ -399,17 +453,145 @@ async function requireImportedWorkflowWorkItemFence(
   });
 }
 
+function semanticProofContract(
+  context: CccCampaignTaskContext,
+): "v1" | "v2" {
+  const hasV1 = context.proofs.some((proof) => proof.schema !== "ccc-prd.proof.v2");
+  const hasV2 = context.proofs.some((proof) => proof.schema === "ccc-prd.proof.v2");
+  if (hasV1 && hasV2) {
+    throw new Error("CCC campaign Git landing refuses a mixed semantic-proof contract");
+  }
+  return hasV2 ? "v2" : "v1";
+}
+
+function approvedFinalProofCustody(
+  context: CccCampaignTaskContext,
+  approvalRunId: string | undefined,
+): CccCampaignFinalProofCustody | null {
+  if (semanticProofContract(context) === "v1") return null;
+  const custody = parseCccCampaignMergeProofRunId(approvalRunId);
+  if (!custody) {
+    throw new Error(
+      "CCC campaign Git landing semantic-v2 approval is missing exact final proof custody",
+    );
+  }
+  return custody;
+}
+
+function finalProofReceiptProjection(
+  receipt: CccCampaignProofAttempt,
+): Record<string, unknown> {
+  return {
+    attemptKey: receipt.attemptKey,
+    attemptContractVersion: receipt.attemptContractVersion,
+    phase: receipt.phase,
+    taskId: receipt.taskId,
+    semanticTaskId: receipt.semanticTaskId,
+    proofId: receipt.proofId,
+    packetHash: receipt.packetHash,
+    sidecarHash: receipt.sidecarHash,
+    bundleHash: receipt.bundleHash,
+    manifestHash: receipt.manifestHash,
+    campaignBindingHash: receipt.campaignBindingHash,
+    targetRepository: receipt.targetRepository,
+    targetBase: receipt.targetBase,
+    sourceCommit: receipt.sourceCommit,
+    sourceTree: receipt.sourceTree,
+    definitionSha256: receipt.definitionSha256,
+    commandSha256: receipt.commandSha256,
+    workItemId: receipt.workItemId,
+    runId: receipt.runId,
+    workItemAttempt: receipt.workItemAttempt,
+    verifierClosureSha256: receipt.verifierClosureSha256,
+    candidateInputsSha256: receipt.candidateInputsSha256,
+    executionToolchainSha256: receipt.executionToolchainSha256,
+    terminalEnvelopeSha256: receipt.terminalEnvelopeSha256,
+    proofEvidenceSha256: receipt.proofEvidenceSha256,
+  };
+}
+
+function finalProofReceiptSetSha256(
+  sourceCommit: string,
+  sourceTree: string,
+  receipts: readonly CccCampaignProofAttempt[],
+): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson({
+      schema: "ccc-campaign.final-proof-receipt-set.v2",
+      phase: "final_integrated",
+      sourceCommit,
+      sourceTree,
+      receipts: receipts.map(finalProofReceiptProjection),
+    }), "utf8")
+    .digest("hex");
+}
+
+export function encodeCccCampaignMergeProofRunId(
+  custody: CccCampaignFinalProofCustody,
+): string {
+  return `${CCC_CAMPAIGN_MERGE_PROOF_RUN_ID_PREFIX}:${custody.sourceCommit}:${custody.sourceTree}:${custody.finalReceiptSetSha256}`;
+}
+
+export function parseCccCampaignMergeProofRunId(
+  runId: string | undefined,
+): CccCampaignFinalProofCustody | null {
+  if (!runId) return null;
+  const [prefix, sourceCommit, sourceTree, finalReceiptSetSha256, extra] =
+    runId.split(":");
+  if (
+    extra !== undefined
+    || prefix !== CCC_CAMPAIGN_MERGE_PROOF_RUN_ID_PREFIX
+    || !isObjectId(sourceCommit)
+    || !isObjectId(sourceTree)
+    || typeof finalReceiptSetSha256 !== "string"
+    || !/^[0-9a-f]{64}$/u.test(finalReceiptSetSha256)
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    schema: CCC_CAMPAIGN_FINAL_PROOF_CUSTODY_SCHEMA_VERSION,
+    sourceCommit,
+    sourceTree,
+    finalReceiptSetSha256,
+  });
+}
+
+function isFinalProofCustody(value: unknown): value is CccCampaignFinalProofCustody {
+  if (!value || typeof value !== "object") return false;
+  const custody = value as Partial<CccCampaignFinalProofCustody>;
+  return custody.schema === CCC_CAMPAIGN_FINAL_PROOF_CUSTODY_SCHEMA_VERSION
+    && isObjectId(custody.sourceCommit)
+    && isObjectId(custody.sourceTree)
+    && typeof custody.finalReceiptSetSha256 === "string"
+    && /^[0-9a-f]{64}$/u.test(custody.finalReceiptSetSha256);
+}
+
+function assertMatchingFinalProofCustody(
+  observed: CccCampaignFinalProofCustody | null,
+  expected: CccCampaignFinalProofCustody | null,
+): void {
+  if (
+    (observed === null) !== (expected === null)
+    || (observed && expected
+      && canonicalCccPrdJson(observed) !== canonicalCccPrdJson(expected))
+  ) {
+    throw new Error(
+      "CCC campaign Git landing final_integrated proof custody does not match the approved commit, tree, and receipt set",
+    );
+  }
+}
+
 async function assertExactCommittedProofReceipts(
   store: TaskStore,
   context: CccCampaignTaskContext,
   source: Readonly<{
     sourceCommit: string;
     sourceTree: string;
-    mutationPaths: readonly string[];
+    mutationPaths?: readonly string[];
   }>,
   tx?: ApprovalTransaction,
-  allowSucceededWorkItem = false,
-): Promise<void> {
+  workItemMode: "issuance" | "landing" | "replay" = "landing",
+): Promise<CccCampaignFinalProofCustody | null> {
   const layer = store.getAsyncLayer();
   if (!layer) throw new Error("CCC campaign Git landing proof receipt check requires PostgreSQL");
   if (!Array.isArray(context.proofs) || context.proofs.length === 0) {
@@ -419,7 +601,7 @@ async function assertExactCommittedProofReceipts(
     store,
     context,
     tx,
-    allowSucceededWorkItem,
+    workItemMode,
   );
   const receipts = await listCccCampaignProofAttemptsForCommit({
     layer,
@@ -429,6 +611,98 @@ async function assertExactCommittedProofReceipts(
     sourceCommit: source.sourceCommit,
     ...(tx ? { tx } : {}),
   });
+  if (semanticProofContract(context) === "v2") {
+    const expectedProofs = context.proofs
+      .filter((proof) =>
+        proof.schema === "ccc-prd.proof.v2"
+        && proof.phases.includes("final_integrated"))
+      .sort((left, right) => compareCccPrdCodeUnits(left.id, right.id));
+    if (expectedProofs.length === 0) {
+      throw new Error("CCC campaign Git landing requires at least one final_integrated proof");
+    }
+    const finalReceipts = receipts
+      .filter((receipt) =>
+        receipt.attemptContractVersion === "v2"
+        && receipt.phase === "final_integrated")
+      .sort((left, right) => compareCccPrdCodeUnits(left.proofId, right.proofId));
+    if (
+      JSON.stringify(finalReceipts.map(({ proofId }) => proofId))
+        !== JSON.stringify(expectedProofs.map(({ id }) => id))
+    ) {
+      throw new Error(
+        "CCC campaign Git landing requires one exact final_integrated v2 receipt for every admitted final proof",
+      );
+    }
+    const changedPathsSha256 = source.mutationPaths
+      ? sha256CanonicalStrings(source.mutationPaths)
+      : null;
+    for (const [index, receipt] of finalReceipts.entries()) {
+      const proof = expectedProofs[index]!;
+      if (proof.schema !== "ccc-prd.proof.v2") {
+        throw new Error("CCC campaign Git landing final proof contract drifted");
+      }
+      const binding = createCccCampaignAuthorityBinding(context, {
+        actionId: `proof:${proof.id}`,
+        actionTarget: source.sourceCommit,
+      });
+      const admissionDigests = computeCccPrdProofV2AdmissionDigests(proof);
+      const observedTerminalEnvelopeSha256 = receipt.terminalEnvelope == null
+        ? null
+        : sha256CanonicalValue(receipt.terminalEnvelope);
+      const observedProofEvidenceSha256 = receipt.proofEvidence == null
+        ? null
+        : sha256CanonicalValue(receipt.proofEvidence);
+      if (
+        receipt.state !== "committed"
+        || receipt.attemptContractVersion !== "v2"
+        || receipt.phase !== "final_integrated"
+        || receipt.terminalEnvelope?.kind !== "verified"
+        || receipt.terminalEnvelope.passed !== true
+        || receipt.proofEvidence?.passed !== true
+        || receipt.terminalEnvelopeSha256 !== observedTerminalEnvelopeSha256
+        || receipt.proofEvidenceSha256 !== observedProofEvidenceSha256
+        || receipt.terminalEnvelope.evidenceSha256 !== receipt.proofEvidenceSha256
+        || receipt.importId !== context.importId
+        || receipt.campaignId !== context.campaignId
+        || receipt.taskId !== context.taskId
+        || receipt.semanticTaskId !== context.semanticTaskId
+        || receipt.packetHash !== context.packetHash
+        || receipt.sidecarHash !== context.sidecarHash
+        || receipt.bundleHash !== context.bundleHash
+        || receipt.manifestHash !== context.manifestHash
+        || receipt.campaignBindingHash !== binding.bindingHash
+        || receipt.targetRepository !== context.targetRepository.path
+        || receipt.targetBase !== context.targetRepository.baseCommit
+        || receipt.sourceCommit !== source.sourceCommit
+        || receipt.sourceTree !== source.sourceTree
+        || receipt.definitionSha256 !== computeCccPrdProofDefinitionSha256(proof)
+        || receipt.command !== proof.command
+        || receipt.commandSha256 !== createHash("sha256").update(proof.command, "utf8").digest("hex")
+        || receipt.verifierClosureSha256 !== admissionDigests.verifierClosureSha256
+        || receipt.candidateInputsSha256 !== admissionDigests.candidateInputsSha256
+        || receipt.executionToolchainSha256 !== admissionDigests.executionToolchainSha256
+        || (changedPathsSha256 !== null
+          && receipt.terminalEnvelope.changedPathsSha256 !== changedPathsSha256)
+        || receipt.workItemId !== workItemFence.id
+        || receipt.runId !== workItemFence.runId
+        || receipt.workItemAttempt !== workItemFence.attempt
+      ) {
+        throw new Error(
+          `CCC campaign Git landing final_integrated proof receipt ${proof.id} is failed, stale, incomplete, or bound to different custody`,
+        );
+      }
+    }
+    return Object.freeze({
+      schema: CCC_CAMPAIGN_FINAL_PROOF_CUSTODY_SCHEMA_VERSION,
+      sourceCommit: source.sourceCommit,
+      sourceTree: source.sourceTree,
+      finalReceiptSetSha256: finalProofReceiptSetSha256(
+        source.sourceCommit,
+        source.sourceTree,
+        finalReceipts,
+      ),
+    });
+  }
   const expectedProofIds = context.proofs.map(({ id }) => id).sort();
   const observedProofIds = receipts.map(({ proofId }) => proofId).sort();
   if (
@@ -437,7 +711,9 @@ async function assertExactCommittedProofReceipts(
   ) {
     throw new Error("CCC campaign Git landing requires one exact passing receipt for every campaign proof");
   }
-  const changedPathsSha256 = sha256CanonicalStrings(source.mutationPaths);
+  const changedPathsSha256 = source.mutationPaths
+    ? sha256CanonicalStrings(source.mutationPaths)
+    : null;
   for (const receipt of receipts) {
     const proof = context.proofs.find(({ id }) => id === receipt.proofId);
     if (!proof) {
@@ -466,7 +742,8 @@ async function assertExactCommittedProofReceipts(
       || receipt.definitionSha256 !== computeCccPrdProofDefinitionSha256(proof)
       || receipt.command !== proof.command
       || receipt.commandSha256 !== createHash("sha256").update(proof.command, "utf8").digest("hex")
-      || receipt.result.changedPathsSha256 !== changedPathsSha256
+      || (changedPathsSha256 !== null
+        && receipt.result.changedPathsSha256 !== changedPathsSha256)
       || receipt.workItemId !== workItemFence.id
       || receipt.runId !== workItemFence.runId
       || receipt.workItemAttempt !== workItemFence.attempt
@@ -476,6 +753,62 @@ async function assertExactCommittedProofReceipts(
       );
     }
   }
+  return null;
+}
+
+async function assertExactApprovedProofReceipts(
+  store: TaskStore,
+  context: CccCampaignTaskContext,
+  source: Readonly<{
+    sourceCommit: string;
+    sourceTree: string;
+    mutationPaths?: readonly string[];
+  }>,
+  expected: CccCampaignFinalProofCustody | null,
+  tx?: ApprovalTransaction,
+  workItemMode: "landing" | "replay" = "landing",
+): Promise<void> {
+  const observed = await assertExactCommittedProofReceipts(
+    store,
+    context,
+    source,
+    tx,
+    workItemMode,
+  );
+  assertMatchingFinalProofCustody(observed, expected);
+}
+
+export async function deriveCccCampaignFinalProofCustodyForCurrentSource(
+  store: TaskStore,
+  context: CccCampaignTaskContext,
+  targetRoot: string,
+): Promise<CccCampaignFinalProofCustody | null> {
+  if (semanticProofContract(context) === "v1") return null;
+  const task = await store.getTask(context.taskId);
+  const branch = resolveTaskWorkingBranch(task);
+  const snapshot = await inspectCccCampaignLocalGit({
+    targetRoot,
+    expectedBaseObject: context.targetRepository.baseCommit,
+  });
+  const sourceCommit = (await runControlledCccCampaignGit(
+    snapshot,
+    ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`],
+  )).toString("utf8").trim();
+  const sourceTree = (await runControlledCccCampaignGit(
+    snapshot,
+    ["rev-parse", "--verify", `${sourceCommit}^{tree}`],
+  )).toString("utf8").trim();
+  const custody = await assertExactCommittedProofReceipts(
+    store,
+    context,
+    { sourceCommit, sourceTree },
+    undefined,
+    "issuance",
+  );
+  if (!custody) {
+    throw new Error("CCC campaign final proof custody was not derived for semantic proof v2");
+  }
+  return custody;
 }
 
 export type CccCampaignLandingTaskCommit = Readonly<{ taskId: string; commit: string }>;
@@ -655,11 +988,22 @@ export async function campaignGitLandingRequiredResult(
     if (!intentMetadata || JSON.stringify(terminalMetadata) !== JSON.stringify(intentMetadata)) {
       throw new Error("CCC campaign Git landing terminal metadata does not match durable intent");
     }
-    await assertExactCommittedProofReceipts(store, context, {
+    const replayProofCustody = semanticProofContract(context) === "v2"
+      ? terminalMetadata.schema === "ccc-campaign.git-landing.intent.v3"
+        ? terminalMetadata.finalProofCustody
+        : null
+      : null;
+    if (semanticProofContract(context) === "v2" && !replayProofCustody) {
+      throw new Error(
+        "CCC campaign Git landing semantic-v2 replay is missing durable final proof custody",
+      );
+    }
+    const replayObservedCustody = await assertExactCommittedProofReceipts(store, context, {
       sourceCommit: terminalMetadata.sourceCommit,
       sourceTree: terminalMetadata.treeObject,
       mutationPaths: terminalMetadata.mutationPaths,
-    }, undefined, true);
+    }, undefined, "replay");
+    assertMatchingFinalProofCustody(replayObservedCustody, replayProofCustody);
     const snapshot = await inspectCccCampaignLocalGit({
       targetRoot,
       expectedBaseObject: terminalMetadata.expectedBaseObject,
@@ -676,6 +1020,36 @@ export async function campaignGitLandingRequiredResult(
 
   const lease = context.activeActionLeases[action.actionId];
   if (!lease) throw new Error("CCC campaign Git landing requires a claimed approval lease");
+  const persistedApproval = await getApprovalRequest(layer.db, lease.approvalRequestId);
+  if (!persistedApproval || persistedApproval.id !== lease.approvalRequestId) {
+    throw new Error("CCC campaign Git landing approval is missing before Git mutation");
+  }
+  const expectedFinalProofCustody = approvedFinalProofCustody(
+    context,
+    persistedApproval.runId,
+  );
+  const approvalInput = {
+    authorityStore,
+    rootDir: targetRoot,
+    taskId: context.taskId,
+    action,
+    approvalRequestId: lease.approvalRequestId,
+    claimToken: lease.claimToken,
+  };
+  if (
+    intentMetadata
+    && (
+      (expectedFinalProofCustody !== null)
+        !== (intentMetadata.schema === "ccc-campaign.git-landing.intent.v3")
+      || (intentMetadata.schema === "ccc-campaign.git-landing.intent.v3"
+        && canonicalCccPrdJson(intentMetadata.finalProofCustody)
+          !== canonicalCccPrdJson(expectedFinalProofCustody))
+    )
+  ) {
+    throw new Error(
+      "CCC campaign Git landing durable intent does not match the approved final proof custody",
+    );
+  }
   const sourceRef = `refs/heads/${branch}`;
   const admittedWriteRoots = sourceWriteRoots(context, targetRoot);
   const identity: CccCampaignGitCommitIdentity = Object.freeze({
@@ -684,13 +1058,42 @@ export async function campaignGitLandingRequiredResult(
     timestamp: COMMIT_TIMESTAMP,
   });
   const message = `CCC campaign native Git landing ${context.taskId}`;
-  if (!intentMetadata) {
-    const snapshot = await inspectCccCampaignLocalGit({
+  // A durable checkout-materialization receipt deliberately permits the target
+  // root's index/worktree to differ from HEAD during recovery.  Re-derive Git
+  // source custody from the live repository only before the first intent; on
+  // replay, the durable intent is the exact source object authority and the
+  // object-restoration path below independently validates it.
+  const preMutationSnapshot = intentMetadata
+    ? null
+    : await inspectCccCampaignLocalGit({
       targetRoot,
       expectedBaseObject: context.targetRepository.baseCommit,
     });
+  const preMutationSourceCommit = intentMetadata?.sourceCommit
+    ?? (await runControlledCccCampaignGit(
+      preMutationSnapshot!,
+      ["rev-parse", "--verify", `${sourceRef}^{commit}`],
+    )).toString("utf8").trim();
+  const preMutationSourceTree = intentMetadata?.treeObject
+    ?? (await runControlledCccCampaignGit(
+      preMutationSnapshot!,
+      ["rev-parse", "--verify", `${preMutationSourceCommit}^{tree}`],
+    )).toString("utf8").trim();
+  await layer.transactionImmediate(async (tx) => {
+    await assertExactApprovedProofReceipts(store, context, {
+      sourceCommit: preMutationSourceCommit,
+      sourceTree: preMutationSourceTree,
+    }, expectedFinalProofCustody, tx);
+    await assertActiveApprovalLeaseWithinTransaction(
+      authorityStore,
+      tx,
+      context,
+      approvalInput,
+    );
+  });
+  if (!intentMetadata) {
     const observed = (await runControlledCccCampaignGit(
-      snapshot,
+      preMutationSnapshot!,
       ["rev-parse", "--verify", `${targetRef}^{commit}`],
     )).toString("utf8").trim();
     if (observed !== context.targetRepository.baseCommit) {
@@ -727,7 +1130,8 @@ export async function campaignGitLandingRequiredResult(
   const prepared = intentMetadata
     ? preparedFromIntent(preparedBase, intentMetadata)
     : preparedBase;
-  const intent = intentMetadata ?? metadataFromPrepared(prepared);
+  const intent = intentMetadata
+    ?? metadataFromPrepared(prepared, expectedFinalProofCustody);
   /*
    * Defense in depth, independent of the proof gate: the landed tree is taken
    * from `sourceCommit`, so every commit another campaign task durably recorded
@@ -740,25 +1144,16 @@ export async function campaignGitLandingRequiredResult(
     prepared.sourceCommit,
     await recordedCampaignTaskCommits(store, context),
   );
-  const approvalInput = {
-    authorityStore,
-    rootDir: targetRoot,
-    taskId: context.taskId,
-    action,
-    approvalRequestId: lease.approvalRequestId,
-    claimToken: lease.claimToken,
-  };
-
   if (!intentMetadata && fault === "after-objects-before-intent") {
     throw new Error("CCC campaign Git landing test fault after deterministic objects before durable intent");
   }
 
   if (!intentMetadata) await layer.transactionImmediate(async (tx) => {
-    await assertExactCommittedProofReceipts(store, context, {
+    await assertExactApprovedProofReceipts(store, context, {
       sourceCommit: prepared.sourceCommit,
       sourceTree: prepared.treeObject,
       mutationPaths: prepared.mutationPaths,
-    }, tx);
+    }, expectedFinalProofCustody, tx);
     await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
     await recheckCccCampaignGitObjects(prepared);
     await recordRunAuditEventWithinTransaction(tx, {
@@ -788,11 +1183,11 @@ export async function campaignGitLandingRequiredResult(
   const observedBeforeCas = await currentTargetCommit(prepared);
   if (observedBeforeCas === prepared.expectedTarget) {
     await layer.transactionImmediate(async (tx) => {
-      await assertExactCommittedProofReceipts(store, context, {
+      await assertExactApprovedProofReceipts(store, context, {
         sourceCommit: prepared.sourceCommit,
         sourceTree: prepared.treeObject,
         mutationPaths: prepared.mutationPaths,
-      }, tx);
+      }, expectedFinalProofCustody, tx);
       await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
     });
     if (fault === "foreign-before-cas") {
@@ -824,11 +1219,11 @@ export async function campaignGitLandingRequiredResult(
     }
     if (prepared.targetCheckout.mode === "target-root" && !checkoutMaterializedMetadata) {
       await layer.transactionImmediate(async (tx) => {
-        await assertExactCommittedProofReceipts(store, context, {
+        await assertExactApprovedProofReceipts(store, context, {
           sourceCommit: prepared.sourceCommit,
           sourceTree: prepared.treeObject,
           mutationPaths: prepared.mutationPaths,
-        }, tx);
+        }, expectedFinalProofCustody, tx);
         await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
         const state = await inspectCccCampaignGitLandingState(prepared);
         if (state !== "checkout-materialized" && state !== "landed-clean") {
@@ -857,11 +1252,11 @@ export async function campaignGitLandingRequiredResult(
       throw new Error("CCC campaign Git landing test fault after checkout materialization receipt");
     }
     await layer.transactionImmediate(async (tx) => {
-      await assertExactCommittedProofReceipts(store, context, {
+      await assertExactApprovedProofReceipts(store, context, {
         sourceCommit: prepared.sourceCommit,
         sourceTree: prepared.treeObject,
         mutationPaths: prepared.mutationPaths,
-      }, tx);
+      }, expectedFinalProofCustody, tx);
       await assertActiveApprovalLeaseWithinTransaction(authorityStore, tx, context, approvalInput);
     });
     const cas = await casCccCampaignGitRef(prepared);
@@ -884,11 +1279,11 @@ export async function campaignGitLandingRequiredResult(
   }
 
   await layer.transactionImmediate(async (tx) => {
-    await assertExactCommittedProofReceipts(store, context, {
+    await assertExactApprovedProofReceipts(store, context, {
       sourceCommit: prepared.sourceCommit,
       sourceTree: prepared.treeObject,
       mutationPaths: prepared.mutationPaths,
-    }, tx);
+    }, expectedFinalProofCustody, tx);
     await assertClaimedCccCampaignApprovalWithinTransaction(tx, approvalInput);
     await recordRunAuditEventWithinTransaction(tx, {
       timestamp: LANDING_TIMESTAMP,

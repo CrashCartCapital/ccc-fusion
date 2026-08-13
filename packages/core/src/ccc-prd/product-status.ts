@@ -1,9 +1,13 @@
+import { createHash } from "node:crypto";
 import { and, eq, inArray, or } from "drizzle-orm";
 import type {
   CccCampaignAuthorityBinding,
   CccCampaignExecutionAuthorizationMode,
   CccCampaignExecutionRoute,
+  CccCampaignProofAttemptContractVersion,
+  CccCampaignProofEvidenceV2,
   CccCampaignProofAttemptState,
+  CccCampaignProofTerminalEnvelopeV2,
   CccCampaignWorkItemFence,
   CccProviderAttemptCost,
   CccProviderAttemptReceiptSource,
@@ -24,6 +28,10 @@ import {
   type CccCampaignExecutionAuthorization,
 } from "../ccc-campaign/execution-authorization.js";
 import {
+  CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_CODE,
+  CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON,
+} from "../ccc-campaign/types.js";
+import {
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
 } from "../ccc-campaign/request-budget.js";
@@ -38,6 +46,7 @@ import {
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
 } from "./contract.js";
 import {
   CccPrdImportError,
@@ -45,6 +54,7 @@ import {
 import { physicalCccPrdImportRoot } from "./import-admission.js";
 import type {
   CccPrdProof,
+  CccPrdProofPhase,
 } from "./types.js";
 
 export const CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION =
@@ -161,8 +171,17 @@ export type CccPrdProductProofAttemptStatus = Readonly<{
   workItemId: string;
   runId: string;
   workItemAttempt: number;
+  attemptContractVersion?: CccCampaignProofAttemptContractVersion;
+  phase?: CccPrdProofPhase | null;
+  verifierClosureSha256?: string | null;
+  candidateInputsSha256?: string | null;
+  executionToolchainSha256?: string | null;
   state: CccCampaignProofAttemptState;
   result: CccPrdProductProofAttemptResult | null;
+  terminalEnvelope?: CccCampaignProofTerminalEnvelopeV2 | null;
+  terminalEnvelopeSha256?: string | null;
+  proofEvidence?: CccCampaignProofEvidenceV2 | null;
+  proofEvidenceSha256?: string | null;
   createdAt: string;
   updatedAt: string;
   dispatchedAt: string | null;
@@ -363,6 +382,20 @@ function routeStatus(
   };
 }
 
+function cloneCanonicalJson<T>(value: unknown): T {
+  return JSON.parse(canonicalCccPrdJson(value)) as T;
+}
+
+function sha256CanonicalValue(value: unknown): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(value), "utf8")
+    .digest("hex");
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 function proofAttemptStatus(
   row: ProofAttemptRow,
 ): CccPrdProductProofAttemptStatus {
@@ -388,6 +421,15 @@ function proofAttemptStatus(
     workItemId: row.workItemId,
     runId: row.runId,
     workItemAttempt: row.workItemAttempt,
+    ...(row.attemptContractVersion === "v2"
+      ? {
+        attemptContractVersion: row.attemptContractVersion,
+        phase: row.phase,
+        verifierClosureSha256: row.verifierClosureSha256,
+        candidateInputsSha256: row.candidateInputsSha256,
+        executionToolchainSha256: row.executionToolchainSha256,
+      }
+      : {}),
     state: row.state,
     result: hasResult
       ? {
@@ -407,6 +449,20 @@ function proofAttemptStatus(
         negativeControlLabel: row.negativeControlLabel,
       }
       : null,
+    ...(row.attemptContractVersion === "v2"
+      ? {
+        terminalEnvelope: row.terminalEnvelope === null
+          ? null
+          : cloneCanonicalJson<CccCampaignProofTerminalEnvelopeV2>(
+            row.terminalEnvelope,
+          ),
+        terminalEnvelopeSha256: row.terminalEnvelopeSha256,
+        proofEvidence: row.proofEvidence === null
+          ? null
+          : cloneCanonicalJson<CccCampaignProofEvidenceV2>(row.proofEvidence),
+        proofEvidenceSha256: row.proofEvidenceSha256,
+      }
+      : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     dispatchedAt: row.dispatchedAt,
@@ -572,14 +628,15 @@ function compareCreatedThenId(
 function commonPassingProofCommit(
   proofs: readonly CccPrdProductProofStatus[],
 ): string | null {
-  if (proofs.length === 0) return null;
+  const mergeProofs = proofs.filter(({ definition }) =>
+    definition.schema !== "ccc-prd.proof.v2"
+    || definition.phases.includes("final_integrated"));
+  if (mergeProofs.length === 0) return null;
   let candidates: Set<string> | null = null;
-  for (const proof of proofs) {
+  for (const proof of mergeProofs) {
     const passing = new Set<string>(
       proof.attempts
-        .filter((attempt) =>
-          attempt.state === "committed"
-          && attempt.result?.success === true)
+        .filter((attempt) => isPassingProofAttempt(proof, attempt))
         .map((attempt) => attempt.sourceCommit),
     );
     if (passing.size === 0) return null;
@@ -597,9 +654,84 @@ function commonPassingProofCommit(
   return [...(candidates ?? [])].sort(compareCccPrdCodeUnits)[0] ?? null;
 }
 
+function isPassingProofAttempt(
+  proof: CccPrdProductProofStatus,
+  attempt: CccPrdProductProofAttemptStatus,
+): boolean {
+  if (proof.definition.schema !== "ccc-prd.proof.v2") {
+    return (attempt.attemptContractVersion ?? "v1") === "v1"
+      && attempt.state === "committed"
+      && attempt.result?.success === true;
+  }
+  const envelope = attempt.terminalEnvelope;
+  const evidence = attempt.proofEvidence;
+  if (
+    attempt.attemptContractVersion !== "v2"
+    || attempt.phase !== "final_integrated"
+    || !proof.definition.phases.includes("final_integrated")
+    || attempt.state !== "committed"
+  ) return false;
+  let admissionDigests: ReturnType<
+    typeof computeCccPrdProofV2AdmissionDigests
+  >;
+  try {
+    admissionDigests = computeCccPrdProofV2AdmissionDigests(proof.definition);
+  } catch {
+    return false;
+  }
+  const expectedEvidenceResults = {
+    clauseResults: [...proof.definition.clauseIds]
+      .sort(compareCccPrdCodeUnits)
+      .map((clauseId) => ({ clauseId, passed: true })),
+    positiveCaseResults: [...proof.definition.positiveCases]
+      .sort((left, right) => compareCccPrdCodeUnits(left.id, right.id))
+      .map(({ id: caseId }) => ({ caseId, passed: true })),
+    negativeControlResults: [...proof.definition.negativeControls]
+      .sort((left, right) => compareCccPrdCodeUnits(left.id, right.id))
+      .map(({ id: controlId }) => ({ controlId, passed: true })),
+  };
+  return attempt.definitionSha256
+      === computeCccPrdProofDefinitionSha256(proof.definition)
+    && attempt.proofId === proof.definition.id
+    && attempt.commandSha256 === sha256Text(proof.definition.command)
+    && attempt.verifierClosureSha256 === admissionDigests.verifierClosureSha256
+    && attempt.candidateInputsSha256 === admissionDigests.candidateInputsSha256
+    && attempt.executionToolchainSha256
+      === admissionDigests.executionToolchainSha256
+    && envelope?.schema === "ccc-prd.proof-terminal-envelope.v2"
+    && envelope.kind === "verified"
+    && envelope.phase === "final_integrated"
+    && envelope.proofId === proof.definition.id
+    && envelope.sourceCommit === attempt.sourceCommit
+    && envelope.sourceTree === attempt.sourceTree
+    && envelope.passed === true
+    && evidence?.schema === "ccc-prd.proof-evidence.v2"
+    && evidence.phase === "final_integrated"
+    && evidence.proofId === proof.definition.id
+    && evidence.sourceCommit === attempt.sourceCommit
+    && evidence.sourceTree === attempt.sourceTree
+    && evidence.passed === true
+    && canonicalCccPrdJson({
+      clauseResults: evidence.clauseResults,
+      positiveCaseResults: evidence.positiveCaseResults,
+      negativeControlResults: evidence.negativeControlResults,
+    }) === canonicalCccPrdJson(expectedEvidenceResults)
+    && attempt.terminalEnvelopeSha256 !== null
+    && attempt.proofEvidenceSha256 !== null
+    && attempt.terminalEnvelopeSha256 === sha256CanonicalValue(envelope)
+    && attempt.proofEvidenceSha256 === sha256CanonicalValue(evidence)
+    && envelope.evidenceSha256 === attempt.proofEvidenceSha256
+    && canonicalCccPrdJson(envelope.evidence) === canonicalCccPrdJson(evidence);
+}
+
 function isKnownVerifierConfinementFailure(
   attempt: CccPrdProductProofAttemptStatus,
 ): boolean {
+  if (attempt.attemptContractVersion === "v2") {
+    return attempt.state === "proved_failed"
+      && attempt.terminalEnvelope?.kind === "execution_refused"
+      && attempt.terminalEnvelope.code === "sandbox_refused";
+  }
   if (attempt.state !== "proved_failed" || !attempt.result) return false;
   const evidence = [
     attempt.result.stderrTail,
@@ -698,6 +830,10 @@ export function productNextAction(
     item.state === "manual-required"
     && item.lastError === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
     && item.blockedReason === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON);
+  const proofDeadlineExpiredWorkItem = input.workItems.find((item) =>
+    item.state === "manual-required"
+    && item.lastError === CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON
+    && item.blockedReason === CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON);
   if (verifierConfinementWorkItem) {
     return {
       kind: "blocked",
@@ -722,6 +858,7 @@ export function productNextAction(
     item.state === "manual-required"
     && item.lastError !== CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON
     && item.lastError !== CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
+    && item.lastError !== CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON
     && item.id !== liveExecutionApprovalWorkItem?.id);
   // Only an unexpired lease matching the full persisted work-item fence proves
   // that the runtime still owns an uncertain effect. Task identity alone is
@@ -763,24 +900,45 @@ export function productNextAction(
         "Campaign provider/proof work is reserved or in flight and still owned by the runtime.",
     };
   }
-  if (
-    reservedProof
-    || unknownProof
-    || reservedProvider
-    || unknownProvider
-    || uncertainManualWorkItem
-  ) {
+  if (unknownProof || unknownProvider || reservedProvider || uncertainManualWorkItem) {
     return {
       kind: "resolve-manual-required",
       reason: uncertainManualWorkItem
         ? `Workflow work item ${uncertainManualWorkItem.id} requires an operator decision.`
-        : reservedProof
-          ? `Proof attempt ${reservedProof.attemptKey} is reserved and has unresolved proof custody.`
-          : unknownProof
-            ? `Proof attempt ${unknownProof.attemptKey} has an uncertain external effect.`
-            : reservedProvider
-              ? `Provider attempt ${reservedProvider.attemptKey} is reserved and has unresolved provider custody.`
-              : `Provider attempt ${unknownProvider!.attemptKey} has an uncertain external effect.`,
+        : unknownProof
+          ? `Proof attempt ${unknownProof.attemptKey} has an uncertain external effect.`
+          : unknownProvider
+            ? `Provider attempt ${unknownProvider.attemptKey} has an uncertain external effect.`
+            : `Provider attempt ${reservedProvider!.attemptKey} is reserved and has unresolved provider custody.`,
+    };
+  }
+  if (proofDeadlineExpiredWorkItem) {
+    const reservedDetail = reservedProof
+      ? ` Proof attempt ${reservedProof.attemptKey} remains durably reserved but was not dispatched.`
+      : " No proof attempt was reserved or dispatched after expiry.";
+    return {
+      kind: "blocked",
+      reason:
+        "The sealed campaign deadline expired before a new semantic proof could begin.",
+      diagnostic: CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_CODE,
+      safeState:
+        `Workflow work item ${proofDeadlineExpiredWorkItem.id} is parked manual-required.${reservedDetail} Existing commits, worktrees, and receipts remain preserved.`,
+      decisionOwner: "Campaign operator",
+      consequence:
+        "This immutable import cannot start another proof or proceed to merge after its sealed deadline.",
+      recoveryOptions: [
+        "Retain this expired import and its receipts as immutable evidence; do not retry or requeue it.",
+        "Create a fresh semantic-v2 packet, preview, and import with a new deadline.",
+        "Treat prior task commits as evidence only; carrying their bytes into a new base requires separate custody and proof.",
+      ],
+      nextSafeAction:
+        "Create and confirm a fresh semantic-v2 import with a new campaign deadline.",
+    };
+  }
+  if (reservedProof) {
+    return {
+      kind: "resolve-manual-required",
+      reason: `Proof attempt ${reservedProof.attemptKey} is reserved and has unresolved proof custody.`,
     };
   }
   if (
@@ -855,11 +1013,10 @@ export function productNextAction(
     || item.state === "exhausted");
   const failedProof = input.proofs.find((proof) =>
     proof.attempts.some((attempt) => attempt.state === "proved_failed")
-    && !proof.attempts.some((attempt) =>
-      attempt.state === "committed" && attempt.result?.success === true));
+    && !proof.attempts.some((attempt) => isPassingProofAttempt(proof, attempt)));
   const historicalVerifierFailure = input.proofs
     .filter((proof) => !proof.attempts.some((attempt) =>
-      attempt.state === "committed" && attempt.result?.success === true))
+      isPassingProofAttempt(proof, attempt)))
     .map((proof) => ({
       proof,
       attempt: proof.attempts.find(isKnownVerifierConfinementFailure),
@@ -1214,6 +1371,15 @@ export async function inspectCccPrdProductStatus(
         workItemId: schema.project.cccCampaignProofAttempts.workItemId,
         runId: schema.project.cccCampaignProofAttempts.runId,
         workItemAttempt: schema.project.cccCampaignProofAttempts.workItemAttempt,
+        attemptContractVersion:
+          schema.project.cccCampaignProofAttempts.attemptContractVersion,
+        phase: schema.project.cccCampaignProofAttempts.phase,
+        verifierClosureSha256:
+          schema.project.cccCampaignProofAttempts.verifierClosureSha256,
+        candidateInputsSha256:
+          schema.project.cccCampaignProofAttempts.candidateInputsSha256,
+        executionToolchainSha256:
+          schema.project.cccCampaignProofAttempts.executionToolchainSha256,
         state: schema.project.cccCampaignProofAttempts.state,
         resultSuccess: schema.project.cccCampaignProofAttempts.resultSuccess,
         exitCode: schema.project.cccCampaignProofAttempts.exitCode,
@@ -1227,6 +1393,13 @@ export async function inspectCccPrdProductStatus(
         warnings: schema.project.cccCampaignProofAttempts.warnings,
         changedPathsSha256: schema.project.cccCampaignProofAttempts.changedPathsSha256,
         negativeControlLabel: schema.project.cccCampaignProofAttempts.negativeControlLabel,
+        terminalEnvelope:
+          schema.project.cccCampaignProofAttempts.terminalEnvelope,
+        terminalEnvelopeSha256:
+          schema.project.cccCampaignProofAttempts.terminalEnvelopeSha256,
+        proofEvidence: schema.project.cccCampaignProofAttempts.proofEvidence,
+        proofEvidenceSha256:
+          schema.project.cccCampaignProofAttempts.proofEvidenceSha256,
         createdAt: schema.project.cccCampaignProofAttempts.createdAt,
         updatedAt: schema.project.cccCampaignProofAttempts.updatedAt,
         dispatchedAt: schema.project.cccCampaignProofAttempts.dispatchedAt,

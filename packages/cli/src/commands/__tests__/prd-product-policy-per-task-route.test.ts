@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -69,8 +70,42 @@ const bootstrapProofAdmission = () => bootstrapCccCampaignProofAdmissionHost({
 function createTwoTaskPacketRoot() {
   const root = mkdtempSync(join(tmpdir(), "ccc-prd-per-task-route-"));
   packetRoots.push(root);
-  const target = "fixture/repo";
-  const base = "a".repeat(40);
+  const target = join(root, "target");
+  const verifierHarness = "verify/routes.mjs";
+  mkdirSync(join(target, "verify"), { recursive: true });
+  writeFileSync(join(target, "Taskfile.yml"), [
+    "version: '3'",
+    "tasks:",
+    "  verify:routes:",
+    "    cmds:",
+    `      - node ${verifierHarness} ${OWNED_PATH_A} ${OWNED_PATH_B}`,
+    "",
+  ].join("\n"));
+  writeFileSync(join(target, verifierHarness), "console.log(process.argv.slice(2).join(','));\n");
+  execFileSync("/usr/bin/git", ["init", "-b", "main"], { cwd: target });
+  execFileSync("/usr/bin/git", ["add", "Taskfile.yml", verifierHarness], { cwd: target });
+  execFileSync("/usr/bin/git", [
+    "-c", "user.name=Fusion CLI Test",
+    "-c", "user.email=fusion-cli-test@example.invalid",
+    "commit", "-m", "proof baseline",
+  ], { cwd: target });
+  const base = execFileSync("/usr/bin/git", ["rev-parse", "HEAD"], { cwd: target, encoding: "utf8" }).trim();
+  const controllerRoot = join(root, "controller");
+  mkdirSync(controllerRoot);
+  const taskExecutablePath = join(controllerRoot, "task-fixture");
+  const proofHostPath = join(controllerRoot, "proof-host.mjs");
+  writeFileSync(taskExecutablePath, "#!/bin/sh\nprintf 'Task fixture 1.0.0\\n'\n");
+  writeFileSync(proofHostPath, "console.log('Fusion CLI proof host fixture 1.0.0');\n");
+  chmodSync(taskExecutablePath, 0o755);
+  chmodSync(proofHostPath, 0o755);
+  const semanticProofToolchainPaths = {
+    taskExecutablePath,
+    nodeExecutablePath: process.execPath,
+    proofHost: {
+      id: "fusion-cli-semantic-proof-host.v1" as const,
+      executablePath: proofHostPath,
+    },
+  };
 
   // Material-coverage admission (analyzeCccPrdMaterialCoverage in
   // packages/engine/src/ccc-prd/material-coverage.ts) requires every
@@ -96,9 +131,28 @@ function createTwoTaskPacketRoot() {
     "Non-goal: live provider call",
     `Requirement ${REQUIREMENT_ID} statement: Run two custody-isolated tasks in one dependency chain.`,
     `Requirement ${REQUIREMENT_ID} acceptance behavior: Both tasks execute with disjoint ownership and distinct routes.`,
-    `Proof ${PROOF_ID} verifier command: pnpm test`,
+    `Proof ${PROOF_ID} verifier command: task verify:routes`,
     `Proof ${PROOF_ID} positive oracle: exit 0`,
     `Proof ${PROOF_ID} negative control: missing sidecar refuses`,
+  ].join("\n");
+  const acceptanceClauseText = "Both tasks execute with disjoint ownership and distinct routes.";
+  const requirementBlock = [
+    `### Requirement ${REQUIREMENT_ID}`,
+    `Requirement statement: Run two custody-isolated tasks in one dependency chain.`,
+    `Acceptance behavior: ${acceptanceClauseText}`,
+  ].join("\n");
+  const acceptanceClauseBlock = [
+    "#### Acceptance clauses",
+    `- [AC-${REQUIREMENT_ID}-001] ${acceptanceClauseText}`,
+  ].join("\n");
+  const semanticProofBlock = [
+    "## Semantic proof custody",
+    "Positive case POS-ROUTES-001: the admitted two-task route candidate passes",
+    "Negative control NEG-ROUTES-001: a missing route candidate fails",
+    "Verifier closure task runner: Taskfile.yml",
+    `Verifier closure harness: ${verifierHarness}`,
+    `Candidate input: ${OWNED_PATH_A}`,
+    `Candidate input: ${OWNED_PATH_B}`,
   ].join("\n");
   const taskABlock = [
     `## ${TASK_A_ID} execution contract`,
@@ -115,6 +169,12 @@ function createTwoTaskPacketRoot() {
     "# Per-Task Route PRD Packet",
     "",
     decisionsBlock,
+    "",
+    requirementBlock,
+    "",
+    acceptanceClauseBlock,
+    "",
+    semanticProofBlock,
     "",
     taskABlock,
     "",
@@ -135,14 +195,16 @@ function createTwoTaskPacketRoot() {
     }],
   }, null, 2));
 
-  const requirementRef = { path: "packet.md", exactQuote: decisionsBlock };
+  const requirementRef = { path: "packet.md", exactQuote: requirementBlock };
   const proofRef = { path: "packet.md", exactQuote: decisionsBlock };
+  const acceptanceClauseRef = { path: "packet.md", exactQuote: acceptanceClauseText };
+  const semanticProofRef = { path: "packet.md", exactQuote: semanticProofBlock };
   const taskARef = { path: "packet.md", exactQuote: taskABlock };
   const taskBRef = { path: "packet.md", exactQuote: taskBBlock };
 
   const proposal = join(root, "authoring-response.fixture.json");
   writeFileSync(proposal, JSON.stringify({
-    schema: "ccc-prd.authoring-proposal.v1",
+    schema: "ccc-prd.authoring-proposal.v2",
     authorityRoles: [{
       id: "AUTHORITY-1",
       role: "root",
@@ -156,16 +218,39 @@ function createTwoTaskPacketRoot() {
       accountableProducer: "fixture",
       dependencies: [],
       proofIds: [PROOF_ID],
-      sourceRefs: [requirementRef],
+      acceptanceClauses: [{
+        id: `AC-${REQUIREMENT_ID}-001`,
+        requirementId: REQUIREMENT_ID,
+        text: acceptanceClauseText,
+        proofIds: [PROOF_ID],
+        sourceRefs: [acceptanceClauseRef],
+      }],
+      acceptanceDispositions: [],
+      sourceRefs: [requirementRef, { path: "packet.md", exactQuote: acceptanceClauseBlock }],
       confidence: "high",
     }],
     proofs: [{
+      schema: "ccc-prd.proof.v2",
       id: PROOF_ID,
       requirementIds: [REQUIREMENT_ID],
-      command: "pnpm test",
+      clauseIds: [`AC-${REQUIREMENT_ID}-001`],
+      command: "task verify:routes",
+      phases: ["task", "final_integrated"],
       positiveOracle: "exit 0",
-      negativeControls: ["missing sidecar refuses"],
-      sourceRefs: [proofRef],
+      positiveCases: [{ id: "POS-ROUTES-001", description: "the admitted two-task route candidate passes" }],
+      negativeControls: [{ id: "NEG-ROUTES-001", description: "a missing route candidate fails" }],
+      verifierClosure: [
+        { role: "task_runner", path: "Taskfile.yml", baseGitBlobOid: "0".repeat(40), sha256: "0".repeat(64) },
+        { role: "harness", path: verifierHarness, baseGitBlobOid: "0".repeat(40), sha256: "0".repeat(64) },
+      ],
+      candidateInputs: [OWNED_PATH_A, OWNED_PATH_B],
+      executionToolchain: {
+        task: { executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+        node: { executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+        proofHost: { id: "", executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+        linkedRuntime: [],
+      },
+      sourceRefs: [proofRef, semanticProofRef],
       confidence: "high",
     }],
     tasks: [
@@ -183,7 +268,7 @@ function createTwoTaskPacketRoot() {
         protectedActionIds: [],
         ownedPaths: [OWNED_PATH_A],
         allowedWriteRoots: [OWNED_PATH_A],
-        sourceRefs: [taskARef],
+        sourceRefs: [requirementRef, proofRef, semanticProofRef, taskARef],
       },
       {
         id: TASK_B_ID,
@@ -199,7 +284,7 @@ function createTwoTaskPacketRoot() {
         protectedActionIds: [],
         ownedPaths: [OWNED_PATH_B],
         allowedWriteRoots: [OWNED_PATH_B],
-        sourceRefs: [taskBRef],
+        sourceRefs: [requirementRef, proofRef, semanticProofRef, taskBRef],
       },
     ],
     edges: [{
@@ -266,6 +351,7 @@ function createTwoTaskPacketRoot() {
     sidecar: join(root, "candidate.sidecar.json"),
     target,
     base,
+    semanticProofToolchainPaths,
   };
 }
 
@@ -277,7 +363,10 @@ async function authorTwoTaskSidecar(
   const exit = await runPrdCommand(
     ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
     { write: (line) => output.push(line) },
-    { bootstrapProofAdmission },
+    {
+      bootstrapProofAdmission,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    },
   );
   if (exit !== 0) {
     throw new Error(`two-task fixture authoring failed (exit ${exit}): ${output.join("\n")}`);
@@ -307,7 +396,9 @@ async function createBelowFloorExecutionPlan() {
     executionPlanPath,
     "--routes-file",
     routesPath,
-  ], { write: (line) => policyOutput.push(line) });
+  ], { write: (line) => policyOutput.push(line) }, {
+    resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+  });
   if (exit !== 0) {
     throw new Error(`below-floor execution plan failed (exit ${exit}): ${policyOutput.join("\n")}`);
   }
@@ -370,7 +461,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       outputPath,
       "--routes-file",
       routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit, output.join("\n")).toBe(0);
     expect(existsSync(outputPath)).toBe(true);
@@ -415,6 +508,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     ], { write: (line) => output.push(line) }, {
       inspectVerifierConfinementReadiness,
       resolveProject,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
     })).toBe(1);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "refusal",
@@ -497,6 +591,10 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       closeProjectStore,
       readTargetHead: vi.fn(async () => packet.base),
       importCccPrdBundle,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+      // The proposal-authoring and semantic-custody suites own executable
+      // revalidation. These cases pin only the core import delegation result.
+      assertSemanticProofV2Custody: vi.fn(async () => undefined),
     })).toBe(0);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "imported",
@@ -565,6 +663,8 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       closeProjectStore: vi.fn(async () => undefined),
       readTargetHead: vi.fn(async () => packet.base),
       importCccPrdBundle,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+      assertSemanticProofV2Custody: vi.fn(async () => undefined),
     })).toBe(1);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "refusal",
@@ -599,7 +699,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       outputPath,
       "--routes-file",
       routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit).toBe(1);
     expect(existsSync(outputPath)).toBe(false);
@@ -693,7 +795,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       outputPath,
       "--routes-file",
       routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit).toBe(1);
     expect(existsSync(outputPath)).toBe(false);
@@ -717,7 +821,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     const exit = await runPrdCommand([
       "policy", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base,
       outputPath, "--routes-file", routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit).toBe(1);
     expect(existsSync(outputPath)).toBe(false);
@@ -737,7 +843,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     const exit = await runPrdCommand([
       "policy", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base,
       outputPath, "--routes-file", routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit).toBe(1);
     expect(existsSync(outputPath)).toBe(false);
@@ -757,7 +865,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     const exit = await runPrdCommand([
       "policy", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base,
       outputPath, "--routes-file", routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit).toBe(1);
     expect(existsSync(outputPath)).toBe(false);
@@ -783,7 +893,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     const exit = await runPrdCommand([
       "policy", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base,
       outputPath, "--routes-file", routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit).toBe(1);
     expect(existsSync(outputPath)).toBe(false);
@@ -810,7 +922,9 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     const exit = await runPrdCommand([
       "policy", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base,
       outputPath, "--routes-file", routesPath,
-    ], { write: (line) => output.push(line) });
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
+    });
 
     expect(exit).toBe(1);
     expect(existsSync(outputPath)).toBe(false);

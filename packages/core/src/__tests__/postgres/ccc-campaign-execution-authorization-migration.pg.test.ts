@@ -163,7 +163,7 @@ describe("CCC campaign execution-authorization migration registry", () => {
       fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
       "utf8",
     );
-    expect(SCHEMA_BASELINE_VERSION).toBe("0039");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0040");
     expect(applierSource).toContain("0039_ccc_campaign_execution_authorization.sql");
     expect(projectTableNames).toEqual(expect.arrayContaining(AUTHORIZATION_TABLES));
     expect(new Set(projectTableNames).size).toBe(projectTableNames.length);
@@ -189,14 +189,16 @@ pgDescribe("CCC campaign execution-authorization migration 0038 to 0039", () => 
     await upgraded.adminDb.execute(sql.raw(`
       DROP TABLE IF EXISTS project.ccc_campaign_execution_authorization_members;
       DROP TABLE IF EXISTS project.ccc_campaign_execution_authorizations;
-      DELETE FROM public.fusion_schema_migrations WHERE version = '0039';
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0039', '0040');
     `));
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0038");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0039");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0040");
 
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toEqual({ applied: true, pluginHooksRun: 0 });
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0039");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0040");
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toEqual({ applied: false, pluginHooksRun: 0 });
 
