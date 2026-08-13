@@ -1,5 +1,5 @@
 // port-4040-allowlist: this file embeds the "never kill port 4040" rule in the executor prompt.
-import { exec, execFile, execSync } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { setImmediate as setImmediateCb } from "node:timers";
@@ -17947,9 +17947,10 @@ ${scopeGuard}
       // FN-4417 false-positive cascade. Always recapture on non-resume.
       if (options.isResume && task.baseCommitSha) {
         try {
-          execSync(`git merge-base --is-ancestor ${task.baseCommitSha} HEAD`, {
+          await execFileAsync("git", ["merge-base", "--is-ancestor", task.baseCommitSha, "HEAD"], {
             cwd: worktreePath,
-            stdio: "pipe",
+            timeout: 120_000,
+            maxBuffer: 10 * 1024 * 1024,
           });
           executorLog.log(`${task.id}: preserved baseCommitSha ${task.baseCommitSha.slice(0, 7)} (resume)`);
           await audit.git({

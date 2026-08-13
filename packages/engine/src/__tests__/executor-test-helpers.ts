@@ -294,7 +294,7 @@ vi.mock("node:child_process", async () => {
   const execFileFn: any = vi.fn((_file: string, _args: string[] | undefined, opts: any, cb: any) => {
     const callback = typeof opts === "function" ? opts : cb;
     if (typeof callback === "function") {
-      callback(null, { stdout: "", stderr: "" });
+      callback(null, "", "");
     }
   });
 
@@ -310,8 +310,18 @@ vi.mock("node:child_process", async () => {
         }
       });
     });
-  execFileFn[promisify.custom] = (_file: string, _args?: string[], _opts?: any) =>
-    Promise.resolve({ stdout: "", stderr: "" });
+  execFileFn[promisify.custom] = (file: string, args?: string[], opts?: any) =>
+    new Promise((resolve, reject) => {
+      execFileFn(file, args, opts, (err: any, stdout: string, stderr: string) => {
+        if (err) {
+          (err as Record<string, unknown>).stdout = stdout;
+          (err as Record<string, unknown>).stderr = stderr;
+          reject(err);
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
 
   return { execSync: execSyncFn, exec: execFn, execFile: execFileFn, spawn: spawnFn };
 });
@@ -393,7 +403,7 @@ import { generateWorktreeName } from "../worktree-names.js";
 import { findWorktreeUser } from "../merger.js";
 import { StepSessionExecutor } from "../step-session-executor.js";
 import { withRateLimitRetry } from "../rate-limit-retry.js";
-import { exec, execSync } from "node:child_process";
+import { exec, execFile, execSync } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { hydrateWorktreeDb } from "../worktree-db-hydrate.js";
 import { classifyTaskWorktree, describeRegisteredWorktrees, isUsableTaskWorktree } from "../worktree-pool.js";
@@ -409,6 +419,7 @@ export const mockedFindWorktreeUser = vi.mocked(findWorktreeUser);
 export const mockedStepSessionExecutor = vi.mocked(StepSessionExecutor);
 export const mockedWithRateLimitRetry = vi.mocked(withRateLimitRetry);
 export const mockedExec = vi.mocked(exec);
+export const mockedExecFile = vi.mocked(execFile);
 export const mockedExecSync = vi.mocked(execSync);
 export const mockedExistsSync = vi.mocked(existsSync);
 export const mockedRealpathSync = vi.mocked(realpathSync);
@@ -761,6 +772,11 @@ export function captureNamedTool<T extends { name: string }>(
 export function resetExecutorMocks() {
   vi.clearAllMocks();
   mockedExec.mockReset();
+  mockedExecFile.mockReset();
+  mockedExecFile.mockImplementation(((_file: string, _args: string[] | undefined, opts: unknown, cb: unknown) => {
+    const callback = typeof opts === "function" ? opts : cb;
+    if (typeof callback === "function") callback(null, "", "");
+  }) as typeof execFile);
   mockedExecSync.mockReset();
   mockedStatSync.mockReset();
   mockedStatSync.mockReturnValue({ isDirectory: () => true } as ReturnType<typeof statSync>);

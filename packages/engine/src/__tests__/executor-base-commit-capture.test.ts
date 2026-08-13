@@ -3,7 +3,7 @@ import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import { executorLog } from "../logger.js";
 import type { Task } from "@fusion/core";
-import { createMockStore, mockedExec, mockedExecSync, resetExecutorMocks } from "./executor-test-helpers.js";
+import { createMockStore, mockedExec, mockedExecFile, resetExecutorMocks } from "./executor-test-helpers.js";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -42,7 +42,6 @@ describe("captureBaseCommitSha", () => {
   });
 
   it("preserves existing valid baseCommitSha across resumed sessions", async () => {
-    mockedExecSync.mockReturnValue("");
     const store = createMockStore();
     const executor = new TaskExecutor(store, "/tmp/test");
     const audit = { git: vi.fn().mockResolvedValue(undefined) };
@@ -63,7 +62,6 @@ describe("captureBaseCommitSha", () => {
     // force-reset to current main, so any stored baseCommitSha is stale
     // relative to the new merge-base. Preserving it would re-introduce the
     // false-positive contamination cascade.
-    mockedExecSync.mockReturnValue(""); // is-ancestor would succeed if asked
     mockedExec.mockImplementation(((cmd: any, _opts: any, cb: any) => {
       cb(null, cmd.includes("merge-base") ? "freshmainSHA\n" : "");
       return {} as any;
@@ -88,9 +86,9 @@ describe("captureBaseCommitSha", () => {
   });
 
   it("recaptures when existing baseCommitSha is not ancestor", async () => {
-    mockedExecSync.mockImplementation(() => {
-      throw new Error("not ancestor");
-    });
+    mockedExecFile.mockImplementation(((_file: string, _args: string[] | undefined, _opts: unknown, cb: unknown) => {
+      if (typeof cb === "function") cb(new Error("not ancestor"), "", "");
+    }) as typeof mockedExecFile);
     mockedExec.mockImplementation(((cmd: any, _opts: any, cb: any) => {
       cb(null, cmd.includes("merge-base") ? "new456\n" : "");
       return {} as any;
@@ -105,7 +103,6 @@ describe("captureBaseCommitSha", () => {
   });
 
   it("preserves prior merge base on resume for FN-4309/FN-4383 multi-session regression", async () => {
-    mockedExecSync.mockReturnValue("");
     const store = createMockStore();
     const executor = new TaskExecutor(store, "/tmp/test");
     const audit = { git: vi.fn().mockResolvedValue(undefined) };
