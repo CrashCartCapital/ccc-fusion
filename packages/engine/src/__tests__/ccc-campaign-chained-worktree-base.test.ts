@@ -3,11 +3,9 @@
  *
  * A multi-task campaign import produces one native task per semantic task,
  * linked by `dependencies` (native ids, written by the importer). M1 executes
- * that chain serially. The importer never writes `executionStartBranch`, so
- * every task worktree is created from the resolved integration branch
- * (worktree-acquisition.ts:265-270) — which means at N=2 task B's branch does
- * not contain task A's commit, and the campaign proof gate's per-task ancestry
- * loop (ccc-campaign-proof-execution.ts:317-326) refuses the whole campaign.
+ * that chain serially. Entry tasks must start from the campaign's sealed base;
+ * each successor must then start from its predecessor's exact branch so its
+ * worktree contains the already-proved history without rewriting custody.
  *
  * These tests pin the worktree START POINT the executor hands to
  * `createWorktree` — the real observable, since acquisition passes
@@ -30,6 +28,8 @@ import {
 } from "./executor-test-helpers.js";
 
 const IMPORT_ID = "0123456789abcdef01234567";
+const FROZEN_BASE = "1111111111111111111111111111111111111111";
+const STALE_REMOTE_BASE = "2222222222222222222222222222222222222222";
 
 function campaignLineage(semanticTaskId: string): string {
   return `ccc-prd:${IMPORT_ID}:${semanticTaskId}`;
@@ -79,6 +79,13 @@ function taskRow(overrides: Row = {}): Row {
 function makeHarness(rows: Record<string, Row>, existingRefs: readonly string[]) {
   const store = createMockStore();
   for (const [id, row] of Object.entries(rows)) store._setRow(id, row);
+  store.getCccCampaignContextForTask = vi.fn(async (taskId: string) => {
+    const row = await store.getTask(taskId);
+    return typeof row.lineageId === "string" && row.lineageId.startsWith("ccc-prd:")
+      && typeof row.baseCommitSha === "string"
+      ? { targetRepository: { path: "/tmp/test", baseCommit: row.baseCommitSha } }
+      : null;
+  }) as never;
   const executor = new TaskExecutor(store as never, "/tmp/test", {
     agentStore: { getAgent: vi.fn().mockResolvedValue(null), createAgent: vi.fn() },
   } as never);
@@ -168,18 +175,78 @@ describe("CCC campaign chained task worktree base", () => {
     expect(createWorktree).not.toHaveBeenCalled();
   });
 
-  it("leaves an entry campaign task (no predecessor) on the integration branch", async () => {
+  it("RED-R11-frozen-base starts an entry campaign task from its sealed base instead of the integration branch", async () => {
     const { store, executor, createWorktree } = makeHarness({
       "FN-1001": taskRow({
         lineageId: campaignLineage("TASK-A"),
         dependencies: [],
+        baseCommitSha: FROZEN_BASE,
       }),
-    }, ["main"]);
+    }, [FROZEN_BASE, "main"]);
 
     await prepare(executor, store, codingNode("TASK-A"), "FN-1001");
 
-    expect(capturedStartPoint(createWorktree)).not.toBe("fusion/fn-1001");
+    expect(capturedStartPoint(createWorktree)).toBe(FROZEN_BASE);
     expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  it("RED-R11-frozen-base outranks a stale explicit start-branch hint for an entry campaign task", async () => {
+    const { store, executor, createWorktree } = makeHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-A"),
+        dependencies: [],
+        baseCommitSha: FROZEN_BASE,
+        executionStartBranch: "main",
+      }),
+    }, [FROZEN_BASE, "main"]);
+
+    await prepare(executor, store, codingNode("TASK-A"), "FN-1001");
+
+    expect(capturedStartPoint(createWorktree)).toBe(FROZEN_BASE);
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  it("RED-R11-frozen-base refuses entry worktree creation when the task row drifts from sealed custody", async () => {
+    const { store, executor, createWorktree } = makeHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-A"),
+        dependencies: [],
+        baseCommitSha: STALE_REMOTE_BASE,
+      }),
+    }, [FROZEN_BASE, STALE_REMOTE_BASE, "main"]);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: "/tmp/test", baseCommit: FROZEN_BASE },
+    })) as never;
+
+    await expect(prepare(executor, store, codingNode("TASK-A"), "FN-1001"))
+      .rejects.toMatchObject({
+        code: "CCC_CAMPAIGN_FROZEN_BASE_REFUSED",
+        message: expect.stringMatching(/sealed base/),
+      });
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
+
+  it("RED-R11-frozen-base checks sealed custody before reusing a workflow-node worktree", async () => {
+    mockedExistsSync.mockReturnValue(true);
+    const { store, executor, createWorktree } = makeHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-A"),
+        dependencies: [],
+        baseCommitSha: STALE_REMOTE_BASE,
+        worktree: "/tmp/existing-campaign-worktree",
+        branch: "fusion/fn-1001",
+      }),
+    }, [FROZEN_BASE, STALE_REMOTE_BASE, "main"]);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: "/tmp/test", baseCommit: FROZEN_BASE },
+    })) as never;
+
+    await expect(prepare(executor, store, codingNode("TASK-A"), "FN-1001"))
+      .rejects.toMatchObject({
+        code: "CCC_CAMPAIGN_FROZEN_BASE_REFUSED",
+        message: expect.stringMatching(/sealed base/),
+      });
+    expect(createWorktree).not.toHaveBeenCalled();
   });
 
   it("leaves a non-campaign task with a dependency unchanged", async () => {
@@ -298,11 +365,16 @@ describe("CCC campaign chained task worktree base", () => {
  * These tests exercise the REAL plan/decide path (`execSync` is the mocked git
  * seam) and assert on the base `tryCreateWorktree` receives.
  */
-const FROZEN_BASE = "1111111111111111111111111111111111111111";
-
 function makeSquashHarness(rows: Record<string, Row>, existingRefs: readonly string[]) {
   const store = createMockStore();
   for (const [id, row] of Object.entries(rows)) store._setRow(id, row);
+  store.getCccCampaignContextForTask = vi.fn(async (taskId: string) => {
+    const row = await store.getTask(taskId);
+    return typeof row.lineageId === "string" && row.lineageId.startsWith("ccc-prd:")
+      && typeof row.baseCommitSha === "string"
+      ? { targetRepository: { path: "/tmp/test", baseCommit: row.baseCommitSha } }
+      : null;
+  }) as never;
   const executor = new TaskExecutor(store as never, "/tmp/test", {
     agentStore: { getAgent: vi.fn().mockResolvedValue(null), createAgent: vi.fn() },
   } as never);
@@ -362,6 +434,35 @@ describe("CCC campaign chained task worktree creation base", () => {
     }) as never);
   });
 
+  it("RED-R11-frozen-base preserves an entry campaign's sealed base when the remote is stale", async () => {
+    mockedExecSync.mockImplementation(((command: string) => {
+      const cmd = String(command).trim();
+      if (cmd === "git remote") return "origin\n";
+      if (cmd === "git rev-parse --abbrev-ref origin/HEAD") return "origin/main\n";
+      if (cmd === "git fetch 'origin' 'main'") return "";
+      if (cmd === "git rev-parse --verify \"origin/main^{commit}\"") {
+        return `${STALE_REMOTE_BASE}\n`;
+      }
+      if (cmd.startsWith("git merge-base --is-ancestor")) {
+        throw new Error("fatal: not an ancestor");
+      }
+      return "";
+    }) as never);
+    const { executor, tryCreateWorktree, squashImportDepIntoWorktree, rebaseNewWorktreeOntoRemote } = makeSquashHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-A"),
+        dependencies: [],
+        baseCommitSha: FROZEN_BASE,
+      }),
+    }, [FROZEN_BASE, "main"]);
+
+    await createWorktreeFor(executor, "FN-1001", "fusion/fn-1001", FROZEN_BASE);
+
+    expect(capturedCreationBase(tryCreateWorktree)).toBe(`sha-for-${FROZEN_BASE}`);
+    expect(squashImportDepIntoWorktree).not.toHaveBeenCalled();
+    expect(rebaseNewWorktreeOntoRemote).not.toHaveBeenCalled();
+  });
+
   it("forks a chained campaign successor directly from its predecessor's tip", async () => {
     const { executor, tryCreateWorktree, squashImportDepIntoWorktree, rebaseNewWorktreeOntoRemote } = makeSquashHarness({
       "FN-1001": taskRow({
@@ -399,7 +500,7 @@ describe("CCC campaign chained task worktree creation base", () => {
     expect(squashImportDepIntoWorktree.mock.calls[0]![2]).toBe("sha-for-fusion/fn-2001");
   });
 
-  it("keeps squash-import behavior for a campaign task whose base is not its chain predecessor", async () => {
+  it("refuses an entry campaign task whose requested start has no sealed custody", async () => {
     const { executor, tryCreateWorktree, squashImportDepIntoWorktree } = makeSquashHarness({
       "FN-3001": taskRow({ branch: "fusion/fn-3001", column: "in-review" }),
       "FN-3002": taskRow({
@@ -408,10 +509,14 @@ describe("CCC campaign chained task worktree creation base", () => {
       }),
     }, ["fusion/fn-3001", "main"]);
 
-    await createWorktreeFor(executor, "FN-3002", "fusion/fn-3002", "fusion/fn-3001");
+    await expect(createWorktreeFor(executor, "FN-3002", "fusion/fn-3002", "fusion/fn-3001"))
+      .rejects.toMatchObject({
+        code: "CCC_CAMPAIGN_FROZEN_BASE_REFUSED",
+        message: expect.stringMatching(/no sealed base custody/),
+      });
 
-    expect(capturedCreationBase(tryCreateWorktree)).toBe(FROZEN_BASE);
-    expect(squashImportDepIntoWorktree).toHaveBeenCalledTimes(1);
+    expect(tryCreateWorktree).not.toHaveBeenCalled();
+    expect(squashImportDepIntoWorktree).not.toHaveBeenCalled();
   });
 
   it("forks a join campaign task directly from its merged join base", async () => {
