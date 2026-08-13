@@ -282,7 +282,7 @@ function canonicalFactBinding(binding: CccPrdImplementationFactBinding) {
   };
 }
 
-function canonicalImplementationFactProvenance(
+export function canonicalizeCccPrdImplementationFactProvenance(
   provenance: CccPrdImplementationFactProvenance,
 ): CccPrdImplementationFactProvenance {
   return {
@@ -388,7 +388,7 @@ function projectCccPrdSemanticBundleV2ForHash(
       : {}),
     ...(bundle.implementationFactProvenance
       ? {
-          implementationFactProvenance: canonicalImplementationFactProvenance(
+          implementationFactProvenance: canonicalizeCccPrdImplementationFactProvenance(
             bundle.implementationFactProvenance,
           ),
         }

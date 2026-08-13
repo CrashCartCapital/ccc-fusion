@@ -35,6 +35,11 @@ const ccc = engine as typeof engine & {
   }): Promise<{ kind: string; sidecar?: Record<string, unknown>; review?: Record<string, unknown[]> }>;
   compileCccPrdPacket(input: CompileInput): Record<string, unknown>;
   validateCccPrdPacket(input: CompileInput): Record<string, unknown>;
+  validateCccPrdPacketImplementationFactProvenance(input: {
+    rootDir: string;
+    manifestPath: string;
+    facts: Record<string, unknown>;
+  }): Array<{ code: string; message: string }>;
 };
 
 type CompileInput = {
@@ -648,6 +653,33 @@ describe("ccc-prd structural sidecar", () => {
     expect(result.kind, JSON.stringify(result)).toBe("bundle");
     expect(result.implementationFactProvenance).toEqual(authored.sidecar.implementationFactProvenance);
     expect(result.bundleHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("RED-S4-v2-provenance-order: compares implementation-fact set custody independent of canonical projection order", async () => {
+    const input = packet(productSource);
+    const authored = await author(input, productProposal(), productConstraints());
+    const facts = structuredClone(authored.sidecar) as Record<string, unknown> & {
+      implementationFactProvenance: {
+        admittedWriteRoots: unknown[];
+        requirements: unknown[];
+        proofs: unknown[];
+        protectedActions: unknown[];
+      };
+    };
+    for (const collection of [
+      "admittedWriteRoots",
+      "requirements",
+      "proofs",
+      "protectedActions",
+    ] as const) {
+      facts.implementationFactProvenance[collection].reverse();
+    }
+
+    expect(ccc.validateCccPrdPacketImplementationFactProvenance({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      facts,
+    })).toEqual([]);
   });
 
   it("binds an ambiguous scalar implementation fact to its labeled declaration", async () => {

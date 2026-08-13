@@ -8,6 +8,7 @@ import {
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   canonicalCccPrdJson,
+  canonicalizeCccPrdImplementationFactProvenance,
   computeCccPrdProofDefinitionSha256,
   computeCccPrdProofV2AdmissionDigests,
   createCccPrdSpanFromBytes,
@@ -757,9 +758,15 @@ export function validateCccPrdImplementationFactProvenance(input: {
   });
   diagnostics.push(...computed.diagnostics);
   if (!computed.provenance) return diagnostics;
+  const persistedProvenance = canonicalizeCccPrdImplementationFactProvenance(
+    input.provenance,
+  );
+  const computedProvenance = canonicalizeCccPrdImplementationFactProvenance(
+    computed.provenance,
+  );
   if (
-    canonicalCccPrdJson(input.provenance.protectedActions)
-    !== canonicalCccPrdJson(computed.provenance.protectedActions)
+    canonicalCccPrdJson(persistedProvenance.protectedActions)
+    !== canonicalCccPrdJson(computedProvenance.protectedActions)
   ) {
     diagnostics.push({
       code: "CCC_PRD_PROTECTED_ACTION_PROVENANCE_STALE",
@@ -767,8 +774,8 @@ export function validateCccPrdImplementationFactProvenance(input: {
     });
   }
   if (
-    canonicalCccPrdJson(input.provenance)
-    !== canonicalCccPrdJson(computed.provenance)
+    canonicalCccPrdJson(persistedProvenance)
+    !== canonicalCccPrdJson(computedProvenance)
     && diagnostics.length === 0
   ) {
     diagnostics.push({
