@@ -594,7 +594,7 @@ async function assertControllerHydratedProofCustody(input) {
   );
   const proofHost = proof.executionToolchain?.proofHost;
   const expectedProofHost = await realpath(
-    path.join(repoRoot, "packages/cli/dist/bin.js"),
+    path.join(repoRoot, "packages/cli/dist/ccc-campaign-proof-admission.js"),
   );
   assert(
     proofHost?.id === "fusion-cli-semantic-proof-host.v1"
