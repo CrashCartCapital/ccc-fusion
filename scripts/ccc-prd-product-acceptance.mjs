@@ -75,6 +75,10 @@ const expectedChecks = Object.freeze([
 ]);
 const commandTimeoutMs = 180_000;
 const productTimeoutMs = Number(process.env.FUSION_PRODUCT_TIMEOUT_MS ?? 120_000);
+// Campaign time includes cold CLI/session/sandbox setup before a pollable
+// provider or proof effect exists. Keep one full product-poll window of
+// headroom so a clean post-merge checkout cannot expire at the cutpoint.
+const verticalCampaignMaxDurationMs = 240_000;
 const shutdownTimeoutMs = 15_000;
 const proofCutpointMarkerName = "ccc-proof-cutpoint.marker.json";
 const proofCutpointCandidateValue = "good-proof-cutpoint";
@@ -1356,7 +1360,11 @@ async function assertExactImplementationFactProvenance(
     ["targetRepository.path", provenance.targetRepository?.path, expected.targetRoot],
     ["targetRepository.baseCommit", provenance.targetRepository?.baseCommit, expected.targetBase],
     ["bounds.maxRequests", provenance.bounds?.maxRequests, 2],
-    ["bounds.maxDurationMs", provenance.bounds?.maxDurationMs, 120_000],
+    [
+      "bounds.maxDurationMs",
+      provenance.bounds?.maxDurationMs,
+      verticalCampaignMaxDurationMs,
+    ],
     ["bounds.maxConcurrency", provenance.bounds?.maxConcurrency, 1],
     [
       "admittedWriteRoots[0].path",
@@ -1935,7 +1943,8 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
   const allowedWriteRootPurposeLine =
     "- Allowed write root purpose: disposable product acceptance repository";
   const maxRequestsLine = "- Maximum requests: 2";
-  const maxDurationLine = "- Maximum duration in milliseconds: 120000";
+  const maxDurationLine =
+    `- Maximum duration in milliseconds: ${verticalCampaignMaxDurationMs}`;
   const maxConcurrencyLine = "- Maximum concurrency: 1";
   const nonGoalLine =
     "- Non-goal: Modify any path outside the two admitted task write roots.";
@@ -2075,7 +2084,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         "--max-requests",
         "2",
         "--max-duration-ms",
-        "120000",
+        String(verticalCampaignMaxDurationMs),
         "--max-concurrency",
         "1",
       ],
@@ -2477,7 +2486,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       // writes exactly three rows, so this is the smallest budget that admits
       // a two-task chain.
       maxRequests: 2,
-      maxDurationMs: 120_000,
+      maxDurationMs: verticalCampaignMaxDurationMs,
       maxConcurrency: 1,
     },
     admittedWriteRoots: [
@@ -4127,7 +4136,7 @@ async function main() {
         "--max-requests",
         "2",
         "--max-duration-ms",
-        "120000",
+        String(verticalCampaignMaxDurationMs),
         "--max-concurrency",
         "1",
         "--max-prompt-bytes",
