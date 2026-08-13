@@ -1,3 +1,5 @@
+import { CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE } from "../ccc-campaign-proof-admission.js";
+
 export const CCC_PRD_INTAKE_CONTRACT_SCHEMA_VERSION =
   "ccc-prd.intake-contract.v1" as const;
 
@@ -42,7 +44,9 @@ const TEMPLATE = `# <Product or change name>
 ## Acceptance behavior and expected proof
 
 - REQ-001 behavior: <observable acceptance behavior>
-- REQ-001 proof: <exact verifier command or reviewable proof>
+- REQ-001 proof command: task verify:<slug> [-- <arg> ...]
+- Admitted campaign proof grammar: ${CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE}
+- State the exact proof.command literally inside the proof's cited source span, together with its positive oracle and negative controls.
 
 ## Constraints and dependencies
 

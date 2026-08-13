@@ -835,6 +835,7 @@ describe("prd command exit contract", () => {
     });
     expect(template.markdown).toContain("Target repository:");
     expect(template.markdown).toContain("Acceptance behavior and expected proof");
+    expect(template.markdown).toContain("task verify:<slug>");
 
     const packet = createPacketRoot();
     const prdPath = join(packet.root, "future-prd.md");

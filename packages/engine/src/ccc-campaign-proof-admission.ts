@@ -15,6 +15,8 @@ export const CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID = "ccc-proof-admission" a
 export const CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION = "ccc-proof-admission.v1" as const;
 export const CCC_CAMPAIGN_PROOF_ADMISSION_REGISTRY_ID =
   "plugin:fusion-native:ccc-proof-admission" as const;
+export const CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE =
+  "^task verify:[a-z0-9][a-z0-9:-]{0,63}(?: --(?: [a-z0-9][a-z0-9:._/-]{0,63}){0,8})?$" as const;
 
 export const CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK = Object.freeze({
   command: "ccc-proof-admission:binding-self-check.v1",
@@ -27,7 +29,7 @@ export const CCC_CAMPAIGN_PROOF_ADMISSION_SELF_CHECK = Object.freeze({
 
 const LOWER_HEX_SHA256_PATTERN = new RegExp("^[0-9a-f]{64}$", "u");
 const TASK_VERIFY_DECLARATION_PATTERN = new RegExp(
-  "^task verify:[a-z0-9][a-z0-9:-]{0,63}(?: --(?: [a-z0-9][a-z0-9:._/-]{0,63}){0,8})?$",
+  CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE,
   "u",
 );
 const MAX_PROOF_DECLARATION_LENGTH = 512;
