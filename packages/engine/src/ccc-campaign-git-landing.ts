@@ -620,10 +620,17 @@ async function assertExactCommittedProofReceipts(
     if (expectedProofs.length === 0) {
       throw new Error("CCC campaign Git landing requires at least one final_integrated proof");
     }
+    // A proof retry advances the imported work-item attempt while preserving
+    // the failed receipt as immutable history. Only the current fence can
+    // authorize landing; duplicate or missing receipts inside that fence still
+    // fail the exact proof-ID comparison below.
     const finalReceipts = receipts
       .filter((receipt) =>
         receipt.attemptContractVersion === "v2"
-        && receipt.phase === "final_integrated")
+        && receipt.phase === "final_integrated"
+        && receipt.workItemId === workItemFence.id
+        && receipt.runId === workItemFence.runId
+        && receipt.workItemAttempt === workItemFence.attempt)
       .sort((left, right) => compareCccPrdCodeUnits(left.proofId, right.proofId));
     if (
       JSON.stringify(finalReceipts.map(({ proofId }) => proofId))

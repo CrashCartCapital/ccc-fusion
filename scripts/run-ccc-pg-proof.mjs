@@ -818,6 +818,7 @@ const expectedWave6ExecutionAndMergeNames = [
   "CCC campaign live-execution approval > refuses a wrong parent identifier and a stale digest before any claim",
   "CCC campaign live-execution approval > claims only the exact live-execution lease and returns no hidden claim material",
   "CCC campaign product merge approval > RED-S5-MERGE-PHASE: task-phase proof cannot issue merge approval",
+  "CCC campaign product merge approval > RED-S5-MERGE-RETRY: a failed final proof does not poison its passing retry",
   "CCC campaign product merge approval > RED-S5-MERGE-BINDING: final proof binds approval to exact commit, tree, and receipt digest",
   "CCC campaign product merge approval > RED-S5-MERGE-DRIFT: source drift after issuance refuses before approval claim",
   "CCC campaign product merge approval > RED-S5-MERGE-PREMUTATION: claimed approval refuses receipt drift before Git mutation",

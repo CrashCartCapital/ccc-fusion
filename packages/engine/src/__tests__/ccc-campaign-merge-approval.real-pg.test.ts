@@ -16,6 +16,7 @@ import {
   inspectCccPrdProductStatus,
   reserveCccCampaignProofAttempt,
   settleCccCampaignProofAttempt,
+  type CccPrdProofV2,
 } from "@fusion/core";
 import {
   admitCccPrdImportTestProductBundle,
@@ -106,9 +107,106 @@ pgTest("CCC campaign product merge approval", () => {
     return { ...fixture, taskId: fixture.terminalTaskId };
   }
 
+  async function settleSemanticProof(
+    input: Readonly<{
+      rootDir: string;
+      taskId: string;
+      proof: CccPrdProofV2;
+      phase: "task" | "final_integrated";
+      sourceCommit: string;
+      sourceTree: string;
+      workItemFence: Readonly<{
+        workItemId: string;
+        runId: string;
+        attempt: number;
+      }>;
+      passed: boolean;
+    }>,
+  ) {
+    const custody = computeCccPrdProofV2AdmissionDigests(input.proof);
+    const reserved = await reserveCccCampaignProofAttempt({
+      layer: h.layer(),
+      rootDir: input.rootDir,
+      taskId: input.taskId,
+      proofId: input.proof.id,
+      attemptContractVersion: "v2",
+      phase: input.phase,
+      sourceCommit: input.sourceCommit,
+      sourceTree: input.sourceTree,
+      workItemFence: input.workItemFence,
+      ...custody,
+    });
+    await beginCccCampaignProofAttemptDispatch({
+      layer: h.layer(),
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+    const clauseResults = input.proof.clauseIds.map((clauseId) => ({
+      clauseId,
+      passed: true,
+    }));
+    const positiveCaseResults = input.proof.positiveCases.map(({ id: caseId }) => ({
+      caseId,
+      passed: true,
+    }));
+    const negativeControlResults = input.proof.negativeControls.map(
+      ({ id: controlId }) => ({ controlId, passed: true }),
+    );
+    if (!input.passed) {
+      const firstResult = clauseResults[0]
+        ?? positiveCaseResults[0]
+        ?? negativeControlResults[0];
+      if (!firstResult) throw new Error("semantic proof fixture requires evidence results");
+      firstResult.passed = false;
+    }
+    const evidence = {
+      schema: "ccc-prd.proof-evidence.v2" as const,
+      proofId: input.proof.id,
+      phase: input.phase,
+      sourceCommit: input.sourceCommit,
+      sourceTree: input.sourceTree,
+      passed: input.passed,
+      clauseResults,
+      positiveCaseResults,
+      negativeControlResults,
+    };
+    const canonicalEvidence = canonicalCccPrdJson(evidence);
+    const envelope = {
+      schema: "ccc-prd.proof-terminal-envelope.v2" as const,
+      kind: "verified" as const,
+      proofId: input.proof.id,
+      phase: input.phase,
+      sourceCommit: input.sourceCommit,
+      sourceTree: input.sourceTree,
+      exitCode: input.passed ? 0 : 1,
+      durationMs: 1,
+      stdoutSha256: sha256(canonicalEvidence),
+      stderrSha256: sha256(""),
+      changedPathsSha256: sha256(
+        JSON.stringify([...input.proof.candidateInputs].sort()),
+      ),
+      stdoutTail: canonicalEvidence,
+      stderrTail: "",
+      timedOut: false,
+      killed: false,
+      warnings: [],
+      passed: input.passed,
+      evidence,
+      evidenceSha256: sha256(canonicalEvidence),
+    };
+    await settleCccCampaignProofAttempt({
+      layer: h.layer(),
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+      terminalEnvelope: envelope,
+    });
+    return reserved;
+  }
+
   async function importSemanticV2Fixture(
     suffix: string,
     phase: "task" | "final_integrated",
+    initialProofPassed = true,
   ) {
     const rootDir = h.rootDir();
     const { bundle, semanticProofToolchainPaths } = await admittedMergeBundle(
@@ -217,13 +315,10 @@ pgTest("CCC campaign product merge approval", () => {
       const ownerTaskId = status.tasks.find(
         ({ semanticTaskId }) => semanticTaskId === ownerSemanticTaskId,
       )!.nativeTaskId;
-      const custody = computeCccPrdProofV2AdmissionDigests(proof);
-      const reserved = await reserveCccCampaignProofAttempt({
-        layer: h.layer(),
+      const reserved = await settleSemanticProof({
         rootDir,
         taskId: phase === "task" ? ownerTaskId : terminalTaskId,
-        proofId: proof.id,
-        attemptContractVersion: "v2",
+        proof,
         phase,
         sourceCommit,
         sourceTree,
@@ -232,52 +327,7 @@ pgTest("CCC campaign product merge approval", () => {
           runId: parked.runId,
           attempt: parked.attempt,
         },
-        ...custody,
-      });
-      await beginCccCampaignProofAttemptDispatch({
-        layer: h.layer(),
-        attemptKey: reserved.attemptKey,
-        controllerToken: reserved.controllerToken,
-      });
-      const evidence = {
-        schema: "ccc-prd.proof-evidence.v2" as const,
-        proofId: proof.id,
-        phase,
-        sourceCommit,
-        sourceTree,
-        passed: true,
-        clauseResults: proof.clauseIds.map((clauseId) => ({ clauseId, passed: true })),
-        positiveCaseResults: proof.positiveCases.map(({ id: caseId }) => ({ caseId, passed: true })),
-        negativeControlResults: proof.negativeControls.map(({ id: controlId }) => ({ controlId, passed: true })),
-      };
-      const canonicalEvidence = canonicalCccPrdJson(evidence);
-      const changedPathsSha256 = sha256(JSON.stringify([...proof.candidateInputs].sort()));
-      const envelope = {
-        schema: "ccc-prd.proof-terminal-envelope.v2" as const,
-        kind: "verified" as const,
-        proofId: proof.id,
-        phase,
-        sourceCommit,
-        sourceTree,
-        exitCode: 0,
-        durationMs: 1,
-        stdoutSha256: sha256(canonicalEvidence),
-        stderrSha256: sha256(""),
-        changedPathsSha256,
-        stdoutTail: canonicalEvidence,
-        stderrTail: "",
-        timedOut: false,
-        killed: false,
-        warnings: [],
-        passed: true,
-        evidence,
-        evidenceSha256: sha256(canonicalEvidence),
-      };
-      await settleCccCampaignProofAttempt({
-        layer: h.layer(),
-        attemptKey: reserved.attemptKey,
-        controllerToken: reserved.controllerToken,
-        terminalEnvelope: envelope,
+        passed: initialProofPassed,
       });
       reservations.push(reserved);
     }
@@ -291,6 +341,8 @@ pgTest("CCC campaign product merge approval", () => {
       sourcePath,
       sourceCommit,
       sourceTree,
+      parked,
+      phaseProofs,
       reservations,
     };
   }
@@ -346,6 +398,69 @@ pgTest("CCC campaign product merge approval", () => {
       rootDir: fixture.rootDir,
     });
     expect(status?.approvals).toEqual([]);
+    expect(await git(fixture.rootDir, "rev-parse", "refs/heads/main"))
+      .toBe(fixture.baseCommit);
+  });
+
+  it("RED-S5-MERGE-RETRY: a failed final proof does not poison its passing retry", async () => {
+    const fixture = await importSemanticV2Fixture(
+      "semantic-merge-final-retry",
+      "final_integrated",
+      false,
+    );
+    const retryFence = await h.store().upsertWorkflowWorkItem({
+      ...fixture.parked,
+      state: "manual-required",
+      attempt: fixture.parked.attempt + 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      retryAfter: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      waitReason: null,
+    });
+    for (const proof of fixture.phaseProofs) {
+      if (proof.schema !== "ccc-prd.proof.v2") {
+        throw new Error("semantic-v2 retry fixture did not retain its proof contract");
+      }
+      await settleSemanticProof({
+        rootDir: fixture.rootDir,
+        taskId: fixture.terminalTaskId,
+        proof,
+        phase: "final_integrated",
+        sourceCommit: fixture.sourceCommit,
+        sourceTree: fixture.sourceTree,
+        workItemFence: {
+          workItemId: retryFence.id,
+          runId: retryFence.runId,
+          attempt: retryFence.attempt,
+        },
+        passed: true,
+      });
+    }
+
+    await expect(issueCccCampaignMergeApproval({
+      store: h.store(),
+      rootDir: fixture.rootDir,
+      taskId: fixture.terminalTaskId,
+      runId: "RUN-semantic-merge-final-retry",
+    })).resolves.toMatchObject({
+      status: "issued",
+      runId: expect.stringMatching(
+        new RegExp(
+          `^ccc-merge-proof-v2:${fixture.sourceCommit}:${fixture.sourceTree}:[0-9a-f]{64}$`,
+          "u",
+        ),
+      ),
+    });
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: "semantic-merge-final-retry",
+      layer: h.layer(),
+      rootDir: fixture.rootDir,
+    });
+    expect(status!.proofs.flatMap(({ attempts }) => attempts)
+      .map(({ state }) => state)
+      .sort()).toEqual(["committed", "proved_failed"]);
     expect(await git(fixture.rootDir, "rev-parse", "refs/heads/main"))
       .toBe(fixture.baseCommit);
   });
