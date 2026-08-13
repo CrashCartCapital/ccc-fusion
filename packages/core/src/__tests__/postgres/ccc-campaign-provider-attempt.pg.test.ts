@@ -932,4 +932,59 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: attempt.attemptKey }))
       .resolves.toMatchObject({ state: "dispatched_unknown" });
   });
+
+  it("permits a follow-on committed settlement in the same fenced visit after the approval is consumed", async () => {
+    const { taskId, action, issued } = await protectedContext("follow-on-settlement");
+    const store = api(h.store());
+    const firstInput = request(taskId, action.actionTarget, "turn-follow-on-settlement-1", {
+      actionId: action.actionId, transport: "pi",
+    });
+    const first = await store.reserveCccProviderAttempt(firstInput);
+    await dispatch(store, { taskId, attemptKey: first.attemptKey, controllerToken: first.controllerToken });
+    await store.settleCccProviderAttemptAndApproval({
+      ...first, outcome: "committed", evidenceDigest: "1".repeat(64), observerId: "follow-on-settlement-1",
+    });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(h.store().inspectCccCampaignActionLease(taskId, action)).resolves.toBeNull();
+
+    const second = await store.reserveCccProviderAttempt({
+      ...request(taskId, action.actionTarget, "turn-follow-on-settlement-2", {
+        actionId: action.actionId, transport: "pi",
+      }),
+      workItemFence: firstInput.workItemFence,
+    });
+    await dispatch(store, { taskId, attemptKey: second.attemptKey, controllerToken: second.controllerToken });
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...second, outcome: "committed", evidenceDigest: "2".repeat(64), observerId: "follow-on-settlement-2",
+    })).resolves.toMatchObject({ state: "committed", terminal: { kind: "reconciled", state: "committed" } });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({ status: "consumed" });
+    await expect(h.store().inspectCccCampaignActionLease(taskId, action)).resolves.toBeNull();
+  });
+
+  it("refuses a follow-on committed settlement under a different work-item fence", async () => {
+    const { taskId, action, issued } = await protectedContext("follow-on-settle-fence");
+    const store = api(h.store());
+    const firstInput = request(taskId, action.actionTarget, "turn-follow-on-fence-1", {
+      actionId: action.actionId, transport: "pi",
+    });
+    const first = await store.reserveCccProviderAttempt(firstInput);
+    await dispatch(store, { taskId, attemptKey: first.attemptKey, controllerToken: first.controllerToken });
+    await store.settleCccProviderAttemptAndApproval({
+      ...first, outcome: "committed", evidenceDigest: "3".repeat(64), observerId: "follow-on-fence-1",
+    });
+
+    const second = await store.reserveCccProviderAttempt({
+      ...request(taskId, action.actionTarget, "turn-follow-on-fence-2", {
+        actionId: action.actionId, transport: "pi",
+      }),
+      workItemFence: { ...firstInput.workItemFence, attempt: firstInput.workItemFence.attempt + 1 },
+    });
+    await dispatch(store, { taskId, attemptKey: second.attemptKey, controllerToken: second.controllerToken });
+    await expect(store.settleCccProviderAttemptAndApproval({
+      ...second, outcome: "committed", evidenceDigest: "4".repeat(64), observerId: "follow-on-fence-2",
+    })).rejects.toThrow(/no exact persisted action lease/i);
+    await expect(store.inspectCccProviderAttempt({ taskId, attemptKey: second.attemptKey }))
+      .resolves.toMatchObject({ state: "dispatched_unknown" });
+    await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({ status: "consumed" });
+  });
 });

@@ -13,7 +13,8 @@ import {
   assertCccCampaignAuthorityBinding,
   createCccCampaignAuthorityBinding,
 } from "./canonical.js";
-import { loadCccCampaignContextForTask } from "./store.js";
+import { loadCccCampaignContextForTask, type CccCampaignAuthorityStore } from "./store.js";
+import { readConsumedCccCampaignApprovalCustodyWithinTransaction } from "../async-approval-request-store.js";
 import {
   CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION,
   CCC_PROVIDER_ATTEMPT_V2_SCHEMA_VERSION,
@@ -1308,4 +1309,49 @@ export async function listCccProviderAttemptsForCampaign(
   };
   if (input.tx) return list(input.tx);
   return input.layer.transaction(list);
+}
+
+/**
+ * Prove that a committed settlement with no persisted action lease belongs to
+ * the same approved session. Settlement consumes the live-execution approval on
+ * the session's first committed terminal, so a follow-on turn of the exact same
+ * fenced node visit settles under consumed custody instead of a claimed lease.
+ * Callers reach this only when no action lease exists at all; a lease that
+ * exists but mismatches must keep refusing on the caller's own settlement error.
+ */
+export async function assertCccProviderFollowOnSettlementCustody(input: Readonly<{
+  layer: AsyncDataLayer;
+  rootDir: string;
+  tx: DbTransaction;
+  authorityStore: CccCampaignAuthorityStore;
+  attempt: CccProviderAttemptScope;
+}>): Promise<void> {
+  const action = {
+    actionId: input.attempt.binding.actionId,
+    actionTarget: input.attempt.binding.actionTarget,
+  };
+  const fence = input.attempt.workItemFence;
+  const attempts = await listCccProviderAttemptsForCampaign({
+    layer: input.layer, rootDir: input.rootDir, taskId: input.attempt.taskId, tx: input.tx,
+  });
+  const sessionCommitted = fence !== null && attempts.some((scope) =>
+    scope.state === "committed"
+    && scope.binding.actionId === action.actionId
+    && scope.binding.actionTarget === action.actionTarget
+    && scope.workItemFence !== null
+    && scope.workItemFence.workItemId === fence.workItemId
+    && scope.workItemFence.runId === fence.runId
+    && scope.workItemFence.attempt === fence.attempt);
+  if (!sessionCommitted) {
+    throw new Error("CCC committed provider settlement has no exact persisted action lease");
+  }
+  const custody = await readConsumedCccCampaignApprovalCustodyWithinTransaction(input.tx, {
+    authorityStore: input.authorityStore,
+    rootDir: input.rootDir,
+    taskId: input.attempt.taskId,
+    action,
+  });
+  if (custody.binding.bindingHash !== input.attempt.binding.bindingHash) {
+    throw new Error("CCC committed provider settlement has no exact persisted action lease");
+  }
 }

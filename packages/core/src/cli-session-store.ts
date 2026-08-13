@@ -51,7 +51,7 @@ import {
   expireClaimedCccCampaignApprovalAfterProvedNoEffectWithinTransaction,
 } from "./async-approval-request-store.js";
 import { assertCccCampaignAuthorityBinding, createCccCampaignAuthorityBinding } from "./ccc-campaign/canonical.js";
-import { inspectCccProviderAttempt, reconcileCccProviderAttempt } from "./ccc-campaign/provider-attempt.js";
+import { assertCccProviderFollowOnSettlementCustody, inspectCccProviderAttempt, reconcileCccProviderAttempt } from "./ccc-campaign/provider-attempt.js";
 import type { CccCampaignAuthorityStore } from "./ccc-campaign/store.js";
 import type {
   CccCampaignAuthorityBinding,
@@ -544,33 +544,41 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
             attemptKey: input.reconciliation.attemptKey,
           });
           if (lockedAttempt?.state === "dispatched_unknown") {
-            if (
-              !lease
-              || lease.binding.bindingHash !== lockedAttempt.binding.bindingHash
+            if (lease === null) {
+              await assertCccProviderFollowOnSettlementCustody({
+                layer: this.layer,
+                rootDir,
+                tx,
+                authorityStore: campaignAuthorityStore,
+                attempt: lockedAttempt,
+              });
+            } else if (
+              lease.binding.bindingHash !== lockedAttempt.binding.bindingHash
               || lease.lease.bindingHash !== lockedAttempt.binding.bindingHash
               || lease.lease.actionId !== lockedAttempt.binding.actionId
               || lease.lease.actionTarget !== lockedAttempt.binding.actionTarget
             ) {
               throw new Error("CCC committed provider settlement has no exact persisted action lease");
+            } else {
+              await assertClaimedCccCampaignApprovalWithinTransaction(tx, {
+                authorityStore: campaignAuthorityStore,
+                rootDir,
+                taskId: lockedAttempt.taskId,
+                action: {
+                  actionId: lockedAttempt.binding.actionId,
+                  actionTarget: lockedAttempt.binding.actionTarget,
+                },
+                approvalRequestId: lease.lease.approvalRequestId,
+                claimToken: lease.lease.claimToken,
+              });
+              claimedApproval = {
+                action: {
+                  actionId: lockedAttempt.binding.actionId,
+                  actionTarget: lockedAttempt.binding.actionTarget,
+                },
+                claimToken: lease.lease.claimToken,
+              };
             }
-            await assertClaimedCccCampaignApprovalWithinTransaction(tx, {
-              authorityStore: campaignAuthorityStore,
-              rootDir,
-              taskId: lockedAttempt.taskId,
-              action: {
-                actionId: lockedAttempt.binding.actionId,
-                actionTarget: lockedAttempt.binding.actionTarget,
-              },
-              approvalRequestId: lease.lease.approvalRequestId,
-              claimToken: lease.lease.claimToken,
-            });
-            claimedApproval = {
-              action: {
-                actionId: lockedAttempt.binding.actionId,
-                actionTarget: lockedAttempt.binding.actionTarget,
-              },
-              claimToken: lease.lease.claimToken,
-            };
           }
         }
       }
