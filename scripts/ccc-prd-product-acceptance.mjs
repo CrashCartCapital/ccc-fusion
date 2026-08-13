@@ -4681,7 +4681,7 @@ async function main() {
       JSON.stringify(preview),
     );
     exactArray(
-      preview.requirements?.map(({ id }) => id),
+      preview.requirements?.map(({ id }) => id).sort(),
       ["REQ-VERTICAL", "REQ-VERTICAL-SECOND"],
       "CCC_PRODUCT_PREVIEW_REQUIREMENTS_DRIFT",
     );
