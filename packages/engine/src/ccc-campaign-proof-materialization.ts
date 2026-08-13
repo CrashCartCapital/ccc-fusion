@@ -774,7 +774,15 @@ export async function inspectCccSemanticProofLinkedRuntime(
 }
 
 function canonicalLinkedRuntimeJson(entries: readonly CccPrdLinkedRuntimeEntry[]): string {
-  return JSON.stringify([...entries].sort((left, right) => (
+  const canonicalEntries = entries.map((entry): CccPrdLinkedRuntimeEntry => ({
+    platform: entry.platform,
+    loaderRole: entry.loaderRole,
+    loaderPath: entry.loaderPath,
+    requestedPath: entry.requestedPath,
+    canonicalPath: entry.canonicalPath,
+    sha256: entry.sha256,
+  }));
+  return JSON.stringify(canonicalEntries.sort((left, right) => (
     linkedRuntimeKey(left) < linkedRuntimeKey(right)
       ? -1
       : linkedRuntimeKey(left) > linkedRuntimeKey(right)

@@ -537,6 +537,44 @@ describe("CCC semantic-proof admission and materialization", () => {
     })).rejects.toThrow(/linked runtime|toolchain/u);
   });
 
+  it("RED-S5-linked-runtime-key-order: accepts an exact persisted manifest after JSON key canonicalization", async () => {
+    if (process.platform !== "darwin") return;
+    const fixture = await createGitFixture();
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
+    roots.push(outputRoot);
+    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const nodeIdentity = await executableIdentity(process.execPath);
+    const linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
+      task: taskIdentity,
+      node: nodeIdentity,
+      proofHost: { id: "fusion-native-semantic-proof-v2", ...nodeIdentity },
+    });
+    const definition = proof({
+      ...fixture,
+      taskIdentity,
+      nodeIdentity,
+      linkedRuntime: linkedRuntime.map((entry) => ({
+        canonicalPath: entry.canonicalPath,
+        loaderPath: entry.loaderPath,
+        loaderRole: entry.loaderRole,
+        platform: entry.platform,
+        requestedPath: entry.requestedPath,
+        sha256: entry.sha256,
+      })),
+    });
+
+    await expect(admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit: fixture.baseCommit,
+      sourceCommit: fixture.candidateCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    })).resolves.toMatchObject({
+      taskTarget: "verify:slugify",
+    });
+  });
+
   it("RED-S5-sealed-toolchain: materializes controller-owned tool copies before originals can be swapped", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
