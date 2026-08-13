@@ -4,18 +4,23 @@ import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "../ccc-prd/contract
 import type { CccPrdSemanticBundle } from "../ccc-prd/types.js";
 import {
   CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_PER_TASK_V1,
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
   CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_POLICY_V3_SCHEMA_VERSION,
-  CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
+  CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+  CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
   CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION,
   CccCampaignContextError,
   type CccCampaignActionLookup,
   type CccCampaignAuthorityBinding,
   type CccCampaignContext,
   type CccCampaignExecutionPolicy,
+  type CccCampaignExecutionAuthorizationMode,
   type CccCampaignExecutionRoute,
   type CccCampaignManifest,
+  type CccCampaignManifestBase,
   type CccCampaignProductExecutionPolicy,
   type CccCampaignProductExecutionPolicyV3,
   type CccCampaignProductExecutionRoute,
@@ -949,7 +954,7 @@ export function parseCccPrdProductExecutionPlan(
   };
 }
 
-export function createCccCampaignManifest(input: {
+type CccCampaignManifestCreationBase = {
   projectId: string;
   importId: string;
   idempotencyKey: string;
@@ -958,7 +963,47 @@ export function createCccCampaignManifest(input: {
   executionPolicy: CccCampaignExecutionPolicy;
   targetRepositoryPath: string;
   campaignStartedAt: string;
-}): CccCampaignManifest {
+};
+
+export type CreateCccCampaignManifestInput = CccCampaignManifestCreationBase & (
+  | Readonly<{
+    manifestSchema?: typeof CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION;
+    executionAuthorizationMode?: never;
+  }>
+  | Readonly<{
+    manifestSchema: typeof CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION;
+    executionAuthorizationMode:
+      typeof CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1;
+  }>
+);
+
+export function executionAuthorizationModeFromManifest(
+  manifest: CccCampaignManifest,
+): CccCampaignExecutionAuthorizationMode {
+  const record = manifest as CccCampaignManifest & Record<string, unknown>;
+  if (manifest.schema === CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION) {
+    if (Object.prototype.hasOwnProperty.call(record, "executionAuthorizationMode")) {
+      throw new CccCampaignExecutionPolicyError(
+        "CCC campaign manifest v1 must not store executionAuthorizationMode",
+      );
+    }
+    return CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_PER_TASK_V1;
+  }
+  if (
+    manifest.schema === CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+    && record.executionAuthorizationMode
+      === CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1
+  ) {
+    return CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1;
+  }
+  throw new CccCampaignExecutionPolicyError(
+    "CCC campaign manifest v2 requires executionAuthorizationMode sealed_bundle_v1",
+  );
+}
+
+export function createCccCampaignManifest(
+  input: CreateCccCampaignManifestInput,
+): CccCampaignManifest {
   const startedAt = Date.parse(input.campaignStartedAt);
   if (
     !Number.isFinite(startedAt)
@@ -968,8 +1013,34 @@ export function createCccCampaignManifest(input: {
       "CCC campaign start must be a canonical ISO timestamp",
     );
   }
-  return {
-    schema: CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
+  const manifestSchema = input.manifestSchema
+    ?? CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION;
+  if (
+    manifestSchema !== CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION
+    && manifestSchema !== CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+  ) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC campaign manifest schema is unsupported",
+    );
+  }
+  if (
+    manifestSchema === CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION
+    && input.executionAuthorizationMode !== undefined
+  ) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC campaign manifest v1 must not store executionAuthorizationMode",
+    );
+  }
+  if (
+    manifestSchema === CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+    && input.executionAuthorizationMode
+      !== CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1
+  ) {
+    throw new CccCampaignExecutionPolicyError(
+      "CCC campaign manifest v2 requires executionAuthorizationMode sealed_bundle_v1",
+    );
+  }
+  const manifestBase: CccCampaignManifestBase = {
     projectId: input.projectId,
     importId: input.importId,
     idempotencyKey: input.idempotencyKey,
@@ -1003,6 +1074,17 @@ export function createCccCampaignManifest(input: {
       routes: input.executionPolicy.routes.map((route) => ({ ...route })),
     },
   };
+  return manifestSchema === CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+    ? {
+      schema: CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+      ...manifestBase,
+      executionAuthorizationMode:
+        CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+    }
+    : {
+      schema: CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+      ...manifestBase,
+    };
 }
 
 export function hashCccCampaignManifest(manifest: CccCampaignManifest): string {

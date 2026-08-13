@@ -354,7 +354,13 @@ function statusBody(
   workItemLines(lines, asList(status.workItems));
   proofLines(lines, asList(status.proofs), asList(status.orphanProofAttempts));
   providerAttemptLines(lines, asList(status.providerAttempts));
-  approvalLines(lines, status, payload, idempotencyKey);
+  const sealedAuthorizationPresent = executionAuthorizationLines(
+    lines,
+    status,
+    payload,
+    idempotencyKey,
+  ) || status.executionAuthorizationMode === "sealed_bundle_v1";
+  approvalLines(lines, status, payload, idempotencyKey, sealedAuthorizationPresent);
   landingLines(lines, asRecord(status.landing));
   operatorControlLines(lines, asList(payload.operatorControls), idempotencyKey);
 }
@@ -368,6 +374,8 @@ function nextActionLines(
   // The status layer already wrote these as operator prose; transcribe them
   // rather than re-summarizing, so the words the operator acts on are exact.
   prose(lines, 1, "Reason", nextAction.reason);
+  field(lines, 1, "Execution authorization", nextAction.executionAuthorizationId);
+  field(lines, 1, "Execution authorization status", nextAction.executionAuthorizationStatus);
   field(lines, 1, "Approval request", nextAction.approvalRequestId);
   field(lines, 1, "Approval status", nextAction.approvalStatus);
   prose(lines, 1, "Diagnostic", nextAction.diagnostic);
@@ -587,16 +595,64 @@ function confirmationFor(
   return null;
 }
 
+function executionAuthorizationLines(
+  lines: string[],
+  status: Record<string, unknown>,
+  payload: Record<string, unknown>,
+  idempotencyKey: string,
+): boolean {
+  const authorization = asRecord(status.executionAuthorization);
+  if (!authorization) return false;
+
+  const authorizationId = asScalar(authorization.authorizationId)
+    ?? "(unidentified execution authorization)";
+  const authorizationStatus = asScalar(authorization.status) ?? "unknown status";
+  const members = asList(authorization.members);
+  lines.push("Execution authorization");
+  lines.push(`${pad(1)}${authorizationId} - ${authorizationStatus}`);
+  field(lines, 2, "expires", authorization.expiresAt);
+  field(lines, 2, "expected request count", authorization.expectedRequestCount);
+  field(lines, 2, "maximum requests", authorization.maxRequests);
+  field(lines, 2, "maximum concurrency", authorization.maxConcurrency);
+  lines.push(
+    `${pad(2)}${members.length} exact child action${members.length === 1 ? "" : "s"}`,
+  );
+
+  const confirmation = asRecord(payload.liveExecutionAuthorizationConfirmation);
+  const digest = asScalar(confirmation?.confirmation);
+  if (
+    authorizationId === "(unidentified execution authorization)"
+    || !confirmation
+    || asScalar(confirmation.authorizationId) !== authorizationId
+    || asScalar(confirmation.status) !== authorizationStatus
+    || (authorizationStatus !== "issued" && authorizationStatus !== "claimed")
+    || digest === null
+    || !CONFIRMATION_DIGEST.test(digest)
+  ) {
+    return true;
+  }
+  lines.push(`${pad(2)}approve all exact live actions with:`);
+  command(
+    lines,
+    3,
+    `fn prd approve-execution ${shellArgument(idempotencyKey)} ${shellArgument(authorizationId)} --confirm ${digest}`,
+  );
+  return true;
+}
+
 function approvalLines(
   lines: string[],
   status: Record<string, unknown>,
   payload: Record<string, unknown>,
   idempotencyKey: string,
+  sealedAuthorizationPresent: boolean,
 ): void {
   const approvals = asList(status.approvals);
   if (approvals.length === 0) return;
   const mergeConfirmations = asList(payload.mergeApprovalConfirmations);
-  const executionConfirmations = asList(payload.liveExecutionApprovalConfirmations);
+  const executionConfirmations = sealedAuthorizationPresent
+    ? []
+    : asList(payload.liveExecutionApprovalConfirmations);
   lines.push(`Approvals (${approvals.length})`);
   for (const entry of approvals) {
     const approval = asRecord(entry);

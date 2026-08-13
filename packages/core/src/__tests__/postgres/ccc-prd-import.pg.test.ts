@@ -709,6 +709,25 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     expect(taskEntities.every(({ entity_id, native_id }) => entity_id !== native_id)).toBe(true);
     expect(new Set(taskEntities.map(({ native_id }) => native_id)).size).toBe(taskEntities.length);
 
+    const [campaignCustody] = await h.layer().db.execute(sql`
+      SELECT campaign_manifest, campaign_manifest_hash, identity_hash
+      FROM project.ccc_prd_imports
+      WHERE import_id = ${imported.importId}
+    `) as unknown as Array<{
+      campaign_manifest: Record<string, unknown>;
+      campaign_manifest_hash: string;
+      identity_hash: string;
+    }>;
+    expect(campaignCustody).toMatchObject({
+      campaign_manifest: {
+        schema: "ccc-campaign.manifest.v2",
+        executionAuthorizationMode: "sealed_bundle_v1",
+      },
+      campaign_manifest_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      identity_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(campaignCustody!.campaign_manifest_hash).toBe(campaignCustody!.identity_hash);
+
     const nativeBySemantic = new Map(
       taskEntities.map(({ entity_id, native_id }) => [entity_id, native_id]),
     );
@@ -734,6 +753,9 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       `${imported.importId}--WORK-${suffix}`,
     )).resolves.toMatchObject({
       taskId: entryNativeId,
+    });
+    await expect(h.store().getCccCampaignContextForTask(entryNativeId)).resolves.toMatchObject({
+      executionAuthorizationMode: "sealed_bundle_v1",
     });
 
     const reservationsBeforeReplay = (await h.layer().db.execute(sql`
@@ -887,6 +909,22 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
           updated_at = ${new Date().toISOString()}
       WHERE idempotency_key = ${key}
     `);
+    const [legacyCustodyBeforeReplay] = await h.layer().db.execute(sql`
+      SELECT campaign_manifest, campaign_manifest_hash, identity_hash
+      FROM project.ccc_prd_imports
+      WHERE idempotency_key = ${key}
+    `) as unknown as Array<{
+      campaign_manifest: Record<string, unknown>;
+      campaign_manifest_hash: string;
+      identity_hash: string;
+    }>;
+    expect(legacyCustodyBeforeReplay).toMatchObject({
+      campaign_manifest: { schema: "ccc-campaign.manifest.v1" },
+      campaign_manifest_hash: manifestHash,
+      identity_hash: manifestHash,
+    });
+    expect(legacyCustodyBeforeReplay!.campaign_manifest)
+      .not.toHaveProperty("executionAuthorizationMode");
     await rm(resolve(h.rootDir(), imported.stagingRelativePath), {
       recursive: true,
       force: true,
@@ -908,6 +946,16 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
       replayed: true,
       importId: imported.importId,
     });
+    const [legacyCustodyAfterReplay] = await h.layer().db.execute(sql`
+      SELECT campaign_manifest, campaign_manifest_hash, identity_hash
+      FROM project.ccc_prd_imports
+      WHERE idempotency_key = ${key}
+    `) as unknown as Array<{
+      campaign_manifest: Record<string, unknown>;
+      campaign_manifest_hash: string;
+      identity_hash: string;
+    }>;
+    expect(legacyCustodyAfterReplay).toEqual(legacyCustodyBeforeReplay);
   });
 
   it("product v2 RED: projects coding custody and a final proof barrier before human landing", async () => {

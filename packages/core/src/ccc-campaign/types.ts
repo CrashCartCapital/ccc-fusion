@@ -17,8 +17,17 @@ export const CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION =
 /** @deprecated Use the version-specific execution-policy constant. */
 export const CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION =
   CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION;
-export const CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION =
+export const CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION =
   "ccc-campaign.manifest.v1" as const;
+export const CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION =
+  "ccc-campaign.manifest.v2" as const;
+/** @deprecated Use the version-specific campaign-manifest constant. */
+export const CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION =
+  CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION;
+export const CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_PER_TASK_V1 =
+  "per_task_v1" as const;
+export const CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1 =
+  "sealed_bundle_v1" as const;
 export const CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION =
   "ccc-campaign.context.v1" as const;
 
@@ -461,8 +470,11 @@ export type CccPrdProductExecutionPlan = {
   policy: CccCampaignProductExecutionPolicy;
 };
 
-export type CccCampaignManifest = {
-  schema: typeof CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION;
+export type CccCampaignExecutionAuthorizationMode =
+  | typeof CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_PER_TASK_V1
+  | typeof CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1;
+
+export type CccCampaignManifestBase = {
   projectId: string;
   importId: string;
   idempotencyKey: string;
@@ -481,8 +493,22 @@ export type CccCampaignManifest = {
   executionPolicy: CccCampaignExecutionPolicy;
 };
 
-export type CccCampaignContext = Omit<CccCampaignManifest, "schema"> & {
+export type CccCampaignManifestV1 = CccCampaignManifestBase & {
+  schema: typeof CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION;
+};
+
+export type CccCampaignManifestV2 = CccCampaignManifestBase & {
+  schema: typeof CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION;
+  executionAuthorizationMode:
+    typeof CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1;
+};
+
+export type CccCampaignManifest = CccCampaignManifestV1 | CccCampaignManifestV2;
+
+export type CccCampaignContext = CccCampaignManifestBase & {
   schema: typeof CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION;
+  /** Persisted TaskStore custody loads normalize this; omission preserves legacy caller fixtures. */
+  executionAuthorizationMode?: CccCampaignExecutionAuthorizationMode;
   taskId: string;
   route: CccCampaignExecutionRoute;
   manifestHash: string;

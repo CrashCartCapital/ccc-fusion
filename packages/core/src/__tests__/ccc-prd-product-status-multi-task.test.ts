@@ -35,6 +35,7 @@ import {
   providerAttemptStatusesForCampaign,
   resolveCccPrdProductStatusProviderAttemptAnchorTaskId,
   type CccPrdProductApprovalStatus,
+  type CccPrdProductExecutionAuthorizationStatus,
   type CccPrdProductNextActionInput,
   type CccPrdProductProofAttemptStatus,
   type CccPrdProductTaskStatus,
@@ -242,6 +243,19 @@ const routedTask = {
   cliAdapterId: null,
 } as const;
 
+function executionAuthorization(
+  status: "issued" | "claimed" | "settled" = "issued",
+): CccPrdProductExecutionAuthorizationStatus {
+  return {
+    authorizationId: `ccc-execution-authorization-${"9".repeat(64)}`,
+    status,
+    members: [
+      { nativeTaskId: "task-1", approvalRequestId: `ccc-approval-${"a".repeat(64)}` },
+      { nativeTaskId: "task-2", approvalRequestId: `ccc-approval-${"b".repeat(64)}` },
+    ],
+  } as unknown as CccPrdProductExecutionAuthorizationStatus;
+}
+
 function nextActionInput(
   overrides: Partial<Pick<CccPrdProductNextActionInput,
     | "workItems"
@@ -252,6 +266,8 @@ function nextActionInput(
     | "orphanProofAttempts"
     | "providerAttempts"
     | "providerAttemptHistoryConsistent"
+    | "executionAuthorizationMode"
+    | "executionAuthorization"
   >> = {},
 ): CccPrdProductNextActionInput {
   return {
@@ -277,6 +293,8 @@ function nextActionInput(
     providerAttemptHistoryConsistent:
       overrides.providerAttemptHistoryConsistent ?? true,
     approvals: overrides.approvals ?? [],
+    executionAuthorizationMode: overrides.executionAuthorizationMode,
+    executionAuthorization: overrides.executionAuthorization,
     landingIntents: [],
     landingMaterializations: [],
     landingTerminals: [],
@@ -321,6 +339,41 @@ function proofAttempt(
 }
 
 describe("productNextAction multi-task live-execution holds", () => {
+  it("surfaces one sealed parent authorization instead of either diagnostic child approval", () => {
+    const authorization = executionAuthorization();
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: authorization,
+      approvals: [
+        approval({ id: authorization.members[0]!.approvalRequestId, taskId: "task-1" }),
+        approval({ id: authorization.members[1]!.approvalRequestId, taskId: "task-2" }),
+      ],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "approve-execution",
+      executionAuthorizationId: authorization.authorizationId,
+      executionAuthorizationStatus: "issued",
+    });
+    expect(action).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("fails closed when a sealed live-execution hold has child diagnostics but no parent", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: null,
+      approvals: [approval({ id: "child-must-not-be-actionable", taskId: "task-1" })],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "blocked",
+      reason: expect.stringContaining("single campaign authorization is missing"),
+    });
+    expect(action).not.toHaveProperty("approvalRequestId");
+  });
+
   it("RED-M1c: surfaces the second task's issued live-execution approval instead of reporting blocked", () => {
     const action = productNextAction(nextActionInput({
       // The parked item's taskId stays pinned to the workflow entry task.

@@ -4,6 +4,7 @@ import type { Database } from "./db.js";
 import { fromJson, toJsonNullable } from "./db.js";
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
 import type { CccCampaignAuthorityStore } from "./ccc-campaign/store.js";
+import * as executionAuthorizationStore from "./ccc-campaign/execution-authorization.js";
 import * as asyncApprovalRequestStore from "./async-approval-request-store.js";
 import * as schema from "./postgres/schema/index.js";
 import {
@@ -416,6 +417,44 @@ export class ApprovalRequestStore {
   ): Promise<ApprovalRequest> {
     const authority = this.campaignAuthority();
     return asyncApprovalRequestStore.issueCccCampaignApproval(authority.layer, {
+      ...input,
+      authorityStore: authority.authorityStore,
+      rootDir: authority.rootDir,
+    });
+  }
+
+  async issueCccCampaignExecutionAuthorization(
+    input: Omit<
+      executionAuthorizationStore.IssueCccCampaignExecutionAuthorizationInput,
+      "authorityStore" | "rootDir"
+    >,
+  ): Promise<executionAuthorizationStore.CccCampaignExecutionAuthorization> {
+    const authority = this.campaignAuthority();
+    return executionAuthorizationStore.issueCccCampaignExecutionAuthorization(authority.layer, {
+      ...input,
+      authorityStore: authority.authorityStore,
+      rootDir: authority.rootDir,
+    });
+  }
+
+  async getCccCampaignExecutionAuthorization(
+    authorizationId: string,
+  ): Promise<executionAuthorizationStore.CccCampaignExecutionAuthorization | null> {
+    const authority = this.campaignAuthority();
+    return executionAuthorizationStore.getCccCampaignExecutionAuthorization(
+      authority.layer.db,
+      authorizationId,
+    );
+  }
+
+  async claimCccCampaignExecutionAuthorization(
+    input: Omit<
+      executionAuthorizationStore.ClaimCccCampaignExecutionAuthorizationInput,
+      "authorityStore" | "rootDir"
+    >,
+  ): Promise<executionAuthorizationStore.CccCampaignExecutionAuthorization> {
+    const authority = this.campaignAuthority();
+    return executionAuthorizationStore.claimCccCampaignExecutionAuthorization(authority.layer, {
       ...input,
       authorityStore: authority.authorityStore,
       rootDir: authority.rootDir,

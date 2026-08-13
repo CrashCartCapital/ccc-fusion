@@ -44,7 +44,12 @@ describe("prd built CLI user contract", () => {
     expect(result.stdout).toContain("fn prd stop <idempotency-key> --reason <reason> --confirm <status-digest>");
     expect(result.stdout).toContain("fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path>");
     expect(result.stdout).toContain("fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed>");
-    expect(result.stdout).toContain("fn prd approve-execution <idempotency-key>");
+    expect(result.stdout).toContain(
+      "fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id>",
+    );
+    expect(result.stdout).toContain(
+      "Claim the single sealed campaign authorization, or an exact legacy per-task approval",
+    );
     expect(result.stdout).toContain("fn prd approve-merge <idempotency-key>");
   });
 

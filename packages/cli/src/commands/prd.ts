@@ -221,7 +221,7 @@ const usage = [
   "       fn prd <stop|abandon> <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]",
   "       fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]",
   "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
-  "       fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
+  "       fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id> --confirm <approval-digest> [--project <id|name>]",
   "       fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
   "       add --json to any command above for the exact machine-readable payload instead of operator prose",
 ].join("\n");
@@ -1294,7 +1294,12 @@ function writeVerifierConfinementImportRefusal(
 function writeVerifierConfinementExecutionRefusal(
   io: PrdCommandIo,
   readiness: VerifierConfinementReadiness,
-  approval: Pick<CccPrdProductApprovalStatus, "id" | "status" | "campaign">,
+  decision: Readonly<{
+    label: "Approval" | "Execution authorization";
+    id: string;
+    status: string;
+    expiresAt: string;
+  }>,
   workItem: Readonly<{ id: string; state: string }>,
   idempotencyKey: string,
   json: boolean,
@@ -1308,11 +1313,11 @@ function writeVerifierConfinementExecutionRefusal(
     }],
     verifierConfinement: sanitizedVerifierConfinementReadiness(readiness),
     safeState:
-      `Approval ${approval.id} remains ${approval.status} and workflow ${workItem.id} remains ${workItem.state}; this command started no provider, source, or proof effect.`,
+      `${decision.label} ${decision.id} remains ${decision.status} and workflow ${workItem.id} remains ${workItem.state}; this command started no provider, source, or proof effect.`,
     decisionOwner: "Fusion host or CI runner operator",
     consequence:
       "Live coding cannot start because Fusion could not prove exact requirement tests can run under enforced confinement.",
-    approvalExpiresAt: approval.campaign.expiresAt,
+    approvalExpiresAt: decision.expiresAt,
     recoveryOptions: [
       `Repair and functionally verify ${backend} before this approval expires.`,
       "If the approval expires, request a fresh exact live-execution approval after the host is ready.",
@@ -2171,17 +2176,34 @@ async function runProductControlCommand(
           expiresAt: approval.campaign.expiresAt,
           status: approval.status,
         }));
-      const liveExecutionApprovalConfirmations = status.approvals
-        .filter(isLiveExecutionApproval)
-        .map((approval) => ({
-          approvalRequestId: approval.id,
-          confirmation: computeLiveExecutionConfirmation(
-            approval as ApprovalRequest,
-          ),
-          expiresAt: approval.campaign.expiresAt,
-          status: approval.status,
-          taskId: approval.taskId,
-        }));
+      const liveExecutionAuthorizationConfirmation = status.executionAuthorization
+        && (
+          status.executionAuthorization.status === "issued"
+          || status.executionAuthorization.status === "claimed"
+        )
+        ? {
+          authorizationId: status.executionAuthorization.authorizationId,
+          confirmation: computeLiveExecutionConfirmation(status.executionAuthorization),
+          expiresAt: status.executionAuthorization.expiresAt,
+          status: status.executionAuthorization.status,
+        }
+        : null;
+      const sealedExecutionAuthorization =
+        status.executionAuthorizationMode === "sealed_bundle_v1"
+        || Boolean(status.executionAuthorization);
+      const liveExecutionApprovalConfirmations = sealedExecutionAuthorization
+        ? []
+        : status.approvals
+          .filter(isLiveExecutionApproval)
+          .map((approval) => ({
+            approvalRequestId: approval.id,
+            confirmation: computeLiveExecutionConfirmation(
+              approval as ApprovalRequest,
+            ),
+            expiresAt: approval.campaign.expiresAt,
+            status: approval.status,
+            taskId: approval.taskId,
+          }));
       writeOperatorPayload(io, commandContext, {
         kind: "product-status",
         found: true,
@@ -2191,39 +2213,58 @@ async function runProductControlCommand(
           ?? engine.describeCccCampaignOperatorControls
         )(status),
         mergeApprovalConfirmations,
+        ...(liveExecutionAuthorizationConfirmation
+          ? { liveExecutionAuthorizationConfirmation }
+          : {}),
         liveExecutionApprovalConfirmations,
       });
       return 0;
     }
 
-    const approval = status.approvals.find(({ id }) =>
-      id === approvalRequestId);
-    if (!approval || (
-      approvingExecution
-        ? !isLiveExecutionApproval(approval)
-        : !isMergeApproval(approval)
-    )) {
-      throw new PrdProductCommandError(
-        approvingExecution
-          ? "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING"
-          : "CCC_PRD_MERGE_APPROVAL_MISSING",
-        `${approvingExecution ? "live-execution" : "merge"} approval ${approvalRequestId} is missing from exact product status`,
-      );
-    }
-    const expectedConfirmation = (
-      approvingExecution
-        ? computeLiveExecutionConfirmation
-        : computeConfirmation
-    )(approval as ApprovalRequest);
-    if (!exactDigest(confirmation!, expectedConfirmation)) {
-      throw new PrdProductCommandError(
-        approvingExecution
-          ? "CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED"
-          : "CCC_PRD_MERGE_CONFIRMATION_REFUSED",
-        `${approvingExecution ? "live-execution" : "merge"} approval confirmation is stale or does not match`,
-      );
-    }
     if (approvingExecution) {
+      const sealedExecutionAuthorization =
+        status.executionAuthorizationMode === "sealed_bundle_v1"
+        || Boolean(status.executionAuthorization);
+      const authorization = sealedExecutionAuthorization
+        ? status.executionAuthorization
+        : null;
+      const approval = sealedExecutionAuthorization
+        ? null
+        : status.approvals.find(({ id }) => id === approvalRequestId);
+      if (
+        sealedExecutionAuthorization
+          ? !authorization || authorization.authorizationId !== approvalRequestId
+          : !approval || !isLiveExecutionApproval(approval)
+      ) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+          sealedExecutionAuthorization
+            ? `live-execution authorization ${approvalRequestId} is missing from exact product status`
+            : `live-execution approval ${approvalRequestId} is missing from exact product status`,
+        );
+      }
+      const expectedConfirmation = computeLiveExecutionConfirmation(
+        authorization ?? (approval as ApprovalRequest),
+      );
+      if (!exactDigest(confirmation!, expectedConfirmation)) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED",
+          authorization
+            ? "live-execution authorization confirmation is stale or does not match"
+            : "live-execution approval confirmation is stale or does not match",
+        );
+      }
+      const taskId = authorization
+        ? authorization.members[0]?.nativeTaskId
+        : approval?.taskId;
+      if (!taskId) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+          authorization
+            ? `live-execution authorization ${approvalRequestId} has no exact task custody`
+            : `live-execution approval ${approvalRequestId} has no exact task custody`,
+        );
+      }
       const workItem = exactLiveExecutionWorkItem(status);
       const verifierConfinement = await (
         dependencies.inspectVerifierConfinementReadiness
@@ -2233,7 +2274,19 @@ async function runProductControlCommand(
         return writeVerifierConfinementExecutionRefusal(
           io,
           verifierConfinement,
-          approval,
+          authorization
+            ? {
+              label: "Execution authorization",
+              id: authorization.authorizationId,
+              status: authorization.status,
+              expiresAt: authorization.expiresAt,
+            }
+            : {
+              label: "Approval",
+              id: approval!.id,
+              status: approval!.status,
+              expiresAt: approval!.campaign.expiresAt,
+            },
           workItem,
           idempotencyKey,
           operatorJson(commandContext),
@@ -2245,8 +2298,10 @@ async function runProductControlCommand(
       )({
         store: project.store,
         rootDir: project.projectPath,
-        taskId: approval.taskId!,
-        approvalRequestId: approval.id,
+        taskId,
+        ...(authorization
+          ? { authorizationId: authorization.authorizationId }
+          : { approvalRequestId: approval!.id }),
         confirmation: confirmation!,
         actor: {
           actorId: "ccc-fusion-local-operator",
@@ -2282,11 +2337,27 @@ async function runProductControlCommand(
       }
       writeOperatorPayload(io, commandContext, {
         kind: "execution-approved",
-        approvalRequestId: approval.id,
+        ...(authorization
+          ? { executionAuthorizationId: authorization.authorizationId }
+          : { approvalRequestId: approval!.id }),
         approval: approved,
         status: resumedStatus,
       });
       return 0;
+    }
+    const approval = status.approvals.find(({ id }) => id === approvalRequestId);
+    if (!approval || !isMergeApproval(approval)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_MERGE_APPROVAL_MISSING",
+        `merge approval ${approvalRequestId} is missing from exact product status`,
+      );
+    }
+    const expectedConfirmation = computeConfirmation(approval as ApprovalRequest);
+    if (!exactDigest(confirmation!, expectedConfirmation)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_MERGE_CONFIRMATION_REFUSED",
+        "merge approval confirmation is stale or does not match",
+      );
     }
     const workItem = exactMergeWorkItem(status);
     const result = await (

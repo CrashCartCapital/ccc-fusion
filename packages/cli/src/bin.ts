@@ -348,8 +348,8 @@ Usage:
                                       Settle an uncertain verifier from reviewed external evidence without rerunning it
   fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>] [--json]
                                       Settle an uncertain PI/workflow provider effect; native CLI attempts retain their held-session fence
-  fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>] [--json]
-                                      Claim the exact campaign-bound live-execution approval
+  fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id> --confirm <approval-digest> [--project <id|name>] [--json]
+                                      Claim the single sealed campaign authorization, or an exact legacy per-task approval
   fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>] [--json]
                                       Land only the exact proof-bound campaign commit after human approval
   fn init [opts]                      Initialize a new fn project (--name, --path, --git)

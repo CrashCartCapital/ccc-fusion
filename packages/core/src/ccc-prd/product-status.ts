@@ -1,6 +1,7 @@
 import { and, eq, inArray, or } from "drizzle-orm";
 import type {
   CccCampaignAuthorityBinding,
+  CccCampaignExecutionAuthorizationMode,
   CccCampaignExecutionRoute,
   CccCampaignProofAttemptState,
   CccCampaignWorkItemFence,
@@ -18,6 +19,10 @@ import {
   assertCccCampaignAuthorityBinding,
 } from "../ccc-campaign/canonical.js";
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
+import {
+  getCccCampaignExecutionAuthorizationForImport,
+  type CccCampaignExecutionAuthorization,
+} from "../ccc-campaign/execution-authorization.js";
 import {
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
@@ -208,6 +213,10 @@ export type CccPrdProductApprovalStatus = Readonly<
   >;
 }>;
 
+export type CccPrdProductExecutionAuthorizationStatus = Readonly<
+  Omit<CccCampaignExecutionAuthorization, "claimToken">
+>;
+
 export type CccPrdProductLandingMetadata = Readonly<{
   schema: string | null;
   expectedBaseObject: string | null;
@@ -264,6 +273,8 @@ export type CccPrdProductStatus = Readonly<{
   proofs: readonly CccPrdProductProofStatus[];
   orphanProofAttempts: readonly CccPrdProductProofAttemptStatus[];
   providerAttempts: readonly CccPrdProductProviderAttemptStatus[];
+  executionAuthorizationMode: CccCampaignExecutionAuthorizationMode;
+  executionAuthorization: CccPrdProductExecutionAuthorizationStatus | null;
   approvals: readonly CccPrdProductApprovalStatus[];
   landing: Readonly<{
     intents: readonly CccPrdProductLandingAudit[];
@@ -275,6 +286,8 @@ export type CccPrdProductStatus = Readonly<{
     reason: string;
     approvalRequestId?: string;
     approvalStatus?: CoreApprovalRequest["status"];
+    executionAuthorizationId?: string;
+    executionAuthorizationStatus?: CccCampaignExecutionAuthorization["status"];
     diagnostic?: string;
     safeState?: string;
     decisionOwner?: string;
@@ -625,6 +638,8 @@ export type CccPrdProductNextActionInput = Readonly<{
   orphanProofAttempts: readonly CccPrdProductProofAttemptStatus[];
   providerAttempts: readonly CccPrdProductProviderAttemptStatus[];
   approvals: readonly CccPrdProductApprovalStatus[];
+  executionAuthorizationMode?: "per_task_v1" | "sealed_bundle_v1";
+  executionAuthorization?: CccPrdProductExecutionAuthorizationStatus | null;
   landingIntents: readonly CccPrdProductLandingAudit[];
   landingMaterializations: readonly CccPrdProductLandingAudit[];
   landingTerminals: readonly CccPrdProductLandingAudit[];
@@ -967,6 +982,34 @@ export function productNextAction(
     }
   }
   if (liveExecutionApprovalWorkItem) {
+    if (input.executionAuthorizationMode === "sealed_bundle_v1") {
+      const authorization = input.executionAuthorization;
+      if (!authorization) {
+        return {
+          kind: "blocked",
+          reason:
+            `Workflow work item ${liveExecutionApprovalWorkItem.id} is parked for sealed live execution, but its single campaign authorization is missing.`,
+          diagnostic: "The runtime did not persist the parent authorization required by manifest-v2 custody.",
+          nextSafeAction: "Preserve the campaign and inspect runtime authorization issuance; do not approve diagnostic child rows.",
+        };
+      }
+      if (authorization.status === "issued" || authorization.status === "claimed") {
+        return {
+          kind: "approve-execution",
+          reason:
+            `Workflow work item ${liveExecutionApprovalWorkItem.id} requires one sealed launch decision for ${authorization.members.length} exact campaign action${authorization.members.length === 1 ? "" : "s"}.`,
+          executionAuthorizationId: authorization.authorizationId,
+          executionAuthorizationStatus: authorization.status,
+        };
+      }
+      return {
+        kind: "blocked",
+        reason:
+          `Workflow work item ${liveExecutionApprovalWorkItem.id} is parked for live execution after sealed authorization ${authorization.authorizationId} became ${authorization.status}.`,
+        diagnostic: "A terminal parent authorization cannot be reused to launch new work.",
+        nextSafeAction: "Preserve campaign custody and reconcile the terminal authorization before any further execution.",
+      };
+    }
     /*
     A multi-task campaign holds once per task, but the parked work item's `taskId` stays pinned
     to the workflow entry task for the whole campaign. Matching the approval by the WORK ITEM's
@@ -1365,6 +1408,33 @@ export async function inspectCccPrdProductStatus(
       })
       .sort(compareCreatedThenId);
 
+    const persistedExecutionAuthorization =
+      await getCccCampaignExecutionAuthorizationForImport(tx, row.importId);
+    const executionAuthorization = persistedExecutionAuthorization
+      ? (() => {
+        if (
+          persistedExecutionAuthorization.projectId !== projectId
+          || persistedExecutionAuthorization.importId !== row.importId
+          || persistedExecutionAuthorization.campaignId !== custody.manifest.campaignId
+          || persistedExecutionAuthorization.manifestHash !== custody.manifestHash
+          || persistedExecutionAuthorization.packetHash !== row.packetHash
+          || persistedExecutionAuthorization.sidecarHash !== row.sidecarHash
+          || persistedExecutionAuthorization.bundleHash !== row.bundleHash
+          || persistedExecutionAuthorization.targetRepository !== row.targetRepository
+          || persistedExecutionAuthorization.targetBase !== row.targetBase
+          || persistedExecutionAuthorization.maxRequests !== custody.manifest.bounds.maxRequests
+          || persistedExecutionAuthorization.maxConcurrency !== custody.manifest.bounds.maxConcurrency
+        ) {
+          throw new CccPrdImportError(
+            "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+            `CCC PRD execution authorization ${persistedExecutionAuthorization.authorizationId} drifted from import custody`,
+          );
+        }
+        const { claimToken: _claimToken, ...redacted } = persistedExecutionAuthorization;
+        return redacted;
+      })()
+      : null;
+
     const landingRows = await tx
       .select({
         auditId: schema.project.runAuditEvents.id,
@@ -1480,6 +1550,8 @@ export async function inspectCccPrdProductStatus(
       orphanProofAttempts,
       providerAttempts,
       approvals,
+      executionAuthorizationMode: custody.executionAuthorizationMode,
+      executionAuthorization,
       landingIntents,
       landingMaterializations,
       landingTerminals,
@@ -1518,6 +1590,8 @@ export async function inspectCccPrdProductStatus(
       proofs,
       orphanProofAttempts,
       providerAttempts,
+      executionAuthorizationMode: custody.executionAuthorizationMode,
+      executionAuthorization,
       approvals,
       landing: {
         intents: landingIntents,

@@ -3,13 +3,14 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import {
   getApprovalRequest,
+  getCccCampaignExecutionAuthorization,
   importCccPrdBundle,
   inspectCccPrdProductStatus,
   queryRunAuditEvents,
-  type ApprovalRequest,
+  TaskStore,
   type ApprovalRequestActorSnapshot,
-  type CccPrdProductApprovalStatus,
   type CccPrdProtectedActionIntent,
+  type CccCampaignExecutionAuthorization,
   type Settings,
   type WorkflowIrNode,
 } from "@fusion/core";
@@ -37,24 +38,29 @@ const OPERATOR: ApprovalRequestActorSnapshot = Object.freeze({
 
 const LIVE_EXECUTION_APPROVAL_TEST_WINDOW_MS = 60_000;
 
+type SealedLiveExecutionApproval = Omit<
+  CccCampaignExecutionAuthorization,
+  "claimToken"
+>;
+
 type LiveExecutionApprovalApi = Readonly<{
   issueCccCampaignLiveExecutionApproval(input: Readonly<{
     store: ReturnType<ReturnType<typeof createSharedPgTaskStoreTestHarness>["store"]>;
     rootDir: string;
     taskId: string;
     runId: string;
-  }>): Promise<CccPrdProductApprovalStatus>;
+  }>): Promise<SealedLiveExecutionApproval>;
   computeCccCampaignLiveExecutionApprovalConfirmation(
-    approval: ApprovalRequest,
+    approval: SealedLiveExecutionApproval,
   ): string;
   approveCccCampaignLiveExecution(input: Readonly<{
     store: ReturnType<ReturnType<typeof createSharedPgTaskStoreTestHarness>["store"]>;
     rootDir: string;
     taskId: string;
-    approvalRequestId: string;
+    authorizationId: string;
     confirmation: string;
     actor: ApprovalRequestActorSnapshot;
-  }>): Promise<CccPrdProductApprovalStatus>;
+  }>): Promise<SealedLiveExecutionApproval>;
 }>;
 
 type LiveExecutionRequireApi = Readonly<{
@@ -65,7 +71,7 @@ type LiveExecutionRequireApi = Readonly<{
     rootDir: string;
     taskId: string;
     runId: string;
-  }>): Promise<CccPrdProductApprovalStatus>;
+  }>): Promise<SealedLiveExecutionApproval>;
 }>;
 
 function liveExecutionApprovalApi(): LiveExecutionApprovalApi {
@@ -142,13 +148,11 @@ pgTest("CCC campaign live-execution approval", () => {
       spans: [firstTask.spans[0]!],
     };
     const protectedActions: CccPrdProtectedActionIntent[] =
-      mode === "live"
-        ? [firstLiveAction]
-        : mode === "two-live"
-          ? [firstLiveAction, secondLiveAction]
-          : mode === "wrong-action"
-            ? [wrongAction]
-            : [];
+      mode === "wrong-action"
+        ? [wrongAction, secondLiveAction]
+        : mode === "missing-action"
+          ? [secondLiveAction]
+          : [firstLiveAction, secondLiveAction];
     const bundle = rehashCccPrdImportTestBundle({
       ...source,
       bounds: {
@@ -166,7 +170,7 @@ pgTest("CCC campaign live-execution approval", () => {
                 : [mode === "wrong-action" ? wrongAction.id : firstLiveAction.id],
           };
         }
-        if (task.id === secondTask.id && mode === "two-live") {
+        if (task.id === secondTask.id) {
           return { ...task, protectedActionIds: [secondLiveAction.id] };
         }
         return task;
@@ -240,28 +244,22 @@ pgTest("CCC campaign live-execution approval", () => {
     });
 
     expect(first).toMatchObject({
+      schemaVersion: "ccc-campaign.execution-authorization.v1",
       status: "issued",
-      taskId: fixture.firstTaskId,
-      actionId: fixture.firstLiveAction.id,
-      actionTarget: fixture.firstLiveAction.target,
-      targetAction: {
-        category: "command_execution",
-        action: fixture.firstLiveAction.id,
-        resourceType: "ccc-campaign-live_execution",
-        resourceId: fixture.firstLiveAction.target,
-        context: {
-          protectedActionKind: "live_execution",
-          operatorDecision: "approve_live_execution",
-        },
-      },
-      campaign: {
-        binding: {
-          importId: fixture.imported.importId,
-          taskId: fixture.firstTaskId,
+      importId: fixture.imported.importId,
+      expectedRequestCount: 0,
+      members: expect.arrayContaining([
+        expect.objectContaining({
+          nativeTaskId: fixture.firstTaskId,
           actionId: fixture.firstLiveAction.id,
           actionTarget: fixture.firstLiveAction.target,
-        },
-      },
+        }),
+        expect.objectContaining({
+          nativeTaskId: fixture.secondTaskId,
+          actionId: fixture.secondLiveAction.id,
+          actionTarget: fixture.secondLiveAction.target,
+        }),
+      ]),
     });
     expect(replay).toEqual(first);
     expect(api.computeCccCampaignLiveExecutionApprovalConfirmation(first))
@@ -276,7 +274,7 @@ pgTest("CCC campaign live-execution approval", () => {
       rootDir: fixture.rootDir,
       taskId: fixture.firstTaskId,
       runId: "RUN-live-execution-issue-drifted",
-    })).rejects.toThrow(/collision or drift/u);
+    })).resolves.toEqual(first);
 
     await expect(h.store().getWorkflowWorkItem(fixture.workItem.id))
       .resolves.toEqual(beforeWorkItem);
@@ -287,6 +285,152 @@ pgTest("CCC campaign live-execution approval", () => {
     });
     expect(audits.filter(({ mutationType }) =>
       mutationType.startsWith("ccc-campaign:provider-attempt:"))).toEqual([]);
+  });
+
+  it("issues one sealed parent from either task and one claim atomically unlocks both exact children", async () => {
+    const api = liveExecutionApprovalApi();
+    const fixture = await importFixture("sealed-parent", "two-live");
+
+    const fromFirstTask = await api.issueCccCampaignLiveExecutionApproval({
+      store: h.store(),
+      rootDir: fixture.rootDir,
+      taskId: fixture.firstTaskId,
+      runId: "RUN-sealed-parent-first",
+    });
+    const fromSecondTask = await api.issueCccCampaignLiveExecutionApproval({
+      store: h.store(),
+      rootDir: fixture.rootDir,
+      taskId: fixture.secondTaskId,
+      runId: "RUN-sealed-parent-second",
+    });
+
+    expect(fromSecondTask).toEqual(fromFirstTask);
+    expect(fromFirstTask).toMatchObject({
+      schemaVersion: "ccc-campaign.execution-authorization.v1",
+      authorizationId: expect.stringMatching(/^ccc-execution-authorization-[a-f0-9]{64}$/u),
+      status: "issued",
+      expectedRequestCount: 0,
+      members: [
+        {
+          nativeTaskId: fixture.firstTaskId,
+          semanticTaskId: fixture.firstSemanticTaskId,
+          actionId: fixture.firstLiveAction.id,
+          actionTarget: fixture.firstLiveAction.target,
+          approvalRequestId: expect.stringMatching(/^ccc-approval-[a-f0-9]{64}$/u),
+        },
+        {
+          nativeTaskId: fixture.secondTaskId,
+          semanticTaskId: fixture.secondSemanticTaskId,
+          actionId: fixture.secondLiveAction.id,
+          actionTarget: fixture.secondLiveAction.target,
+          approvalRequestId: expect.stringMatching(/^ccc-approval-[a-f0-9]{64}$/u),
+        },
+      ],
+    });
+    expect(JSON.stringify(fromFirstTask)).not.toContain("claimToken");
+    const confirmation =
+      api.computeCccCampaignLiveExecutionApprovalConfirmation(fromFirstTask);
+    expect(confirmation).toMatch(/^[a-f0-9]{64}$/u);
+
+    const claimed = await api.approveCccCampaignLiveExecution({
+      store: h.store(),
+      rootDir: fixture.rootDir,
+      taskId: fixture.secondTaskId,
+      authorizationId: fromFirstTask.authorizationId,
+      confirmation,
+      actor: OPERATOR,
+    });
+    expect(claimed).toMatchObject({
+      authorizationId: fromFirstTask.authorizationId,
+      status: "claimed",
+    });
+    expect(api.computeCccCampaignLiveExecutionApprovalConfirmation(claimed))
+      .toBe(confirmation);
+    expect(JSON.stringify(claimed)).not.toContain("claimToken");
+
+    const persistedParent = await getCccCampaignExecutionAuthorization(
+      h.layer().db,
+      fromFirstTask.authorizationId,
+    );
+    expect(persistedParent).toMatchObject({
+      status: "claimed",
+      claimToken: expect.any(String),
+    });
+    for (const member of fromFirstTask.members) {
+      await expect(getApprovalRequest(h.layer().db, member.approvalRequestId))
+        .resolves.toMatchObject({ status: "claimed" });
+      await expect(h.store().inspectCccCampaignActionLease(
+        member.nativeTaskId,
+        { actionId: member.actionId, actionTarget: member.actionTarget },
+      )).resolves.toMatchObject({
+        binding: { bindingHash: member.bindingHash },
+        lease: {
+          approvalRequestId: member.approvalRequestId,
+          bindingHash: member.bindingHash,
+        },
+      });
+    }
+    const firstContext = await h.store().getCccCampaignContextForTask(
+      fixture.firstTaskId,
+    );
+    if (!firstContext) throw new Error("missing first sealed task context");
+    const reserved = await h.store().reserveCccProviderAttempt({
+      taskId: fixture.firstTaskId,
+      actionId: fixture.firstLiveAction.id,
+      actionTarget: fixture.firstLiveAction.target,
+      turnKey: "sealed-parent-task-a-turn-1",
+      dispatchKey: "pi-stream:sealed-parent-task-a-turn-1",
+      providerId: firstContext.route.providerId,
+      modelId: firstContext.route.modelId,
+      transport: firstContext.route.transport,
+      workItemFence: {
+        workItemId: fixture.workItem.id,
+        runId: fixture.workItem.runId,
+        attempt: Math.max(1, fixture.workItem.attempt),
+      },
+    });
+    await h.store().proveCccProviderAttemptNotDispatched({
+      taskId: fixture.firstTaskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+    await expect(h.store().getCccCampaignContextForTask(fixture.firstTaskId))
+      .resolves.toMatchObject({ requestCount: 1 });
+    const advancedWorkItem = await h.store().transitionWorkflowWorkItem(
+      fixture.workItem.id,
+      "running",
+      {
+        expectedState: fixture.workItem.state,
+        expectedAttempt: fixture.workItem.attempt,
+        expectedLeaseOwner: fixture.workItem.leaseOwner,
+        attempt: Math.max(1, fixture.workItem.attempt + 1),
+        leaseOwner: "sealed-parent-restart-owner",
+        leaseExpiresAt: "2999-07-31T23:59:59.000Z",
+      },
+    );
+    expect(advancedWorkItem.attempt).toBeGreaterThan(fixture.workItem.attempt);
+    await expect(liveExecutionRequireApi().requireCccCampaignLiveExecutionApproval({
+      store: new TaskStore(
+        fixture.rootDir,
+        undefined,
+        { asyncLayer: h.layer() },
+      ),
+      rootDir: fixture.rootDir,
+      taskId: fixture.secondTaskId,
+      runId: "RUN-sealed-parent-replay-after-request",
+    })).resolves.toMatchObject({
+      authorizationId: fromFirstTask.authorizationId,
+      status: "claimed",
+    });
+    const providerAudits = (await Promise.all([
+      queryRunAuditEvents(h.layer().db, { taskId: fixture.firstTaskId }),
+      queryRunAuditEvents(h.layer().db, { taskId: fixture.secondTaskId }),
+    ])).flat().filter(({ mutationType }) =>
+      mutationType.startsWith("ccc-campaign:provider-attempt:"));
+    expect(providerAudits.map(({ mutationType }) => mutationType).sort()).toEqual([
+      "ccc-campaign:provider-attempt:reserved",
+      "ccc-campaign:provider-attempt:terminal",
+    ]);
   });
 
   it("requires an exact claimed live-execution lease without exposing or performing the effect", async () => {
@@ -313,9 +457,13 @@ pgTest("CCC campaign live-execution approval", () => {
     const issued = await api.issueCccCampaignLiveExecutionApproval(input);
     expect(issued).toMatchObject({
       status: "issued",
-      taskId: fixture.firstTaskId,
-      actionId: fixture.firstLiveAction.id,
-      actionTarget: fixture.firstLiveAction.target,
+      members: expect.arrayContaining([
+        expect.objectContaining({
+          nativeTaskId: fixture.firstTaskId,
+          actionId: fixture.firstLiveAction.id,
+          actionTarget: fixture.firstLiveAction.target,
+        }),
+      ]),
     });
     expect(JSON.stringify(issued)).not.toContain("claimToken");
     await expect(h.store().getCccCampaignContextForTask(fixture.firstTaskId))
@@ -333,7 +481,7 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       rootDir: fixture.rootDir,
       taskId: fixture.firstTaskId,
-      approvalRequestId: issued.id,
+      authorizationId: issued.authorizationId,
       confirmation,
       actor: OPERATOR,
     });
@@ -443,7 +591,7 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       rootDir: fixture.rootDir,
       taskId: fixture.firstTaskId,
-      approvalRequestId: issued.id,
+      authorizationId: issued.authorizationId,
       confirmation,
       actor: OPERATOR,
     });
@@ -483,7 +631,7 @@ pgTest("CCC campaign live-execution approval", () => {
     });
   });
 
-  it("refuses a wrong task/action binding and a stale digest before any claim", async () => {
+  it("refuses a wrong parent identifier and a stale digest before any claim", async () => {
     const api = liveExecutionApprovalApi();
     const fixture = await importFixture("binding", "two-live");
     const approval = await api.issueCccCampaignLiveExecutionApproval({
@@ -500,24 +648,27 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       rootDir: fixture.rootDir,
       taskId: fixture.secondTaskId,
-      approvalRequestId: approval.id,
+      authorizationId: `ccc-execution-authorization-${"0".repeat(64)}`,
       confirmation,
       actor: OPERATOR,
     })).rejects.toMatchObject({
-      code: "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_DRIFT",
+      code: "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_MISSING",
     });
     await expect(api.approveCccCampaignLiveExecution({
       store: h.store(),
       rootDir: fixture.rootDir,
       taskId: fixture.firstTaskId,
-      approvalRequestId: approval.id,
+      authorizationId: approval.authorizationId,
       confirmation: "0".repeat(64),
       actor: OPERATOR,
     })).rejects.toMatchObject({
       code: "CCC_CAMPAIGN_LIVE_EXECUTION_CONFIRMATION_REFUSED",
     });
 
-    await expect(getApprovalRequest(h.layer().db, approval.id))
+    await expect(getCccCampaignExecutionAuthorization(
+      h.layer().db,
+      approval.authorizationId,
+    ))
       .resolves.toMatchObject({ status: "issued" });
     await expect(h.store().getCccCampaignContextForTask(fixture.firstTaskId))
       .resolves.toMatchObject({ requestCount: 0, activeActionLeases: {} });
@@ -553,7 +704,7 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       rootDir: fixture.rootDir,
       taskId: fixture.firstTaskId,
-      approvalRequestId: approval.id,
+      authorizationId: approval.authorizationId,
       confirmation,
       actor: OPERATOR,
     });
@@ -561,7 +712,7 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       rootDir: `${fixture.rootDir}-stale`,
       taskId: fixture.firstTaskId,
-      approvalRequestId: approval.id,
+      authorizationId: approval.authorizationId,
       confirmation,
       actor: OPERATOR,
     })).rejects.toMatchObject({
@@ -571,11 +722,21 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       rootDir: fixture.rootDir,
       taskId: fixture.firstTaskId,
-      approvalRequestId: approval.id,
+      authorizationId: approval.authorizationId,
       confirmation,
       actor: OPERATOR,
     });
-    const persisted = await getApprovalRequest(h.layer().db, approval.id);
+    const persisted = await getCccCampaignExecutionAuthorization(
+      h.layer().db,
+      approval.authorizationId,
+    );
+    const firstMember = approval.members.find(({ nativeTaskId }) =>
+      nativeTaskId === fixture.firstTaskId);
+    if (!firstMember) throw new Error("missing first sealed member");
+    const persistedChild = await getApprovalRequest(
+      h.layer().db,
+      firstMember.approvalRequestId,
+    );
     const lease = await h.store().inspectCccCampaignActionLease(
       fixture.firstTaskId,
       {
@@ -586,33 +747,30 @@ pgTest("CCC campaign live-execution approval", () => {
 
     expect(claimed).toMatchObject({
       status: "claimed",
-      actionId: fixture.firstLiveAction.id,
-      actionTarget: fixture.firstLiveAction.target,
+      authorizationId: approval.authorizationId,
     });
     expect(replay).toEqual(claimed);
     expect(JSON.stringify(claimed)).not.toContain("claimToken");
     expect(persisted).toMatchObject({
-      id: approval.id,
       status: "claimed",
-      campaign: {
-        binding: {
-          bindingHash: claimed.campaign.binding.bindingHash,
-          actionId: fixture.firstLiveAction.id,
-          actionTarget: fixture.firstLiveAction.target,
-        },
-        claimToken: expect.any(String),
-      },
+      authorizationId: approval.authorizationId,
+      claimToken: expect.any(String),
+    });
+    expect(persistedChild).toMatchObject({
+      id: firstMember.approvalRequestId,
+      status: "claimed",
+      campaign: { claimToken: expect.any(String) },
     });
     expect(lease).toMatchObject({
       binding: {
-        bindingHash: claimed.campaign.binding.bindingHash,
+        bindingHash: firstMember.bindingHash,
       },
       lease: {
-        approvalRequestId: approval.id,
-        claimToken: persisted?.campaign?.claimToken,
+        approvalRequestId: firstMember.approvalRequestId,
+        claimToken: persistedChild?.campaign?.claimToken,
         actionId: fixture.firstLiveAction.id,
         actionTarget: fixture.firstLiveAction.target,
-        bindingHash: claimed.campaign.binding.bindingHash,
+        bindingHash: firstMember.bindingHash,
       },
     });
     await expect(h.store().getWorkflowWorkItem(fixture.workItem.id))

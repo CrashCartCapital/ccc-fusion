@@ -399,6 +399,8 @@ export {
   requireCccCampaignMergeApproval,
   type ApproveCccCampaignLiveExecutionInput,
   type ApproveCccCampaignMergeInput,
+  type CccCampaignLiveExecutionApprovalStatus,
+  type CccCampaignLiveExecutionAuthorizationStatus,
   type IssueCccCampaignLiveExecutionApprovalInput,
   type IssueCccCampaignMergeApprovalInput,
 } from "./ccc-campaign-product-control.js";

@@ -6,17 +6,20 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import {
   beginCccCampaignProofAttemptDispatch,
   claimCccCampaignApproval,
+  claimCccCampaignExecutionAuthorization,
   consumeCccCampaignApprovalWithinTransaction,
   createCccCampaignAuthorityBinding,
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
   importCccPrdBundle,
   issueCccCampaignApproval,
+  issueCccCampaignExecutionAuthorization,
   recordRunAuditEventWithinTransaction,
   reserveCccCampaignProofAttempt,
   settleCccCampaignProofAttempt,
 } from "../../index.js";
 import {
   createCccPrdImportTestProductBundle,
+  createCccPrdImportTestExecutionPolicy,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
@@ -70,21 +73,30 @@ function withMergeAction(source: CccPrdSemanticBundle): CccPrdSemanticBundle {
 function withLiveExecutionAction(
   source: CccPrdSemanticBundle,
 ): CccPrdSemanticBundle {
-  const codingTask = source.tasks[0]!;
+  const liveActions = source.tasks.map((task, index) => index === 0
+    ? {
+      id: LIVE_EXECUTION_ACTION.actionId,
+      kind: "live_execution" as const,
+      target: LIVE_EXECUTION_ACTION.actionTarget,
+      operatorDecision: "approve_live_execution" as const,
+      requiresOperatorDecision: true,
+      spans: [task.spans[0]!],
+    }
+    : {
+      id: `${LIVE_EXECUTION_ACTION.actionId}-${index + 1}`,
+      kind: "live_execution" as const,
+      target: `fixture://native-done/${task.id}`,
+      operatorDecision: "approve_live_execution" as const,
+      requiresOperatorDecision: true,
+      spans: [task.spans[0]!],
+    });
   return rehashCccPrdImportTestBundle({
     ...source,
-    tasks: source.tasks.map((task) =>
-      task.id === codingTask.id
-        ? { ...task, protectedActionIds: [LIVE_EXECUTION_ACTION.actionId] }
-        : task),
-    protectedActions: [{
-      id: LIVE_EXECUTION_ACTION.actionId,
-      kind: "live_execution",
-      target: LIVE_EXECUTION_ACTION.actionTarget,
-      operatorDecision: "approve_live_execution",
-      requiresOperatorDecision: true,
-      spans: [codingTask.spans[0]!],
-    }],
+    tasks: source.tasks.map((task, index) => ({
+      ...task,
+      protectedActionIds: [liveActions[index]!.id],
+    })),
+    protectedActions: liveActions,
   });
 }
 
@@ -388,7 +400,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     });
   });
 
-  it("projects exact live-execution approval and returns to runtime waiting after requeue", async () => {
+  it("projects one redacted sealed execution authorization and returns to runtime waiting after requeue", async () => {
     const source = withLiveExecutionAction(
       createCccPrdImportTestProductBundle(h.rootDir(), "product-status-live"),
     );
@@ -406,17 +418,15 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     );
     const campaign = await h.store().getCccCampaignContextForTask(codingTaskId);
     if (!campaign) throw new Error("missing live-execution campaign context");
-    const issued = await issueCccCampaignApproval(h.layer(), {
+    const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
       authorityStore: h.store(),
       rootDir: h.rootDir(),
       taskId: codingTaskId,
-      action: LIVE_EXECUTION_ACTION,
       requester: {
         actorId: "runtime-product-status-live",
         actorType: "agent",
         actorName: "Runtime",
       },
-      runId: "product-status-live-issue",
       notBeforeAt: campaign.campaignStartedAt,
       expiresAt: campaign.campaignDeadlineAt,
     });
@@ -435,62 +445,79 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       waitReason: null,
     });
 
-    await expect(inspectCccPrdProductStatus({
+    const issuedStatus = await inspectCccPrdProductStatus({
       idempotencyKey: "product-status-live",
       layer: h.layer(),
       rootDir: h.rootDir(),
-    })).resolves.toMatchObject({
-      workItems: [{
-        id: workItem.id,
-        state: "manual-required",
-        lastError: LIVE_EXECUTION_APPROVAL_REQUIRED,
-        blockedReason: LIVE_EXECUTION_APPROVAL_REQUIRED,
-      }],
-      approvals: [{
-        id: issued.id,
+    });
+    expect(issuedStatus?.executionAuthorizationMode).toBe("sealed_bundle_v1");
+    expect(issuedStatus?.workItems).toMatchObject([{
+      id: workItem.id,
+      state: "manual-required",
+      lastError: LIVE_EXECUTION_APPROVAL_REQUIRED,
+      blockedReason: LIVE_EXECUTION_APPROVAL_REQUIRED,
+    }]);
+    expect(issuedStatus?.executionAuthorization).toMatchObject({
+      authorizationId: issued.authorizationId,
+      authorizationDigest: issued.authorizationDigest,
+      memberSetHash: issued.memberSetHash,
+      expectedRequestCount: 0,
+      status: "issued",
+      members: issued.members.map((member) => ({
+        nativeTaskId: member.nativeTaskId,
+        approvalRequestId: member.approvalRequestId,
+        bindingHash: member.bindingHash,
+      })),
+    });
+    expect(issuedStatus?.approvals).toEqual(expect.arrayContaining(
+      issued.members.map((member) => expect.objectContaining({
+        id: member.approvalRequestId,
         status: "issued",
-        actionId: LIVE_EXECUTION_ACTION.actionId,
-        actionTarget: LIVE_EXECUTION_ACTION.actionTarget,
-      }],
-      nextAction: {
-        kind: "approve-execution",
-        approvalRequestId: issued.id,
-        approvalStatus: "issued",
-      },
+      })),
+    ));
+    expect(issuedStatus?.nextAction).toMatchObject({
+      kind: "approve-execution",
+      executionAuthorizationId: issued.authorizationId,
+      executionAuthorizationStatus: "issued",
     });
 
-    await claimCccCampaignApproval(h.layer(), {
+    await claimCccCampaignExecutionAuthorization(h.layer(), {
       authorityStore: h.store(),
       rootDir: h.rootDir(),
-      taskId: codingTaskId,
-      action: LIVE_EXECUTION_ACTION,
+      authorizationId: issued.authorizationId,
       claimant: {
         actorId: "operator-product-status-live",
         actorType: "user",
         actorName: "Operator",
       },
-      runId: "product-status-live-claim",
       claimToken: "product-status-live-claim-token",
     });
-    await expect(inspectCccPrdProductStatus({
+    const claimedStatus = await inspectCccPrdProductStatus({
       idempotencyKey: "product-status-live",
       layer: h.layer(),
       rootDir: h.rootDir(),
-    })).resolves.toMatchObject({
-      workItems: [{
-        id: workItem.id,
-        state: "manual-required",
-      }],
-      approvals: [{
-        id: issued.id,
-        status: "claimed",
-      }],
-      nextAction: {
-        kind: "approve-execution",
-        approvalRequestId: issued.id,
-        approvalStatus: "claimed",
-      },
     });
+    expect(claimedStatus?.workItems).toMatchObject([{
+      id: workItem.id,
+      state: "manual-required",
+    }]);
+    expect(claimedStatus?.executionAuthorization).toMatchObject({
+      authorizationId: issued.authorizationId,
+      status: "claimed",
+    });
+    expect(claimedStatus?.approvals).toEqual(expect.arrayContaining(
+      issued.members.map((member) => expect.objectContaining({
+        id: member.approvalRequestId,
+        status: "claimed",
+      })),
+    ));
+    expect(claimedStatus?.nextAction).toMatchObject({
+      kind: "approve-execution",
+      executionAuthorizationId: issued.authorizationId,
+      executionAuthorizationStatus: "claimed",
+    });
+    expect(JSON.stringify(claimedStatus)).not.toContain("claimToken");
+    expect(JSON.stringify(claimedStatus)).not.toContain("product-status-live-claim-token");
 
     await h.store().transitionWorkflowWorkItem(workItem.id, "runnable", {
       expectedState: "manual-required",
@@ -502,25 +529,94 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       blockedReason: null,
     });
 
-    await expect(inspectCccPrdProductStatus({
+    const resumedStatus = await inspectCccPrdProductStatus({
       idempotencyKey: "product-status-live",
       layer: h.layer(),
       rootDir: h.rootDir(),
-    })).resolves.toMatchObject({
-      workItems: [{
-        id: workItem.id,
-        state: "runnable",
-        lastError: null,
-        blockedReason: null,
-      }],
-      approvals: [{
-        id: issued.id,
-        status: "claimed",
-        actionId: LIVE_EXECUTION_ACTION.actionId,
-        actionTarget: LIVE_EXECUTION_ACTION.actionTarget,
-      }],
-      nextAction: { kind: "wait-for-runtime" },
     });
+    expect(resumedStatus?.workItems).toMatchObject([{
+      id: workItem.id,
+      state: "runnable",
+      lastError: null,
+      blockedReason: null,
+    }]);
+    expect(resumedStatus?.executionAuthorization).toMatchObject({
+      authorizationId: issued.authorizationId,
+      status: "claimed",
+    });
+    expect(resumedStatus?.approvals).toEqual(expect.arrayContaining(
+      issued.members.map((member) => expect.objectContaining({
+        id: member.approvalRequestId,
+        status: "claimed",
+      })),
+    ));
+    expect(resumedStatus?.nextAction).toMatchObject({ kind: "wait-for-runtime" });
+  });
+
+  it("keeps manifest-v1 imports on their exact per-task approval status contract", async () => {
+    const source = withLiveExecutionAction(
+      createCccPrdImportTestProductBundle(h.rootDir(), "product-status-live-legacy"),
+    );
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+      idempotencyKey: "product-status-live-legacy",
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    const codingTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const campaign = await h.store().getCccCampaignContextForTask(codingTaskId);
+    if (!campaign) throw new Error("missing legacy live-execution campaign context");
+    expect(campaign.executionAuthorizationMode).toBe("per_task_v1");
+    const issued = await issueCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: codingTaskId,
+      action: LIVE_EXECUTION_ACTION,
+      requester: {
+        actorId: "runtime-product-status-live-legacy",
+        actorType: "agent",
+        actorName: "Runtime",
+      },
+      runId: "product-status-live-legacy-issue",
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-live-legacy`,
+    );
+    if (!workItem) throw new Error("missing legacy live-execution workflow work item");
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: LIVE_EXECUTION_APPROVAL_REQUIRED,
+      blockedReason: LIVE_EXECUTION_APPROVAL_REQUIRED,
+      waitReason: null,
+    });
+
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-live-legacy",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    expect(status?.executionAuthorizationMode).toBe("per_task_v1");
+    expect(status?.executionAuthorization).toBeNull();
+    expect(status?.approvals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: issued.id, status: "issued" }),
+    ]));
+    expect(status?.nextAction).toMatchObject({
+      kind: "approve-execution",
+      approvalRequestId: issued.id,
+      approvalStatus: "issued",
+    });
+    expect(status?.nextAction).not.toHaveProperty("executionAuthorizationId");
   });
 
   it("explains a verifier-confinement manual stop without calling it an uncertain effect", async () => {

@@ -80,6 +80,7 @@ import {
   CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
   CCC_CAMPAIGN_GOVERNANCE_VERSION,
   CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -219,18 +220,21 @@ describe("schema-applier: immutable migration identities", () => {
     expect(applierSource).toMatch(/applied\.includes\(\s*BIGINT_COUNTERS_VERSION\s*\)/);
   });
 
-  it("registers campaign governance at 0037 and proof attempts at 0038", () => {
+  it("registers campaign governance at 0037, proof attempts at 0038, and aggregate authorization at 0039", () => {
     expect(CCC_CAMPAIGN_GOVERNANCE_VERSION).toBe("0037");
     expect(CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION).toBe("0038");
-    expect(SCHEMA_BASELINE_VERSION).toBe("0038");
+    expect(CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION).toBe("0039");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0039");
     const applierSource = readFileSync(
       fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
       "utf8",
     );
     expect(applierSource).toContain("0037_ccc_campaign_governance.sql");
     expect(applierSource).toContain("0038_ccc_campaign_proof_attempts.sql");
+    expect(applierSource).toContain("0039_ccc_campaign_execution_authorization.sql");
     expect(applierSource).toMatch(/cccCampaignGovernanceAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_GOVERNANCE_VERSION\s*,?\s*\)/);
     expect(applierSource).toMatch(/cccCampaignProofAttemptsAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION\s*,?\s*\)/);
+    expect(applierSource).toMatch(/cccCampaignExecutionAuthorizationAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION\s*,?\s*\)/);
   });
 });
 
@@ -656,7 +660,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     ctx = null;
   });
 
-  it("creates all 101 project tables, 18 central tables, 1 archive table", async () => {
+  it("creates all 103 project tables, 18 central tables, 1 archive table", async () => {
     ctx = await setupFreshDb();
     // FNXC:PostgresCutover 2026-07-05-15:55: apply the BASELINE only.
     // applySchemaBaseline now runs the plugin schema-init hooks by default,
@@ -676,9 +680,10 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 1 configuration_revisions (FNXC:ConfigVersioning 2026-07-18-14:00)
     // + 2 ideation_sessions/ideation_candidates (FNXC:Ideation 2026-07-18-13:25 / FN-8295)
     // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
-    // + 1 ccc_effect_receipts table, its authority turn, 3 CCC PRD custody tables, and 1 exact-commit proof-attempt table.
+    // + 1 ccc_effect_receipts table, its authority turn, 3 CCC PRD custody tables,
+    // 1 exact-commit proof-attempt table, and 2 aggregate execution-authorization tables.
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(101);
+    expect(bySchema.project).toBe(103);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -1656,6 +1661,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
+      CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1718,6 +1724,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
+      CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
     ]);
   });
 
@@ -1916,6 +1923,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
+      CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
     ]);
   });
 
@@ -1992,6 +2000,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
+      CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
     ]);
   });
 
@@ -2068,6 +2077,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_EFFECT_RECEIPTS_VERSION, CCC_PRD_IMPORTS_VERSION, CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION,
       CCC_CAMPAIGN_GOVERNANCE_VERSION,
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
+      CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
     ]);
   });
 });

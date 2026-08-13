@@ -9,6 +9,7 @@ import {
 const CLAIM_TOKEN = "claim-token-must-never-render";
 const CONTROLLER_TOKEN = "controller-token-must-never-render";
 const MERGE_DIGEST = "c".repeat(64);
+const EXECUTION_AUTHORIZATION_DIGEST = "8".repeat(64);
 const PAUSE_DIGEST = "1".repeat(64);
 const STOP_DIGEST = "2".repeat(64);
 
@@ -213,6 +214,60 @@ function mergeHoldStatus() {
   };
 }
 
+function sealedExecutionHoldStatus() {
+  const payload = mergeHoldStatus();
+  const authorizationId = `ccc-execution-authorization-${"9".repeat(64)}`;
+  const firstChildId = `ccc-approval-${"a".repeat(64)}`;
+  const secondChildId = `ccc-approval-${"b".repeat(64)}`;
+  return {
+    ...payload,
+    status: {
+      ...payload.status,
+      workItems: [{
+        ...payload.status.workItems[0],
+        state: "manual-required",
+        lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+        blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      }],
+      executionAuthorization: {
+        authorizationId,
+        status: "issued",
+        expiresAt: "2026-07-31T01:00:00.000Z",
+        expectedRequestCount: 0,
+        maxRequests: 24,
+        maxConcurrency: 1,
+        members: [
+          { ordinal: 0, semanticTaskId: "TASK-entry", approvalRequestId: firstChildId },
+          { ordinal: 1, semanticTaskId: "TASK-second", approvalRequestId: secondChildId },
+        ],
+      },
+      approvals: [
+        { id: firstChildId, status: "issued", taskId: "FN-entry", campaign: { expiresAt: "2026-07-31T01:00:00.000Z" } },
+        { id: secondChildId, status: "issued", taskId: "FN-second", campaign: { expiresAt: "2026-07-31T01:00:00.000Z" } },
+      ],
+      nextAction: {
+        kind: "approve-execution",
+        reason: "One sealed launch decision unlocks both exact child actions.",
+        executionAuthorizationId: authorizationId,
+        executionAuthorizationStatus: "issued",
+      },
+    },
+    mergeApprovalConfirmations: [],
+    liveExecutionAuthorizationConfirmation: {
+      authorizationId,
+      confirmation: EXECUTION_AUTHORIZATION_DIGEST,
+      expiresAt: "2026-07-31T01:00:00.000Z",
+      status: "issued",
+    },
+    // Even if a mixed-version caller supplies child confirmations, the sealed
+    // parent is the only human launch command.
+    liveExecutionApprovalConfirmations: [
+      { approvalRequestId: firstChildId, confirmation: "a".repeat(64), status: "issued" },
+      { approvalRequestId: secondChildId, confirmation: "b".repeat(64), status: "issued" },
+    ],
+  };
+}
+
 describe("operator --json flag parsing", () => {
   it("reports json mode and removes every --json token", () => {
     expect(parseOperatorJsonFlag(["status", "key-1", "--json"]))
@@ -293,6 +348,40 @@ describe("human product status rendering", () => {
     expect(lines).toContainEqual(expect.stringContaining(
       `fn prd approve-merge ccc-product-operator-key approval-merge-1 --confirm ${MERGE_DIGEST}`,
     ));
+  });
+
+  it("prints exactly one sealed approve-execution command and no child commands", () => {
+    const payload = sealedExecutionHoldStatus();
+    const text = renderOperatorPayload(payload).join("\n");
+    const commands = text.match(/fn prd approve-execution[^\n]*/gu) ?? [];
+
+    expect(commands).toEqual([
+      `fn prd approve-execution ccc-product-operator-key ${payload.status.executionAuthorization.authorizationId} --confirm ${EXECUTION_AUTHORIZATION_DIGEST}`,
+    ]);
+    for (const member of payload.status.executionAuthorization.members) {
+      expect(commands[0]).not.toContain(member.approvalRequestId);
+      expect(text).toContain(member.approvalRequestId);
+    }
+    expect(text).toContain("Execution authorization");
+    expect(text).toContain("2 exact child actions");
+  });
+
+  it("prints no child execution command when sealed parent custody is missing", () => {
+    const payload = sealedExecutionHoldStatus();
+    payload.status.executionAuthorizationMode = "sealed_bundle_v1";
+    payload.status.executionAuthorization = null;
+    payload.status.nextAction = {
+      kind: "blocked",
+      reason: "The single sealed campaign authorization is missing.",
+    };
+    payload.liveExecutionAuthorizationConfirmation = null;
+    const text = renderOperatorPayload(payload).join("\n");
+
+    expect(text).toContain("single sealed campaign authorization is missing");
+    expect(text).not.toContain("fn prd approve-execution");
+    for (const confirmation of payload.liveExecutionApprovalConfirmations) {
+      expect(text).toContain(confirmation.approvalRequestId);
+    }
   });
 
   it("prints lifecycle commands only for allowed operator controls", () => {

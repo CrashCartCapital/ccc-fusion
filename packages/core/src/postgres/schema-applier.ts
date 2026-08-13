@@ -49,8 +49,12 @@ FNXC:TaskWedgeNotifications 2026-10-19-00:00:
 Advance the PostgreSQL schema ceiling for the durable wedge episode column. The
 forward migration must run before TaskStore writes the new field on fresh and
 upgraded databases.
+
+FNXC:CCCCampaignExecutionAuthorization 2026-08-12:
+Advance the ceiling to 0039 for the sealed parent launch authorization and its
+exact child-approval membership map.
 */
-export const SCHEMA_BASELINE_VERSION = "0038";
+export const SCHEMA_BASELINE_VERSION = "0039";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -156,6 +160,8 @@ export const CCC_CAMPAIGN_NATIVE_ENFORCEMENT_VERSION = "0036";
 export const CCC_CAMPAIGN_GOVERNANCE_VERSION = "0037";
 /** Exact-commit campaign proof commands need crash-safe process receipts before dispatch. */
 export const CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION = "0038";
+/** One sealed campaign launch needs an immutable parent and exact child membership map. */
+export const CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION = "0039";
 
 /** SECURITY DEFINER helper that only inserts LEGACY_ADOPTION_DRAINED_MARKER. */
 export const LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION = "fusion_mark_legacy_adoption_drained";
@@ -374,6 +380,10 @@ const CCC_CAMPAIGN_PROOF_ATTEMPTS_MIGRATION_PATH = join(
   MIGRATIONS_DIR,
   "0038_ccc_campaign_proof_attempts.sql",
 );
+const CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MIGRATION_PATH = join(
+  MIGRATIONS_DIR,
+  "0039_ccc_campaign_execution_authorization.sql",
+);
 
 /**
  * Ensure the migration bookkeeping table exists. Lives in the public schema so
@@ -487,6 +497,9 @@ export async function applySchemaBaseline(
     );
     const cccCampaignProofAttemptsAlreadyApplied = applied.includes(
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
+    );
+    const cccCampaignExecutionAuthorizationAlreadyApplied = applied.includes(
+      CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
     );
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
@@ -1029,6 +1042,18 @@ export async function applySchemaBaseline(
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(
         sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION}) ON CONFLICT (version) DO NOTHING`,
+      );
+      schemaChanged = true;
+    }
+
+    if (!cccCampaignExecutionAuthorizationAlreadyApplied) {
+      const migrationSql = await readFile(
+        CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MIGRATION_PATH,
+        "utf8",
+      );
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(
+        sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION}) ON CONFLICT (version) DO NOTHING`,
       );
       schemaChanged = true;
     }

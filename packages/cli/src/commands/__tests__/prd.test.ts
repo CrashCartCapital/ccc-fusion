@@ -60,6 +60,121 @@ async function runPrdJson(
   return runPrdCommand([...args, "--json"], io, dependencies, commandContext);
 }
 
+function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" = "issued") {
+  const authorizationDigest = "9".repeat(64);
+  const member = (
+    ordinal: number,
+    nativeTaskId: string,
+    semanticTaskId: string,
+    digest: string,
+  ) => ({
+    ordinal,
+    nativeTaskId,
+    semanticTaskId,
+    actionId: `ACTION-live-${ordinal + 1}`,
+    actionTarget: `provider://fixture/${semanticTaskId}`,
+    providerId: "fixture",
+    modelId: "fixture-v2",
+    transport: "pi" as const,
+    promptSchema: "ccc-prd.execution-prompt.v1" as const,
+    promptSha256: digest.repeat(64),
+    routeSha256: digest.repeat(64),
+    bindingHash: digest.repeat(64),
+    approvalRequestId: `ccc-approval-${digest.repeat(64)}`,
+    memberHash: digest.repeat(64),
+  });
+  return {
+    schemaVersion: "ccc-campaign.execution-authorization.v1" as const,
+    projectId: "project-1",
+    importId: "import-1",
+    campaignId: "campaign-1",
+    idempotencyKey: "operator-key",
+    workflowId: "workflow-1",
+    workItemId: "work-item-1",
+    workflowIrHash: "1".repeat(64),
+    packetHash: "2".repeat(64),
+    sidecarHash: "3".repeat(64),
+    bundleHash: "4".repeat(64),
+    manifestHash: "5".repeat(64),
+    executionPolicySha256: "6".repeat(64),
+    targetRepository: "/tmp/product-target",
+    targetBase: "d".repeat(40),
+    campaignStartedAt: "2026-07-31T00:00:00.000Z",
+    campaignDeadlineAt: "2026-07-31T02:00:00.000Z",
+    maxRequests: 24,
+    maxConcurrency: 1,
+    authorizationId: `ccc-execution-authorization-${authorizationDigest}`,
+    authorizationDigest,
+    memberSetHash: "7".repeat(64),
+    members: [
+      member(0, "TASK-coding", "TASK-1", "a"),
+      member(1, "TASK-review", "TASK-2", "b"),
+    ],
+    expectedRequestCount: 0,
+    status,
+    requester: {
+      actorId: "ccc-campaign-runtime",
+      actorType: "agent" as const,
+      actorName: "CCC Campaign Runtime",
+    },
+    notBeforeAt: "2026-07-31T00:00:00.000Z",
+    expiresAt: "2026-07-31T01:00:00.000Z",
+    createdAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-07-31T00:00:00.000Z",
+  };
+}
+
+function diagnosticLiveApproval(id: string, taskId: string) {
+  return {
+    id,
+    status: "issued",
+    taskId,
+    runId: "RUN-product",
+    requester: {
+      actorId: "ccc-campaign-runtime",
+      actorType: "agent",
+      actorName: "CCC Campaign Runtime",
+    },
+    targetAction: {
+      category: "command_execution",
+      action: `ACTION-${taskId}`,
+      summary: "Run one exact admitted provider action",
+      resourceType: "ccc-campaign-live_execution",
+      resourceId: `provider://fixture/${taskId}`,
+      context: {
+        protectedActionKind: "live_execution",
+        operatorDecision: "approve_live_execution",
+      },
+    },
+    requestedAt: "2026-07-31T00:00:00.000Z",
+    createdAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-07-31T00:00:00.000Z",
+    campaign: {
+      binding: {
+        projectId: "project-1",
+        importId: "import-1",
+        campaignId: "campaign-1",
+        taskId,
+        actionId: `ACTION-${taskId}`,
+        actionTarget: `provider://fixture/${taskId}`,
+        idempotencyKey: "operator-key",
+        packetHash: "2".repeat(64),
+        sidecarHash: "3".repeat(64),
+        bundleHash: "4".repeat(64),
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        providerId: "fixture",
+        modelId: "fixture-v2",
+        transport: "pi",
+        manifestHash: "5".repeat(64),
+        bindingHash: taskId === "TASK-coding" ? "a".repeat(64) : "b".repeat(64),
+      },
+      notBeforeAt: "2026-07-31T00:00:00.000Z",
+      expiresAt: "2026-07-31T01:00:00.000Z",
+    },
+  };
+}
+
 /** Recursive content-hash snapshot of a packet root, used to prove a run left zero residue. */
 function snapshotPacketRoot(root: string): Record<string, string> {
   const files: Record<string, string> = {};
@@ -150,7 +265,7 @@ describe("prd command exit contract", () => {
         "       fn prd <stop|abandon> <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]",
         "       fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]",
         "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
-        "       fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
+        "       fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id> --confirm <approval-digest> [--project <id|name>]",
         "       fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
         "       add --json to any command above for the exact machine-readable payload instead of operator prose",
       ].join("\n"),
@@ -1454,6 +1569,203 @@ describe("prd command exit contract", () => {
     expect(output[0]).not.toContain("must-never-serialize");
   });
 
+  it("shows one sealed execution-authorization confirmation while retaining child diagnostics", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const childApprovals = [
+      diagnosticLiveApproval(authorization.members[0]!.approvalRequestId, "TASK-coding"),
+      diagnosticLiveApproval(authorization.members[1]!.approvalRequestId, "TASK-review"),
+    ];
+    const status = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-1",
+      import: {
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        state: "active",
+        runnable: true,
+      },
+      tasks: [],
+      workItems: [],
+      proofs: [],
+      orphanProofAttempts: [],
+      providerAttempts: [],
+      executionAuthorizationMode: "sealed_bundle_v1" as const,
+      executionAuthorization: authorization,
+      approvals: childApprovals,
+      landing: { intents: [], materializations: [], terminals: [] },
+      nextAction: {
+        kind: "approve-execution",
+        reason: "Approve the one sealed campaign launch.",
+        executionAuthorizationId: authorization.authorizationId,
+        executionAuthorizationStatus: "issued",
+      },
+    };
+    const computeConfirmation = vi.fn(() => confirmation);
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["status", "operator-key"],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => status),
+        computeCccCampaignLiveExecutionApprovalConfirmation: computeConfirmation,
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const payload = JSON.parse(output[0]!);
+    expect(payload).toMatchObject({
+      kind: "product-status",
+      found: true,
+      status: {
+        executionAuthorization: {
+          authorizationId: authorization.authorizationId,
+          status: "issued",
+          members: [
+            { approvalRequestId: authorization.members[0]!.approvalRequestId },
+            { approvalRequestId: authorization.members[1]!.approvalRequestId },
+          ],
+        },
+        approvals: [
+          { id: authorization.members[0]!.approvalRequestId },
+          { id: authorization.members[1]!.approvalRequestId },
+        ],
+      },
+      liveExecutionAuthorizationConfirmation: {
+        authorizationId: authorization.authorizationId,
+        confirmation,
+        expiresAt: authorization.expiresAt,
+        status: "issued",
+      },
+      liveExecutionApprovalConfirmations: [],
+    });
+    expect(computeConfirmation).toHaveBeenCalledTimes(1);
+    expect(computeConfirmation).toHaveBeenCalledWith(authorization);
+  });
+
+  it("emits no live execution confirmation after the sealed authorization settles", async () => {
+    const authorization = sealedExecutionAuthorization("settled");
+    const computeConfirmation = vi.fn(() => "8".repeat(64));
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["status", "operator-key"],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+          approvals: [],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "blocked",
+            reason: "The sealed execution authorization is already settled.",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: computeConfirmation,
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const payload = JSON.parse(output[0]!);
+    expect(payload).not.toHaveProperty("liveExecutionAuthorizationConfirmation");
+    expect(payload.liveExecutionApprovalConfirmations).toEqual([]);
+    expect(computeConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("emits no child execution confirmations when sealed parent custody is missing", async () => {
+    const childApproval = diagnosticLiveApproval(
+      `ccc-approval-${"a".repeat(64)}`,
+      "TASK-coding",
+    );
+    const computeConfirmation = vi.fn(() => "8".repeat(64));
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["status", "operator-key"],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: null,
+          approvals: [childApproval],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "blocked",
+            reason: "The single sealed campaign authorization is missing.",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: computeConfirmation,
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const payload = JSON.parse(output[0]!);
+    expect(payload.status.approvals).toEqual([
+      expect.objectContaining({ id: childApproval.id }),
+    ]);
+    expect(payload.liveExecutionApprovalConfirmations).toEqual([]);
+    expect(payload).not.toHaveProperty("liveExecutionAuthorizationConfirmation");
+    expect(computeConfirmation).not.toHaveBeenCalled();
+  });
+
   it("pauses and resumes only the exact confirmed unleased campaign status", async () => {
     const confirmation = "6".repeat(64);
     const workItem = {
@@ -2359,6 +2671,190 @@ describe("prd command exit contract", () => {
       approvalRequestId: "approval-1",
       result: { merged: true, noOp: false },
       status: { nextAction: { kind: "complete" } },
+    });
+  });
+
+  it("claims one sealed execution authorization by parent ID and requeues the parked campaign", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const childApprovals = [
+      diagnosticLiveApproval(authorization.members[0]!.approvalRequestId, "TASK-coding"),
+      diagnosticLiveApproval(authorization.members[1]!.approvalRequestId, "TASK-review"),
+    ];
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const before = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-1",
+      import: {
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        state: "active",
+        runnable: true,
+      },
+      tasks: [],
+      workItems: [workItem],
+      proofs: [],
+      orphanProofAttempts: [],
+      providerAttempts: [],
+      executionAuthorization: authorization,
+      approvals: childApprovals,
+      landing: { intents: [], materializations: [], terminals: [] },
+      nextAction: {
+        kind: "approve-execution",
+        reason: "Approve the one sealed campaign launch.",
+        executionAuthorizationId: authorization.authorizationId,
+        executionAuthorizationStatus: "issued",
+      },
+    };
+    const claimedAuthorization = sealedExecutionAuthorization("claimed");
+    const after = {
+      ...before,
+      executionAuthorization: claimedAuthorization,
+      workItems: [{
+        ...workItem,
+        state: "runnable",
+        lastError: null,
+        blockedReason: null,
+      }],
+      nextAction: {
+        kind: "wait-for-runtime",
+        reason: "Campaign work is admitted and ready for the runtime.",
+      },
+    };
+    const transitionWorkflowWorkItem = vi.fn(async () => after.workItems[0]);
+    const context = {
+      projectId: "project-1",
+      projectPath: "/tmp/product-target",
+      projectName: "Fixture",
+      isRegistered: true,
+      store: {
+        getAsyncLayer: () => ({}),
+        transitionWorkflowWorkItem,
+      },
+    };
+    const inspectStatus = vi.fn()
+      .mockResolvedValueOnce(before)
+      .mockResolvedValueOnce(after);
+    const approveExecution = vi.fn(async () => claimedAuthorization);
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", authorization.authorizationId, "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => context),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: inspectStatus,
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: vi.fn(async () => ({
+          ready: true,
+          backend: "sandbox-exec" as const,
+          code: "VERIFIER_CONFINEMENT_READY",
+          message: "verifier confinement readiness probe executed successfully",
+          trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+        })),
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    expect(approveExecution).toHaveBeenCalledWith({
+      store: context.store,
+      rootDir: context.projectPath,
+      taskId: "TASK-coding",
+      authorizationId: authorization.authorizationId,
+      confirmation,
+      actor: {
+        actorId: "ccc-fusion-local-operator",
+        actorType: "user",
+        actorName: "CCC Fusion Local Operator",
+      },
+    });
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "execution-approved",
+      executionAuthorizationId: authorization.authorizationId,
+      approval: { status: "claimed" },
+      status: { nextAction: { kind: "wait-for-runtime" } },
+    });
+    expect(JSON.parse(output[0]!)).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("refuses a diagnostic child approval ID when a sealed parent authorization exists", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const childApproval = diagnosticLiveApproval(
+      authorization.members[0]!.approvalRequestId,
+      "TASK-coding",
+    );
+    const approveExecution = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", childApproval.id, "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorization: authorization,
+          approvals: [childApproval],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "approve-execution",
+            reason: "Approve the one sealed campaign launch.",
+            executionAuthorizationId: authorization.authorizationId,
+            executionAuthorizationStatus: "issued",
+          },
+        })),
+        approveCccCampaignLiveExecution: approveExecution,
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(approveExecution).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+        message: expect.stringContaining(authorization.members[0]!.approvalRequestId),
+      }],
     });
   });
 

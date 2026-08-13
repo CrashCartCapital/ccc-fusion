@@ -23,7 +23,14 @@ import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
 import {
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
 } from "../ccc-campaign/request-budget.js";
-import type { CccCampaignExecutionPolicy, CccCampaignManifest } from "../ccc-campaign/types.js";
+import {
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+  CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
+  CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+  CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+  type CccCampaignExecutionPolicy,
+  type CccCampaignManifest,
+} from "../ccc-campaign/types.js";
 import { canonicalCccPrdJson } from "./contract.js";
 import {
   assertCccPrdImportBundle,
@@ -1216,7 +1223,7 @@ async function prepareDatabaseImport(
       const existing = await selectImportRow(tx, projectId, idempotencyKey);
       if (existing) {
         const persisted = persistedCampaignIdentity(existing);
-        const manifest = createCccCampaignManifest({
+        const manifestInput = {
           projectId,
           importId,
           idempotencyKey,
@@ -1225,7 +1232,18 @@ async function prepareDatabaseImport(
           executionPolicy,
           targetRepositoryPath: canonicalRootDir,
           campaignStartedAt: persisted.manifest.campaignStartedAt,
-        });
+        };
+        const manifest = persisted.manifest.schema === CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+          ? createCccCampaignManifest({
+            ...manifestInput,
+            manifestSchema: CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+            executionAuthorizationMode:
+              CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+          })
+          : createCccCampaignManifest({
+            ...manifestInput,
+            manifestSchema: CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+          });
         const identityHash = hashCccCampaignManifest(manifest);
         if (
           existing.bundleHash !== bundle.bundleHash
@@ -1255,7 +1273,7 @@ async function prepareDatabaseImport(
       input.transactionProbe?.onPrepareTransaction(tx);
       try {
         const now = new Date().toISOString();
-        const manifest = createCccCampaignManifest({
+        const manifestInput = {
           projectId,
           importId,
           idempotencyKey,
@@ -1264,7 +1282,19 @@ async function prepareDatabaseImport(
           executionPolicy,
           targetRepositoryPath: canonicalRootDir,
           campaignStartedAt: now,
-        });
+        };
+        const manifest = executionPolicy.schema
+          === CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION
+          ? createCccCampaignManifest({
+            ...manifestInput,
+            manifestSchema: CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+            executionAuthorizationMode:
+              CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+          })
+          : createCccCampaignManifest({
+            ...manifestInput,
+            manifestSchema: CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+          });
         const identityHash = hashCccCampaignManifest(manifest);
         const nativeTaskIds = await allocateNativeTaskIds(
           tx,
