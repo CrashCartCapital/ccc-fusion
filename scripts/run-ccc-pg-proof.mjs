@@ -357,6 +357,7 @@ const expectedWave5EngineContractNames = [
   "ccc-prd structural sidecar > authors raw-byte custody and compiles the complete structural graph in code-unit order",
   "ccc-prd structural sidecar > refuses constrained authoring when implementation-changing facts are not source-bound",
   "ccc-prd structural sidecar > persists exact-span custody for implementation facts on the supported product route",
+  "ccc-prd structural sidecar > RED-S4-v2-provenance-order: compares implementation-fact set custody independent of canonical projection order",
   "ccc-prd structural sidecar > binds an ambiguous scalar implementation fact to its labeled declaration",
   "ccc-prd structural sidecar > refuses a fact value that appears in source but outside the entity cited span",
   "ccc-prd structural sidecar > refuses stale material coverage deterministically",
