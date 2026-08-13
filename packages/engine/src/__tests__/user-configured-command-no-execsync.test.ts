@@ -294,9 +294,10 @@ describe("user-configured command static execSync guard", () => {
   });
 
   it("does not false-positive on allowed git-plumbing execSync outside protected slices", () => {
-    const executorSource = readSource("src/executor.ts");
-    expect(executorSource, "executor keeps a git-only execSync ancestry check outside the protected configured-command helper").toContain("execSync(`git merge-base --is-ancestor");
+    const gitPlumbingSource = readSource("src/worktree-prune.ts");
+    expect(gitPlumbingSource, "worktree pruning remains an audited git-only execSync outside configured-command helpers").toContain('execSync("git worktree prune"');
 
+    const executorSource = readSource("src/executor.ts");
     const configuredCommand = protectedCommandPaths.find((entry) => entry.file === "src/executor.ts" && entry.name === "runConfiguredCommand");
     expect(configuredCommand, "executor runConfiguredCommand registry entry must exist").toBeDefined();
     const body = sliceFunctionBody(executorSource, configuredCommand!.signature, "src/executor.ts :: runConfiguredCommand");
