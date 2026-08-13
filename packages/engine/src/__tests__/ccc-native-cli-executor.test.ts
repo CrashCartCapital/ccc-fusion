@@ -207,6 +207,7 @@ type HarnessOptions = {
   unfenced?: boolean;
   nodeTaskWorktree?: string;
   omitNodeTaskWorktree?: boolean;
+  persistedNodeTaskWorktree?: string;
   sealedSignal?: AbortSignal;
   cliProfile?: string;
   cliProviderId?: string;
@@ -398,7 +399,9 @@ function createHarness(
     createdAt: "2026-07-25T19:00:00.000Z",
     updatedAt: "2026-07-25T19:00:00.000Z",
   };
-  store.getTask.mockResolvedValue(nodeTask);
+  store.getTask.mockResolvedValue(options.persistedNodeTaskWorktree
+    ? { ...nodeTask, worktree: options.persistedNodeTaskWorktree }
+    : nodeTask);
   const cliSettings = options.omitCliSettings
     ? undefined
     : {
@@ -456,6 +459,35 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
     resetExecutorMocks();
     launchCliTaskSessionMock.mockReset();
     killLiveTaskSessionsMock.mockReset();
+  });
+
+  it("RED-PRODUCT-serial-cli: refreshes a task prepared after graph resolution before fenced dispatch", async () => {
+    const preparedWorktree = "/tmp/cli-prepared-after-graph-resolution";
+    const h = createHarness(undefined, {
+      omitNodeTaskWorktree: true,
+      persistedNodeTaskWorktree: preparedWorktree,
+    });
+
+    try {
+      await expect(h.run()).resolves.toEqual({
+        outcome: "failure",
+        value: "cli-agent-needs-attention",
+      });
+      expect(h.store.getTask).toHaveBeenCalledWith("REQ-9");
+      expect(h.launchCliTaskSession).toHaveBeenCalledWith(expect.objectContaining({
+        worktreePath: preparedWorktree,
+      }));
+      expect(h.sequence).toEqual([
+        "pty-preflight",
+        "resolver",
+        "preDispatch",
+        "mcp",
+        "kill",
+        "launch",
+      ]);
+    } finally {
+      h.resolveMcpServersSpy.mockRestore();
+    }
   });
 
   it("Task 4 RED: valid custody-bound CLI binding earns one permit before one launch", async () => {

@@ -9553,9 +9553,14 @@ export class TaskExecutor {
     );
 
     if (executorKind === "cli-agent" && executionContext?.execution?.executionFence) {
+      // Node preparation may have created the semantic task worktree after the
+      // graph resolved its immutable execution identity. Re-read the task row
+      // before enforcing the native CLI fence so we validate the prepared
+      // worktree and current sealed route, not the pre-preparation snapshot.
+      const live = await this.store.getTask(nodeTask.id);
       return this.runCliAgentNode(
         node,
-        nodeTask,
+        live,
         cfg,
         columnBinding,
         executionContext,
