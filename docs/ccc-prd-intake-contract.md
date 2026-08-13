@@ -23,6 +23,16 @@ Missing facts become blocking questions. The operator can answer them in a revie
 
 For the supported product route, every implementation-changing fact must also have exact-span custody in the frozen packet. Fusion records the target path and baseline, task ownership, task write roots, admitted write-root paths and purposes, execution bounds, non-goals, requirement acceptance behavior, proof commands and oracles, negative controls, and protected-action kinds and targets in `implementationFactProvenance`. Each recorded value cites admitted source bytes and hashes. Requirement, proof, and task-custody facts must appear inside that entity's cited source span; a matching phrase elsewhere in the PRD is not enough.
 
+### Campaign proof commands
+
+An executable campaign proof must name a repository-owned Go Task target. The admitted declaration grammar is:
+
+    ^task verify:[a-z0-9][a-z0-9:-]{0,63}(?: --(?: [a-z0-9][a-z0-9:._/-]{0,63}){0,8})?$
+
+For example, write `the verifier command task verify:slugify` inside the proof's cited source text. The sidecar's exact `proof.command` value must appear literally inside that same cited span, together with the positive oracle and negative controls. Repeating the command elsewhere in the PRD does not establish proof custody.
+
+Commands such as `npm test`, `pnpm test`, `pytest`, arbitrary executables, shell pipelines, redirection, and command substitution are not admitted directly. Put the required verification behind a repository `task verify:<slug>` target, then cite that exact declaration in the PRD.
+
 Operator decisions can supply missing facts only when they are admitted into the frozen packet as a reviewed source. Raw CLI flags and transient prompts are constraints, not source facts; guided freeze promotes the reviewed values only by rendering, hashing, and receipting the companion described below.
 
 ## Guided intake for existing PRDs

@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE } from "../ccc-campaign-proof-admission.js";
 import {
   CCC_PRD_INTAKE_CONTRACT_SCHEMA_VERSION,
   lintCccPrdIntakeMarkdown,
@@ -26,7 +28,7 @@ The normal CLI must execute the product journey.
 
 ## Acceptance behavior and expected proof
 
-- REQ-001: run \`pnpm test -- product\` against the campaign-created commit.
+- REQ-001: run \`task verify:product\` against the campaign-created commit.
 
 ## Constraints and dependencies
 
@@ -57,7 +59,14 @@ describe("optional CCC PRD Intake Contract", () => {
     expect(template).toContain("Baseline commit:");
     expect(template).toContain("Allowed write roots:");
     expect(template).toContain("Acceptance behavior and expected proof");
+    expect(template).toContain("task verify:<slug>");
+    expect(template).toContain(CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE);
+    expect(template).toMatch(/exact.*proof\.command.*cited source span/iu);
     expect(template).toContain("Protected actions");
+    expect(readFileSync(
+      new URL("../../../../docs/ccc-prd-intake-contract.md", import.meta.url),
+      "utf8",
+    )).toContain(CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE);
 
     expect(lintCccPrdIntakeMarkdown({
       sourcePath: "PRJ-HUM-Example.md",
@@ -116,7 +125,7 @@ Allowed paths: src/example
 ## Acceptance
 
 - Behavior: the CLI returns the admitted result.
-- Proof: \`pnpm test -- cli-route\`.
+- Proof: \`task verify:cli-route\`.
 
 ## Protected actions
 

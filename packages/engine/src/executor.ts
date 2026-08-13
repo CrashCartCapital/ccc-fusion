@@ -1956,6 +1956,46 @@ export class TaskCancellationAbortError extends Error {
   }
 }
 
+const LOWER_HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+
+function isExactFencedCccCampaignImplementationNode(
+  node: WorkflowIrNode,
+  execution: WorkflowNodeExecutionContext["execution"],
+): boolean {
+  const cfg = node.config;
+  if (!cfg || !execution?.executionFence) return false;
+  return node.kind === "prompt"
+    && Object.isFrozen(execution)
+    && Object.isFrozen(execution.executionFence)
+    && cfg.executor === "model"
+    && cfg.cccExecutionTransport === "pi"
+    && typeof cfg.cccPrdTaskId === "string"
+    && cfg.cccPrdTaskId.length > 0
+    && cfg.cccPrdTaskId === cfg.cccPrdTaskId.trim()
+    && cfg.cccPrdTaskId === execution.semanticTaskId
+    && typeof cfg.cccNativeTaskId === "string"
+    && cfg.cccNativeTaskId.length > 0
+    && cfg.cccNativeTaskId === cfg.cccNativeTaskId.trim()
+    && cfg.cccNativeTaskId === execution.nativeTaskId
+    && cfg.cccExecutionPromptSchema === "ccc-prd.execution-prompt.v1"
+    && typeof cfg.cccExecutionPromptSha256 === "string"
+    && LOWER_HEX_SHA256_PATTERN.test(cfg.cccExecutionPromptSha256)
+    && typeof cfg.cccExecutionProviderId === "string"
+    && cfg.cccExecutionProviderId.trim().length > 0
+    && typeof cfg.cccExecutionModelId === "string"
+    && cfg.cccExecutionModelId.trim().length > 0
+    && typeof cfg.cccExecutionRouteSha256 === "string"
+    && LOWER_HEX_SHA256_PATTERN.test(cfg.cccExecutionRouteSha256)
+    && cfg.toolMode === "coding"
+    && cfg.worktreeMode === "isolated"
+    && Array.isArray(cfg.ownedPaths)
+    && cfg.ownedPaths.every((path) => typeof path === "string")
+    && Array.isArray(cfg.allowedWriteRoots)
+    && cfg.allowedWriteRoots.every((path) => typeof path === "string")
+    && cfg.commitPolicy === "required"
+    && cfg.gateMode === "gate";
+}
+
 export class TaskExecutor {
   /*
   FNXC:Workspace 2026-06-21-12:00:
@@ -9496,6 +9536,20 @@ export class TaskExecutor {
   ): Promise<WorkflowNodeResult> {
     const cfg = node.config ?? {};
     const executorKind = typeof cfg.executor === "string" ? cfg.executor : "model";
+    const sealedExecution = executionContext?.execution;
+    /*
+     * FNXC:CCCCampaignImplementation 2026-08-12-18:50:
+     * Imported product tasks are prompt nodes so they can retain the sealed Pi
+     * provider-attempt binding below. They are implementation nodes, not review
+     * gates: routing them through the generic workflow-step reviewer prompt made
+     * a real coding model inspect an empty worktree and return REVISE. Derive the
+     * implementation posture only from the complete, frozen campaign custody
+     * shape. A caller-controlled prompt flag can never opt an ordinary node in.
+     */
+    const cccCampaignImplementation = isExactFencedCccCampaignImplementationNode(
+      node,
+      sealedExecution,
+    );
 
     if (executorKind === "cli-agent" && executionContext?.execution?.executionFence) {
       return this.runCliAgentNode(
@@ -9860,7 +9914,12 @@ export class TaskExecutor {
 
     const outcome = mode === "script"
       ? await this.executeScriptWorkflowStep(live, step, worktreePath, settings, nodeEnv)
-      : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, { unattended, execution: executionContext?.execution, signal: executionContext?.signal });
+      : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, {
+          unattended,
+          execution: sealedExecution,
+          signal: executionContext?.signal,
+          cccCampaignImplementation,
+        });
 
     // Skill-emitted await-input (U6): if the skill asked the user a blocking
     // question via the ===FUSION_AWAIT_INPUT=== sentinel, park the task
@@ -18280,13 +18339,19 @@ ${scopeGuard}
     worktreePath: string,
     settings: Settings,
     taskEnv?: NodeJS.ProcessEnv,
-    stepOptions?: { unattended?: boolean; execution?: WorkflowNodeExecutionContext["execution"]; signal?: AbortSignal },
+    stepOptions?: {
+      unattended?: boolean;
+      execution?: WorkflowNodeExecutionContext["execution"];
+      signal?: AbortSignal;
+      cccCampaignImplementation?: boolean;
+    },
   ): Promise<WorkflowStepOutcome> {
     let toolMode: "coding" | "readonly" = workflowStep.toolMode || "readonly";
     // (U3) Genuinely-unattended run — set FUSION_HEADLESS=1 below so skills record
     // assumptions and proceed instead of parking on a question. Explicit opt-in
     // only (default false = board run); see runGraphCustomNode / KTD-3.
     const unattended = stepOptions?.unattended === true;
+    const cccCampaignImplementation = stepOptions?.cccCampaignImplementation === true;
     const isPlanReviewStep = workflowStep.id === "graph:plan-review-step" || workflowStep.name === "Plan Review";
     const workflowStepMetadata = workflowStep as WorkflowStep & {
       optionalGroupId?: string;
@@ -18295,12 +18360,13 @@ ${scopeGuard}
     };
     const optionalGroupId = workflowStepMetadata.optionalGroupId;
     const isReviewTypeWorkflowStep =
-      isPlanReviewStep
+      !cccCampaignImplementation
+      && (isPlanReviewStep
       || workflowStepMetadata.reviewCanFixInline === true
       || /(?:^|\b)(?:review|verification)(?:\b|$)/i.test(workflowStep.name)
       || optionalGroupId === "plan-review"
       || optionalGroupId === "code-review"
-      || optionalGroupId === "browser-verification";
+      || optionalGroupId === "browser-verification");
     const reviewerInlineFixesEnabled = (settings as Settings & { reviewerInlineFixes?: boolean }).reviewerInlineFixes !== false;
     const allowReviewerInlineFixes = reviewerInlineFixesEnabled && isReviewTypeWorkflowStep && workflowStep.mode === "prompt";
     const allowPlanReviewPromptWrite = allowReviewerInlineFixes && isPlanReviewStep;
@@ -18386,19 +18452,23 @@ ${scopeGuard}
     // open-ended review prompts (e.g. "verify visual polish") have been
     // observed to spend the entire timeout budget reading pre-existing files
     // that match the task description's keywords. See FN-3327 post-mortem.
-    const scopedFiles = await this.captureModifiedFiles(worktreePath, task.baseCommitSha, task.id, undefined, "workflow-step-handler");
+    const scopedFiles = cccCampaignImplementation
+      ? []
+      : await this.captureModifiedFiles(worktreePath, task.baseCommitSha, task.id, undefined, "workflow-step-handler");
     let diffShortstat: string | undefined;
-    try {
-      const baseRef = await this.resolveDiffBaseRef(worktreePath, task.baseCommitSha);
-      if (baseRef) {
-        const { stdout } = await execAsync(`git diff --shortstat ${baseRef}..HEAD`, {
-          cwd: worktreePath,
-          encoding: "utf-8",
-        });
-        diffShortstat = stdout.trim() || undefined;
+    if (!cccCampaignImplementation) {
+      try {
+        const baseRef = await this.resolveDiffBaseRef(worktreePath, task.baseCommitSha);
+        if (baseRef) {
+          const { stdout } = await execAsync(`git diff --shortstat ${baseRef}..HEAD`, {
+            cwd: worktreePath,
+            encoding: "utf-8",
+          });
+          diffShortstat = stdout.trim() || undefined;
+        }
+      } catch {
+        // best-effort — fall through with no shortstat
       }
-    } catch {
-      // best-effort — fall through with no shortstat
     }
 
     const MAX_SCOPE_FILES = 100;
@@ -18428,8 +18498,16 @@ Approved Task Contract:
 ${workflowReviewSpecText}
 --- END APPROVED PROMPT.md ---`
       : "";
-    const scopeBlock = isPlanReviewStep
-      ? `Plan Review Scope:
+    let scopeBlock: string;
+    if (cccCampaignImplementation) {
+      scopeBlock = `Campaign Implementation Scope:
+- Implement the sealed campaign task in this isolated worktree.
+- Follow the admitted task instructions exactly, including owned paths and allowed write roots.
+- Inspect the repository as needed, edit the required files, and run the narrowest relevant verification.
+- Do not merely review the current worktree or return a reviewer verdict.
+- Do not stage or commit changes; the campaign controller validates and commits the admitted change set after this session.`;
+    } else if (isPlanReviewStep) {
+      scopeBlock = `Plan Review Scope:
 - Review the task plan artifact (PROMPT.md), reproduced verbatim below, and task metadata only.
 - The plan is embedded in this prompt — do NOT go looking for a PROMPT.md file in the worktree; it lives at the project root (\`.fusion/tasks/${task.id}/PROMPT.md\`), outside this worktree, so review the embedded copy.
 - Do NOT judge current implementation diffs, uncommitted worktree changes, or unrelated repository changes.
@@ -18437,14 +18515,16 @@ ${workflowReviewSpecText}
 
 --- BEGIN PROMPT.md ---
 ${planReviewSpecText}
---- END PROMPT.md ---`
-      : `Diff Scope (files changed by THIS task vs base):
+--- END PROMPT.md ---`;
+    } else {
+      scopeBlock = `Diff Scope (files changed by THIS task vs base):
 ${scopeFileBlock}${diffShortstat ? `\nDiff stat: ${diffShortstat}` : ""}
 
 CRITICAL SCOPING RULES — read before doing anything else:
 - Review ONLY the files listed above. Do NOT analyze unmodified files or unrelated parts of the codebase.
 - If NONE of the files in the diff scope are relevant to your review category (e.g. a UX/design reviewer with no UI/CSS/component files in scope, a security reviewer with no auth/network code in scope, an a11y reviewer with no markup changes), respond IMMEDIATELY with a single short approval line such as "No relevant changes in scope — approved." and STOP. Do not start exploring the codebase.
 - Your wall-clock budget is short. Spending it browsing unmodified files will cause this step to time out and block merge.${approvedContractBlock}`;
+    }
 
     const latestTaskForUserComments = await this.store.getTask(task.id).catch(() => task);
     const workflowStepUserComments = selectUserCommentsForAgentContext(latestTaskForUserComments, { limit: null });
@@ -18466,9 +18546,19 @@ CRITICAL SCOPING RULES — read before doing anything else:
     // sentinel always takes priority when present.
     const isSkillStep = typeof workflowStep.skillName === "string" && workflowStep.skillName.trim().length > 0;
     const isSummaryProjectionStep = (workflowStep as WorkflowStep & { summaryTarget?: string }).summaryTarget === "task";
-    const requireVerdict = !isSummaryProjectionStep && (workflowStep.gateMode === "gate" || !isSkillStep);
-    const verdictBlock = requireVerdict
-      ? `
+    const requireVerdict = !cccCampaignImplementation
+      && !isSummaryProjectionStep
+      && (workflowStep.gateMode === "gate" || !isSkillStep);
+    let verdictBlock: string;
+    if (cccCampaignImplementation) {
+      verdictBlock = `
+
+## Completion Format
+
+Complete the implementation work and report what changed and what targeted verification ran.
+Do not emit an APPROVE, APPROVE_WITH_NOTES, or REVISE reviewer verdict.`;
+    } else if (requireVerdict) {
+      verdictBlock = `
 
 ## Feedback Format
 
@@ -18482,8 +18572,9 @@ Rules:
 - notes should be concise and actionable. Use an empty string when there are no notes.
 - For out-of-scope fast-bail responses, use: {"verdict":"APPROVE","notes":"out of scope: no UI files changed"}
 
-Backward compat fallback: if JSON is unavailable, you may still begin output with REQUEST REVISION to request changes.`
-      : `
+Backward compat fallback: if JSON is unavailable, you may still begin output with REQUEST REVISION to request changes.`;
+    } else {
+      verdictBlock = `
 
 ## Output Format
 
@@ -18491,6 +18582,7 @@ Follow the skill's own output conventions. You are NOT required to end with a
 verdict JSON object — this step does not gate merge. If you need to ask the user
 a question, emit a single ===FUSION_AWAIT_INPUT=== block and stop (see the
 workflow-step conventions in your instructions).`;
+    }
 
     const inlineFixBlock = allowReviewerInlineFixes
       ? `
@@ -18504,7 +18596,26 @@ This review-type node may fix issues it finds before returning a final verdict.
 - Code Review and Browser Verification may fix implementation issues inside the assigned task worktree and should mention the fix in notes.`
       : "";
 
-    const systemPrompt = `You are a workflow step agent executing: ${workflowStep.name}
+    const systemPrompt = cccCampaignImplementation
+      ? `You are a campaign implementation agent executing: ${workflowStep.name}
+
+Task Context:
+- Task ID: ${task.id}
+- Task Description: ${task.description}
+- Worktree: ${worktreePath}
+
+${scopeBlock}${workflowStepUserCommentSection ? `\n\n${workflowStepUserCommentSection}` : ""}
+
+Your role:
+- Implement the admitted task completely inside its declared scope.
+- Use coding tools to create or modify the required files and verify the result.
+- Treat the sealed instructions below as the authoritative implementation contract.
+
+Your Instructions:
+${workflowStep.prompt}
+
+You have access to the file system and coding tools for this implementation.${verdictBlock}`
+      : `You are a workflow step agent executing: ${workflowStep.name}
 
 Task Context:
 - Task ID: ${task.id}
@@ -18526,7 +18637,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     const agentLogger = new AgentLogger({
       store: this.store,
       taskId: task.id,
-      agent: "reviewer",
+      agent: cccCampaignImplementation ? "executor" : "reviewer",
       persistAgentToolOutput: settings.persistAgentToolOutput,
       // Review-in-executor sessions are task-scoped ephemeral workers.
       persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
@@ -18557,7 +18668,12 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     const useOverride = !!(workflowStep.modelProvider && workflowStep.modelId);
 
     const executorFallback = resolveExecutorFallbackModel(settings);
-    const fallback = executorFallback.provider && executorFallback.modelId
+    const sealedCampaignExecution = Boolean(stepOptions?.execution?.executionFence);
+    // A campaign execution fence binds one approved provider/model route. Do
+    // not even instantiate the generic outer fallback or same-primary retry:
+    // either would start another model session after the sealed terminal.
+    const fallback = !sealedCampaignExecution
+      && executorFallback.provider && executorFallback.modelId
       && (executorFallback.provider !== primaryProvider || executorFallback.modelId !== primaryModelId)
       ? executorFallback
       : undefined;
@@ -18866,8 +18982,11 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       try {
         const promptPromise = promptWithFallback(
           session,
-          `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
-          `Review the work done in this worktree and evaluate it against the criteria in your instructions.`,
+          cccCampaignImplementation
+            ? `Implement the sealed campaign task "${workflowStep.name}" for task ${task.id}.\n\n` +
+              "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification."
+            : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
+              "Review the work done in this worktree and evaluate it against the criteria in your instructions.",
         );
 
         const outcome = await Promise.race([
@@ -19017,7 +19136,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
        * FNXC:ReviewLeniency 2026-07-05-17:24:
        * FN-7561: when NO fallback model is configured, a MALFORMED primary (unparseable verdict — a single fumbled response) still deserves one retry so a transient formatting fumble does not feed the plan-review replan loop. Self-retry once on the SAME primary model. Timeouts are NOT self-retried — they would likely just time out again and burn another full budget. If the self-retry is still malformed it is returned as a non-blocking advisory downstream.
        */
-      if (primaryMalformed && !primaryOutcome.timedOut) {
+      if (primaryMalformed && !primaryOutcome.timedOut && !sealedCampaignExecution) {
         executorLog.log(`${task.id}: workflow step '${workflowStep.name}' produced malformed output and no fallback is configured — retrying once on the primary model`);
         const retryOutcome = await runOnce(primaryProvider, primaryModelId, "primary-retry");
         const retryMalformed = (retryOutcome as { malformed?: boolean }).malformed === true;
@@ -19029,10 +19148,15 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         return retryOutcome;
       }
       const reason = primaryOutcome.timedOut ? "timed out" : "produced malformed output";
-      executorLog.warn(`${task.id}: workflow step '${workflowStep.name}' ${reason} and no fallback model is configured`);
+      const fallbackDisposition = sealedCampaignExecution
+        ? "the sealed campaign route permits no fallback or self-retry"
+        : "no fallback model is configured";
+      executorLog.warn(`${task.id}: workflow step '${workflowStep.name}' ${reason} and ${fallbackDisposition}`);
       await this.store.logEntry(
         task.id,
-        `Workflow step '${workflowStep.name}' ${reason} — no fallback model configured (set settings.executionFallbackProvider/Id or fallbackProvider/Id)`,
+        sealedCampaignExecution
+          ? `Workflow step '${workflowStep.name}' ${reason} — sealed campaign route permits no fallback or self-retry`
+          : `Workflow step '${workflowStep.name}' ${reason} — no fallback model configured (set settings.executionFallbackProvider/Id or fallbackProvider/Id)`,
       );
       return primaryOutcome;
     }

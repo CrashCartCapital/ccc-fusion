@@ -20,6 +20,7 @@ import {
   consumeCccCampaignApprovalWithinTransaction,
 } from "./async-approval-request-store.js";
 import {
+  assertCccProviderFollowOnSettlementCustody,
   inspectCccProviderAttempt,
   beginCccProviderAttemptDispatch,
   markCccProviderAttemptDispatched,
@@ -1104,22 +1105,28 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       if (input.outcome === "committed" && initial.state === "dispatched_unknown") {
         const action = { actionId: initial.binding.actionId, actionTarget: initial.binding.actionTarget };
         const lease = await this.inspectCccCampaignActionLease(initial.taskId, action, tx);
-        if (
-          !lease
-          || lease.binding.bindingHash !== initial.binding.bindingHash
+        if (lease === null) {
+          await assertCccProviderFollowOnSettlementCustody({
+            layer: this.asyncLayer!, rootDir: this.rootDir, tx, authorityStore: this, attempt: initial,
+          });
+        } else if (
+          lease.binding.bindingHash !== initial.binding.bindingHash
           || lease.lease.bindingHash !== initial.binding.bindingHash
           || lease.lease.actionId !== action.actionId
           || lease.lease.actionTarget !== action.actionTarget
-        ) throw new Error("CCC committed provider settlement has no exact persisted action lease");
-        await assertClaimedCccCampaignApprovalWithinTransaction(tx, {
-          authorityStore: this,
-          rootDir: this.rootDir,
-          taskId: initial.taskId,
-          action,
-          approvalRequestId: lease.lease.approvalRequestId,
-          claimToken: lease.lease.claimToken,
-        });
-        claimedApproval = { action, claimToken: lease.lease.claimToken };
+        ) {
+          throw new Error("CCC committed provider settlement has no exact persisted action lease");
+        } else {
+          await assertClaimedCccCampaignApprovalWithinTransaction(tx, {
+            authorityStore: this,
+            rootDir: this.rootDir,
+            taskId: initial.taskId,
+            action,
+            approvalRequestId: lease.lease.approvalRequestId,
+            claimToken: lease.lease.claimToken,
+          });
+          claimedApproval = { action, claimToken: lease.lease.claimToken };
+        }
       }
       const terminal = await reconcileCccProviderAttempt({
         layer: this.asyncLayer!, rootDir: this.rootDir, tx, reconciliation: input,

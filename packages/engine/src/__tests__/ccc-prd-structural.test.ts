@@ -555,6 +555,36 @@ describe("ccc-prd structural sidecar", () => {
     });
   });
 
+  it("refuses a proof command that appears outside the proof's cited source span", async () => {
+    const elsewhereCommand = "task verify:elsewhere";
+    const input = packet([
+      productSource,
+      "",
+      `Elsewhere only proof command: ${elsewhereCommand}`,
+    ].join("\n"));
+    const candidate = productProposal();
+    candidate.proofs.find(({ id }) => id === "PROOF-1")!.command = elsewhereCommand;
+
+    const result = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      adapter: {
+        id: "local-deterministic-fixture",
+        model: "fixture-v1",
+        generateCandidate: async () => candidate,
+      },
+      constraints: productConstraints(),
+      workflowExtensionRegistry: await proofAdmissionRegistry(input),
+    });
+
+    expect(result).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "CCC_PRD_PROOF_COMMAND_PROVENANCE_REQUIRED" }),
+      ]),
+    });
+  });
+
   it.each([
     ["raw byte mutation"],
     ["stale span"],
