@@ -17,6 +17,7 @@ const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).dig
 
 export type CccPrdChunkEnvelope = {
   mode: CccPrdNativeAuthoringMode;
+  semanticProofContract?: "v1" | "v2";
   packetHash: string;
   sourceVersion: string;
   chunkPlanHash: string;
@@ -58,6 +59,14 @@ const CHUNK_FRAGMENT_ROW_TEMPLATE_LINES: readonly string[] = [
   "  \"exceptions\": [{ \"id\": \"\", \"message\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }], \"materialItemIds\": [\"\"] }],",
 ];
 
+const CHUNK_FRAGMENT_V2_ROW_TEMPLATE_LINES: readonly string[] = [
+  "  \"schema\": \"ccc-prd.authoring-proposal-fragment.v2\",",
+  CHUNK_FRAGMENT_ROW_TEMPLATE_LINES[1]!,
+  "  \"requirements\": [{ \"id\": \"\", \"statement\": \"\", \"acceptance\": \"\", \"accountableProducer\": \"\", \"dependencies\": [\"\"], \"proofIds\": [\"\"], \"acceptanceClauses\": [{ \"id\": \"\", \"requirementId\": \"\", \"text\": \"\", \"proofIds\": [\"\"], \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }], \"acceptanceDispositions\": [{ \"clauseId\": \"\", \"requirementId\": \"\", \"kind\": \"deferred\" | \"excluded\" | \"unresolved\", \"reason\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }], \"materialItemIds\": [\"\"] }],",
+  "  \"proofs\": [{ \"schema\": \"ccc-prd.proof.v2\", \"id\": \"\", \"requirementIds\": [\"\"], \"clauseIds\": [\"\"], \"phases\": [\"task\" | \"final_integrated\"], \"command\": \"\", \"positiveOracle\": \"\", \"positiveCases\": [{ \"id\": \"\", \"description\": \"\" }], \"negativeControls\": [{ \"id\": \"\", \"description\": \"\" }], \"verifierClosure\": [{ \"role\": \"task_runner\" | \"harness\" | \"fixture\" | \"config\", \"path\": \"\", \"baseGitBlobOid\": \"\", \"sha256\": \"\" }], \"candidateInputs\": [\"\"], \"executionToolchain\": { \"task\": { \"executablePath\": \"\", \"executableSha256\": \"\", \"version\": \"\", \"versionOutputSha256\": \"\" }, \"node\": { \"executablePath\": \"\", \"executableSha256\": \"\", \"version\": \"\", \"versionOutputSha256\": \"\" }, \"proofHost\": { \"id\": \"\", \"executablePath\": \"\", \"executableSha256\": \"\", \"version\": \"\", \"versionOutputSha256\": \"\" }, \"linkedRuntime\": [] }, \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }], \"materialItemIds\": [\"\"] }],",
+  ...CHUNK_FRAGMENT_ROW_TEMPLATE_LINES.slice(4),
+];
+
 /**
  * How many accumulated violations a repair prompt carries. `priorViolations`
  * is otherwise unbounded -- runCccPrdChunkAttempt feeds the whole violation
@@ -84,6 +93,13 @@ export function buildCccPrdChunkPrompt(
   envelope: CccPrdChunkEnvelope,
   priorViolations: string[] = [],
 ): string {
+  const semanticV2 = envelope.semanticProofContract === "v2";
+  const fragmentSchema = semanticV2
+    ? "ccc-prd.authoring-proposal-fragment.v2"
+    : CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION;
+  const templateLines = semanticV2
+    ? CHUNK_FRAGMENT_V2_ROW_TEMPLATE_LINES
+    : CHUNK_FRAGMENT_ROW_TEMPLATE_LINES;
   const modeInstructions = envelope.mode === "understanding"
     ? [
         "This is review-only PRD understanding. The result is never executable and must not claim operator approval.",
@@ -96,9 +112,18 @@ export function buildCccPrdChunkPrompt(
 
   const lines = [
     "Generate exactly one JSON object and no Markdown or commentary.",
-    `The object schema must be ${CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION}.`,
+    `The object schema must be ${fragmentSchema}.`,
     "Preserve the source packet. Do not execute actions or invent source text.",
     ...modeInstructions,
+    ...(semanticV2
+      ? [
+          "Use only source-declared clauses under the exact normative Acceptance clauses grammar; clause IDs and text must be copied exactly from the source grammar.",
+          "The model may only attach proofIds or echo exact source dispositions. It must never invent clause IDs, text, ownership, or spans.",
+          "Acceptance-clause sourceRefs must quote the exact clause text only; fuzzy quote recovery never applies to acceptance clauses.",
+          "Every source clause visible in this slice must be returned once as accepted or dispositioned, and every accepted clause must link to at least one v2 proof.",
+          "Declare verifier closure roles/paths, candidate inputs, phases, and cases only. Fusion replaces every Git blob OID, SHA-256, Task identity, Node identity, and proof-host identity before any executable admission; use empty strings for those controller-owned placeholder fields.",
+        ]
+      : []),
     "Quote only from the bytes between BEGIN CHUNK SLICE and END CHUNK SLICE below. A quote drawn from anywhere else is refused.",
     "Every requirement, proof, task, workflow, document, artifact, unresolved decision, ambiguity, exception, and protected action must cite one or more admitted sources using {path, exactQuote}; every exactQuote must occur exactly once in that source.",
     "Copy each exactQuote verbatim from the source bytes -- never paraphrase, summarize, or normalize whitespace. Choose quotes long enough to occur exactly once: quote the complete sentence or line, and extend with adjacent text whenever a shorter phrase could repeat elsewhere in the document.",
@@ -111,7 +136,7 @@ export function buildCccPrdChunkPrompt(
     "Return exactly these arrays: authorityRoles, requirements, proofs, tasks, edges, workflows, documents, artifacts, importIntents, protectedActions, unresolvedDecisions, ambiguities, exceptions.",
     "The exact field contract, with every key name mandatory (enumerated values are written with |; all other values are strings unless shown as numbers; every source-bound row carries its citations under \"sourceRefs\"):",
     "{",
-    ...CHUNK_FRAGMENT_ROW_TEMPLATE_LINES,
+    ...templateLines,
     "}",
     "Use stable IDs. Human review is limited to ambiguities, unresolved decisions, exceptions, and protected actions.",
     ...(priorViolations.length > 0
@@ -129,6 +154,7 @@ export function buildCccPrdChunkPrompt(
       : []),
     canonicalCccPrdJson({
       mode: envelope.mode,
+      ...(semanticV2 ? { semanticProofContract: "v2" } : {}),
       packetHash: envelope.packetHash,
       sourceVersion: envelope.sourceVersion,
       chunkPlanHash: envelope.chunkPlanHash,
@@ -151,6 +177,7 @@ export function buildCccPrdChunkPrompt(
 
 export function buildCccPrdChunkEnvelope(input: {
   mode: CccPrdNativeAuthoringMode;
+  semanticProofContract?: "v1" | "v2";
   packetHash: string;
   sourceVersion: string;
   chunkPlanHash: string;
@@ -166,6 +193,7 @@ export function buildCccPrdChunkEnvelope(input: {
 }): CccPrdChunkEnvelope {
   return {
     mode: input.mode,
+    ...(input.semanticProofContract ? { semanticProofContract: input.semanticProofContract } : {}),
     packetHash: input.packetHash,
     sourceVersion: input.sourceVersion,
     chunkPlanHash: input.chunkPlanHash,

@@ -1,8 +1,21 @@
-import { isTaskMoveDisposalActive, registerTaskMoveDisposer, type Settings, type TaskDetail, type TaskStore, type WorkflowWorkItem, type WorkflowWorkItemKind, type WorkflowWorkItemState } from "@fusion/core";
+import {
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+  closeUnopenedCccCampaignExecutionAuthorizationMembers,
+  getCccCampaignExecutionAuthorizationForImport,
+  isTaskMoveDisposalActive,
+  registerTaskMoveDisposer,
+  type Settings,
+  type TaskDetail,
+  type TaskStore,
+  type WorkflowWorkItem,
+  type WorkflowWorkItemKind,
+  type WorkflowWorkItemState,
+} from "@fusion/core";
 import { claimDueWorkflowWorkItem, type ExactWorkflowWorkCandidate, type WorkflowWorkSchedulerStore } from "./workflow-work-scheduler.js";
 import { WorkflowTaskRuntime, type WorkflowTaskRuntimeResult } from "./workflow-task-runtime.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
+import { CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON } from "./ccc-campaign-product-control.js";
 
 export interface WorkflowWorkProcessorOptions {
   leaseOwner: string;
@@ -18,6 +31,8 @@ export interface WorkflowWorkProcessorResult {
   workItemId?: string;
   taskId?: string;
   runtime?: WorkflowTaskRuntimeResult;
+  /** Post-terminal custody warnings; durable work-item state remains authoritative. */
+  diagnostics?: readonly string[];
 }
 
 type WorkflowWorkProcessorStore = WorkflowWorkSchedulerStore & {
@@ -43,6 +58,12 @@ class WorkflowCampaignTerminalTransitionError extends Error {
     this.name = "WorkflowCampaignTerminalTransitionError";
   }
 }
+
+const WORKFLOW_TERMINAL_AUTHORIZATION_ACTOR = Object.freeze({
+  actorId: "ccc-campaign-work-processor",
+  actorType: "system" as const,
+  actorName: "CCC Campaign Work Processor",
+});
 
 type CampaignCompletion =
   | { runtime: WorkflowTaskRuntimeResult }
@@ -72,8 +93,10 @@ export async function processDueWorkflowWorkItem(
     bypassMissionSymbolAdmission: opts.campaignRequired === true,
   });
   if (!dispatch) return { claimed: false };
+  const diagnostics: string[] = [];
 
   let runtimeResult: WorkflowTaskRuntimeResult;
+  let campaignContext: unknown | null = null;
   const abortController = new AbortController();
   let resolveCampaignCompletion: ((completion: CampaignCompletion) => void) | undefined;
   let campaignCompletion: Promise<CampaignCompletion> | undefined;
@@ -134,41 +157,26 @@ export async function processDueWorkflowWorkItem(
     const importedCampaignWorkItem = isImportedCccCampaignWorkItem(dispatch.workItem);
     const campaignRequired = opts.campaignRequired === true || importedCampaignWorkItem;
     if (userCancellationRequested) {
-      runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
-      return {
-        claimed: true,
-        workItemId: dispatch.workItem.id,
-        taskId: dispatch.taskId,
-        runtime: runtimeResult,
-      };
+      runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal, campaignContext, diagnostics);
+      return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
     }
     if (campaignRequired) {
       await observeUserPausedTask();
       if (userCancellationRequested) {
-        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
-        return {
-          claimed: true,
-          workItemId: dispatch.workItem.id,
-          taskId: dispatch.taskId,
-          runtime: runtimeResult,
-        };
+        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal, campaignContext, diagnostics);
+        return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
       }
     }
     const getCampaignContext = store.getCccCampaignContextForTask;
     if (campaignRequired && typeof getCampaignContext !== "function") {
       throw new Error("workflow campaign custody lookup is unwired");
     }
-    const campaignContext = typeof getCampaignContext === "function"
+    campaignContext = typeof getCampaignContext === "function"
       ? await awaitPreRuntimeRead(Promise.resolve(getCampaignContext.call(store, dispatch.taskId)), abortController.signal)
       : null;
     if (userCancellationRequested) {
-      runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
-      return {
-        claimed: true,
-        workItemId: dispatch.workItem.id,
-        taskId: dispatch.taskId,
-        runtime: runtimeResult,
-      };
+      runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal, campaignContext, diagnostics);
+      return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
     }
     if (campaignRequired && !campaignContext) {
       throw new Error(importedCampaignWorkItem
@@ -179,13 +187,8 @@ export async function processDueWorkflowWorkItem(
       if (!campaignRequired) {
         await observeUserPausedTask();
         if (userCancellationRequested) {
-          runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
-          return {
-            claimed: true,
-            workItemId: dispatch.workItem.id,
-            taskId: dispatch.taskId,
-            runtime: runtimeResult,
-          };
+          runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal, campaignContext, diagnostics);
+          return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
         }
       }
       if (dispatch.workItem.attempt === 0) {
@@ -200,19 +203,14 @@ export async function processDueWorkflowWorkItem(
       }
       registerCampaignTaskMoveDisposer();
       if (abortController.signal.aborted) {
-        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(userCancellationRequested), abortController.signal);
-        return {
-          claimed: true,
-          workItemId: dispatch.workItem.id,
-          taskId: dispatch.taskId,
-          runtime: runtimeResult,
-        };
+        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(userCancellationRequested), abortController.signal, campaignContext, diagnostics);
+        return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
       }
       if (typeof store.renewWorkflowWorkItemLease !== "function") {
         throw new Error("workflow campaign processor requires renewWorkflowWorkItemLease");
       }
       workflowLeaseRenewInterval = startWorkflowLeaseRenewal(store, dispatch.workItem, opts, abortController);
-      runtimeResult = await runCampaignWorkflowWorkItem(store, runtime, settings, opts, dispatch.workItem, abortController.signal, () => userCancellationRequested);
+      runtimeResult = await runCampaignWorkflowWorkItem(store, runtime, settings, opts, dispatch.workItem, abortController.signal, () => userCancellationRequested, campaignContext, diagnostics);
     } else {
       unregisterTaskMoveDisposer?.();
       unregisterTaskMoveDisposer = undefined;
@@ -225,13 +223,8 @@ export async function processDueWorkflowWorkItem(
     }
     if (userCancellationRequested) {
       try {
-        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal);
-        return {
-          claimed: true,
-          workItemId: dispatch.workItem.id,
-          taskId: dispatch.taskId,
-          runtime: runtimeResult,
-        };
+        runtimeResult = await transitionCampaignTerminal(store, opts, dispatch.workItem, abortedCampaignRuntimeResult(true), abortController.signal, campaignContext, diagnostics);
+        return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
       } catch (terminalPersistenceError) {
         campaignCompletionError = new AggregateError(
           [err, terminalPersistenceError],
@@ -265,6 +258,14 @@ export async function processDueWorkflowWorkItem(
       );
       throw campaignCompletionError;
     }
+    await closeClaimedSealedAuthorizationAfterTerminal(
+      store,
+      dispatch.workItem,
+      "failed",
+      reason,
+      campaignContext,
+      diagnostics,
+    );
     runtimeResult = {
       disposition: "failed",
       outcome: "failure",
@@ -280,11 +281,20 @@ export async function processDueWorkflowWorkItem(
       ? { runtime: runtimeResult! }
       : { error: campaignCompletionError });
   }
+  return claimedProcessorResult(dispatch.workItem, runtimeResult, diagnostics);
+}
+
+function claimedProcessorResult(
+  workItem: WorkflowWorkItem,
+  runtime: WorkflowTaskRuntimeResult,
+  diagnostics: readonly string[],
+): WorkflowWorkProcessorResult {
   return {
     claimed: true,
-    workItemId: dispatch.workItem.id,
-    taskId: dispatch.taskId,
-    runtime: runtimeResult,
+    workItemId: workItem.id,
+    taskId: workItem.taskId,
+    runtime,
+    ...(diagnostics.length > 0 ? { diagnostics: [...diagnostics] } : {}),
   };
 }
 
@@ -317,6 +327,8 @@ async function runCampaignWorkflowWorkItem(
   workItem: WorkflowWorkItem,
   signal: AbortSignal,
   userCancellationRequested: () => boolean,
+  campaignContext: unknown | null,
+  diagnostics: string[],
 ): Promise<WorkflowTaskRuntimeResult> {
   if (!store.getTask) {
     throw new Error("workflow campaign processor requires getTask");
@@ -332,6 +344,8 @@ async function runCampaignWorkflowWorkItem(
       workItem,
       abortedCampaignRuntimeResult(userCancellationRequested()),
       signal,
+      campaignContext,
+      diagnostics,
     );
   }
   let runtimeResult: WorkflowTaskRuntimeResult;
@@ -350,13 +364,13 @@ async function runCampaignWorkflowWorkItem(
     });
   } catch (err) {
     if (!signal.aborted) throw err;
-    return await transitionCampaignTerminal(store, opts, workItem, abortedCampaignRuntimeResult(userCancellationRequested()), signal);
+    return await transitionCampaignTerminal(store, opts, workItem, abortedCampaignRuntimeResult(userCancellationRequested()), signal, campaignContext, diagnostics);
   }
   if (signal.aborted) {
-    return await transitionCampaignTerminal(store, opts, workItem, abortedCampaignRuntimeResult(userCancellationRequested(), runtimeResult), signal);
+    return await transitionCampaignTerminal(store, opts, workItem, abortedCampaignRuntimeResult(userCancellationRequested(), runtimeResult), signal, campaignContext, diagnostics);
   }
 
-  return await transitionCampaignTerminal(store, opts, workItem, runtimeResult, signal);
+  return await transitionCampaignTerminal(store, opts, workItem, runtimeResult, signal, campaignContext, diagnostics);
 }
 
 function abortedCampaignRuntimeResult(
@@ -378,6 +392,8 @@ async function transitionCampaignTerminal(
   workItem: WorkflowWorkItem,
   runtimeResult: WorkflowTaskRuntimeResult,
   signal: AbortSignal,
+  campaignContext: unknown | null,
+  diagnostics: string[],
 ): Promise<WorkflowTaskRuntimeResult> {
   const terminalState: WorkflowWorkItemState = runtimeResult.disposition === "completed"
     ? "succeeded"
@@ -403,6 +419,14 @@ async function transitionCampaignTerminal(
   } catch (err) {
     const cancelled = await cancelledWorkItemAfterCasFailure(store, workItem.id);
     if (cancelled) {
+      await closeClaimedSealedAuthorizationAfterTerminal(
+        store,
+        workItem,
+        "cancelled",
+        "workflow-work-item-cancelled",
+        campaignContext,
+        diagnostics,
+      );
       return {
         disposition: "cancelled",
         outcome: "failure",
@@ -413,6 +437,15 @@ async function transitionCampaignTerminal(
     }
     throw new WorkflowCampaignTerminalTransitionError(err);
   }
+
+  await closeClaimedSealedAuthorizationAfterTerminal(
+    store,
+    workItem,
+    terminalState,
+    runtimeResult.reason,
+    campaignContext,
+    diagnostics,
+  );
 
   if (terminalState === "succeeded" && store.getTask) {
     const latestTask = await awaitPreRuntimeRead(
@@ -431,6 +464,92 @@ async function transitionCampaignTerminal(
     }
   }
   return runtimeResult;
+}
+
+async function closeClaimedSealedAuthorizationAfterTerminal(
+  store: WorkflowWorkProcessorStore,
+  workItem: WorkflowWorkItem,
+  terminalState: WorkflowWorkItemState,
+  reason: string | undefined,
+  campaignContext: unknown | null,
+  diagnostics: string[],
+): Promise<void> {
+  if (
+    terminalState === "succeeded"
+    || (
+      terminalState === "manual-required"
+      && reason === CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON
+    )
+  ) {
+    return;
+  }
+  let authorizationId = "unknown";
+  try {
+    const importId = sealedAuthorizationImportId(campaignContext, workItem);
+    if (!importId) return;
+    const authorityStore = store as TaskStore;
+    const layer = authorityStore.getAsyncLayer();
+    if (!layer) {
+      throw new Error("sealed campaign terminal authorization cleanup requires PostgreSQL custody");
+    }
+    const authorization = await getCccCampaignExecutionAuthorizationForImport(
+      layer.db,
+      importId,
+    );
+    if (authorization?.status !== "claimed") return;
+    authorizationId = authorization.authorizationId;
+    const closure = await closeUnopenedCccCampaignExecutionAuthorizationMembers(layer, {
+      authorityStore,
+      rootDir: authorityStore.rootDir,
+      authorizationId,
+      actor: WORKFLOW_TERMINAL_AUTHORIZATION_ACTOR,
+      runId: workItem.runId,
+    });
+    if (closure.openedApprovalRequestIds.length > 0) {
+      const diagnostic =
+        "[ccc-campaign:execution-authorization-reconciliation-required] "
+        + `workItem=${workItem.id} authorization=${authorizationId} `
+        + `terminal=${terminalState} openedApprovalRequests=${closure.openedApprovalRequestIds.join(",")}`;
+      diagnostics.push(diagnostic);
+      await bestEffortWorkflowDiagnostic(store, workItem.taskId, diagnostic);
+    }
+  } catch (error) {
+    const diagnostic =
+      "[ccc-campaign:execution-authorization-closure-failed] "
+      + `workItem=${workItem.id} authorization=${authorizationId} `
+      + `terminal=${terminalState} error=${error instanceof Error ? error.message : String(error)}`;
+    diagnostics.push(diagnostic);
+    await bestEffortWorkflowDiagnostic(store, workItem.taskId, diagnostic);
+  }
+}
+
+function sealedAuthorizationImportId(
+  campaignContext: unknown | null,
+  workItem: WorkflowWorkItem,
+): string | null {
+  if (campaignContext && typeof campaignContext === "object") {
+    return "executionAuthorizationMode" in campaignContext
+      && campaignContext.executionAuthorizationMode
+        === CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1
+      && "importId" in campaignContext
+      && typeof campaignContext.importId === "string"
+      ? campaignContext.importId
+      : null;
+  }
+  if (!isImportedCccCampaignWorkItem(workItem)) return null;
+  return workItem.runId.slice("ccc-prd:".length);
+}
+
+async function bestEffortWorkflowDiagnostic(
+  store: WorkflowWorkProcessorStore,
+  taskId: string,
+  diagnostic: string,
+): Promise<void> {
+  try {
+    await store.logEntry?.(taskId, diagnostic);
+  } catch {
+    // The returned processor diagnostic remains available when logging is down.
+  }
 }
 
 function startWorkflowLeaseRenewal(

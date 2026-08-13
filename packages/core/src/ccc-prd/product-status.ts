@@ -1,8 +1,13 @@
+import { createHash } from "node:crypto";
 import { and, eq, inArray, or } from "drizzle-orm";
 import type {
   CccCampaignAuthorityBinding,
+  CccCampaignExecutionAuthorizationMode,
   CccCampaignExecutionRoute,
+  CccCampaignProofAttemptContractVersion,
+  CccCampaignProofEvidenceV2,
   CccCampaignProofAttemptState,
+  CccCampaignProofTerminalEnvelopeV2,
   CccCampaignWorkItemFence,
   CccProviderAttemptCost,
   CccProviderAttemptReceiptSource,
@@ -18,6 +23,18 @@ import {
   assertCccCampaignAuthorityBinding,
 } from "../ccc-campaign/canonical.js";
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
+import {
+  getCccCampaignExecutionAuthorizationForImport,
+  type CccCampaignExecutionAuthorization,
+} from "../ccc-campaign/execution-authorization.js";
+import {
+  CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_CODE,
+  CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON,
+} from "../ccc-campaign/types.js";
+import {
+  CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
+  CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+} from "../ccc-campaign/request-budget.js";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
 import {
@@ -29,6 +46,7 @@ import {
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
 } from "./contract.js";
 import {
   CccPrdImportError,
@@ -36,6 +54,7 @@ import {
 import { physicalCccPrdImportRoot } from "./import-admission.js";
 import type {
   CccPrdProof,
+  CccPrdProofPhase,
 } from "./types.js";
 
 export const CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION =
@@ -152,8 +171,17 @@ export type CccPrdProductProofAttemptStatus = Readonly<{
   workItemId: string;
   runId: string;
   workItemAttempt: number;
+  attemptContractVersion?: CccCampaignProofAttemptContractVersion;
+  phase?: CccPrdProofPhase | null;
+  verifierClosureSha256?: string | null;
+  candidateInputsSha256?: string | null;
+  executionToolchainSha256?: string | null;
   state: CccCampaignProofAttemptState;
   result: CccPrdProductProofAttemptResult | null;
+  terminalEnvelope?: CccCampaignProofTerminalEnvelopeV2 | null;
+  terminalEnvelopeSha256?: string | null;
+  proofEvidence?: CccCampaignProofEvidenceV2 | null;
+  proofEvidenceSha256?: string | null;
   createdAt: string;
   updatedAt: string;
   dispatchedAt: string | null;
@@ -204,6 +232,10 @@ export type CccPrdProductApprovalStatus = Readonly<
   >;
 }>;
 
+export type CccPrdProductExecutionAuthorizationStatus = Readonly<
+  Omit<CccCampaignExecutionAuthorization, "claimToken">
+>;
+
 export type CccPrdProductLandingMetadata = Readonly<{
   schema: string | null;
   expectedBaseObject: string | null;
@@ -247,6 +279,7 @@ export type CccPrdProductStatus = Readonly<{
     campaignId: string;
     campaignStartedAt: string;
     campaignDeadlineAt: string;
+    requestBudget: CccPrdProductRequestBudgetStatus;
     state: string;
     runnable: boolean;
     lastError: string | null;
@@ -259,6 +292,8 @@ export type CccPrdProductStatus = Readonly<{
   proofs: readonly CccPrdProductProofStatus[];
   orphanProofAttempts: readonly CccPrdProductProofAttemptStatus[];
   providerAttempts: readonly CccPrdProductProviderAttemptStatus[];
+  executionAuthorizationMode: CccCampaignExecutionAuthorizationMode;
+  executionAuthorization: CccPrdProductExecutionAuthorizationStatus | null;
   approvals: readonly CccPrdProductApprovalStatus[];
   landing: Readonly<{
     intents: readonly CccPrdProductLandingAudit[];
@@ -270,6 +305,8 @@ export type CccPrdProductStatus = Readonly<{
     reason: string;
     approvalRequestId?: string;
     approvalStatus?: CoreApprovalRequest["status"];
+    executionAuthorizationId?: string;
+    executionAuthorizationStatus?: CccCampaignExecutionAuthorization["status"];
     diagnostic?: string;
     safeState?: string;
     decisionOwner?: string;
@@ -277,6 +314,17 @@ export type CccPrdProductStatus = Readonly<{
     recoveryOptions?: readonly string[];
     nextSafeAction?: string;
   }>;
+}>;
+
+export type CccPrdProductRequestBudgetStatus = Readonly<{
+  scope: "campaign-global";
+  maximum: number;
+  used: number;
+  remaining: number;
+  providerTasks: number;
+  deterministicMinimum: number;
+  headroomAboveMinimum: number;
+  completionAdequacy: "unproven";
 }>;
 
 export type InspectCccPrdProductStatusInput = Readonly<{
@@ -334,6 +382,20 @@ function routeStatus(
   };
 }
 
+function cloneCanonicalJson<T>(value: unknown): T {
+  return JSON.parse(canonicalCccPrdJson(value)) as T;
+}
+
+function sha256CanonicalValue(value: unknown): string {
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(value), "utf8")
+    .digest("hex");
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 function proofAttemptStatus(
   row: ProofAttemptRow,
 ): CccPrdProductProofAttemptStatus {
@@ -359,6 +421,15 @@ function proofAttemptStatus(
     workItemId: row.workItemId,
     runId: row.runId,
     workItemAttempt: row.workItemAttempt,
+    ...(row.attemptContractVersion === "v2"
+      ? {
+        attemptContractVersion: row.attemptContractVersion,
+        phase: row.phase,
+        verifierClosureSha256: row.verifierClosureSha256,
+        candidateInputsSha256: row.candidateInputsSha256,
+        executionToolchainSha256: row.executionToolchainSha256,
+      }
+      : {}),
     state: row.state,
     result: hasResult
       ? {
@@ -378,6 +449,20 @@ function proofAttemptStatus(
         negativeControlLabel: row.negativeControlLabel,
       }
       : null,
+    ...(row.attemptContractVersion === "v2"
+      ? {
+        terminalEnvelope: row.terminalEnvelope === null
+          ? null
+          : cloneCanonicalJson<CccCampaignProofTerminalEnvelopeV2>(
+            row.terminalEnvelope,
+          ),
+        terminalEnvelopeSha256: row.terminalEnvelopeSha256,
+        proofEvidence: row.proofEvidence === null
+          ? null
+          : cloneCanonicalJson<CccCampaignProofEvidenceV2>(row.proofEvidence),
+        proofEvidenceSha256: row.proofEvidenceSha256,
+      }
+      : {}),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     dispatchedAt: row.dispatchedAt,
@@ -543,14 +628,15 @@ function compareCreatedThenId(
 function commonPassingProofCommit(
   proofs: readonly CccPrdProductProofStatus[],
 ): string | null {
-  if (proofs.length === 0) return null;
+  const mergeProofs = proofs.filter(({ definition }) =>
+    definition.schema !== "ccc-prd.proof.v2"
+    || definition.phases.includes("final_integrated"));
+  if (mergeProofs.length === 0) return null;
   let candidates: Set<string> | null = null;
-  for (const proof of proofs) {
+  for (const proof of mergeProofs) {
     const passing = new Set<string>(
       proof.attempts
-        .filter((attempt) =>
-          attempt.state === "committed"
-          && attempt.result?.success === true)
+        .filter((attempt) => isPassingProofAttempt(proof, attempt))
         .map((attempt) => attempt.sourceCommit),
     );
     if (passing.size === 0) return null;
@@ -568,9 +654,84 @@ function commonPassingProofCommit(
   return [...(candidates ?? [])].sort(compareCccPrdCodeUnits)[0] ?? null;
 }
 
+function isPassingProofAttempt(
+  proof: CccPrdProductProofStatus,
+  attempt: CccPrdProductProofAttemptStatus,
+): boolean {
+  if (proof.definition.schema !== "ccc-prd.proof.v2") {
+    return (attempt.attemptContractVersion ?? "v1") === "v1"
+      && attempt.state === "committed"
+      && attempt.result?.success === true;
+  }
+  const envelope = attempt.terminalEnvelope;
+  const evidence = attempt.proofEvidence;
+  if (
+    attempt.attemptContractVersion !== "v2"
+    || attempt.phase !== "final_integrated"
+    || !proof.definition.phases.includes("final_integrated")
+    || attempt.state !== "committed"
+  ) return false;
+  let admissionDigests: ReturnType<
+    typeof computeCccPrdProofV2AdmissionDigests
+  >;
+  try {
+    admissionDigests = computeCccPrdProofV2AdmissionDigests(proof.definition);
+  } catch {
+    return false;
+  }
+  const expectedEvidenceResults = {
+    clauseResults: [...proof.definition.clauseIds]
+      .sort(compareCccPrdCodeUnits)
+      .map((clauseId) => ({ clauseId, passed: true })),
+    positiveCaseResults: [...proof.definition.positiveCases]
+      .sort((left, right) => compareCccPrdCodeUnits(left.id, right.id))
+      .map(({ id: caseId }) => ({ caseId, passed: true })),
+    negativeControlResults: [...proof.definition.negativeControls]
+      .sort((left, right) => compareCccPrdCodeUnits(left.id, right.id))
+      .map(({ id: controlId }) => ({ controlId, passed: true })),
+  };
+  return attempt.definitionSha256
+      === computeCccPrdProofDefinitionSha256(proof.definition)
+    && attempt.proofId === proof.definition.id
+    && attempt.commandSha256 === sha256Text(proof.definition.command)
+    && attempt.verifierClosureSha256 === admissionDigests.verifierClosureSha256
+    && attempt.candidateInputsSha256 === admissionDigests.candidateInputsSha256
+    && attempt.executionToolchainSha256
+      === admissionDigests.executionToolchainSha256
+    && envelope?.schema === "ccc-prd.proof-terminal-envelope.v2"
+    && envelope.kind === "verified"
+    && envelope.phase === "final_integrated"
+    && envelope.proofId === proof.definition.id
+    && envelope.sourceCommit === attempt.sourceCommit
+    && envelope.sourceTree === attempt.sourceTree
+    && envelope.passed === true
+    && evidence?.schema === "ccc-prd.proof-evidence.v2"
+    && evidence.phase === "final_integrated"
+    && evidence.proofId === proof.definition.id
+    && evidence.sourceCommit === attempt.sourceCommit
+    && evidence.sourceTree === attempt.sourceTree
+    && evidence.passed === true
+    && canonicalCccPrdJson({
+      clauseResults: evidence.clauseResults,
+      positiveCaseResults: evidence.positiveCaseResults,
+      negativeControlResults: evidence.negativeControlResults,
+    }) === canonicalCccPrdJson(expectedEvidenceResults)
+    && attempt.terminalEnvelopeSha256 !== null
+    && attempt.proofEvidenceSha256 !== null
+    && attempt.terminalEnvelopeSha256 === sha256CanonicalValue(envelope)
+    && attempt.proofEvidenceSha256 === sha256CanonicalValue(evidence)
+    && envelope.evidenceSha256 === attempt.proofEvidenceSha256
+    && canonicalCccPrdJson(envelope.evidence) === canonicalCccPrdJson(evidence);
+}
+
 function isKnownVerifierConfinementFailure(
   attempt: CccPrdProductProofAttemptStatus,
 ): boolean {
+  if (attempt.attemptContractVersion === "v2") {
+    return attempt.state === "proved_failed"
+      && attempt.terminalEnvelope?.kind === "execution_refused"
+      && attempt.terminalEnvelope.code === "sandbox_refused";
+  }
   if (attempt.state !== "proved_failed" || !attempt.result) return false;
   const evidence = [
     attempt.result.stderrTail,
@@ -601,12 +762,16 @@ function hasLiveRuntimeLease(item: CccPrdProductWorkItemStatus): boolean {
 
 export type CccPrdProductNextActionInput = Readonly<{
   row: ProductImportRow;
+  requestBudget: CccPrdProductRequestBudgetStatus;
+  providerAttemptHistoryConsistent?: boolean;
   taskStatuses: readonly CccPrdProductTaskStatus[];
   workItems: readonly CccPrdProductWorkItemStatus[];
   proofs: readonly CccPrdProductProofStatus[];
   orphanProofAttempts: readonly CccPrdProductProofAttemptStatus[];
   providerAttempts: readonly CccPrdProductProviderAttemptStatus[];
   approvals: readonly CccPrdProductApprovalStatus[];
+  executionAuthorizationMode?: "per_task_v1" | "sealed_bundle_v1";
+  executionAuthorization?: CccPrdProductExecutionAuthorizationStatus | null;
   landingIntents: readonly CccPrdProductLandingAudit[];
   landingMaterializations: readonly CccPrdProductLandingAudit[];
   landingTerminals: readonly CccPrdProductLandingAudit[];
@@ -633,12 +798,21 @@ export function productNextAction(
         `Workflow work item ${operatorStopped.id} was terminally stopped by the operator; worktrees, approvals, proof receipts, and any uncertain-effect evidence remain preserved for review.`,
     };
   }
-  const unknownProofs = input.proofs
-    .flatMap((proof) => proof.attempts)
+  const proofAttempts = [
+    ...input.proofs.flatMap((proof) => proof.attempts),
+    ...input.orphanProofAttempts,
+  ];
+  const reservedProofs = proofAttempts
+    .filter((attempt) => attempt.state === "reserved");
+  const unknownProofs = proofAttempts
     .filter((attempt) => attempt.state === "dispatched_unknown");
+  const reservedProviders = input.providerAttempts
+    .filter((attempt) => attempt.state === "reserved");
   const unknownProviders = input.providerAttempts
     .filter((attempt) => attempt.state === "dispatched_unknown");
+  const reservedProof = reservedProofs[0];
   const unknownProof = unknownProofs[0];
+  const reservedProvider = reservedProviders[0];
   const unknownProvider = unknownProviders[0];
   const liveExecutionApprovalWorkItem = input.workItems.find((item) =>
     item.state === "manual-required"
@@ -652,6 +826,14 @@ export function productNextAction(
       CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON
     && item.blockedReason ===
       CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON);
+  const requestBudgetExhaustionWorkItem = input.workItems.find((item) =>
+    item.state === "manual-required"
+    && item.lastError === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
+    && item.blockedReason === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON);
+  const proofDeadlineExpiredWorkItem = input.workItems.find((item) =>
+    item.state === "manual-required"
+    && item.lastError === CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON
+    && item.blockedReason === CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON);
   if (verifierConfinementWorkItem) {
     return {
       kind: "blocked",
@@ -675,13 +857,25 @@ export function productNextAction(
   const uncertainManualWorkItem = input.workItems.find((item) =>
     item.state === "manual-required"
     && item.lastError !== CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON
+    && item.lastError !== CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
+    && item.lastError !== CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON
     && item.id !== liveExecutionApprovalWorkItem?.id);
   // Only an unexpired lease matching the full persisted work-item fence proves
   // that the runtime still owns an uncertain effect. Task identity alone is
   // insufficient because a later retry can reuse the same task and item ID.
   const runningWorkOwnsAllUnknownEffects =
     uncertainManualWorkItem === undefined
-    && (unknownProofs.length + unknownProviders.length) > 0
+    && (
+      reservedProofs.length
+      + unknownProofs.length
+      + unknownProviders.length
+      + reservedProviders.length
+    ) > 0
+    && reservedProofs.every((attempt) => input.workItems.some((item) =>
+      hasLiveRuntimeLease(item)
+      && item.id === attempt.workItemId
+      && item.runId === attempt.runId
+      && item.attempt === attempt.workItemAttempt))
     && unknownProofs.every((attempt) => input.workItems.some((item) =>
       hasLiveRuntimeLease(item)
       && item.id === attempt.workItemId
@@ -692,22 +886,59 @@ export function productNextAction(
         hasLiveRuntimeLease(item)
         && item.id === attempt.workItemFence!.workItemId
         && item.runId === attempt.workItemFence!.runId
+        && item.attempt === attempt.workItemFence!.attempt))
+    && reservedProviders.every((attempt) => attempt.workItemFence !== null
+      && input.workItems.some((item) =>
+        hasLiveRuntimeLease(item)
+        && item.id === attempt.workItemFence!.workItemId
+        && item.runId === attempt.workItemFence!.runId
         && item.attempt === attempt.workItemFence!.attempt));
   if (runningWorkOwnsAllUnknownEffects) {
     return {
       kind: "wait-for-runtime",
       reason:
-        "Campaign external work is in flight and still owned by the runtime.",
+        "Campaign provider/proof work is reserved or in flight and still owned by the runtime.",
     };
   }
-  if (unknownProof || unknownProvider || uncertainManualWorkItem) {
+  if (unknownProof || unknownProvider || reservedProvider || uncertainManualWorkItem) {
     return {
       kind: "resolve-manual-required",
       reason: uncertainManualWorkItem
         ? `Workflow work item ${uncertainManualWorkItem.id} requires an operator decision.`
         : unknownProof
           ? `Proof attempt ${unknownProof.attemptKey} has an uncertain external effect.`
-          : `Provider attempt ${unknownProvider!.attemptKey} has an uncertain external effect.`,
+          : unknownProvider
+            ? `Provider attempt ${unknownProvider.attemptKey} has an uncertain external effect.`
+            : `Provider attempt ${reservedProvider!.attemptKey} is reserved and has unresolved provider custody.`,
+    };
+  }
+  if (proofDeadlineExpiredWorkItem) {
+    const reservedDetail = reservedProof
+      ? ` Proof attempt ${reservedProof.attemptKey} remains durably reserved but was not dispatched.`
+      : " No proof attempt was reserved or dispatched after expiry.";
+    return {
+      kind: "blocked",
+      reason:
+        "The sealed campaign deadline expired before a new semantic proof could begin.",
+      diagnostic: CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_CODE,
+      safeState:
+        `Workflow work item ${proofDeadlineExpiredWorkItem.id} is parked manual-required.${reservedDetail} Existing commits, worktrees, and receipts remain preserved.`,
+      decisionOwner: "Campaign operator",
+      consequence:
+        "This immutable import cannot start another proof or proceed to merge after its sealed deadline.",
+      recoveryOptions: [
+        "Retain this expired import and its receipts as immutable evidence; do not retry or requeue it.",
+        "Create a fresh semantic-v2 packet, preview, and import with a new deadline.",
+        "Treat prior task commits as evidence only; carrying their bytes into a new base requires separate custody and proof.",
+      ],
+      nextSafeAction:
+        "Create and confirm a fresh semantic-v2 import with a new campaign deadline.",
+    };
+  }
+  if (reservedProof) {
+    return {
+      kind: "resolve-manual-required",
+      reason: `Proof attempt ${reservedProof.attemptKey} is reserved and has unresolved proof custody.`,
     };
   }
   if (
@@ -719,17 +950,73 @@ export function productNextAction(
       reason: "Persisted campaign custody is missing a task, route, or declared proof.",
     };
   }
+  if (
+    requestBudgetExhaustionWorkItem
+    && (
+      input.requestBudget.used !== input.requestBudget.maximum
+      || input.providerAttemptHistoryConsistent === false
+    )
+  ) {
+    const driftDetail = input.providerAttemptHistoryConsistent === false
+      ? `${input.requestBudget.used} of ${input.requestBudget.maximum} first-time provider-attempt reservation slots are persisted as consumed, but that counter does not match the provider-attempt ledger`
+      : `${input.requestBudget.used} of ${input.requestBudget.maximum} first-time provider-attempt reservation slots are persisted as consumed`;
+    return {
+      kind: "blocked",
+      reason:
+        "Request-budget exhaustion custody is inconsistent with the persisted reservation-slot counter.",
+      diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+      safeState:
+        `Workflow work item ${requestBudgetExhaustionWorkItem.id} is parked manual-required for request-budget exhaustion, but ${driftDetail}.`,
+      decisionOwner: "Fusion database operator",
+      consequence:
+        "Campaign status cannot prove true budget exhaustion until the marker and counter are reconciled.",
+      recoveryOptions: [
+        "Inspect campaign provider-attempt rows and the import request_count in the same database snapshot.",
+        "Reconcile missing receipts or repair the persisted marker; do not requeue the campaign from this inconsistent state.",
+      ],
+      nextSafeAction:
+        "Run a read-only custody audit for the import row and provider-attempt ledger.",
+    };
+  }
+  /*
+  FNXC:CCCCampaignRequestBudgetStatus 2026-08-12-21:10:
+  A sealed campaign cannot raise its request cap in place. Surface exhaustion
+  as a terminal recovery path before the generic manual-required classifier so
+  operators are never told to retry an immutable import against the same cap.
+  Reserved or dispatched-unknown provider/proof attempts still dominate this
+  advice because their runtime custody must be reconciled before budget finality
+  is safe.
+  */
+  if (requestBudgetExhaustionWorkItem) {
+    return {
+      kind: "blocked",
+      reason:
+        "The campaign-global provider request budget is exhausted; this immutable import cannot resume.",
+      diagnostic: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
+      safeState:
+        `Workflow work item ${requestBudgetExhaustionWorkItem.id} is parked manual-required after using ${input.requestBudget.used} of ${input.requestBudget.maximum} first-time provider-attempt reservation slots; the refused next slot was not reserved or dispatched. Existing attempts, commits, worktrees, and receipts remain preserved.`,
+      decisionOwner: "Campaign operator",
+      consequence:
+        "The same immutable import cannot resume, prove, or land because its sealed request cap cannot be raised.",
+      recoveryOptions: [
+        "Retain the exhausted import and its receipts as immutable evidence; do not retry or requeue it.",
+        "Create a fresh source-bound packet, preview, and import with a larger campaign-global maxRequests value.",
+        "Treat prior task commits as evidence only; integrating those bytes into a new base requires separate authorization and proof.",
+      ],
+      nextSafeAction:
+        "Create and confirm a fresh sealed import with a larger campaign-global request cap.",
+    };
+  }
   const failedWorkItem = input.workItems.find((item) =>
     item.state === "failed"
     || item.state === "cancelled"
     || item.state === "exhausted");
   const failedProof = input.proofs.find((proof) =>
     proof.attempts.some((attempt) => attempt.state === "proved_failed")
-    && !proof.attempts.some((attempt) =>
-      attempt.state === "committed" && attempt.result?.success === true));
+    && !proof.attempts.some((attempt) => isPassingProofAttempt(proof, attempt)));
   const historicalVerifierFailure = input.proofs
     .filter((proof) => !proof.attempts.some((attempt) =>
-      attempt.state === "committed" && attempt.result?.success === true))
+      isPassingProofAttempt(proof, attempt)))
     .map((proof) => ({
       proof,
       attempt: proof.attempts.find(isKnownVerifierConfinementFailure),
@@ -852,6 +1139,34 @@ export function productNextAction(
     }
   }
   if (liveExecutionApprovalWorkItem) {
+    if (input.executionAuthorizationMode === "sealed_bundle_v1") {
+      const authorization = input.executionAuthorization;
+      if (!authorization) {
+        return {
+          kind: "blocked",
+          reason:
+            `Workflow work item ${liveExecutionApprovalWorkItem.id} is parked for sealed live execution, but its single campaign authorization is missing.`,
+          diagnostic: "The runtime did not persist the parent authorization required by manifest-v2 custody.",
+          nextSafeAction: "Preserve the campaign and inspect runtime authorization issuance; do not approve diagnostic child rows.",
+        };
+      }
+      if (authorization.status === "issued" || authorization.status === "claimed") {
+        return {
+          kind: "approve-execution",
+          reason:
+            `Workflow work item ${liveExecutionApprovalWorkItem.id} requires one sealed launch decision for ${authorization.members.length} exact campaign action${authorization.members.length === 1 ? "" : "s"}.`,
+          executionAuthorizationId: authorization.authorizationId,
+          executionAuthorizationStatus: authorization.status,
+        };
+      }
+      return {
+        kind: "blocked",
+        reason:
+          `Workflow work item ${liveExecutionApprovalWorkItem.id} is parked for live execution after sealed authorization ${authorization.authorizationId} became ${authorization.status}.`,
+        diagnostic: "A terminal parent authorization cannot be reused to launch new work.",
+        nextSafeAction: "Preserve campaign custody and reconcile the terminal authorization before any further execution.",
+      };
+    }
     /*
     A multi-task campaign holds once per task, but the parked work item's `taskId` stays pinned
     to the workflow entry task for the whole campaign. Matching the approval by the WORK ITEM's
@@ -1001,15 +1316,6 @@ export async function inspectCccPrdProductStatus(
         },
       };
     });
-    const providerAttempts = providerAttemptStatusesForCampaign(
-      await listCccProviderAttemptsForCampaign({
-        layer: input.layer,
-        rootDir,
-        taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
-        tx,
-      }),
-    );
-
     const campaignRunId = `ccc-prd:${row.importId}`;
     const workItemRows = await tx
       .select()
@@ -1065,6 +1371,15 @@ export async function inspectCccPrdProductStatus(
         workItemId: schema.project.cccCampaignProofAttempts.workItemId,
         runId: schema.project.cccCampaignProofAttempts.runId,
         workItemAttempt: schema.project.cccCampaignProofAttempts.workItemAttempt,
+        attemptContractVersion:
+          schema.project.cccCampaignProofAttempts.attemptContractVersion,
+        phase: schema.project.cccCampaignProofAttempts.phase,
+        verifierClosureSha256:
+          schema.project.cccCampaignProofAttempts.verifierClosureSha256,
+        candidateInputsSha256:
+          schema.project.cccCampaignProofAttempts.candidateInputsSha256,
+        executionToolchainSha256:
+          schema.project.cccCampaignProofAttempts.executionToolchainSha256,
         state: schema.project.cccCampaignProofAttempts.state,
         resultSuccess: schema.project.cccCampaignProofAttempts.resultSuccess,
         exitCode: schema.project.cccCampaignProofAttempts.exitCode,
@@ -1078,6 +1393,13 @@ export async function inspectCccPrdProductStatus(
         warnings: schema.project.cccCampaignProofAttempts.warnings,
         changedPathsSha256: schema.project.cccCampaignProofAttempts.changedPathsSha256,
         negativeControlLabel: schema.project.cccCampaignProofAttempts.negativeControlLabel,
+        terminalEnvelope:
+          schema.project.cccCampaignProofAttempts.terminalEnvelope,
+        terminalEnvelopeSha256:
+          schema.project.cccCampaignProofAttempts.terminalEnvelopeSha256,
+        proofEvidence: schema.project.cccCampaignProofAttempts.proofEvidence,
+        proofEvidenceSha256:
+          schema.project.cccCampaignProofAttempts.proofEvidenceSha256,
         createdAt: schema.project.cccCampaignProofAttempts.createdAt,
         updatedAt: schema.project.cccCampaignProofAttempts.updatedAt,
         dispatchedAt: schema.project.cccCampaignProofAttempts.dispatchedAt,
@@ -1259,6 +1581,33 @@ export async function inspectCccPrdProductStatus(
       })
       .sort(compareCreatedThenId);
 
+    const persistedExecutionAuthorization =
+      await getCccCampaignExecutionAuthorizationForImport(tx, row.importId);
+    const executionAuthorization = persistedExecutionAuthorization
+      ? (() => {
+        if (
+          persistedExecutionAuthorization.projectId !== projectId
+          || persistedExecutionAuthorization.importId !== row.importId
+          || persistedExecutionAuthorization.campaignId !== custody.manifest.campaignId
+          || persistedExecutionAuthorization.manifestHash !== custody.manifestHash
+          || persistedExecutionAuthorization.packetHash !== row.packetHash
+          || persistedExecutionAuthorization.sidecarHash !== row.sidecarHash
+          || persistedExecutionAuthorization.bundleHash !== row.bundleHash
+          || persistedExecutionAuthorization.targetRepository !== row.targetRepository
+          || persistedExecutionAuthorization.targetBase !== row.targetBase
+          || persistedExecutionAuthorization.maxRequests !== custody.manifest.bounds.maxRequests
+          || persistedExecutionAuthorization.maxConcurrency !== custody.manifest.bounds.maxConcurrency
+        ) {
+          throw new CccPrdImportError(
+            "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+            `CCC PRD execution authorization ${persistedExecutionAuthorization.authorizationId} drifted from import custody`,
+          );
+        }
+        const { claimToken: _claimToken, ...redacted } = persistedExecutionAuthorization;
+        return redacted;
+      })()
+      : null;
+
     const landingRows = await tx
       .select({
         auditId: schema.project.runAuditEvents.id,
@@ -1324,14 +1673,58 @@ export async function inspectCccPrdProductStatus(
         .filter((action) => action.kind === "live_execution")
         .map((action) => action.id),
     );
+    const providerTasks = custody.executionPolicy.routes.length;
+    const requestBudget: CccPrdProductRequestBudgetStatus = {
+      scope: "campaign-global",
+      maximum: custody.manifest.bounds.maxRequests,
+      used: row.requestCount,
+      remaining: Math.max(
+        0,
+        custody.manifest.bounds.maxRequests - row.requestCount,
+      ),
+      providerTasks,
+      deterministicMinimum: providerTasks,
+      headroomAboveMinimum:
+        custody.manifest.bounds.maxRequests - providerTasks,
+      completionAdequacy: "unproven",
+    };
+    let providerAttempts: readonly CccPrdProductProviderAttemptStatus[] = [];
+    let providerAttemptHistoryConsistent = true;
+    try {
+      providerAttempts = providerAttemptStatusesForCampaign(
+        await listCccProviderAttemptsForCampaign({
+          layer: input.layer,
+          rootDir,
+          taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
+          tx,
+        }),
+      );
+    } catch (error) {
+      const hasBudgetExhaustionMarker = workItems.some((item) =>
+        item.state === "manual-required"
+        && item.lastError === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
+        && item.blockedReason === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON);
+      if (
+        !(error instanceof CccCampaignContextError)
+        || !error.message.includes("request count")
+        || !hasBudgetExhaustionMarker
+      ) {
+        throw error;
+      }
+      providerAttemptHistoryConsistent = false;
+    }
     const nextAction = productNextAction({
       row,
+      requestBudget,
+      providerAttemptHistoryConsistent,
       taskStatuses,
       workItems,
       proofs,
       orphanProofAttempts,
       providerAttempts,
       approvals,
+      executionAuthorizationMode: custody.executionAuthorizationMode,
+      executionAuthorization,
       landingIntents,
       landingMaterializations,
       landingTerminals,
@@ -1357,6 +1750,7 @@ export async function inspectCccPrdProductStatus(
         campaignId: custody.manifest.campaignId,
         campaignStartedAt: custody.manifest.campaignStartedAt,
         campaignDeadlineAt: custody.manifest.campaignDeadlineAt,
+        requestBudget,
         state: row.state,
         runnable: row.runnable === 1,
         lastError: row.lastError,
@@ -1369,6 +1763,8 @@ export async function inspectCccPrdProductStatus(
       proofs,
       orphanProofAttempts,
       providerAttempts,
+      executionAuthorizationMode: custody.executionAuthorizationMode,
+      executionAuthorization,
       approvals,
       landing: {
         intents: landingIntents,

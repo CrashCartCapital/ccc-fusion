@@ -5,21 +5,32 @@ import {
 } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import {
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_SCHEMA_VERSION,
   canonicalCccPrdJson,
   claimCccCampaignApproval,
+  claimCccCampaignExecutionAuthorization,
   createCccCampaignAuthorityBinding,
   getApprovalRequest,
+  getCccCampaignExecutionAuthorization,
   issueCccCampaignApproval as issuePersistedCccCampaignApproval,
+  issueCccCampaignExecutionAuthorization,
   selectCccCampaignDeclaredLiveExecutionAction,
   type ApprovalRequest,
   type ApprovalRequestActorSnapshot,
   type CccCampaignActionLookup,
+  type CccCampaignExecutionAuthorization,
   type CccCampaignTaskContext,
   type CccPrdProductApprovalStatus,
   type MergeResult,
   type TaskStore,
 } from "@fusion/core";
 import { matchesCccCampaignMergeControl } from "./ccc-campaign-merge-control.js";
+import {
+  deriveCccCampaignFinalProofCustodyForCurrentSource,
+  encodeCccCampaignMergeProofRunId,
+  parseCccCampaignMergeProofRunId,
+  type CccCampaignFinalProofCustody,
+} from "./ccc-campaign-git-landing.js";
 import { PermanentError } from "./engine-errors.js";
 import { runAiMerge } from "./merger-ai.js";
 
@@ -75,14 +86,36 @@ export type IssueCccCampaignLiveExecutionApprovalInput = Readonly<{
   runId: string;
 }>;
 
-export type ApproveCccCampaignLiveExecutionInput = Readonly<{
+type ApproveCccCampaignLiveExecutionBaseInput = Readonly<{
   store: CampaignAuthorityStore;
   rootDir: string;
   taskId: string;
-  approvalRequestId: string;
   confirmation: string;
   actor: ApprovalRequestActorSnapshot;
 }>;
+
+export type ApproveCccCampaignLiveExecutionInput =
+  ApproveCccCampaignLiveExecutionBaseInput & (
+    | Readonly<{
+      /** Required for sealed-bundle manifests. */
+      authorizationId: string;
+      approvalRequestId?: never;
+    }>
+    | Readonly<{
+      /** Required only for legacy per-task manifests. */
+      approvalRequestId: string;
+      authorizationId?: never;
+    }>
+  );
+
+export type CccCampaignLiveExecutionAuthorizationStatus = Omit<
+  CccCampaignExecutionAuthorization,
+  "claimToken"
+>;
+
+export type CccCampaignLiveExecutionApprovalStatus =
+  | CccPrdProductApprovalStatus
+  | CccCampaignLiveExecutionAuthorizationStatus;
 
 function exactMergeAction(context: CccCampaignTaskContext): CccCampaignActionLookup {
   if (context.executionPolicy.schema !== "ccc-campaign.execution-policy.v2") {
@@ -143,13 +176,30 @@ export async function issueCccCampaignMergeApproval(
     );
   }
   const context = await exactCampaignContext(input.store, input.taskId);
+  let finalProofCustody: CccCampaignFinalProofCustody | null;
+  try {
+    finalProofCustody = await deriveCccCampaignFinalProofCustodyForCurrentSource(
+      input.store,
+      context,
+      input.rootDir,
+    );
+  } catch (error) {
+    throw new PermanentError(
+      "CCC campaign merge approval requires an exact passing final_integrated proof receipt set",
+      "CCC_CAMPAIGN_MERGE_PROOF_CUSTODY_REFUSED",
+      undefined,
+      error instanceof Error ? error : undefined,
+    );
+  }
   return issuePersistedCccCampaignApproval(layer, {
     authorityStore: input.store,
     rootDir: input.rootDir,
     taskId: input.taskId,
     action: exactMergeAction(context),
     requester: MERGE_APPROVAL_REQUESTER,
-    runId: input.runId,
+    runId: finalProofCustody
+      ? encodeCccCampaignMergeProofRunId(finalProofCustody)
+      : input.runId,
     notBeforeAt: context.campaignStartedAt,
     expiresAt: context.campaignDeadlineAt,
   });
@@ -167,8 +217,20 @@ export function computeCccCampaignMergeApprovalConfirmation(
   if (!approval.campaign) {
     throw new TypeError("CCC campaign merge approval confirmation requires campaign custody");
   }
-  return createHash("sha256")
-    .update(canonicalCccPrdJson({
+  const finalProofCustody = parseCccCampaignMergeProofRunId(approval.runId);
+  const confirmation = finalProofCustody
+    ? {
+      schema: "ccc-campaign.merge-approval-confirmation.v2",
+      approvalRequestId: approval.id,
+      taskId: approval.taskId ?? null,
+      runId: approval.runId ?? null,
+      targetAction: approval.targetAction,
+      binding: approval.campaign.binding,
+      finalProofCustody,
+      notBeforeAt: approval.campaign.notBeforeAt,
+      expiresAt: approval.campaign.expiresAt,
+    }
+    : {
       schema: "ccc-campaign.merge-approval-confirmation.v1",
       approvalRequestId: approval.id,
       taskId: approval.taskId ?? null,
@@ -177,7 +239,9 @@ export function computeCccCampaignMergeApprovalConfirmation(
       binding: approval.campaign.binding,
       notBeforeAt: approval.campaign.notBeforeAt,
       expiresAt: approval.campaign.expiresAt,
-    }), "utf8")
+    };
+  return createHash("sha256")
+    .update(canonicalCccPrdJson(confirmation), "utf8")
     .digest("hex");
 }
 
@@ -189,6 +253,39 @@ function exactConfirmation(provided: string, expected: string): boolean {
     Buffer.from(provided, "hex"),
     Buffer.from(expected, "hex"),
   );
+}
+
+async function assertCurrentSemanticMergeProofCustody(
+  store: CampaignAuthorityStore,
+  rootDir: string,
+  context: CccCampaignTaskContext,
+  approval: ApprovalRequest,
+): Promise<void> {
+  if (!context.proofs.some((proof) => proof.schema === "ccc-prd.proof.v2")) {
+    return;
+  }
+  const approvedCustody = parseCccCampaignMergeProofRunId(approval.runId);
+  try {
+    const currentCustody = await deriveCccCampaignFinalProofCustodyForCurrentSource(
+      store,
+      context,
+      rootDir,
+    );
+    if (
+      !approvedCustody
+      || !currentCustody
+      || canonicalCccPrdJson(approvedCustody) !== canonicalCccPrdJson(currentCustody)
+    ) {
+      throw new Error("CCC campaign merge proof custody drifted after approval issuance");
+    }
+  } catch (error) {
+    throw new PermanentError(
+      "CCC campaign merge approval no longer matches the exact passing final_integrated proof custody",
+      "CCC_CAMPAIGN_MERGE_PROOF_CUSTODY_REFUSED",
+      undefined,
+      error instanceof Error ? error : undefined,
+    );
+  }
 }
 
 function assertExactApprovalBinding(
@@ -245,6 +342,12 @@ export async function approveCccCampaignMerge(
   }
 
   if (approval.status === "issued") {
+    await assertCurrentSemanticMergeProofCustody(
+      input.store,
+      input.rootDir,
+      context,
+      approval,
+    );
     try {
       approval = await claimCccCampaignApproval(layer, {
         authorityStore: input.store,
@@ -415,16 +518,134 @@ function redactLiveExecutionApproval(
   };
 }
 
+function redactLiveExecutionAuthorization(
+  authorization: CccCampaignExecutionAuthorization,
+): CccCampaignLiveExecutionAuthorizationStatus {
+  const { claimToken: _claimToken, ...redacted } = authorization;
+  return redacted;
+}
+
+function isSealedLiveExecutionAuthorization(
+  value: ApprovalRequest | CccCampaignLiveExecutionApprovalStatus,
+): value is CccCampaignLiveExecutionAuthorizationStatus {
+  return "schemaVersion" in value
+    && value.schemaVersion === CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_SCHEMA_VERSION
+    && "authorizationId" in value;
+}
+
+function assertExactLiveExecutionAuthorizationBinding(
+  authorization: CccCampaignExecutionAuthorization,
+  context: CccCampaignTaskContext,
+  action: CccCampaignActionLookup,
+): CccCampaignExecutionAuthorization["members"][number] {
+  const binding = createCccCampaignAuthorityBinding(context, action);
+  const members = authorization.members.filter(({ nativeTaskId }) =>
+    nativeTaskId === context.taskId);
+  const member = members[0];
+  if (
+    authorization.schemaVersion !== CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_SCHEMA_VERSION
+    || authorization.projectId !== context.projectId
+    || authorization.importId !== context.importId
+    || authorization.campaignId !== context.campaignId
+    || authorization.idempotencyKey !== context.idempotencyKey
+    || authorization.packetHash !== context.packetHash
+    || authorization.sidecarHash !== context.sidecarHash
+    || authorization.bundleHash !== context.bundleHash
+    || authorization.manifestHash !== context.manifestHash
+    || authorization.targetRepository !== context.targetRepository.path
+    || authorization.targetBase !== context.targetRepository.baseCommit
+    || authorization.campaignStartedAt !== context.campaignStartedAt
+    || authorization.campaignDeadlineAt !== context.campaignDeadlineAt
+    || authorization.maxRequests !== context.bounds.maxRequests
+    || authorization.maxConcurrency !== context.bounds.maxConcurrency
+    || authorization.notBeforeAt !== context.campaignStartedAt
+    || authorization.expiresAt !== context.campaignDeadlineAt
+    || canonicalCccPrdJson(authorization.requester)
+      !== canonicalCccPrdJson(LIVE_EXECUTION_APPROVAL_REQUESTER)
+    || members.length !== 1
+    || !member
+    || member.semanticTaskId !== context.semanticTaskId
+    || member.actionId !== action.actionId
+    || member.actionTarget !== action.actionTarget
+    || member.bindingHash !== binding.bindingHash
+    || member.providerId !== binding.providerId
+    || member.modelId !== binding.modelId
+    || member.transport !== binding.transport
+    || member.promptSchema !== context.executionCustody?.promptSchema
+    || member.promptSha256 !== context.executionCustody?.promptSha256
+    || member.routeSha256 !== context.executionCustody?.routeSha256
+    || member.approvalRequestId !== `ccc-approval-${binding.bindingHash}`
+  ) {
+    throw new PermanentError(
+      `CCC campaign live-execution authorization ${authorization.authorizationId} does not match current campaign custody`,
+      "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_DRIFT",
+    );
+  }
+  return member;
+}
+
+async function assertExactSealedLiveExecutionMemberClaim(
+  store: CampaignAuthorityStore,
+  rootDir: string,
+  authorization: CccCampaignExecutionAuthorization,
+  taskId: string,
+): Promise<void> {
+  if (authorization.status !== "claimed" || !authorization.claimToken) {
+    throw new PermanentError(
+      `CCC campaign live-execution authorization ${authorization.authorizationId} is not exactly claimed`,
+      "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_NOT_CLAIMABLE",
+    );
+  }
+  const layer = store.getAsyncLayer();
+  if (!layer) {
+    throw new PermanentError(
+      "CCC campaign live-execution authorization requires PostgreSQL custody",
+      "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_STORE_REQUIRED",
+    );
+  }
+  const context = await exactLiveExecutionCampaignContext(store, rootDir, taskId);
+  const action = exactLiveExecutionAction(context);
+  const member = assertExactLiveExecutionAuthorizationBinding(
+    authorization,
+    context,
+    action,
+  );
+  const child = await getApprovalRequest(layer.db, member.approvalRequestId);
+  if (!child) {
+    throw new PermanentError(
+      `CCC campaign live-execution authorization ${authorization.authorizationId} is missing child approval ${member.approvalRequestId}`,
+      "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_LEASE_DRIFT",
+    );
+  }
+  assertExactLiveExecutionApprovalBinding(child, context, action);
+  await assertExactLiveExecutionClaimLease(store, context, action, child);
+}
+
+async function assertAllExactSealedLiveExecutionClaims(
+  store: CampaignAuthorityStore,
+  rootDir: string,
+  authorization: CccCampaignExecutionAuthorization,
+): Promise<void> {
+  for (const { nativeTaskId } of authorization.members) {
+    await assertExactSealedLiveExecutionMemberClaim(
+      store,
+      rootDir,
+      authorization,
+      nativeTaskId,
+    );
+  }
+}
+
 /**
- * Issue the exact product-v2 live-execution decision without dispatching work.
+ * Issue the exact live-execution decision without dispatching work.
  *
- * The persistence primitive owns immutable idempotency. This wrapper selects
- * only the live action assigned to the semantic task and returns the same
- * claim-token-free shape used by product status.
+ * Manifest-v2 campaigns issue one sealed parent over every provider member;
+ * manifest-v1 campaigns retain the original per-task approval. Both operator
+ * shapes omit claim tokens.
  */
 export async function issueCccCampaignLiveExecutionApproval(
   input: IssueCccCampaignLiveExecutionApprovalInput,
-): Promise<CccPrdProductApprovalStatus> {
+): Promise<CccCampaignLiveExecutionApprovalStatus> {
   const layer = input.store.getAsyncLayer();
   if (!layer) {
     throw new PermanentError(
@@ -438,6 +659,22 @@ export async function issueCccCampaignLiveExecutionApproval(
     input.taskId,
   );
   const action = exactLiveExecutionAction(context);
+  if (context.executionAuthorizationMode === "sealed_bundle_v1") {
+    const authorization = await issueCccCampaignExecutionAuthorization(layer, {
+      authorityStore: input.store,
+      rootDir: input.rootDir,
+      taskId: input.taskId,
+      requester: LIVE_EXECUTION_APPROVAL_REQUESTER,
+      notBeforeAt: context.campaignStartedAt,
+      expiresAt: context.campaignDeadlineAt,
+    });
+    assertExactLiveExecutionAuthorizationBinding(
+      authorization,
+      context,
+      action,
+    );
+    return redactLiveExecutionAuthorization(authorization);
+  }
   const approval = await issuePersistedCccCampaignApproval(layer, {
     authorityStore: input.store,
     rootDir: input.rootDir,
@@ -459,8 +696,41 @@ export async function issueCccCampaignLiveExecutionApproval(
  * same digest remains valid across an idempotent claim replay.
  */
 export function computeCccCampaignLiveExecutionApprovalConfirmation(
-  approval: ApprovalRequest,
+  approval: ApprovalRequest | CccCampaignLiveExecutionApprovalStatus,
 ): string {
+  if (isSealedLiveExecutionAuthorization(approval)) {
+    return createHash("sha256")
+      .update(canonicalCccPrdJson({
+        schema: "ccc-campaign.live-execution-approval-confirmation.v2",
+        authorizationId: approval.authorizationId,
+        authorizationDigest: approval.authorizationDigest,
+        memberSetHash: approval.memberSetHash,
+        members: approval.members,
+        projectId: approval.projectId,
+        importId: approval.importId,
+        campaignId: approval.campaignId,
+        idempotencyKey: approval.idempotencyKey,
+        workflowId: approval.workflowId,
+        workItemId: approval.workItemId,
+        workflowIrHash: approval.workflowIrHash,
+        packetHash: approval.packetHash,
+        sidecarHash: approval.sidecarHash,
+        bundleHash: approval.bundleHash,
+        manifestHash: approval.manifestHash,
+        executionPolicySha256: approval.executionPolicySha256,
+        targetRepository: approval.targetRepository,
+        targetBase: approval.targetBase,
+        campaignStartedAt: approval.campaignStartedAt,
+        campaignDeadlineAt: approval.campaignDeadlineAt,
+        maxRequests: approval.maxRequests,
+        maxConcurrency: approval.maxConcurrency,
+        expectedRequestCount: approval.expectedRequestCount,
+        requester: approval.requester,
+        notBeforeAt: approval.notBeforeAt,
+        expiresAt: approval.expiresAt,
+      }), "utf8")
+      .digest("hex");
+  }
   if (!approval.campaign) {
     throw new TypeError(
       "CCC campaign live-execution approval confirmation requires campaign custody",
@@ -514,14 +784,14 @@ async function assertExactLiveExecutionClaimLease(
 }
 
 /**
- * Claim only the exact live-execution decision and action lease.
+ * Claim the sealed launch decision, or the legacy exact per-task decision.
  *
- * Provider dispatch and workflow work-item mutation remain separate seams.
- * The returned operator payload intentionally omits the claim token.
+ * A sealed claim atomically creates every exact child lease, while provider
+ * dispatch remains task-specific. The returned operator payload omits tokens.
  */
 export async function approveCccCampaignLiveExecution(
   input: ApproveCccCampaignLiveExecutionInput,
-): Promise<CccPrdProductApprovalStatus> {
+): Promise<CccCampaignLiveExecutionApprovalStatus> {
   const layer = input.store.getAsyncLayer();
   if (!layer) {
     throw new PermanentError(
@@ -534,6 +804,71 @@ export async function approveCccCampaignLiveExecution(
     input.rootDir,
     input.taskId,
   );
+  if (context.executionAuthorizationMode === "sealed_bundle_v1") {
+    if (!input.authorizationId || input.approvalRequestId !== undefined) {
+      throw new PermanentError(
+        "CCC sealed live-execution approval requires exactly one parent authorization ID",
+        "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_MISSING",
+      );
+    }
+    let authorization = await getCccCampaignExecutionAuthorization(
+      layer.db,
+      input.authorizationId,
+    );
+    if (!authorization || authorization.authorizationId !== input.authorizationId) {
+      throw new PermanentError(
+        `CCC campaign live-execution authorization ${input.authorizationId} is missing`,
+        "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_MISSING",
+      );
+    }
+    const action = exactLiveExecutionAction(context);
+    assertExactLiveExecutionAuthorizationBinding(authorization, context, action);
+    const expectedConfirmation =
+      computeCccCampaignLiveExecutionApprovalConfirmation(authorization);
+    if (!exactConfirmation(input.confirmation, expectedConfirmation)) {
+      throw new PermanentError(
+        "CCC campaign live-execution authorization confirmation is stale or does not match",
+        "CCC_CAMPAIGN_LIVE_EXECUTION_CONFIRMATION_REFUSED",
+      );
+    }
+    if (authorization.status === "issued") {
+      try {
+        authorization = await claimCccCampaignExecutionAuthorization(layer, {
+          authorityStore: input.store,
+          rootDir: input.rootDir,
+          authorizationId: authorization.authorizationId,
+          claimant: input.actor,
+          claimToken: randomUUID(),
+        });
+      } catch (error) {
+        const concurrent = await getCccCampaignExecutionAuthorization(
+          layer.db,
+          authorization.authorizationId,
+        );
+        if (!concurrent || concurrent.status !== "claimed") throw error;
+        assertExactLiveExecutionAuthorizationBinding(concurrent, context, action);
+        authorization = concurrent;
+      }
+    }
+    if (authorization.status !== "claimed") {
+      throw new PermanentError(
+        `CCC campaign live-execution authorization ${authorization.authorizationId} is ${authorization.status}, not claimable`,
+        "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_NOT_CLAIMABLE",
+      );
+    }
+    await assertAllExactSealedLiveExecutionClaims(
+      input.store,
+      input.rootDir,
+      authorization,
+    );
+    return redactLiveExecutionAuthorization(authorization);
+  }
+  if (!input.approvalRequestId || input.authorizationId !== undefined) {
+    throw new PermanentError(
+      "CCC legacy live-execution approval requires exactly one child approval request ID",
+      "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_MISSING",
+    );
+  }
   const action = exactLiveExecutionAction(context);
   let approval = await getApprovalRequest(layer.db, input.approvalRequestId);
   if (!approval || approval.id !== input.approvalRequestId) {
@@ -586,15 +921,15 @@ export async function approveCccCampaignLiveExecution(
 }
 
 /**
- * Issue or replay the task's exact live-execution approval, then stop unless
- * its matching claimed action lease is already durable.
+ * Issue or replay live-execution authority, then stop unless this task's exact
+ * child lease is already durable.
  *
  * This seam neither claims the decision nor dispatches provider work. Its
  * successful replay is redacted for direct operator-surface compatibility.
  */
 export async function requireCccCampaignLiveExecutionApproval(
   input: IssueCccCampaignLiveExecutionApprovalInput,
-): Promise<CccPrdProductApprovalStatus> {
+): Promise<CccCampaignLiveExecutionApprovalStatus> {
   const approval = await issueCccCampaignLiveExecutionApproval(input);
   const layer = input.store.getAsyncLayer();
   if (!layer) {
@@ -608,6 +943,48 @@ export async function requireCccCampaignLiveExecutionApproval(
     input.rootDir,
     input.taskId,
   );
+  if (context.executionAuthorizationMode === "sealed_bundle_v1") {
+    if (!isSealedLiveExecutionAuthorization(approval)) {
+      throw new PermanentError(
+        `CCC campaign ${context.campaignId} has mismatched sealed live-execution authorization custody`,
+        CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_CODE,
+      );
+    }
+    const persisted = await getCccCampaignExecutionAuthorization(
+      layer.db,
+      approval.authorizationId,
+    );
+    try {
+      if (!persisted || persisted.authorizationId !== approval.authorizationId) {
+        throw new Error("sealed live-execution authorization disappeared after issuance");
+      }
+      assertExactLiveExecutionAuthorizationBinding(
+        persisted,
+        context,
+        exactLiveExecutionAction(context),
+      );
+      await assertExactSealedLiveExecutionMemberClaim(
+        input.store,
+        input.rootDir,
+        persisted,
+        input.taskId,
+      );
+      return redactLiveExecutionAuthorization(persisted);
+    } catch (error) {
+      throw new PermanentError(
+        `CCC campaign ${context.campaignId} is awaiting exact human live-execution authorization ${approval.authorizationId}`,
+        CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_CODE,
+        undefined,
+        error instanceof Error ? error : undefined,
+      );
+    }
+  }
+  if (isSealedLiveExecutionAuthorization(approval)) {
+    throw new PermanentError(
+      `CCC campaign ${context.campaignId} has mismatched legacy live-execution approval custody`,
+      CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_CODE,
+    );
+  }
   const action = exactLiveExecutionAction(context);
   const persisted = await getApprovalRequest(layer.db, approval.id);
   try {

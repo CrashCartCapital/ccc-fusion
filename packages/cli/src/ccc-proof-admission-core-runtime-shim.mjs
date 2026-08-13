@@ -4,6 +4,7 @@ export {
 } from "../../core/src/ccc-prd/contract.ts";
 export {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  CCC_PRD_PROOF_V2_SCHEMA_VERSION,
 } from "../../core/src/ccc-prd/types.ts";
 export {
   WORKFLOW_EXTENSION_SCHEMA_VERSION,

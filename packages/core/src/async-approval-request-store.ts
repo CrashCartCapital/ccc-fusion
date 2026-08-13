@@ -432,6 +432,19 @@ export type ExpireClaimedCccCampaignApprovalAfterProvedNoEffectInput =
     logicalKey: string;
   };
 
+export type CloseUnopenedCccCampaignApprovalInput = Pick<
+  CccCampaignApprovalBaseInput,
+  "authorityStore" | "rootDir" | "taskId" | "action" | "runId"
+> & {
+  approvalRequestId: string;
+  actor: ApprovalRequestActorSnapshot;
+};
+
+export type CloseUnopenedCccCampaignApprovalResult = Readonly<{
+  outcome: "closed-no-effect" | "opened";
+  approval: ApprovalRequest;
+}>;
+
 export type ClaimedCccCampaignApproval = {
   approval: ApprovalRequest;
   binding: CccCampaignAuthorityBinding;
@@ -462,6 +475,15 @@ function requireCanonicalText(value: string, label: string): string {
 
 function campaignApprovalId(binding: CccCampaignAuthorityBinding): string {
   return `ccc-approval-${binding.bindingHash}`;
+}
+
+export function cccCampaignExecutionAuthorizationChildClaimToken(
+  parentClaimToken: string,
+  bindingHash: string,
+): string {
+  return `ccc-child-claim-${createHash("sha256")
+    .update(`ccc-execution-child-claim/v1\0${parentClaimToken}\0${bindingHash}`, "utf8")
+    .digest("hex")}`;
 }
 
 function canonicalCampaignApprovalEventKey(
@@ -586,6 +608,62 @@ async function lockedCampaignApproval(
   return rows[0] ? rowToRequest(rows[0] as ApprovalRequestRow) : null;
 }
 
+async function lockedSealedExecutionAuthorizationForChild(
+  tx: DbTransaction,
+  binding: CccCampaignAuthorityBinding,
+): Promise<Readonly<{
+  authorizationId: string;
+  status: string;
+  claimToken: string | null;
+}> | null> {
+  const members = await tx
+    .select({
+      authorizationId: schema.project.cccCampaignExecutionAuthorizationMembers.authorizationId,
+      bindingHash: schema.project.cccCampaignExecutionAuthorizationMembers.bindingHash,
+    })
+    .from(schema.project.cccCampaignExecutionAuthorizationMembers)
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizationMembers.projectId, binding.projectId),
+      eq(
+        schema.project.cccCampaignExecutionAuthorizationMembers.approvalRequestId,
+        campaignApprovalId(binding),
+      ),
+    ))
+    .limit(2);
+  if (members.length === 0) return null;
+  if (members.length !== 1 || members[0]!.bindingHash !== binding.bindingHash) {
+    throw new Error(`CCC campaign approval ${binding.actionId} has ambiguous sealed parent membership`);
+  }
+  const parents = await tx
+    .select({
+      authorizationId: schema.project.cccCampaignExecutionAuthorizations.authorizationId,
+      importId: schema.project.cccCampaignExecutionAuthorizations.importId,
+      campaignId: schema.project.cccCampaignExecutionAuthorizations.campaignId,
+      manifestHash: schema.project.cccCampaignExecutionAuthorizations.manifestHash,
+      status: schema.project.cccCampaignExecutionAuthorizations.status,
+      claimToken: schema.project.cccCampaignExecutionAuthorizations.claimToken,
+    })
+    .from(schema.project.cccCampaignExecutionAuthorizations)
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizations.projectId, binding.projectId),
+      eq(
+        schema.project.cccCampaignExecutionAuthorizations.authorizationId,
+        members[0]!.authorizationId,
+      ),
+    ))
+    .limit(2)
+    .for("update");
+  if (
+    parents.length !== 1
+    || parents[0]!.importId !== binding.importId
+    || parents[0]!.campaignId !== binding.campaignId
+    || parents[0]!.manifestHash !== binding.manifestHash
+  ) {
+    throw new Error(`CCC campaign approval ${binding.actionId} has no exact sealed parent authorization`);
+  }
+  return parents[0]!;
+}
+
 function campaignEffectReceiptWhere(binding: CccCampaignAuthorityBinding) {
   const table = schema.project.cccEffectReceipts;
   return and(
@@ -686,6 +764,133 @@ async function appendCampaignApprovalAudit(
   });
 }
 
+/**
+ * Advance a sealed parent only after every immutable child has terminal
+ * custody. Legacy per-task approvals have no member row and are a no-op.
+ */
+export async function settleCccCampaignExecutionAuthorizationIfTerminalWithinTransaction(
+  tx: DbTransaction,
+  input: Readonly<{
+    approvalRequestId: string;
+    binding: CccCampaignAuthorityBinding;
+    actor: ApprovalRequestActorSnapshot;
+    runId: string;
+    timestamp?: string;
+  }>,
+): Promise<void> {
+  const memberRows = await tx
+    .select({
+      projectId: schema.project.cccCampaignExecutionAuthorizationMembers.projectId,
+      authorizationId: schema.project.cccCampaignExecutionAuthorizationMembers.authorizationId,
+    })
+    .from(schema.project.cccCampaignExecutionAuthorizationMembers)
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizationMembers.projectId, input.binding.projectId),
+      eq(
+        schema.project.cccCampaignExecutionAuthorizationMembers.approvalRequestId,
+        input.approvalRequestId,
+      ),
+    ))
+    .limit(2);
+  if (memberRows.length === 0) return;
+  if (memberRows.length !== 1) {
+    throw new Error(`CCC sealed execution authorization child ${input.approvalRequestId} is ambiguous`);
+  }
+  const authorizationId = memberRows[0]!.authorizationId;
+  const parents = await tx
+    .select()
+    .from(schema.project.cccCampaignExecutionAuthorizations)
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizations.projectId, input.binding.projectId),
+      eq(schema.project.cccCampaignExecutionAuthorizations.authorizationId, authorizationId),
+    ))
+    .limit(2)
+    .for("update");
+  if (parents.length !== 1) {
+    throw new Error(`CCC sealed execution authorization ${authorizationId} is missing or ambiguous`);
+  }
+  const parent = parents[0]!;
+  if (
+    parent.importId !== input.binding.importId
+    || parent.campaignId !== input.binding.campaignId
+    || parent.manifestHash !== input.binding.manifestHash
+  ) {
+    throw new Error(`CCC sealed execution authorization ${authorizationId} drifted from child custody`);
+  }
+  const children = await tx
+    .select({
+      ordinal: schema.project.cccCampaignExecutionAuthorizationMembers.ordinal,
+      approvalRequestId: schema.project.cccCampaignExecutionAuthorizationMembers.approvalRequestId,
+      status: schema.project.approvalRequests.status,
+    })
+    .from(schema.project.cccCampaignExecutionAuthorizationMembers)
+    .innerJoin(
+      schema.project.approvalRequests,
+      and(
+        eq(
+          schema.project.approvalRequests.projectId,
+          schema.project.cccCampaignExecutionAuthorizationMembers.projectId,
+        ),
+        eq(
+          schema.project.approvalRequests.id,
+          schema.project.cccCampaignExecutionAuthorizationMembers.approvalRequestId,
+        ),
+      ),
+    )
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizationMembers.projectId, input.binding.projectId),
+      eq(schema.project.cccCampaignExecutionAuthorizationMembers.authorizationId, authorizationId),
+    ))
+    .orderBy(schema.project.cccCampaignExecutionAuthorizationMembers.ordinal)
+    .for("update");
+  if (children.length === 0) {
+    throw new Error(`CCC sealed execution authorization ${authorizationId} has no children`);
+  }
+  const terminalChildren = children.filter(({ status }) =>
+    status === "consumed" || status === "expired");
+  if (terminalChildren.length !== children.length) return;
+  const consumedMemberCount = children.filter(({ status }) => status === "consumed").length;
+  const closedNoEffectMemberCount = children.length - consumedMemberCount;
+  if (parent.status === "settled") return;
+  if (parent.status !== "claimed") {
+    throw new Error(`CCC sealed execution authorization ${authorizationId} is not claimed for settlement`);
+  }
+  const now = input.timestamp ?? await dbNow(tx);
+  const updated = await tx
+    .update(schema.project.cccCampaignExecutionAuthorizations)
+    .set({ status: "settled", settledAt: now, updatedAt: now })
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizations.projectId, input.binding.projectId),
+      eq(schema.project.cccCampaignExecutionAuthorizations.authorizationId, authorizationId),
+      eq(schema.project.cccCampaignExecutionAuthorizations.status, "claimed"),
+    ))
+    .returning({ authorizationId: schema.project.cccCampaignExecutionAuthorizations.authorizationId });
+  if (updated.length !== 1) {
+    throw new Error(`CCC sealed execution authorization ${authorizationId} settlement compare-and-swap lost`);
+  }
+  await recordRunAuditEventWithinTransaction(tx, {
+    timestamp: now,
+    taskId: input.binding.taskId,
+    agentId: input.actor.actorId,
+    runId: input.runId,
+    domain: "ccc-campaign",
+    mutationType: "execution-authorization:settled",
+    target: input.binding.actionTarget,
+    metadata: {
+      authorizationId,
+      outcome: "settled",
+      terminalSummary: closedNoEffectMemberCount === 0 ? "complete-effect" : "partial-no-effect",
+      memberCount: children.length,
+      consumedMemberCount,
+      closedNoEffectMemberCount,
+    },
+    campaign: {
+      eventKey: `ccc-execution-authorization:${authorizationId}:settled`,
+      binding: input.binding,
+    },
+  });
+}
+
 function campaignRequestFromRow(row: unknown): ApprovalRequest {
   return rowToRequest(row as ApprovalRequestRow);
 }
@@ -694,152 +899,176 @@ function campaignRequestFromRow(row: unknown): ApprovalRequest {
  * Issue a campaign-bound approval from persisted task custody. This is a
  * PostgreSQL-only native seam; it never accepts a caller-provided binding.
  */
+export async function issueCccCampaignApprovalWithinTransaction(
+  tx: DbTransaction,
+  input: IssueCccCampaignApprovalInput,
+): Promise<ApprovalRequest> {
+  requireCanonicalText(input.runId, "run ID");
+  const { context, binding, protectedAction } = await lockedCampaignAuthority(tx, input);
+  assertCampaignWindow(context, input.notBeforeAt, input.expiresAt);
+  const now = await dbNow(tx);
+  const id = campaignApprovalId(binding);
+  const requested: ApprovalRequest = {
+    id,
+    status: "issued",
+    requester: input.requester,
+    targetAction: campaignTargetAction(binding, protectedAction),
+    taskId: binding.taskId,
+    runId: input.runId,
+    requestedAt: now,
+    createdAt: now,
+    updatedAt: now,
+    campaign: { binding, notBeforeAt: input.notBeforeAt, expiresAt: input.expiresAt },
+  };
+  const inserted = await tx.insert(schema.project.approvalRequests).values({
+    projectId: binding.projectId,
+    id,
+    status: "issued",
+    requesterActorId: input.requester.actorId,
+    requesterActorType: input.requester.actorType,
+    requesterActorName: input.requester.actorName,
+    targetActionCategory: requested.targetAction.category,
+    targetActionOperation: requested.targetAction.action,
+    targetActionSummary: requested.targetAction.summary,
+    targetResourceType: requested.targetAction.resourceType,
+    targetResourceId: requested.targetAction.resourceId,
+    targetContext: requested.targetAction.context,
+    taskId: binding.taskId,
+    runId: input.runId,
+    requestedAt: now,
+    decidedAt: null,
+    completedAt: null,
+    createdAt: now,
+    updatedAt: now,
+    notBeforeAt: input.notBeforeAt,
+    expiresAt: input.expiresAt,
+    claimToken: null,
+    claimedAt: null,
+    campaignProjectId: binding.projectId,
+    campaignImportId: binding.importId,
+    campaignId: binding.campaignId,
+    campaignTaskId: binding.taskId,
+    campaignActionId: binding.actionId,
+    campaignActionTarget: binding.actionTarget,
+    campaignIdempotencyKey: binding.idempotencyKey,
+    campaignPacketHash: binding.packetHash,
+    campaignSidecarHash: binding.sidecarHash,
+    campaignBundleHash: binding.bundleHash,
+    campaignTargetRepository: binding.targetRepository,
+    campaignTargetBase: binding.targetBase,
+    campaignProviderId: binding.providerId,
+    campaignModelId: binding.modelId,
+    campaignTransport: binding.transport,
+    campaignManifestHash: binding.manifestHash,
+    campaignBindingHash: binding.bindingHash,
+  }).onConflictDoNothing().returning();
+  if (inserted.length === 1) {
+    const result = campaignRequestFromRow(inserted[0]);
+    await appendCampaignApprovalAudit(tx, result, binding, "issued", input.requester, input.runId, now);
+    return result;
+  }
+  const existing = await lockedCampaignApproval(tx, binding);
+  if (!existing || !equivalentCampaignIssue(existing, requested)) {
+    throw new Error(`CCC campaign approval ${binding.actionId} collision or drift`);
+  }
+  return existing;
+}
+
 export async function issueCccCampaignApproval(
   layer: AsyncDataLayer,
   input: IssueCccCampaignApprovalInput,
 ): Promise<ApprovalRequest> {
-  requireCanonicalText(input.runId, "run ID");
-  return layer.transactionImmediate(async (tx) => {
-    const { context, binding, protectedAction } = await lockedCampaignAuthority(tx, input);
-    assertCampaignWindow(context, input.notBeforeAt, input.expiresAt);
-    const now = await dbNow(tx);
-    const id = campaignApprovalId(binding);
-    const requested: ApprovalRequest = {
-      id,
-      status: "issued",
-      requester: input.requester,
-      targetAction: campaignTargetAction(binding, protectedAction),
-      taskId: binding.taskId,
-      runId: input.runId,
-      requestedAt: now,
-      createdAt: now,
-      updatedAt: now,
-      campaign: { binding, notBeforeAt: input.notBeforeAt, expiresAt: input.expiresAt },
-    };
-    const inserted = await tx.insert(schema.project.approvalRequests).values({
-      projectId: binding.projectId,
-      id,
-      status: "issued",
-      requesterActorId: input.requester.actorId,
-      requesterActorType: input.requester.actorType,
-      requesterActorName: input.requester.actorName,
-      targetActionCategory: requested.targetAction.category,
-      targetActionOperation: requested.targetAction.action,
-      targetActionSummary: requested.targetAction.summary,
-      targetResourceType: requested.targetAction.resourceType,
-      targetResourceId: requested.targetAction.resourceId,
-      targetContext: requested.targetAction.context,
-      taskId: binding.taskId,
-      runId: input.runId,
-      requestedAt: now,
-      decidedAt: null,
-      completedAt: null,
-      createdAt: now,
-      updatedAt: now,
-      notBeforeAt: input.notBeforeAt,
-      expiresAt: input.expiresAt,
-      claimToken: null,
-      claimedAt: null,
-      campaignProjectId: binding.projectId,
-      campaignImportId: binding.importId,
-      campaignId: binding.campaignId,
-      campaignTaskId: binding.taskId,
-      campaignActionId: binding.actionId,
-      campaignActionTarget: binding.actionTarget,
-      campaignIdempotencyKey: binding.idempotencyKey,
-      campaignPacketHash: binding.packetHash,
-      campaignSidecarHash: binding.sidecarHash,
-      campaignBundleHash: binding.bundleHash,
-      campaignTargetRepository: binding.targetRepository,
-      campaignTargetBase: binding.targetBase,
-      campaignProviderId: binding.providerId,
-      campaignModelId: binding.modelId,
-      campaignTransport: binding.transport,
-      campaignManifestHash: binding.manifestHash,
-      campaignBindingHash: binding.bindingHash,
-    }).onConflictDoNothing().returning();
-    if (inserted.length === 1) {
-      const result = campaignRequestFromRow(inserted[0]);
-      await appendCampaignApprovalAudit(tx, result, binding, "issued", input.requester, input.runId, now);
-      return result;
-    }
-    const existing = await lockedCampaignApproval(tx, binding);
-    if (!existing || !equivalentCampaignIssue(existing, requested)) {
-      throw new Error(`CCC campaign approval ${binding.actionId} collision or drift`);
-    }
-    return existing;
-  });
+  return layer.transactionImmediate((tx) => issueCccCampaignApprovalWithinTransaction(tx, input));
 }
 
 /** Claim an issued campaign approval and its matching campaign action lease atomically. */
-export async function claimCccCampaignApproval(
-  layer: AsyncDataLayer,
+export async function claimCccCampaignApprovalWithinTransaction(
+  tx: DbTransaction,
   input: ClaimCccCampaignApprovalInput,
 ): Promise<ApprovalRequest> {
   const claimToken = requireCanonicalText(input.claimToken, "claim token");
   requireCanonicalText(input.runId, "run ID");
-  return layer.transactionImmediate(async (tx) => {
-    const { binding } = await lockedCampaignAuthority(tx, input);
-    const existing = await lockedCampaignApproval(tx, binding);
-    if (!existing?.campaign) throw new Error(`CCC campaign approval ${binding.actionId} is missing`);
-    if (existing.status === "claimed" && existing.campaign.claimToken === claimToken) {
-      const persistedLease = await input.authorityStore.inspectCccCampaignActionLease(
-        input.taskId,
-        input.action,
-        tx,
-      );
-      if (
-        !persistedLease
-        || persistedLease.binding.bindingHash !== binding.bindingHash
-        || persistedLease.lease.approvalRequestId !== existing.id
-        || persistedLease.lease.claimToken !== claimToken
-        || persistedLease.lease.actionId !== binding.actionId
-        || persistedLease.lease.actionTarget !== binding.actionTarget
-        || persistedLease.lease.bindingHash !== binding.bindingHash
-      ) {
-        throw new Error(`CCC campaign approval ${binding.actionId} claimed replay has no exact persisted action lease`);
-      }
-      return existing;
-    }
-    if (existing.status !== "issued") {
-      throw new Error(`CCC campaign approval ${binding.actionId} is not issued for claim`);
-    }
-    const now = await dbNow(tx);
-    if (Date.parse(existing.campaign.notBeforeAt) > Date.parse(now) || Date.parse(existing.campaign.expiresAt) <= Date.parse(now)) {
-      throw new Error(`CCC campaign approval ${binding.actionId} is outside its not-before or expiry window`);
-    }
-    const lease = await input.authorityStore.claimCccCampaignActionLease(
+  const { binding } = await lockedCampaignAuthority(tx, input);
+  const sealedParent = await lockedSealedExecutionAuthorizationForChild(tx, binding);
+  if (sealedParent && (
+    sealedParent.status !== "claimed"
+    || !sealedParent.claimToken
+    || claimToken !== cccCampaignExecutionAuthorizationChildClaimToken(
+      sealedParent.claimToken,
+      binding.bindingHash,
+    )
+    || input.runId !== `ccc-execution-authorization:${sealedParent.authorizationId}`
+  )) {
+    throw new Error(
+      `CCC campaign approval ${binding.actionId} is a sealed child and can only transition with its claimed parent authorization`,
+    );
+  }
+  const existing = await lockedCampaignApproval(tx, binding);
+  if (!existing?.campaign) throw new Error(`CCC campaign approval ${binding.actionId} is missing`);
+  if (existing.status === "claimed" && existing.campaign.claimToken === claimToken) {
+    const persistedLease = await input.authorityStore.inspectCccCampaignActionLease(
       input.taskId,
       input.action,
-      {
-        approvalRequestId: existing.id,
-        claimToken,
-        claimedAt: now,
-        expiresAt: existing.campaign.expiresAt,
-      },
       tx,
     );
-    if (lease.binding.bindingHash !== binding.bindingHash) {
-      throw new Error(`CCC campaign approval ${binding.actionId} lease binding drifted`);
+    if (
+      !persistedLease
+      || persistedLease.binding.bindingHash !== binding.bindingHash
+      || persistedLease.lease.approvalRequestId !== existing.id
+      || persistedLease.lease.claimToken !== claimToken
+      || persistedLease.lease.actionId !== binding.actionId
+      || persistedLease.lease.actionTarget !== binding.actionTarget
+      || persistedLease.lease.bindingHash !== binding.bindingHash
+    ) {
+      throw new Error(`CCC campaign approval ${binding.actionId} claimed replay has no exact persisted action lease`);
     }
-    const updated = await tx.update(schema.project.approvalRequests).set({
-      status: "claimed",
+    return existing;
+  }
+  if (existing.status !== "issued") {
+    throw new Error(`CCC campaign approval ${binding.actionId} is not issued for claim`);
+  }
+  const now = await dbNow(tx);
+  if (Date.parse(existing.campaign.notBeforeAt) > Date.parse(now) || Date.parse(existing.campaign.expiresAt) <= Date.parse(now)) {
+    throw new Error(`CCC campaign approval ${binding.actionId} is outside its not-before or expiry window`);
+  }
+  const lease = await input.authorityStore.claimCccCampaignActionLease(
+    input.taskId,
+    input.action,
+    {
+      approvalRequestId: existing.id,
       claimToken,
       claimedAt: now,
-      updatedAt: now,
-    }).where(and(
-      campaignApprovalWhere(binding, existing.id),
-      eq(schema.project.approvalRequests.status, "issued"),
-      sql`${schema.project.approvalRequests.notBeforeAt}::timestamptz <= clock_timestamp()`,
-      sql`${schema.project.approvalRequests.expiresAt}::timestamptz > clock_timestamp()`,
-    )).returning();
-    if (updated.length !== 1) {
-      throw new Error(`CCC campaign approval ${binding.actionId} claim compare-and-swap lost`);
-    }
-    const result = campaignRequestFromRow(updated[0]);
-    await appendCampaignApprovalAudit(tx, result, binding, "claimed", input.claimant, input.runId, now);
-    return result;
-  });
+      expiresAt: existing.campaign.expiresAt,
+    },
+    tx,
+  );
+  if (lease.binding.bindingHash !== binding.bindingHash) {
+    throw new Error(`CCC campaign approval ${binding.actionId} lease binding drifted`);
+  }
+  const updated = await tx.update(schema.project.approvalRequests).set({
+    status: "claimed",
+    claimToken,
+    claimedAt: now,
+    updatedAt: now,
+  }).where(and(
+    campaignApprovalWhere(binding, existing.id),
+    eq(schema.project.approvalRequests.status, "issued"),
+    sql`${schema.project.approvalRequests.notBeforeAt}::timestamptz <= clock_timestamp()`,
+    sql`${schema.project.approvalRequests.expiresAt}::timestamptz > clock_timestamp()`,
+  )).returning();
+  if (updated.length !== 1) {
+    throw new Error(`CCC campaign approval ${binding.actionId} claim compare-and-swap lost`);
+  }
+  const result = campaignRequestFromRow(updated[0]);
+  await appendCampaignApprovalAudit(tx, result, binding, "claimed", input.claimant, input.runId, now);
+  return result;
+}
+
+export async function claimCccCampaignApproval(
+  layer: AsyncDataLayer,
+  input: ClaimCccCampaignApprovalInput,
+): Promise<ApprovalRequest> {
+  return layer.transactionImmediate((tx) => claimCccCampaignApprovalWithinTransaction(tx, input));
 }
 
 /** Deny only a still-issued campaign approval; claimed work is never silently revoked. */
@@ -850,6 +1079,11 @@ export async function denyCccCampaignApproval(
   requireCanonicalText(input.runId, "run ID");
   return layer.transactionImmediate(async (tx) => {
     const { binding } = await lockedCampaignAuthority(tx, input);
+    if (await lockedSealedExecutionAuthorizationForChild(tx, binding)) {
+      throw new Error(
+        `CCC campaign approval ${binding.actionId} is a sealed child and cannot be denied outside its parent authorization`,
+      );
+    }
     const now = await dbNow(tx);
     const updated = await tx.update(schema.project.approvalRequests).set({
       status: "denied", decidedAt: now, updatedAt: now,
@@ -877,6 +1111,11 @@ export async function expireCccCampaignApproval(
   requireCanonicalText(input.runId, "run ID");
   return layer.transactionImmediate(async (tx) => {
     const { binding } = await lockedCampaignAuthority(tx, input);
+    if (await lockedSealedExecutionAuthorizationForChild(tx, binding)) {
+      throw new Error(
+        `CCC campaign approval ${binding.actionId} is a sealed child and cannot expire outside its parent authorization`,
+      );
+    }
     const existing = await lockedCampaignApproval(tx, binding);
     if (!existing?.campaign) throw new Error(`CCC campaign approval ${binding.actionId} is missing`);
     if (existing.status === "claimed") {
@@ -922,6 +1161,13 @@ export async function consumeCccCampaignApprovalWithinTransaction(
   const result = campaignRequestFromRow(updated[0]);
   await input.authorityStore.settleCccCampaignActionLease(input.taskId, input.action, claimToken, tx);
   await appendCampaignApprovalAudit(tx, result, binding, "consumed", input.actor, input.runId, now);
+  await settleCccCampaignExecutionAuthorizationIfTerminalWithinTransaction(tx, {
+    approvalRequestId: result.id,
+    binding,
+    actor: input.actor,
+    runId: input.runId,
+    timestamp: now,
+  });
   return result;
 }
 
@@ -1130,6 +1376,12 @@ export async function expireClaimedCccCampaignApprovalAfterProvedNoEffectWithinT
   requireCanonicalText(input.runId, "run ID");
   const effectScopeId = requireCanonicalText(input.effectScopeId, "effect scope ID");
   const logicalKey = requireCanonicalText(input.logicalKey, "effect logical key");
+  const authority = await lockedCampaignAuthority(tx, input);
+  if (await lockedSealedExecutionAuthorizationForChild(tx, authority.binding)) {
+    throw new Error(
+      `CCC campaign approval ${authority.binding.actionId} is a sealed child and requires aggregate parent no-effect closure`,
+    );
+  }
   const { approval, binding } = await assertClaimedCccCampaignApprovalWithinTransaction(tx, input);
   const now = await dbNow(tx);
   if (Date.parse(now) < Date.parse(approval.campaign!.expiresAt)) {
@@ -1177,6 +1429,193 @@ export async function expireClaimedCccCampaignApprovalAfterProvedNoEffectWithinT
   await input.authorityStore.settleCccCampaignActionLease(input.taskId, input.action, input.claimToken, tx);
   await appendCampaignApprovalAudit(tx, result, binding, "expired", input.actor, input.runId, now);
   return result;
+}
+
+/**
+ * Close a claimed sealed child that provably never reserved provider work.
+ * All authority, parent, work-item, attempt, effect, and lease facts are read
+ * under the caller's transaction; no caller-supplied no-effect claim is trusted.
+ */
+export async function closeUnopenedCccCampaignApprovalWithinTransaction(
+  tx: DbTransaction,
+  input: CloseUnopenedCccCampaignApprovalInput,
+): Promise<CloseUnopenedCccCampaignApprovalResult> {
+  requireCanonicalText(input.runId, "run ID");
+  const approvalRequestId = requireCanonicalText(input.approvalRequestId, "approval request ID");
+  const { binding } = await lockedCampaignAuthority(tx, input);
+  if (approvalRequestId !== campaignApprovalId(binding)) {
+    throw new Error(`CCC campaign approval ${binding.actionId} request identity does not match campaign custody`);
+  }
+  const approval = await lockedCampaignApproval(tx, binding);
+  if (
+    !approval?.campaign
+    || approval.id !== approvalRequestId
+    || approval.status !== "claimed"
+    || !approval.campaign.claimToken
+    || canonicalCccPrdJson(approval.campaign.binding) !== canonicalCccPrdJson(binding)
+  ) {
+    throw new Error(`CCC campaign approval ${binding.actionId} is not exactly claimed for unopened closure`);
+  }
+  const memberRows = await tx
+    .select({
+      authorizationId: schema.project.cccCampaignExecutionAuthorizationMembers.authorizationId,
+      memberBindingHash: schema.project.cccCampaignExecutionAuthorizationMembers.bindingHash,
+    })
+    .from(schema.project.cccCampaignExecutionAuthorizationMembers)
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizationMembers.projectId, binding.projectId),
+      eq(schema.project.cccCampaignExecutionAuthorizationMembers.approvalRequestId, approval.id),
+    ))
+    .limit(2);
+  if (memberRows.length !== 1 || memberRows[0]!.memberBindingHash !== binding.bindingHash) {
+    throw new Error(`CCC campaign approval ${binding.actionId} has no exact sealed parent membership`);
+  }
+  const authorizationId = memberRows[0]!.authorizationId;
+  const parentRows = await tx
+    .select()
+    .from(schema.project.cccCampaignExecutionAuthorizations)
+    .where(and(
+      eq(schema.project.cccCampaignExecutionAuthorizations.projectId, binding.projectId),
+      eq(schema.project.cccCampaignExecutionAuthorizations.authorizationId, authorizationId),
+    ))
+    .limit(2)
+    .for("update");
+  if (
+    parentRows.length !== 1
+    || parentRows[0]!.status !== "claimed"
+    || parentRows[0]!.importId !== binding.importId
+    || parentRows[0]!.manifestHash !== binding.manifestHash
+  ) {
+    throw new Error(`CCC sealed execution authorization ${authorizationId} is not exactly claimed`);
+  }
+  const parent = parentRows[0]!;
+  const workItems = await tx
+    .select()
+    .from(schema.project.workflowWorkItems)
+    .where(and(
+      eq(schema.project.workflowWorkItems.projectId, binding.projectId),
+      eq(schema.project.workflowWorkItems.id, parent.workItemId),
+    ))
+    .limit(2)
+    .for("update");
+  if (workItems.length !== 1 || workItems[0]!.irHash !== parent.workflowIrHash) {
+    throw new Error(`CCC sealed execution authorization ${authorizationId} has no exact work-item custody`);
+  }
+  const workItem = workItems[0]!;
+  const now = await dbNow(tx);
+  const deadlineElapsed = Date.parse(now) >= Date.parse(parent.campaignDeadlineAt);
+  const exactTerminalReason = typeof workItem.lastError === "string"
+    && workItem.lastError.length > 0
+    && workItem.lastError === workItem.lastError.trim()
+    ? workItem.lastError
+    : null;
+  const terminalFailure = (
+    workItem.state === "failed" || workItem.state === "cancelled"
+  ) && exactTerminalReason !== null;
+  const exactManualReason = exactTerminalReason;
+  const terminalManualRequired = workItem.state === "manual-required"
+    && exactManualReason !== null
+    && exactManualReason === workItem.blockedReason
+    && exactManualReason.startsWith("ccc-permanent:")
+    && exactManualReason !== "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+  if (!deadlineElapsed && !terminalFailure && !terminalManualRequired) {
+    throw new Error(
+      `CCC sealed execution authorization ${authorizationId} cannot close unopened members from work-item state ${workItem.state}`,
+    );
+  }
+  const reservations = await tx
+    .select({ id: schema.project.runAuditEvents.id })
+    .from(schema.project.runAuditEvents)
+    .where(and(
+      eq(schema.project.runAuditEvents.projectId, binding.projectId),
+      eq(schema.project.runAuditEvents.campaignImportId, binding.importId),
+      eq(schema.project.runAuditEvents.campaignBindingHash, binding.bindingHash),
+      eq(schema.project.runAuditEvents.mutationType, "ccc-campaign:provider-attempt:reserved"),
+    ))
+    .limit(1)
+    .for("update");
+  if (reservations.length > 0) {
+    return { outcome: "opened", approval };
+  }
+  const unknownEffects = await tx
+    .select({ logicalKey: schema.project.cccEffectReceipts.logicalKey })
+    .from(schema.project.cccEffectReceipts)
+    .where(and(
+      campaignEffectReceiptWhere(binding),
+      eq(schema.project.cccEffectReceipts.state, "dispatched_unknown"),
+    ))
+    .limit(1)
+    .for("update");
+  if (unknownEffects.length > 0) {
+    throw new Error(
+      `CCC campaign approval ${binding.actionId} unopened closure refuses unresolved dispatched receipt ${unknownEffects[0]!.logicalKey}`,
+    );
+  }
+  const persistedLease = await input.authorityStore.inspectCccCampaignActionLease(
+    input.taskId,
+    input.action,
+    tx,
+  );
+  if (
+    !persistedLease
+    || persistedLease.binding.bindingHash !== binding.bindingHash
+    || persistedLease.lease.bindingHash !== binding.bindingHash
+    || persistedLease.lease.approvalRequestId !== approval.id
+    || persistedLease.lease.claimToken !== approval.campaign.claimToken
+  ) {
+    throw new Error(`CCC campaign approval ${binding.actionId} unopened closure has no exact action lease`);
+  }
+  const updated = await tx
+    .update(schema.project.approvalRequests)
+    .set({ status: "expired", decidedAt: now, updatedAt: now })
+    .where(and(
+      campaignApprovalWhere(binding, approval.id),
+      eq(schema.project.approvalRequests.status, "claimed"),
+      eq(schema.project.approvalRequests.claimToken, approval.campaign.claimToken),
+    ))
+    .returning();
+  if (updated.length !== 1) {
+    throw new Error(`CCC campaign approval ${binding.actionId} unopened closure compare-and-swap lost`);
+  }
+  const result = campaignRequestFromRow(updated[0]);
+  await input.authorityStore.settleCccCampaignActionLease(
+    input.taskId,
+    input.action,
+    approval.campaign.claimToken,
+    tx,
+  );
+  await appendCampaignApprovalAudit(tx, result, binding, "expired", input.actor, input.runId, now);
+  await recordRunAuditEventWithinTransaction(tx, {
+    timestamp: now,
+    taskId: binding.taskId,
+    agentId: input.actor.actorId,
+    runId: input.runId,
+    domain: "ccc-campaign",
+    mutationType: "execution-authorization:child-closed-no-effect",
+    target: binding.actionTarget,
+    metadata: {
+      authorizationId,
+      approvalRequestId: result.id,
+      outcome: "closed-no-effect",
+      workItemId: workItem.id,
+      workItemState: workItem.state,
+      terminalReason: deadlineElapsed ? "campaign-deadline" : workItem.lastError ?? workItem.blockedReason,
+      reservationCount: 0,
+      unresolvedEffectCount: 0,
+    },
+    campaign: {
+      eventKey: `ccc-execution-authorization:${authorizationId}:child:${binding.bindingHash}:closed-no-effect`,
+      binding,
+    },
+  });
+  await settleCccCampaignExecutionAuthorizationIfTerminalWithinTransaction(tx, {
+    approvalRequestId: result.id,
+    binding,
+    actor: input.actor,
+    runId: input.runId,
+    timestamp: now,
+  });
+  return { outcome: "closed-no-effect", approval: result };
 }
 
 /**

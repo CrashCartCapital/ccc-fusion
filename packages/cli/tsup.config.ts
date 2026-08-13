@@ -73,6 +73,7 @@ const linearImportPluginDest = join(__dirname, "dist", "plugins", "fusion-plugin
 const pluginSdkCoreRuntimeShim = join(__dirname, "src", "plugin-sdk-core-runtime-shim.mjs");
 const cccCampaignProofAdmissionManifestSrc = join(__dirname, "..", "engine", "src", "ccc-campaign-proof-admission.manifest.json");
 const cccCampaignProofAdmissionManifestDest = join(__dirname, "dist", "plugins", "fusion-native-proof-admission");
+const cccCampaignProofAdmissionEntryDest = join(__dirname, "dist", "ccc-campaign-proof-admission.js");
 const cccProofAdmissionCoreRuntimeShim = join(__dirname, "src", "ccc-proof-admission-core-runtime-shim.mjs");
 const dashboardClientStub = `<!doctype html>
 <html lang="en">
@@ -670,7 +671,7 @@ const cccProofAdmissionBuildConfig = {
    * deliberately omits the general CLI createRequire(import.meta.url) banner.
    */
   entry: {
-    "ccc-campaign-proof-admission": "../engine/src/ccc-campaign-proof-admission.ts",
+    "ccc-campaign-proof-admission": "ccc-semantic-proof-host.mjs",
   },
   format: ["esm"],
   platform: "node",
@@ -688,6 +689,7 @@ const cccProofAdmissionBuildConfig = {
   removeNodeProtocol: false,
   outDir: "dist",
   onSuccess: async () => {
+    chmodSync(cccCampaignProofAdmissionEntryDest, 0o755);
     mkdirSync(cccCampaignProofAdmissionManifestDest, { recursive: true });
     cpSync(
       cccCampaignProofAdmissionManifestSrc,

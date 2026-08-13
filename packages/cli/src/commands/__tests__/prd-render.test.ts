@@ -9,6 +9,7 @@ import {
 const CLAIM_TOKEN = "claim-token-must-never-render";
 const CONTROLLER_TOKEN = "controller-token-must-never-render";
 const MERGE_DIGEST = "c".repeat(64);
+const EXECUTION_AUTHORIZATION_DIGEST = "8".repeat(64);
 const PAUSE_DIGEST = "1".repeat(64);
 const STOP_DIGEST = "2".repeat(64);
 
@@ -36,6 +37,16 @@ function mergeHoldStatus() {
         lastError: null,
         campaignId: "campaign-1",
         campaignDeadlineAt: "2026-07-31T02:00:00.000Z",
+        requestBudget: {
+          scope: "campaign-global",
+          maximum: 24,
+          used: 7,
+          remaining: 17,
+          providerTasks: 2,
+          deterministicMinimum: 2,
+          headroomAboveMinimum: 22,
+          completionAdequacy: "unproven",
+        },
       },
       tasks: [{
         ordinal: 1,
@@ -203,6 +214,60 @@ function mergeHoldStatus() {
   };
 }
 
+function sealedExecutionHoldStatus() {
+  const payload = mergeHoldStatus();
+  const authorizationId = `ccc-execution-authorization-${"9".repeat(64)}`;
+  const firstChildId = `ccc-approval-${"a".repeat(64)}`;
+  const secondChildId = `ccc-approval-${"b".repeat(64)}`;
+  return {
+    ...payload,
+    status: {
+      ...payload.status,
+      workItems: [{
+        ...payload.status.workItems[0],
+        state: "manual-required",
+        lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+        blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      }],
+      executionAuthorization: {
+        authorizationId,
+        status: "issued",
+        expiresAt: "2026-07-31T01:00:00.000Z",
+        expectedRequestCount: 0,
+        maxRequests: 24,
+        maxConcurrency: 1,
+        members: [
+          { ordinal: 0, semanticTaskId: "TASK-entry", approvalRequestId: firstChildId },
+          { ordinal: 1, semanticTaskId: "TASK-second", approvalRequestId: secondChildId },
+        ],
+      },
+      approvals: [
+        { id: firstChildId, status: "issued", taskId: "FN-entry", campaign: { expiresAt: "2026-07-31T01:00:00.000Z" } },
+        { id: secondChildId, status: "issued", taskId: "FN-second", campaign: { expiresAt: "2026-07-31T01:00:00.000Z" } },
+      ],
+      nextAction: {
+        kind: "approve-execution",
+        reason: "One sealed launch decision unlocks both exact child actions.",
+        executionAuthorizationId: authorizationId,
+        executionAuthorizationStatus: "issued",
+      },
+    },
+    mergeApprovalConfirmations: [],
+    liveExecutionAuthorizationConfirmation: {
+      authorizationId,
+      confirmation: EXECUTION_AUTHORIZATION_DIGEST,
+      expiresAt: "2026-07-31T01:00:00.000Z",
+      status: "issued",
+    },
+    // Even if a mixed-version caller supplies child confirmations, the sealed
+    // parent is the only human launch command.
+    liveExecutionApprovalConfirmations: [
+      { approvalRequestId: firstChildId, confirmation: "a".repeat(64), status: "issued" },
+      { approvalRequestId: secondChildId, confirmation: "b".repeat(64), status: "issued" },
+    ],
+  };
+}
+
 describe("operator --json flag parsing", () => {
   it("reports json mode and removes every --json token", () => {
     expect(parseOperatorJsonFlag(["status", "key-1", "--json"]))
@@ -277,12 +342,75 @@ describe("human product status rendering", () => {
     expect(text).toContain("ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED");
   });
 
+  it("RED-S5-RENDER-V2: renders phase and semantic envelope/evidence digests without a generic-result verdict", () => {
+    const payload = mergeHoldStatus();
+    const attempt = payload.status.proofs[0]!.attempts[0]! as Record<string, unknown>;
+    Object.assign(attempt, {
+      attemptContractVersion: "v2",
+      phase: "final_integrated",
+      verifierClosureSha256: "1".repeat(64),
+      candidateInputsSha256: "2".repeat(64),
+      executionToolchainSha256: "3".repeat(64),
+      terminalEnvelope: {
+        kind: "verified",
+        passed: true,
+      },
+      terminalEnvelopeSha256: "4".repeat(64),
+      proofEvidence: { passed: true },
+      proofEvidenceSha256: "5".repeat(64),
+      result: { success: false, exitCode: 17 },
+    });
+
+    const text = renderOperatorPayload(payload).join("\n");
+    expect(text).toContain("attempt contract: v2");
+    expect(text).toContain("proof phase: final_integrated");
+    expect(text).toContain(`terminal envelope digest: ${"4".repeat(64)}`);
+    expect(text).toContain(`semantic evidence digest: ${"5".repeat(64)}`);
+    expect(text).toContain("verified verdict: passed");
+    expect(text).toContain("semantic evidence: passed");
+    expect(text).not.toContain("result: failed, exit code 17");
+  });
+
   it("prints the ready-to-paste approve-merge command beside the merge digest", () => {
     const lines = renderOperatorPayload(mergeHoldStatus());
 
     expect(lines).toContainEqual(expect.stringContaining(
       `fn prd approve-merge ccc-product-operator-key approval-merge-1 --confirm ${MERGE_DIGEST}`,
     ));
+  });
+
+  it("prints exactly one sealed approve-execution command and no child commands", () => {
+    const payload = sealedExecutionHoldStatus();
+    const text = renderOperatorPayload(payload).join("\n");
+    const commands = text.match(/fn prd approve-execution[^\n]*/gu) ?? [];
+
+    expect(commands).toEqual([
+      `fn prd approve-execution ccc-product-operator-key ${payload.status.executionAuthorization.authorizationId} --confirm ${EXECUTION_AUTHORIZATION_DIGEST}`,
+    ]);
+    for (const member of payload.status.executionAuthorization.members) {
+      expect(commands[0]).not.toContain(member.approvalRequestId);
+      expect(text).toContain(member.approvalRequestId);
+    }
+    expect(text).toContain("Execution authorization");
+    expect(text).toContain("2 exact child actions");
+  });
+
+  it("prints no child execution command when sealed parent custody is missing", () => {
+    const payload = sealedExecutionHoldStatus();
+    payload.status.executionAuthorizationMode = "sealed_bundle_v1";
+    payload.status.executionAuthorization = null;
+    payload.status.nextAction = {
+      kind: "blocked",
+      reason: "The single sealed campaign authorization is missing.",
+    };
+    payload.liveExecutionAuthorizationConfirmation = null;
+    const text = renderOperatorPayload(payload).join("\n");
+
+    expect(text).toContain("single sealed campaign authorization is missing");
+    expect(text).not.toContain("fn prd approve-execution");
+    for (const confirmation of payload.liveExecutionApprovalConfirmations) {
+      expect(text).toContain(confirmation.approvalRequestId);
+    }
   });
 
   it("prints lifecycle commands only for allowed operator controls", () => {
@@ -308,6 +436,25 @@ describe("human product status rendering", () => {
     expect(text).toContain("provider-api");
     expect(text).toContain("1200");
     expect(text).toContain("340");
+  });
+
+  it("renders the campaign-global request budget as reservation-slot accounting without implying per-task quotas", () => {
+    const text = renderOperatorPayload(mergeHoldStatus()).join("\n");
+
+    expect(text).toContain("Request budget (campaign-global)");
+    expect(text).toContain("maximum reservation slots: 24");
+    expect(text).toContain("used reservation slots: 7");
+    expect(text).toContain("remaining reservation slots: 17");
+    expect(text).toContain("provider tasks: 2");
+    expect(text).toContain("static admission floor: 2");
+    expect(text).toContain("headroom above floor: 22");
+    expect(text).toContain("completion adequacy: unproven");
+    expect(text).toContain(
+      "Reservation-slot accounting: each first-time provider-attempt reservation spends one slot; exact idempotent replay is free, while proved-not-dispatched and unknown attempts remain spent.",
+    );
+    expect(text).toContain(
+      "Slots are campaign-global and are not reserved per task; earlier tasks may exhaust the cap.",
+    );
   });
 
   it("never renders a claim token or controller token", () => {
@@ -392,6 +539,16 @@ describe("human preview rendering", () => {
     proofs: [{ id: "PROOF-exact" }],
     requirements: [{ id: "REQ-1" }],
     admittedWriteRoots: ["src"],
+    requestBudget: {
+      scope: "campaign-global",
+      maximum: 7,
+      providerTasks: 2,
+      deterministicMinimum: 2,
+      headroomAboveMinimum: 5,
+      completionAdequacy: "unproven",
+      explanation:
+        "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+    },
     verifierConfinement: { ready: true, backend: "bwrap", message: "confinement ready" },
   };
 
@@ -412,6 +569,15 @@ describe("human preview rendering", () => {
       `fn prd import /tmp/packet /tmp/packet/manifest.json /tmp/packet/sidecar.json /tmp/packet/execution-plan.json /tmp/product-target ${"d".repeat(40)} ccc-prd-11111111-2222-3333-4444-555555555555 --confirm ${"f".repeat(64)}`,
     ));
     expect(lines.join("\n")).toContain("confinement ready");
+    expect(lines.join("\n")).toContain("Request budget (campaign-global)");
+    expect(lines.join("\n")).toContain("maximum reservation slots: 7");
+    expect(lines.join("\n")).toContain("provider tasks: 2");
+    expect(lines.join("\n")).toContain("static admission floor: 2");
+    expect(lines.join("\n")).toContain("headroom above floor: 5");
+    expect(lines.join("\n")).toContain("completion adequacy: unproven");
+    expect(lines.join("\n")).toContain(
+      "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+    );
     expect(jsonObjectLines(lines)).toEqual([]);
   });
 

@@ -322,6 +322,20 @@ export {
   type BootstrapCccCampaignProofAdmissionHostInput,
 } from "./ccc-campaign-proof-host.js";
 export {
+  admitAndMaterializeCccSemanticProof,
+  inspectCccSemanticProofExecutable,
+  verifyCccSemanticProofToolchainBeforeSpawn,
+  type CccSemanticProofMaterialization,
+  type CccSemanticProofMaterializationInput,
+} from "./ccc-campaign-proof-materialization.js";
+export {
+  buildCccSemanticProofDarwinProfile,
+  runCccSemanticProofSandboxedProcess,
+  type CccSemanticProofSandboxPolicyInput,
+  type CccSemanticProofSandboxedProcessResult,
+  type RunCccSemanticProofSandboxedProcessInput,
+} from "./ccc-campaign-proof-sandbox.js";
+export {
   createCccCampaignProofNodeAdmission,
   type CccCampaignProofNodeAdmission,
   type CccCampaignProofWorkflowStore,
@@ -399,6 +413,8 @@ export {
   requireCccCampaignMergeApproval,
   type ApproveCccCampaignLiveExecutionInput,
   type ApproveCccCampaignMergeInput,
+  type CccCampaignLiveExecutionApprovalStatus,
+  type CccCampaignLiveExecutionAuthorizationStatus,
   type IssueCccCampaignLiveExecutionApprovalInput,
   type IssueCccCampaignMergeApprovalInput,
 } from "./ccc-campaign-product-control.js";

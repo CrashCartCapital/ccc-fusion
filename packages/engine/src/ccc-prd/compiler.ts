@@ -3,21 +3,32 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, win32 } from "node:path";
 import {
   CCC_PRD_BUNDLE_SCHEMA_VERSION,
+  CCC_PRD_BUNDLE_V2_SCHEMA_VERSION,
   CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
+  CCC_PRD_PROOF_V2_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
+  CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
+  computeCccPrdSemanticBundleSha256,
   createCccPrdSpanFromBytes,
   createRefusalBundle,
   normalizeProtectedAction,
+  projectCccPrdSemanticBundleForHash,
   parseWorkflowIr,
   type CccPrdDiagnostic,
   type CccPrdProof,
+  type CccPrdProofV2,
   type CccPrdRefusalBundle,
   type CccPrdSemanticBundle,
+  type CccPrdSemanticBundleV1,
+  type CccPrdSemanticBundleV2,
   type CccPrdSidecar,
+  type CccPrdRequirementV2,
   type CccPrdSourceSpan,
   type CccPrdValidationResult,
   type WorkflowIr,
@@ -37,6 +48,7 @@ import {
 } from "./protected-action-ids.js";
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
 import { validateCccPrdImplementationFactProvenance } from "./authoring.js";
+import { assertCccPrdAcceptanceClauseCustody } from "./acceptance-clauses.js";
 
 export type CompileCccPrdInput = {
   rootDir: string;
@@ -151,6 +163,14 @@ const PROOF_ADMISSION_FIELDS = [
   "extensionManifestSha256",
   "definitionSha256",
 ] as const;
+const PROOF_ADMISSION_V2_FIELDS = [
+  ...PROOF_ADMISSION_FIELDS,
+  "verifierClosureSha256",
+  "candidateInputsSha256",
+  "executionToolchainSha256",
+] as const;
+const PROOF_PHASES = new Set(["task", "final_integrated"]);
+const VERIFIER_CLOSURE_ROLES = new Set(["task_runner", "harness", "fixture", "config"]);
 
 function validateExactKeys(
   label: string,
@@ -203,11 +223,172 @@ function validateConfidence(
   }
 }
 
+function validateProofCases(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+): boolean {
+  if (!Array.isArray(value) || value.length === 0) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be a non-empty array`));
+    return false;
+  }
+  const ids = new Set<string>();
+  let valid = true;
+  for (const [index, item] of value.entries()) {
+    if (!isPlainRecord(item)) {
+      diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label}[${index}] must be an object`));
+      valid = false;
+      continue;
+    }
+    validateExactKeys(`${label}[${index}]`, item, ["id", "description"], diagnostics);
+    if (!isNonEmptyString(item.id) || !isNonEmptyString(item.description) || ids.has(String(item.id))) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_PROOF_INVALID",
+        `${label}[${index}] needs a unique non-empty id and description`,
+      ));
+      valid = false;
+      continue;
+    }
+    ids.add(item.id);
+  }
+  return valid;
+}
+
+function validateExecutableIdentity(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+  proofHost: boolean,
+): boolean {
+  if (!isPlainRecord(value)) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be an object`));
+    return false;
+  }
+  validateExactKeys(
+    label,
+    value,
+    proofHost
+      ? ["id", "executablePath", "executableSha256", "version", "versionOutputSha256"]
+      : ["executablePath", "executableSha256", "version", "versionOutputSha256"],
+    diagnostics,
+  );
+  const valid = (!proofHost || isNonEmptyString(value.id))
+    && isNonEmptyString(value.executablePath)
+    && isAbsolute(value.executablePath)
+    && /^[0-9a-f]{64}$/u.test(String(value.executableSha256))
+    && isNonEmptyString(value.version)
+    && /^[0-9a-f]{64}$/u.test(String(value.versionOutputSha256));
+  if (!valid) diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} identity is malformed`));
+  return valid;
+}
+
+function validateV2ProofShape(
+  proof: Record<string, unknown>,
+  diagnostics: CccPrdDiagnostic[],
+): boolean {
+  const label = `proof ${String(proof.id)}`;
+  let valid = proof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION;
+  if (!valid) diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} has the wrong proof schema`));
+
+  if (!validateStringArray(`${label} clauseIds`, proof.clauseIds, diagnostics, { nonEmpty: true })) valid = false;
+  if (!validateStringArray(`${label} phases`, proof.phases, diagnostics, { nonEmpty: true })) {
+    valid = false;
+  } else if (proof.phases.some((phase) => !PROOF_PHASES.has(phase))) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} contains an unsupported proof phase`));
+    valid = false;
+  }
+  if (!validateProofCases(`${label} positiveCases`, proof.positiveCases, diagnostics)) valid = false;
+  if (!validateProofCases(`${label} negativeControls`, proof.negativeControls, diagnostics)) valid = false;
+
+  if (!Array.isArray(proof.verifierClosure) || proof.verifierClosure.length === 0) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} verifierClosure must be non-empty`));
+    valid = false;
+  } else {
+    const paths = new Set<string>();
+    for (const [index, entry] of proof.verifierClosure.entries()) {
+      const entryLabel = `${label} verifierClosure[${index}]`;
+      if (!isPlainRecord(entry)) {
+        diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${entryLabel} must be an object`));
+        valid = false;
+        continue;
+      }
+      validateExactKeys(
+        entryLabel,
+        entry,
+        ["role", "path", "baseGitBlobOid", "sha256"],
+        diagnostics,
+      );
+      if (
+        !VERIFIER_CLOSURE_ROLES.has(String(entry.role))
+        || !isCanonicalRootRelativeSource(entry.path)
+        || !/^[0-9a-f]{40,64}$/u.test(String(entry.baseGitBlobOid))
+        || !/^[0-9a-f]{64}$/u.test(String(entry.sha256))
+        || paths.has(String(entry.path))
+      ) {
+        diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${entryLabel} custody is malformed or duplicated`));
+        valid = false;
+      }
+      paths.add(String(entry.path));
+    }
+  }
+
+  if (!validateStringArray(`${label} candidateInputs`, proof.candidateInputs, diagnostics, { nonEmpty: true })) {
+    valid = false;
+  } else {
+    const closurePaths = new Set(
+      Array.isArray(proof.verifierClosure)
+        ? proof.verifierClosure
+          .filter(isPlainRecord)
+          .map((entry) => String(entry.path))
+        : [],
+    );
+    for (const path of proof.candidateInputs) {
+      if (!isCanonicalRootRelativeSource(path) || closurePaths.has(path)) {
+        diagnostics.push(diagnostic(
+          "CCC_PRD_PROOF_INVALID",
+          `${label} candidate input ${path} is non-canonical or overlaps verifier closure`,
+        ));
+        valid = false;
+      }
+    }
+  }
+
+  if (!isPlainRecord(proof.executionToolchain)) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} executionToolchain must be an object`));
+    return false;
+  }
+  validateExactKeys(
+    `${label} executionToolchain`,
+    proof.executionToolchain,
+    ["task", "node", "proofHost", "linkedRuntime"],
+    diagnostics,
+  );
+  if (!validateExecutableIdentity(`${label} Task identity`, proof.executionToolchain.task, diagnostics, false)) valid = false;
+  if (!validateExecutableIdentity(`${label} Node identity`, proof.executionToolchain.node, diagnostics, false)) valid = false;
+  if (!validateExecutableIdentity(`${label} proof-host identity`, proof.executionToolchain.proofHost, diagnostics, true)) valid = false;
+  if (!Array.isArray(proof.executionToolchain.linkedRuntime)) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_INVALID",
+      `${label} executionToolchain linkedRuntime must be an array manifest`,
+    ));
+    valid = false;
+  }
+  return valid;
+}
+
 function validateProofAdmission(
   proof: Record<string, unknown>,
   diagnostics: CccPrdDiagnostic[],
 ): void {
-  if (proof.admission === undefined) return;
+  if (proof.admission === undefined) {
+    if (proof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_PROOF_ADMISSION_MISSING",
+        `proof ${String(proof.id)} has no v2 admission custody`,
+      ));
+    }
+    return;
+  }
   const label = `proof ${String(proof.id)} admission`;
   if (!isPlainRecord(proof.admission)) {
     diagnostics.push(diagnostic(
@@ -217,9 +398,17 @@ function validateProofAdmission(
     return;
   }
   const admission = proof.admission;
-  validateExactKeys(label, admission, PROOF_ADMISSION_FIELDS, diagnostics);
+  const semanticV2 = proof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION;
+  validateExactKeys(
+    label,
+    admission,
+    semanticV2 ? PROOF_ADMISSION_V2_FIELDS : PROOF_ADMISSION_FIELDS,
+    diagnostics,
+  );
   if (
-    admission.schema !== CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION
+    admission.schema !== (semanticV2
+      ? CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION
+      : CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION)
     || !isNonEmptyString(admission.pluginId)
     || !isNonEmptyString(admission.pluginVersion)
     || !isNonEmptyString(admission.extensionId)
@@ -228,6 +417,11 @@ function validateProofAdmission(
     || !/^[0-9a-f]{64}$/u.test(String(admission.extensionSourceSha256))
     || !/^[0-9a-f]{64}$/u.test(String(admission.extensionManifestSha256))
     || !/^[0-9a-f]{64}$/u.test(String(admission.definitionSha256))
+    || (semanticV2 && (
+      !/^[0-9a-f]{64}$/u.test(String(admission.verifierClosureSha256))
+      || !/^[0-9a-f]{64}$/u.test(String(admission.candidateInputsSha256))
+      || !/^[0-9a-f]{64}$/u.test(String(admission.executionToolchainSha256))
+    ))
   ) {
     diagnostics.push(diagnostic(
       "CCC_PRD_PROOF_ADMISSION_INVALID",
@@ -253,6 +447,19 @@ function validateProofAdmission(
       `${label} definition hash does not match the current proof`,
     ));
   }
+  if (semanticV2) {
+    const expected = computeCccPrdProofV2AdmissionDigests(proof as unknown as CccPrdProofV2);
+    if (
+      admission.verifierClosureSha256 !== expected.verifierClosureSha256
+      || admission.candidateInputsSha256 !== expected.candidateInputsSha256
+      || admission.executionToolchainSha256 !== expected.executionToolchainSha256
+    ) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_PROOF_ADMISSION_STALE",
+        `${label} verifier closure, candidate inputs, or execution toolchain digest is stale`,
+      ));
+    }
+  }
 }
 
 function stableDiagnostics(values: CccPrdDiagnostic[]): CccPrdDiagnostic[] {
@@ -269,10 +476,13 @@ function validateTopLevelShape(value: unknown, diagnostics: CccPrdDiagnostic[]):
     diagnostics.push(diagnostic("CCC_PRD_SIDECAR_INVALID", "sidecar must be a JSON object"));
     return false;
   }
-  if (value.schema !== CCC_PRD_SIDECAR_SCHEMA_VERSION) {
+  if (
+    value.schema !== CCC_PRD_SIDECAR_SCHEMA_VERSION
+    && value.schema !== CCC_PRD_SIDECAR_V2_SCHEMA_VERSION
+  ) {
     diagnostics.push(diagnostic(
       "CCC_PRD_UNKNOWN_SIDECAR_SCHEMA",
-      `sidecar schema must be ${CCC_PRD_SIDECAR_SCHEMA_VERSION}`,
+      `sidecar schema must be ${CCC_PRD_SIDECAR_SCHEMA_VERSION} or ${CCC_PRD_SIDECAR_V2_SCHEMA_VERSION}`,
     ));
   }
   for (const field of Object.keys(value)) {
@@ -1145,10 +1355,13 @@ function validateSidecar(
   }
 
   for (const requirement of collections.requirements.values()) {
+    const semanticV2 = sidecar.schema === CCC_PRD_SIDECAR_V2_SCHEMA_VERSION;
     validateExactKeys(
       `requirement ${String(requirement.id)}`,
       requirement,
-      ["id", "statement", "acceptance", "accountableProducer", "dependencies", "proofIds", "spans", "confidence"],
+      semanticV2
+        ? ["id", "statement", "acceptance", "accountableProducer", "dependencies", "proofIds", "spans", "confidence", "acceptanceClauses", "acceptanceDispositions"]
+        : ["id", "statement", "acceptance", "accountableProducer", "dependencies", "proofIds", "spans", "confidence"],
       diagnostics,
     );
     if (
@@ -1171,6 +1384,13 @@ function validateSidecar(
       collections.proofs,
       diagnostics,
     );
+    if (semanticV2 && (!Array.isArray(requirement.acceptanceClauses)
+      || !Array.isArray(requirement.acceptanceDispositions))) {
+      diagnostics.push(diagnostic(
+        "CCC_PRD_ACCEPTANCE_CLAUSE_MANIFEST_INVALID",
+        `requirement ${String(requirement.id)} must carry acceptance-clause and disposition inventories`,
+      ));
+    }
   }
   const requirementCycle = detectDependencyCycle(collections.requirements, "dependencies");
   if (requirementCycle) {
@@ -1178,10 +1398,27 @@ function validateSidecar(
   }
 
   for (const proof of collections.proofs.values()) {
+    const semanticV2 = sidecar.schema === CCC_PRD_SIDECAR_V2_SCHEMA_VERSION;
     validateExactKeys(
       `proof ${String(proof.id)}`,
       proof,
-      [
+      semanticV2 ? [
+        "schema",
+        "id",
+        "requirementIds",
+        "clauseIds",
+        "phases",
+        "command",
+        "positiveOracle",
+        "positiveCases",
+        "negativeControls",
+        "verifierClosure",
+        "candidateInputs",
+        "executionToolchain",
+        "spans",
+        "confidence",
+        "admission",
+      ] : [
         "id",
         "requirementIds",
         "command",
@@ -1194,17 +1431,58 @@ function validateSidecar(
       diagnostics,
     );
     requireReferences(`proof ${String(proof.id)}`, proof.requirementIds, collections.requirements, diagnostics);
+    const v2ShapeValid = !semanticV2 || validateV2ProofShape(proof, diagnostics);
     if (
-      !isNonEmptyString(proof.command)
+      !v2ShapeValid
+      || !isNonEmptyString(proof.command)
       || !isNonEmptyString(proof.positiveOracle)
       || !Array.isArray(proof.negativeControls)
       || proof.negativeControls.length === 0
-      || proof.negativeControls.some((control) => !isNonEmptyString(control))
+      || proof.negativeControls.some((control) => semanticV2
+        ? !isPlainRecord(control) || !isNonEmptyString(control.id) || !isNonEmptyString(control.description)
+        : !isNonEmptyString(control))
     ) {
       diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `proof ${String(proof.id)} is incomplete`));
     }
     validateConfidence(`proof ${String(proof.id)}`, proof.confidence, diagnostics);
     validateProofAdmission(proof, diagnostics);
+  }
+
+  if (sidecar.schema === CCC_PRD_SIDECAR_V2_SCHEMA_VERSION) {
+    try {
+      assertCccPrdAcceptanceClauseCustody({
+        sourceBytes: custody.sourceBytes,
+        requirements: (sidecar.requirements as CccPrdRequirementV2[]).map((requirement) => ({
+          requirementId: requirement.id,
+          acceptanceClauses: requirement.acceptanceClauses,
+          acceptanceDispositions: requirement.acceptanceDispositions,
+        })),
+        proofs: sidecar.proofs as CccPrdProofV2[],
+      });
+      for (const requirement of sidecar.requirements as CccPrdRequirementV2[]) {
+        for (const clause of requirement.acceptanceClauses) {
+          const coversFinalIntegrated = (sidecar.proofs as CccPrdProofV2[]).some((proof) => (
+            proof.clauseIds.includes(clause.id) && proof.phases.includes("final_integrated")
+          ));
+          if (!coversFinalIntegrated) {
+            diagnostics.push(diagnostic(
+              "CCC_PRD_ACCEPTANCE_CLAUSE_UNDISPOSITIONED",
+              `accepted clause ${clause.id} has no final_integrated proof coverage`,
+              clause.span,
+            ));
+          }
+        }
+      }
+    } catch (error) {
+      if (error instanceof CccPrdCustodyError) {
+        diagnostics.push(diagnostic(error.code, error.message));
+      } else {
+        diagnostics.push(diagnostic(
+          "CCC_PRD_ACCEPTANCE_CLAUSE_MANIFEST_INVALID",
+          "v2 acceptance-clause or proof inventory is malformed",
+        ));
+      }
+    }
   }
 
   for (const task of collections.tasks.values()) {
@@ -1594,6 +1872,41 @@ export function compileCccPrdPacket(input: CompileCccPrdInput): CccPrdSemanticBu
     return { kind: "refusal", diagnostics: checked.diagnostics };
   }
   const sidecar = checked.sidecar;
+  if (sidecar.schema === CCC_PRD_SIDECAR_V2_SCHEMA_VERSION) {
+    const bundleWithoutHash = {
+      kind: "bundle" as const,
+      schema: CCC_PRD_BUNDLE_V2_SCHEMA_VERSION,
+      sourceHash: sidecar.provenance.packetHash,
+      sidecarHash: checked.sidecarHash,
+      sourceVersion: sidecar.sourceVersion,
+      orderedSources: sidecar.orderedSources,
+      provenance: sidecar.provenance,
+      authorityRoles: sortCccPrdById(sidecar.authorityRoles),
+      requirements: sortCccPrdById(sidecar.requirements),
+      proofs: sortCccPrdById(sidecar.proofs),
+      tasks: sortCccPrdById(sidecar.tasks),
+      edges: sortCccPrdById(sidecar.edges),
+      workflows: sortCccPrdById(sidecar.workflows),
+      documents: sortCccPrdById(sidecar.documents),
+      artifacts: sortCccPrdById(sidecar.artifacts),
+      importIntents: sortCccPrdById(sidecar.importIntents),
+      protectedActions: sortCccPrdById(sidecar.protectedActions),
+      bounds: sidecar.bounds,
+      admittedWriteRoots: sidecar.admittedWriteRoots,
+      targetRepository: sidecar.targetRepository,
+      nonGoals: sidecar.nonGoals,
+      ...(sidecar.materialCoverage ? { materialCoverage: sidecar.materialCoverage } : {}),
+      ...(sidecar.implementationFactProvenance ? { implementationFactProvenance: sidecar.implementationFactProvenance } : {}),
+      confidence: sidecar.confidence,
+    };
+    const canonicalBundle = projectCccPrdSemanticBundleForHash(
+      bundleWithoutHash,
+    ) as Omit<CccPrdSemanticBundleV2, "bundleHash">;
+    return {
+      ...canonicalBundle,
+      bundleHash: computeCccPrdSemanticBundleSha256(canonicalBundle),
+    } satisfies CccPrdSemanticBundleV2;
+  }
   const bundleWithoutHash = {
     kind: "bundle" as const,
     schema: CCC_PRD_BUNDLE_SCHEMA_VERSION,
@@ -1623,7 +1936,7 @@ export function compileCccPrdPacket(input: CompileCccPrdInput): CccPrdSemanticBu
   return {
     ...bundleWithoutHash,
     bundleHash: sha256(canonicalCccPrdJson(bundleWithoutHash)),
-  };
+  } satisfies CccPrdSemanticBundleV1;
 }
 
 export function validateNeoCandidate(candidate: unknown): {

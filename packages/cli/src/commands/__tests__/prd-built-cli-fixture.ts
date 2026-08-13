@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,14 @@ import { fileURLToPath } from "node:url";
 export const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../../../../..");
 const cliEntry = join(repoRoot, "packages/cli/bin.mjs");
 const roots: string[] = [];
+
+function expectGit(root: string, args: string[]): string {
+  const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `git ${args.join(" ")} failed`);
+  }
+  return result.stdout;
+}
 
 export function cleanupPacketRoots() {
   while (roots.length > 0) {
@@ -44,11 +52,57 @@ export function runFnAsync(
   });
 }
 
-export function createPacketRoot() {
+export function createPacketRoot(options: { semanticV2?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "ccc-prd-built-cli-"));
   roots.push(root);
-  const target = "fixture/repo";
-  const base = "a".repeat(40);
+  const target = options.semanticV2 ? join(root, "target") : "fixture/repo";
+  let base = "a".repeat(40);
+  let semanticProofToolchainPaths: {
+    taskExecutablePath: string;
+    nodeExecutablePath: string;
+    proofHost: {
+      id: "fusion-cli-semantic-proof-host.v1";
+      executablePath: string;
+    };
+  } | undefined;
+  if (options.semanticV2) {
+    const harness = "verify/fixture.mjs";
+    const candidate = "src/task-1/change.js";
+    mkdirSync(join(target, "verify"), { recursive: true });
+    writeFileSync(join(target, "Taskfile.yml"), [
+      "version: '3'",
+      "tasks:",
+      "  verify:fixture:",
+      "    cmds:",
+      `      - node ${harness} ${candidate}`,
+      "",
+    ].join("\n"));
+    writeFileSync(join(target, harness), "console.log(process.argv.slice(2).join(','));\n");
+    expectGit(target, ["init", "-b", "main"]);
+    expectGit(target, ["add", "Taskfile.yml", harness]);
+    expectGit(target, [
+      "-c", "user.name=Fusion CLI Test",
+      "-c", "user.email=fusion-cli-test@example.invalid",
+      "commit", "-m", "proof baseline",
+    ]);
+    base = expectGit(target, ["rev-parse", "HEAD"]).trim();
+    const controllerRoot = join(root, "controller");
+    mkdirSync(controllerRoot);
+    const taskExecutablePath = join(controllerRoot, "task-fixture");
+    const proofHostPath = join(controllerRoot, "proof-host.mjs");
+    writeFileSync(taskExecutablePath, "#!/bin/sh\nprintf 'Task fixture 1.0.0\\n'\n");
+    writeFileSync(proofHostPath, "console.log('Fusion CLI proof host fixture 1.0.0');\n");
+    chmodSync(taskExecutablePath, 0o755);
+    chmodSync(proofHostPath, 0o755);
+    semanticProofToolchainPaths = {
+      taskExecutablePath,
+      nodeExecutablePath: process.execPath,
+      proofHost: {
+        id: "fusion-cli-semantic-proof-host.v1",
+        executablePath: proofHostPath,
+      },
+    };
+  }
   const declarations = {
     schema: "ccc-prd.declarations.v1",
     authority: { source: "prd", producer: "fixture" },
@@ -94,16 +148,34 @@ export function createPacketRoot() {
     "Admitted write purpose: fixture projection",
     "Non-goal: live provider call",
   ].join("\n");
+  const acceptanceClauseText = "The generated sidecar is traceable to the exact frozen packet.";
+  const acceptanceClauseEvidence = [
+    "#### Acceptance clauses",
+    `- [AC-CF-CLI-001-001] ${acceptanceClauseText}`,
+  ].join("\n");
   const requirementEvidence = [
-    "## Reviewed requirement: CF-CLI-001",
+    options.semanticV2
+      ? "### Requirement CF-CLI-001"
+      : "## Reviewed requirement: CF-CLI-001",
     "Requirement statement: Generate a traceable sidecar.",
     "Acceptance behavior: Sidecar has source spans and proof IDs.",
+    ...(options.semanticV2 ? ["", acceptanceClauseEvidence] : []),
   ].join("\n");
   const proofEvidence = [
     "## Reviewed proof: PF-CLI-001",
-    "Verifier command: pnpm test",
+    options.semanticV2
+      ? "Proof authority: the verifier command task verify:fixture"
+      : "Verifier command: pnpm test",
     "Positive oracle: exit 0",
     "Negative control: missing sidecar refuses",
+  ].join("\n");
+  const semanticProofEvidence = [
+    "## Semantic proof custody",
+    "Positive case POS-CLI-001: the admitted candidate passes",
+    "Negative control NEG-CLI-001: a missing candidate fails",
+    "Verifier closure task runner: Taskfile.yml",
+    "Verifier closure harness: verify/fixture.mjs",
+    "Candidate input: src/task-1/change.js",
   ].join("\n");
   const protectedActionEvidence = [
     "## Reviewed protected action: ACTION-CLI-001",
@@ -118,7 +190,10 @@ export function createPacketRoot() {
     "```",
   ].join("\n");
   const source = [
-    "# Dense PRD Packet", "", functionalRequirements, "", executionContract, "", requirementEvidence, "", proofEvidence, "", protectedActionEvidence, "", declarationEvidence, "",
+    "# Dense PRD Packet", "", functionalRequirements, "", executionContract, "", requirementEvidence,
+    "", proofEvidence,
+    ...(options.semanticV2 ? ["", semanticProofEvidence] : []),
+    "", protectedActionEvidence, "", declarationEvidence, "",
   ].join("\n");
   writeFileSync(join(root, "packet.md"), source);
   writeFileSync(join(root, "manifest.json"), JSON.stringify({ schema: "ccc-prd.packet.v1", source_version: "test", entries: [{ relative_path: "packet.md", role: "root", authoritative: true, sha256: createHash("sha256").update(source).digest("hex") }] }, null, 2));
@@ -126,25 +201,81 @@ export function createPacketRoot() {
   const executionSourceRef = { path: "packet.md", exactQuote: executionContract };
   const requirementSourceRef = { path: "packet.md", exactQuote: requirementEvidence };
   const proofSourceRef = { path: "packet.md", exactQuote: proofEvidence };
+  const acceptanceClauseSourceRef = { path: "packet.md", exactQuote: acceptanceClauseText };
+  const semanticProofSourceRef = { path: "packet.md", exactQuote: semanticProofEvidence };
   const protectedActionSourceRef = { path: "packet.md", exactQuote: protectedActionEvidence };
   const declarationSourceRef = { path: "packet.md", exactQuote: declarationEvidence };
   const sourceRefs = [functionalRequirementsSourceRef, executionSourceRef, requirementSourceRef];
-  const proofSourceRefs = [executionSourceRef, proofSourceRef];
+  const proofSourceRefs = [
+    executionSourceRef,
+    proofSourceRef,
+    ...(options.semanticV2 ? [semanticProofSourceRef] : []),
+  ];
   const protectedActionSourceRefs = [executionSourceRef, protectedActionSourceRef];
   const taskSourceRefs = [
     functionalRequirementsSourceRef,
     executionSourceRef,
     requirementSourceRef,
+    ...(options.semanticV2 ? [{ path: "packet.md", exactQuote: acceptanceClauseEvidence }] : []),
     proofSourceRef,
+    ...(options.semanticV2 ? [semanticProofSourceRef] : []),
     protectedActionSourceRef,
     declarationSourceRef,
   ];
   const proposal = join(root, "authoring-response.fixture.json");
   writeFileSync(proposal, JSON.stringify({
-    schema: "ccc-prd.authoring-proposal.v1",
+    schema: options.semanticV2
+      ? "ccc-prd.authoring-proposal.v2"
+      : "ccc-prd.authoring-proposal.v1",
     authorityRoles: [{ id: "AUTHORITY-1", role: "root", sourcePaths: ["packet.md"], accountableProducer: "fixture" }],
-    requirements: [{ id: "CF-CLI-001", statement: "Generate a traceable sidecar.", acceptance: "Sidecar has source spans and proof IDs.", accountableProducer: "fixture", dependencies: [], proofIds: ["PF-CLI-001"], sourceRefs, confidence: "high" }],
-    proofs: [{ id: "PF-CLI-001", requirementIds: ["CF-CLI-001"], command: "pnpm test", positiveOracle: "exit 0", negativeControls: ["missing sidecar refuses"], sourceRefs: proofSourceRefs, confidence: "high" }],
+    requirements: [{
+      id: "CF-CLI-001",
+      statement: "Generate a traceable sidecar.",
+      acceptance: "Sidecar has source spans and proof IDs.",
+      accountableProducer: "fixture",
+      dependencies: [],
+      proofIds: ["PF-CLI-001"],
+      ...(options.semanticV2 ? {
+        acceptanceClauses: [{
+          id: "AC-CF-CLI-001-001",
+          requirementId: "CF-CLI-001",
+          text: acceptanceClauseText,
+          proofIds: ["PF-CLI-001"],
+          sourceRefs: [acceptanceClauseSourceRef],
+        }],
+        acceptanceDispositions: [],
+      } : {}),
+      sourceRefs: options.semanticV2
+        ? [...sourceRefs, { path: "packet.md", exactQuote: acceptanceClauseEvidence }]
+        : sourceRefs,
+      confidence: "high",
+    }],
+    proofs: [{
+      id: "PF-CLI-001",
+      requirementIds: ["CF-CLI-001"],
+      command: options.semanticV2 ? "task verify:fixture" : "pnpm test",
+      positiveOracle: "exit 0",
+      ...(options.semanticV2 ? {
+        schema: "ccc-prd.proof.v2",
+        clauseIds: ["AC-CF-CLI-001-001"],
+        phases: ["task", "final_integrated"],
+        positiveCases: [{ id: "POS-CLI-001", description: "the admitted candidate passes" }],
+        negativeControls: [{ id: "NEG-CLI-001", description: "a missing candidate fails" }],
+        verifierClosure: [
+          { role: "task_runner", path: "Taskfile.yml", baseGitBlobOid: "0".repeat(40), sha256: "0".repeat(64) },
+          { role: "harness", path: "verify/fixture.mjs", baseGitBlobOid: "0".repeat(40), sha256: "0".repeat(64) },
+        ],
+        candidateInputs: ["src/task-1/change.js"],
+        executionToolchain: {
+          task: { executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+          node: { executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+          proofHost: { id: "", executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+          linkedRuntime: [],
+        },
+      } : { negativeControls: ["missing sidecar refuses"] }),
+      sourceRefs: proofSourceRefs,
+      confidence: "high",
+    }],
     tasks: [
       { id: "TASK-CLI-001", title: "Author sidecar", description: "Generate the candidate sidecar.", accountableProducer: "fixture", requirementIds: ["CF-CLI-001"], dependencyTaskIds: [], proofIds: ["PF-CLI-001"], workflowId: "WORKFLOW-CLI-001", documentIds: ["DOCUMENT-CLI-001"], artifactIds: [], protectedActionIds: [], ownedPaths: ["src/task-1"], allowedWriteRoots: ["src/task-1"], sourceRefs: taskSourceRefs },
     ],
@@ -158,5 +289,13 @@ export function createPacketRoot() {
     protectedActions: [{ id: "ACTION-CLI-001", kind: "live_execution", target: "fixture/repo:provider-canary", sourceRefs: protectedActionSourceRefs }],
     bounds: { maxRequests: 1, maxDurationMs: 30_000, maxConcurrency: 1 }, admittedWriteRoots: [{ path: `${target}/src/task-1`, purpose: "fixture projection" }], targetRepository: { path: target, baseCommit: base }, nonGoals: ["live provider call"], unresolvedDecisions: [], ambiguities: [], exceptions: [], confidence: "high",
   }, null, 2));
-  return { root, manifest: join(root, "manifest.json"), proposal, sidecar: join(root, "candidate.sidecar.json"), target, base };
+  return {
+    root,
+    manifest: join(root, "manifest.json"),
+    proposal,
+    sidecar: join(root, "candidate.sidecar.json"),
+    target,
+    base,
+    semanticProofToolchainPaths,
+  };
 }

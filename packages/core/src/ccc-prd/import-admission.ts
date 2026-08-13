@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { canonicalCccPrdJson } from "./contract.js";
+import { computeCccPrdSemanticBundleSha256 } from "./contract.js";
 import { CccPrdImportError } from "./import-error.js";
 import type {
   CccPrdImportEntityType,
@@ -33,10 +32,7 @@ function isContainedPath(parent: string, child: string): boolean {
 }
 
 function bundleIdentity(bundle: CccPrdSemanticBundle): string {
-  const { bundleHash: _declared, ...withoutHash } = bundle;
-  return createHash("sha256")
-    .update(canonicalCccPrdJson(withoutHash))
-    .digest("hex");
+  return computeCccPrdSemanticBundleSha256(bundle);
 }
 
 function assertSafeEntityId(id: string, label: string): void {
@@ -59,10 +55,16 @@ export function assertCccPrdImportBundle(
       "CCC PRD import idempotencyKey must contain 1-256 characters",
     );
   }
-  if (bundle.kind !== "bundle" || bundle.schema !== "ccc-prd.bundle.v1") {
+  if (
+    bundle.kind !== "bundle"
+    || (
+      bundle.schema !== "ccc-prd.bundle.v1"
+      && bundle.schema !== "ccc-prd.bundle.v2"
+    )
+  ) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_INVALID_BUNDLE",
-      "CCC PRD import requires a v1 semantic bundle",
+      "CCC PRD import requires a supported v1 or v2 semantic bundle",
     );
   }
   const identityHash = bundleIdentity(bundle);

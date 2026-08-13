@@ -44,7 +44,12 @@ describe("prd built CLI user contract", () => {
     expect(result.stdout).toContain("fn prd stop <idempotency-key> --reason <reason> --confirm <status-digest>");
     expect(result.stdout).toContain("fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path>");
     expect(result.stdout).toContain("fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed>");
-    expect(result.stdout).toContain("fn prd approve-execution <idempotency-key>");
+    expect(result.stdout).toContain(
+      "fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id>",
+    );
+    expect(result.stdout).toContain(
+      "Claim the single sealed campaign authorization, or an exact legacy per-task approval",
+    );
     expect(result.stdout).toContain("fn prd approve-merge <idempotency-key>");
   });
 
@@ -167,7 +172,7 @@ version: 2.0.0
     expect(template.status, `${template.stdout}\n${template.stderr}`).toBe(0);
     expect(JSON.parse(template.stdout)).toMatchObject({
       kind: "prd-intake-template",
-      schema: "ccc-prd.intake-contract.v1",
+      schema: "ccc-prd.intake-contract.v2",
     });
 
     const packet = createPacketRoot();
@@ -177,7 +182,7 @@ version: 2.0.0
     const lint = runFn(["prd", "lint", prdPath]);
     expect(lint.status, `${lint.stdout}\n${lint.stderr}`).toBe(1);
     expect(JSON.parse(lint.stdout)).toMatchObject({
-      schema: "ccc-prd.intake-contract.v1",
+      schema: "ccc-prd.intake-contract.v2",
       optionalContract: true,
       readyForIntake: false,
       blockingQuestions: expect.arrayContaining([
@@ -257,7 +262,7 @@ version: 2.0.0
   });
 
   it("preserves a product refusal exit code after embedded PostgreSQL cleanup", async () => {
-    const packet = createPacketRoot();
+    const packet = createPacketRoot({ semanticV2: true });
     const home = join(packet.root, "home");
     const policy = join(packet.root, "execution-plan.json");
     mkdirSync(home);

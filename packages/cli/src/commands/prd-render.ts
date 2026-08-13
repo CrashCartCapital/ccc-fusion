@@ -347,13 +347,20 @@ function statusBody(
   }
   field(lines, 1, "campaign deadline", importRecord.campaignDeadlineAt);
   field(lines, 1, "last error", importRecord.lastError);
+  requestBudgetLines(lines, asRecord(importRecord.requestBudget));
 
   nextActionLines(lines, asRecord(status.nextAction));
   taskLines(lines, asList(status.tasks));
   workItemLines(lines, asList(status.workItems));
   proofLines(lines, asList(status.proofs), asList(status.orphanProofAttempts));
   providerAttemptLines(lines, asList(status.providerAttempts));
-  approvalLines(lines, status, payload, idempotencyKey);
+  const sealedAuthorizationPresent = executionAuthorizationLines(
+    lines,
+    status,
+    payload,
+    idempotencyKey,
+  ) || status.executionAuthorizationMode === "sealed_bundle_v1";
+  approvalLines(lines, status, payload, idempotencyKey, sealedAuthorizationPresent);
   landingLines(lines, asRecord(status.landing));
   operatorControlLines(lines, asList(payload.operatorControls), idempotencyKey);
 }
@@ -367,6 +374,8 @@ function nextActionLines(
   // The status layer already wrote these as operator prose; transcribe them
   // rather than re-summarizing, so the words the operator acts on are exact.
   prose(lines, 1, "Reason", nextAction.reason);
+  field(lines, 1, "Execution authorization", nextAction.executionAuthorizationId);
+  field(lines, 1, "Execution authorization status", nextAction.executionAuthorizationStatus);
   field(lines, 1, "Approval request", nextAction.approvalRequestId);
   field(lines, 1, "Approval status", nextAction.approvalStatus);
   prose(lines, 1, "Diagnostic", nextAction.diagnostic);
@@ -466,6 +475,36 @@ function proofAttemptLines(
     const attemptKey = asScalar(attempt.attemptKey) ?? "(unidentified attempt)";
     const state = asScalar(attempt.state) ?? "unknown state";
     lines.push(`${pad(depth)}${attemptKey} - state ${state}`);
+    const contractVersion = asScalar(attempt.attemptContractVersion);
+    field(lines, depth + 1, "attempt contract", contractVersion);
+    field(lines, depth + 1, "proof phase", attempt.phase);
+    field(lines, depth + 1, "verifier closure digest", attempt.verifierClosureSha256);
+    field(lines, depth + 1, "candidate inputs digest", attempt.candidateInputsSha256);
+    field(lines, depth + 1, "execution toolchain digest", attempt.executionToolchainSha256);
+    if (contractVersion === "v2") {
+      const envelope = asRecord(attempt.terminalEnvelope);
+      if (envelope) {
+        const kind = asScalar(envelope.kind) ?? "unknown";
+        lines.push(`${pad(depth + 1)}terminal envelope: ${kind}`);
+        if (kind === "verified") {
+          lines.push(
+            `${pad(depth + 2)}verified verdict: ${envelope.passed === true ? "passed" : "failed"}`,
+          );
+        } else {
+          field(lines, depth + 2, "refusal code", envelope.code);
+        }
+      }
+      const evidence = asRecord(attempt.proofEvidence);
+      if (evidence) {
+        lines.push(
+          `${pad(depth + 1)}semantic evidence: ${evidence.passed === true ? "passed" : "failed"}`,
+        );
+      }
+      field(lines, depth + 1, "terminal envelope digest", attempt.terminalEnvelopeSha256);
+      field(lines, depth + 1, "semantic evidence digest", attempt.proofEvidenceSha256);
+      field(lines, depth + 1, "settled at", attempt.settledAt);
+      continue;
+    }
     const result = asRecord(attempt.result);
     if (result) {
       const verdict = result.success === true ? "passed" : "failed";
@@ -586,16 +625,64 @@ function confirmationFor(
   return null;
 }
 
+function executionAuthorizationLines(
+  lines: string[],
+  status: Record<string, unknown>,
+  payload: Record<string, unknown>,
+  idempotencyKey: string,
+): boolean {
+  const authorization = asRecord(status.executionAuthorization);
+  if (!authorization) return false;
+
+  const authorizationId = asScalar(authorization.authorizationId)
+    ?? "(unidentified execution authorization)";
+  const authorizationStatus = asScalar(authorization.status) ?? "unknown status";
+  const members = asList(authorization.members);
+  lines.push("Execution authorization");
+  lines.push(`${pad(1)}${authorizationId} - ${authorizationStatus}`);
+  field(lines, 2, "expires", authorization.expiresAt);
+  field(lines, 2, "expected request count", authorization.expectedRequestCount);
+  field(lines, 2, "maximum requests", authorization.maxRequests);
+  field(lines, 2, "maximum concurrency", authorization.maxConcurrency);
+  lines.push(
+    `${pad(2)}${members.length} exact child action${members.length === 1 ? "" : "s"}`,
+  );
+
+  const confirmation = asRecord(payload.liveExecutionAuthorizationConfirmation);
+  const digest = asScalar(confirmation?.confirmation);
+  if (
+    authorizationId === "(unidentified execution authorization)"
+    || !confirmation
+    || asScalar(confirmation.authorizationId) !== authorizationId
+    || asScalar(confirmation.status) !== authorizationStatus
+    || (authorizationStatus !== "issued" && authorizationStatus !== "claimed")
+    || digest === null
+    || !CONFIRMATION_DIGEST.test(digest)
+  ) {
+    return true;
+  }
+  lines.push(`${pad(2)}approve all exact live actions with:`);
+  command(
+    lines,
+    3,
+    `fn prd approve-execution ${shellArgument(idempotencyKey)} ${shellArgument(authorizationId)} --confirm ${digest}`,
+  );
+  return true;
+}
+
 function approvalLines(
   lines: string[],
   status: Record<string, unknown>,
   payload: Record<string, unknown>,
   idempotencyKey: string,
+  sealedAuthorizationPresent: boolean,
 ): void {
   const approvals = asList(status.approvals);
   if (approvals.length === 0) return;
   const mergeConfirmations = asList(payload.mergeApprovalConfirmations);
-  const executionConfirmations = asList(payload.liveExecutionApprovalConfirmations);
+  const executionConfirmations = sealedAuthorizationPresent
+    ? []
+    : asList(payload.liveExecutionApprovalConfirmations);
   lines.push(`Approvals (${approvals.length})`);
   for (const entry of approvals) {
     const approval = asRecord(entry);
@@ -717,6 +804,29 @@ function verifierConfinementLines(
   prose(lines, 1, "Next safe action", confinement.nextSafeAction);
 }
 
+function requestBudgetLines(
+  lines: string[],
+  budget: Record<string, unknown> | null,
+): void {
+  if (!budget) return;
+  const scope = asScalar(budget.scope);
+  lines.push(`Request budget${scope === null ? "" : ` (${scope})`}`);
+  field(lines, 1, "maximum reservation slots", budget.maximum);
+  field(lines, 1, "used reservation slots", budget.used);
+  field(lines, 1, "remaining reservation slots", budget.remaining);
+  field(lines, 1, "provider tasks", budget.providerTasks);
+  field(lines, 1, "static admission floor", budget.deterministicMinimum);
+  field(lines, 1, "headroom above floor", budget.headroomAboveMinimum);
+  field(lines, 1, "completion adequacy", budget.completionAdequacy);
+  lines.push(
+    `${pad(1)}Reservation-slot accounting: each first-time provider-attempt reservation spends one slot; exact idempotent replay is free, while proved-not-dispatched and unknown attempts remain spent.`,
+  );
+  lines.push(
+    `${pad(1)}Slots are campaign-global and are not reserved per task; earlier tasks may exhaust the cap.`,
+  );
+  prose(lines, 1, "Meaning", budget.explanation);
+}
+
 function refusalLines(payload: Record<string, unknown>): string[] {
   const lines: string[] = ["Refused. Fusion did not complete this operation."];
   diagnosticLines(lines, asList(payload.diagnostics));
@@ -755,6 +865,7 @@ function previewLines(
   );
   bulletList(lines, 1, "admitted write roots", preview.admittedWriteRoots);
   bulletList(lines, 1, "non-goals", preview.nonGoals);
+  requestBudgetLines(lines, asRecord(preview.requestBudget));
   verifierConfinementLines(lines, asRecord(preview.verifierConfinement));
 
   const digest = asScalar(preview.confirmationDigest);

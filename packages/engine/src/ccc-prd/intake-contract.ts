@@ -1,7 +1,12 @@
 import { CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE } from "../ccc-campaign-proof-admission.js";
+import { parseCccPrdAcceptanceClauseInventory } from "./acceptance-clauses.js";
 
-export const CCC_PRD_INTAKE_CONTRACT_SCHEMA_VERSION =
+export const CCC_PRD_INTAKE_CONTRACT_V1_SCHEMA_VERSION =
   "ccc-prd.intake-contract.v1" as const;
+export const CCC_PRD_INTAKE_CONTRACT_V2_SCHEMA_VERSION =
+  "ccc-prd.intake-contract.v2" as const;
+export const CCC_PRD_INTAKE_CONTRACT_SCHEMA_VERSION =
+  CCC_PRD_INTAKE_CONTRACT_V2_SCHEMA_VERSION;
 
 export type CccPrdIntakeContractFinding = Readonly<{
   code: string;
@@ -37,16 +42,28 @@ const TEMPLATE = `# <Product or change name>
 
 ## Requirements
 
-### REQ-001 — <Requirement name>
+### Requirement REQ-001
 
 <Required behavior, including important constraints and dependencies.>
 
-## Acceptance behavior and expected proof
+#### Acceptance clauses
 
-- REQ-001 behavior: <observable acceptance behavior>
-- REQ-001 proof command: task verify:<slug> [-- <arg> ...]
+- [AC-REQ-001-001] <One exact, observable acceptance behavior on this physical line.>
+
+## Expected proof
+
+### Proof PROOF-REQ-001
+
+- the verifier command task verify:<slug> passes only when <positive oracle stated literally>.
+- Accepted clause IDs: AC-REQ-001-001
+- Phases: task and final_integrated
+- Positive cases: <stable case ID and expected passing behavior>
+- Negative controls: <stable control ID and expected refusal behavior>
+- Trusted verifier closure: Taskfile.yml, proof/<trusted-harness>.mjs
+- Candidate inputs: <task-owned implementation paths judged by the harness>
 - Admitted campaign proof grammar: ${CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE}
-- State the exact proof.command literally inside the proof's cited source span, together with its positive oracle and negative controls.
+- The exact proof.command must appear inside this proof's cited source span.
+- Trusted verifier files must already be regular Git blobs at the baseline and must be outside every model-writeable root.
 
 ## Constraints and dependencies
 
@@ -172,6 +189,26 @@ export function lintCccPrdIntakeMarkdown(
     });
   }
 
+  try {
+    const inventory = parseCccPrdAcceptanceClauseInventory({
+      sourcePath: input.sourcePath,
+      sourceBytes: Buffer.from(markdown, "utf8"),
+    });
+    if (inventory.clauses.length === 0) {
+      blockingQuestions.push({
+        code: "CCC_PRD_ACCEPTANCE_CLAUSES_REQUIRED",
+        message: "Declare each acceptance behavior with the exact Requirement and Acceptance clauses grammar so Fusion can preserve it byte-for-byte.",
+      });
+    }
+  } catch (error) {
+    blockingQuestions.push({
+      code: "CCC_PRD_ACCEPTANCE_CLAUSES_MALFORMED",
+      message: error instanceof Error
+        ? error.message
+        : "Acceptance clauses do not match the exact clause grammar.",
+    });
+  }
+
   const hasExpectedProof = (
     hasHeading(markdown, [/\bexpected proof\b/iu, /\bverification\b/iu])
     || hasInlineValue(markdown, ["Proof", "Expected proof", "Verifier", "Verification"])
@@ -181,6 +218,12 @@ export function lintCccPrdIntakeMarkdown(
     blockingQuestions.push({
       code: "CCC_PRD_EXPECTED_PROOF_REQUIRED",
       message: "Which exact verifier or reviewable proof must execute against the campaign result?",
+    });
+  }
+  if (!/\bthe verifier command task verify:[a-z0-9][a-z0-9:-]{0,63}(?: --(?: [a-z0-9][a-z0-9:._/-]{0,63}){0,8})?/iu.test(markdown)) {
+    blockingQuestions.push({
+      code: "CCC_PRD_PROOF_DECLARATION_REQUIRED",
+      message: "State the exact words 'the verifier command task verify:<slug>' inside the proof's source text.",
     });
   }
 

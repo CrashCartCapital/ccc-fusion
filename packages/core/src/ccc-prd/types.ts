@@ -1,13 +1,41 @@
 export const CCC_PRD_PACKET_SCHEMA_VERSION = "ccc-prd.packet.v1" as const;
-export const CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION = "ccc-prd.authoring-proposal.v1" as const;
-export const CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION =
+export const CCC_PRD_AUTHORING_PROPOSAL_V1_SCHEMA_VERSION =
+  "ccc-prd.authoring-proposal.v1" as const;
+export const CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION =
+  "ccc-prd.authoring-proposal.v2" as const;
+export const CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V1_SCHEMA_VERSION =
   "ccc-prd.authoring-proposal-fragment.v1" as const;
-export const CCC_PRD_SIDECAR_SCHEMA_VERSION = "ccc-prd.sidecar.v1" as const;
-export const CCC_PRD_BUNDLE_SCHEMA_VERSION = "ccc-prd.bundle.v1" as const;
-export const CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION = "ccc-prd.proof-admission.v1" as const;
+export const CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V2_SCHEMA_VERSION =
+  "ccc-prd.authoring-proposal-fragment.v2" as const;
+export const CCC_PRD_SIDECAR_V1_SCHEMA_VERSION = "ccc-prd.sidecar.v1" as const;
+export const CCC_PRD_SIDECAR_V2_SCHEMA_VERSION = "ccc-prd.sidecar.v2" as const;
+export const CCC_PRD_BUNDLE_V1_SCHEMA_VERSION = "ccc-prd.bundle.v1" as const;
+export const CCC_PRD_BUNDLE_V2_SCHEMA_VERSION = "ccc-prd.bundle.v2" as const;
+export const CCC_PRD_PROOF_ADMISSION_V1_SCHEMA_VERSION =
+  "ccc-prd.proof-admission.v1" as const;
+export const CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION =
+  "ccc-prd.proof-admission.v2" as const;
+export const CCC_PRD_PROOF_V2_SCHEMA_VERSION = "ccc-prd.proof.v2" as const;
+export const CCC_PRD_EXECUTION_PROMPT_V1_SCHEMA_VERSION =
+  "ccc-prd.execution-prompt.v1" as const;
+export const CCC_PRD_EXECUTION_PROMPT_V2_SCHEMA_VERSION =
+  "ccc-prd.execution-prompt.v2" as const;
 export const CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION =
   "ccc-prd.implementation-fact-provenance.v1" as const;
 
+/** @deprecated Frozen v1 alias; use the version-specific proposal constant. */
+export const CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION =
+  CCC_PRD_AUTHORING_PROPOSAL_V1_SCHEMA_VERSION;
+/** @deprecated Frozen v1 alias; use the version-specific fragment constant. */
+export const CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION =
+  CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V1_SCHEMA_VERSION;
+/** @deprecated Frozen v1 alias; use the version-specific sidecar constant. */
+export const CCC_PRD_SIDECAR_SCHEMA_VERSION = CCC_PRD_SIDECAR_V1_SCHEMA_VERSION;
+/** @deprecated Frozen v1 alias; use the version-specific bundle constant. */
+export const CCC_PRD_BUNDLE_SCHEMA_VERSION = CCC_PRD_BUNDLE_V1_SCHEMA_VERSION;
+/** @deprecated Frozen v1 alias; use the version-specific admission constant. */
+export const CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION =
+  CCC_PRD_PROOF_ADMISSION_V1_SCHEMA_VERSION;
 /** @deprecated Use the specific packet, sidecar, or bundle schema constant. */
 export const CCC_PRD_SCHEMA_VERSION = CCC_PRD_BUNDLE_SCHEMA_VERSION;
 
@@ -36,8 +64,7 @@ export type CccPrdDiagnostic = {
 
 export type CccPrdConfidence = "high" | "medium" | "low";
 
-export type CccPrdProofAdmission = {
-  schema: typeof CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION;
+type CccPrdProofAdmissionBase = {
   pluginId: string;
   pluginVersion: string;
   extensionId: string;
@@ -48,6 +75,36 @@ export type CccPrdProofAdmission = {
   definitionSha256: string;
 };
 
+export type CccPrdProofAdmissionV1 = CccPrdProofAdmissionBase & {
+  schema: typeof CCC_PRD_PROOF_ADMISSION_V1_SCHEMA_VERSION;
+};
+
+export type CccPrdProofAdmissionV2 = CccPrdProofAdmissionBase & {
+  schema: typeof CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION;
+  /** Canonical digest of the complete frozen verifier-closure set. */
+  verifierClosureSha256: string;
+  /** Canonical digest of the complete candidate-input path set. */
+  candidateInputsSha256: string;
+  /** Canonical digest of Task, Node, and proof-host execution identity. */
+  executionToolchainSha256: string;
+};
+
+export type CccPrdProofAdmission = CccPrdProofAdmissionV1 | CccPrdProofAdmissionV2;
+
+export type CccPrdExecutionPromptV1 = {
+  schema: typeof CCC_PRD_EXECUTION_PROMPT_V1_SCHEMA_VERSION;
+  content: string;
+  sha256: string;
+};
+
+export type CccPrdExecutionPromptV2 = {
+  schema: typeof CCC_PRD_EXECUTION_PROMPT_V2_SCHEMA_VERSION;
+  content: string;
+  sha256: string;
+};
+
+export type CccPrdExecutionPrompt = CccPrdExecutionPromptV1 | CccPrdExecutionPromptV2;
+
 export type CccPrdAuthorityRole = {
   id: string;
   role: "root" | "production_module" | "blocking_test_index" | "support";
@@ -55,7 +112,9 @@ export type CccPrdAuthorityRole = {
   accountableProducer: string;
 };
 
-export type CccPrdProof = {
+export type CccPrdProofV1 = {
+  /** A missing discriminator is part of the frozen v1 proof shape. */
+  schema?: never;
   id: string;
   requirementIds: string[];
   command: string;
@@ -63,10 +122,103 @@ export type CccPrdProof = {
   negativeControls: string[];
   spans: CccPrdSourceSpan[];
   confidence: CccPrdConfidence;
-  admission?: CccPrdProofAdmission;
+  admission?: CccPrdProofAdmissionV1;
 };
 
-export type CccPrdRequirement = {
+export type CccPrdProofPhase = "task" | "final_integrated";
+
+export type CccPrdProofCase = {
+  id: string;
+  description: string;
+};
+
+export type CccPrdVerifierClosureEntry = {
+  role: "task_runner" | "harness" | "fixture" | "config";
+  /** Canonical target-relative path at the frozen base. */
+  path: string;
+  /** Git object identity of the regular file at the frozen base. */
+  baseGitBlobOid: string;
+  /** SHA-256 of the exact frozen-base file bytes. */
+  sha256: string;
+};
+
+export type CccPrdExecutableIdentity = {
+  executablePath: string;
+  executableSha256: string;
+  version: string;
+  versionOutputSha256: string;
+};
+
+export type CccPrdProofHostIdentity = CccPrdExecutableIdentity & {
+  id: string;
+};
+
+export type CccPrdLinkedRuntimeEntry = {
+  platform: "darwin";
+  loaderRole: "task" | "node" | "proof_host" | "linked_runtime";
+  loaderPath: string;
+  requestedPath: string;
+  canonicalPath: string;
+  sha256: string;
+};
+
+export type CccPrdProofExecutionToolchain = {
+  task: CccPrdExecutableIdentity;
+  node: CccPrdExecutableIdentity;
+  proofHost: CccPrdProofHostIdentity;
+  linkedRuntime: CccPrdLinkedRuntimeEntry[];
+};
+
+export type CccPrdProofV2 = {
+  schema: typeof CCC_PRD_PROOF_V2_SCHEMA_VERSION;
+  id: string;
+  requirementIds: string[];
+  /** Exact accepted clauses this proof is authoritative for. */
+  clauseIds: string[];
+  /** Disjoint attempt phases admitted for this exact proof definition. */
+  phases: CccPrdProofPhase[];
+  command: string;
+  /** Source-owned human summary retained for v1 implementation-fact provenance. */
+  positiveOracle: string;
+  positiveCases: CccPrdProofCase[];
+  negativeControls: CccPrdProofCase[];
+  verifierClosure: CccPrdVerifierClosureEntry[];
+  candidateInputs: string[];
+  executionToolchain: CccPrdProofExecutionToolchain;
+  spans: CccPrdSourceSpan[];
+  confidence: CccPrdConfidence;
+  admission?: CccPrdProofAdmissionV2;
+};
+
+export type CccPrdProof = CccPrdProofV1 | CccPrdProofV2;
+
+export type CccPrdAcceptanceSourceSpan = CccPrdSourceSpan & {
+  excerptSha256: string;
+};
+
+export type CccPrdAcceptanceClause = {
+  id: string;
+  requirementId: string;
+  /** Exact, single-line source-owned acceptance text. */
+  text: string;
+  /** Executable proofs admitted to establish this exact clause. */
+  proofIds: string[];
+  /** Exact text-only source span, excluding the bullet prefix and line terminator. */
+  span: CccPrdAcceptanceSourceSpan;
+};
+
+export type CccPrdAcceptanceDispositionKind = "deferred" | "excluded" | "unresolved";
+
+export type CccPrdAcceptanceDisposition = {
+  clauseId: string;
+  requirementId: string;
+  kind: CccPrdAcceptanceDispositionKind;
+  reason: string;
+  /** Exact reason-only source span, excluding the disposition prefix and line terminator. */
+  span: CccPrdAcceptanceSourceSpan;
+};
+
+export type CccPrdRequirementV1 = {
   id: string;
   statement: string;
   acceptance: string;
@@ -76,6 +228,13 @@ export type CccPrdRequirement = {
   spans: CccPrdSourceSpan[];
   confidence: CccPrdConfidence;
 };
+
+export type CccPrdRequirementV2 = CccPrdRequirementV1 & {
+  acceptanceClauses: CccPrdAcceptanceClause[];
+  acceptanceDispositions: CccPrdAcceptanceDisposition[];
+};
+
+export type CccPrdRequirement = CccPrdRequirementV1 | CccPrdRequirementV2;
 
 export type CccPrdTask = {
   id: string;
@@ -312,10 +471,8 @@ export type CccPrdImplementationFactProvenance = {
   }>;
 };
 
-export type CccPrdSemanticDeclarations = {
+type CccPrdSemanticDeclarationBase = {
   authorityRoles: CccPrdAuthorityRole[];
-  requirements: CccPrdRequirement[];
-  proofs: CccPrdProof[];
   tasks: CccPrdTask[];
   edges: CccPrdDependencyEdge[];
   workflows: CccPrdWorkflow[];
@@ -333,8 +490,21 @@ export type CccPrdSemanticDeclarations = {
   confidence: CccPrdConfidence;
 };
 
-export type CccPrdSidecar = CccPrdSemanticDeclarations & {
-  schema: typeof CCC_PRD_SIDECAR_SCHEMA_VERSION;
+export type CccPrdSemanticDeclarationsV1 = CccPrdSemanticDeclarationBase & {
+  requirements: CccPrdRequirementV1[];
+  proofs: CccPrdProofV1[];
+};
+
+export type CccPrdSemanticDeclarationsV2 = CccPrdSemanticDeclarationBase & {
+  requirements: CccPrdRequirementV2[];
+  proofs: CccPrdProofV2[];
+};
+
+export type CccPrdSemanticDeclarations =
+  | CccPrdSemanticDeclarationsV1
+  | CccPrdSemanticDeclarationsV2;
+
+type CccPrdSidecarBase = {
   sourceVersion: string;
   orderedSources: CccPrdSource[];
   provenance: CccPrdProvenance;
@@ -350,16 +520,39 @@ export type CccPrdSidecar = CccPrdSemanticDeclarations & {
   implementationFactProvenance?: CccPrdImplementationFactProvenance;
 };
 
-export type CccPrdSemanticBundle = Omit<
-  CccPrdSidecar,
-  "schema" | "ambiguities" | "exceptions" | "unresolvedDecisions"
+export type CccPrdSidecarV1 = CccPrdSemanticDeclarationsV1 & CccPrdSidecarBase & {
+  schema: typeof CCC_PRD_SIDECAR_V1_SCHEMA_VERSION;
+};
+
+export type CccPrdSidecarV2 = CccPrdSemanticDeclarationsV2 & CccPrdSidecarBase & {
+  schema: typeof CCC_PRD_SIDECAR_V2_SCHEMA_VERSION;
+};
+
+export type CccPrdSidecar = CccPrdSidecarV1 | CccPrdSidecarV2;
+
+type CccPrdSemanticBundleBase = CccPrdSidecarBase & Omit<
+  CccPrdSemanticDeclarationBase,
+  "unresolvedDecisions" | "ambiguities" | "exceptions"
 > & {
   kind: "bundle";
-  schema: typeof CCC_PRD_BUNDLE_SCHEMA_VERSION;
   sourceHash: string;
   sidecarHash: string;
   bundleHash: string;
 };
+
+export type CccPrdSemanticBundleV1 = CccPrdSemanticBundleBase & {
+  schema: typeof CCC_PRD_BUNDLE_V1_SCHEMA_VERSION;
+  requirements: CccPrdRequirementV1[];
+  proofs: CccPrdProofV1[];
+};
+
+export type CccPrdSemanticBundleV2 = CccPrdSemanticBundleBase & {
+  schema: typeof CCC_PRD_BUNDLE_V2_SCHEMA_VERSION;
+  requirements: CccPrdRequirementV2[];
+  proofs: CccPrdProofV2[];
+};
+
+export type CccPrdSemanticBundle = CccPrdSemanticBundleV1 | CccPrdSemanticBundleV2;
 
 export type CccPrdRefusalBundle = {
   kind: "refusal";
@@ -377,13 +570,43 @@ export type CccPrdSourceReferenceProposal = {
   exactQuote: string;
 };
 
-export type CccPrdProposalRequirement = Omit<CccPrdRequirement, "spans"> & {
+export type CccPrdProposalAcceptanceClause = Omit<CccPrdAcceptanceClause, "span"> & {
   sourceRefs: CccPrdSourceReferenceProposal[];
 };
 
-export type CccPrdProposalProof = Omit<CccPrdProof, "spans" | "admission"> & {
+export type CccPrdProposalAcceptanceDisposition = Omit<
+  CccPrdAcceptanceDisposition,
+  "span"
+> & {
   sourceRefs: CccPrdSourceReferenceProposal[];
 };
+
+export type CccPrdProposalRequirementV1 = Omit<CccPrdRequirementV1, "spans"> & {
+  sourceRefs: CccPrdSourceReferenceProposal[];
+};
+
+export type CccPrdProposalRequirementV2 = Omit<
+  CccPrdRequirementV2,
+  "spans" | "acceptanceClauses" | "acceptanceDispositions"
+> & {
+  acceptanceClauses: CccPrdProposalAcceptanceClause[];
+  acceptanceDispositions: CccPrdProposalAcceptanceDisposition[];
+  sourceRefs: CccPrdSourceReferenceProposal[];
+};
+
+export type CccPrdProposalRequirement =
+  | CccPrdProposalRequirementV1
+  | CccPrdProposalRequirementV2;
+
+export type CccPrdProposalProofV1 = Omit<CccPrdProofV1, "spans" | "admission"> & {
+  sourceRefs: CccPrdSourceReferenceProposal[];
+};
+
+export type CccPrdProposalProofV2 = Omit<CccPrdProofV2, "spans" | "admission"> & {
+  sourceRefs: CccPrdSourceReferenceProposal[];
+};
+
+export type CccPrdProposalProof = CccPrdProposalProofV1 | CccPrdProposalProofV2;
 
 export type CccPrdProposalTask = Omit<CccPrdTask, "spans"> & {
   sourceRefs: CccPrdSourceReferenceProposal[];
@@ -416,22 +639,11 @@ export type CccPrdProposalReviewItem = Omit<CccPrdReviewItem, "spans"> & {
   sourceRefs: CccPrdSourceReferenceProposal[];
 };
 
-export type CccPrdAuthoringProposal = Omit<
-  CccPrdSemanticDeclarations,
-  | "requirements"
-  | "proofs"
-  | "tasks"
-  | "workflows"
-  | "documents"
-  | "artifacts"
-  | "protectedActions"
-  | "unresolvedDecisions"
-  | "ambiguities"
-  | "exceptions"
+type CccPrdAuthoringProposalBase = Omit<
+  CccPrdSemanticDeclarationBase,
+  | "tasks" | "workflows" | "documents" | "artifacts" | "protectedActions"
+  | "unresolvedDecisions" | "ambiguities" | "exceptions"
 > & {
-  schema: typeof CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION;
-  requirements: CccPrdProposalRequirement[];
-  proofs: CccPrdProposalProof[];
   tasks: CccPrdProposalTask[];
   workflows: CccPrdProposalWorkflow[];
   documents: CccPrdProposalDocument[];
@@ -441,6 +653,20 @@ export type CccPrdAuthoringProposal = Omit<
   ambiguities: CccPrdProposalReviewItem[];
   exceptions: CccPrdProposalReviewItem[];
 };
+
+export type CccPrdAuthoringProposalV1 = CccPrdAuthoringProposalBase & {
+  schema: typeof CCC_PRD_AUTHORING_PROPOSAL_V1_SCHEMA_VERSION;
+  requirements: CccPrdProposalRequirementV1[];
+  proofs: CccPrdProposalProofV1[];
+};
+
+export type CccPrdAuthoringProposalV2 = CccPrdAuthoringProposalBase & {
+  schema: typeof CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION;
+  requirements: CccPrdProposalRequirementV2[];
+  proofs: CccPrdProposalProofV2[];
+};
+
+export type CccPrdAuthoringProposal = CccPrdAuthoringProposalV1 | CccPrdAuthoringProposalV2;
 
 /** A chunk-scoped row carries a ledger of the material items it claims to
  * disposition; per design §2 this is checked against the real analyzer and
@@ -454,11 +680,8 @@ export type CccPrdFragmentRow<T> = T & { materialItemIds?: string[] };
  * `confidence` -- those are packet-global singletons synthesized once at
  * assembly (design §4), not re-emitted per chunk.
  */
-export type CccPrdAuthoringProposalFragment = {
-  schema: typeof CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_SCHEMA_VERSION;
+type CccPrdAuthoringProposalFragmentBase = {
   authorityRoles: CccPrdFragmentRow<CccPrdAuthorityRole>[];
-  requirements: CccPrdFragmentRow<CccPrdProposalRequirement>[];
-  proofs: CccPrdFragmentRow<CccPrdProposalProof>[];
   tasks: CccPrdFragmentRow<CccPrdProposalTask>[];
   edges: CccPrdFragmentRow<CccPrdDependencyEdge>[];
   workflows: CccPrdFragmentRow<CccPrdProposalWorkflow>[];
@@ -471,6 +694,22 @@ export type CccPrdAuthoringProposalFragment = {
   exceptions: CccPrdFragmentRow<CccPrdProposalReviewItem>[];
 };
 
+export type CccPrdAuthoringProposalFragmentV1 = CccPrdAuthoringProposalFragmentBase & {
+  schema: typeof CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V1_SCHEMA_VERSION;
+  requirements: CccPrdFragmentRow<CccPrdProposalRequirementV1>[];
+  proofs: CccPrdFragmentRow<CccPrdProposalProofV1>[];
+};
+
+export type CccPrdAuthoringProposalFragmentV2 = CccPrdAuthoringProposalFragmentBase & {
+  schema: typeof CCC_PRD_AUTHORING_PROPOSAL_FRAGMENT_V2_SCHEMA_VERSION;
+  requirements: CccPrdFragmentRow<CccPrdProposalRequirementV2>[];
+  proofs: CccPrdFragmentRow<CccPrdProposalProofV2>[];
+};
+
+export type CccPrdAuthoringProposalFragment =
+  | CccPrdAuthoringProposalFragmentV1
+  | CccPrdAuthoringProposalFragmentV2;
+
 export type CccPrdAuthoringConstraints = {
   targetRepository: CccPrdTargetRepository;
   bounds: CccPrdExecutionBounds;
@@ -482,9 +721,13 @@ export type CccPrdAuthoringRequest = {
   sourceVersion: string;
   packetHash: string;
   sources: Array<CccPrdSource & { content: string }>;
+  /** Omission preserves the frozen v1 authoring route. */
+  semanticProofContract?: CccPrdSemanticProofContractVersion;
   constraints?: CccPrdAuthoringConstraints;
   previousSidecar?: CccPrdSidecar;
 };
+
+export type CccPrdSemanticProofContractVersion = "v1" | "v2";
 
 export type CccPrdAuthoringAdapter = {
   id: string;

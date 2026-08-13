@@ -1,10 +1,18 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CccPrdProductStatus } from "@fusion/core";
 import {
   applyCccCampaignOperatorControl,
   computeCccCampaignOperatorControlConfirmation,
   describeCccCampaignOperatorControls,
 } from "../ccc-campaign-operator-control.js";
+
+const closeUnopenedExecutionAuthorizationMembers = vi.hoisted(() => vi.fn());
+
+vi.mock("@fusion/core", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@fusion/core")>(),
+  closeUnopenedCccCampaignExecutionAuthorizationMembers:
+    closeUnopenedExecutionAuthorizationMembers,
+}));
 
 const PAUSED_REASON = "ccc-operator:campaign-paused";
 
@@ -101,8 +109,21 @@ function status(
   } as unknown as CccPrdProductStatus;
 }
 
-function store() {
+function sealedClaimedStatus(): CccPrdProductStatus {
   return {
+    ...status(),
+    executionAuthorization: {
+      authorizationId: `ccc-execution-authorization-${"e".repeat(64)}`,
+      status: "claimed",
+    },
+  } as unknown as CccPrdProductStatus;
+}
+
+function store() {
+  const asyncLayer = { db: {} };
+  return {
+    rootDir: "/tmp/product-target",
+    getAsyncLayer: vi.fn(() => asyncLayer),
     transitionWorkflowWorkItem: vi.fn(async (
       id: string,
       state: string,
@@ -113,6 +134,158 @@ function store() {
 }
 
 describe("CCC campaign operator lifecycle controls", () => {
+  beforeEach(() => {
+    closeUnopenedExecutionAuthorizationMembers.mockReset();
+  });
+
+  it("[PRD:Slice3] closes unopened claimed sealed members only after stop is durable", async () => {
+    const current = sealedClaimedStatus();
+    const taskStore = store();
+    closeUnopenedExecutionAuthorizationMembers.mockResolvedValueOnce({
+      authorization: {
+        ...current.executionAuthorization,
+        status: "settled",
+      },
+      closedApprovalRequestIds: [
+        `ccc-approval-${"a".repeat(64)}`,
+        `ccc-approval-${"b".repeat(64)}`,
+      ],
+      openedApprovalRequestIds: [],
+    });
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator stops before either authorized task contacts a model.",
+      status: current,
+      store: taskStore,
+    })).resolves.toMatchObject({
+      action: "stop",
+      workItemState: "cancelled",
+      unresolvedEffectsPreserved: false,
+    });
+
+    expect(closeUnopenedExecutionAuthorizationMembers).toHaveBeenCalledWith(
+      taskStore.getAsyncLayer(),
+      {
+        authorityStore: taskStore,
+        rootDir: "/tmp/product-target",
+        authorizationId: current.executionAuthorization!.authorizationId,
+        actor: {
+          actorId: "ccc-campaign-operator-control",
+          actorType: "system",
+          actorName: "CCC Campaign Operator Control",
+        },
+        runId: "ccc-prd:import-1",
+      },
+    );
+    expect(taskStore.transitionWorkflowWorkItem.mock.invocationCallOrder[0])
+      .toBeLessThan(
+        closeUnopenedExecutionAuthorizationMembers.mock.invocationCallOrder[0]!,
+      );
+  });
+
+  it("[PRD:Slice3] preserves a sealed child that already has a durable reservation", async () => {
+    const current = sealedClaimedStatus();
+    const openedApprovalRequestId = `ccc-approval-${"a".repeat(64)}`;
+    closeUnopenedExecutionAuthorizationMembers.mockResolvedValueOnce({
+      authorization: current.executionAuthorization,
+      closedApprovalRequestIds: [`ccc-approval-${"b".repeat(64)}`],
+      openedApprovalRequestIds: [openedApprovalRequestId],
+    });
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator stops while one authorized task may already have effects.",
+      status: current,
+      store: store(),
+    })).resolves.toMatchObject({
+      action: "stop",
+      workItemState: "cancelled",
+      unresolvedEffectsPreserved: true,
+    });
+  });
+
+  it("[PRD:Slice3] refuses to report clean closure when the sealed parent did not settle", async () => {
+    const current = sealedClaimedStatus();
+    const taskStore = store();
+    closeUnopenedExecutionAuthorizationMembers.mockResolvedValueOnce({
+      authorization: current.executionAuthorization,
+      closedApprovalRequestIds: [
+        `ccc-approval-${"a".repeat(64)}`,
+        `ccc-approval-${"b".repeat(64)}`,
+      ],
+      openedApprovalRequestIds: [],
+    });
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator stops before any authorized provider dispatch.",
+      status: current,
+      store: taskStore,
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_OPERATOR_CONTROL_AUTHORIZATION_CLOSURE_INCOMPLETE",
+      message: expect.stringMatching(/authorization.*claimed.*settled/i),
+      safeState: {
+        workItemId: "work-1",
+        workItemState: "cancelled",
+      },
+    });
+    expect(taskStore.pauseTask).toHaveBeenCalled();
+  });
+
+  it("[PRD:Slice3] reports a typed cancelled safe state when unknown-effect closure refuses", async () => {
+    const current = sealedClaimedStatus();
+    const taskStore = store();
+    closeUnopenedExecutionAuthorizationMembers.mockRejectedValueOnce(
+      new Error(
+        "CCC campaign approval execute-task unopened closure refuses unresolved dispatched receipt effect-1",
+      ),
+    );
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator stops while the sealed effect remains unknown.",
+      status: current,
+      store: taskStore,
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_OPERATOR_CONTROL_AUTHORIZATION_CLOSURE_INCOMPLETE",
+      message: expect.stringContaining("unresolved dispatched receipt"),
+      safeState: {
+        workItemId: "work-1",
+        workItemState: "cancelled",
+      },
+    });
+
+    expect(taskStore.transitionWorkflowWorkItem).toHaveBeenCalledWith(
+      "work-1",
+      "cancelled",
+      expect.any(Object),
+    );
+    expect(taskStore.pauseTask).toHaveBeenCalledWith(
+      "FN-1",
+      true,
+      undefined,
+      expect.any(Object),
+    );
+  });
+
+  it("[PRD:Slice3] leaves legacy per-task approval stop behavior unchanged", async () => {
+    const taskStore = store();
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator stops this legacy per-task approval campaign.",
+      status: status(),
+      store: taskStore,
+    })).resolves.toMatchObject({
+      action: "stop",
+      workItemState: "cancelled",
+    });
+
+    expect(closeUnopenedExecutionAuthorizationMembers).not.toHaveBeenCalled();
+    expect(taskStore.getAsyncLayer).not.toHaveBeenCalled();
+  });
+
   it("binds confirmations to exact persisted status and describes only safe controls", () => {
     const runnable = status();
     const controls = describeCccCampaignOperatorControls(runnable);

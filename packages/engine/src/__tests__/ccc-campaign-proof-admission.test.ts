@@ -1,7 +1,9 @@
 import {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  computeCccPrdProofV2AdmissionDigests,
   computeCccPrdProofDefinitionSha256,
   type CccPrdProof,
+  type CccPrdProofV2,
 } from "@fusion/core";
 import { describe, expect, it } from "vitest";
 import {
@@ -61,7 +63,61 @@ function evaluatorInput(proof = admittedProof(), signal = new AbortController().
   });
 }
 
+function semanticProofV2(): CccPrdProofV2 {
+  const definition: CccPrdProofV2 = {
+    schema: "ccc-prd.proof.v2",
+    id: "PROOF-SEMANTIC-1",
+    requirementIds: ["REQ-SEMANTIC-1"],
+    clauseIds: ["AC-REQ-SEMANTIC-1-001"],
+    phases: ["final_integrated", "task"],
+    command: "task verify:semantic",
+    positiveOracle: "the exact candidate passes",
+    positiveCases: [{ id: "CASE-PASS", description: "candidate passes" }],
+    negativeControls: [{ id: "CONTROL-BAD", description: "bad candidate fails" }],
+    verifierClosure: [
+      { role: "harness", path: "verify/harness.mjs", baseGitBlobOid: "1".repeat(40), sha256: "2".repeat(64) },
+      { role: "task_runner", path: "Taskfile.yml", baseGitBlobOid: "3".repeat(40), sha256: "4".repeat(64) },
+    ],
+    candidateInputs: ["src/value.js"],
+    executionToolchain: {
+      task: { executablePath: "/tool/task", executableSha256: "5".repeat(64), version: "task 1", versionOutputSha256: "6".repeat(64) },
+      node: { executablePath: "/tool/node", executableSha256: "7".repeat(64), version: "node 24", versionOutputSha256: "8".repeat(64) },
+      proofHost: { id: "fusion-proof-host", executablePath: "/tool/host", executableSha256: "9".repeat(64), version: "host 1", versionOutputSha256: "a".repeat(64) },
+      linkedRuntime: [],
+    },
+    spans: [],
+    confidence: "high",
+  };
+  return {
+    ...definition,
+    admission: {
+      schema: "ccc-prd.proof-admission.v2",
+      pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+      pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+      extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+      proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+      extensionRootRelativeSource: "ccc-campaign-proof-admission.js",
+      extensionSourceSha256: "b".repeat(64),
+      extensionManifestSha256: "c".repeat(64),
+      definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+      ...computeCccPrdProofV2AdmissionDigests(definition),
+    },
+  };
+}
+
 describe("CCC native campaign proof admission", () => {
+  it("keeps the self-contained evaluator byte-identical to core's semantic-v2 definition hash", async () => {
+    const proof = semanticProofV2();
+    const input = evaluatorInput(proof);
+
+    expect(input.proofDefinitionSha256).toBe(computeCccPrdProofDefinitionSha256(proof));
+    await expect(evaluateCccCampaignProofAdmission(input)).resolves.toEqual({
+      outcome: "pass",
+      evaluatedInputSha256: input.inputSha256,
+      summary: "semantic proof v2 declaration is admissible; command not executed",
+    });
+  });
+
   it("accepts the exact CCC lab kernel transaction declaration without executing it", async () => {
     const input = evaluatorInput(admittedProof({
       command: "task verify:phase0 -- kernel-transaction",

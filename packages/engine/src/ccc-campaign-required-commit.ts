@@ -482,14 +482,19 @@ legitimate successor whose agent left its change uncommitted, and it accepts a
 successor that created no commit at all (the predecessor's commit already moved
 HEAD off the frozen base). Every such comparison must use the task's OWN start.
 */
-type ExpectedStartCommit = Readonly<{
+export type CccCampaignExpectedStartCommit = Readonly<{
   commit: string;
   reference: "frozen-base" | "predecessor-commit" | "join-base-commit";
   predecessorTaskId?: string;
   predecessorTaskIds?: readonly string[];
 }>;
 
-function describeExpectedStart(expected: ExpectedStartCommit): string {
+export type CccCampaignExpectedStartRefusal = (
+  message: string,
+  details?: Record<string, unknown>,
+) => never;
+
+function describeExpectedStart(expected: CccCampaignExpectedStartCommit): string {
   if (expected.reference === "frozen-base") return "the frozen campaign base";
   if (expected.reference === "join-base-commit") {
     return `the merged join base of dependency predecessors ${(expected.predecessorTaskIds ?? []).join(", ")}`;
@@ -498,7 +503,7 @@ function describeExpectedStart(expected: ExpectedStartCommit): string {
 }
 
 function expectedStartDetails(
-  expected: ExpectedStartCommit,
+  expected: CccCampaignExpectedStartCommit,
 ): Record<string, unknown> {
   return {
     expectedStartCommit: expected.commit,
@@ -536,48 +541,85 @@ async function optionalGitObject(
 }
 
 /*
-The proof gate's per-task commit ladder (ccc-campaign-proof-execution.ts:236-269):
-isolated worktree HEAD, then the recorded merge commit, then the persisted branch.
-This walks the same durable sources but falls through a source that no longer
-resolves instead of refusing on it, because a disposed predecessor worktree still
-has an authoritative branch ref. Exhausting the ladder is a refusal: a task that
-declares a predecessor must never silently fall back to the frozen base.
+The predecessor's worktree HEAD, recorded merge commit, and persisted branch are
+independent custody witnesses. A source that no longer resolves may fall through
+because a legitimately disposed worktree can still have an authoritative durable
+branch ref. Every source that DOES resolve must agree byte-for-byte, however, and
+the agreed commit must descend strictly from the frozen base. This prevents a
+rewound or split custody witness from silently erasing the predecessor's campaign
+work, including a rewind past (rather than exactly onto) the frozen base.
 */
 async function derivePredecessorCampaignCommit(
   targetRoot: string,
   taskId: string,
   predecessor: TaskDetail,
+  frozenBase: string,
+  refusalLabel: string,
+  refuse: CccCampaignExpectedStartRefusal,
 ): Promise<string> {
+  const sources: Array<{
+    source: "worktree-head" | "merge-details" | "branch-ref";
+    commit: string;
+  }> = [];
   if (typeof predecessor.worktree === "string" && predecessor.worktree.length > 0) {
     const predecessorWorktree = await realpath(predecessor.worktree)
       .catch(() => undefined);
     const commit = predecessorWorktree === undefined
       ? null
       : await optionalGitObject(predecessorWorktree, "HEAD");
-    if (commit) return commit;
+    if (commit) sources.push({ source: "worktree-head", commit });
   }
   const mergeCommit = predecessor.mergeDetails?.commitSha;
   if (typeof mergeCommit === "string" && GIT_OBJECT_ID.test(mergeCommit)) {
     const commit = await optionalGitObject(targetRoot, mergeCommit);
-    if (commit) return commit;
+    if (commit) sources.push({ source: "merge-details", commit });
   }
   if (typeof predecessor.branch === "string" && predecessor.branch.length > 0) {
     const commit = await optionalGitObject(
       targetRoot,
       `refs/heads/${predecessor.branch}`,
     );
-    if (commit) return commit;
+    if (commit) sources.push({ source: "branch-ref", commit });
   }
-  refusal(
-    `CCC campaign required-commit task ${taskId} cannot derive the campaign commit of its dependency predecessor ${predecessor.id} from durable state`,
-    {
-      taskId,
-      predecessorTaskId: predecessor.id,
-      predecessorWorktree: predecessor.worktree,
-      predecessorBranch: predecessor.branch,
-      predecessorMergeCommit: predecessor.mergeDetails?.commitSha,
-    },
-  );
+  if (sources.length === 0) {
+    return refuse(
+      `${refusalLabel} ${taskId} cannot derive the campaign commit of its dependency predecessor ${predecessor.id} from durable state`,
+      {
+        taskId,
+        predecessorTaskId: predecessor.id,
+        predecessorWorktree: predecessor.worktree,
+        predecessorBranch: predecessor.branch,
+        predecessorMergeCommit: predecessor.mergeDetails?.commitSha,
+      },
+    );
+  }
+  const commits = [...new Set(sources.map(({ commit }) => commit))];
+  if (commits.length !== 1) {
+    return refuse(
+      `${refusalLabel} ${taskId} dependency predecessor ${predecessor.id} commit custody sources disagree`,
+      {
+        taskId,
+        predecessorTaskId: predecessor.id,
+        predecessorCommitSources: sources,
+      },
+    );
+  }
+  const commit = commits[0]!;
+  if (
+    commit === frozenBase
+    || !(await optionalIsAncestor(targetRoot, frozenBase, commit))
+  ) {
+    return refuse(
+      `${refusalLabel} ${taskId} dependency predecessor ${predecessor.id} does not resolve to a campaign-created commit after the frozen campaign base`,
+      {
+        taskId,
+        predecessorTaskId: predecessor.id,
+        frozenBase,
+        predecessorCommitSources: sources,
+      },
+    );
+  }
+  return commit;
 }
 
 /** True when `base` is an ancestor of `head`, without refusing on its own. */
@@ -610,13 +652,16 @@ async function optionalIsAncestor(
  * still contain every predecessor's campaign commit, or a branch's work was
  * silently lost before the join task ran.
  */
-async function resolveExpectedStartCommit(
-  store: RequiredCommitStore,
-  targetRoot: string,
-  task: TaskDetail,
-  frozenBase: string,
-): Promise<ExpectedStartCommit> {
-  const frozenStart: ExpectedStartCommit = {
+export async function resolveCccCampaignExpectedStartCommit(input: {
+  store: Pick<TaskStore, "getTask">;
+  targetRoot: string;
+  task: TaskDetail;
+  frozenBase: string;
+  refusalLabel: string;
+  refuse: CccCampaignExpectedStartRefusal;
+}): Promise<CccCampaignExpectedStartCommit> {
+  const { store, targetRoot, task, frozenBase, refusalLabel, refuse } = input;
+  const frozenStart: CccCampaignExpectedStartCommit = {
     commit: frozenBase,
     reference: "frozen-base",
   };
@@ -630,8 +675,8 @@ async function resolveExpectedStartCommit(
     for (const predecessorTaskId of predecessorTaskIds) {
       const predecessor = await store.getTask(predecessorTaskId).catch(() => undefined);
       if (!predecessor || predecessor.id !== predecessorTaskId) {
-        refusal(
-          `CCC campaign required-commit task ${task.id} cannot load its dependency predecessor ${predecessorTaskId}`,
+        return refuse(
+          `${refusalLabel} ${task.id} cannot load its dependency predecessor ${predecessorTaskId}`,
           { taskId: task.id, predecessorTaskId },
         );
       }
@@ -640,8 +685,8 @@ async function resolveExpectedStartCommit(
     const joinBranch = cccCampaignJoinBaseBranchName(task.id);
     const joinTip = await optionalGitObject(targetRoot, `refs/heads/${joinBranch}`);
     if (joinTip === null) {
-      refusal(
-        `CCC campaign required-commit task ${task.id} declares ${dependencies.length} dependency predecessors but its join base branch "${joinBranch}" is unresolvable`,
+      return refuse(
+        `${refusalLabel} ${task.id} declares ${dependencies.length} dependency predecessors but its join base branch "${joinBranch}" is unresolvable`,
         { taskId: task.id, joinBranch, predecessorTaskIds },
       );
     }
@@ -650,10 +695,13 @@ async function resolveExpectedStartCommit(
         targetRoot,
         task.id,
         predecessor,
+        frozenBase,
+        refusalLabel,
+        refuse,
       );
       if (!(await optionalIsAncestor(targetRoot, predecessorCommit, joinTip))) {
-        refusal(
-          `CCC campaign required-commit task ${task.id} join base "${joinBranch}" does not contain the campaign commit of dependency predecessor ${predecessor.id}`,
+        refuse(
+          `${refusalLabel} ${task.id} join base "${joinBranch}" does not contain the campaign commit of dependency predecessor ${predecessor.id}`,
           {
             taskId: task.id,
             joinBranch,
@@ -673,8 +721,8 @@ async function resolveExpectedStartCommit(
   const predecessorTaskId = dependencies[0]!;
   const predecessor = await store.getTask(predecessorTaskId).catch(() => undefined);
   if (!predecessor || predecessor.id !== predecessorTaskId) {
-    refusal(
-      `CCC campaign required-commit task ${task.id} cannot load its dependency predecessor ${predecessorTaskId}`,
+    return refuse(
+      `${refusalLabel} ${task.id} cannot load its dependency predecessor ${predecessorTaskId}`,
       { taskId: task.id, predecessorTaskId },
     );
   }
@@ -683,6 +731,9 @@ async function resolveExpectedStartCommit(
       targetRoot,
       task.id,
       predecessor,
+      frozenBase,
+      refusalLabel,
+      refuse,
     ),
     reference: "predecessor-commit",
     predecessorTaskId,
@@ -821,12 +872,14 @@ async function inspectRequiredCommit(
     );
   }
 
-  const expectedStart = await resolveExpectedStartCommit(
+  const expectedStart = await resolveCccCampaignExpectedStartCommit({
     store,
     targetRoot,
     task,
     frozenBase,
-  );
+    refusalLabel: "CCC campaign required-commit task",
+    refuse: (message, details) => refusal(message, details),
+  });
 
   const worktreeRoot = await assertRegisteredIsolatedWorktree(targetRoot, task);
   const [initialHead, resolvedBase] = await Promise.all([

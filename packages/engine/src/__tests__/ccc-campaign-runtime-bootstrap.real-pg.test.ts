@@ -1,11 +1,14 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { execFile as execFileCallback } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { TaskStore, WorkflowWorkItem } from "@fusion/core";
 import {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   computeCccPrdProofDefinitionSha256,
+  computeCccPrdProofV2AdmissionDigests,
   deriveWorkflowExtensionHostProvenance,
   getWorkflowExtensionHostProvenanceBinding,
   importCccPrdBundle,
@@ -13,6 +16,7 @@ import {
   queryRunAuditEvents,
   registerTaskMoveDisposer,
   TaskStore as FreshTaskStore,
+  type ApprovalRequestActorSnapshot,
 } from "@fusion/core";
 import {
   claimCccCampaignApproval,
@@ -20,10 +24,13 @@ import {
   issueCccCampaignApproval,
 } from "../../../core/src/async-approval-request-store.js";
 import {
+  admitCccPrdImportTestProductBundle,
   createCccPrdImportTestBundle,
   createCccPrdImportTestExecutionPolicy,
+  createCccPrdImportTestProductBundle,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
+  rehashCccPrdImportTestProductBundleV2,
 } from "../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import { createSharedPgTaskStoreTestHarness, pgDescribe, type SharedPgTaskStoreHarness } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import { InProcessRuntime } from "../runtimes/in-process-runtime.js";
@@ -40,6 +47,11 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
 } from "../ccc-campaign-proof-admission.js";
+import {
+  approveCccCampaignLiveExecution,
+  computeCccCampaignLiveExecutionApprovalConfirmation,
+  issueCccCampaignLiveExecutionApproval,
+} from "../ccc-campaign-product-control.js";
 
 type RuntimeHarness = InProcessRuntime & {
   status: "active";
@@ -65,6 +77,11 @@ const providerWorker = Object.freeze({
   actorType: "agent" as const,
   actorName: "Runtime provider worker",
 });
+const operator: ApprovalRequestActorSnapshot = Object.freeze({
+  actorId: "runtime-live-execution-operator",
+  actorType: "user",
+  actorName: "Runtime live execution operator",
+});
 
 async function initializeGitRoot(rootDir: string): Promise<string> {
   await execFile("git", ["init", "--initial-branch=main", rootDir]);
@@ -84,6 +101,10 @@ function runtimeWithStore(
   store: TaskStore,
   rootDir: string,
   prepareNodeExecution = vi.fn(async () => undefined),
+  runCustomNode = vi.fn(async () => ({
+    outcome: "success" as const,
+    value: "mocked-provider-effect",
+  })),
 ): RuntimeHarness {
   const runtime = new InProcessRuntime({
     projectId: "runtime-real-pg",
@@ -97,10 +118,7 @@ function runtimeWithStore(
   runtime.executor = {
     execute: vi.fn(async () => undefined),
     createAuthoritativeWorkflowPrimitives: vi.fn(() => ({})),
-    createAuthoritativeWorkflowCustomNodeRunner: vi.fn(() => vi.fn(async () => ({
-      outcome: "success" as const,
-      value: "mocked-provider-effect",
-    }))),
+    createAuthoritativeWorkflowCustomNodeRunner: vi.fn(() => runCustomNode),
     createAuthoritativeWorkflowNodePreparation: vi.fn(() => prepareNodeExecution),
     createAuthoritativeWorkflowBranchPersistence: vi.fn(() => ({
       saveBranchState: (state) => store.saveWorkflowRunBranch(state),
@@ -115,6 +133,40 @@ function runtimeWithStore(
     builtRootPath: ENGINE_DIST_ROOT,
   }).then(() => undefined);
   return runtime;
+}
+
+async function bindEngineNativeProofAdmission(
+  source: Awaited<ReturnType<typeof admitCccPrdImportTestProductBundle>>["bundle"],
+): Promise<typeof source> {
+  const provenance = await deriveWorkflowExtensionHostProvenance({
+    pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+    pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+    trustedRootPath: ENGINE_DIST_ROOT,
+    entryRelativePath: "ccc-campaign-proof-admission.js",
+    manifestRelativePath: "ccc-campaign-proof-admission.manifest.json",
+  });
+  const binding = getWorkflowExtensionHostProvenanceBinding(provenance);
+  return rehashCccPrdImportTestProductBundleV2({
+    ...source,
+    proofs: source.proofs.map((proof) => {
+      const { admission: _oldAdmission, ...definition } = proof;
+      return {
+        ...definition,
+        admission: {
+          schema: "ccc-prd.proof-admission.v2" as const,
+          pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+          pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+          extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+          proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+          extensionRootRelativeSource: binding.extensionRootRelativeSource,
+          extensionSourceSha256: binding.extensionSourceSha256,
+          extensionManifestSha256: binding.extensionManifestSha256,
+          definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+          ...computeCccPrdProofV2AdmissionDigests(definition),
+        },
+      };
+    }),
+  });
 }
 
 async function nativeTaskIdForImport(
@@ -182,7 +234,15 @@ async function importCampaignFixture(
   suffix: string,
   productExecution = false,
 ): Promise<WorkflowWorkItem> {
-  const source = await createAdmittedCampaignBundle(h.rootDir(), suffix);
+  const fixture = productExecution
+    ? await admitCccPrdImportTestProductBundle(
+      createCccPrdImportTestProductBundle(h.rootDir(), suffix),
+      suffix,
+    )
+    : { bundle: await createAdmittedLegacyCampaignBundle(h.rootDir(), suffix), semanticProofToolchainPaths: undefined };
+  const source = productExecution
+    ? await bindEngineNativeProofAdmission(fixture.bundle)
+    : fixture.bundle;
   const idempotencyKey = `runtime-real-pg-${suffix}`;
   const imported = await importCccPrdBundle({
     bundle: source,
@@ -193,6 +253,7 @@ async function importCampaignFixture(
     executionPolicy: productExecution
       ? createCccPrdImportTestProductExecutionPolicy(source)
       : createCccPrdImportTestExecutionPolicy(source),
+    semanticProofToolchainPaths: fixture.semanticProofToolchainPaths,
   });
   const semanticTaskId = `TASK-${suffix}`;
   const nativeTaskId = await nativeTaskIdForImport(h, {
@@ -227,8 +288,28 @@ async function importCampaignFixture(
   return runnable;
 }
 
-async function createAdmittedCampaignBundle(rootDir: string, suffix: string) {
-  const source = createCccPrdImportTestBundle(rootDir, suffix);
+async function approveLiveExecutionFixture(
+  h: SharedPgTaskStoreHarness,
+  workItem: WorkflowWorkItem,
+): Promise<void> {
+  const issued = await issueCccCampaignLiveExecutionApproval({
+    store: h.store(),
+    rootDir: h.rootDir(),
+    taskId: workItem.taskId,
+    runId: workItem.runId,
+  });
+  await approveCccCampaignLiveExecution({
+    store: h.store(),
+    rootDir: h.rootDir(),
+    taskId: workItem.taskId,
+    authorizationId: issued.authorizationId,
+    confirmation: computeCccCampaignLiveExecutionApprovalConfirmation(issued),
+    actor: operator,
+  });
+}
+
+async function createAdmittedLegacyCampaignBundle(rootDir: string, suffix: string) {
+  const source = createCccPrdImportTestProductBundle(rootDir, suffix);
   const provenance = await deriveWorkflowExtensionHostProvenance({
     pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
     pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
@@ -408,18 +489,37 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
   it("product v2 RED: the in-process campaign runtime prepares coding nodes before provider dispatch", async () => {
     const store = h.store();
     const campaign = await importCampaignFixture(h, "product-v2-preparation", true);
-    const prepareNodeExecution = vi.fn(async () => undefined);
-    const runtime = runtimeWithStore(store, h.rootDir(), prepareNodeExecution);
+    await approveLiveExecutionFixture(h, campaign);
+    const prepareNodeExecution = vi.fn(async (node: { config?: { ownedPaths?: string[] } }) => {
+      const [ownedPath] = node.config?.ownedPaths ?? [];
+      if (ownedPath) {
+        await mkdir(join(h.rootDir(), ownedPath), { recursive: true });
+        await writeFile(join(h.rootDir(), ownedPath, "change.txt"), "implemented\n", "utf8");
+      }
+    });
+    const implementNode = vi.fn(async (node: { config?: { ownedPaths?: string[] } }) => {
+      const [ownedPath] = node.config?.ownedPaths ?? [];
+      if (ownedPath) {
+        await mkdir(join(h.rootDir(), ownedPath), { recursive: true });
+        await writeFile(join(h.rootDir(), ownedPath, "change.txt"), "implemented\n", "utf8");
+      }
+      return {
+        outcome: "success" as const,
+        value: "mocked-provider-effect",
+      };
+    });
+    const runtime = runtimeWithStore(store, h.rootDir(), prepareNodeExecution, implementNode);
 
     await runtime.drainWorkflowContinuations();
     await waitFor(
       async () => prepareNodeExecution.mock.calls.length,
-      (calls) => calls === 2,
+      (calls) => calls === 1,
       "authoritative coding-node preparation",
     );
 
     expect(runtime.executor.createAuthoritativeWorkflowNodePreparation).toHaveBeenCalledTimes(1);
-    expect(prepareNodeExecution).toHaveBeenCalledTimes(2);
+    expect(prepareNodeExecution).toHaveBeenCalledTimes(1);
+    expect(implementNode).toHaveBeenCalledTimes(1);
     expect(prepareNodeExecution).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: "prompt",
@@ -443,38 +543,23 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
         }),
       }),
     );
-    expect(prepareNodeExecution).toHaveBeenCalledWith(
-      expect.objectContaining({
-        kind: "prompt",
-        config: expect.objectContaining({
-          cccPrdTaskId: "TASK-terminal-product-v2-preparation",
-          toolMode: "coding",
-          worktreeMode: "isolated",
-          ownedPaths: ["src/task-1"],
-          allowedWriteRoots: ["src/task-1"],
-          commitPolicy: "required",
+    expect(prepareNodeExecution.mock.calls).not.toEqual(expect.arrayContaining([
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "prompt",
+          config: expect.objectContaining({
+            cccPrdTaskId: "TASK-terminal-product-v2-preparation",
+          }),
         }),
-      }),
-      expect.objectContaining({ id: expect.any(String) }),
-      expect.objectContaining({ requiresWorktree: true }),
-      expect.objectContaining({
-        nodeId: expect.any(String),
-        materializedNodeId: expect.any(String),
-      }),
-      expect.objectContaining({
-        executionFence: expect.objectContaining({
-          workItemId: campaign.id,
-          runId: campaign.runId,
-        }),
-      }),
-    );
+      ]),
+    ]));
     const terminal = await waitFor(
       () => store.getWorkflowWorkItem(campaign.id),
       (item): item is WorkflowWorkItem => item?.state === "manual-required",
       "product-v2 preparation campaign terminal state",
     );
     expect(terminal).toMatchObject({
-      blockedReason: "ccc-permanent:CCC_CAMPAIGN_PROOF_EXECUTION_REFUSED",
+      blockedReason: "ccc-permanent:CCC_PROOF_ADMISSION_REFUSED",
       leaseOwner: null,
       leaseExpiresAt: null,
     });

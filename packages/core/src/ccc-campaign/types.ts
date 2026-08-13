@@ -1,7 +1,9 @@
 import type {
   CccPrdAdmittedWriteRoot,
   CccPrdExecutionBounds,
+  CccPrdExecutionPrompt,
   CccPrdProof,
+  CccPrdProofPhase,
   CccPrdProtectedActionIntent,
   CccPrdTargetRepository,
 } from "../ccc-prd/types.js";
@@ -17,8 +19,17 @@ export const CCC_PRD_EXECUTION_PLAN_SCHEMA_VERSION =
 /** @deprecated Use the version-specific execution-policy constant. */
 export const CCC_CAMPAIGN_EXECUTION_POLICY_SCHEMA_VERSION =
   CCC_CAMPAIGN_EXECUTION_POLICY_V1_SCHEMA_VERSION;
-export const CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION =
+export const CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION =
   "ccc-campaign.manifest.v1" as const;
+export const CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION =
+  "ccc-campaign.manifest.v2" as const;
+/** @deprecated Use the version-specific campaign-manifest constant. */
+export const CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION =
+  CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION;
+export const CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_PER_TASK_V1 =
+  "per_task_v1" as const;
+export const CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1 =
+  "sealed_bundle_v1" as const;
 export const CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION =
   "ccc-campaign.context.v1" as const;
 
@@ -32,8 +43,19 @@ export const CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION =
   "ccc-campaign.provider-attempt.v4" as const;
 export const CCC_PROVIDER_ATTEMPT_SCHEMA_VERSION =
   CCC_PROVIDER_ATTEMPT_V4_SCHEMA_VERSION;
-export const CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION =
+export const CCC_CAMPAIGN_PROOF_ATTEMPT_V1_SCHEMA_VERSION =
   "ccc-campaign.proof-attempt.v1" as const;
+export const CCC_CAMPAIGN_PROOF_ATTEMPT_V2_SCHEMA_VERSION =
+  "ccc-campaign.proof-attempt.v2" as const;
+/** Frozen legacy alias; explicit v2 attempts use the v2 discriminator. */
+export const CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION =
+  CCC_CAMPAIGN_PROOF_ATTEMPT_V1_SCHEMA_VERSION;
+export const CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V1 = "v1" as const;
+export const CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2 = "v2" as const;
+
+export type CccCampaignProofAttemptContractVersion =
+  | typeof CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V1
+  | typeof CCC_CAMPAIGN_PROOF_ATTEMPT_CONTRACT_V2;
 
 export type CccCampaignProofAttemptState =
   | "reserved"
@@ -79,8 +101,90 @@ export type CccCampaignProofExecutionResult = Readonly<{
   negativeControlLabel?: string;
 }>;
 
+export const CCC_PRD_PROOF_EVIDENCE_V2_SCHEMA_VERSION =
+  "ccc-prd.proof-evidence.v2" as const;
+export const CCC_PRD_PROOF_TERMINAL_ENVELOPE_V2_SCHEMA_VERSION =
+  "ccc-prd.proof-terminal-envelope.v2" as const;
+
+export type CccCampaignProofEvidenceClauseResult = Readonly<{
+  clauseId: string;
+  passed: boolean;
+}>;
+
+export type CccCampaignProofEvidencePositiveCaseResult = Readonly<{
+  caseId: string;
+  passed: boolean;
+}>;
+
+export type CccCampaignProofEvidenceNegativeControlResult = Readonly<{
+  controlId: string;
+  passed: boolean;
+}>;
+
+export type CccCampaignProofEvidenceV2 = Readonly<{
+  schema: typeof CCC_PRD_PROOF_EVIDENCE_V2_SCHEMA_VERSION;
+  proofId: string;
+  phase: CccPrdProofPhase;
+  sourceCommit: string;
+  sourceTree: string;
+  passed: boolean;
+  clauseResults: readonly CccCampaignProofEvidenceClauseResult[];
+  positiveCaseResults: readonly CccCampaignProofEvidencePositiveCaseResult[];
+  negativeControlResults: readonly CccCampaignProofEvidenceNegativeControlResult[];
+}>;
+
+export type CccCampaignProofExecutionRefusalCode =
+  | "timeout"
+  | "killed"
+  | "no_output"
+  | "malformed_output"
+  | "output_over_limit"
+  | "spawn_refused"
+  | "sandbox_refused";
+
+type CccCampaignProofTerminalEnvelopeV2Base = Readonly<{
+  schema: typeof CCC_PRD_PROOF_TERMINAL_ENVELOPE_V2_SCHEMA_VERSION;
+  proofId: string;
+  phase: CccPrdProofPhase;
+  sourceCommit: string;
+  sourceTree: string;
+  exitCode: number | null;
+  durationMs: number;
+  stdoutSha256: string;
+  stderrSha256: string;
+  changedPathsSha256: string;
+  stdoutTail: string;
+  stderrTail: string;
+  timedOut: boolean;
+  killed: boolean;
+  warnings: readonly string[];
+}>;
+
+export type CccCampaignProofVerifiedTerminalEnvelopeV2 =
+  CccCampaignProofTerminalEnvelopeV2Base
+  & Readonly<{
+    kind: "verified";
+    passed: boolean;
+    evidence: CccCampaignProofEvidenceV2;
+    evidenceSha256: string;
+  }>;
+
+export type CccCampaignProofExecutionRefusedTerminalEnvelopeV2 =
+  CccCampaignProofTerminalEnvelopeV2Base
+  & Readonly<{
+    kind: "execution_refused";
+    code: CccCampaignProofExecutionRefusalCode;
+  }>;
+
+export type CccCampaignProofTerminalEnvelopeV2 =
+  | CccCampaignProofVerifiedTerminalEnvelopeV2
+  | CccCampaignProofExecutionRefusedTerminalEnvelopeV2;
+
 export type CccCampaignProofAttempt = Readonly<{
-  schema: typeof CCC_CAMPAIGN_PROOF_ATTEMPT_SCHEMA_VERSION;
+  schema:
+    | typeof CCC_CAMPAIGN_PROOF_ATTEMPT_V1_SCHEMA_VERSION
+    | typeof CCC_CAMPAIGN_PROOF_ATTEMPT_V2_SCHEMA_VERSION;
+  attemptContractVersion: CccCampaignProofAttemptContractVersion;
   attemptKey: string;
   controllerToken: string;
   projectId: string;
@@ -104,8 +208,16 @@ export type CccCampaignProofAttempt = Readonly<{
   workItemId: string;
   runId: string;
   workItemAttempt: number;
+  phase?: CccPrdProofPhase;
+  verifierClosureSha256?: string;
+  candidateInputsSha256?: string;
+  executionToolchainSha256?: string;
   state: CccCampaignProofAttemptState;
   result?: CccCampaignProofExecutionResult;
+  terminalEnvelope?: CccCampaignProofTerminalEnvelopeV2;
+  terminalEnvelopeSha256?: string;
+  proofEvidence?: CccCampaignProofEvidenceV2;
+  proofEvidenceSha256?: string;
   createdAt: string;
   updatedAt: string;
   dispatchedAt?: string;
@@ -134,6 +246,23 @@ export class CccCampaignProofAttemptStateError extends Error {
   public constructor(message: string) {
     super(message);
     this.name = "CccCampaignProofAttemptStateError";
+  }
+}
+
+export const CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_CODE =
+  "CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED" as const;
+export const CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON =
+  `ccc-permanent:${CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_CODE}` as const;
+
+export class CccCampaignProofAttemptLimitError extends Error {
+  public readonly code = "CCC_CAMPAIGN_PROOF_ATTEMPT_LIMIT_REFUSED";
+
+  public constructor(
+    public readonly reason: "deadline",
+    message: string,
+  ) {
+    super(message);
+    this.name = "CccCampaignProofAttemptLimitError";
   }
 }
 
@@ -461,8 +590,11 @@ export type CccPrdProductExecutionPlan = {
   policy: CccCampaignProductExecutionPolicy;
 };
 
-export type CccCampaignManifest = {
-  schema: typeof CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION;
+export type CccCampaignExecutionAuthorizationMode =
+  | typeof CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_PER_TASK_V1
+  | typeof CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1;
+
+export type CccCampaignManifestBase = {
   projectId: string;
   importId: string;
   idempotencyKey: string;
@@ -481,8 +613,22 @@ export type CccCampaignManifest = {
   executionPolicy: CccCampaignExecutionPolicy;
 };
 
-export type CccCampaignContext = Omit<CccCampaignManifest, "schema"> & {
+export type CccCampaignManifestV1 = CccCampaignManifestBase & {
+  schema: typeof CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION;
+};
+
+export type CccCampaignManifestV2 = CccCampaignManifestBase & {
+  schema: typeof CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION;
+  executionAuthorizationMode:
+    typeof CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1;
+};
+
+export type CccCampaignManifest = CccCampaignManifestV1 | CccCampaignManifestV2;
+
+export type CccCampaignContext = CccCampaignManifestBase & {
   schema: typeof CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION;
+  /** Persisted TaskStore custody loads normalize this; omission preserves legacy caller fixtures. */
+  executionAuthorizationMode?: CccCampaignExecutionAuthorizationMode;
   taskId: string;
   route: CccCampaignExecutionRoute;
   manifestHash: string;
@@ -501,7 +647,7 @@ export type CccCampaignTaskContext = CccCampaignContext & {
    * graph, provider, or tool effect.
    */
   executionCustody?: Readonly<{
-    promptSchema: "ccc-prd.execution-prompt.v1";
+    promptSchema: CccPrdExecutionPrompt["schema"];
     promptSha256: string;
     routeSha256: string;
   }>;

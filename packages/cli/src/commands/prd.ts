@@ -12,7 +12,10 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
+  CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+  assertCccPrdSemanticProofV2Custody,
   canonicalCccPrdJson,
   createCccPrdProductExecutionPlan,
   importCccPrdBundle,
@@ -34,11 +37,13 @@ import {
   type CccPrdProductApprovalStatus,
   type CccPrdProductStatus,
   type CccPrdSemanticBundle,
+  type CccPrdSemanticProofToolchainPaths,
   type CccPrdSidecar,
   type WorkflowExtensionRegistry,
 } from "@fusion/core";
 import * as engine from "@fusion/engine";
 import { bootstrapCccCampaignProofAdmissionHost } from "./ccc-native-proof-host.js";
+import { resolveCccPrdSemanticProofToolchainPaths } from "./ccc-semantic-proof-toolchain.js";
 import {
   closeProjectStore,
   resolveProject,
@@ -76,6 +81,8 @@ type Compiler = {
     constraints?: CccPrdAuthoringConstraints;
     previousSidecar?: CccPrdSidecar;
     workflowExtensionRegistry?: WorkflowExtensionRegistry;
+    semanticProofContract?: "v1" | "v2";
+    semanticProofToolchainPaths?: CccPrdSemanticProofToolchainPaths;
   }): Promise<{ kind: "candidate"; sidecar: unknown; review: unknown } | { kind: "refusal" }>;
   createNativeCccPrdAuthoringAdapter(input: {
     provider: string;
@@ -131,6 +138,7 @@ type Compiler = {
 const compiler = engine as typeof engine & Compiler;
 export type VerifierConfinementReadiness = engine.VerifierConfinementReadiness;
 export type PrdCommandDependencies = {
+  authorCccPrdPacket?: typeof engine.authorCccPrdPacket;
   bootstrapProofAdmission?: () => Promise<WorkflowExtensionRegistry>;
   buildCccPrdCorpusManifest?: typeof engine.buildCccPrdCorpusManifest;
   createNativeCccPrdAuthoringAdapter?: typeof engine.createNativeCccPrdAuthoringAdapter;
@@ -148,6 +156,8 @@ export type PrdCommandDependencies = {
   settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
   understandCccPrdPacket?: typeof engine.understandCccPrdPacket;
   resolveCustomProviderModelLimits?: typeof engine.resolveCustomProviderModelLimits;
+  resolveSemanticProofToolchainPaths?: () => CccPrdSemanticProofToolchainPaths;
+  assertSemanticProofV2Custody?: typeof assertCccPrdSemanticProofV2Custody;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
   approveCccCampaignLiveExecution?: typeof engine.approveCccCampaignLiveExecution;
@@ -220,7 +230,7 @@ const usage = [
   "       fn prd <stop|abandon> <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]",
   "       fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]",
   "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
-  "       fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
+  "       fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id> --confirm <approval-digest> [--project <id|name>]",
   "       fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
   "       add --json to any command above for the exact machine-readable payload instead of operator prose",
 ].join("\n");
@@ -305,7 +315,10 @@ function resolveAuthorOutput(
       !existing
       || typeof existing !== "object"
       || Array.isArray(existing)
-      || (existing as { schema?: unknown }).schema !== CCC_PRD_SIDECAR_SCHEMA_VERSION
+      || (
+        (existing as { schema?: unknown }).schema !== CCC_PRD_SIDECAR_SCHEMA_VERSION
+        && (existing as { schema?: unknown }).schema !== CCC_PRD_SIDECAR_V2_SCHEMA_VERSION
+      )
     ) {
       throw new Error(`CCC_PRD_SIDECAR_TARGET_OCCUPIED: existing output is not a versioned sidecar: ${outputPath}`);
     }
@@ -924,6 +937,12 @@ async function runProductPolicyCommand(
       io.write(JSON.stringify(compiled));
       return 1;
     }
+    if (compiled.schema !== "ccc-prd.bundle.v2") {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+        "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+      );
+    }
     const plan = input.routeSelection === "routes-file"
       ? createCccPrdProductExecutionPlan({
         bundle: compiled,
@@ -963,7 +982,7 @@ async function runProductPolicyCommand(
 async function runGeneratedAuthor(
   input: GeneratedAuthorArgs,
   io: PrdCommandIo,
-  bootstrapProofAdmission: () => Promise<WorkflowExtensionRegistry>,
+  dependencies: PrdCommandDependencies,
 ): Promise<number> {
   let outputPath: string;
   let previousSidecar: CccPrdSidecar | undefined;
@@ -988,9 +1007,31 @@ async function runGeneratedAuthor(
     return 1;
   }
 
+  let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths;
+  try {
+    semanticProofToolchainPaths = (
+      dependencies.resolveSemanticProofToolchainPaths
+      ?? resolveCccPrdSemanticProofToolchainPaths
+    )();
+  } catch (error) {
+    io.write(JSON.stringify({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+        message: error instanceof Error
+          ? error.message
+          : "semantic-proof toolchain identity could not be resolved",
+      }],
+    }));
+    return 1;
+  }
+
   let adapter: ReturnType<Compiler["createNativeCccPrdAuthoringAdapter"]>;
   try {
-    adapter = compiler.createNativeCccPrdAuthoringAdapter({
+    adapter = (
+      dependencies.createNativeCccPrdAuthoringAdapter
+      ?? compiler.createNativeCccPrdAuthoringAdapter
+    )({
       provider: input.provider,
       model: input.model,
       maxDurationMs: input.maxDurationMs,
@@ -1010,7 +1051,9 @@ async function runGeneratedAuthor(
 
   let workflowExtensionRegistry: WorkflowExtensionRegistry;
   try {
-    workflowExtensionRegistry = await bootstrapProofAdmission();
+    workflowExtensionRegistry = await (
+      dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost
+    )();
   } catch (error) {
     io.write(JSON.stringify({
       kind: "refusal",
@@ -1024,13 +1067,17 @@ async function runGeneratedAuthor(
     return 1;
   }
 
-  const result = await compiler.authorCccPrdPacket({
+  const result = await (
+    dependencies.authorCccPrdPacket ?? compiler.authorCccPrdPacket
+  )({
     rootDir: input.rootDir,
     manifestPath: input.manifestPath,
     adapter,
     constraints: input.constraints,
     ...(previousSidecar ? { previousSidecar } : {}),
     workflowExtensionRegistry,
+    semanticProofContract: "v2",
+    semanticProofToolchainPaths,
   });
   if (result.kind === "refusal") {
     io.write(JSON.stringify(result));
@@ -1293,7 +1340,12 @@ function writeVerifierConfinementImportRefusal(
 function writeVerifierConfinementExecutionRefusal(
   io: PrdCommandIo,
   readiness: VerifierConfinementReadiness,
-  approval: Pick<CccPrdProductApprovalStatus, "id" | "status" | "campaign">,
+  decision: Readonly<{
+    label: "Approval" | "Execution authorization";
+    id: string;
+    status: string;
+    expiresAt: string;
+  }>,
   workItem: Readonly<{ id: string; state: string }>,
   idempotencyKey: string,
   json: boolean,
@@ -1307,11 +1359,11 @@ function writeVerifierConfinementExecutionRefusal(
     }],
     verifierConfinement: sanitizedVerifierConfinementReadiness(readiness),
     safeState:
-      `Approval ${approval.id} remains ${approval.status} and workflow ${workItem.id} remains ${workItem.state}; this command started no provider, source, or proof effect.`,
+      `${decision.label} ${decision.id} remains ${decision.status} and workflow ${workItem.id} remains ${workItem.state}; this command started no provider, source, or proof effect.`,
     decisionOwner: "Fusion host or CI runner operator",
     consequence:
       "Live coding cannot start because Fusion could not prove exact requirement tests can run under enforced confinement.",
-    approvalExpiresAt: approval.campaign.expiresAt,
+    approvalExpiresAt: decision.expiresAt,
     recoveryOptions: [
       `Repair and functionally verify ${backend} before this approval expires.`,
       "If the approval expires, request a fresh exact live-execution approval after the host is ready.",
@@ -1625,6 +1677,35 @@ function productConfirmationDigest(
     .digest("hex");
 }
 
+function productRequestBudget(
+  bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignProductExecutionPolicy,
+) {
+  const providerTasks = executionPolicy.routes.length;
+  return {
+    scope: "campaign-global" as const,
+    maximum: bundle.bounds.maxRequests,
+    providerTasks,
+    deterministicMinimum: providerTasks,
+    headroomAboveMinimum: bundle.bounds.maxRequests - providerTasks,
+    completionAdequacy: "unproven" as const,
+    explanation:
+      "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+  };
+}
+
+function assertProductRequestBudgetFloor(
+  bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignProductExecutionPolicy,
+): void {
+  const budget = productRequestBudget(bundle, executionPolicy);
+  if (budget.maximum >= budget.deterministicMinimum) return;
+  throw new PrdProductCommandError(
+    CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+    `campaign maxRequests ${budget.maximum} is below the deterministic provider-task floor ${budget.deterministicMinimum}`,
+  );
+}
+
 function operatorVerifierConfinementReadiness(
   readiness: VerifierConfinementReadiness,
 ) {
@@ -1684,6 +1765,7 @@ function productPreview(
     protectedActions: bundle.protectedActions,
     admittedWriteRoots: bundle.admittedWriteRoots,
     bounds: bundle.bounds,
+    requestBudget: productRequestBudget(bundle, identity.executionPolicy),
     nonGoals: bundle.nonGoals,
     materialCoverage: bundle.materialCoverage,
     verifierConfinement: operatorVerifierConfinementReadiness(
@@ -1799,6 +1881,7 @@ async function runProductPacketCommand(
 
   let bundle: CccPrdSemanticBundle;
   let executionPolicy: CccCampaignProductExecutionPolicy;
+  let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths | undefined;
   try {
     const compiled = compileProductBundle({
       rootDir,
@@ -1812,7 +1895,20 @@ async function runProductPacketCommand(
       return 1;
     }
     bundle = compiled;
+    if (preview && bundle.schema !== "ccc-prd.bundle.v2") {
+      throw new PrdProductCommandError(
+        "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+        "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+      );
+    }
     executionPolicy = readProductExecutionPolicy(rootDir, executionPlanPath, bundle);
+    if (preview) assertProductRequestBudgetFloor(bundle, executionPolicy);
+    if (bundle.schema === "ccc-prd.bundle.v2") {
+      semanticProofToolchainPaths = (
+        dependencies.resolveSemanticProofToolchainPaths
+        ?? resolveCccPrdSemanticProofToolchainPaths
+      )();
+    }
   } catch (error) {
     const detail = error as { code?: unknown; message?: unknown };
     return writeProductRefusal(
@@ -1855,6 +1951,40 @@ async function runProductPacketCommand(
         "CCC_PRD_TARGET_HEAD_DRIFT",
         `target HEAD ${targetHead} does not match frozen base ${bundle.targetRepository.baseCommit}`,
       );
+    }
+    if (bundle.schema === "ccc-prd.bundle.v2") {
+      await (
+        dependencies.assertSemanticProofV2Custody
+        ?? assertCccPrdSemanticProofV2Custody
+      )({
+        repositoryRoot: project.projectPath,
+        baseCommit: bundle.targetRepository.baseCommit,
+        proofs: bundle.proofs,
+        modelWriteRoots: executionPolicy.routes.flatMap((route) => [
+          ...(route.ownedPaths ?? []),
+          ...(route.allowedWriteRoots ?? []),
+        ]),
+        toolchainPaths: semanticProofToolchainPaths!,
+      });
+    } else {
+      const inspected = await (
+        dependencies.inspectCccPrdImport ?? inspectCccPrdImport
+      )({
+        idempotencyKey: idempotencyKey!,
+        layer,
+        rootDir: project.projectPath,
+      });
+      if (
+        !inspected
+        || inspected.bundleHash !== bundle.bundleHash
+        || resolve(inspected.targetRepository) !== resolve(project.projectPath)
+        || inspected.targetBase !== bundle.targetRepository.baseCommit
+      ) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+          "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+        );
+      }
     }
     const identity = productPreviewIdentity({
       projectId: project.projectId,
@@ -1900,6 +2030,7 @@ async function runProductPacketCommand(
       store: project.store,
       layer,
       rootDir: project.projectPath,
+      ...(semanticProofToolchainPaths ? { semanticProofToolchainPaths } : {}),
     });
     writeOperatorValue(io, commandContext, {
       kind: "imported",
@@ -2139,17 +2270,34 @@ async function runProductControlCommand(
           expiresAt: approval.campaign.expiresAt,
           status: approval.status,
         }));
-      const liveExecutionApprovalConfirmations = status.approvals
-        .filter(isLiveExecutionApproval)
-        .map((approval) => ({
-          approvalRequestId: approval.id,
-          confirmation: computeLiveExecutionConfirmation(
-            approval as ApprovalRequest,
-          ),
-          expiresAt: approval.campaign.expiresAt,
-          status: approval.status,
-          taskId: approval.taskId,
-        }));
+      const liveExecutionAuthorizationConfirmation = status.executionAuthorization
+        && (
+          status.executionAuthorization.status === "issued"
+          || status.executionAuthorization.status === "claimed"
+        )
+        ? {
+          authorizationId: status.executionAuthorization.authorizationId,
+          confirmation: computeLiveExecutionConfirmation(status.executionAuthorization),
+          expiresAt: status.executionAuthorization.expiresAt,
+          status: status.executionAuthorization.status,
+        }
+        : null;
+      const sealedExecutionAuthorization =
+        status.executionAuthorizationMode === "sealed_bundle_v1"
+        || Boolean(status.executionAuthorization);
+      const liveExecutionApprovalConfirmations = sealedExecutionAuthorization
+        ? []
+        : status.approvals
+          .filter(isLiveExecutionApproval)
+          .map((approval) => ({
+            approvalRequestId: approval.id,
+            confirmation: computeLiveExecutionConfirmation(
+              approval as ApprovalRequest,
+            ),
+            expiresAt: approval.campaign.expiresAt,
+            status: approval.status,
+            taskId: approval.taskId,
+          }));
       writeOperatorPayload(io, commandContext, {
         kind: "product-status",
         found: true,
@@ -2159,39 +2307,58 @@ async function runProductControlCommand(
           ?? engine.describeCccCampaignOperatorControls
         )(status),
         mergeApprovalConfirmations,
+        ...(liveExecutionAuthorizationConfirmation
+          ? { liveExecutionAuthorizationConfirmation }
+          : {}),
         liveExecutionApprovalConfirmations,
       });
       return 0;
     }
 
-    const approval = status.approvals.find(({ id }) =>
-      id === approvalRequestId);
-    if (!approval || (
-      approvingExecution
-        ? !isLiveExecutionApproval(approval)
-        : !isMergeApproval(approval)
-    )) {
-      throw new PrdProductCommandError(
-        approvingExecution
-          ? "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING"
-          : "CCC_PRD_MERGE_APPROVAL_MISSING",
-        `${approvingExecution ? "live-execution" : "merge"} approval ${approvalRequestId} is missing from exact product status`,
-      );
-    }
-    const expectedConfirmation = (
-      approvingExecution
-        ? computeLiveExecutionConfirmation
-        : computeConfirmation
-    )(approval as ApprovalRequest);
-    if (!exactDigest(confirmation!, expectedConfirmation)) {
-      throw new PrdProductCommandError(
-        approvingExecution
-          ? "CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED"
-          : "CCC_PRD_MERGE_CONFIRMATION_REFUSED",
-        `${approvingExecution ? "live-execution" : "merge"} approval confirmation is stale or does not match`,
-      );
-    }
     if (approvingExecution) {
+      const sealedExecutionAuthorization =
+        status.executionAuthorizationMode === "sealed_bundle_v1"
+        || Boolean(status.executionAuthorization);
+      const authorization = sealedExecutionAuthorization
+        ? status.executionAuthorization
+        : null;
+      const approval = sealedExecutionAuthorization
+        ? null
+        : status.approvals.find(({ id }) => id === approvalRequestId);
+      if (
+        sealedExecutionAuthorization
+          ? !authorization || authorization.authorizationId !== approvalRequestId
+          : !approval || !isLiveExecutionApproval(approval)
+      ) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+          sealedExecutionAuthorization
+            ? `live-execution authorization ${approvalRequestId} is missing from exact product status`
+            : `live-execution approval ${approvalRequestId} is missing from exact product status`,
+        );
+      }
+      const expectedConfirmation = computeLiveExecutionConfirmation(
+        authorization ?? (approval as ApprovalRequest),
+      );
+      if (!exactDigest(confirmation!, expectedConfirmation)) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED",
+          authorization
+            ? "live-execution authorization confirmation is stale or does not match"
+            : "live-execution approval confirmation is stale or does not match",
+        );
+      }
+      const taskId = authorization
+        ? authorization.members[0]?.nativeTaskId
+        : approval?.taskId;
+      if (!taskId) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+          authorization
+            ? `live-execution authorization ${approvalRequestId} has no exact task custody`
+            : `live-execution approval ${approvalRequestId} has no exact task custody`,
+        );
+      }
       const workItem = exactLiveExecutionWorkItem(status);
       const verifierConfinement = await (
         dependencies.inspectVerifierConfinementReadiness
@@ -2201,7 +2368,19 @@ async function runProductControlCommand(
         return writeVerifierConfinementExecutionRefusal(
           io,
           verifierConfinement,
-          approval,
+          authorization
+            ? {
+              label: "Execution authorization",
+              id: authorization.authorizationId,
+              status: authorization.status,
+              expiresAt: authorization.expiresAt,
+            }
+            : {
+              label: "Approval",
+              id: approval!.id,
+              status: approval!.status,
+              expiresAt: approval!.campaign.expiresAt,
+            },
           workItem,
           idempotencyKey,
           operatorJson(commandContext),
@@ -2213,8 +2392,10 @@ async function runProductControlCommand(
       )({
         store: project.store,
         rootDir: project.projectPath,
-        taskId: approval.taskId!,
-        approvalRequestId: approval.id,
+        taskId,
+        ...(authorization
+          ? { authorizationId: authorization.authorizationId }
+          : { approvalRequestId: approval!.id }),
         confirmation: confirmation!,
         actor: {
           actorId: "ccc-fusion-local-operator",
@@ -2250,11 +2431,27 @@ async function runProductControlCommand(
       }
       writeOperatorPayload(io, commandContext, {
         kind: "execution-approved",
-        approvalRequestId: approval.id,
+        ...(authorization
+          ? { executionAuthorizationId: authorization.authorizationId }
+          : { approvalRequestId: approval!.id }),
         approval: approved,
         status: resumedStatus,
       });
       return 0;
+    }
+    const approval = status.approvals.find(({ id }) => id === approvalRequestId);
+    if (!approval || !isMergeApproval(approval)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_MERGE_APPROVAL_MISSING",
+        `merge approval ${approvalRequestId} is missing from exact product status`,
+      );
+    }
+    const expectedConfirmation = computeConfirmation(approval as ApprovalRequest);
+    if (!exactDigest(confirmation!, expectedConfirmation)) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_MERGE_CONFIRMATION_REFUSED",
+        "merge approval confirmation is stale or does not match",
+      );
     }
     const workItem = exactMergeWorkItem(status);
     const result = await (
@@ -2601,6 +2798,15 @@ function exactProofResolutionContext(
     );
   }
   const attempt = matches[0]!;
+  if (
+    "attemptContractVersion" in attempt
+    && attempt.attemptContractVersion === "v2"
+  ) {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROOF_RESOLUTION_V2_REFUSED",
+      `semantic proof v2 attempt ${attemptKey} can only be settled by the trusted verifier controller; manual result fabrication is disabled`,
+    );
+  }
   if (
     attempt.importId !== status.import.importId
     || attempt.packetHash !== status.import.packetHash
@@ -3326,7 +3532,7 @@ export async function runPrdCommand(
     return runGeneratedAuthor(
       generatedAuthor,
       io,
-      dependencies.bootstrapProofAdmission ?? bootstrapCccCampaignProofAdmissionHost,
+      dependencies,
     );
   }
 
@@ -3361,14 +3567,42 @@ export async function runPrdCommand(
       }));
       return 1;
     }
-    const result = await compiler.authorCccPrdPacket({
+    let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths | undefined;
+    if (proposal.schema === "ccc-prd.authoring-proposal.v2") {
+      try {
+        semanticProofToolchainPaths = (
+          dependencies.resolveSemanticProofToolchainPaths
+          ?? resolveCccPrdSemanticProofToolchainPaths
+        )();
+      } catch (error) {
+        io.write(JSON.stringify({
+          kind: "refusal",
+          diagnostics: [{
+            code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+            message: error instanceof Error
+              ? error.message
+              : "semantic-proof toolchain identity could not be resolved",
+          }],
+        }));
+        return 1;
+      }
+    }
+    const result = await (dependencies.authorCccPrdPacket ?? compiler.authorCccPrdPacket)({
       rootDir,
       manifestPath,
       adapter: {
         id: "local-deterministic-fixture",
-        model: "proposal-file-v1",
+        model: proposal.schema === "ccc-prd.authoring-proposal.v2"
+          ? "proposal-file-v2"
+          : "proposal-file-v1",
         generateCandidate: async () => proposal,
       },
+      ...(proposal.schema === "ccc-prd.authoring-proposal.v2"
+        ? {
+          semanticProofContract: "v2" as const,
+          semanticProofToolchainPaths: semanticProofToolchainPaths!,
+        }
+        : {}),
       constraints: {
         targetRepository: proposal.targetRepository,
         bounds: proposal.bounds,

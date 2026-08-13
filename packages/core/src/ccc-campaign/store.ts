@@ -389,7 +389,13 @@ export async function loadCccCampaignContextForTask(
       `Task ${taskId} campaign custody is missing, unadmitted, or drifted`,
     );
   }
-  const { bundle, executionPolicy, manifest, manifestHash } = custody;
+  const {
+    bundle,
+    executionPolicy,
+    manifest,
+    manifestHash,
+    executionAuthorizationMode,
+  } = custody;
   let physicalRoot: string;
   try {
     physicalRoot = await realpath(rootDir);
@@ -490,6 +496,7 @@ export async function loadCccCampaignContextForTask(
     proofs: manifest.proofs,
     protectedActions: manifest.protectedActions,
     executionPolicy: manifest.executionPolicy,
+    executionAuthorizationMode,
     route: { ...route },
     ...(executionCustody ? { executionCustody } : {}),
     campaignStartedAt: manifest.campaignStartedAt,

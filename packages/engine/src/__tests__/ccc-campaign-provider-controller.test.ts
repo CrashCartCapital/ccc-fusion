@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CccProviderAttemptLimitError } from "@fusion/core";
 
 const effects = vi.hoisted(() => ({
   git: vi.fn(),
@@ -115,6 +116,26 @@ describe("CCC campaign provider controller", () => {
     await expect(preDispatchCccCampaignProviderFromEngine({ initialGitSnapshot: snapshot, preDispatch }))
       .rejects.toThrow("dirty");
     expect(effects.core).not.toHaveBeenCalled();
+  });
+
+  it("tags campaign-global request exhaustion so Pi can restore permanent refusal custody", async () => {
+    effects.git.mockResolvedValue(recheckedSnapshot);
+    effects.core.mockRejectedValue(new CccProviderAttemptLimitError(
+      "max-requests",
+      "CCC provider attempt for TASK-1 exceeds its admitted request bound",
+    ));
+
+    await expect(preDispatchCccCampaignProviderFromEngine({
+      initialGitSnapshot: snapshot,
+      preDispatch,
+    })).rejects.toMatchObject({
+      name: "PermanentError",
+      code: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      retryable: false,
+      message: expect.stringContaining(
+        "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      ),
+    });
   });
 
   it("has no routeKind admission label on the engine pre-dispatch input", () => {

@@ -2,8 +2,12 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CustomProvider } from "@fusion/core";
-import { understandCccPrdPacket } from "@fusion/engine";
+import {
+  canonicalCccPrdJson,
+  createCccPrdProductExecutionPlan,
+  type CustomProvider,
+} from "@fusion/core";
+import { compileCccPrdPacket, understandCccPrdPacket } from "@fusion/engine";
 import type { CccPrdNativeAuthoringTransport } from "@fusion/engine";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
 import {
@@ -47,6 +51,55 @@ async function createExecutionPlan(
   return outputPath;
 }
 
+function createLegacyExecutionPlan(
+  packet: ReturnType<typeof createPacketRoot>,
+): { bundleHash: string; outputPath: string } {
+  const bundle = compileCccPrdPacket({
+    rootDir: packet.root,
+    manifestPath: packet.manifest,
+    sidecarPath: packet.sidecar,
+    expectedTarget: packet.target,
+    expectedBase: packet.base,
+    requireMaterialCoverage: true,
+  });
+  if (bundle.kind === "refusal") {
+    throw new Error(`legacy fixture did not compile: ${JSON.stringify(bundle.diagnostics)}`);
+  }
+  const plan = createCccPrdProductExecutionPlan({
+    bundle,
+    route: {
+      providerId: "deterministic-fake",
+      modelId: "fixture-v1",
+      transport: "pi",
+    },
+  });
+  const outputPath = join(packet.root, "legacy-execution-plan.json");
+  writeFileSync(outputPath, `${canonicalCccPrdJson(plan)}\n`);
+  return { bundleHash: bundle.bundleHash, outputPath };
+}
+
+async function authorSemanticV2Packet(
+  packet: ReturnType<typeof createPacketRoot>,
+): Promise<void> {
+  if (!packet.semanticProofToolchainPaths) {
+    throw new Error("semantic-v2 packet fixture is missing controller toolchain paths");
+  }
+  const output: string[] = [];
+  const exit = await runPrdCommand(
+    ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+    { write: (line) => output.push(line) },
+    {
+      bootstrapProofAdmission,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+    },
+  );
+  expect(exit, output.join("\n")).toBe(0);
+  expect(JSON.parse(readFileSync(packet.sidecar, "utf8"))).toMatchObject({
+    schema: "ccc-prd.sidecar.v2",
+    provenance: { authoringModel: "proposal-file-v2" },
+  });
+}
+
 /**
  * The operator loop prints human-readable prose by default. These assertions
  * pin the machine-readable contract, so they ask for it explicitly.
@@ -58,6 +111,121 @@ async function runPrdJson(
   commandContext?: Parameters<typeof runPrdCommand>[3],
 ): Promise<number> {
   return runPrdCommand([...args, "--json"], io, dependencies, commandContext);
+}
+
+function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" = "issued") {
+  const authorizationDigest = "9".repeat(64);
+  const member = (
+    ordinal: number,
+    nativeTaskId: string,
+    semanticTaskId: string,
+    digest: string,
+  ) => ({
+    ordinal,
+    nativeTaskId,
+    semanticTaskId,
+    actionId: `ACTION-live-${ordinal + 1}`,
+    actionTarget: `provider://fixture/${semanticTaskId}`,
+    providerId: "fixture",
+    modelId: "fixture-v2",
+    transport: "pi" as const,
+    promptSchema: "ccc-prd.execution-prompt.v1" as const,
+    promptSha256: digest.repeat(64),
+    routeSha256: digest.repeat(64),
+    bindingHash: digest.repeat(64),
+    approvalRequestId: `ccc-approval-${digest.repeat(64)}`,
+    memberHash: digest.repeat(64),
+  });
+  return {
+    schemaVersion: "ccc-campaign.execution-authorization.v1" as const,
+    projectId: "project-1",
+    importId: "import-1",
+    campaignId: "campaign-1",
+    idempotencyKey: "operator-key",
+    workflowId: "workflow-1",
+    workItemId: "work-item-1",
+    workflowIrHash: "1".repeat(64),
+    packetHash: "2".repeat(64),
+    sidecarHash: "3".repeat(64),
+    bundleHash: "4".repeat(64),
+    manifestHash: "5".repeat(64),
+    executionPolicySha256: "6".repeat(64),
+    targetRepository: "/tmp/product-target",
+    targetBase: "d".repeat(40),
+    campaignStartedAt: "2026-07-31T00:00:00.000Z",
+    campaignDeadlineAt: "2026-07-31T02:00:00.000Z",
+    maxRequests: 24,
+    maxConcurrency: 1,
+    authorizationId: `ccc-execution-authorization-${authorizationDigest}`,
+    authorizationDigest,
+    memberSetHash: "7".repeat(64),
+    members: [
+      member(0, "TASK-coding", "TASK-1", "a"),
+      member(1, "TASK-review", "TASK-2", "b"),
+    ],
+    expectedRequestCount: 0,
+    status,
+    requester: {
+      actorId: "ccc-campaign-runtime",
+      actorType: "agent" as const,
+      actorName: "CCC Campaign Runtime",
+    },
+    notBeforeAt: "2026-07-31T00:00:00.000Z",
+    expiresAt: "2026-07-31T01:00:00.000Z",
+    createdAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-07-31T00:00:00.000Z",
+  };
+}
+
+function diagnosticLiveApproval(id: string, taskId: string) {
+  return {
+    id,
+    status: "issued",
+    taskId,
+    runId: "RUN-product",
+    requester: {
+      actorId: "ccc-campaign-runtime",
+      actorType: "agent",
+      actorName: "CCC Campaign Runtime",
+    },
+    targetAction: {
+      category: "command_execution",
+      action: `ACTION-${taskId}`,
+      summary: "Run one exact admitted provider action",
+      resourceType: "ccc-campaign-live_execution",
+      resourceId: `provider://fixture/${taskId}`,
+      context: {
+        protectedActionKind: "live_execution",
+        operatorDecision: "approve_live_execution",
+      },
+    },
+    requestedAt: "2026-07-31T00:00:00.000Z",
+    createdAt: "2026-07-31T00:00:00.000Z",
+    updatedAt: "2026-07-31T00:00:00.000Z",
+    campaign: {
+      binding: {
+        projectId: "project-1",
+        importId: "import-1",
+        campaignId: "campaign-1",
+        taskId,
+        actionId: `ACTION-${taskId}`,
+        actionTarget: `provider://fixture/${taskId}`,
+        idempotencyKey: "operator-key",
+        packetHash: "2".repeat(64),
+        sidecarHash: "3".repeat(64),
+        bundleHash: "4".repeat(64),
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        providerId: "fixture",
+        modelId: "fixture-v2",
+        transport: "pi",
+        manifestHash: "5".repeat(64),
+        bindingHash: taskId === "TASK-coding" ? "a".repeat(64) : "b".repeat(64),
+      },
+      notBeforeAt: "2026-07-31T00:00:00.000Z",
+      expiresAt: "2026-07-31T01:00:00.000Z",
+    },
+  };
 }
 
 /** Recursive content-hash snapshot of a packet root, used to prove a run left zero residue. */
@@ -80,6 +248,274 @@ function snapshotPacketRoot(root: string): Record<string, string> {
 }
 
 describe("prd command exit contract", () => {
+  it("RED-S4-executable-author: generated author explicitly requests semantic v2 with controller toolchain custody", async () => {
+    const packet = createPacketRoot();
+    const adapter = {
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(),
+    };
+    const toolchainPaths = {
+      taskExecutablePath: "/controller/task",
+      nodeExecutablePath: "/controller/node",
+      proofHost: {
+        id: "fusion-cli-semantic-proof-host.v1" as const,
+        executablePath: "/controller/fusion-cli",
+      },
+    };
+    const authorCccPrdPacket = vi.fn(async () => ({
+      kind: "candidate" as const,
+      sidecar: { schema: "ccc-prd.sidecar.v2" },
+      review: { ambiguities: [], unresolvedDecisions: [], exceptions: [], protectedActions: [] },
+    }));
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "author",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      "--target", packet.target,
+      "--base", packet.base,
+      "--provider", "loopback",
+      "--model", "fixture",
+      "--max-requests", "1",
+      "--max-duration-ms", "30000",
+      "--max-concurrency", "1",
+      "--max-prompt-bytes", "1000000",
+      "--max-response-bytes", "262144",
+      "--max-review-items", "8",
+    ], { write: (line) => output.push(line) }, {
+      authorCccPrdPacket: authorCccPrdPacket as never,
+      bootstrapProofAdmission: async () => ({}) as never,
+      createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      resolveSemanticProofToolchainPaths: () => toolchainPaths,
+    })).toBe(0);
+
+    expect(authorCccPrdPacket).toHaveBeenCalledWith(expect.objectContaining({
+      semanticProofContract: "v2",
+      semanticProofToolchainPaths: toolchainPaths,
+      adapter,
+      constraints: expect.objectContaining({
+        targetRepository: { path: packet.target, baseCommit: packet.base },
+      }),
+    }));
+    expect(JSON.parse(readFileSync(packet.sidecar, "utf8"))).toEqual({
+      schema: "ccc-prd.sidecar.v2",
+    });
+  });
+
+  it("refuses generated executable authoring before model setup when controller toolchain custody is unavailable", async () => {
+    const packet = createPacketRoot();
+    const createAdapter = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "author",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      "--target", packet.target,
+      "--base", packet.base,
+      "--provider", "loopback",
+      "--model", "fixture",
+      "--max-requests", "1",
+      "--max-duration-ms", "30000",
+      "--max-concurrency", "1",
+      "--max-prompt-bytes", "1000000",
+      "--max-response-bytes", "262144",
+      "--max-review-items", "8",
+    ], { write: (line) => output.push(line) }, {
+      createNativeCccPrdAuthoringAdapter: createAdapter,
+      resolveSemanticProofToolchainPaths: () => {
+        throw new Error("built proof host missing");
+      },
+    })).toBe(1);
+
+    expect(createAdapter).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+        message: "built proof host missing",
+      }],
+    });
+  });
+
+  it("RED-S4-product-preview-v1: refuses a fresh legacy semantic packet before toolchain or project access", async () => {
+    const packet = createPacketRoot();
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: () => undefined },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+    const output: string[] = [];
+    const resolveToolchain = vi.fn();
+    const resolveProject = vi.fn();
+
+    expect(await runPrdJson([
+      "preview",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      join(packet.root, "not-read.execution-plan.json"),
+      packet.target,
+      packet.base,
+    ], { write: (line) => output.push(line) }, {
+      resolveSemanticProofToolchainPaths: resolveToolchain,
+      resolveProject,
+    })).toBe(1);
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED" }],
+    });
+    expect(resolveToolchain).not.toHaveBeenCalled();
+    expect(resolveProject).not.toHaveBeenCalled();
+  });
+
+  it("RED-S5-product-preview-fabricated-custody: refuses changed controller executable bytes before the executable can run", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    await authorSemanticV2Packet(packet);
+    const executionPlanPath = await createExecutionPlan(packet);
+    const markerPath = join(packet.root, "swapped-task-ran.marker");
+    writeFileSync(
+      packet.semanticProofToolchainPaths!.taskExecutablePath,
+      `#!/bin/sh\nprintf swapped > '${markerPath}'\nprintf 'Task fixture swapped\n'\n`,
+    );
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store: { getAsyncLayer: vi.fn(() => ({})) },
+    };
+    const output: string[] = [];
+
+    expect(await runPrdJson([
+      "preview",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      executionPlanPath,
+      packet.target,
+      packet.base,
+    ], { write: (line) => output.push(line) }, {
+      resolveProject: vi.fn(async () => context),
+      closeProjectStore: vi.fn(async () => undefined),
+      readTargetHead: vi.fn(async () => packet.base),
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+      inspectVerifierConfinementReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "test confinement is ready",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+        detail: "test-injected ready confinement",
+      })),
+    })).toBe(1);
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED" }],
+    });
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  it("RED-S4-exact-legacy-replay: reaches core replay without resolving semantic-v2 toolchain custody", async () => {
+    const packet = createPacketRoot();
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: () => undefined },
+      { bootstrapProofAdmission },
+    )).toBe(0);
+    const legacyPlan = createLegacyExecutionPlan(packet);
+    const layer = {};
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store: { getAsyncLayer: vi.fn(() => layer) },
+    };
+    const resolveToolchain = vi.fn();
+    const assertCustody = vi.fn();
+    const inspectImport = vi.fn(async () => ({
+      bundleHash: legacyPlan.bundleHash,
+      targetRepository: packet.target,
+      targetBase: packet.base,
+    }));
+    const importBundle = vi.fn(async () => ({
+      importId: "legacy-import-1",
+      idempotencyKey: "legacy-key",
+      bundleHash: legacyPlan.bundleHash,
+      identityHash: "identity-hash",
+      targetRepository: packet.target,
+      targetBase: packet.base,
+      state: "active",
+      runnable: true,
+      stagingRelativePath: ".fusion/ccc-prd-import-staging/legacy-import-1",
+      transactionWitness: {},
+      directCounts: {},
+      replayed: true,
+    }));
+    const dependencies = {
+      resolveProject: vi.fn(async () => context),
+      closeProjectStore: vi.fn(async () => undefined),
+      readTargetHead: vi.fn(async () => packet.base),
+      resolveSemanticProofToolchainPaths: resolveToolchain,
+      assertSemanticProofV2Custody: assertCustody,
+      inspectCccPrdImport: inspectImport as never,
+      importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "test confinement is ready",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+        detail: "test-injected ready confinement",
+      })),
+    };
+    const common = [
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      legacyPlan.outputPath,
+      packet.target,
+      packet.base,
+      "legacy-key",
+      "--confirm",
+    ];
+    const mismatchOutput: string[] = [];
+    expect(await runPrdJson(
+      ["import", ...common, "0".repeat(64)],
+      { write: (line) => mismatchOutput.push(line) },
+      dependencies,
+    )).toBe(1);
+    const mismatch = JSON.parse(mismatchOutput[0]!) as {
+      diagnostics: Array<{ code: string; message: string }>;
+    };
+    expect(mismatch.diagnostics[0]).toMatchObject({ code: "CCC_PRD_CONFIRMATION_MISMATCH" });
+    const confirmation = mismatch.diagnostics[0]!.message.match(/[0-9a-f]{64}$/u)?.[0];
+    expect(confirmation).toMatch(/^[0-9a-f]{64}$/u);
+
+    const replayOutput: string[] = [];
+    expect(await runPrdJson(
+      ["import", ...common, confirmation!],
+      { write: (line) => replayOutput.push(line) },
+      dependencies,
+    )).toBe(0);
+    expect(JSON.parse(replayOutput[0]!)).toMatchObject({
+      kind: "imported",
+      result: { importId: "legacy-import-1", replayed: true },
+    });
+    expect(resolveToolchain).not.toHaveBeenCalled();
+    expect(assertCustody).not.toHaveBeenCalled();
+    expect(importBundle).toHaveBeenCalledWith(expect.not.objectContaining({
+      semanticProofToolchainPaths: expect.anything(),
+    }));
+  });
+
   it("stops reading typed operator context as soon as the byte limit is crossed", async () => {
     let chunksRead = 0;
     async function* chunks(): AsyncGenerator<Buffer> {
@@ -150,7 +586,7 @@ describe("prd command exit contract", () => {
         "       fn prd <stop|abandon> <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]",
         "       fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]",
         "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
-        "       fn prd approve-execution <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
+        "       fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id> --confirm <approval-digest> [--project <id|name>]",
         "       fn prd approve-merge <idempotency-key> <approval-request-id> --confirm <approval-digest> [--project <id|name>]",
         "       add --json to any command above for the exact machine-readable payload instead of operator prose",
       ].join("\n"),
@@ -759,13 +1195,8 @@ describe("prd command exit contract", () => {
   });
 
   it("generates a hash-bound execution plan without operator-authored policy JSON", async () => {
-    const packet = createPacketRoot();
-    const authorOutput: string[] = [];
-    expect(await runPrdCommand(
-      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
-      { write: (line) => authorOutput.push(line) },
-      { bootstrapProofAdmission },
-    )).toBe(0);
+    const packet = createPacketRoot({ semanticV2: true });
+    await authorSemanticV2Packet(packet);
 
     const executionPlanPath = join(packet.root, "execution-plan.json");
     const output: string[] = [];
@@ -831,11 +1262,12 @@ describe("prd command exit contract", () => {
     };
     expect(template).toMatchObject({
       kind: "prd-intake-template",
-      schema: "ccc-prd.intake-contract.v1",
+      schema: "ccc-prd.intake-contract.v2",
     });
     expect(template.markdown).toContain("Target repository:");
-    expect(template.markdown).toContain("Acceptance behavior and expected proof");
-    expect(template.markdown).toContain("task verify:<slug>");
+    expect(template.markdown).toContain("### Requirement REQ-001");
+    expect(template.markdown).toContain("#### Acceptance clauses");
+    expect(template.markdown).toContain("the verifier command task verify:<slug>");
 
     const packet = createPacketRoot();
     const prdPath = join(packet.root, "future-prd.md");
@@ -852,7 +1284,7 @@ describe("prd command exit contract", () => {
       { write: (line) => lintOutput.push(line) },
     )).toBe(1);
     expect(JSON.parse(lintOutput[0]!)).toMatchObject({
-      schema: "ccc-prd.intake-contract.v1",
+      schema: "ccc-prd.intake-contract.v2",
       optionalContract: true,
       readyForIntake: false,
       blockingQuestions: [
@@ -860,7 +1292,9 @@ describe("prd command exit contract", () => {
         expect.objectContaining({ code: "CCC_PRD_BASELINE_REQUIRED" }),
         expect.objectContaining({ code: "CCC_PRD_ALLOWED_PATHS_REQUIRED" }),
         expect.objectContaining({ code: "CCC_PRD_ACCEPTANCE_BEHAVIOR_REQUIRED" }),
+        expect.objectContaining({ code: "CCC_PRD_ACCEPTANCE_CLAUSES_REQUIRED" }),
         expect.objectContaining({ code: "CCC_PRD_EXPECTED_PROOF_REQUIRED" }),
+        expect.objectContaining({ code: "CCC_PRD_PROOF_DECLARATION_REQUIRED" }),
         expect.objectContaining({ code: "CCC_PRD_PROTECTED_ACTIONS_REQUIRED" }),
       ],
     });
@@ -868,13 +1302,8 @@ describe("prd command exit contract", () => {
   });
 
   it("previews and imports one hash-bound product bundle through the production service seam", async () => {
-    const packet = createPacketRoot();
-    const authorOutput: string[] = [];
-    expect(await runPrdCommand(
-      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
-      { write: (line) => authorOutput.push(line) },
-      { bootstrapProofAdmission },
-    )).toBe(0);
+    const packet = createPacketRoot({ semanticV2: true });
+    await authorSemanticV2Packet(packet);
     const policyPath = join(packet.root, "execution-plan.json");
     expect(await runPrdCommand([
       "policy",
@@ -929,6 +1358,11 @@ describe("prd command exit contract", () => {
       readTargetHead: vi.fn(async () => packet.base),
       importCccPrdBundle: importBundle,
       inspectVerifierConfinementReadiness,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+      // Controller custody is exercised by the dedicated changed-executable
+      // regression above. This service-seam test starts from that admitted
+      // sidecar and stays focused on preview/import identity and delegation.
+      assertSemanticProofV2Custody: vi.fn(async () => undefined),
     };
     const common = [
       packet.root,
@@ -939,20 +1373,38 @@ describe("prd command exit contract", () => {
       packet.base,
     ];
     const previewOutput: string[] = [];
-    expect(await runPrdJson(
+    const previewExit = await runPrdJson(
       ["preview", ...common],
       { write: (line) => previewOutput.push(line) },
       dependencies,
       { projectName: "fixture" },
-    )).toBe(0);
+    );
+    expect(previewExit, previewOutput.join("\n")).toBe(0);
     const preview = JSON.parse(previewOutput[0]!) as {
       kind: string;
+      schema: string;
       confirmationDigest: string;
       projectId: string;
+      projectPath: string;
       bundleHash: string;
+      packetHash: string;
+      sidecarHash: string;
+      targetRepository: string;
+      targetBase: string;
+      targetHead: string;
+      executionPolicy: unknown;
       requirements: unknown[];
       tasks: unknown[];
       proofs: unknown[];
+      requestBudget: {
+        scope: string;
+        maximum: number;
+        providerTasks: number;
+        deterministicMinimum: number;
+        headroomAboveMinimum: number;
+        completionAdequacy: string;
+        explanation: string;
+      };
     };
     expect(preview).toMatchObject({
       kind: "preview",
@@ -962,6 +1414,16 @@ describe("prd command exit contract", () => {
         expect.objectContaining({ id: "TASK-CLI-001" }),
       ],
       proofs: [expect.objectContaining({ id: "PF-CLI-001" })],
+      requestBudget: {
+        scope: "campaign-global",
+        maximum: 1,
+        providerTasks: 1,
+        deterministicMinimum: 1,
+        headroomAboveMinimum: 0,
+        completionAdequacy: "unproven",
+        explanation:
+          "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+      },
       verifierConfinement: {
         ready: true,
         backend: "sandbox-exec",
@@ -971,6 +1433,18 @@ describe("prd command exit contract", () => {
       },
     });
     expect(preview.confirmationDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(preview.confirmationDigest).toBe(createHash("sha256").update(canonicalCccPrdJson({
+      schema: preview.schema,
+      projectId: preview.projectId,
+      projectPath: preview.projectPath,
+      bundleHash: preview.bundleHash,
+      packetHash: preview.packetHash,
+      sidecarHash: preview.sidecarHash,
+      targetRepository: preview.targetRepository,
+      targetBase: preview.targetBase,
+      targetHead: preview.targetHead,
+      executionPolicy: preview.executionPolicy,
+    }), "utf8").digest("hex"));
     expect(closeProjectStore).toHaveBeenCalledTimes(1);
 
     const importOutput: string[] = [];
@@ -993,18 +1467,15 @@ describe("prd command exit contract", () => {
       executionPolicy: expect.objectContaining({
         schema: "ccc-campaign.execution-policy.v2",
       }),
+      semanticProofToolchainPaths: packet.semanticProofToolchainPaths,
     }));
     expect(closeProjectStore).toHaveBeenCalledTimes(2);
     expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(2);
   });
 
   it("shows extracted PRD work and actionable verifier guidance when confinement is unavailable", async () => {
-    const packet = createPacketRoot();
-    expect(await runPrdCommand(
-      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
-      { write: () => undefined },
-      { bootstrapProofAdmission },
-    )).toBe(0);
+    const packet = createPacketRoot({ semanticV2: true });
+    await authorSemanticV2Packet(packet);
     const policyPath = await createExecutionPlan(packet);
     const context = {
       projectId: "project-1",
@@ -1030,6 +1501,7 @@ describe("prd command exit contract", () => {
         resolveProject: vi.fn(async () => context),
         closeProjectStore: vi.fn(async () => undefined),
         readTargetHead: vi.fn(async () => packet.base),
+        resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
         inspectVerifierConfinementReadiness: vi.fn(async () => ({
           ready: false,
           backend: "bubblewrap" as const,
@@ -1065,12 +1537,8 @@ describe("prd command exit contract", () => {
   });
 
   it("refuses import before project or importer residue when readiness has no admitted backend", async () => {
-    const packet = createPacketRoot();
-    expect(await runPrdCommand(
-      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
-      { write: () => undefined },
-      { bootstrapProofAdmission },
-    )).toBe(0);
+    const packet = createPacketRoot({ semanticV2: true });
+    await authorSemanticV2Packet(packet);
     const policyPath = await createExecutionPlan(packet);
     const context = {
       projectId: "project-1",
@@ -1103,6 +1571,10 @@ describe("prd command exit contract", () => {
       readTargetHead: vi.fn(async () => packet.base),
       importCccPrdBundle: importBundle,
       inspectVerifierConfinementReadiness,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+      // The dedicated executable-drift tests own the real custody probe. This
+      // case isolates confinement refusal without re-running toolchain probes.
+      assertSemanticProofV2Custody: vi.fn(async () => undefined),
     };
     const common = [
       packet.root,
@@ -1154,12 +1626,8 @@ describe("prd command exit contract", () => {
   });
 
   it("recomputes preview identity and refuses a stale confirmation before import residue", async () => {
-    const packet = createPacketRoot();
-    expect(await runPrdCommand(
-      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
-      { write: () => undefined },
-      { bootstrapProofAdmission },
-    )).toBe(0);
+    const packet = createPacketRoot({ semanticV2: true });
+    await authorSemanticV2Packet(packet);
     const policyPath = await createExecutionPlan(packet);
     const importBundle = vi.fn();
     const closeProjectStore = vi.fn(async () => undefined);
@@ -1198,6 +1666,10 @@ describe("prd command exit contract", () => {
         readTargetHead: vi.fn(async () => packet.base),
         importCccPrdBundle: importBundle,
         inspectVerifierConfinementReadiness,
+        resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+        // Digest mismatch is the authority under test; executable custody has
+        // dedicated drift and pre-launch coverage elsewhere in this suite.
+        assertSemanticProofV2Custody: vi.fn(async () => undefined),
       },
       { projectName: "fixture" },
     )).toBe(1);
@@ -1413,6 +1885,203 @@ describe("prd command exit contract", () => {
     expect(output[0]).not.toContain("claimToken");
     expect(output[0]).not.toContain("controllerToken");
     expect(output[0]).not.toContain("must-never-serialize");
+  });
+
+  it("shows one sealed execution-authorization confirmation while retaining child diagnostics", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const childApprovals = [
+      diagnosticLiveApproval(authorization.members[0]!.approvalRequestId, "TASK-coding"),
+      diagnosticLiveApproval(authorization.members[1]!.approvalRequestId, "TASK-review"),
+    ];
+    const status = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-1",
+      import: {
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        state: "active",
+        runnable: true,
+      },
+      tasks: [],
+      workItems: [],
+      proofs: [],
+      orphanProofAttempts: [],
+      providerAttempts: [],
+      executionAuthorizationMode: "sealed_bundle_v1" as const,
+      executionAuthorization: authorization,
+      approvals: childApprovals,
+      landing: { intents: [], materializations: [], terminals: [] },
+      nextAction: {
+        kind: "approve-execution",
+        reason: "Approve the one sealed campaign launch.",
+        executionAuthorizationId: authorization.authorizationId,
+        executionAuthorizationStatus: "issued",
+      },
+    };
+    const computeConfirmation = vi.fn(() => confirmation);
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["status", "operator-key"],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => status),
+        computeCccCampaignLiveExecutionApprovalConfirmation: computeConfirmation,
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const payload = JSON.parse(output[0]!);
+    expect(payload).toMatchObject({
+      kind: "product-status",
+      found: true,
+      status: {
+        executionAuthorization: {
+          authorizationId: authorization.authorizationId,
+          status: "issued",
+          members: [
+            { approvalRequestId: authorization.members[0]!.approvalRequestId },
+            { approvalRequestId: authorization.members[1]!.approvalRequestId },
+          ],
+        },
+        approvals: [
+          { id: authorization.members[0]!.approvalRequestId },
+          { id: authorization.members[1]!.approvalRequestId },
+        ],
+      },
+      liveExecutionAuthorizationConfirmation: {
+        authorizationId: authorization.authorizationId,
+        confirmation,
+        expiresAt: authorization.expiresAt,
+        status: "issued",
+      },
+      liveExecutionApprovalConfirmations: [],
+    });
+    expect(computeConfirmation).toHaveBeenCalledTimes(1);
+    expect(computeConfirmation).toHaveBeenCalledWith(authorization);
+  });
+
+  it("emits no live execution confirmation after the sealed authorization settles", async () => {
+    const authorization = sealedExecutionAuthorization("settled");
+    const computeConfirmation = vi.fn(() => "8".repeat(64));
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["status", "operator-key"],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+          approvals: [],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "blocked",
+            reason: "The sealed execution authorization is already settled.",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: computeConfirmation,
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const payload = JSON.parse(output[0]!);
+    expect(payload).not.toHaveProperty("liveExecutionAuthorizationConfirmation");
+    expect(payload.liveExecutionApprovalConfirmations).toEqual([]);
+    expect(computeConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("emits no child execution confirmations when sealed parent custody is missing", async () => {
+    const childApproval = diagnosticLiveApproval(
+      `ccc-approval-${"a".repeat(64)}`,
+      "TASK-coding",
+    );
+    const computeConfirmation = vi.fn(() => "8".repeat(64));
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["status", "operator-key"],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: null,
+          approvals: [childApproval],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "blocked",
+            reason: "The single sealed campaign authorization is missing.",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: computeConfirmation,
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const payload = JSON.parse(output[0]!);
+    expect(payload.status.approvals).toEqual([
+      expect.objectContaining({ id: childApproval.id }),
+    ]);
+    expect(payload.liveExecutionApprovalConfirmations).toEqual([]);
+    expect(payload).not.toHaveProperty("liveExecutionAuthorizationConfirmation");
+    expect(computeConfirmation).not.toHaveBeenCalled();
   });
 
   it("pauses and resumes only the exact confirmed unleased campaign status", async () => {
@@ -1879,6 +2548,115 @@ describe("prd command exit contract", () => {
     expect(settleOutput[0]).not.toContain(persistedAttempt.controllerToken);
   });
 
+  it("RED-S5-RESOLVE-V2: refuses manual fabrication for semantic proof v2 attempts", async () => {
+    const packet = createPacketRoot();
+    const evidencePath = join(packet.root, "proof-resolution-v2.json");
+    writeFileSync(evidencePath, JSON.stringify({
+      schema: "ccc-campaign.proof-resolution.v1",
+      observerId: "operator-local-v2",
+      summary: "A generic process result cannot fabricate semantic proof evidence.",
+      result: {
+        success: true,
+        exitCode: 0,
+        durationMs: 1,
+        stdout: "PASS\n",
+        stderr: "",
+        timedOut: false,
+        killed: false,
+        warnings: [],
+        negativeControlLabel: "generic-only",
+      },
+    }));
+    const attemptKey = `ccc-proof-attempt-${"b".repeat(64)}`;
+    const workItem = {
+      id: "work-item-v2",
+      runId: "ccc-prd:import-v2",
+      taskId: "FN-v2",
+      nodeId: "node-proof-v2",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+    };
+    const proofAttempt = {
+      attemptKey,
+      attemptContractVersion: "v2",
+      phase: "final_integrated",
+      importId: "import-v2",
+      campaignId: "campaign-v2",
+      taskId: "FN-v2",
+      semanticTaskId: "TASK-v2",
+      proofId: "PROOF-v2",
+      packetHash: "a".repeat(64),
+      sidecarHash: "b".repeat(64),
+      bundleHash: "c".repeat(64),
+      manifestHash: "d".repeat(64),
+      campaignBindingHash: "e".repeat(64),
+      targetRepository: "/tmp/product-target-v2",
+      targetBase: "f".repeat(40),
+      sourceCommit: "1".repeat(40),
+      sourceTree: "2".repeat(40),
+      definitionSha256: "3".repeat(64),
+      commandSha256: "4".repeat(64),
+      workItemId: workItem.id,
+      runId: workItem.runId,
+      workItemAttempt: workItem.attempt,
+      state: "dispatched_unknown",
+      result: null,
+    };
+    const status = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-v2",
+      import: {
+        importId: "import-v2",
+        idempotencyKey: "operator-key-v2",
+        packetHash: "a".repeat(64),
+        sidecarHash: "b".repeat(64),
+        bundleHash: "c".repeat(64),
+        targetRepository: "/tmp/product-target-v2",
+        targetBase: "f".repeat(40),
+      },
+      tasks: [],
+      workItems: [workItem],
+      proofs: [{
+        definition: { schema: "ccc-prd.proof.v2", id: "PROOF-v2" },
+        definitionSha256: "3".repeat(64),
+        attempts: [proofAttempt],
+      }],
+      orphanProofAttempts: [],
+      approvals: [],
+      landing: { intents: [], materializations: [], terminals: [] },
+    };
+    const settleAttempt = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["resolve-proof", "operator-key-v2", attemptKey, evidencePath],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-v2",
+          projectPath: "/tmp/product-target-v2",
+          projectName: "Fixture v2",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => status),
+        settleCccCampaignProofAttempt: settleAttempt,
+      },
+      { projectName: "fixture-v2" },
+    )).toBe(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_PROOF_RESOLUTION_V2_REFUSED" }],
+    });
+    expect(settleAttempt).not.toHaveBeenCalled();
+  });
+
   it("previews and settles one non-CLI provider effect while routing CLI recovery to its native fence", async () => {
     const attemptKey = `ccc-provider-attempt-${"a".repeat(64)}`;
     const controllerToken =
@@ -2320,6 +3098,190 @@ describe("prd command exit contract", () => {
       approvalRequestId: "approval-1",
       result: { merged: true, noOp: false },
       status: { nextAction: { kind: "complete" } },
+    });
+  });
+
+  it("claims one sealed execution authorization by parent ID and requeues the parked campaign", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const childApprovals = [
+      diagnosticLiveApproval(authorization.members[0]!.approvalRequestId, "TASK-coding"),
+      diagnosticLiveApproval(authorization.members[1]!.approvalRequestId, "TASK-review"),
+    ];
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const before = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-1",
+      import: {
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        state: "active",
+        runnable: true,
+      },
+      tasks: [],
+      workItems: [workItem],
+      proofs: [],
+      orphanProofAttempts: [],
+      providerAttempts: [],
+      executionAuthorization: authorization,
+      approvals: childApprovals,
+      landing: { intents: [], materializations: [], terminals: [] },
+      nextAction: {
+        kind: "approve-execution",
+        reason: "Approve the one sealed campaign launch.",
+        executionAuthorizationId: authorization.authorizationId,
+        executionAuthorizationStatus: "issued",
+      },
+    };
+    const claimedAuthorization = sealedExecutionAuthorization("claimed");
+    const after = {
+      ...before,
+      executionAuthorization: claimedAuthorization,
+      workItems: [{
+        ...workItem,
+        state: "runnable",
+        lastError: null,
+        blockedReason: null,
+      }],
+      nextAction: {
+        kind: "wait-for-runtime",
+        reason: "Campaign work is admitted and ready for the runtime.",
+      },
+    };
+    const transitionWorkflowWorkItem = vi.fn(async () => after.workItems[0]);
+    const context = {
+      projectId: "project-1",
+      projectPath: "/tmp/product-target",
+      projectName: "Fixture",
+      isRegistered: true,
+      store: {
+        getAsyncLayer: () => ({}),
+        transitionWorkflowWorkItem,
+      },
+    };
+    const inspectStatus = vi.fn()
+      .mockResolvedValueOnce(before)
+      .mockResolvedValueOnce(after);
+    const approveExecution = vi.fn(async () => claimedAuthorization);
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", authorization.authorizationId, "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => context),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: inspectStatus,
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: vi.fn(async () => ({
+          ready: true,
+          backend: "sandbox-exec" as const,
+          code: "VERIFIER_CONFINEMENT_READY",
+          message: "verifier confinement readiness probe executed successfully",
+          trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+        })),
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    expect(approveExecution).toHaveBeenCalledWith({
+      store: context.store,
+      rootDir: context.projectPath,
+      taskId: "TASK-coding",
+      authorizationId: authorization.authorizationId,
+      confirmation,
+      actor: {
+        actorId: "ccc-fusion-local-operator",
+        actorType: "user",
+        actorName: "CCC Fusion Local Operator",
+      },
+    });
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "execution-approved",
+      executionAuthorizationId: authorization.authorizationId,
+      approval: { status: "claimed" },
+      status: { nextAction: { kind: "wait-for-runtime" } },
+    });
+    expect(JSON.parse(output[0]!)).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("refuses a diagnostic child approval ID when a sealed parent authorization exists", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const childApproval = diagnosticLiveApproval(
+      authorization.members[0]!.approvalRequestId,
+      "TASK-coding",
+    );
+    const approveExecution = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", childApproval.id, "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorization: authorization,
+          approvals: [childApproval],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "approve-execution",
+            reason: "Approve the one sealed campaign launch.",
+            executionAuthorizationId: authorization.authorizationId,
+            executionAuthorizationStatus: "issued",
+          },
+        })),
+        approveCccCampaignLiveExecution: approveExecution,
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(approveExecution).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_LIVE_EXECUTION_APPROVAL_MISSING",
+        message: expect.stringContaining(authorization.members[0]!.approvalRequestId),
+      }],
     });
   });
 

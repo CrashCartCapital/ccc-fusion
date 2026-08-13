@@ -1576,6 +1576,15 @@ CREATE TABLE IF NOT EXISTS project.ccc_campaign_proof_attempts (
   updated_at text NOT NULL,
   dispatched_at text,
   settled_at text,
+  attempt_contract_version text NOT NULL DEFAULT 'v1',
+  phase text,
+  verifier_closure_sha256 text,
+  candidate_inputs_sha256 text,
+  execution_toolchain_sha256 text,
+  terminal_envelope jsonb,
+  terminal_envelope_sha256 text,
+  proof_evidence jsonb,
+  proof_evidence_sha256 text,
   PRIMARY KEY (project_id, attempt_key),
   CONSTRAINT ccc_campaign_proof_attempts_import_fkey
     FOREIGN KEY (project_id, import_id)
@@ -1596,6 +1605,11 @@ CREATE TABLE IF NOT EXISTS project.ccc_campaign_proof_attempts (
     AND definition_sha256 ~ '^[0-9a-f]{64}$'
     AND command_sha256 ~ '^[0-9a-f]{64}$'
     AND (changed_paths_sha256 IS NULL OR changed_paths_sha256 ~ '^[0-9a-f]{64}$')
+    AND (verifier_closure_sha256 IS NULL OR verifier_closure_sha256 ~ '^[0-9a-f]{64}$')
+    AND (candidate_inputs_sha256 IS NULL OR candidate_inputs_sha256 ~ '^[0-9a-f]{64}$')
+    AND (execution_toolchain_sha256 IS NULL OR execution_toolchain_sha256 ~ '^[0-9a-f]{64}$')
+    AND (terminal_envelope_sha256 IS NULL OR terminal_envelope_sha256 ~ '^[0-9a-f]{64}$')
+    AND (proof_evidence_sha256 IS NULL OR proof_evidence_sha256 ~ '^[0-9a-f]{64}$')
   ),
   CONSTRAINT ccc_campaign_proof_attempts_git_objects_check CHECK (
     source_commit ~ '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'
@@ -1604,6 +1618,32 @@ CREATE TABLE IF NOT EXISTS project.ccc_campaign_proof_attempts (
   CONSTRAINT ccc_campaign_proof_attempts_state_check
     CHECK (state IN ('reserved', 'dispatched_unknown', 'committed', 'proved_failed')),
   CONSTRAINT ccc_campaign_proof_attempts_work_item_attempt_check CHECK (work_item_attempt > 0),
+  CONSTRAINT ccc_campaign_proof_attempts_contract_version_check
+    CHECK (attempt_contract_version IN ('v1', 'v2')),
+  CONSTRAINT ccc_campaign_proof_attempts_v2_custody_check CHECK (
+    (
+      attempt_contract_version = 'v1'
+      AND phase IS NULL
+      AND verifier_closure_sha256 IS NULL
+      AND candidate_inputs_sha256 IS NULL
+      AND execution_toolchain_sha256 IS NULL
+      AND terminal_envelope IS NULL
+      AND terminal_envelope_sha256 IS NULL
+      AND proof_evidence IS NULL
+      AND proof_evidence_sha256 IS NULL
+    )
+    OR (
+      attempt_contract_version = 'v2'
+      AND phase IS NOT NULL
+      AND phase IN ('task', 'final_integrated')
+      AND verifier_closure_sha256 IS NOT NULL
+      AND verifier_closure_sha256 ~ '^[0-9a-f]{64}$'
+      AND candidate_inputs_sha256 IS NOT NULL
+      AND candidate_inputs_sha256 ~ '^[0-9a-f]{64}$'
+      AND execution_toolchain_sha256 IS NOT NULL
+      AND execution_toolchain_sha256 ~ '^[0-9a-f]{64}$'
+    )
+  ),
   CONSTRAINT ccc_campaign_proof_attempts_result_shape_check CHECK (
     (
       state = 'reserved'
@@ -1621,6 +1661,10 @@ CREATE TABLE IF NOT EXISTS project.ccc_campaign_proof_attempts (
       AND warnings IS NULL
       AND changed_paths_sha256 IS NULL
       AND negative_control_label IS NULL
+      AND terminal_envelope IS NULL
+      AND terminal_envelope_sha256 IS NULL
+      AND proof_evidence IS NULL
+      AND proof_evidence_sha256 IS NULL
     )
     OR (
       state = 'dispatched_unknown'
@@ -1638,25 +1682,135 @@ CREATE TABLE IF NOT EXISTS project.ccc_campaign_proof_attempts (
       AND warnings IS NULL
       AND changed_paths_sha256 IS NULL
       AND negative_control_label IS NULL
+      AND terminal_envelope IS NULL
+      AND terminal_envelope_sha256 IS NULL
+      AND proof_evidence IS NULL
+      AND proof_evidence_sha256 IS NULL
     )
     OR (
       state IN ('committed', 'proved_failed')
       AND dispatched_at IS NOT NULL
       AND settled_at IS NOT NULL
+      AND result_success IS NOT NULL
       AND result_success IN (0, 1)
+      AND duration_ms IS NOT NULL
       AND duration_ms >= 0
+      AND stdout_sha256 IS NOT NULL
       AND stdout_sha256 ~ '^[0-9a-f]{64}$'
+      AND stderr_sha256 IS NOT NULL
       AND stderr_sha256 ~ '^[0-9a-f]{64}$'
+      AND stdout_tail IS NOT NULL
       AND char_length(stdout_tail) <= 8000
+      AND stderr_tail IS NOT NULL
       AND char_length(stderr_tail) <= 8000
+      AND timed_out IS NOT NULL
       AND timed_out IN (0, 1)
+      AND killed IS NOT NULL
       AND killed IN (0, 1)
+      AND warnings IS NOT NULL
       AND jsonb_typeof(warnings) = 'array'
       AND jsonb_array_length(warnings) <= 64
       AND (negative_control_label IS NULL OR char_length(negative_control_label) <= 512)
       AND (
-        (state = 'committed' AND result_success = 1 AND exit_code = 0 AND timed_out = 0 AND killed = 0)
-        OR (state = 'proved_failed' AND result_success = 0)
+        (
+          attempt_contract_version = 'v1'
+          AND terminal_envelope IS NULL
+          AND terminal_envelope_sha256 IS NULL
+          AND proof_evidence IS NULL
+          AND proof_evidence_sha256 IS NULL
+          AND (
+            (state = 'committed' AND result_success = 1 AND exit_code = 0 AND timed_out = 0 AND killed = 0)
+            OR (state = 'proved_failed' AND result_success = 0)
+          )
+        )
+        OR (
+          attempt_contract_version = 'v2'
+          AND changed_paths_sha256 IS NOT NULL
+          AND changed_paths_sha256 ~ '^[0-9a-f]{64}$'
+          AND negative_control_label IS NULL
+          AND terminal_envelope IS NOT NULL
+          AND jsonb_typeof(terminal_envelope) = 'object'
+          AND terminal_envelope ?& ARRAY[
+            'schema', 'kind', 'proofId', 'phase', 'sourceCommit', 'sourceTree',
+            'exitCode', 'durationMs', 'stdoutSha256', 'stderrSha256',
+            'changedPathsSha256', 'stdoutTail', 'stderrTail', 'timedOut',
+            'killed', 'warnings'
+          ]
+          AND octet_length(terminal_envelope::text) <= 262144
+          AND terminal_envelope_sha256 IS NOT NULL
+          AND terminal_envelope_sha256 ~ '^[0-9a-f]{64}$'
+          AND terminal_envelope ->> 'schema' = 'ccc-prd.proof-terminal-envelope.v2'
+          AND terminal_envelope ->> 'phase' = phase
+          AND terminal_envelope ->> 'proofId' = proof_id
+          AND terminal_envelope ->> 'sourceCommit' = source_commit
+          AND terminal_envelope ->> 'sourceTree' = source_tree
+          AND terminal_envelope ->> 'stdoutSha256' = stdout_sha256
+          AND terminal_envelope ->> 'stderrSha256' = stderr_sha256
+          AND terminal_envelope ->> 'changedPathsSha256' = changed_paths_sha256
+          AND terminal_envelope ->> 'stdoutTail' = stdout_tail
+          AND terminal_envelope ->> 'stderrTail' = stderr_tail
+          AND terminal_envelope -> 'warnings' = warnings
+          AND (terminal_envelope ->> 'durationMs')::bigint = duration_ms
+          AND terminal_envelope -> 'timedOut' = to_jsonb(timed_out = 1)
+          AND terminal_envelope -> 'killed' = to_jsonb(killed = 1)
+          AND (
+            (exit_code IS NULL AND terminal_envelope -> 'exitCode' = 'null'::jsonb)
+            OR (exit_code IS NOT NULL AND terminal_envelope ->> 'exitCode' = exit_code::text)
+          )
+          AND (
+            (
+              terminal_envelope ->> 'kind' = 'verified'
+              AND terminal_envelope ?& ARRAY['passed', 'evidence', 'evidenceSha256']
+              AND proof_evidence IS NOT NULL
+              AND jsonb_typeof(proof_evidence) = 'object'
+              AND proof_evidence ?& ARRAY[
+                'schema', 'proofId', 'phase', 'sourceCommit', 'sourceTree',
+                'passed', 'clauseResults', 'positiveCaseResults',
+                'negativeControlResults'
+              ]
+              AND octet_length(proof_evidence::text) <= 131072
+              AND proof_evidence_sha256 IS NOT NULL
+              AND proof_evidence_sha256 ~ '^[0-9a-f]{64}$'
+              AND terminal_envelope -> 'evidence' = proof_evidence
+              AND terminal_envelope ->> 'evidenceSha256' = proof_evidence_sha256
+              AND proof_evidence ->> 'schema' = 'ccc-prd.proof-evidence.v2'
+              AND proof_evidence ->> 'phase' = phase
+              AND proof_evidence ->> 'proofId' = proof_id
+              AND proof_evidence ->> 'sourceCommit' = source_commit
+              AND proof_evidence ->> 'sourceTree' = source_tree
+              AND terminal_envelope -> 'passed' = proof_evidence -> 'passed'
+              AND (
+                (
+                  state = 'committed'
+                  AND result_success = 1
+                  AND terminal_envelope -> 'passed' = 'true'::jsonb
+                  AND exit_code = 0
+                  AND timed_out = 0
+                  AND killed = 0
+                )
+                OR (
+                  state = 'proved_failed'
+                  AND result_success = 0
+                  AND terminal_envelope -> 'passed' = 'false'::jsonb
+                  AND timed_out = 0
+                  AND killed = 0
+                )
+              )
+            )
+            OR (
+              state = 'proved_failed'
+              AND result_success = 0
+              AND terminal_envelope ->> 'kind' = 'execution_refused'
+              AND terminal_envelope ? 'code'
+              AND terminal_envelope ->> 'code' IN (
+                'timeout', 'killed', 'no_output', 'malformed_output',
+                'output_over_limit', 'spawn_refused', 'sandbox_refused'
+              )
+              AND proof_evidence IS NULL
+              AND proof_evidence_sha256 IS NULL
+            )
+          )
+        )
       )
     )
   )
@@ -1867,6 +2021,149 @@ CREATE TABLE IF NOT EXISTS project.approval_requests (
     DEFERRABLE INITIALLY IMMEDIATE
 );
 
+-- FNXC:CCCCampaignExecutionAuthorization 2026-08-12:
+-- Fresh baselines include the one sealed launch parent and its exact mapping to
+-- existing task/action child approvals. Migration 0006 applies forced project
+-- ownership after every baseline table exists.
+CREATE TABLE IF NOT EXISTS project.ccc_campaign_execution_authorizations (
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  authorization_id text NOT NULL,
+  schema_version text NOT NULL,
+  import_id text NOT NULL,
+  campaign_id text NOT NULL,
+  idempotency_key text NOT NULL,
+  workflow_id text NOT NULL,
+  work_item_id text NOT NULL,
+  workflow_ir_hash text NOT NULL,
+  packet_hash text NOT NULL,
+  sidecar_hash text NOT NULL,
+  bundle_hash text NOT NULL,
+  manifest_hash text NOT NULL,
+  execution_policy_sha256 text NOT NULL,
+  target_repository text NOT NULL,
+  target_base text NOT NULL,
+  campaign_started_at text NOT NULL,
+  campaign_deadline_at text NOT NULL,
+  max_requests integer NOT NULL,
+  max_concurrency integer NOT NULL,
+  member_set_hash text NOT NULL,
+  authorization_digest text NOT NULL,
+  expected_request_count integer NOT NULL,
+  status text NOT NULL,
+  requester_actor_id text NOT NULL,
+  requester_actor_type text NOT NULL,
+  requester_actor_name text NOT NULL,
+  not_before_at text NOT NULL,
+  expires_at text NOT NULL,
+  claim_token text,
+  claimed_at text,
+  settled_at text,
+  created_at text NOT NULL,
+  updated_at text NOT NULL,
+  PRIMARY KEY (project_id, authorization_id),
+  CONSTRAINT ccc_campaign_execution_authorizations_project_import_unique
+    UNIQUE (project_id, import_id),
+  CONSTRAINT ccc_campaign_execution_authorizations_project_digest_unique
+    UNIQUE (project_id, authorization_digest),
+  CONSTRAINT ccc_campaign_execution_authorizations_import_fkey
+    FOREIGN KEY (project_id, import_id)
+    REFERENCES project.ccc_prd_imports(project_id, import_id)
+    ON DELETE NO ACTION
+    ON UPDATE NO ACTION
+    DEFERRABLE INITIALLY IMMEDIATE,
+  CONSTRAINT ccc_campaign_execution_authorizations_schema_version_check
+    CHECK (schema_version = 'ccc-campaign.execution-authorization.v1'),
+  CONSTRAINT ccc_campaign_execution_authorizations_identity_check
+    CHECK (authorization_id = 'ccc-execution-authorization-' || authorization_digest),
+  CONSTRAINT ccc_campaign_execution_authorizations_hashes_check CHECK (
+    workflow_ir_hash ~ '^[0-9a-f]{64}$'
+    AND packet_hash ~ '^[0-9a-f]{64}$'
+    AND sidecar_hash ~ '^[0-9a-f]{64}$'
+    AND bundle_hash ~ '^[0-9a-f]{64}$'
+    AND manifest_hash ~ '^[0-9a-f]{64}$'
+    AND execution_policy_sha256 ~ '^[0-9a-f]{64}$'
+    AND target_base ~ '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'
+    AND member_set_hash ~ '^[0-9a-f]{64}$'
+    AND authorization_digest ~ '^[0-9a-f]{64}$'
+  ),
+  CONSTRAINT ccc_campaign_execution_authorizations_bounds_check CHECK (
+    max_requests > 0
+    AND max_concurrency > 0
+    AND expected_request_count >= 0
+    AND expected_request_count <= max_requests
+  ),
+  CONSTRAINT ccc_campaign_execution_authorizations_window_check CHECK (
+    campaign_started_at <= not_before_at
+    AND not_before_at <= expires_at
+    AND expires_at <= campaign_deadline_at
+  ),
+  CONSTRAINT ccc_campaign_execution_authorizations_status_check
+    CHECK (status IN ('issued', 'claimed', 'settled')),
+  CONSTRAINT ccc_campaign_execution_authorizations_lifecycle_check CHECK (
+    (status = 'issued' AND claim_token IS NULL AND claimed_at IS NULL AND settled_at IS NULL)
+    OR (status = 'claimed' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL AND settled_at IS NULL)
+    OR (status = 'settled' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL AND settled_at IS NOT NULL AND claimed_at <= settled_at)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS project.ccc_campaign_execution_authorization_members (
+  project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
+  authorization_id text NOT NULL,
+  ordinal integer NOT NULL,
+  native_task_id text NOT NULL,
+  semantic_task_id text NOT NULL,
+  action_id text NOT NULL,
+  action_target text NOT NULL,
+  provider_id text NOT NULL,
+  model_id text NOT NULL,
+  transport text NOT NULL,
+  prompt_schema text NOT NULL,
+  prompt_sha256 text NOT NULL,
+  route_sha256 text NOT NULL,
+  binding_hash text NOT NULL,
+  approval_request_id text NOT NULL,
+  member_hash text NOT NULL,
+  PRIMARY KEY (project_id, authorization_id, ordinal),
+  CONSTRAINT ccc_campaign_execution_authorization_members_binding_unique
+    UNIQUE (project_id, authorization_id, binding_hash),
+  CONSTRAINT ccc_campaign_execution_authorization_members_task_action_unique
+    UNIQUE (project_id, authorization_id, native_task_id, action_id),
+  CONSTRAINT ccc_campaign_execution_authorization_members_native_task_unique
+    UNIQUE (project_id, authorization_id, native_task_id),
+  CONSTRAINT ccc_campaign_execution_auth_members_semantic_task_unique
+    UNIQUE (project_id, authorization_id, semantic_task_id),
+  CONSTRAINT ccc_campaign_execution_authorization_members_approval_unique
+    UNIQUE (project_id, approval_request_id),
+  CONSTRAINT ccc_campaign_execution_authorization_members_member_hash_unique
+    UNIQUE (project_id, authorization_id, member_hash),
+  CONSTRAINT ccc_campaign_execution_authorization_members_authorization_fkey
+    FOREIGN KEY (project_id, authorization_id)
+    REFERENCES project.ccc_campaign_execution_authorizations(project_id, authorization_id)
+    ON DELETE CASCADE
+    ON UPDATE NO ACTION
+    DEFERRABLE INITIALLY IMMEDIATE,
+  CONSTRAINT ccc_campaign_execution_authorization_members_approval_fkey
+    FOREIGN KEY (project_id, approval_request_id)
+    REFERENCES project.approval_requests(project_id, id)
+    ON DELETE NO ACTION
+    ON UPDATE NO ACTION
+    DEFERRABLE INITIALLY IMMEDIATE,
+  CONSTRAINT ccc_campaign_execution_authorization_members_ordinal_check
+    CHECK (ordinal >= 0),
+  CONSTRAINT ccc_campaign_execution_authorization_members_transport_check
+    CHECK (transport IN ('pi', 'cli', 'workflow')),
+  CONSTRAINT ccc_campaign_execution_auth_members_prompt_schema_check
+    CHECK (prompt_schema IN ('ccc-prd.execution-prompt.v1', 'ccc-prd.execution-prompt.v2')),
+  CONSTRAINT ccc_campaign_execution_authorization_members_hashes_check CHECK (
+    prompt_sha256 ~ '^[0-9a-f]{64}$'
+    AND route_sha256 ~ '^[0-9a-f]{64}$'
+    AND binding_hash ~ '^[0-9a-f]{64}$'
+    AND member_hash ~ '^[0-9a-f]{64}$'
+  ),
+  CONSTRAINT ccc_campaign_execution_authorization_members_approval_id_check
+    CHECK (approval_request_id = 'ccc-approval-' || binding_hash)
+);
+
 CREATE TABLE IF NOT EXISTS project.approval_request_audit_events (
   project_id text NOT NULL DEFAULT COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__'),
   id text NOT NULL,
@@ -2014,6 +2311,12 @@ CREATE INDEX IF NOT EXISTS "idx_ccc_prd_import_entities_native"
   ON project.ccc_prd_import_entities(project_id, import_id, entity_type, native_id);
 CREATE INDEX IF NOT EXISTS "idx_ccc_campaign_proof_attempts_campaign_commit"
   ON project.ccc_campaign_proof_attempts(project_id, import_id, source_commit, proof_id);
+CREATE UNIQUE INDEX IF NOT EXISTS "ccc_campaign_proof_attempts_v2_phase_fence_unique"
+  ON project.ccc_campaign_proof_attempts(
+    project_id, import_id, proof_id, phase, source_commit, definition_sha256,
+    work_item_id, run_id, work_item_attempt
+  )
+  WHERE attempt_contract_version = 'v2';
 
 -- run_audit_events
 CREATE INDEX IF NOT EXISTS "idxRunAuditEventsRunIdTimestamp" ON project.run_audit_events(run_id, timestamp);
@@ -2061,6 +2364,14 @@ CREATE INDEX IF NOT EXISTS "idx_approval_requests_campaign_import"
 CREATE UNIQUE INDEX IF NOT EXISTS "ux_approval_requests_campaign_action"
   ON project.approval_requests(project_id, campaign_import_id, campaign_action_id)
   WHERE campaign_project_id IS NOT NULL;
+
+-- CCC campaign aggregate execution authorization
+CREATE INDEX IF NOT EXISTS "idx_ccc_campaign_execution_authorizations_campaign"
+  ON project.ccc_campaign_execution_authorizations(project_id, campaign_id);
+CREATE INDEX IF NOT EXISTS "idx_ccc_campaign_execution_authorizations_status"
+  ON project.ccc_campaign_execution_authorizations(project_id, status, created_at);
+CREATE INDEX IF NOT EXISTS "idx_ccc_campaign_execution_authorization_members_task_action"
+  ON project.ccc_campaign_execution_authorization_members(project_id, native_task_id, action_id);
 
 -- approval_request_audit_events
 CREATE INDEX IF NOT EXISTS "idxApprovalRequestAuditRequestCreatedAt"

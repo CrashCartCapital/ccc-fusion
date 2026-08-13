@@ -15,10 +15,12 @@ import {
   inspectCccCampaignProofAttempt,
   inspectCccPrdProductStatus,
   reserveCccCampaignProofAttempt,
-  type CccCampaignProductExecutionPolicy,
+  type CccCampaignExecutionPolicy,
 } from "@fusion/core";
 import {
-  createCccPrdImportTestBundle,
+  admitCccPrdImportTestProductBundle,
+  createCccPrdImportTestProductBundle,
+  createCccPrdImportTestExecutionPolicy,
   createCccPrdImportTestProductExecutionPolicy,
 } from "../../../../core/src/__test-utils__/ccc-prd-import-fixture.js";
 import {
@@ -76,15 +78,22 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
   async function importRecoveryCampaign(
     suffix: string,
     transport: "pi" | "cli" = "pi",
+    contract: "semantic-v2" | "legacy-v1-proof" = "semantic-v2",
   ) {
-    const source = createCccPrdImportTestBundle(h.rootDir(), suffix);
+    const legacySource = createCccPrdImportTestProductBundle(h.rootDir(), suffix);
+    const admitted = contract === "semantic-v2"
+      ? await admitCccPrdImportTestProductBundle(legacySource, suffix)
+      : null;
+    const source = admitted?.bundle ?? legacySource;
     const basePolicy =
-      createCccPrdImportTestProductExecutionPolicy(source);
+      contract === "semantic-v2"
+        ? createCccPrdImportTestProductExecutionPolicy(source)
+        : createCccPrdImportTestExecutionPolicy(source);
     const entrySemanticTaskId = source.workflows[0]!.entryTaskIds[0]!;
     const siblingSemanticTaskId = source.workflows[0]!.taskIds.find(
       (taskId) => taskId !== entrySemanticTaskId,
     )!;
-    const executionPolicy: CccCampaignProductExecutionPolicy =
+    const executionPolicy: CccCampaignExecutionPolicy =
       transport === "cli"
         ? {
           ...basePolicy,
@@ -103,6 +112,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     const imported = await importCccPrdBundle({
       bundle: source,
       executionPolicy,
+      semanticProofToolchainPaths: admitted?.semanticProofToolchainPaths,
       idempotencyKey,
       store: h.store(),
       layer: h.layer(),
@@ -180,7 +190,11 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
   }
 
   it("previews and settles one uncertain proof from strict external evidence, then requeues only its exact work item", async () => {
-    const campaign = await importRecoveryCampaign("proof");
+    const campaign = await importRecoveryCampaign(
+      "proof",
+      "pi",
+      "legacy-v1-proof",
+    );
     const proof = campaign.source.proofs[0]!;
     const reserved = await reserveCccCampaignProofAttempt({
       layer: h.layer(),

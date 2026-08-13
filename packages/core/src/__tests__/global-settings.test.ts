@@ -470,6 +470,8 @@ describe("GlobalSettingsStore", () => {
         "fallback-used",
         "memory-dreams-processed",
         "token-budget",
+        "campaign-needs-decision",
+        "campaign-failed",
       ]);
     });
 

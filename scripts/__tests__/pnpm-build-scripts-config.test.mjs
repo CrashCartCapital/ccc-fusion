@@ -3,11 +3,23 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, parseDocument } from "yaml";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "../..");
+
+test("pnpm-lock.yaml is strict YAML without duplicate dependency keys", () => {
+  const document = parseDocument(
+    readFileSync(path.join(repoRoot, "pnpm-lock.yaml"), "utf8"),
+    { prettyErrors: false, strict: true, uniqueKeys: true },
+  );
+  assert.deepEqual(
+    document.errors.map(({ message }) => message),
+    [],
+    "pnpm-lock.yaml must remain parseable by pnpm instead of being ignored as broken",
+  );
+});
 
 /*
  * FNXC:SqliteFinalRemoval 2026-06-24-16:15:

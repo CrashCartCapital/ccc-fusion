@@ -893,6 +893,7 @@ pgTest("CCC campaign native persistence", () => {
       proofs: source.proofs,
       protectedActions: source.protectedActions,
       executionPolicy,
+      executionAuthorizationMode: "per_task_v1",
       route: routesFor(source)[0],
       campaignStartedAt: expect.any(String),
       campaignDeadlineAt: expect.any(String),

@@ -20,7 +20,17 @@ import { allocateCommittedTaskIdsInTransaction } from "../task-store/async-alloc
 import type { Task } from "../types.js";
 import { createCccCampaignManifest, hashCccCampaignManifest, parseCccCampaignExecutionPolicy } from "../ccc-campaign/canonical.js";
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
-import type { CccCampaignExecutionPolicy, CccCampaignManifest } from "../ccc-campaign/types.js";
+import {
+  CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+} from "../ccc-campaign/request-budget.js";
+import {
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+  CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION,
+  CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+  CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+  type CccCampaignExecutionPolicy,
+  type CccCampaignManifest,
+} from "../ccc-campaign/types.js";
 import { canonicalCccPrdJson } from "./contract.js";
 import {
   assertCccPrdImportBundle,
@@ -28,6 +38,10 @@ import {
   physicalCccPrdImportRoot,
 } from "./import-admission.js";
 import { CccPrdImportError } from "./import-error.js";
+import {
+  assertCccPrdSemanticProofV2Custody,
+  type CccPrdSemanticProofToolchainPaths,
+} from "./semantic-proof-custody.js";
 import {
   buildCccPrdProjection,
   buildCccPrdTaskExecutionPrompt,
@@ -38,7 +52,13 @@ import {
   type CccPrdNativeTaskIds,
   type PreparedCccPrdProjection,
 } from "./projection.js";
-import type { CccPrdImportEntityType, CccPrdImportIntent, CccPrdSemanticBundle, CccPrdWorkflow } from "./types.js";
+import type {
+  CccPrdImportEntityType,
+  CccPrdImportIntent,
+  CccPrdSemanticBundle,
+  CccPrdSemanticBundleV2,
+  CccPrdWorkflow,
+} from "./types.js";
 import { parseWorkflowIr } from "../workflow-ir.js";
 import type { WorkflowIr, WorkflowIrEdge, WorkflowIrNode } from "../workflow-ir-types.js";
 
@@ -47,6 +67,7 @@ const RETRYABLE_SQLSTATES = new Set(["40001", "40P01"]);
 
 export type CccPrdImportFailureCheckpoint =
   | CccPrdImportEntityType
+  | "before_prepare_lock"
   | "after_prepared_db_commit"
   | "task_directory"
   | "task_json"
@@ -109,6 +130,8 @@ export type ImportCccPrdBundleInput = {
   store: TaskStore;
   layer: AsyncDataLayer;
   rootDir: string;
+  /** Required for fresh product campaigns; exact persisted replay may omit it. */
+  semanticProofToolchainPaths?: CccPrdSemanticProofToolchainPaths;
   failureInjection?: {
     checkpoint?: CccPrdImportFailureCheckpoint;
     projectionLeaseMs?: number;
@@ -565,6 +588,10 @@ function nativeWorkflowProofNodeId(workflowId: string): string {
   return `ccc-proof-${sha256(workflowId).slice(0, 24)}`;
 }
 
+function nativeWorkflowTaskProofNodeId(workflowId: string, taskId: string): string {
+  return `ccc-task-proof-${sha256(`${workflowId}\0${taskId}`).slice(0, 24)}`;
+}
+
 function nativeWorkflowProofJoinNodeId(workflowId: string): string {
   return `ccc-proof-join-${sha256(workflowId).slice(0, 24)}`;
 }
@@ -583,7 +610,131 @@ function nativeWorkflowProofJoinNodeId(workflowId: string): string {
  */
 const CCC_CAMPAIGN_WORK_ITEM_MAX_RETRIES = 3;
 
-function nativeWorkflowIr(
+type SemanticV2WorkflowProofPlan = {
+  taskProofIdsByTaskId: ReadonlyMap<string, readonly string[]>;
+  finalProofIds: readonly string[];
+};
+
+function invalidSemanticV2ProofGraph(message: string): never {
+  throw new CccPrdImportError("CCC_PRD_IMPORT_INVALID_BUNDLE", message);
+}
+
+function semanticV2WorkflowProofPlan(
+  bundle: CccPrdSemanticBundleV2,
+  workflow: CccPrdWorkflow,
+): SemanticV2WorkflowProofPlan {
+  const workflowTaskIds = new Set(workflow.taskIds);
+  if (
+    workflowTaskIds.size !== workflow.taskIds.length
+    || workflowTaskIds.size !== bundle.tasks.length
+    || bundle.tasks.some((task) => (
+      !workflowTaskIds.has(task.id) || task.workflowId !== workflow.id
+    ))
+  ) {
+    invalidSemanticV2ProofGraph(
+      `CCC PRD workflow ${workflow.id} must gate every semantic task exactly once`,
+    );
+  }
+  const proofById = new Map(bundle.proofs.map((proof) => [proof.id, proof]));
+  const taskOwnersByProofId = new Map<string, string[]>();
+  const clauseRequirementById = new Map(
+    bundle.requirements.flatMap((requirement) => requirement.acceptanceClauses.map((clause) => (
+      [clause.id, requirement.id] as const
+    ))),
+  );
+
+  for (const task of bundle.tasks) {
+    for (const proofId of task.proofIds) {
+      const proof = proofById.get(proofId);
+      if (!proof) {
+        invalidSemanticV2ProofGraph(
+          `CCC PRD semantic task ${task.id} references unknown proof ${proofId}`,
+        );
+      }
+      if (!proof.phases.includes("task")) continue;
+      const owners = taskOwnersByProofId.get(proofId) ?? [];
+      owners.push(task.id);
+      taskOwnersByProofId.set(proofId, owners);
+    }
+  }
+
+  for (const proof of bundle.proofs) {
+    if (!proof.phases.includes("task")) continue;
+    const owners = taskOwnersByProofId.get(proof.id) ?? [];
+    if (owners.length !== 1) {
+      invalidSemanticV2ProofGraph(
+        `CCC PRD task-phase proof ${proof.id} must have exactly one semantic task owner; received ${owners.length}`,
+      );
+    }
+    const owner = bundle.tasks.find((task) => task.id === owners[0])!;
+    const ownedRequirementIds = new Set(owner.requirementIds);
+    for (const requirementId of proof.requirementIds) {
+      if (!ownedRequirementIds.has(requirementId)) {
+        invalidSemanticV2ProofGraph(
+          `CCC PRD task-phase proof ${proof.id} covers requirement ${requirementId} outside semantic task ${owner.id}`,
+        );
+      }
+      const foreignOwner = bundle.tasks.find((task) => (
+        task.id !== owner.id && task.requirementIds.includes(requirementId)
+      ));
+      if (foreignOwner) {
+        invalidSemanticV2ProofGraph(
+          `CCC PRD task-phase proof ${proof.id} covers cross-task requirement ${requirementId} owned by ${owner.id} and ${foreignOwner.id}`,
+        );
+      }
+    }
+    for (const clauseId of proof.clauseIds) {
+      const requirementId = clauseRequirementById.get(clauseId);
+      if (!requirementId) {
+        invalidSemanticV2ProofGraph(
+          `CCC PRD task-phase proof ${proof.id} references unknown accepted clause ${clauseId}`,
+        );
+      }
+      if (!ownedRequirementIds.has(requirementId)) {
+        invalidSemanticV2ProofGraph(
+          `CCC PRD task-phase proof ${proof.id} covers clause ${clauseId} outside semantic task ${owner.id}`,
+        );
+      }
+    }
+  }
+
+  const taskProofIdsByTaskId = new Map<string, readonly string[]>();
+  for (const task of bundle.tasks) {
+    const taskProofIds = task.proofIds.filter((proofId) => (
+      proofById.get(proofId)?.phases.includes("task") === true
+    ));
+    if (taskProofIds.length === 0) {
+      invalidSemanticV2ProofGraph(
+        `CCC PRD semantic task ${task.id} requires at least one task-phase proof`,
+      );
+    }
+    taskProofIdsByTaskId.set(task.id, taskProofIds);
+  }
+
+  for (const requirement of bundle.requirements) {
+    for (const clause of requirement.acceptanceClauses) {
+      const hasFinalCoverage = clause.proofIds.some((proofId) => {
+        const proof = proofById.get(proofId);
+        return proof?.phases.includes("final_integrated") === true
+          && proof.clauseIds.includes(clause.id);
+      });
+      if (!hasFinalCoverage) {
+        invalidSemanticV2ProofGraph(
+          `CCC PRD accepted clause ${clause.id} has no final_integrated proof coverage`,
+        );
+      }
+    }
+  }
+
+  return {
+    taskProofIdsByTaskId,
+    finalProofIds: bundle.proofs
+      .filter((proof) => proof.phases.includes("final_integrated"))
+      .map(({ id }) => id),
+  };
+}
+
+export function nativeWorkflowIr(
   bundle: CccPrdSemanticBundle,
   workflow: CccPrdWorkflow,
   executionPolicy: CccCampaignExecutionPolicy,
@@ -593,6 +744,9 @@ function nativeWorkflowIr(
   const routeByTaskId = new Map(executionPolicy.routes.map((route) => [route.taskId, route]));
   const mergeLanding = mergeLandingFor(bundle, workflow, taskById);
   const productExecution = executionPolicy.schema === "ccc-campaign.execution-policy.v2";
+  const semanticV2ProofPlan = productExecution && bundle.schema === "ccc-prd.bundle.v2"
+    ? semanticV2WorkflowProofPlan(bundle, workflow)
+    : undefined;
   if (productExecution && bundle.proofs.length === 0) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_INVALID_BUNDLE",
@@ -692,17 +846,36 @@ function nativeWorkflowIr(
   const joinTaskIds = workflow.taskIds.filter((taskId) => (incoming.get(nativeWorkflowTaskNodeId(taskId))?.length ?? 0) > 1);
   const splitByTaskNodeId = new Map(splitTaskIds.map((taskId) => [nativeWorkflowTaskNodeId(taskId), nativeWorkflowSplitNodeId(taskId)]));
   const joinByTaskNodeId = new Map(joinTaskIds.map((taskId) => [nativeWorkflowTaskNodeId(taskId), nativeWorkflowJoinNodeId(taskId)]));
+  const taskProofByTaskNodeId = new Map(
+    semanticV2ProofPlan
+      ? workflow.taskIds.map((taskId) => [
+        nativeWorkflowTaskNodeId(taskId),
+        nativeWorkflowTaskProofNodeId(workflow.id, taskId),
+      ] as const)
+      : [],
+  );
   const topologyEdges: WorkflowIrEdge[] = dependencyEdges.map((edge) => ({
     ...edge,
-    from: splitByTaskNodeId.get(edge.from) ?? edge.from,
+    from: splitByTaskNodeId.get(edge.from) ?? taskProofByTaskNodeId.get(edge.from) ?? edge.from,
     to: joinByTaskNodeId.get(edge.to) ?? edge.to,
   }));
   for (const [taskNodeId, splitNodeId] of splitByTaskNodeId) {
-    topologyEdges.push({ from: taskNodeId, to: splitNodeId, condition: "success" });
+    topologyEdges.push({
+      from: taskProofByTaskNodeId.get(taskNodeId) ?? taskNodeId,
+      to: splitNodeId,
+      condition: "success",
+    });
   }
   for (const [taskNodeId, joinNodeId] of joinByTaskNodeId) {
     topologyEdges.push({ from: joinNodeId, to: taskNodeId, condition: "success" });
   }
+  const taskProofEdges: WorkflowIrEdge[] = semanticV2ProofPlan
+    ? workflow.taskIds.map((taskId) => ({
+      from: nativeWorkflowTaskNodeId(taskId),
+      to: nativeWorkflowTaskProofNodeId(workflow.id, taskId),
+      condition: "success" as const,
+    }))
+    : [];
   const proofNodeId = nativeWorkflowProofNodeId(workflow.id);
   const proofJoinNodeId = nativeWorkflowProofJoinNodeId(workflow.id);
   const requiresProofJoin = productExecution && workflow.terminalTaskIds.length > 1;
@@ -713,6 +886,21 @@ function nativeWorkflowIr(
     nodes: [
       { id: "start", kind: "start" },
       ...taskNodes,
+      ...(semanticV2ProofPlan ? workflow.taskIds.map((taskId) => ({
+        id: nativeWorkflowTaskProofNodeId(workflow.id, taskId),
+        kind: "gate" as const,
+        config: {
+          name: "CCC PRD task proof gate",
+          cccProofGate: true,
+          cccProofPhase: "task",
+          cccProofIds: [...semanticV2ProofPlan.taskProofIdsByTaskId.get(taskId)!],
+          cccPrdTaskId: taskId,
+          cccNativeTaskId: nativeCccPrdTaskId(taskId, nativeTaskIds),
+          gateMode: "gate",
+          toolMode: "readonly",
+          maxRetries: CCC_CAMPAIGN_WORK_ITEM_MAX_RETRIES,
+        },
+      })) : []),
       ...splitTaskIds.map((taskId) => ({
         id: nativeWorkflowSplitNodeId(taskId),
         kind: "split" as const,
@@ -741,7 +929,10 @@ function nativeWorkflowIr(
         config: {
           name: "CCC PRD proof suite",
           cccProofSuite: true,
-          cccProofIds: bundle.proofs.map(({ id }) => id),
+          cccProofIds: semanticV2ProofPlan
+            ? [...semanticV2ProofPlan.finalProofIds]
+            : bundle.proofs.map(({ id }) => id),
+          ...(semanticV2ProofPlan ? { cccProofPhase: "final_integrated" } : {}),
           cccPrdTaskIds: workflow.taskIds,
           cccNativeTaskIds: workflow.taskIds.map((taskId) =>
             nativeCccPrdTaskId(taskId, nativeTaskIds)),
@@ -771,10 +962,13 @@ function nativeWorkflowIr(
         condition: "success" as const,
       })),
       ...topologyEdges,
+      ...taskProofEdges,
       ...(productExecution
         ? [
           ...workflow.terminalTaskIds.map((taskId) => ({
-            from: nativeWorkflowTaskNodeId(taskId),
+            from: semanticV2ProofPlan
+              ? nativeWorkflowTaskProofNodeId(workflow.id, taskId)
+              : nativeWorkflowTaskNodeId(taskId),
             to: requiresProofJoin ? proofJoinNodeId : proofNodeId,
             condition: "success" as const,
           })),
@@ -1186,11 +1380,103 @@ function persistedCampaignIdentity(row: ImportRow): CccCampaignImportIdentity {
   }
 }
 
+function assertFreshProductRequestBudgetFloor(
+  bundle: CccPrdSemanticBundle,
+  executionPolicy: CccCampaignExecutionPolicy,
+): void {
+  if (executionPolicy.schema !== "ccc-campaign.execution-policy.v2") return;
+  const providerTaskCount = executionPolicy.routes.length;
+  if (bundle.bounds.maxRequests >= providerTaskCount) return;
+  throw new CccPrdImportError(
+    CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+    `CCC PRD product import maxRequests ${bundle.bounds.maxRequests} is below the provider-task floor ${providerTaskCount}`,
+  );
+}
+
+function assertExactExistingImportRequest(
+  input: Pick<ImportCccPrdBundleInput, "bundle" | "idempotencyKey">,
+  existing: ImportRow,
+  executionPolicy: CccCampaignExecutionPolicy,
+  canonicalRootDir: string,
+): void {
+  const persisted = persistedCampaignIdentity(existing);
+  const importId = importIdFor(existing.projectId, input.idempotencyKey);
+  const campaignId = oneIntent(input.bundle, "campaign").entityId;
+  const manifestInput = {
+    projectId: existing.projectId,
+    importId,
+    idempotencyKey: input.idempotencyKey,
+    campaignId,
+    bundle: input.bundle,
+    executionPolicy,
+    targetRepositoryPath: canonicalRootDir,
+    campaignStartedAt: persisted.manifest.campaignStartedAt,
+  };
+  const manifest = persisted.manifest.schema === CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+    ? createCccCampaignManifest({
+      ...manifestInput,
+      manifestSchema: CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+      executionAuthorizationMode:
+        CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+    })
+    : createCccCampaignManifest({
+      ...manifestInput,
+      manifestSchema: CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+    });
+  const identityHash = hashCccCampaignManifest(manifest);
+  if (
+    existing.bundleHash !== input.bundle.bundleHash
+    || existing.identityHash !== identityHash
+    || existing.campaignManifestHash !== identityHash
+    || canonicalCccPrdJson(existing.executionPolicy) !== canonicalCccPrdJson(executionPolicy)
+    || canonicalCccPrdJson(existing.campaignManifest) !== canonicalCccPrdJson(manifest)
+    || existing.targetRepository !== canonicalRootDir
+    || existing.rootDir !== canonicalRootDir
+    || existing.targetBase !== input.bundle.targetRepository.baseCommit
+  ) {
+    throw new CccPrdImportError(
+      "CCC_PRD_IMPORT_IDEMPOTENCY_COLLISION",
+      `CCC PRD idempotency key ${JSON.stringify(input.idempotencyKey)} is already bound to a different bundle, target, base, or execution policy`,
+    );
+  }
+}
+
+async function assertFreshProductSemanticV2(
+  input: ImportCccPrdBundleInput,
+  executionPolicy: CccCampaignExecutionPolicy,
+  canonicalRootDir: string,
+): Promise<void> {
+  if (executionPolicy.schema !== CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION) return;
+  if (input.bundle.schema !== "ccc-prd.bundle.v2") {
+    throw new CccPrdImportError(
+      "CCC_PRD_PRODUCT_SEMANTIC_V2_REQUIRED",
+      "Fresh CCC PRD product campaigns require a controller-admitted semantic bundle v2; v1 remains inspection and exact-replay only",
+    );
+  }
+  if (!input.semanticProofToolchainPaths) {
+    throw new CccPrdImportError(
+      "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+      "Fresh CCC PRD product campaigns require controller-owned semantic-proof toolchain custody",
+    );
+  }
+  await assertCccPrdSemanticProofV2Custody({
+    repositoryRoot: canonicalRootDir,
+    baseCommit: input.bundle.targetRepository.baseCommit,
+    proofs: input.bundle.proofs,
+    modelWriteRoots: executionPolicy.routes.flatMap((route) => [
+      ...(route.ownedPaths ?? []),
+      ...(route.allowedWriteRoots ?? []),
+    ]),
+    toolchainPaths: input.semanticProofToolchainPaths,
+  });
+}
+
 async function prepareDatabaseImport(
   input: ImportCccPrdBundleInput,
   executionPolicy: CccCampaignExecutionPolicy,
   canonicalRootDir: string,
   waitBudgetMs: number,
+  expectedExistingReplay: boolean,
 ): Promise<{ row: ImportRow; created: boolean }> {
   const { bundle, layer, idempotencyKey, store, failureInjection } = input;
   const projectId = projectIdFor(layer);
@@ -1199,35 +1485,21 @@ async function prepareDatabaseImport(
   return withImportIdentityLock(layer, projectId, idempotencyKey, waitBudgetMs, async (tx) => {
       const existing = await selectImportRow(tx, projectId, idempotencyKey);
       if (existing) {
-        const persisted = persistedCampaignIdentity(existing);
-        const manifest = createCccCampaignManifest({
-          projectId,
-          importId,
-          idempotencyKey,
-          campaignId,
-          bundle,
+        assertExactExistingImportRequest(
+          { bundle, idempotencyKey },
+          existing,
           executionPolicy,
-          targetRepositoryPath: canonicalRootDir,
-          campaignStartedAt: persisted.manifest.campaignStartedAt,
-        });
-        const identityHash = hashCccCampaignManifest(manifest);
-        if (
-          existing.bundleHash !== bundle.bundleHash
-          || existing.identityHash !== identityHash
-          || existing.campaignManifestHash !== identityHash
-          || canonicalCccPrdJson(existing.executionPolicy) !== canonicalCccPrdJson(executionPolicy)
-          || canonicalCccPrdJson(existing.campaignManifest) !== canonicalCccPrdJson(manifest)
-          || existing.targetRepository !== canonicalRootDir
-          || existing.rootDir !== canonicalRootDir
-          || existing.targetBase !== bundle.targetRepository.baseCommit
-        ) {
-          throw new CccPrdImportError(
-            "CCC_PRD_IMPORT_IDEMPOTENCY_COLLISION",
-            `CCC PRD idempotency key ${JSON.stringify(idempotencyKey)} is already bound to a different bundle, target, base, or execution policy`,
-          );
-        }
+          canonicalRootDir,
+        );
         return { row: existing, created: false };
       }
+      if (expectedExistingReplay) {
+        throw new CccPrdImportError(
+          "CCC_PRD_IMPORT_REPLAY_DISAPPEARED",
+          `CCC PRD exact replay row disappeared before its identity lock for ${JSON.stringify(idempotencyKey)}`,
+        );
+      }
+      assertFreshProductRequestBudgetFloor(bundle, executionPolicy);
 
       const recorder: ImportTransactionWitnessRecorder = {
         transactionId: randomUUID(),
@@ -1238,7 +1510,7 @@ async function prepareDatabaseImport(
       input.transactionProbe?.onPrepareTransaction(tx);
       try {
         const now = new Date().toISOString();
-        const manifest = createCccCampaignManifest({
+        const manifestInput = {
           projectId,
           importId,
           idempotencyKey,
@@ -1247,7 +1519,19 @@ async function prepareDatabaseImport(
           executionPolicy,
           targetRepositoryPath: canonicalRootDir,
           campaignStartedAt: now,
-        });
+        };
+        const manifest = executionPolicy.schema
+          === CCC_CAMPAIGN_EXECUTION_POLICY_V2_SCHEMA_VERSION
+          ? createCccCampaignManifest({
+            ...manifestInput,
+            manifestSchema: CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+            executionAuthorizationMode:
+              CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+          })
+          : createCccCampaignManifest({
+            ...manifestInput,
+            manifestSchema: CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+          });
         const identityHash = hashCccCampaignManifest(manifest);
         const nativeTaskIds = await allocateNativeTaskIds(
           tx,
@@ -2395,12 +2679,24 @@ export async function importCccPrdBundle(
     input.executionPolicy,
     input.bundle,
   );
+  if (existing) {
+    assertExactExistingImportRequest(
+      input,
+      existing,
+      executionPolicy,
+      canonicalRootDir,
+    );
+  } else {
+    await assertFreshProductSemanticV2(input, executionPolicy, canonicalRootDir);
+  }
   const waitBudgetMs = input.bundle.bounds.maxDurationMs + reconciliationAllowance(input.failureInjection);
+  await inject(input.failureInjection, "before_prepare_lock");
   const prepared = await prepareDatabaseImport(
     input,
     executionPolicy,
     canonicalRootDir,
     waitBudgetMs,
+    existing !== null,
   );
   invalidateImportReadCaches(input.store);
   if (prepared.created) {

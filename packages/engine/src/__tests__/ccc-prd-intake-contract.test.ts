@@ -22,13 +22,19 @@ Make the operator journey work without developer-written glue.
 
 ## Requirements
 
-### REQ-001 — Supported operator route
+### Requirement REQ-001
 
 The normal CLI must execute the product journey.
 
-## Acceptance behavior and expected proof
+#### Acceptance clauses
 
-- REQ-001: run \`task verify:product\` against the campaign-created commit.
+- [AC-REQ-001-001] The normal CLI executes the product journey against the campaign-created commit.
+
+## Expected proof
+
+### Proof PROOF-REQ-001
+
+The verifier command task verify:product passes only when the normal CLI executes the product journey against the campaign-created commit. The positive case CASE-REQ-001-CLI exercises that route. The negative control CONTROL-REQ-001-STALE rejects a stale baseline. The proof runs in task and final_integrated phases, uses trusted verifier closure Taskfile.yml and proof/product.mjs, and judges candidate inputs src/product and tests/product.
 
 ## Constraints and dependencies
 
@@ -58,8 +64,13 @@ describe("optional CCC PRD Intake Contract", () => {
     expect(template).toContain("Target repository:");
     expect(template).toContain("Baseline commit:");
     expect(template).toContain("Allowed write roots:");
-    expect(template).toContain("Acceptance behavior and expected proof");
-    expect(template).toContain("task verify:<slug>");
+    expect(template).toContain("### Requirement REQ-001");
+    expect(template).toContain("#### Acceptance clauses");
+    expect(template).toContain("[AC-REQ-001-001]");
+    expect(template).toContain("the verifier command task verify:<slug>");
+    expect(template).toContain("Trusted verifier closure:");
+    expect(template).toContain("Candidate inputs:");
+    expect(template).toContain("task and final_integrated");
     expect(template).toContain(CCC_CAMPAIGN_TASK_VERIFY_DECLARATION_PATTERN_SOURCE);
     expect(template).toMatch(/exact.*proof\.command.*cited source span/iu);
     expect(template).toContain("Protected actions");
@@ -98,18 +109,22 @@ describe("optional CCC PRD Intake Contract", () => {
       { code: "CCC_PRD_BASELINE_REQUIRED" },
       { code: "CCC_PRD_ALLOWED_PATHS_REQUIRED" },
       { code: "CCC_PRD_ACCEPTANCE_BEHAVIOR_REQUIRED" },
+      { code: "CCC_PRD_ACCEPTANCE_CLAUSES_REQUIRED" },
       { code: "CCC_PRD_EXPECTED_PROOF_REQUIRED" },
+      { code: "CCC_PRD_PROOF_DECLARATION_REQUIRED" },
       { code: "CCC_PRD_PROTECTED_ACTIONS_REQUIRED" },
     ]);
     expect(result.blockingQuestions[0]?.message).toMatch(/target repository/i);
     expect(result.blockingQuestions[1]?.message).toMatch(/baseline/i);
     expect(result.blockingQuestions[2]?.message).toMatch(/allowed.*paths|write roots/i);
     expect(result.blockingQuestions[3]?.message).toMatch(/acceptance behavior/i);
-    expect(result.blockingQuestions[4]?.message).toMatch(/proof/i);
-    expect(result.blockingQuestions[5]?.message).toMatch(/protected actions/i);
+    expect(result.blockingQuestions[4]?.message).toMatch(/clause/i);
+    expect(result.blockingQuestions[5]?.message).toMatch(/proof/i);
+    expect(result.blockingQuestions[6]?.message).toMatch(/verifier command/i);
+    expect(result.blockingQuestions[7]?.message).toMatch(/protected actions/i);
   });
 
-  it("treats explicit none as a decision and reports optional structure only as advice", () => {
+  it("refuses legacy free-form acceptance that cannot become a clause-complete product packet", () => {
     const result = lintCccPrdIntakeMarkdown({
       sourcePath: "compact.md",
       markdown: `# Compact PRD
@@ -133,8 +148,10 @@ None.
 `,
     });
 
-    expect(result.readyForIntake).toBe(true);
-    expect(result.blockingQuestions).toEqual([]);
+    expect(result.readyForIntake).toBe(false);
+    expect(result.blockingQuestions).toContainEqual(expect.objectContaining({
+      code: "CCC_PRD_ACCEPTANCE_CLAUSES_REQUIRED",
+    }));
     expect(result.advisories.map(({ code }) => ({ code }))).toEqual([
       { code: "CCC_PRD_CONSTRAINTS_RECOMMENDED" },
       { code: "CCC_PRD_NON_GOALS_RECOMMENDED" },

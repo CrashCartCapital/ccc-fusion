@@ -1,6 +1,7 @@
 import {
   atomicReserveCccCampaignProviderDispatch,
   createCccCampaignAuthorityBinding,
+  CccProviderAttemptLimitError,
   readConsumedCccCampaignApprovalCustodyWithinTransaction,
   selectCccCampaignDeclaredLiveExecutionAction,
   type CccCampaignAuthorityStore,
@@ -16,6 +17,7 @@ import { realpath } from "node:fs/promises";
 import { inspectCccCampaignLocalGit } from "./ccc-campaign-local-git.js";
 import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { recheckCccCampaignLocalGit, type CccCampaignLocalGitSnapshot } from "./ccc-campaign-local-git.js";
+import { encodeCccCampaignRequestBudgetExhausted } from "./ccc-campaign-runtime-errors.js";
 
 const CANONICAL_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 
@@ -44,10 +46,20 @@ export async function preDispatchCccCampaignProviderFromEngine(
 ): Promise<CccCampaignProviderControllerDecision> {
   const rechecked = await recheckCccCampaignLocalGit(input.initialGitSnapshot, input.signal);
   input.signal?.throwIfAborted();
-  return atomicReserveCccCampaignProviderDispatch({
-    ...input.preDispatch,
-    gitObservation: Object.freeze({ targetRoot: rechecked.targetRoot, expectedBaseObject: rechecked.expectedBaseObject, head: rechecked.head, headDescendsFromExpectedBase: true }),
-  });
+  try {
+    return await atomicReserveCccCampaignProviderDispatch({
+      ...input.preDispatch,
+      gitObservation: Object.freeze({ targetRoot: rechecked.targetRoot, expectedBaseObject: rechecked.expectedBaseObject, head: rechecked.head, headDescendsFromExpectedBase: true }),
+    });
+  } catch (error) {
+    if (
+      error instanceof CccProviderAttemptLimitError
+      && error.reason === "max-requests"
+    ) {
+      throw encodeCccCampaignRequestBudgetExhausted(error);
+    }
+    throw error;
+  }
 }
 
 /**

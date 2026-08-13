@@ -1,5 +1,6 @@
 import {
   canonicalCccPrdJson,
+  projectCccPrdProofV2DefinitionForHash,
   type CccPrdAdmittedWriteRoot,
   type CccPrdArtifact,
   type CccPrdAuthorityRole,
@@ -10,8 +11,11 @@ import {
   type CccPrdImportIntent,
   type CccPrdMaterialCoverageItem,
   type CccPrdProof,
+  type CccPrdProofV2,
   type CccPrdProtectedActionIntent,
   type CccPrdRequirement,
+  type CccPrdRequirementV2,
+  type CccPrdSemanticProofContractVersion,
   type CccPrdReviewItem,
   type CccPrdSourceSpan,
   type CccPrdTargetRepository,
@@ -23,6 +27,7 @@ import { compareSourceSpans } from "./authoring.js";
 import { CccPrdCustodyError, sortCccPrdById } from "./custody.js";
 import { analyzeCccPrdMaterialCoverage } from "./material-coverage.js";
 import type { CccPrdResolvedChunkFragment } from "./chunk-verification.js";
+import { assertCccPrdAcceptanceClauseCustody } from "./acceptance-clauses.js";
 
 type IdRow = { id: string; spans?: CccPrdSourceSpan[] };
 
@@ -89,6 +94,118 @@ function mergeCollection<T extends IdRow>(
   return merged;
 }
 
+function mergeV2Requirements(
+  occurrences: Array<Occurrence<CccPrdRequirementV2>>,
+): CccPrdRequirementV2[] {
+  const byId = new Map<string, Array<Occurrence<CccPrdRequirementV2>>>();
+  for (const occurrence of occurrences) {
+    const rows = byId.get(occurrence.row.id) ?? [];
+    rows.push(occurrence);
+    byId.set(occurrence.row.id, rows);
+  }
+  return [...byId.values()].map((group) => {
+    const first = group[0]!;
+    const base = (row: CccPrdRequirementV2) => {
+      const {
+        spans,
+        dependencies,
+        proofIds,
+        acceptanceClauses,
+        acceptanceDispositions,
+        ...rest
+      } = row;
+      return rest;
+    };
+    for (const other of group.slice(1)) {
+      const differingField = firstDifferingField(base(first.row), base(other.row));
+      if (differingField) {
+        throw new CccPrdCustodyError(
+          "CCC_PRD_ASSEMBLY_ID_COLLISION",
+          `requirement ${first.row.id} has contradictory "${differingField}" between chunk `
+            + `${first.chunkOrdinal} and chunk ${other.chunkOrdinal}`,
+        );
+      }
+    }
+    const mergeNested = <T extends Record<string, unknown>>(
+      rows: T[],
+      key: keyof T,
+      label: string,
+    ): T[] => {
+      const indexed = new Map<string, T>();
+      for (const row of rows) {
+        const id = String(row[key]);
+        const prior = indexed.get(id);
+        if (prior && canonicalCccPrdJson(prior) !== canonicalCccPrdJson(row)) {
+          throw new CccPrdCustodyError(
+            "CCC_PRD_ASSEMBLY_ID_COLLISION",
+            `${label} ${id} has contradictory source custody or linkage across chunks`,
+          );
+        }
+        indexed.set(id, prior ?? row);
+      }
+      return [...indexed.values()].sort((left, right) => (
+        String(left[key]) < String(right[key]) ? -1 : String(left[key]) > String(right[key]) ? 1 : 0
+      ));
+    };
+    return {
+      ...first.row,
+      dependencies: [...new Set(group.flatMap(({ row }) => row.dependencies))].sort(),
+      proofIds: [...new Set(group.flatMap(({ row }) => row.proofIds))].sort(),
+      spans: mergeSpans(group.flatMap(({ row }) => row.spans)),
+      acceptanceClauses: mergeNested(
+        group.flatMap(({ row }) => row.acceptanceClauses),
+        "id",
+        "acceptance clause",
+      ),
+      acceptanceDispositions: mergeNested(
+        group.flatMap(({ row }) => row.acceptanceDispositions),
+        "clauseId",
+        "acceptance disposition",
+      ),
+    };
+  });
+}
+
+function mergeV2Proofs(occurrences: Array<Occurrence<CccPrdProofV2>>): CccPrdProofV2[] {
+  const byId = new Map<string, Array<Occurrence<CccPrdProofV2>>>();
+  for (const occurrence of occurrences) {
+    const rows = byId.get(occurrence.row.id) ?? [];
+    rows.push(occurrence);
+    byId.set(occurrence.row.id, rows);
+  }
+  return [...byId.values()].map((group) => {
+    const first = group[0]!;
+    const base = (row: CccPrdProofV2) => {
+      const projected = projectCccPrdProofV2DefinitionForHash(row);
+      const { spans, requirementIds, clauseIds, ...rest } = projected;
+      return rest;
+    };
+    for (const other of group.slice(1)) {
+      const differingField = firstDifferingField(base(first.row), base(other.row));
+      if (differingField) {
+        throw new CccPrdCustodyError(
+          "CCC_PRD_ASSEMBLY_ID_COLLISION",
+          `proof ${first.row.id} has contradictory "${differingField}" between chunk `
+            + `${first.chunkOrdinal} and chunk ${other.chunkOrdinal}`,
+        );
+      }
+    }
+    const unique = (values: string[]) => [...new Set(values)].sort();
+    const canonical = projectCccPrdProofV2DefinitionForHash(first.row);
+    return {
+      ...first.row,
+      requirementIds: unique(group.flatMap(({ row }) => row.requirementIds)),
+      clauseIds: unique(group.flatMap(({ row }) => row.clauseIds)),
+      phases: canonical.phases as CccPrdProofV2["phases"],
+      positiveCases: canonical.positiveCases,
+      negativeControls: canonical.negativeControls,
+      verifierClosure: canonical.verifierClosure,
+      candidateInputs: canonical.candidateInputs,
+      spans: mergeSpans(group.flatMap(({ row }) => row.spans)),
+    };
+  });
+}
+
 function referencedIds(fields: unknown[]): string[] {
   return fields.flatMap((field) => {
     if (typeof field === "string") return field.length > 0 ? [field] : [];
@@ -99,6 +216,7 @@ function referencedIds(fields: unknown[]): string[] {
 
 export type CccPrdChunkAssemblyInput = {
   packetSourceBytes: Map<string, Buffer>;
+  semanticProofContract?: CccPrdSemanticProofContractVersion;
   fragments: Array<{ chunkOrdinal: number; resolved: CccPrdResolvedChunkFragment }>;
 };
 
@@ -149,11 +267,17 @@ function collect<T extends IdRow>(
 export function assembleCccPrdChunkedUnderstanding(
   input: CccPrdChunkAssemblyInput,
 ): CccPrdAssembledUnderstanding {
-  const requirements = sortCccPrdById(mergeCollection(
-    collect(input.fragments, (r) => r.requirements),
-    "requirement",
-  ));
-  const proofs = sortCccPrdById(mergeCollection(collect(input.fragments, (r) => r.proofs), "proof"));
+  const semanticV2 = input.semanticProofContract === "v2";
+  const requirementOccurrences = collect(input.fragments, (r) => r.requirements);
+  const proofOccurrences = collect(input.fragments, (r) => r.proofs);
+  const requirements: CccPrdRequirement[] = semanticV2
+    ? sortCccPrdById(mergeV2Requirements(
+        requirementOccurrences as Array<Occurrence<CccPrdRequirementV2>>,
+      ))
+    : sortCccPrdById(mergeCollection(requirementOccurrences, "requirement"));
+  const proofs: CccPrdProof[] = semanticV2
+    ? sortCccPrdById(mergeV2Proofs(proofOccurrences as Array<Occurrence<CccPrdProofV2>>))
+    : sortCccPrdById(mergeCollection(proofOccurrences, "proof"));
   const tasks = sortCccPrdById(mergeCollection(collect(input.fragments, (r) => r.tasks), "task"));
   const workflows = sortCccPrdById(mergeCollection(collect(input.fragments, (r) => r.workflows), "workflow"));
   const documents = sortCccPrdById(mergeCollection(collect(input.fragments, (r) => r.documents), "document"));
@@ -226,6 +350,32 @@ export function assembleCccPrdChunkedUnderstanding(
         );
       }
     }
+  }
+
+  if (semanticV2) {
+    if (
+      requirements.some((requirement) => !("acceptanceClauses" in requirement))
+      || proofs.some((proof) => proof.schema !== "ccc-prd.proof.v2")
+    ) {
+      throw new CccPrdCustodyError(
+        "CCC_PRD_ACCEPTANCE_CLAUSE_MANIFEST_INVALID",
+        "v2 chunk assembly cannot mix legacy requirements or proofs into its semantic inventory",
+      );
+    }
+    assertCccPrdAcceptanceClauseCustody({
+      sourceBytes: input.packetSourceBytes,
+      requirements: (requirements as CccPrdRequirementV2[]).map((requirement) => ({
+        requirementId: requirement.id,
+        acceptanceClauses: requirement.acceptanceClauses,
+        acceptanceDispositions: requirement.acceptanceDispositions,
+      })),
+      proofs: proofs as CccPrdProofV2[],
+    });
+  } else if (proofs.some((proof) => proof.schema === "ccc-prd.proof.v2")) {
+    throw new CccPrdCustodyError(
+      "CCC_PRD_ACCEPTANCE_CLAUSE_MANIFEST_INVALID",
+      "legacy chunk assembly cannot admit a v2 proof into its frozen v1 inventory",
+    );
   }
 
   const analysis = analyzeCccPrdMaterialCoverage({

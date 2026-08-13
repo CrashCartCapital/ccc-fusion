@@ -75,7 +75,7 @@ describe("prd native authoring descendant contract", () => {
   });
 
   it("authors from an unchanged packet through one bounded native loopback request without a proposal argument", async () => {
-    const packet = createPacketRoot();
+    const packet = createPacketRoot({ semanticV2: true });
     const proposal = readFileSync(packet.proposal, "utf8");
     const requests: Array<Record<string, unknown>> = [];
     const server = createServer((request, response) => {
@@ -108,8 +108,10 @@ describe("prd native authoring descendant contract", () => {
       expect(requests).toHaveLength(1);
       expect(JSON.stringify(requests[0])).toContain("Dense PRD Packet");
       expect(JSON.parse(author.stdout)).toMatchObject({ kind: "candidate", sidecarPath: packet.sidecar, review: { ambiguities: [], unresolvedDecisions: [], exceptions: [], protectedActions: [expect.objectContaining({ id: "ACTION-CLI-001", target: "fixture/repo:provider-canary" })] } });
-      expect(runFn(["prd", "validate", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base]).status).toBe(0);
-      expect(runFn(["prd", "compile", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base]).status).toBe(0);
+      expect(JSON.parse(readFileSync(packet.sidecar, "utf8"))).toMatchObject({
+        schema: "ccc-prd.sidecar.v2",
+        provenance: { authoringAdapterId: "fusion-native-model-runtime-v1" },
+      });
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }

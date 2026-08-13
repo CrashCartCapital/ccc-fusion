@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
 import {
   canonicalCccPrdJson,
+  closeUnopenedCccCampaignExecutionAuthorizationMembers,
   type CccPrdProductStatus,
-  type Task,
-  type WorkflowWorkItem,
+  type TaskStore,
   type WorkflowWorkItemState,
-  type WorkflowWorkItemTransitionPatch,
 } from "@fusion/core";
 
 export const CCC_CAMPAIGN_OPERATOR_PAUSED_REASON =
@@ -15,22 +14,13 @@ export const CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX =
 
 export type CccCampaignOperatorControlAction = "pause" | "resume" | "stop";
 
-type OperatorControlStore = Readonly<{
-  transitionWorkflowWorkItem(
-    id: string,
-    state: WorkflowWorkItemState,
-    patch: WorkflowWorkItemTransitionPatch,
-  ): Promise<WorkflowWorkItem | unknown>;
-  pauseTask(
-    id: string,
-    paused: boolean,
-    runContext?: undefined,
-    agentOptions?: {
-      pausedByAgentId?: string;
-      pausedReason?: string;
-    },
-  ): Promise<Task | unknown>;
-}>;
+type OperatorControlStore = TaskStore;
+
+const OPERATOR_CONTROL_ACTOR = Object.freeze({
+  actorId: "ccc-campaign-operator-control",
+  actorType: "system" as const,
+  actorName: "CCC Campaign Operator Control",
+});
 
 export type CccCampaignOperatorControlDescriptor = Readonly<{
   action: CccCampaignOperatorControlAction;
@@ -457,12 +447,71 @@ export async function applyCccCampaignOperatorControl(
     lastError: stoppedMarker,
     blockedReason: `${stoppedMarker} ${reason}`,
   });
+  const executionAuthorization = input.status.executionAuthorization;
+  let sealedOpenedEffects = false;
+  let authorizationClosureError: unknown = null;
+  if (executionAuthorization?.status === "claimed") {
+    const layer = input.store.getAsyncLayer();
+    if (!layer) {
+      authorizationClosureError = new Error(
+        `Sealed authorization ${executionAuthorization.authorizationId} requires PostgreSQL custody for unopened-member closure.`,
+      );
+    } else {
+      try {
+        const closure =
+          await closeUnopenedCccCampaignExecutionAuthorizationMembers(layer, {
+            authorityStore: input.store,
+            rootDir: input.store.rootDir,
+            authorizationId: executionAuthorization.authorizationId,
+            actor: OPERATOR_CONTROL_ACTOR,
+            runId: workItem.runId,
+          });
+        sealedOpenedEffects = closure.openedApprovalRequestIds.length > 0;
+        const expectedStatus = sealedOpenedEffects ? "claimed" : "settled";
+        if (
+          closure.authorization.authorizationId
+            !== executionAuthorization.authorizationId
+          || closure.authorization.status !== expectedStatus
+        ) {
+          throw new Error(
+            `Sealed authorization ${executionAuthorization.authorizationId} returned ${closure.authorization.status}; expected ${expectedStatus} after unopened-member closure.`,
+          );
+        }
+      } catch (error) {
+        authorizationClosureError = error;
+      }
+    }
+  }
+  let taskPauseError: unknown = null;
   try {
     await pauseTasks(input.store, taskIds, stoppedMarker);
   } catch (error) {
+    taskPauseError = error;
+  }
+  if (authorizationClosureError !== null) {
+    const closureReason = authorizationClosureError instanceof Error
+      ? authorizationClosureError.message
+      : String(authorizationClosureError);
+    if (taskPauseError !== null) {
+      const pauseReason = taskPauseError instanceof Error
+        ? taskPauseError.message
+        : String(taskPauseError);
+      throw new CccCampaignOperatorControlError(
+        "CCC_CAMPAIGN_OPERATOR_CONTROL_STOP_INCOMPLETE",
+        `Campaign workflow is terminally stopped, but sealed authorization closure failed (${closureReason}) and one or more task pause projections failed (${pauseReason}).`,
+        { workItemId: workItem.id, workItemState: "cancelled" },
+      );
+    }
+    throw new CccCampaignOperatorControlError(
+      "CCC_CAMPAIGN_OPERATOR_CONTROL_AUTHORIZATION_CLOSURE_INCOMPLETE",
+      `Campaign workflow is terminally stopped and task pause projections completed, but sealed authorization closure failed: ${closureReason}`,
+      { workItemId: workItem.id, workItemState: "cancelled" },
+    );
+  }
+  if (taskPauseError !== null) {
     throw new CccCampaignOperatorControlError(
       "CCC_CAMPAIGN_OPERATOR_CONTROL_TASK_STOP_INCOMPLETE",
-      `Campaign workflow is terminally stopped, but one or more task pause projections failed: ${error instanceof Error ? error.message : String(error)}`,
+      `Campaign workflow is terminally stopped, but one or more task pause projections failed: ${taskPauseError instanceof Error ? taskPauseError.message : String(taskPauseError)}`,
       { workItemId: workItem.id, workItemState: "cancelled" },
     );
   }
@@ -471,6 +520,7 @@ export async function applyCccCampaignOperatorControl(
     workItemId: workItem.id,
     workItemState: "cancelled",
     taskIds,
-    unresolvedEffectsPreserved: unresolvedEffects(input.status),
+    unresolvedEffectsPreserved:
+      sealedOpenedEffects || unresolvedEffects(input.status),
   };
 }

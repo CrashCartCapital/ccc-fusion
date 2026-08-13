@@ -73,6 +73,91 @@ function taskRow(id: string, spans: CccPrdSourceSpan[], overrides: Record<string
 }
 
 describe("assembleCccPrdChunkedUnderstanding", () => {
+  it("Slice 4 GREEN: reconciles partial v2 clause manifests globally and keeps one proof definition", () => {
+    const text = [
+      "### Requirement REQ-1",
+      "#### Acceptance clauses",
+      "- [AC-REQ-1-001] Behavior one is verified.",
+      "- [AC-REQ-1-002] Behavior two is verified.",
+    ].join("\n") + "\n";
+    const bytes = Buffer.from(text, "utf8");
+    const sourceSpan = spanFor(bytes, SOURCE_PATH, text.trimEnd());
+    const clause = (ordinal: "001" | "002", clauseText: string) => ({
+      id: `AC-REQ-1-${ordinal}`,
+      requirementId: "REQ-1",
+      text: clauseText,
+      proofIds: ["PROOF-1"],
+      span: spanFor(bytes, SOURCE_PATH, clauseText) as CccPrdSourceSpan & { excerptSha256: string },
+    });
+    const requirement = (acceptanceClauses: ReturnType<typeof clause>[]) => ({
+      ...requirementRow("REQ-1", [sourceSpan], { proofIds: ["PROOF-1"] }),
+      acceptanceClauses,
+      acceptanceDispositions: [],
+    });
+    const proof = (clauseIds: string[]) => ({
+      schema: "ccc-prd.proof.v2" as const,
+      id: "PROOF-1",
+      requirementIds: ["REQ-1"],
+      clauseIds,
+      phases: ["task", "final_integrated"] as const,
+      command: "task verify:one",
+      positiveOracle: "all assertions pass",
+      positiveCases: [{ id: "POS-1", description: "integrated behavior passes" }],
+      negativeControls: [{ id: "NEG-1", description: "mutated behavior refuses" }],
+      verifierClosure: [{
+        role: "task_runner" as const,
+        path: "Taskfile.yml",
+        baseGitBlobOid: "a".repeat(40),
+        sha256: "b".repeat(64),
+      }],
+      candidateInputs: ["src/one.ts"],
+      executionToolchain: {
+        task: { executablePath: "/task", executableSha256: "c".repeat(64), version: "1", versionOutputSha256: "d".repeat(64) },
+        node: { executablePath: "/node", executableSha256: "e".repeat(64), version: "24", versionOutputSha256: "f".repeat(64) },
+        proofHost: { id: "host", executablePath: "/host", executableSha256: "1".repeat(64), version: "1", versionOutputSha256: "2".repeat(64) },
+        linkedRuntime: [],
+      },
+      spans: [sourceSpan],
+      confidence: "high" as const,
+    });
+    const task = taskRow("TASK-1", [sourceSpan], {
+      requirementIds: ["REQ-1"],
+      proofIds: ["PROOF-1"],
+    });
+    const fragmentA: CccPrdResolvedChunkFragment = {
+      ...emptyResolved(),
+      requirements: [requirement([clause("001", "Behavior one is verified.")])],
+      proofs: [proof(["AC-REQ-1-001"])],
+      tasks: [task],
+    };
+    const fragmentB: CccPrdResolvedChunkFragment = {
+      ...emptyResolved(),
+      requirements: [requirement([clause("002", "Behavior two is verified.")])],
+      proofs: [proof(["AC-REQ-1-002"])],
+      tasks: [task],
+    };
+
+    const assembled = assembleCccPrdChunkedUnderstanding({
+      packetSourceBytes: new Map([[SOURCE_PATH, bytes]]),
+      semanticProofContract: "v2",
+      fragments: [
+        { chunkOrdinal: 0, resolved: fragmentA },
+        { chunkOrdinal: 1, resolved: fragmentB },
+      ],
+    });
+
+    expect(assembled.requirements[0]).toMatchObject({
+      acceptanceClauses: [
+        { id: "AC-REQ-1-001" },
+        { id: "AC-REQ-1-002" },
+      ],
+    });
+    expect(assembled.proofs).toHaveLength(1);
+    expect(assembled.proofs[0]).toMatchObject({
+      clauseIds: ["AC-REQ-1-001", "AC-REQ-1-002"],
+    });
+  });
+
   it("test 33: emitted requirement IDs are unprefixed, so requirement.id === item.title still dispositions", () => {
     const text = ["# Alpha", "- REQ-1: alpha requirement text."].join("\n") + "\n";
     const bytes = Buffer.from(text, "utf8");

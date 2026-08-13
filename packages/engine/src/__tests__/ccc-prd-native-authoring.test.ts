@@ -731,6 +731,39 @@ describe("CCC PRD native authoring adapter", () => {
     expect(prompt).toContain("complete sentence");
   });
 
+  it("RED-S4-v2-native-prompt: explicitly requests parser-owned clause and verifier-proof v2 fields", async () => {
+    const generate = vi.fn<CccPrdNativeAuthoringTransport>(async (request) => ({
+      text: canonicalCccPrdJson({ ...proposal, schema: "ccc-prd.authoring-proposal.v2" }),
+      provider: request.provider,
+      model: request.model,
+    }));
+    const adapter = nativeAdapter(generate);
+
+    await adapter.generateCandidate({
+      sourceVersion: "semantic-v2",
+      packetHash: "a".repeat(64),
+      semanticProofContract: "v2",
+      sources: [{
+        path: "prd.md",
+        role: "root",
+        authoritative: true,
+        sha256: "b".repeat(64),
+        byteLength: 1,
+        content: "x",
+      }],
+      constraints,
+    });
+
+    const prompt = generate.mock.calls[0]![0].prompt;
+    expect(prompt).toContain('"schema": "ccc-prd.authoring-proposal.v2"');
+    expect(prompt).toContain('"acceptanceClauses"');
+    expect(prompt).toContain('"acceptanceDispositions"');
+    expect(prompt).toContain('"clauseIds"');
+    expect(prompt).toContain('"verifierClosure"');
+    expect(prompt).toContain("IDs, text, and raw-byte spans are owned by the admitted PRD source");
+    expect(prompt).toContain("fuzzy quote recovery is forbidden for acceptance clauses");
+  });
+
   /*
   Defense in depth alongside the transport-side outermost-fence strip: the
   prompt already said "no Markdown or commentary", and glm-5.2 still wrapped

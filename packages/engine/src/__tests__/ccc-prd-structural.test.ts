@@ -30,10 +30,16 @@ const ccc = engine as typeof engine & {
       bounds: { maxRequests: number; maxDurationMs: number; maxConcurrency: number };
       maxReviewItems: number;
     };
+    semanticProofContract?: "v1" | "v2";
     workflowExtensionRegistry?: WorkflowExtensionRegistry;
   }): Promise<{ kind: string; sidecar?: Record<string, unknown>; review?: Record<string, unknown[]> }>;
   compileCccPrdPacket(input: CompileInput): Record<string, unknown>;
   validateCccPrdPacket(input: CompileInput): Record<string, unknown>;
+  validateCccPrdPacketImplementationFactProvenance(input: {
+    rootDir: string;
+    manifestPath: string;
+    facts: Record<string, unknown>;
+  }): Array<{ code: string; message: string }>;
 };
 
 type CompileInput = {
@@ -94,6 +100,19 @@ const productSource = [
   secondRequirementLine,
   firstRequirementLine,
 ].join("\n");
+const v2RequirementOneBlock = [
+  "### Requirement REQ-1",
+  "Normative behavior one. Acceptance: first proof passes. Proof: task prove:first. Oracle: exit 0 and first assertion observed. Negative: mutated first declaration refuses.",
+  "#### Acceptance clauses",
+  "- [AC-REQ-1-001] Behavior one passes its integrated verifier.",
+].join("\n");
+const v2RequirementTwoBlock = [
+  "### Requirement REQ-2",
+  "Normative behavior two. Acceptance: second proof passes. Proof: task prove:second. Oracle: exit 0 and second assertion observed. Negative: mutated second declaration refuses.",
+  "#### Acceptance clauses",
+  "- [AC-REQ-2-001] Behavior two passes its integrated verifier.",
+].join("\n");
+const v2ProductSource = [productSource, v2RequirementOneBlock, v2RequirementTwoBlock].join("\n");
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -313,6 +332,73 @@ function productProposal(): ReturnType<typeof proposal> {
   return candidate;
 }
 
+function v2ProductProposal() {
+  const candidate = productProposal() as unknown as Record<string, unknown> & {
+    schema: string;
+    requirements: Array<Record<string, unknown> & { id: string }>;
+    proofs: Array<Record<string, unknown> & { id: string }>;
+  };
+  candidate.schema = "ccc-prd.authoring-proposal.v2";
+  for (const requirement of candidate.requirements) {
+    const ordinal = requirement.id === "REQ-1" ? "1" : "2";
+    const clauseId = `AC-REQ-${ordinal}-001`;
+    const text = ordinal === "1"
+      ? "Behavior one passes its integrated verifier."
+      : "Behavior two passes its integrated verifier.";
+    const block = ordinal === "1" ? v2RequirementOneBlock : v2RequirementTwoBlock;
+    requirement.sourceRefs = ref(block);
+    requirement.acceptanceClauses = [{
+      id: clauseId,
+      requirementId: requirement.id,
+      text,
+      proofIds: [`PROOF-${ordinal}`],
+      sourceRefs: ref(text),
+    }];
+    requirement.acceptanceDispositions = [];
+  }
+  for (const proof of candidate.proofs) {
+    const ordinal = proof.id === "PROOF-1" ? "1" : "2";
+    const block = ordinal === "1" ? v2RequirementOneBlock : v2RequirementTwoBlock;
+    const negativeDescription = `mutated ${ordinal === "1" ? "first" : "second"} declaration refuses`;
+    proof.schema = "ccc-prd.proof.v2";
+    proof.clauseIds = [`AC-REQ-${ordinal}-001`];
+    proof.phases = ["task", "final_integrated"];
+    proof.positiveCases = [{ id: `POS-${ordinal}`, description: `positive case ${ordinal}` }];
+    proof.negativeControls = [{ id: `NEG-${ordinal}`, description: negativeDescription }];
+    proof.verifierClosure = [{
+      role: "task_runner",
+      path: "Taskfile.yml",
+      baseGitBlobOid: "b".repeat(40),
+      sha256: "c".repeat(64),
+    }];
+    proof.candidateInputs = [`tasks/${ordinal}`];
+    proof.executionToolchain = {
+      task: {
+        executablePath: "/usr/local/bin/task",
+        executableSha256: "d".repeat(64),
+        version: "3.44.0",
+        versionOutputSha256: "e".repeat(64),
+      },
+      node: {
+        executablePath: "/usr/local/bin/node",
+        executableSha256: "f".repeat(64),
+        version: "24.0.0",
+        versionOutputSha256: "1".repeat(64),
+      },
+      proofHost: {
+        id: "proof-host",
+        executablePath: "/usr/local/bin/proof-host",
+        executableSha256: "2".repeat(64),
+        version: "1.0.0",
+        versionOutputSha256: "3".repeat(64),
+      },
+      linkedRuntime: [],
+    };
+    proof.sourceRefs = ref(block);
+  }
+  return candidate;
+}
+
 function productConstraints() {
   return {
     targetRepository: { path: target, baseCommit: base },
@@ -378,6 +464,87 @@ function refusalCode(result: Record<string, unknown>): string | undefined {
 }
 
 describe("ccc-prd structural sidecar", () => {
+  it("RED-S5-v2-proposal-toolchain-shape: refuses proof executionToolchain without linkedRuntime", async () => {
+    const input = packet(v2ProductSource);
+    const candidate = v2ProductProposal();
+    delete (candidate.proofs[0]!.executionToolchain as Record<string, unknown>).linkedRuntime;
+
+    const authored = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      semanticProofContract: "v2",
+      adapter: {
+        id: "local-v2-fixture",
+        model: "fixture-v2",
+        generateCandidate: async () => candidate,
+      },
+      workflowExtensionRegistry: await proofAdmissionRegistry(input),
+    });
+
+    expect(authored).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_AUTHORING_PROPOSAL_INVALID" }],
+    });
+    expect(JSON.stringify(authored)).toContain("executionToolchain");
+    expect(JSON.stringify(authored)).toContain("linkedRuntime");
+  });
+
+  it("RED-S5-review-only-v2: does not stamp model-fabricated Git and toolchain identities as executable admission", async () => {
+    const input = packet(v2ProductSource);
+    const workflowExtensionRegistry = await proofAdmissionRegistry(input);
+    const authored = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      semanticProofContract: "v2",
+      adapter: {
+        id: "local-v2-fixture",
+        model: "fixture-v2",
+        generateCandidate: async () => v2ProductProposal(),
+      },
+      workflowExtensionRegistry,
+    });
+    expect(authored.kind, JSON.stringify(authored)).toBe("candidate");
+    expect(authored.sidecar).toMatchObject({
+      schema: "ccc-prd.sidecar.v2",
+      requirements: [
+        expect.objectContaining({
+          id: "REQ-1",
+          acceptanceClauses: [expect.objectContaining({
+            id: "AC-REQ-1-001",
+            text: "Behavior one passes its integrated verifier.",
+            span: expect.objectContaining({ excerptSha256: expect.stringMatching(/^[0-9a-f]{64}$/) }),
+          })],
+        }),
+        expect.objectContaining({ id: "REQ-2" }),
+      ],
+      proofs: expect.arrayContaining([expect.objectContaining({
+        schema: "ccc-prd.proof.v2",
+      })]),
+    });
+    expect((authored.sidecar!.proofs as Array<{ admission?: unknown }>).every(
+      (proof) => !("admission" in proof),
+    )).toBe(true);
+    const sidecarPath = write(input.root, "candidate-v2.sidecar.json", JSON.stringify(authored.sidecar));
+    expect(ccc.compileCccPrdPacket({ ...input, sidecarPath })).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "CCC_PRD_PROOF_ADMISSION_MISSING" }),
+      ]),
+    });
+
+    const drifted = structuredClone(authored.sidecar) as {
+      requirements: Array<{ acceptanceClauses: Array<{ text: string }> }>;
+    };
+    drifted.requirements[0]!.acceptanceClauses[0]!.text = "model-owned drift";
+    writeFileSync(sidecarPath, JSON.stringify(drifted));
+    expect(ccc.compileCccPrdPacket({ ...input, sidecarPath })).toMatchObject({
+      kind: "refusal",
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: "CCC_PRD_ACCEPTANCE_CLAUSE_MANIFEST_INVALID" }),
+      ]),
+    });
+  });
+
   it("authors raw-byte custody and compiles the complete structural graph in code-unit order", async () => {
     const input = packet();
     const authored = await author(input);
@@ -486,6 +653,33 @@ describe("ccc-prd structural sidecar", () => {
     expect(result.kind, JSON.stringify(result)).toBe("bundle");
     expect(result.implementationFactProvenance).toEqual(authored.sidecar.implementationFactProvenance);
     expect(result.bundleHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("RED-S4-v2-provenance-order: compares implementation-fact set custody independent of canonical projection order", async () => {
+    const input = packet(productSource);
+    const authored = await author(input, productProposal(), productConstraints());
+    const facts = structuredClone(authored.sidecar) as Record<string, unknown> & {
+      implementationFactProvenance: {
+        admittedWriteRoots: unknown[];
+        requirements: unknown[];
+        proofs: unknown[];
+        protectedActions: unknown[];
+      };
+    };
+    for (const collection of [
+      "admittedWriteRoots",
+      "requirements",
+      "proofs",
+      "protectedActions",
+    ] as const) {
+      facts.implementationFactProvenance[collection].reverse();
+    }
+
+    expect(ccc.validateCccPrdPacketImplementationFactProvenance({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      facts,
+    })).toEqual([]);
   });
 
   it("binds an ambiguous scalar implementation fact to its labeled declaration", async () => {

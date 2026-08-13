@@ -58,6 +58,8 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       copyFromGolden: true,
     });
     await upgraded.adminDb.execute(sql.raw(`
+      DROP TABLE project.ccc_campaign_execution_authorization_members;
+      DROP TABLE project.ccc_campaign_execution_authorizations;
       DROP TABLE project.ccc_campaign_proof_attempts;
       ALTER TABLE project.run_audit_events
         DROP CONSTRAINT run_audit_events_campaign_import_fkey;
@@ -68,13 +70,14 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       DROP TABLE project.ccc_prd_import_sources;
       DROP TABLE project.ccc_prd_import_entities;
       DROP TABLE project.ccc_prd_imports;
-      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037', '0038');
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037', '0038', '0039');
     `));
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0034");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0035");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0036");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0037");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0038");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0039");
 
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
@@ -82,6 +85,7 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0036");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0037");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0038");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0039");
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] })).toEqual({
       applied: false,
       pluginHooksRun: 0,
@@ -292,6 +296,8 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
       .resolves.toMatchObject({ taskId, semanticTaskId, idempotencyKey });
 
     await harness.adminDb.execute(sql.raw(`
+      DROP TABLE project.ccc_campaign_execution_authorization_members;
+      DROP TABLE project.ccc_campaign_execution_authorizations;
       DROP TABLE project.ccc_campaign_proof_attempts;
       ALTER TABLE project.ccc_prd_imports
         DROP COLUMN execution_policy,
@@ -301,18 +307,20 @@ pgDescribe("CCC PRD import migration 0035 to 0036", () => {
         DROP COLUMN campaign_deadline_at,
         DROP COLUMN request_count,
         DROP COLUMN active_action_leases;
-      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0036', '0037', '0038');
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0036', '0037', '0038', '0039');
     `));
     expect(await getAppliedMigrations(harness.adminDb)).toContain("0035");
     expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0036");
     expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0037");
     expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0038");
+    expect(await getAppliedMigrations(harness.adminDb)).not.toContain("0039");
 
     expect(await applySchemaBaseline(harness.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
     expect(await getAppliedMigrations(harness.adminDb)).toContain("0036");
     expect(await getAppliedMigrations(harness.adminDb)).toContain("0037");
     expect(await getAppliedMigrations(harness.adminDb)).toContain("0038");
+    expect(await getAppliedMigrations(harness.adminDb)).toContain("0039");
     const readCampaignState = () => harness.adminDb.execute(sql`
       SELECT
         state,

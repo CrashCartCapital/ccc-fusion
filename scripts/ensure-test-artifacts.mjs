@@ -39,6 +39,7 @@ export const REQUIRED_BUILD_PACKAGES = [
       "packages/cli/dist/plugins/fusion-native-proof-admission/manifest.json",
     ],
     staleAgainstGlobs: [
+      { sourcePath: "packages/cli/ccc-semantic-proof-host.mjs" },
       { sourcePath: "packages/cli/src" },
       { sourcePath: "packages/engine/src" },
     ],

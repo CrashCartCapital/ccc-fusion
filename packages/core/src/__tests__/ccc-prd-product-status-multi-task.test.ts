@@ -35,7 +35,9 @@ import {
   providerAttemptStatusesForCampaign,
   resolveCccPrdProductStatusProviderAttemptAnchorTaskId,
   type CccPrdProductApprovalStatus,
+  type CccPrdProductExecutionAuthorizationStatus,
   type CccPrdProductNextActionInput,
+  type CccPrdProductProofAttemptStatus,
   type CccPrdProductTaskStatus,
   type CccPrdProductWorkItemStatus,
 } from "../ccc-prd/product-status.js";
@@ -172,6 +174,12 @@ describe("providerAttemptStatusesForCampaign multi-task surfacing", () => {
  */
 const LIVE_EXECUTION_APPROVAL_REQUIRED_REASON =
   "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+const REQUEST_BUDGET_EXHAUSTED_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED";
+const PROOF_DEADLINE_EXPIRED_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED";
+const MERGE_APPROVAL_REQUIRED_REASON =
+  "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
 const LIVE_EXECUTION_ACTION_ID = "ccc:live-execution";
 
 function workItem(
@@ -239,24 +247,58 @@ const routedTask = {
   cliAdapterId: null,
 } as const;
 
+function executionAuthorization(
+  status: "issued" | "claimed" | "settled" = "issued",
+): CccPrdProductExecutionAuthorizationStatus {
+  return {
+    authorizationId: `ccc-execution-authorization-${"9".repeat(64)}`,
+    status,
+    members: [
+      { nativeTaskId: "task-1", approvalRequestId: `ccc-approval-${"a".repeat(64)}` },
+      { nativeTaskId: "task-2", approvalRequestId: `ccc-approval-${"b".repeat(64)}` },
+    ],
+  } as unknown as CccPrdProductExecutionAuthorizationStatus;
+}
+
 function nextActionInput(
-  overrides: Partial<{
-    workItems: readonly CccPrdProductWorkItemStatus[];
-    approvals: readonly CccPrdProductApprovalStatus[];
-    taskStatuses: readonly CccPrdProductTaskStatus[];
-  }> = {},
+  overrides: Partial<Pick<CccPrdProductNextActionInput,
+    | "workItems"
+    | "approvals"
+    | "taskStatuses"
+    | "requestBudget"
+    | "proofs"
+    | "orphanProofAttempts"
+    | "providerAttempts"
+    | "providerAttemptHistoryConsistent"
+    | "executionAuthorizationMode"
+    | "executionAuthorization"
+  >> = {},
 ): CccPrdProductNextActionInput {
   return {
     row: { state: "active", runnable: 1 } as unknown as CccPrdProductNextActionInput["row"],
+    requestBudget: overrides.requestBudget ?? {
+      scope: "campaign-global",
+      maximum: 24,
+      used: 0,
+      remaining: 24,
+      providerTasks: 2,
+      deterministicMinimum: 2,
+      headroomAboveMinimum: 22,
+      completionAdequacy: "unproven",
+    },
     taskStatuses: overrides.taskStatuses ?? [
       taskStatus({ nativeTaskId: "task-1", semanticTaskId: "TASK-1", ordinal: 0, route: routedTask }),
       taskStatus({ nativeTaskId: "task-2", semanticTaskId: "TASK-2", ordinal: 1, route: routedTask }),
     ],
     workItems: overrides.workItems ?? [],
-    proofs: [],
-    orphanProofAttempts: [],
-    providerAttempts: [],
+    proofs: overrides.proofs ?? [],
+    orphanProofAttempts: overrides.orphanProofAttempts ?? [],
+    providerAttempts: overrides.providerAttempts ?? [],
+    providerAttemptHistoryConsistent:
+      overrides.providerAttemptHistoryConsistent ?? true,
     approvals: overrides.approvals ?? [],
+    executionAuthorizationMode: overrides.executionAuthorizationMode,
+    executionAuthorization: overrides.executionAuthorization,
     landingIntents: [],
     landingMaterializations: [],
     landingTerminals: [],
@@ -265,7 +307,86 @@ function nextActionInput(
   };
 }
 
+function proofAttempt(
+  state: CccPrdProductProofAttemptStatus["state"],
+  overrides: Partial<CccPrdProductProofAttemptStatus> = {},
+): CccPrdProductProofAttemptStatus {
+  return {
+    attemptKey: "ccc-proof-attempt-1",
+    importId: "import-1",
+    campaignId: "campaign-1",
+    taskId: "task-1",
+    semanticTaskId: "TASK-1",
+    proofId: "PROOF-1",
+    packetHash: "0".repeat(64),
+    sidecarHash: "1".repeat(64),
+    bundleHash: "2".repeat(64),
+    manifestHash: "3".repeat(64),
+    campaignBindingHash: "4".repeat(64),
+    targetRepository: "org/repo",
+    targetBase: "main",
+    sourceCommit: "5".repeat(40),
+    sourceTree: "6".repeat(40),
+    definitionSha256: "7".repeat(64),
+    commandSha256: "8".repeat(64),
+    workItemId: "work-item-1",
+    runId: "run-1",
+    workItemAttempt: 1,
+    attemptContractVersion: "v1",
+    phase: null,
+    verifierClosureSha256: null,
+    candidateInputsSha256: null,
+    executionToolchainSha256: null,
+    state,
+    result: null,
+    terminalEnvelope: null,
+    terminalEnvelopeSha256: null,
+    proofEvidence: null,
+    proofEvidenceSha256: null,
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+    dispatchedAt: null,
+    settledAt: null,
+    ...overrides,
+  };
+}
+
 describe("productNextAction multi-task live-execution holds", () => {
+  it("surfaces one sealed parent authorization instead of either diagnostic child approval", () => {
+    const authorization = executionAuthorization();
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: authorization,
+      approvals: [
+        approval({ id: authorization.members[0]!.approvalRequestId, taskId: "task-1" }),
+        approval({ id: authorization.members[1]!.approvalRequestId, taskId: "task-2" }),
+      ],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "approve-execution",
+      executionAuthorizationId: authorization.authorizationId,
+      executionAuthorizationStatus: "issued",
+    });
+    expect(action).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("fails closed when a sealed live-execution hold has child diagnostics but no parent", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: null,
+      approvals: [approval({ id: "child-must-not-be-actionable", taskId: "task-1" })],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "blocked",
+      reason: expect.stringContaining("single campaign authorization is missing"),
+    });
+    expect(action).not.toHaveProperty("approvalRequestId");
+  });
+
   it("RED-M1c: surfaces the second task's issued live-execution approval instead of reporting blocked", () => {
     const action = productNextAction(nextActionInput({
       // The parked item's taskId stays pinned to the workflow entry task.
@@ -398,5 +519,241 @@ describe("productNextAction multi-task live-execution holds", () => {
       approvalRequestId: "approval-2",
       approvalStatus: "claimed",
     });
+  });
+});
+
+describe("productNextAction request-budget custody precedence", () => {
+  const exhaustedBudget = {
+    scope: "campaign-global" as const,
+    maximum: 2,
+    used: 2,
+    remaining: 0,
+    providerTasks: 2,
+    deterministicMinimum: 2,
+    headroomAboveMinimum: 0,
+    completionAdequacy: "unproven" as const,
+  };
+  const budgetWorkItem = workItem({
+    id: "budget-work-item",
+    state: "manual-required",
+    lastError: REQUEST_BUDGET_EXHAUSTED_REASON,
+    blockedReason: REQUEST_BUDGET_EXHAUSTED_REASON,
+  });
+
+  it("RED-S1-status: a reserved proof outranks fresh-import budget recovery", () => {
+    const reserved = proofAttempt("reserved", {
+      workItemId: "proof-work-item",
+      runId: "proof-run",
+      workItemAttempt: 3,
+    });
+    const action = productNextAction(nextActionInput({
+      requestBudget: exhaustedBudget,
+      workItems: [budgetWorkItem],
+      proofs: [{
+        definition: {} as never,
+        definitionSha256: reserved.definitionSha256,
+        attempts: [reserved],
+      }],
+    }));
+
+    expect(action).toEqual({
+      kind: "resolve-manual-required",
+      reason: `Proof attempt ${reserved.attemptKey} is reserved and has unresolved proof custody.`,
+    });
+  });
+
+  it("RED-S1-status: an exact live lease owns a reserved proof before budget recovery", () => {
+    const reserved = proofAttempt("reserved", {
+      workItemId: "proof-work-item",
+      runId: "proof-run",
+      workItemAttempt: 3,
+    });
+    const action = productNextAction(nextActionInput({
+      requestBudget: exhaustedBudget,
+      workItems: [
+        budgetWorkItem,
+        workItem({
+          id: reserved.workItemId,
+          runId: reserved.runId,
+          state: "running",
+          attempt: reserved.workItemAttempt,
+          leaseOwner: "proof-runtime",
+          leaseExpiresAt: "2999-08-01T00:00:00.000Z",
+          lastError: null,
+          blockedReason: null,
+        }),
+      ],
+      proofs: [{
+        definition: {} as never,
+        definitionSha256: reserved.definitionSha256,
+        attempts: [reserved],
+      }],
+    }));
+
+    expect(action).toEqual({
+      kind: "wait-for-runtime",
+      reason:
+        "Campaign provider/proof work is reserved or in flight and still owned by the runtime.",
+    });
+  });
+
+  it("RED-S1-status: orphan proof custody outranks fresh-import budget recovery", () => {
+    const action = productNextAction(nextActionInput({
+      requestBudget: exhaustedBudget,
+      workItems: [budgetWorkItem],
+      orphanProofAttempts: [proofAttempt("proved_failed")],
+    }));
+
+    expect(action).toEqual({
+      kind: "blocked",
+      reason: "Persisted campaign custody is missing a task, route, or declared proof.",
+    });
+  });
+});
+
+describe("productNextAction semantic-proof deadline custody", () => {
+  const deadlineWorkItem = workItem({
+    id: "proof-deadline-work-item",
+    state: "manual-required",
+    lastError: PROOF_DEADLINE_EXPIRED_REASON,
+    blockedReason: PROOF_DEADLINE_EXPIRED_REASON,
+  });
+
+  it("RED-S5-db-deadline reports immutable expiry when reservation never became an external effect", () => {
+    const reserved = proofAttempt("reserved", {
+      workItemId: deadlineWorkItem.id,
+      runId: deadlineWorkItem.runId,
+      workItemAttempt: deadlineWorkItem.attempt,
+    });
+    const action = productNextAction(nextActionInput({
+      workItems: [deadlineWorkItem],
+      proofs: [{
+        definition: {} as never,
+        definitionSha256: reserved.definitionSha256,
+        attempts: [reserved],
+      }],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "blocked",
+      diagnostic: "CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED",
+      nextSafeAction: expect.stringContaining("fresh"),
+    });
+    expect(action.reason).toContain("deadline");
+    expect(action.safeState).toContain(reserved.attemptKey);
+    expect(action.safeState).toContain("was not dispatched");
+    expect(action.recoveryOptions?.some((option) =>
+      /^(?:retry|requeue)\b/iu.test(option))).toBe(false);
+  });
+
+  it("RED-S5-db-deadline keeps a dispatched-unknown proof ahead of fresh-import expiry advice", () => {
+    const unknown = proofAttempt("dispatched_unknown", {
+      workItemId: deadlineWorkItem.id,
+      runId: deadlineWorkItem.runId,
+      workItemAttempt: deadlineWorkItem.attempt,
+    });
+    const action = productNextAction(nextActionInput({
+      workItems: [deadlineWorkItem],
+      proofs: [{
+        definition: {} as never,
+        definitionSha256: unknown.definitionSha256,
+        attempts: [unknown],
+      }],
+    }));
+
+    expect(action).toEqual({
+      kind: "resolve-manual-required",
+      reason: `Proof attempt ${unknown.attemptKey} has an uncertain external effect.`,
+    });
+  });
+});
+
+describe("productNextAction semantic proof v2 truth", () => {
+  it("RED-S5-STATUS-PHASE: never infers final proof from a passing task-phase generic result", () => {
+    const taskAttempt = proofAttempt("committed", {
+      attemptContractVersion: "v2",
+      phase: "task",
+      result: {
+        success: true,
+        exitCode: 0,
+        durationMs: 1,
+        stdoutSha256: "a".repeat(64),
+        stderrSha256: "b".repeat(64),
+        stdoutTail: "PASS",
+        stderrTail: "",
+        timedOut: false,
+        killed: false,
+        warnings: [],
+        changedPathsSha256: "c".repeat(64),
+        negativeControlLabel: null,
+      },
+      terminalEnvelope: {
+        schema: "ccc-prd.proof-terminal-envelope.v2",
+        kind: "verified",
+        proofId: "PROOF-1",
+        phase: "task",
+        sourceCommit: "5".repeat(40),
+        sourceTree: "6".repeat(40),
+        exitCode: 0,
+        durationMs: 1,
+        stdoutSha256: "a".repeat(64),
+        stderrSha256: "b".repeat(64),
+        changedPathsSha256: "c".repeat(64),
+        stdoutTail: "PASS",
+        stderrTail: "",
+        timedOut: false,
+        killed: false,
+        warnings: [],
+        passed: true,
+        evidence: {
+          schema: "ccc-prd.proof-evidence.v2",
+          proofId: "PROOF-1",
+          phase: "task",
+          sourceCommit: "5".repeat(40),
+          sourceTree: "6".repeat(40),
+          passed: true,
+          clauseResults: [],
+          positiveCaseResults: [],
+          negativeControlResults: [],
+        },
+        evidenceSha256: "d".repeat(64),
+      },
+      terminalEnvelopeSha256: "e".repeat(64),
+      proofEvidence: {
+        schema: "ccc-prd.proof-evidence.v2",
+        proofId: "PROOF-1",
+        phase: "task",
+        sourceCommit: "5".repeat(40),
+        sourceTree: "6".repeat(40),
+        passed: true,
+        clauseResults: [],
+        positiveCaseResults: [],
+        negativeControlResults: [],
+      },
+      proofEvidenceSha256: "d".repeat(64),
+    });
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({
+        state: "manual-required",
+        lastError: MERGE_APPROVAL_REQUIRED_REASON,
+        blockedReason: MERGE_APPROVAL_REQUIRED_REASON,
+      })],
+      proofs: [{
+        definition: {
+          schema: "ccc-prd.proof.v2",
+          id: "PROOF-1",
+          phases: ["task", "final_integrated"],
+        } as never,
+        definitionSha256: taskAttempt.definitionSha256,
+        attempts: [taskAttempt],
+      }],
+      approvals: [approval({
+        id: "merge-approval",
+        actionId: "ccc:merge",
+        status: "issued",
+      })],
+    }));
+
+    expect(action.kind).not.toBe("approve-merge");
   });
 });

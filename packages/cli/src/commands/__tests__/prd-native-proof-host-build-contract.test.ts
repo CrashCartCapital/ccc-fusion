@@ -21,6 +21,10 @@ describe("CCC native proof host build contract", () => {
       join(repoRoot, "packages", "cli", "tsup.config.ts"),
       "utf8",
     );
+    const proofCoreShim = readFileSync(
+      join(repoRoot, "packages", "cli", "src", "ccc-proof-admission-core-runtime-shim.mjs"),
+      "utf8",
+    );
     const packageFiles = (
       JSON.parse(readFileSync(
         join(repoRoot, "packages", "cli", "package.json"),
@@ -30,7 +34,7 @@ describe("CCC native proof host build contract", () => {
 
     expect(packageFiles).toContain("dist/plugins/**");
     expect(config).toContain(
-      '"ccc-campaign-proof-admission": "../engine/src/ccc-campaign-proof-admission.ts"',
+      '"ccc-campaign-proof-admission": "ccc-semantic-proof-host.mjs"',
     );
     expect(config).toContain(
       'const cccCampaignProofAdmissionManifestSrc = join(__dirname, "..", "engine", "src", "ccc-campaign-proof-admission.manifest.json")',
@@ -50,10 +54,10 @@ describe("CCC native proof host build contract", () => {
       config.indexOf("const pluginSdkBuildConfig = {"),
     );
     expect(cliConfig).not.toContain(
-      '"ccc-campaign-proof-admission": "../engine/src/ccc-campaign-proof-admission.ts"',
+      '"ccc-campaign-proof-admission": "ccc-semantic-proof-host.mjs"',
     );
     expect(proofConfig).toContain(
-      '"ccc-campaign-proof-admission": "../engine/src/ccc-campaign-proof-admission.ts"',
+      '"ccc-campaign-proof-admission": "ccc-semantic-proof-host.mjs"',
     );
     expect(proofConfig).toContain("cpSync(");
     expect(proofConfig).toContain("cccCampaignProofAdmissionManifestSrc");
@@ -61,8 +65,12 @@ describe("CCC native proof host build contract", () => {
     expect(proofConfig).toContain(
       '"@fusion/core": cccProofAdmissionCoreRuntimeShim',
     );
+    expect(proofCoreShim).toContain("CCC_PRD_PROOF_V2_SCHEMA_VERSION");
     expect(proofConfig).toContain(
       'join(cccCampaignProofAdmissionManifestDest, "manifest.json")',
+    );
+    expect(proofConfig).toContain(
+      "chmodSync(cccCampaignProofAdmissionEntryDest, 0o755)",
     );
     expect(proofConfig).not.toContain("banner:");
     expect(config).toContain("function selectCliTsupConfigs");

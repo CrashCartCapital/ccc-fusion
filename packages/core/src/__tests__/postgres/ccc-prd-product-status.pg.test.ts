@@ -5,17 +5,24 @@ import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import {
   beginCccCampaignProofAttemptDispatch,
+  canonicalCccPrdJson,
   claimCccCampaignApproval,
+  claimCccCampaignExecutionAuthorization,
   consumeCccCampaignApprovalWithinTransaction,
   createCccCampaignAuthorityBinding,
+  CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+  computeCccPrdProofV2AdmissionDigests,
   importCccPrdBundle,
   issueCccCampaignApproval,
+  issueCccCampaignExecutionAuthorization,
   recordRunAuditEventWithinTransaction,
   reserveCccCampaignProofAttempt,
   settleCccCampaignProofAttempt,
 } from "../../index.js";
 import {
-  createCccPrdImportTestBundle,
+  admitCccPrdImportTestProductBundle,
+  createCccPrdImportTestProductBundle,
+  createCccPrdImportTestExecutionPolicy,
   createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
@@ -42,7 +49,6 @@ const MERGE_APPROVAL_REQUIRED =
   "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED";
 const LIVE_EXECUTION_APPROVAL_REQUIRED =
   "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
-
 function withMergeAction(source: CccPrdSemanticBundle): CccPrdSemanticBundle {
   const terminalTask = source.tasks.at(-1)!;
   return rehashCccPrdImportTestBundle({
@@ -70,21 +76,30 @@ function withMergeAction(source: CccPrdSemanticBundle): CccPrdSemanticBundle {
 function withLiveExecutionAction(
   source: CccPrdSemanticBundle,
 ): CccPrdSemanticBundle {
-  const codingTask = source.tasks[0]!;
+  const liveActions = source.tasks.map((task, index) => index === 0
+    ? {
+      id: LIVE_EXECUTION_ACTION.actionId,
+      kind: "live_execution" as const,
+      target: LIVE_EXECUTION_ACTION.actionTarget,
+      operatorDecision: "approve_live_execution" as const,
+      requiresOperatorDecision: true,
+      spans: [task.spans[0]!],
+    }
+    : {
+      id: `${LIVE_EXECUTION_ACTION.actionId}-${index + 1}`,
+      kind: "live_execution" as const,
+      target: `fixture://native-done/${task.id}`,
+      operatorDecision: "approve_live_execution" as const,
+      requiresOperatorDecision: true,
+      spans: [task.spans[0]!],
+    });
   return rehashCccPrdImportTestBundle({
     ...source,
-    tasks: source.tasks.map((task) =>
-      task.id === codingTask.id
-        ? { ...task, protectedActionIds: [LIVE_EXECUTION_ACTION.actionId] }
-        : task),
-    protectedActions: [{
-      id: LIVE_EXECUTION_ACTION.actionId,
-      kind: "live_execution",
-      target: LIVE_EXECUTION_ACTION.actionTarget,
-      operatorDecision: "approve_live_execution",
-      requiresOperatorDecision: true,
-      spans: [codingTask.spans[0]!],
-    }],
+    tasks: source.tasks.map((task, index) => ({
+      ...task,
+      protectedActionIds: [liveActions[index]!.id],
+    })),
+    protectedActions: liveActions,
   });
 }
 
@@ -113,19 +128,34 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     return rows[0]!.native_id;
   }
 
-  it("reports an operator-stopped campaign as abandoned while preserving uncertainty", async () => {
-    const source = createCccPrdImportTestBundle(
-      h.rootDir(),
-      "product-status-stopped",
+  async function importAdmittedProduct(
+    suffix: string,
+    idempotencyKey: string,
+    transform: (source: CccPrdSemanticBundle) => CccPrdSemanticBundle =
+      (source) => source,
+  ) {
+    const admitted = await admitCccPrdImportTestProductBundle(
+      transform(createCccPrdImportTestProductBundle(h.rootDir(), suffix)),
+      suffix,
     );
+    const source = admitted.bundle;
     const imported = await importCccPrdBundle({
       bundle: source,
       executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-stopped",
+      semanticProofToolchainPaths: admitted.semanticProofToolchainPaths,
+      idempotencyKey,
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
     });
+    return { imported, source };
+  }
+
+  it("reports an operator-stopped campaign as abandoned while preserving uncertainty", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-stopped",
+      "product-status-stopped",
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-stopped`,
     );
@@ -163,18 +193,10 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("surfaces redacted provider uncertainty as an exact operator decision", async () => {
-    const source = createCccPrdImportTestBundle(
-      h.rootDir(),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-provider-unknown",
       "product-status-provider-unknown",
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-provider-unknown",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const taskId = await nativeTaskIdForImport(
       imported.importId,
       source.tasks[0]!.id,
@@ -304,18 +326,10 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("does not let one runtime-owned provider attempt hide separate manual work", async () => {
-    const source = createCccPrdImportTestBundle(
-      h.rootDir(),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-mixed-uncertainty",
       "product-status-mixed-uncertainty",
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-mixed-uncertainty",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const taskId = await nativeTaskIdForImport(
       imported.importId,
       source.tasks[0]!.id,
@@ -388,35 +402,27 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     });
   });
 
-  it("projects exact live-execution approval and returns to runtime waiting after requeue", async () => {
-    const source = withLiveExecutionAction(
-      createCccPrdImportTestBundle(h.rootDir(), "product-status-live"),
+  it("projects one redacted sealed execution authorization and returns to runtime waiting after requeue", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-live",
+      "product-status-live",
+      withLiveExecutionAction,
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-live",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
     const codingTaskId = await nativeTaskIdForImport(
       imported.importId,
       source.tasks[0]!.id,
     );
     const campaign = await h.store().getCccCampaignContextForTask(codingTaskId);
     if (!campaign) throw new Error("missing live-execution campaign context");
-    const issued = await issueCccCampaignApproval(h.layer(), {
+    const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
       authorityStore: h.store(),
       rootDir: h.rootDir(),
       taskId: codingTaskId,
-      action: LIVE_EXECUTION_ACTION,
       requester: {
         actorId: "runtime-product-status-live",
         actorType: "agent",
         actorName: "Runtime",
       },
-      runId: "product-status-live-issue",
       notBeforeAt: campaign.campaignStartedAt,
       expiresAt: campaign.campaignDeadlineAt,
     });
@@ -435,62 +441,79 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       waitReason: null,
     });
 
-    await expect(inspectCccPrdProductStatus({
+    const issuedStatus = await inspectCccPrdProductStatus({
       idempotencyKey: "product-status-live",
       layer: h.layer(),
       rootDir: h.rootDir(),
-    })).resolves.toMatchObject({
-      workItems: [{
-        id: workItem.id,
-        state: "manual-required",
-        lastError: LIVE_EXECUTION_APPROVAL_REQUIRED,
-        blockedReason: LIVE_EXECUTION_APPROVAL_REQUIRED,
-      }],
-      approvals: [{
-        id: issued.id,
+    });
+    expect(issuedStatus?.executionAuthorizationMode).toBe("sealed_bundle_v1");
+    expect(issuedStatus?.workItems).toMatchObject([{
+      id: workItem.id,
+      state: "manual-required",
+      lastError: LIVE_EXECUTION_APPROVAL_REQUIRED,
+      blockedReason: LIVE_EXECUTION_APPROVAL_REQUIRED,
+    }]);
+    expect(issuedStatus?.executionAuthorization).toMatchObject({
+      authorizationId: issued.authorizationId,
+      authorizationDigest: issued.authorizationDigest,
+      memberSetHash: issued.memberSetHash,
+      expectedRequestCount: 0,
+      status: "issued",
+      members: issued.members.map((member) => ({
+        nativeTaskId: member.nativeTaskId,
+        approvalRequestId: member.approvalRequestId,
+        bindingHash: member.bindingHash,
+      })),
+    });
+    expect(issuedStatus?.approvals).toEqual(expect.arrayContaining(
+      issued.members.map((member) => expect.objectContaining({
+        id: member.approvalRequestId,
         status: "issued",
-        actionId: LIVE_EXECUTION_ACTION.actionId,
-        actionTarget: LIVE_EXECUTION_ACTION.actionTarget,
-      }],
-      nextAction: {
-        kind: "approve-execution",
-        approvalRequestId: issued.id,
-        approvalStatus: "issued",
-      },
+      })),
+    ));
+    expect(issuedStatus?.nextAction).toMatchObject({
+      kind: "approve-execution",
+      executionAuthorizationId: issued.authorizationId,
+      executionAuthorizationStatus: "issued",
     });
 
-    await claimCccCampaignApproval(h.layer(), {
+    await claimCccCampaignExecutionAuthorization(h.layer(), {
       authorityStore: h.store(),
       rootDir: h.rootDir(),
-      taskId: codingTaskId,
-      action: LIVE_EXECUTION_ACTION,
+      authorizationId: issued.authorizationId,
       claimant: {
         actorId: "operator-product-status-live",
         actorType: "user",
         actorName: "Operator",
       },
-      runId: "product-status-live-claim",
       claimToken: "product-status-live-claim-token",
     });
-    await expect(inspectCccPrdProductStatus({
+    const claimedStatus = await inspectCccPrdProductStatus({
       idempotencyKey: "product-status-live",
       layer: h.layer(),
       rootDir: h.rootDir(),
-    })).resolves.toMatchObject({
-      workItems: [{
-        id: workItem.id,
-        state: "manual-required",
-      }],
-      approvals: [{
-        id: issued.id,
-        status: "claimed",
-      }],
-      nextAction: {
-        kind: "approve-execution",
-        approvalRequestId: issued.id,
-        approvalStatus: "claimed",
-      },
     });
+    expect(claimedStatus?.workItems).toMatchObject([{
+      id: workItem.id,
+      state: "manual-required",
+    }]);
+    expect(claimedStatus?.executionAuthorization).toMatchObject({
+      authorizationId: issued.authorizationId,
+      status: "claimed",
+    });
+    expect(claimedStatus?.approvals).toEqual(expect.arrayContaining(
+      issued.members.map((member) => expect.objectContaining({
+        id: member.approvalRequestId,
+        status: "claimed",
+      })),
+    ));
+    expect(claimedStatus?.nextAction).toMatchObject({
+      kind: "approve-execution",
+      executionAuthorizationId: issued.authorizationId,
+      executionAuthorizationStatus: "claimed",
+    });
+    expect(JSON.stringify(claimedStatus)).not.toContain("claimToken");
+    expect(JSON.stringify(claimedStatus)).not.toContain("product-status-live-claim-token");
 
     await h.store().transitionWorkflowWorkItem(workItem.id, "runnable", {
       expectedState: "manual-required",
@@ -502,40 +525,101 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       blockedReason: null,
     });
 
-    await expect(inspectCccPrdProductStatus({
+    const resumedStatus = await inspectCccPrdProductStatus({
       idempotencyKey: "product-status-live",
       layer: h.layer(),
       rootDir: h.rootDir(),
-    })).resolves.toMatchObject({
-      workItems: [{
-        id: workItem.id,
-        state: "runnable",
-        lastError: null,
-        blockedReason: null,
-      }],
-      approvals: [{
-        id: issued.id,
-        status: "claimed",
-        actionId: LIVE_EXECUTION_ACTION.actionId,
-        actionTarget: LIVE_EXECUTION_ACTION.actionTarget,
-      }],
-      nextAction: { kind: "wait-for-runtime" },
     });
+    expect(resumedStatus?.workItems).toMatchObject([{
+      id: workItem.id,
+      state: "runnable",
+      lastError: null,
+      blockedReason: null,
+    }]);
+    expect(resumedStatus?.executionAuthorization).toMatchObject({
+      authorizationId: issued.authorizationId,
+      status: "claimed",
+    });
+    expect(resumedStatus?.approvals).toEqual(expect.arrayContaining(
+      issued.members.map((member) => expect.objectContaining({
+        id: member.approvalRequestId,
+        status: "claimed",
+      })),
+    ));
+    expect(resumedStatus?.nextAction).toMatchObject({ kind: "wait-for-runtime" });
   });
 
-  it("explains a verifier-confinement manual stop without calling it an uncertain effect", async () => {
-    const source = createCccPrdImportTestBundle(
-      h.rootDir(),
-      "product-status-verifier-manual",
+  it("keeps manifest-v1 imports on their exact per-task approval status contract", async () => {
+    const source = withLiveExecutionAction(
+      createCccPrdImportTestProductBundle(h.rootDir(), "product-status-live-legacy"),
     );
     const imported = await importCccPrdBundle({
       bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-verifier-manual",
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
+      idempotencyKey: "product-status-live-legacy",
       store: h.store(),
       layer: h.layer(),
       rootDir: h.rootDir(),
     });
+    const codingTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const campaign = await h.store().getCccCampaignContextForTask(codingTaskId);
+    if (!campaign) throw new Error("missing legacy live-execution campaign context");
+    expect(campaign.executionAuthorizationMode).toBe("per_task_v1");
+    const issued = await issueCccCampaignApproval(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: codingTaskId,
+      action: LIVE_EXECUTION_ACTION,
+      requester: {
+        actorId: "runtime-product-status-live-legacy",
+        actorType: "agent",
+        actorName: "Runtime",
+      },
+      runId: "product-status-live-legacy-issue",
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-live-legacy`,
+    );
+    if (!workItem) throw new Error("missing legacy live-execution workflow work item");
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: LIVE_EXECUTION_APPROVAL_REQUIRED,
+      blockedReason: LIVE_EXECUTION_APPROVAL_REQUIRED,
+      waitReason: null,
+    });
+
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-live-legacy",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    expect(status?.executionAuthorizationMode).toBe("per_task_v1");
+    expect(status?.executionAuthorization).toBeNull();
+    expect(status?.approvals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: issued.id, status: "issued" }),
+    ]));
+    expect(status?.nextAction).toMatchObject({
+      kind: "approve-execution",
+      approvalRequestId: issued.id,
+      approvalStatus: "issued",
+    });
+    expect(status?.nextAction).not.toHaveProperty("executionAuthorizationId");
+  });
+
+  it("explains a verifier-confinement manual stop without calling it an uncertain effect", async () => {
+    const { imported } = await importAdmittedProduct(
+      "product-status-verifier-manual",
+      "product-status-verifier-manual",
+    );
     const workItem = await h.store().getWorkflowWorkItem(
       `${imported.importId}--WORK-product-status-verifier-manual`,
     );
@@ -574,14 +658,461 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     expect(status?.nextAction.kind).not.toBe("resolve-manual-required");
   });
 
+  it("RED-S1-status: explains campaign-global request-budget exhaustion without suggesting a retry", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget",
+      "product-status-request-budget",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget`,
+    );
+    if (!workItem) throw new Error("missing request-budget work item");
+    const taskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: "runtime-request-budget-owner",
+        leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+      },
+    );
+    for (let ordinal = 1; ordinal <= 5; ordinal += 1) {
+      const reservation = await h.store().reserveCccProviderAttempt({
+        taskId,
+        actionId: taskId,
+        actionTarget: h.rootDir(),
+        turnKey: `turn-product-status-request-budget-${ordinal}`,
+        dispatchKey: `dispatch-product-status-request-budget-${ordinal}`,
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        workItemFence: {
+          workItemId: claimedWorkItem.id,
+          runId: claimedWorkItem.runId,
+          attempt: claimedWorkItem.attempt,
+        },
+      });
+      await h.store().proveCccProviderAttemptNotDispatched({
+        taskId,
+        attemptKey: reservation.attemptKey,
+        controllerToken: reservation.controllerToken,
+      });
+    }
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+
+    expect(status?.nextAction).toEqual({
+      kind: "blocked",
+      reason:
+        "The campaign-global provider request budget is exhausted; this immutable import cannot resume.",
+      diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      safeState:
+        `Workflow work item ${workItem.id} is parked manual-required after using 5 of 5 first-time provider-attempt reservation slots; the refused next slot was not reserved or dispatched. Existing attempts, commits, worktrees, and receipts remain preserved.`,
+      decisionOwner: "Campaign operator",
+      consequence:
+        "The same immutable import cannot resume, prove, or land because its sealed request cap cannot be raised.",
+      recoveryOptions: [
+        "Retain the exhausted import and its receipts as immutable evidence; do not retry or requeue it.",
+        "Create a fresh source-bound packet, preview, and import with a larger campaign-global maxRequests value.",
+        "Treat prior task commits as evidence only; integrating those bytes into a new base requires separate authorization and proof.",
+      ],
+      nextSafeAction:
+        "Create and confirm a fresh sealed import with a larger campaign-global request cap.",
+    });
+    expect(status?.nextAction.kind).not.toBe("resolve-manual-required");
+    expect(status?.import.requestBudget).toEqual({
+      scope: "campaign-global",
+      maximum: 5,
+      used: 5,
+      remaining: 0,
+      providerTasks: 2,
+      deterministicMinimum: 2,
+      headroomAboveMinimum: 3,
+      completionAdequacy: "unproven",
+    });
+  });
+
+  it("RED-S1-status: provider uncertainty dominates budget exhaustion until reconciliation", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget-unknown",
+      "product-status-request-budget-unknown",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-unknown`,
+    );
+    if (!workItem) throw new Error("missing request-budget-unknown work item");
+    const taskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: "runtime-request-budget-unknown-owner",
+        leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+      },
+    );
+    const reserved = await h.store().reserveCccProviderAttempt({
+      taskId,
+      actionId: taskId,
+      actionTarget: h.rootDir(),
+      turnKey: "turn-product-status-request-budget-unknown",
+      dispatchKey: "dispatch-product-status-request-budget-unknown",
+      providerId: "deterministic-fake",
+      modelId: "fixture-v2",
+      transport: "pi",
+      workItemFence: {
+        workItemId: claimedWorkItem.id,
+        runId: claimedWorkItem.runId,
+        attempt: claimedWorkItem.attempt,
+      },
+    });
+    await h.store().beginCccProviderAttemptDispatch({
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+    for (let ordinal = 2; ordinal <= 5; ordinal += 1) {
+      const filler = await h.store().reserveCccProviderAttempt({
+        taskId,
+        actionId: taskId,
+        actionTarget: h.rootDir(),
+        turnKey: `turn-product-status-request-budget-unknown-${ordinal}`,
+        dispatchKey: `dispatch-product-status-request-budget-unknown-${ordinal}`,
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        workItemFence: {
+          workItemId: claimedWorkItem.id,
+          runId: claimedWorkItem.runId,
+          attempt: claimedWorkItem.attempt,
+        },
+      });
+      await h.store().proveCccProviderAttemptNotDispatched({
+        taskId,
+        attemptKey: filler.attemptKey,
+        controllerToken: filler.controllerToken,
+      });
+    }
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-unknown",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "resolve-manual-required",
+        reason: expect.stringContaining(reserved.attemptKey),
+      },
+    });
+
+    await h.store().reconcileCccProviderAttempt({
+      ...reserved,
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+      outcome: "proved_failed",
+      evidenceDigest: "1".repeat(64),
+      observerId: "product-status-request-budget-unknown",
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-unknown",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+        safeState: expect.stringContaining("first-time provider-attempt reservation slots"),
+      },
+    });
+  });
+
+  it("RED-S1-status: reserved provider custody dominates exact budget exhaustion advice", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget-reserved",
+      "product-status-request-budget-reserved",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-reserved`,
+    );
+    if (!workItem) throw new Error("missing request-budget-reserved work item");
+    const taskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      workItem.id,
+      "running",
+      {
+        expectedState: "runnable",
+        expectedAttempt: workItem.attempt,
+        expectedLeaseOwner: null,
+        attempt: workItem.attempt + 1,
+        leaseOwner: "runtime-request-budget-reserved-owner",
+        leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+      },
+    );
+    const reserved = await h.store().reserveCccProviderAttempt({
+      taskId,
+      actionId: taskId,
+      actionTarget: h.rootDir(),
+      turnKey: "turn-product-status-request-budget-reserved",
+      dispatchKey: "dispatch-product-status-request-budget-reserved",
+      providerId: "deterministic-fake",
+      modelId: "fixture-v2",
+      transport: "pi",
+      workItemFence: {
+        workItemId: claimedWorkItem.id,
+        runId: claimedWorkItem.runId,
+        attempt: claimedWorkItem.attempt,
+      },
+    });
+    for (let ordinal = 2; ordinal <= 5; ordinal += 1) {
+      await h.store().reserveCccProviderAttempt({
+        taskId,
+        actionId: taskId,
+        actionTarget: h.rootDir(),
+        turnKey: `turn-product-status-request-budget-reserved-${ordinal}`,
+        dispatchKey: `dispatch-product-status-request-budget-reserved-${ordinal}`,
+        providerId: "deterministic-fake",
+        modelId: "fixture-v2",
+        transport: "pi",
+        workItemFence: {
+          workItemId: claimedWorkItem.id,
+          runId: claimedWorkItem.runId,
+          attempt: claimedWorkItem.attempt,
+        },
+      });
+    }
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-reserved",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "resolve-manual-required",
+        reason: expect.stringContaining(reserved.attemptKey),
+      },
+    });
+
+    await h.store().upsertWorkflowWorkItem({
+      ...claimedWorkItem,
+      state: "running",
+      leaseOwner: "runtime-request-budget-reserved-owner",
+      leaseExpiresAt: "2999-08-12T00:00:00.000Z",
+    });
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-reserved",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "wait-for-runtime",
+        reason: expect.stringContaining("still owned by the runtime"),
+      },
+    });
+  });
+
+  it("RED-S1-status: refuses budget-exhaustion advice when the marker outruns the persisted counter", async () => {
+    const { imported } = await importAdmittedProduct(
+      "product-status-request-budget-counter-drift",
+      "product-status-request-budget-counter-drift",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 5,
+          maxDurationMs: 120_000,
+          maxConcurrency: 5,
+        },
+      }),
+    );
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-counter-drift`,
+    );
+    if (!workItem) throw new Error("missing request-budget-counter-drift work item");
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-counter-drift",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+        safeState: expect.stringContaining("0 of 5 first-time provider-attempt reservation slots"),
+      },
+    });
+  });
+
+  it("RED-S1-status: treats request-budget counter overshoot as custody drift", async () => {
+    const { imported } = await importAdmittedProduct(
+      "product-status-request-budget-overshoot",
+      "product-status-request-budget-overshoot",
+      (legacy) => rehashCccPrdImportTestBundle({
+        ...legacy,
+        bounds: {
+          maxRequests: 2,
+          maxDurationMs: 120_000,
+          maxConcurrency: 2,
+        },
+      }),
+    );
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-overshoot`,
+    );
+    if (!workItem) throw new Error("missing request-budget-overshoot work item");
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET request_count = 3
+      WHERE import_id = ${imported.importId}
+    `);
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-overshoot",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+        safeState: expect.stringContaining("3 of 2 first-time provider-attempt reservation slots"),
+      },
+    });
+  });
+
+  it("RED-S1-status: treats an at-limit counter with missing attempt history as custody drift", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-request-budget-ledger-drift",
+      "product-status-request-budget-ledger-drift",
+    );
+    const workItem = await h.store().getWorkflowWorkItem(
+      `${imported.importId}--WORK-product-status-request-budget-ledger-drift`,
+    );
+    if (!workItem) throw new Error("missing request-budget-ledger-drift work item");
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET request_count = ${source.bounds.maxRequests}
+      WHERE import_id = ${imported.importId}
+    `);
+    await h.store().upsertWorkflowWorkItem({
+      ...workItem,
+      state: "manual-required",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      blockedReason: CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+      waitReason: null,
+    });
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-request-budget-ledger-drift",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).resolves.toMatchObject({
+      nextAction: {
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
+        safeState: expect.stringContaining("does not match the provider-attempt ledger"),
+      },
+    });
+  });
+
   it("prefers sanitized verifier recovery over a generic failed-work-item message for historical receipts", async () => {
-    const source = createCccPrdImportTestBundle(
+    const source = createCccPrdImportTestProductBundle(
       h.rootDir(),
       "product-status-verifier-history",
     );
     const imported = await importCccPrdBundle({
       bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
+      executionPolicy: createCccPrdImportTestExecutionPolicy(source),
       idempotencyKey: "product-status-verifier-history",
       store: h.store(),
       layer: h.layer(),
@@ -677,26 +1208,15 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("returns a deterministic, redacted, import-scoped operator snapshot", async () => {
-    const source = withMergeAction(
-      createCccPrdImportTestBundle(h.rootDir(), "product-status"),
+    const { source, imported } = await importAdmittedProduct(
+      "product-status",
+      "product-status-primary",
+      withMergeAction,
     );
-    const imported = await importCccPrdBundle({
-      bundle: source,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(source),
-      idempotencyKey: "product-status-primary",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
-    const other = createCccPrdImportTestBundle(h.rootDir(), "product-status-other");
-    await importCccPrdBundle({
-      bundle: other,
-      executionPolicy: createCccPrdImportTestProductExecutionPolicy(other),
-      idempotencyKey: "product-status-other",
-      store: h.store(),
-      layer: h.layer(),
-      rootDir: h.rootDir(),
-    });
+    await importAdmittedProduct(
+      "product-status-other",
+      "product-status-other",
+    );
 
     await expect(inspectCccPrdProductStatus({
       idempotencyKey: "missing",
@@ -749,7 +1269,25 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         },
       ],
       proofs: [{
-        definition: { id: "PROOF-product-status", command: "pnpm test" },
+        definition: {
+          id: "PROOF-final-product-status",
+          command: "task verify:integrated",
+          phases: ["final_integrated"],
+        },
+        attempts: [],
+      }, {
+        definition: {
+          id: "PROOF-v2-product-status-0",
+          command: "task verify:task-0",
+          phases: ["task"],
+        },
+        attempts: [],
+      }, {
+        definition: {
+          id: "PROOF-v2-product-status-1",
+          command: "task verify:task-1",
+          phases: ["task"],
+        },
         attempts: [],
       }],
       landing: { intents: [], terminals: [] },
@@ -814,11 +1352,14 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     });
 
     const proof = source.proofs[0]!;
+    const proofCustody = computeCccPrdProofV2AdmissionDigests(proof);
     const reserved = await reserveCccCampaignProofAttempt({
       layer: h.layer(),
       rootDir: h.rootDir(),
       taskId: terminalTaskId,
       proofId: proof.id,
+      attemptContractVersion: "v2",
+      phase: "final_integrated",
       sourceCommit: SOURCE_COMMIT,
       sourceTree: SOURCE_TREE,
       workItemFence: {
@@ -826,30 +1367,65 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         runId: workItem.runId,
         attempt: 3,
       },
+      ...proofCustody,
     });
     await beginCccCampaignProofAttemptDispatch({
       layer: h.layer(),
       attemptKey: reserved.attemptKey,
       controllerToken: reserved.controllerToken,
     });
+    const evidence = {
+      schema: "ccc-prd.proof-evidence.v2" as const,
+      proofId: proof.id,
+      phase: "final_integrated" as const,
+      sourceCommit: SOURCE_COMMIT,
+      sourceTree: SOURCE_TREE,
+      passed: true,
+      clauseResults: proof.clauseIds.map((clauseId) => ({
+        clauseId,
+        passed: true,
+      })),
+      positiveCaseResults: proof.positiveCases.map(({ id: caseId }) => ({
+        caseId,
+        passed: true,
+      })),
+      negativeControlResults: proof.negativeControls.map(({ id: controlId }) => ({
+        controlId,
+        passed: true,
+      })),
+    };
+    const evidenceJson = canonicalCccPrdJson(evidence);
+    const evidenceSha256 = createHash("sha256")
+      .update(evidenceJson, "utf8")
+      .digest("hex");
+    const terminalEnvelope = {
+      schema: "ccc-prd.proof-terminal-envelope.v2" as const,
+      kind: "verified" as const,
+      proofId: proof.id,
+      phase: "final_integrated" as const,
+      sourceCommit: SOURCE_COMMIT,
+      sourceTree: SOURCE_TREE,
+      exitCode: 0,
+      durationMs: 19,
+      stdoutSha256: evidenceSha256,
+      stderrSha256: createHash("sha256").update("", "utf8").digest("hex"),
+      changedPathsSha256: createHash("sha256")
+        .update(canonicalCccPrdJson(["src/task-1"]), "utf8")
+        .digest("hex"),
+      stdoutTail: evidenceJson,
+      stderrTail: "",
+      timedOut: false,
+      killed: false,
+      warnings: ["fixture warning"],
+      passed: true,
+      evidence,
+      evidenceSha256,
+    };
     await settleCccCampaignProofAttempt({
       layer: h.layer(),
       attemptKey: reserved.attemptKey,
       controllerToken: reserved.controllerToken,
-      result: {
-        success: true,
-        exitCode: 0,
-        durationMs: 19,
-        stdout: "one passing verifier\n",
-        stderr: "",
-        timedOut: false,
-        killed: false,
-        warnings: ["fixture warning"],
-        changedPathsSha256: createHash("sha256")
-          .update(JSON.stringify(["src/task-1"]), "utf8")
-          .digest("hex"),
-        negativeControlLabel: "planted-defect-failed",
-      },
+      terminalEnvelope,
     });
 
     const campaign = await h.store().getCccCampaignContextForTask(terminalTaskId);
@@ -893,6 +1469,8 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         definitionSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
         attempts: [{
           attemptKey: reserved.attemptKey,
+          attemptContractVersion: "v2",
+          phase: "final_integrated",
           state: "committed",
           sourceCommit: SOURCE_COMMIT,
           sourceTree: SOURCE_TREE,
@@ -907,15 +1485,29 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
             durationMs: 19,
             stdoutSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
             stderrSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
-            stdoutTail: "one passing verifier\n",
+            stdoutTail: evidenceJson,
             stderrTail: "",
             timedOut: false,
             killed: false,
             warnings: ["fixture warning"],
             changedPathsSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
-            negativeControlLabel: "planted-defect-failed",
+            negativeControlLabel: null,
           },
+          terminalEnvelope: expect.objectContaining({
+            kind: "verified",
+            passed: true,
+            evidenceSha256,
+          }),
+          terminalEnvelopeSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+          proofEvidence: evidence,
+          proofEvidenceSha256: evidenceSha256,
         }],
+      }, {
+        definition: { id: "PROOF-v2-product-status-0" },
+        attempts: [],
+      }, {
+        definition: { id: "PROOF-v2-product-status-1" },
+        attempts: [],
       }],
       approvals: [{
         status: "issued",

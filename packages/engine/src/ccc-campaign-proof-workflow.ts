@@ -10,6 +10,8 @@ import type {
 } from "@fusion/core";
 import {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
+  CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
+  CCC_PRD_PROOF_V2_SCHEMA_VERSION,
   WORKFLOW_EXTENSION_SCHEMA_VERSION,
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
@@ -103,6 +105,12 @@ export function createCccCampaignProofNodeAdmission(
     ) {
       refuse(`CCC proof node ${node.id} task identity does not match persisted custody`);
     }
+    if (
+      context.executionPolicy.schema === "ccc-campaign.execution-policy.v2"
+      && !isProofAdmissionNode(node)
+    ) {
+      return;
+    }
 
     const proofs = requireTaskProofs(context, node);
     for (const proof of proofs) {
@@ -180,6 +188,12 @@ const ORCHESTRATION_ONLY_NODE_KINDS = new Set<WorkflowIrNode["kind"]>([
 
 function isOrchestrationOnlyNode(node: WorkflowIrNode): boolean {
   return ORCHESTRATION_ONLY_NODE_KINDS.has(node.kind);
+}
+
+function isProofAdmissionNode(node: WorkflowIrNode): boolean {
+  return node.config?.cccProofGate === true
+    || node.config?.cccProofSuite === true
+    || node.config?.cccProofPhase !== undefined;
 }
 
 function refuse(message: string): never {
@@ -279,8 +293,21 @@ function requireTaskProofs(
   context: CccCampaignTaskContext,
   node: WorkflowIrNode,
 ): CccPrdProof[] {
-  const selectedProofIds = node.config?.cccProofSuite === true
-    ? node.config.cccProofIds
+  const semanticPhase = node.config?.cccProofPhase;
+  const semanticV2 = semanticPhase === "task" || semanticPhase === "final_integrated";
+  if (
+    (semanticPhase !== undefined && !semanticV2)
+    || (semanticPhase === "task" && (
+      node.config?.cccProofGate !== true || node.config?.cccProofSuite === true
+    ))
+    || (semanticPhase === "final_integrated" && (
+      node.config?.cccProofSuite !== true || node.config?.cccProofGate === true
+    ))
+  ) {
+    refuse(`CCC proof node ${node.id} has an inconsistent semantic proof phase`);
+  }
+  const selectedProofIds = semanticV2 || node.config?.cccProofSuite === true
+    ? node.config?.cccProofIds
     : context.proofIds;
   if (!Array.isArray(selectedProofIds) || selectedProofIds.length === 0) {
     refuse(`CCC proof task ${context.semanticTaskId} declares no proof ids`);
@@ -293,7 +320,30 @@ function requireTaskProofs(
   if (!Array.isArray(context.proofs)) {
     refuse(`CCC proof task ${context.semanticTaskId} has no campaign proof catalog`);
   }
-  if (node.config?.cccProofSuite === true) {
+  if (semanticV2) {
+    const v2Catalog = context.proofs.filter((proof) => (
+      proof?.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION
+    ));
+    if (v2Catalog.length !== context.proofs.length) {
+      refuse("CCC semantic proof node requires one exact v2 campaign proof catalog");
+    }
+    const expectedIds = semanticPhase === "final_integrated"
+      ? v2Catalog
+        .filter((proof) => proof.phases.includes("final_integrated"))
+        .map(({ id }) => id)
+      : v2Catalog
+        .filter((proof) => (
+          proof.phases.includes("task") && context.proofIds.includes(proof.id)
+        ))
+        .map(({ id }) => id);
+    if (
+      expectedIds.length === 0
+      || canonicalCccPrdJson([...proofIds].sort(compareCccPrdCodeUnits))
+        !== canonicalCccPrdJson([...expectedIds].sort(compareCccPrdCodeUnits))
+    ) {
+      refuse(`CCC ${semanticPhase} proof node must admit its exact phase proof set once`);
+    }
+  } else if (node.config?.cccProofSuite === true) {
     const catalogIds = context.proofs.map((proof) =>
       requireCanonicalText(proof?.id, `task ${context.semanticTaskId} catalog proof id`));
     if (new Set(catalogIds).size !== catalogIds.length) {
@@ -388,9 +438,12 @@ async function requireProofEvaluator(
   definitionSha256: string,
 ): Promise<WorkflowProofAdmissionEvaluator> {
   const admission = proof.admission;
+  const expectedAdmissionSchema = proof.schema === CCC_PRD_PROOF_V2_SCHEMA_VERSION
+    ? CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION
+    : CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION;
   if (
     !admission
-    || admission.schema !== CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION
+    || admission.schema !== expectedAdmissionSchema
     || admission.pluginId !== CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID
     || admission.pluginVersion !== CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION
     || admission.extensionId !== CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID

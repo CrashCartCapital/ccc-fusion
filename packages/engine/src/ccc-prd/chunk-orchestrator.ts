@@ -1,5 +1,6 @@
 import {
   type CccPrdSource,
+  type CccPrdSemanticProofContractVersion,
   type CustomProvider,
 } from "@fusion/core";
 import {
@@ -36,6 +37,8 @@ export type CccPrdChunkedUnderstandingOptions = {
   maxPromptBytes: number;
   maxResponseBytes: number;
   maxReviewItems: number;
+  /** Omission preserves the frozen v1 fragment/assembly contract. */
+  semanticProofContract?: CccPrdSemanticProofContractVersion;
   maxChunkAttempts?: number;
   chunkPolicy?: Partial<CccPrdChunkPolicy>;
   anchorLimits?: CccPrdAnchorLimits;
@@ -227,6 +230,7 @@ export async function runCccPrdChunkedUnderstanding(
 
     const envelope = buildCccPrdChunkEnvelope({
       mode: options.mode,
+      semanticProofContract: options.semanticProofContract,
       packetHash: custody.packetHash,
       sourceVersion: custody.sourceVersion,
       chunkPlanHash: plan.chunkPlanHash,
@@ -247,6 +251,7 @@ export async function runCccPrdChunkedUnderstanding(
       fullSourceBytes,
       sliceBounds: { byteStart: chunk.sliceByteStart, byteEnd: chunk.sliceByteEnd },
       assignedMaterialItemIds: chunk.materialItemIds,
+      semanticProofContract: options.semanticProofContract,
       expectedProvider: options.provider,
       expectedModel: options.model,
       transport: transportCaller,
@@ -279,6 +284,7 @@ export async function runCccPrdChunkedUnderstanding(
 
   const assembled = assembleCccPrdChunkedUnderstanding({
     packetSourceBytes: custody.sourceBytes,
+    semanticProofContract: options.semanticProofContract,
     fragments,
   });
 

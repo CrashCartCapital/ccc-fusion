@@ -3,16 +3,21 @@ import {
   computeCccPrdSemanticBundleSha256,
 } from "../ccc-prd/contract.js";
 import {
-  CCC_PRD_BUNDLE_SCHEMA_VERSION,
+  CCC_PRD_BUNDLE_V1_SCHEMA_VERSION,
+  CCC_PRD_BUNDLE_V2_SCHEMA_VERSION,
   type CccPrdSemanticBundle,
 } from "../ccc-prd/types.js";
 import {
   createCccCampaignManifest,
+  executionAuthorizationModeFromManifest,
   hashCccCampaignManifest,
   parseCccCampaignExecutionPolicy,
 } from "./canonical.js";
 import {
-  CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION,
+  CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+  CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+  CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+  type CccCampaignExecutionAuthorizationMode,
   type CccCampaignExecutionPolicy,
   type CccCampaignManifest,
 } from "./types.js";
@@ -41,6 +46,7 @@ export type ReconstructedCccCampaignCustody = {
   executionPolicy: CccCampaignExecutionPolicy;
   manifest: CccCampaignManifest;
   manifestHash: string;
+  executionAuthorizationMode: CccCampaignExecutionAuthorizationMode;
 };
 
 export class CccCampaignCustodyError extends Error {
@@ -57,7 +63,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function storedManifest(value: unknown): CccCampaignManifest {
   if (
     !isRecord(value)
-    || value.schema !== CCC_CAMPAIGN_MANIFEST_SCHEMA_VERSION
+    || (
+      value.schema !== CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION
+      && value.schema !== CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+    )
     || typeof value.campaignId !== "string"
     || value.campaignId.length === 0
     || !isRecord(value.targetRepository)
@@ -68,14 +77,25 @@ function storedManifest(value: unknown): CccCampaignManifest {
   ) {
     throw new CccCampaignCustodyError("missing admitted campaign manifest");
   }
-  return value as CccCampaignManifest;
+  const manifest = value as CccCampaignManifest;
+  try {
+    executionAuthorizationModeFromManifest(manifest);
+  } catch {
+    throw new CccCampaignCustodyError(
+      "campaign manifest schema and execution authorization mode disagree",
+    );
+  }
+  return manifest;
 }
 
 function storedBundle(value: unknown): CccPrdSemanticBundle {
   if (
     !isRecord(value)
     || value.kind !== "bundle"
-    || value.schema !== CCC_PRD_BUNDLE_SCHEMA_VERSION
+    || (
+      value.schema !== CCC_PRD_BUNDLE_V1_SCHEMA_VERSION
+      && value.schema !== CCC_PRD_BUNDLE_V2_SCHEMA_VERSION
+    )
     || !Array.isArray(value.tasks)
     || !Array.isArray(value.proofs)
     || !Array.isArray(value.protectedActions)
@@ -99,7 +119,7 @@ export function reconstructCccCampaignCustody(
       row.executionPolicy,
       bundle,
     );
-    const manifest = createCccCampaignManifest({
+    const manifestInput = {
       projectId: row.projectId,
       importId: row.importId,
       idempotencyKey: row.idempotencyKey,
@@ -108,7 +128,18 @@ export function reconstructCccCampaignCustody(
       executionPolicy,
       targetRepositoryPath: row.targetRepository,
       campaignStartedAt: persistedManifest.campaignStartedAt,
-    });
+    };
+    const manifest = persistedManifest.schema === CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION
+      ? createCccCampaignManifest({
+        ...manifestInput,
+        manifestSchema: CCC_CAMPAIGN_MANIFEST_V2_SCHEMA_VERSION,
+        executionAuthorizationMode:
+          CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
+      })
+      : createCccCampaignManifest({
+        ...manifestInput,
+        manifestSchema: CCC_CAMPAIGN_MANIFEST_V1_SCHEMA_VERSION,
+      });
     const manifestHash = hashCccCampaignManifest(manifest);
     if (
       canonicalCccPrdJson(persistedManifest) !== canonicalCccPrdJson(manifest)
@@ -126,7 +157,13 @@ export function reconstructCccCampaignCustody(
     ) {
       throw new CccCampaignCustodyError("campaign manifest drift");
     }
-    return { bundle, executionPolicy, manifest, manifestHash };
+    return {
+      bundle,
+      executionPolicy,
+      manifest,
+      manifestHash,
+      executionAuthorizationMode: executionAuthorizationModeFromManifest(manifest),
+    };
   } catch (error) {
     if (error instanceof CccCampaignCustodyError) throw error;
     throw new CccCampaignCustodyError(

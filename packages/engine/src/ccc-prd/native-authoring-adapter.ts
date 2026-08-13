@@ -201,12 +201,32 @@ function buildPrompt(
     : [
         "This is execution-sidecar authoring. Return the exact admitted target, bounds, and review constraints.",
       ];
+  const semanticV2 = request.semanticProofContract === "v2";
+  const proposalSchema = semanticV2
+    ? "ccc-prd.authoring-proposal.v2"
+    : CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION;
+  const requirementTemplate = semanticV2
+    ? "  \"requirements\": [{ \"id\": \"\", \"statement\": \"\", \"acceptance\": \"\", \"accountableProducer\": \"\", \"dependencies\": [\"\"], \"proofIds\": [\"\"], \"acceptanceClauses\": [{ \"id\": \"\", \"requirementId\": \"\", \"text\": \"\", \"proofIds\": [\"\"], \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }], \"acceptanceDispositions\": [{ \"clauseId\": \"\", \"requirementId\": \"\", \"kind\": \"deferred\" | \"excluded\" | \"unresolved\", \"reason\": \"\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],"
+    : "  \"requirements\": [{ \"id\": \"\", \"statement\": \"\", \"acceptance\": \"\", \"accountableProducer\": \"\", \"dependencies\": [\"\"], \"proofIds\": [\"\"], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],";
+  const proofTemplate = semanticV2
+    ? "  \"proofs\": [{ \"schema\": \"ccc-prd.proof.v2\", \"id\": \"\", \"requirementIds\": [\"\"], \"clauseIds\": [\"\"], \"phases\": [\"task\" | \"final_integrated\"], \"command\": \"\", \"positiveOracle\": \"\", \"positiveCases\": [{ \"id\": \"\", \"description\": \"\" }], \"negativeControls\": [{ \"id\": \"\", \"description\": \"\" }], \"verifierClosure\": [{ \"role\": \"task_runner\" | \"harness\" | \"fixture\" | \"config\", \"path\": \"\", \"baseGitBlobOid\": \"\", \"sha256\": \"\" }], \"candidateInputs\": [\"\"], \"executionToolchain\": { \"task\": { \"executablePath\": \"\", \"executableSha256\": \"\", \"version\": \"\", \"versionOutputSha256\": \"\" }, \"node\": { \"executablePath\": \"\", \"executableSha256\": \"\", \"version\": \"\", \"versionOutputSha256\": \"\" }, \"proofHost\": { \"id\": \"\", \"executablePath\": \"\", \"executableSha256\": \"\", \"version\": \"\", \"versionOutputSha256\": \"\" }, \"linkedRuntime\": [] }, \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],"
+    : "  \"proofs\": [{ \"id\": \"\", \"requirementIds\": [\"\"], \"command\": \"\", \"positiveOracle\": \"\", \"negativeControls\": [\"\"], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],";
   return [
     "Generate exactly one JSON object and no Markdown or commentary.",
     "Return raw JSON only -- do not wrap the object in a ```json or ``` code fence and do not add any text before or after the object.",
-    `The object schema must be ${CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION}.`,
+    `The object schema must be ${proposalSchema}.`,
     "Preserve the source packet. Do not execute actions or invent source text.",
     ...modeInstructions,
+    ...(semanticV2
+      ? [
+          "Use only the exact normative Markdown grammar under `### Requirement <id>` and `#### Acceptance clauses`; ordinary prose never becomes an acceptance clause.",
+          "Acceptance clause IDs, text, and raw-byte spans are owned by the admitted PRD source. Copy every ID and text byte-exactly, cite the exact text once, and only link the parser-owned clause to proofIds; never invent, split, merge, renumber, or paraphrase a clause.",
+          "Every source-declared clause must appear exactly once as an accepted acceptanceClauses row or as its exact deferred, excluded, or unresolved acceptanceDispositions row. Unresolved or omitted clauses refuse semantic normalization.",
+          "Exact clause sourceRefs must contain only the clause text bytes (or disposition reason bytes); fuzzy quote recovery is forbidden for acceptance clauses.",
+          "Every accepted clause needs one or more proofIds, and every v2 proof must name its exact clauseIds, allowed phases, positive cases, negative controls, closed verifierClosure, candidateInputs, and executionToolchain.",
+          "Declare verifierClosure roles and paths, candidateInputs, phases, cases, and proof meaning. Fusion—not you—reads closure bytes from the frozen Git base and replaces every baseGitBlobOid, SHA-256, Task identity, Node identity, and proof-host identity before executable admission. Emit empty strings in those controller-owned identity fields; never claim that you observed executable bytes or versions.",
+        ]
+      : []),
     "Every requirement, proof, task, workflow, document, artifact, unresolved decision, ambiguity, exception, and protected action must cite one or more admitted sources using {path, exactQuote}; every exactQuote must occur exactly once in that source.",
     "Copy each exactQuote verbatim from the source bytes -- never paraphrase, summarize, or normalize whitespace. Choose quotes long enough to occur exactly once: quote the complete sentence or line, and extend with adjacent text whenever a shorter phrase could repeat elsewhere in the document.",
     "When a short identifier, test name, or phrase repeats across the document, never quote it alone: quote the entire sentence or line around its defining occurrence, extended until the quote is unique. When quoting lines from code blocks, tables, or directory trees, reproduce interior spacing, alignment runs of spaces, and trailing comments byte-for-byte.",
@@ -223,10 +243,10 @@ function buildPrompt(
     */
     "The exact field contract, with every key name mandatory (enumerated values are written with |; all other values are strings unless shown as numbers; every source-bound row carries its citations under \"sourceRefs\"):",
     "{",
-    "  \"schema\": \"ccc-prd.authoring-proposal.v1\",",
+    `  "schema": "${proposalSchema}",`,
     "  \"authorityRoles\": [{ \"id\": \"\", \"role\": \"root\" | \"production_module\" | \"blocking_test_index\" | \"support\", \"sourcePaths\": [\"\"], \"accountableProducer\": \"\" }],",
-    "  \"requirements\": [{ \"id\": \"\", \"statement\": \"\", \"acceptance\": \"\", \"accountableProducer\": \"\", \"dependencies\": [\"\"], \"proofIds\": [\"\"], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
-    "  \"proofs\": [{ \"id\": \"\", \"requirementIds\": [\"\"], \"command\": \"\", \"positiveOracle\": \"\", \"negativeControls\": [\"\"], \"confidence\": \"high\" | \"medium\" | \"low\", \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
+    requirementTemplate,
+    proofTemplate,
     "  \"tasks\": [{ \"id\": \"\", \"title\": \"\", \"description\": \"\", \"accountableProducer\": \"\", \"requirementIds\": [\"\"], \"dependencyTaskIds\": [\"\"], \"proofIds\": [\"\"], \"workflowId\": \"\", \"documentIds\": [\"\"], \"artifactIds\": [\"\"], \"protectedActionIds\": [\"\"], \"ownedPaths\": [\"\"], \"allowedWriteRoots\": [\"\"], \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
     "  \"edges\": [{ \"id\": \"\", \"fromTaskId\": \"\", \"toTaskId\": \"\", \"kind\": \"depends_on\" }],",
     "  \"workflows\": [{ \"id\": \"\", \"title\": \"\", \"taskIds\": [\"\"], \"entryTaskIds\": [\"\"], \"terminalTaskIds\": [\"\"], \"sourceRefs\": [{ \"path\": \"\", \"exactQuote\": \"\" }] }],",
@@ -248,6 +268,7 @@ function buildPrompt(
       mode,
       packetHash: request.packetHash,
       sourceVersion: request.sourceVersion,
+      ...(semanticV2 ? { semanticProofContract: "v2" } : {}),
       ...(request.constraints ? { constraints: request.constraints } : {}),
       orderedSources: request.sources,
       ...(request.previousSidecar ? { previousSidecar: request.previousSidecar } : {}),

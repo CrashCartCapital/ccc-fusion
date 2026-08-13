@@ -16,6 +16,8 @@ import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   beginCccCampaignProofAttemptDispatch,
+  canonicalCccPrdJson,
+  computeCccPrdProofV2AdmissionDigests,
   importCccPrdBundle,
   inspectCccPrdProductStatus,
   queryRunAuditEvents,
@@ -33,6 +35,7 @@ import {
   issueCccCampaignApproval,
 } from "../../../core/src/async-approval-request-store.js";
 import {
+  admitCccPrdImportTestProductBundle,
   createCccPrdImportTestBundle,
   createCccPrdImportTestExecutionPolicy,
   createCccPrdImportTestProductExecutionPolicy,
@@ -53,7 +56,12 @@ import {
   inspectCccCampaignLocalGit,
   runControlledCccCampaignGit,
 } from "../ccc-campaign-local-git.js";
+import {
+  CCC_CAMPAIGN_FINAL_PROOF_CUSTODY_SCHEMA_VERSION,
+  encodeCccCampaignMergeProofRunId,
+} from "../ccc-campaign-git-landing.js";
 import { createCccCampaignMergeControl } from "../ccc-campaign-merge-control.js";
+import { issueCccCampaignMergeApproval } from "../ccc-campaign-product-control.js";
 import { runAiMerge } from "../merger-ai.js";
 import { resolveTaskWorkingBranch } from "../worktree-names.js";
 
@@ -145,6 +153,7 @@ const worker: ApprovalRequestActorSnapshot = {
   actorType: "agent",
   actorName: "Worker",
 };
+const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 
 function createForbiddenEffectRecorder() {
   const effects: string[] = [];
@@ -326,7 +335,7 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
     const base = git(root, ["rev-parse", "HEAD"]);
     const action = { actionId: "PA-merge-main", actionTarget: "refs/heads/main" };
     const initial = createCccPrdImportTestBundle(root, suffix);
-    const source = rehashCccPrdImportTestBundle({
+    const legacySource = rehashCccPrdImportTestBundle({
       ...initial,
       bounds: { maxRequests: 2, maxDurationMs: 120_000, maxConcurrency: 1 },
       targetRepository: { path: root, baseCommit: base },
@@ -342,6 +351,11 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
         spans: [initial.tasks[0]!.spans[0]!],
       }],
     });
+    const fixture = options.executionPolicy === "v1"
+      ? { bundle: legacySource, semanticProofToolchainPaths: undefined }
+      : await admitCccPrdImportTestProductBundle(legacySource, suffix);
+    const source = fixture.bundle;
+    const importedBase = source.targetRepository.baseCommit;
     const idempotencyKey = `git-landing-${suffix}`;
     const imported = await importCccPrdBundle({
       bundle: source,
@@ -352,6 +366,7 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
       executionPolicy: options.executionPolicy === "v1"
         ? createCccPrdImportTestExecutionPolicy(source)
         : createCccPrdImportTestProductExecutionPolicy(source),
+      semanticProofToolchainPaths: fixture.semanticProofToolchainPaths,
     });
     const semanticTaskId = `TASK-${suffix}`;
     const productStatus = await inspectCccPrdProductStatus({
@@ -404,11 +419,12 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
       semanticTaskId,
     });
     const proofReceipt = options.proofReceipt ?? "passing";
+    const branchSourceCommit = git(root, ["rev-parse", `refs/heads/${branch}`]);
+    const branchSourceTree = git(root, ["rev-parse", `${branchSourceCommit}^{tree}`]);
     if (proofReceipt !== "missing") {
-      const branchCommit = git(root, ["rev-parse", `refs/heads/${branch}`]);
-      const sourceCommit = proofReceipt === "wrong-commit" ? base : branchCommit;
+      const sourceCommit = proofReceipt === "wrong-commit" ? importedBase : branchSourceCommit;
       const sourceTree = proofReceipt === "wrong-tree"
-        ? git(root, ["rev-parse", `${base}^{tree}`])
+        ? git(root, ["rev-parse", `${importedBase}^{tree}`])
         : git(root, ["rev-parse", `${sourceCommit}^{tree}`]);
       const exactChangedPathsSha256 = createHash("sha256")
         .update(JSON.stringify([sourcePath]), "utf8")
@@ -416,12 +432,32 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
       const changedPathsSha256 = proofReceipt === "wrong-paths"
         ? "0".repeat(64)
         : exactChangedPathsSha256;
-      for (const proof of context.proofs) {
+      const landingProofs = context.proofs.filter((proof) =>
+        proof.schema !== "ccc-prd.proof.v2" || proof.phases.includes("final_integrated"));
+      if (landingProofs.length === 0) {
+        throw new Error(`missing final-integrated proof for ${suffix}`);
+      }
+      for (const proof of landingProofs) {
+        const proofPhase = proof.schema === "ccc-prd.proof.v2"
+          ? "final_integrated"
+          : "task";
+        const admissionDigests = proof.schema === "ccc-prd.proof.v2"
+          ? computeCccPrdProofV2AdmissionDigests(proof)
+          : undefined;
         const reserved = await reserveCccCampaignProofAttempt({
           layer: h.layer(),
           rootDir: root,
           taskId,
           proofId: proof.id,
+          ...(proof.schema === "ccc-prd.proof.v2"
+            ? {
+              attemptContractVersion: "v2" as const,
+              phase: proofPhase,
+              verifierClosureSha256: admissionDigests!.verifierClosureSha256,
+              candidateInputsSha256: admissionDigests!.candidateInputsSha256,
+              executionToolchainSha256: admissionDigests!.executionToolchainSha256,
+            }
+            : {}),
           sourceCommit,
           sourceTree,
           workItemFence: {
@@ -442,34 +478,94 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
           controllerToken: reserved.controllerToken,
         });
         if (proofReceipt === "dispatched-unknown") continue;
-        await settleCccCampaignProofAttempt({
-          layer: h.layer(),
-          attemptKey: reserved.attemptKey,
-          controllerToken: reserved.controllerToken,
-          result: {
-            success: proofReceipt !== "failed",
-            exitCode: proofReceipt === "failed" ? 1 : 0,
-            durationMs: 1,
-            stdout: proofReceipt === "failed" ? "" : "proof passed\n",
-            stderr: proofReceipt === "failed" ? "proof failed\n" : "",
-            timedOut: false,
-            killed: false,
-            warnings: [],
-            changedPathsSha256,
-          },
-        });
+        if (proof.schema === "ccc-prd.proof.v2") {
+          const passed = proofReceipt !== "failed";
+          const evidence = {
+            schema: "ccc-prd.proof-evidence.v2" as const,
+            proofId: proof.id,
+            phase: proofPhase,
+            sourceCommit,
+            sourceTree,
+            passed,
+            clauseResults: proof.clauseIds.map((clauseId) => ({ clauseId, passed })),
+            positiveCaseResults: proof.positiveCases.map(({ id: caseId }) => ({ caseId, passed })),
+            negativeControlResults: proof.negativeControls.map(({ id: controlId }) => ({ controlId, passed })),
+          };
+          const stdoutTail = canonicalCccPrdJson(evidence);
+          await settleCccCampaignProofAttempt({
+            layer: h.layer(),
+            attemptKey: reserved.attemptKey,
+            controllerToken: reserved.controllerToken,
+            terminalEnvelope: {
+              schema: "ccc-prd.proof-terminal-envelope.v2" as const,
+              kind: "verified" as const,
+              proofId: proof.id,
+              phase: proofPhase,
+              sourceCommit,
+              sourceTree,
+              exitCode: passed ? 0 : 1,
+              durationMs: 1,
+              stdoutSha256: sha256(stdoutTail),
+              stderrSha256: sha256(passed ? "" : "proof failed\n"),
+              changedPathsSha256,
+              stdoutTail,
+              stderrTail: passed ? "" : "proof failed\n",
+              timedOut: false,
+              killed: false,
+              warnings: [],
+              passed,
+              evidence,
+              evidenceSha256: sha256(stdoutTail),
+            },
+          });
+        } else {
+          await settleCccCampaignProofAttempt({
+            layer: h.layer(),
+            attemptKey: reserved.attemptKey,
+            controllerToken: reserved.controllerToken,
+            result: {
+              success: proofReceipt !== "failed",
+              exitCode: proofReceipt === "failed" ? 1 : 0,
+              durationMs: 1,
+              stdout: proofReceipt === "failed" ? "" : "proof passed\n",
+              stderr: proofReceipt === "failed" ? "proof failed\n" : "",
+              timedOut: false,
+              killed: false,
+              warnings: [],
+              changedPathsSha256,
+            },
+          });
+        }
       }
     }
-    const issued = await issueCccCampaignApproval(h.layer(), {
-      authorityStore: h.store(),
-      rootDir: root,
-      taskId,
-      action,
-      requester,
-      runId: `approval-issue:${suffix}`,
-      notBeforeAt: context.campaignStartedAt,
-      expiresAt: context.campaignDeadlineAt,
-    });
+    const shouldUseProductionMergeApproval = options.executionPolicy !== "v1"
+      && proofReceipt === "passing"
+      && (options.proofFence ?? "exact") === "exact"
+      && (options.workItemState ?? "manual-required") === "manual-required";
+    const issued = shouldUseProductionMergeApproval
+      ? await issueCccCampaignMergeApproval({
+        store: h.store(),
+        rootDir: root,
+        taskId,
+        runId: `approval-issue:${suffix}`,
+      })
+      : await issueCccCampaignApproval(h.layer(), {
+        authorityStore: h.store(),
+        rootDir: root,
+        taskId,
+        action,
+        requester,
+        runId: options.executionPolicy === "v1"
+          ? `approval-issue:${suffix}`
+          : encodeCccCampaignMergeProofRunId({
+            schema: CCC_CAMPAIGN_FINAL_PROOF_CUSTODY_SCHEMA_VERSION,
+            sourceCommit: branchSourceCommit,
+            sourceTree: branchSourceTree,
+            finalReceiptSetSha256: "0".repeat(64),
+          }),
+        notBeforeAt: context.campaignStartedAt,
+        expiresAt: context.campaignDeadlineAt,
+      });
     const claimed = await claimCccCampaignApproval(h.layer(), {
       authorityStore: h.store(),
       rootDir: root,
@@ -537,7 +633,7 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
       fixture.taskId,
       {},
       forbidden.deps,
-    )).rejects.toThrow(/proof receipt|proof execution|exact commit|passing receipt/i);
+    )).rejects.toThrow(/semantic-v2|proof receipt|final_integrated v2 receipt|proof execution|exact commit|passing receipt/i);
 
     expect(git(fixture.root, ["rev-parse", "refs/heads/main"]))
       .toBe(fixture.claimed.campaign!.binding.targetBase);
@@ -582,13 +678,15 @@ pgDescribe("Task 5 native CCC campaign Git landing real PG/Git", () => {
       );
       const forbidden = createForbiddenEffectRecorder();
 
-      await expect(runAiMerge(
-        h.store(),
-        fixture.root,
-        fixture.taskId,
-        {},
-        forbidden.deps,
-      )).rejects.toThrow(/proof|receipt|source/i);
+      await expect(
+        runAiMerge(
+          h.store(),
+          fixture.root,
+          fixture.taskId,
+          {},
+          forbidden.deps,
+        ),
+      ).rejects.toThrow(/proof|receipt|final_integrated v2 receipt|source/i);
 
       expect(git(fixture.root, ["rev-parse", "refs/heads/main"]))
         .toBe(fixture.claimed.campaign!.binding.targetBase);
