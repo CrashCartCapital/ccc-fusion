@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   cp,
+  lstat,
   mkdir,
   mkdtemp,
   readdir,
@@ -12,6 +13,7 @@ import {
   realpath,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
@@ -3392,7 +3394,44 @@ async function cleanupOwnedProofCutpointMarkers(token) {
     }
   }
   for (const executionRoot of removableExecutionRoots) {
-    await rm(executionRoot, { recursive: true, force: true });
+    const canonicalTmp = await realpath(tmpdir());
+    const canonicalExecutionRoot = await realpath(executionRoot);
+    if (
+      path.dirname(canonicalExecutionRoot) !== canonicalTmp
+      || !path.basename(canonicalExecutionRoot)
+        .startsWith("ccc-semantic-proof-execution-")
+    ) {
+      throw new Error(
+        `CCC_PRODUCT_PROOF_CLEANUP_ROOT_REFUSED: ${canonicalExecutionRoot}`,
+      );
+    }
+    const makeWriteable = async (ownedPath) => {
+      const fromRoot = path.relative(canonicalExecutionRoot, ownedPath);
+      if (
+        fromRoot === ".."
+        || fromRoot.startsWith(`..${path.sep}`)
+        || path.isAbsolute(fromRoot)
+      ) {
+        throw new Error(`CCC_PRODUCT_PROOF_CLEANUP_ESCAPE: ${ownedPath}`);
+      }
+      const metadata = await lstat(ownedPath).catch(() => undefined);
+      if (!metadata) return;
+      if (metadata.isSymbolicLink()) {
+        await unlink(ownedPath);
+        return;
+      }
+      if (!metadata.isDirectory()) {
+        await chmod(ownedPath, 0o600);
+        return;
+      }
+      await chmod(ownedPath, 0o700);
+      const entries = await readdir(ownedPath, { withFileTypes: true });
+      await Promise.all(entries.map((entry) => (
+        makeWriteable(path.join(ownedPath, entry.name))
+      )));
+    };
+    await makeWriteable(canonicalExecutionRoot);
+    await rm(canonicalExecutionRoot, { recursive: true, force: true });
   }
 }
 
