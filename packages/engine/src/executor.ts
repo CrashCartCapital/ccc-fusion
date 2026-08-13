@@ -339,7 +339,12 @@ import {
   type RunTaskStepResult,
 } from "./step-runner.js";
 // FNXC:MergerUnification 2026-06-21-19:05: the foundation branch imported `acquireWorkspaceRepoWorktree` here but never used it in executor.ts (the agent tool wraps it via agent-tools.ts), which fails lint on the inherited base. Removed until master-plan U1 re-adds it together with its per-repo acquisition usage.
-import { acquireTaskWorktree, type AcquireTaskWorktreeResult } from "./worktree-acquisition.js";
+import {
+  acquireTaskWorktree,
+  assertCccCampaignEntryFrozenBaseCustody,
+  CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+  type AcquireTaskWorktreeResult,
+} from "./worktree-acquisition.js";
 import { resolveCapturedBaseCommitSha } from "./base-commit-capture.js";
 import { installTaskWorktreeIdentityGuard } from "./worktree-hooks.js";
 import {
@@ -9306,10 +9311,9 @@ export class TaskExecutor {
   /*
   FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
   A multi-task campaign import links its native tasks through `dependencies` and M1 executes that
-  chain serially, but the importer never writes `executionStartBranch`. Without an explicit start
-  point every task worktree is created from the integration branch (worktree-acquisition.ts:265-270),
-  so a successor's branch does not contain its predecessor's commit and the campaign proof gate's
-  per-task ancestry loop (ccc-campaign-proof-execution.ts:317-326) refuses the whole campaign.
+  chain serially. Worktree acquisition pins the entry task to the sealed base; this resolver pins
+  every successor to its predecessor's exact result branch so the campaign proof gate can prove
+  the full ancestry without replaying or rewriting earlier commits.
   An unresolvable predecessor is a REFUSAL, never an integration-branch fallback: falling back
   silently produces a worktree whose history is missing prior task work, and the defect would
   resurface much later as an opaque proof-integration failure with no pointer back to this choice.
@@ -9392,7 +9396,10 @@ export class TaskExecutor {
   ): Promise<void> {
     if (!requirement.requiresWorktree) return;
     const live = await this.store.getTask(nodeTask.id);
-    if (live.worktree && existsSync(live.worktree)) return;
+    if (live.worktree && existsSync(live.worktree)) {
+      await assertCccCampaignEntryFrozenBaseCustody(live, this.store, live.worktree);
+      return;
+    }
     const chainedStartBranch = await this.resolveCccCampaignChainedStartBranch(live);
     const acquisitionBase = live.worktree
       ? ({ ...live, worktree: undefined, sessionFile: undefined } as TaskDetail)
@@ -19545,7 +19552,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     when the start point is exactly the chain branch this task's own predecessor resolves to.
     */
     const chainedCampaignBase = await this.usesCccCampaignChainedStartBranch(taskId, startPoint);
-    const squashImport = resolvedStartPoint && !chainedCampaignBase
+    const frozenCampaignBase = await this.usesCccCampaignFrozenStartCommit(taskId, startPoint);
+    const preservedCampaignBase = chainedCampaignBase || frozenCampaignBase;
+    const squashImport = resolvedStartPoint && !preservedCampaignBase
       ? await this.planSquashImportFromDep(taskId, resolvedStartPoint, startPoint)
       : null;
     const initialStartPoint = squashImport ? squashImport.mainBase : resolvedStartPoint;
@@ -19585,13 +19594,13 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         // if the user actively skips this setting. Best-effort: failures here
         // don't abort task setup.
         /*
-        FNXC:CccCampaignChainedWorktrees 2026-08-01-00:00:
-        Same ancestry reason as the squash exemption: rebasing a chained campaign successor onto
-        the remote default branch replays the predecessor's commits under new SHAs, which breaks
-        `merge-base --is-ancestor <predecessor> <successor>` just as effectively as the squash
-        rewrite would. Leave the chain intact.
+        FNXC:CccCampaignFrozenBase 2026-08-13-15:45:
+        Preserve both forms of sealed campaign ancestry. Rebasing a successor
+        rewrites predecessor commits; rebasing an entry task can replace its
+        exact frozen base with a stale remote tip. Either breaks later custody
+        checks, so neither controller-selected campaign base is rewritten.
         */
-        if (!chainedCampaignBase) {
+        if (!preservedCampaignBase) {
           await this.rebaseNewWorktreeOntoRemote(result.path, result.branch, taskId).catch((err: unknown) => {
             executorLog.warn(
               `Post-create worktree rebase failed for ${taskId} (continuing): ${err instanceof Error ? err.message : String(err)}`,
@@ -19652,6 +19661,24 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     if (!task || !isImportedCccCampaignTask(task)) return false;
     const chainedStartBranch = await this.resolveCccCampaignChainedStartBranch(task).catch(() => null);
     return chainedStartBranch !== null && chainedStartBranch === startPoint;
+  }
+
+  private async usesCccCampaignFrozenStartCommit(
+    taskId: string,
+    startPoint: string | undefined,
+  ): Promise<boolean> {
+    if (!startPoint) return false;
+    const task = await this.store.getTask(taskId).catch(() => null);
+    if (!task) return false;
+    const frozenBase = await assertCccCampaignEntryFrozenBaseCustody(task, this.store);
+    if (!frozenBase) return false;
+    if (startPoint !== frozenBase) {
+      throw new PermanentError(
+        `CCC campaign entry task ${taskId} worktree start does not match its sealed base`,
+        CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+      );
+    }
+    return true;
   }
 
   /**

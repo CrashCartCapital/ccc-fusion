@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {acquireWorktreePathReservation, canonicalizeWorktreePath, type RunMutationContext, type Settings, type Task, type TaskStore, type SecretsStore} from "@fusion/core";
 import { generateWorktreeName, resolveTaskWorkingBranch, slugify } from "./worktree-names.js";
@@ -43,8 +43,40 @@ import { copyConfiguredWorktreeFiles, type WorktreeCopyFileResult } from "./work
 import { resolveCapturedBaseCommitSha } from "./base-commit-capture.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
 import { activeSessionRegistry, type ActiveSessionRegistry } from "./active-session-registry.js";
+import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
+import { PermanentError } from "./engine-errors.js";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+export const CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE = "CCC_CAMPAIGN_FROZEN_BASE_REFUSED";
+const CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS = 30_000;
+const CCC_CAMPAIGN_GIT_CUSTODY_MAX_BUFFER = 10 * 1024 * 1024;
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isCccCampaignTaskOwnedCommit(input: {
+  taskId: string;
+  subject: string;
+  body: string;
+  authorName: string;
+  authorEmail: string;
+}): boolean {
+  const taskId = escapeRegex(input.taskId);
+  const subject = new RegExp(
+    `^(?:feat|fix|test|chore|docs|refactor|perf|build|ci|style|revert)\\s*\\(${taskId}\\)!?:`,
+    "iu",
+  );
+  const trailer = new RegExp(
+    `(?:^|\\n)(?:Fusion-Task-Id|Task-Id):\\s*${taskId}\\s*(?:\\n|$)`,
+    "iu",
+  );
+  const controllerCommit = input.subject === `ccc-fusion campaign ${input.taskId}`
+    && input.authorName === "ccc-fusion"
+    && input.authorEmail === "ccc-fusion@localhost";
+  return controllerCommit || subject.test(input.subject) || trailer.test(input.body);
+}
 
 /**
  * Worktree acquisition contract:
@@ -199,6 +231,116 @@ async function pinnedWorktreeBranchMatches(rootDir: string, worktreePath: string
   return match?.branch === expectedBranch;
 }
 
+/**
+ * Re-derive an imported entry task's frozen base from sealed campaign storage.
+ * When a worktree already exists, also prove that its current HEAD descends
+ * from that exact base and every later commit belongs to this task and this
+ * campaign window before any cleanup, hydration, secret, or model effect.
+ */
+export async function assertCccCampaignEntryFrozenBaseCustody(
+  task: Task,
+  store: TaskStore,
+  worktreePath?: string,
+): Promise<string | null> {
+  if (!isImportedCccCampaignTask(task) || (task.dependencies ?? []).length > 0) {
+    return null;
+  }
+  let context;
+  try {
+    context = await store.getCccCampaignContextForTask(task.id);
+  } catch (error) {
+    throw new PermanentError(
+      `CCC campaign entry task ${task.id} cannot re-derive its sealed base`,
+      CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+      undefined,
+      error instanceof Error ? error : undefined,
+    );
+  }
+  if (!context) {
+    throw new PermanentError(
+      `CCC campaign entry task ${task.id} has no sealed base custody`,
+      CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+    );
+  }
+  const frozenBase = context.targetRepository.baseCommit;
+  if (task.baseCommitSha !== frozenBase) {
+    throw new PermanentError(
+      `CCC campaign entry task ${task.id} persisted base does not match its sealed base`,
+      CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+    );
+  }
+  if (worktreePath) {
+    try {
+      await execFileAsync(
+        "git",
+        ["merge-base", "--is-ancestor", frozenBase, "HEAD"],
+        {
+          cwd: worktreePath,
+          encoding: "utf-8",
+          timeout: CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS,
+          maxBuffer: CCC_CAMPAIGN_GIT_CUSTODY_MAX_BUFFER,
+        },
+      );
+    } catch (error) {
+      throw new PermanentError(
+        `CCC campaign entry task ${task.id} worktree does not descend from its sealed base`,
+        CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+        { worktreePath, frozenBase },
+        error instanceof Error ? error : undefined,
+      );
+    }
+    let logOutput: string;
+    try {
+      const result = await execFileAsync(
+        "git",
+        [
+          "log",
+          "--format=%H%x1f%s%x1f%B%x1f%an%x1f%ae%x1f%cI%x1e",
+          `${frozenBase}..HEAD`,
+        ],
+        {
+          cwd: worktreePath,
+          encoding: "utf-8",
+          timeout: CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS,
+          maxBuffer: CCC_CAMPAIGN_GIT_CUSTODY_MAX_BUFFER,
+        },
+      );
+      logOutput = result.stdout;
+    } catch (error) {
+      throw new PermanentError(
+        `CCC campaign entry task ${task.id} cannot inspect commits after its sealed base`,
+        CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+        { worktreePath, frozenBase },
+        error instanceof Error ? error : undefined,
+      );
+    }
+    const campaignStartedAtMs = Date.parse(context.campaignStartedAt);
+    if (!Number.isFinite(campaignStartedAtMs)) {
+      throw new PermanentError(
+        `CCC campaign entry task ${task.id} has an invalid sealed campaign start time`,
+        CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+      );
+    }
+    for (const record of logOutput.split("\x1e").map((entry) => entry.trim()).filter(Boolean)) {
+      const [sha = "", subject = "", body = "", authorName = "", authorEmail = "", committedAt = ""] = record.split("\x1f");
+      const committedAtMs = Date.parse(committedAt);
+      if (
+        !sha
+        || !Number.isFinite(committedAtMs)
+        || committedAtMs < campaignStartedAtMs
+        || !isCccCampaignTaskOwnedCommit({ taskId: task.id, subject, body, authorName, authorEmail })
+      ) {
+        throw new PermanentError(
+          `CCC campaign entry task ${task.id} worktree contains a commit not owned by this campaign task after its sealed base`,
+          CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+          { worktreePath, frozenBase, commit: sha || null },
+        );
+      }
+    }
+  }
+  return frozenBase;
+}
+
 export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Promise<AcquireTaskWorktreeResult> {
   const { task, rootDir, store, settings, pool, logger, audit, runContext, createWorktree, runConfiguredCommand, runInitCommand, taskEnv, secretsStore } = opts;
   const notifyFallback = async (op: WorktrunkOpName, stderr?: string) => {
@@ -263,11 +405,20 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
     && settings.worktrunk?.enabled !== true;
   const allowSiblingBranchRename = settings.executorAllowSiblingBranchRename === true;
   const baseBranch = task.executionStartBranch || null;
+  const campaignFrozenBase = await assertCccCampaignEntryFrozenBaseCustody(task, store);
   /*
    * FNXC:WorktreeIsolation 2026-07-01-08:35:
-   * Fresh task worktrees must never inherit the project root checkout's ambient HEAD. The root checkout can temporarily point at a sibling task branch/commit during merge or recovery work, so an omitted `git worktree add -b ... <startPoint>` contaminates new task branches with unrelated task commits. Use the task's explicit executionStartBranch when present; otherwise pin creation to the resolved integration branch.
+   * Fresh task worktrees must never inherit the project root checkout's ambient HEAD. The root checkout can temporarily point at a sibling task branch/commit during merge or recovery work, so an omitted `git worktree add -b ... <startPoint>` contaminates new task branches with unrelated task commits. Outside sealed campaign entry tasks, use the task's explicit executionStartBranch when present; otherwise pin creation to the resolved integration branch.
+   *
+   * FNXC:CccCampaignFrozenBase 2026-08-13-15:45:
+   * A sealed campaign entry task must start from the exact imported base commit,
+   * even when local main is ahead of origin/main. Generic integration-branch
+   * selection can otherwise replace the hash-bound base before any provider call;
+   * the required-commit gate then correctly refuses the resulting task too late.
    */
-  const freshStartPoint = baseBranch ?? await resolveIntegrationBranch(rootDir, settings, { logger: logger ?? console });
+  const freshStartPoint = campaignFrozenBase
+    ?? baseBranch
+    ?? await resolveIntegrationBranch(rootDir, settings, { logger: logger ?? console });
 
   let worktreePath = task.worktree;
   if (!worktreePath) {
@@ -534,6 +685,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
 
   /** Warm-reuse an existing, usable, branch-matched worktree (mirrors the resume path). */
   const reuseWarmWorktree = async (path: string, resumedBranch: string, source: "existing"): Promise<AcquireTaskWorktreeResult> => {
+    await assertCccCampaignEntryFrozenBaseCustody(task, store, path);
     logger?.log(`Reusing existing worktree: ${path}`);
     const cleanup = await removeDesktopBuildArtifacts(path, logger);
     if (cleanup.removed.length > 0) {
@@ -656,25 +808,9 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
   }
 
   if (task.worktree && isResume) {
-    logger?.log(`Reusing existing worktree: ${worktreePath}`);
-    const cleanup = await removeDesktopBuildArtifacts(worktreePath, logger);
-    if (cleanup.removed.length > 0) {
-      await store.logEntry(task.id, `Removed desktop build artifacts from worktree: ${cleanup.removed.join(", ")}`, undefined, runContext);
-    }
-    const hydrated = await hydrate(worktreePath);
     const resumedBranch = task.branch ?? branchName;
-    await verifyResumeBranchNotMisbound({
-      worktreePath,
-      branchName: resumedBranch,
-      taskId: task.id,
-      rootDir,
-      store,
-      audit,
-      logger,
-      runContext,
-    });
     // FN-4912: resume path reuses the prior on-disk .env (and its fingerprint sidecar). Rewrite is owned by the next fresh acquisition.
-    return guardAcquisitionReturn({ worktreePath, branch: resumedBranch, source: "existing", hydrated, isResume: true });
+    return reuseWarmWorktree(worktreePath, resumedBranch, "existing");
   }
 
   if (!isResume && pool && settings.recycleWorktrees) {
@@ -736,6 +872,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
           worktreePath = await resolveTaskWorktreePathForBackend(rootDir, fallbackName, settings, backend, branchName);
           branch = branchName;
         } else {
+          await assertCccCampaignEntryFrozenBaseCustody(task, store, worktreePath);
           /*
           FNXC:WorktreeIdentity 2026-07-19-16:05:
           Pool preparation changes the checked-out branch but linked-worktree

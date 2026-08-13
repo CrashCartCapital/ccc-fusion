@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -8,6 +8,7 @@ import { acquireTaskWorktree, RepoRootWorktreeError } from "../worktree-acquisit
 import { classifyTaskWorktree, PoolDoubleLeaseError } from "../worktree-pool.js";
 import * as desktopArtifacts from "../worktree-desktop-artifacts.js";
 import * as branchConflicts from "../branch-conflicts.js";
+import { pinnedWorktreePathForTask } from "../worktree-pinning.js";
 
 vi.mock("../worktree-pool.js", async () => {
   const actual = await vi.importActual<any>("../worktree-pool.js");
@@ -75,6 +76,25 @@ function makeRepo(): string {
   return rootDir;
 }
 
+function addStaleCampaignWorktree(
+  rootDir: string,
+  worktreePath: string,
+): { frozenBase: string; staleHead: string } {
+  const commonParent = git(rootDir, "git rev-parse HEAD");
+  writeFileSync(join(rootDir, "sealed.txt"), "sealed\n", "utf-8");
+  git(rootDir, "git add sealed.txt");
+  git(rootDir, 'git commit -m "sealed campaign base"');
+  const frozenBase = git(rootDir, "git rev-parse HEAD");
+  mkdirSync(dirname(worktreePath), { recursive: true });
+  git(rootDir, `git worktree add -b fusion/fn-1 ${JSON.stringify(worktreePath)} ${commonParent}`);
+  writeFileSync(join(worktreePath, "stale.txt"), "stale remote history\n", "utf-8");
+  git(worktreePath, "git add stale.txt");
+  git(worktreePath, 'git commit -m "stale integration tip"');
+  const staleHead = git(worktreePath, "git rev-parse HEAD");
+  expect(() => git(worktreePath, `git merge-base --is-ancestor ${frozenBase} HEAD`)).toThrow();
+  return { frozenBase, staleHead };
+}
+
 afterEach(() => {
   for (const path of cleanupPaths.splice(0)) {
     rmSync(path, { recursive: true, force: true });
@@ -117,6 +137,180 @@ describe("acquireTaskWorktree", () => {
     });
     expect(result.source).toBe("existing");
     expect(result.worktreePath).toBe(worktreePath);
+  });
+
+  it("RED-R11-frozen-base refuses a resumed campaign entry worktree on stale sibling history", async () => {
+    const rootDir = makeRepo();
+    const worktreeRoot = track(mkdtempSync(join(tmpdir(), "ccc-frozen-base-resume-")));
+    const worktreePath = join(worktreeRoot, "wt");
+    const { frozenBase, staleHead } = addStaleCampaignWorktree(rootDir, worktreePath);
+    expect(staleHead).not.toBe(frozenBase);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: frozenBase },
+    }));
+    const createWorktree = vi.fn();
+
+    await expect(acquireTaskWorktree({
+      task: {
+        ...task,
+        lineageId: `ccc-prd:${"a".repeat(24)}:TASK-A`,
+        dependencies: [],
+        baseCommitSha: frozenBase,
+        worktree: worktreePath,
+        branch: "fusion/fn-1",
+      },
+      rootDir,
+      store,
+      settings: {},
+      createWorktree,
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_FROZEN_BASE_REFUSED",
+      message: expect.stringMatching(/does not descend from its sealed base/),
+    });
+    expect(createWorktree).not.toHaveBeenCalled();
+  });
+
+  it("allows a resumed campaign entry worktree that descends from the sealed base", async () => {
+    const rootDir = makeRepo();
+    writeFileSync(join(rootDir, "sealed.txt"), "sealed\n", "utf-8");
+    git(rootDir, "git add sealed.txt");
+    git(rootDir, 'git commit -m "sealed campaign base"');
+    const frozenBase = git(rootDir, "git rev-parse HEAD");
+    const worktreeRoot = track(mkdtempSync(join(tmpdir(), "ccc-frozen-base-valid-resume-")));
+    const worktreePath = join(worktreeRoot, "wt");
+    git(rootDir, `git worktree add -b fusion/fn-1 ${JSON.stringify(worktreePath)} ${frozenBase}`);
+    writeFileSync(join(worktreePath, "owned.txt"), "owned campaign work\n", "utf-8");
+    git(worktreePath, "git add owned.txt");
+    git(worktreePath, 'git commit -m "feat(FN-1): campaign task work"');
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: frozenBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    const result = await acquireTaskWorktree({
+      task: {
+        ...task,
+        lineageId: `ccc-prd:${"a".repeat(24)}:TASK-A`,
+        dependencies: [],
+        baseCommitSha: frozenBase,
+        worktree: worktreePath,
+        branch: "fusion/fn-1",
+      },
+      rootDir,
+      store,
+      settings: {},
+      createWorktree: vi.fn(),
+    });
+
+    expect(result).toMatchObject({
+      worktreePath,
+      branch: "fusion/fn-1",
+      source: "existing",
+      isResume: true,
+    });
+  });
+
+  it("allows the controller-owned campaign commit on resume", async () => {
+    const rootDir = makeRepo();
+    writeFileSync(join(rootDir, "sealed.txt"), "sealed\n", "utf-8");
+    git(rootDir, "git add sealed.txt");
+    git(rootDir, 'git commit -m "sealed campaign base"');
+    const frozenBase = git(rootDir, "git rev-parse HEAD");
+    const worktreeRoot = track(mkdtempSync(join(tmpdir(), "ccc-frozen-base-controller-resume-")));
+    const worktreePath = join(worktreeRoot, "wt");
+    git(rootDir, `git worktree add -b fusion/fn-1 ${JSON.stringify(worktreePath)} ${frozenBase}`);
+    writeFileSync(join(worktreePath, "owned.txt"), "controller-owned work\n", "utf-8");
+    git(worktreePath, "git add owned.txt");
+    git(
+      worktreePath,
+      'git -c user.name="ccc-fusion" -c user.email="ccc-fusion@localhost" commit -m "ccc-fusion campaign FN-1"',
+    );
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: frozenBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await expect(acquireTaskWorktree({
+      task: {
+        ...task,
+        lineageId: `ccc-prd:${"a".repeat(24)}:TASK-A`,
+        dependencies: [],
+        baseCommitSha: frozenBase,
+        worktree: worktreePath,
+        branch: "fusion/fn-1",
+      },
+      rootDir,
+      store,
+      settings: {},
+      createWorktree: vi.fn(),
+    })).resolves.toMatchObject({ source: "existing", isResume: true });
+  });
+
+  it("RED-R11-frozen-base refuses descendant integration drift that is not task-owned", async () => {
+    const rootDir = makeRepo();
+    writeFileSync(join(rootDir, "sealed.txt"), "sealed\n", "utf-8");
+    git(rootDir, "git add sealed.txt");
+    git(rootDir, 'git commit -m "sealed campaign base"');
+    const frozenBase = git(rootDir, "git rev-parse HEAD");
+    const worktreeRoot = track(mkdtempSync(join(tmpdir(), "ccc-frozen-base-descendant-drift-")));
+    const worktreePath = join(worktreeRoot, "wt");
+    git(rootDir, `git worktree add -b fusion/fn-1 ${JSON.stringify(worktreePath)} ${frozenBase}`);
+    writeFileSync(join(worktreePath, "integration.txt"), "unowned integration drift\n", "utf-8");
+    git(worktreePath, "git add integration.txt");
+    git(worktreePath, 'git commit -m "integration drift after sealed base"');
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: frozenBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await expect(acquireTaskWorktree({
+      task: {
+        ...task,
+        lineageId: `ccc-prd:${"a".repeat(24)}:TASK-A`,
+        dependencies: [],
+        baseCommitSha: frozenBase,
+        worktree: worktreePath,
+        branch: "fusion/fn-1",
+      },
+      rootDir,
+      store,
+      settings: {},
+      createWorktree: vi.fn(),
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_FROZEN_BASE_REFUSED",
+      message: expect.stringMatching(/not owned by this campaign task/),
+    });
+  });
+
+  it("RED-R11-frozen-base refuses pinned warm reuse on stale sibling history", async () => {
+    const rootDir = makeRepo();
+    const settings = { worktreeNaming: "task-id", recycleWorktrees: false } as const;
+    const worktreePath = pinnedWorktreePathForTask(task.id, settings, rootDir);
+    const { frozenBase, staleHead } = addStaleCampaignWorktree(rootDir, worktreePath);
+    expect(staleHead).not.toBe(frozenBase);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: frozenBase },
+    }));
+    const createWorktree = vi.fn();
+
+    await expect(acquireTaskWorktree({
+      task: {
+        ...task,
+        lineageId: `ccc-prd:${"a".repeat(24)}:TASK-A`,
+        dependencies: [],
+        baseCommitSha: frozenBase,
+        worktree: worktreePath,
+        branch: "fusion/fn-1",
+      },
+      rootDir,
+      store,
+      settings,
+      createWorktree,
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_FROZEN_BASE_REFUSED",
+      message: expect.stringMatching(/does not descend from its sealed base/),
+    });
+    expect(createWorktree).not.toHaveBeenCalled();
   });
 
   // Regression: FN-5475 — when a resumed worktree's branch was created from
