@@ -315,12 +315,15 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
   });
 
-  it("TSK-001 runs an exact fenced CCC Pi coding node as implementation without a reviewer verdict", async () => {
+  it.each([
+    "ccc-prd.execution-prompt.v1",
+    "ccc-prd.execution-prompt.v2",
+  ])("TSK-001 runs an exact fenced CCC Pi coding node with %s as implementation without a reviewer verdict", async (promptSchema) => {
     const { binding, execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
       "Files written and targeted verification passed.",
       "/tmp/ccc-campaign-implementation",
     );
-    const node = campaignModelNode(execution);
+    const node = campaignModelNode(execution, { cccExecutionPromptSchema: promptSchema });
 
     const result = await (executor as any).runGraphCustomNode(
       node,
