@@ -190,6 +190,26 @@ describe("CCC campaign chained task worktree base", () => {
     expect(createWorktree).toHaveBeenCalledTimes(1);
   });
 
+  it("RED-R11-frozen-base reacquires an entry campaign task after safe cleanup clears its cached base", async () => {
+    const { store, executor, createWorktree } = makeHarness({
+      "FN-1001": taskRow({
+        lineageId: campaignLineage("TASK-A"),
+        dependencies: [],
+        baseCommitSha: undefined,
+        worktree: undefined,
+        branch: undefined,
+      }),
+    }, [FROZEN_BASE, "main"]);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: "/tmp/test", baseCommit: FROZEN_BASE },
+    })) as never;
+
+    await prepare(executor, store, codingNode("TASK-A"), "FN-1001");
+
+    expect(capturedStartPoint(createWorktree)).toBe(FROZEN_BASE);
+    expect(createWorktree).toHaveBeenCalledTimes(1);
+  });
+
   it("RED-R11-frozen-base outranks a stale explicit start-branch hint for an entry campaign task", async () => {
     const { store, executor, createWorktree } = makeHarness({
       "FN-1001": taskRow({
