@@ -1248,6 +1248,11 @@ async function runSemanticProofV2(
         await dependencies.verifyToolchain(materialized.sealedExecutionToolchain);
         await dependencies.preflightSandbox(sandboxPolicyFor(materialized));
       } catch (error) {
+        process.stderr.write(
+          `[ccc-semantic-proof-diagnostic] proof=${proof.id} phase=${execution.phase} ${
+            error instanceof Error ? error.stack ?? error.message : String(error)
+          }\n`,
+        );
         proofRefusal(
           `CCC campaign semantic proof ${proof.id} pre-dispatch custody refused: ${
             error instanceof Error ? error.message : String(error)
