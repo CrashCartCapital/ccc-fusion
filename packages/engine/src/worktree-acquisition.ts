@@ -263,7 +263,7 @@ export async function assertCccCampaignEntryFrozenBaseCustody(
     );
   }
   const frozenBase = context.targetRepository.baseCommit;
-  if (task.baseCommitSha !== frozenBase) {
+  if (task.baseCommitSha != null && task.baseCommitSha !== frozenBase) {
     throw new PermanentError(
       `CCC campaign entry task ${task.id} persisted base does not match its sealed base`,
       CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
