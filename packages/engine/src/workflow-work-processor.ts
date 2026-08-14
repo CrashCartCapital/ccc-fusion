@@ -565,7 +565,11 @@ function startWorkflowLeaseRenewal(
   return setInterval(() => {
     if (renewalInFlight) return;
     renewalInFlight = true;
-    void Promise.resolve(renewWorkflowWorkItemLease(workItem.id, opts.leaseOwner, workItem.attempt, {
+    /*
+    FNXC:CccCampaignWorkflowLease 2026-08-14-10:03: TaskStore lease renewal is
+    receiver-dependent; preserve its store binding across the interval callback.
+    */
+    void Promise.resolve(renewWorkflowWorkItemLease.call(store, workItem.id, opts.leaseOwner, workItem.attempt, {
       leaseDurationMs: opts.leaseDurationMs,
     }))
       .then((renewed) => {
