@@ -40,6 +40,7 @@ import {
   type CccSemanticProofSandboxedProcessResult,
   type RunCccSemanticProofSandboxedProcessInput,
 } from "./ccc-campaign-proof-sandbox.js";
+import { AgentSemaphore, PRIORITY_EXECUTE } from "./concurrency.js";
 import { resolveCccCampaignExpectedStartCommit } from "./ccc-campaign-required-commit.js";
 import { PermanentError } from "./engine-errors.js";
 import {
@@ -1167,6 +1168,24 @@ type SemanticProofRuntimeDependencies = Readonly<{
   ) => Promise<CccSemanticProofSandboxedProcessResult>;
 }>;
 
+// macOS can refuse freshly sealed Node copies when several proof nodes seal and
+// probe them at once. This host-wide custody step is intentionally fixed at one;
+// provider and verifier execution concurrency remain governed separately.
+const semanticProofPreparationSemaphore = new AgentSemaphore(1);
+
+async function withSerializedSemanticProofPreparation<T>(
+  prepare: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  await semanticProofPreparationSemaphore.acquire(PRIORITY_EXECUTE, signal);
+  try {
+    signal?.throwIfAborted();
+    return await prepare();
+  } finally {
+    semanticProofPreparationSemaphore.release();
+  }
+}
+
 async function runSemanticProofV2(
   input: CreateCccCampaignProofSuiteHandlerInput,
   dependencies: SemanticProofRuntimeDependencies,
@@ -1231,23 +1250,27 @@ async function runSemanticProofV2(
         ]),
       });
       try {
-        materialized = await dependencies.materialize({
-          repositoryRoot: execution.snapshot.targetRoot,
-          baseCommit: execution.campaign.targetRepository.baseCommit,
-          sourceCommit: execution.snapshot.sourceCommit,
-          proof,
-          modelWriteRoots: execution.verifierDisjointRoots,
-          outputRoot: tempRoot,
-        });
-        if (
-          materialized.closureSha256 !== digests.verifierClosureSha256
-          || materialized.candidateInputsSha256 !== digests.candidateInputsSha256
-        ) {
-          throw new Error("materialized proof digests differ from immutable admission");
-        }
-        await dependencies.verifyToolchain(materialized.sealedExecutionToolchain);
-        await dependencies.preflightSandbox(sandboxPolicyFor(materialized));
+        materialized = await withSerializedSemanticProofPreparation(async () => {
+          const prepared = await dependencies.materialize({
+            repositoryRoot: execution.snapshot.targetRoot,
+            baseCommit: execution.campaign.targetRepository.baseCommit,
+            sourceCommit: execution.snapshot.sourceCommit,
+            proof,
+            modelWriteRoots: execution.verifierDisjointRoots,
+            outputRoot: tempRoot,
+          });
+          if (
+            prepared.closureSha256 !== digests.verifierClosureSha256
+            || prepared.candidateInputsSha256 !== digests.candidateInputsSha256
+          ) {
+            throw new Error("materialized proof digests differ from immutable admission");
+          }
+          await dependencies.verifyToolchain(prepared.sealedExecutionToolchain);
+          await dependencies.preflightSandbox(sandboxPolicyFor(prepared));
+          return prepared;
+        }, context.signal);
       } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") throw error;
         proofRefusal(
           `CCC campaign semantic proof ${proof.id} pre-dispatch custody refused: ${
             error instanceof Error ? error.message : String(error)
