@@ -29,7 +29,11 @@ import {
   isImportedCccCampaignWorkItem,
 } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
-import { CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE } from "@fusion/core";
+import {
+  CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
+  CCC_PRD_EXECUTION_PROMPT_V1_SCHEMA_VERSION,
+  CCC_PRD_EXECUTION_PROMPT_V2_SCHEMA_VERSION,
+} from "@fusion/core";
 import { matchesCccCampaignMergeControl, resolveCccCampaignMergeCustody } from "./ccc-campaign-merge-control.js";
 import {
   requireCccCampaignLiveExecutionApproval,
@@ -1983,7 +1987,10 @@ function isExactFencedCccCampaignImplementationNode(
     && cfg.cccNativeTaskId.length > 0
     && cfg.cccNativeTaskId === cfg.cccNativeTaskId.trim()
     && cfg.cccNativeTaskId === execution.nativeTaskId
-    && cfg.cccExecutionPromptSchema === "ccc-prd.execution-prompt.v1"
+    && (
+      cfg.cccExecutionPromptSchema === CCC_PRD_EXECUTION_PROMPT_V1_SCHEMA_VERSION
+      || cfg.cccExecutionPromptSchema === CCC_PRD_EXECUTION_PROMPT_V2_SCHEMA_VERSION
+    )
     && typeof cfg.cccExecutionPromptSha256 === "string"
     && LOWER_HEX_SHA256_PATTERN.test(cfg.cccExecutionPromptSha256)
     && typeof cfg.cccExecutionProviderId === "string"
