@@ -29,7 +29,7 @@
  * therefore anchor-refusal in product-status.ts, not a query-scoping change
  * in provider-attempt.ts.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   productNextAction,
   providerAttemptStatusesForCampaign,
@@ -253,6 +253,7 @@ function executionAuthorization(
   return {
     authorizationId: `ccc-execution-authorization-${"9".repeat(64)}`,
     status,
+    expiresAt: "2999-01-01T00:00:00.000Z",
     members: [
       { nativeTaskId: "task-1", approvalRequestId: `ccc-approval-${"a".repeat(64)}` },
       { nativeTaskId: "task-2", approvalRequestId: `ccc-approval-${"b".repeat(64)}` },
@@ -276,6 +277,7 @@ function nextActionInput(
 ): CccPrdProductNextActionInput {
   return {
     row: { state: "active", runnable: 1 } as unknown as CccPrdProductNextActionInput["row"],
+    observedAt: "2026-08-01T00:00:00.000Z",
     requestBudget: overrides.requestBudget ?? {
       scope: "campaign-global",
       maximum: 24,
@@ -370,6 +372,78 @@ describe("productNextAction multi-task live-execution holds", () => {
       executionAuthorizationStatus: "issued",
     });
     expect(action).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("RED-R11-expired-parent-status: blocks an expired sealed parent instead of advertising approve-execution", () => {
+    const authorization = {
+      ...executionAuthorization(),
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    };
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: authorization,
+      approvals: [
+        approval({ id: authorization.members[0]!.approvalRequestId, taskId: "task-1" }),
+        approval({ id: authorization.members[1]!.approvalRequestId, taskId: "task-2" }),
+      ],
+    }));
+
+    expect(action).toMatchObject({
+      kind: "blocked",
+      diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+      nextSafeAction: expect.stringContaining("fresh semantic-v2 import"),
+    });
+    expect(action).not.toHaveProperty("executionAuthorizationId");
+  });
+
+  it("RED-R11-expired-claimed-parent: blocks an expired claimed parent after runtime requeue", () => {
+    const authorization = {
+      ...executionAuthorization("claimed"),
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    };
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({
+        taskId: "task-1",
+        state: "runnable",
+        lastError: null,
+        blockedReason: null,
+      })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: authorization,
+    }));
+
+    expect(action).toMatchObject({
+      kind: "blocked",
+      diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+      nextSafeAction: expect.stringContaining("fresh semantic-v2 import"),
+    });
+  });
+
+  it("RED-R11-expired-parent-db-clock: trusts the status snapshot clock when the app clock lags", () => {
+    const authorization = {
+      ...executionAuthorization(),
+      expiresAt: "2026-08-14T14:19:04.384Z",
+    };
+    const appClock = vi.spyOn(Date, "now")
+      .mockReturnValue(Date.parse("2026-08-14T14:00:00.000Z"));
+    try {
+      const action = productNextAction({
+        ...nextActionInput({
+          workItems: [workItem({ taskId: "task-1" })],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+        }),
+        observedAt: "2026-08-14T14:30:00.000Z",
+      });
+
+      expect(action).toMatchObject({
+        kind: "blocked",
+        diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+      });
+    } finally {
+      appClock.mockRestore();
+    }
   });
 
   it("fails closed when a sealed live-execution hold has child diagnostics but no parent", () => {
@@ -608,6 +682,89 @@ describe("productNextAction request-budget custody precedence", () => {
       kind: "blocked",
       reason: "Persisted campaign custody is missing a task, route, or declared proof.",
     });
+  });
+});
+
+describe("productNextAction runtime-lease snapshot clock", () => {
+  it("RED-R11-lease-db-clock: treats a proof lease expired by database time as unowned when the app clock lags", () => {
+    const unknown = proofAttempt("dispatched_unknown", {
+      workItemId: "proof-work-item",
+      runId: "proof-run",
+      workItemAttempt: 3,
+    });
+    const appClock = vi.spyOn(Date, "now")
+      .mockReturnValue(Date.parse("2026-08-14T14:00:00.000Z"));
+    try {
+      const action = productNextAction({
+        ...nextActionInput({
+          workItems: [workItem({
+            id: unknown.workItemId,
+            runId: unknown.runId,
+            state: "running",
+            attempt: unknown.workItemAttempt,
+            leaseOwner: "proof-runtime",
+            leaseExpiresAt: "2026-08-14T14:15:00.000Z",
+            lastError: null,
+            blockedReason: null,
+          })],
+          proofs: [{
+            definition: {} as never,
+            definitionSha256: unknown.definitionSha256,
+            attempts: [unknown],
+          }],
+        }),
+        observedAt: "2026-08-14T14:30:00.000Z",
+      });
+
+      expect(action).toEqual({
+        kind: "resolve-manual-required",
+        reason: `Proof attempt ${unknown.attemptKey} has an uncertain external effect.`,
+      });
+    } finally {
+      appClock.mockRestore();
+    }
+  });
+
+  it("RED-R11-lease-db-clock: keeps a provider attempt runtime-owned by database time when the app clock is ahead", () => {
+    const fence = {
+      workItemId: "provider-work-item",
+      runId: "provider-run",
+      attempt: 4,
+    };
+    const unknown = providerAttemptStatusesForCampaign([
+      scope({
+        state: "dispatched_unknown",
+        workItemFence: fence,
+      }),
+    ])[0]!;
+    const appClock = vi.spyOn(Date, "now")
+      .mockReturnValue(Date.parse("2026-08-14T15:00:00.000Z"));
+    try {
+      const action = productNextAction({
+        ...nextActionInput({
+          workItems: [workItem({
+            id: fence.workItemId,
+            runId: fence.runId,
+            state: "running",
+            attempt: fence.attempt,
+            leaseOwner: "provider-runtime",
+            leaseExpiresAt: "2026-08-14T14:45:00.000Z",
+            lastError: null,
+            blockedReason: null,
+          })],
+          providerAttempts: [unknown],
+        }),
+        observedAt: "2026-08-14T14:30:00.000Z",
+      });
+
+      expect(action).toEqual({
+        kind: "wait-for-runtime",
+        reason:
+          "Campaign provider/proof work is reserved or in flight and still owned by the runtime.",
+      });
+    } finally {
+      appClock.mockRestore();
+    }
   });
 });
 
