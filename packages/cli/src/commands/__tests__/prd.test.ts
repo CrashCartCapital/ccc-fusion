@@ -152,8 +152,8 @@ function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" =
     executionPolicySha256: "6".repeat(64),
     targetRepository: "/tmp/product-target",
     targetBase: "d".repeat(40),
-    campaignStartedAt: "2026-07-31T00:00:00.000Z",
-    campaignDeadlineAt: "2026-07-31T02:00:00.000Z",
+    campaignStartedAt: "2999-01-01T00:00:00.000Z",
+    campaignDeadlineAt: "2999-01-01T02:00:00.000Z",
     maxRequests: 24,
     maxConcurrency: 1,
     authorizationId: `ccc-execution-authorization-${authorizationDigest}`,
@@ -170,10 +170,10 @@ function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" =
       actorType: "agent" as const,
       actorName: "CCC Campaign Runtime",
     },
-    notBeforeAt: "2026-07-31T00:00:00.000Z",
-    expiresAt: "2026-07-31T01:00:00.000Z",
-    createdAt: "2026-07-31T00:00:00.000Z",
-    updatedAt: "2026-07-31T00:00:00.000Z",
+    notBeforeAt: "2999-01-01T00:00:00.000Z",
+    expiresAt: "2999-01-01T01:00:00.000Z",
+    createdAt: "2999-01-01T00:00:00.000Z",
+    updatedAt: "2999-01-01T00:00:00.000Z",
   };
 }
 
@@ -2025,6 +2025,63 @@ describe("prd command exit contract", () => {
     expect(computeConfirmation).not.toHaveBeenCalled();
   });
 
+  it("RED-R11-expired-parent-status: emits no confirmation for an expired issued parent authorization", async () => {
+    const authorization = {
+      ...sealedExecutionAuthorization(),
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    };
+    const computeConfirmation = vi.fn(() => "8".repeat(64));
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["status", "operator-key"],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+          approvals: [],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "blocked",
+            reason: "The sealed execution authorization expired.",
+            diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: computeConfirmation,
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    const payload = JSON.parse(output[0]!);
+    expect(payload).not.toHaveProperty("liveExecutionAuthorizationConfirmation");
+    expect(payload.liveExecutionApprovalConfirmations).toEqual([]);
+    expect(computeConfirmation).not.toHaveBeenCalled();
+  });
+
   it("emits no child execution confirmations when sealed parent custody is missing", async () => {
     const childApproval = diagnosticLiveApproval(
       `ccc-approval-${"a".repeat(64)}`,
@@ -3124,6 +3181,7 @@ describe("prd command exit contract", () => {
     };
     const before = {
       schema: "ccc-prd.product-status.v1",
+      observedAt: "2026-08-14T00:00:00.000Z",
       projectId: "project-1",
       import: {
         importId: "import-1",
@@ -3220,6 +3278,182 @@ describe("prd command exit contract", () => {
       status: { nextAction: { kind: "wait-for-runtime" } },
     });
     expect(JSON.parse(output[0]!)).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("RED-R11-expired-parent-approve: refuses an expired parent before verifier preflight or engine claim", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = {
+      ...sealedExecutionAuthorization(),
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    };
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const approveExecution = vi.fn(async () => {
+      throw new Error("expired authorization reached the engine");
+    });
+    const inspectReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "sandbox-exec" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "verifier confinement readiness probe executed successfully",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+    }));
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", authorization.authorizationId, "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [workItem],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+          approvals: [],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "blocked",
+            reason: "The sealed execution authorization expired.",
+            diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: inspectReadiness,
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+        message: expect.stringContaining("fresh semantic-v2 import"),
+      }],
+    });
+    expect(inspectReadiness).not.toHaveBeenCalled();
+    expect(approveExecution).not.toHaveBeenCalled();
+  });
+
+  it("RED-R11-expired-claimed-parent: refuses an expired claimed parent after runtime requeue", async () => {
+    const confirmation = "8".repeat(64);
+    const authorization = {
+      ...sealedExecutionAuthorization("claimed"),
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    };
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "runnable",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: null,
+      blockedReason: null,
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const approveExecution = vi.fn(async () => {
+      throw new Error("expired claimed authorization reached the engine");
+    });
+    const inspectReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "sandbox-exec" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "verifier confinement readiness probe executed successfully",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+    }));
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", authorization.authorizationId, "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          observedAt: "2026-08-14T14:30:00.000Z",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [workItem],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+          approvals: [],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "wait-for-runtime",
+            reason: "Campaign work was already requeued.",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => confirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: inspectReadiness,
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+        message: expect.stringContaining("fresh semantic-v2 import"),
+      }],
+    });
+    expect(inspectReadiness).not.toHaveBeenCalled();
+    expect(approveExecution).not.toHaveBeenCalled();
   });
 
   it("refuses a diagnostic child approval ID when a sealed parent authorization exists", async () => {

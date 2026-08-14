@@ -2275,6 +2275,9 @@ async function runProductControlCommand(
           status.executionAuthorization.status === "issued"
           || status.executionAuthorization.status === "claimed"
         )
+        && status.nextAction.kind === "approve-execution"
+        && status.nextAction.executionAuthorizationId
+          === status.executionAuthorization.authorizationId
         ? {
           authorizationId: status.executionAuthorization.authorizationId,
           confirmation: computeLiveExecutionConfirmation(status.executionAuthorization),
@@ -2335,6 +2338,26 @@ async function runProductControlCommand(
           sealedExecutionAuthorization
             ? `live-execution authorization ${approvalRequestId} is missing from exact product status`
             : `live-execution approval ${approvalRequestId} is missing from exact product status`,
+        );
+      }
+      if (
+        authorization
+        && (
+          (
+            status.nextAction.kind === "blocked"
+            && status.nextAction.diagnostic
+              === "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED"
+          )
+          || (
+            Number.isFinite(Date.parse(status.observedAt))
+            && Number.isFinite(Date.parse(authorization.expiresAt))
+            && Date.parse(authorization.expiresAt) <= Date.parse(status.observedAt)
+          )
+        )
+      ) {
+        throw new PrdProductCommandError(
+          "CCC_PRD_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+          `live-execution authorization ${authorization.authorizationId} expired; preserve this import and create a fresh semantic-v2 import with a new campaign deadline`,
         );
       }
       const expectedConfirmation = computeLiveExecutionConfirmation(

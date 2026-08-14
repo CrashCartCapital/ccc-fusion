@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, or } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import type {
   CccCampaignAuthorityBinding,
   CccCampaignExecutionAuthorizationMode,
@@ -263,6 +263,7 @@ export type CccPrdProductLandingAudit = Readonly<{
 
 export type CccPrdProductStatus = Readonly<{
   schema: typeof CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION;
+  observedAt: string;
   projectId: string;
   import: Readonly<{
     importId: string;
@@ -748,7 +749,10 @@ function isKnownVerifierConfinementFailure(
     || value.includes("failed to build Linux verifier sandbox policy ("));
 }
 
-function hasLiveRuntimeLease(item: CccPrdProductWorkItemStatus): boolean {
+function hasLiveRuntimeLease(
+  item: CccPrdProductWorkItemStatus,
+  observedAt: string,
+): boolean {
   if (
     item.state !== "running"
     || item.leaseOwner === null
@@ -757,11 +761,15 @@ function hasLiveRuntimeLease(item: CccPrdProductWorkItemStatus): boolean {
     return false;
   }
   const leaseExpiresAt = Date.parse(item.leaseExpiresAt);
-  return Number.isFinite(leaseExpiresAt) && leaseExpiresAt > Date.now();
+  const databaseObservedAt = Date.parse(observedAt);
+  return Number.isFinite(leaseExpiresAt)
+    && Number.isFinite(databaseObservedAt)
+    && leaseExpiresAt > databaseObservedAt;
 }
 
 export type CccPrdProductNextActionInput = Readonly<{
   row: ProductImportRow;
+  observedAt: string;
   requestBudget: CccPrdProductRequestBudgetStatus;
   providerAttemptHistoryConsistent?: boolean;
   taskStatuses: readonly CccPrdProductTaskStatus[];
@@ -872,24 +880,24 @@ export function productNextAction(
       + reservedProviders.length
     ) > 0
     && reservedProofs.every((attempt) => input.workItems.some((item) =>
-      hasLiveRuntimeLease(item)
+      hasLiveRuntimeLease(item, input.observedAt)
       && item.id === attempt.workItemId
       && item.runId === attempt.runId
       && item.attempt === attempt.workItemAttempt))
     && unknownProofs.every((attempt) => input.workItems.some((item) =>
-      hasLiveRuntimeLease(item)
+      hasLiveRuntimeLease(item, input.observedAt)
       && item.id === attempt.workItemId
       && item.runId === attempt.runId
       && item.attempt === attempt.workItemAttempt))
     && unknownProviders.every((attempt) => attempt.workItemFence !== null
       && input.workItems.some((item) =>
-        hasLiveRuntimeLease(item)
+        hasLiveRuntimeLease(item, input.observedAt)
         && item.id === attempt.workItemFence!.workItemId
         && item.runId === attempt.workItemFence!.runId
         && item.attempt === attempt.workItemFence!.attempt))
     && reservedProviders.every((attempt) => attempt.workItemFence !== null
       && input.workItems.some((item) =>
-        hasLiveRuntimeLease(item)
+        hasLiveRuntimeLease(item, input.observedAt)
         && item.id === attempt.workItemFence!.workItemId
         && item.runId === attempt.workItemFence!.runId
         && item.attempt === attempt.workItemFence!.attempt));
@@ -1135,6 +1143,57 @@ export function productNextAction(
       return {
         kind: "landing-recovery",
         reason: "Merge approval was consumed without a terminal Git landing audit.",
+      };
+    }
+  }
+  if (
+    input.executionAuthorizationMode === "sealed_bundle_v1"
+    && input.executionAuthorization
+    && (
+      input.executionAuthorization.status === "issued"
+      || input.executionAuthorization.status === "claimed"
+    )
+  ) {
+    const authorizationExpiresAt = Date.parse(input.executionAuthorization.expiresAt);
+    const observedAt = Date.parse(input.observedAt);
+    if (!Number.isFinite(observedAt)) {
+      return {
+        kind: "blocked",
+        reason: "Product status could not establish an authoritative database clock.",
+        diagnostic: "CCC_CAMPAIGN_STATUS_DATABASE_CLOCK_INVALID",
+        nextSafeAction:
+          "Preserve campaign custody and repair the product-status database clock before approving execution.",
+      };
+    }
+    if (!Number.isFinite(authorizationExpiresAt)) {
+      return {
+        kind: "blocked",
+        reason: "The sealed live-execution authorization window is invalid.",
+        diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_WINDOW_INVALID",
+        nextSafeAction:
+          "Preserve campaign custody and inspect the persisted parent authorization before any execution.",
+      };
+    }
+    if (authorizationExpiresAt <= observedAt) {
+      const preservedWorkItem = liveExecutionApprovalWorkItem ?? input.workItems[0];
+      return {
+        kind: "blocked",
+        reason:
+          "The sealed live-execution authorization window expired before the campaign could start or continue provider work.",
+        diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+        safeState: preservedWorkItem
+          ? `Workflow work item ${preservedWorkItem.id} remains ${preservedWorkItem.state}; no new provider effect may start under the expired parent authorization. Existing attempts, worktrees, and receipts remain preserved.`
+          : "No new provider effect may start under the expired parent authorization. Existing attempts, worktrees, and receipts remain preserved.",
+        decisionOwner: "Campaign operator",
+        consequence:
+          "This immutable import cannot authorize a new provider request after its sealed deadline.",
+        recoveryOptions: [
+          "Retain this expired import and its persisted custody as immutable evidence; do not retry its authorization.",
+          "Create a fresh semantic-v2 preview and import with a new campaign deadline.",
+          "Confirm only the new parent authorization emitted by that fresh import.",
+        ],
+        nextSafeAction:
+          "Create and confirm a fresh semantic-v2 import with a new campaign deadline.",
       };
     }
   }
@@ -1713,8 +1772,25 @@ export async function inspectCccPrdProductStatus(
       }
       providerAttemptHistoryConsistent = false;
     }
+    // Read the authority clock after collecting the status snapshot so an
+    // authorization that expires during inspection is never advertised as
+    // actionable in the returned result.
+    const databaseClockRows = await tx.execute(sql`
+      SELECT to_char(
+        clock_timestamp() AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      ) AS now
+    `) as unknown as Array<{ now: string }>;
+    const observedAt = databaseClockRows[0]?.now;
+    if (typeof observedAt !== "string" || !Number.isFinite(Date.parse(observedAt))) {
+      throw new CccPrdImportError(
+        "CCC_PRD_PRODUCT_STATUS_DATABASE_CLOCK_INVALID",
+        "CCC PRD product status could not read the canonical database clock",
+      );
+    }
     const nextAction = productNextAction({
       row,
+      observedAt,
       requestBudget,
       providerAttemptHistoryConsistent,
       taskStatuses,
@@ -1734,6 +1810,7 @@ export async function inspectCccPrdProductStatus(
 
     return {
       schema: CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION,
+      observedAt,
       projectId,
       import: {
         importId: row.importId,

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import {
   beginCccCampaignProofAttemptDispatch,
   canonicalCccPrdJson,
@@ -196,6 +196,13 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     const { source, imported } = await importAdmittedProduct(
       "product-status-provider-unknown",
       "product-status-provider-unknown",
+      (bundle) => rehashCccPrdImportTestBundle({
+        ...bundle,
+        bounds: {
+          ...bundle.bounds,
+          maxDurationMs: 120_000,
+        },
+      }),
     );
     const taskId = await nativeTaskIdForImport(
       imported.importId,
@@ -547,6 +554,40 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       })),
     ));
     expect(resumedStatus?.nextAction).toMatchObject({ kind: "wait-for-runtime" });
+
+    const laggingAppClock = vi.spyOn(Date, "now")
+      .mockReturnValue(Date.parse(campaign.campaignStartedAt) + 1);
+    try {
+      await h.layer().db.execute(sql`
+        SELECT pg_sleep(
+          GREATEST(
+            0,
+            EXTRACT(EPOCH FROM (
+              ${campaign.campaignDeadlineAt}::timestamptz - clock_timestamp()
+            ))
+          ) + 0.05
+        )
+      `);
+      const expiredStatus = await inspectCccPrdProductStatus({
+        idempotencyKey: "product-status-live",
+        layer: h.layer(),
+        rootDir: h.rootDir(),
+      });
+      expect(expiredStatus).toMatchObject({
+        executionAuthorization: {
+          authorizationId: issued.authorizationId,
+          status: "claimed",
+        },
+        nextAction: {
+          kind: "blocked",
+          diagnostic: "CCC_CAMPAIGN_LIVE_EXECUTION_AUTHORIZATION_EXPIRED",
+        },
+      });
+      expect(Date.parse(expiredStatus!.observedAt))
+        .toBeGreaterThanOrEqual(Date.parse(campaign.campaignDeadlineAt));
+    } finally {
+      laggingAppClock.mockRestore();
+    }
   });
 
   it("keeps manifest-v1 imports on their exact per-task approval status contract", async () => {
