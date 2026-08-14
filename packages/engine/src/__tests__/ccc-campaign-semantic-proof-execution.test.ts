@@ -616,7 +616,11 @@ function semanticHandler(
   options: {
     attempts?: ReturnType<typeof attemptApi>;
     tasks?: ReadonlyMap<string, TaskDetail>;
+    materializeSemanticProof?: (
+      input: { outputRoot: string },
+    ) => Promise<ReturnType<typeof materializedFixture>>;
     verifyToolchain?: () => Promise<void>;
+    preflightSemanticProofSandbox?: () => Promise<void>;
     runSandbox?: () => Promise<ReturnType<typeof processResult>>;
   } = {},
 ) {
@@ -640,10 +644,12 @@ function semanticHandler(
       assertCccCampaignWorkflowLeaseFence: async () => undefined,
     },
     semanticProofAttempts: attempts,
-    materializeSemanticProof: async ({ outputRoot }: { outputRoot: string }) =>
-      materializedFixture(outputRoot, admission, f.proof.executionToolchain),
+    materializeSemanticProof: options.materializeSemanticProof
+      ?? (async ({ outputRoot }: { outputRoot: string }) =>
+        materializedFixture(outputRoot, admission, f.proof.executionToolchain)),
     verifySemanticProofToolchain: options.verifyToolchain ?? (async () => undefined),
-    preflightSemanticProofSandbox: async () => undefined,
+    preflightSemanticProofSandbox: options.preflightSemanticProofSandbox
+      ?? (async () => undefined),
     runSemanticProofSandbox: runSandbox,
   } as never);
   return { handler, attempts, runSandbox };
@@ -654,6 +660,35 @@ afterEach(async () => {
 });
 
 describe("CCC semantic proof v2 execution", () => {
+  it("RED-R11-proof-preflight-concurrency: serializes sealed toolchain preparation across concurrent proof nodes", async () => {
+    const first = await fixture();
+    const second = await fixture();
+    let activePreparations = 0;
+    let maximumActivePreparations = 0;
+
+    const preparationFor = (f: SemanticFixture) => {
+      const materializeSemanticProof = async ({ outputRoot }: { outputRoot: string }) => {
+        activePreparations += 1;
+        maximumActivePreparations = Math.max(maximumActivePreparations, activePreparations);
+        return materializedFixture(outputRoot, f.proof.admission!, f.proof.executionToolchain);
+      };
+      const preflightSemanticProofSandbox = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        activePreparations -= 1;
+      };
+      return { materializeSemanticProof, preflightSemanticProofSandbox };
+    };
+    const firstHandler = semanticHandler(first, preparationFor(first)).handler;
+    const secondHandler = semanticHandler(second, preparationFor(second)).handler;
+
+    await Promise.all([
+      firstHandler(first.node, first.context),
+      secondHandler(second.node, second.context),
+    ]);
+
+    expect(maximumActivePreparations).toBe(1);
+  });
+
   it("RED-S5-task-delta proves a serial successor from full HEAD but binds only its own delta", async () => {
     const f = await serialSuccessorFixture();
     const { handler, attempts } = semanticHandler(f, { tasks: f.tasks });
