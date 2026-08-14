@@ -954,6 +954,51 @@ describe("processDueWorkflowWorkItem symbol lock renewal", () => {
     }));
   });
 
+  it("RED-S6-lease-receiver: a successful campaign lease renewal keeps its TaskStore receiver", async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const run = vi.fn((_task, _settings, options) => new Promise<any>((resolve) => {
+      finish = () => resolve({ disposition: "completed", outcome: "success", visitedNodeIds: [], context: {} });
+      options.signal.addEventListener("abort", () => resolve({
+        disposition: "failed",
+        outcome: "failure",
+        visitedNodeIds: [],
+        context: {},
+        reason: "workflow-aborted",
+      }), { once: true });
+    }));
+    const transitionWorkflowWorkItem = vi.fn(async (_id, state) => ({ ...item, state }));
+    const store = {
+      renewedItem: item,
+      listDueWorkflowWorkItems: async () => [item],
+      acquireWorkflowWorkItemLease: async () => item,
+      transitionWorkflowWorkItem,
+      async renewWorkflowWorkItemLease() {
+        return this.renewedItem;
+      },
+      getCccCampaignContextForTask: async () => campaignContext(),
+      getTask: async () => ({ id: "FN-renew", title: "Campaign task", summary: "already summarized" }),
+    };
+
+    const processing = processDueWorkflowWorkItem(store as any, { run } as any, undefined, {
+      leaseOwner: "worker",
+      leaseDurationMs: 900,
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    finish();
+
+    const result = await processing;
+    expect(result.runtime).toEqual(expect.objectContaining({
+      disposition: "completed",
+      outcome: "success",
+    }));
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(item.id, "succeeded", expect.objectContaining({
+      expectedState: "running",
+      expectedLeaseOwner: "worker",
+      expectedAttempt: 1,
+    }));
+  });
+
   it("Task 3 RED: campaign work persists fenced failure before runtime when native work-item lease renewal is absent", async () => {
     const run = vi.fn(async () => ({ disposition: "completed", outcome: "success", visitedNodeIds: [], context: {} }));
     const transitionWorkflowWorkItem = vi.fn(async () => ({ ...item, state: "failed" }));
