@@ -16,10 +16,17 @@ import { afterEach, expect } from "vitest";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { isMainThread } from "node:worker_threads";
 import { assertOutsideRealFusionPath } from "../test-safety.js";
+import {
+  resolveTrustedTestGitFile,
+  resolveTrustedTestGitShell,
+  pathUsesSafeExecGitShim,
+  type TrustedTestGitContext,
+} from "./git-subprocess-policy.js";
 import {
   resolveReservedPortsFromEnv,
   shouldRunPortProbe,
@@ -528,6 +535,40 @@ function ensureRuntimeIsolationForSubprocess(): void {
   ensureWorkerCwdForSubprocess();
 }
 
+type SubprocessIsolationOptions = {
+  cwd?: string | URL | undefined;
+  env?: NodeJS.ProcessEnv | undefined;
+};
+
+function trustedTestGitContext(options?: SubprocessIsolationOptions): TrustedTestGitContext {
+  const configuredCwd = options?.cwd;
+  const env = options?.env ?? process.env;
+  const cwd = configuredCwd instanceof URL
+    ? fileURLToPath(configuredCwd)
+    : configuredCwd ?? originalCwd();
+  return {
+    cwd,
+    workerRoot: WORKER_ROOT,
+    env,
+    enableTrustedGitBypass: pathUsesSafeExecGitShim(env.PATH ?? ""),
+  };
+}
+
+function withTrustedTestGitPath<T extends SubprocessIsolationOptions>(
+  options: T | undefined,
+  enabled: boolean,
+): T | undefined {
+  if (!enabled) return options;
+  const env = options?.env ?? process.env;
+  return {
+    ...(options ?? {}),
+    env: {
+      ...env,
+      PATH: ["/usr/bin", "/bin", env.PATH ?? ""].filter(Boolean).join(delimiter),
+    },
+  } as T;
+}
+
 function installFsGuards(): void {
   const guardState = globalThis as typeof globalThis & { __fusionTestFsGuardInstalled?: boolean };
   if (guardState.__fusionTestFsGuardInstalled) return;
@@ -990,7 +1031,9 @@ function installChildProcessGuards(): void {
       throw blockedCliError(commandLine);
     }
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.spawn(command, args, options);
+    const trustedCommand = resolveTrustedTestGitFile(command, args, trustedTestGitContext(options));
+    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
+    const proc = originalChildProcess.spawn(command, args, guardedOptions);
     registerTrackedSubprocess(proc, commandLine);
     return proc;
   }) as ChildProcessModule["spawn"];
@@ -1006,7 +1049,9 @@ function installChildProcessGuards(): void {
       throw blockedCliError(commandLine);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.spawnSync(command, args, options);
+    const trustedCommand = resolveTrustedTestGitFile(command, args, trustedTestGitContext(options));
+    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
+    return originalChildProcess.spawnSync(command, args, guardedOptions);
   }) as ChildProcessModule["spawnSync"];
 
   mutableChildProcess.execSync = ((command: string, options?: ExecSyncOptions) => {
@@ -1017,7 +1062,9 @@ function installChildProcessGuards(): void {
       throw blockedCliError(command);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.execSync(command, withDefaultTimeout(options));
+    const trustedCommand = resolveTrustedTestGitShell(command, trustedTestGitContext(options));
+    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
+    return originalChildProcess.execSync(command, withDefaultTimeout(guardedOptions));
   }) as ChildProcessModule["execSync"];
 
   mutableChildProcess.execFileSync = ((file: string, argsOrOptions?: readonly string[] | ExecFileSyncOptions, maybeOptions?: ExecFileSyncOptions) => {
@@ -1031,7 +1078,9 @@ function installChildProcessGuards(): void {
       throw blockedCliError(commandLine);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.execFileSync(file, args, options);
+    const trustedFile = resolveTrustedTestGitFile(file, args, trustedTestGitContext(options));
+    const guardedOptions = withTrustedTestGitPath(options, trustedFile !== file);
+    return originalChildProcess.execFileSync(file, args, guardedOptions);
   }) as ChildProcessModule["execFileSync"];
 
   // Preserve util.promisify(exec) → { stdout, stderr } semantics. Function.prototype.bind
@@ -1047,7 +1096,9 @@ function installChildProcessGuards(): void {
     const options = typeof optionsOrCallback === "function" ? undefined : optionsOrCallback;
     const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.exec(command, withDefaultTimeout(options), callback);
+    const trustedCommand = resolveTrustedTestGitShell(command, trustedTestGitContext(options));
+    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
+    const proc = originalChildProcess.exec(command, withDefaultTimeout(guardedOptions), callback);
     registerTrackedSubprocess(proc, command);
     return proc;
   }) as unknown as ChildProcessModule["exec"];
@@ -1081,7 +1132,9 @@ function installChildProcessGuards(): void {
       ? (typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback)
       : (typeof argsOrOptions === "function" ? argsOrOptions : typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback);
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.execFile(file, args, withDefaultTimeout(options), callback);
+    const trustedFile = resolveTrustedTestGitFile(file, args, trustedTestGitContext(options));
+    const guardedOptions = withTrustedTestGitPath(options, trustedFile !== file);
+    const proc = originalChildProcess.execFile(file, args, withDefaultTimeout(guardedOptions), callback);
     registerTrackedSubprocess(proc, commandLine);
     return proc;
   }) as unknown as ChildProcessModule["execFile"];
