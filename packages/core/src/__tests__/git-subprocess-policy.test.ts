@@ -185,6 +185,7 @@ describe("test git subprocess policy", () => {
   it("accepts the null device as an explicit no-config boundary", () => {
     const context = policyContext();
     const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+    const tracePath = join(context.workerRoot, "git-trace.json");
 
     expect(resolveTrustedTestGitFile(TRUSTED_GIT, ["-C", context.cwd, "status", "--short"], {
       ...context,
@@ -193,6 +194,7 @@ describe("test git subprocess policy", () => {
         GIT_CONFIG_GLOBAL: nullDevice,
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_CONFIG_SYSTEM: nullDevice,
+        GIT_TRACE2_EVENT: tracePath,
       },
     })).toBe(TRUSTED_GIT);
   });

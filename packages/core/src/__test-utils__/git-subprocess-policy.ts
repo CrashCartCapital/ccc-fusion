@@ -100,6 +100,21 @@ function resolveGitPath(value: string, cwd: string): string {
   return isAbsolute(value) ? value : resolve(cwd, value);
 }
 
+function gitTraceEnvironmentStaysWithinWorker(context: TrustedTestGitContext): boolean {
+  for (const [key, value] of Object.entries(context.env ?? {})) {
+    if (!key.startsWith("GIT_TRACE") || !value) continue;
+    const normalized = value.toLowerCase();
+    if (key.endsWith("_NO_DATA") || key.endsWith("_REDACT")) {
+      if (!["0", "1", "false", "true"].includes(normalized)) return false;
+      continue;
+    }
+    if (["0", "false"].includes(normalized)) continue;
+    if (/^(?:true|[1-9])$/u.test(normalized) || value.startsWith("~") || value.includes("\0")) return false;
+    if (!isWithin(context.workerRoot, resolveGitPath(value, context.cwd))) return false;
+  }
+  return true;
+}
+
 function tokenPathValue(token: string): string | null {
   const equals = token.indexOf("=");
   if (equals <= 0) return null;
@@ -119,7 +134,7 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
     if (paths.some((path) => path && !isWithin(context.workerRoot, resolveGitPath(path, context.cwd)))) return false;
   }
   if (GIT_EXECUTION_ENV_KEYS.some((key) => Boolean(context.env?.[key]))) return false;
-  if (Object.entries(context.env ?? {}).some(([key, value]) => key.startsWith("GIT_TRACE") && Boolean(value))) return false;
+  if (!gitTraceEnvironmentStaysWithinWorker(context)) return false;
   if (context.env?.GIT_EDITOR && context.env.GIT_EDITOR !== "true") return false;
   if (context.env?.GIT_PAGER && context.env.GIT_PAGER !== "cat") return false;
   if (context.env?.PAGER && context.env.PAGER !== "cat") return false;
