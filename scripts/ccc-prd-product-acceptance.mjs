@@ -3764,6 +3764,8 @@ async function main() {
     await mkdir(globalSettingsDir, { recursive: true });
     const configureNativeAuthoring = async (baseUrl) => {
       await writeFile(globalSettingsPath, `${JSON.stringify({
+        openrouterModelSync: false,
+        opencodeGoModelSync: false,
         customProviders: [{
           id: "550e8400-e29b-41d4-a716-446655440004",
           name: "CCC Product Authoring",
@@ -4709,6 +4711,8 @@ async function main() {
       version: 2,
       exportedAt: new Date().toISOString(),
       global: {
+        openrouterModelSync: false,
+        opencodeGoModelSync: false,
         experimentalFeatures: { cliAgentExecutor: true },
       },
       project: {
@@ -6704,6 +6708,8 @@ async function main() {
       version: 2,
       exportedAt: new Date().toISOString(),
       global: {
+        openrouterModelSync: false,
+        opencodeGoModelSync: false,
         experimentalFeatures: { cliAgentExecutor: true },
       },
       project: {
