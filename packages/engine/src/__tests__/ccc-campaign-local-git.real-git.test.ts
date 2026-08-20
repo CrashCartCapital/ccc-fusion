@@ -296,6 +296,16 @@ describe("CCC campaign local Git observation", () => {
     })).rejects.toThrow(/dirty|index.*HEAD|tracked worktree|untracked/i);
   });
 
+  it("RED-W1-acceptance-diagnostic: reports the exact nonignored untracked path", async () => {
+    const { root, base } = createRepository();
+    writeFileSync(join(root, "unexpected-runtime-file.txt"), "unexpected\n");
+
+    await expect(inspectCccCampaignLocalGit({
+      targetRoot: root,
+      expectedBaseObject: base,
+    })).rejects.toThrow(/unexpected-runtime-file\.txt/u);
+  });
+
   it.skipIf(process.platform === "win32")(
     "never admits dirty bytes through an ambient PATH Git that spoofs index and HEAD",
     async () => {

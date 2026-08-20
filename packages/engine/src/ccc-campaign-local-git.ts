@@ -1050,8 +1050,12 @@ async function assertCleanGitSample(
     signal,
   );
   if (untracked.length > 0) {
+    const untrackedPaths = untracked
+      .toString("utf8")
+      .split("\0")
+      .filter((path) => path.length > 0);
     throw new CccCampaignLocalGitError(
-      "CCC campaign target worktree has nonignored untracked paths",
+      `CCC campaign target worktree has nonignored untracked paths: ${JSON.stringify(untrackedPaths)}`,
     );
   }
 }
