@@ -26,6 +26,7 @@ const GIT_PATH_OPTIONS = new Set([
 ]);
 
 const GIT_EXECUTION_ENV_KEYS = [
+  "GIT_EXEC_PATH",
   "GIT_SSH",
   "GIT_SSH_COMMAND",
   "GIT_PROXY_COMMAND",
@@ -33,6 +34,7 @@ const GIT_EXECUTION_ENV_KEYS = [
   "SSH_ASKPASS",
   "GIT_SEQUENCE_EDITOR",
   "GIT_EXTERNAL_DIFF",
+  "GIT_TEMPLATE_DIR",
 ] as const;
 
 export function pathUsesSafeExecGitShim(pathValue: string): boolean {
@@ -51,6 +53,16 @@ export function pathUsesSafeExecGitShim(pathValue: string): boolean {
   return false;
 }
 
+export function isolateTrustedTestGitEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+  return {
+    ...env,
+    GIT_CONFIG_GLOBAL: nullDevice,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: nullDevice,
+  };
+}
+
 function resolvedPhysicalPath(path: string): string {
   const absolute = resolve(path);
   if (existsSync(absolute)) return realpathSync(absolute);
@@ -64,6 +76,17 @@ function resolvedPhysicalPath(path: string): string {
     cursor = parent;
   }
   return resolve(realpathSync(cursor), ...missing);
+}
+
+function isTrustedGitExecutable(file: string, trusted: string, cwd: string = process.cwd()): boolean {
+  if (file === trusted) return true;
+  if (!isAbsolute(file) && !file.includes("/") && !file.includes("\\")) return false;
+  const candidate = isAbsolute(file) ? file : resolve(cwd, file);
+  try {
+    return realpathSync(candidate) === realpathSync(trusted);
+  } catch {
+    return false;
+  }
 }
 
 function isWithin(root: string, path: string): boolean {
@@ -96,10 +119,15 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
     if (paths.some((path) => path && !isWithin(context.workerRoot, resolveGitPath(path, context.cwd)))) return false;
   }
   if (GIT_EXECUTION_ENV_KEYS.some((key) => Boolean(context.env?.[key]))) return false;
+  if (Object.entries(context.env ?? {}).some(([key, value]) => key.startsWith("GIT_TRACE") && Boolean(value))) return false;
   if (context.env?.GIT_EDITOR && context.env.GIT_EDITOR !== "true") return false;
   if (context.env?.GIT_PAGER && context.env.GIT_PAGER !== "cat") return false;
   if (context.env?.PAGER && context.env.PAGER !== "cat") return false;
-  if (context.env?.GIT_CONFIG_GLOBAL || context.env?.GIT_CONFIG_SYSTEM || context.env?.GIT_CONFIG_PARAMETERS) return false;
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+  if ((context.env?.GIT_CONFIG_GLOBAL && context.env.GIT_CONFIG_GLOBAL !== nullDevice)
+    || (context.env?.GIT_CONFIG_SYSTEM && context.env.GIT_CONFIG_SYSTEM !== nullDevice)
+    || (context.env?.GIT_CONFIG_NOSYSTEM && context.env.GIT_CONFIG_NOSYSTEM !== "1")
+    || context.env?.GIT_CONFIG_PARAMETERS) return false;
   const configCountText = context.env?.GIT_CONFIG_COUNT;
   if (configCountText) {
     const configCount = Number.parseInt(configCountText, 10);
@@ -129,7 +157,10 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
       continue;
     }
     if (token === "-c") {
-      if (args[index + 1] !== "core.quotePath=false") return false;
+      const config = args[index + 1] ?? "";
+      if (config !== "core.quotePath=false"
+        && !config.startsWith("user.name=")
+        && !config.startsWith("user.email=")) return false;
       index += 1;
       continue;
     }
@@ -173,7 +204,8 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
 }
 
 function parseSimpleShellWords(command: string): string[] | null {
-  if (/[\r\n;&|<>`$()*?[\]{}]/.test(command) || /(^|[\s=])~/.test(command)) return null;
+  const syntaxProbe = command.replace(/stash@\{\d+\}/g, "stash-ref");
+  if (/[\r\n;&|<>`$()*?[\]{}]/.test(syntaxProbe) || /(^|[\s=])~/.test(syntaxProbe)) return null;
   const words: string[] = [];
   let word = "";
   let quote: "'" | '"' | null = null;
@@ -213,6 +245,35 @@ function parseSimpleShellWords(command: string): string[] | null {
   return words;
 }
 
+function leadingShellExecutable(command: string): { end: number; start: number; value: string } | null {
+  const leadingWhitespace = command.match(/^\s*/u)?.[0].length ?? 0;
+  const rest = command.slice(leadingWhitespace);
+  const match = /^(?:"([^"]+)"|'([^']+)'|([^\s;&|<>`$()*?[\]{}]+))/u.exec(rest);
+  if (!match) return null;
+  return {
+    start: leadingWhitespace,
+    end: leadingWhitespace + match[0].length,
+    value: match[1] ?? match[2] ?? match[3]!,
+  };
+}
+
+function shellMentionsTrustedGit(command: string, trusted: string, cwd: string): boolean {
+  const pathTokens = Array.from(
+    command.matchAll(/(?:^|[\s'"=;&|<>`$()])((?:\/|\.\.?[\\/])[^\s'";&|<>`$()*?[\]{}]+)/gu),
+    (match) => match[1]!,
+  );
+  return pathTokens.some((token) => isTrustedGitExecutable(token, trusted, cwd));
+}
+
+export function shellUsesTrustedTestGit(
+  command: string,
+  trusted: string = "/usr/bin/git",
+  cwd: string = process.cwd(),
+): boolean {
+  const executable = leadingShellExecutable(command);
+  return executable !== null && isTrustedGitExecutable(executable.value, trusted, cwd);
+}
+
 function requiresTrustedGitBypass(args: readonly string[]): boolean {
   let index = 0;
   while (index < args.length) {
@@ -233,11 +294,17 @@ function requiresTrustedGitBypass(args: readonly string[]): boolean {
   }
 
   const subcommand = args[index];
-  if (["checkout", "clean", "reset", "restore", "switch"].includes(subcommand ?? "")) {
+  if (["checkout", "reset", "restore", "revert"].includes(subcommand ?? "")) {
     return true;
   }
+  if (subcommand === "clean") {
+    return args.slice(index + 1).some((arg) => arg === "-f" || arg === "--force");
+  }
+  if (subcommand === "switch") {
+    return args.slice(index + 1).some((arg) => arg === "-f" || arg === "--force" || arg === "--discard-changes");
+  }
   if (subcommand === "stash") {
-    return ["apply", "clear", "drop", "pop"].includes(args[index + 1] ?? "");
+    return ["clear", "drop", "pop"].includes(args[index + 1] ?? "");
   }
   return false;
 }
@@ -248,13 +315,14 @@ export function resolveTrustedTestGitFile(
   context: TrustedTestGitContext,
 ): string {
   const trusted = context.trustedGitBinary ?? "/usr/bin/git";
-  const explicitTrusted = file === trusted;
+  const explicitTrusted = isTrustedGitExecutable(file, trusted, context.cwd);
   if (file !== "git" && !explicitTrusted) return file;
   const safeTarget = invocationStaysWithinWorker(args, context);
   if (explicitTrusted && !safeTarget) {
     throw new Error(`Explicit trusted git target is outside the Vitest worker root: ${args.join(" ")}`);
   }
-  if (explicitTrusted || !context.enableTrustedGitBypass || !existsSync(trusted) || !safeTarget || !requiresTrustedGitBypass(args)) return file;
+  if (explicitTrusted) return trusted;
+  if (!context.enableTrustedGitBypass || !existsSync(trusted) || !safeTarget || !requiresTrustedGitBypass(args)) return file;
   return trusted;
 }
 
@@ -263,11 +331,10 @@ export function resolveTrustedTestGitShell(
   context: TrustedTestGitContext,
 ): string {
   const trustedBinary = context.trustedGitBinary ?? "/usr/bin/git";
-  const trimmed = command.trimStart();
-  const beginsWithTrusted = trimmed.startsWith(trustedBinary)
-    || trimmed.startsWith(`"${trustedBinary}"`)
-    || trimmed.startsWith(`'${trustedBinary}'`);
-  if (command.includes(trustedBinary) && !beginsWithTrusted) {
+  const leadingExecutable = leadingShellExecutable(command);
+  const beginsWithTrusted = leadingExecutable !== null
+    && isTrustedGitExecutable(leadingExecutable.value, trustedBinary, context.cwd);
+  if (shellMentionsTrustedGit(command, trustedBinary, context.cwd) && !beginsWithTrusted) {
     throw new Error("Unsupported explicit trusted git shell command");
   }
   const words = parseSimpleShellWords(command);
@@ -278,8 +345,9 @@ export function resolveTrustedTestGitShell(
     return command;
   }
   const executable = words[0];
-  if (executable !== "git" && executable !== trustedBinary) return command;
+  if (executable !== "git" && !isTrustedGitExecutable(executable, trustedBinary, context.cwd)) return command;
   const trusted = resolveTrustedTestGitFile(executable, words.slice(1), context);
-  if (executable === trustedBinary || trusted === "git") return command;
-  return command.replace(/^(\s*)git(?=\s|$)/, `$1${trusted}`);
+  if (trusted === "git") return command;
+  if (!leadingExecutable) return command;
+  return `${command.slice(0, leadingExecutable.start)}${trusted}${command.slice(leadingExecutable.end)}`;
 }

@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, realpathSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, realpathSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
@@ -126,6 +126,32 @@ describe("vitest setup tmpdir mkdtemp redirect", () => {
     expect(process.env.HOME).toBe(originalHome);
     expect(existsSync(process.env.HOME!)).toBe(true);
     expect(existsSync(sink)).toBe(true);
+  });
+
+  it("forwards a confined destructive Git command to the validated binary", () => {
+    const root = remember(mkdtempSync(join(tmpdir(), "fn-trusted-git-forward-")));
+    const repo = join(root, "repo");
+    const fakeBin = join(root, "fake-bin");
+    const fakeGit = join(fakeBin, "git");
+    const marker = join(root, "fake-git-invoked");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(fakeGit, `#!/bin/sh\n# safeexec test shim\nprintf invoked > ${JSON.stringify(marker)}\nexit 97\n`);
+    chmodSync(fakeGit, 0o755);
+
+    execFileSync("/usr/bin/git", ["-C", repo, "init", "-q"]);
+    execFileSync("/usr/bin/git", [
+      "-C", repo,
+      "-c", "user.name=Fusion Test",
+      "-c", "user.email=fusion-test@example.invalid",
+      "commit", "--allow-empty", "-qm", "baseline",
+    ]);
+
+    expect(() => execFileSync("git", ["-C", repo, "reset", "--hard", "HEAD"], {
+      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+      stdio: "pipe",
+    })).not.toThrow();
+    expect(existsSync(marker)).toBe(false);
   });
 
   it("sweeps only dead redirect sinks and preserves current or alive pids", () => {

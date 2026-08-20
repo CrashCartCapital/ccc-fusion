@@ -22,9 +22,11 @@ import { fileURLToPath } from "node:url";
 import { isMainThread } from "node:worker_threads";
 import { assertOutsideRealFusionPath } from "../test-safety.js";
 import {
+  isolateTrustedTestGitEnvironment,
   resolveTrustedTestGitFile,
   resolveTrustedTestGitShell,
   pathUsesSafeExecGitShim,
+  shellUsesTrustedTestGit,
   type TrustedTestGitContext,
 } from "./git-subprocess-policy.js";
 import {
@@ -43,6 +45,8 @@ type ExecFileOptions = import("node:child_process").ExecFileOptions;
 type ExecSyncOptions = import("node:child_process").ExecSyncOptions;
 type ExecFileSyncOptions = import("node:child_process").ExecFileSyncOptions;
 type ForkOptions = import("node:child_process").ForkOptions;
+
+const TRUSTED_TEST_GIT_BINARY = "/usr/bin/git";
 
 const requireFromHere = createRequire(import.meta.url);
 const fs = requireFromHere("node:fs") as FsModule;
@@ -562,10 +566,10 @@ function withTrustedTestGitPath<T extends SubprocessIsolationOptions>(
   const env = options?.env ?? process.env;
   return {
     ...(options ?? {}),
-    env: {
+    env: isolateTrustedTestGitEnvironment({
       ...env,
       PATH: ["/usr/bin", "/bin", env.PATH ?? ""].filter(Boolean).join(delimiter),
-    },
+    }),
   } as T;
 }
 
@@ -1032,8 +1036,8 @@ function installChildProcessGuards(): void {
     }
     ensureRuntimeIsolationForSubprocess();
     const trustedCommand = resolveTrustedTestGitFile(command, args, trustedTestGitContext(options));
-    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
-    const proc = originalChildProcess.spawn(command, args, guardedOptions);
+    const guardedOptions = withTrustedTestGitPath(options, trustedCommand === TRUSTED_TEST_GIT_BINARY);
+    const proc = originalChildProcess.spawn(trustedCommand, args, guardedOptions);
     registerTrackedSubprocess(proc, commandLine);
     return proc;
   }) as ChildProcessModule["spawn"];
@@ -1050,8 +1054,8 @@ function installChildProcessGuards(): void {
     }
     ensureRuntimeIsolationForSubprocess();
     const trustedCommand = resolveTrustedTestGitFile(command, args, trustedTestGitContext(options));
-    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
-    return originalChildProcess.spawnSync(command, args, guardedOptions);
+    const guardedOptions = withTrustedTestGitPath(options, trustedCommand === TRUSTED_TEST_GIT_BINARY);
+    return originalChildProcess.spawnSync(trustedCommand, args, guardedOptions);
   }) as ChildProcessModule["spawnSync"];
 
   mutableChildProcess.execSync = ((command: string, options?: ExecSyncOptions) => {
@@ -1063,8 +1067,8 @@ function installChildProcessGuards(): void {
     }
     ensureRuntimeIsolationForSubprocess();
     const trustedCommand = resolveTrustedTestGitShell(command, trustedTestGitContext(options));
-    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
-    return originalChildProcess.execSync(command, withDefaultTimeout(guardedOptions));
+    const guardedOptions = withTrustedTestGitPath(options, shellUsesTrustedTestGit(trustedCommand));
+    return originalChildProcess.execSync(trustedCommand, withDefaultTimeout(guardedOptions));
   }) as ChildProcessModule["execSync"];
 
   mutableChildProcess.execFileSync = ((file: string, argsOrOptions?: readonly string[] | ExecFileSyncOptions, maybeOptions?: ExecFileSyncOptions) => {
@@ -1079,8 +1083,8 @@ function installChildProcessGuards(): void {
     }
     ensureRuntimeIsolationForSubprocess();
     const trustedFile = resolveTrustedTestGitFile(file, args, trustedTestGitContext(options));
-    const guardedOptions = withTrustedTestGitPath(options, trustedFile !== file);
-    return originalChildProcess.execFileSync(file, args, guardedOptions);
+    const guardedOptions = withTrustedTestGitPath(options, trustedFile === TRUSTED_TEST_GIT_BINARY);
+    return originalChildProcess.execFileSync(trustedFile, args, guardedOptions);
   }) as ChildProcessModule["execFileSync"];
 
   // Preserve util.promisify(exec) → { stdout, stderr } semantics. Function.prototype.bind
@@ -1097,8 +1101,8 @@ function installChildProcessGuards(): void {
     const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
     ensureRuntimeIsolationForSubprocess();
     const trustedCommand = resolveTrustedTestGitShell(command, trustedTestGitContext(options));
-    const guardedOptions = withTrustedTestGitPath(options, trustedCommand !== command);
-    const proc = originalChildProcess.exec(command, withDefaultTimeout(guardedOptions), callback);
+    const guardedOptions = withTrustedTestGitPath(options, shellUsesTrustedTestGit(trustedCommand));
+    const proc = originalChildProcess.exec(trustedCommand, withDefaultTimeout(guardedOptions), callback);
     registerTrackedSubprocess(proc, command);
     return proc;
   }) as unknown as ChildProcessModule["exec"];
@@ -1133,8 +1137,8 @@ function installChildProcessGuards(): void {
       : (typeof argsOrOptions === "function" ? argsOrOptions : typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback);
     ensureRuntimeIsolationForSubprocess();
     const trustedFile = resolveTrustedTestGitFile(file, args, trustedTestGitContext(options));
-    const guardedOptions = withTrustedTestGitPath(options, trustedFile !== file);
-    const proc = originalChildProcess.execFile(file, args, withDefaultTimeout(guardedOptions), callback);
+    const guardedOptions = withTrustedTestGitPath(options, trustedFile === TRUSTED_TEST_GIT_BINARY);
+    const proc = originalChildProcess.execFile(trustedFile, args, withDefaultTimeout(guardedOptions), callback);
     registerTrackedSubprocess(proc, commandLine);
     return proc;
   }) as unknown as ChildProcessModule["execFile"];
