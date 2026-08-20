@@ -232,8 +232,23 @@ export type CccPrdProductApprovalStatus = Readonly<
   >;
 }>;
 
+export type CccPrdProductExecutionAuthorizationMemberCustody = Readonly<{
+  ordinal: number;
+  nativeTaskId: string;
+  semanticTaskId: string;
+  actionId: string;
+  actionTarget: string;
+  approvalRequestId: string;
+  approvalStatus: CoreApprovalRequest["status"];
+  approvalTaskId: string | null;
+  approvalRunId: string | null;
+  bindingHash: string;
+}>;
+
 export type CccPrdProductExecutionAuthorizationStatus = Readonly<
-  Omit<CccCampaignExecutionAuthorization, "claimToken">
+  Omit<CccCampaignExecutionAuthorization, "claimToken"> & {
+    memberCustody: readonly CccPrdProductExecutionAuthorizationMemberCustody[];
+  }
 >;
 
 export type CccPrdProductLandingMetadata = Readonly<{
@@ -612,6 +627,45 @@ function approvalActorType(
     "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
     `CCC PRD approval ${approvalId} has an invalid requester actor type`,
   );
+}
+
+function executionAuthorizationMemberCustody(
+  authorization: CccCampaignExecutionAuthorization,
+  approvals: readonly CccPrdProductApprovalStatus[],
+): readonly CccPrdProductExecutionAuthorizationMemberCustody[] {
+  const approvalsById = new Map(approvals.map((approval) => [approval.id, approval]));
+  return authorization.members.map((member) => {
+    const approval = approvalsById.get(member.approvalRequestId);
+    if (!approval) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+        `CCC PRD execution authorization ${authorization.authorizationId} member ${member.approvalRequestId} has no child approval custody`,
+      );
+    }
+    if (
+      approval.actionId !== member.actionId
+      || approval.actionTarget !== member.actionTarget
+      || approval.campaign.binding.bindingHash !== member.bindingHash
+      || approval.campaign.binding.taskId !== member.nativeTaskId
+    ) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+        `CCC PRD execution authorization ${authorization.authorizationId} member ${member.approvalRequestId} drifted from child approval custody`,
+      );
+    }
+    return {
+      ordinal: member.ordinal,
+      nativeTaskId: member.nativeTaskId,
+      semanticTaskId: member.semanticTaskId,
+      actionId: member.actionId,
+      actionTarget: member.actionTarget,
+      approvalRequestId: member.approvalRequestId,
+      approvalStatus: approval.status,
+      approvalTaskId: approval.taskId ?? null,
+      approvalRunId: approval.runId ?? null,
+      bindingHash: member.bindingHash,
+    };
+  });
 }
 
 function compareCreatedThenId(
@@ -1663,7 +1717,13 @@ export async function inspectCccPrdProductStatus(
           );
         }
         const { claimToken: _claimToken, ...redacted } = persistedExecutionAuthorization;
-        return redacted;
+        return {
+          ...redacted,
+          memberCustody: executionAuthorizationMemberCustody(
+            persistedExecutionAuthorization,
+            approvals,
+          ),
+        };
       })()
       : null;
 

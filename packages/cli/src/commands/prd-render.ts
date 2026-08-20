@@ -647,6 +647,22 @@ function executionAuthorizationLines(
   lines.push(
     `${pad(2)}${members.length} exact child action${members.length === 1 ? "" : "s"}`,
   );
+  const memberCustody = asList(authorization.memberCustody);
+  const childCustodyRows = memberCustody.length > 0 ? memberCustody : members;
+  for (const entry of childCustodyRows) {
+    const custody = asRecord(entry);
+    if (!custody) continue;
+    const ordinal = asScalar(custody.ordinal);
+    const semanticTaskId = asScalar(custody.semanticTaskId);
+    const nativeTaskId = asScalar(custody.nativeTaskId);
+    const approvalRequestId = asScalar(custody.approvalRequestId);
+    const approvalStatus = asScalar(custody.approvalStatus);
+    lines.push(
+      `${pad(3)}${ordinal === null ? "?" : ordinal}: ${semanticTaskId ?? nativeTaskId ?? "unknown task"}`
+      + `${approvalRequestId === null ? "" : ` -> ${approvalRequestId}`}`
+      + `${approvalStatus === null ? "" : ` (${approvalStatus})`}`,
+    );
+  }
 
   const confirmation = asRecord(payload.liveExecutionAuthorizationConfirmation);
   const digest = asScalar(confirmation?.confirmation);

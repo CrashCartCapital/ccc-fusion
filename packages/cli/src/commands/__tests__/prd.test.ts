@@ -136,6 +136,10 @@ function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" =
     approvalRequestId: `ccc-approval-${digest.repeat(64)}`,
     memberHash: digest.repeat(64),
   });
+  const members = [
+    member(0, "TASK-coding", "TASK-1", "a"),
+    member(1, "TASK-review", "TASK-2", "b"),
+  ];
   return {
     schemaVersion: "ccc-campaign.execution-authorization.v1" as const,
     projectId: "project-1",
@@ -159,10 +163,23 @@ function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" =
     authorizationId: `ccc-execution-authorization-${authorizationDigest}`,
     authorizationDigest,
     memberSetHash: "7".repeat(64),
-    members: [
-      member(0, "TASK-coding", "TASK-1", "a"),
-      member(1, "TASK-review", "TASK-2", "b"),
-    ],
+    members,
+    memberCustody: members.map((entry) => ({
+      ordinal: entry.ordinal,
+      nativeTaskId: entry.nativeTaskId,
+      semanticTaskId: entry.semanticTaskId,
+      actionId: entry.actionId,
+      actionTarget: entry.actionTarget,
+      approvalRequestId: entry.approvalRequestId,
+      approvalStatus: status === "issued"
+        ? "issued"
+        : status === "claimed"
+          ? "claimed"
+          : "consumed",
+      approvalTaskId: entry.nativeTaskId,
+      approvalRunId: "RUN-product",
+      bindingHash: entry.bindingHash,
+    })),
     expectedRequestCount: 0,
     status,
     requester: {
@@ -1953,6 +1970,18 @@ describe("prd command exit contract", () => {
           members: [
             { approvalRequestId: authorization.members[0]!.approvalRequestId },
             { approvalRequestId: authorization.members[1]!.approvalRequestId },
+          ],
+          memberCustody: [
+            {
+              approvalRequestId: authorization.members[0]!.approvalRequestId,
+              approvalStatus: "issued",
+              nativeTaskId: "TASK-coding",
+            },
+            {
+              approvalRequestId: authorization.members[1]!.approvalRequestId,
+              approvalStatus: "issued",
+              nativeTaskId: "TASK-review",
+            },
           ],
         },
         approvals: [

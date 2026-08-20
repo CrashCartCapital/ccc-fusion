@@ -466,6 +466,16 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       memberSetHash: issued.memberSetHash,
       expectedRequestCount: 0,
       status: "issued",
+      memberCustody: issued.members.map((member) => ({
+        ordinal: member.ordinal,
+        nativeTaskId: member.nativeTaskId,
+        semanticTaskId: member.semanticTaskId,
+        actionId: member.actionId,
+        actionTarget: member.actionTarget,
+        approvalRequestId: member.approvalRequestId,
+        approvalStatus: "issued",
+        bindingHash: member.bindingHash,
+      })),
       members: issued.members.map((member) => ({
         nativeTaskId: member.nativeTaskId,
         approvalRequestId: member.approvalRequestId,
@@ -507,6 +517,13 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     expect(claimedStatus?.executionAuthorization).toMatchObject({
       authorizationId: issued.authorizationId,
       status: "claimed",
+      memberCustody: issued.members.map((member) => ({
+        ordinal: member.ordinal,
+        nativeTaskId: member.nativeTaskId,
+        semanticTaskId: member.semanticTaskId,
+        approvalRequestId: member.approvalRequestId,
+        approvalStatus: "claimed",
+      })),
     });
     expect(claimedStatus?.approvals).toEqual(expect.arrayContaining(
       issued.members.map((member) => expect.objectContaining({

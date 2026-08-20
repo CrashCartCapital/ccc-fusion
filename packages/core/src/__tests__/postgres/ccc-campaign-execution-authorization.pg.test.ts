@@ -56,9 +56,57 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
 
   async function fixture(
     suffix: string,
-    options: Readonly<{ maxDurationMs?: number }> = {},
+    options: Readonly<{ maxDurationMs?: number; taskCount?: 2 | 3 }> = {},
   ) {
-    const source = createCccPrdImportTestProductBundle(h.rootDir(), suffix);
+    const baseSource = createCccPrdImportTestProductBundle(h.rootDir(), suffix);
+    const source = options.taskCount === 3
+      ? rehashCccPrdImportTestBundle({
+        ...baseSource,
+        tasks: [
+          ...baseSource.tasks,
+          {
+            ...baseSource.tasks[1]!,
+            id: `${baseSource.tasks[1]!.id}-extra`,
+            title: "Extra terminal import-owned task",
+            dependencyTaskIds: [baseSource.tasks[1]!.id],
+            documentIds: [],
+            artifactIds: [],
+            protectedActionIds: [],
+          },
+        ],
+        edges: [
+          ...baseSource.edges,
+          {
+            ...baseSource.edges[0]!,
+            id: `${baseSource.edges[0]!.id}-extra`,
+            fromTaskId: `${baseSource.tasks[1]!.id}-extra`,
+            toTaskId: baseSource.tasks[1]!.id,
+          },
+        ],
+        workflows: baseSource.workflows.map((workflow) => ({
+          ...workflow,
+          taskIds: [...workflow.taskIds, `${baseSource.tasks[1]!.id}-extra`],
+          terminalTaskIds: [`${baseSource.tasks[1]!.id}-extra`],
+        })),
+        importIntents: [
+          ...baseSource.importIntents,
+          {
+            id: `${baseSource.tasks[1]!.id}-extra`,
+            entityType: "task",
+            entityId: `${baseSource.tasks[1]!.id}-extra`,
+            operation: "create",
+            target: h.rootDir(),
+          },
+          {
+            id: `${baseSource.edges[0]!.id}-extra`,
+            entityType: "dependency_edge",
+            entityId: `${baseSource.edges[0]!.id}-extra`,
+            operation: "create",
+            target: h.rootDir(),
+          },
+        ],
+      })
+      : baseSource;
     const actions = source.tasks.map((task, index) => ({
       id: `ACTION-${suffix}-LIVE-${index}`,
       kind: "live_execution" as const,
@@ -99,7 +147,7 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
         AND entity_type = 'task'
       ORDER BY ordinal
     `) as unknown as Array<{ entity_id: string; native_id: string }>;
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(options.taskCount ?? 2);
     const firstContext = await h.store().getCccCampaignContextForTask(rows[0]!.native_id);
     if (!firstContext) throw new Error("missing sealed campaign context");
     return {
@@ -612,6 +660,134 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
         lease: { approvalRequestId: issued.members[index]!.approvalRequestId },
       });
     }
+  });
+
+  it("RED-S3-workflow-row-contention: three parent claims and one lease renewal serialize through the imported work item", async () => {
+    const campaign = await fixture("claim-renew-same-work-item", { taskCount: 3 });
+    const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: campaign.taskIds[0]!,
+      requester: REQUESTER,
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    expect(issued.members).toHaveLength(3);
+    const workItemRows = await h.layer().db.execute(sql`
+      UPDATE project.workflow_work_items
+      SET state = 'running',
+          attempt = 7,
+          lease_owner = 'workflow-owner',
+          lease_expires_at = '2999-07-25T12:10:00.000Z',
+          last_error = NULL,
+          blocked_reason = NULL,
+          updated_at = '2026-07-25T12:00:00.000Z'
+      WHERE id = ${issued.workItemId}
+      RETURNING id, run_id, task_id, attempt
+    `) as unknown as Array<{
+      id: string;
+      run_id: string;
+      task_id: string;
+      attempt: number;
+    }>;
+    expect(workItemRows).toEqual([{
+      id: issued.workItemId,
+      run_id: `ccc-prd:${campaign.imported.importId}`,
+      task_id: campaign.taskIds[0]!,
+      attempt: 7,
+    }]);
+
+    let releaseWorkItemLock!: () => void;
+    const workItemLockReleased = new Promise<void>((resolve) => {
+      releaseWorkItemLock = resolve;
+    });
+    let signalWorkItemLocked!: () => void;
+    const workItemLocked = new Promise<void>((resolve) => {
+      signalWorkItemLocked = resolve;
+    });
+    const lockHolder = h.layer().transactionImmediate(async (tx) => {
+      const rows = await tx.execute(sql`
+        SELECT id
+        FROM project.workflow_work_items
+        WHERE id = ${issued.workItemId}
+        FOR UPDATE
+      `) as unknown as Array<{ id: string }>;
+      expect(rows).toEqual([{ id: issued.workItemId }]);
+      signalWorkItemLocked();
+      await workItemLockReleased;
+    });
+    await workItemLocked;
+
+    const claim = (claimToken: string) => claimCccCampaignExecutionAuthorization(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      authorizationId: issued.authorizationId,
+      claimant: OPERATOR,
+      claimToken,
+    });
+    const claims = [
+      claim("sealed-parent-claim-renew-token-a"),
+      claim("sealed-parent-claim-renew-token-b"),
+      claim("sealed-parent-claim-renew-token-c"),
+    ];
+    const renewal = h.store().renewWorkflowWorkItemLease(
+      issued.workItemId,
+      "workflow-owner",
+      7,
+      {
+        leaseDurationMs: 60_000,
+        now: "2999-07-25T12:00:30.000Z",
+      },
+    );
+    await expect(Promise.race([
+      Promise.allSettled([...claims, renewal]).then(() => "settled"),
+      new Promise<"pending">((resolve) => setImmediate(() => resolve("pending"))),
+    ])).resolves.toBe("pending");
+
+    releaseWorkItemLock();
+    await lockHolder;
+    const claimOutcomes = await Promise.allSettled(claims);
+    const renewalOutcome = await renewal;
+    expect(claimOutcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+    expect(claimOutcomes.filter(({ status }) => status === "rejected")).toHaveLength(2);
+    expect(renewalOutcome).toMatchObject({
+      id: issued.workItemId,
+      state: "running",
+      leaseOwner: "workflow-owner",
+      attempt: 7,
+      leaseExpiresAt: "2999-07-25T12:01:30.000Z",
+    });
+    await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-stale", 7, {
+      leaseDurationMs: 60_000,
+      now: "2999-07-25T12:00:31.000Z",
+    })).resolves.toBeNull();
+    await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-owner", 8, {
+      leaseDurationMs: 60_000,
+      now: "2999-07-25T12:00:31.000Z",
+    })).resolves.toBeNull();
+
+    const winner = claimOutcomes.find(({ status }) => status === "fulfilled");
+    if (!winner || winner.status !== "fulfilled") throw new Error("missing parent claim winner");
+    await expect(getCccCampaignExecutionAuthorization(
+      h.layer().db,
+      issued.authorizationId,
+    )).resolves.toEqual(winner.value);
+    for (const [index, taskId] of campaign.taskIds.entries()) {
+      await expect(h.store().inspectCccCampaignActionLease(taskId, {
+        actionId: campaign.actions[index]!.id,
+        actionTarget: campaign.actions[index]!.target,
+      })).resolves.toMatchObject({
+        binding: { bindingHash: issued.members[index]!.bindingHash },
+        lease: { approvalRequestId: issued.members[index]!.approvalRequestId },
+      });
+    }
+    await expect(h.store().assertCccCampaignWorkflowLeaseFence({
+      workItemId: issued.workItemId,
+      originTaskId: campaign.taskIds[0]!,
+      leaseOwner: "workflow-owner",
+      attempt: 7,
+      runId: workItemRows[0]!.run_id,
+    })).resolves.toBeUndefined();
   });
 
   it("RED-S3-lock-order: issue replay holding the import cannot deadlock a concurrent parent claim", async () => {

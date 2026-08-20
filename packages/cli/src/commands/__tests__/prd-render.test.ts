@@ -240,6 +240,22 @@ function sealedExecutionHoldStatus() {
           { ordinal: 0, semanticTaskId: "TASK-entry", approvalRequestId: firstChildId },
           { ordinal: 1, semanticTaskId: "TASK-second", approvalRequestId: secondChildId },
         ],
+        memberCustody: [
+          {
+            ordinal: 0,
+            nativeTaskId: "FN-entry",
+            semanticTaskId: "TASK-entry",
+            approvalRequestId: firstChildId,
+            approvalStatus: "issued",
+          },
+          {
+            ordinal: 1,
+            nativeTaskId: "FN-second",
+            semanticTaskId: "TASK-second",
+            approvalRequestId: secondChildId,
+            approvalStatus: "issued",
+          },
+        ],
       },
       approvals: [
         { id: firstChildId, status: "issued", taskId: "FN-entry", campaign: { expiresAt: "2026-07-31T01:00:00.000Z" } },
@@ -391,6 +407,8 @@ describe("human product status rendering", () => {
       expect(commands[0]).not.toContain(member.approvalRequestId);
       expect(text).toContain(member.approvalRequestId);
     }
+    expect(text).toContain(`0: TASK-entry -> ${payload.status.executionAuthorization.memberCustody[0].approvalRequestId} (issued)`);
+    expect(text).toContain(`1: TASK-second -> ${payload.status.executionAuthorization.memberCustody[1].approvalRequestId} (issued)`);
     expect(text).toContain("Execution authorization");
     expect(text).toContain("2 exact child actions");
   });
