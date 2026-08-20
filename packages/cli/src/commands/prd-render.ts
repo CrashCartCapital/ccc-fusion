@@ -648,20 +648,23 @@ function executionAuthorizationLines(
     `${pad(2)}${members.length} exact child action${members.length === 1 ? "" : "s"}`,
   );
   const memberCustody = asList(authorization.memberCustody);
-  const childCustodyRows = memberCustody.length > 0 ? memberCustody : members;
-  for (const entry of childCustodyRows) {
-    const custody = asRecord(entry);
-    if (!custody) continue;
-    const ordinal = asScalar(custody.ordinal);
-    const semanticTaskId = asScalar(custody.semanticTaskId);
-    const nativeTaskId = asScalar(custody.nativeTaskId);
-    const approvalRequestId = asScalar(custody.approvalRequestId);
-    const approvalStatus = asScalar(custody.approvalStatus);
-    lines.push(
-      `${pad(3)}${ordinal === null ? "?" : ordinal}: ${semanticTaskId ?? nativeTaskId ?? "unknown task"}`
-      + `${approvalRequestId === null ? "" : ` -> ${approvalRequestId}`}`
-      + `${approvalStatus === null ? "" : ` (${approvalStatus})`}`,
-    );
+  if (memberCustody.length !== members.length) {
+    lines.push(`${pad(3)}Member custody unavailable: joined child status is incomplete.`);
+  } else {
+    for (const entry of memberCustody) {
+      const custody = asRecord(entry);
+      if (!custody) continue;
+      const ordinal = asScalar(custody.ordinal);
+      const semanticTaskId = asScalar(custody.semanticTaskId);
+      const nativeTaskId = asScalar(custody.nativeTaskId);
+      const approvalRequestId = asScalar(custody.approvalRequestId);
+      const status = asScalar(custody.status);
+      lines.push(
+        `${pad(3)}${ordinal === null ? "?" : ordinal}: ${semanticTaskId ?? nativeTaskId ?? "unknown task"}`
+        + `${approvalRequestId === null ? "" : ` -> ${approvalRequestId}`}`
+        + `${status === null ? "" : ` (${status})`}`,
+      );
+    }
   }
 
   const confirmation = asRecord(payload.liveExecutionAuthorizationConfirmation);

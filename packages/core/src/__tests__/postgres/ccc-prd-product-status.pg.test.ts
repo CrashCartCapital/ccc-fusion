@@ -473,7 +473,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         actionId: member.actionId,
         actionTarget: member.actionTarget,
         approvalRequestId: member.approvalRequestId,
-        approvalStatus: "issued",
+        status: "issued",
         bindingHash: member.bindingHash,
       })),
       members: issued.members.map((member) => ({
@@ -522,7 +522,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
         nativeTaskId: member.nativeTaskId,
         semanticTaskId: member.semanticTaskId,
         approvalRequestId: member.approvalRequestId,
-        approvalStatus: "claimed",
+        status: "claimed",
       })),
     });
     expect(claimedStatus?.approvals).toEqual(expect.arrayContaining(
@@ -605,6 +605,45 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     } finally {
       laggingAppClock.mockRestore();
     }
+  });
+
+  it("RED-W1-status-custody: refuses sealed parent status when a child approval binding drifts", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-live-custody-drift",
+      "product-status-live-custody-drift",
+      withLiveExecutionAction,
+    );
+    const codingTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const campaign = await h.store().getCccCampaignContextForTask(codingTaskId);
+    if (!campaign) throw new Error("missing live-execution campaign context");
+    const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: codingTaskId,
+      requester: {
+        actorId: "runtime-product-status-live-custody-drift",
+        actorType: "agent",
+        actorName: "Runtime",
+      },
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    await h.layer().db.execute(sql`
+      UPDATE project.approval_requests
+      SET task_id = 'drifted-child-task'
+      WHERE id = ${issued.members[0]!.approvalRequestId}
+    `);
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-live-custody-drift",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).rejects.toMatchObject({
+      code: "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+    });
   });
 
   it("keeps manifest-v1 imports on their exact per-task approval status contract", async () => {

@@ -171,7 +171,7 @@ function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" =
       actionId: entry.actionId,
       actionTarget: entry.actionTarget,
       approvalRequestId: entry.approvalRequestId,
-      approvalStatus: status === "issued"
+      status: status === "issued"
         ? "issued"
         : status === "claimed"
           ? "claimed"
@@ -1974,12 +1974,12 @@ describe("prd command exit contract", () => {
           memberCustody: [
             {
               approvalRequestId: authorization.members[0]!.approvalRequestId,
-              approvalStatus: "issued",
+              status: "issued",
               nativeTaskId: "TASK-coding",
             },
             {
               approvalRequestId: authorization.members[1]!.approvalRequestId,
-              approvalStatus: "issued",
+              status: "issued",
               nativeTaskId: "TASK-review",
             },
           ],
@@ -3307,6 +3307,86 @@ describe("prd command exit contract", () => {
       status: { nextAction: { kind: "wait-for-runtime" } },
     });
     expect(JSON.parse(output[0]!)).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("RED-W1-structural-digest: refuses a stale parent confirmation before preflight or claim", async () => {
+    const currentConfirmation = "8".repeat(64);
+    const staleConfirmation = "7".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const approveExecution = vi.fn();
+    const inspectReadiness = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", authorization.authorizationId, "--confirm", staleConfirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          observedAt: "2026-07-31T00:00:00.000Z",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [workItem],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+          approvals: [],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "approve-execution",
+            reason: "Approve the one sealed campaign launch.",
+            executionAuthorizationId: authorization.authorizationId,
+            executionAuthorizationStatus: "issued",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => currentConfirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: inspectReadiness,
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED",
+        message: expect.stringContaining("stale or does not match"),
+      }],
+    });
+    expect(inspectReadiness).not.toHaveBeenCalled();
+    expect(approveExecution).not.toHaveBeenCalled();
   });
 
   it("RED-R11-expired-parent-approve: refuses an expired parent before verifier preflight or engine claim", async () => {

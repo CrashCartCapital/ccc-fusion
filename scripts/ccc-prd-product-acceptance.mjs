@@ -3674,6 +3674,11 @@ async function main() {
       const childApprovalIds = authorization?.members?.map(
         ({ approvalRequestId }) => approvalRequestId,
       ) ?? [];
+      const memberCustody = authorization?.memberCustody ?? [];
+      const custodyByApprovalId = new Map(memberCustody.map((custody) => [
+        custody.approvalRequestId,
+        custody,
+      ]));
       assert(
         authorization
         && confirmation
@@ -3687,8 +3692,22 @@ async function main() {
         // zero and each member later spends against the normal request budget.
         && authorization.expectedRequestCount === 0
         && new Set(childApprovalIds).size === expectedMemberCount
+        && memberCustody.length === expectedMemberCount
+        && custodyByApprovalId.size === expectedMemberCount
+        && authorization.members.every((member) => {
+          const custody = custodyByApprovalId.get(member.approvalRequestId);
+          return custody?.ordinal === member.ordinal
+            && custody.semanticTaskId === member.semanticTaskId
+            && custody.nativeTaskId === member.nativeTaskId
+            && custody.actionId === member.actionId
+            && custody.actionTarget === member.actionTarget
+            && custody.bindingHash === member.bindingHash
+            && custody.status === "issued";
+        })
         && childApprovalIds.every((approvalRequestId) =>
           hold.status.approvals.some(({ id }) => id === approvalRequestId))
+        && !JSON.stringify({ authorization, approvals: hold.status.approvals })
+          .includes("claimToken")
         && (hold.liveExecutionApprovalConfirmations ?? []).length === 0
         && nextAction?.kind === "approve-execution"
         && nextAction.executionAuthorizationId
@@ -3708,6 +3727,7 @@ async function main() {
         authorization,
         confirmation,
         childApprovalIds,
+        memberCustody,
         nextAction,
       };
     };
@@ -6963,6 +6983,15 @@ async function main() {
       && fanoutMergeHold.status.executionAuthorization?.authorizationId
         === fanoutAuthorization.authorizationId
       && fanoutMergeHold.status.executionAuthorization?.status === "settled"
+      && fanoutMergeHold.status.executionAuthorization?.memberCustody?.length
+        === fanTasks.length
+      && fanoutMergeHold.status.executionAuthorization.memberCustody.every(
+        (custody) => custody.status === "consumed"
+          && fanoutNativeIds[custody.semanticTaskId] === custody.nativeTaskId
+          && fanoutAuthorization.members.some((member) =>
+            member.approvalRequestId === custody.approvalRequestId
+            && member.bindingHash === custody.bindingHash),
+      )
       && fanoutMergeHold.liveExecutionApprovalConfirmations?.length === 0
       && fanoutProviderAttempts.every(({ state }) => state === "committed"),
       "CCC_PRODUCT_FANOUT_APPROVAL_ORDER_INVALID",

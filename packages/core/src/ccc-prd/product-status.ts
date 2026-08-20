@@ -239,11 +239,20 @@ export type CccPrdProductExecutionAuthorizationMemberCustody = Readonly<{
   actionId: string;
   actionTarget: string;
   approvalRequestId: string;
-  approvalStatus: CoreApprovalRequest["status"];
+  status: CccPrdProductExecutionAuthorizationMemberCustodyStatus;
   approvalTaskId: string | null;
   approvalRunId: string | null;
   bindingHash: string;
+  expiresAt: string;
+  claimedAt?: string;
 }>;
+
+export type CccPrdProductExecutionAuthorizationMemberCustodyStatus =
+  | "issued"
+  | "claimed"
+  | "consumed"
+  | "expired"
+  | "denied";
 
 export type CccPrdProductExecutionAuthorizationStatus = Readonly<
   Omit<CccCampaignExecutionAuthorization, "claimToken"> & {
@@ -629,24 +638,49 @@ function approvalActorType(
   );
 }
 
-function executionAuthorizationMemberCustody(
-  authorization: CccCampaignExecutionAuthorization,
+function isExecutionAuthorizationMemberCustodyStatus(
+  status: CoreApprovalRequest["status"],
+): status is CccPrdProductExecutionAuthorizationMemberCustodyStatus {
+  return status === "issued"
+    || status === "claimed"
+    || status === "consumed"
+    || status === "expired"
+    || status === "denied";
+}
+
+export function joinCccPrdProductExecutionAuthorizationMemberCustody(
+  authorization: Omit<CccCampaignExecutionAuthorization, "claimToken">,
   approvals: readonly CccPrdProductApprovalStatus[],
 ): readonly CccPrdProductExecutionAuthorizationMemberCustody[] {
-  const approvalsById = new Map(approvals.map((approval) => [approval.id, approval]));
+  const approvalsById = new Map<string, CccPrdProductApprovalStatus[]>();
+  for (const approval of approvals) {
+    const current = approvalsById.get(approval.id) ?? [];
+    current.push(approval);
+    approvalsById.set(approval.id, current);
+  }
   return authorization.members.map((member) => {
-    const approval = approvalsById.get(member.approvalRequestId);
-    if (!approval) {
+    const matches = approvalsById.get(member.approvalRequestId) ?? [];
+    if (matches.length !== 1) {
       throw new CccPrdImportError(
         "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
-        `CCC PRD execution authorization ${authorization.authorizationId} member ${member.approvalRequestId} has no child approval custody`,
+        `CCC PRD execution authorization ${authorization.authorizationId} member ${member.approvalRequestId} has ${matches.length === 0 ? "no" : "ambiguous"} child approval custody`,
+      );
+    }
+    const approval = matches[0]!;
+    if (!isExecutionAuthorizationMemberCustodyStatus(approval.status)) {
+      throw new CccPrdImportError(
+        "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+        `CCC PRD execution authorization ${authorization.authorizationId} member ${member.approvalRequestId} has non-campaign child approval status ${approval.status}`,
       );
     }
     if (
-      approval.actionId !== member.actionId
+      (approval.taskId ?? null) !== member.nativeTaskId
+      || approval.actionId !== member.actionId
       || approval.actionTarget !== member.actionTarget
-      || approval.campaign.binding.bindingHash !== member.bindingHash
       || approval.campaign.binding.taskId !== member.nativeTaskId
+      || approval.campaign.binding.actionId !== member.actionId
+      || approval.campaign.binding.actionTarget !== member.actionTarget
+      || approval.campaign.binding.bindingHash !== member.bindingHash
     ) {
       throw new CccPrdImportError(
         "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
@@ -660,10 +694,14 @@ function executionAuthorizationMemberCustody(
       actionId: member.actionId,
       actionTarget: member.actionTarget,
       approvalRequestId: member.approvalRequestId,
-      approvalStatus: approval.status,
+      status: approval.status,
       approvalTaskId: approval.taskId ?? null,
       approvalRunId: approval.runId ?? null,
       bindingHash: member.bindingHash,
+      expiresAt: approval.campaign.expiresAt,
+      ...(approval.campaign.claimedAt === undefined
+        ? {}
+        : { claimedAt: approval.campaign.claimedAt }),
     };
   });
 }
@@ -1719,8 +1757,8 @@ export async function inspectCccPrdProductStatus(
         const { claimToken: _claimToken, ...redacted } = persistedExecutionAuthorization;
         return {
           ...redacted,
-          memberCustody: executionAuthorizationMemberCustody(
-            persistedExecutionAuthorization,
+          memberCustody: joinCccPrdProductExecutionAuthorizationMemberCustody(
+            redacted,
             approvals,
           ),
         };

@@ -246,14 +246,14 @@ function sealedExecutionHoldStatus() {
             nativeTaskId: "FN-entry",
             semanticTaskId: "TASK-entry",
             approvalRequestId: firstChildId,
-            approvalStatus: "issued",
+            status: "issued",
           },
           {
             ordinal: 1,
             nativeTaskId: "FN-second",
             semanticTaskId: "TASK-second",
             approvalRequestId: secondChildId,
-            approvalStatus: "issued",
+            status: "issued",
           },
         ],
       },
@@ -429,6 +429,16 @@ describe("human product status rendering", () => {
     for (const confirmation of payload.liveExecutionApprovalConfirmations) {
       expect(text).toContain(confirmation.approvalRequestId);
     }
+  });
+
+  it("RED-W1-status-custody: refuses to present raw members as joined custody", () => {
+    const payload = sealedExecutionHoldStatus();
+    payload.status.executionAuthorization.memberCustody = [];
+
+    const text = renderOperatorPayload(payload).join("\n");
+
+    expect(text).toContain("Member custody unavailable");
+    expect(text).not.toContain(`0: TASK-entry -> ${payload.status.executionAuthorization.members[0].approvalRequestId}`);
   });
 
   it("prints lifecycle commands only for allowed operator controls", () => {

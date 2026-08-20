@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { importCccPrdBundle } from "../../index.js";
 import {
+  cccCampaignExecutionAuthorizationChildClaimToken,
   claimCccCampaignApproval,
   consumeCccCampaignApproval,
   denyCccCampaignApproval,
@@ -32,6 +33,12 @@ import type {
   CccProviderAttemptSettlementInput,
   CccProviderAttemptTransition,
 } from "../../ccc-campaign/types.js";
+import { TaskStore } from "../../store.js";
+import type {
+  AsyncDataLayer,
+  DbTransaction,
+  TransactionOptions,
+} from "../../postgres/data-layer.js";
 
 const REQUESTER: ApprovalRequestActorSnapshot = Object.freeze({
   actorId: "ccc-campaign-runtime",
@@ -697,6 +704,32 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
       attempt: 7,
     }]);
 
+    const labelledLayer = (label: string): AsyncDataLayer => {
+      const base = h.layer();
+      const setLabel = async (tx: DbTransaction): Promise<void> => {
+        await tx.execute(sql`
+          SELECT set_config('application_name', ${`ccc-w1-lock:${label}`}, true)
+        `);
+      };
+      return {
+        ...base,
+        transaction: <T>(
+          fn: (tx: DbTransaction) => Promise<T>,
+          options?: TransactionOptions,
+        ): Promise<T> => base.transaction(async (tx) => {
+          await setLabel(tx);
+          return fn(tx);
+        }, options),
+        transactionImmediate: <T>(
+          fn: (tx: DbTransaction) => Promise<T>,
+          options?: TransactionOptions,
+        ): Promise<T> => base.transactionImmediate(async (tx) => {
+          await setLabel(tx);
+          return fn(tx);
+        }, options),
+      };
+    };
+
     let releaseWorkItemLock!: () => void;
     const workItemLockReleased = new Promise<void>((resolve) => {
       releaseWorkItemLock = resolve;
@@ -705,7 +738,12 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
     const workItemLocked = new Promise<void>((resolve) => {
       signalWorkItemLocked = resolve;
     });
-    const lockHolder = h.layer().transactionImmediate(async (tx) => {
+    let holderPid = 0;
+    const lockHolder = labelledLayer("holder").transactionImmediate(async (tx) => {
+      const backendRows = await tx.execute(sql`
+        SELECT pg_backend_pid()::int AS pid
+      `) as unknown as Array<{ pid: number }>;
+      holderPid = backendRows[0]!.pid;
       const rows = await tx.execute(sql`
         SELECT id
         FROM project.workflow_work_items
@@ -718,7 +756,7 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
     });
     await workItemLocked;
 
-    const claim = (claimToken: string) => claimCccCampaignExecutionAuthorization(h.layer(), {
+    const claim = (label: string, claimToken: string) => claimCccCampaignExecutionAuthorization(labelledLayer(label), {
       authorityStore: h.store(),
       rootDir: h.rootDir(),
       authorizationId: issued.authorizationId,
@@ -726,11 +764,15 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
       claimToken,
     });
     const claims = [
-      claim("sealed-parent-claim-renew-token-a"),
-      claim("sealed-parent-claim-renew-token-b"),
-      claim("sealed-parent-claim-renew-token-c"),
+      claim("claim-a", "sealed-parent-claim-renew-token-a"),
+      claim("claim-b", "sealed-parent-claim-renew-token-b"),
+      claim("claim-c", "sealed-parent-claim-renew-token-c"),
     ];
-    const renewal = h.store().renewWorkflowWorkItemLease(
+    const renewingStore = new TaskStore(h.rootDir(), undefined, {
+      asyncLayer: labelledLayer("renew"),
+    });
+    await renewingStore.init();
+    const renewal = renewingStore.renewWorkflowWorkItemLease(
       issued.workItemId,
       "workflow-owner",
       7,
@@ -739,55 +781,151 @@ pgDescribe("CCC sealed execution authorization (PostgreSQL)", () => {
         now: "2999-07-25T12:00:30.000Z",
       },
     );
-    await expect(Promise.race([
-      Promise.allSettled([...claims, renewal]).then(() => "settled"),
-      new Promise<"pending">((resolve) => setImmediate(() => resolve("pending"))),
-    ])).resolves.toBe("pending");
+    const claimOutcomesPromise = Promise.allSettled(claims);
 
-    releaseWorkItemLock();
-    await lockHolder;
-    const claimOutcomes = await Promise.allSettled(claims);
-    const renewalOutcome = await renewal;
-    expect(claimOutcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
-    expect(claimOutcomes.filter(({ status }) => status === "rejected")).toHaveLength(2);
-    expect(renewalOutcome).toMatchObject({
-      id: issued.workItemId,
-      state: "running",
-      leaseOwner: "workflow-owner",
-      attempt: 7,
-      leaseExpiresAt: "2999-07-25T12:01:30.000Z",
-    });
-    await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-stale", 7, {
-      leaseDurationMs: 60_000,
-      now: "2999-07-25T12:00:31.000Z",
-    })).resolves.toBeNull();
-    await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-owner", 8, {
-      leaseDurationMs: 60_000,
-      now: "2999-07-25T12:00:31.000Z",
-    })).resolves.toBeNull();
+    const expectedLabels = new Set([
+      "ccc-w1-lock:claim-a",
+      "ccc-w1-lock:claim-b",
+      "ccc-w1-lock:claim-c",
+      "ccc-w1-lock:renew",
+    ]);
+    let lastObservedRows: Array<{
+      pid: number;
+      application_name: string;
+      wait_event_type: string | null;
+      blockers: number[];
+    }> = [];
+    const waitForAllContenders = async (): Promise<void> => {
+      for (let attempt = 0; attempt < 1_000; attempt += 1) {
+        const rows = await h.adminDb().execute(sql`
+          SELECT
+            pid::int AS pid,
+            application_name,
+            wait_event_type,
+            pg_blocking_pids(pid)::int[] AS blockers
+          FROM pg_stat_activity
+          WHERE datname = current_database()
+            AND application_name LIKE 'ccc-w1-lock:%'
+        `) as unknown as typeof lastObservedRows;
+        lastObservedRows = rows;
+        const byPid = new Map(rows.map((row) => [row.pid, row]));
+        const reachesHolder = (pid: number, seen = new Set<number>()): boolean => {
+          if (seen.has(pid)) return false;
+          seen.add(pid);
+          const row = byPid.get(pid);
+          return (row?.blockers ?? []).some((blocker) =>
+            blocker === holderPid || reachesHolder(blocker, seen));
+        };
+        const contenders = rows.filter((row) => expectedLabels.has(row.application_name));
+        if (
+          new Set(contenders.map((row) => row.application_name)).size === expectedLabels.size
+          && contenders.every((row) =>
+            row.wait_event_type === "Lock" && reachesHolder(row.pid))
+        ) {
+          return;
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      throw new Error(
+        `labelled contenders did not all block behind workflow row holder: ${JSON.stringify(lastObservedRows)}`,
+      );
+    };
 
-    const winner = claimOutcomes.find(({ status }) => status === "fulfilled");
-    if (!winner || winner.status !== "fulfilled") throw new Error("missing parent claim winner");
-    await expect(getCccCampaignExecutionAuthorization(
-      h.layer().db,
-      issued.authorizationId,
-    )).resolves.toEqual(winner.value);
-    for (const [index, taskId] of campaign.taskIds.entries()) {
-      await expect(h.store().inspectCccCampaignActionLease(taskId, {
-        actionId: campaign.actions[index]!.id,
-        actionTarget: campaign.actions[index]!.target,
-      })).resolves.toMatchObject({
-        binding: { bindingHash: issued.members[index]!.bindingHash },
-        lease: { approvalRequestId: issued.members[index]!.approvalRequestId },
-      });
+    let pendingProofError: unknown;
+    try {
+      await waitForAllContenders();
+    } catch (error) {
+      pendingProofError = error;
+    } finally {
+      releaseWorkItemLock();
+      await lockHolder;
     }
-    await expect(h.store().assertCccCampaignWorkflowLeaseFence({
-      workItemId: issued.workItemId,
-      originTaskId: campaign.taskIds[0]!,
-      leaseOwner: "workflow-owner",
-      attempt: 7,
-      runId: workItemRows[0]!.run_id,
-    })).resolves.toBeUndefined();
+
+    try {
+      const claimOutcomes = await claimOutcomesPromise;
+      const renewalOutcome = await renewal;
+      if (pendingProofError) throw pendingProofError;
+      expect(claimOutcomes.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+      expect(claimOutcomes.filter(({ status }) => status === "rejected")).toHaveLength(2);
+      expect(renewalOutcome).toMatchObject({
+        id: issued.workItemId,
+        state: "running",
+        leaseOwner: "workflow-owner",
+        attempt: 7,
+        leaseExpiresAt: "2999-07-25T12:01:30.000Z",
+      });
+
+      const winner = claimOutcomes.find(({ status }) => status === "fulfilled");
+      if (!winner || winner.status !== "fulfilled") throw new Error("missing parent claim winner");
+      await expect(getCccCampaignExecutionAuthorization(
+        h.layer().db,
+        issued.authorizationId,
+      )).resolves.toEqual(winner.value);
+      for (const [index, taskId] of campaign.taskIds.entries()) {
+        const member = issued.members[index]!;
+        await expect(h.store().inspectCccCampaignActionLease(taskId, {
+          actionId: campaign.actions[index]!.id,
+          actionTarget: campaign.actions[index]!.target,
+        })).resolves.toMatchObject({
+          binding: { bindingHash: member.bindingHash },
+          lease: {
+            approvalRequestId: member.approvalRequestId,
+            claimToken: cccCampaignExecutionAuthorizationChildClaimToken(
+              winner.value.claimToken!,
+              member.bindingHash,
+            ),
+          },
+        });
+      }
+
+      const liveFence = {
+        workItemId: issued.workItemId,
+        originTaskId: campaign.taskIds[0]!,
+        leaseOwner: "workflow-owner",
+        attempt: 7,
+        runId: workItemRows[0]!.run_id,
+      };
+      await expect(h.store().assertCccCampaignWorkflowLeaseFence(liveFence))
+        .resolves.toBeUndefined();
+      for (const staleFence of [
+        { ...liveFence, originTaskId: `${liveFence.originTaskId}-stale` },
+        { ...liveFence, leaseOwner: `${liveFence.leaseOwner}-stale` },
+        { ...liveFence, attempt: liveFence.attempt + 1 },
+        { ...liveFence, runId: `${liveFence.runId}-stale` },
+      ]) {
+        await expect(h.store().assertCccCampaignWorkflowLeaseFence(staleFence))
+          .rejects.toMatchObject({ code: "CCC_CAMPAIGN_WORKFLOW_LEASE_REFUSED" });
+      }
+
+      await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-stale", 7, {
+        leaseDurationMs: 60_000,
+        now: "2999-07-25T12:00:31.000Z",
+      })).resolves.toBeNull();
+      await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-owner", 8, {
+        leaseDurationMs: 60_000,
+        now: "2999-07-25T12:00:31.000Z",
+      })).resolves.toBeNull();
+      await h.layer().db.execute(sql`
+        UPDATE project.workflow_work_items
+        SET lease_expires_at = '2999-07-25T12:00:00.000Z'
+        WHERE id = ${issued.workItemId}
+      `);
+      await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-owner", 7, {
+        leaseDurationMs: 60_000,
+        now: "2999-07-25T12:00:31.000Z",
+      })).resolves.toBeNull();
+      await h.layer().db.execute(sql`
+        UPDATE project.workflow_work_items
+        SET state = 'runnable', lease_expires_at = '2999-07-25T12:10:00.000Z'
+        WHERE id = ${issued.workItemId}
+      `);
+      await expect(h.store().renewWorkflowWorkItemLease(issued.workItemId, "workflow-owner", 7, {
+        leaseDurationMs: 60_000,
+        now: "2999-07-25T12:00:31.000Z",
+      })).resolves.toBeNull();
+    } finally {
+      renewingStore.stopWatching();
+    }
   });
 
   it("RED-S3-lock-order: issue replay holding the import cannot deadlock a concurrent parent claim", async () => {
