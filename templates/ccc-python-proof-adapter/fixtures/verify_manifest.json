@@ -1,0 +1,4 @@
+{
+  "report_command": ["python3", "run_target.py"],
+  "report_file": "verify-report.json"
+}
