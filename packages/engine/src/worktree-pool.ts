@@ -96,6 +96,18 @@ export function canonicalizePath(path: string): string {
   }
 }
 
+/**
+ * True when `candidate` IS the project root the engine is serving.
+ *
+ * Every pool sweep must consult this before deleting. When the project root is
+ * itself a linked git worktree, `resolveWorktreesDir` walks to the shared
+ * common dir, so the pool directory is the PRIMARY checkout's `.worktrees/` —
+ * which contains the engine's own root as a sibling of the task worktrees. It
+ * is then bound to no task ("idle"), and if `git worktree list` fails it also
+ * reads as unregistered, because `describeRegisteredWorktrees` fails open with
+ * an empty set. Either way the sweeps would delete the checkout the engine is
+ * serving; this was observed live removing a sealed campaign target twice.
+ */
 export function isRepoRootPath(rootDir: string, candidate: string): boolean {
   return canonicalizePath(rootDir) === canonicalizePath(candidate);
 }
@@ -865,6 +877,8 @@ export async function scanIdleWorktrees(
     return [];
   }
 
+  dirs = dirs.filter((dir) => !isRepoRootPath(rootDir, dir));
+
   if (dirs.length === 0) {
     return [];
   }
@@ -928,7 +942,11 @@ export async function cleanupOrphanedWorktrees(
     }
   }
 
-  const unregistered = dirs.filter((dir) => !registeredWorktrees.has(resolve(dir)));
+  // See isRepoRootPath: this list is computed independently of scanIdleWorktrees,
+  // and a failed `git worktree list` empties registeredWorktrees, so without the
+  // guard the engine's own root lands here and is removed by the rmSync branch.
+  const unregistered = dirs.filter((dir) =>
+    !registeredWorktrees.has(resolve(dir)) && !isRepoRootPath(rootDir, dir));
   const candidates = [...orphaned, ...unregistered];
   let cleaned = 0;
 
@@ -1072,6 +1090,11 @@ export async function reapOrphanWorktrees(
     const rel = relative(resolve(worktreesDir), resolvedFull);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
       worktreePoolLog.warn(`reapOrphanWorktrees: skipping out-of-bounds path ${fullPath}`);
+      continue;
+    }
+
+    // Never reap the project root the engine is serving — see isRepoRootPath.
+    if (isRepoRootPath(projectRoot, fullPath)) {
       continue;
     }
 

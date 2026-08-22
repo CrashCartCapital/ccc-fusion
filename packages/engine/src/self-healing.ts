@@ -35,7 +35,7 @@ import { finalizePlanningSegment } from "@fusion/core";
 import type { MeshLeaseManager } from "./mesh-lease-manager.js";
 import { createLogger, schedulerLog } from "./logger.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
-import { RemovalReason, classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "./worktree-pool.js";
+import { RemovalReason, classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isRepoRootPath, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "./worktree-pool.js";
 import {
   classifyMissingWorktreeSessionStartFailure,
   extractMissingWorktreePathFromSessionStartFailure,
@@ -12740,7 +12740,11 @@ export class SelfHealingManager {
     if (dirs.length === 0) return 0;
 
     const registered = await getRegisteredWorktreePaths(this.options.rootDir);
-    const unregistered = dirs.filter((d) => !registered.has(resolve(d)));
+    // See isRepoRootPath: a linked-root project sits inside the primary
+    // checkout's pool, and a failed `git worktree list` empties `registered`,
+    // so without the guard this sweep rmSyncs the root the engine is serving.
+    const unregistered = dirs.filter((d) =>
+      !registered.has(resolve(d)) && !isRepoRootPath(this.options.rootDir, d));
 
     let cleaned = 0;
     for (const path of unregistered) {
