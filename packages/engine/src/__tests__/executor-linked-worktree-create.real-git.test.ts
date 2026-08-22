@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TaskExecutor } from "../executor.js";
+import { canonicalizePath, getRegisteredWorktreePaths, isInsideWorktreesDir } from "../worktree-pool.js";
 
 const cleanupPaths: string[] = [];
 
@@ -68,6 +69,38 @@ describe("TaskExecutor linked worktree creation", () => {
       "FN-LINKED-CREATE",
       "Refusing to create nested worktree",
       expect.any(String),
+    );
+  });
+
+  it("still refuses arbitrary nested paths outside the configured worktree container", async () => {
+    const mainRoot = makeRepo();
+    const linkedRoot = track(mkdtempSync(join(tmpdir(), "fusion-linked-executor-linked-")));
+    rmSync(linkedRoot, { recursive: true, force: true });
+    git(mainRoot, `git worktree add -b runner-root ${JSON.stringify(linkedRoot)} HEAD`);
+    const store = {
+      on: vi.fn(),
+      logEntry: vi.fn(async () => undefined),
+      getTask: vi.fn(async () => null),
+      updateTask: vi.fn(async () => undefined),
+    };
+    const executor = new TaskExecutor(store as any, linkedRoot);
+    const arbitraryNestedPath = join(mainRoot, "src", "not-a-task-worktree");
+    const registered = await getRegisteredWorktreePaths(linkedRoot);
+    expect(registered).toContain(canonicalizePath(mainRoot));
+    expect(registered).toContain(canonicalizePath(linkedRoot));
+    expect(isInsideWorktreesDir(linkedRoot, arbitraryNestedPath, {})).toBe(false);
+
+    await expect(
+      (executor as any).assertWorktreePathNotNested(
+        arbitraryNestedPath,
+        "FN-LINKED-REFUSE",
+        {},
+      ),
+    ).rejects.toThrow("path is nested inside existing worktree");
+    expect(store.logEntry).toHaveBeenCalledWith(
+      "FN-LINKED-REFUSE",
+      "Refusing to create nested worktree",
+      expect.stringContaining(arbitraryNestedPath),
     );
   });
 });

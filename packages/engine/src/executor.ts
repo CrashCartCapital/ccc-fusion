@@ -11,7 +11,7 @@ const execFileAsync = promisify(execFile);
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
 
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
 import { getUnmetSchedulingDependencies } from "./scheduler.js";
@@ -20230,7 +20230,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     // at a worktree directory instead of the main repo — produces paths like
     // `.worktrees/green-finch/.worktrees/amber-panda` that bloat the filesystem
     // and confuse every tool that walks git state.
-    await this.assertWorktreePathNotNested(path, taskId);
+    await this.assertWorktreePathNotNested(path, taskId, settings);
 
     const installGuardOrCleanup = async () => {
       try {
@@ -20704,18 +20704,35 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
    * repo root. The repo root itself is a worktree (main branch) and must be
    * allowed — we only reject paths strictly *inside* a non-root worktree.
    */
-  private async assertWorktreePathNotNested(path: string, taskId: string): Promise<void> {
+  private async assertWorktreePathNotNested(
+    path: string,
+    taskId: string,
+    settings: Pick<Settings, "worktreesDir"> = {},
+  ): Promise<void> {
     const target = canonicalizePath(path);
     const rootResolved = canonicalizePath(this.rootDir);
     const primaryCheckoutRoot = await this.resolvePrimaryCheckoutRoot();
+    const targetUsesConfiguredWorktreeContainer = isInsideWorktreesDir(
+      this.rootDir,
+      target,
+      settings,
+    );
     const registered = await getRegisteredWorktreePaths(this.rootDir);
 
     for (const wt of registered) {
       if (wt === rootResolved) continue; // root is allowed as ancestor
-      if (primaryCheckoutRoot && wt === primaryCheckoutRoot) continue; // primary checkout is allowed as ancestor
+      // A linked project root defaults task worktrees to the primary checkout's
+      // configured worktree container. Permit only that derived container;
+      // arbitrary paths elsewhere inside the primary checkout remain refused.
+      if (
+        primaryCheckoutRoot
+        && wt === primaryCheckoutRoot
+        && targetUsesConfiguredWorktreeContainer
+      ) continue;
       if (wt === target) continue; // exact match handled later as "already registered"
       const rel = relative(wt, target);
-      if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+      const lexicallyNested = rel && !rel.startsWith("..") && !isAbsolute(rel);
+      if (lexicallyNested || this.hasRegisteredAncestorIdentity(path, wt)) {
         await this.store.logEntry(
           taskId,
           `Refusing to create nested worktree`,
@@ -20726,6 +20743,30 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           `This usually means the executor was launched with rootDir pointing at a worktree instead of the main repo.`,
         );
       }
+    }
+  }
+
+  private hasRegisteredAncestorIdentity(path: string, registeredPath: string): boolean {
+    let registeredIdentity: ReturnType<typeof statSync>;
+    try {
+      registeredIdentity = statSync(registeredPath);
+    } catch {
+      return false;
+    }
+    let cursor = dirname(resolvePath(path));
+    for (;;) {
+      try {
+        const identity = statSync(cursor);
+        if (
+          identity.dev === registeredIdentity.dev
+          && identity.ino === registeredIdentity.ino
+        ) return true;
+      } catch {
+        // Missing descendants are expected before a worktree is created.
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) return false;
+      cursor = parent;
     }
   }
 
