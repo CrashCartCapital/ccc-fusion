@@ -265,7 +265,7 @@ function snapshotPacketRoot(root: string): Record<string, string> {
 }
 
 describe("prd command exit contract", () => {
-  it("RED-S4-executable-author: generated author explicitly requests semantic v2 with controller toolchain custody", async () => {
+  it("RED-S4-executable-author: generated author defers controller toolchain custody until proposal parsing", async () => {
     const packet = createPacketRoot();
     const adapter = {
       id: "fusion-native-model-runtime-v1",
@@ -310,13 +310,10 @@ describe("prd command exit contract", () => {
       resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(0);
 
-    expect(resolveToolchain).toHaveBeenCalledWith({
-      pythonRequired: true,
-      targetRoot: packet.target,
-    });
+    expect(resolveToolchain).not.toHaveBeenCalled();
     expect(authorCccPrdPacket).toHaveBeenCalledWith(expect.objectContaining({
       semanticProofContract: "v2",
-      semanticProofToolchainPaths: toolchainPaths,
+      resolveSemanticProofToolchainPaths: expect.any(Function),
       adapter,
       constraints: expect.objectContaining({
         targetRepository: { path: packet.target, baseCommit: packet.base },
@@ -324,6 +321,86 @@ describe("prd command exit contract", () => {
     }));
     expect(JSON.parse(readFileSync(packet.sidecar, "utf8"))).toEqual({
       schema: "ccc-prd.sidecar.v2",
+    });
+  });
+
+  it("RED-R1-generated-author-python: resolves the target Python venv after the model proposal", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8")) as {
+      proofs: Array<{
+        executionToolchain: Record<string, unknown>;
+        verifierProfile?: unknown;
+      }>;
+    };
+    const proof = proposal.proofs[0]!;
+    proof.executionToolchain.python = {
+      executablePath: "",
+      executableSha256: "",
+      version: "",
+      versionOutputSha256: "",
+      runtimeManifest: {
+        schema: "ccc-prd.python-runtime-manifest.v1",
+        interpreter: { path: "", sha256: "" },
+        stdlibRoot: "",
+        pythonHomeRoot: "",
+        sitePackagesRoots: [],
+        extensionModuleRoots: [],
+        runtimeSupport: [],
+        stdlib: [],
+        sitePackages: [],
+        extensionModules: [],
+        dylibClosure: [],
+      },
+    };
+    proof.verifierProfile = {
+      schema: "ccc-prd.verifier.python-adapter.v1",
+      adapterPath: "verify/python_adapter.py",
+      targetPath: "fixtures/python-target",
+    };
+    writeFileSync(packet.proposal, JSON.stringify(proposal, null, 2));
+
+    const adapter = {
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(async () => proposal),
+    };
+    const resolveToolchain = vi.fn(() => {
+      throw new Error("CCC semantic-proof active Python venv is unavailable: target/.venv");
+    });
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "author",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      "--target", packet.target,
+      "--base", packet.base,
+      "--provider", "loopback",
+      "--model", "fixture",
+      "--max-requests", "1",
+      "--max-duration-ms", "30000",
+      "--max-concurrency", "1",
+      "--max-prompt-bytes", "1000000",
+      "--max-response-bytes", "262144",
+      "--max-review-items", "8",
+    ], { write: (line) => output.push(line) }, {
+      bootstrapProofAdmission,
+      createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      resolveSemanticProofToolchainPaths: resolveToolchain,
+    })).toBe(1);
+
+    expect(adapter.generateCandidate).toHaveBeenCalledTimes(1);
+    expect(resolveToolchain).toHaveBeenCalledWith({
+      pythonRequired: true,
+      targetRoot: packet.target,
+    });
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+        message: "CCC semantic-proof active Python venv is unavailable: target/.venv",
+      }],
     });
   });
 
@@ -399,9 +476,14 @@ describe("prd command exit contract", () => {
     }));
   });
 
-  it("refuses generated executable authoring before model setup when controller toolchain custody is unavailable", async () => {
-    const packet = createPacketRoot();
-    const createAdapter = vi.fn();
+  it("refuses generated executable authoring after model setup when controller toolchain custody is unavailable", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8"));
+    const createAdapter = vi.fn(() => ({
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(async () => proposal),
+    }));
     const output: string[] = [];
 
     expect(await runPrdCommand([
@@ -421,12 +503,13 @@ describe("prd command exit contract", () => {
       "--max-review-items", "8",
     ], { write: (line) => output.push(line) }, {
       createNativeCccPrdAuthoringAdapter: createAdapter,
+      bootstrapProofAdmission,
       resolveSemanticProofToolchainPaths: () => {
         throw new Error("built proof host missing");
       },
     })).toBe(1);
 
-    expect(createAdapter).not.toHaveBeenCalled();
+    expect(createAdapter).toHaveBeenCalledTimes(1);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "refusal",
       diagnostics: [{

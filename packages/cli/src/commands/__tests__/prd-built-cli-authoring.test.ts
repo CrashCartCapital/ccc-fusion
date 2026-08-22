@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -74,8 +74,9 @@ describe("prd native authoring descendant contract", () => {
     }
   });
 
-  it("authors from an unchanged packet through one bounded native loopback request without a proposal argument", async () => {
+  it("authors generated semantic-v2 Node proof without requiring a target Python venv", async () => {
     const packet = createPacketRoot({ semanticV2: true });
+    expect(existsSync(join(packet.target, ".venv"))).toBe(false);
     const proposal = readFileSync(packet.proposal, "utf8");
     const requests: Array<Record<string, unknown>> = [];
     const server = createServer((request, response) => {

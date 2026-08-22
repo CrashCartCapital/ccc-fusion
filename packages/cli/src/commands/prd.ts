@@ -83,6 +83,9 @@ type Compiler = {
     workflowExtensionRegistry?: WorkflowExtensionRegistry;
     semanticProofContract?: "v1" | "v2";
     semanticProofToolchainPaths?: CccPrdSemanticProofToolchainPaths;
+    resolveSemanticProofToolchainPaths?: (input: Readonly<{
+      pythonRequired: boolean;
+    }>) => CccPrdSemanticProofToolchainPaths;
   }): Promise<{ kind: "candidate"; sidecar: unknown; review: unknown } | { kind: "refusal" }>;
   createNativeCccPrdAuthoringAdapter(input: {
     provider: string;
@@ -1011,28 +1014,6 @@ async function runGeneratedAuthor(
     return 1;
   }
 
-  let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths;
-  try {
-    semanticProofToolchainPaths = (
-      dependencies.resolveSemanticProofToolchainPaths
-      ?? resolveCccPrdSemanticProofToolchainPaths
-    )({
-      pythonRequired: true,
-      targetRoot: input.constraints.targetRepository.path,
-    });
-  } catch (error) {
-    io.write(JSON.stringify({
-      kind: "refusal",
-      diagnostics: [{
-        code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
-        message: error instanceof Error
-          ? error.message
-          : "semantic-proof toolchain identity could not be resolved",
-      }],
-    }));
-    return 1;
-  }
-
   let adapter: ReturnType<Compiler["createNativeCccPrdAuthoringAdapter"]>;
   try {
     adapter = (
@@ -1084,7 +1065,13 @@ async function runGeneratedAuthor(
     ...(previousSidecar ? { previousSidecar } : {}),
     workflowExtensionRegistry,
     semanticProofContract: "v2",
-    semanticProofToolchainPaths,
+    resolveSemanticProofToolchainPaths: ({ pythonRequired }) => (
+      dependencies.resolveSemanticProofToolchainPaths
+      ?? resolveCccPrdSemanticProofToolchainPaths
+    )({
+      pythonRequired,
+      ...(pythonRequired ? { targetRoot: input.constraints.targetRepository.path } : {}),
+    }),
   });
   if (result.kind === "refusal") {
     io.write(JSON.stringify(result));

@@ -86,6 +86,14 @@ export type AuthorCccPrdInput = {
    * and executable identities are never executable authority.
    */
   semanticProofToolchainPaths?: CccPrdSemanticProofToolchainPaths;
+  /**
+   * Resolve executable-author custody only after the adapter's proposal has
+   * been parsed and its verifier profiles have been admitted. This keeps
+   * review-only or Node-only proposals from requiring a target Python venv.
+  */
+  resolveSemanticProofToolchainPaths?: (input: Readonly<{
+    pythonRequired: boolean;
+  }>) => CccPrdSemanticProofToolchainPaths;
 };
 
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
@@ -1090,11 +1098,39 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
         message: "authoring proposal changed stable declaration IDs for an unchanged admitted packet",
       });
     }
+    let semanticProofToolchainPaths = input.semanticProofToolchainPaths;
+    if (
+      proposalValue.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+      && !semanticProofToolchainPaths
+      && input.resolveSemanticProofToolchainPaths
+    ) {
+      if (!input.constraints) {
+        return createRefusalBundle({
+          code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+          message: "executable semantic-proof authoring requires controller-admitted target and bounds",
+        });
+      }
+      const pythonRequired = proposalValue.proofs.some((proof) => (
+        proof.verifierProfile?.schema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
+      ));
+      try {
+        semanticProofToolchainPaths = input.resolveSemanticProofToolchainPaths({
+          pythonRequired,
+        });
+      } catch (error) {
+        return createRefusalBundle({
+          code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+          message: error instanceof Error
+            ? error.message
+            : "semantic-proof toolchain identity could not be resolved",
+        });
+      }
+    }
     const mapped = mapProposal(proposalValue, custody.sourceBytes);
     let controllerOwnedV2Proofs: CccPrdProofV2[] | undefined;
     if (
       proposalValue.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
-      && input.semanticProofToolchainPaths
+      && semanticProofToolchainPaths
     ) {
       if (!input.constraints) {
         return createRefusalBundle({
@@ -1110,7 +1146,7 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
           ...(task.ownedPaths ?? []),
           ...(task.allowedWriteRoots ?? []),
         ]),
-        toolchainPaths: input.semanticProofToolchainPaths,
+        toolchainPaths: semanticProofToolchainPaths,
       });
     }
     let implementationFactProvenance: CccPrdImplementationFactProvenance | undefined;
