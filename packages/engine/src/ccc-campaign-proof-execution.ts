@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, lstat, mkdtemp, realpath, readdir, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, posix, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, posix, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -635,6 +635,19 @@ function workItemFence(context: WorkflowNodeExecutionContext) {
   };
 }
 
+function sealedPythonHome(
+  python: NonNullable<CccSemanticProofMaterialization["sealedExecutionToolchain"]["python"]>,
+): string {
+  const pythonHomeRoot = python.runtimeManifest.pythonHomeRoot;
+  if (!pythonHomeRoot) {
+    proofRefusal(
+      "CCC campaign Python semantic proof has no sealed stdlib runtime entry",
+      "CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+    );
+  }
+  return pythonHomeRoot;
+}
+
 async function assertLiveWorkItemFence(
   store: ProofExecutionStore,
   originTaskId: string,
@@ -1245,8 +1258,38 @@ async function runSemanticProofV2(
         scratchRoot: value.scratchRoot,
         taskExecutable: value.sealedExecutionToolchain.task.executablePath,
         nodeExecutable: value.sealedExecutionToolchain.node.executablePath,
+        ...(value.sealedExecutionToolchain.python ? {
+          pythonExecutable: value.sealedExecutionToolchain.python.executablePath,
+          pythonHome: sealedPythonHome(value.sealedExecutionToolchain.python),
+          pythonPathRoots: [
+            ...value.sealedExecutionToolchain.python.runtimeManifest.sitePackagesRoots,
+            ...value.sealedExecutionToolchain.python.runtimeManifest.extensionModuleRoots,
+          ],
+          pythonRuntimeFiles: [
+            value.sealedExecutionToolchain.python.runtimeManifest.interpreter.path,
+            ...value.sealedExecutionToolchain.python.runtimeManifest.dylibClosure.map(({ path }) => path),
+            ...value.sealedExecutionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => path),
+          ],
+          pythonRuntimeExecutables: value.sealedExecutionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => path),
+        } : {}),
         deniedReadRoots: Object.freeze([
-          ...new Set([execution.snapshot.targetRoot, engineRoot]),
+          ...new Set([
+            execution.snapshot.targetRoot,
+            engineRoot,
+            ...(proof.executionToolchain.python ? [
+              proof.executionToolchain.python.runtimeManifest.stdlibRoot,
+              proof.executionToolchain.python.runtimeManifest.pythonHomeRoot,
+              ...proof.executionToolchain.python.runtimeManifest.sitePackagesRoots,
+              ...proof.executionToolchain.python.runtimeManifest.extensionModuleRoots,
+              ...proof.executionToolchain.python.runtimeManifest.dylibClosure.map(({ path }) => dirname(path)),
+              ...proof.executionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => dirname(path)),
+              dirname(proof.executionToolchain.python.executablePath),
+            ].filter((path) => ![
+              "/usr/lib",
+              "/usr/share",
+              "/System/Library",
+            ].some((systemRoot) => path === systemRoot || path.startsWith(`${systemRoot}/`))) : []),
+          ]),
         ]),
       });
       try {

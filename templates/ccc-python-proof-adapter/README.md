@@ -16,8 +16,12 @@ contains `verify_manifest.json` with a `report_command` and `report_file`.
 `report_command` must name `python` or `python3` followed by a bare `.py`
 filename in the target; the adapter executes it with the same interpreter as
 the wrapper. `report_file` must be a bare filename. The script emits a raw
-report; the adapter validates it and prints canonical evidence. Taskfile
-wiring:
+report; the adapter validates it and prints canonical evidence. The controller
+may omit `--proof-id`, `--phase`, `--source-commit`, and `--source-tree`; the
+adapter then consumes `CCC_PROOF_ID`, `CCC_PROOF_PHASE`,
+`CCC_PROOF_SOURCE_COMMIT`, and `CCC_PROOF_SOURCE_TREE` from its sealed
+controller environment. Phase defaults to `task` for legacy direct
+invocations. Taskfile wiring:
 
 ```yaml
 verify:<slug>:

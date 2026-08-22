@@ -220,8 +220,20 @@ describe("TaskDetailModal tab persistence", () => {
 
   it("keeps the Terminal guard when the mocked CLI session disappears", async () => {
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (url) => {
-      const body = url.toString().includes("FN-TERMINAL")
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname !== "/api/cli-sessions") {
+        if (url.pathname.startsWith("/api/cli-sessions/")) {
+          return new Response(JSON.stringify({ error: "attach ticket not configured in tab-persistence fixture" }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return originalFetch(input, init);
+      }
+
+      const taskId = url.searchParams.get("taskId");
+      const body = taskId === "FN-TERMINAL"
         ? { sessions: [{ id: "session-8256", taskId: "FN-TERMINAL", agentState: "ready", adapterId: "claude" }] }
         : { sessions: [] };
       return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });

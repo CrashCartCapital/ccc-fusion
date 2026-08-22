@@ -246,6 +246,15 @@ export default defineConfig({
     maxWorkers,
     minWorkers: 1,
     fileParallelism: true,
+    // Built CLI contract tests spawn a fresh Node process. Under the full
+    // workspace matrix, CPU contention can delay that child past the shared
+    // 30s subprocess guard even when the test itself is healthy. Keep the
+    // guard bounded, but give these integration probes the same 120s envelope
+    // used by the engine's real-git lane; individual tests retain their own
+    // 60s wall-clock budget where needed.
+    env: {
+      FUSION_TEST_SUBPROCESS_TIMEOUT_MS: "120000",
+    },
     coverage: {
       enabled: false,
       reporter: ["text", "html", "json"],

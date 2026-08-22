@@ -374,6 +374,106 @@ function clearSessionStateError(session: AgentSession): void {
 const CCC_EXPECTED_RESPONSE_MODEL = "__fusionCccExpectedResponseModel";
 const cccProviderAttemptSessions = new WeakSet<object>();
 
+type CccOmniRouteObservation = Readonly<{
+  provider: string;
+  model: string;
+}>;
+
+type CccOmniRouteReceipt = Readonly<{
+  initial: CccOmniRouteObservation;
+  final: CccOmniRouteObservation;
+}>;
+
+type CccOmniRouteState = {
+  initial?: CccOmniRouteObservation;
+};
+
+const CCC_OMNI_ROUTE_PROVIDER_RE = /(?:^|[-_:./])omniroute(?:$|[-_:./])/i;
+
+function isCccOmniRouteProvider(provider: unknown): provider is string {
+  return typeof provider === "string" && CCC_OMNI_ROUTE_PROVIDER_RE.test(provider);
+}
+
+function splitCccProviderQualifiedModel(modelId: unknown): CccOmniRouteObservation | undefined {
+  if (typeof modelId !== "string") return undefined;
+  const separator = modelId.indexOf("/");
+  if (separator <= 0 || separator === modelId.length - 1 || modelId.indexOf("/", separator + 1) !== -1) {
+    return undefined;
+  }
+  if (modelId !== modelId.trim()) return undefined;
+  const provider = modelId.slice(0, separator);
+  const model = modelId.slice(separator + 1);
+  if (provider !== provider.trim() || model !== model.trim()) return undefined;
+  return {
+    provider,
+    model,
+  };
+}
+
+function requireCccOmniRouteRequestedIdentity(provider: unknown, modelId: unknown): CccOmniRouteObservation | undefined {
+  if (!isCccOmniRouteProvider(provider)) return undefined;
+  const requested = splitCccProviderQualifiedModel(modelId);
+  if (!requested) {
+    throw new Error(
+      `ccc-fusion OmniRoute requires a provider-qualified requested model: ${String(provider)}/${String(modelId)}`,
+    );
+  }
+  return requested;
+}
+
+function readCccOmniRouteHeader(headers: unknown, name: string): string | undefined {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return undefined;
+  const entry = Object.entries(headers as Record<string, unknown>)
+    .find(([key]) => key.toLowerCase() === name);
+  return typeof entry?.[1] === "string" && entry[1].length > 0 ? entry[1] : undefined;
+}
+
+function readCccOmniRouteFinal(result: unknown): CccOmniRouteObservation | undefined {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return undefined;
+  const receipt = (result as Record<string, unknown>).omniRoute;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return undefined;
+  const provider = (receipt as Record<string, unknown>).provider;
+  const model = (receipt as Record<string, unknown>).model;
+  if (typeof provider !== "string" || provider.length === 0 || typeof model !== "string" || model.length === 0) {
+    return undefined;
+  }
+  return { provider, model };
+}
+
+function requireCccOmniRouteReceipt(
+  requested: CccOmniRouteObservation,
+  state: CccOmniRouteState | undefined,
+  result: unknown,
+): CccOmniRouteReceipt {
+  const initial = state?.initial;
+  if (!initial) {
+    throw new Error("ccc-fusion OmniRoute initial HTTP route receipt missing");
+  }
+  const final = readCccOmniRouteFinal(result);
+  if (!final) {
+    throw new Error("ccc-fusion OmniRoute terminal SSE route receipt missing");
+  }
+  if (initial.provider !== requested.provider || initial.model !== requested.model) {
+    throw new Error(
+      `ccc-fusion OmniRoute initial route mismatch: requested ${requested.provider}/${requested.model}, `
+      + `initial ${initial.provider}/${initial.model}`,
+    );
+  }
+  if (final.provider !== requested.provider || final.model !== requested.model) {
+    throw new Error(
+      `ccc-fusion OmniRoute final route mismatch: requested ${requested.provider}/${requested.model}, `
+      + `final ${final.provider}/${final.model}`,
+    );
+  }
+  if (initial.provider !== final.provider || initial.model !== final.model) {
+    throw new Error(
+      `ccc-fusion OmniRoute initial/final route mismatch: initial ${initial.provider}/${initial.model}, `
+      + `final ${final.provider}/${final.model}`,
+    );
+  }
+  return { initial, final };
+}
+
 /** Test seam for the string-only Pi failure boundary. Production marks only
  * sessions created from a validated provider-attempt binding below. */
 export function _markCccProviderAttemptSessionForTest(session: AgentSession): void {
@@ -408,6 +508,8 @@ type CccResponseIdentitySession = AgentSession & {
   [CCC_EXPECTED_RESPONSE_MODEL]?: {
     provider: string;
     modelId: string;
+    omniRoute?: boolean;
+    omniRouteState?: { current?: CccOmniRouteState };
   };
 };
 
@@ -522,6 +624,14 @@ function assertCccResponseModelIdentity(session: AgentSession): void {
     (message): message is Record<string, unknown> =>
       Boolean(message) && typeof message === "object" && (message as Record<string, unknown>).role === "assistant",
   ) : undefined;
+  if (expected.omniRoute) {
+    const requested = splitCccProviderQualifiedModel(expected.modelId);
+    if (!requested) {
+      throw new Error(`ccc-fusion OmniRoute terminal route receipt missing: configured ${expected.provider}/${expected.modelId}`);
+    }
+    requireCccOmniRouteReceipt(requested, expected.omniRouteState?.current, assistant);
+    return;
+  }
   const responseModel = assistant?.responseModel;
   if (typeof responseModel !== "string" || responseModel.trim().length === 0) {
     throw new Error(
@@ -782,6 +892,8 @@ function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAtt
 function createCccProviderAttemptControlledStream(input: {
   binding: CccProviderAttemptBinding;
   state: CccProviderAttemptSessionState;
+  omniRouteState?: CccOmniRouteState;
+  omniRouteRequested?: CccOmniRouteObservation;
   dispatch: (...args: any[]) => AsyncIterable<any> & { result: () => Promise<any> };
   model: any;
   dispatchModel: any;
@@ -856,6 +968,9 @@ function createCccProviderAttemptControlledStream(input: {
               // reported as a real receipt.
               const usage = result.usage;
               const hasUsage = usage != null && !(usage.input === 0 && usage.output === 0);
+              const omniRoute = input.omniRouteRequested
+                ? requireCccOmniRouteReceipt(input.omniRouteRequested, input.omniRouteState, result)
+                : undefined;
               const reconciliation: CccProviderAttemptSubmittedReconciliation = {
                 ...scope,
                 outcome: "committed" as const,
@@ -867,13 +982,19 @@ function createCccProviderAttemptControlledStream(input: {
                 }),
                 observerId: "pi",
                 effectiveRoute: {
-                  effectiveProvider: result.provider,
-                  effectiveModel: result.responseModel ?? result.model,
+                  // OmniRoute's upstream identity is a separate terminal receipt.
+                  // Keep the requested Pi registry route in the ordinary effective
+                  // fields so a body-model alias cannot replace the campaign key.
+                  effectiveProvider: input.omniRouteRequested ? input.model.provider : result.provider,
+                  effectiveModel: input.omniRouteRequested
+                    ? input.model.id
+                    : result.responseModel ?? result.model,
                   usage: hasUsage ? { inputTokens: usage.input, outputTokens: usage.output } : null,
                   cost: hasUsage
                     ? { amountUsd: usage.cost.total, source: "pi-ai" }
                     : { kind: "unknown" as const, reason: "no-usage-in-stream" },
                   receiptSource: hasUsage ? "stream-usage" as const : "none" as const,
+                  ...(omniRoute ? { omniRoute } : {}),
                 },
               };
               const reconciledScope = await input.binding.controller.reconcile(reconciliation);
@@ -2947,6 +3068,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   const modelRegistry = await createFusionModelRegistry(authStorage);
   const modelRuntime = modelRegistry.modelRuntime;
   const cccTransportClosures = new Set<Promise<void>>();
+  const cccOmniRouteSessionState: { current?: CccOmniRouteState } = {};
 
   if (options.profile === CCC_FUSION_PROFILE) {
     const cccProviderAttemptState = createCccProviderAttemptSessionState();
@@ -2967,10 +3089,16 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       requestOptions: any,
     ) => {
       const expectedModelId = model.id as string;
+      const omniRouteRequested = requireCccOmniRouteRequestedIdentity(model.provider, expectedModelId);
+      const omniRouteState: CccOmniRouteState | undefined = omniRouteRequested ? {} : undefined;
+      if (omniRouteState) {
+        cccOmniRouteSessionState.current = omniRouteState;
+      }
       const optionsWithBoundary = {
         ...(requestOptions ?? {}),
         profile: CCC_FUSION_PROFILE,
         subscriptionReady: true,
+        maxRetries: 0,
       };
       const priorOnPayload = optionsWithBoundary.onPayload as
         | ((payload: unknown, model: unknown) => unknown | Promise<unknown>)
@@ -2986,6 +3114,31 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           model: expectedModelId,
         };
       };
+      const priorOnResponse = optionsWithBoundary.onResponse as
+        | ((response: unknown, responseModel: unknown) => unknown | Promise<unknown>)
+        | undefined;
+      if (omniRouteRequested) {
+        optionsWithBoundary.onResponse = async (response: unknown, responseModel: unknown) => {
+          await priorOnResponse?.(response, responseModel);
+          const headers = response && typeof response === "object"
+            ? (response as { headers?: unknown }).headers
+            : undefined;
+          const provider = readCccOmniRouteHeader(headers, "x-omniroute-provider");
+          const routeModel = readCccOmniRouteHeader(headers, "x-omniroute-model");
+          if (provider === undefined || routeModel === undefined) {
+            throw new Error("ccc-fusion OmniRoute initial HTTP route receipt missing");
+          }
+          const observed = { provider, model: routeModel };
+          const prior = omniRouteState!.initial;
+          if (prior && (prior.provider !== observed.provider || prior.model !== observed.model)) {
+            throw new Error(
+              `ccc-fusion OmniRoute initial HTTP route receipt conflict: `
+              + `first ${prior.provider}/${prior.model}, later ${observed.provider}/${observed.model}`,
+            );
+          }
+          omniRouteState!.initial = observed;
+        };
+      }
       /*
        * pi-ai records responseModel only when the provider-reported model differs
        * from model.id. Use a private in-process probe id while forcing the exact
@@ -2998,6 +3151,8 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         ? createCccProviderAttemptControlledStream({
           binding: cccProviderAttemptBinding,
           state: cccProviderAttemptState,
+          omniRouteState,
+          omniRouteRequested,
           dispatch,
           model,
           dispatchModel,
@@ -3120,7 +3275,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   // as a reliability safeguard — disabling it would cause overflow failures.
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true },
-    retry: { enabled: true, maxRetries: 3 },
+    retry: options.profile === CCC_FUSION_PROFILE
+      ? { enabled: false, maxRetries: 0 }
+      : { enabled: true, maxRetries: 3 },
   });
 
   // Resolve explicit model selection if provider and model ID are specified.
@@ -3137,6 +3294,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       options.profile,
     );
   } catch (primaryResolutionError) {
+    if (options.profile === CCC_FUSION_PROFILE) {
+      throw primaryResolutionError;
+    }
     if (!options.fallbackProvider || !options.fallbackModelId) {
       throw primaryResolutionError;
     }
@@ -3318,6 +3478,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   };
 
   const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
+    if (options.profile === CCC_FUSION_PROFILE && modelOverride) {
+      requireCccOmniRouteRequestedIdentity(modelOverride.provider, modelOverride.id);
+    }
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
     // Tool instances. We need boundary-wrapped versions of the built-ins, so we
     // suppress the defaults with `noTools: "builtin"` and register our wrapped
@@ -3534,6 +3697,10 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
         (result.session as CccResponseIdentitySession)[CCC_EXPECTED_RESPONSE_MODEL] = {
           provider: modelOverride.provider,
           modelId: modelOverride.id,
+          ...(isCccOmniRouteProvider(modelOverride.provider) ? { omniRoute: true } : {}),
+          ...(isCccOmniRouteProvider(modelOverride.provider)
+            ? { omniRouteState: cccOmniRouteSessionState }
+            : {}),
         };
       }
       return result;

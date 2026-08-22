@@ -1,9 +1,9 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fsConstants, existsSync } from "node:fs";
-import { access, chmod, lstat, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, isAbsolute, normalize, resolve, sep } from "node:path";
+import { basename, dirname, join, isAbsolute, normalize, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { isAlias, isMap, isScalar, isSeq, parseDocument, type Node, type Pair } from "yaml";
 import { resolveGitBinary } from "../git-binary.js";
@@ -17,6 +17,8 @@ import {
 import type {
   CccPrdExecutableIdentity,
   CccPrdLinkedRuntimeEntry,
+  CccPrdPythonExecutionToolchain,
+  CccPrdPythonRuntimeFile,
   CccPrdProofExecutionToolchain,
   CccPrdProofV2,
   CccPrdVerifierClosureEntry,
@@ -32,6 +34,22 @@ const LOWER_SHA256 = /^[0-9a-f]{64}$/u;
 const GIT_COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const EXECUTABLE_VERSION_ARGS = Object.freeze(["--version"] as const);
 const OTOOL_TIMEOUT_MS = 10_000;
+const MAX_PYTHON_RUNTIME_ROOTS = 16;
+const MAX_PYTHON_RUNTIME_FILES = 200_000;
+const MAX_PYTHON_RUNTIME_BYTES = 1024 * 1024 * 1024;
+const MAX_PYTHON_DISCOVERY_BYTES = 64 * 1024 * 1024;
+const MAX_PYTHON_DYLIB_CLOSURE_FILES = 256;
+const PYTHON_REQUESTED_PATH = /^(?:\/|@(rpath|loader_path|executable_path)\/)[^\0\\\s]+$/u;
+const MACH_O_MAGICS = new Set([
+  0xfeedface,
+  0xcefaedfe,
+  0xfeedfacf,
+  0xcffaedfe,
+  0xcafebabe,
+  0xbebafeca,
+  0xcafebabf,
+  0xbfbafeca,
+]);
 
 export const CCC_PRD_SEMANTIC_PROOF_HOST_ID =
   "fusion-cli-semantic-proof-host.v1" as const;
@@ -50,6 +68,8 @@ export class CccPrdSemanticProofCustodyError extends Error {
 export type CccPrdSemanticProofToolchainPaths = Readonly<{
   taskExecutablePath: string;
   nodeExecutablePath: string;
+  /** Required only when a proof opts into verifierProfile/python-adapter.v1. */
+  pythonExecutablePath?: string;
   proofHost: Readonly<{
     id: typeof CCC_PRD_SEMANTIC_PROOF_HOST_ID;
     executablePath: string;
@@ -205,6 +225,27 @@ function parseLiteralCommand(command: string): string[] {
   return tokens;
 }
 
+function parsePythonLiteralCommand(command: string): string[] {
+  if (
+    command.trim() !== command
+    || /[;&|`$<>\n\r\t'"\\*?{}()[\]!~]/u.test(command)
+  ) {
+    custodyRefusal("CCC semantic-proof Python Task target command must be literal and substitution-free");
+  }
+  const tokens = command.split(" ");
+  if (
+    tokens.length !== 4
+    || tokens[0] !== "python3"
+    || tokens[2] !== "--target"
+    || tokens.some((token) => token.length === 0 || !TARGET_COMMAND_TOKEN.test(token))
+  ) {
+    custodyRefusal(
+      "CCC semantic-proof Python Task target must be exactly python3 <adapter> --target <target>",
+    );
+  }
+  return tokens;
+}
+
 function assertNoAliases(node: unknown): void {
   if (isAlias(node) || (node && typeof node === "object" && "anchor" in node && node.anchor)) {
     custodyRefusal("CCC semantic-proof Taskfile aliases and anchors are forbidden");
@@ -222,6 +263,7 @@ function assertNoAliases(node: unknown): void {
 function verifyStrictTaskTarget(
   targetName: string,
   targetNode: Node | null | undefined,
+  pythonProfile = false,
 ): string[] {
   if (!VERIFY_TARGET.test(targetName)) {
     custodyRefusal(`CCC semantic-proof Taskfile target must be verify:* only: ${targetName}`);
@@ -237,7 +279,9 @@ function verifyStrictTaskTarget(
   if (!isSeq(commands) || commands.anchor || commands.items.length !== 1) {
     custodyRefusal("CCC semantic-proof Task target must contain exactly one literal command");
   }
-  const tokens = parseLiteralCommand(plainScalar(commands.items[0] as Node, "command"));
+  const tokens = pythonProfile
+    ? parsePythonLiteralCommand(plainScalar(commands.items[0] as Node, "command"))
+    : parseLiteralCommand(plainScalar(commands.items[0] as Node, "command"));
   return [
     tokens[0]!,
     ...tokens.slice(1).map((path) => canonicalRelativePath(
@@ -273,15 +317,33 @@ function verifyTaskfile(bytes: Buffer, proof: CccPrdProofV2): void {
   if (!tasks.has(selectedTarget)) {
     custodyRefusal("CCC semantic-proof Taskfile does not declare the selected verify target");
   }
+  const pythonProfile = proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1";
   let selectedTokens: string[] | undefined;
   for (const [targetName, targetNode] of tasks) {
-    const tokens = verifyStrictTaskTarget(targetName, targetNode);
+    const tokens = verifyStrictTaskTarget(targetName, targetNode, pythonProfile);
     if (targetName === selectedTarget) selectedTokens = tokens;
   }
   const tokens = selectedTokens!;
   const harnesses = proof.verifierClosure
     .filter((entry) => entry.role === "harness")
     .map((entry) => entry.path);
+  if (pythonProfile) {
+    const profile = proof.verifierProfile!;
+    const fixtures = proof.verifierClosure
+      .filter((entry) => entry.role === "fixture")
+      .map((entry) => entry.path);
+    if (
+      tokens.length !== 4
+      || tokens[1] !== profile.adapterPath
+      || tokens[3] !== profile.targetPath
+      || harnesses.length !== 1
+      || !harnesses.includes(profile.adapterPath)
+      || !fixtures.some((path) => path.startsWith(`${profile.targetPath}/`))
+    ) {
+      custodyRefusal("CCC semantic-proof Python adapter and target must be closure-owned");
+    }
+    return;
+  }
   if (harnesses.length !== 1 || tokens[1] !== harnesses[0]) {
     custodyRefusal("CCC semantic-proof Task target must invoke the one declared harness");
   }
@@ -328,6 +390,9 @@ type StaticToolchainIdentity = {
   task: StaticExecutableIdentity;
   node: StaticExecutableIdentity;
   proofHost: StaticExecutableIdentity & { id: typeof CCC_PRD_SEMANTIC_PROOF_HOST_ID };
+  python?: StaticExecutableIdentity & {
+    runtimeManifest: CccPrdPythonExecutionToolchain["runtimeManifest"];
+  };
 };
 
 async function inspectExecutableBytes(
@@ -358,6 +423,492 @@ async function inspectExecutableBytes(
     executableSha256: sha256(bytes),
     executableBytes: bytes,
   };
+}
+
+async function resolveControllerPythonExecutable(
+  requestedPath: string,
+): Promise<StaticExecutableIdentity & { executableBytes: Buffer }> {
+  let stdout: Buffer;
+  try {
+    ({ stdout } = await execFile(
+      requestedPath,
+      ["-c", "import os,sys; print(os.path.realpath(sys.executable))"],
+      {
+        ...versionOptions(),
+        env: {
+          ...process.env,
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          PYTHONHOME: undefined,
+          PYTHONPATH: undefined,
+          PYTHONUSERBASE: undefined,
+        },
+      },
+    ));
+  } catch (error) {
+    custodyRefusal(`CCC semantic-proof Python controller executable could not resolve its interpreter: ${requestedPath}`, error);
+  }
+  const resolvedPath = stdout.toString("utf8").trim().split("\n").at(-1)?.trim() ?? "";
+  if (!isAbsolute(resolvedPath) || !/^(?:python3(?:\.\d+)*|Python)$/u.test(basename(resolvedPath))) {
+    custodyRefusal(`CCC semantic-proof Python controller executable resolved to an unsupported interpreter: ${resolvedPath}`);
+  }
+  const frameworkExecutable = resolve(
+    dirname(resolvedPath),
+    "../Resources/Python.app/Contents/MacOS/Python",
+  );
+  if (existsSync(frameworkExecutable)) return inspectExecutableBytes(frameworkExecutable);
+  return inspectExecutableBytes(resolvedPath);
+}
+
+async function inspectPythonRuntimeFile(
+  entry: CccPrdPythonRuntimeFile,
+  label: string,
+): Promise<CccPrdPythonRuntimeFile> {
+  if (!isAbsolute(entry.path) || !LOWER_SHA256.test(entry.sha256)) {
+    custodyRefusal(`CCC semantic-proof Python ${label} manifest entry is malformed`);
+  }
+  if (
+    entry.requestedPaths !== undefined
+    && (
+      entry.requestedPaths.length === 0
+      || entry.requestedPaths.length > 16
+      || entry.requestedPaths.some((requestedPath) => (
+        !PYTHON_REQUESTED_PATH.test(requestedPath)
+      ))
+      || new Set(entry.requestedPaths).size !== entry.requestedPaths.length
+    )
+  ) {
+    custodyRefusal(`CCC semantic-proof Python ${label} requested paths are malformed`);
+  }
+  let canonicalPath: string;
+  try {
+    canonicalPath = await realpath(entry.path);
+    if (canonicalPath !== entry.path) throw new Error("symlinked runtime path");
+    const metadata = await lstat(canonicalPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("not a regular file");
+  } catch (error) {
+    custodyRefusal(`CCC semantic-proof Python ${label} runtime file is unavailable: ${entry.path}`, error);
+  }
+  const handle = await open(canonicalPath, "r");
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error("not a regular file");
+    const bytes = await handle.readFile();
+    const observed = sha256(bytes);
+    if (observed !== entry.sha256) {
+      custodyRefusal(`CCC semantic-proof Python ${label} runtime digest drifted: ${entry.path}`);
+    }
+  } catch (error) {
+    if (error instanceof CccPrdSemanticProofCustodyError) throw error;
+    custodyRefusal(`CCC semantic-proof Python ${label} runtime file could not be read: ${entry.path}`, error);
+  } finally {
+    await handle.close();
+  }
+  return {
+    path: canonicalPath,
+    sha256: entry.sha256,
+    ...(entry.requestedPaths ? { requestedPaths: [...entry.requestedPaths].sort() } : {}),
+  };
+}
+
+async function observePythonRuntimeFile(
+  path: string,
+  label: string,
+): Promise<CccPrdPythonRuntimeFile> {
+  if (!isAbsolute(path)) custodyRefusal(`CCC semantic-proof Python ${label} runtime path is not absolute: ${path}`);
+  let canonicalPath: string;
+  try {
+    canonicalPath = await realpath(path);
+    if (canonicalPath !== path) throw new Error("symlinked runtime path");
+    const metadata = await lstat(canonicalPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("not a regular file");
+  } catch (error) {
+    custodyRefusal(`CCC semantic-proof Python ${label} runtime file is unavailable: ${path}`, error);
+  }
+  const handle = await open(canonicalPath, "r");
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile()) throw new Error("not a regular file");
+    return { path: canonicalPath, sha256: sha256(await handle.readFile()) };
+  } catch (error) {
+    custodyRefusal(`CCC semantic-proof Python ${label} runtime file could not be read: ${path}`, error);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function isDarwinMachOFile(path: string): Promise<boolean> {
+  if (process.platform !== "darwin") return false;
+  const handle = await open(path, "r");
+  try {
+    const bytes = Buffer.alloc(4);
+    const result = await handle.read(bytes, 0, bytes.length, 0);
+    if (result.bytesRead < 4) return false;
+    return MACH_O_MAGICS.has(bytes.readUInt32BE(0)) || MACH_O_MAGICS.has(bytes.readUInt32LE(0));
+  } finally {
+    await handle.close();
+  }
+}
+
+async function inspectPythonRuntimeRoot(
+  root: string,
+  label: string,
+): Promise<string> {
+  if (
+    !isAbsolute(root)
+    || root.length === 0
+    || root !== root.trim()
+    || root.endsWith(sep)
+  ) {
+    custodyRefusal(`CCC semantic-proof Python ${label} root is malformed: ${root}`);
+  }
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = await realpath(root);
+    if (canonicalRoot !== root) throw new Error("symlinked runtime root");
+    const metadata = await lstat(canonicalRoot);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("not a regular directory");
+  } catch (error) {
+    custodyRefusal(`CCC semantic-proof Python ${label} root is unavailable: ${root}`, error);
+  }
+  return canonicalRoot;
+}
+
+function assertPythonRuntimeRootMembership(
+  manifest: CccPrdPythonExecutionToolchain["runtimeManifest"],
+): void {
+  const rootSet = [
+    manifest.stdlibRoot,
+    manifest.pythonHomeRoot,
+    ...manifest.sitePackagesRoots,
+    ...manifest.extensionModuleRoots,
+  ];
+  if (
+    new Set(manifest.sitePackagesRoots).size !== manifest.sitePackagesRoots.length
+    || new Set(manifest.extensionModuleRoots).size !== manifest.extensionModuleRoots.length
+    || new Set(rootSet).size > MAX_PYTHON_RUNTIME_ROOTS + 1
+  ) {
+    custodyRefusal("CCC semantic-proof Python runtime roots are unbounded or duplicated");
+  }
+  if (!isSameOrWithin(manifest.stdlibRoot, manifest.pythonHomeRoot)) {
+    custodyRefusal("CCC semantic-proof Python stdlib root escapes pythonHomeRoot");
+  }
+  const requireWithin = (
+    entries: readonly CccPrdPythonRuntimeFile[],
+    roots: readonly string[],
+    label: string,
+  ): void => {
+    for (const entry of entries) {
+      if (!roots.some((root) => isSameOrWithin(entry.path, root))) {
+        custodyRefusal(`CCC semantic-proof Python ${label} escapes its declared runtime roots: ${entry.path}`);
+      }
+    }
+  };
+  requireWithin(manifest.stdlib, [manifest.stdlibRoot], "stdlib");
+  requireWithin(manifest.sitePackages, manifest.sitePackagesRoots, "site-packages");
+  requireWithin(manifest.extensionModules, manifest.extensionModuleRoots, "extension module");
+}
+
+async function discoverPythonRuntimeManifest(
+  pythonExecutablePath: string,
+): Promise<CccPrdPythonExecutionToolchain["runtimeManifest"]> {
+  const discoveryRoot = await mkdtemp(join(tmpdir(), "ccc-python-runtime-discovery-"));
+  const discoveryPath = join(discoveryRoot, "manifest.json");
+  const script = [
+    "import json, os, sys, sysconfig",
+    "paths = sysconfig.get_paths()",
+    "stdlib_root = os.path.realpath(paths.get('stdlib') or '')",
+    "python_home_root = os.path.realpath(sys.prefix)",
+    "site_roots = sorted({os.path.realpath(paths[k]) for k in ('purelib', 'platlib') if paths.get(k)})",
+    "extension_roots = [stdlib_root, *site_roots]",
+    "framework_python = os.path.realpath(os.path.join(os.path.dirname(sys.executable), '..', 'Resources', 'Python.app', 'Contents', 'MacOS', 'Python'))",
+    "runtime_support = [framework_python] if os.path.isfile(framework_python) and not os.path.islink(framework_python) else []",
+    `max_files = ${MAX_PYTHON_RUNTIME_FILES}`,
+    `max_bytes = ${MAX_PYTHON_RUNTIME_BYTES}`,
+    "seen = set()",
+    "total_files = 0",
+    "total_bytes = 0",
+    "def files(root):",
+    "  global total_files, total_bytes",
+    "  out = []",
+    "  if not root or not os.path.isdir(root): return out",
+    "  for base, dirs, names in os.walk(root, followlinks=False):",
+    "    dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(base, d)))",
+    "    for name in sorted(names):",
+    "      path = os.path.join(base, name)",
+    "      if os.path.isfile(path) and not os.path.islink(path):",
+    "        canonical = os.path.realpath(path)",
+    "        if canonical not in seen:",
+    "          seen.add(canonical)",
+    "          total_files += 1",
+    "          total_bytes += os.path.getsize(canonical)",
+    "          if total_files > max_files or total_bytes > max_bytes:",
+    "            raise RuntimeError('Python runtime exceeds controller sealing bounds')",
+    "        out.append(canonical)",
+    "  return sorted(set(out))",
+    "payload = {'stdlibRoot': stdlib_root, 'pythonHomeRoot': python_home_root, 'sitePackagesRoots': site_roots, 'extensionModuleRoots': extension_roots, 'runtimeSupport': runtime_support, 'stdlib': files(stdlib_root), 'purelib': files(paths.get('purelib')), 'platlib': files(paths.get('platlib'))}",
+    "with open(sys.argv[1], 'x', encoding='utf-8') as output:",
+    "  json.dump(payload, output, separators=(',', ':'))",
+  ].join("\n");
+  try {
+    await execFile(pythonExecutablePath, ["-c", script, discoveryPath], versionOptions());
+  } catch (error) {
+    await rm(discoveryRoot, { recursive: true, force: true });
+    custodyRefusal("CCC semantic-proof Python runtime manifest could not be discovered within controller bounds", error);
+  }
+  let discoveryBytes: Buffer;
+  try {
+    const metadata = await lstat(discoveryPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_PYTHON_DISCOVERY_BYTES) {
+      throw new Error("discovery manifest is missing, symlinked, or oversized");
+    }
+    discoveryBytes = await readFile(discoveryPath);
+  } catch (error) {
+    await rm(discoveryRoot, { recursive: true, force: true });
+    custodyRefusal("CCC semantic-proof Python runtime manifest discovery output is unavailable", error);
+  }
+  await rm(discoveryRoot, { recursive: true, force: true });
+  let discovered: Record<string, unknown>;
+  try {
+    discovered = JSON.parse(discoveryBytes.toString("utf8")) as Record<string, unknown>;
+  } catch (error) {
+    custodyRefusal("CCC semantic-proof Python runtime manifest discovery was malformed", error);
+  }
+  const filesFor = async (key: string): Promise<CccPrdPythonRuntimeFile[]> => {
+    const values = discovered[key];
+    if (!Array.isArray(values)) custodyRefusal(`CCC semantic-proof Python runtime discovery omitted ${key}`);
+    const observed: CccPrdPythonRuntimeFile[] = [];
+    for (const [index, value] of values.entries()) {
+      if (typeof value !== "string") custodyRefusal(`CCC semantic-proof Python runtime discovery ${key}[${index}] is malformed`);
+      observed.push(await observePythonRuntimeFile(value, `${key}[${index}]`));
+    }
+    return observed;
+  };
+  if (typeof discovered.stdlibRoot !== "string") {
+    custodyRefusal("CCC semantic-proof Python runtime discovery omitted stdlibRoot");
+  }
+  if (!Array.isArray(discovered.sitePackagesRoots) || !Array.isArray(discovered.extensionModuleRoots)) {
+    custodyRefusal("CCC semantic-proof Python runtime discovery omitted bounded import roots");
+  }
+  const stdlibRoot = await inspectPythonRuntimeRoot(discovered.stdlibRoot, "stdlib");
+  if (typeof discovered.pythonHomeRoot !== "string") {
+    custodyRefusal("CCC semantic-proof Python runtime discovery omitted pythonHomeRoot");
+  }
+  const pythonHomeRoot = await inspectPythonRuntimeRoot(discovered.pythonHomeRoot, "python home");
+  const sitePackagesRoots = await Promise.all(discovered.sitePackagesRoots.map((root, index) => {
+    if (typeof root !== "string") custodyRefusal(`CCC semantic-proof Python runtime discovery sitePackagesRoots[${index}] is malformed`);
+    return inspectPythonRuntimeRoot(root, `site-packages[${index}]`);
+  }));
+  const extensionModuleRoots = await Promise.all(discovered.extensionModuleRoots.map((root, index) => {
+    if (typeof root !== "string") custodyRefusal(`CCC semantic-proof Python runtime discovery extensionModuleRoots[${index}] is malformed`);
+    return inspectPythonRuntimeRoot(root, `extension-module[${index}]`);
+  }));
+  const runtimeSupport = await filesFor("runtimeSupport");
+  const uniqueFiles = (entries: readonly CccPrdPythonRuntimeFile[]): CccPrdPythonRuntimeFile[] => [
+    ...new Map(entries.map((entry) => [entry.path, entry])).values(),
+  ];
+  const stdlib = uniqueFiles(await filesFor("stdlib"));
+  const purelib = uniqueFiles(await filesFor("purelib"));
+  const platlib = uniqueFiles(await filesFor("platlib"));
+  const extensionModules = uniqueFiles([...purelib, ...platlib, ...stdlib]
+    .filter((entry) => /\.(?:so|dylib|pyd|dll)(?:\.[0-9.]+)?$/u.test(entry.path)));
+  const extensionSet = new Set(extensionModules.map((entry) => entry.path));
+  const sitePackages = uniqueFiles([...purelib, ...platlib].filter((entry) => !extensionSet.has(entry.path)));
+  const dylibClosure = process.platform === "darwin"
+    ? await discoverDarwinPythonDylibClosure(
+      pythonExecutablePath,
+      [...stdlib, ...sitePackages, ...extensionModules].map((entry) => entry.path),
+    )
+    : [];
+  const interpreterIdentity = await inspectExecutableBytes(pythonExecutablePath);
+  const manifest: CccPrdPythonExecutionToolchain["runtimeManifest"] = {
+    schema: "ccc-prd.python-runtime-manifest.v1",
+    interpreter: {
+      path: interpreterIdentity.executablePath,
+      sha256: interpreterIdentity.executableSha256,
+    },
+    stdlibRoot,
+    pythonHomeRoot,
+    sitePackagesRoots,
+      extensionModuleRoots,
+      runtimeSupport,
+      stdlib,
+    sitePackages,
+    extensionModules,
+    dylibClosure,
+  };
+  assertPythonRuntimeRootMembership(manifest);
+  return manifest;
+}
+
+function darwinSystemRuntimePath(path: string): boolean {
+  return path.startsWith("/usr/lib/") || path.startsWith("/System/Library/");
+}
+
+async function discoverDarwinPythonDylibClosure(
+  executablePath: string,
+  additionalLoaders: readonly string[] = [],
+): Promise<CccPrdPythonRuntimeFile[]> {
+  const entries = new Map<string, CccPrdPythonRuntimeFile>();
+  const visited = new Set<string>();
+  const queue = [executablePath, ...additionalLoaders];
+  while (queue.length > 0) {
+    const loaderPath = queue.shift()!;
+    if (visited.has(loaderPath)) continue;
+    visited.add(loaderPath);
+    if (!(await isDarwinMachOFile(loaderPath))) continue;
+    let stdout: string;
+    try {
+      ({ stdout } = await execFile("/usr/bin/otool", ["-L", loaderPath], {
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024,
+        timeout: OTOOL_TIMEOUT_MS,
+        windowsHide: true,
+      }));
+    } catch (error) {
+      custodyRefusal(`CCC semantic-proof Python dylib closure inspection failed: ${loaderPath}`, error);
+    }
+    for (const line of stdout.split("\n").slice(1)) {
+      const requestedPath = line.trim().split(/\s+/u)[0];
+      if (!requestedPath || darwinSystemRuntimePath(requestedPath)) continue;
+      const linkedPath = resolveDarwinLinkedPath(requestedPath, loaderPath, executablePath);
+      if (!linkedPath || darwinSystemRuntimePath(linkedPath)) continue;
+      const runtime = await linkedRuntimeIdentity(linkedPath).catch((error: unknown) =>
+        custodyRefusal(`CCC semantic-proof Python dylib closure file is unavailable: ${linkedPath}`, error));
+      const prior = entries.get(runtime.canonicalPath);
+      entries.set(runtime.canonicalPath, {
+        path: runtime.canonicalPath,
+        sha256: runtime.sha256,
+        requestedPaths: [...new Set([
+          ...(prior?.requestedPaths ?? []),
+          requestedPath,
+        ])].sort(),
+      });
+      if (entries.size > MAX_PYTHON_DYLIB_CLOSURE_FILES) {
+        custodyRefusal("CCC semantic-proof Python dylib closure exceeds controller bounds");
+      }
+      if (!visited.has(runtime.canonicalPath)) queue.push(runtime.canonicalPath);
+    }
+  }
+  return [...entries.values()].sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+}
+
+async function observePythonExecutionToolchain(
+  paths: CccPrdSemanticProofToolchainPaths,
+  template: CccPrdPythonExecutionToolchain,
+): Promise<CccPrdPythonExecutionToolchain> {
+  if (!paths.pythonExecutablePath) {
+    custodyRefusal("CCC semantic-proof Python verifier requires a controller-owned python3 executable");
+  }
+  if (template.runtimeManifest.schema !== "ccc-prd.python-runtime-manifest.v1") {
+    custodyRefusal("CCC semantic-proof Python runtime manifest schema is unsupported");
+  }
+  const executable = await resolveControllerPythonExecutable(paths.pythonExecutablePath);
+  if (!/^(?:python3(?:\.\d+)*|Python)$/u.test(basename(executable.executablePath))) {
+    custodyRefusal("CCC semantic-proof Python verifier executable must be named python3");
+  }
+  const runtimeManifest = template.runtimeManifest.interpreter.path.length === 0
+    ? await discoverPythonRuntimeManifest(executable.executablePath)
+    : template.runtimeManifest;
+  const stdlibRoot = await inspectPythonRuntimeRoot(runtimeManifest.stdlibRoot, "stdlib");
+  const pythonHomeRoot = await inspectPythonRuntimeRoot(runtimeManifest.pythonHomeRoot, "python home");
+  const sitePackagesRoots = await Promise.all(runtimeManifest.sitePackagesRoots.map((root, index) => (
+    inspectPythonRuntimeRoot(root, `site-packages[${index}]`)
+  )));
+  const extensionModuleRoots = await Promise.all(runtimeManifest.extensionModuleRoots.map((root, index) => (
+    inspectPythonRuntimeRoot(root, `extension-module[${index}]`)
+  )));
+  const runtimeSupport: CccPrdPythonRuntimeFile[] = [];
+  for (const [index, entry] of runtimeManifest.runtimeSupport.entries()) {
+    runtimeSupport.push(await inspectPythonRuntimeFile(entry, `runtime-support[${index}]`));
+  }
+  const expectedFrameworkPython = resolve(
+    dirname(executable.executablePath),
+    "../Resources/Python.app/Contents/MacOS/Python",
+  );
+  if (existsSync(expectedFrameworkPython)) {
+    const canonicalFrameworkPython = await realpath(expectedFrameworkPython);
+    if (!runtimeSupport.some((entry) => entry.path === canonicalFrameworkPython)) {
+      custodyRefusal("CCC semantic-proof Python framework interpreter support is not sealed");
+    }
+  }
+  const interpreter = await inspectPythonRuntimeFile(runtimeManifest.interpreter, "interpreter");
+  if (
+    interpreter.path !== executable.executablePath
+    || interpreter.sha256 !== executable.executableSha256
+  ) {
+    custodyRefusal("CCC semantic-proof Python runtime interpreter does not match controller executable");
+  }
+  const categories: CccPrdPythonRuntimeFile[][] = [];
+  for (const [label, entries] of [
+    ["stdlib", runtimeManifest.stdlib] as const,
+    ["site-packages", runtimeManifest.sitePackages] as const,
+    ["extension module", runtimeManifest.extensionModules] as const,
+    ["dylib", runtimeManifest.dylibClosure] as const,
+  ]) {
+    const observed: CccPrdPythonRuntimeFile[] = [];
+    for (const [index, entry] of entries.entries()) {
+      observed.push(await inspectPythonRuntimeFile(entry, `${label}[${index}]`));
+    }
+    categories.push(observed);
+  }
+  const suppliedDylibClosure = categories[3]!;
+  const machOLoaders = [
+    ...categories[0]!,
+    ...categories[1]!,
+    ...categories[2]!,
+    ...runtimeSupport,
+  ].map((entry) => entry.path);
+  const discoveredDylibClosure = process.platform === "darwin"
+    && await isDarwinMachOFile(executable.executablePath)
+    ? await discoverDarwinPythonDylibClosure(executable.executablePath, machOLoaders)
+    : suppliedDylibClosure;
+  if (
+    runtimeManifest.interpreter.path.length > 0
+    && process.platform === "darwin"
+    && await isDarwinMachOFile(executable.executablePath)
+    && canonicalCccPrdJson(discoveredDylibClosure) !== canonicalCccPrdJson(suppliedDylibClosure)
+  ) {
+    custodyRefusal("CCC semantic-proof Python dylib closure is incomplete or drifted");
+  }
+  let versionOutput: Buffer;
+  try {
+    const result = await execFile(
+      executable.executablePath,
+      [...EXECUTABLE_VERSION_ARGS],
+      versionOptions(),
+    );
+    versionOutput = Buffer.concat([result.stdout, result.stderr]);
+  } catch (error) {
+    custodyRefusal(`CCC semantic-proof Python executable --version probe failed: ${executable.executablePath}`, error);
+  }
+  const versionText = versionOutput.toString("utf8").trim();
+  if (versionText.length === 0) {
+    custodyRefusal(`CCC semantic-proof Python executable version output is empty: ${executable.executablePath}`);
+  }
+  const version = {
+    version: versionText,
+    versionOutputSha256: sha256(versionOutput),
+  };
+  const manifest = {
+    executablePath: executable.executablePath,
+    executableSha256: executable.executableSha256,
+    ...version,
+    runtimeManifest: {
+      schema: runtimeManifest.schema,
+      interpreter,
+      stdlibRoot,
+      pythonHomeRoot,
+      sitePackagesRoots,
+      extensionModuleRoots,
+      runtimeSupport,
+      stdlib: categories[0]!,
+      sitePackages: categories[1]!,
+      extensionModules: categories[2]!,
+      dylibClosure: discoveredDylibClosure,
+    },
+  };
+  assertPythonRuntimeRootMembership(manifest.runtimeManifest);
+  return manifest;
 }
 
 function staticExecutableIdentity(
@@ -531,6 +1082,7 @@ async function sealDarwinLinkedRuntime(
 
 async function deriveStaticToolchain(
   paths: CccPrdSemanticProofToolchainPaths,
+  pythonTemplate?: CccPrdPythonExecutionToolchain,
 ): Promise<StaticToolchainIdentity> {
   if (paths.proofHost.id !== CCC_PRD_SEMANTIC_PROOF_HOST_ID) {
     custodyRefusal(
@@ -542,6 +1094,9 @@ async function deriveStaticToolchain(
     inspectExecutableBytes(paths.nodeExecutablePath),
     inspectExecutableBytes(paths.proofHost.executablePath),
   ]);
+  const python = pythonTemplate
+    ? await observePythonExecutionToolchain(paths, pythonTemplate)
+    : undefined;
   return {
     task: staticExecutableIdentity(task),
     node: staticExecutableIdentity(node),
@@ -549,6 +1104,13 @@ async function deriveStaticToolchain(
       id: CCC_PRD_SEMANTIC_PROOF_HOST_ID,
       ...staticExecutableIdentity(proofHost),
     },
+    ...(python ? {
+      python: {
+        executablePath: python.executablePath,
+        executableSha256: python.executableSha256,
+        runtimeManifest: python.runtimeManifest,
+      },
+    } : {}),
   };
 }
 
@@ -565,6 +1127,7 @@ function versionOptions() {
 async function deriveToolchain(
   paths: CccPrdSemanticProofToolchainPaths,
   expected?: StaticToolchainIdentity,
+  pythonTemplate?: CccPrdPythonExecutionToolchain,
 ): Promise<CccPrdProofExecutionToolchain> {
   if (paths.proofHost.id !== CCC_PRD_SEMANTIC_PROOF_HOST_ID) {
     custodyRefusal(
@@ -576,6 +1139,9 @@ async function deriveToolchain(
     inspectExecutableBytes(paths.nodeExecutablePath),
     inspectExecutableBytes(paths.proofHost.executablePath),
   ]);
+  const python = pythonTemplate
+    ? await observePythonExecutionToolchain(paths, pythonTemplate)
+    : undefined;
   const taskIdentity = staticExecutableIdentity(taskBytes);
   const nodeIdentity = staticExecutableIdentity(nodeBytes);
   const proofHostIdentity = staticExecutableIdentity(proofHostBytes);
@@ -586,6 +1152,11 @@ async function deriveToolchain(
       || canonicalCccPrdJson(nodeIdentity) !== canonicalCccPrdJson(expected.node)
       || canonicalCccPrdJson(proofHostIdentity)
         !== canonicalCccPrdJson(staticExecutableIdentity(expected.proofHost))
+      || (python && expected.python && canonicalCccPrdJson({
+        executablePath: python.executablePath,
+        executableSha256: python.executableSha256,
+        runtimeManifest: python.runtimeManifest,
+      }) !== canonicalCccPrdJson(expected.python))
     )
   ) {
     custodyRefusal("CCC semantic-proof toolchain executable identity drifted");
@@ -637,6 +1208,7 @@ async function deriveToolchain(
         ...proofHost,
       },
       linkedRuntime,
+      ...(python ? { python } : {}),
     };
   } finally {
     await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
@@ -722,9 +1294,18 @@ async function hydrateSemanticProofV2Custody(
   input: CccPrdSemanticProofCustodyInput,
   expectedToolchain?: StaticToolchainIdentity,
 ): Promise<CccPrdProofV2[]> {
+  const pythonProofs = input.proofs.filter((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1");
+  const pythonTemplate = pythonProofs[0]?.executionToolchain.python;
+  if (pythonProofs.some((proof) => !proof.executionToolchain.python)) {
+    custodyRefusal("CCC semantic-proof Python verifier profile requires executionToolchain.python");
+  }
+  if (pythonProofs.some((proof) => canonicalCccPrdJson(proof.executionToolchain.python?.runtimeManifest)
+    !== canonicalCccPrdJson(pythonTemplate?.runtimeManifest))) {
+    custodyRefusal("CCC semantic-proof Python proofs must share one exact runtime manifest");
+  }
   let toolchain: CccPrdProofExecutionToolchain;
   try {
-    toolchain = await deriveToolchain(input.toolchainPaths, expectedToolchain);
+    toolchain = await deriveToolchain(input.toolchainPaths, expectedToolchain, pythonTemplate);
   } catch (error) {
     if (error instanceof CccPrdSemanticProofCustodyError) throw error;
     custodyRefusal("CCC semantic-proof toolchain identity could not be derived", error);
@@ -741,7 +1322,8 @@ export async function hydrateCccPrdSemanticProofV2Custody(
 export async function assertCccPrdSemanticProofV2Custody(
   input: CccPrdSemanticProofCustodyInput,
 ): Promise<void> {
-  const staticToolchain = await deriveStaticToolchain(input.toolchainPaths);
+  const pythonTemplate = input.proofs.find((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1")?.executionToolchain.python;
+  const staticToolchain = await deriveStaticToolchain(input.toolchainPaths, pythonTemplate);
   for (const proof of input.proofs) {
     const admittedStaticToolchain: StaticToolchainIdentity = {
       task: {
@@ -757,6 +1339,13 @@ export async function assertCccPrdSemanticProofV2Custody(
         executablePath: proof.executionToolchain.proofHost.executablePath,
         executableSha256: proof.executionToolchain.proofHost.executableSha256,
       },
+      ...(proof.executionToolchain.python ? {
+        python: {
+          executablePath: proof.executionToolchain.python.executablePath,
+          executableSha256: proof.executionToolchain.python.executableSha256,
+          runtimeManifest: proof.executionToolchain.python.runtimeManifest,
+        },
+      } : {}),
     };
     if (
       proof.executionToolchain.proofHost.id !== CCC_PRD_SEMANTIC_PROOF_HOST_ID

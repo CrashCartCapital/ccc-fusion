@@ -270,8 +270,15 @@ def closed_runner_environment():
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONHASHSEED": "0",
         "PYTHONIOENCODING": "utf8",
+        "PYTHONNOUSERSITE": "1",
         "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
     }
+    # The controller may provide a sealed relocated runtime through its
+    # internal custody variables. Never copy ambient PYTHONHOME/PYTHONPATH.
+    if os.environ.get("CCC_PYTHON_HOME"):
+        environment["PYTHONHOME"] = os.environ["CCC_PYTHON_HOME"]
+    if os.environ.get("CCC_PYTHON_PATH"):
+        environment["PYTHONPATH"] = os.environ["CCC_PYTHON_PATH"]
     if os.name == "nt":
         for key in ("SYSTEMROOT", "TEMP", "TMP", "WINDIR"):
             if key in os.environ:
@@ -428,7 +435,7 @@ def build_evidence(report, args):
     return {
         "schema": SCHEMA_EVIDENCE,
         "proofId": require_identifier(args.proof_id, "proof id"),
-        "phase": "task",
+        "phase": args.phase,
         "sourceCommit": require_git_object(args.source_commit, "source commit"),
         "sourceTree": require_git_object(args.source_tree, "source tree"),
         "passed": True,
@@ -453,13 +460,20 @@ def emit_refusal(refusal):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="ccc-python-proof-adapter verify wrapper")
-    parser.add_argument("--proof-id", required=True)
-    parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--source-tree", required=True)
+    parser.add_argument("--proof-id")
+    parser.add_argument("--phase")
+    parser.add_argument("--source-commit")
+    parser.add_argument("--source-tree")
     parser.add_argument("--target", required=True, help="directory containing verify_manifest.json")
     args = parser.parse_args(argv)
 
     try:
+        args.proof_id = args.proof_id or os.environ.get("CCC_PROOF_ID")
+        args.phase = args.phase or os.environ.get("CCC_PROOF_PHASE") or "task"
+        args.source_commit = args.source_commit or os.environ.get("CCC_PROOF_SOURCE_COMMIT")
+        args.source_tree = args.source_tree or os.environ.get("CCC_PROOF_SOURCE_TREE")
+        if args.phase not in ("task", "final_integrated"):
+            raise Refusal("malformed_evidence_json", "proof phase must be task or final_integrated")
         require_identifier(args.proof_id, "proof id")
         require_git_object(args.source_commit, "source commit")
         require_git_object(args.source_tree, "source tree")

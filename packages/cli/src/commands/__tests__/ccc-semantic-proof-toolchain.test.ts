@@ -50,4 +50,12 @@ describe("CCC semantic-proof CLI toolchain resolver", () => {
       env: { PATH: "/definitely/missing" },
     })).toThrow(/Task executable is absent from PATH/u);
   });
+
+  it("RED-R1-python-semantic-v2-toolchain: admits an explicitly controller-selected python3 executable without ambient fallback", () => {
+    const pythonExecutablePath = process.platform === "darwin"
+      ? "/opt/homebrew/bin/python3"
+      : "/usr/bin/python3";
+    const resolved = resolveCccPrdSemanticProofToolchainPaths({ pythonExecutablePath } as any);
+    expect(resolved.pythonExecutablePath).toBe(realpathSync(pythonExecutablePath));
+  });
 });

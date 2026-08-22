@@ -151,6 +151,24 @@ describe("ccc-python-proof-adapter fail-closed evidence contract", () => {
     expect(existsSync(`${fixturesDir}/verify-report.json`)).toBe(false);
   });
 
+  it("RED-R1-python-semantic-v2-controller-env: consumes controller proof identity when CLI identity flags are absent", () => {
+    const run = runAdapter([
+      "--target", fixturesDir,
+    ], {
+      CCC_PROOF_ID: "PROOF-W3T2-ENV",
+      CCC_PROOF_PHASE: "final_integrated",
+      CCC_PROOF_SOURCE_COMMIT: "5".repeat(40),
+      CCC_PROOF_SOURCE_TREE: "6".repeat(40),
+    });
+
+    expect(run.status).toBe(0);
+    const evidence = parseJsonOutput(run.stdout);
+    expect(evidence.proofId).toBe("PROOF-W3T2-ENV");
+    expect(evidence.phase).toBe("final_integrated");
+    expect(evidence.sourceCommit).toBe("5".repeat(40));
+    expect(evidence.sourceTree).toBe("6".repeat(40));
+  });
+
   it("refuses a newline-terminated git object instead of emitting invalid evidence", () => {
     const args = adapterArgs("PROOF-W3T2-GIT-NEWLINE", fixturesDir);
     args[3] = `${"5".repeat(40)}\n`;
@@ -447,7 +465,7 @@ describe("ccc-python-proof-adapter fail-closed evidence contract", () => {
     const target = tempTarget();
     writeFileSync(join(target, "gen_report.py"), [
       "import json, os",
-      "closed = os.environ.get('UNTRUSTED_PARENT_VALUE') is None and os.environ.get('CCC_PYTHON_PROOF_FORCE_UNITTEST') is None and os.environ.get('PYTEST_DISABLE_PLUGIN_AUTOLOAD') == '1'",
+      "closed = os.environ.get('UNTRUSTED_PARENT_VALUE') is None and os.environ.get('CCC_PYTHON_PROOF_FORCE_UNITTEST') is None and os.environ.get('PYTHONHOME') is None and os.environ.get('PYTHONPATH') is None and os.environ.get('PYTEST_DISABLE_PLUGIN_AUTOLOAD') == '1'",
       "report = {",
       "  'clauseResults': [{'clauseId': 'clause.environment', 'passed': closed}],",
       "  'positiveCaseResults': [{'caseId': 'case.environment', 'passed': closed}],",

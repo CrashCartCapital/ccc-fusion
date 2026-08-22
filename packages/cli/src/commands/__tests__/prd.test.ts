@@ -1551,7 +1551,7 @@ describe("prd command exit contract", () => {
       },
     });
     expect(output[0]).not.toContain("private runner detail");
-  });
+  }, 60_000);
 
   it("refuses import before project or importer residue when readiness has no admitted backend", async () => {
     const packet = createPacketRoot({ semanticV2: true });

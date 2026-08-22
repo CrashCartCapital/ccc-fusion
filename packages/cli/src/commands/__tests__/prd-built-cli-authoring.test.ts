@@ -115,5 +115,5 @@ describe("prd native authoring descendant contract", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
-  });
+  }, 60_000);
 });

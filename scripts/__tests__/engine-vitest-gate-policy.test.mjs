@@ -91,6 +91,42 @@ test("root and package gate scripts still propagate real Vitest failures", () =>
   assert.doesNotMatch(root.scripts?.["test"] ?? "", /NODE_NO_WARNINGS/);
 });
 
+test("full workspace verification defaults to serial package and dashboard lanes", () => {
+  const root = readJson("package.json");
+  const testFull = root.scripts?.["test:full"] ?? "";
+  const expectedPrefix =
+    "FUSION_TEST_WORKSPACE_CONCURRENCY=${FUSION_TEST_WORKSPACE_CONCURRENCY:-1} " +
+    "FUSION_DASHBOARD_TEST_CONCURRENCY=${FUSION_DASHBOARD_TEST_CONCURRENCY:-1} sh -c";
+
+  /*
+   * The full sweep is a reliability gate, not a throughput benchmark. Two
+   * 6-GiB dashboard lanes plus another workspace package can starve timers and
+   * turn otherwise-green UI/CLI tests into timing failures. Keep explicit
+   * caller overrides available for profiling, but make the gate safe by
+   * default and apply both variables before the shell owns all phases.
+   */
+  assert.ok(
+    testFull.startsWith(expectedPrefix),
+    `test:full must default package and dashboard lane concurrency to 1: ${testFull}`,
+  );
+});
+
+test("fast workspace verification explicitly opts dashboard lanes back to two", () => {
+  const root = readJson("package.json");
+  const testFast = root.scripts?.["test:fast"] ?? "";
+
+  assert.match(
+    testFast,
+    /(?:^|\s)FUSION_TEST_WORKSPACE_CONCURRENCY=4(?:\s|$)/,
+    `test:fast must keep its four-package override: ${testFast}`,
+  );
+  assert.match(
+    testFast,
+    /(?:^|\s)FUSION_DASHBOARD_TEST_CONCURRENCY=2(?:\s|$)/,
+    `test:fast must explicitly opt into two dashboard lanes: ${testFast}`,
+  );
+});
+
 test("real-PG product routes run in an explicit serialized lane outside engine-default", () => {
   const config = read("packages/engine/vitest.config.ts");
   const engine = readJson("packages/engine/package.json");

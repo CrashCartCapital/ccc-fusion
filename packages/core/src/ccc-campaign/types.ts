@@ -316,6 +316,22 @@ export type CccProviderAttemptCost = CccProviderAttemptCostClaim | CccProviderAt
 
 export type CccProviderAttemptReceiptSource = "stream-usage" | "provider-api" | "none";
 
+/** The two allowlisted provider/model observations emitted by OmniRoute. */
+export type CccProviderAttemptOmniRouteObservation = Readonly<{
+  provider: string;
+  model: string;
+}>;
+
+/**
+ * Initial HTTP metadata and terminal SSE metadata are kept together so a
+ * replay cannot silently replace the terminal upstream identity with a body
+ * model or a request echo.
+ */
+export type CccProviderAttemptOmniRouteReceipt = Readonly<{
+  initial: CccProviderAttemptOmniRouteObservation;
+  final: CccProviderAttemptOmniRouteObservation;
+}>;
+
 /** The validated, persisted shape: what the transport actually used. */
 export type CccProviderAttemptEffectiveRoute = Readonly<{
   effectiveProvider: string;
@@ -325,6 +341,7 @@ export type CccProviderAttemptEffectiveRoute = Readonly<{
   usage: CccProviderAttemptUsage | null;
   cost: CccProviderAttemptCost;
   receiptSource: CccProviderAttemptReceiptSource;
+  omniRoute?: CccProviderAttemptOmniRouteReceipt;
 }>;
 
 /**
@@ -342,6 +359,7 @@ export type CccProviderAttemptEffectiveRouteInput = Readonly<{
   usage: CccProviderAttemptUsage | null;
   cost: CccProviderAttemptCost;
   receiptSource: CccProviderAttemptReceiptSource;
+  omniRoute?: CccProviderAttemptOmniRouteReceipt;
 }>;
 
 export type CccProviderAttemptReconciliation = CccProviderAttemptTransition & Readonly<{

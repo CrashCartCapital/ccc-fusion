@@ -15,6 +15,29 @@ import { invalidateAllGlobalSettingsCaches } from "../project-store-resolver.js"
 const API_KEY_MASK_CHAR = "•";
 
 /**
+ * Internal settings-only provenance for rows written by the provider catalog
+ * refresh. It is intentionally kept outside each model row so settings-authored
+ * model objects remain byte-for-byte intact and the public provider API shape
+ * stays unchanged. Legacy providers without this marker are treated as
+ * settings-authored (fail closed) rather than deleting unknown user data.
+ */
+type CustomProviderWithModelProvenance = CustomProvider & {
+  modelProvenance?: {
+    discoveredModelIds?: unknown;
+  };
+};
+
+type CustomProviderModel = NonNullable<CustomProvider["models"]>[number];
+
+function readDiscoveredModelIds(provider: CustomProvider): Set<string> {
+  const provenance = (provider as CustomProviderWithModelProvenance).modelProvenance;
+  const ids = provenance?.discoveredModelIds;
+  return new Set(
+    Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [],
+  );
+}
+
+/**
  * Masks an API key for safe display, showing only the first 3 and last 4 characters.
  */
 function maskApiKey(key: string): string {
@@ -37,13 +60,16 @@ function isMaskedApiKey(value: string): boolean {
  * Removes the raw API key from a provider object, replacing it with a masked version.
  */
 function sanitizeProvider(provider: CustomProvider): CustomProvider {
-  if (!provider.apiKey) {
-    return provider;
+  const safeProvider = { ...provider } as CustomProviderWithModelProvenance;
+  delete safeProvider.modelProvenance;
+
+  if (!safeProvider.apiKey) {
+    return safeProvider;
   }
 
   return {
-    ...provider,
-    apiKey: maskApiKey(provider.apiKey),
+    ...safeProvider,
+    apiKey: maskApiKey(safeProvider.apiKey),
   };
 }
 
@@ -126,10 +152,11 @@ function validateHeaders(value: unknown): Record<string, string> | undefined {
 
 /**
  * Validates and normalizes a models array from a request body.
- * Returns undefined if models is omitted, or an array of { id, name } objects.
+ * Returns undefined if models is omitted, or an array preserving the supported
+ * per-model limits/capability fields alongside id and name.
  * @throws {ApiError} with status 400 if the structure is invalid.
  */
-function validateModels(value: unknown): Array<{ id: string; name: string }> | undefined {
+function validateModels(value: unknown): CustomProvider["models"] | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -144,10 +171,28 @@ function validateModels(value: unknown): Array<{ id: string; name: string }> | u
     }
 
     const row = entry as Record<string, unknown>;
-    return {
+    const model: CustomProviderModel = {
       id: assertNonEmptyString(row.id, `models[${index}].id`),
       name: assertNonEmptyString(row.name, `models[${index}].name`),
     };
+
+    for (const field of ["contextWindow", "maxTokens"] as const) {
+      const raw = row[field];
+      if (raw === undefined) continue;
+      if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw <= 0) {
+        throw badRequest(`models[${index}].${field} must be a positive safe integer`);
+      }
+      model[field] = raw;
+    }
+
+    if (row.verbatimCapable !== undefined) {
+      if (typeof row.verbatimCapable !== "boolean") {
+        throw badRequest(`models[${index}].verbatimCapable must be a boolean`);
+      }
+      model.verbatimCapable = row.verbatimCapable;
+    }
+
+    return model;
   });
 }
 
@@ -496,6 +541,33 @@ function dedupeProviderModels(models: ProbeModelResult[]): ProbeModelResult[] {
   return deduped;
 }
 
+/**
+ * Keep settings-authored model entries authoritative while allowing a provider
+ * refresh to add models discovered from its catalog. Catalog endpoints may be
+ * truncated, so replacing the configured list would silently remove pinned
+ * models (and their exact IDs and per-model limits).
+ */
+function mergeConfiguredProviderModels(
+  provider: CustomProvider,
+  discoveredModels: ProbeModelResult[],
+): {
+  models: NonNullable<CustomProvider["models"]>;
+  discoveredModelIds: string[];
+} {
+  const configured = provider.models ?? [];
+  const priorDiscoveredIds = readDiscoveredModelIds(provider);
+  const authored = configured.filter((model) => !priorDiscoveredIds.has(model.id));
+  const authoredIds = new Set(authored.map((model) => model.id));
+  const discovered = discoveredModels.filter((model) => !authoredIds.has(model.id));
+  return {
+    models: [
+      ...authored,
+      ...discovered.map(({ id, name }) => ({ id, name })),
+    ],
+    discoveredModelIds: discovered.map((model) => model.id),
+  };
+}
+
 async function discoverUsableProviderModels(provider: Pick<CustomProvider, "baseUrl" | "apiKey" | "apiType">): Promise<ProbeModelResult[]> {
   const models = dedupeProviderModels(
     await probeProviderModels(provider.baseUrl, provider.apiKey, provider.apiType, { allowPrivateAddress: true }),
@@ -508,7 +580,7 @@ async function discoverUsableProviderModels(provider: Pick<CustomProvider, "base
 
 /**
  * FNXC:CustomProviders 2026-06-29-00:00:
- * Startup and Settings refreshes share this seam so persisted custom-provider model lists can be updated from the stored provider record while the browser only receives sanitized providers. The refresh must reuse probe SSRF checks, use the raw stored API key, and preserve the previous model list when probing fails or yields no chat models.
+ * Startup and Settings refreshes share this seam so persisted custom-provider model lists can be updated from the stored provider record while the browser only receives sanitized providers. The refresh must reuse probe SSRF checks, use the raw stored API key, and preserve configured model entries when probing fails or a partial catalog omits them.
  */
 export async function refreshCustomProviderModels(
   store: CustomProviderSettingsStore,
@@ -523,7 +595,6 @@ export async function refreshCustomProviderModels(
 
   const targetProvider = providers[targetIndex];
   const models = await discoverUsableProviderModels(targetProvider);
-  const persistedModels = models.map((model) => ({ id: model.id, name: model.name }));
 
   /*
    * FNXC:CustomProviders 2026-06-30-00:00:
@@ -548,16 +619,20 @@ export async function refreshCustomProviderModels(
     throw new ApiError(409, "Custom provider connection changed during model refresh; retry refresh to use the latest endpoint");
   }
 
-  const updatedProvider: CustomProvider = {
+  const merged = mergeConfiguredProviderModels(latestTargetProvider, models);
+  const updatedProvider = {
     ...latestTargetProvider,
-    models: persistedModels,
-  };
+    models: merged.models,
+    modelProvenance: { discoveredModelIds: merged.discoveredModelIds },
+  } as CustomProvider;
   const nextProviders = [...latestProviders];
   nextProviders[latestTargetIndex] = updatedProvider;
   await store.updateGlobalSettings({ customProviders: nextProviders });
   invalidateAllGlobalSettingsCaches();
 
-  return { provider: sanitizeProvider(updatedProvider), modelsRefreshed: persistedModels.length };
+  // Keep this count scoped to the catalog result for API/UI compatibility;
+  // The persisted list also includes settings-authored entries retained above.
+  return { provider: sanitizeProvider(updatedProvider), modelsRefreshed: models.length };
 }
 
 export async function refreshAllCustomProviderModels(
@@ -714,6 +789,9 @@ export const registerCustomProviderRoutes: ApiRouteRegistrar = (ctx) => {
         ...providers[targetIndex],
         ...updates,
       };
+      if (updates.models !== undefined) {
+        delete (updatedProvider as CustomProviderWithModelProvenance).modelProvenance;
+      }
 
       const nextProviders = [...providers];
       nextProviders[targetIndex] = updatedProvider;

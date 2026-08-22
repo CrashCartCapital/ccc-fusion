@@ -31,6 +31,8 @@ import {
   type CccProviderAttemptCost,
   type CccProviderAttemptEffectiveRoute,
   type CccProviderAttemptEffectiveRouteInput,
+  type CccProviderAttemptOmniRouteReceipt,
+  type CccProviderAttemptOmniRouteObservation,
   type CccProviderAttemptReceiptSource,
   type CccProviderAttemptReconciliation,
   type CccProviderAttemptDispatchDecision,
@@ -242,7 +244,59 @@ function requireReceiptSource(value: unknown): CccProviderAttemptReceiptSource {
 }
 
 /** Shared field parsing between the settlement-input boundary and the audit read-back boundary. */
-function parseEffectiveRouteFields(value: Record<string, unknown>): CccProviderAttemptEffectiveRoute {
+type ReceiptParseError = (message: string) => never;
+
+function parseOmniRouteText(value: unknown, label: string, error: ReceiptParseError): string {
+  try {
+    return requireCanonicalText(value, `OmniRoute ${label}`);
+  } catch {
+    return error(`CCC provider attempt OmniRoute ${label} must be a non-empty canonical string`);
+  }
+}
+
+function parseOmniRouteObservation(
+  value: unknown,
+  label: string,
+  error: ReceiptParseError,
+): CccProviderAttemptOmniRouteObservation {
+  if (!isRecord(value)) {
+    return error(`CCC provider attempt OmniRoute ${label} observation must be an object`);
+  }
+  const keys = Object.keys(value).sort();
+  if (!sameCanonicalValue(keys, ["model", "provider"])) {
+    return error(`CCC provider attempt OmniRoute ${label} observation fields must be exactly model, provider`);
+  }
+  return Object.freeze({
+    provider: parseOmniRouteText(value.provider, `${label} provider`, error),
+    model: parseOmniRouteText(value.model, `${label} model`, error),
+  });
+}
+
+function parseOmniRouteReceipt(
+  value: unknown,
+  error: ReceiptParseError = (message) => {
+    throw new CccProviderAttemptIdentityError("invalid-input", message);
+  },
+): CccProviderAttemptOmniRouteReceipt {
+  if (!isRecord(value)) {
+    return error("CCC provider attempt OmniRoute receipt must be an object");
+  }
+  const keys = Object.keys(value).sort();
+  if (!sameCanonicalValue(keys, ["final", "initial"])) {
+    return error("CCC provider attempt OmniRoute receipt fields must be exactly final, initial");
+  }
+  return Object.freeze({
+    initial: parseOmniRouteObservation(value.initial, "initial", error),
+    final: parseOmniRouteObservation(value.final, "final", error),
+  });
+}
+
+function parseEffectiveRouteFields(
+  value: Record<string, unknown>,
+  error: ReceiptParseError = (message) => {
+    throw new CccProviderAttemptIdentityError("invalid-input", message);
+  },
+): CccProviderAttemptEffectiveRoute {
   return Object.freeze({
     effectiveProvider: requireCanonicalText(value.effectiveProvider, "effective provider"),
     effectiveModel: requireCanonicalText(value.effectiveModel, "effective model"),
@@ -255,6 +309,9 @@ function parseEffectiveRouteFields(value: Record<string, unknown>): CccProviderA
     usage: requireUsage(value.usage),
     cost: requireCost(value.cost),
     receiptSource: requireReceiptSource(value.receiptSource),
+    ...(Object.prototype.hasOwnProperty.call(value, "omniRoute")
+      ? { omniRoute: parseOmniRouteReceipt(value.omniRoute, error) }
+      : {}),
   });
 }
 
@@ -268,8 +325,63 @@ function assertNoCostWithoutReceipt(receipt: CccProviderAttemptEffectiveRoute): 
 }
 
 const EFFECTIVE_ROUTE_REQUIRED_KEYS = ["effectiveProvider", "effectiveModel", "usage", "cost", "receiptSource"] as const;
-const EFFECTIVE_ROUTE_INPUT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "fallbackReason"] as const;
-const EFFECTIVE_ROUTE_RECEIPT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier"] as const;
+const EFFECTIVE_ROUTE_INPUT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "fallbackReason", "omniRoute"] as const;
+const EFFECTIVE_ROUTE_RECEIPT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "omniRoute"] as const;
+
+function isOmniRouteProvider(providerId: string): boolean {
+  return /(?:^|[-_:./])omniroute(?:$|[-_:./])/i.test(providerId);
+}
+
+function splitProviderQualifiedModel(modelId: string): { provider: string; model: string } | undefined {
+  const separator = modelId.indexOf("/");
+  if (separator <= 0 || separator === modelId.length - 1 || modelId.indexOf("/", separator + 1) !== -1) {
+    return undefined;
+  }
+  if (modelId !== modelId.trim()) return undefined;
+  const provider = modelId.slice(0, separator);
+  const model = modelId.slice(separator + 1);
+  if (provider !== provider.trim() || model !== model.trim()) return undefined;
+  return { provider, model };
+}
+
+function assertOmniRouteReceipt(
+  receipt: CccProviderAttemptEffectiveRoute,
+  requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
+): void {
+  if (!isOmniRouteProvider(requestedIdentity.providerId)) return;
+  const requestedUpstream = splitProviderQualifiedModel(requestedIdentity.modelId);
+  if (!requestedUpstream) {
+    throw new CccProviderAttemptIdentityError(
+      "invalid-input",
+      "CCC OmniRoute provider attempt requires a provider-qualified requested model",
+    );
+  }
+  const observed = receipt.omniRoute;
+  if (!observed) {
+    throw new CccProviderAttemptIdentityError(
+      "invalid-input",
+      "CCC OmniRoute provider attempt requires an initial and final terminal route receipt",
+    );
+  }
+  if (
+    observed.initial.provider !== observed.final.provider
+    || observed.initial.model !== observed.final.model
+  ) {
+    throw new CccProviderAttemptIdentityError(
+      "route-drift",
+      "CCC OmniRoute initial and final route receipts conflict",
+    );
+  }
+  if (
+    observed.final.provider !== requestedUpstream.provider
+    || observed.final.model !== requestedUpstream.model
+  ) {
+    throw new CccProviderAttemptIdentityError(
+      "route-drift",
+      "CCC OmniRoute final provider/model receipt does not match the requested provider-qualified route",
+    );
+  }
+}
 
 function assertExactEffectiveRouteKeys(
   value: Record<string, unknown>,
@@ -301,7 +413,15 @@ export function assertCccProviderAttemptEffectiveRoute(
   input: CccProviderAttemptEffectiveRouteInput | undefined,
   requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
 ): CccProviderAttemptEffectiveRoute | undefined {
-  if (input === undefined) return undefined;
+  if (input === undefined) {
+    if (isOmniRouteProvider(requestedIdentity.providerId)) {
+      throw new CccProviderAttemptIdentityError(
+        "invalid-input",
+        "CCC OmniRoute provider attempt requires an effective route terminal receipt",
+      );
+    }
+    return undefined;
+  }
   if (!isRecord(input)) {
     throw new CccProviderAttemptIdentityError(
       "invalid-input",
@@ -328,6 +448,7 @@ export function assertCccProviderAttemptEffectiveRoute(
         + "campaign fallback is not an admitted behavior",
     );
   }
+  assertOmniRouteReceipt(receipt, requestedIdentity);
   assertNoCostWithoutReceipt(receipt);
   return receipt;
 }
@@ -358,7 +479,9 @@ function parseEffectiveRouteReceipt(value: unknown): CccProviderAttemptEffective
   assertExactEffectiveRouteKeys(value, EFFECTIVE_ROUTE_RECEIPT_OPTIONAL_KEYS, (message) => {
     throw new CccCampaignContextError(message);
   });
-  const receipt = parseEffectiveRouteFields(value);
+  const receipt = parseEffectiveRouteFields(value, (message) => {
+    throw new CccCampaignContextError(message);
+  });
   assertNoCostWithoutReceipt(receipt);
   return receipt;
 }
@@ -705,6 +828,23 @@ function assertAuditRow(
     throw new CccCampaignContextError(
       "CCC provider attempt history has an effective route that does not match its persisted binding",
     );
+  }
+  if (isOmniRouteProvider(binding.providerId) && !effectiveRoute) {
+    throw new CccCampaignContextError(
+      "CCC provider attempt history has no required OmniRoute terminal receipt",
+    );
+  }
+  if (effectiveRoute && isOmniRouteProvider(binding.providerId)) {
+    try {
+      assertOmniRouteReceipt(effectiveRoute, {
+        providerId: binding.providerId,
+        modelId: binding.modelId,
+      });
+    } catch (error) {
+      throw new CccCampaignContextError(
+        `CCC provider attempt history has an invalid OmniRoute terminal receipt: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   assertCanonicalTimestamp(row.timestamp, "audit timestamp");
   return {

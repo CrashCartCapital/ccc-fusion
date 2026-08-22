@@ -109,13 +109,32 @@ describe("custom providers openai-completions regression", () => {
   */
   async function streamIdentityProbe(
     sseChunks: string[],
-  ): Promise<{ responseModel?: string; model: string }> {
-    const server = createServer((request, response) => {
+    providerName = "keepalive-probe",
+    sseComments: string[] = [],
+    signal?: AbortSignal,
+    holdOpenMs = 0,
+    commentsBeforeChunks = false,
+  ): Promise<{ responseModel?: string; model: string; stopReason?: string; errorMessage?: string }> {
+    const server = createServer(async (request, response) => {
       request.on("data", () => {});
       request.on("end", () => {
         response.writeHead(200, { "content-type": "text/event-stream" });
+        if (commentsBeforeChunks) {
+          for (const comment of sseComments) {
+            response.write(`: ${comment}\n\n`);
+          }
+        }
         for (const chunk of sseChunks) {
           response.write(`data: ${chunk}\n\n`);
+        }
+        if (!commentsBeforeChunks) {
+          for (const comment of sseComments) {
+            response.write(`: ${comment}\n\n`);
+          }
+        }
+        if (holdOpenMs > 0) {
+          setTimeout(() => response.end("data: [DONE]\n\n"), holdOpenMs);
+          return;
         }
         response.end("data: [DONE]\n\n");
       });
@@ -127,20 +146,20 @@ describe("custom providers openai-completions regression", () => {
     const address = server.address() as AddressInfo;
     try {
       const modelRegistry = await createInMemoryModelRegistry();
-      modelRegistry.registerProvider("keepalive-probe", {
+      modelRegistry.registerProvider(providerName, {
         baseUrl: `http://127.0.0.1:${address.port}/v1`,
         api: "openai-completions",
         apiKey: "CUSTOM_KEY",
         models: [{ id: "my-model", name: "My Model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16384 }],
       });
       await modelRegistry.refresh();
-      const model = modelRegistry.find("keepalive-probe", "my-model");
+      const model = modelRegistry.find(providerName, "my-model");
       const response = await completeSimple(
         model!,
         { messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
-        { apiKey: "CUSTOM_KEY" },
+        { apiKey: "CUSTOM_KEY", ...(signal ? { signal } : {}) },
       );
-      return response as { responseModel?: string; model: string };
+      return response as { responseModel?: string; model: string; stopReason?: string; errorMessage?: string };
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
@@ -161,6 +180,146 @@ describe("custom providers openai-completions regression", () => {
       "{\"id\":\"chatcmpl-alias\",\"object\":\"chat.completion.chunk\",\"model\":\"other-backend-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
     ]);
     expect(response.responseModel).toBe("other-backend-model");
+  });
+
+  it("RED-OMNI-STREAM-1: captures only the allowlisted final OmniRoute SSE comment pair", async () => {
+    const response = await streamIdentityProbe([
+      "{\"id\":\"chatcmpl-omni\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+      "{\"id\":\"chatcmpl-omni\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
+    ], "omniroute-minimax-m3-pinned", [
+      "unrelated=do-not-expose",
+      "x-omniroute-provider=minimax",
+      "x-omniroute-model=MiniMax-M3",
+    ]);
+    expect((response as { omniRoute?: unknown }).omniRoute).toEqual({
+      provider: "minimax",
+      model: "MiniMax-M3",
+    });
+    expect(response).not.toHaveProperty("comments");
+  });
+
+  it("RED-OMNI-STREAM-2: handles malformed primary SSE plus conflicting comments without unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const response = await streamIdentityProbe(
+        ["not-json"],
+        "omniroute-minimax-m3-pinned",
+        [
+          "x-omniroute-provider=minimax",
+        "x-omniroute-provider=opencode-go",
+          "x-omniroute-model=MiniMax-M3",
+        ],
+        undefined,
+        100,
+        true,
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(response).toMatchObject({ stopReason: "error" });
+      expect(response.errorMessage).toContain("conflicting provider/model comments");
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("RED-OMNI-STREAM-3: aborts an in-flight OmniRoute clone without unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const controller = new AbortController();
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const responsePromise = streamIdentityProbe(
+        [
+          "{\"id\":\"chatcmpl-abort\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+        ],
+        "omniroute-minimax-m3-pinned",
+        ["x-omniroute-provider=minimax", "x-omniroute-model=MiniMax-M3"],
+        controller.signal,
+        100,
+      );
+      setTimeout(() => controller.abort(), 10);
+      const response = await responsePromise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(response).toMatchObject({ stopReason: "aborted" });
+      expect(unhandled).toEqual([]);
+    } finally {
+      controller.abort();
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("RED-OMNI-STREAM-4: refuses when a cancelled receipt clone cannot prove settlement", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const originalFetch = globalThis.fetch;
+    const encoder = new TextEncoder();
+    let primaryReads = 0;
+    let cloneDelivered = false;
+    let cancelCalls = 0;
+    const primaryReader = {
+      read: async () => primaryReads++ === 0
+        ? { done: false, value: encoder.encode("data: not-json\n\n") }
+        : { done: true, value: undefined },
+      cancel: async () => undefined,
+      releaseLock: () => undefined,
+    };
+    const cloneReader = {
+      read: async () => {
+        if (!cloneDelivered) {
+          cloneDelivered = true;
+          return {
+            done: false,
+            value: encoder.encode(": x-omniroute-provider=minimax\n: x-omniroute-provider=opencode-go\n: x-omniroute-model=MiniMax-M3\n\n"),
+          };
+        }
+        return new Promise<never>(() => {});
+      },
+      cancel: () => {
+        cancelCalls += 1;
+        return new Promise<never>(() => {});
+      },
+      releaseLock: () => undefined,
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body: { getReader: () => primaryReader },
+      text: async () => "",
+      clone: () => ({
+        status: 200,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: { getReader: () => cloneReader },
+        text: async () => "",
+      }),
+    })));
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const response = await completeSimple(
+        {
+          provider: "omniroute-minimax-m3-pinned",
+          id: "my-model",
+          api: "openai-completions",
+          baseUrl: "http://127.0.0.1:65535/v1",
+          headers: {},
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 16384,
+        } as never,
+        { messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+        { apiKey: "CUSTOM_KEY" },
+      );
+      expect(response.stopReason).toBe("error");
+      expect(response.errorMessage).toContain("route-receipt-capture-timeout/unavailable");
+      expect(cancelCalls).toBe(1);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
   });
 
   it("uses system role when reasoning model explicitly disables developer role compat", () => {

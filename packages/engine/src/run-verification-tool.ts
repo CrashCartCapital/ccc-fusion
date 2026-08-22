@@ -37,6 +37,7 @@ const MAX_OUTPUT_BYTES = 200 * 1024; // 200 KB
 const QUIET_HEARTBEAT_INTERVAL_MS = 60_000; // emit synthetic heartbeat after 60s silence
 const SIGKILL_GRACE_MS = 10_000;
 const NORMAL_EXIT_REAP_GRACE_MS = 500;
+const CALLER_ABORT_WARNING = "Verification aborted by caller signal";
 export const DEFAULT_TIMEOUT_PACKAGE_SEC = 300;
 export const DEFAULT_TIMEOUT_WORKSPACE_SEC = 900;
 export const MAX_TIMEOUT_SEC = 1800;
@@ -970,6 +971,7 @@ export interface VerificationResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** True when Fusion deliberately sent a termination signal to the verifier process group. */
   killed: boolean;
   command: string;
   cwd: string;
@@ -1081,6 +1083,24 @@ export interface RunVerificationOptions {
   signal?: AbortSignal;
 }
 
+function createCallerAbortedVerificationResult(
+  opts: Pick<RunVerificationOptions, "command" | "cwd">,
+  startMs: number,
+): VerificationResult {
+  return {
+    success: false,
+    exitCode: null,
+    durationMs: Date.now() - startMs,
+    stdout: "",
+    stderr: "",
+    timedOut: false,
+    killed: false,
+    command: opts.command,
+    cwd: opts.cwd,
+    warnings: [CALLER_ABORT_WARNING],
+  };
+}
+
 /**
  * Spawns a shell command with heartbeat protection, quiet-interval synthetic
  * heartbeats, and hard timeout enforcement.
@@ -1098,6 +1118,9 @@ export interface RunVerificationOptions {
 export async function runVerificationCommand(
   opts: RunVerificationOptions,
 ): Promise<VerificationResult> {
+  if (opts.signal?.aborted) {
+    return createCallerAbortedVerificationResult(opts, Date.now());
+  }
   if (opts.bypassVerificationSlot) {
     return runVerificationCommandUnlocked(opts);
   }
@@ -1187,6 +1210,10 @@ async function runVerificationCommandUnlocked(
   const warnings: string[] = [];
   const commandDiagnostic = `verifier command (${Buffer.byteLength(command, "utf8")} bytes)`;
 
+  if (opts.signal?.aborted) {
+    return createCallerAbortedVerificationResult(opts, startMs);
+  }
+
   const stdoutBuf = createBuffer();
   const stderrBuf = createBuffer();
   const childEnv = buildVerificationChildEnv(process.env);
@@ -1235,6 +1262,8 @@ async function runVerificationCommandUnlocked(
     let settled = false;
     let aborted = false;
     let abortListener: (() => void) | undefined;
+    let terminationReason: "running" | "timeout" | "abort" = "running";
+    let terminationSignal: NodeJS.Signals | null = null;
 
     const detachAbortListener = () => {
       if (abortListener) {
@@ -1257,13 +1286,39 @@ async function runVerificationCommandUnlocked(
 
     // ── Hard timeout ────────────────────────────────────────────────────────
     let killTimer: ReturnType<typeof setTimeout> | null = null;
+    let forcedSettleTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearKillTimer = () => {
+      if (killTimer) {
+        clearTimeout(killTimer);
+        killTimer = null;
+      }
+    };
+    const clearForcedSettleTimer = () => {
+      if (forcedSettleTimer) {
+        clearTimeout(forcedSettleTimer);
+        forcedSettleTimer = null;
+      }
+    };
+    const scheduleForcedSettle = () => {
+      if (forcedSettleTimer) return;
+      forcedSettleTimer = setTimeout(() => {
+        if (settled) return;
+        warnings.push("Verifier process did not report close after termination; settling from supervisor termination path");
+        finalizeClose(null, terminationSignal ?? "SIGTERM");
+      }, SIGKILL_GRACE_MS + NORMAL_EXIT_REAP_GRACE_MS);
+      forcedSettleTimer.unref?.();
+    };
     const hardTimer = setTimeout(() => {
-      if (settled) return;
+      if (settled || terminationReason !== "running") return;
+      terminationReason = "timeout";
       timedOut = true;
+      killed = true;
+      terminationSignal = "SIGTERM";
       executorLog.warn(
         `[fn_run_verification] hard timeout (${timeoutMs / 1000}s) — sending SIGTERM to ${commandDiagnostic}`,
       );
       killVerificationProcess(supervised, "SIGTERM");
+      scheduleForcedSettle();
 
       killTimer = setTimeout(() => {
         if (!settled) {
@@ -1272,20 +1327,25 @@ async function runVerificationCommandUnlocked(
           );
           killVerificationProcess(supervised, "SIGKILL");
           killed = true;
+          terminationSignal = "SIGKILL";
         }
       }, SIGKILL_GRACE_MS);
     }, timeoutMs);
 
     if (opts.signal) {
       abortListener = () => {
-        if (settled || aborted) return;
+        if (settled || terminationReason !== "running") return;
+        terminationReason = "abort";
         aborted = true;
         killed = true;
-        warnings.push("Verification aborted by caller signal");
+        terminationSignal = "SIGTERM";
+        clearTimeout(hardTimer);
+        warnings.push(CALLER_ABORT_WARNING);
         executorLog.warn(
           "[fn_run_verification] caller abort — sending SIGTERM to verifier process group",
         );
         killVerificationProcess(supervised, "SIGTERM");
+        scheduleForcedSettle();
         if (!killTimer) {
           killTimer = setTimeout(() => {
             if (!settled) {
@@ -1293,6 +1353,7 @@ async function runVerificationCommandUnlocked(
                 "[fn_run_verification] caller abort SIGTERM ignored — sending SIGKILL to verifier process group",
               );
               killVerificationProcess(supervised, "SIGKILL");
+              terminationSignal = "SIGKILL";
             }
           }, SIGKILL_GRACE_MS);
         }
@@ -1332,12 +1393,13 @@ async function runVerificationCommandUnlocked(
     });
 
     // ── Process exit ─────────────────────────────────────────────────────────
-    child.on("close", (code, signal) => {
+    function finalizeClose(code: number | null, signal: NodeJS.Signals | null) {
       if (settled) return;
       settled = true;
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
-      if (killTimer) clearTimeout(killTimer);
+      clearKillTimer();
+      clearForcedSettleTimer();
       detachAbortListener();
 
       // Flush remainders
@@ -1347,7 +1409,7 @@ async function runVerificationCommandUnlocked(
       const exitCode = code ?? null;
       const durationMs = Date.now() - startMs;
       const zeroExit = exitCode === 0;
-      const success = !aborted && (expectFailure ? true : zeroExit);
+      const success = !aborted && !timedOut && (expectFailure ? true : zeroExit);
 
       if (!success && !timedOut) {
         executorLog.warn(
@@ -1371,14 +1433,17 @@ async function runVerificationCommandUnlocked(
         cwd,
         warnings: warnings.map(redactCapturedText),
       });
-    });
+    }
+
+    child.on("close", finalizeClose);
 
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
       clearInterval(quietTimer);
       clearTimeout(hardTimer);
-      if (killTimer) clearTimeout(killTimer);
+      clearKillTimer();
+      clearForcedSettleTimer();
       detachAbortListener();
       const durationMs = Date.now() - startMs;
       warnings.push(`Spawn error: ${err.message}`);
@@ -1578,7 +1643,7 @@ export function createRunVerificationTool(
 
       if (result.timedOut) {
         lines.push(
-          `Command timed out after ${timeoutSec}s and was ${result.killed ? "killed (SIGKILL)" : "terminated (SIGTERM)"}.\n`,
+          `Command timed out after ${timeoutSec}s and was terminated by Fusion.\n`,
         );
       }
 

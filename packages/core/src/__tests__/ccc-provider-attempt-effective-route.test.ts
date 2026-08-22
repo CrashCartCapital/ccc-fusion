@@ -229,6 +229,64 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       )
     ).toThrow(CccProviderAttemptIdentityError);
   });
+
+  describe("OmniRoute terminal receipt", () => {
+    const omniRouteIdentity = {
+      providerId: "omniroute-minimax-m3-pinned",
+      modelId: "minimax/MiniMax-M3",
+    };
+
+    const omniRouteReceipt = {
+      initial: { provider: "minimax", model: "MiniMax-M3" },
+      final: { provider: "minimax", model: "MiniMax-M3" },
+    };
+
+    const omniRouteInput = (
+      overrides: Partial<CccProviderAttemptEffectiveRouteInput> = {},
+    ): CccProviderAttemptEffectiveRouteInput => ({
+      effectiveProvider: omniRouteIdentity.providerId,
+      effectiveModel: omniRouteIdentity.modelId,
+      usage: { inputTokens: 100, outputTokens: 40 },
+      cost: { amountUsd: 0.0123, source: "stream-usage" },
+      receiptSource: "stream-usage",
+      ...overrides,
+    });
+
+    it("RED-OMNI-1: persists the exact initial/final allowlisted receipt for a provider-qualified route", () => {
+      const receipt = assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute: omniRouteReceipt }),
+        omniRouteIdentity,
+      );
+      expect(receipt?.omniRoute).toEqual(omniRouteReceipt);
+    });
+
+    it.each([
+      { label: "missing nested receipt", overrides: {} },
+      { label: "missing final provider", overrides: { omniRoute: { initial: omniRouteReceipt.initial, final: { model: "MiniMax-M3" } } } },
+      { label: "missing final model", overrides: { omniRoute: { initial: omniRouteReceipt.initial, final: { provider: "minimax" } } } },
+    ])("RED-OMNI-2: refuses $label for a newly declared OmniRoute route", ({ overrides }) => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(omniRouteInput(overrides), omniRouteIdentity))
+        .toThrow(CccProviderAttemptIdentityError);
+    });
+
+    it.each([
+      { label: "initial/final provider conflict", omniRoute: { initial: { provider: "minimax", model: "MiniMax-M3" }, final: { provider: "opencode-go", model: "MiniMax-M3" } } },
+      { label: "initial/final model conflict", omniRoute: { initial: { provider: "minimax", model: "MiniMax-M3" }, final: { provider: "minimax", model: "minimax-m3" } } },
+      { label: "provider drift", omniRoute: { initial: { provider: "opencode-go", model: "minimax-m3" }, final: { provider: "opencode-go", model: "minimax-m3" } } },
+      { label: "model alias drift", omniRoute: { initial: { provider: "minimax", model: "minimax-m3" }, final: { provider: "minimax", model: "minimax-m3" } } },
+      { label: "fallback model", omniRoute: { initial: { provider: "minimax", model: "MiniMax-M3" }, final: { provider: "minimax", model: "glm-5.3" } } },
+    ])("RED-OMNI-3: refuses $label instead of normalizing upstream identity", ({ omniRoute }) => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(omniRouteInput({ omniRoute }), omniRouteIdentity))
+        .toThrow(CccProviderAttemptIdentityError);
+    });
+
+    it("RED-OMNI-4: refuses a provider-qualified OmniRoute declaration without a slash", () => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ effectiveModel: "MiniMax-M3" }),
+        { ...omniRouteIdentity, modelId: "MiniMax-M3" },
+      )).toThrow(CccProviderAttemptIdentityError);
+    });
+  });
 });
 
 describe("sameCccProviderAttemptEffectiveRoute (idempotent-replay comparison)", () => {
@@ -262,5 +320,23 @@ describe("sameCccProviderAttemptEffectiveRoute (idempotent-replay comparison)", 
 
   it("present-vs-same resolves idempotently", () => {
     expect(sameCccProviderAttemptEffectiveRoute(receiptA, { ...receiptA })).toBe(true);
+  });
+
+  it("RED-OMNI-5: replay compares the nested OmniRoute receipt byte-for-byte", () => {
+    const withOmniRoute = {
+      ...receiptA,
+      omniRoute: {
+        initial: { provider: "minimax", model: "MiniMax-M3" },
+        final: { provider: "minimax", model: "MiniMax-M3" },
+      },
+    } as CccProviderAttemptEffectiveRoute;
+    expect(sameCccProviderAttemptEffectiveRoute(withOmniRoute, { ...withOmniRoute })).toBe(true);
+    expect(sameCccProviderAttemptEffectiveRoute(withOmniRoute, {
+      ...withOmniRoute,
+      omniRoute: {
+        initial: { provider: "minimax", model: "MiniMax-M3" },
+        final: { provider: "opencode-go", model: "minimax-m3" },
+      },
+    })).toBe(false);
   });
 });

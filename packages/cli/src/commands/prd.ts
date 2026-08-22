@@ -156,7 +156,7 @@ export type PrdCommandDependencies = {
   settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
   understandCccPrdPacket?: typeof engine.understandCccPrdPacket;
   resolveCustomProviderModelLimits?: typeof engine.resolveCustomProviderModelLimits;
-  resolveSemanticProofToolchainPaths?: () => CccPrdSemanticProofToolchainPaths;
+  resolveSemanticProofToolchainPaths?: (input?: { pythonRequired?: boolean }) => CccPrdSemanticProofToolchainPaths;
   assertSemanticProofV2Custody?: typeof assertCccPrdSemanticProofV2Custody;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
@@ -1907,7 +1907,10 @@ async function runProductPacketCommand(
       semanticProofToolchainPaths = (
         dependencies.resolveSemanticProofToolchainPaths
         ?? resolveCccPrdSemanticProofToolchainPaths
-      )();
+      )({
+        pythonRequired: bundle.schema === "ccc-prd.bundle.v2"
+          && bundle.proofs.some((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1"),
+      });
     }
   } catch (error) {
     const detail = error as { code?: unknown; message?: unknown };

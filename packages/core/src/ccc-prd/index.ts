@@ -63,10 +63,12 @@ export {
   CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_PROOF_V2_SCHEMA_VERSION,
+  CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
   CCC_PRD_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V1_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
+  CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION,
 } from "./types.js";
 export type {
   CccPrdAcceptanceClause,
@@ -116,6 +118,9 @@ export type {
   CccPrdProofPhase,
   CccPrdProofV1,
   CccPrdProofV2,
+  CccPrdPythonExecutionToolchain,
+  CccPrdPythonRuntimeFile,
+  CccPrdPythonRuntimeManifestV1,
   CccPrdProposalAcceptanceClause,
   CccPrdProposalAcceptanceDisposition,
   CccPrdProposalArtifact,
@@ -157,6 +162,8 @@ export type {
   CccPrdUnresolvedDecision,
   CccPrdValidationResult,
   CccPrdVerifierClosureEntry,
+  CccPrdVerifierProfile,
+  CccPrdVerifierProfilePythonAdapterV1,
   CccPrdWorkflow,
 } from "./types.js";
 export type {

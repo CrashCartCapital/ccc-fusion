@@ -363,6 +363,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
   let incrementalRelease: Deferred;
   let incrementalFirstChunk: Deferred;
   let abortClosed: Deferred;
+  let transientRequestCount: number;
   const sockets = new Set<Socket>();
   const durableRestartPg: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_ccc_executor_restart",
@@ -386,9 +387,24 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
         body,
         responseModel: reportedModel,
       });
+      if (userText(body).includes("CCC_TRANSIENT_RETRY")) {
+        transientRequestCount += 1;
+        if (transientRequestCount === 1) {
+          response.writeHead(503, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: { message: "synthetic permanent failure" } }));
+          return;
+        }
+      }
+      const isOmniRouteRequest = reportedModel === "minimax/MiniMax-M3";
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
+        ...(isOmniRouteRequest
+          ? {
+              "x-omniroute-provider": "minimax",
+              "x-omniroute-model": "MiniMax-M3",
+            }
+          : {}),
       });
 
       if (userText(body).includes("CCC_INCREMENTAL")) {
@@ -508,7 +524,11 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
 
       writeSse(response, startChunk(model, { role: "assistant", content: `identity:${model}` }));
       writeSse(response, startChunk(model, {}, "stop"));
-      finishSse(response);
+      if (isOmniRouteRequest) {
+        response.end(": x-omniroute-provider=minimax\n: x-omniroute-model=MiniMax-M3\ndata: [DONE]\n\n");
+      } else {
+        finishSse(response);
+      }
     });
     server.on("connection", (socket) => {
       sockets.add(socket);
@@ -538,6 +558,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     incrementalRelease = deferred();
     incrementalFirstChunk = deferred();
     abortClosed = deferred();
+    transientRequestCount = 0;
     registry = new TestModelRegistry();
     providers = [
       {
@@ -1802,6 +1823,104 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     ]);
   });
 
+  it("GREEN-OMNI-PI-1: binds the final OmniRoute SSE receipt separately from the Pi registry identity", async () => {
+    const omniProvider: CustomProvider = {
+      id: "omniroute-minimax-m3-pinned",
+      name: "OmniRoute MiniMax M3 Pinned",
+      apiType: "openai-compatible",
+      baseUrl,
+      apiKey: "synthetic-loopback-only",
+      models: [{ id: "minimax/MiniMax-M3", name: "MiniMax M3" }],
+    };
+    providers = [omniProvider];
+    registry = new TestModelRegistry();
+    await registerCustomProviders(registry, providers, vi.fn());
+    harness.customProviders = providers;
+    harness.modelRegistry = registry;
+    harness.createAgentSession.mockReset();
+    harness.createAgentSession.mockImplementation(harness.actualCreateAgentSession!);
+
+    /*
+     * The workspace dependency is intentionally not reinstalled by this lane.
+     * The patch-level SSE proof lives in custom-providers-openai-completions.test.ts;
+     * this engine seam supplies that already-captured terminal pair so this test
+     * remains focused on session/result identity and the no-retry boundary.
+     */
+    const runtimeOptions: Record<string, unknown>[] = [];
+    const baseStreamSimple = registry.modelRuntime.streamSimple;
+    registry.modelRuntime.streamSimple = vi.fn((requestModel, context, options = {}) => {
+      runtimeOptions.push(options);
+      const source = baseStreamSimple(requestModel, context, options);
+      const attachReceipt = (value: unknown): unknown => {
+        if (value && typeof value === "object") {
+          (value as Record<string, unknown>).omniRoute = {
+            provider: "minimax",
+            model: "MiniMax-M3",
+          };
+        }
+        return value;
+      };
+      return {
+        async *[Symbol.asyncIterator]() {
+          for await (const event of source) {
+            if (event && typeof event === "object" && (event as { type?: unknown }).type === "done") {
+              attachReceipt((event as { message?: unknown }).message);
+            }
+            yield event;
+          }
+        },
+        async result() {
+          return attachReceipt(await source.result());
+        },
+      } as typeof source;
+    });
+
+    const model = registeredModel(omniProvider);
+    const registryKey = customProviderRegistryKey(omniProvider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const created = await createFnAgent({
+      cwd: "/tmp/ccc-omniroute-receipt",
+      systemPrompt: "synthetic OmniRoute loopback only",
+      tools: "readonly",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+
+    await expect((created.session as unknown as { promptWithFallback(value: string): Promise<void> })
+      .promptWithFallback("CCC_OMNI_ROUTE_RECEIPT"))
+      .resolves.toBeUndefined();
+    const assistant = [...((created.session as unknown as { messages?: unknown[] }).messages ?? [])]
+      .reverse()
+      .find((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && entry.role === "assistant");
+    expect(assistant?.omniRoute).toEqual({ provider: "minimax", model: "MiniMax-M3" });
+    expect(runtimeOptions[0]).toMatchObject({ maxRetries: 0 });
+    expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests.at(-1)?.body.model).toBe("minimax/MiniMax-M3");
+  });
+
+  it("RED-CCC-RETRY-1: disables agent lifecycle retries for a ccc transient provider failure", async () => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const created = await createFnAgent({
+      cwd: "/tmp/ccc-retry-boundary",
+      systemPrompt: "synthetic loopback only",
+      tools: "readonly",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+
+    await expect((created.session as unknown as { promptWithFallback(value: string): Promise<void> })
+      .promptWithFallback("CCC_TRANSIENT_RETRY")).rejects.toThrow();
+    expect(transientRequestCount).toBe(1);
+    expect(capturedRequests).toHaveLength(1);
+  });
+
   it("refuses a ccc response model that differs from the configured request model", async () => {
     const provider = providers[0]!;
     const model = registeredModel(provider);
@@ -1942,6 +2061,29 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       subscriptionReady: true,
     })).rejects.toThrow(
       `Configured model ${registryKey}/alpha-7b-alias (primary selection) was not found in the pi model registry`,
+    );
+    expect(harness.createAgentSession).not.toHaveBeenCalled();
+    expect(capturedRequests).toHaveLength(0);
+  });
+
+  it("RED-CCC-FALLBACK-1: refuses missing primary before opening a configured fallback session", async () => {
+    const fallback = providers[0]!;
+    const fallbackModel = registeredModel(fallback);
+    const fallbackKey = customProviderRegistryKey(fallback, providers);
+    const { createFnAgent } = await import("../pi.js");
+
+    await expect(createFnAgent({
+      cwd: "/tmp/ccc-primary-required",
+      systemPrompt: "must fail before fallback session creation",
+      tools: "readonly",
+      defaultProvider: "pi-claude-cli",
+      defaultModelId: "missing-primary-model",
+      fallbackProvider: fallbackKey,
+      fallbackModelId: fallbackModel.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    })).rejects.toThrow(
+      "Configured model pi-claude-cli/missing-primary-model (primary selection) was not found in the pi model registry",
     );
     expect(harness.createAgentSession).not.toHaveBeenCalled();
     expect(capturedRequests).toHaveLength(0);

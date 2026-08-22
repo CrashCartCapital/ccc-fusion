@@ -5,8 +5,10 @@ import {
   CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
+  CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+  CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION,
   canonicalCccPrdJson,
   canonicalizeCccPrdImplementationFactProvenance,
   computeCccPrdProofDefinitionSha256,
@@ -113,6 +115,42 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
   const expected = [...keys].sort();
   return actual.length === expected.length
     && actual.every((key, index) => key === expected[index]);
+}
+
+function hasCompletePythonProposalShape(value: unknown): boolean {
+  if (!isPlainRecord(value) || !exactKeys(value, [
+    "executablePath",
+    "executableSha256",
+    "version",
+    "versionOutputSha256",
+    "runtimeManifest",
+  ])) return false;
+  const manifest = value.runtimeManifest;
+  if (!isPlainRecord(manifest) || !exactKeys(manifest, [
+    "schema",
+    "interpreter",
+    "stdlibRoot",
+    "pythonHomeRoot",
+    "sitePackagesRoots",
+    "extensionModuleRoots",
+    "runtimeSupport",
+    "stdlib",
+    "sitePackages",
+    "extensionModules",
+    "dylibClosure",
+  ])) return false;
+  return manifest.schema === CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION
+    && isPlainRecord(manifest.interpreter)
+    && exactKeys(manifest.interpreter, ["path", "sha256"])
+    && typeof manifest.stdlibRoot === "string"
+    && typeof manifest.pythonHomeRoot === "string"
+    && Array.isArray(manifest.sitePackagesRoots)
+    && Array.isArray(manifest.extensionModuleRoots)
+    && Array.isArray(manifest.runtimeSupport)
+    && Array.isArray(manifest.stdlib)
+    && Array.isArray(manifest.sitePackages)
+    && Array.isArray(manifest.extensionModules)
+    && Array.isArray(manifest.dylibClosure);
 }
 
 function sourceQuoteContainsCanonicalPath(
@@ -287,22 +325,42 @@ function describeProposalShapeViolations(
     }
     const proofs = value.proofs;
     if (Array.isArray(proofs)) {
-      const badIndex = proofs.findIndex((entry) => !(
-        isPlainRecord(entry)
-        && entry.schema === "ccc-prd.proof.v2"
-        && Array.isArray(entry.clauseIds)
-        && Array.isArray(entry.phases)
-        && Array.isArray(entry.positiveCases)
-        && Array.isArray(entry.negativeControls)
-        && Array.isArray(entry.verifierClosure)
-        && Array.isArray(entry.candidateInputs)
-        && isPlainRecord(entry.executionToolchain)
-        && exactKeys(entry.executionToolchain, ["task", "node", "proofHost", "linkedRuntime"])
-        && Array.isArray(entry.executionToolchain.linkedRuntime)
-      ));
+      const badIndex = proofs.findIndex((entry) => {
+        if (!isPlainRecord(entry) || !isPlainRecord(entry.executionToolchain)) return true;
+        const hasPython = Object.prototype.hasOwnProperty.call(entry.executionToolchain, "python");
+        const hasVerifierProfile = Object.prototype.hasOwnProperty.call(entry, "verifierProfile");
+        const verifierProfileValid = !hasVerifierProfile || (
+          isPlainRecord(entry.verifierProfile)
+          && exactKeys(entry.verifierProfile, ["schema", "adapterPath", "targetPath"])
+          && entry.verifierProfile.schema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
+          && typeof entry.verifierProfile.adapterPath === "string"
+          && entry.verifierProfile.adapterPath.length > 0
+          && typeof entry.verifierProfile.targetPath === "string"
+          && entry.verifierProfile.targetPath.length > 0
+        );
+        return !(
+          entry.schema === "ccc-prd.proof.v2"
+          && Array.isArray(entry.clauseIds)
+          && Array.isArray(entry.phases)
+          && Array.isArray(entry.positiveCases)
+          && Array.isArray(entry.negativeControls)
+          && Array.isArray(entry.verifierClosure)
+          && Array.isArray(entry.candidateInputs)
+          && exactKeys(
+            entry.executionToolchain,
+            hasPython
+              ? ["task", "node", "proofHost", "linkedRuntime", "python"]
+              : ["task", "node", "proofHost", "linkedRuntime"],
+          )
+          && Array.isArray(entry.executionToolchain.linkedRuntime)
+          && hasPython === hasVerifierProfile
+          && (!hasPython || hasCompletePythonProposalShape(entry.executionToolchain.python))
+          && verifierProfileValid
+        );
+      });
       if (badIndex >= 0) {
         violations.push(
-          `proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape, including executionToolchain task/node/proofHost/linkedRuntime`,
+          `proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape, including executionToolchain task/node/proofHost/linkedRuntime and a paired verifierProfile/executionToolchain.python when using the Python adapter`,
         );
       }
     }

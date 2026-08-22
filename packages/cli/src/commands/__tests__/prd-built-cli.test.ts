@@ -165,7 +165,7 @@ version: 2.0.0
       "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
     ), "utf8")).toContain("Target repository: " + guidedTarget);
     expect(readFileSync(selectedPrdPath).equals(sourceBefore)).toBe(true);
-  });
+  }, 60_000);
 
   it("prints and lints the optional future-PRD contract through the built CLI", () => {
     const template = runFn(["prd", "template"]);
@@ -227,7 +227,7 @@ version: 2.0.0
     expect(JSON.parse(compile.stdout)).toHaveProperty("requirements");
     expect(existsSync(tempPrefix)).toBe(false);
     expect(readFileSync(join(packet.root, "packet.md"), "utf8")).toContain("Dense PRD Packet");
-  });
+  }, 60_000);
 
   it("returns stable usage and semantic-refusal exit codes", () => {
     const usage = runFn(["prd", "compile"]);
@@ -320,7 +320,7 @@ version: 2.0.0
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("CCC_PRD_FOREIGN_TARGET");
     }
-  });
+  }, 60_000);
 
   it("refuses a foreign admitted base through built validate and compile", () => {
     const packet = createPacketRoot();
@@ -330,7 +330,7 @@ version: 2.0.0
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("CCC_PRD_FOREIGN_BASE");
     }
-  });
+  }, 60_000);
 
   it.each(["packet.md", "manifest.json"])("refuses author output that would overwrite admitted %s bytes", (relativeOutput) => {
     const packet = createPacketRoot();
@@ -361,5 +361,5 @@ version: 2.0.0
     const second = runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]);
     expect(second.status, `${second.stdout}\n${second.stderr}`).toBe(0);
     expect(readFileSync(packet.sidecar).equals(firstBytes)).toBe(true);
-  });
+  }, 60_000);
 });

@@ -60,14 +60,27 @@ export function resolveCccPrdSemanticProofToolchainPaths(input: Readonly<{
   moduleUrl?: string;
   env?: NodeJS.ProcessEnv;
   nodeExecutablePath?: string;
+  pythonExecutablePath?: string;
+  pythonRequired?: boolean;
 }> = {}): CccPrdSemanticProofToolchainPaths {
   const nodeExecutablePath = regularExecutable(input.nodeExecutablePath ?? process.execPath);
   if (!nodeExecutablePath || !isAbsolute(nodeExecutablePath)) {
     throw new Error("CCC semantic-proof Node executable identity is unavailable");
   }
+  const requestedPythonPath = input.pythonExecutablePath
+    ?? (input.pythonRequired
+      ? resolvePathExecutable("python3", "Python", input.env ?? process.env)
+      : undefined);
+  const pythonExecutablePath = requestedPythonPath
+    ? regularExecutable(requestedPythonPath)
+    : undefined;
+  if (requestedPythonPath && !pythonExecutablePath) {
+    throw new Error("CCC semantic-proof Python executable identity is unavailable");
+  }
   return {
     taskExecutablePath: resolvePathExecutable("task", "Task", input.env ?? process.env),
     nodeExecutablePath,
+    ...(pythonExecutablePath ? { pythonExecutablePath } : {}),
     proofHost: {
       id: CCC_PRD_SEMANTIC_PROOF_HOST_ID,
       executablePath: resolveBuiltProofHost(input.moduleUrl ?? import.meta.url),

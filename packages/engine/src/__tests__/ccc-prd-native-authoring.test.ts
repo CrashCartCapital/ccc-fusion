@@ -760,6 +760,11 @@ describe("CCC PRD native authoring adapter", () => {
     expect(prompt).toContain('"acceptanceDispositions"');
     expect(prompt).toContain('"clauseIds"');
     expect(prompt).toContain('"verifierClosure"');
+    expect(prompt).toContain('"pythonHomeRoot"');
+    expect(prompt).toContain('"stdlibRoot"');
+    expect(prompt).toContain('"sitePackagesRoots"');
+    expect(prompt).toContain('"extensionModuleRoots"');
+    expect(prompt).toContain('"runtimeSupport"');
     expect(prompt).toContain("IDs, text, and raw-byte spans are owned by the admitted PRD source");
     expect(prompt).toContain("fuzzy quote recovery is forbidden for acceptance clauses");
   });
