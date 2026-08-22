@@ -249,6 +249,11 @@ function exactTargetRelativePaths(
         `CCC campaign execution route ${index} ${field}[${pathIndex}] must be a canonical target-relative path`,
       );
     }
+    if (candidate === ".fusion" || candidate.startsWith(".fusion/")) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC campaign execution route ${index} ${field}[${pathIndex}] targets a reserved controller path`,
+      );
+    }
     return candidate;
   });
   if (new Set(paths).size !== paths.length) {
@@ -414,6 +419,11 @@ function exactTargetRelativePathsV3(
     ) {
       throw new CccCampaignExecutionPolicyError(
         `${label} ${field}[${pathIndex}] must be a canonical target-relative path`,
+      );
+    }
+    if (candidate === ".fusion" || candidate.startsWith(".fusion/")) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} ${field}[${pathIndex}] targets a reserved controller path`,
       );
     }
     return candidate;

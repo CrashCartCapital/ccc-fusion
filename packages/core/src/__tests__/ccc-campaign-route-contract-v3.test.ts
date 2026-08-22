@@ -55,6 +55,25 @@ describe("CCC campaign execution-policy v3", () => {
     expect(parseCccCampaignProductExecutionPolicyV3(policy, bundle())).toEqual(policy);
   });
 
+  it.each(["ownedPaths", "allowedWriteRoots"] as const)(
+    "rejects controller-reserved paths in %s",
+    (field) => {
+      for (const reservedPath of [".fusion", ".fusion/tasks", ".fusion/anything"]) {
+        const policy = policyV3();
+        const targetTaskId = policy.routes[0]!.taskId;
+        const mutated = {
+          ...policy,
+          routes: policy.routes.map((route) => route.taskId === targetTaskId
+            ? { ...route, [field]: [reservedPath] }
+            : route),
+        };
+
+        expect(() => parseCccCampaignProductExecutionPolicyV3(mutated, bundle()))
+          .toThrow(/reserved controller path/u);
+      }
+    },
+  );
+
   it.each([
     {
       label: "missing routeProfileId",
