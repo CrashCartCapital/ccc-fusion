@@ -749,7 +749,7 @@ async function discoverPythonRuntimeManifest(
   const runtimeSupport = await filesFor("runtimeSupport");
   const uniqueFiles = (entries: readonly CccPrdPythonRuntimeFile[]): CccPrdPythonRuntimeFile[] => [
     ...new Map(entries.map((entry) => [entry.path, entry])).values(),
-  ];
+  ].sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
   const stdlib = uniqueFiles(await filesFor("stdlib"));
   const purelib = uniqueFiles(await filesFor("purelib"));
   const platlib = uniqueFiles(await filesFor("platlib"));

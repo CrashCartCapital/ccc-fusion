@@ -509,6 +509,17 @@ describe("CCC PRD semantic-proof controller custody", () => {
       path: await realpath(extensionModuleFile),
       sha256: sha256(await readFile(extensionModuleFile)),
     });
+    for (const files of [
+      manifest.runtimeSupport,
+      manifest.stdlib,
+      manifest.sitePackages,
+      manifest.extensionModules,
+      manifest.dylibClosure,
+    ]) {
+      expect(files.map((entry) => entry.path)).toEqual(
+        files.map((entry) => entry.path).sort(),
+      );
+    }
     expect(existsSync(sitecustomizeMarker)).toBe(false);
     const hydratedProof = hydrated[0]!;
     const admittedProof = {
