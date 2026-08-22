@@ -14,6 +14,9 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, ccc-fusion, m2max-fusion-arm64-1]
     timeout-minutes: 10
     steps:
+      - name: Hold admission lease for controller proof
+        shell: bash
+        run: sleep 45
       - name: Prove exact runtime and Docker tooling
         shell: bash
         run: |
@@ -22,8 +25,5 @@ jobs:
           test "$(uname -m)" = "aarch64"
           test "$(docker version --format '{{.Client.Version}}|{{.Server.Version}}')" = "29.1.3|29.5.2"
           psql --version
-          node --version
+          /opt/actions-runner/externals/node24/bin/node --version
           test -r /opt/ci-admission/config
-      - name: Hold admission lease for controller proof
-        shell: bash
-        run: sleep 45
