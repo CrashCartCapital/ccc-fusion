@@ -1,0 +1,108 @@
+name: M2 Task 6 Steady Load Canary
+
+on:
+  push:
+    branches: [codex/m2-fusion-runner-1-canary-20260822]
+    paths: [.github/workflows/task6-steady-canary.yml]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  general-postgres:
+    name: M2 general Docker PostgreSQL steady
+    runs-on: [self-hosted, Linux, ARM64, ccc-fusion, m2max-fusion-arm64-1]
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Hold exact general lane under Docker and PostgreSQL load
+        env:
+          PGPASSWORD: postgres
+          PGURL: postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}/postgres
+        run: |
+          set -euo pipefail
+          test "${{ runner.name }}" = m2max-fusion-arm64-1
+          test "$(getent hosts host.docker.internal | awk '$2 == "host.docker.internal" {print $1; exit}')" = 172.17.0.1
+          docker version --format '{{.Client.Version}}|{{.Server.Version}}'
+          assert_blocked() {
+            set +e
+            timeout 3 bash -c "</dev/tcp/$1/$2"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 124 ]; then
+              echo "protected destination became reachable: $1:$2 rc=$rc" >&2
+              exit 1
+            fi
+          }
+          assert_blocked 192.168.50.10 22
+          assert_blocked 100.80.188.56 5432
+          curl -fsS --max-time 15 https://api.github.com/zen >/dev/null || { echo "public egress failed" >&2; exit 1; }
+          for iteration in $(seq 1 16); do
+            test "$(psql "$PGURL" -Atqc 'SELECT 1')" = 1
+            printf 'general_iteration=%s postgres=1\n' "$iteration"
+            sleep 60
+          done
+
+  bwrap-postgres:
+    name: M2 bwrap Docker PostgreSQL steady
+    runs-on: [self-hosted, Linux, ARM64, ccc-fusion-bwrap]
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Hold exact bwrap lane under confinement, Docker, and PostgreSQL load
+        env:
+          PGPASSWORD: postgres
+          PGURL: postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}/postgres
+        run: |
+          set -euo pipefail
+          test "${{ runner.name }}" = m2max-ccc-bwrap-runner-1
+          test "$(getent hosts host.docker.internal | awk '$2 == "host.docker.internal" {print $1; exit}')" = 172.17.0.1
+          docker version --format '{{.Client.Version}}|{{.Server.Version}}'
+          bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc /bin/true
+          assert_blocked() {
+            set +e
+            timeout 3 bash -c "</dev/tcp/$1/$2"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 124 ]; then
+              echo "protected destination became reachable: $1:$2 rc=$rc" >&2
+              exit 1
+            fi
+          }
+          assert_blocked 192.168.50.10 22
+          assert_blocked 100.80.188.56 5432
+          curl -fsS --max-time 15 https://api.github.com/zen >/dev/null || { echo "public egress failed" >&2; exit 1; }
+          for iteration in $(seq 1 16); do
+            test "$(psql "$PGURL" -Atqc 'SELECT 1')" = 1
+            printf 'bwrap_iteration=%s postgres=1\n' "$iteration"
+            sleep 60
+          done
