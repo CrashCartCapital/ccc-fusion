@@ -115,6 +115,17 @@ function canonicalDirectory(path: string, label: string): string {
   return canonical;
 }
 
+function resolvedCanonicalDirectory(path: string, label: string): string {
+  try {
+    const canonical = realpathSync(path);
+    const metadata = lstatSync(canonical);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("not a directory");
+    return canonical;
+  } catch {
+    throw new Error(`CCC semantic-proof ${label} could not be resolved to a canonical directory: ${path}`);
+  }
+}
+
 function parseTargetVenvConfig(configPath: string): { version: string; home: string } {
   let contents: string;
   try {
@@ -150,7 +161,11 @@ function parseTargetVenvConfig(configPath: string): { version: string; home: str
   if (!version || !home || !isAbsolute(home) || values.get("include-system-site-packages") !== "false") {
     throw new Error(`CCC semantic-proof active Python venv config is mismatched: ${configPath}`);
   }
-  const canonicalHome = canonicalDirectory(home, "active Python venv home");
+  // uv writes a stable version alias into pyvenv.cfg (for example,
+  // cpython-3.12-macos-aarch64-none -> cpython-3.12.11-macos-aarch64-none).
+  // Persist and compare only its resolved directory; execution and sealing use
+  // the same canonical interpreter path, so the mutable alias is not authority.
+  const canonicalHome = resolvedCanonicalDirectory(home, "active Python venv home");
   return { version, home: canonicalHome };
 }
 

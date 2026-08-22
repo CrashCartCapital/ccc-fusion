@@ -116,6 +116,39 @@ describe("CCC semantic-proof CLI toolchain resolver", () => {
     }
   });
 
+  it("RED-R1-python-semantic-v2-target-venv: admits a resolved uv-style home alias that matches the canonical interpreter home", () => {
+    const targetRoot = mkdtempSync(join(tmpdir(), "ccc-semantic-proof-target-venv-home-alias-"));
+    try {
+      const launcher = process.platform === "darwin" ? "/opt/homebrew/bin/python3" : "/usr/bin/python3";
+      const canonicalPython = realpathSync(launcher);
+      const version = basename(canonicalPython).match(/^python(\d+\.\d+)$/u)?.[1];
+      if (!version) throw new Error(`test launcher is not versioned: ${canonicalPython}`);
+      const venvRoot = join(targetRoot, ".venv");
+      const sitePackagesRoot = join(venvRoot, "lib", `python${version}`, "site-packages");
+      const homeAlias = join(targetRoot, "python-home-alias");
+      mkdirSync(join(venvRoot, "bin"), { recursive: true });
+      mkdirSync(sitePackagesRoot, { recursive: true });
+      symlinkSync(dirname(canonicalPython), homeAlias, "dir");
+      symlinkSync(canonicalPython, join(venvRoot, "bin", "python3"));
+      writeFileSync(join(venvRoot, "pyvenv.cfg"), [
+        `home = ${homeAlias}`,
+        `version_info = ${version}`,
+        "include-system-site-packages = false",
+        "",
+      ].join("\n"));
+
+      const resolved = resolveCccPrdSemanticProofToolchainPaths({
+        pythonRequired: true,
+        targetRoot,
+      } as never);
+
+      expect(resolved.pythonExecutablePath).toBe(canonicalPython);
+      expect(resolved.pythonPathRoots).toEqual([realpathSync(sitePackagesRoot)]);
+    } finally {
+      rmSync(targetRoot, { recursive: true, force: true });
+    }
+  });
+
   it("RED-R1-python-semantic-v2-target-venv: refuses absent, ambiguous, symlinked, and mismatched active roots", () => {
     const makeTarget = (setup: (venvRoot: string, version: string, canonicalPython: string) => void) => {
       const targetRoot = mkdtempSync(join(tmpdir(), "ccc-semantic-proof-target-venv-invalid-"));
@@ -193,5 +226,25 @@ describe("CCC semantic-proof CLI toolchain resolver", () => {
       targetRoot: homeMismatched,
     } as never)).toThrow(/canonical|mismatch|version/u);
     rmSync(homeMismatched, { recursive: true, force: true });
+
+    const homeAliasMismatched = makeTarget((venvRoot, version, canonicalPython) => {
+      const wrongHome = join(dirname(venvRoot), "wrong-python-home");
+      const wrongHomeAlias = join(dirname(venvRoot), "wrong-python-home-alias");
+      mkdirSync(wrongHome);
+      symlinkSync(wrongHome, wrongHomeAlias, "dir");
+      writeFileSync(join(venvRoot, "pyvenv.cfg"), [
+        `home = ${wrongHomeAlias}`,
+        `version_info = ${version}`,
+        "include-system-site-packages = false",
+        "",
+      ].join("\n"));
+      mkdirSync(join(venvRoot, "lib", `python${version}`, "site-packages"), { recursive: true });
+      expect(realpathSync(wrongHomeAlias)).not.toBe(dirname(canonicalPython));
+    });
+    expect(() => resolveCccPrdSemanticProofToolchainPaths({
+      pythonRequired: true,
+      targetRoot: homeAliasMismatched,
+    } as never)).toThrow(/mismatch|version/u);
+    rmSync(homeAliasMismatched, { recursive: true, force: true });
   });
 });
