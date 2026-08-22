@@ -158,6 +158,14 @@ export interface WorkflowTaskRuntimeDeps extends Omit<WorkflowGraphExecutorDeps,
   };
   primitives: WorkflowRuntimePrimitives;
   runCustomNode: WorkflowCustomNodeRunner;
+  /**
+   * Campaign-only live-provider gate. The runtime invokes this during graph
+   * admission, before provider preflight or worktree preparation.
+   */
+  requireCccCampaignLiveExecutionApproval?: (input: {
+    taskId: string;
+    runId: string;
+  }) => Promise<unknown>;
   /** Campaign-only executor for the final PRD proof-suite gate. */
   runCccProofSuite?: WorkflowNodeHandler;
   onEvent?: (event: { type: "start" | "terminal"; taskId: string; detail: string }) => void;
@@ -256,6 +264,7 @@ export class WorkflowTaskRuntime {
     const runtimeRunId = runOptions.workItemFence?.runId ?? this.deps.runId ?? `${task.id}:${target.workflowId}`;
     const invoked: string[] = [];
     const campaignProofAdmission = this.campaignProofAdmission(task, runOptions);
+    const campaignLiveExecutionAdmission = this.campaignLiveExecutionAdmission(runOptions);
     const graphExecutionFence = runOptions.workItemFence
       ? createGraphExecutionFence(runOptions.workItemFence)
       : undefined;
@@ -280,10 +289,12 @@ export class WorkflowTaskRuntime {
             // producer remains a closed capability, not an ordinary plugin run.
             resolveNodeProviderController: async (input) =>
               ordinaryResolveNodeProviderController?.(input),
-            admitNodeExecution: (node, semanticTask, signal, visitIdentity, execution) =>
-              campaignProofAdmission?.(node, signal, execution && visitIdentity
+            admitNodeExecution: async (node, semanticTask, signal, visitIdentity, execution) => {
+              await campaignProofAdmission?.(node, signal, execution && visitIdentity
                 ? { semanticTask, visitIdentity, execution }
-                : undefined),
+                : undefined);
+              await campaignLiveExecutionAdmission(node, execution);
+            },
             executionFence: graphExecutionFence,
           }
         : {
@@ -568,6 +579,39 @@ export class WorkflowTaskRuntime {
       fence: options.workItemFence,
       requireExecutionBinding: true,
     });
+  }
+
+  private campaignLiveExecutionAdmission(
+    options: WorkflowTaskRuntimeRunOptions,
+  ): (
+    node: WorkflowIrNode,
+    execution: Parameters<NonNullable<WorkflowGraphExecutorDeps["admitNodeExecution"]>>[4],
+  ) => Promise<void> {
+    return async (node, execution) => {
+      const config = node.config;
+      if (
+        !options.workItemFence
+        || !execution?.executionFence
+        || node.kind !== "prompt"
+        || config?.cccPrdTaskId !== execution.semanticTaskId
+        || config?.cccNativeTaskId !== execution.nativeTaskId
+        || config.toolMode !== "coding"
+        || (config.executor !== "model" && config.executor !== "cli-agent")
+      ) {
+        return;
+      }
+      const requireApproval = this.deps.requireCccCampaignLiveExecutionApproval;
+      if (!requireApproval) {
+        throw new PermanentError(
+          "CCC campaign live-execution admission is unwired",
+          "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+        );
+      }
+      await requireApproval({
+        taskId: execution.nativeTaskId,
+        runId: execution.runId,
+      });
+    };
   }
 
   private campaignNodeExecutionResolver(originTask: TaskDetail): NonNullable<WorkflowGraphExecutorDeps["resolveNodeExecution"]> {
