@@ -1,0 +1,143 @@
+name: Task 6 Exact M2 Assignment
+
+on:
+  push:
+    branches: [codex/m2-fusion-runner-1-canary-20260822]
+    paths:
+      - .github/workflows/task6-exact-assignment.yml
+      - .github/task6-exact-assignment-marker
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  runner-1:
+    if: contains(github.event.head_commit.message, 'task6-assignment-1')
+    runs-on: [self-hosted, Linux, ARM64, ccc-fusion, m2max-fusion-arm64-1]
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: [5432/tcp]
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Prove exact runner 1 assignment
+        env:
+          PGPASSWORD: postgres
+          PGURL: postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}/postgres
+        run: |
+          set -euo pipefail
+          test "${{ runner.name }}" = m2max-fusion-arm64-1
+          test "$(getent hosts host.docker.internal | awk '$2 == "host.docker.internal" {print $1; exit}')" = 172.17.0.1
+          docker version --format '{{.Client.Version}}|{{.Server.Version}}'
+          assert_blocked() { set +e; timeout 3 bash -c "</dev/tcp/$1/$2"; rc=$?; set -e; test "$rc" -eq 124; }
+          assert_blocked 192.168.50.10 22
+          assert_blocked 100.80.188.56 5432
+          curl -fsS --max-time 15 https://api.github.com/zen >/dev/null
+          test "$(psql "$PGURL" -Atqc 'SELECT 1')" = 1
+          sleep 45
+
+  runner-2:
+    if: contains(github.event.head_commit.message, 'task6-assignment-2')
+    runs-on: [self-hosted, Linux, ARM64, ccc-fusion, m2max-fusion-arm64-2]
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: [5432/tcp]
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Prove exact runner 2 assignment
+        env:
+          PGPASSWORD: postgres
+          PGURL: postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}/postgres
+        run: |
+          set -euo pipefail
+          test "${{ runner.name }}" = m2max-fusion-arm64-2
+          test "$(getent hosts host.docker.internal | awk '$2 == "host.docker.internal" {print $1; exit}')" = 172.17.0.1
+          docker version --format '{{.Client.Version}}|{{.Server.Version}}'
+          assert_blocked() { set +e; timeout 3 bash -c "</dev/tcp/$1/$2"; rc=$?; set -e; test "$rc" -eq 124; }
+          assert_blocked 192.168.50.10 22
+          assert_blocked 100.80.188.56 5432
+          curl -fsS --max-time 15 https://api.github.com/zen >/dev/null
+          test "$(psql "$PGURL" -Atqc 'SELECT 1')" = 1
+          sleep 45
+
+  runner-3:
+    if: contains(github.event.head_commit.message, 'task6-assignment-3')
+    runs-on: [self-hosted, Linux, ARM64, ccc-fusion, m2max-fusion-arm64-3]
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: [5432/tcp]
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Prove exact runner 3 assignment
+        env:
+          PGPASSWORD: postgres
+          PGURL: postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}/postgres
+        run: |
+          set -euo pipefail
+          test "${{ runner.name }}" = m2max-fusion-arm64-3
+          test "$(getent hosts host.docker.internal | awk '$2 == "host.docker.internal" {print $1; exit}')" = 172.17.0.1
+          docker version --format '{{.Client.Version}}|{{.Server.Version}}'
+          assert_blocked() { set +e; timeout 3 bash -c "</dev/tcp/$1/$2"; rc=$?; set -e; test "$rc" -eq 124; }
+          assert_blocked 192.168.50.10 22
+          assert_blocked 100.80.188.56 5432
+          curl -fsS --max-time 15 https://api.github.com/zen >/dev/null
+          test "$(psql "$PGURL" -Atqc 'SELECT 1')" = 1
+          sleep 45
+
+  runner-4:
+    if: contains(github.event.head_commit.message, 'task6-assignment-4')
+    runs-on: [self-hosted, Linux, ARM64, ccc-fusion, m2max-fusion-arm64-4]
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: [5432/tcp]
+        options: >-
+          --health-cmd "pg_isready -h localhost -p 5432 -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Prove exact runner 4 assignment
+        env:
+          PGPASSWORD: postgres
+          PGURL: postgresql://postgres:postgres@host.docker.internal:${{ job.services.postgres.ports[5432] }}/postgres
+        run: |
+          set -euo pipefail
+          test "${{ runner.name }}" = m2max-fusion-arm64-4
+          test "$(getent hosts host.docker.internal | awk '$2 == "host.docker.internal" {print $1; exit}')" = 172.17.0.1
+          docker version --format '{{.Client.Version}}|{{.Server.Version}}'
+          assert_blocked() { set +e; timeout 3 bash -c "</dev/tcp/$1/$2"; rc=$?; set -e; test "$rc" -eq 124; }
+          assert_blocked 192.168.50.10 22
+          assert_blocked 100.80.188.56 5432
+          curl -fsS --max-time 15 https://api.github.com/zen >/dev/null
+          test "$(psql "$PGURL" -Atqc 'SELECT 1')" = 1
+          sleep 45
