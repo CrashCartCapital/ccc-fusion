@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TaskStore } from "@fusion/core";
-import { cleanupOrphanedWorktrees, scanIdleWorktrees } from "../worktree-pool.js";
+import { cleanupOrphanedWorktrees, reapOrphanWorktrees, scanIdleWorktrees } from "../worktree-pool.js";
 
 /*
  * A linked-worktree project root resolves its pool directory by walking to the
@@ -93,6 +93,36 @@ describe("worktree pool sweeps never reclaim the engine's own project root", () 
       expect(existsSync(join(engineRoot, "serving.txt"))).toBe(true);
       // The unregistered sweep still works on everything that is not the root.
       expect(existsSync(join(staleSibling, "junk.txt"))).toBe(false);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("never reaps the engine's own project root as a half-initialized orphan", async () => {
+    /*
+     * reapOrphanWorktrees is a THIRD independent enumeration of the pool. It
+     * normally spares a real worktree via its `.git` backstop, so the guard
+     * only matters once that signal is gone too — which is exactly the state a
+     * root is left in after an earlier sweep has already started deleting it,
+     * or on a host where `git worktree list` cannot run at all. Reproduce that
+     * worst case: pool = the root's parent, root is plain and unregistered.
+     */
+    const fixtureRoot = realpathSync(mkdtempSync(join(tmpdir(), "fusion-reap-orphan-root-")));
+    const engineRoot = join(fixtureRoot, "pool", "engine-root");
+    const staleSibling = join(fixtureRoot, "pool", "stale-sibling");
+    mkdirSync(engineRoot, { recursive: true });
+    mkdirSync(staleSibling, { recursive: true });
+    writeFileSync(join(engineRoot, "serving.txt"), "engine root\n", "utf-8");
+    writeFileSync(join(staleSibling, "junk.txt"), "stale\n", "utf-8");
+
+    try {
+      const removed = await reapOrphanWorktrees(engineRoot, { worktreesDir: ".." });
+
+      expect(existsSync(join(engineRoot, "serving.txt"))).toBe(true);
+      // The sweep still reaps everything that is not the root, so the guard
+      // cannot be passing merely because reaping stopped altogether.
+      expect(existsSync(join(staleSibling, "junk.txt"))).toBe(false);
+      expect(removed).toBe(1);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
