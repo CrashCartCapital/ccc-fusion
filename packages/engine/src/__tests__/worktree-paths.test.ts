@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -49,6 +49,36 @@ describe("worktree-paths", () => {
     } finally {
       rmSync(linkedRoot, { recursive: true, force: true });
       rmSync(mainRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("re-resolves a reused linked-root path instead of retaining stale repository metadata", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "fusion-worktree-paths-reuse-"));
+    const linkedRoot = join(fixtureRoot, "linked");
+    const createLinkedRepo = (mainName: string): string => {
+      const mainRoot = join(fixtureRoot, mainName);
+      mkdirSync(mainRoot, { recursive: true });
+      git(mainRoot, "git init -b main");
+      git(mainRoot, 'git config user.email "test@example.com"');
+      git(mainRoot, 'git config user.name "Test User"');
+      writeFileSync(join(mainRoot, "README.md"), `${mainName}\n`, "utf-8");
+      git(mainRoot, "git add README.md");
+      git(mainRoot, 'git commit -m "init"');
+      git(mainRoot, `git worktree add -b linked-${mainName} ${JSON.stringify(linkedRoot)} HEAD`);
+      return mainRoot;
+    };
+    try {
+      const firstMain = createLinkedRepo("main-a");
+      const firstPrimary = dirname(git(linkedRoot, "git rev-parse --path-format=absolute --git-common-dir"));
+      expect(resolveWorktreesDir(linkedRoot, undefined)).toBe(join(firstPrimary, ".worktrees"));
+      rmSync(linkedRoot, { recursive: true, force: true });
+      rmSync(firstMain, { recursive: true, force: true });
+
+      createLinkedRepo("main-b");
+      const secondPrimary = dirname(git(linkedRoot, "git rev-parse --path-format=absolute --git-common-dir"));
+      expect(resolveWorktreesDir(linkedRoot, undefined)).toBe(join(secondPrimary, ".worktrees"));
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
     }
   });
 
