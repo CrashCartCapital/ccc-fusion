@@ -10,7 +10,7 @@ const execFileAsync = promisify(execFile);
 
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
 
-import { basename, delimiter, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
@@ -20705,12 +20705,14 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
    * allowed — we only reject paths strictly *inside* a non-root worktree.
    */
   private async assertWorktreePathNotNested(path: string, taskId: string): Promise<void> {
-    const target = resolvePath(path);
-    const rootResolved = resolvePath(this.rootDir);
+    const target = canonicalizePath(path);
+    const rootResolved = canonicalizePath(this.rootDir);
+    const primaryCheckoutRoot = await this.resolvePrimaryCheckoutRoot();
     const registered = await getRegisteredWorktreePaths(this.rootDir);
 
     for (const wt of registered) {
       if (wt === rootResolved) continue; // root is allowed as ancestor
+      if (primaryCheckoutRoot && wt === primaryCheckoutRoot) continue; // primary checkout is allowed as ancestor
       if (wt === target) continue; // exact match handled later as "already registered"
       const rel = relative(wt, target);
       if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
@@ -20724,6 +20726,22 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           `This usually means the executor was launched with rootDir pointing at a worktree instead of the main repo.`,
         );
       }
+    }
+  }
+
+  private async resolvePrimaryCheckoutRoot(): Promise<string | null> {
+    try {
+      const result = await execAsync("git rev-parse --path-format=absolute --git-common-dir", {
+        cwd: this.rootDir,
+        encoding: "utf-8",
+        timeout: 5_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const commonGitDir = (typeof result === "string" ? result : result.stdout).trim();
+      if (basename(commonGitDir) !== ".git") return null;
+      return canonicalizePath(dirname(commonGitDir));
+    } catch {
+      return null;
     }
   }
 

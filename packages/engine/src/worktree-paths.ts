@@ -6,6 +6,7 @@ import type { WorktreeBackendKind } from "./worktree-backend.js";
 import { canonicalizePath } from "./worktree-pool.js";
 
 export const AI_MERGE_DIRNAME = ".ai-merge";
+const defaultWorktreesBaseDirCache = new Map<string, string>();
 
 export function isAiMergeContainerDir(name: string): boolean {
   return name === AI_MERGE_DIRNAME;
@@ -37,6 +38,10 @@ export function resolveWorktreesDir(
 }
 
 function resolveDefaultWorktreesBaseDir(rootDir: string): string {
+  const cacheKey = resolve(rootDir);
+  const cached = defaultWorktreesBaseDirCache.get(cacheKey);
+  if (cached) return cached;
+  let baseDir = rootDir;
   try {
     const commonGitDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
       cwd: rootDir,
@@ -46,12 +51,13 @@ function resolveDefaultWorktreesBaseDir(rootDir: string): string {
       maxBuffer: 1024 * 1024,
     }).trim();
     if (basename(commonGitDir) === ".git") {
-      return dirname(commonGitDir);
+      baseDir = dirname(commonGitDir);
     }
   } catch {
     // Non-git roots keep the historical default.
   }
-  return rootDir;
+  defaultWorktreesBaseDirCache.set(cacheKey, baseDir);
+  return baseDir;
 }
 
 export function resolveTaskWorktreePath(
