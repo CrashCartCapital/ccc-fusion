@@ -852,12 +852,11 @@ async function observePythonExecutionToolchain(
   if (!/^(?:python3(?:\.\d+)*|Python)$/u.test(basename(executable.executablePath))) {
     custodyRefusal("CCC semantic-proof Python verifier executable must be named python3");
   }
-  const runtimeManifest = template.runtimeManifest.interpreter.path.length === 0
+  const runtimeManifest = controllerPythonPathRoots.length > 0
     ? await discoverPythonRuntimeManifest(executable.executablePath, controllerPythonPathRoots)
-    : template.runtimeManifest;
-  if (runtimeManifest === template.runtimeManifest && controllerPythonPathRoots.length > 0) {
-    custodyRefusal("CCC semantic-proof Python controller PYTHONPATH roots require runtime discovery");
-  }
+    : template.runtimeManifest.interpreter.path.length === 0
+      ? await discoverPythonRuntimeManifest(executable.executablePath)
+      : template.runtimeManifest;
   const stdlibRoot = await inspectPythonRuntimeRoot(runtimeManifest.stdlibRoot, "stdlib");
   const pythonHomeRoot = await inspectPythonRuntimeRoot(runtimeManifest.pythonHomeRoot, "python home");
   const sitePackagesRoots = await Promise.all(runtimeManifest.sitePackagesRoots.map((root, index) => (

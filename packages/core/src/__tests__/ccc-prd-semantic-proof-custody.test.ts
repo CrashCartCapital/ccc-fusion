@@ -510,6 +510,42 @@ describe("CCC PRD semantic-proof controller custody", () => {
       sha256: sha256(await readFile(extensionModuleFile)),
     });
     expect(existsSync(sitecustomizeMarker)).toBe(false);
+    const hydratedProof = hydrated[0]!;
+    const admittedProof = {
+      ...hydratedProof,
+      admission: {
+        schema: "ccc-prd.proof-admission.v2" as const,
+        pluginId: "fusion-native",
+        pluginVersion: "1.0.0",
+        extensionId: "ccc-proof-admission",
+        proofVersion: "ccc-proof-admission.v1",
+        extensionRootRelativeSource: "ccc-campaign-proof-admission.js",
+        extensionSourceSha256: "a".repeat(64),
+        extensionManifestSha256: "b".repeat(64),
+        definitionSha256: computeCccPrdProofDefinitionSha256(hydratedProof),
+        ...computeCccPrdProofV2AdmissionDigests(hydratedProof),
+      },
+    };
+    await expect(assertCccPrdSemanticProofV2Custody({
+      repositoryRoot: state.root,
+      baseCommit,
+      proofs: [admittedProof],
+      modelWriteRoots: ["src", "test"],
+      toolchainPaths,
+    })).resolves.toBeUndefined();
+    const differentSitePackagesRoot = join(sitePackagesParent, "different-site-packages");
+    await mkdir(differentSitePackagesRoot);
+    await writeFile(join(differentSitePackagesRoot, "different.py"), "DIFFERENT = True\n");
+    await expect(assertCccPrdSemanticProofV2Custody({
+      repositoryRoot: state.root,
+      baseCommit,
+      proofs: [admittedProof],
+      modelWriteRoots: ["src", "test"],
+      toolchainPaths: {
+        ...toolchainPaths,
+        pythonPathRoots: [await realpath(differentSitePackagesRoot)],
+      },
+    })).rejects.toThrow(/custody|drifted/u);
     for (const pythonPathRoots of [
       [".venv/lib/python3.12/site-packages"],
       [join(sitePackagesParent, "missing-site-packages")],
