@@ -320,12 +320,9 @@ function verifyTaskfile(
   if (tasks.size === 0 || !tasks.has(commandMatch[1]!)) {
     throw new Error("CCC semantic-proof Taskfile must declare the selected verify target");
   }
-  const targetTokens = new Map<string, string[]>();
   const pythonProfile = proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1";
-  for (const [targetName, targetNode] of tasks) {
-    targetTokens.set(targetName, literalTargetTokens(targetName, targetNode, pythonProfile));
-  }
-  const tokens = targetTokens.get(commandMatch[1]!)!;
+  const selectedTarget = commandMatch[1]!;
+  const tokens = literalTargetTokens(selectedTarget, tasks.get(selectedTarget)!, pythonProfile);
   if (pythonProfile) {
     const profile = proof.verifierProfile!;
     const adapters = proof.verifierClosure
@@ -777,18 +774,34 @@ async function readPythonRuntimeByHandle(
   if (!isAbsolute(entry.path)) {
     throw new Error(`CCC semantic-proof Python ${label} runtime path must be absolute`);
   }
-  const directMetadata = await lstat(entry.path);
+  const directMetadata = await lstat(entry.path, { bigint: true });
   if (directMetadata.isSymbolicLink()) {
     throw new Error(`CCC semantic-proof Python ${label} runtime path must not be a symlink`);
   }
   const canonicalPath = await realpath(entry.path);
-  const handle = await open(canonicalPath, "r");
+  if (canonicalPath !== entry.path) {
+    throw new Error(`CCC semantic-proof Python ${label} runtime path must be canonical: ${entry.path}`);
+  }
+  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  const handle = await open(entry.path, fsConstants.O_RDONLY | noFollow);
   try {
-    const metadata = await handle.stat();
-    if (!metadata.isFile()) {
+    const metadata = await handle.stat({ bigint: true });
+    if (
+      !metadata.isFile()
+      || metadata.dev !== directMetadata.dev
+      || metadata.ino !== directMetadata.ino
+      || metadata.mode !== directMetadata.mode
+      || metadata.size !== directMetadata.size
+      || metadata.mtimeNs !== directMetadata.mtimeNs
+      || metadata.ctimeNs !== directMetadata.ctimeNs
+      || metadata.birthtimeNs !== directMetadata.birthtimeNs
+    ) {
       throw new Error(`CCC semantic-proof Python ${label} runtime path is not a regular file`);
     }
     const bytes = await handle.readFile();
+    if (BigInt(bytes.length) !== metadata.size) {
+      throw new Error(`CCC semantic-proof Python ${label} runtime size drifted: ${entry.path}`);
+    }
     if (sha256(bytes) !== entry.sha256) {
       throw new Error(`CCC semantic-proof Python ${label} runtime digest drifted: ${entry.path}`);
     }

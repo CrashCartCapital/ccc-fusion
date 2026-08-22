@@ -280,6 +280,7 @@ describe("prd command exit contract", () => {
         executablePath: "/controller/fusion-cli",
       },
     };
+    const resolveToolchain = vi.fn(() => toolchainPaths);
     const authorCccPrdPacket = vi.fn(async () => ({
       kind: "candidate" as const,
       sidecar: { schema: "ccc-prd.sidecar.v2" },
@@ -306,9 +307,13 @@ describe("prd command exit contract", () => {
       authorCccPrdPacket: authorCccPrdPacket as never,
       bootstrapProofAdmission: async () => ({}) as never,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
-      resolveSemanticProofToolchainPaths: () => toolchainPaths,
+      resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(0);
 
+    expect(resolveToolchain).toHaveBeenCalledWith({
+      pythonRequired: true,
+      targetRoot: packet.target,
+    });
     expect(authorCccPrdPacket).toHaveBeenCalledWith(expect.objectContaining({
       semanticProofContract: "v2",
       semanticProofToolchainPaths: toolchainPaths,
@@ -320,6 +325,78 @@ describe("prd command exit contract", () => {
     expect(JSON.parse(readFileSync(packet.sidecar, "utf8"))).toEqual({
       schema: "ccc-prd.sidecar.v2",
     });
+  });
+
+  it("RED-R1-deterministic-author-python-semantic-v2-toolchain: requests and forwards controller-owned python3 custody", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8")) as {
+      proofs: Array<{
+        executionToolchain: Record<string, unknown>;
+        verifierProfile?: unknown;
+      }>;
+    };
+    const proof = proposal.proofs[0]!;
+    proof.executionToolchain.python = {
+      executablePath: "",
+      executableSha256: "",
+      version: "",
+      versionOutputSha256: "",
+      runtimeManifest: {
+        schema: "ccc-prd.python-runtime-manifest.v1",
+        interpreter: { path: "", sha256: "" },
+        stdlibRoot: "",
+        pythonHomeRoot: "",
+        sitePackagesRoots: [],
+        extensionModuleRoots: [],
+        runtimeSupport: [],
+        stdlib: [],
+        sitePackages: [],
+        extensionModules: [],
+        dylibClosure: [],
+      },
+    };
+    proof.verifierProfile = {
+      schema: "ccc-prd.verifier.python-adapter.v1",
+      adapterPath: "verify/python_adapter.py",
+      targetPath: "fixtures/python-target",
+    };
+    writeFileSync(packet.proposal, JSON.stringify(proposal, null, 2));
+
+    const toolchainPaths = {
+      taskExecutablePath: "/controller/task",
+      nodeExecutablePath: "/controller/node",
+      pythonExecutablePath: "/controller/python3",
+      proofHost: {
+        id: "fusion-cli-semantic-proof-host.v1" as const,
+        executablePath: "/controller/proof-host",
+      },
+    };
+    const resolveToolchain = vi.fn(() => toolchainPaths);
+    const authorCccPrdPacket = vi.fn(async () => ({
+      kind: "candidate" as const,
+      sidecar: { schema: "ccc-prd.sidecar.v2" },
+      review: { ambiguities: [], unresolvedDecisions: [], exceptions: [], protectedActions: [] },
+    }));
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: (line) => output.push(line) },
+      {
+        authorCccPrdPacket: authorCccPrdPacket as never,
+        bootstrapProofAdmission: async () => ({}) as never,
+        resolveSemanticProofToolchainPaths: resolveToolchain,
+      },
+    )).toBe(0);
+
+    expect(resolveToolchain).toHaveBeenCalledWith({
+      pythonRequired: true,
+      targetRoot: packet.target,
+    });
+    expect(authorCccPrdPacket).toHaveBeenCalledWith(expect.objectContaining({
+      semanticProofContract: "v2",
+      semanticProofToolchainPaths: toolchainPaths,
+    }));
   });
 
   it("refuses generated executable authoring before model setup when controller toolchain custody is unavailable", async () => {

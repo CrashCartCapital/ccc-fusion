@@ -156,7 +156,11 @@ export type PrdCommandDependencies = {
   settleCccCampaignProofAttempt?: typeof settleCccCampaignProofAttempt;
   understandCccPrdPacket?: typeof engine.understandCccPrdPacket;
   resolveCustomProviderModelLimits?: typeof engine.resolveCustomProviderModelLimits;
-  resolveSemanticProofToolchainPaths?: (input?: { pythonRequired?: boolean }) => CccPrdSemanticProofToolchainPaths;
+  resolveSemanticProofToolchainPaths?: (input?: {
+    pythonRequired?: boolean;
+    pythonPathRoots?: readonly string[];
+    targetRoot?: string;
+  }) => CccPrdSemanticProofToolchainPaths;
   assertSemanticProofV2Custody?: typeof assertCccPrdSemanticProofV2Custody;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
@@ -1012,7 +1016,10 @@ async function runGeneratedAuthor(
     semanticProofToolchainPaths = (
       dependencies.resolveSemanticProofToolchainPaths
       ?? resolveCccPrdSemanticProofToolchainPaths
-    )();
+    )({
+      pythonRequired: true,
+      targetRoot: input.constraints.targetRepository.path,
+    });
   } catch (error) {
     io.write(JSON.stringify({
       kind: "refusal",
@@ -1904,12 +1911,13 @@ async function runProductPacketCommand(
     executionPolicy = readProductExecutionPolicy(rootDir, executionPlanPath, bundle);
     if (preview) assertProductRequestBudgetFloor(bundle, executionPolicy);
     if (bundle.schema === "ccc-prd.bundle.v2") {
+      const pythonRequired = bundle.proofs.some((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1");
       semanticProofToolchainPaths = (
         dependencies.resolveSemanticProofToolchainPaths
         ?? resolveCccPrdSemanticProofToolchainPaths
       )({
-        pythonRequired: bundle.schema === "ccc-prd.bundle.v2"
-          && bundle.proofs.some((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1"),
+        pythonRequired,
+        ...(pythonRequired ? { targetRoot: bundle.targetRepository.path } : {}),
       });
     }
   } catch (error) {
@@ -3596,10 +3604,14 @@ export async function runPrdCommand(
     let semanticProofToolchainPaths: CccPrdSemanticProofToolchainPaths | undefined;
     if (proposal.schema === "ccc-prd.authoring-proposal.v2") {
       try {
+        const pythonRequired = proposal.proofs.some((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1");
         semanticProofToolchainPaths = (
           dependencies.resolveSemanticProofToolchainPaths
           ?? resolveCccPrdSemanticProofToolchainPaths
-        )();
+        )({
+          pythonRequired,
+          ...(pythonRequired ? { targetRoot: proposal.targetRepository.path } : {}),
+        });
       } catch (error) {
         io.write(JSON.stringify({
           kind: "refusal",

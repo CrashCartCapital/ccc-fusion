@@ -1,8 +1,8 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +13,7 @@ import {
   computeCccPrdProofV2AdmissionDigests,
   hydrateCccPrdSemanticProofV2Custody,
   type CccPrdProofV2,
+  type CccPrdSemanticProofToolchainPaths,
 } from "../ccc-prd/index.js";
 
 const execFile = promisify(execFileCallback);
@@ -128,6 +129,17 @@ async function fixture(overrides: {
       },
     },
   };
+}
+
+async function controllerPython312Path(): Promise<string> {
+  const uvPythonRoot = join(userInfo().homedir, ".local/share/uv/python");
+  const uvPythonDirectories = await readdir(uvPythonRoot).catch(() => [] as string[]);
+  const isolated = uvPythonDirectories
+    .filter((name) => /^cpython-3\.12(?:[.-]|$)/u.test(name))
+    .sort()
+    .map((name) => join(uvPythonRoot, name, "bin/python3.12"))
+    .find((path) => existsSync(path));
+  return isolated ?? (await execFile("which", ["python3"])).stdout.trim();
 }
 
 describe("CCC PRD semantic-proof controller custody", () => {
@@ -385,6 +397,133 @@ describe("CCC PRD semantic-proof controller custody", () => {
     ]);
   });
 
+  it("RED-R1-python-discovery-controller-pythonpath: admits an existing absolute site-packages root from sanitized controller sys.path", async () => {
+    const state = await fixture({
+      taskCommand: "python3 verify/python_adapter.py --target fixtures/python-target",
+    });
+    await mkdir(join(state.root, "fixtures/python-target"), { recursive: true });
+    await mkdir(join(state.root, "src"), { recursive: true });
+    await mkdir(join(state.root, "test"), { recursive: true });
+    await writeFile(join(state.root, "src/slugify.js"), "export const slugify = () => 'candidate';\n");
+    await writeFile(join(state.root, "test/slugify.test.js"), "export const proof = true;\n");
+    await writeFile(join(state.root, "verify/python_adapter.py"), "print('adapter')\n");
+    await writeFile(join(state.root, "fixtures/python-target/target.py"), "print('target')\n");
+    await execFile("git", [
+      "-C", state.root,
+      "add", "Taskfile.yml", "verify/python_adapter.py", "fixtures/python-target/target.py", "src/slugify.js", "test/slugify.test.js",
+    ]);
+    await execFile("git", [
+      "-C", state.root,
+      "-c", "user.name=Fusion Test",
+      "-c", "user.email=fusion-test@example.invalid",
+      "commit", "-m", "python explicit path baseline",
+    ]);
+    const baseCommit = (await execFile("git", ["-C", state.root, "rev-parse", "HEAD"])).stdout.trim();
+    const sitePackagesParent = await mkdtemp(join(tmpdir(), "ccc-python-explicit-path-"));
+    roots.push(sitePackagesParent);
+    const sitePackagesRoot = join(sitePackagesParent, ".venv", "lib", "python3.12", "site-packages");
+    await mkdir(sitePackagesRoot, { recursive: true });
+    const canonicalSitePackagesRoot = await realpath(sitePackagesRoot);
+    const sitePackagesFile = join(sitePackagesRoot, "controller_fixture.py");
+    const extensionModuleFile = join(sitePackagesRoot, "controller_extension.so");
+    const sitecustomizeMarker = join(sitePackagesParent, "sitecustomize-ran");
+    await writeFile(sitePackagesFile, "CONTROLLER_EXPLICIT = True\n");
+    await writeFile(extensionModuleFile, "not-a-real-extension\n");
+    await writeFile(
+      join(sitePackagesRoot, "sitecustomize.py"),
+      `from pathlib import Path\nPath(${JSON.stringify(sitecustomizeMarker)}).write_text("executed")\n`,
+    );
+
+    const requestedPythonPath = await controllerPython312Path();
+    const proof = {
+      ...state.proof,
+      verifierProfile: {
+        schema: "ccc-prd.verifier.python-adapter.v1" as const,
+        adapterPath: "verify/python_adapter.py",
+        targetPath: "fixtures/python-target",
+      },
+      verifierClosure: [
+        {
+          role: "task_runner" as const,
+          path: "Taskfile.yml",
+          baseGitBlobOid: (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:Taskfile.yml`])).stdout.trim(),
+          sha256: sha256(await readFile(join(state.root, "Taskfile.yml"))),
+        },
+        {
+          role: "harness" as const,
+          path: "verify/python_adapter.py",
+          baseGitBlobOid: (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:verify/python_adapter.py`])).stdout.trim(),
+          sha256: sha256(await readFile(join(state.root, "verify/python_adapter.py"))),
+        },
+        {
+          role: "fixture" as const,
+          path: "fixtures/python-target/target.py",
+          baseGitBlobOid: (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:fixtures/python-target/target.py`])).stdout.trim(),
+          sha256: sha256(await readFile(join(state.root, "fixtures/python-target/target.py"))),
+        },
+      ],
+      executionToolchain: {
+        ...state.proof.executionToolchain,
+        python: {
+          executablePath: "",
+          executableSha256: "",
+          version: "",
+          versionOutputSha256: "",
+          runtimeManifest: {
+            schema: "ccc-prd.python-runtime-manifest.v1" as const,
+            interpreter: { path: "", sha256: "" },
+            stdlibRoot: "",
+            pythonHomeRoot: "",
+            sitePackagesRoots: [],
+            extensionModuleRoots: [],
+            runtimeSupport: [],
+            stdlib: [],
+            sitePackages: [],
+            extensionModules: [],
+            dylibClosure: [],
+          },
+        },
+      },
+    } as unknown as CccPrdProofV2;
+
+    const toolchainPaths = {
+      ...state.toolchainPaths,
+      pythonExecutablePath: requestedPythonPath,
+      pythonPathRoots: [canonicalSitePackagesRoot],
+    } as CccPrdSemanticProofToolchainPaths;
+    const hydrated = await hydrateCccPrdSemanticProofV2Custody({
+      repositoryRoot: state.root,
+      baseCommit,
+      proofs: [proof],
+      modelWriteRoots: ["src", "test"],
+      toolchainPaths,
+    });
+    const manifest = hydrated[0]!.executionToolchain.python!.runtimeManifest;
+
+    expect(manifest.sitePackagesRoots).toContain(await realpath(sitePackagesRoot));
+    expect(manifest.sitePackages).toContainEqual({
+      path: await realpath(sitePackagesFile),
+      sha256: sha256(await readFile(sitePackagesFile)),
+    });
+    expect(manifest.extensionModules).toContainEqual({
+      path: await realpath(extensionModuleFile),
+      sha256: sha256(await readFile(extensionModuleFile)),
+    });
+    expect(existsSync(sitecustomizeMarker)).toBe(false);
+    for (const pythonPathRoots of [
+      [".venv/lib/python3.12/site-packages"],
+      [join(sitePackagesParent, "missing-site-packages")],
+    ]) {
+      await expect(hydrateCccPrdSemanticProofV2Custody({
+        repositoryRoot: state.root,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src", "test"],
+        toolchainPaths: { ...toolchainPaths, pythonPathRoots },
+      })).rejects.toThrow(/controller PYTHONPATH|root/u);
+    }
+  });
+
   it("RED-S5-preflight-no-probe-before-hash: rejects a replaced executable before its version command can run", async () => {
     const f = await fixture();
     const hydratedWithoutAdmission = await hydrateCccPrdSemanticProofV2Custody({
@@ -537,12 +676,35 @@ describe("CCC PRD semantic-proof controller custody", () => {
     })).rejects.toThrow(/literal and substitution-free/u);
   });
 
-  it("RED-S5-multi-target-taskfile: admits a selected proof target when every frozen verify target is strict", async () => {
+  it("RED-R1-multi-target-taskfile: admits a selected proof target when another verify target exists", async () => {
     const f = await fixture({
       additionalTaskfileLines: [
         "  verify:integrated:",
         "    cmds:",
         "      - node verify/slugify.acceptance.test.js src/slugify.js test/slugify.test.js",
+      ],
+    });
+
+    await expect(hydrateCccPrdSemanticProofV2Custody({
+      repositoryRoot: f.root,
+      baseCommit: f.baseCommit,
+      proofs: [f.proof],
+      modelWriteRoots: ["src", "test"],
+      toolchainPaths: f.toolchainPaths,
+    })).resolves.toHaveLength(1);
+  });
+
+  it("RED-R1-taskfile-selected-target: admits a strict selected verify target alongside ordinary tasks", async () => {
+    const f = await fixture({
+      additionalTaskfileLines: [
+        "  setup:",
+        "    desc: Install project dependencies",
+        "    deps:",
+        "      - bootstrap",
+        "    vars:",
+        "      ENV: development",
+        "    cmds:",
+        "      - pnpm install --filter '{{.ENV}}'",
       ],
     });
 
@@ -571,7 +733,7 @@ describe("CCC PRD semantic-proof controller custody", () => {
     })).resolves.toHaveLength(1);
   });
 
-  it("RED-S5-multi-target-taskfile-negative: refuses unsafe behavior hidden in an unselected target", async () => {
+  it("RED-R1-taskfile-unselected-target: ignores dependencies hidden in an unselected target", async () => {
     const f = await fixture({
       additionalTaskfileLines: [
         "  verify:hidden:",
@@ -588,10 +750,10 @@ describe("CCC PRD semantic-proof controller custody", () => {
       proofs: [f.proof],
       modelWriteRoots: ["src", "test"],
       toolchainPaths: f.toolchainPaths,
-    })).rejects.toThrow(/dependencies behavior is forbidden/u);
+    })).resolves.toHaveLength(1);
   });
 
-  it("RED-S5-multi-target-canonical-path: refuses a noncanonical path hidden in an unselected target", async () => {
+  it("RED-R1-taskfile-unselected-target-path: ignores a noncanonical path hidden in an unselected target", async () => {
     const f = await fixture({
       additionalTaskfileLines: [
         "  verify:hidden:",
@@ -606,6 +768,35 @@ describe("CCC PRD semantic-proof controller custody", () => {
       proofs: [f.proof],
       modelWriteRoots: ["src", "test"],
       toolchainPaths: f.toolchainPaths,
-    })).rejects.toThrow(/must be a canonical target-relative path/u);
+    })).resolves.toHaveLength(1);
+  });
+
+  it("RED-S5-selected-target-grammar: refuses dependencies on the selected target", async () => {
+    const f = await fixture({
+      additionalTaskfileLines: [
+        "    deps:",
+        "      - bootstrap",
+      ],
+    });
+
+    await expect(hydrateCccPrdSemanticProofV2Custody({
+      repositoryRoot: f.root,
+      baseCommit: f.baseCommit,
+      proofs: [f.proof],
+      modelWriteRoots: ["src", "test"],
+      toolchainPaths: f.toolchainPaths,
+    })).rejects.toThrow(/dependencies behavior is forbidden/u);
+  });
+
+  it("RED-S5-taskfile-root-grammar: refuses unknown top-level behavior", async () => {
+    const f = await fixture({ additionalTaskfileLines: ["metadata: unsafe"] });
+
+    await expect(hydrateCccPrdSemanticProofV2Custody({
+      repositoryRoot: f.root,
+      baseCommit: f.baseCommit,
+      proofs: [f.proof],
+      modelWriteRoots: ["src", "test"],
+      toolchainPaths: f.toolchainPaths,
+    })).rejects.toThrow(/Taskfile metadata behavior is forbidden/u);
   });
 });

@@ -178,7 +178,7 @@ export type CccPrdPythonRuntimeManifestV1 = {
   stdlibRoot: string;
   /** Canonical Python prefix used as PYTHONHOME (parent of stdlibRoot). */
   pythonHomeRoot: string;
-  /** Canonical controller-observed purelib/platlib roots; kept bounded for PYTHONPATH. */
+  /** Canonical controller-observed purelib/platlib and explicit import roots; kept bounded for PYTHONPATH. */
   sitePackagesRoots: string[];
   /** Canonical roots that contain extension modules; kept bounded for PYTHONPATH. */
   extensionModuleRoots: string[];
