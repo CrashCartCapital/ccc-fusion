@@ -1018,4 +1018,91 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       .resolves.toMatchObject({ state: "dispatched_unknown" });
     await expect(getApprovalRequest(h.layer().db, issued.id)).resolves.toMatchObject({ status: "consumed" });
   });
+
+  async function omniRouteContext(suffix: string) {
+    const source = rehashCccPrdImportTestBundle({
+      ...bundle(h.rootDir(), suffix),
+      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+    });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: `provider-attempt-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy: {
+        ...createCccPrdImportTestExecutionPolicy(source),
+        routes: source.tasks.map(({ id }) => ({
+          taskId: id,
+          providerId: "omniroute-minimax-m3-pinned",
+          modelId: "minimax/MiniMax-M3",
+          transport: "pi" as const,
+        })),
+      },
+    });
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
+    return { taskId, semanticTaskId };
+  }
+
+  function omniRouteRequest(taskId: string, turnKey: string) {
+    return request(taskId, h.rootDir(), turnKey, {
+      providerId: "omniroute-minimax-m3-pinned",
+      modelId: "minimax/MiniMax-M3",
+    });
+  }
+
+  // OmniRoute pre-terminal history: an OmniRoute campaign must be able to read
+  // back its own reserved and dispatched rows. Those stages cannot carry a
+  // terminal receipt, so demanding one makes the guard unsatisfiable and rolls
+  // the whole provider step back before any request is ever built.
+  it("reads back a reserved OmniRoute attempt without demanding a terminal receipt", async () => {
+    const { taskId } = await omniRouteContext("omniroute-reserved");
+    const store = api(h.store());
+    const input = omniRouteRequest(taskId, "turn-omniroute-reserved");
+
+    const first = await store.reserveCccProviderAttempt(input);
+    expect(first.attemptOrdinal).toBe(1);
+    expect(first.binding).toMatchObject({
+      providerId: "omniroute-minimax-m3-pinned",
+      modelId: "minimax/MiniMax-M3",
+    });
+
+    // Re-reading history is what every later stage does. It must not refuse a
+    // pre-terminal row.
+    await expect(store.reserveCccProviderAttempt(input)).resolves.toEqual(first);
+    await expect(store.inspectCccProviderAttempt({
+      taskId, attemptKey: first.attemptKey,
+    })).resolves.toEqual(first);
+  });
+
+  it("reads back a dispatched OmniRoute attempt and a proved-not-dispatched terminal", async () => {
+    const { taskId } = await omniRouteContext("omniroute-terminal");
+    const store = api(h.store());
+    const input = omniRouteRequest(taskId, "turn-omniroute-terminal");
+
+    // A proved-not-dispatched terminal structurally has no effectiveRoute field
+    // at all, so it can never satisfy an unconditional receipt demand. Proving
+    // no dispatch is only legal from a reserved attempt, and maxConcurrency is
+    // 1, so this terminating attempt runs before the one left dispatched.
+    const undispatched = await store.reserveCccProviderAttempt(input);
+    await store.proveCccProviderAttemptNotDispatched({
+      taskId, attemptKey: undispatched.attemptKey, controllerToken: undispatched.controllerToken,
+    });
+    await expect(store.inspectCccProviderAttempt({
+      taskId, attemptKey: undispatched.attemptKey,
+    })).resolves.toMatchObject({ state: "proved_failed" });
+
+    // A dispatched row likewise carries no terminal receipt.
+    const dispatched = await store.reserveCccProviderAttempt(
+      omniRouteRequest(taskId, "turn-omniroute-dispatched"),
+    );
+    const permit = await dispatch(store, {
+      taskId, attemptKey: dispatched.attemptKey, controllerToken: dispatched.controllerToken,
+    });
+    expect(permit.attemptKey).toBe(dispatched.attemptKey);
+    await expect(store.inspectCccProviderAttempt({
+      taskId, attemptKey: dispatched.attemptKey,
+    })).resolves.toMatchObject({ state: "dispatched_unknown" });
+  });
 });

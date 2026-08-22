@@ -820,7 +820,14 @@ function assertAuditRow(
   ) {
     throw new CccCampaignContextError("CCC provider attempt history has inconsistent audit custody");
   }
-  const effectiveRoute = metadata.terminal?.kind === "reconciled" ? metadata.terminal.effectiveRoute : undefined;
+  /*
+   * A route receipt can only exist on a reconciled settlement. "reserved" and
+   * "dispatched" rows carry no terminal at all, and a "not-dispatched" terminal
+   * has no effectiveRoute field by construction, so requiring a receipt from
+   * those stages is unsatisfiable rather than strict.
+   */
+  const reconciledTerminal = stage === "terminal" && metadata.terminal?.kind === "reconciled";
+  const effectiveRoute = reconciledTerminal ? metadata.terminal!.effectiveRoute : undefined;
   if (
     effectiveRoute
     && (effectiveRoute.effectiveProvider !== binding.providerId || effectiveRoute.effectiveModel !== binding.modelId)
@@ -829,7 +836,7 @@ function assertAuditRow(
       "CCC provider attempt history has an effective route that does not match its persisted binding",
     );
   }
-  if (isOmniRouteProvider(binding.providerId) && !effectiveRoute) {
+  if (reconciledTerminal && isOmniRouteProvider(binding.providerId) && !effectiveRoute) {
     throw new CccCampaignContextError(
       "CCC provider attempt history has no required OmniRoute terminal receipt",
     );
