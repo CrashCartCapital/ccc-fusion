@@ -1487,6 +1487,66 @@ describe("session failure diagnostics", () => {
       expect(lifecycle).toEqual(["final", "reconcile"]);
     });
 
+    /*
+     * A real uncached OmniRoute call flushes `: omniroute-keepalive` to hold the
+     * SSE stream open, committing the HTTP headers before the upstream provider
+     * is known. x-omniroute-provider/model are then absent from the headers and
+     * arrive only as trailing SSE comments, so requiring the initial receipt
+     * refuses exactly the calls that actually reached a model. The terminal SSE
+     * receipt remains mandatory and is still matched against the requested route.
+     */
+    it("binds a final-only OmniRoute receipt when the initial response carried no route headers", async () => {
+      const omniModel = {
+        provider: "omniroute-minimax-m3-pinned",
+        id: "minimax/MiniMax-M3",
+      } as any;
+      const omniMessage = {
+        ...message,
+        provider: omniModel.provider,
+        model: `__fusion_ccc_response_probe__${omniModel.id}`,
+        omniRoute: { provider: "minimax", model: "MiniMax-M3" },
+      } as any;
+      let initialReceipt: Promise<unknown> = Promise.resolve();
+      const providerStream = vi.fn((_model: any, _context: any, options: any) => {
+        // Keepalive-first headers: every ordinary header, no route identity.
+        initialReceipt = Promise.resolve(options.onResponse?.({
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "x-omniroute-route-class": "CLIENT_API",
+          },
+        }, _model));
+        const source = {
+          result: vi.fn(async () => {
+            await initialReceipt;
+            return omniMessage;
+          }),
+          async *[Symbol.asyncIterator]() {
+            await initialReceipt;
+            yield { type: "done", reason: "stop", message: omniMessage };
+          },
+        };
+        return source;
+      });
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({ kind: "dispatch-permit", scope: scopeFromDispatchInput(input) })),
+        reconcile: vi.fn(async (input) => committedScope(input, {
+          binding: {
+            ...authorityBinding,
+            providerId: input.binding.providerId,
+            modelId: input.binding.modelId,
+            transport: input.binding.transport,
+          },
+        })),
+      };
+      const created = await createBoundAgent({ controller, providerStream });
+
+      await expect(created.modelRuntime.stream(omniModel, providerContext, {}).result())
+        .resolves.toMatchObject({ omniRoute: { provider: "minimax", model: "MiniMax-M3" } });
+      expect(controller.reconcile.mock.calls[0]?.[0]?.effectiveRoute?.omniRoute)
+        .toEqual({ final: { provider: "minimax", model: "MiniMax-M3" } });
+    });
+
     it.each([
       {
         label: "missing final receipt",

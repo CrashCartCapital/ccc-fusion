@@ -380,7 +380,7 @@ type CccOmniRouteObservation = Readonly<{
 }>;
 
 type CccOmniRouteReceipt = Readonly<{
-  initial: CccOmniRouteObservation;
+  initial?: CccOmniRouteObservation;
   final: CccOmniRouteObservation;
 }>;
 
@@ -445,15 +445,22 @@ function requireCccOmniRouteReceipt(
   state: CccOmniRouteState | undefined,
   result: unknown,
 ): CccOmniRouteReceipt {
+  /*
+   * The initial HTTP receipt is corroborating evidence, not the proof. When
+   * OmniRoute has to wait on a real upstream it flushes an
+   * `: omniroute-keepalive` SSE comment to hold the stream open, which commits
+   * the response headers before it has chosen a provider; the route identity
+   * then arrives only as trailing SSE comments. Requiring the header receipt
+   * therefore refused exactly the uncached calls that did reach a model, while
+   * cache hits (which already know the answer) passed. The terminal receipt
+   * below stays mandatory and still carries the anti-substitution guarantee.
+   */
   const initial = state?.initial;
-  if (!initial) {
-    throw new Error("ccc-fusion OmniRoute initial HTTP route receipt missing");
-  }
   const final = readCccOmniRouteFinal(result);
   if (!final) {
     throw new Error("ccc-fusion OmniRoute terminal SSE route receipt missing");
   }
-  if (initial.provider !== requested.provider || initial.model !== requested.model) {
+  if (initial && (initial.provider !== requested.provider || initial.model !== requested.model)) {
     throw new Error(
       `ccc-fusion OmniRoute initial route mismatch: requested ${requested.provider}/${requested.model}, `
       + `initial ${initial.provider}/${initial.model}`,
@@ -465,13 +472,13 @@ function requireCccOmniRouteReceipt(
       + `final ${final.provider}/${final.model}`,
     );
   }
-  if (initial.provider !== final.provider || initial.model !== final.model) {
+  if (initial && (initial.provider !== final.provider || initial.model !== final.model)) {
     throw new Error(
       `ccc-fusion OmniRoute initial/final route mismatch: initial ${initial.provider}/${initial.model}, `
       + `final ${final.provider}/${final.model}`,
     );
   }
-  return { initial, final };
+  return initial ? { initial, final } : { final };
 }
 
 /** Test seam for the string-only Pi failure boundary. Production marks only
@@ -3125,8 +3132,14 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
             : undefined;
           const provider = readCccOmniRouteHeader(headers, "x-omniroute-provider");
           const routeModel = readCccOmniRouteHeader(headers, "x-omniroute-model");
+          /*
+           * Absent route headers are an ordinary shape, not a substitution: a
+           * keepalive-first response commits its headers before OmniRoute has
+           * picked an upstream. Record nothing and let the mandatory terminal
+           * SSE receipt prove the route.
+           */
           if (provider === undefined || routeModel === undefined) {
-            throw new Error("ccc-fusion OmniRoute initial HTTP route receipt missing");
+            return;
           }
           const observed = { provider, model: routeModel };
           const prior = omniRouteState!.initial;

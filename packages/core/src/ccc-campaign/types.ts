@@ -328,7 +328,8 @@ export type CccProviderAttemptOmniRouteObservation = Readonly<{
  * model or a request echo.
  */
 export type CccProviderAttemptOmniRouteReceipt = Readonly<{
-  initial: CccProviderAttemptOmniRouteObservation;
+  /** Absent when OmniRoute committed response headers before choosing an upstream. */
+  initial?: CccProviderAttemptOmniRouteObservation;
   final: CccProviderAttemptOmniRouteObservation;
 }>;
 

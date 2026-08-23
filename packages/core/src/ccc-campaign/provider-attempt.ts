@@ -281,12 +281,19 @@ function parseOmniRouteReceipt(
   if (!isRecord(value)) {
     return error("CCC provider attempt OmniRoute receipt must be an object");
   }
+  /*
+   * `initial` is the header-derived observation and is optional: a keepalive-first
+   * OmniRoute response commits its headers before an upstream is chosen, so only
+   * the trailing SSE comments carry the route. `final` is always required.
+   */
   const keys = Object.keys(value).sort();
-  if (!sameCanonicalValue(keys, ["final", "initial"])) {
-    return error("CCC provider attempt OmniRoute receipt fields must be exactly final, initial");
+  if (!sameCanonicalValue(keys, ["final", "initial"]) && !sameCanonicalValue(keys, ["final"])) {
+    return error("CCC provider attempt OmniRoute receipt fields must be exactly final, or final and initial");
   }
   return Object.freeze({
-    initial: parseOmniRouteObservation(value.initial, "initial", error),
+    ...(Object.prototype.hasOwnProperty.call(value, "initial")
+      ? { initial: parseOmniRouteObservation(value.initial, "initial", error) }
+      : {}),
     final: parseOmniRouteObservation(value.final, "final", error),
   });
 }
@@ -360,12 +367,13 @@ function assertOmniRouteReceipt(
   if (!observed) {
     throw new CccProviderAttemptIdentityError(
       "invalid-input",
-      "CCC OmniRoute provider attempt requires an initial and final terminal route receipt",
+      "CCC OmniRoute provider attempt requires a final terminal route receipt",
     );
   }
   if (
-    observed.initial.provider !== observed.final.provider
-    || observed.initial.model !== observed.final.model
+    observed.initial
+    && (observed.initial.provider !== observed.final.provider
+      || observed.initial.model !== observed.final.model)
   ) {
     throw new CccProviderAttemptIdentityError(
       "route-drift",

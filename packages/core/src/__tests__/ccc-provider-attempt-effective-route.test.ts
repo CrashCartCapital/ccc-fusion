@@ -280,6 +280,33 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
         .toThrow(CccProviderAttemptIdentityError);
     });
 
+    /*
+     * When OmniRoute has to wait on a real upstream call it flushes an
+     * `: omniroute-keepalive` SSE comment immediately to hold the stream open,
+     * which commits the HTTP response headers before it knows which provider it
+     * will use. x-omniroute-provider/model are therefore absent from the headers
+     * on exactly the uncached calls that matter, and arrive only as trailing SSE
+     * comments. Demanding the initial observation is unsatisfiable there. The
+     * final receipt stays mandatory and carries the anti-substitution guarantee
+     * on its own; the initial one corroborates it whenever OmniRoute supplied it.
+     */
+    it("RED-OMNI-7: accepts a final-only receipt when OmniRoute stamped no initial headers", () => {
+      const receipt = assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute: { final: omniRouteReceipt.final } }),
+        omniRouteIdentity,
+      );
+      expect(receipt?.omniRoute).toEqual({ final: omniRouteReceipt.final });
+    });
+
+    it.each([
+      { label: "final provider drift", omniRoute: { final: { provider: "opencode-go", model: "MiniMax-M3" } } },
+      { label: "final model alias drift", omniRoute: { final: { provider: "minimax", model: "minimax-m3" } } },
+      { label: "fallback model", omniRoute: { final: { provider: "minimax", model: "glm-5.3" } } },
+    ])("RED-OMNI-8: still refuses $label on a final-only receipt", ({ omniRoute }) => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(omniRouteInput({ omniRoute }), omniRouteIdentity))
+        .toThrow(CccProviderAttemptIdentityError);
+    });
+
     it("RED-OMNI-4: refuses a provider-qualified OmniRoute declaration without a slash", () => {
       expect(() => assertCccProviderAttemptEffectiveRoute(
         omniRouteInput({ effectiveModel: "MiniMax-M3" }),
