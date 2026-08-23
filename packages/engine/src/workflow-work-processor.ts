@@ -447,6 +447,23 @@ async function transitionCampaignTerminal(
     diagnostics,
   );
 
+  /*
+   * The transition above is the ONLY place the terminal reason is recorded, and
+   * it goes to the work item's lastError column. Reading that back needs the
+   * campaign idempotency key or database credentials, so a failed item otherwise
+   * dies with nothing an operator can see — the sealed-authorization diagnostics
+   * above report `terminal=failed` but never why. Surface the reason on the same
+   * best-effort channel. Emitted after the authorization cleanup so that a
+   * closure diagnostic, which explains that cleanup, still leads.
+   */
+  if (terminalState !== "succeeded") {
+    const diagnostic =
+      `[ccc-campaign:work-item-terminal] workItem=${workItem.id} `
+      + `terminal=${terminalState} reason=${runtimeResult.reason ?? "<none recorded>"}`;
+    diagnostics.push(diagnostic);
+    await bestEffortWorkflowDiagnostic(store, workItem.taskId, diagnostic);
+  }
+
   if (terminalState === "succeeded" && store.getTask) {
     const latestTask = await awaitPreRuntimeRead(
       Promise.resolve(store.getTask(workItem.taskId)),
