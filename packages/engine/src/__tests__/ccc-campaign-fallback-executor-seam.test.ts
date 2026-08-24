@@ -434,6 +434,38 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     }
   });
 
+  it("gives a no-diff continuation that creates a diff one bounded verification handoff", async () => {
+    const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
+      "Implementation turn completed.",
+      "/tmp/ccc-campaign-no-diff-verification-handoff",
+    );
+    const statuses = ["", " M src/slugify.js\n"];
+    mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
+      if (command === "git status --porcelain=v1 --untracked-files=all") {
+        callback(null, statuses.shift() ?? " M src/slugify.js\n", "");
+        return {} as any;
+      }
+      callback(null, "", "");
+      return {} as any;
+    }) as any);
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(userPrompts).toHaveLength(3);
+    expect(userPrompts[2]).toMatch(/implementation diff now exists/i);
+    expect(userPrompts[2]).toMatch(/exact sealed verifier command/i);
+    expect(userPrompts[2]).toMatch(/only the admitted paths/i);
+    expect(userPrompts[2]).toMatch(/untracked generated artifacts/i);
+    expect(userPrompts[2]).toMatch(/never delete tracked files/i);
+  });
+
   it("keeps a fenced lookalike with non-required commit policy in reviewer mode", async () => {
     const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
       '{"verdict":"APPROVE","notes":""}',

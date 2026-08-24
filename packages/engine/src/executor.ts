@@ -19069,6 +19069,36 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               "If a concrete blocker truly prevents any admitted edit, report that blocker explicitly instead of claiming completion. " +
               "This is the only no-diff continuation; do not stop again with a clean worktree.",
           );
+
+          let continuationCreatedDiff = false;
+          try {
+            const { stdout } = await execAsync(
+              "git status --porcelain=v1 --untracked-files=all",
+              {
+                cwd: worktreePath,
+                encoding: "utf-8",
+                timeout: 10_000,
+                maxBuffer: 8 * 1024 * 1024,
+              },
+            );
+            continuationCreatedDiff = stdout.trim().length > 0;
+          } catch (error) {
+            executorLog.warn(
+              `${task.id}: unable to inspect the campaign worktree before bounded verification handoff: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          if (!continuationCreatedDiff) return;
+
+          await this.store.logEntry(
+            task.id,
+            "[ccc-campaign:verify-generated-diff] No-diff continuation created an implementation diff; issuing the one allowed verification handoff",
+          );
+          await promptWithFallback(
+            session,
+            "CCC_CAMPAIGN_VERIFY_GENERATED_DIFF: An implementation diff now exists. Before returning, run the exact sealed verifier command from your instructions and fix every failure it reports. " +
+              "Then inspect git status and ensure only the admitted paths remain changed. Remove only untracked generated artifacts outside those paths, such as bytecode caches or verifier reports; never delete tracked files. " +
+              "This is the only verification handoff. Finish with a passing verifier and a scope-clean diff, or report the concrete blocker explicitly.",
+          );
         })();
 
         const outcome = await Promise.race([
