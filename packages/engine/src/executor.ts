@@ -17952,6 +17952,54 @@ ${scopeGuard}
     options: { isResume: boolean } = { isResume: false },
   ): Promise<void> {
     try {
+      /*
+       * FNXC:CCCCampaignFrozenBaseCapture 2026-08-24-14:42:
+       * Imported campaign tasks are projected with the sealed target base in
+       * baseCommitSha. Their isolated worktree can intentionally fork behind
+       * local main, so generic `merge-base HEAD main` recaptures an ambient
+       * integration ancestor and destroys campaign custody. Preserve the
+       * compiler-owned frozen base after proving both persisted identity and
+       * on-disk ancestry. The required-commit fence separately derives each
+       * chained task's own start commit while retaining this campaign-wide
+       * frozen-base witness.
+       */
+      if (isImportedCccCampaignTask(task)) {
+        const campaign = await this.store.getCccCampaignContextForTask(task.id);
+        const frozenBase = campaign?.targetRepository.baseCommit;
+        if (!frozenBase || task.baseCommitSha !== frozenBase) {
+          throw new PermanentError(
+            `CCC campaign task ${task.id} base capture does not match its sealed base`,
+            CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+            { persistedBase: task.baseCommitSha, frozenBase },
+          );
+        }
+        try {
+          await execFileAsync("git", ["merge-base", "--is-ancestor", frozenBase, "HEAD"], {
+            cwd: worktreePath,
+            timeout: 120_000,
+            maxBuffer: 10 * 1024 * 1024,
+          });
+        } catch (error) {
+          throw new PermanentError(
+            `CCC campaign task ${task.id} worktree does not descend from its sealed base`,
+            CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+            { worktreePath, frozenBase },
+            error instanceof Error ? error : undefined,
+          );
+        }
+        executorLog.log(`${task.id}: preserved sealed campaign baseCommitSha ${frozenBase.slice(0, 7)}`);
+        await audit.git({
+          type: "commit:create",
+          target: frozenBase,
+          metadata: {
+            purpose: "base",
+            preserved: true,
+            custody: "campaign-frozen-base",
+          },
+        });
+        return;
+      }
+
       // Preserve an existing baseCommitSha only on RESUME of the same
       // worktree, where diff-base stability across sessions of the same task
       // matters. On fresh/pooled acquisitions the branch was just
@@ -17989,6 +18037,7 @@ ${scopeGuard}
       executorLog.log(`${task.id}: captured baseCommitSha ${baseCommitSha.slice(0, 7)}`);
       await audit.git({ type: "commit:create", target: baseCommitSha, metadata: { purpose: "base", preserved: false } });
     } catch (err: unknown) {
+      if (isImportedCccCampaignTask(task)) throw err;
       const errorMessage = err instanceof Error ? err.message : String(err);
       executorLog.log(`Failed to capture baseCommitSha for ${task.id}: ${errorMessage}`);
       // Non-fatal: task can continue without baseCommitSha

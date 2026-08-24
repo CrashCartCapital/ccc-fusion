@@ -85,6 +85,39 @@ describe("captureBaseCommitSha", () => {
     // Even if it would have passed, non-resume always recaptures.
   });
 
+  it("preserves the sealed frozen base on a fresh imported campaign worktree", async () => {
+    mockedExec.mockImplementation(((cmd: any, _opts: any, cb: any) => {
+      cb(null, cmd.includes("merge-base") ? "ambient-main-base\n" : "");
+      return {} as any;
+    }) as any);
+    const store = createMockStore();
+    store.getCccCampaignContextForTask = vi.fn().mockResolvedValue({
+      targetRepository: { baseCommit: "sealed-frozen-base" },
+    } as any);
+    const executor = new TaskExecutor(store, "/tmp/test");
+    const audit = { git: vi.fn().mockResolvedValue(undefined) };
+
+    await (executor as any).captureBaseCommitSha(
+      makeTask({
+        lineageId: "ccc-prd:0123456789abcdef01234567:REQ-1",
+        baseCommitSha: "sealed-frozen-base",
+      }),
+      "/tmp/test/.worktrees/campaign",
+      audit,
+      { isResume: false },
+    );
+
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(audit.git).toHaveBeenCalledWith(expect.objectContaining({
+      target: "sealed-frozen-base",
+      metadata: {
+        purpose: "base",
+        preserved: true,
+        custody: "campaign-frozen-base",
+      },
+    }));
+  });
+
   it("recaptures when existing baseCommitSha is not ancestor", async () => {
     mockedExecFile.mockImplementation(((_file: string, _args: string[] | undefined, _opts: unknown, cb: unknown) => {
       if (typeof cb === "function") cb(new Error("not ancestor"), "", "");
