@@ -19019,14 +19019,57 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       });
 
       try {
-        const promptPromise = promptWithFallback(
-          session,
-          cccCampaignImplementation
-            ? `Implement the sealed campaign task "${workflowStep.name}" for task ${task.id}.\n\n` +
-              "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification."
-            : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
-              "Review the work done in this worktree and evaluate it against the criteria in your instructions.",
-        );
+        const initialPrompt = cccCampaignImplementation
+          ? `Implement the sealed campaign task "${workflowStep.name}" for task ${task.id}.\n\n` +
+            "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification."
+          : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
+            "Review the work done in this worktree and evaluate it against the criteria in your instructions.";
+        const promptPromise = (async () => {
+          await promptWithFallback(session, initialPrompt);
+          if (!cccCampaignImplementation) return;
+
+          /*
+           * FNXC:CCCCampaignNoDiffContinuation 2026-08-24-13:46:
+           * A no-tool-call assistant turn is a normal pi loop terminal. For a
+           * required-commit campaign that can create a false-success handoff:
+           * the executor disposes the still-useful session, and only afterward
+           * does the required-commit fence discover that the worktree is clean.
+           * Give that exact campaign shape one bounded same-session correction.
+           * Dirty work never receives the prompt, and a second clean completion
+           * falls through to the existing fail-closed commit refusal.
+           */
+          let worktreeIsClean = false;
+          try {
+            const { stdout } = await execAsync(
+              "git status --porcelain=v1 --untracked-files=all",
+              {
+                cwd: worktreePath,
+                encoding: "utf-8",
+                timeout: 10_000,
+                maxBuffer: 8 * 1024 * 1024,
+              },
+            );
+            worktreeIsClean = stdout.trim().length === 0;
+          } catch (error) {
+            executorLog.warn(
+              `${task.id}: unable to inspect the campaign worktree before bounded no-diff continuation: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          if (!worktreeIsClean) return;
+
+          await this.store.logEntry(
+            task.id,
+            "[ccc-campaign:incomplete-no-diff] First implementation turn ended with a clean worktree; issuing the one allowed same-session continuation",
+          );
+          await promptWithFallback(
+            session,
+            "CCC_CAMPAIGN_INCOMPLETE_NO_DIFF: The first implementation turn ended, but no worktree diff exists. " +
+              "This required-commit task is incomplete. Continue now in the same session. Do not re-read files already read. " +
+              "Call edit or write to make the admitted changes, then run the targeted verification. " +
+              "If a concrete blocker truly prevents any admitted edit, report that blocker explicitly instead of claiming completion. " +
+              "This is the only no-diff continuation; do not stop again with a clean worktree.",
+          );
+        })();
 
         const outcome = await Promise.race([
           promptPromise.then(() => "completed" as const),

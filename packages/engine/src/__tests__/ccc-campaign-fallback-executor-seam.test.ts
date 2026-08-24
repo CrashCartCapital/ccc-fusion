@@ -8,6 +8,7 @@ import { TaskExecutor } from "../executor.js";
 import {
   createMockStore,
   mockedCreateFnAgent,
+  mockedExec,
   mockedExistsSync,
   resetExecutorMocks,
 } from "./executor-test-helpers.js";
@@ -167,6 +168,14 @@ function makeCampaignNodeHarness(output: string, worktree: string) {
   });
   createCccCampaignProviderAttemptBindingMock.mockResolvedValue(binding);
   const userPrompts = installOutputSession(output);
+  mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
+    if (command === "git status --porcelain=v1 --untracked-files=all") {
+      callback(null, " M src/slugify.js\n", "");
+      return {} as any;
+    }
+    callback(null, "", "");
+    return {} as any;
+  }) as any);
   const execution = sealedExecution(nodeTask);
   return { binding, execution, executor, nodeTask, store, userPrompts };
 }
@@ -386,6 +395,43 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(systemPrompt).toContain("/tmp/ccc-campaign-worktree-identity");
     expect(systemPrompt).toMatch(/isolated checkout of the sealed target repository/i);
     expect(systemPrompt).toMatch(/never copy files between checkouts/i);
+  });
+
+  it.each([
+    { status: "", expectedPrompts: 2, label: "clean" },
+    { status: " M src/slugify.js\n", expectedPrompts: 1, label: "dirty" },
+  ])("gives a $label required-commit campaign at most one no-diff continuation", async ({
+    status,
+    expectedPrompts,
+  }) => {
+    const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
+      "Implementation turn completed.",
+      "/tmp/ccc-campaign-no-diff-continuation",
+    );
+    mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
+      if (command === "git status --porcelain=v1 --untracked-files=all") {
+        callback(null, status, "");
+        return {} as any;
+      }
+      callback(null, "", "");
+      return {} as any;
+    }) as any);
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(userPrompts).toHaveLength(expectedPrompts);
+    if (status === "") {
+      expect(userPrompts[1]).toMatch(/no worktree diff exists/i);
+      expect(userPrompts[1]).toMatch(/do not re-read files already read/i);
+      expect(userPrompts[1]).toMatch(/edit or write/i);
+    }
   });
 
   it("keeps a fenced lookalike with non-required commit policy in reviewer mode", async () => {
