@@ -18646,6 +18646,7 @@ ${scopeBlock}${workflowStepUserCommentSection ? `\n\n${workflowStepUserCommentSe
 
 Your role:
 - Implement the admitted task completely inside its declared scope.
+- The worktree above is this task's isolated checkout of the sealed target repository at the frozen base commit. Every owned path and allowed write root in the sealed instructions resolves inside it, so edit them there directly. The sealed "Target repository" path records custody only; it is not a second copy to inspect, and it is not where you edit. Never copy files between checkouts.
 - Use coding tools to create or modify the required files and verify the result.
 - Treat the sealed instructions below as the authoritative implementation contract.
 

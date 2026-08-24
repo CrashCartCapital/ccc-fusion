@@ -353,6 +353,41 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(sessionCall).not.toHaveProperty("fallbackModelId");
   });
 
+  /*
+   * FNXC:CampaignWorktreeIdentity 2026-08-24-14:45:
+   * The sealed instructions name the campaign's custody repository as "Target
+   * repository", but an `isolated` route runs the agent in a freshly created
+   * worktree with a different absolute path. Nothing previously told the agent
+   * those two paths hold the same content, so five consecutive MiniMax M3 runs
+   * spent their whole request budget trying to reconcile them and never edited
+   * a file -- one run explicitly planned to "copy the files into light-marsh
+   * where I can edit them". The sealed prompt bytes are hash-checked against
+   * executionCustody.promptSha256, so the reconciliation has to live in the
+   * system prompt, which is outside the seal.
+   */
+  it("tells a campaign agent its worktree is the sealed target's isolated checkout", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "Files written and targeted verification passed.",
+      "/tmp/ccc-campaign-worktree-identity",
+    );
+    const node = campaignModelNode(execution);
+
+    await (executor as any).runGraphCustomNode(
+      node,
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    const sessionCall = mockedCreateFnAgent.mock.calls[0]?.[0] as Record<string, unknown>;
+    const systemPrompt = String(sessionCall.systemPrompt);
+    expect(systemPrompt).toContain("/tmp/ccc-campaign-worktree-identity");
+    expect(systemPrompt).toMatch(/isolated checkout of the sealed target repository/i);
+    expect(systemPrompt).toMatch(/never copy files between checkouts/i);
+  });
+
   it("keeps a fenced lookalike with non-required commit policy in reviewer mode", async () => {
     const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
       '{"verdict":"APPROVE","notes":""}',
