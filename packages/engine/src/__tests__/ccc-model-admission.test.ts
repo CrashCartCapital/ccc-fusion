@@ -316,4 +316,52 @@ describe("CCC deterministic model admission", () => {
     ]);
     expect(first.nextProbe).toEqual(first.reasons[0]?.nextProbe);
   });
+
+  it("PRD-C14 rejects unresolved attempts even under unexpected evidence IDs", () => {
+    const input = fullInput();
+    input.replicatedScenarios.push({
+      armId: "unexpected-arm",
+      routeMatched: true,
+      terminalClassification: "dispatched_unknown",
+      streamClosed: false,
+      unresolvedAttempt: true,
+    });
+    input.boundedCodingTrials.push({
+      taskId: "unexpected-task",
+      sealed: true,
+      routeMatched: true,
+      terminalClassification: "dispatched_unknown",
+      streamClosed: false,
+      unresolvedAttempt: true,
+      diffProduced: true,
+      verifierPassed: true,
+      scopeClean: true,
+      proofEligible: true,
+    });
+
+    const result = evaluateCccModelAdmission(input);
+    expect(result.verdict).toBe("rejected");
+    expect(result.reasons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "unresolved_dispatched_unknown",
+          evidenceId: "unexpected-arm",
+        }),
+        expect.objectContaining({
+          code: "unresolved_dispatched_unknown",
+          evidenceId: "unexpected-task",
+        }),
+      ]),
+    );
+  });
+
+  it("PRD-C15 treats malformed route identity as insufficient evidence", () => {
+    const input = fullInput();
+    input.routeEvidence.requestedRoute = {} as never;
+
+    expect(evaluateCccModelAdmission(input)).toMatchObject({
+      verdict: "insufficient_evidence",
+      reasons: [{ code: "route_proof_missing" }],
+    });
+  });
 });

@@ -114,6 +114,7 @@ type JsonObject = Record<string, unknown>;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const SHA256_FINGERPRINT_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const HMAC_PATTERN = /^hmac-sha256:[0-9a-f]{64}$/;
+const METADATA_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,255}$/;
 const FORBIDDEN_PROPERTY_NAMES = new Set([
   "prompt",
   "reasoningtext",
@@ -177,13 +178,13 @@ function rejectUnknownKeys(
   }
 }
 
-function validateNonEmptyString(
+function validateMetadataIdentifier(
   value: unknown,
   path: string,
   issues: string[],
 ): void {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    issues.push(`${path}: must be a non-empty string`);
+  if (typeof value !== "string" || !METADATA_IDENTIFIER_PATTERN.test(value)) {
+    issues.push(`${path}: must be a bounded metadata identifier`);
   }
 }
 
@@ -198,7 +199,9 @@ function validateIdentity(
   }
   const keys = ["runId", "scenarioId", "turnId", "attemptId"] as const;
   rejectUnknownKeys(value, keys, path, issues);
-  for (const key of keys) validateNonEmptyString(value[key], `${path}.${key}`, issues);
+  for (const key of keys) {
+    validateMetadataIdentifier(value[key], `${path}.${key}`, issues);
+  }
 }
 
 function validateRoute(
@@ -215,7 +218,9 @@ function validateRoute(
     ? (["provider", "model", "transport"] as const)
     : (["provider", "model"] as const);
   rejectUnknownKeys(value, keys, path, issues);
-  for (const key of keys) validateNonEmptyString(value[key], `${path}.${key}`, issues);
+  for (const key of keys) {
+    validateMetadataIdentifier(value[key], `${path}.${key}`, issues);
+  }
 }
 
 function validateReceipt(value: unknown, issues: string[]): void {
@@ -246,8 +251,8 @@ function validateTool(value: unknown, stage: unknown, issues: string[]): void {
     return;
   }
   rejectUnknownKeys(value, ["name", "category"], "tool", issues);
-  validateNonEmptyString(value.name, "tool.name", issues);
-  validateNonEmptyString(value.category, "tool.category", issues);
+  validateMetadataIdentifier(value.name, "tool.name", issues);
+  validateMetadataIdentifier(value.category, "tool.category", issues);
   if (stage !== "tool_call_observed" && stage !== "tool_result_dispatched") {
     issues.push("tool: may be present only for tool boundary stages");
   }
@@ -366,7 +371,7 @@ export function parseCccModelBoundaryEvent(
   if (input.effectiveRoute !== null) {
     validateRoute(input.effectiveRoute, "effectiveRoute", false, issues);
   }
-  validateNonEmptyString(input.adapterVersion, "adapterVersion", issues);
+  validateMetadataIdentifier(input.adapterVersion, "adapterVersion", issues);
   validateReceipt(input.omniRouteReceipt, issues);
   if (
     typeof input.occurredAt !== "string" ||

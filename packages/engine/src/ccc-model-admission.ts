@@ -337,9 +337,10 @@ function evaluateRouteEvidence(
     !isRecord(route) ||
     route.proofPresent !== true ||
     route.finalReceiptPresent !== true ||
-    !isRecord(route.requestedRoute) ||
-    !isRecord(route.effectiveRoute) ||
-    !isNonEmptyString(route.profileDigest)
+    !hasRouteIdentity(route.requestedRoute, true) ||
+    !hasRouteIdentity(route.effectiveRoute, false) ||
+    typeof route.profileDigest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(route.profileDigest)
   ) {
     addReason(
       reasons,
@@ -371,6 +372,15 @@ function evaluateRouteEvidence(
       "rerun_route_identity_probe",
     );
   }
+}
+
+function hasRouteIdentity(value: unknown, includeTransport: boolean): value is UnknownRecord {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.provider) &&
+    isNonEmptyString(value.model) &&
+    (!includeTransport || isNonEmptyString(value.transport))
+  );
 }
 
 function isTerminalResult(value: unknown): value is CccAdmissionTerminalResult {
@@ -525,6 +535,21 @@ function evaluateScenarios(
       "replace_scenario_evidence",
     );
   }
+  const expectedArmIds = new Set(policy.replicatedScenarioArmIds);
+  for (const [armId, result] of [...byId.entries()]
+    .filter(([armId]) => !expectedArmIds.has(armId))
+    .sort(([left], [right]) => left.localeCompare(right))) {
+    addReason(
+      reasons,
+      "replicated_scenarios",
+      "unexpected_scenario_arm",
+      "insufficient_evidence",
+      armId,
+      `scenario arm ${armId} is not part of the predefined policy`,
+      "replace_scenario_evidence",
+    );
+    evaluateTerminalResult(result, "replicated_scenarios", armId, reasons);
+  }
   for (const armId of policy.replicatedScenarioArmIds) {
     const result = byId.get(armId);
     if (!result) {
@@ -584,6 +609,21 @@ function evaluateCoding(
       "replace_bounded_coding_evidence",
     );
   }
+  const expectedTaskIds = new Set(policy.boundedCodingTaskIds);
+  for (const [taskId, trial] of [...byId.entries()]
+    .filter(([taskId]) => !expectedTaskIds.has(taskId))
+    .sort(([left], [right]) => left.localeCompare(right))) {
+    addReason(
+      reasons,
+      "bounded_coding",
+      "unexpected_coding_task",
+      "insufficient_evidence",
+      taskId,
+      `coding task ${taskId} is not part of the sealed policy`,
+      "replace_bounded_coding_evidence",
+    );
+    evaluateCodingTrial(trial, taskId, reasons);
+  }
   for (const taskId of policy.boundedCodingTaskIds) {
     const trial = byId.get(taskId);
     if (!trial) {
@@ -598,34 +638,37 @@ function evaluateCoding(
       );
       continue;
     }
-    if (trial.unresolvedAttempt || trial.terminalClassification === "dispatched_unknown") {
-      addReason(
-        reasons,
-        "bounded_coding",
-        "unresolved_dispatched_unknown",
-        "rejected",
-        taskId,
-        `${taskId} contains an unresolved dispatched_unknown attempt`,
-        "run_new_attempt_after_reconciliation",
-      );
-      continue;
-    }
-    if (!trial.sealed) addCodingFailure(reasons, taskId, "coding_task_unsealed", "seal_and_rerun_coding_task");
-    if (!trial.diffProduced) addCodingFailure(reasons, taskId, "coding_diff_missing", "rerun_bounded_coding_task");
-    if (!trial.routeMatched) addCodingFailure(reasons, taskId, "route_substitution_observed", "rerun_with_bound_route_proof");
-    if (trial.terminalClassification !== "success") {
-      addCodingFailure(
-        reasons,
-        taskId,
-        "coding_terminal_return_missing",
-        "rerun_coding_terminal_probe",
-      );
-    }
-    if (!trial.streamClosed) addCodingFailure(reasons, taskId, "terminal_stream_closure_missing", "rerun_terminal_closure_probe");
-    if (!trial.verifierPassed) addCodingFailure(reasons, taskId, "coding_verifier_failed", "rerun_sealed_verifier_after_repair");
-    if (!trial.scopeClean) addCodingFailure(reasons, taskId, "coding_scope_dirty", "rerun_clean_scope_task");
-    if (!trial.proofEligible) addCodingFailure(reasons, taskId, "coding_proof_ineligible", "rerun_proof_eligible_task");
+    evaluateCodingTrial(trial, taskId, reasons);
   }
+}
+
+function evaluateCodingTrial(
+  trial: CccBoundedCodingTrialResult,
+  taskId: string,
+  reasons: CccModelAdmissionReason[],
+): void {
+  if (trial.unresolvedAttempt || trial.terminalClassification === "dispatched_unknown") {
+    addReason(
+      reasons,
+      "bounded_coding",
+      "unresolved_dispatched_unknown",
+      "rejected",
+      taskId,
+      `${taskId} contains an unresolved dispatched_unknown attempt`,
+      "run_new_attempt_after_reconciliation",
+    );
+    return;
+  }
+  if (!trial.sealed) addCodingFailure(reasons, taskId, "coding_task_unsealed", "seal_and_rerun_coding_task");
+  if (!trial.diffProduced) addCodingFailure(reasons, taskId, "coding_diff_missing", "rerun_bounded_coding_task");
+  if (!trial.routeMatched) addCodingFailure(reasons, taskId, "route_substitution_observed", "rerun_with_bound_route_proof");
+  if (trial.terminalClassification !== "success") {
+    addCodingFailure(reasons, taskId, "coding_terminal_return_missing", "rerun_coding_terminal_probe");
+  }
+  if (!trial.streamClosed) addCodingFailure(reasons, taskId, "terminal_stream_closure_missing", "rerun_terminal_closure_probe");
+  if (!trial.verifierPassed) addCodingFailure(reasons, taskId, "coding_verifier_failed", "rerun_sealed_verifier_after_repair");
+  if (!trial.scopeClean) addCodingFailure(reasons, taskId, "coding_scope_dirty", "rerun_clean_scope_task");
+  if (!trial.proofEligible) addCodingFailure(reasons, taskId, "coding_proof_ineligible", "rerun_proof_eligible_task");
 }
 
 function addCodingFailure(

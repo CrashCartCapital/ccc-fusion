@@ -314,4 +314,23 @@ describe("CCC model boundary telemetry", () => {
       ]),
     ).toThrow("stream_closed classification must match the attempt terminal state");
   });
+
+  it("PRD-B14 rejects content-bearing text in metadata identifier fields", () => {
+    expect(() =>
+      parseCccModelBoundaryEvent(
+        event("tool_call_observed", 4, {
+          tool: { name: "read_file\nraw prompt bytes", category: "read" },
+        }),
+      ),
+    ).toThrow("tool.name: must be a bounded metadata identifier");
+
+    const input = event("request_built", 1);
+    input.identity = {
+      ...(input.identity as Record<string, unknown>),
+      runId: "run id containing payload text",
+    };
+    expect(() => parseCccModelBoundaryEvent(input)).toThrow(
+      "identity.runId: must be a bounded metadata identifier",
+    );
+  });
 });
