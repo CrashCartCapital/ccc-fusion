@@ -295,6 +295,31 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     },
   );
 
+  it(
+    "unresolved_mutating_turn_never_commits: refuses a successful outcome "
+      + "whose sealed execution carries no providerAttemptTurnKey binding to the dirty diff",
+    async () => {
+      const h = await fixture();
+      await writeFile(
+        join(h.worktree, "src", "task-0", "result.txt"),
+        "result\n",
+        "utf8",
+      );
+
+      // sealedExecutionContext() never sets providerAttemptTurnKey, so this
+      // "success" outcome carries no verifiable link between the dirty diff
+      // already on disk and a turn that actually resolved -- the same gap an
+      // unresolved (failed/timed-out/cancelled) mutating turn's leftover diff
+      // would exploit. The gate must refuse to commit it, not silently commit
+      // whatever is dirty just because outcome === "success".
+      await expect(runSuccessfulNode(h)).rejects.toMatchObject({
+        name: "PermanentError",
+        code: REFUSAL_CODE,
+        message: expect.stringMatching(/turn|attempt/i),
+      });
+    },
+  );
+
   it("refuses to stage a dirty candidate when the fresh sealed readiness verifier fails", async () => {
     const h = await fixture();
     h.context.proofs[0]!.command = "node -e \"process.exit(17)\"";
