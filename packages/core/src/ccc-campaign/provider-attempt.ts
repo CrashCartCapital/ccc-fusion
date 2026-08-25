@@ -420,9 +420,13 @@ function assertExactEffectiveRouteKeys(
 export function assertCccProviderAttemptEffectiveRoute(
   input: CccProviderAttemptEffectiveRouteInput | undefined,
   requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
+  options: Readonly<{ omniRouteTerminalReceiptRequired?: boolean }> = {},
 ): CccProviderAttemptEffectiveRoute | undefined {
   if (input === undefined) {
-    if (isOmniRouteProvider(requestedIdentity.providerId)) {
+    if (
+      isOmniRouteProvider(requestedIdentity.providerId)
+      && options.omniRouteTerminalReceiptRequired !== false
+    ) {
       throw new CccProviderAttemptIdentityError(
         "invalid-input",
         "CCC OmniRoute provider attempt requires an effective route terminal receipt",
@@ -844,7 +848,12 @@ function assertAuditRow(
       "CCC provider attempt history has an effective route that does not match its persisted binding",
     );
   }
-  if (reconciledTerminal && isOmniRouteProvider(binding.providerId) && !effectiveRoute) {
+  if (
+    reconciledTerminal
+    && metadata.terminal?.state === "committed"
+    && isOmniRouteProvider(binding.providerId)
+    && !effectiveRoute
+  ) {
     throw new CccCampaignContextError(
       "CCC provider attempt history has no required OmniRoute terminal receipt",
     );
@@ -1396,10 +1405,14 @@ export async function reconcileCccProviderAttempt(
   return withinWriteTransaction(input, async (tx) => {
     const context = await lockedContext(input, tx, input.reconciliation.taskId);
     const attempt = transitionAttempt(await loadHistory(tx, context), input.reconciliation, context.taskId);
-    const effectiveRoute = assertCccProviderAttemptEffectiveRoute(input.reconciliation.effectiveRoute, {
-      providerId: attempt.scope.binding.providerId,
-      modelId: attempt.scope.binding.modelId,
-    });
+    const effectiveRoute = assertCccProviderAttemptEffectiveRoute(
+      input.reconciliation.effectiveRoute,
+      {
+        providerId: attempt.scope.binding.providerId,
+        modelId: attempt.scope.binding.modelId,
+      },
+      { omniRouteTerminalReceiptRequired: outcome === "committed" },
+    );
     if (attempt.terminal) {
       if (
         attempt.terminal.kind === "reconciled"

@@ -252,6 +252,22 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       ...overrides,
     });
 
+    it("allows a proved-failed settlement to omit the terminal route receipt that never arrived", () => {
+      expect(assertCccProviderAttemptEffectiveRoute(
+        undefined,
+        omniRouteIdentity,
+        { omniRouteTerminalReceiptRequired: false },
+      )).toBeUndefined();
+    });
+
+    it("still requires a terminal route receipt for a committed OmniRoute settlement", () => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        undefined,
+        omniRouteIdentity,
+        { omniRouteTerminalReceiptRequired: true },
+      )).toThrow(CccProviderAttemptIdentityError);
+    });
+
     it("RED-OMNI-1: persists the exact initial/final allowlisted receipt for a provider-qualified route", () => {
       const receipt = assertCccProviderAttemptEffectiveRoute(
         omniRouteInput({ omniRoute: omniRouteReceipt }),

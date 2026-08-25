@@ -1105,4 +1105,36 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
       taskId, attemptKey: dispatched.attemptKey,
     })).resolves.toMatchObject({ state: "dispatched_unknown" });
   });
+
+  it("reads back a reconciled proved-failed OmniRoute attempt without a terminal route receipt", async () => {
+    const { taskId } = await omniRouteContext("omniroute-reconciled-proved-failed");
+    const store = api(h.store());
+    const reserved = await store.reserveCccProviderAttempt(
+      omniRouteRequest(taskId, "turn-omniroute-reconciled-proved-failed"),
+    );
+    await dispatch(store, {
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+
+    await expect(store.reconcileCccProviderAttempt({
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+      outcome: "proved_failed",
+      evidenceDigest: "e".repeat(64),
+      observerId: "omniroute-timeout-observer",
+    })).resolves.toMatchObject({
+      state: "proved_failed",
+      terminal: { kind: "reconciled", state: "proved_failed" },
+    });
+    await expect(store.inspectCccProviderAttempt({
+      taskId,
+      attemptKey: reserved.attemptKey,
+    })).resolves.toMatchObject({
+      state: "proved_failed",
+      terminal: { kind: "reconciled", state: "proved_failed" },
+    });
+  });
 });
