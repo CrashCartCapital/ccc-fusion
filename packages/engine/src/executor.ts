@@ -40,6 +40,7 @@ import {
   requireCccCampaignMergeApproval,
 } from "./ccc-campaign-product-control.js";
 import {
+  assertCccCampaignRejectedTurnCustody,
   assertCccCampaignRequiredCommitCandidate,
   CCC_CAMPAIGN_REQUIRED_COMMIT_REFUSED_CODE,
   enforceCccCampaignRequiredCommitAfterNode,
@@ -9541,20 +9542,24 @@ export class TaskExecutor {
       A resolved {outcome:"failure"} reaches enforceCccCampaignRequiredCommitAfterNode
       below and no-ops harmlessly, but a REJECTED runGraphCustomNode call used to skip
       the fence entirely — the one gate that inspects a dirty diff before committing
-      it. A turn that mutated the worktree and then rejected with no classification at
-      all (timeout, crash, OOM, an unrelated bug) left its diff completely unvetted,
-      with nothing binding it to a resolution. This is NOT a deliberate commit-policy
-      refusal — it fires for any UNCLASSIFIED rejection — so the message says "before
-      commit custody could be established", not "refused", and the original error
-      survives as `.cause` rather than being swallowed or bare-rethrown.
+      it. Rejected required-commit turns now receive a controller-owned custody
+      assertion which validates any surviving dirty candidate without staging,
+      verifying, committing, or cleaning it.
       An already-classified `EngineError` (PermanentError/TransientError/etc.) is a
-      DIFFERENT shape: some other seam already decided what this failure means (e.g.
+      distinct failure shape: some other seam already decided what it means (e.g.
       the graph's own ccc-retry-classification park/retry bookkeeping keys off that
       error's own code and TransientError-vs-PermanentError type). Relabeling it here
       would erase that classification for its real owner, so it bare-rethrows
-      unchanged — this fence only widens custody for the case the graph has no
-      opinion about at all.
+      unchanged after custody is established. An UNCLASSIFIED rejection becomes a
+      permanent custody refusal whose honest message says "before commit custody
+      could be established" and whose original error survives as `.cause`.
       */
+      await assertCccCampaignRejectedTurnCustody({
+        rootDir: this.rootDir,
+        store: this.store,
+        taskId: nodeTask.id,
+        executionContext,
+      });
       if (error instanceof EngineError) throw error;
       throw new PermanentError(
         `CCC campaign task ${nodeTask.id} turn rejected before commit custody could `

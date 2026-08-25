@@ -60,6 +60,11 @@ export type AssertCccCampaignRequiredCommitCandidateInput = Omit<
   "result"
 >;
 
+export type AssertCccCampaignRejectedTurnCustodyInput = Pick<
+  EnforceCccCampaignRequiredCommitInput,
+  "rootDir" | "store" | "taskId" | "executionContext"
+>;
+
 function refusal(
   message: string,
   details?: Record<string, unknown>,
@@ -1084,6 +1089,36 @@ export async function assertCccCampaignRequiredCommitCandidate(
   if (candidate.initialStatus.length === 0) {
     refusal(`CCC campaign readiness task ${taskId} has no uncommitted candidate diff`);
   }
+}
+
+export async function assertCccCampaignRejectedTurnCustody(
+  input: AssertCccCampaignRejectedTurnCustodyInput,
+): Promise<void> {
+  if (!input.executionContext?.execution?.executionFence) {
+    return;
+  }
+  const taskId = input.executionContext.execution.nativeTaskId;
+  if (taskId !== input.taskId) {
+    refusal(
+      `CCC campaign rejected-turn invocation task ${input.taskId} differs from sealed task ${taskId}`,
+    );
+  }
+  const { task, campaign } = await loadExactTaskCustody(input.store, taskId);
+  if (!campaign || !isRequiredProductRoute(campaign)) {
+    return;
+  }
+  assertExactCustody(taskId, task, campaign, input.executionContext);
+  await assertLiveWorkItemFence(input.store, taskId, input.executionContext);
+
+  // A rejected turn never stages, verifies, commits, or cleans its candidate.
+  // Inspection only binds any surviving dirty bytes to the live sealed custody
+  // and refuses out-of-scope paths or other invalid worktree state.
+  await inspectRequiredCommitCandidate(
+    input.rootDir,
+    input.store,
+    task,
+    campaign,
+  );
 }
 
 export async function enforceCccCampaignRequiredCommitAfterNode(

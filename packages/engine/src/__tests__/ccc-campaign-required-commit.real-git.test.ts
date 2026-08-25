@@ -13,6 +13,7 @@ import type {
   WorkflowIrNode,
 } from "@fusion/core";
 import { ensureCccCampaignJoinBaseBranch } from "../ccc-campaign-join-base.js";
+import { TransientError } from "../engine-errors.js";
 import { TaskExecutor } from "../executor.js";
 import type {
   WorkflowNodeExecutionContext,
@@ -333,6 +334,79 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
         code: REFUSAL_CODE,
         message: expect.stringMatching(/turn|attempt/i),
       });
+    },
+  );
+
+  it(
+    "classified_mutating_turn_binds_custody_without_erasing_retry_classification",
+    async () => {
+      const h = await fixture();
+      await writeFile(
+        join(h.worktree, "src", "task-0", "result.txt"),
+        "result\n",
+        "utf8",
+      );
+      const rejection = new TransientError(
+        "provider retry",
+        "CCC_TRANSIENT",
+      );
+      const executor = new TaskExecutor(h.store, h.rootDir);
+      vi.spyOn(executor as never, "runGraphCustomNode" as never)
+        .mockRejectedValue(rejection);
+
+      await expect(
+        executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(
+          node("model"),
+          h.task,
+          {},
+          sealedExecutionContext(h.task),
+        ),
+      ).rejects.toBe(rejection);
+
+      expect(rejection).toMatchObject({
+        name: "TransientError",
+        code: "CCC_TRANSIENT",
+        retryable: true,
+        message: "provider retry",
+      });
+      expect(h.store.assertCccCampaignWorkflowLeaseFence).toHaveBeenCalledTimes(1);
+      expect(await git(h.worktree, "rev-parse", "HEAD")).toBe(h.baseCommit);
+      expect(await git(h.worktree, "status", "--porcelain=v1")).toContain(
+        "?? src/task-0/result.txt",
+      );
+    },
+  );
+
+  it(
+    "classified_mutating_turn_refuses_out_of_scope_candidate_before_rethrow",
+    async () => {
+      const h = await fixture();
+      await writeFile(
+        join(h.worktree, "README.md"),
+        "out-of-scope mutation\n",
+        "utf8",
+      );
+      const executor = new TaskExecutor(h.store, h.rootDir);
+      vi.spyOn(executor as never, "runGraphCustomNode" as never)
+        .mockRejectedValue(new TransientError("provider retry", "CCC_TRANSIENT"));
+
+      await expect(
+        executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(
+          node("model"),
+          h.task,
+          {},
+          sealedExecutionContext(h.task),
+        ),
+      ).rejects.toMatchObject({
+        name: "PermanentError",
+        code: REFUSAL_CODE,
+        message: expect.stringMatching(/outside allowedWriteRoots/i),
+      });
+
+      expect(await git(h.worktree, "rev-parse", "HEAD")).toBe(h.baseCommit);
+      expect(await git(h.worktree, "status", "--porcelain=v1")).toContain(
+        "M README.md",
+      );
     },
   );
 
