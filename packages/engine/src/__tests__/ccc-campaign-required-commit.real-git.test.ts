@@ -296,8 +296,8 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
   );
 
   it(
-    "unresolved_mutating_turn_never_commits: refuses a successful outcome "
-      + "whose sealed execution carries no providerAttemptTurnKey binding to the dirty diff",
+    "unresolved_mutating_turn_never_commits: refuses to commit a dirty diff "
+      + "left behind by a turn whose provider session never settled",
     async () => {
       const h = await fixture();
       await writeFile(
@@ -306,13 +306,29 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
         "utf8",
       );
 
-      // sealedExecutionContext() never sets providerAttemptTurnKey, so this
-      // "success" outcome carries no verifiable link between the dirty diff
-      // already on disk and a turn that actually resolved -- the same gap an
-      // unresolved (failed/timed-out/cancelled) mutating turn's leftover diff
-      // would exploit. The gate must refuse to commit it, not silently commit
-      // whatever is dirty just because outcome === "success".
-      await expect(runSuccessfulNode(h)).rejects.toMatchObject({
+      // Model a turn that mutated the tree (the writeFile above already landed
+      // it) and then ended UNRESOLVED -- failed, timed out, or cancelled --
+      // instead of settling into a WorkflowNodeResult. WorkflowNodeOutcome
+      // (workflow-graph-executor.ts:55) is only ever "success" | "failure"; an
+      // unresolved turn has no outcome value to report at all, so the only way
+      // to represent it here is a REJECTED runGraphCustomNode promise instead
+      // of a resolved one. runGraphCustomNodeWithRequiredCommitFence
+      // (executor.ts:9503-9547) awaits that call with no try/catch, so this
+      // rejection skips enforceCccCampaignRequiredCommitAfterNode entirely --
+      // the one gate that ever inspects a dirty diff before committing it --
+      // leaving the tool's already-written file completely unvetted.
+      const executor = new TaskExecutor(h.store, h.rootDir);
+      vi.spyOn(executor as never, "runGraphCustomNode" as never)
+        .mockRejectedValue(new Error("workflow step timed out after 60000ms"));
+
+      await expect(
+        executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(
+          node("model"),
+          h.task,
+          {},
+          sealedExecutionContext(h.task),
+        ),
+      ).rejects.toMatchObject({
         name: "PermanentError",
         code: REFUSAL_CODE,
         message: expect.stringMatching(/turn|attempt/i),
