@@ -1,5 +1,5 @@
 import { execFile as execFileCallback, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -88,7 +88,15 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
       timeoutMs: 30_000,
     });
 
-    expect(result).toMatchObject({ ready: true });
+    expect(result).toMatchObject({
+      ready: true,
+      taskId: campaign.taskId,
+      verifiedWorktreePath: await realpath(root),
+      verifiedStartCommit: campaign.targetRepository.baseCommit,
+      frozenBaseCommit: campaign.targetRepository.baseCommit,
+      allowedRoots: ["src/value.txt"],
+      candidateFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     await expect(readFile(join(root, "src", "value.txt"), "utf8")).resolves.toBe("ready\n");
     await expect(readFile(join(root, "verifier-side-effect.txt"), "utf8")).rejects.toThrow();
   });

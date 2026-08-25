@@ -37,6 +37,34 @@ describe("CCC campaign readiness intent", () => {
     });
   });
 
+  it("records phase-completion intent without running controller verification", async () => {
+    const assertCandidateCommittable = vi.fn().mockResolvedValue(undefined);
+    const verifyCandidate = vi.fn().mockResolvedValue({
+      ready: true,
+      summary: "must not run inside the model turn",
+    });
+    const signalPhaseCompletion = vi.fn();
+    const tool = createCccCampaignReadyTool({
+      mode: "phase-signal",
+      signalPhaseCompletion,
+      assertCandidateCommittable,
+      verifyCandidate,
+    } as any);
+
+    const result = await execute(tool);
+
+    expect(tool.name).toBe("fn_complete_phase");
+    expect(signalPhaseCompletion).toHaveBeenCalledTimes(1);
+    expect(assertCandidateCommittable).not.toHaveBeenCalled();
+    expect(verifyCandidate).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      isError: false,
+      terminate: true,
+      details: { phaseCompletionRequested: true },
+    });
+    expect(result.details).not.toHaveProperty("ready");
+  });
+
   it("returns exact repair feedback and keeps the session open when verification fails", async () => {
     const tool = createCccCampaignReadyTool({
       assertCandidateCommittable: vi.fn().mockResolvedValue(undefined),

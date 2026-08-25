@@ -13,6 +13,11 @@ import type {
   WorkflowIrNode,
 } from "@fusion/core";
 import { ensureCccCampaignJoinBaseBranch } from "../ccc-campaign-join-base.js";
+import {
+  type CccCampaignReadyCommitHandoff,
+  verifyCccCampaignReadyCandidate,
+} from "../ccc-campaign-ready.js";
+import { enforceCccCampaignRequiredCommitAfterNode } from "../ccc-campaign-required-commit.js";
 import { TransientError } from "../engine-errors.js";
 import { TaskExecutor } from "../executor.js";
 import type {
@@ -296,6 +301,141 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
     },
   );
 
+  it("reuses an exact controller-verified fingerprint without rerunning the sealed verifier", async () => {
+    const h = await fixture();
+    await writeFile(
+      join(h.worktree, "src", "task-0", "result.txt"),
+      "verified once\n",
+      "utf8",
+    );
+    const verification = await verifyCccCampaignReadyCandidate({
+      taskId: h.task.id,
+      worktreePath: h.worktree,
+      campaign: h.context,
+      timeoutMs: 30_000,
+    });
+    expect(verification.ready).toBe(true);
+    if (!verification.ready) throw new Error(verification.summary);
+    const executionContext = sealedExecutionContext(h.task);
+    const fence = executionContext.execution!.executionFence!;
+    const verifiedCandidateHandoff = Object.freeze({
+      taskId: verification.taskId,
+      verifiedWorktreePath: verification.verifiedWorktreePath,
+      verifiedStartCommit: verification.verifiedStartCommit,
+      frozenBaseCommit: verification.frozenBaseCommit,
+      allowedRoots: Object.freeze([...verification.allowedRoots]),
+      candidateFingerprint: verification.candidateFingerprint,
+      executionFence: Object.freeze({
+        workItemId: fence.workItemId,
+        leaseOwner: fence.leaseOwner,
+        attempt: fence.attempt,
+        runId: fence.runId,
+      }),
+    });
+    h.context.proofs[0]!.command = "node -e \"process.exit(17)\"";
+
+    await expect(enforceCccCampaignRequiredCommitAfterNode({
+      rootDir: h.rootDir,
+      store: h.store,
+      taskId: h.task.id,
+      result: { outcome: "success", value: "passed" },
+      executionContext,
+      verifiedCandidateHandoff,
+    } as any)).resolves.toBeUndefined();
+
+    expect(await git(h.worktree, "status", "--porcelain=v1")).toBe("");
+    expect(await git(h.worktree, "rev-parse", "HEAD")).not.toBe(h.baseCommit);
+  });
+
+  it.each<[
+    string,
+    (handoff: CccCampaignReadyCommitHandoff) => CccCampaignReadyCommitHandoff,
+  ]>([
+    ["task id", (handoff) => Object.freeze({ ...handoff, taskId: "TASK-other" })],
+    ["worktree", (handoff) => Object.freeze({
+      ...handoff,
+      verifiedWorktreePath: `${handoff.verifiedWorktreePath}-other`,
+    })],
+    ["start commit", (handoff) => Object.freeze({
+      ...handoff,
+      verifiedStartCommit: "0".repeat(40),
+    })],
+    ["frozen base", (handoff) => Object.freeze({
+      ...handoff,
+      frozenBaseCommit: "0".repeat(40),
+    })],
+    ["allowed roots", (handoff) => Object.freeze({
+      ...handoff,
+      allowedRoots: Object.freeze(["src/other"]),
+    })],
+    ["execution fence", (handoff) => Object.freeze({
+      ...handoff,
+      executionFence: Object.freeze({
+        ...handoff.executionFence,
+        attempt: handoff.executionFence.attempt + 1,
+      }),
+    })],
+    ["fingerprint", (handoff) => Object.freeze({
+      ...handoff,
+      candidateFingerprint: "not-a-sha256",
+    })],
+    ["top-level freeze", (handoff) => ({ ...handoff })],
+    ["nested freeze", (handoff) => Object.freeze({
+      ...handoff,
+      executionFence: { ...handoff.executionFence },
+    })],
+    ["allowed-roots freeze", (handoff) => Object.freeze({
+      ...handoff,
+      allowedRoots: [...handoff.allowedRoots],
+    })],
+  ])("refuses a verified candidate handoff with mismatched %s", async (_label, mutate) => {
+    const h = await fixture();
+    await writeFile(
+      join(h.worktree, "src", "task-0", "result.txt"),
+      "verified once\n",
+      "utf8",
+    );
+    const verification = await verifyCccCampaignReadyCandidate({
+      taskId: h.task.id,
+      worktreePath: h.worktree,
+      campaign: h.context,
+      timeoutMs: 30_000,
+    });
+    expect(verification.ready).toBe(true);
+    if (!verification.ready) throw new Error(verification.summary);
+    const executionContext = sealedExecutionContext(h.task);
+    const fence = executionContext.execution!.executionFence!;
+    const validHandoff = Object.freeze({
+      taskId: verification.taskId,
+      verifiedWorktreePath: verification.verifiedWorktreePath,
+      verifiedStartCommit: verification.verifiedStartCommit,
+      frozenBaseCommit: verification.frozenBaseCommit,
+      allowedRoots: Object.freeze([...verification.allowedRoots]),
+      candidateFingerprint: verification.candidateFingerprint,
+      executionFence: Object.freeze({
+        workItemId: fence.workItemId,
+        leaseOwner: fence.leaseOwner,
+        attempt: fence.attempt,
+        runId: fence.runId,
+      }),
+    });
+
+    await expect(enforceCccCampaignRequiredCommitAfterNode({
+      rootDir: h.rootDir,
+      store: h.store,
+      taskId: h.task.id,
+      result: { outcome: "success", value: "passed" },
+      executionContext,
+      verifiedCandidateHandoff: mutate(validHandoff),
+    })).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+    });
+
+    expect(await git(h.worktree, "rev-parse", "HEAD")).toBe(h.baseCommit);
+    expect(await git(h.worktree, "diff", "--cached", "--name-only")).toBe("");
+  });
+
   it(
     "unresolved_mutating_turn_never_commits: refuses to commit a dirty diff "
       + "left behind by a turn whose provider session never settled",
@@ -389,6 +529,39 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
       const executor = new TaskExecutor(h.store, h.rootDir);
       vi.spyOn(executor as never, "runGraphCustomNode" as never)
         .mockRejectedValue(new TransientError("provider retry", "CCC_TRANSIENT"));
+
+      await expect(
+        executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(
+          node("model"),
+          h.task,
+          {},
+          sealedExecutionContext(h.task),
+        ),
+      ).rejects.toMatchObject({
+        name: "PermanentError",
+        code: REFUSAL_CODE,
+        message: expect.stringMatching(/outside allowedWriteRoots/i),
+      });
+
+      expect(await git(h.worktree, "rev-parse", "HEAD")).toBe(h.baseCommit);
+      expect(await git(h.worktree, "status", "--porcelain=v1")).toContain(
+        "M README.md",
+      );
+    },
+  );
+
+  it(
+    "resolved_failed_turn_refuses_out_of_scope_candidate_before_return",
+    async () => {
+      const h = await fixture();
+      await writeFile(
+        join(h.worktree, "README.md"),
+        "out-of-scope mutation\n",
+        "utf8",
+      );
+      const executor = new TaskExecutor(h.store, h.rootDir);
+      vi.spyOn(executor as never, "runGraphCustomNode" as never)
+        .mockResolvedValue({ outcome: "failure", value: "failed" } as never);
 
       await expect(
         executor.createAuthoritativeWorkflowCustomNodeRunner({} as Settings)(

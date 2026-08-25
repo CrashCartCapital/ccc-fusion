@@ -3,6 +3,20 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 const { createCccCampaignProviderAttemptBindingMock } = vi.hoisted(() => ({
   createCccCampaignProviderAttemptBindingMock: vi.fn(),
 }));
+const {
+  assertCccCampaignRequiredCommitCandidateMock,
+  enforceCccCampaignRequiredCommitAfterNodeMock,
+  fingerprintCccCampaignReadyCandidateMock,
+  verifyCccCampaignReadyCandidateMock,
+} = vi.hoisted(() => ({
+  assertCccCampaignRequiredCommitCandidateMock: vi.fn(),
+  enforceCccCampaignRequiredCommitAfterNodeMock: vi.fn(),
+  fingerprintCccCampaignReadyCandidateMock: vi.fn(),
+  verifyCccCampaignReadyCandidateMock: vi.fn(),
+}));
+const { requireCccCampaignLiveExecutionApprovalMock } = vi.hoisted(() => ({
+  requireCccCampaignLiveExecutionApprovalMock: vi.fn(),
+}));
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import {
@@ -17,6 +31,20 @@ vi.mock("../ccc-campaign-provider-controller.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../ccc-campaign-provider-controller.js")>(),
   createCccCampaignProviderAttemptBinding: createCccCampaignProviderAttemptBindingMock,
 }));
+vi.mock("../ccc-campaign-required-commit.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../ccc-campaign-required-commit.js")>(),
+  assertCccCampaignRequiredCommitCandidate: assertCccCampaignRequiredCommitCandidateMock,
+  enforceCccCampaignRequiredCommitAfterNode: enforceCccCampaignRequiredCommitAfterNodeMock,
+}));
+vi.mock("../ccc-campaign-product-control.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../ccc-campaign-product-control.js")>(),
+  requireCccCampaignLiveExecutionApproval: requireCccCampaignLiveExecutionApprovalMock,
+}));
+vi.mock("../ccc-campaign-ready.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../ccc-campaign-ready.js")>(),
+  fingerprintCccCampaignReadyCandidate: fingerprintCccCampaignReadyCandidateMock,
+  verifyCccCampaignReadyCandidate: verifyCccCampaignReadyCandidateMock,
+}));
 
 /*
 FNXC:CCCCampaignFallback 2026-08-01-17:10:
@@ -29,6 +57,22 @@ ordinary (unfenced) workflow step keeps its fallback pair unchanged.
 
 const now = "2026-08-01T00:00:00.000Z";
 const TURN_KEY = "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+function readyVerification(
+  candidateFingerprint = "f".repeat(64),
+  verifiedWorktreePath = "/tmp/ccc-campaign",
+) {
+  return {
+    ready: true,
+    summary: "sealed verifier passed",
+    taskId: "FN-CCC-FALLBACK",
+    verifiedWorktreePath,
+    verifiedStartCommit: "a".repeat(40),
+    frozenBaseCommit: "a".repeat(40),
+    allowedRoots: ["src", "test"],
+    candidateFingerprint,
+  };
+}
 
 function task(overrides: Record<string, unknown> = {}) {
   return {
@@ -123,9 +167,16 @@ function campaignModelNode(
   };
 }
 
-function installOutputSession(output: string, userPrompts: string[] = []) {
-  mockedCreateFnAgent.mockImplementation(async () => {
+function installOutputSession(
+  output: string,
+  userPrompts: string[] = [],
+  signalPhaseCompletion = true,
+) {
+  mockedCreateFnAgent.mockImplementation(async (options: any) => {
     const subscribers = new Set<(event: any) => void>();
+    const phaseTool = options.customTools?.find(
+      (tool: { name: string }) => tool.name === "fn_complete_phase",
+    );
     return {
       session: {
         subscribe: vi.fn((subscriber: (event: any) => void) => {
@@ -145,6 +196,9 @@ function installOutputSession(output: string, userPrompts: string[] = []) {
               },
             });
           }
+          if (phaseTool && signalPhaseCompletion) {
+            await phaseTool.execute("complete-phase", {}, undefined, () => undefined);
+          }
         }),
         dispose: vi.fn(),
       },
@@ -153,7 +207,11 @@ function installOutputSession(output: string, userPrompts: string[] = []) {
   return userPrompts;
 }
 
-function makeCampaignNodeHarness(output: string, worktree: string) {
+function makeCampaignNodeHarness(
+  output: string,
+  worktree: string,
+  options: { signalPhaseCompletion?: boolean } = {},
+) {
   const nodeTask = task({
     executionMode: "standard",
     worktree,
@@ -167,7 +225,11 @@ function makeCampaignNodeHarness(output: string, worktree: string) {
     controller: Object.freeze({ preDispatch: vi.fn(), reconcile: vi.fn() }),
   });
   createCccCampaignProviderAttemptBindingMock.mockResolvedValue(binding);
-  const userPrompts = installOutputSession(output);
+  const userPrompts = installOutputSession(
+    output,
+    [],
+    options.signalPhaseCompletion ?? true,
+  );
   mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
     if (command === "git status --porcelain=v1 --untracked-files=all") {
       callback(null, " M src/slugify.js\n", "");
@@ -211,6 +273,18 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     resetExecutorMocks();
     mockedExistsSync.mockReturnValue(true);
     createCccCampaignProviderAttemptBindingMock.mockReset();
+    assertCccCampaignRequiredCommitCandidateMock.mockReset();
+    assertCccCampaignRequiredCommitCandidateMock.mockResolvedValue(undefined);
+    enforceCccCampaignRequiredCommitAfterNodeMock.mockReset();
+    enforceCccCampaignRequiredCommitAfterNodeMock.mockResolvedValue(undefined);
+    requireCccCampaignLiveExecutionApprovalMock.mockReset();
+    requireCccCampaignLiveExecutionApprovalMock.mockResolvedValue(undefined);
+    fingerprintCccCampaignReadyCandidateMock.mockReset();
+    fingerprintCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValue("b".repeat(64));
+    verifyCccCampaignReadyCandidateMock.mockReset();
+    verifyCccCampaignReadyCandidateMock.mockResolvedValue(readyVerification());
     mockedCreateFnAgent.mockResolvedValue({
       session: {
         subscribe: vi.fn(() => vi.fn()),
@@ -388,7 +462,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(sessionCall).not.toHaveProperty("fallbackModelId");
   });
 
-  it("exposes one controller-owned readiness intent tool only to a required-commit campaign", async () => {
+  it("exposes one phase-completion intent tool only to a required-commit campaign", async () => {
     const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
       "Files written and targeted verification passed.",
       "/tmp/ccc-campaign-ready-tool",
@@ -405,9 +479,441 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
 
     const sessionCall = mockedCreateFnAgent.mock.calls[0]?.[0] as Record<string, any>;
     expect(sessionCall.customTools?.map((tool: { name: string }) => tool.name)).toContain(
+      "fn_complete_phase",
+    );
+    expect(sessionCall.customTools?.map((tool: { name: string }) => tool.name)).not.toContain(
       "fn_campaign_ready",
     );
-    expect(String(sessionCall.systemPrompt)).toMatch(/call fn_campaign_ready by itself/i);
+    expect(String(sessionCall.systemPrompt)).toMatch(/call fn_complete_phase by itself/i);
+  });
+
+  it("verify_is_engine_driven: verifies only after the phase-signal turn settles", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-engine-verify",
+    );
+    const order: string[] = [];
+    assertCccCampaignRequiredCommitCandidateMock.mockImplementation(async () => {
+      order.push("assert-candidate");
+    });
+    verifyCccCampaignReadyCandidateMock.mockImplementation(async () => {
+      order.push("verify-candidate");
+      return readyVerification("f".repeat(64), "/tmp/ccc-campaign-engine-verify");
+    });
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async () => {
+            order.push("prompt-active");
+            await phaseTool.execute("complete-phase", {}, undefined, () => undefined);
+            order.push("prompt-settled");
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(order).toEqual([
+      "prompt-active",
+      "prompt-settled",
+      "assert-candidate",
+      "verify-candidate",
+    ]);
+    expect(assertCccCampaignRequiredCommitCandidateMock).toHaveBeenCalledTimes(1);
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands the exact phase-verification fingerprint to post-node commit custody", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-fingerprint-handoff",
+    );
+    const candidateFingerprint = "d".repeat(64);
+    verifyCccCampaignReadyCandidateMock.mockResolvedValue(
+      readyVerification(candidateFingerprint, "/tmp/ccc-campaign-fingerprint-handoff"),
+    );
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async () => {
+            await phaseTool.execute("complete-phase", {}, undefined, () => undefined);
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    await executor.createAuthoritativeWorkflowCustomNodeRunner(
+      await store.getSettings(),
+    )(
+      campaignModelNode(execution),
+      nodeTask,
+      {},
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(1);
+    expect(enforceCccCampaignRequiredCommitAfterNodeMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        verifiedCandidateHandoff: expect.objectContaining({
+          taskId: nodeTask.id,
+          candidateFingerprint,
+          executionFence: execution.executionFence,
+        }),
+      }),
+    );
+  });
+
+  it("verify_is_engine_driven: fails closed when settled controller verification fails", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-engine-verify-failure",
+    );
+    verifyCccCampaignReadyCandidateMock.mockResolvedValue({
+      ready: false,
+      summary: "sealed verifier exit 1: AC-002 failed",
+    });
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async () => {
+            await phaseTool.execute("complete-phase", {}, undefined, () => undefined);
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: "failed",
+      contextPatch: {
+        "node:ccc-task-implementation:error": expect.stringContaining("AC-002 failed"),
+      },
+    });
+  });
+
+  it("runs exactly one same-session REPAIR turn after verification failure", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-repair-once",
+    );
+    fingerprintCccCampaignReadyCandidateMock.mockReset();
+    fingerprintCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("c".repeat(64));
+    verifyCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce({
+        ready: false,
+        summary: "sealed verifier exit 1: AC-002 failed",
+      })
+      .mockResolvedValueOnce(
+        readyVerification("c".repeat(64), "/tmp/ccc-campaign-repair-once"),
+      );
+    const prompts: string[] = [];
+    let promptCount = 0;
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const subscribers = new Set<(event: any) => void>();
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn((subscriber: (event: any) => void) => {
+            subscribers.add(subscriber);
+            return () => subscribers.delete(subscriber);
+          }),
+          prompt: vi.fn(async (prompt: string) => {
+            prompts.push(prompt);
+            promptCount += 1;
+            if (promptCount === 2) {
+              for (const subscriber of subscribers) {
+                subscriber({
+                  type: "tool_execution_start",
+                  toolName: "edit",
+                  args: { path: "src/slugify.js" },
+                });
+                subscriber({
+                  type: "tool_execution_end",
+                  toolName: "edit",
+                  isError: false,
+                  result: { content: [{ type: "text", text: "repair edit returned" }] },
+                });
+              }
+            }
+            await phaseTool.execute(`complete-phase-${promptCount}`, {}, undefined, () => undefined);
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toMatch(/CCC_CAMPAIGN_REPAIR/);
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(2);
+    expect(result.outcome).toBe("success");
+  });
+
+  it("eager_verify_blocked: invalidates a phase signal followed by same-turn tool activity", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-eager-verify",
+    );
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const subscribers = new Set<(event: any) => void>();
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn((subscriber: (event: any) => void) => {
+            subscribers.add(subscriber);
+            return () => subscribers.delete(subscriber);
+          }),
+          prompt: vi.fn(async () => {
+            await phaseTool.execute("complete-phase", {}, undefined, () => undefined);
+            for (const subscriber of subscribers) {
+              subscriber({
+                type: "tool_execution_start",
+                toolName: "edit",
+                args: { path: "src/slugify.js" },
+              });
+              subscriber({
+                type: "tool_execution_end",
+                toolName: "edit",
+                isError: false,
+                result: { content: [{ type: "text", text: "edit returned" }] },
+              });
+            }
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(assertCccCampaignRequiredCommitCandidateMock).not.toHaveBeenCalled();
+    expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: "failed",
+      contextPatch: {
+        "node:ccc-task-implementation:error": expect.stringMatching(/phase completion signal.*later tool activity/i),
+      },
+    });
+  });
+
+  it("discover_exit_requires_explicit_signal: warns at 33 reads and fails after one quiet continuation", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-discover-quiet",
+    );
+    const userPrompts: string[] = [];
+    let promptCount = 0;
+    mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
+      if (command === "git status --porcelain=v1 --untracked-files=all") {
+        callback(null, "", "");
+        return {} as any;
+      }
+      callback(null, "", "");
+      return {} as any;
+    }) as any);
+    mockedCreateFnAgent.mockImplementation(async () => {
+      const subscribers = new Set<(event: any) => void>();
+      return {
+        session: {
+          subscribe: vi.fn((subscriber: (event: any) => void) => {
+            subscribers.add(subscriber);
+            return () => subscribers.delete(subscriber);
+          }),
+          prompt: vi.fn(async (prompt: string) => {
+            userPrompts.push(prompt);
+            promptCount += 1;
+            if (promptCount !== 1) return;
+            for (let index = 0; index < 33; index += 1) {
+              for (const subscriber of subscribers) {
+                subscriber({
+                  type: "tool_execution_start",
+                  toolName: "read",
+                  args: { path: `src/file-${index}.ts` },
+                });
+                subscriber({
+                  type: "tool_execution_end",
+                  toolName: "read",
+                  isError: false,
+                  result: { content: [{ type: "text", text: "bounded read" }] },
+                });
+              }
+            }
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(userPrompts).toHaveLength(2);
+    expect(userPrompts[1]).toContain("CCC_CAMPAIGN_DISCOVER_CESSATION");
+    expect(store.logEntry).toHaveBeenCalledWith(
+      nodeTask.id,
+      expect.stringMatching(/read-cap-warning.*33/i),
+    );
+    expect(assertCccCampaignRequiredCommitCandidateMock).not.toHaveBeenCalled();
+    expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: "failed",
+      contextPatch: {
+        "node:ccc-task-implementation:error": expect.stringMatching(/DISCOVER.*explicit phase signal/i),
+      },
+    });
+  });
+
+  it("mutate_exit_requires_explicit_signal: a dirty quiet turn cannot return success", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-mutate-quiet",
+    );
+    const userPrompts: string[] = [];
+    mockedCreateFnAgent.mockImplementation(async () => ({
+      session: {
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn(async (prompt: string) => {
+          userPrompts.push(prompt);
+        }),
+        dispose: vi.fn(),
+      },
+    }));
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(userPrompts).toHaveLength(2);
+    expect(userPrompts[1]).toContain("CCC_CAMPAIGN_MUTATE_CESSATION");
+    expect(assertCccCampaignRequiredCommitCandidateMock).not.toHaveBeenCalled();
+    expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: "failed",
+      contextPatch: {
+        "node:ccc-task-implementation:error": expect.stringMatching(/MUTATE.*explicit phase signal/i),
+      },
+    });
+  });
+
+  it("does not treat an unchanged pre-existing dirty candidate as this turn's mutation", async () => {
+    const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
+      "quiet turn",
+      "/tmp/ccc-campaign-preexisting-dirty",
+      { signalPhaseCompletion: false },
+    );
+    fingerprintCccCampaignReadyCandidateMock.mockReset();
+    fingerprintCccCampaignReadyCandidateMock.mockResolvedValue("a".repeat(64));
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(userPrompts).toHaveLength(2);
+    expect(userPrompts[1]).toMatch(/CCC_CAMPAIGN_DISCOVER_CESSATION/);
+    expect(userPrompts[1]).not.toMatch(/CCC_CAMPAIGN_MUTATE_CESSATION/);
+    expect(result.outcome).toBe("failure");
+  });
+
+  it("refuses a phase signal that would launder an unchanged pre-existing candidate", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "signalled without changing prior bytes",
+      "/tmp/ccc-campaign-preexisting-dirty-signal",
+    );
+    fingerprintCccCampaignReadyCandidateMock.mockReset();
+    fingerprintCccCampaignReadyCandidateMock.mockResolvedValue("a".repeat(64));
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(assertCccCampaignRequiredCommitCandidateMock).not.toHaveBeenCalled();
+    expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: "failed",
+      contextPatch: {
+        "node:ccc-task-implementation:error": expect.stringMatching(/unchanged pre-existing candidate/i),
+      },
+    });
   });
 
   it("persists bounded tool evidence for a campaign even when the project default is off", async () => {
@@ -494,15 +1000,16 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
   });
 
   it.each([
-    { status: "", expectedPrompts: 2, label: "clean" },
-    { status: " M src/slugify.js\n", expectedPrompts: 1, label: "dirty" },
-  ])("gives a $label required-commit campaign at most one no-diff continuation", async ({
+    { status: "", marker: /CCC_CAMPAIGN_DISCOVER_CESSATION/, label: "clean" },
+    { status: " M src/slugify.js\n", marker: /CCC_CAMPAIGN_MUTATE_CESSATION/, label: "dirty" },
+  ])("gives a $label unsignaled campaign exactly one bounded phase continuation", async ({
     status,
-    expectedPrompts,
+    marker,
   }) => {
     const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
       "Implementation turn completed.",
       "/tmp/ccc-campaign-no-diff-continuation",
+      { signalPhaseCompletion: false },
     );
     mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
       if (command === "git status --porcelain=v1 --untracked-files=all") {
@@ -513,7 +1020,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       return {} as any;
     }) as any);
 
-    await (executor as any).runGraphCustomNode(
+    const result = await (executor as any).runGraphCustomNode(
       campaignModelNode(execution),
       nodeTask,
       await store.getSettings(),
@@ -522,18 +1029,16 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       { task: nodeTask, settings: undefined, context: {}, execution },
     );
 
-    expect(userPrompts).toHaveLength(expectedPrompts);
-    if (status === "") {
-      expect(userPrompts[1]).toMatch(/no worktree diff exists/i);
-      expect(userPrompts[1]).toMatch(/do not re-read files already read/i);
-      expect(userPrompts[1]).toMatch(/edit or write/i);
-    }
+    expect(userPrompts).toHaveLength(2);
+    expect(userPrompts[1]).toMatch(marker);
+    expect(result.outcome).toBe("failure");
   });
 
-  it("gives a no-diff continuation that creates a diff one bounded verification handoff", async () => {
+  it("does not let a no-diff continuation run model verification after creating a diff", async () => {
     const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
       "Implementation turn completed.",
       "/tmp/ccc-campaign-no-diff-verification-handoff",
+      { signalPhaseCompletion: false },
     );
     const statuses = ["", " M src/slugify.js\n"];
     mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
@@ -545,7 +1050,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       return {} as any;
     }) as any);
 
-    await (executor as any).runGraphCustomNode(
+    const result = await (executor as any).runGraphCustomNode(
       campaignModelNode(execution),
       nodeTask,
       await store.getSettings(),
@@ -555,11 +1060,12 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     );
 
     expect(userPrompts).toHaveLength(3);
-    expect(userPrompts[2]).toMatch(/implementation diff now exists/i);
-    expect(userPrompts[2]).toMatch(/exact sealed verifier command/i);
-    expect(userPrompts[2]).toMatch(/only the admitted paths/i);
-    expect(userPrompts[2]).toMatch(/untracked generated artifacts/i);
-    expect(userPrompts[2]).toMatch(/never delete tracked files/i);
+    expect(userPrompts[1]).toMatch(/CCC_CAMPAIGN_DISCOVER_CESSATION/);
+    expect(userPrompts[2]).toMatch(/CCC_CAMPAIGN_MUTATE_CESSATION/);
+    expect(userPrompts[2]).not.toMatch(/run the exact sealed verifier/i);
+    expect(assertCccCampaignRequiredCommitCandidateMock).not.toHaveBeenCalled();
+    expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
+    expect(result.outcome).toBe("failure");
   });
 
   it("keeps a fenced lookalike with non-required commit policy in reviewer mode", async () => {

@@ -13,6 +13,7 @@ import {
   resolveCccCampaignReadyTimeoutMs,
   verifyCccCampaignReadyCandidate,
 } from "./ccc-campaign-ready.js";
+import type { CccCampaignReadyCommitHandoff } from "./ccc-campaign-ready.js";
 import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
 import type {
@@ -51,6 +52,7 @@ export interface EnforceCccCampaignRequiredCommitInput {
   taskId: string;
   result: WorkflowNodeResult;
   executionContext?: WorkflowNodeExecutionContext;
+  verifiedCandidateHandoff?: CccCampaignReadyCommitHandoff;
   verificationCommandTimeoutMs?: number;
   onVerificationHeartbeat?: () => void;
 }
@@ -976,6 +978,7 @@ async function inspectRequiredCommit(
     timeoutMs: number;
     signal?: AbortSignal;
     onHeartbeat?: () => void;
+    verifiedCandidateHandoff?: CccCampaignReadyCommitHandoff;
   }>,
 ): Promise<void> {
   const {
@@ -986,23 +989,50 @@ async function inspectRequiredCommit(
     worktreeRoot,
   } = await inspectRequiredCommitCandidate(rootDir, store, task, campaign);
   if (initialStatus.length > 0) {
-    const readiness = await verifyCccCampaignReadyCandidate({
-      taskId: task.id,
-      worktreePath: worktreeRoot,
-      campaign,
-      timeoutMs: verification.timeoutMs,
-      signal: verification.signal,
-      onHeartbeat: verification.onHeartbeat,
-    });
-    if (!readiness.ready) {
-      refusal(
-        `CCC campaign required-commit task ${task.id} readiness verifier refused the exact candidate: ${readiness.summary}`,
-      );
+    const handoff = verification.verifiedCandidateHandoff;
+    let verifiedFingerprint: string | undefined;
+    if (handoff) {
+      const currentHead = await gitObject(worktreeRoot, "HEAD");
+      const rootsMatch = handoff.allowedRoots.length === canonicalRoots.length
+        && handoff.allowedRoots.every((root, index) => root === canonicalRoots[index]);
+      if (
+        !Object.isFrozen(handoff)
+        || !Object.isFrozen(handoff.executionFence)
+        || !Object.isFrozen(handoff.allowedRoots)
+        || handoff.taskId !== task.id
+        || handoff.verifiedWorktreePath !== worktreeRoot
+        || handoff.verifiedStartCommit !== currentHead
+        || handoff.verifiedStartCommit !== expectedStart.commit
+        || handoff.frozenBaseCommit !== frozenBase
+        || !rootsMatch
+        || !/^[0-9a-f]{64}$/u.test(handoff.candidateFingerprint)
+      ) {
+        refusal(
+          `CCC campaign required-commit task ${task.id} received a stale or mismatched verified candidate handoff`,
+        );
+      }
+      verifiedFingerprint = handoff.candidateFingerprint;
     }
-    if (!readiness.candidateFingerprint) {
-      refusal(
-        `CCC campaign required-commit task ${task.id} readiness verifier returned no candidate fingerprint`,
-      );
+    if (!verifiedFingerprint) {
+      const readiness = await verifyCccCampaignReadyCandidate({
+        taskId: task.id,
+        worktreePath: worktreeRoot,
+        campaign,
+        timeoutMs: verification.timeoutMs,
+        signal: verification.signal,
+        onHeartbeat: verification.onHeartbeat,
+      });
+      if (!readiness.ready) {
+        refusal(
+          `CCC campaign required-commit task ${task.id} readiness verifier refused the exact candidate: ${readiness.summary}`,
+        );
+      }
+      if (!readiness.candidateFingerprint) {
+        refusal(
+          `CCC campaign required-commit task ${task.id} readiness verifier returned no candidate fingerprint`,
+        );
+      }
+      verifiedFingerprint = readiness.candidateFingerprint;
     }
     await createControllerOwnedCommit(
       worktreeRoot,
@@ -1010,7 +1040,7 @@ async function inspectRequiredCommit(
       canonicalRoots,
       initialStatus,
       assertFence,
-      readiness.candidateFingerprint,
+      verifiedFingerprint,
     );
   }
 
@@ -1148,6 +1178,21 @@ export async function enforceCccCampaignRequiredCommitAfterNode(
   );
   const assertFence = () =>
     assertLiveWorkItemFence(input.store, taskId, input.executionContext!);
+  const verifiedCandidateHandoff = input.verifiedCandidateHandoff;
+  if (verifiedCandidateHandoff) {
+    const liveFence = input.executionContext.execution.executionFence!;
+    const handoffFence = verifiedCandidateHandoff.executionFence;
+    if (
+      handoffFence.workItemId !== liveFence.workItemId
+      || handoffFence.leaseOwner !== liveFence.leaseOwner
+      || handoffFence.attempt !== liveFence.attempt
+      || handoffFence.runId !== liveFence.runId
+    ) {
+      refusal(
+        `CCC campaign required-commit task ${taskId} verified candidate handoff does not match the live execution fence`,
+      );
+    }
+  }
   await assertFence();
   await inspectRequiredCommit(
     input.rootDir,
@@ -1159,6 +1204,7 @@ export async function enforceCccCampaignRequiredCommitAfterNode(
       timeoutMs: resolveCccCampaignReadyTimeoutMs(input.verificationCommandTimeoutMs),
       signal: input.executionContext.signal,
       onHeartbeat: input.onVerificationHeartbeat,
+      verifiedCandidateHandoff,
     },
   );
 }

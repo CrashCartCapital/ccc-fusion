@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix } from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +12,7 @@ import { runVerificationCommand } from "./run-verification-tool.js";
 const MAX_READY_FEEDBACK_CHARS = 4_000;
 const MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 30_000;
+const GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const execFile = promisify(execFileCallback);
 
 export function resolveCccCampaignReadyTimeoutMs(value: unknown): number {
@@ -20,16 +21,48 @@ export function resolveCccCampaignReadyTimeoutMs(value: unknown): number {
     : 900_000;
 }
 
-export type CccCampaignReadyVerification = Readonly<{
-  ready: boolean;
-  summary: string;
-  candidateFingerprint?: string;
+export type CccCampaignReadyVerification =
+  | Readonly<{
+    ready: false;
+    summary: string;
+  }>
+  | Readonly<{
+    ready: true;
+    summary: string;
+    taskId: string;
+    verifiedWorktreePath: string;
+    verifiedStartCommit: string;
+    frozenBaseCommit: string;
+    allowedRoots: readonly string[];
+    candidateFingerprint: string;
+  }>;
+
+export type CccCampaignReadyCommitHandoff = Readonly<{
+  taskId: string;
+  verifiedWorktreePath: string;
+  verifiedStartCommit: string;
+  frozenBaseCommit: string;
+  allowedRoots: readonly string[];
+  candidateFingerprint: string;
+  executionFence: Readonly<{
+    workItemId: string;
+    leaseOwner: string;
+    attempt: number;
+    runId: string;
+  }>;
 }>;
 
-export type CreateCccCampaignReadyToolOptions = Readonly<{
-  assertCandidateCommittable: () => Promise<void>;
-  verifyCandidate: () => Promise<CccCampaignReadyVerification>;
-}>;
+export type CreateCccCampaignReadyToolOptions = Readonly<
+  | {
+    mode?: "verify";
+    assertCandidateCommittable: () => Promise<void>;
+    verifyCandidate: () => Promise<CccCampaignReadyVerification>;
+  }
+  | {
+    mode: "phase-signal";
+    signalPhaseCompletion: () => void;
+  }
+>;
 
 export type VerifyCccCampaignReadyCandidateInput = Readonly<{
   taskId: string;
@@ -233,12 +266,28 @@ export async function verifyCccCampaignReadyCandidate(
     return { ready: false, summary: "the sealed route has no allowed write roots" };
   }
   const allowedRoots = configuredRoots.map(canonicalGitPath);
+  let verifiedWorktreePath: string;
+  let verifiedStartCommit: string;
+  try {
+    verifiedWorktreePath = await realpath(input.worktreePath);
+    verifiedStartCommit = (
+      await git(verifiedWorktreePath, ["rev-parse", "--verify", "HEAD^{commit}"])
+    ).trim();
+  } catch (error) {
+    return {
+      ready: false,
+      summary: `readiness could not resolve the candidate worktree and HEAD: ${boundedFeedback(error)}`,
+    };
+  }
+  if (!GIT_OBJECT_ID.test(verifiedStartCommit)) {
+    return { ready: false, summary: "readiness resolved a non-canonical candidate HEAD" };
+  }
   const commands = taskProofCommands(input.campaign);
   if (commands.length === 0) {
     return { ready: false, summary: "no task-phase sealed proof command is admitted" };
   }
 
-  const { changedPaths, untrackedPaths } = await listCandidatePaths(input.worktreePath);
+  const { changedPaths, untrackedPaths } = await listCandidatePaths(verifiedWorktreePath);
   if (changedPaths.length === 0) {
     return { ready: false, summary: "the candidate worktree has no implementation diff" };
   }
@@ -252,13 +301,13 @@ export async function verifyCccCampaignReadyCandidate(
     };
   }
   const candidateFingerprint = await fingerprintCandidate(
-    input.worktreePath,
+    verifiedWorktreePath,
     allowedRoots,
     untrackedPaths,
   );
 
   const shadow = await materializeCandidateShadow({
-    worktreePath: input.worktreePath,
+    worktreePath: verifiedWorktreePath,
     allowedRoots,
     untrackedPaths,
   });
@@ -293,7 +342,7 @@ export async function verifyCccCampaignReadyCandidate(
       }
     }
     const currentFingerprint = await fingerprintCccCampaignReadyCandidate({
-      worktreePath: input.worktreePath,
+      worktreePath: verifiedWorktreePath,
       allowedRoots,
     });
     if (currentFingerprint !== candidateFingerprint) {
@@ -305,6 +354,11 @@ export async function verifyCccCampaignReadyCandidate(
     return {
       ready: true,
       summary: `sealed verifier passed in isolated candidate: ${commands.join(", ")}`,
+      taskId: input.taskId,
+      verifiedWorktreePath,
+      verifiedStartCommit,
+      frozenBaseCommit: input.campaign.targetRepository.baseCommit,
+      allowedRoots,
       candidateFingerprint,
     };
   } finally {
@@ -315,6 +369,29 @@ export async function verifyCccCampaignReadyCandidate(
 export function createCccCampaignReadyTool(
   options: CreateCccCampaignReadyToolOptions,
 ): ToolDefinition {
+  if (options.mode === "phase-signal") {
+    return {
+      name: "fn_complete_phase",
+      label: "Complete Campaign Phase",
+      description:
+        "Signal that the current campaign phase is complete. The controller will "
+        + "decide the next phase after this model turn has fully settled.",
+      executionMode: "sequential",
+      parameters: Type.Object({}),
+      execute: async () => {
+        options.signalPhaseCompletion();
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Campaign phase completion requested; controller decision pending.",
+          }],
+          details: { phaseCompletionRequested: true },
+          isError: false,
+          terminate: true,
+        };
+      },
+    };
+  }
   return {
     name: "fn_campaign_ready",
     label: "Submit Campaign Candidate",
