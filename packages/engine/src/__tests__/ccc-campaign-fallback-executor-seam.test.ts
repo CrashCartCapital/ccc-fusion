@@ -177,6 +177,32 @@ function makeCampaignNodeHarness(output: string, worktree: string) {
     return {} as any;
   }) as any);
   const execution = sealedExecution(nodeTask);
+  store.getCccCampaignContextForTask = vi.fn().mockResolvedValue({
+    semanticTaskId: execution.semanticTaskId,
+    proofIds: ["PROOF-READY"],
+    targetRepository: { path: worktree, baseCommit: "a".repeat(40) },
+    route: {
+      taskId: execution.semanticTaskId,
+      providerId: "provider-approved",
+      modelId: "model-approved",
+      transport: "pi",
+      executor: "model",
+      toolMode: "coding",
+      worktreeMode: "isolated",
+      ownedPaths: ["src/slugify.js", "test/slugify.test.js"],
+      allowedWriteRoots: ["src", "test"],
+      commitPolicy: "required",
+    },
+    proofs: [{
+      id: "PROOF-READY",
+      requirementIds: ["REQ-READY"],
+      command: "task verify:ready",
+      positiveOracle: "ready",
+      negativeControls: [],
+      spans: [],
+      confidence: "high",
+    }],
+  });
   return { binding, execution, executor, nodeTask, store, userPrompts };
 }
 
@@ -360,6 +386,76 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(sessionCall.cccProviderAttemptBinding).toBe(binding);
     expect(sessionCall).not.toHaveProperty("fallbackProvider");
     expect(sessionCall).not.toHaveProperty("fallbackModelId");
+  });
+
+  it("exposes one controller-owned readiness intent tool only to a required-commit campaign", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "Files written and targeted verification passed.",
+      "/tmp/ccc-campaign-ready-tool",
+    );
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    const sessionCall = mockedCreateFnAgent.mock.calls[0]?.[0] as Record<string, any>;
+    expect(sessionCall.customTools?.map((tool: { name: string }) => tool.name)).toContain(
+      "fn_campaign_ready",
+    );
+    expect(String(sessionCall.systemPrompt)).toMatch(/call fn_campaign_ready by itself/i);
+  });
+
+  it("persists bounded tool evidence for a campaign even when the project default is off", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "Files written and targeted verification passed.",
+      "/tmp/ccc-campaign-tool-evidence",
+    );
+    mockedCreateFnAgent.mockImplementation(async () => {
+      const subscribers = new Set<(event: any) => void>();
+      return {
+        session: {
+          subscribe: vi.fn((subscriber: (event: any) => void) => {
+            subscribers.add(subscriber);
+            return () => subscribers.delete(subscriber);
+          }),
+          prompt: vi.fn(async () => {
+            for (const subscriber of subscribers) {
+              subscriber({
+                type: "tool_execution_start",
+                toolName: "read",
+                args: { path: "src/slugify.js" },
+              });
+              subscriber({
+                type: "tool_execution_end",
+                toolName: "read",
+                isError: false,
+                result: { content: [{ type: "text", text: "bounded file preview" }] },
+              });
+            }
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    const toolStart = store.appendAgentLog.mock.calls.find((call: any[]) => call[2] === "tool");
+    const toolResult = store.appendAgentLog.mock.calls.find((call: any[]) => call[2] === "tool_result");
+    expect(toolStart?.[3]).toContain("src/slugify.js");
+    expect(toolResult?.[3]).toContain("bounded file preview");
   });
 
   /*

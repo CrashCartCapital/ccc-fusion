@@ -92,7 +92,15 @@ function campaignContext(
     campaignStartedAt: "2026-07-30T00:00:00.000Z",
     campaignDeadlineAt: "2026-07-30T00:01:00.000Z",
     admittedWriteRoots: [{ path: rootDir, purpose: "disposable test target" }],
-    proofs: [],
+    proofs: [{
+      id: "proof-1",
+      requirementIds: ["REQ-required-commit"],
+      command: "node -e \"process.exit(0)\"",
+      positiveOracle: "candidate verifier exits zero",
+      negativeControls: [],
+      spans: [],
+      confidence: "high",
+    }],
     protectedActions: [],
     executionPolicy: {
       schema: "ccc-campaign.execution-policy.v2",
@@ -286,6 +294,43 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
       );
     },
   );
+
+  it("refuses to stage a dirty candidate when the fresh sealed readiness verifier fails", async () => {
+    const h = await fixture();
+    h.context.proofs[0]!.command = "node -e \"process.exit(17)\"";
+    await writeFile(
+      join(h.worktree, "src", "task-0", "result.txt"),
+      "result\n",
+      "utf8",
+    );
+
+    await expect(runSuccessfulNode(h)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringMatching(/readiness|verifier/i),
+    });
+    expect(await git(h.worktree, "rev-parse", "HEAD")).toBe(h.baseCommit);
+    expect(await git(h.worktree, "diff", "--cached", "--name-only")).toBe("");
+  });
+
+  it("refuses an admitted mutation that lands after readiness proof but before staging", async () => {
+    const h = await fixture();
+    const candidatePath = join(h.worktree, "src", "task-0", "result.txt");
+    await writeFile(candidatePath, "verified bytes\n", "utf8");
+    vi.mocked(h.store.assertCccCampaignWorkflowLeaseFence)
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(async () => {
+        await writeFile(candidatePath, "late unverified bytes\n", "utf8");
+      });
+
+    await expect(runSuccessfulNode(h)).rejects.toMatchObject({
+      name: "PermanentError",
+      code: REFUSAL_CODE,
+      message: expect.stringMatching(/changed after readiness|fingerprint/i),
+    });
+    expect(await git(h.worktree, "rev-parse", "HEAD")).toBe(h.baseCommit);
+    expect(await git(h.worktree, "diff", "--cached", "--name-only")).toBe("");
+  });
 
   it("does not run target-repository hooks while creating the controller-owned commit", async () => {
     const h = await fixture();

@@ -8,6 +8,11 @@ import type {
   TaskStore,
 } from "@fusion/core";
 import { cccCampaignJoinBaseBranchName } from "./ccc-campaign-join-base.js";
+import {
+  fingerprintCccCampaignReadyCandidate,
+  resolveCccCampaignReadyTimeoutMs,
+  verifyCccCampaignReadyCandidate,
+} from "./ccc-campaign-ready.js";
 import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
 import type {
@@ -46,7 +51,14 @@ export interface EnforceCccCampaignRequiredCommitInput {
   taskId: string;
   result: WorkflowNodeResult;
   executionContext?: WorkflowNodeExecutionContext;
+  verificationCommandTimeoutMs?: number;
+  onVerificationHeartbeat?: () => void;
 }
+
+export type AssertCccCampaignRequiredCommitCandidateInput = Omit<
+  EnforceCccCampaignRequiredCommitInput,
+  "result"
+>;
 
 function refusal(
   message: string,
@@ -778,6 +790,7 @@ async function createControllerOwnedCommit(
   canonicalRoots: readonly string[],
   status: readonly WorktreeStatusEntry[],
   assertFence: () => Promise<void>,
+  verifiedFingerprint: string,
 ): Promise<void> {
   assertPathsWithinAllowedRoots(
     task.id,
@@ -790,6 +803,25 @@ async function createControllerOwnedCommit(
     status.map((entry) => entry.path),
   );
   await assertFence();
+  let currentFingerprint: string;
+  try {
+    currentFingerprint = await fingerprintCccCampaignReadyCandidate({
+      worktreePath: worktreeRoot,
+      allowedRoots: canonicalRoots,
+    });
+  } catch (error) {
+    refusal(
+      `CCC campaign required-commit task ${task.id} could not re-fingerprint the verified candidate`,
+      undefined,
+      errorCause(error),
+    );
+  }
+  if (currentFingerprint !== verifiedFingerprint) {
+    refusal(
+      `CCC campaign required-commit task ${task.id} changed after readiness verification and before staging`,
+      { verifiedFingerprint, currentFingerprint },
+    );
+  }
   await git(worktreeRoot, ["add", "-A", "--", ...canonicalRoots]);
 
   const stagedStatus = await readWorktreeStatus(worktreeRoot, task.id);
@@ -841,13 +873,20 @@ async function createControllerOwnedCommit(
   ]);
 }
 
-async function inspectRequiredCommit(
+type RequiredCommitCandidateInspection = Readonly<{
+  canonicalRoots: readonly string[];
+  expectedStart: Awaited<ReturnType<typeof resolveCccCampaignExpectedStartCommit>>;
+  frozenBase: string;
+  initialStatus: readonly WorktreeStatusEntry[];
+  worktreeRoot: string;
+}>;
+
+async function inspectRequiredCommitCandidate(
   rootDir: string,
   store: RequiredCommitStore,
   task: TaskDetail,
   campaign: CccCampaignTaskContext,
-  assertFence: () => Promise<void>,
-): Promise<void> {
+): Promise<RequiredCommitCandidateInspection> {
   if (campaign.route.worktreeMode !== "isolated") {
     refusal("CCC campaign required-commit route does not require an isolated worktree");
   }
@@ -909,12 +948,64 @@ async function inspectRequiredCommit(
     );
   }
   if (initialStatus.length > 0) {
+    const candidatePaths = initialStatus.map((entry) => entry.path);
+    assertPathsWithinAllowedRoots(task.id, candidatePaths, canonicalRoots);
+    await assertNoActiveGitFilters(worktreeRoot, task.id, candidatePaths);
+  }
+  return {
+    canonicalRoots,
+    expectedStart,
+    frozenBase,
+    initialStatus,
+    worktreeRoot,
+  };
+}
+
+async function inspectRequiredCommit(
+  rootDir: string,
+  store: RequiredCommitStore,
+  task: TaskDetail,
+  campaign: CccCampaignTaskContext,
+  assertFence: () => Promise<void>,
+  verification: Readonly<{
+    timeoutMs: number;
+    signal?: AbortSignal;
+    onHeartbeat?: () => void;
+  }>,
+): Promise<void> {
+  const {
+    canonicalRoots,
+    expectedStart,
+    frozenBase,
+    initialStatus,
+    worktreeRoot,
+  } = await inspectRequiredCommitCandidate(rootDir, store, task, campaign);
+  if (initialStatus.length > 0) {
+    const readiness = await verifyCccCampaignReadyCandidate({
+      taskId: task.id,
+      worktreePath: worktreeRoot,
+      campaign,
+      timeoutMs: verification.timeoutMs,
+      signal: verification.signal,
+      onHeartbeat: verification.onHeartbeat,
+    });
+    if (!readiness.ready) {
+      refusal(
+        `CCC campaign required-commit task ${task.id} readiness verifier refused the exact candidate: ${readiness.summary}`,
+      );
+    }
+    if (!readiness.candidateFingerprint) {
+      refusal(
+        `CCC campaign required-commit task ${task.id} readiness verifier returned no candidate fingerprint`,
+      );
+    }
     await createControllerOwnedCommit(
       worktreeRoot,
       task,
       canonicalRoots,
       initialStatus,
       assertFence,
+      readiness.candidateFingerprint,
     );
   }
 
@@ -966,6 +1057,35 @@ async function inspectRequiredCommit(
   assertPathsWithinAllowedRoots(task.id, changedPaths, canonicalRoots);
 }
 
+export async function assertCccCampaignRequiredCommitCandidate(
+  input: AssertCccCampaignRequiredCommitCandidateInput,
+): Promise<void> {
+  if (!input.executionContext?.execution?.executionFence) {
+    refusal("CCC campaign readiness candidate has no live execution fence");
+  }
+  const taskId = input.executionContext.execution.nativeTaskId;
+  if (taskId !== input.taskId) {
+    refusal(
+      `CCC campaign readiness invocation task ${input.taskId} differs from sealed task ${taskId}`,
+    );
+  }
+  const { task, campaign } = await loadExactTaskCustody(input.store, taskId);
+  if (!campaign || !isRequiredProductRoute(campaign)) {
+    refusal(`CCC campaign readiness task ${taskId} is not a required-commit product route`);
+  }
+  assertExactCustody(taskId, task, campaign, input.executionContext);
+  await assertLiveWorkItemFence(input.store, taskId, input.executionContext);
+  const candidate = await inspectRequiredCommitCandidate(
+    input.rootDir,
+    input.store,
+    task,
+    campaign,
+  );
+  if (candidate.initialStatus.length === 0) {
+    refusal(`CCC campaign readiness task ${taskId} has no uncommitted candidate diff`);
+  }
+}
+
 export async function enforceCccCampaignRequiredCommitAfterNode(
   input: EnforceCccCampaignRequiredCommitInput,
 ): Promise<void> {
@@ -1000,5 +1120,10 @@ export async function enforceCccCampaignRequiredCommitAfterNode(
     task,
     campaign,
     assertFence,
+    {
+      timeoutMs: resolveCccCampaignReadyTimeoutMs(input.verificationCommandTimeoutMs),
+      signal: input.executionContext.signal,
+      onHeartbeat: input.onVerificationHeartbeat,
+    },
   );
 }

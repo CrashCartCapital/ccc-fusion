@@ -39,7 +39,15 @@ import {
   requireCccCampaignLiveExecutionApproval,
   requireCccCampaignMergeApproval,
 } from "./ccc-campaign-product-control.js";
-import { enforceCccCampaignRequiredCommitAfterNode } from "./ccc-campaign-required-commit.js";
+import {
+  assertCccCampaignRequiredCommitCandidate,
+  enforceCccCampaignRequiredCommitAfterNode,
+} from "./ccc-campaign-required-commit.js";
+import {
+  createCccCampaignReadyTool,
+  resolveCccCampaignReadyTimeoutMs,
+  verifyCccCampaignReadyCandidate,
+} from "./ccc-campaign-ready.js";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflow-column-boundary.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { createCodeNodeRunner } from "./code-node-runner.js";
@@ -9530,6 +9538,10 @@ export class TaskExecutor {
       taskId: nodeTask.id,
       result,
       executionContext,
+      verificationCommandTimeoutMs: settings.verificationCommandTimeoutMs,
+      onVerificationHeartbeat: () => executorLog.log(
+        `${nodeTask.id}: final controller-owned campaign readiness verifier still running`,
+      ),
     });
     return result;
   }
@@ -9937,6 +9949,7 @@ export class TaskExecutor {
       : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, {
           unattended,
           execution: sealedExecution,
+          executionContext,
           signal: executionContext?.signal,
           cccCampaignImplementation,
         });
@@ -18429,6 +18442,7 @@ ${scopeGuard}
     stepOptions?: {
       unattended?: boolean;
       execution?: WorkflowNodeExecutionContext["execution"];
+      executionContext?: WorkflowNodeExecutionContext;
       signal?: AbortSignal;
       cccCampaignImplementation?: boolean;
     },
@@ -18643,6 +18657,9 @@ CRITICAL SCOPING RULES — read before doing anything else:
 ## Completion Format
 
 Complete the implementation work and report what changed and what targeted verification ran.
+When the admitted implementation is complete, call fn_campaign_ready by itself. The controller will
+independently verify the candidate; a failed readiness check returns exact repair feedback and keeps
+the session open. Do not call fn_campaign_ready in the same assistant turn as any other tool.
 Do not emit an APPROVE, APPROVE_WITH_NOTES, or REVISE reviewer verdict.`;
     } else if (requireVerdict) {
       verdictBlock = `
@@ -18726,7 +18743,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       store: this.store,
       taskId: task.id,
       agent: cccCampaignImplementation ? "executor" : "reviewer",
-      persistAgentToolOutput: settings.persistAgentToolOutput,
+      // Campaign evidence must retain the bounded, redacted tool transcript even when the
+      // project-wide opt-in is disabled; AgentLogger still enforces its normal size caps.
+      persistAgentToolOutput: cccCampaignImplementation || settings.persistAgentToolOutput,
       // Review-in-executor sessions are task-scoped ephemeral workers.
       persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
       onAgentText: (taskId, delta) => {
@@ -18892,7 +18911,42 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       const codingCustomTools: ToolDefinition[] = toolMode === "coding"
         ? [this.createSpawnAgentTool(task.id, worktreePath, settings, stepEnv)]
         : [];
-      const workflowCustomTools = [...planReviewPromptTools, ...codingCustomTools];
+      const campaignReadyContext = cccCampaignImplementation
+        ? await this.store.getCccCampaignContextForTask(task.id)
+        : null;
+      if (cccCampaignImplementation && !campaignReadyContext) {
+        throw new PermanentError(
+          `CCC campaign task ${task.id} has no persisted readiness custody`,
+          "CCC_CAMPAIGN_READY_CUSTODY_REFUSED",
+        );
+      }
+      const campaignReadyTools: ToolDefinition[] = cccCampaignImplementation
+        ? [createCccCampaignReadyTool({
+            assertCandidateCommittable: () => assertCccCampaignRequiredCommitCandidate({
+              rootDir: this.rootDir,
+              store: this.store,
+              taskId: task.id,
+              executionContext: stepOptions?.executionContext,
+            }),
+            verifyCandidate: () => verifyCccCampaignReadyCandidate({
+              taskId: task.id,
+              worktreePath,
+              campaign: campaignReadyContext!,
+              timeoutMs: resolveCccCampaignReadyTimeoutMs(
+                settings.verificationCommandTimeoutMs,
+              ),
+              signal: stepOptions?.signal,
+              onHeartbeat: () => executorLog.log(
+                `${task.id}: controller-owned campaign readiness verifier still running`,
+              ),
+            }),
+          })]
+        : [];
+      const workflowCustomTools = [
+        ...planReviewPromptTools,
+        ...codingCustomTools,
+        ...campaignReadyTools,
+      ];
       const readonlyCustomTools = toolMode === "readonly"
         ? filterCustomToolsForReadonly(workflowCustomTools, {
             allowTool: (tool) => allowPlanReviewPromptWrite && tool.name === "fn_task_prompt_write",
