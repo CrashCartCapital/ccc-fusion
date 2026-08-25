@@ -3209,16 +3209,22 @@ function exactProviderResolutionContext(
     workItem.kind !== "task"
     || workItem.runId !== expectedRunId
     || workItem.stableWorkflowRunId !== expectedRunId
-    || workItem.state !== "manual-required"
     || workItem.leaseOwner !== null
     || workItem.leaseExpiresAt !== null
   ) {
     throw new PrdProductCommandError(
       "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_REFUSED",
-      `provider attempt ${attemptKey} is not parked at one unleased manual-resolution boundary`,
+      `provider attempt ${attemptKey} is not parked at one unleased operator-resolution boundary`,
     );
   }
-  return { attempt, workItem };
+  if (workItem.state !== "manual-required" && workItem.state !== "failed") {
+    throw new PrdProductCommandError(
+      "CCC_PRD_PROVIDER_RESOLUTION_WORK_ITEM_REFUSED",
+      `provider attempt ${attemptKey} is not parked at one unleased operator-resolution boundary`,
+    );
+  }
+  const workItemState: "manual-required" | "failed" = workItem.state;
+  return { attempt, workItem, workItemState };
 }
 
 function providerResolutionConfirmation(
@@ -3352,6 +3358,7 @@ async function runProviderResolutionCommand(
       observerId,
       evidenceDigest,
     );
+    const requeuesWorkItem = context.workItemState === "manual-required";
     if (args.length === 6) {
       writeOperatorPayload(io, commandContext, {
         kind: "provider-resolution-preview",
@@ -3360,16 +3367,18 @@ async function runProviderResolutionCommand(
         observerId,
         evidenceDigest,
         confirmation,
-        consequence:
-          "Persists the operator-observed provider outcome, consumes an exact claimed approval only for a committed effect, then requeues only the exact parked work item.",
+        consequence: requeuesWorkItem
+          ? "Persists the operator-observed provider outcome, consumes an exact claimed approval only for a committed effect, then requeues only the exact parked work item."
+          : "Persists the operator-observed provider outcome while preserving the terminal failed work item; no provider request is replayed and no work is requeued.",
         safeState:
           "No provider request is replayed. The worktree, source commit, approval, and existing receipts remain unchanged until confirmation.",
         decisionOwner: "human operator",
         approvalExpiresAt: null,
         rollback:
           "Terminal provider evidence is immutable. If the observation is wrong, stop this campaign and import a corrected reviewed campaign.",
-        nextSafeAction:
-          `Rerun this command with --confirm ${confirmation}, or use fn prd stop to abandon the campaign.`,
+        nextSafeAction: requeuesWorkItem
+          ? `Rerun this command with --confirm ${confirmation}, or use fn prd stop to abandon the campaign.`
+          : `Rerun this command with --confirm ${confirmation} to settle the uncertain provider receipt while leaving the failed campaign terminal.`,
       });
       return 0;
     }
@@ -3397,21 +3406,23 @@ async function runProviderResolutionCommand(
       observerId,
       evidenceDigest,
     });
-    await project.store.transitionWorkflowWorkItem(
-      context.workItem.id,
-      "runnable",
-      {
-        expectedState: "manual-required",
-        expectedAttempt: context.workItem.attempt,
-        expectedLeaseOwner: null,
-        attempt: context.workItem.attempt,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        retryAfter: null,
-        lastError: null,
-        blockedReason: null,
-      },
-    );
+    if (requeuesWorkItem) {
+      await project.store.transitionWorkflowWorkItem(
+        context.workItem.id,
+        "runnable",
+        {
+          expectedState: "manual-required",
+          expectedAttempt: context.workItem.attempt,
+          expectedLeaseOwner: null,
+          attempt: context.workItem.attempt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          retryAfter: null,
+          lastError: null,
+          blockedReason: null,
+        },
+      );
+    }
     const completedStatus = await inspectProductStatus(
       dependencies,
       project,
@@ -3427,8 +3438,9 @@ async function runProviderResolutionCommand(
       kind: "provider-resolved",
       attempt: settled,
       status: completedStatus,
-      nextSafeAction:
-        "Resume the campaign runtime; it will replay the terminal receipt without repeating the provider effect.",
+      nextSafeAction: requeuesWorkItem
+        ? "Resume the campaign runtime; it will replay the terminal receipt without repeating the provider effect."
+        : "The uncertain provider receipt is settled and the failed campaign remains terminal; start a new reviewed campaign for any further execution.",
     });
     return 0;
   });

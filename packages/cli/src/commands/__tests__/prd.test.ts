@@ -2903,7 +2903,9 @@ describe("prd command exit contract", () => {
     expect(settleAttempt).not.toHaveBeenCalled();
   });
 
-  it("previews and settles one non-CLI provider effect while routing CLI recovery to its native fence", async () => {
+  async function exerciseNonCliProviderResolution(
+    parkedState: "manual-required" | "failed",
+  ): Promise<void> {
     const attemptKey = `ccc-provider-attempt-${"a".repeat(64)}`;
     const controllerToken =
       "ccc-provider-controller-00000000-0000-4000-8000-000000000001";
@@ -2951,12 +2953,16 @@ describe("prd command exit contract", () => {
       taskId: "FN-1",
       nodeId: "node-provider",
       kind: "task",
-      state: "manual-required",
+      state: parkedState,
       attempt: workItemFence.attempt,
       leaseOwner: null,
       leaseExpiresAt: null,
-      lastError: "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
-      blockedReason: "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
+      lastError: parkedState === "failed"
+        ? "workflow-node-error:node-provider:workflow step timed out after 900000ms"
+        : "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
+      blockedReason: parkedState === "failed"
+        ? null
+        : "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
       stableWorkflowRunId: "ccc-prd:import-1",
     };
     const before = {
@@ -3011,9 +3017,9 @@ describe("prd command exit contract", () => {
       ...before,
       workItems: [{
         ...workItem,
-        state: "runnable",
-        lastError: null,
-        blockedReason: null,
+        state: parkedState === "manual-required" ? "runnable" : "failed",
+        lastError: parkedState === "manual-required" ? null : workItem.lastError,
+        blockedReason: parkedState === "manual-required" ? null : workItem.blockedReason,
       }],
       providerAttempts: [{
         ...providerAttempt,
@@ -3077,7 +3083,9 @@ describe("prd command exit contract", () => {
       kind: "provider-resolution-preview",
       attemptKey,
       outcome: "committed",
-      consequence: expect.stringContaining("requeue"),
+      consequence: expect.stringContaining(
+        parkedState === "manual-required" ? "requeue" : "terminal failed",
+      ),
       confirmation: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(inspectAttempt).not.toHaveBeenCalled();
@@ -3115,26 +3123,32 @@ describe("prd command exit contract", () => {
       evidenceDigest,
       observerId: "operator-local-1",
     }));
-    expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
-      workItem.id,
-      "runnable",
-      {
-        expectedState: "manual-required",
-        expectedAttempt: workItem.attempt,
-        expectedLeaseOwner: null,
-        attempt: workItem.attempt,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        retryAfter: null,
-        lastError: null,
-        blockedReason: null,
-      },
-    );
+    if (parkedState === "manual-required") {
+      expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
+        workItem.id,
+        "runnable",
+        {
+          expectedState: "manual-required",
+          expectedAttempt: workItem.attempt,
+          expectedLeaseOwner: null,
+          attempt: workItem.attempt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          retryAfter: null,
+          lastError: null,
+          blockedReason: null,
+        },
+      );
+    } else {
+      expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    }
     expect(JSON.parse(settleOutput[0]!)).toMatchObject({
       kind: "provider-resolved",
       attempt: { attemptKey, state: "committed" },
       status: {
-        workItems: [expect.objectContaining({ state: "runnable" })],
+        workItems: [expect.objectContaining({
+          state: parkedState === "manual-required" ? "runnable" : "failed",
+        })],
       },
     });
     expect(settleOutput[0]).not.toContain("controllerToken");
@@ -3187,7 +3201,12 @@ describe("prd command exit contract", () => {
       ]),
       nextSafeAction: expect.stringContaining("fn prd status"),
     });
-  });
+  }
+
+  it.each(["manual-required", "failed"] as const)(
+    "previews and settles one non-CLI provider effect from an unleased %s boundary while routing CLI recovery to its native fence",
+    exerciseNonCliProviderResolution,
+  );
 
   it("claims exact merge approval, lands, and settles only its parked imported work item", async () => {
     const confirmation = "9".repeat(64);
