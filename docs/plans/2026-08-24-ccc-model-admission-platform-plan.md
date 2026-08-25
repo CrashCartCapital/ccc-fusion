@@ -243,8 +243,8 @@ Required deliberate failure probes are named tests and must also be visible in t
 | Checkpoint | Git identity | Evidence | Status |
 |---|---|---|---|
 | Ownership preflight | baseline `67a123b2a50953c42809617890b56d36b8d100f3`; branch `codex/model-admission-platform`; isolated path above | branch/path collision checks absent; R1 worktree dirty at baseline; `oc-fanout doctor` ready and capacity observed read-only, but oc-fanout intentionally unused | accepted |
-| Durable plan | uncommitted candidate | AGY `gemini-3.7-flash-high` returned REJECT; adopted export sequencing, deterministic ordering, binary HMAC input, explicit state return, and critical-key constant; retained the operator-required root Vitest command plus package-configured proof; rejected `nextProbe: null` for rejected verdicts because the controlling spec requires the smallest result-changing probe; AGY closure review of repaired SHA-256 `e927c9c7bfa4f1e97aa39306d0ba8cc8ade069d272376a1f330bfb57d263ad10` returned ACCEPT | accepted; commit pending |
-| Slice A | baseline | RED/GREEN/REFACTOR not yet run | pending |
+| Durable plan | `7980f8d0e7c6d940770ca5b950c790a7b55897c8` | AGY `gemini-3.7-flash-high` returned REJECT; adopted export sequencing, deterministic ordering, binary HMAC input, explicit state return, and critical-key constant; retained the operator-required root Vitest command plus package-configured proof; rejected `nextProbe: null` for rejected verdicts because the controlling spec requires the smallest result-changing probe; AGY closure review of repaired SHA-256 `e927c9c7bfa4f1e97aa39306d0ba8cc8ade069d272376a1f330bfb57d263ad10` returned ACCEPT | accepted |
+| Slice A | plan commit `7980f8d0e` | RED: targeted Vitest failed on missing `../ccc-model-capability-profile.js`; GREEN: same command passed 11/11; REFACTOR: same 11/11 passed and `pnpm --filter @fusion/core typecheck` exited 0 | accepted; commit pending |
 | Slice B | baseline | RED/GREEN/REFACTOR not yet run | pending |
 | Slice C | baseline | RED/GREEN/REFACTOR not yet run | pending |
 | Exports/docs | baseline | targeted/package proof not yet run | pending |
