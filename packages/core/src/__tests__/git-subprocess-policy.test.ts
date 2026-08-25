@@ -215,6 +215,33 @@ describe("test git subprocess policy", () => {
     });
   });
 
+  it("reroutes a contained invocation when a display-only pager variable is set", () => {
+    const context = policyContext();
+    const outside = dirname(context.workerRoot);
+    const contained = ["-C", context.cwd, "checkout", "--quiet", "--detach", "HEAD"];
+
+    // PAGER, GIT_PAGER and GIT_EDITOR only name programs that display or edit text.
+    // None of them can move a git invocation outside the worker root, so none of them
+    // may veto a reroute whose target is already contained.
+    expect(resolveTrustedTestGitFile("git", contained, { ...context, env: { PAGER: "less" } }))
+      .toBe(TRUSTED_GIT);
+    expect(resolveTrustedTestGitFile("git", contained, { ...context, env: { GIT_PAGER: "delta" } }))
+      .toBe(TRUSTED_GIT);
+    expect(resolveTrustedTestGitFile("git", contained, { ...context, env: { GIT_EDITOR: "vim" } }))
+      .toBe(TRUSTED_GIT);
+
+    // Containment is unchanged: an out-of-worker target still declines.
+    expect(resolveTrustedTestGitFile("git", ["-C", outside, "checkout", "--quiet", "--detach", "HEAD"], {
+      ...context,
+      env: { PAGER: "less" },
+    })).toBe("git");
+  });
+
+  it("neutralizes display-only git environment variables on the trusted path", () => {
+    expect(isolateTrustedTestGitEnvironment({ PAGER: "less", GIT_PAGER: "delta", GIT_EDITOR: "vim" }))
+      .toMatchObject({ PAGER: "cat", GIT_PAGER: "cat", GIT_EDITOR: "true" });
+  });
+
   it("recognizes trusted shell Git across supported whitespace", () => {
     expect(shellUsesTrustedTestGit("  /usr/bin/git\tstatus --short")).toBe(true);
     expect(shellUsesTrustedTestGit("/usr/bin/git-other status --short")).toBe(false);

@@ -60,6 +60,13 @@ export function isolateTrustedTestGitEnvironment(env: NodeJS.ProcessEnv): NodeJS
     GIT_CONFIG_GLOBAL: nullDevice,
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_SYSTEM: nullDevice,
+    // Display-only variables. These cannot move an invocation outside the worker
+    // root, so they are sanitized here rather than vetoing the reroute upstream.
+    // A worker has no controlling terminal, so an inherited pager or editor would
+    // hang or fail rather than page anything.
+    GIT_EDITOR: "true",
+    GIT_PAGER: "cat",
+    PAGER: "cat",
   };
 }
 
@@ -135,9 +142,9 @@ function invocationStaysWithinWorker(args: readonly string[], context: TrustedTe
   }
   if (GIT_EXECUTION_ENV_KEYS.some((key) => Boolean(context.env?.[key]))) return false;
   if (!gitTraceEnvironmentStaysWithinWorker(context)) return false;
-  if (context.env?.GIT_EDITOR && context.env.GIT_EDITOR !== "true") return false;
-  if (context.env?.GIT_PAGER && context.env.GIT_PAGER !== "cat") return false;
-  if (context.env?.PAGER && context.env.PAGER !== "cat") return false;
+  // GIT_EDITOR, GIT_PAGER and PAGER are deliberately not tested here. They name a
+  // program that displays or edits text, which is not a containment property, and
+  // isolateTrustedTestGitEnvironment pins all three on every reroute path.
   const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
   if ((context.env?.GIT_CONFIG_GLOBAL && context.env.GIT_CONFIG_GLOBAL !== nullDevice)
     || (context.env?.GIT_CONFIG_SYSTEM && context.env.GIT_CONFIG_SYSTEM !== nullDevice)
