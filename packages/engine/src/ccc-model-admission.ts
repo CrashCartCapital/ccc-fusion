@@ -246,6 +246,17 @@ function evaluateOfflineEvidence(
         `offline fixture ${probe.fixtureId} appears more than once`,
         "replace_offline_fixture_evidence",
       );
+      if (!probe.passed) {
+        addReason(
+          reasons,
+          "offline_conformance",
+          "offline_fixture_failed",
+          "rejected",
+          probe.fixtureId,
+          `required offline fixture ${probe.fixtureId} failed`,
+          "rerun_offline_fixture_after_repair",
+        );
+      }
     } else {
       byId.set(probe.fixtureId, probe);
     }
@@ -466,10 +477,19 @@ function evaluateMicroprobes(
     if (
       !isRecord(candidate) ||
       !isTerminalResult(candidate) ||
-      !isNonEmptyString(candidate.probeId) ||
-      ids.has(candidate.probeId)
+      !isNonEmptyString(candidate.probeId)
     ) {
       malformed = true;
+      continue;
+    }
+    if (ids.has(candidate.probeId)) {
+      malformed = true;
+      evaluateTerminalResult(
+        candidate as unknown as CccLiveMicroprobeResult,
+        "live_microprobe",
+        candidate.probeId,
+        reasons,
+      );
       continue;
     }
     ids.add(candidate.probeId);
@@ -485,7 +505,8 @@ function evaluateMicroprobes(
       "live microprobe evidence is malformed or duplicated",
       "replace_live_microprobe_evidence",
     );
-  } else if (valid.length < policy.minimumLiveMicroprobes) {
+  }
+  if (valid.length < policy.minimumLiveMicroprobes) {
     addReason(
       reasons,
       "live_microprobe",
@@ -516,10 +537,19 @@ function evaluateScenarios(
     if (
       !isRecord(candidate) ||
       !isTerminalResult(candidate) ||
-      !isNonEmptyString(candidate.armId) ||
-      byId.has(candidate.armId)
+      !isNonEmptyString(candidate.armId)
     ) {
       malformed = true;
+      continue;
+    }
+    if (byId.has(candidate.armId)) {
+      malformed = true;
+      evaluateTerminalResult(
+        candidate as unknown as CccReplicatedScenarioResult,
+        "replicated_scenarios",
+        candidate.armId,
+        reasons,
+      );
       continue;
     }
     byId.set(candidate.armId, candidate as unknown as CccReplicatedScenarioResult);
@@ -592,8 +622,13 @@ function evaluateCoding(
   const byId = new Map<string, CccBoundedCodingTrialResult>();
   let malformed = false;
   for (const trial of trials) {
-    if (!isCodingTrial(trial) || byId.has(trial.taskId)) {
+    if (!isCodingTrial(trial)) {
       malformed = true;
+      continue;
+    }
+    if (byId.has(trial.taskId)) {
+      malformed = true;
+      evaluateCodingTrial(trial, trial.taskId, reasons);
       continue;
     }
     byId.set(trial.taskId, trial);
@@ -699,6 +734,27 @@ function highestPassedStage(
   return "campaign_admitted";
 }
 
+function orderReasons(
+  reasons: readonly CccModelAdmissionReason[],
+): CccModelAdmissionReason[] {
+  const stageOrder = new Map(
+    CCC_MODEL_ADMISSION_STAGES.map((stage, index) => [stage, index]),
+  );
+  return [...reasons].sort((left, right) => {
+    const byStage =
+      (stageOrder.get(left.stage) ?? Number.MAX_SAFE_INTEGER) -
+      (stageOrder.get(right.stage) ?? Number.MAX_SAFE_INTEGER);
+    if (byStage !== 0) return byStage;
+    const byOutcome =
+      (left.outcome === "rejected" ? 0 : 1) -
+      (right.outcome === "rejected" ? 0 : 1);
+    if (byOutcome !== 0) return byOutcome;
+    const byCode = left.code.localeCompare(right.code);
+    if (byCode !== 0) return byCode;
+    return (left.evidenceId ?? "").localeCompare(right.evidenceId ?? "");
+  });
+}
+
 export function evaluateCccModelAdmission(
   input: CccModelAdmissionInput,
   policy: Readonly<CccModelAdmissionPolicy> = CCC_MODEL_ADMISSION_POLICY_V1,
@@ -736,17 +792,19 @@ export function evaluateCccModelAdmission(
   evaluateScenarios(input, policy, reasons);
   evaluateCoding(input, policy, reasons);
 
-  const verdict: CccModelAdmissionVerdict = reasons.some(
+  const orderedReasons = orderReasons(reasons);
+
+  const verdict: CccModelAdmissionVerdict = orderedReasons.some(
     (reason) => reason.outcome === "rejected",
   )
     ? "rejected"
-    : reasons.length > 0
+    : orderedReasons.length > 0
       ? "insufficient_evidence"
       : "admitted";
   return deepFreeze({
     verdict,
-    highestStage: highestPassedStage(reasons),
-    reasons,
-    nextProbe: verdict === "admitted" ? null : reasons[0].nextProbe,
+    highestStage: highestPassedStage(orderedReasons),
+    reasons: orderedReasons,
+    nextProbe: verdict === "admitted" ? null : orderedReasons[0].nextProbe,
   });
 }

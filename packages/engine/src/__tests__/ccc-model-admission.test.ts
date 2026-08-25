@@ -141,7 +141,7 @@ describe("CCC deterministic model admission", () => {
     expect(result.reasons[0]).toMatchObject({
       stage: "profile_validated",
       code: "capability_evidence_too_low",
-      evidenceId: "supportedInstructionRoles",
+      evidenceId: "declaredLimits",
     });
     expect(result.nextProbe).toEqual(
       result.reasons[0]?.nextProbe,
@@ -292,10 +292,12 @@ describe("CCC deterministic model admission", () => {
     const input = fullInput();
     input.liveMicroprobes = [null as never];
 
-    expect(evaluateCccModelAdmission(input)).toMatchObject({
-      verdict: "insufficient_evidence",
-      reasons: [{ code: "malformed_microprobe_evidence" }],
-    });
+    const result = evaluateCccModelAdmission(input);
+    expect(result.verdict).toBe("insufficient_evidence");
+    expect(result.reasons.map((reason) => reason.code)).toEqual([
+      "malformed_microprobe_evidence",
+      "microprobe_replication_insufficient",
+    ]);
   });
 
   it("PRD-C13 orders reasons deterministically and uses the first next probe", () => {
@@ -363,5 +365,89 @@ describe("CCC deterministic model admission", () => {
       verdict: "insufficient_evidence",
       reasons: [{ code: "route_proof_missing" }],
     });
+  });
+
+  it("PRD-C16 rejects negative evidence hidden behind duplicate IDs", () => {
+    const input = fullInput();
+    input.offlineProbes.push({
+      fixtureId: input.offlineProbes[0].fixtureId,
+      passed: false,
+    });
+    input.liveMicroprobes.push({
+      ...input.liveMicroprobes[0],
+      terminalClassification: "dispatched_unknown",
+      unresolvedAttempt: true,
+      streamClosed: false,
+    });
+    input.replicatedScenarios.push({
+      ...input.replicatedScenarios[0],
+      terminalClassification: "dispatched_unknown",
+      unresolvedAttempt: true,
+      streamClosed: false,
+    });
+    input.boundedCodingTrials.push({
+      ...input.boundedCodingTrials[0],
+      terminalClassification: "dispatched_unknown",
+      unresolvedAttempt: true,
+      streamClosed: false,
+    });
+
+    const result = evaluateCccModelAdmission(input);
+    expect(result.verdict).toBe("rejected");
+    expect(result.reasons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "offline_fixture_failed" }),
+        expect.objectContaining({
+          code: "unresolved_dispatched_unknown",
+          evidenceId: input.liveMicroprobes[0].probeId,
+        }),
+        expect.objectContaining({
+          code: "unresolved_dispatched_unknown",
+          evidenceId: input.replicatedScenarios[0].armId,
+        }),
+        expect.objectContaining({
+          code: "unresolved_dispatched_unknown",
+          evidenceId: input.boundedCodingTrials[0].taskId,
+        }),
+      ]),
+    );
+  });
+
+  it("PRD-C17 orders mixed capability failures by stage before next probe", () => {
+    const input = fullInput();
+    const mixed = structuredClone(input.profile) as unknown as {
+      capabilities: Record<
+        string,
+        { evidence: string; value: unknown }
+      >;
+    };
+    mixed.capabilities.supportedInstructionRoles.evidence = "offline_proven";
+    mixed.capabilities.usageReceipt = { evidence: "unknown", value: null };
+    input.profile = parseCccModelCapabilityProfile(mixed);
+    input.routeEvidence.profileDigest = digestCccModelCapabilityProfile(input.profile);
+
+    const result = evaluateCccModelAdmission(input);
+    expect(result.reasons[0]).toMatchObject({
+      stage: "profile_validated",
+      evidenceId: "usageReceipt",
+    });
+    expect(result.nextProbe?.stage).toBe("profile_validated");
+    expect(
+      result.reasons.findIndex((reason) => reason.stage === "live_microprobe"),
+    ).toBeGreaterThan(0);
+  });
+
+  it("PRD-C18 reports malformed microprobes and the remaining count deficit", () => {
+    const input = fullInput();
+    input.liveMicroprobes = [null as never, ...input.liveMicroprobes.slice(0, 9)];
+
+    expect(
+      evaluateCccModelAdmission(input).reasons.map((reason) => reason.code),
+    ).toEqual(
+      expect.arrayContaining([
+        "malformed_microprobe_evidence",
+        "microprobe_replication_insufficient",
+      ]),
+    );
   });
 });
