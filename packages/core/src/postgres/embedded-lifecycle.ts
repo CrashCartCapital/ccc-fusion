@@ -1149,10 +1149,12 @@ export function isClusterStartingUpError(error: unknown): boolean {
 
 /**
  * FNXC:PostgresEmbedded 2026-07-23-10:40:
- * Superset used by the OWNED start readiness wait and by joined-instance
- * verification: socket-level failures can mean a real postmaster is in its
- * pre-listen window, but if they persist through the bounded join wait, startup
- * must fail instead of returning an unreachable URL.
+ * Superset used only by the OWNED start's readiness wait: an owned postmaster
+ * that was just launched may also be in its pre-listen window, so socket-level
+ * connect failures are retryable there too. The JOIN path deliberately does NOT
+ * retry socket errors: once PID ownership was live or otherwise ambiguous, the
+ * optimistic-join contract resolves the URL and lets the connection layer
+ * report an unreachable endpoint without adding another wait.
  */
 export function isClusterNotYetAcceptingError(error: unknown): boolean {
   if (isClusterStartingUpError(error)) return true;
@@ -1858,9 +1860,11 @@ export class EmbeddedPostgresLifecycle {
    * both this path and the owner's `ensureDatabase` tolerate `42P04`, so whoever loses the
    * race treats the winner's database as its own success.
    *
-   * A joined URL is only useful if the joined instance accepts the database verification.
-   * Retry transient startup/recovery/socket failures within the bounded recovery window, then
-   * fail instead of returning a dead URL that makes startup look successful.
+   * Best-effort by contract. `isAlreadyRunning` joins only after PID ownership is live or
+   * otherwise ambiguous, but that owner can still be pre-listen, recovering, or a retained
+   * PID-reuse collision. Report a probe failure and return the URL, letting the connection
+   * layer surface an unreachable cluster. Never convert an optimistic join into a hard
+   * startup failure.
    */
   private async ensureJoinedDatabase(port: number): Promise<void> {
     /*
@@ -1868,9 +1872,10 @@ export class EmbeddedPostgresLifecycle {
     Issue #2411 (beta.4 follow-up): a joined instance can be mid crash-recovery,
     where PostgreSQL listens but rejects every connection with 57P03. A one-shot
     verify turned that transient state into the "could not verify database on
-    joined instance" give-up path. Retry recovery and socket-level not-ready
-    signals within a bounded window, then fail closed if the endpoint never
-    proves usable.
+    joined instance" give-up path. Retry the RECOVERY signal (57P03 only) within
+    a bounded window; socket-level failures keep the historical instant
+    best-effort optimistic join (resolve the URL and let the connection layer
+    report the unreachable cluster).
     */
     const deadline = Date.now() + JOINED_INSTANCE_RECOVERY_WAIT_MS;
     let announced = false;
@@ -1879,7 +1884,7 @@ export class EmbeddedPostgresLifecycle {
         await this.createDatabaseIfMissing(port);
         return;
       } catch (error) {
-        if (isClusterNotYetAcceptingError(error) && Date.now() < deadline) {
+        if (isClusterStartingUpError(error) && Date.now() < deadline) {
           if (!announced) {
             announced = true;
             this.options.onLog(
@@ -1889,10 +1894,10 @@ export class EmbeddedPostgresLifecycle {
           await new Promise<void>((resolve) => setTimeout(resolve, CLUSTER_ACCEPTING_POLL_MS));
           continue;
         }
-        throw new Error(
-          `embedded postgres: joined instance at port ${port} did not accept connections for database "${this.options.database}"; startup will not return an unreachable URL. Last error: ${error instanceof Error ? error.message : String(error)}`,
-          { cause: error },
+        this.options.onLog(
+          `embedded postgres: could not verify database "${this.options.database}" on joined instance at port ${port} (${error instanceof Error ? error.message : String(error)}); continuing — the connection layer will report an unreachable cluster`,
         );
+        return;
       }
     }
   }

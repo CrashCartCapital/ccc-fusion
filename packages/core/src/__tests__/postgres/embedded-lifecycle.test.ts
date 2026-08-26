@@ -903,9 +903,6 @@ describe("embedded-lifecycle: startup race (cross-process)", () => {
     }
 
     __setEmbeddedPostgresCtorForTests(RacingEmbeddedPostgres as never);
-    const ensureJoinedDatabase = vi
-      .spyOn(EmbeddedPostgresLifecycle.prototype, "ensureJoinedDatabase")
-      .mockResolvedValue(undefined);
     try {
       const lifecycle = new EmbeddedPostgresLifecycle({
         ...baseOptions(dataDir),
@@ -920,7 +917,6 @@ describe("embedded-lifecycle: startup race (cross-process)", () => {
       expect(lifecycle.isRunning()).toBe(false);
       expect(logLines.some((line) => /startup raced with an existing instance/i.test(line))).toBe(true);
     } finally {
-      ensureJoinedDatabase.mockRestore();
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
@@ -931,8 +927,10 @@ FNXC:PostgresStartupRace 2026-07-15-20:45:
 Mocked ctor, no real Postgres — kept outside the real-process block so it runs under the
 gate/CI default (see the sibling startup-race block for why that placement matters).
 
-The lock-collision tests below verify routing into the join path. Separate join-verification tests
-own whether the joined endpoint is usable or must fail before returning a URL.
+Pins the best-effort half of the join-path database verify: after PID ownership is classified as
+live or otherwise ambiguous, `isAlreadyRunning` still joins without requiring the endpoint to be
+reachable. A hard throw here would turn a real postmaster's pre-listen/recovery window into a
+startup failure.
 */
 /*
 FNXC:PostgresStartupRace 2026-07-15-21:10:
@@ -987,9 +985,6 @@ describe("embedded-lifecycle: startup race only joins on a lock collision", () =
     }
 
     __setEmbeddedPostgresCtorForTests(RacingEmbeddedPostgres as never);
-    const ensureJoinedDatabase = vi
-      .spyOn(EmbeddedPostgresLifecycle.prototype, "ensureJoinedDatabase")
-      .mockResolvedValue(undefined);
     try {
       const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), port: 55445 });
 
@@ -997,50 +992,12 @@ describe("embedded-lifecycle: startup race only joins on a lock collision", () =
         runtimeUrl: expect.stringContaining(":55444/"),
       });
     } finally {
-      ensureJoinedDatabase.mockRestore();
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
 });
 
 describe("embedded-lifecycle: join-path database verify is best-effort", () => {
-  it("does not resolve a live-pid join when the recorded database port stays unreachable", async () => {
-    vi.useFakeTimers();
-    const dataDir = makeDataDir();
-    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
-    writeFileSync(
-      join(dataDir, "postmaster.pid"),
-      [String(process.pid), dataDir, String(Date.now()), "55441", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
-    );
-    const logLines: string[] = [];
-    const createDatabaseIfMissing = vi
-      .spyOn(
-        EmbeddedPostgresLifecycle.prototype as unknown as {
-          createDatabaseIfMissing: (port: number) => Promise<void>;
-        },
-        "createDatabaseIfMissing",
-      )
-      .mockRejectedValue(Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:55441"), { code: "ECONNREFUSED" }));
-
-    try {
-      const lifecycle = new EmbeddedPostgresLifecycle({
-        ...baseOptions(dataDir),
-        onLog: (message) => logLines.push(message),
-      });
-
-      const start = expect(lifecycle.start()).rejects.toThrow(
-        /joined instance at port 55441 did not accept connections/i,
-      );
-      await vi.advanceTimersByTimeAsync(16_000);
-      await start;
-      expect(createDatabaseIfMissing).toHaveBeenCalled();
-      expect(logLines.some((line) => /could not verify database/i.test(line))).toBe(false);
-    } finally {
-      createDatabaseIfMissing.mockRestore();
-      rmSync(dataDir, { recursive: true, force: true });
-    }
-  });
-
   it("starts an owned instance when a stable postmaster pid is provably dead", async () => {
     const dataDir = makeDataDir();
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
