@@ -147,6 +147,7 @@ import {
   CCC_AWAIT_OWNED_TRANSPORT_CLOSURE,
   describeModel,
   formatModelMarkerDetails,
+  isCccCampaignDiscoveryToolCall,
   promptWithFallback,
   compactSessionContext,
 } from "./pi.js";
@@ -19011,17 +19012,38 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           "CCC_CAMPAIGN_READY_CUSTODY_REFUSED",
         );
       }
+      const campaignPhaseReadOnlyToolNames = ["read", "grep", "find", "ls", "glob", "bash"] as const;
+      const campaignRemainingRequests = cccCampaignImplementation
+        ? Math.max(
+            1,
+            (Number.isSafeInteger(campaignReadyContext!.bounds.maxRequests)
+              ? campaignReadyContext!.bounds.maxRequests
+              : 1)
+              - (Number.isSafeInteger(campaignReadyContext!.requestCount)
+                ? campaignReadyContext!.requestCount
+                : 0),
+          )
+        : 1;
+      const campaignDiscoveryGuidanceToolLimit = Math.max(
+        1,
+        Math.floor(campaignRemainingRequests / 3),
+      );
+      const campaignDiscoveryRefusalToolLimit = Math.max(
+        campaignDiscoveryGuidanceToolLimit,
+        Math.floor(campaignRemainingRequests / 2),
+      );
       const campaignPhaseIntent: {
         completionRequested: boolean;
         invalidatedByTool?: string;
       } = { completionRequested: false };
       const campaignPhaseRuntime: {
+        activePhase: "DISCOVER" | "MUTATE" | "VERIFY" | "REPAIR";
         discoverContinuations: number;
         mutateContinuations: number;
         readCount: number;
         terminalFailure?: string;
         turnConfirmedMutation?: boolean;
-      } = { discoverContinuations: 0, mutateContinuations: 0, readCount: 0 };
+      } = { activePhase: "DISCOVER", discoverContinuations: 0, mutateContinuations: 0, readCount: 0 };
       const campaignReadyTools: ToolDefinition[] = cccCampaignImplementation
         ? [createCccCampaignReadyTool({
             mode: "phase-signal",
@@ -19103,6 +19125,20 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ...(effectiveSkillSelection ? { skillSelection: effectiveSkillSelection } : {}),
         ...(additionalSkillPaths ? { additionalSkillPaths } : {}),
         ...(readonlyCustomTools.allowed.length > 0 ? { customTools: readonlyCustomTools.allowed } : {}),
+        ...(cccCampaignImplementation ? {
+          cccCampaignPhaseToolPolicy: {
+            readOnlyToolNames: campaignPhaseReadOnlyToolNames,
+            maxReadOnlyToolCallsBeforeGuidance: campaignDiscoveryGuidanceToolLimit,
+            maxReadOnlyToolCallsBeforeRefusal: campaignDiscoveryRefusalToolLimit,
+            guidanceMessage:
+              "CCC_CAMPAIGN_DISCOVER_BOUNDARY: DISCOVER read/search/list allowance has been reached for this provider turn. "
+              + "Stop inspecting and proceed immediately to modify an admitted file, or call fn_complete_phase only after mutation is complete.",
+            refusalMessage:
+              "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: repeated DISCOVER read/search/list calls are phase-bounded. "
+              + "No more discovery tools will run in this turn; use write/edit/bash to make the admitted change or stop honestly.",
+            currentPhase: () => campaignPhaseRuntime.activePhase,
+          },
+        } : {}),
         ...(cccProviderAttemptBinding ? { profile: CCC_FUSION_PROFILE, subscriptionReady: true as const, cccProviderAttemptBinding } : {}),
       });
 
@@ -19158,7 +19194,14 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           }
         }
         if (event.type === "tool_execution_start") {
-          if (cccCampaignImplementation && event.toolName === "read") {
+          if (
+            cccCampaignImplementation
+            && campaignPhaseRuntime.activePhase === "DISCOVER"
+            && isCccCampaignDiscoveryToolCall(
+              event.toolName,
+              event.args as Record<string, unknown> | undefined,
+            )
+          ) {
             campaignPhaseRuntime.readCount += 1;
           }
           if (
@@ -19223,7 +19266,10 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       try {
         const initialPrompt = cccCampaignImplementation
           ? `Implement the sealed campaign task "${workflowStep.name}" for task ${task.id}.\n\n` +
-            "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification."
+            "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification.\n\n" +
+            "CCC_CAMPAIGN_DISCOVER_BOUNDARY: DISCOVER is phase-bounded by the admitted request budget. " +
+            `You may make at most ${campaignDiscoveryGuidanceToolLimit} read/search/list discovery tool call(s) before moving to MUTATE. ` +
+            "Do not spend the provider turn re-reading context. If the admitted task identifies exact files, create or edit them first."
           : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
             "Review the work done in this worktree and evaluate it against the criteria in your instructions.";
         const promptPromise = (async () => {
@@ -19298,6 +19344,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               return;
             }
             campaignPhaseRuntime.mutateContinuations += 1;
+            campaignPhaseRuntime.activePhase = "MUTATE";
             await this.store.logEntry(
               task.id,
               "[ccc-campaign:mutate-cessation] MUTATE ended with a dirty candidate but no explicit phase signal; issuing the one allowed same-session continuation",
@@ -19349,6 +19396,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             "[ccc-campaign:discover-cessation] DISCOVER ended with no confirmed mutation or explicit phase signal; issuing the one allowed same-session continuation",
           );
           campaignPhaseRuntime.discoverContinuations += 1;
+          campaignPhaseRuntime.activePhase = "MUTATE";
           await promptWithFallback(
             session,
             "CCC_CAMPAIGN_DISCOVER_CESSATION: The settled DISCOVER turn stopped making tool calls without an explicit phase signal or confirmed mutation. " +
@@ -19399,6 +19447,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           if (campaignPhaseIntent.completionRequested) return;
 
           campaignPhaseRuntime.mutateContinuations += 1;
+          campaignPhaseRuntime.activePhase = "MUTATE";
           await this.store.logEntry(
             task.id,
             "[ccc-campaign:mutate-cessation] DISCOVER continuation created a dirty candidate without an explicit phase signal; issuing the one allowed MUTATE continuation",
@@ -19516,6 +19565,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
                 allowedRoots: campaignAllowedWriteRoots,
               });
               repairAttempts += 1;
+              campaignPhaseRuntime.activePhase = "REPAIR";
               campaignPhaseIntent.completionRequested = false;
               campaignPhaseIntent.invalidatedByTool = undefined;
               await this.store.logEntry(

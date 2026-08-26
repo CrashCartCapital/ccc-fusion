@@ -1813,6 +1813,14 @@ export interface AgentOptions {
   toolsAllowlist?: string[];
   /** Optional allowlist of builtin runtime web tools to keep enabled. */
   builtinToolsAllowlist?: BuiltinWebToolName[];
+  cccCampaignPhaseToolPolicy?: {
+    readOnlyToolNames: readonly string[];
+    maxReadOnlyToolCallsBeforeGuidance: number;
+    maxReadOnlyToolCallsBeforeRefusal: number;
+    guidanceMessage: string;
+    refusalMessage: string;
+    currentPhase?: () => string | undefined;
+  };
   onText?: (delta: string) => void;
   onThinking?: (delta: string) => void;
   onToolStart?: (name: string, args?: Record<string, unknown>) => void;
@@ -2569,6 +2577,23 @@ function boundaryRejection(message: string, details?: Record<string, unknown>) {
   };
 }
 
+export function isCccCampaignDiscoveryToolCall(
+  toolName: string,
+  params: Record<string, unknown> | undefined,
+): boolean {
+  const normalizedToolName = toolName.trim().toLowerCase();
+  if (!["read", "grep", "find", "ls", "glob", "bash"].includes(normalizedToolName)) return false;
+  if (normalizedToolName !== "bash") return true;
+  let command = typeof params?.command === "string" ? params.command.trim() : "";
+  while (/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+/.test(command)) {
+    command = command.replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+/, "").trim();
+  }
+  if (/\b(?:sed)\s+(?:-[^-]*i|--in-place)\b/.test(command)) return false;
+  if (/(?:^|\s)1>>?|(?:^|[^0-9])(?:>>?|<<)/.test(command.replace(/\s+2>>?\S+/g, ""))) return false;
+  if (/^git\s+(?:grep|diff|log|show|status|ls-files)\b/.test(command)) return true;
+  return /^(?:ls|pwd|find|grep|rg|sed|cat|head|tail|stat|wc|file)\b/.test(command);
+}
+
 function normalizeApprovalRequestCategory(
   category: PermanentAgentActionCategory,
 ): AgentPermissionPolicyActionCategory {
@@ -2651,6 +2676,52 @@ export function wrapToolsWithBoundary(
         }
 
         // Call the original tool implementation with all arguments passed through
+        return originalExecute(...args);
+      },
+    };
+  });
+}
+
+export function wrapToolsWithCccCampaignPhaseToolPolicy(
+  tools: ToolDefinition[],
+  policy: AgentOptions["cccCampaignPhaseToolPolicy"] | undefined,
+): ToolDefinition[] {
+  if (!policy) return tools;
+  const readOnlyToolNames = new Set(
+    policy.readOnlyToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
+  );
+  if (readOnlyToolNames.size === 0) return tools;
+  let readOnlyToolCalls = 0;
+  return tools.map((tool) => {
+    if (!readOnlyToolNames.has(tool.name.trim().toLowerCase())) return tool;
+    const originalExecute = tool.execute as any;
+    return {
+      ...tool,
+      execute: async (...args: any[]) => {
+        if (policy.currentPhase && policy.currentPhase() !== "DISCOVER") {
+          return originalExecute(...args);
+        }
+        const params = args[1] as Record<string, unknown> | undefined;
+        if (!isCccCampaignDiscoveryToolCall(tool.name, params)) {
+          return originalExecute(...args);
+        }
+        readOnlyToolCalls += 1;
+        if (readOnlyToolCalls > policy.maxReadOnlyToolCallsBeforeRefusal) {
+          return boundaryRejection(policy.refusalMessage, {
+            phase: "DISCOVER",
+            toolName: tool.name,
+            readOnlyToolCalls,
+            maxReadOnlyToolCallsBeforeRefusal: policy.maxReadOnlyToolCallsBeforeRefusal,
+          });
+        }
+        if (readOnlyToolCalls > policy.maxReadOnlyToolCallsBeforeGuidance) {
+          return boundaryRejection(policy.guidanceMessage, {
+            phase: "DISCOVER",
+            toolName: tool.name,
+            readOnlyToolCalls,
+            maxReadOnlyToolCallsBeforeGuidance: policy.maxReadOnlyToolCallsBeforeGuidance,
+          });
+        }
         return originalExecute(...args);
       },
     };
@@ -3590,11 +3661,15 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       boundaryContext.worktreeProjectRoot,
       normalizedAdditionalSkillPaths,
     );
-    const cccBinding = await resolveCccReceiptBinding(boundaryTools);
+    const phaseBoundedTools = wrapToolsWithCccCampaignPhaseToolPolicy(
+      boundaryTools,
+      options.cccCampaignPhaseToolPolicy,
+    );
+    const cccBinding = await resolveCccReceiptBinding(phaseBoundedTools);
     const customToolList: ToolDefinition[] = options.profile === CCC_FUSION_PROFILE
       && cccBinding
       ? wrapCccToolsWithDurableEffectReceipts(
-          boundaryTools,
+          phaseBoundedTools,
           cccBinding.store,
           cccBinding.sessionId,
           {
@@ -3605,7 +3680,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
             },
           },
         )
-      : boundaryTools;
+      : phaseBoundedTools;
     // Sort tools alphabetically by name for deterministic ordering.
     // Prompt caching requires the tool list to be byte-identical across
     // sessions — reordering breaks cache prefix matching.

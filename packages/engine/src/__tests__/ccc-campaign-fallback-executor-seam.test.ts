@@ -243,6 +243,17 @@ function makeCampaignNodeHarness(
     semanticTaskId: execution.semanticTaskId,
     proofIds: ["PROOF-READY"],
     targetRepository: { path: worktree, baseCommit: "a".repeat(40) },
+    bounds: { maxRequests: 4, maxDurationMs: 120_000, maxConcurrency: 1 },
+    requestCount: 0,
+    executionPolicy: {
+      schema: "ccc-campaign.execution-policy.v2",
+      routes: [{
+        taskId: execution.semanticTaskId,
+        providerId: "provider-approved",
+        modelId: "model-approved",
+        transport: "pi",
+      }],
+    },
     route: {
       taskId: execution.semanticTaskId,
       providerId: "provider-approved",
@@ -781,14 +792,17 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
             if (promptCount !== 1) return;
             for (let index = 0; index < 33; index += 1) {
               for (const subscriber of subscribers) {
+                const bashDiscovery = index % 3 === 0;
                 subscriber({
                   type: "tool_execution_start",
-                  toolName: "read",
-                  args: { path: `src/file-${index}.ts` },
+                  toolName: bashDiscovery ? "bash" : "read",
+                  args: bashDiscovery
+                    ? { command: "FUSION_TEST=1 git grep bounded" }
+                    : { path: `src/file-${index}.ts` },
                 });
                 subscriber({
                   type: "tool_execution_end",
-                  toolName: "read",
+                  toolName: bashDiscovery ? "bash" : "read",
                   isError: false,
                   result: { content: [{ type: "text", text: "bounded read" }] },
                 });
@@ -824,6 +838,36 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
         "node:ccc-task-implementation:error": expect.stringMatching(/DISCOVER.*explicit phase signal/i),
       },
     });
+  });
+
+  it("campaign implementation sessions receive a request-budget-derived discovery tool boundary", async () => {
+    const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-discover-tool-boundary",
+    );
+    store.getCccCampaignContextForTask.mockResolvedValueOnce({
+      ...(await store.getCccCampaignContextForTask(nodeTask.id)),
+      bounds: { maxRequests: 4, maxDurationMs: 120_000, maxConcurrency: 1 },
+      requestCount: 0,
+    });
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    const sessionCall = mockedCreateFnAgent.mock.calls[0]?.[0] as Record<string, any>;
+    expect(sessionCall.cccCampaignPhaseToolPolicy).toMatchObject({
+      readOnlyToolNames: ["read", "grep", "find", "ls", "glob", "bash"],
+      maxReadOnlyToolCallsBeforeGuidance: 1,
+      maxReadOnlyToolCallsBeforeRefusal: 2,
+    });
+    expect(userPrompts[0]).toContain("CCC_CAMPAIGN_DISCOVER_BOUNDARY");
+    expect(userPrompts[0]).toContain("at most 1 read/search/list discovery tool call");
   });
 
   it("mutate_exit_requires_explicit_signal: a dirty quiet turn cannot return success", async () => {
