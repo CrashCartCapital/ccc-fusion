@@ -124,7 +124,8 @@ Implement and prove the design in `docs/plans/2026-08-25-ccc-prd-oss-reuse-admis
 - 2026-08-25 — First `task verify` completed with nonzero status from unrelated load-sensitive tests: one core PostgreSQL readiness timing assertion, one engine real-Git process-reaping timing assertion, and six CLI 5-second timeouts. Isolated reruns passed: core 12 active tests, engine 39 tests, CLI route-policy 13 tests, and CLI PRD 51 tests. No temp leaks or live `.fusion` mutations were detected by the gate.
 - 2026-08-25 — `task ci` passed on implementation commit `b13f94f1e`: lint, changeset and route checks, full workspace typecheck/build, boot smoke, engine/core gates, CCC-PRD safety, PostgreSQL gate, and CI-shape proof all passed. One non-failing regex lint warning was removed in the following refactor checkpoint.
 - 2026-08-25 — R1 advanced from the common baseline through `400a8c332`, `4b446f244`, and `bc571db39`, changing only embedded PostgreSQL lifecycle/test paths. Exact changed-path comparison found no overlap with this branch. The R1 worktree's owned `.opencode/` and `.scratch/` state remained untouched.
-- Task 6 canonical closeout: final `task verify` retry, final-tree `task ci`, diff review, commit, and cleanliness proof pending.
+- 2026-08-25 — Final source tree `62732788a` passed `task verify` with every workspace test lane, test-isolation checks, and full production build green. The same commit passed a fresh `task ci` rerun. Branch audit found nine intended changed paths, zero R1 path overlap, no whitespace errors, and a clean worktree before this documentation-only checkpoint.
+- Task 6 canonical closeout: complete. The implementation remains source-and-test only; no push, PR, merge, install, runtime wiring, live repository search, provider call, database change, or automatic fork occurred.
 
 ## Remaining Risks
 
