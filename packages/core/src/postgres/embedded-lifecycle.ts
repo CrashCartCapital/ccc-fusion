@@ -148,17 +148,18 @@ function getStagedEmbeddedPgBundlePath(): string | null {
 }
 
 type ProcessEventName = string | symbol;
-type ProcessListenerSnapshot = Map<ProcessEventName, Function[]>;
+type ProcessListener = (...args: unknown[]) => unknown;
+type ProcessListenerSnapshot = Map<ProcessEventName, ProcessListener[]>;
 
 function snapshotProcessListeners(): ProcessListenerSnapshot {
   return new Map(
-    process.eventNames().map((eventName) => [eventName, process.rawListeners(eventName)]),
+    process.eventNames().map((eventName) => [eventName, process.rawListeners(eventName) as ProcessListener[]]),
   );
 }
 
 function removeProcessListenersAddedSince(before: ProcessListenerSnapshot): void {
   const after = new Map(
-    process.eventNames().map((eventName) => [eventName, process.rawListeners(eventName)]),
+    process.eventNames().map((eventName) => [eventName, process.rawListeners(eventName) as ProcessListener[]]),
   );
 
   for (const [eventName, listeners] of after) {
@@ -170,7 +171,7 @@ function removeProcessListenersAddedSince(before: ProcessListenerSnapshot): void
         unmatchedBefore.splice(beforeIndex, 1);
         continue;
       }
-      process.removeListener(eventName, listener as (...args: unknown[]) => void);
+      process.removeListener(eventName, listener);
     }
   }
 }
