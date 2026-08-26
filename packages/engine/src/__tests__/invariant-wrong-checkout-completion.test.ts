@@ -71,6 +71,12 @@ function implementationSessionCalls() {
 describe("FN-4115 wrong-checkout completion rejection", () => {
   beforeEach(() => {
     resetExecutorMocks();
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        dispose: vi.fn(),
+      },
+    } as any);
     vi.spyOn(worktreePool, "classifyTaskWorktree").mockResolvedValue({ ok: true });
     mockedExecSync.mockImplementation((cmd: string) => {
       if (cmd.includes("rev-parse --show-toplevel")) return Buffer.from("/repo/.worktrees/swift-falcon\n");

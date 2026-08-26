@@ -771,6 +771,7 @@ export function captureNamedTool<T extends { name: string }>(
 
 export function resetExecutorMocks() {
   vi.clearAllMocks();
+  mockedCreateFnAgent.mockReset();
   mockedExec.mockReset();
   mockedExecFile.mockReset();
   mockedExecFile.mockImplementation(((_file: string, _args: string[] | undefined, opts: unknown, cb: unknown) => {

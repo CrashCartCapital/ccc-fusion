@@ -1626,6 +1626,13 @@ describe("fast mode workflow/runtime invariants", () => {
     });
     const { store, executor } = makeExecutorForTask(nodeTask);
     store.getAsyncLayer = vi.fn(() => ({}) as any);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      semanticTaskId: "TSK-002",
+      route: {
+        taskId: "TSK-002",
+        allowedWriteRoots: ["src"],
+      },
+    }));
     const turnKey = "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     createCccCampaignProviderAttemptBindingMock.mockResolvedValueOnce(Object.freeze({
       turnKey,
