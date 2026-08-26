@@ -237,32 +237,10 @@ export function evaluateCccPrdOssReuseAdmission(
       nextSmallestEvidence: "pass the positive and negative discovery controls",
     });
   }
-  if (!evidence.scratchCost || evidence.scratchCost.confidence === "unknown") {
-    return applicationResult(evidenceSha256, {
-      decision: "insufficient_evidence",
-      selectedCandidateId: null,
-      reasons: ["scratch ownership cost is unknown"],
-      candidateDiagnostics: [],
-      nextSmallestEvidence: "provide a bounded scratch ownership-cost receipt",
-    });
-  }
   const evaluated = evidence.candidates
     .filter((candidate): candidate is CccPrdOssReuseCandidateEvidence => candidate.kind === "application_base")
     .map((candidate) => evaluateApplicationCandidate(evidence, candidate));
   const diagnostics = evaluated.map(({ diagnostic }) => diagnostic);
-  const eligible = evaluated.filter((candidate) => candidate.class !== null).sort(compareApplicationCandidates);
-  const selected = eligible[0];
-  if (selected) {
-    const decision = selected.class === "close" ? "close_match_fork" : "partial_match_fork";
-    const label = selected.class === "close" ? "proven close match" : "bounded partial match";
-    return applicationResult(evidenceSha256, {
-      decision,
-      selectedCandidateId: selected.candidate.id,
-      reasons: [`candidate ${selected.candidate.id} is a ${label} and cheaper than scratch`],
-      candidateDiagnostics: diagnostics,
-      nextSmallestEvidence: null,
-    });
-  }
   const uncertain = evaluated
     .filter(({ unknownEvidence }) => unknownEvidence)
     .sort((left, right) => compareCccPrdCodeUnits(left.candidate.id, right.candidate.id))[0];
@@ -274,6 +252,28 @@ export function evaluateCccPrdOssReuseAdmission(
       reasons: [`candidate ${uncertain.candidate.id} has unresolved controlling evidence`],
       candidateDiagnostics: diagnostics,
       nextSmallestEvidence: `prove candidate ${uncertain.candidate.id}: ${firstReason}`,
+    });
+  }
+  if (!evidence.scratchCost || evidence.scratchCost.confidence === "unknown") {
+    return applicationResult(evidenceSha256, {
+      decision: "insufficient_evidence",
+      selectedCandidateId: null,
+      reasons: ["scratch ownership cost is unknown"],
+      candidateDiagnostics: diagnostics,
+      nextSmallestEvidence: "provide a bounded scratch ownership-cost receipt",
+    });
+  }
+  const eligible = evaluated.filter((candidate) => candidate.class !== null).sort(compareApplicationCandidates);
+  const selected = eligible[0];
+  if (selected) {
+    const decision = selected.class === "close" ? "close_match_fork" : "partial_match_fork";
+    const label = selected.class === "close" ? "proven close match" : "bounded partial match";
+    return applicationResult(evidenceSha256, {
+      decision,
+      selectedCandidateId: selected.candidate.id,
+      reasons: [`candidate ${selected.candidate.id} is a ${label} and cheaper than scratch`],
+      candidateDiagnostics: diagnostics,
+      nextSmallestEvidence: null,
     });
   }
   return applicationResult(evidenceSha256, {
@@ -312,15 +312,6 @@ export function selectCccPrdOssPackage(
       reasons: ["package discovery is incomplete"],
       candidateDiagnostics: [],
       nextSmallestEvidence: "complete bounded package discovery",
-    });
-  }
-  if (!evidence.scratchCost || evidence.scratchCost.confidence === "unknown") {
-    return result({
-      decision: "insufficient_evidence",
-      selectedCandidateId: null,
-      reasons: ["scratch ownership cost is unknown"],
-      candidateDiagnostics: [],
-      nextSmallestEvidence: "provide a bounded scratch ownership-cost receipt",
     });
   }
   const evaluated = evidence.candidates
@@ -376,6 +367,27 @@ export function selectCccPrdOssPackage(
       };
     });
   const diagnostics = evaluated.map(({ diagnostic }) => diagnostic);
+  const uncertain = evaluated
+    .filter(({ unknownEvidence }) => unknownEvidence)
+    .sort((left, right) => compareCccPrdCodeUnits(left.candidate.id, right.candidate.id))[0];
+  if (uncertain) {
+    return result({
+      decision: "insufficient_evidence",
+      selectedCandidateId: null,
+      reasons: [`candidate ${uncertain.candidate.id} has unresolved controlling evidence`],
+      candidateDiagnostics: diagnostics,
+      nextSmallestEvidence: `prove candidate ${uncertain.candidate.id}: ${uncertain.diagnostic.reasons[0]}`,
+    });
+  }
+  if (!evidence.scratchCost || evidence.scratchCost.confidence === "unknown") {
+    return result({
+      decision: "insufficient_evidence",
+      selectedCandidateId: null,
+      reasons: ["scratch ownership cost is unknown"],
+      candidateDiagnostics: diagnostics,
+      nextSmallestEvidence: "provide a bounded scratch ownership-cost receipt",
+    });
+  }
   const eligible = evaluated.filter(({ diagnostic }) => diagnostic.eligible).sort((left, right) => {
     const costDifference = left.candidate.baseOwnershipCost.totalOwnershipHours
       - right.candidate.baseOwnershipCost.totalOwnershipHours;
@@ -394,18 +406,6 @@ export function selectCccPrdOssPackage(
       reasons: [`candidate ${selected.candidate.id} provides the bounded capability and is cheaper than scratch`],
       candidateDiagnostics: diagnostics,
       nextSmallestEvidence: null,
-    });
-  }
-  const uncertain = evaluated
-    .filter(({ unknownEvidence }) => unknownEvidence)
-    .sort((left, right) => compareCccPrdCodeUnits(left.candidate.id, right.candidate.id))[0];
-  if (uncertain) {
-    return result({
-      decision: "insufficient_evidence",
-      selectedCandidateId: null,
-      reasons: [`candidate ${uncertain.candidate.id} has unresolved controlling evidence`],
-      candidateDiagnostics: diagnostics,
-      nextSmallestEvidence: `prove candidate ${uncertain.candidate.id}: ${uncertain.diagnostic.reasons[0]}`,
     });
   }
   if (evaluated.some(({ architectureConflict }) => architectureConflict)) {
@@ -456,6 +456,14 @@ export function recordCccPrdOssReferenceLearning(
   const references = evidence.candidates
     .filter((candidate) => candidate.kind === "reference_only")
     .sort((left, right) => compareCccPrdCodeUnits(left.id, right.id));
+  if (references.length === 0) {
+    return result({
+      decision: "insufficient_evidence",
+      referenceCandidateIds: [],
+      reasons: ["no reference candidates were provided"],
+      nextSmallestEvidence: "provide one pinned reference candidate",
+    });
+  }
   const uncertain = references.find(({ sourceProvenance }) =>
     sourceProvenance.state === "unknown"
     || sourceProvenance.state === "declared"

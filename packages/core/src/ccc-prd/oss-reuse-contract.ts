@@ -162,9 +162,7 @@ function text(value: unknown, path: string): string {
     typeof value !== "string"
     || value.length === 0
     || value !== value.trim()
-    || value.includes("\n")
-    || value.includes("\r")
-    || value.includes("\0")
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(value)
   ) {
     refuse(path, "must be one non-empty trimmed line");
   }
@@ -273,7 +271,7 @@ function cost(value: unknown, path: string): CccPrdOssReuseCostEstimate {
   }
   if (parsed.confidence === "unknown") {
     const numericTotal = parsed.initialAdoptionHours + parsed.adaptationHours
-      + parsed.annualMaintenanceHours + parsed.annualSecurityHours + parsed.horizonYears;
+      + parsed.annualMaintenanceHours + parsed.annualSecurityHours;
     if (numericTotal !== 0 || parsed.evidenceIds.length !== 0) {
       refuse(path, "unknown cost confidence requires zero components and no evidence IDs");
     }
@@ -427,7 +425,11 @@ export function parseCccPrdOssReuseEvidence(
   }
   const reuseKind = oneOf(input.reuseKind, ["application_base", "package_dependency", "reference_only"] as const, "$.reuseKind");
   const requiredCapabilities = stringSet(input.requiredCapabilities, "$.requiredCapabilities", reuseKind === "reference_only");
-  const criticalCapabilities = stringSet(input.criticalCapabilities, "$.criticalCapabilities", reuseKind === "reference_only");
+  const criticalCapabilities = stringSet(
+    input.criticalCapabilities,
+    "$.criticalCapabilities",
+    reuseKind !== "package_dependency",
+  );
   if (criticalCapabilities.some((capability) => !requiredCapabilities.includes(capability))) {
     refuse("$.criticalCapabilities", "must be a subset of requiredCapabilities");
   }

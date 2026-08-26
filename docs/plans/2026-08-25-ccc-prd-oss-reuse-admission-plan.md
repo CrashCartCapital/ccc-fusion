@@ -118,8 +118,11 @@ Implement and prove the design in `docs/plans/2026-08-25-ccc-prd-oss-reuse-admis
 - 2026-08-25 — Task 3 engine REDs: public evaluator, established-project refusal, unknown classification, close-match selection, separate package/reference surfaces, package selection, and reference learning each failed as an executed assertion before implementation. GREEN/REFACTOR: 15 tests passed and `pnpm --filter @fusion/engine typecheck` passed.
 - 2026-08-25 — Task 4 documentation added at `docs/ccc-prd-oss-reuse-admission.md`; combined targeted package commands passed with 8 core tests and 15 engine tests.
 - 2026-08-25 — Task 5 AGY implementation review returned `ACCEPT` and verified all three failure probes. One diagnostics-index finding received a regression RED (`$.candidates[0]` observed instead of original `$.candidates[1]`), then GREEN after validation moved before canonical sorting; import order and defensive package uncertainty ordering were also cleaned up.
-- Task 5 independent Luna implementation review: in progress; effective route proof pending.
-- Task 6 canonical closeout: pending.
+- 2026-08-25 — Task 1 exact artifacts reviewed at SHA-256 `dd0ab656f253c70b976af5f69ed46e18ce305bd38dab77225e615c5a261260d3` (design) and `ca262e1a75c350f32b99949af2a1ec9553b0e25c1c667e60efefce423bc7c552` (plan before this checkpoint-only update).
+- 2026-08-25 — Task 5 independent Luna implementation review completed read-only. Effective Luna route proof remained unavailable and is recorded as `ROUTE_UNAVAILABLE`; no substitute model is claimed. The review found five material contract gaps and one disputed parser-boundary suggestion.
+- 2026-08-25 — AGY `gemini-3.7-flash-high` independently confirmed the five material gaps and rejected duplicate engine-side parsing because the core parser owns the validated typed boundary. Regression RED observed 3 core and 2 engine failures; GREEN/REFACTOR reached 11 core and 18 engine tests, both package typechecks, and both package builds passing. AGY closure returned `ACCEPT` with no material blockers.
+- 2026-08-25 — First `task verify` completed with nonzero status from unrelated load-sensitive tests: one core PostgreSQL readiness timing assertion, one engine real-Git process-reaping timing assertion, and six CLI 5-second timeouts. Isolated reruns passed: core 12 active tests, engine 39 tests, CLI route-policy 13 tests, and CLI PRD 51 tests. No temp leaks or live `.fusion` mutations were detected by the gate.
+- Task 6 canonical closeout: `task ci`, final diff/R1 overlap review, commit, and cleanliness proof pending.
 
 ## Remaining Risks
 

@@ -40,6 +40,25 @@ function cost(input: {
   };
 }
 
+function unknownCost(horizonYears = 2) {
+  const projection = {
+    initialAdoptionHours: 0,
+    adaptationHours: 0,
+    annualMaintenanceHours: 0,
+    annualSecurityHours: 0,
+    horizonYears,
+    totalOwnershipHours: 0,
+    confidence: "unknown",
+    evidenceIds: [] as string[],
+  };
+  return {
+    ...projection,
+    receiptSha256: createHash("sha256")
+      .update(canonicalCccPrdJson(projection), "utf8")
+      .digest("hex"),
+  };
+}
+
 function applicationEvidence(): Record<string, unknown> {
   return {
     schema: "ccc-prd.oss-reuse-evidence.v1",
@@ -115,6 +134,44 @@ describe("CCC PRD open-source reuse evidence contract", () => {
     expect(Object.isFrozen(parsed)).toBe(true);
     expect(Object.isFrozen(parsed.candidates)).toBe(true);
     expect(Object.isFrozen(parsed.candidates[0])).toBe(true);
+  });
+
+  it("allows an unknown candidate cost to share the packet planning horizon", () => {
+    const evidence = applicationEvidence();
+    const candidate = (evidence.candidates as Array<Record<string, unknown>>)[0];
+    candidate.baseOwnershipCost = unknownCost(2);
+
+    const parsed = ccc.parseCccPrdOssReuseEvidence(evidence) as {
+      candidates: readonly [{ baseOwnershipCost: { confidence: string; horizonYears: number } }];
+    };
+
+    expect(parsed.candidates[0].baseOwnershipCost).toMatchObject({
+      confidence: "unknown",
+      horizonYears: 2,
+    });
+  });
+
+  it("allows an application-base packet with no critical capabilities", () => {
+    const evidence = applicationEvidence();
+    evidence.criticalCapabilities = [];
+
+    const parsed = ccc.parseCccPrdOssReuseEvidence(evidence) as {
+      criticalCapabilities: readonly string[];
+    };
+
+    expect(parsed.criticalCapabilities).toEqual([]);
+  });
+
+  it("rejects control characters before identifiers can enter diagnostics", () => {
+    const evidence = applicationEvidence();
+    const candidate = (evidence.candidates as Array<Record<string, unknown>>)[0];
+    candidate.id = "candidate-\u001b[31m";
+
+    expect(() => ccc.parseCccPrdOssReuseEvidence(evidence)).toThrowError(
+      expect.objectContaining({
+        message: expect.stringContaining("$.candidates[0].id"),
+      }),
+    );
   });
 
   it("rejects unknown fields with the exact object path", () => {

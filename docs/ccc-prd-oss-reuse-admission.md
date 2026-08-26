@@ -24,7 +24,7 @@ Reuse does not win merely because a repository exists or is popular. A code-reus
 
 The parser accepts exact keys, canonicalizes set-like arrays, rejects duplicate identities and invalid relationships, verifies SHA-256 cost receipts, recomputes ownership totals, enforces a shared comparison horizon, limits the canonical packet to 1 MiB, and deeply freezes the normalized result. Structural failures throw `CccPrdOssReuseContractError` with `CCC_PRD_OSS_REUSE_EVIDENCE_INVALID` and the failing JSON path.
 
-`@fusion/engine` exports three separate pure decisions:
+Call the core parser before evaluation. `@fusion/engine` accepts the parser's validated, normalized evidence type rather than arbitrary runtime JSON and exports three separate pure decisions:
 
 - `evaluateCccPrdOssReuseAdmission` for full application bases, returning `close_match_fork`, `partial_match_fork`, `scratch_build`, `rejected`, or `insufficient_evidence`.
 - `selectCccPrdOssPackage` for one bounded package, returning `package_selected`, `scratch_build`, `rejected`, or `insufficient_evidence`.
@@ -57,4 +57,3 @@ Cost receipts contain initial adoption, adaptation, yearly maintenance, yearly s
 ## What This Does Not Prove
 
 This is not installed or runtime-loaded behavior. It has not searched GitHub, selected a real repository, performed a legal review, scanned or executed third-party source, run a sandbox pilot, created a fork, modified a PRD import, or affected a live campaign. Later work may add provider-neutral discovery adapters and disposable sandbox pilots, but those adapters must preserve this contract and receive their own safety, permission, and verification review.
-

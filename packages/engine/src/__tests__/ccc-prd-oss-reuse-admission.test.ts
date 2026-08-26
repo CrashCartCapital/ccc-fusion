@@ -44,6 +44,25 @@ function cost(input: {
   };
 }
 
+function unknownCost(horizonYears = 2) {
+  const projection = {
+    initialAdoptionHours: 0,
+    adaptationHours: 0,
+    annualMaintenanceHours: 0,
+    annualSecurityHours: 0,
+    horizonYears,
+    totalOwnershipHours: 0,
+    confidence: "unknown",
+    evidenceIds: [] as string[],
+  };
+  return {
+    ...projection,
+    receiptSha256: createHash("sha256")
+      .update(canonicalCccPrdJson(projection), "utf8")
+      .digest("hex"),
+  };
+}
+
 function rawApplicationEvidence(): Record<string, any> {
   return {
     schema: "ccc-prd.oss-reuse-evidence.v1",
@@ -206,6 +225,22 @@ describe("CCC PRD open-source reuse admission", () => {
     });
   });
 
+  it("reports an unknown package gate before an unknown scratch cost", () => {
+    const selection = engine.selectCccPrdOssPackage(packageEvidence((raw) => {
+      raw.scratchCost = unknownCost();
+      raw.candidates[0].gates.sourceProvenance = {
+        state: "unknown",
+        outcome: "unknown",
+      };
+    }));
+
+    expect(selection).toMatchObject({
+      decision: "insufficient_evidence",
+      nextSmallestEvidence:
+        "prove candidate candidate-a: sourceProvenance evidence is unknown",
+    });
+  });
+
   it("records pinned reference learning without granting code-reuse admission", () => {
     const evidence = referenceEvidence();
     const learning = engine.recordCccPrdOssReferenceLearning(evidence);
@@ -222,6 +257,19 @@ describe("CCC PRD open-source reuse admission", () => {
     expect(engine.selectCccPrdOssPackage(evidence).decision).toBe(
       "insufficient_evidence",
     );
+  });
+
+  it("does not report reference learning success when no reference was provided", () => {
+    const learning = engine.recordCccPrdOssReferenceLearning(referenceEvidence((raw) => {
+      raw.candidates = [];
+    }));
+
+    expect(learning).toMatchObject({
+      decision: "insufficient_evidence",
+      referenceCandidateIds: [],
+      reasons: ["no reference candidates were provided"],
+      nextSmallestEvidence: "provide one pinned reference candidate",
+    });
   });
 
   it("does not record reference learning from merely declared source provenance", () => {
@@ -294,6 +342,20 @@ describe("CCC PRD open-source reuse admission", () => {
       decision: "insufficient_evidence",
       selectedCandidateId: null,
       nextSmallestEvidence: "prove candidate candidate-a: staticSafety evidence is unknown",
+    });
+  });
+
+  it("reports an unknown candidate gate before an unknown scratch cost", () => {
+    const recommendation = engine.evaluateCccPrdOssReuseAdmission(
+      applicationEvidence((raw) => {
+        raw.scratchCost = unknownCost();
+        raw.candidates[0].gates.license = { state: "unknown", outcome: "unknown" };
+      }),
+    );
+
+    expect(recommendation).toMatchObject({
+      decision: "insufficient_evidence",
+      nextSmallestEvidence: "prove candidate candidate-a: license evidence is unknown",
     });
   });
 
