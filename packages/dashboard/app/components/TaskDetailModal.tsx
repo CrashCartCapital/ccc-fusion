@@ -1411,6 +1411,7 @@ export function TaskDetailContent({
   // Load the CLI agent session for this task (drives the terminal tab + matrix).
   useEffect(() => {
     let cancelled = false;
+    setCliSession(null);
     const search = new URLSearchParams({ taskId: task.id });
     if (projectId) search.set("projectId", projectId);
     void api<{ sessions: CliSessionSummaryRecord[] }>(`/cli-sessions?${search.toString()}`)

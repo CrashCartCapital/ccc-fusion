@@ -1869,6 +1869,10 @@ describe("ChatView mobile behavior", () => {
         },
       });
 
+      await waitFor(() => {
+        expect(scrollTopValue).toBe(2000);
+      });
+
       fireEvent.scroll(messagesContainer);
       scrollHeightValue = 2400;
 

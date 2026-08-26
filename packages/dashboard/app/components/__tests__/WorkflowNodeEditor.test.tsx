@@ -4334,12 +4334,14 @@ describe("WorkflowNodeEditor simplified view modes", () => {
     vi.mocked(updateWorkflow).mockImplementation(async (_id, updates) => ({ ...def(), ...(updates as object) }));
     render(<WorkflowNodeEditor isOpen onClose={() => {}} addToast={() => {}} />);
     await screen.findByTestId("wf-simple-canvas");
+    await screen.findByTestId("wf-simple-node-end");
 
     // def() has a single edge into end, so the toolbar add targets that edge.
     fireEvent.click(screen.getByTestId("wf-simple-toolbar-add-step"));
     const dialog = await screen.findByTestId("wf-add-step-modal");
     fireEvent.click(within(dialog).getByTestId("wf-add-step-fragment-WF-FRAG"));
     await waitFor(() => expect(screen.queryByTestId("wf-add-step-modal")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByTestId("wf-simple-node-gate")).toHaveLength(2));
 
     // Save and inspect the serialized IR: merge no longer feeds end directly;
     // the fragment's lint gate sits between them.

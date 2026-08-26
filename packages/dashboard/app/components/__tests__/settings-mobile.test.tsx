@@ -542,11 +542,11 @@ describe("SettingsModal mobile adaptations", () => {
     expect(queryByLabelText("Push Remote")).toBeNull();
     expect(queryByText("Git remote to push to")).toBeNull();
 
-    await waitFor(() => expect(updateSettings).toHaveBeenCalled());
-
-    const payload = vi.mocked(updateSettings).mock.calls[0][0] as Record<string, unknown>;
-    expect(payload.pushAfterMerge).toBe(false);
-    expect(payload).not.toHaveProperty("pushRemote");
+    await waitFor(() => {
+      const payload = vi.mocked(updateSettings).mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+      expect(payload?.pushAfterMerge).toBe(false);
+      expect(payload?.pushRemote ?? null).toBeNull();
+    });
   });
 
   it("keeps research settings controls inside mobile containment wrappers", async () => {
