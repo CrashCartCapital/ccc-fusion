@@ -122,7 +122,9 @@ Implement and prove the design in `docs/plans/2026-08-25-ccc-prd-oss-reuse-admis
 - 2026-08-25 — Task 5 independent Luna implementation review completed read-only. Effective Luna route proof remained unavailable and is recorded as `ROUTE_UNAVAILABLE`; no substitute model is claimed. The review found five material contract gaps and one disputed parser-boundary suggestion.
 - 2026-08-25 — AGY `gemini-3.7-flash-high` independently confirmed the five material gaps and rejected duplicate engine-side parsing because the core parser owns the validated typed boundary. Regression RED observed 3 core and 2 engine failures; GREEN/REFACTOR reached 11 core and 18 engine tests, both package typechecks, and both package builds passing. AGY closure returned `ACCEPT` with no material blockers.
 - 2026-08-25 — First `task verify` completed with nonzero status from unrelated load-sensitive tests: one core PostgreSQL readiness timing assertion, one engine real-Git process-reaping timing assertion, and six CLI 5-second timeouts. Isolated reruns passed: core 12 active tests, engine 39 tests, CLI route-policy 13 tests, and CLI PRD 51 tests. No temp leaks or live `.fusion` mutations were detected by the gate.
-- Task 6 canonical closeout: `task ci`, final diff/R1 overlap review, commit, and cleanliness proof pending.
+- 2026-08-25 — `task ci` passed on implementation commit `b13f94f1e`: lint, changeset and route checks, full workspace typecheck/build, boot smoke, engine/core gates, CCC-PRD safety, PostgreSQL gate, and CI-shape proof all passed. One non-failing regex lint warning was removed in the following refactor checkpoint.
+- 2026-08-25 — R1 advanced from the common baseline through `400a8c332`, `4b446f244`, and `bc571db39`, changing only embedded PostgreSQL lifecycle/test paths. Exact changed-path comparison found no overlap with this branch. The R1 worktree's owned `.opencode/` and `.scratch/` state remained untouched.
+- Task 6 canonical closeout: final `task verify` retry, final-tree `task ci`, diff review, commit, and cleanliness proof pending.
 
 ## Remaining Risks
 

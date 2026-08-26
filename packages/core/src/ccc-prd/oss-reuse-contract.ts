@@ -157,12 +157,23 @@ function exactKeys(
   }
 }
 
+function containsControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (
+      codePoint !== undefined
+      && (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f))
+    ) return true;
+  }
+  return false;
+}
+
 function text(value: unknown, path: string): string {
   if (
     typeof value !== "string"
     || value.length === 0
     || value !== value.trim()
-    || /[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    || containsControlCharacter(value)
   ) {
     refuse(path, "must be one non-empty trimmed line");
   }
