@@ -142,6 +142,28 @@ describe("CCC PRD open-source reuse evidence contract", () => {
     );
   });
 
+  it("reports the caller's original candidate index before canonical sorting", () => {
+    const evidence = applicationEvidence();
+    const first = (evidence.candidates as Array<Record<string, any>>)[0];
+    first.id = "candidate-z";
+    const invalid = structuredClone(first);
+    invalid.id = "candidate-a";
+    invalid.coveredCapabilities = ["not-required"];
+    invalid.baseOwnershipCost = cost({
+      initialAdoptionHours: 20,
+      annualMaintenanceHours: 5,
+      annualSecurityHours: 2,
+      evidenceIds: ["EVIDENCE-INVALID"],
+    });
+    (evidence.candidates as Array<Record<string, unknown>>).push(invalid);
+
+    expect(() => ccc.parseCccPrdOssReuseEvidence(evidence)).toThrowError(
+      expect.objectContaining({
+        message: expect.stringContaining("$.candidates[1].coveredCapabilities"),
+      }),
+    );
+  });
+
   it("requires package reuse to name exactly one matching bounded capability", () => {
     const evidence = applicationEvidence();
     evidence.reuseKind = "package_dependency";

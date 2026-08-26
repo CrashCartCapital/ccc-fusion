@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "./contract.js";
+
 export const CCC_PRD_OSS_REUSE_EVIDENCE_SCHEMA_VERSION =
   "ccc-prd.oss-reuse-evidence.v1" as const;
 
@@ -454,24 +457,29 @@ export function parseCccPrdOssReuseEvidence(
     negativeControl: oneOf(discoveryInput.negativeControl, EVIDENCE_OUTCOMES, "$.discovery.negativeControl"),
   };
   if (!Array.isArray(input.candidates)) refuse("$.candidates", "must be an array");
-  const candidates = input.candidates.map((entry, index) => candidate(entry, `$.candidates[${index}]`));
-  const candidateIds = candidates.map(({ id }) => id);
+  const candidateEntries = input.candidates.map((entry, index) => ({
+    candidate: candidate(entry, `$.candidates[${index}]`),
+    originalIndex: index,
+  }));
+  const candidateIds = candidateEntries.map(({ candidate: entry }) => entry.id);
   if (new Set(candidateIds).size !== candidateIds.length) refuse("$.candidates", "candidate IDs must be unique");
-  candidates.sort((left, right) => compareCccPrdCodeUnits(left.id, right.id));
-  for (const [index, entry] of candidates.entries()) {
-    if (entry.kind !== reuseKind) refuse(`$.candidates[${index}].kind`, `must match reuseKind ${reuseKind}`);
+  for (const { candidate: entry, originalIndex } of candidateEntries) {
+    if (entry.kind !== reuseKind) refuse(`$.candidates[${originalIndex}].kind`, `must match reuseKind ${reuseKind}`);
     if (entry.kind !== "reference_only" && entry.coveredCapabilities.some((item) => !requiredCapabilities.includes(item))) {
-      refuse(`$.candidates[${index}].coveredCapabilities`, "must be a subset of requiredCapabilities");
+      refuse(`$.candidates[${originalIndex}].coveredCapabilities`, "must be a subset of requiredCapabilities");
     }
   }
+  const candidates = candidateEntries
+    .map(({ candidate: entry }) => entry)
+    .sort((left, right) => compareCccPrdCodeUnits(left.id, right.id));
   const scratchCost = input.scratchCost === null ? null : cost(input.scratchCost, "$.scratchCost");
   if (reuseKind === "reference_only") {
     if (scratchCost !== null) refuse("$.scratchCost", "must be null for reference-only evidence");
   } else {
     if (!scratchCost) refuse("$.scratchCost", "must be present for code reuse");
-    for (const [index, entry] of candidates.entries()) {
+    for (const { candidate: entry, originalIndex } of candidateEntries) {
       if (entry.kind !== "reference_only" && entry.baseOwnershipCost.horizonYears !== scratchCost.horizonYears) {
-        refuse(`$.candidates[${index}].baseOwnershipCost.horizonYears`, "must match scratchCost.horizonYears");
+        refuse(`$.candidates[${originalIndex}].baseOwnershipCost.horizonYears`, "must match scratchCost.horizonYears");
       }
     }
   }
@@ -509,5 +517,3 @@ export function computeCccPrdOssReuseEvidenceSha256(
 ): string {
   return sha256(canonicalizeCccPrdOssReuseEvidence(evidence));
 }
-import { createHash } from "node:crypto";
-import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "./contract.js";
