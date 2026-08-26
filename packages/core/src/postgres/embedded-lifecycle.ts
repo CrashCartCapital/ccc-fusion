@@ -147,6 +147,34 @@ function getStagedEmbeddedPgBundlePath(): string | null {
   return stagedEmbeddedPgBundleCache;
 }
 
+type ProcessEventName = string | symbol;
+type ProcessListenerSnapshot = Map<ProcessEventName, Function[]>;
+
+function snapshotProcessListeners(): ProcessListenerSnapshot {
+  return new Map(
+    process.eventNames().map((eventName) => [eventName, process.rawListeners(eventName)]),
+  );
+}
+
+function removeProcessListenersAddedSince(before: ProcessListenerSnapshot): void {
+  const after = new Map(
+    process.eventNames().map((eventName) => [eventName, process.rawListeners(eventName)]),
+  );
+
+  for (const [eventName, listeners] of after) {
+    const unmatchedBefore = [...(before.get(eventName) ?? [])];
+    for (let index = listeners.length - 1; index >= 0; index -= 1) {
+      const listener = listeners[index]!;
+      const beforeIndex = unmatchedBefore.lastIndexOf(listener);
+      if (beforeIndex >= 0) {
+        unmatchedBefore.splice(beforeIndex, 1);
+        continue;
+      }
+      process.removeListener(eventName, listener as (...args: unknown[]) => void);
+    }
+  }
+}
+
 /**
  * require("embedded-postgres") with the staged-standalone fallback (loaded by
  * absolute path — the only require form a compiled bun binary can resolve
@@ -155,13 +183,13 @@ function getStagedEmbeddedPgBundlePath(): string | null {
 function requireEmbeddedPostgresModule(): unknown {
   /*
    * embedded-postgres installs async-exit-hook at module evaluation time.
-   * That dependency's beforeExit listener always calls process.exit(0), which
-   * overwrites a caller's non-zero process.exitCode after an otherwise clean
-   * embedded-cluster shutdown. Fusion owns shutdown through this lifecycle's
-   * exact-instance hook, so retain every pre-existing listener and remove only
-   * listeners synchronously added while evaluating the dependency.
+   * Its async-exit-hook listeners duplicate Fusion's exact-instance shutdown
+   * custody; the dependency's `exit` listener also invokes an async callback
+   * without the required completion argument. Retain every pre-existing
+   * listener and remove only listeners synchronously added while evaluating
+   * the dependency.
    */
-  const beforeExitListeners = new Set(process.rawListeners("beforeExit"));
+  const listenersBeforeRequire = snapshotProcessListeners();
   try {
     return require("embedded-postgres");
   } catch (primaryError) {
@@ -175,11 +203,7 @@ function requireEmbeddedPostgresModule(): unknown {
     }
     throw primaryError;
   } finally {
-    for (const listener of process.rawListeners("beforeExit")) {
-      if (!beforeExitListeners.has(listener)) {
-        process.removeListener("beforeExit", listener);
-      }
-    }
+    removeProcessListenersAddedSince(listenersBeforeRequire);
   }
 }
 
@@ -1040,18 +1064,34 @@ const runningInstances = new Map<string, { port: number; database: string }>();
  * Returns null if the file cannot be read or parsed.
  */
 export function readPortFromPostmasterPid(dataDir: string): number | null {
+  return readPostmasterPidSnapshot(dataDir)?.port ?? null;
+}
+
+interface PostmasterPidSnapshot {
+  raw: string;
+  pid: number;
+  port: number;
+}
+
+function readPostmasterPidSnapshot(dataDir: string): PostmasterPidSnapshot | null {
   try {
-    const content = readFileSync(join(dataDir, "postmaster.pid"), "utf-8");
-    const lines = content.split("\n");
-    // Line 4 (index 3) is the TCP port in standard PostgreSQL postmaster.pid.
-    const portStr = lines[3]?.trim();
-    if (portStr) {
-      const port = parseInt(portStr, 10);
-      if (!isNaN(port) && port > 0) return port;
-    }
-    return null;
+    const raw = readFileSync(join(dataDir, "postmaster.pid"), "utf-8");
+    const lines = raw.split("\n");
+    const pid = Number(lines[0]?.trim());
+    const port = Number(lines[3]?.trim());
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port <= 0) return null;
+    return { raw, pid, port };
   } catch {
     return null;
+  }
+}
+
+function isRecordedProcessAbsent(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
   }
 }
 
@@ -1109,12 +1149,10 @@ export function isClusterStartingUpError(error: unknown): boolean {
 
 /**
  * FNXC:PostgresEmbedded 2026-07-23-10:40:
- * Superset used only by the OWNED start's readiness wait: an owned postmaster
- * that was just launched may also be in its pre-listen window, so socket-level
- * connect failures are retryable there too. The JOIN path deliberately does NOT
- * retry socket errors — a stale pid file from a crash resolves to a dead port,
- * and the optimistic-join contract (resolve the URL, let the connection layer
- * report it) must stay instant for that case.
+ * Superset used by the OWNED start readiness wait and by joined-instance
+ * verification: socket-level failures can mean a real postmaster is in its
+ * pre-listen window, but if they persist through the bounded join wait, startup
+ * must fail instead of returning an unreachable URL.
  */
 export function isClusterNotYetAcceptingError(error: unknown): boolean {
   if (isClusterStartingUpError(error)) return true;
@@ -1133,8 +1171,8 @@ const CLUSTER_ACCEPTING_POLL_MS = 500;
  * Bounded wait a JOINER gives a starting/recovering instance before falling
  * back to the historical best-effort optimistic join. Recovery on the reported
  * cluster completes in ~1s once the .pgrunner fsync stall is gone; 15s covers
- * modest WAL replay without turning a stale-pid join into a long hang (the
- * startup-factory retry layer bounds the rest).
+ * modest WAL replay without turning an ambiguous joined endpoint into a long
+ * hang (the startup-factory retry layer bounds the rest).
  */
 const JOINED_INSTANCE_RECOVERY_WAIT_MS = 15_000;
 
@@ -1158,11 +1196,13 @@ function waitForPostmasterPidReread(): Promise<void> {
  * Resolve an instance another lifecycle/process already owns.
  *
  * FNXC:PostgresEmbedded 2026-07-21-10:00:
- * A present `postmaster.pid` is a live-lock signal, not permission to launch a
- * second postmaster. PostgreSQL can write it while a joiner reads, so retry a
- * small bounded number of times; if its port remains unreadable, fail closed
- * instead of turning parser-null into the double-boot collision that exhausts
- * extension TaskStore's caller budget.
+ * A present `postmaster.pid` is normally a live-lock signal, not permission to
+ * launch a second postmaster. A stable snapshot whose exact PID is absent is
+ * the one exception: enter the normal owned-start path without mutating the
+ * file and let PostgreSQL itself arbitrate/reconcile its lock. PostgreSQL can
+ * rewrite the file while a joiner reads, so every decision shares this small
+ * bounded retry budget; malformed, changing, EPERM, and otherwise ambiguous
+ * ownership all fail closed.
  */
 async function isAlreadyRunning(dataDir: string): Promise<{ port: number; database: string } | null> {
   // Check in-process registry first.
@@ -1172,17 +1212,33 @@ async function isAlreadyRunning(dataDir: string): Promise<{ port: number; databa
   const pidPath = join(dataDir, "postmaster.pid");
   if (!existsSync(pidPath)) return null;
 
+  let sawChangingSnapshot = false;
   for (let attempt = 0; attempt < POSTMASTER_PID_READ_ATTEMPTS; attempt += 1) {
-    const port = readPortFromPostmasterPid(dataDir);
-    if (port) {
-      // Probe: can we connect to this port? We return it optimistically; the
-      // connection layer reports a stale-but-parseable pid without a second start.
-      return { port, database: "fusion" };
+    const snapshot = readPostmasterPidSnapshot(dataDir);
+    if (snapshot) {
+      if (!isRecordedProcessAbsent(snapshot.pid)) {
+        return { port: snapshot.port, database: "fusion" };
+      }
+
+      const confirmed = readPostmasterPidSnapshot(dataDir);
+      if (!confirmed && !existsSync(pidPath)) return null;
+      if (!confirmed || confirmed.raw !== snapshot.raw) {
+        sawChangingSnapshot = true;
+      } else if (isRecordedProcessAbsent(confirmed.pid)) {
+        return null;
+      } else {
+        return { port: confirmed.port, database: "fusion" };
+      }
     }
     if (!existsSync(pidPath)) return null;
     if (attempt < POSTMASTER_PID_READ_ATTEMPTS - 1) await waitForPostmasterPidReread();
   }
 
+  if (sawChangingSnapshot) {
+    throw new Error(
+      `embedded postgres: postmaster.pid changed while ownership was checked after ${POSTMASTER_PID_READ_ATTEMPTS} attempts; a second postmaster will not be started (data dir ${dataDir})`,
+    );
+  }
   throw new Error(
     `embedded postgres: postmaster.pid is present but its port could not be read after ${POSTMASTER_PID_READ_ATTEMPTS} attempts; a second postmaster will not be started (data dir ${dataDir})`,
   );
@@ -1802,11 +1858,9 @@ export class EmbeddedPostgresLifecycle {
    * both this path and the owner's `ensureDatabase` tolerate `42P04`, so whoever loses the
    * race treats the winner's database as its own success.
    *
-   * Best-effort by contract. `isAlreadyRunning` joins optimistically without probing (a stale
-   * pid file from a crash still resolves to a port), so a probe failure must leave that
-   * behavior exactly as it was — report it and return the URL, letting the connection layer
-   * surface an unreachable cluster as it always has. Never convert an optimistic join into a
-   * hard startup failure.
+   * A joined URL is only useful if the joined instance accepts the database verification.
+   * Retry transient startup/recovery/socket failures within the bounded recovery window, then
+   * fail instead of returning a dead URL that makes startup look successful.
    */
   private async ensureJoinedDatabase(port: number): Promise<void> {
     /*
@@ -1814,10 +1868,9 @@ export class EmbeddedPostgresLifecycle {
     Issue #2411 (beta.4 follow-up): a joined instance can be mid crash-recovery,
     where PostgreSQL listens but rejects every connection with 57P03. A one-shot
     verify turned that transient state into the "could not verify database on
-    joined instance" give-up path. Retry the RECOVERY signal (57P03 only) within
-    a bounded window; socket-level failures (dead stale-pid port) keep the
-    historical instant best-effort optimistic join (resolve the URL and let the
-    connection layer report the unreachable cluster).
+    joined instance" give-up path. Retry recovery and socket-level not-ready
+    signals within a bounded window, then fail closed if the endpoint never
+    proves usable.
     */
     const deadline = Date.now() + JOINED_INSTANCE_RECOVERY_WAIT_MS;
     let announced = false;
@@ -1826,7 +1879,7 @@ export class EmbeddedPostgresLifecycle {
         await this.createDatabaseIfMissing(port);
         return;
       } catch (error) {
-        if (isClusterStartingUpError(error) && Date.now() < deadline) {
+        if (isClusterNotYetAcceptingError(error) && Date.now() < deadline) {
           if (!announced) {
             announced = true;
             this.options.onLog(
@@ -1836,10 +1889,10 @@ export class EmbeddedPostgresLifecycle {
           await new Promise<void>((resolve) => setTimeout(resolve, CLUSTER_ACCEPTING_POLL_MS));
           continue;
         }
-        this.options.onLog(
-          `embedded postgres: could not verify database "${this.options.database}" on joined instance at port ${port} (${error instanceof Error ? error.message : String(error)}); continuing — the connection layer will report an unreachable cluster`,
+        throw new Error(
+          `embedded postgres: joined instance at port ${port} did not accept connections for database "${this.options.database}"; startup will not return an unreachable URL. Last error: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
-        return;
       }
     }
   }

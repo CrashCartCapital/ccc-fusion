@@ -15,6 +15,7 @@
  */
 
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { spawn } from "node:child_process";
 import {
   mkdtempSync,
   existsSync,
@@ -58,6 +59,8 @@ import {
 } from "../../postgres/embedded-lifecycle.js";
 
 const testRequire = createRequire(import.meta.url);
+const tsxPackageJsonPath = testRequire.resolve("tsx/package.json");
+const tsxCliPath = join(tsxPackageJsonPath, "..", "dist", "cli.mjs");
 
 const SKIP = process.env.FUSION_EMBEDDED_TEST_SKIP === "1";
 const embeddedDescribe = SKIP ? describe.skip : describe;
@@ -792,6 +795,61 @@ embeddedDescribe("embedded-lifecycle: real process (VAL-CONN-001, VAL-CONN-006, 
     REAL_PROCESS_TEST_TIMEOUT_MS,
   );
 
+  it.skipIf(process.platform === "win32")(
+    "restarts the same data directory after its exact owned postmaster is killed",
+    async () => {
+      const dataDir = makeDataDir();
+      const first = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
+      let second: EmbeddedPostgresLifecycle | null = null;
+
+      try {
+        await first.start();
+        const pidPath = join(dataDir, "postmaster.pid");
+        const staleBytes = readFileSync(pidPath, "utf8");
+        const firstPid = Number(staleBytes.split("\n")[0]?.trim());
+        expect(Number.isInteger(firstPid) && firstPid > 0).toBe(true);
+
+        // This is the exact child owned by this disposable lifecycle and data dir.
+        process.kill(firstPid, "SIGKILL");
+        const deadline = Date.now() + 5_000;
+        for (;;) {
+          try {
+            process.kill(firstPid, 0);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+            throw error;
+          }
+          if (Date.now() >= deadline) throw new Error(`owned postmaster ${firstPid} did not exit`);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+
+        first.detachWithoutStop();
+        expect(readFileSync(pidPath, "utf8")).toBe(staleBytes);
+
+        second = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
+        await second.start();
+        expect(second.getOwnsProcess()).toBe(true);
+
+        const secondPid = Number(readFileSync(pidPath, "utf8").split("\n")[0]?.trim());
+        expect(secondPid).toBeGreaterThan(0);
+        expect(secondPid).not.toBe(firstPid);
+
+        const sql = postgres(second.getConnectionUrl(), { max: 1 });
+        try {
+          const rows = await sql`SELECT current_database() AS db`;
+          expect(rows[0].db).toBe("fusion");
+        } finally {
+          await sql.end({ timeout: 5 });
+        }
+      } finally {
+        first.detachWithoutStop();
+        if (second) await second.stop().catch(() => undefined);
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    },
+    REAL_PROCESS_TEST_TIMEOUT_MS,
+  );
+
   it(
     "start reports already-initialized reuse via the log when the dir exists",
     async () => {
@@ -837,7 +895,7 @@ describe("embedded-lifecycle: startup race (cross-process)", () => {
       async start() {
         writeFileSync(
           join(dataDir, "postmaster.pid"),
-          ["12345", dataDir, String(Date.now()), "55440", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+          [String(process.pid), dataDir, String(Date.now()), "55440", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
         );
         throw new Error('lock file "postmaster.pid" already exists');
       }
@@ -845,6 +903,9 @@ describe("embedded-lifecycle: startup race (cross-process)", () => {
     }
 
     __setEmbeddedPostgresCtorForTests(RacingEmbeddedPostgres as never);
+    const ensureJoinedDatabase = vi
+      .spyOn(EmbeddedPostgresLifecycle.prototype, "ensureJoinedDatabase")
+      .mockResolvedValue(undefined);
     try {
       const lifecycle = new EmbeddedPostgresLifecycle({
         ...baseOptions(dataDir),
@@ -859,6 +920,7 @@ describe("embedded-lifecycle: startup race (cross-process)", () => {
       expect(lifecycle.isRunning()).toBe(false);
       expect(logLines.some((line) => /startup raced with an existing instance/i.test(line))).toBe(true);
     } finally {
+      ensureJoinedDatabase.mockRestore();
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
@@ -869,11 +931,8 @@ FNXC:PostgresStartupRace 2026-07-15-20:45:
 Mocked ctor, no real Postgres — kept outside the real-process block so it runs under the
 gate/CI default (see the sibling startup-race block for why that placement matters).
 
-Pins the best-effort half of the join-path database verify: `isAlreadyRunning` joins
-optimistically without probing (a stale pid file from a crash still resolves to a port), so an
-unreachable joined instance must return the URL exactly as it did before the verify existed and
-let the connection layer report it. A hard throw here would turn every stale-pid start into a
-startup failure.
+The lock-collision tests below verify routing into the join path. Separate join-verification tests
+own whether the joined endpoint is usable or must fail before returning a URL.
 */
 /*
 FNXC:PostgresStartupRace 2026-07-15-21:10:
@@ -920,7 +979,7 @@ describe("embedded-lifecycle: startup race only joins on a lock collision", () =
       async start() {
         writeFileSync(
           join(dataDir, "postmaster.pid"),
-          ["12345", dataDir, String(Date.now()), "55444", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+          [String(process.pid), dataDir, String(Date.now()), "55444", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
         );
         throw new Error('lock file "postmaster.pid" already exists');
       }
@@ -928,6 +987,9 @@ describe("embedded-lifecycle: startup race only joins on a lock collision", () =
     }
 
     __setEmbeddedPostgresCtorForTests(RacingEmbeddedPostgres as never);
+    const ensureJoinedDatabase = vi
+      .spyOn(EmbeddedPostgresLifecycle.prototype, "ensureJoinedDatabase")
+      .mockResolvedValue(undefined);
     try {
       const lifecycle = new EmbeddedPostgresLifecycle({ ...baseOptions(dataDir), port: 55445 });
 
@@ -935,21 +997,30 @@ describe("embedded-lifecycle: startup race only joins on a lock collision", () =
         runtimeUrl: expect.stringContaining(":55444/"),
       });
     } finally {
+      ensureJoinedDatabase.mockRestore();
       rmSync(dataDir, { recursive: true, force: true });
     }
   });
 });
 
 describe("embedded-lifecycle: join-path database verify is best-effort", () => {
-  it("still resolves optimistically when the joined instance is unreachable", async () => {
+  it("does not resolve a live-pid join when the recorded database port stays unreachable", async () => {
+    vi.useFakeTimers();
     const dataDir = makeDataDir();
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
-    // A port nothing is listening on: the verify's probe cannot succeed.
     writeFileSync(
       join(dataDir, "postmaster.pid"),
-      ["12345", dataDir, String(Date.now()), "55441", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+      [String(process.pid), dataDir, String(Date.now()), "55441", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
     );
     const logLines: string[] = [];
+    const createDatabaseIfMissing = vi
+      .spyOn(
+        EmbeddedPostgresLifecycle.prototype as unknown as {
+          createDatabaseIfMissing: (port: number) => Promise<void>;
+        },
+        "createDatabaseIfMissing",
+      )
+      .mockRejectedValue(Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:55441"), { code: "ECONNREFUSED" }));
 
     try {
       const lifecycle = new EmbeddedPostgresLifecycle({
@@ -957,15 +1028,86 @@ describe("embedded-lifecycle: join-path database verify is best-effort", () => {
         onLog: (message) => logLines.push(message),
       });
 
-      await expect(lifecycle.start()).resolves.toMatchObject({
-        mode: "embedded",
-        runtimeUrl: expect.stringContaining(":55441/"),
+      const start = expect(lifecycle.start()).rejects.toThrow(
+        /joined instance at port 55441 did not accept connections/i,
+      );
+      await vi.advanceTimersByTimeAsync(16_000);
+      await start;
+      expect(createDatabaseIfMissing).toHaveBeenCalled();
+      expect(logLines.some((line) => /could not verify database/i.test(line))).toBe(false);
+    } finally {
+      createDatabaseIfMissing.mockRestore();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("starts an owned instance when a stable postmaster pid is provably dead", async () => {
+    const dataDir = makeDataDir();
+    writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
+    const deadPid = 999_999_999;
+    try {
+      process.kill(deadPid, 0);
+      throw new Error(`test requires absent pid ${deadPid}`);
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
+    }
+
+    const pidPath = join(dataDir, "postmaster.pid");
+    const staleBytes =
+      [String(deadPid), dataDir, String(Date.now()), "55441", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n";
+    writeFileSync(pidPath, staleBytes);
+    const reachedOwnedStart = new Error("mock owned start reached");
+    const ctor = vi.fn();
+    class RecordingEmbeddedPostgres {
+      constructor() {
+        ctor();
+      }
+      initialise = vi.fn(async () => {});
+      start = vi.fn(async () => {
+        throw reachedOwnedStart;
       });
-      expect(lifecycle.isRunning()).toBe(false);
-      expect(logLines.some((line) => /could not verify database/i.test(line))).toBe(true);
+      stop = vi.fn(async () => {});
+    }
+    __setEmbeddedPostgresCtorForTests(RecordingEmbeddedPostgres as never);
+
+    try {
+      const lifecycle = new EmbeddedPostgresLifecycle({
+        ...baseOptions(dataDir),
+        startTimeoutMs: 0,
+      });
+
+      await expect(lifecycle.start()).rejects.toBe(reachedOwnedStart);
+      expect(ctor).toHaveBeenCalledOnce();
+      expect(readFileSync(pidPath, "utf8")).toBe(staleBytes);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("embedded-lifecycle: dependency listener custody", () => {
+  it("removes only listeners added while loading the real embedded-postgres dependency", async () => {
+    const fixturePath = join(import.meta.dirname, "fixtures", "embedded-listener-cleanup-fixture.mts");
+
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [tsxCliPath, fixturePath], {
+        cwd: join(import.meta.dirname, "../../.."),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.once("error", reject);
+      child.once("close", (code) => resolve({ code, stdout, stderr }));
+    });
+
+    expect(result, result.stderr || result.stdout).toMatchObject({ code: 0 });
+    expect(JSON.parse(result.stdout)).toEqual({ listenersPreserved: true });
   });
 });
 
@@ -975,7 +1117,7 @@ Issue #2411 (beta.4 follow-up): an interrupted cluster listens during crash
 recovery but rejects every connection with 57P03 until redo completes. The
 owned start must WAIT that out (never stop the recovering postmaster), and the
 join path must retry the 57P03 signal — while socket-level failures keep the
-instant optimistic-join contract (a stale pid file must not add a wait).
+instant optimistic-join contract after PID ownership was retained.
 Mocked/stubbed, no real Postgres; runs under the gate/CI default.
 */
 describe("embedded-lifecycle: crash-recovery-aware connect classification (issue #2411)", () => {
@@ -1063,7 +1205,7 @@ describe("embedded-lifecycle: join path retries crash recovery (issue #2411)", (
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");
     writeFileSync(
       join(dataDir, "postmaster.pid"),
-      ["12345", dataDir, String(1784424901), "55446", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
+      [String(process.pid), dataDir, String(1784424901), "55446", "/tmp", "localhost", "5432101", "ready"].join("\n") + "\n",
     );
     const logLines: string[] = [];
     let attempts = 0;
@@ -1426,7 +1568,7 @@ describe("embedded-lifecycle: postmaster.pid join safety", () => {
     try {
       writeFileSync(
         join(dataDir, "postmaster.pid"),
-        ["1866", dataDir, "1784424901", "34643", "/tmp", "localhost", "79484 2", "ready"].join("\n") + "\n",
+        [String(process.pid), dataDir, "1784424901", "34643", "/tmp", "localhost", "79484 2", "ready"].join("\n") + "\n",
       );
       const lifecycle = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
 
