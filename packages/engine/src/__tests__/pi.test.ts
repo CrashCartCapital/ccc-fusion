@@ -1272,7 +1272,11 @@ describe("session failure diagnostics", () => {
       controller: { preDispatch: ReturnType<typeof vi.fn>; reconcile: ReturnType<typeof vi.fn> };
       providerStream?: ReturnType<typeof vi.fn>;
       providerStreamSimple?: ReturnType<typeof vi.fn>;
+      receiptAdapterId?: "terminal-route-sse-comments.v1";
     }) {
+      const selectedModel = input.receiptAdapterId
+        ? { provider: "omniroute-minimax-m3-pinned", id: "minimax/MiniMax-M3" }
+        : providerModel;
       const createAgentSessionMock = vi.mocked(createAgentSession);
       const providerStream = input.providerStream ?? vi.fn(successfulAsyncStream);
       const providerStreamSimple = input.providerStreamSimple ?? vi.fn(successfulAsyncStream);
@@ -1284,7 +1288,7 @@ describe("session failure diagnostics", () => {
         completeSimple: vi.fn(async () => ({ role: "assistant", content: [] })),
       };
       const session = {
-        model: providerModel,
+        model: selectedModel,
         prompt: vi.fn(),
         subscribe: vi.fn(),
         dispose: vi.fn(),
@@ -1297,13 +1301,14 @@ describe("session failure diagnostics", () => {
       await createFnAgent({
         cwd: "/test/project",
         systemPrompt: "Test PI provider admission controller seam",
-        defaultProvider: "pi-claude-cli",
-        defaultModelId: "claude-sonnet-4-6",
+        defaultProvider: selectedModel.provider,
+        defaultModelId: selectedModel.id,
         profile: "ccc-fusion",
         subscriptionReady: true,
         cccProviderAttemptBinding: Object.freeze({
           turnKey: "turn-stable-01",
           controller: Object.freeze(input.controller),
+          ...(input.receiptAdapterId ? { receiptAdapterId: input.receiptAdapterId } : {}),
         }),
       } as any);
 
@@ -1461,7 +1466,11 @@ describe("session failure diagnostics", () => {
           });
         }),
       };
-      const created = await createBoundAgent({ controller, providerStream });
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+      });
 
       const result = await created.modelRuntime.stream(omniModel, providerContext, {}).result();
 
@@ -1478,10 +1487,7 @@ describe("session failure diagnostics", () => {
           usage: { inputTokens: 120, outputTokens: 340 },
           cost: { amountUsd: 0.0048, source: "pi-ai" },
           receiptSource: "stream-usage",
-          omniRoute: {
-            initial: { provider: "minimax", model: "MiniMax-M3" },
-            final: { provider: "minimax", model: "MiniMax-M3" },
-          },
+          omniRoute: { final: { provider: "minimax", model: "MiniMax-M3" } },
         },
       }));
       expect(lifecycle).toEqual(["final", "reconcile"]);
@@ -1539,7 +1545,11 @@ describe("session failure diagnostics", () => {
           },
         })),
       };
-      const created = await createBoundAgent({ controller, providerStream });
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+      });
 
       await expect(created.modelRuntime.stream(omniModel, providerContext, {}).result())
         .resolves.toMatchObject({ omniRoute: { provider: "minimax", model: "MiniMax-M3" } });
@@ -1601,17 +1611,27 @@ describe("session failure diagnostics", () => {
           },
         })),
       };
-      const created = await createBoundAgent({ controller, providerStream });
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+      });
 
       await expect(created.modelRuntime.stream(omniModel, providerContext, {}).result())
         .rejects.toThrow(expectedError);
       expect(controller.reconcile).not.toHaveBeenCalled();
     });
 
-    it("refuses conflicting repeated OmniRoute initial headers without reconciling", async () => {
+    it("ignores conflicting non-authoritative route headers when the terminal receipt is exact", async () => {
       const omniModel = {
         provider: "omniroute-minimax-m3-pinned",
         id: "minimax/MiniMax-M3",
+      } as any;
+      const terminalReceiptMessage = {
+        ...message,
+        provider: omniModel.provider,
+        model: `__fusion_ccc_response_probe__${omniModel.id}`,
+        omniRoute: { provider: "minimax", model: "MiniMax-M3" },
       } as any;
       const providerStream = vi.fn((_model: any, _context: any, options: any) => {
         const first = Promise.resolve(options.onResponse?.({
@@ -1631,11 +1651,11 @@ describe("session failure diagnostics", () => {
         const source = {
           result: vi.fn(async () => {
             await second;
-            return message;
+            return terminalReceiptMessage;
           }),
           async *[Symbol.asyncIterator]() {
             await second;
-            yield { type: "done", reason: "stop", message };
+            yield { type: "done", reason: "stop", message: terminalReceiptMessage };
           },
         };
         return source;
@@ -1651,11 +1671,15 @@ describe("session failure diagnostics", () => {
           },
         })),
       };
-      const created = await createBoundAgent({ controller, providerStream });
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+      });
 
       await expect(created.modelRuntime.stream(omniModel, providerContext, {}).result())
-        .rejects.toThrow(/initial HTTP route receipt conflict/);
-      expect(controller.reconcile).not.toHaveBeenCalled();
+        .resolves.toMatchObject({ omniRoute: { provider: "minimax", model: "MiniMax-M3" } });
+      expect(controller.reconcile).toHaveBeenCalledTimes(1);
     });
 
     it("still refuses a reconciled terminal whose effectiveRoute receipt is not the one submitted", async () => {

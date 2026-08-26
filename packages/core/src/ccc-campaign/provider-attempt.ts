@@ -26,6 +26,7 @@ import {
   CccProviderAttemptLimitError,
   CccProviderAttemptStateError,
   type CccCampaignAuthorityBinding,
+  type CccCampaignRouteReceiptAdapterId,
   type CccCampaignTaskContext,
   type CccCampaignWorkItemFence,
   type CccProviderAttemptCost,
@@ -335,10 +336,6 @@ const EFFECTIVE_ROUTE_REQUIRED_KEYS = ["effectiveProvider", "effectiveModel", "u
 const EFFECTIVE_ROUTE_INPUT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "fallbackReason", "omniRoute"] as const;
 const EFFECTIVE_ROUTE_RECEIPT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "omniRoute"] as const;
 
-function isOmniRouteProvider(providerId: string): boolean {
-  return /(?:^|[-_:./])omniroute(?:$|[-_:./])/i.test(providerId);
-}
-
 function splitProviderQualifiedModel(modelId: string): { provider: string; model: string } | undefined {
   const separator = modelId.indexOf("/");
   if (separator <= 0 || separator === modelId.length - 1 || modelId.indexOf("/", separator + 1) !== -1) {
@@ -351,23 +348,24 @@ function splitProviderQualifiedModel(modelId: string): { provider: string; model
   return { provider, model };
 }
 
-function assertOmniRouteReceipt(
+function assertTerminalRouteReceipt(
   receipt: CccProviderAttemptEffectiveRoute,
   requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
+  receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
 ): void {
-  if (!isOmniRouteProvider(requestedIdentity.providerId)) return;
+  if (receiptAdapterId === undefined) return;
   const requestedUpstream = splitProviderQualifiedModel(requestedIdentity.modelId);
   if (!requestedUpstream) {
     throw new CccProviderAttemptIdentityError(
       "invalid-input",
-      "CCC OmniRoute provider attempt requires a provider-qualified requested model",
+      "CCC terminal route receipt adapter requires a provider-qualified requested model",
     );
   }
   const observed = receipt.omniRoute;
   if (!observed) {
     throw new CccProviderAttemptIdentityError(
       "invalid-input",
-      "CCC OmniRoute provider attempt requires a final terminal route receipt",
+      "CCC terminal route receipt adapter requires a final terminal route receipt",
     );
   }
   if (
@@ -377,7 +375,7 @@ function assertOmniRouteReceipt(
   ) {
     throw new CccProviderAttemptIdentityError(
       "route-drift",
-      "CCC OmniRoute initial and final route receipts conflict",
+      "CCC initial and final terminal route receipts conflict",
     );
   }
   if (
@@ -386,7 +384,7 @@ function assertOmniRouteReceipt(
   ) {
     throw new CccProviderAttemptIdentityError(
       "route-drift",
-      "CCC OmniRoute final provider/model receipt does not match the requested provider-qualified route",
+      "CCC final terminal provider/model receipt does not match the requested provider-qualified route",
     );
   }
 }
@@ -420,16 +418,19 @@ function assertExactEffectiveRouteKeys(
 export function assertCccProviderAttemptEffectiveRoute(
   input: CccProviderAttemptEffectiveRouteInput | undefined,
   requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
-  options: Readonly<{ omniRouteTerminalReceiptRequired?: boolean }> = {},
+  options: Readonly<{
+    receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
+    terminalReceiptRequired?: boolean;
+  }> = {},
 ): CccProviderAttemptEffectiveRoute | undefined {
   if (input === undefined) {
     if (
-      isOmniRouteProvider(requestedIdentity.providerId)
-      && options.omniRouteTerminalReceiptRequired !== false
+      options.receiptAdapterId !== undefined
+      && options.terminalReceiptRequired !== false
     ) {
       throw new CccProviderAttemptIdentityError(
         "invalid-input",
-        "CCC OmniRoute provider attempt requires an effective route terminal receipt",
+        "CCC terminal route receipt adapter requires an effective route terminal receipt",
       );
     }
     return undefined;
@@ -460,7 +461,9 @@ export function assertCccProviderAttemptEffectiveRoute(
         + "campaign fallback is not an admitted behavior",
     );
   }
-  assertOmniRouteReceipt(receipt, requestedIdentity);
+  if (options.terminalReceiptRequired !== false || receipt.omniRoute !== undefined) {
+    assertTerminalRouteReceipt(receipt, requestedIdentity, options.receiptAdapterId);
+  }
   assertNoCostWithoutReceipt(receipt);
   return receipt;
 }
@@ -817,6 +820,7 @@ function bindingFromAuditRow(
 
 function assertAuditRow(
   row: typeof schema.project.runAuditEvents.$inferSelect,
+  receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
 ): { stage: AttemptStage; metadata: ProviderAttemptMetadata; scope: CccProviderAttemptScope } {
   const stage = stageForMutationType(row.mutationType);
   const metadata = parseMetadata(row.metadata, stage);
@@ -851,22 +855,26 @@ function assertAuditRow(
   if (
     reconciledTerminal
     && metadata.terminal?.state === "committed"
-    && isOmniRouteProvider(binding.providerId)
+    && receiptAdapterId !== undefined
     && !effectiveRoute
   ) {
     throw new CccCampaignContextError(
-      "CCC provider attempt history has no required OmniRoute terminal receipt",
+      "CCC provider attempt history has no required terminal route receipt",
     );
   }
-  if (effectiveRoute && isOmniRouteProvider(binding.providerId)) {
+  if (
+    effectiveRoute
+    && receiptAdapterId !== undefined
+    && (metadata.terminal?.state === "committed" || effectiveRoute.omniRoute !== undefined)
+  ) {
     try {
-      assertOmniRouteReceipt(effectiveRoute, {
+      assertTerminalRouteReceipt(effectiveRoute, {
         providerId: binding.providerId,
         modelId: binding.modelId,
-      });
+      }, receiptAdapterId);
     } catch (error) {
       throw new CccCampaignContextError(
-        `CCC provider attempt history has an invalid OmniRoute terminal receipt: ${error instanceof Error ? error.message : String(error)}`,
+        `CCC provider attempt history has an invalid terminal route receipt: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
@@ -906,7 +914,7 @@ function assembleHistory(
 ): ProviderAttemptHistory {
   const attempts = new Map<string, StoredAttempt>();
   for (const row of rows) {
-    const { stage, metadata, scope } = assertAuditRow(row);
+    const { stage, metadata, scope } = assertAuditRow(row, context.route.receiptAdapterId);
     let attempt = attempts.get(scope.attemptKey);
     if (!attempt) {
       attempt = {
@@ -1411,7 +1419,10 @@ export async function reconcileCccProviderAttempt(
         providerId: attempt.scope.binding.providerId,
         modelId: attempt.scope.binding.modelId,
       },
-      { omniRouteTerminalReceiptRequired: outcome === "committed" },
+      {
+        receiptAdapterId: context.route.receiptAdapterId,
+        terminalReceiptRequired: outcome === "committed",
+      },
     );
     if (attempt.terminal) {
       if (

@@ -795,6 +795,9 @@ export function nativeWorkflowIr(
             cccExecutionTransport: route.transport,
             cccExecutionProviderId: route.providerId,
             cccExecutionModelId: route.modelId,
+            ...(route.receiptAdapterId
+              ? { cccExecutionReceiptAdapterId: route.receiptAdapterId }
+              : {}),
             cccExecutionRouteSha256: contentDigest(route),
             ...(route.workflowExtensionId
               ? { cccExecutionWorkflowExtensionId: route.workflowExtensionId }

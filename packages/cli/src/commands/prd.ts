@@ -223,8 +223,8 @@ const usage = [
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
   "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin",
-  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
-  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path> (mutually exclusive with --provider/--model/--transport/--cli-adapter; exactly one form required)",
+  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>] [--receipt-adapter <id>]",
+  "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path> (mutually exclusive with --provider/--model/--transport/--cli-adapter/--receipt-adapter; exactly one form required)",
   "       fn prd template",
   "       fn prd lint <prd-path>",
   "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
@@ -619,6 +619,7 @@ type ProductPolicyArgs = ProductPolicyCommonArgs & (
     modelId: string;
     transport: "pi" | "cli";
     cliAdapterId?: string;
+    receiptAdapterId?: "terminal-route-sse-comments.v1";
   }
   | {
     routeSelection: "routes-file";
@@ -631,11 +632,12 @@ const PRODUCT_POLICY_FLAGS = [
   "--model",
   "--transport",
   "--cli-adapter",
+  "--receipt-adapter",
   "--routes-file",
 ] as const;
 
 const PRODUCT_POLICY_ROUTE_SELECTION_MESSAGE =
-  "fn prd policy requires exactly one route selection: --provider/--model/--transport [--cli-adapter] for a single route applied to every task, or --routes-file <path> for one route per task; provide exactly one form, not both and not neither.";
+  "fn prd policy requires exactly one route selection: --provider/--model/--transport [--cli-adapter] [--receipt-adapter] for a single route applied to every task, or --routes-file <path> for one route per task; provide exactly one form, not both and not neither.";
 
 type ProductPolicyParseResult =
   | { kind: "usage" }
@@ -687,11 +689,13 @@ function parseProductPolicyArgs(args: string[]): ProductPolicyParseResult {
   const modelId = values.get("--model");
   const transport = values.get("--transport");
   const cliAdapterId = values.get("--cli-adapter");
+  const receiptAdapterId = values.get("--receipt-adapter");
   const hasRoutesFile = routesFilePath !== undefined;
   const hasSingleFlag = providerId !== undefined
     || modelId !== undefined
     || transport !== undefined
-    || cliAdapterId !== undefined;
+    || cliAdapterId !== undefined
+    || receiptAdapterId !== undefined;
 
   if (hasRoutesFile === hasSingleFlag) {
     return { kind: "route-selection-invalid" };
@@ -719,7 +723,12 @@ function parseProductPolicyArgs(args: string[]): ProductPolicyParseResult {
     || (transport !== "pi" && transport !== "cli")
     || (transport === "cli" && !cliAdapterId)
     || (transport === "pi" && cliAdapterId)
-    || values.size !== (transport === "cli" ? 4 : 3)
+    || (transport === "cli" && receiptAdapterId !== undefined)
+    || (
+      receiptAdapterId !== undefined
+      && receiptAdapterId !== "terminal-route-sse-comments.v1"
+    )
+    || values.size !== (transport === "cli" ? 4 : receiptAdapterId ? 4 : 3)
   ) {
     return { kind: "usage" };
   }
@@ -732,12 +741,20 @@ function parseProductPolicyArgs(args: string[]): ProductPolicyParseResult {
       modelId,
       transport,
       ...(cliAdapterId ? { cliAdapterId } : {}),
+      ...(receiptAdapterId === "terminal-route-sse-comments.v1"
+        ? { receiptAdapterId }
+        : {}),
     },
   };
 }
 
 const CCC_PRD_ROUTES_BY_TASK_SCHEMA = "ccc-prd.routes-by-task.v1" as const;
-const PRODUCT_POLICY_ROUTE_ENTRY_PI_KEYS = new Set(["providerId", "modelId", "transport"]);
+const PRODUCT_POLICY_ROUTE_ENTRY_PI_KEYS = new Set([
+  "providerId",
+  "modelId",
+  "transport",
+  "receiptAdapterId",
+]);
 const PRODUCT_POLICY_ROUTE_ENTRY_CLI_KEYS = new Set([
   "providerId",
   "modelId",
@@ -838,6 +855,7 @@ function readProductPolicyRoutesFile(
     const providerId = route.providerId;
     const modelId = route.modelId;
     const cliAdapterId = route.cliAdapterId;
+    const receiptAdapterId = route.receiptAdapterId;
     if (
       typeof providerId !== "string"
       || providerId.length === 0
@@ -846,6 +864,11 @@ function readProductPolicyRoutesFile(
       || (transport !== "pi" && transport !== "cli")
       || (transport === "cli" && (typeof cliAdapterId !== "string" || cliAdapterId.length === 0))
       || (transport === "pi" && cliAdapterId !== undefined)
+      || (transport === "cli" && receiptAdapterId !== undefined)
+      || (
+        receiptAdapterId !== undefined
+        && receiptAdapterId !== "terminal-route-sse-comments.v1"
+      )
     ) {
       throw new PrdProductCommandError(
         "CCC_PRD_ROUTES_FILE_INVALID",
@@ -857,6 +880,9 @@ function readProductPolicyRoutesFile(
       modelId,
       transport,
       ...(transport === "cli" ? { cliAdapterId: cliAdapterId as string } : {}),
+      ...(receiptAdapterId === "terminal-route-sse-comments.v1"
+        ? { receiptAdapterId }
+        : {}),
     };
   }
   return routesByTaskId;
@@ -962,6 +988,7 @@ async function runProductPolicyCommand(
           modelId: input.modelId,
           transport: input.transport,
           ...(input.cliAdapterId ? { cliAdapterId: input.cliAdapterId } : {}),
+          ...(input.receiptAdapterId ? { receiptAdapterId: input.receiptAdapterId } : {}),
         },
       });
     const outputPath = writeExecutionPlanAtomically(input, plan);

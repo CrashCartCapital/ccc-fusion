@@ -204,7 +204,13 @@ export async function createCccCampaignProviderAttemptBinding(
       }),
     });
   }
-  return Object.freeze({ turnKey: input.turnKey, controller });
+  return Object.freeze({
+    turnKey: input.turnKey,
+    controller,
+    ...(context.route.receiptAdapterId
+      ? { receiptAdapterId: context.route.receiptAdapterId }
+      : {}),
+  });
 }
 
 export function requireCccCampaignWorkItemLeaseOwner(value: unknown): string {

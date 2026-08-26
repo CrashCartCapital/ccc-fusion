@@ -439,7 +439,12 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     writeFileSync(routesPath, JSON.stringify({
       schema: "ccc-prd.routes-by-task.v1",
       routes: {
-        [TASK_A_ID]: { providerId: "provider-x", modelId: "model-x", transport: "pi" },
+        [TASK_A_ID]: {
+          providerId: "provider-x",
+          modelId: "upstream/model-x",
+          transport: "pi",
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+        },
         [TASK_B_ID]: {
           providerId: "provider-y",
           modelId: "model-y",
@@ -474,11 +479,17 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
         modelId: string;
         transport: string;
         cliAdapterId?: string;
+        receiptAdapterId?: string;
       }> };
     };
     const routeA = plan.policy.routes.find((route) => route.taskId === TASK_A_ID);
     const routeB = plan.policy.routes.find((route) => route.taskId === TASK_B_ID);
-    expect(routeA).toMatchObject({ providerId: "provider-x", modelId: "model-x", transport: "pi" });
+    expect(routeA).toMatchObject({
+      providerId: "provider-x",
+      modelId: "upstream/model-x",
+      transport: "pi",
+      receiptAdapterId: "terminal-route-sse-comments.v1",
+    });
     expect(routeB).toMatchObject({
       providerId: "provider-y",
       modelId: "model-y",

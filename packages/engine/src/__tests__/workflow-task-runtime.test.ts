@@ -673,14 +673,15 @@ describe("WorkflowTaskRuntime", () => {
     });
   });
 
-  it("product v2 RED: imported route custody drift refuses before any graph effect even when the mutable IR hash is rewritten", async () => {
+  it("product v2 RED: removing only the sealed receipt adapter refuses before any graph effect even when the mutable IR hash is rewritten", async () => {
     const semanticTaskId = "TASK-SEALED";
     const nativeTaskId = "FN-SEALED";
     const expectedRoute = {
       taskId: semanticTaskId,
       providerId: "provider-approved",
-      modelId: "model-approved",
+      modelId: "upstream/model-approved",
       transport: "pi" as const,
+      receiptAdapterId: "terminal-route-sse-comments.v1" as const,
       executor: "model" as const,
       toolMode: "coding" as const,
       worktreeMode: "isolated" as const,
@@ -709,8 +710,9 @@ describe("WorkflowTaskRuntime", () => {
             cccExecutionPromptSchema: "ccc-prd.execution-prompt.v1",
             cccExecutionPromptSha256: expectedPromptSha256,
             cccExecutionTransport: "pi",
-            cccExecutionProviderId: "provider-tampered",
+            cccExecutionProviderId: expectedRoute.providerId,
             cccExecutionModelId: expectedRoute.modelId,
+            // Deliberate custody mutation: the exact sealed adapter is omitted.
             cccExecutionRouteSha256: expectedRouteSha256,
             executor: expectedRoute.executor,
             toolMode: expectedRoute.toolMode,
@@ -782,8 +784,9 @@ describe("WorkflowTaskRuntime", () => {
     const route = {
       taskId: semanticTaskId,
       providerId: "provider-approved",
-      modelId: "model-approved",
+      modelId: "upstream/model-approved",
       transport: "pi" as const,
+      receiptAdapterId: "terminal-route-sse-comments.v1" as const,
       executor: "model" as const,
       toolMode: "coding" as const,
       worktreeMode: "isolated" as const,
@@ -814,6 +817,7 @@ describe("WorkflowTaskRuntime", () => {
             cccExecutionTransport: route.transport,
             cccExecutionProviderId: route.providerId,
             cccExecutionModelId: route.modelId,
+            cccExecutionReceiptAdapterId: route.receiptAdapterId,
             cccExecutionRouteSha256: routeSha256,
             executor: route.executor,
             toolMode: route.toolMode,

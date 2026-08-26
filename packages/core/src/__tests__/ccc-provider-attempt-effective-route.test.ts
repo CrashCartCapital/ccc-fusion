@@ -231,6 +231,9 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
   });
 
   describe("OmniRoute terminal receipt", () => {
+    const receiptAdapterOptions = {
+      receiptAdapterId: "terminal-route-sse-comments.v1",
+    } as const;
     const omniRouteIdentity = {
       providerId: "omniroute-minimax-m3-pinned",
       modelId: "minimax/MiniMax-M3",
@@ -256,7 +259,7 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       expect(assertCccProviderAttemptEffectiveRoute(
         undefined,
         omniRouteIdentity,
-        { omniRouteTerminalReceiptRequired: false },
+        { ...receiptAdapterOptions, terminalReceiptRequired: false },
       )).toBeUndefined();
     });
 
@@ -264,7 +267,7 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       expect(() => assertCccProviderAttemptEffectiveRoute(
         undefined,
         omniRouteIdentity,
-        { omniRouteTerminalReceiptRequired: true },
+        { ...receiptAdapterOptions, terminalReceiptRequired: true },
       )).toThrow(CccProviderAttemptIdentityError);
     });
 
@@ -272,6 +275,7 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       const receipt = assertCccProviderAttemptEffectiveRoute(
         omniRouteInput({ omniRoute: omniRouteReceipt }),
         omniRouteIdentity,
+        receiptAdapterOptions,
       );
       expect(receipt?.omniRoute).toEqual(omniRouteReceipt);
     });
@@ -281,7 +285,11 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       { label: "missing final provider", overrides: { omniRoute: { initial: omniRouteReceipt.initial, final: { model: "MiniMax-M3" } } } },
       { label: "missing final model", overrides: { omniRoute: { initial: omniRouteReceipt.initial, final: { provider: "minimax" } } } },
     ])("RED-OMNI-2: refuses $label for a newly declared OmniRoute route", ({ overrides }) => {
-      expect(() => assertCccProviderAttemptEffectiveRoute(omniRouteInput(overrides), omniRouteIdentity))
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput(overrides),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      ))
         .toThrow(CccProviderAttemptIdentityError);
     });
 
@@ -292,7 +300,11 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       { label: "model alias drift", omniRoute: { initial: { provider: "minimax", model: "minimax-m3" }, final: { provider: "minimax", model: "minimax-m3" } } },
       { label: "fallback model", omniRoute: { initial: { provider: "minimax", model: "MiniMax-M3" }, final: { provider: "minimax", model: "glm-5.3" } } },
     ])("RED-OMNI-3: refuses $label instead of normalizing upstream identity", ({ omniRoute }) => {
-      expect(() => assertCccProviderAttemptEffectiveRoute(omniRouteInput({ omniRoute }), omniRouteIdentity))
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute }),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      ))
         .toThrow(CccProviderAttemptIdentityError);
     });
 
@@ -310,6 +322,7 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       const receipt = assertCccProviderAttemptEffectiveRoute(
         omniRouteInput({ omniRoute: { final: omniRouteReceipt.final } }),
         omniRouteIdentity,
+        receiptAdapterOptions,
       );
       expect(receipt?.omniRoute).toEqual({ final: omniRouteReceipt.final });
     });
@@ -319,7 +332,11 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       { label: "final model alias drift", omniRoute: { final: { provider: "minimax", model: "minimax-m3" } } },
       { label: "fallback model", omniRoute: { final: { provider: "minimax", model: "glm-5.3" } } },
     ])("RED-OMNI-8: still refuses $label on a final-only receipt", ({ omniRoute }) => {
-      expect(() => assertCccProviderAttemptEffectiveRoute(omniRouteInput({ omniRoute }), omniRouteIdentity))
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute }),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      ))
         .toThrow(CccProviderAttemptIdentityError);
     });
 
@@ -327,6 +344,7 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       expect(() => assertCccProviderAttemptEffectiveRoute(
         omniRouteInput({ effectiveModel: "MiniMax-M3" }),
         { ...omniRouteIdentity, modelId: "MiniMax-M3" },
+        receiptAdapterOptions,
       )).toThrow(CccProviderAttemptIdentityError);
     });
   });

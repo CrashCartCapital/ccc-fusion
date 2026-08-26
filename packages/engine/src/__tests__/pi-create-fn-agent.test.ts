@@ -23,6 +23,8 @@ const refreshMock = vi.fn();
 // resolvable auth so attachSessionRoutingHeaders' header merge is observable.
 const getApiKeyAndHeadersMock = vi.fn(async () => ({ ok: true, apiKey: undefined, headers: undefined }));
 const modelRuntimeGetAuthMock = vi.fn(async (..._args: unknown[]) => ({ auth: { headers: {} as Record<string, string> } }));
+const modelRuntimeStreamMock = vi.fn();
+const modelRuntimeStreamSimpleMock = vi.fn();
 const sessionManagerGetSessionIdMock = vi.fn(() => undefined);
 const settingsManagerCreateMock = vi.fn(() => ({ kind: "settings-manager-create" }));
 const settingsManagerInMemoryMock = vi.fn(() => ({ kind: "settings-manager" }));
@@ -161,6 +163,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     create: async () => ({
       getAuth: modelRuntimeGetAuthMock,
       refresh: refreshMock,
+      stream: modelRuntimeStreamMock,
+      streamSimple: modelRuntimeStreamSimpleMock,
     }),
   },
   ModelRegistry: class {
@@ -1807,6 +1811,86 @@ describe("createFnAgent", () => {
         expect(PI_AI_REGISTERED_APIS.has(api)).toBe(true);
       }
     }
+  });
+
+  it("selects the terminal receipt adapter only from the exact sealed binding", async () => {
+    readCustomProvidersMock.mockReturnValue([{
+      id: "550e8400-e29b-41d4-a716-446655440010",
+      name: "Neutral Gateway",
+      apiType: "openai-compatible",
+      baseUrl: "http://127.0.0.1:4011/v1",
+      apiKey: "FIXTURE_KEY",
+      models: [{ id: "upstream/model-a", name: "Upstream Model A" }],
+    }] as any);
+    const controller = Object.freeze({
+      preDispatch: vi.fn(),
+      reconcile: vi.fn(),
+    });
+    const { createFnAgent } = await import("../pi.js");
+
+    await createFnAgent({
+      cwd: "/tmp",
+      systemPrompt: "test",
+      tools: "readonly",
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+      defaultProvider: "neutral-gateway",
+      defaultModelId: "upstream/model-a",
+      cccProviderAttemptBinding: Object.freeze({
+        turnKey: "turn-receipt-adapter",
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+        controller,
+      }),
+    } as any);
+
+    expect(registerProviderMock).toHaveBeenCalledWith("neutral-gateway", expect.objectContaining({
+      api: "ccc-terminal-route-receipt.v1",
+      streamSimple: expect.any(Function),
+      models: [expect.objectContaining({
+        id: "upstream/model-a",
+        api: "ccc-terminal-route-receipt.v1",
+      })],
+    }));
+  });
+
+  it("never selects the terminal receipt adapter from provider branding alone", async () => {
+    readCustomProvidersMock.mockReturnValue([{
+      id: "550e8400-e29b-41d4-a716-446655440011",
+      name: "OmniRoute MiniMax Pinned",
+      apiType: "openai-compatible",
+      baseUrl: "http://127.0.0.1:4012/v1",
+      apiKey: "FIXTURE_KEY",
+      models: [{ id: "minimax/MiniMax-M3", name: "MiniMax M3" }],
+    }] as any);
+    const controller = Object.freeze({
+      preDispatch: vi.fn(),
+      reconcile: vi.fn(),
+    });
+    const { createFnAgent } = await import("../pi.js");
+
+    await createFnAgent({
+      cwd: "/tmp",
+      systemPrompt: "test",
+      tools: "readonly",
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+      defaultProvider: "omniroute-minimax-pinned",
+      defaultModelId: "minimax/MiniMax-M3",
+      cccProviderAttemptBinding: Object.freeze({
+        turnKey: "turn-provider-branding",
+        controller,
+      }),
+    } as any);
+
+    expect(registerProviderMock).toHaveBeenCalledWith("omniroute-minimax-pinned", expect.objectContaining({
+      api: "openai-completions",
+      models: [expect.objectContaining({
+        id: "minimax/MiniMax-M3",
+        api: "openai-completions",
+      })],
+    }));
+    const registration = registerProviderMock.mock.calls.find(([key]) => key === "omniroute-minimax-pinned");
+    expect(registration?.[1]).not.toHaveProperty("streamSimple");
   });
 
   /*

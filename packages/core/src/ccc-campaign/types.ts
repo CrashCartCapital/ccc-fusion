@@ -445,6 +445,9 @@ export class CccProviderAttemptCollisionError extends Error {
   }
 }
 
+export type CccCampaignRouteReceiptAdapterId =
+  | "terminal-route-sse-comments.v1";
+
 export type CccCampaignExecutionRoute = {
   taskId: string;
   providerId: string;
@@ -458,6 +461,7 @@ export type CccCampaignExecutionRoute = {
   allowedWriteRoots?: string[];
   commitPolicy?: "required";
   cliAdapterId?: string;
+  receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
 };
 
 export type CccCampaignProductExecutionRoute = CccCampaignExecutionRoute & {
@@ -599,6 +603,7 @@ export type CccPrdProductExecutionRouteSelection = {
   modelId: string;
   transport: "pi" | "cli";
   cliAdapterId?: string;
+  receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
 };
 
 export type CccPrdProductExecutionPlan = {

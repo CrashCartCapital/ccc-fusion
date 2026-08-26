@@ -399,6 +399,7 @@ const cliBuildConfig = {
     bin: "src/bin.ts",
     extension: "src/extension.ts",
     "child-process-worker": "../engine/src/runtimes/child-process-worker.ts",
+    "ccc-route-receipt-adapter": "../engine/src/ccc-route-receipt-adapter.ts",
   },
   format: ["esm"],
   platform: "node",

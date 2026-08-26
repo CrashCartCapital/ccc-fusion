@@ -67,6 +67,7 @@ export type {
   CccCampaignRouteFallbackPolicy,
   CccCampaignRouteLimits,
   CccCampaignRouteReasoningEffort,
+  CccCampaignRouteReceiptAdapterId,
   CccCampaignRouteSensitivityClass,
   CccCampaignRouteServiceTier,
   CccPrdProductExecutionPlan,

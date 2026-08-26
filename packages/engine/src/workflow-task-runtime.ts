@@ -105,6 +105,10 @@ function importedProductRouteFromNode(node: WorkflowIrNode): Record<string, unkn
     || config.allowedWriteRoots.some((path) => typeof path !== "string")
     || config.commitPolicy !== "required"
     || (config.cliAdapterId !== undefined && typeof config.cliAdapterId !== "string")
+    || (
+      config.cccExecutionReceiptAdapterId !== undefined
+      && config.cccExecutionReceiptAdapterId !== "terminal-route-sse-comments.v1"
+    )
   ) {
     return null;
   }
@@ -121,6 +125,9 @@ function importedProductRouteFromNode(node: WorkflowIrNode): Record<string, unkn
     commitPolicy: config.commitPolicy,
     ...(config.cliAdapterId !== undefined
       ? { cliAdapterId: config.cliAdapterId }
+      : {}),
+    ...(config.cccExecutionReceiptAdapterId !== undefined
+      ? { receiptAdapterId: config.cccExecutionReceiptAdapterId }
       : {}),
   };
 }

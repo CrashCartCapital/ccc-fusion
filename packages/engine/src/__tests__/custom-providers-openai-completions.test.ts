@@ -9,6 +9,10 @@ The pi 0.80 SDK keeps compatibility helpers under ./compat and exposes provider 
 */
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
+import {
+  CCC_TERMINAL_ROUTE_RECEIPT_API,
+  streamCccTerminalRouteReceipt,
+} from "../ccc-route-receipt-adapter.js";
 
 async function createInMemoryModelRegistry(): Promise<ModelRegistry> {
   const runtime = await ModelRuntime.create({
@@ -114,6 +118,7 @@ describe("custom providers openai-completions regression", () => {
     signal?: AbortSignal,
     holdOpenMs = 0,
     commentsBeforeChunks = false,
+    receiptAdapterSelected = false,
   ): Promise<{ responseModel?: string; model: string; stopReason?: string; errorMessage?: string }> {
     const server = createServer(async (request, response) => {
       request.on("data", () => {});
@@ -148,17 +153,29 @@ describe("custom providers openai-completions regression", () => {
       const modelRegistry = await createInMemoryModelRegistry();
       modelRegistry.registerProvider(providerName, {
         baseUrl: `http://127.0.0.1:${address.port}/v1`,
-        api: "openai-completions",
+        api: receiptAdapterSelected
+          ? CCC_TERMINAL_ROUTE_RECEIPT_API
+          : "openai-completions",
         apiKey: "CUSTOM_KEY",
-        models: [{ id: "my-model", name: "My Model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16384 }],
+        models: [{
+          id: "my-model",
+          name: "My Model",
+          api: receiptAdapterSelected ? CCC_TERMINAL_ROUTE_RECEIPT_API : "openai-completions",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 16384,
+        }],
+        ...(receiptAdapterSelected ? { streamSimple: streamCccTerminalRouteReceipt } : {}),
       });
       await modelRegistry.refresh();
       const model = modelRegistry.find(providerName, "my-model");
-      const response = await completeSimple(
-        model!,
-        { messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
-        { apiKey: "CUSTOM_KEY", ...(signal ? { signal } : {}) },
-      );
+      const context = { messages: [{ role: "user" as const, content: "Hi", timestamp: Date.now() }] };
+      const streamOptions = { apiKey: "CUSTOM_KEY", ...(signal ? { signal } : {}) };
+      const response = receiptAdapterSelected
+        ? await streamCccTerminalRouteReceipt(model!, context, streamOptions).result()
+        : await completeSimple(model!, context, streamOptions);
       return response as { responseModel?: string; model: string; stopReason?: string; errorMessage?: string };
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -190,7 +207,7 @@ describe("custom providers openai-completions regression", () => {
       "unrelated=do-not-expose",
       "x-omniroute-provider=minimax",
       "x-omniroute-model=MiniMax-M3",
-    ]);
+    ], undefined, 0, false, true);
     expect((response as { omniRoute?: unknown }).omniRoute).toEqual({
       provider: "minimax",
       model: "MiniMax-M3",
@@ -214,10 +231,11 @@ describe("custom providers openai-completions regression", () => {
         undefined,
         100,
         true,
+        true,
       );
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(response).toMatchObject({ stopReason: "error" });
-      expect(response.errorMessage).toContain("conflicting provider/model comments");
+      expect(response.errorMessage).toMatch(/JSON|Unexpected token/u);
       expect(unhandled).toEqual([]);
     } finally {
       process.removeListener("unhandledRejection", onUnhandled);
@@ -238,6 +256,8 @@ describe("custom providers openai-completions regression", () => {
         ["x-omniroute-provider=minimax", "x-omniroute-model=MiniMax-M3"],
         controller.signal,
         100,
+        false,
+        true,
       );
       setTimeout(() => controller.abort(), 10);
       const response = await responsePromise;
@@ -250,57 +270,34 @@ describe("custom providers openai-completions regression", () => {
     }
   });
 
-  it("RED-OMNI-STREAM-4: refuses when a cancelled receipt clone cannot prove settlement", async () => {
+  it("RED-OMNI-STREAM-4: consumes receipt and provider data through one reader without cloning", async () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown) => unhandled.push(reason);
     const originalFetch = globalThis.fetch;
     const encoder = new TextEncoder();
-    let primaryReads = 0;
-    let cloneDelivered = false;
-    let cancelCalls = 0;
-    const primaryReader = {
-      read: async () => primaryReads++ === 0
-        ? { done: false, value: encoder.encode("data: not-json\n\n") }
-        : { done: true, value: undefined },
-      cancel: async () => undefined,
-      releaseLock: () => undefined,
-    };
-    const cloneReader = {
-      read: async () => {
-        if (!cloneDelivered) {
-          cloneDelivered = true;
-          return {
-            done: false,
-            value: encoder.encode(": x-omniroute-provider=minimax\n: x-omniroute-provider=opencode-go\n: x-omniroute-model=MiniMax-M3\n\n"),
-          };
-        }
-        return new Promise<never>(() => {});
+    const clone = vi.fn(() => { throw new Error("clone must not be called"); });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          "data: not-json\n\n: x-omniroute-provider=minimax\n: x-omniroute-model=MiniMax-M3\n\n",
+        ));
+        controller.close();
       },
-      cancel: () => {
-        cancelCalls += 1;
-        return new Promise<never>(() => {});
-      },
-      releaseLock: () => undefined,
-    };
+    });
     vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
       status: 200,
       headers: new Headers({ "content-type": "text/event-stream" }),
-      body: { getReader: () => primaryReader },
-      text: async () => "",
-      clone: () => ({
-        status: 200,
-        headers: new Headers({ "content-type": "text/event-stream" }),
-        body: { getReader: () => cloneReader },
-        text: async () => "",
-      }),
+      body,
+      clone,
     })));
     process.on("unhandledRejection", onUnhandled);
     try {
-      const response = await completeSimple(
+      const response = await streamCccTerminalRouteReceipt(
         {
-          provider: "omniroute-minimax-m3-pinned",
+          provider: "arbitrary-gateway",
           id: "my-model",
-          api: "openai-completions",
+          api: CCC_TERMINAL_ROUTE_RECEIPT_API,
           baseUrl: "http://127.0.0.1:65535/v1",
           headers: {},
           input: ["text"],
@@ -310,10 +307,10 @@ describe("custom providers openai-completions regression", () => {
         } as never,
         { messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
         { apiKey: "CUSTOM_KEY" },
-      );
+      ).result();
       expect(response.stopReason).toBe("error");
-      expect(response.errorMessage).toContain("route-receipt-capture-timeout/unavailable");
-      expect(cancelCalls).toBe(1);
+      expect(response.errorMessage).toMatch(/JSON|Unexpected token/u);
+      expect(clone).not.toHaveBeenCalled();
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(unhandled).toEqual([]);
     } finally {

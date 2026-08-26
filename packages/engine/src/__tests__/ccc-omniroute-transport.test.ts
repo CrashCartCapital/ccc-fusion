@@ -138,6 +138,7 @@ type ProviderConfig = {
   baseUrl: string;
   api: string;
   apiKey?: string;
+  streamSimple?: typeof streamSimple;
   models: Array<{
     id: string;
     name: string;
@@ -152,6 +153,7 @@ type ProviderConfig = {
 
 class TestModelRegistry {
   readonly configs = new Map<string, ProviderConfig>();
+  readonly runtimeOptions: Record<string, unknown>[] = [];
   readonly modelRuntime = {
     getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
     hasConfiguredAuth: vi.fn(() => true),
@@ -161,15 +163,23 @@ class TestModelRegistry {
       model: Model,
       context: Context,
       options: Record<string, unknown> = {},
-    ) => streamSimple(model, context, {
-      ...options,
-      apiKey: "synthetic-loopback-only",
-      maxRetries: 0,
-    })),
+    ) => {
+      this.runtimeOptions.push(options);
+      const providerStream = this.configs.get(model.provider)?.streamSimple ?? streamSimple;
+      return providerStream(model, context, {
+        ...options,
+        apiKey: "synthetic-loopback-only",
+        maxRetries: 0,
+      });
+    }),
   };
 
   registerProvider(name: string, config: ProviderConfig): void {
-    this.configs.set(name, structuredClone(config));
+    this.configs.set(name, {
+      ...config,
+      models: structuredClone(config.models),
+      ...(config.streamSimple ? { streamSimple: config.streamSimple } : {}),
+    });
   }
 
   async refresh(): Promise<void> {}
@@ -1823,10 +1833,10 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     ]);
   });
 
-  it("GREEN-OMNI-PI-1: binds the final OmniRoute SSE receipt separately from the Pi registry identity", async () => {
+  it("GREEN-RECEIPT-PI-1: explicit adapter binds the terminal SSE receipt for a neutrally named provider", async () => {
     const omniProvider: CustomProvider = {
-      id: "omniroute-minimax-m3-pinned",
-      name: "OmniRoute MiniMax M3 Pinned",
+      id: "route-receipt-gateway-pinned",
+      name: "Route Receipt Gateway Pinned",
       apiType: "openai-compatible",
       baseUrl,
       apiKey: "synthetic-loopback-only",
@@ -1840,43 +1850,57 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     harness.createAgentSession.mockReset();
     harness.createAgentSession.mockImplementation(harness.actualCreateAgentSession!);
 
-    /*
-     * The workspace dependency is intentionally not reinstalled by this lane.
-     * The patch-level SSE proof lives in custom-providers-openai-completions.test.ts;
-     * this engine seam supplies that already-captured terminal pair so this test
-     * remains focused on session/result identity and the no-retry boundary.
-     */
-    const runtimeOptions: Record<string, unknown>[] = [];
-    const baseStreamSimple = registry.modelRuntime.streamSimple;
-    registry.modelRuntime.streamSimple = vi.fn((requestModel, context, options = {}) => {
-      runtimeOptions.push(options);
-      const source = baseStreamSimple(requestModel, context, options);
-      const attachReceipt = (value: unknown): unknown => {
-        if (value && typeof value === "object") {
-          (value as Record<string, unknown>).omniRoute = {
-            provider: "minimax",
-            model: "MiniMax-M3",
-          };
-        }
-        return value;
-      };
-      return {
-        async *[Symbol.asyncIterator]() {
-          for await (const event of source) {
-            if (event && typeof event === "object" && (event as { type?: unknown }).type === "done") {
-              attachReceipt((event as { message?: unknown }).message);
-            }
-            yield event;
-          }
-        },
-        async result() {
-          return attachReceipt(await source.result());
-        },
-      } as typeof source;
-    });
-
     const model = registeredModel(omniProvider);
     const registryKey = customProviderRegistryKey(omniProvider, providers);
+    const authorityBinding = Object.freeze({
+      projectId: "project-receipt",
+      importId: "import-receipt",
+      campaignId: "campaign-receipt",
+      taskId: "TASK-RECEIPT",
+      actionId: "ACTION-RECEIPT",
+      actionTarget: "provider://receipt",
+      idempotencyKey: "receipt-idempotency",
+      packetHash: "a".repeat(64),
+      sidecarHash: "b".repeat(64),
+      bundleHash: "c".repeat(64),
+      targetRepository: "/tmp/ccc-omniroute-receipt",
+      targetBase: "d".repeat(40),
+      providerId: registryKey,
+      modelId: model.id,
+      transport: "pi" as const,
+      manifestHash: "e".repeat(64),
+      bindingHash: "f".repeat(64),
+    });
+    const controller = Object.freeze({
+      preDispatch: vi.fn(async (request) => ({
+        kind: "dispatch-permit" as const,
+        scope: {
+          attemptKey: `ccc-provider-attempt-${"1".repeat(64)}`,
+          controllerToken: "ccc-provider-controller-00000000-0000-4000-8000-000000000001",
+          taskId: authorityBinding.taskId,
+          semanticTaskId: "SEMANTIC-RECEIPT",
+          campaignDeadlineAt: "2026-08-27T00:00:00.000Z",
+          turnKey: request.turnKey,
+          dispatchKey: request.dispatchKey,
+          attemptOrdinal: 1,
+          requestCount: 1,
+          workItemFence: null,
+          state: "dispatched_unknown" as const,
+          binding: authorityBinding,
+        },
+      })),
+      reconcile: vi.fn(async (reconciliation) => ({
+        ...reconciliation,
+        state: "committed" as const,
+        terminal: {
+          kind: "reconciled" as const,
+          state: "committed" as const,
+          evidenceDigest: reconciliation.evidenceDigest,
+          observerId: reconciliation.observerId,
+          effectiveRoute: reconciliation.effectiveRoute,
+        },
+      })),
+    });
     const { createFnAgent } = await import("../pi.js");
     const created = await createFnAgent({
       cwd: "/tmp/ccc-omniroute-receipt",
@@ -1886,6 +1910,11 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       defaultModelId: model.id,
       profile: "ccc-fusion",
       subscriptionReady: true,
+      cccProviderAttemptBinding: Object.freeze({
+        turnKey: "turn-receipt-1",
+        controller,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+      }),
     });
 
     await expect((created.session as unknown as { promptWithFallback(value: string): Promise<void> })
@@ -1895,9 +1924,19 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       .reverse()
       .find((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && entry.role === "assistant");
     expect(assistant?.omniRoute).toEqual({ provider: "minimax", model: "MiniMax-M3" });
-    expect(runtimeOptions[0]).toMatchObject({ maxRetries: 0 });
+    expect(assistant).not.toHaveProperty("responseModel");
+    expect(registry.runtimeOptions[0]).toMatchObject({ maxRetries: 0 });
     expect(capturedRequests).toHaveLength(1);
     expect(capturedRequests.at(-1)?.body.model).toBe("minimax/MiniMax-M3");
+    expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+      effectiveRoute: expect.objectContaining({
+        effectiveProvider: registryKey,
+        effectiveModel: "minimax/MiniMax-M3",
+        omniRoute: {
+          final: { provider: "minimax", model: "MiniMax-M3" },
+        },
+      }),
+    }));
   });
 
   it("RED-CCC-RETRY-1: disables agent lifecycle retries for a ccc transient provider failure", async () => {
