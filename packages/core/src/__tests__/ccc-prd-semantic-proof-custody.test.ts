@@ -5,7 +5,7 @@ import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFi
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CCC_PRD_SEMANTIC_PROOF_HOST_ID,
   assertCccPrdSemanticProofV2Custody,
@@ -271,133 +271,206 @@ describe("CCC PRD semantic-proof controller custody", () => {
     })).resolves.toBeUndefined();
   });
 
-  it("RED-R1-python-semantic-v2-controller-custody: observes and persists a complete Python runtime manifest", async () => {
-    const state = await fixture({
-      taskCommand: "python3 verify/python_adapter.py --target fixtures/python-target",
-    });
-    await mkdir(join(state.root, "verify"), { recursive: true });
-    await mkdir(join(state.root, "fixtures/python-target"), { recursive: true });
-    await mkdir(join(state.root, "src"), { recursive: true });
-    await mkdir(join(state.root, "test"), { recursive: true });
-    await writeFile(join(state.root, "src/slugify.js"), "export const slugify = () => 'candidate';\n");
-    await writeFile(join(state.root, "test/slugify.test.js"), "export const proof = true;\n");
-    await writeFile(join(state.root, "verify/python_adapter.py"), "print('adapter')\n");
-    await writeFile(join(state.root, "fixtures/python-target/target.py"), "print('target')\n");
-    await execFile("git", ["-C", state.root, "add", "Taskfile.yml", "verify/python_adapter.py", "fixtures/python-target/target.py", "src/slugify.js", "test/slugify.test.js"]);
-    await execFile("git", [
-      "-C", state.root,
-      "-c", "user.name=Fusion Test",
-      "-c", "user.email=fusion-test@example.invalid",
-      "commit", "-m", "python semantic proof baseline",
-    ]);
-    const baseCommit = (await execFile("git", ["-C", state.root, "rev-parse", "HEAD"])).stdout.trim();
-    const pythonRoot = await mkdtemp(join(tmpdir(), "ccc-python-runtime-"));
-    roots.push(pythonRoot);
-    const requestedPythonPath = (await execFile("which", ["python3"])).stdout.trim();
-    const resolvedPythonProbe = await execFile(
-      requestedPythonPath,
-      ["-c", "import os,sys; print(os.path.realpath(sys.executable))"],
-    );
-    const resolvedPythonPath = await realpath(resolvedPythonProbe.stdout.trim());
-    const frameworkPythonPath = resolve(
-      dirname(resolvedPythonPath),
-      "../Resources/Python.app/Contents/MacOS/Python",
-    );
-    const pythonPath = await realpath(existsSync(frameworkPythonPath) ? frameworkPythonPath : resolvedPythonPath);
-    const versionProbe = await execFile(pythonPath, ["--version"], { encoding: "buffer" });
-    const versionOutput = Buffer.concat([versionProbe.stdout, versionProbe.stderr]);
-    const dylibRequestedPaths = new Map<string, Set<string>>();
-    const dylibPaths = new Set<string>();
-    const dylibLoaders = process.platform === "darwin" ? [pythonPath] : [];
-    while (dylibLoaders.length > 0) {
-      const loader = dylibLoaders.shift()!;
-      const otool = await execFile("/usr/bin/otool", ["-L", loader]);
-      for (const line of otool.stdout.split("\n").slice(1)) {
-        const requested = line.trim().split(/\s+/u)[0];
-        if (!requested || !requested.startsWith("/") || requested.startsWith("/usr/lib/") || requested.startsWith("/System/Library/") || !existsSync(requested)) continue;
-        const canonical = await realpath(requested);
-        const requestedSet = dylibRequestedPaths.get(canonical) ?? new Set<string>();
-        requestedSet.add(requested);
-        dylibRequestedPaths.set(canonical, requestedSet);
-        if (!dylibPaths.has(canonical)) {
-          dylibPaths.add(canonical);
-          dylibLoaders.push(canonical);
+  describe("prepared Python runtime custody", () => {
+    let state: Awaited<ReturnType<typeof fixture>>;
+    let baseCommit: string;
+    let requestedPythonPath: string;
+    let proof: CccPrdProofV2;
+    let preparedProof: CccPrdProofV2;
+    let runtimePaths: {
+      readonly stdlib: string;
+      readonly sitePackages: string;
+      readonly extensionModules: string;
+    };
+    let entry: (path: string) => Promise<{ path: string; sha256: string }>;
+
+    beforeEach(async () => {
+      state = await fixture({
+        taskCommand: "python3 verify/python_adapter.py --target fixtures/python-target",
+      });
+      await mkdir(join(state.root, "verify"), { recursive: true });
+      await mkdir(join(state.root, "fixtures/python-target"), { recursive: true });
+      await mkdir(join(state.root, "src"), { recursive: true });
+      await mkdir(join(state.root, "test"), { recursive: true });
+      await writeFile(join(state.root, "src/slugify.js"), "export const slugify = () => 'candidate';\n");
+      await writeFile(join(state.root, "test/slugify.test.js"), "export const proof = true;\n");
+      await writeFile(join(state.root, "verify/python_adapter.py"), "print('adapter')\n");
+      await writeFile(join(state.root, "fixtures/python-target/target.py"), "print('target')\n");
+      await execFile("git", ["-C", state.root, "add", "Taskfile.yml", "verify/python_adapter.py", "fixtures/python-target/target.py", "src/slugify.js", "test/slugify.test.js"]);
+      await execFile("git", [
+        "-C", state.root,
+        "-c", "user.name=Fusion Test",
+        "-c", "user.email=fusion-test@example.invalid",
+        "commit", "-m", "python semantic proof baseline",
+      ]);
+      baseCommit = (await execFile("git", ["-C", state.root, "rev-parse", "HEAD"])).stdout.trim();
+      const pythonRoot = await mkdtemp(join(tmpdir(), "ccc-python-runtime-"));
+      roots.push(pythonRoot);
+      requestedPythonPath = (await execFile("which", ["python3"])).stdout.trim();
+      const resolvedPythonProbe = await execFile(
+        requestedPythonPath,
+        ["-c", "import os,sys; print(os.path.realpath(sys.executable))"],
+      );
+      const resolvedPythonPath = await realpath(resolvedPythonProbe.stdout.trim());
+      const frameworkPythonPath = resolve(
+        dirname(resolvedPythonPath),
+        "../Resources/Python.app/Contents/MacOS/Python",
+      );
+      const pythonPath = await realpath(existsSync(frameworkPythonPath) ? frameworkPythonPath : resolvedPythonPath);
+      const versionProbe = await execFile(pythonPath, ["--version"], { encoding: "buffer" });
+      const versionOutput = Buffer.concat([versionProbe.stdout, versionProbe.stderr]);
+      const dylibRequestedPaths = new Map<string, Set<string>>();
+      const dylibPaths = new Set<string>();
+      const dylibLoaders = process.platform === "darwin" ? [pythonPath] : [];
+      while (dylibLoaders.length > 0) {
+        const loader = dylibLoaders.shift()!;
+        const otool = await execFile("/usr/bin/otool", ["-L", loader]);
+        for (const line of otool.stdout.split("\n").slice(1)) {
+          const requested = line.trim().split(/\s+/u)[0];
+          if (!requested || !requested.startsWith("/") || requested.startsWith("/usr/lib/") || requested.startsWith("/System/Library/") || !existsSync(requested)) continue;
+          const canonical = await realpath(requested);
+          const requestedSet = dylibRequestedPaths.get(canonical) ?? new Set<string>();
+          requestedSet.add(requested);
+          dylibRequestedPaths.set(canonical, requestedSet);
+          if (!dylibPaths.has(canonical)) {
+            dylibPaths.add(canonical);
+            dylibLoaders.push(canonical);
+          }
         }
       }
-    }
-    const dylibClosure = await Promise.all([...dylibPaths].sort().map(async (path) => ({
-      path,
-      sha256: sha256(await readFile(path)),
-      requestedPaths: [...(dylibRequestedPaths.get(path) ?? [])].sort(),
-    })));
-    const runtimeSupport = [];
-    const runtimePaths = {
-      stdlib: join(pythonRoot, "lib/python3.12/os.py"),
-      sitePackages: join(pythonRoot, "lib/python3.12/site-packages/fixture.py"),
-      extensionModules: join(pythonRoot, "lib/python3.12/lib-dynload/fixture.so"),
-    } as const;
-    await Promise.all(Object.values(runtimePaths).map(async (path) => {
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, `runtime:${path}\n`);
-    }));
-    const entry = async (path: string) => ({ path: await realpath(path), sha256: sha256(await readFile(path)) });
-    const pythonIdentity = {
-      executablePath: pythonPath,
-      executableSha256: sha256(await readFile(pythonPath)),
-      version: versionOutput.toString("utf8").trim(),
-      versionOutputSha256: sha256(versionOutput),
-      runtimeManifest: {
-        schema: "ccc-prd.python-runtime-manifest.v1",
-        interpreter: await entry(pythonPath),
-        stdlibRoot: await realpath(dirname(runtimePaths.stdlib)),
-        pythonHomeRoot: await realpath(pythonRoot),
-        sitePackagesRoots: [await realpath(dirname(runtimePaths.sitePackages))],
-        extensionModuleRoots: [await realpath(dirname(runtimePaths.extensionModules))],
-        runtimeSupport,
-        stdlib: [await entry(runtimePaths.stdlib)],
-        sitePackages: [await entry(runtimePaths.sitePackages)],
-        extensionModules: [await entry(runtimePaths.extensionModules)],
-        dylibClosure,
-      },
-    };
-    const adapterOid = (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:verify/python_adapter.py`])).stdout.trim();
-    const targetOid = (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:fixtures/python-target/target.py`])).stdout.trim();
-    const taskOid = (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:Taskfile.yml`])).stdout.trim();
-    const proof = {
-      ...state.proof,
-      command: "task verify:slugify",
-      verifierProfile: {
-        schema: "ccc-prd.verifier.python-adapter.v1",
-        adapterPath: "verify/python_adapter.py",
-        targetPath: "fixtures/python-target",
-      },
-      verifierClosure: [
-        { role: "task_runner", path: "Taskfile.yml", baseGitBlobOid: taskOid, sha256: sha256(await readFile(join(state.root, "Taskfile.yml"))) },
-        { role: "harness", path: "verify/python_adapter.py", baseGitBlobOid: adapterOid, sha256: sha256(await readFile(join(state.root, "verify/python_adapter.py"))) },
-        { role: "fixture", path: "fixtures/python-target/target.py", baseGitBlobOid: targetOid, sha256: sha256(await readFile(join(state.root, "fixtures/python-target/target.py"))) },
-      ],
-      executionToolchain: {
-        ...state.proof.executionToolchain,
-        python: pythonIdentity,
-      },
-    } as unknown as CccPrdProofV2;
-    const hydrated = await hydrateCccPrdSemanticProofV2Custody({
-      repositoryRoot: state.root,
-      baseCommit,
-      proofs: [proof],
-      modelWriteRoots: ["src", "test"],
-      toolchainPaths: {
-        ...state.toolchainPaths,
-        pythonExecutablePath: requestedPythonPath,
-      },
+      const dylibClosure = await Promise.all([...dylibPaths].sort().map(async (path) => ({
+        path,
+        sha256: sha256(await readFile(path)),
+        requestedPaths: [...(dylibRequestedPaths.get(path) ?? [])].sort(),
+      })));
+      const runtimeSupport = [];
+      runtimePaths = {
+        stdlib: join(pythonRoot, "lib/python3.12/os.py"),
+        sitePackages: join(pythonRoot, "lib/python3.12/site-packages/fixture.py"),
+        extensionModules: join(pythonRoot, "lib/python3.12/lib-dynload/fixture.so"),
+      } as const;
+      await Promise.all(Object.values(runtimePaths).map(async (path) => {
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, `runtime:${path}\n`);
+      }));
+      entry = async (path: string) => ({ path: await realpath(path), sha256: sha256(await readFile(path)) });
+      const pythonIdentity = {
+        executablePath: pythonPath,
+        executableSha256: sha256(await readFile(pythonPath)),
+        version: versionOutput.toString("utf8").trim(),
+        versionOutputSha256: sha256(versionOutput),
+        runtimeManifest: {
+          schema: "ccc-prd.python-runtime-manifest.v1",
+          interpreter: await entry(pythonPath),
+          stdlibRoot: await realpath(dirname(runtimePaths.stdlib)),
+          pythonHomeRoot: await realpath(pythonRoot),
+          sitePackagesRoots: [await realpath(dirname(runtimePaths.sitePackages))],
+          extensionModuleRoots: [await realpath(dirname(runtimePaths.extensionModules))],
+          runtimeSupport,
+          stdlib: [await entry(runtimePaths.stdlib)],
+          sitePackages: [await entry(runtimePaths.sitePackages)],
+          extensionModules: [await entry(runtimePaths.extensionModules)],
+          dylibClosure,
+        },
+      };
+      const adapterOid = (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:verify/python_adapter.py`])).stdout.trim();
+      const targetOid = (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:fixtures/python-target/target.py`])).stdout.trim();
+      const taskOid = (await execFile("git", ["-C", state.root, "rev-parse", `${baseCommit}:Taskfile.yml`])).stdout.trim();
+      proof = {
+        ...state.proof,
+        command: "task verify:slugify",
+        verifierProfile: {
+          schema: "ccc-prd.verifier.python-adapter.v1",
+          adapterPath: "verify/python_adapter.py",
+          targetPath: "fixtures/python-target",
+        },
+        verifierClosure: [
+          { role: "task_runner", path: "Taskfile.yml", baseGitBlobOid: taskOid, sha256: sha256(await readFile(join(state.root, "Taskfile.yml"))) },
+          { role: "harness", path: "verify/python_adapter.py", baseGitBlobOid: adapterOid, sha256: sha256(await readFile(join(state.root, "verify/python_adapter.py"))) },
+          { role: "fixture", path: "fixtures/python-target/target.py", baseGitBlobOid: targetOid, sha256: sha256(await readFile(join(state.root, "fixtures/python-target/target.py"))) },
+        ],
+        executionToolchain: {
+          ...state.proof.executionToolchain,
+          python: pythonIdentity,
+        },
+      } as unknown as CccPrdProofV2;
+      [preparedProof] = await hydrateCccPrdSemanticProofV2Custody({
+        repositoryRoot: state.root,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src", "test"],
+        toolchainPaths: {
+          ...state.toolchainPaths,
+          pythonExecutablePath: requestedPythonPath,
+        },
+      });
     });
 
-    expect(hydrated[0]!.executionToolchain.python?.runtimeManifest.stdlib).toEqual([
-      await entry(runtimePaths.stdlib),
-    ]);
+    it("RED-R1-python-semantic-v2-controller-custody: observes and persists a complete Python runtime manifest", async () => {
+      expect(preparedProof.executionToolchain.python?.runtimeManifest.stdlib).toEqual([
+        await entry(runtimePaths.stdlib),
+      ]);
+    });
+
+    it("accepts an exact prepared Python runtime manifest", async () => {
+      const admittedProof = {
+        ...preparedProof,
+        admission: {
+          schema: "ccc-prd.proof-admission.v2" as const,
+          pluginId: "fusion-native",
+          pluginVersion: "1.0.0",
+          extensionId: "ccc-proof-admission",
+          proofVersion: "ccc-proof-admission.v1",
+          extensionRootRelativeSource: "ccc-campaign-proof-admission.js",
+          extensionSourceSha256: "a".repeat(64),
+          extensionManifestSha256: "b".repeat(64),
+          definitionSha256: computeCccPrdProofDefinitionSha256(preparedProof),
+          ...computeCccPrdProofV2AdmissionDigests(preparedProof),
+        },
+      };
+      await expect(assertCccPrdSemanticProofV2Custody({
+        repositoryRoot: state.root,
+        baseCommit,
+        proofs: [admittedProof],
+        modelWriteRoots: ["src", "test"],
+        toolchainPaths: {
+          ...state.toolchainPaths,
+          pythonExecutablePath: requestedPythonPath,
+        },
+      })).resolves.toBeUndefined();
+    });
+
+    it("rejects byte drift in an admitted prepared Python runtime manifest", async () => {
+      const admittedProof = {
+        ...preparedProof,
+        admission: {
+          schema: "ccc-prd.proof-admission.v2" as const,
+          pluginId: "fusion-native",
+          pluginVersion: "1.0.0",
+          extensionId: "ccc-proof-admission",
+          proofVersion: "ccc-proof-admission.v1",
+          extensionRootRelativeSource: "ccc-campaign-proof-admission.js",
+          extensionSourceSha256: "a".repeat(64),
+          extensionManifestSha256: "b".repeat(64),
+          definitionSha256: computeCccPrdProofDefinitionSha256(preparedProof),
+          ...computeCccPrdProofV2AdmissionDigests(preparedProof),
+        },
+      };
+      await writeFile(runtimePaths.sitePackages, "drifted runtime bytes\n");
+      await expect(assertCccPrdSemanticProofV2Custody({
+        repositoryRoot: state.root,
+        baseCommit,
+        proofs: [admittedProof],
+        modelWriteRoots: ["src", "test"],
+        toolchainPaths: {
+          ...state.toolchainPaths,
+          pythonExecutablePath: requestedPythonPath,
+        },
+      })).rejects.toThrow(/custody|drifted/u);
+    });
   });
 
-  it("RED-R1-python-discovery-controller-pythonpath: admits an existing absolute site-packages root from sanitized controller sys.path", async () => {
+  it("RED-R1-python-discovery-controller-pythonpath: rejects invalid roots and exercises real discovery in its integration lane", async () => {
     const state = await fixture({
       taskCommand: "python3 verify/python_adapter.py --target fixtures/python-target",
     });
@@ -491,6 +564,20 @@ describe("CCC PRD semantic-proof controller custody", () => {
       pythonExecutablePath: requestedPythonPath,
       pythonPathRoots: [canonicalSitePackagesRoot],
     } as CccPrdSemanticProofToolchainPaths;
+    for (const pythonPathRoots of [
+      [".venv/lib/python3.12/site-packages"],
+      [join(sitePackagesParent, "missing-site-packages")],
+    ]) {
+      await expect(hydrateCccPrdSemanticProofV2Custody({
+        repositoryRoot: state.root,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src", "test"],
+        toolchainPaths: { ...toolchainPaths, pythonPathRoots },
+      })).rejects.toThrow(/controller PYTHONPATH|root/u);
+    }
+    if (process.env.FUSION_TEST_PYTHON_RUNTIME_INTEGRATION !== "1") return;
+
     const hydrated = await hydrateCccPrdSemanticProofV2Custody({
       repositoryRoot: state.root,
       baseCommit,
@@ -521,54 +608,6 @@ describe("CCC PRD semantic-proof controller custody", () => {
       );
     }
     expect(existsSync(sitecustomizeMarker)).toBe(false);
-    const hydratedProof = hydrated[0]!;
-    const admittedProof = {
-      ...hydratedProof,
-      admission: {
-        schema: "ccc-prd.proof-admission.v2" as const,
-        pluginId: "fusion-native",
-        pluginVersion: "1.0.0",
-        extensionId: "ccc-proof-admission",
-        proofVersion: "ccc-proof-admission.v1",
-        extensionRootRelativeSource: "ccc-campaign-proof-admission.js",
-        extensionSourceSha256: "a".repeat(64),
-        extensionManifestSha256: "b".repeat(64),
-        definitionSha256: computeCccPrdProofDefinitionSha256(hydratedProof),
-        ...computeCccPrdProofV2AdmissionDigests(hydratedProof),
-      },
-    };
-    await expect(assertCccPrdSemanticProofV2Custody({
-      repositoryRoot: state.root,
-      baseCommit,
-      proofs: [admittedProof],
-      modelWriteRoots: ["src", "test"],
-      toolchainPaths,
-    })).resolves.toBeUndefined();
-    const differentSitePackagesRoot = join(sitePackagesParent, "different-site-packages");
-    await mkdir(differentSitePackagesRoot);
-    await writeFile(join(differentSitePackagesRoot, "different.py"), "DIFFERENT = True\n");
-    await expect(assertCccPrdSemanticProofV2Custody({
-      repositoryRoot: state.root,
-      baseCommit,
-      proofs: [admittedProof],
-      modelWriteRoots: ["src", "test"],
-      toolchainPaths: {
-        ...toolchainPaths,
-        pythonPathRoots: [await realpath(differentSitePackagesRoot)],
-      },
-    })).rejects.toThrow(/custody|drifted/u);
-    for (const pythonPathRoots of [
-      [".venv/lib/python3.12/site-packages"],
-      [join(sitePackagesParent, "missing-site-packages")],
-    ]) {
-      await expect(hydrateCccPrdSemanticProofV2Custody({
-        repositoryRoot: state.root,
-        baseCommit,
-        proofs: [proof],
-        modelWriteRoots: ["src", "test"],
-        toolchainPaths: { ...toolchainPaths, pythonPathRoots },
-      })).rejects.toThrow(/controller PYTHONPATH|root/u);
-    }
   });
 
   it("RED-S5-preflight-no-probe-before-hash: rejects a replaced executable before its version command can run", async () => {

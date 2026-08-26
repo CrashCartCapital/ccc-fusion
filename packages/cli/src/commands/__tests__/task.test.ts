@@ -206,7 +206,7 @@ import {
 } from "@fusion/core/gh-cli";
 import { GitHubClient, generatePrMetadata, isGitHubIssueAlreadyImported } from "@fusion/dashboard";
 import { createSession, submitResponse } from "@fusion/dashboard/planning";
-import { resolveProject, createLocalStore } from "../../project-context.js";
+import { closeProjectStore, resolveProject, createLocalStore } from "../../project-context.js";
 import { aiMergeTask, runAiMerge, landWorkspaceTask } from "@fusion/engine";
 
 const mockedExec = vi.mocked(exec);
@@ -1140,6 +1140,136 @@ describe("project-aware task command behavior", () => {
 
     expect(resolveProject).toHaveBeenCalledWith("demo-project");
     expect(mockMoveTask).toHaveBeenCalledWith("FN-123", "done");
+  });
+
+  it("runTaskShow retries a transient lock through the real command boundary and closes each attempt", async () => {
+    vi.useFakeTimers();
+    process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
+    const getTask = vi.fn()
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce(makeTask({ id: "FN-126", column: "todo" }));
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test",
+      projectPath: "/test",
+      projectName: "demo-project",
+      isRegistered: true,
+      store: { getTask } as unknown as TaskStore,
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const pending = runTaskShow("FN-126", "demo-project");
+      for (let i = 0; i < 10 && getTask.mock.calls.length < 2; i++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      await pending;
+
+      expect(getTask).toHaveBeenCalledTimes(2);
+      expect(resolveProject).toHaveBeenCalledTimes(2);
+      expect(closeProjectStore).toHaveBeenCalledTimes(2);
+    } finally {
+      delete process.env.FUSION_CLI_LOCK_RETRY_MS;
+      vi.useRealTimers();
+      logSpy.mockRestore();
+    }
+  });
+
+  it("runTaskMove retries a transient lock through the real command boundary and closes each attempt", async () => {
+    vi.useFakeTimers();
+    process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
+    const moveTask = vi.fn()
+      .mockRejectedValueOnce(new Error("SQLITE_BUSY: database is locked"))
+      .mockResolvedValueOnce(makeTask({ id: "FN-127", column: "done" }));
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test",
+      projectPath: "/test",
+      projectName: "demo-project",
+      isRegistered: true,
+      store: { moveTask } as unknown as TaskStore,
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const pending = runTaskMove("FN-127", "done", "demo-project");
+      for (let i = 0; i < 10 && moveTask.mock.calls.length < 2; i++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      await pending;
+
+      expect(moveTask).toHaveBeenCalledTimes(2);
+      expect(resolveProject).toHaveBeenCalledTimes(2);
+      expect(closeProjectStore).toHaveBeenCalledTimes(2);
+    } finally {
+      delete process.env.FUSION_CLI_LOCK_RETRY_MS;
+      vi.useRealTimers();
+      logSpy.mockRestore();
+    }
+  });
+
+  it("runTaskUpdate keeps the production command wired through whole-unit retry and teardown", async () => {
+    vi.useFakeTimers();
+    process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
+    const updateStep = vi.fn()
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce(makeTask({ id: "FN-124", steps: [{ name: "step0", status: "done" }] }));
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test",
+      projectPath: "/test",
+      projectName: "demo-project",
+      isRegistered: true,
+      store: { updateStep } as unknown as TaskStore,
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const pending = runTaskUpdate("FN-124", "0", "done", "demo-project");
+      for (let i = 0; i < 10 && updateStep.mock.calls.length < 2; i++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      await pending;
+
+      expect(updateStep).toHaveBeenCalledTimes(2);
+      expect(resolveProject).toHaveBeenCalledTimes(2);
+      expect(closeProjectStore).toHaveBeenCalledTimes(2);
+    } finally {
+      delete process.env.FUSION_CLI_LOCK_RETRY_MS;
+      vi.useRealTimers();
+      logSpy.mockRestore();
+    }
+  });
+
+  it("runTaskDelete retries only its terminal write without repeating the existence check", async () => {
+    vi.useFakeTimers();
+    process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
+    const getTask = vi.fn().mockResolvedValue(makeTask({ id: "FN-125" }));
+    const deleteTask = vi.fn()
+      .mockRejectedValueOnce(new Error("database is locked"))
+      .mockResolvedValueOnce(undefined);
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectId: "proj_test",
+      projectPath: "/test",
+      projectName: "demo-project",
+      isRegistered: true,
+      store: { getTask, deleteTask } as unknown as TaskStore,
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const pending = runTaskDelete("FN-125", true, false, "demo-project");
+      for (let i = 0; i < 10 && deleteTask.mock.calls.length < 2; i++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+      }
+      await pending;
+
+      expect(getTask).toHaveBeenCalledTimes(1);
+      expect(deleteTask).toHaveBeenCalledTimes(2);
+      expect(resolveProject).toHaveBeenCalledTimes(1);
+      expect(closeProjectStore).toHaveBeenCalled();
+    } finally {
+      delete process.env.FUSION_CLI_LOCK_RETRY_MS;
+      vi.useRealTimers();
+      logSpy.mockRestore();
+    }
   });
 
   it("runTaskAttach uses resolved project store when project name is provided", async () => {

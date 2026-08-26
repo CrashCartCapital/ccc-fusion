@@ -102,6 +102,12 @@ describe("CLI package.json publishing config", () => {
     expect(pkg.bin.fusion).toBe("./bin.mjs");
   });
 
+  it("runs the required dist-artifact bootstrap explicitly before the full CLI suite", () => {
+    expect(pkg.scripts?.test).toBe(
+      "node ../../scripts/ensure-test-artifacts.mjs && vitest run --silent=passed-only --reporter=dot",
+    );
+  });
+
   it("marks the internal proof host executable in packed artifacts without exposing a public bin", () => {
     const proofHost = "dist/ccc-campaign-proof-admission.js";
     const publishedPkg = applyPrepackTransform(pkg);

@@ -15,9 +15,29 @@ import {
   runFn,
   runFnAsync,
 } from "./prd-built-cli-fixture.js";
+import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
+import { runPrdCommand } from "../prd.js";
 
 afterEach(cleanupPacketRoots);
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+async function createDeterministicallyAuthoredPacketRoot() {
+  const packet = createPacketRoot();
+  const output: string[] = [];
+  const status = await runPrdCommand(
+    ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+    { write: (line) => output.push(line) },
+    {
+      bootstrapProofAdmission: () => bootstrapCccCampaignProofAdmissionHost({
+        builtRootPath: join(repoRoot, "packages/cli/dist"),
+      }),
+    },
+  );
+  if (status !== 0) {
+    throw new Error(`deterministic sidecar fixture authoring failed: ${output.join("\n")}`);
+  }
+  return packet;
+}
 
 describe("prd built CLI user contract", () => {
   it("advertises author, validate, and compile from top-level help", () => {
@@ -312,14 +332,11 @@ version: 2.0.0
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
   }, 60_000);
 
-  it("refuses a foreign admitted target through built validate and compile", () => {
-    const packet = createPacketRoot();
-    expect(runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]).status).toBe(0);
-    for (const command of ["validate", "compile"]) {
-      const result = runFn(["prd", command, packet.root, packet.manifest, packet.sidecar, "foreign/repo", packet.base]);
-      expect(result.status).toBe(1);
-      expect(result.stdout).toContain("CCC_PRD_FOREIGN_TARGET");
-    }
+  it.each(["validate", "compile"] as const)("refuses a foreign admitted target through built %s", async (command) => {
+    const packet = await createDeterministicallyAuthoredPacketRoot();
+    const result = runFn(["prd", command, packet.root, packet.manifest, packet.sidecar, "foreign/repo", packet.base]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("CCC_PRD_FOREIGN_TARGET");
   }, 60_000);
 
   it("refuses a foreign admitted base through built validate and compile", () => {

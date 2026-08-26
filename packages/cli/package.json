@@ -60,7 +60,7 @@
     "build:exe": "bun run build.ts",
     "build:exe:all": "bun run build.ts --all",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --silent=passed-only --reporter=dot",
+    "test": "node ../../scripts/ensure-test-artifacts.mjs && vitest run --silent=passed-only --reporter=dot",
     "test:ci-shape": "vitest run src/__tests__/ci-workflow.test.ts --silent=passed-only --reporter=dot",
     "test:docs-index": "vitest run src/__tests__/docs-readme-index.test.ts --silent=passed-only --reporter=dot",
     "test:slow-cli": "cross-env FUSION_TEST_SLOW_CLI=1 vitest run src/commands/__tests__/agent-export.test.ts --silent=passed-only --reporter=dot",
