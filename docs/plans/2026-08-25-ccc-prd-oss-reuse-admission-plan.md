@@ -114,10 +114,11 @@ Implement and prove the design in `docs/plans/2026-08-25-ccc-prd-oss-reuse-admis
 - 2026-08-25 — Baseline engine Vitest lane proof: 1 file, 8 tests passed.
 - 2026-08-25 — Requested Luna review route could not expose an effective model receipt and is recorded as `ROUTE_UNAVAILABLE`; its read-only findings were treated as advisory only.
 - 2026-08-25 — AGY exact-artifact review initially rejected five major and three minor ambiguities. All eight were repaired; closure review using `gemini-3.7-flash-high` returned `ACCEPT`, with two minor follow-ups (uniform cost horizon and explicit result interfaces) applied.
-- Task 2 core contract: pending.
-- Task 3 engine evaluator: pending.
-- Task 4 combined documentation/proof: pending.
-- Task 5 independent implementation review: pending.
+- 2026-08-25 — Task 2 core RED: public parser assertion received `undefined`; normalization RED observed caller ordering instead of canonical ordering. GREEN/REFACTOR: 8 tests passed and `pnpm --filter @fusion/core typecheck` passed.
+- 2026-08-25 — Task 3 engine REDs: public evaluator, established-project refusal, unknown classification, close-match selection, separate package/reference surfaces, package selection, and reference learning each failed as an executed assertion before implementation. GREEN/REFACTOR: 15 tests passed and `pnpm --filter @fusion/engine typecheck` passed.
+- 2026-08-25 — Task 4 documentation added at `docs/ccc-prd-oss-reuse-admission.md`; combined targeted package commands passed with 8 core tests and 15 engine tests.
+- 2026-08-25 — Task 5 AGY implementation review returned `ACCEPT` and verified all three failure probes. One diagnostics-index finding received a regression RED (`$.candidates[0]` observed instead of original `$.candidates[1]`), then GREEN after validation moved before canonical sorting; import order and defensive package uncertainty ordering were also cleaned up.
+- Task 5 independent Luna implementation review: in progress; effective route proof pending.
 - Task 6 canonical closeout: pending.
 
 ## Remaining Risks
