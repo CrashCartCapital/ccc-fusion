@@ -47,7 +47,7 @@ import {
 } from "./ccc-campaign-required-commit.js";
 import {
   createCccCampaignReadyTool,
-  fingerprintCccCampaignReadyCandidate,
+  fingerprintCccCampaignAllowedCandidate,
   resolveCccCampaignReadyTimeoutMs,
   verifyCccCampaignReadyCandidate,
 } from "./ccc-campaign-ready.js";
@@ -19016,10 +19016,10 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       const campaignRemainingRequests = cccCampaignImplementation
         ? Math.max(
             1,
-            (Number.isSafeInteger(campaignReadyContext!.bounds.maxRequests)
-              ? campaignReadyContext!.bounds.maxRequests
+            (Number.isSafeInteger(campaignReadyContext?.bounds?.maxRequests)
+              ? campaignReadyContext!.bounds!.maxRequests
               : 1)
-              - (Number.isSafeInteger(campaignReadyContext!.requestCount)
+              - (Number.isSafeInteger(campaignReadyContext?.requestCount)
                 ? campaignReadyContext!.requestCount
                 : 0),
           )
@@ -19029,7 +19029,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         Math.floor(campaignRemainingRequests / 3),
       );
       const campaignDiscoveryRefusalToolLimit = Math.max(
-        campaignDiscoveryGuidanceToolLimit,
+        campaignDiscoveryGuidanceToolLimit + 1,
         Math.floor(campaignRemainingRequests / 2),
       );
       const campaignPhaseIntent: {
@@ -19090,6 +19090,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             signal: stepOptions?.signal,
           })
         : undefined;
+      let campaignTurnStartAllowedFingerprint: string | undefined;
       const { session } = await createResolvedAgentSession({
         sessionPurpose: "executor",
         runtimeHint: cccProviderAttemptBinding ? "pi" : workflowRuntimeHint,
@@ -19128,6 +19129,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ...(cccCampaignImplementation ? {
           cccCampaignPhaseToolPolicy: {
             readOnlyToolNames: campaignPhaseReadOnlyToolNames,
+            exemptToolNames: ["fn_complete_phase"],
             maxReadOnlyToolCallsBeforeGuidance: campaignDiscoveryGuidanceToolLimit,
             maxReadOnlyToolCallsBeforeRefusal: campaignDiscoveryRefusalToolLimit,
             guidanceMessage:
@@ -19137,6 +19139,26 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: repeated DISCOVER read/search/list calls are phase-bounded. "
               + "No more discovery tools will run in this turn; use write/edit/bash to make the admitted change or stop honestly.",
             currentPhase: () => campaignPhaseRuntime.activePhase,
+            onPotentialMutationCompleted: async () => {
+              try {
+                const currentFingerprint = await fingerprintCccCampaignAllowedCandidate({
+                  worktreePath,
+                  allowedRoots: campaignAllowedWriteRoots,
+                });
+                const confirmedMutation = typeof campaignTurnStartAllowedFingerprint === "string"
+                  && currentFingerprint !== campaignTurnStartAllowedFingerprint;
+                if (confirmedMutation) {
+                  campaignPhaseRuntime.turnConfirmedMutation = true;
+                  campaignPhaseRuntime.activePhase = "MUTATE";
+                }
+                return confirmedMutation;
+              } catch (error) {
+                executorLog.warn(
+                  `${task.id}: unable to fingerprint campaign candidate after a potential mutation: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                return false;
+              }
+            },
           },
         } : {}),
         ...(cccProviderAttemptBinding ? { profile: CCC_FUSION_PROFILE, subscriptionReady: true as const, cccProviderAttemptBinding } : {}),
@@ -19273,10 +19295,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
             "Review the work done in this worktree and evaluate it against the criteria in your instructions.";
         const promptPromise = (async () => {
-          let campaignTurnStartFingerprint: string | undefined;
           if (cccCampaignImplementation) {
             try {
-              campaignTurnStartFingerprint = await fingerprintCccCampaignReadyCandidate({
+              campaignTurnStartAllowedFingerprint = await fingerprintCccCampaignAllowedCandidate({
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
               });
@@ -19300,7 +19321,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
            * falls through to the existing fail-closed commit refusal.
            */
           let worktreeIsClean = false;
-          let campaignTurnEndFingerprint: string | undefined;
+          let campaignTurnEndAllowedFingerprint: string | undefined;
           try {
             const { stdout } = await execAsync(
               "git status --porcelain=v1 --untracked-files=all",
@@ -19312,7 +19333,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               },
             );
             worktreeIsClean = stdout.trim().length === 0;
-            campaignTurnEndFingerprint = await fingerprintCccCampaignReadyCandidate({
+            campaignTurnEndAllowedFingerprint = await fingerprintCccCampaignAllowedCandidate({
               worktreePath,
               allowedRoots: campaignAllowedWriteRoots,
             });
@@ -19322,9 +19343,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             );
           }
           const turnConfirmedMutation = !worktreeIsClean
-            && typeof campaignTurnStartFingerprint === "string"
-            && typeof campaignTurnEndFingerprint === "string"
-            && campaignTurnStartFingerprint !== campaignTurnEndFingerprint;
+            && typeof campaignTurnStartAllowedFingerprint === "string"
+            && typeof campaignTurnEndAllowedFingerprint === "string"
+            && campaignTurnStartAllowedFingerprint !== campaignTurnEndAllowedFingerprint;
           campaignPhaseRuntime.turnConfirmedMutation = turnConfirmedMutation;
           if (campaignPhaseIntent.completionRequested) return;
 
@@ -19417,13 +19438,13 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               },
             );
             const continuationIsDirty = stdout.trim().length > 0;
-            const continuationFingerprint = await fingerprintCccCampaignReadyCandidate({
+            const continuationFingerprint = await fingerprintCccCampaignAllowedCandidate({
               worktreePath,
               allowedRoots: campaignAllowedWriteRoots,
             });
             continuationCreatedDiff = continuationIsDirty
-              && typeof campaignTurnStartFingerprint === "string"
-              && continuationFingerprint !== campaignTurnStartFingerprint;
+              && typeof campaignTurnStartAllowedFingerprint === "string"
+              && continuationFingerprint !== campaignTurnStartAllowedFingerprint;
             campaignPhaseRuntime.turnConfirmedMutation = continuationCreatedDiff;
           } catch (error) {
             executorLog.warn(
@@ -19560,7 +19581,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               repairAttempts,
             });
             if (verificationDecision.action === "PROMPT_REPAIR") {
-              const repairStartFingerprint = await fingerprintCccCampaignReadyCandidate({
+              const repairStartFingerprint = await fingerprintCccCampaignAllowedCandidate({
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
               });
@@ -19578,7 +19599,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
                   + "Repair only the admitted files, rerun the targeted check needed to diagnose the failure, and call fn_complete_phase by itself when REPAIR is complete. "
                   + "This is the only REPAIR turn; a second controller verification failure is terminal.",
               );
-              const repairEndFingerprint = await fingerprintCccCampaignReadyCandidate({
+              const repairEndFingerprint = await fingerprintCccCampaignAllowedCandidate({
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
               });

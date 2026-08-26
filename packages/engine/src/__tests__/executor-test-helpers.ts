@@ -1,5 +1,6 @@
 import { vi } from "vitest";
 import type { Mock } from "vitest";
+import { isCccCampaignDiscoveryToolCall } from "../ccc-campaign-tool-phase.js";
 import { installTaskWorktreeIdentityGuard } from "../worktree-hooks.js";
 import type * as ReviewerModule from "../reviewer.js";
 
@@ -12,19 +13,7 @@ vi.mock("../pi.js", () => ({
     const suffixes = [thinking ? `thinking effort: ${thinking}` : "", ...annotations].filter(Boolean);
     return suffixes.length ? `${model} ${suffixes.map((suffix) => `(${suffix})`).join(" ")}` : model;
   }),
-  isCccCampaignDiscoveryToolCall: (toolName: string, args?: Record<string, unknown>) => {
-    const normalizedToolName = toolName.trim().toLowerCase();
-    if (!["read", "grep", "find", "ls", "glob", "bash"].includes(normalizedToolName)) return false;
-    if (normalizedToolName !== "bash") return true;
-    let command = typeof args?.command === "string" ? args.command.trim() : "";
-    while (/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+/.test(command)) {
-      command = command.replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+/, "").trim();
-    }
-    if (/\b(?:sed)\s+(?:-[^-]*i|--in-place)\b/.test(command)) return false;
-    if (/(?:^|\s)1>>?|(?:^|[^0-9])(?:>>?|<<)/.test(command.replace(/\s+2>>?\S+/g, ""))) return false;
-    if (/^git\s+(?:grep|diff|log|show|status|ls-files)\b/.test(command)) return true;
-    return /^(?:ls|pwd|find|grep|rg|sed|cat|head|tail|stat|wc|file)\b/.test(command);
-  },
+  isCccCampaignDiscoveryToolCall,
   compactSessionContext: vi.fn(async (session, instructions) => {
     if (typeof (session as any).compact === "function") {
       return (session as any).compact(instructions);

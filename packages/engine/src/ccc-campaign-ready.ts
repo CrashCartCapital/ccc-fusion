@@ -192,6 +192,19 @@ export async function fingerprintCccCampaignReadyCandidate(input: {
   return fingerprintCandidate(input.worktreePath, input.allowedRoots, untrackedPaths);
 }
 
+/** Fingerprint only bytes admitted to drive a live phase transition. */
+export async function fingerprintCccCampaignAllowedCandidate(input: {
+  worktreePath: string;
+  allowedRoots: readonly string[];
+}): Promise<string> {
+  const allowedRoots = input.allowedRoots.map(canonicalGitPath);
+  const { untrackedPaths } = await listCandidatePaths(input.worktreePath);
+  const admittedUntrackedPaths = untrackedPaths.filter((path) =>
+    allowedRoots.some((root) => pathWithinRoot(path, root))
+  );
+  return fingerprintCandidate(input.worktreePath, allowedRoots, admittedUntrackedPaths);
+}
+
 function taskProofCommands(campaign: CccCampaignTaskContext): string[] {
   const ids = new Set(campaign.proofIds);
   return campaign.proofs

@@ -191,4 +191,18 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
 
     expect(oneFile).not.toBe(twoFiles);
   });
+
+  it("scopes phase-transition fingerprints to admitted roots", async () => {
+    const { root } = await fixture();
+    const fingerprint = (readyModule as any).fingerprintCccCampaignAllowedCandidate;
+
+    const baseline = await fingerprint({ worktreePath: root, allowedRoots: ["src"] });
+    await writeFile(join(root, "outside.txt"), "unrelated\n");
+    const outsideOnly = await fingerprint({ worktreePath: root, allowedRoots: ["src"] });
+    await writeFile(join(root, "src", "inside.txt"), "admitted\n");
+    const admittedChange = await fingerprint({ worktreePath: root, allowedRoots: ["src"] });
+
+    expect(outsideOnly).toBe(baseline);
+    expect(admittedChange).not.toBe(baseline);
+  });
 });

@@ -6,11 +6,13 @@ const { createCccCampaignProviderAttemptBindingMock } = vi.hoisted(() => ({
 const {
   assertCccCampaignRequiredCommitCandidateMock,
   enforceCccCampaignRequiredCommitAfterNodeMock,
+  fingerprintCccCampaignAllowedCandidateMock,
   fingerprintCccCampaignReadyCandidateMock,
   verifyCccCampaignReadyCandidateMock,
 } = vi.hoisted(() => ({
   assertCccCampaignRequiredCommitCandidateMock: vi.fn(),
   enforceCccCampaignRequiredCommitAfterNodeMock: vi.fn(),
+  fingerprintCccCampaignAllowedCandidateMock: vi.fn(),
   fingerprintCccCampaignReadyCandidateMock: vi.fn(),
   verifyCccCampaignReadyCandidateMock: vi.fn(),
 }));
@@ -42,6 +44,7 @@ vi.mock("../ccc-campaign-product-control.js", async (importOriginal) => ({
 }));
 vi.mock("../ccc-campaign-ready.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../ccc-campaign-ready.js")>(),
+  fingerprintCccCampaignAllowedCandidate: fingerprintCccCampaignAllowedCandidateMock,
   fingerprintCccCampaignReadyCandidate: fingerprintCccCampaignReadyCandidateMock,
   verifyCccCampaignReadyCandidate: verifyCccCampaignReadyCandidateMock,
 }));
@@ -292,6 +295,10 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     requireCccCampaignLiveExecutionApprovalMock.mockResolvedValue(undefined);
     fingerprintCccCampaignReadyCandidateMock.mockReset();
     fingerprintCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValue("b".repeat(64));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
       .mockResolvedValueOnce("a".repeat(64))
       .mockResolvedValue("b".repeat(64));
     verifyCccCampaignReadyCandidateMock.mockReset();
@@ -645,6 +652,12 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       .mockResolvedValueOnce("b".repeat(64))
       .mockResolvedValueOnce("b".repeat(64))
       .mockResolvedValue("c".repeat(64));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("c".repeat(64));
     verifyCccCampaignReadyCandidateMock
       .mockResolvedValueOnce({
         ready: false,
@@ -870,6 +883,69 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(userPrompts[0]).toContain("at most 1 read/search/list discovery tool call");
   });
 
+  it("fails closed to the minimum discovery boundary when persisted request bounds are absent", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-missing-request-bounds",
+    );
+    store.getCccCampaignContextForTask.mockResolvedValueOnce({
+      ...(await store.getCccCampaignContextForTask(nodeTask.id)),
+      bounds: undefined,
+      requestCount: 0,
+    } as never);
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect((mockedCreateFnAgent.mock.calls[0]?.[0] as Record<string, any>).cccCampaignPhaseToolPolicy)
+      .toMatchObject({
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+      });
+  });
+
+  it("moves the live controller policy to MUTATE only after admitted candidate bytes change", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-live-mutation-phase",
+    );
+    let observedBefore: string | undefined;
+    let observedAfter: string | undefined;
+    mockedCreateFnAgent.mockImplementation(async (options: any) => ({
+      session: {
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn(async () => {
+          observedBefore = options.cccCampaignPhaseToolPolicy.currentPhase();
+          await options.cccCampaignPhaseToolPolicy.onPotentialMutationCompleted("write", {
+            path: "src/slugify.js",
+          });
+          observedAfter = options.cccCampaignPhaseToolPolicy.currentPhase();
+          const phaseTool = options.customTools.find((tool: any) => tool.name === "fn_complete_phase");
+          await phaseTool.execute("complete-phase", {}, undefined, () => undefined);
+        }),
+        dispose: vi.fn(),
+      },
+    }));
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(observedBefore).toBe("DISCOVER");
+    expect(observedAfter).toBe("MUTATE");
+  });
+
   it("mutate_exit_requires_explicit_signal: a dirty quiet turn cannot return success", async () => {
     const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
       "",
@@ -916,6 +992,8 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     );
     fingerprintCccCampaignReadyCandidateMock.mockReset();
     fingerprintCccCampaignReadyCandidateMock.mockResolvedValue("a".repeat(64));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock.mockResolvedValue("a".repeat(64));
 
     const result = await (executor as any).runGraphCustomNode(
       campaignModelNode(execution),
@@ -939,6 +1017,8 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     );
     fingerprintCccCampaignReadyCandidateMock.mockReset();
     fingerprintCccCampaignReadyCandidateMock.mockResolvedValue("a".repeat(64));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock.mockResolvedValue("a".repeat(64));
 
     const result = await (executor as any).runGraphCustomNode(
       campaignModelNode(execution),

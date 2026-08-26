@@ -76,6 +76,12 @@ import {
 import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { applyClaudeAcpEnable } from "./claude-acp-enable.js";
+import {
+  isCccCampaignDiscoveryToolCall,
+  isCccCampaignExplicitMutationToolCall,
+  isCccCampaignPotentialMutationToolCall,
+} from "./ccc-campaign-tool-phase.js";
+export { isCccCampaignDiscoveryToolCall } from "./ccc-campaign-tool-phase.js";
 import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
 import { refreshFusionModelRegistry } from "./model-registry-refresh.js";
 import { piLog, extensionsLog } from "./logger.js";
@@ -1815,11 +1821,16 @@ export interface AgentOptions {
   builtinToolsAllowlist?: BuiltinWebToolName[];
   cccCampaignPhaseToolPolicy?: {
     readOnlyToolNames: readonly string[];
+    exemptToolNames?: readonly string[];
     maxReadOnlyToolCallsBeforeGuidance: number;
     maxReadOnlyToolCallsBeforeRefusal: number;
     guidanceMessage: string;
     refusalMessage: string;
     currentPhase?: () => string | undefined;
+    onPotentialMutationCompleted?: (
+      toolName: string,
+      params: Record<string, unknown> | undefined,
+    ) => Promise<boolean>;
   };
   onText?: (delta: string) => void;
   onThinking?: (delta: string) => void;
@@ -2577,23 +2588,6 @@ function boundaryRejection(message: string, details?: Record<string, unknown>) {
   };
 }
 
-export function isCccCampaignDiscoveryToolCall(
-  toolName: string,
-  params: Record<string, unknown> | undefined,
-): boolean {
-  const normalizedToolName = toolName.trim().toLowerCase();
-  if (!["read", "grep", "find", "ls", "glob", "bash"].includes(normalizedToolName)) return false;
-  if (normalizedToolName !== "bash") return true;
-  let command = typeof params?.command === "string" ? params.command.trim() : "";
-  while (/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+/.test(command)) {
-    command = command.replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+/, "").trim();
-  }
-  if (/\b(?:sed)\s+(?:-[^-]*i|--in-place)\b/.test(command)) return false;
-  if (/(?:^|\s)1>>?|(?:^|[^0-9])(?:>>?|<<)/.test(command.replace(/\s+2>>?\S+/g, ""))) return false;
-  if (/^git\s+(?:grep|diff|log|show|status|ls-files)\b/.test(command)) return true;
-  return /^(?:ls|pwd|find|grep|rg|sed|cat|head|tail|stat|wc|file)\b/.test(command);
-}
-
 function normalizeApprovalRequestCategory(
   category: PermanentAgentActionCategory,
 ): AgentPermissionPolicyActionCategory {
@@ -2691,38 +2685,117 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
     policy.readOnlyToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
   );
   if (readOnlyToolNames.size === 0) return tools;
+  const exemptToolNames = new Set(
+    (policy.exemptToolNames ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean),
+  );
+  const guidanceLimit = Number.isSafeInteger(policy.maxReadOnlyToolCallsBeforeGuidance)
+    ? Math.max(1, policy.maxReadOnlyToolCallsBeforeGuidance)
+    : 1;
+  const refusalLimit = Math.max(
+    guidanceLimit + 1,
+    Number.isSafeInteger(policy.maxReadOnlyToolCallsBeforeRefusal)
+      ? policy.maxReadOnlyToolCallsBeforeRefusal
+      : 1,
+  );
   let readOnlyToolCalls = 0;
+  let postRefusalMutationAttempted = false;
+  const appendGuidance = (
+    result: unknown,
+    message: string,
+    details: Record<string, unknown>,
+  ): unknown => {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const value = result as Record<string, unknown>;
+    if (!Array.isArray(value.content)) return result;
+    return {
+      ...value,
+      content: [...value.content, { type: "text", text: message }],
+      isError: value.isError === true,
+      details: {
+        ...(typeof value.details === "object" && value.details ? value.details : {}),
+        ...details,
+      },
+    };
+  };
+  const refuseIfExhausted = (toolName: string) => readOnlyToolCalls > refusalLimit
+    ? boundaryRejection(policy.refusalMessage, {
+        phase: "DISCOVER",
+        toolName,
+        readOnlyToolCalls,
+        maxReadOnlyToolCallsBeforeRefusal: refusalLimit,
+      })
+    : undefined;
   return tools.map((tool) => {
-    if (!readOnlyToolNames.has(tool.name.trim().toLowerCase())) return tool;
+    const normalizedToolName = tool.name.trim().toLowerCase();
+    if (exemptToolNames.has(normalizedToolName)) {
+      return { ...tool, executionMode: "sequential" as const };
+    }
     const originalExecute = tool.execute as any;
     return {
       ...tool,
+      // pi-agent-core executes tool batches in parallel by default. Campaign
+      // counters and candidate fingerprints are custody state, so every tool
+      // in this policy must participate in one deterministic sequence.
+      executionMode: "sequential" as const,
       execute: async (...args: any[]) => {
-        if (policy.currentPhase && policy.currentPhase() !== "DISCOVER") {
+        if ((policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
           return originalExecute(...args);
         }
         const params = args[1] as Record<string, unknown> | undefined;
-        if (!isCccCampaignDiscoveryToolCall(tool.name, params)) {
-          return originalExecute(...args);
+        const discovery = readOnlyToolNames.has(normalizedToolName)
+          && isCccCampaignDiscoveryToolCall(tool.name, params);
+        if (discovery) {
+          readOnlyToolCalls += 1;
+          const refusal = refuseIfExhausted(tool.name);
+          if (refusal) return refusal;
+          const result = await originalExecute(...args);
+          if (readOnlyToolCalls > guidanceLimit) {
+            return appendGuidance(result, policy.guidanceMessage, {
+              phase: "DISCOVER",
+              toolName: tool.name,
+              readOnlyToolCalls,
+              maxReadOnlyToolCallsBeforeGuidance: guidanceLimit,
+            });
+          }
+          return result;
         }
-        readOnlyToolCalls += 1;
-        if (readOnlyToolCalls > policy.maxReadOnlyToolCallsBeforeRefusal) {
+
+        const explicitMutationTool = isCccCampaignExplicitMutationToolCall(tool.name, params);
+        if (
+          readOnlyToolCalls >= refusalLimit
+          && (!explicitMutationTool || postRefusalMutationAttempted)
+        ) {
           return boundaryRejection(policy.refusalMessage, {
             phase: "DISCOVER",
             toolName: tool.name,
             readOnlyToolCalls,
-            maxReadOnlyToolCallsBeforeRefusal: policy.maxReadOnlyToolCallsBeforeRefusal,
+            maxReadOnlyToolCallsBeforeRefusal: refusalLimit,
           });
         }
-        if (readOnlyToolCalls > policy.maxReadOnlyToolCallsBeforeGuidance) {
-          return boundaryRejection(policy.guidanceMessage, {
+        if (readOnlyToolCalls >= refusalLimit) postRefusalMutationAttempted = true;
+
+        const result = await originalExecute(...args);
+        if (!isCccCampaignPotentialMutationToolCall(tool.name, params)) return result;
+        const confirmedMutation = await policy.onPotentialMutationCompleted?.(tool.name, params) ?? false;
+        if (confirmedMutation || (policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
+          return result;
+        }
+
+        // Unknown Bash syntax is allowed to run once so real mutations are not
+        // blocked. If the controller fingerprint stays unchanged, count it as
+        // discovery after execution so wrappers cannot create an unbounded bypass.
+        readOnlyToolCalls += 1;
+        const refusal = refuseIfExhausted(tool.name);
+        if (refusal) return refusal;
+        if (readOnlyToolCalls > guidanceLimit) {
+          return appendGuidance(result, policy.guidanceMessage, {
             phase: "DISCOVER",
             toolName: tool.name,
             readOnlyToolCalls,
-            maxReadOnlyToolCallsBeforeGuidance: policy.maxReadOnlyToolCallsBeforeGuidance,
+            maxReadOnlyToolCallsBeforeGuidance: guidanceLimit,
           });
         }
-        return originalExecute(...args);
+        return result;
       },
     };
   });
