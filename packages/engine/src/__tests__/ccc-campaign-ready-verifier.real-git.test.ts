@@ -1,7 +1,7 @@
 import { execFile as execFileCallback, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import * as readyModule from "../ccc-campaign-ready.js";
@@ -99,6 +99,77 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
     });
     await expect(readFile(join(root, "src", "value.txt"), "utf8")).resolves.toBe("ready\n");
     await expect(readFile(join(root, "verifier-side-effect.txt"), "utf8")).rejects.toThrow();
+  });
+
+  it.sequential("verifies headlessly when checkout requires an interactive Git safety prompt", async () => {
+    const { root, campaign } = await fixture();
+    const guardRoot = await mkdtemp(join(tmpdir(), "fusion-headless-git-guard-"));
+    roots.push(guardRoot);
+    const guardedGit = join(guardRoot, "git");
+    const guardMarker = join(guardRoot, "invocations.log");
+    await writeFile(
+      guardedGit,
+      [
+        "#!/bin/sh",
+        "printf '%s\\n' \"$*\" >> \"$FUSION_TEST_GIT_GUARD_MARKER\"",
+        "for arg in \"$@\"; do",
+        "  if [ \"$arg\" = \"checkout\" ]; then",
+        "    echo \"headless Git policy blocks checkout\" >&2",
+        "    exit 126",
+        "  fi",
+        "done",
+        "PATH=\"$FUSION_TEST_AMBIENT_PATH\"",
+        "export PATH",
+        "exec git \"$@\"",
+        "",
+      ].join("\n"),
+    );
+    await chmod(guardedGit, 0o755);
+    const previousPath = process.env.PATH;
+    const ambientPath = previousPath ?? "";
+    const previousDelegatePath = process.env.FUSION_TEST_AMBIENT_PATH;
+    const previousMarkerPath = process.env.FUSION_TEST_GIT_GUARD_MARKER;
+    process.env.PATH = `${guardRoot}${delimiter}${ambientPath}`;
+    process.env.FUSION_TEST_AMBIENT_PATH = ambientPath;
+    process.env.FUSION_TEST_GIT_GUARD_MARKER = guardMarker;
+
+    try {
+      const result = await (readyModule as any).verifyCccCampaignReadyCandidate({
+        taskId: campaign.taskId,
+        worktreePath: root,
+        campaign,
+        timeoutMs: 30_000,
+      });
+
+      expect(result).toMatchObject({
+        ready: true,
+        taskId: campaign.taskId,
+        candidateFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+      });
+      const invocations = await readFile(guardMarker, "utf8");
+      expect(invocations).toContain("switch --quiet --detach HEAD");
+      const invokedCheckout = invocations
+        .trim()
+        .split("\n")
+        .some((line) => line.split(/\s+/u).includes("checkout"));
+      expect(invokedCheckout).toBe(false);
+    } finally {
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
+      if (previousDelegatePath === undefined) {
+        delete process.env.FUSION_TEST_AMBIENT_PATH;
+      } else {
+        process.env.FUSION_TEST_AMBIENT_PATH = previousDelegatePath;
+      }
+      if (previousMarkerPath === undefined) {
+        delete process.env.FUSION_TEST_GIT_GUARD_MARKER;
+      } else {
+        process.env.FUSION_TEST_GIT_GUARD_MARKER = previousMarkerPath;
+      }
+    }
   });
 
   it("refuses foreign paths before running the sealed verifier", async () => {

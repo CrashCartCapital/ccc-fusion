@@ -230,7 +230,9 @@ async function materializeCandidateShadow(input: {
         timeout: GIT_TIMEOUT_MS,
       },
     );
-    await git(candidateRoot, ["checkout", "--quiet", "--detach", "HEAD"]);
+    // `switch --detach` materializes the no-checkout clone without requiring an
+    // interactive prompt from command-name guards that gate every `checkout`.
+    await git(candidateRoot, ["switch", "--quiet", "--detach", "HEAD"]);
     const patch = await git(input.worktreePath, [
       "diff",
       "--binary",
