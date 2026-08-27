@@ -13,6 +13,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+  cccCampaignRequestFloor,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   assertCccPrdSemanticProofV2Custody,
@@ -1588,15 +1589,19 @@ function productRequestBudget(
   executionPolicy: CccCampaignProductExecutionPolicy,
 ) {
   const providerTasks = executionPolicy.routes.length;
+  // Same structural floor core's importer enforces (2 per provider task: one
+  // MUTATE turn plus the single REPAIR turn); preview must never admit a
+  // bundle that import will refuse.
+  const deterministicMinimum = cccCampaignRequestFloor(providerTasks);
   return {
     scope: "campaign-global" as const,
     maximum: bundle.bounds.maxRequests,
     providerTasks,
-    deterministicMinimum: providerTasks,
-    headroomAboveMinimum: bundle.bounds.maxRequests - providerTasks,
+    deterministicMinimum,
+    headroomAboveMinimum: bundle.bounds.maxRequests - deterministicMinimum,
     completionAdequacy: "unproven" as const,
     explanation:
-      "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+      "Two requests per provider task (one MUTATE turn plus the single REPAIR turn) is only a structural admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, live runs commonly cost 9-13 requests per task, and completion adequacy remains unproven.",
   };
 }
 
@@ -1608,7 +1613,7 @@ function assertProductRequestBudgetFloor(
   if (budget.maximum >= budget.deterministicMinimum) return;
   throw new PrdProductCommandError(
     CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
-    `campaign maxRequests ${budget.maximum} is below the deterministic provider-task floor ${budget.deterministicMinimum}`,
+    `campaign maxRequests ${budget.maximum} is below the structural floor ${budget.deterministicMinimum} (2 per provider task: one MUTATE turn plus the single REPAIR turn; this floor is not an adequacy guarantee)`,
   );
 }
 

@@ -31,8 +31,10 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import {
+  campaignClockStatus,
   joinCccPrdProductExecutionAuthorizationMemberCustody,
   productNextAction,
+  productRequestBudgetStatus,
   providerAttemptStatusesForCampaign,
   resolveCccPrdProductStatusProviderAttemptAnchorTaskId,
   type CccPrdProductApprovalStatus,
@@ -42,6 +44,7 @@ import {
   type CccPrdProductTaskStatus,
   type CccPrdProductWorkItemStatus,
 } from "../ccc-prd/product-status.js";
+import { cccCampaignRequestFloor } from "../ccc-campaign/request-budget.js";
 import { CccCampaignContextError } from "../ccc-campaign/types.js";
 import { CccPrdImportError } from "../ccc-prd/import-error.js";
 import type { CccProviderAttemptScope } from "../ccc-campaign/types.js";
@@ -314,6 +317,7 @@ function nextActionInput(
   return {
     row: { state: "active", runnable: 1 } as unknown as CccPrdProductNextActionInput["row"],
     observedAt: "2026-08-01T00:00:00.000Z",
+    campaignDeadlineAt: "2026-08-08T00:00:00.000Z",
     requestBudget: overrides.requestBudget ?? {
       scope: "campaign-global",
       maximum: 24,
@@ -1044,5 +1048,87 @@ describe("productNextAction semantic proof v2 truth", () => {
     }));
 
     expect(action.kind).not.toBe("approve-merge");
+  });
+});
+
+describe("C3: request floor is 2x provider tasks (structural, not adequacy)", () => {
+  it("cccCampaignRequestFloor doubles provider task count", () => {
+    expect(cccCampaignRequestFloor(2)).toBe(4);
+    expect(cccCampaignRequestFloor(1)).toBe(2);
+    expect(cccCampaignRequestFloor(5)).toBe(10);
+  });
+
+  it("productRequestBudgetStatus reports the doubled deterministic minimum and headroom", () => {
+    const status = productRequestBudgetStatus(2, 4, 0);
+    expect(status).toEqual({
+      scope: "campaign-global",
+      maximum: 4,
+      used: 0,
+      remaining: 4,
+      providerTasks: 2,
+      deterministicMinimum: 4,
+      headroomAboveMinimum: 0,
+      completionAdequacy: "unproven",
+    });
+  });
+
+  it("with 2 provider tasks, maxRequests 3 is below the floor and maxRequests 4 meets it", () => {
+    const floor = cccCampaignRequestFloor(2);
+    expect(floor).toBe(4);
+    expect(3 >= floor).toBe(false);
+    expect(4 >= floor).toBe(true);
+
+    const below = productRequestBudgetStatus(2, 3, 0);
+    expect(below.deterministicMinimum).toBe(4);
+    expect(below.headroomAboveMinimum).toBe(3 - 4);
+
+    const at = productRequestBudgetStatus(2, 4, 0);
+    expect(at.deterministicMinimum).toBe(4);
+    expect(at.headroomAboveMinimum).toBe(0);
+  });
+});
+
+describe("C4a: campaign clock visibility", () => {
+  it("campaignClockStatus reports remaining ms before the deadline", () => {
+    const clock = campaignClockStatus(
+      "2026-08-01T01:00:00.000Z",
+      "2026-08-01T00:00:00.000Z",
+    );
+    expect(clock).toEqual({
+      campaignDeadlineAt: "2026-08-01T01:00:00.000Z",
+      remainingMs: 60 * 60 * 1000,
+    });
+  });
+
+  it("campaignClockStatus never goes negative once the deadline has passed", () => {
+    const clock = campaignClockStatus(
+      "2026-08-01T00:00:00.000Z",
+      "2026-08-01T01:00:00.000Z",
+    );
+    expect(clock.remainingMs).toBe(0);
+  });
+
+  it("approve-execution (sealed_bundle_v1) reason states the campaign deadline and remaining time", () => {
+    const authorization = executionAuthorization();
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: authorization,
+    }));
+
+    expect(action.kind).toBe("approve-execution");
+    expect(action.reason).toContain("campaign clock started at import");
+    expect(action.reason).toContain("2026-08-08T00:00:00.000Z");
+  });
+
+  it("approve-execution (per_task_v1) reason states the campaign deadline and remaining time", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [approval({ id: "approval-1", taskId: "task-1", status: "issued" })],
+    }));
+
+    expect(action.kind).toBe("approve-execution");
+    expect(action.reason).toContain("campaign clock started at import");
+    expect(action.reason).toContain("2026-08-08T00:00:00.000Z");
   });
 });

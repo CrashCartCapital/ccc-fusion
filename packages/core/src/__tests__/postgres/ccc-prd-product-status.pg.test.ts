@@ -333,9 +333,16 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("does not let one runtime-owned provider attempt hide separate manual work", async () => {
+    // Reserving a live provider attempt needs the campaign window to exceed
+    // the minimum launch headroom floor; the fixture default (1 s) is only
+    // meant for deadline-expiry tests.
     const { source, imported } = await importAdmittedProduct(
       "product-status-mixed-uncertainty",
       "product-status-mixed-uncertainty",
+      (bundle) => rehashCccPrdImportTestBundle({
+        ...bundle,
+        bounds: { ...bundle.bounds, maxDurationMs: 120_000 },
+      }),
     );
     const taskId = await nativeTaskIdForImport(
       imported.importId,
@@ -851,8 +858,8 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       used: 5,
       remaining: 0,
       providerTasks: 2,
-      deterministicMinimum: 2,
-      headroomAboveMinimum: 3,
+      deterministicMinimum: 4,
+      headroomAboveMinimum: 1,
       completionAdequacy: "unproven",
     });
   });
@@ -1160,7 +1167,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       nextAction: {
         kind: "blocked",
         diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
-        safeState: expect.stringContaining("3 of 2 first-time provider-attempt reservation slots"),
+        safeState: expect.stringContaining("3 of 4 first-time provider-attempt reservation slots"),
       },
     });
   });

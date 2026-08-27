@@ -408,7 +408,7 @@ async function createPacket(
       },
     ],
     bounds: {
-      maxRequests: 1,
+      maxRequests: 2,
       maxDurationMs: 120_000,
       maxConcurrency: 1,
     },
@@ -972,7 +972,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         "--model",
         "vertical-authoring-model",
         "--max-requests",
-        "1",
+        "2",
         "--max-duration-ms",
         "120000",
         "--max-concurrency",

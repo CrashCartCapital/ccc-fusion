@@ -106,7 +106,7 @@ export function createPacketRoot(options: { semanticV2?: boolean } = {}) {
   const declarations = {
     schema: "ccc-prd.declarations.v1",
     authority: { source: "prd", producer: "fixture" },
-    bounds: { maxRequests: 1, maxDurationMs: 30000, maxConcurrency: 1 },
+    bounds: { maxRequests: 2, maxDurationMs: 30000, maxConcurrency: 1 },
     admittedWriteRoots: [`${target}/src/task-1`],
     targetRepository: target,
     targetBase: base,
@@ -139,7 +139,7 @@ export function createPacketRoot(options: { semanticV2?: boolean } = {}) {
     "## Reviewed Operator Decisions",
     `Target repository path: ${target}`,
     `Frozen baseline commit: ${base}`,
-    "Maximum requests: 1",
+    "Maximum requests: 2",
     "Maximum duration in milliseconds: 30000",
     "Maximum concurrency: 1",
     "Task owned path: src/task-1",
@@ -287,7 +287,7 @@ export function createPacketRoot(options: { semanticV2?: boolean } = {}) {
       { id: "IMPORT-CLI-001", entityType: "task", entityId: "TASK-CLI-001", operation: "create", target: "project.tasks" }, { id: "IMPORT-CLI-004", entityType: "workflow", entityId: "WORKFLOW-CLI-001", operation: "create", target: "project.workflow_work_items" }, { id: "IMPORT-CLI-010", entityType: "work_item", entityId: "WORKFLOW-CLI-001", operation: "create", target: "project.workflow_work_items" }, { id: "IMPORT-CLI-005", entityType: "document", entityId: "DOCUMENT-CLI-001", operation: "create", target: "project.task_documents" }, { id: "IMPORT-CLI-006", entityType: "artifact", entityId: "ARTIFACT-CLI-001", operation: "create", target: "project.artifacts" }, { id: "IMPORT-CLI-007", entityType: "campaign", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.missions" }, { id: "IMPORT-CLI-008", entityType: "source", entityId: "SOURCE-CLI-001", operation: "create", target: "project.ccc_prd_import_sources" }, { id: "IMPORT-CLI-009", entityType: "run_audit", entityId: "CAMPAIGN-CLI-001", operation: "create", target: "project.run_audit_events" },
     ],
     protectedActions: [{ id: "ACTION-CLI-001", kind: "live_execution", target: "fixture/repo:provider-canary", sourceRefs: protectedActionSourceRefs }],
-    bounds: { maxRequests: 1, maxDurationMs: 30_000, maxConcurrency: 1 }, admittedWriteRoots: [{ path: `${target}/src/task-1`, purpose: "fixture projection" }], targetRepository: { path: target, baseCommit: base }, nonGoals: ["live provider call"], unresolvedDecisions: [], ambiguities: [], exceptions: [], confidence: "high",
+    bounds: { maxRequests: 2, maxDurationMs: 30_000, maxConcurrency: 1 }, admittedWriteRoots: [{ path: `${target}/src/task-1`, purpose: "fixture projection" }], targetRepository: { path: target, baseCommit: base }, nonGoals: ["live provider call"], unresolvedDecisions: [], ambiguities: [], exceptions: [], confidence: "high",
   }, null, 2));
   return {
     root,

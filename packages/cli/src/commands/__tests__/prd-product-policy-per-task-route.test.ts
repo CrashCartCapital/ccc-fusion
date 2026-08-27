@@ -526,7 +526,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       diagnostics: [{
         code: CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
         message:
-          "campaign maxRequests 1 is below the deterministic provider-task floor 2",
+          "campaign maxRequests 1 is below the structural floor 4 (2 per provider task: one MUTATE turn plus the single REPAIR turn; this floor is not an adequacy guarantee)",
       }],
     });
     expect(inspectVerifierConfinementReadiness).not.toHaveBeenCalled();

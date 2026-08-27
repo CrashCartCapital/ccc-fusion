@@ -1,3 +1,4 @@
+import { cccCampaignRequestFloor } from "../ccc-campaign/request-budget.js";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -253,7 +254,7 @@ export function withCccPrdImportTestProductRequestFloor(
     ...source,
     bounds: {
       ...source.bounds,
-      maxRequests: Math.max(source.bounds.maxRequests, source.tasks.length),
+      maxRequests: Math.max(source.bounds.maxRequests, cccCampaignRequestFloor(source.tasks.length)),
     },
   });
 }
@@ -527,7 +528,7 @@ export async function admitCccPrdImportTestProductBundle(
     targetRepository: { path: targetRoot, baseCommit },
     bounds: {
       ...legacy.bounds,
-      maxRequests: Math.max(legacy.bounds.maxRequests, legacy.tasks.length),
+      maxRequests: Math.max(legacy.bounds.maxRequests, cccCampaignRequestFloor(legacy.tasks.length)),
     },
     requirements,
     proofs,

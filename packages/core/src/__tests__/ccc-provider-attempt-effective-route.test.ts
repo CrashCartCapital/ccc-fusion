@@ -14,9 +14,11 @@
 import { describe, expect, it } from "vitest";
 import {
   assertCccProviderAttemptEffectiveRoute,
+  assertCccProviderAttemptLaunchHeadroom,
+  CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS,
   sameCccProviderAttemptEffectiveRoute,
 } from "../ccc-campaign/provider-attempt.js";
-import { CccProviderAttemptIdentityError } from "../ccc-campaign/types.js";
+import { CccProviderAttemptIdentityError, CccProviderAttemptLimitError } from "../ccc-campaign/types.js";
 import type { CccProviderAttemptEffectiveRouteInput, CccProviderAttemptEffectiveRoute } from "../ccc-campaign/types.js";
 
 const requestedIdentity = { providerId: "anthropic", modelId: "claude-sonnet-5" };
@@ -399,5 +401,48 @@ describe("sameCccProviderAttemptEffectiveRoute (idempotent-replay comparison)", 
         final: { provider: "opencode-go", model: "minimax-m3" },
       },
     })).toBe(false);
+  });
+});
+
+describe("C4b: assertCccProviderAttemptLaunchHeadroom", () => {
+  const deadlineAtMs = Date.parse("2026-08-14T15:00:00.000Z");
+
+  it("allows a reservation with a full minute of headroom before the deadline", () => {
+    const nowMs = deadlineAtMs - 60_000;
+    expect(() => assertCccProviderAttemptLaunchHeadroom(deadlineAtMs, nowMs, "task-1"))
+      .not.toThrow();
+  });
+
+  it("refuses a reservation with only 10s of headroom before the deadline (reason: deadline)", () => {
+    const nowMs = deadlineAtMs - 10_000;
+    let thrown: unknown;
+    try {
+      assertCccProviderAttemptLaunchHeadroom(deadlineAtMs, nowMs, "task-1");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CccProviderAttemptLimitError);
+    expect((thrown as CccProviderAttemptLimitError).reason).toBe("deadline");
+    expect((thrown as Error).message).toContain("minimum launch headroom");
+    expect((thrown as Error).message).toContain("task-1");
+    expect((thrown as Error).message).toContain(String(CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS));
+  });
+
+  it("refuses (with the original message) a reservation at or past the deadline", () => {
+    let thrown: unknown;
+    try {
+      assertCccProviderAttemptLaunchHeadroom(deadlineAtMs, deadlineAtMs, "task-1");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CccProviderAttemptLimitError);
+    expect((thrown as CccProviderAttemptLimitError).reason).toBe("deadline");
+    expect((thrown as Error).message).toBe(
+      "CCC provider attempt for task-1 is outside its database-clock campaign deadline",
+    );
+  });
+
+  it("CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS floor is 30 seconds", () => {
+    expect(CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS).toBe(30_000);
   });
 });

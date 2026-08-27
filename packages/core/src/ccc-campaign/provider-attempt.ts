@@ -1046,14 +1046,39 @@ async function databaseNow(tx: DbTransaction): Promise<string> {
   return assertCanonicalTimestamp(rows[0]?.now, "database clock");
 }
 
-function assertBeforeDeadline(context: CccCampaignTaskContext, now: string): void {
-  const { deadlineAt } = admittedBounds(context);
-  if (Date.parse(now) >= deadlineAt) {
+/**
+ * Every provider task's executor phase machine requires the full MUTATE
+ * turn to actually run before its outcome can be observed, so a reservation
+ * granted with less than this much time left before the database-clock
+ * campaign deadline can never complete honestly. This is a pure launch-time
+ * headroom floor -- it does not touch `campaignStartedAt`/`campaignDeadlineAt`,
+ * digests, or leases.
+ */
+export const CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS = 30_000 as const;
+
+export function assertCccProviderAttemptLaunchHeadroom(
+  deadlineAtMs: number,
+  nowMs: number,
+  taskId: string,
+): void {
+  if (nowMs >= deadlineAtMs) {
     throw new CccProviderAttemptLimitError(
       "deadline",
-      `CCC provider attempt for ${context.taskId} is outside its database-clock campaign deadline`,
+      `CCC provider attempt for ${taskId} is outside its database-clock campaign deadline`,
     );
   }
+  const remainingMs = deadlineAtMs - nowMs;
+  if (remainingMs < CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS) {
+    throw new CccProviderAttemptLimitError(
+      "deadline",
+      `CCC provider attempt for ${taskId} has less than the minimum launch headroom (${remainingMs}ms remaining, floor ${CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS}ms) before its database-clock campaign deadline`,
+    );
+  }
+}
+
+function assertBeforeDeadline(context: CccCampaignTaskContext, now: string): void {
+  const { deadlineAt } = admittedBounds(context);
+  assertCccProviderAttemptLaunchHeadroom(deadlineAt, Date.parse(now), context.taskId);
 }
 
 function assertRequestRoute(

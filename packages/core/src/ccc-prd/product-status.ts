@@ -34,6 +34,7 @@ import {
 import {
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+  cccCampaignRequestFloor,
 } from "../ccc-campaign/request-budget.js";
 import type { AsyncDataLayer } from "../postgres/data-layer.js";
 import * as schema from "../postgres/schema/index.js";
@@ -305,6 +306,7 @@ export type CccPrdProductStatus = Readonly<{
     campaignStartedAt: string;
     campaignDeadlineAt: string;
     requestBudget: CccPrdProductRequestBudgetStatus;
+    campaignClock: CccPrdProductCampaignClockStatus;
     state: string;
     runnable: boolean;
     lastError: string | null;
@@ -351,6 +353,53 @@ export type CccPrdProductRequestBudgetStatus = Readonly<{
   headroomAboveMinimum: number;
   completionAdequacy: "unproven";
 }>;
+
+export type CccPrdProductCampaignClockStatus = Readonly<{
+  campaignDeadlineAt: string;
+  remainingMs: number;
+}>;
+
+/**
+ * Pure derivation of the campaign-clock status: how much time remains, by
+ * the same authoritative clock reading (`observedAt`) already threaded
+ * through the rest of product status, before the campaign's import-anchored
+ * deadline. Never negative -- an already-expired deadline reports 0.
+ */
+export function campaignClockStatus(
+  campaignDeadlineAt: string,
+  observedAt: string,
+): CccPrdProductCampaignClockStatus {
+  const deadlineAtMs = Date.parse(campaignDeadlineAt);
+  const observedAtMs = Date.parse(observedAt);
+  const remainingMs = Number.isFinite(deadlineAtMs) && Number.isFinite(observedAtMs)
+    ? Math.max(0, deadlineAtMs - observedAtMs)
+    : 0;
+  return { campaignDeadlineAt, remainingMs };
+}
+
+/**
+ * Pure derivation of the request-budget status fields. `deterministicMinimum`
+ * is the structural floor (2 requests per provider task: one MUTATE turn
+ * plus the single REPAIR turn), not an adequacy guarantee -- live runs cost
+ * 9-13 requests per task.
+ */
+export function productRequestBudgetStatus(
+  providerTasks: number,
+  maximum: number,
+  used: number,
+): CccPrdProductRequestBudgetStatus {
+  const deterministicMinimum = cccCampaignRequestFloor(providerTasks);
+  return {
+    scope: "campaign-global",
+    maximum,
+    used,
+    remaining: Math.max(0, maximum - used),
+    providerTasks,
+    deterministicMinimum,
+    headroomAboveMinimum: maximum - deterministicMinimum,
+    completionAdequacy: "unproven",
+  };
+}
 
 export type InspectCccPrdProductStatusInput = Readonly<{
   idempotencyKey: string;
@@ -862,6 +911,7 @@ function hasLiveRuntimeLease(
 export type CccPrdProductNextActionInput = Readonly<{
   row: ProductImportRow;
   observedAt: string;
+  campaignDeadlineAt: string;
   requestBudget: CccPrdProductRequestBudgetStatus;
   providerAttemptHistoryConsistent?: boolean;
   taskStatuses: readonly CccPrdProductTaskStatus[];
@@ -1302,10 +1352,12 @@ export function productNextAction(
         };
       }
       if (authorization.status === "issued" || authorization.status === "claimed") {
+        const clock = campaignClockStatus(input.campaignDeadlineAt, input.observedAt);
         return {
           kind: "approve-execution",
           reason:
-            `Workflow work item ${liveExecutionApprovalWorkItem.id} requires one sealed launch decision for ${authorization.members.length} exact campaign action${authorization.members.length === 1 ? "" : "s"}.`,
+            `Workflow work item ${liveExecutionApprovalWorkItem.id} requires one sealed launch decision for ${authorization.members.length} exact campaign action${authorization.members.length === 1 ? "" : "s"}.`
+            + ` The campaign clock started at import; approve within ${Math.floor(clock.remainingMs / 1000)}s (deadline ${clock.campaignDeadlineAt}).`,
           executionAuthorizationId: authorization.authorizationId,
           executionAuthorizationStatus: authorization.status,
         };
@@ -1346,9 +1398,11 @@ export function productNextAction(
       const heldTask = approval.taskId && approval.taskId !== liveExecutionApprovalWorkItem.taskId
         ? ` for campaign task ${approval.taskId}`
         : "";
+      const clock = campaignClockStatus(input.campaignDeadlineAt, input.observedAt);
       return {
         kind: "approve-execution",
-        reason: `Workflow work item ${liveExecutionApprovalWorkItem.id} requires exact live-execution approval${heldTask}.`,
+        reason: `Workflow work item ${liveExecutionApprovalWorkItem.id} requires exact live-execution approval${heldTask}.`
+          + ` The campaign clock started at import; approve within ${Math.floor(clock.remainingMs / 1000)}s (deadline ${clock.campaignDeadlineAt}).`,
         approvalRequestId: approval.id,
         approvalStatus: approval.status,
       };
@@ -1831,20 +1885,11 @@ export async function inspectCccPrdProductStatus(
         .map((action) => action.id),
     );
     const providerTasks = custody.executionPolicy.routes.length;
-    const requestBudget: CccPrdProductRequestBudgetStatus = {
-      scope: "campaign-global",
-      maximum: custody.manifest.bounds.maxRequests,
-      used: row.requestCount,
-      remaining: Math.max(
-        0,
-        custody.manifest.bounds.maxRequests - row.requestCount,
-      ),
+    const requestBudget: CccPrdProductRequestBudgetStatus = productRequestBudgetStatus(
       providerTasks,
-      deterministicMinimum: providerTasks,
-      headroomAboveMinimum:
-        custody.manifest.bounds.maxRequests - providerTasks,
-      completionAdequacy: "unproven",
-    };
+      custody.manifest.bounds.maxRequests,
+      row.requestCount,
+    );
     let providerAttempts: readonly CccPrdProductProviderAttemptStatus[] = [];
     let providerAttemptHistoryConsistent = true;
     try {
@@ -1889,6 +1934,7 @@ export async function inspectCccPrdProductStatus(
     const nextAction = productNextAction({
       row,
       observedAt,
+      campaignDeadlineAt: custody.manifest.campaignDeadlineAt,
       requestBudget,
       providerAttemptHistoryConsistent,
       taskStatuses,
@@ -1926,6 +1972,7 @@ export async function inspectCccPrdProductStatus(
         campaignStartedAt: custody.manifest.campaignStartedAt,
         campaignDeadlineAt: custody.manifest.campaignDeadlineAt,
         requestBudget,
+        campaignClock: campaignClockStatus(custody.manifest.campaignDeadlineAt, observedAt),
         state: row.state,
         runnable: row.runnable === 1,
         lastError: row.lastError,
