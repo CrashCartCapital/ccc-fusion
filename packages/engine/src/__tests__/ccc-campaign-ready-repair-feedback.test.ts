@@ -345,4 +345,70 @@ describe("CCC campaign repair-feedback renderer (pure, no git required)", () => 
     expect(rendered).toContain("src/removed.js: deleted");
     expect(rendered).toContain("src/link.js: non-regular");
   });
+
+  const NOTE_LINE = "NOTE: readiness verification runs without CCC_PROOF_* identity; any "
+    + "proof/clause IDs above are the verifier's own defaults. Formal proof admission binds "
+    + "the PRD's proof/clause IDs and the committed sourceCommit/sourceTree.";
+
+  it("RED: renders the readiness caveat NOTE line after PROOF EVIDENCE and before OBSERVED CANDIDATE when proof evidence parses", () => {
+    const feedback = {
+      verdict: "failed" as const,
+      verifierCommand: "task verify:ready",
+      exitCode: 1,
+      proofEvidence: {
+        schema: "ccc-prd.proof-evidence.v2" as const,
+        proofId: "PROOF-READY",
+        phase: "task" as const,
+        sourceCommit: "0".repeat(40),
+        sourceTree: "0".repeat(40),
+        passed: false,
+        clauseResults: [{ clauseId: "AC-002", passed: false }],
+        positiveCaseResults: [{ caseId: "CASE-001", passed: false }],
+        negativeControlResults: [],
+      },
+      proofEvidenceParseIssue: undefined,
+      observedCandidate: [
+        { path: "src/change.js", kind: "file" as const, bytes: 19, sha256: "a".repeat(64), endsWithNewline: false },
+      ],
+      omittedPaths: 0,
+      diagnosticTail: "exit 1",
+      diagnosticTruncated: false,
+    };
+
+    const rendered = renderCccCampaignRepairFeedback(feedback as any);
+
+    expect(rendered).toContain(NOTE_LINE);
+    const proofIndex = rendered.indexOf("PROOF EVIDENCE");
+    const noteIndex = rendered.indexOf(NOTE_LINE);
+    const observedIndex = rendered.indexOf("OBSERVED CANDIDATE");
+    expect(proofIndex).toBeGreaterThanOrEqual(0);
+    expect(noteIndex).toBeGreaterThan(proofIndex);
+    expect(observedIndex).toBeGreaterThan(noteIndex);
+  });
+
+  it("RED: renders the readiness caveat NOTE line after PROOF EVIDENCE and before OBSERVED CANDIDATE when proof evidence is unavailable", () => {
+    const feedback = {
+      verdict: "failed" as const,
+      verifierCommand: "task verify:ready",
+      exitCode: 1,
+      proofEvidence: undefined,
+      proofEvidenceParseIssue: "no ccc-prd.proof-evidence.v2 JSON object found in verifier stdout",
+      observedCandidate: [
+        { path: "src/removed.js", kind: "deleted" as const },
+      ],
+      omittedPaths: 0,
+      diagnosticTail: "exit 1",
+      diagnosticTruncated: false,
+    };
+
+    const rendered = renderCccCampaignRepairFeedback(feedback as any);
+
+    expect(rendered).toContain(NOTE_LINE);
+    const proofIndex = rendered.indexOf("PROOF EVIDENCE");
+    const noteIndex = rendered.indexOf(NOTE_LINE);
+    const observedIndex = rendered.indexOf("OBSERVED CANDIDATE");
+    expect(proofIndex).toBeGreaterThanOrEqual(0);
+    expect(noteIndex).toBeGreaterThan(proofIndex);
+    expect(observedIndex).toBeGreaterThan(noteIndex);
+  });
 });

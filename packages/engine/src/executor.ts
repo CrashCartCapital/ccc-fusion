@@ -1983,6 +1983,17 @@ export class TaskCancellationAbortError extends Error {
 
 const LOWER_HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
+/*
+FNXC:CccCampaignFastModeRefusal 2026-08-27-00:00:
+A sealed CCC campaign implementation node (isExactFencedCccCampaignImplementationNode)
+skipped by fast mode returns a success-shaped "workflow-step-skipped" result with no
+provider turn. The post-node required-commit fence then reports the misleading "no
+campaign-created commit" instead of the real cause. Fail closed and loud instead: refuse
+fast mode outright for sealed campaign implementation nodes before the generic
+prompt/script/gate skip can fire.
+*/
+const CCC_CAMPAIGN_FAST_MODE_REFUSED_CODE = "CCC_CAMPAIGN_FAST_MODE_REFUSED";
+
 function isExactFencedCccCampaignImplementationNode(
   node: WorkflowIrNode,
   execution: WorkflowNodeExecutionContext["execution"],
@@ -9757,6 +9768,13 @@ export class TaskExecutor {
     FNXC:WorkflowCompletion 2026-07-01-18:42:
     Fast mode skips review/validation work, not the agent-authored completion summary. FN-7335 reached review with "Fast mode — custom graph node 'completion-summary' skipped"; keep summary nodes executable so fast tasks still produce the same review/done card summary as standard tasks.
     */
+    if (live.executionMode === "fast" && cccCampaignImplementation) {
+      throw new PermanentError(
+        `CCC campaign sealed implementation node ${node.id} for task ${live.id} `
+          + "cannot run under fast execution mode",
+        CCC_CAMPAIGN_FAST_MODE_REFUSED_CODE,
+      );
+    }
     if (live.executionMode === "fast" && !isCompletionSummaryNode && !optionalGroupId && !cfg.seam && (node.kind === "prompt" || node.kind === "script" || node.kind === "gate")) {
       executorLog.log(`${live.id}: fast mode — skipping custom graph node '${node.id}'`);
       await this.store.logEntry(

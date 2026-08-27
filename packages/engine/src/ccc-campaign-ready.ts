@@ -245,6 +245,11 @@ export function renderCccCampaignRepairFeedback(feedback: CccCampaignRepairFeedb
     const issue = capText(feedback.proofEvidenceParseIssue ?? "not parsed", MAX_REPAIR_PARSE_ISSUE_CHARS);
     lines.push(`PROOF EVIDENCE: unavailable (${issue.text})`);
   }
+  lines.push(
+    "NOTE: readiness verification runs without CCC_PROOF_* identity; any proof/clause "
+      + "IDs above are the verifier's own defaults. Formal proof admission binds the "
+      + "PRD's proof/clause IDs and the committed sourceCommit/sourceTree.",
+  );
 
   lines.push(
     "OBSERVED CANDIDATE (bytes the controller read from the verified snapshot, before the verifier ran):",

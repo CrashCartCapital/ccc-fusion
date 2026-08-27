@@ -1381,6 +1381,73 @@ describe("fast mode workflow/runtime invariants", () => {
     expect(executeScript).not.toHaveBeenCalled();
   });
 
+  it("still skips an ordinary prompt node in fast mode when no sealed campaign fence is present", async () => {
+    const { executor } = makeExecutorForTask(task({ executionMode: "fast", worktree: "/tmp/wt" }));
+    const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true });
+
+    const result = await (executor as any).runGraphCustomNode(
+      { id: "custom-review", kind: "prompt", config: { prompt: "Review this" } },
+      task({ executionMode: "fast" }),
+      {},
+      undefined,
+    );
+
+    expect(result).toMatchObject({ outcome: "success", value: "workflow-step-skipped" });
+    expect(executeStep).not.toHaveBeenCalled();
+  });
+
+  it("RED: refuses a sealed CCC campaign implementation node under fast execution mode instead of skipping it", async () => {
+    const nodeTask = task({ executionMode: "fast", worktree: "/tmp/ccc-fast-mode-refused" });
+    const { executor } = makeExecutorForTask(nodeTask);
+    const executeStep = vi.spyOn(executor as any, "executeWorkflowStep").mockResolvedValue({ success: true });
+    const execution = Object.freeze({
+      originTaskId: nodeTask.id,
+      semanticTaskId: "TSK-003",
+      nativeTaskId: nodeTask.id,
+      semanticTask: task({ id: "TSK-003" }),
+      runId: "campaign-run",
+      visitIdentity: Object.freeze({ nodeId: "ccc-task", materializedNodeId: "ccc-task" }),
+      executionFence: Object.freeze({ workItemId: "wi-fast-mode", leaseOwner: "provider-worker", attempt: 1, runId: "campaign-run" }),
+      providerAttemptTurnKey: "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    const node = {
+      id: "ccc-task",
+      kind: "prompt",
+      config: {
+        executor: "model",
+        cccExecutionTransport: "pi",
+        cccPrdTaskId: "TSK-003",
+        cccNativeTaskId: nodeTask.id,
+        cccExecutionPromptSchema: "ccc-prd.execution-prompt.v1",
+        cccExecutionPromptSha256: "a".repeat(64),
+        cccExecutionProviderId: "provider",
+        cccExecutionModelId: "model",
+        cccExecutionRouteSha256: "b".repeat(64),
+        toolMode: "coding",
+        worktreeMode: "isolated",
+        ownedPaths: ["src/target.js"],
+        allowedWriteRoots: ["src/target.js"],
+        commitPolicy: "required",
+        gateMode: "gate",
+        prompt: "Implement the sealed task.",
+      },
+    };
+
+    await expect((executor as any).runGraphCustomNode(
+      node,
+      nodeTask,
+      {},
+      undefined,
+      {},
+      { execution },
+    )).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_FAST_MODE_REFUSED",
+      message: "CCC campaign sealed implementation node ccc-task for task "
+        + `${nodeTask.id} cannot run under fast execution mode`,
+    });
+    expect(executeStep).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["completion-summary id", { id: "completion-summary", kind: "prompt", config: { prompt: "summarize" } }],
     ["summaryTarget task", { id: "custom-summary", kind: "prompt", config: { prompt: "summarize", summaryTarget: "task" } }],
