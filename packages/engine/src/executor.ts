@@ -48,6 +48,7 @@ import {
 import {
   createCccCampaignReadyTool,
   fingerprintCccCampaignAllowedCandidate,
+  renderCccCampaignRepairFeedback,
   resolveCccCampaignReadyTimeoutMs,
   verifyCccCampaignReadyCandidate,
 } from "./ccc-campaign-ready.js";
@@ -19589,13 +19590,20 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               campaignPhaseRuntime.activePhase = "REPAIR";
               campaignPhaseIntent.completionRequested = false;
               campaignPhaseIntent.invalidatedByTool = undefined;
+              // The repair-feedback envelope is only guaranteed on the
+              // sealed-verifier-failure branch; every other ready:false
+              // reason (identity mismatch, no diff, foreign paths, ...)
+              // falls back to the plain summary string.
+              const repairFeedbackText = (!verification.ready && verification.repairFeedback)
+                ? renderCccCampaignRepairFeedback(verification.repairFeedback)
+                : verification.summary.slice(-2_000);
               await this.store.logEntry(
                 task.id,
-                `[ccc-campaign:repair] Controller VERIFY failed; issuing the one allowed REPAIR turn: ${verification.summary.slice(-2_000)}`,
+                `[ccc-campaign:repair] Controller VERIFY failed; issuing the one allowed REPAIR turn: ${repairFeedbackText}`,
               );
               await promptWithFallback(
                 session,
-                `CCC_CAMPAIGN_REPAIR: Controller VERIFY failed against the exact candidate:\n${verification.summary.slice(-2_000)}\n\n`
+                `CCC_CAMPAIGN_REPAIR: Controller VERIFY failed against the exact candidate:\n${repairFeedbackText}\n\n`
                   + "Repair only the admitted files, rerun the targeted check needed to diagnose the failure, and call fn_complete_phase by itself when REPAIR is complete. "
                   + "This is the only REPAIR turn; a second controller verification failure is terminal.",
               );

@@ -719,6 +719,225 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(result.outcome).toBe("success");
   });
 
+  it("carries the rendered repair-feedback envelope, verdict-first, into the REPAIR log entry and prompt", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-repair-envelope",
+    );
+    fingerprintCccCampaignReadyCandidateMock.mockReset();
+    fingerprintCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("c".repeat(64));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("c".repeat(64));
+    const largeDiagnosticTail = "x".repeat(2_000);
+    verifyCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce({
+        ready: false,
+        summary: "sealed verifier exit 1: AC-002 failed",
+        repairFeedback: {
+          verdict: "failed",
+          verifierCommand: "task verify:ready",
+          exitCode: 1,
+          proofEvidence: {
+            schema: "ccc-prd.proof-evidence.v2",
+            proofId: "PROOF-READY",
+            phase: "task",
+            sourceCommit: "a".repeat(40),
+            sourceTree: "a".repeat(40),
+            passed: false,
+            clauseResults: [{ clauseId: "AC-002", passed: false }],
+            positiveCaseResults: [],
+            negativeControlResults: [],
+          },
+          proofEvidenceParseIssue: undefined,
+          observedCandidate: [
+            {
+              path: "src/slugify.js",
+              kind: "file",
+              bytes: 42,
+              sha256: "f".repeat(64),
+              endsWithNewline: false,
+            },
+          ],
+          omittedPaths: 0,
+          diagnosticTail: largeDiagnosticTail,
+          diagnosticTruncated: true,
+        },
+      })
+      .mockResolvedValueOnce(
+        readyVerification("c".repeat(64), "/tmp/ccc-campaign-repair-envelope"),
+      );
+    const prompts: string[] = [];
+    let promptCount = 0;
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const subscribers = new Set<(event: any) => void>();
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn((subscriber: (event: any) => void) => {
+            subscribers.add(subscriber);
+            return () => subscribers.delete(subscriber);
+          }),
+          prompt: vi.fn(async (prompt: string) => {
+            prompts.push(prompt);
+            promptCount += 1;
+            if (promptCount === 2) {
+              for (const subscriber of subscribers) {
+                subscriber({
+                  type: "tool_execution_start",
+                  toolName: "edit",
+                  args: { path: "src/slugify.js" },
+                });
+                subscriber({
+                  type: "tool_execution_end",
+                  toolName: "edit",
+                  isError: false,
+                  result: { content: [{ type: "text", text: "repair edit returned" }] },
+                });
+              }
+            }
+            await phaseTool.execute(`complete-phase-${promptCount}`, {}, undefined, () => undefined);
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(prompts).toHaveLength(2);
+    const repairPrompt = prompts[1];
+    expect(repairPrompt).toMatch(/CCC_CAMPAIGN_REPAIR/);
+    // Verdict-first: the rendered verdict marker must precede the raw diagnostic
+    // tail inside the prompt, proving the prompt is not built by a tail slice
+    // that could drop the verdict.
+    const verdictIndex = repairPrompt.search(/FAILED/i);
+    const commandIndex = repairPrompt.indexOf("task verify:ready");
+    const exitCodeIndex = repairPrompt.indexOf("AC-002");
+    const diagnosticIndex = repairPrompt.indexOf(largeDiagnosticTail);
+    expect(verdictIndex).toBeGreaterThanOrEqual(0);
+    expect(commandIndex).toBeGreaterThan(verdictIndex);
+    expect(exitCodeIndex).toBeGreaterThan(-1);
+    expect(diagnosticIndex).toBeGreaterThan(exitCodeIndex);
+    expect(repairPrompt).toContain("src/slugify.js");
+    expect(repairPrompt).toContain("42 bytes");
+    expect(repairPrompt).toContain("endsWithNewline=false");
+
+    const repairLogCall = (store.logEntry as any).mock.calls.find(
+      ([, message]: [string, string]) => message.includes("[ccc-campaign:repair]"),
+    );
+    expect(repairLogCall).toBeDefined();
+    expect(repairLogCall[1]).toMatch(/FAILED/i);
+    expect(repairLogCall[1]).toContain("task verify:ready");
+    expect(repairLogCall[1]).toContain("AC-002");
+
+    expect(result.outcome).toBe("success");
+  });
+
+  it("falls back to the plain summary in the REPAIR prompt when the verification failure carries no repair-feedback envelope", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-repair-fallback",
+    );
+    fingerprintCccCampaignReadyCandidateMock.mockReset();
+    fingerprintCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("c".repeat(64));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("c".repeat(64));
+    // A pre-command verifyCccCampaignReadyCandidate failure (e.g. "no
+    // implementation diff") never populates repairFeedback — only the
+    // sealed-verifier-failure branch does. The executor must still surface
+    // the plain summary text in the REPAIR prompt/log in that case.
+    verifyCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce({
+        ready: false,
+        summary: "the candidate worktree has no implementation diff",
+      })
+      .mockResolvedValueOnce(
+        readyVerification("c".repeat(64), "/tmp/ccc-campaign-repair-fallback"),
+      );
+    const prompts: string[] = [];
+    let promptCount = 0;
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const subscribers = new Set<(event: any) => void>();
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn((subscriber: (event: any) => void) => {
+            subscribers.add(subscriber);
+            return () => subscribers.delete(subscriber);
+          }),
+          prompt: vi.fn(async (prompt: string) => {
+            prompts.push(prompt);
+            promptCount += 1;
+            if (promptCount === 2) {
+              for (const subscriber of subscribers) {
+                subscriber({
+                  type: "tool_execution_start",
+                  toolName: "edit",
+                  args: { path: "src/slugify.js" },
+                });
+                subscriber({
+                  type: "tool_execution_end",
+                  toolName: "edit",
+                  isError: false,
+                  result: { content: [{ type: "text", text: "repair edit returned" }] },
+                });
+              }
+            }
+            await phaseTool.execute(`complete-phase-${promptCount}`, {}, undefined, () => undefined);
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(prompts).toHaveLength(2);
+    const repairPrompt = prompts[1];
+    expect(repairPrompt).toMatch(/CCC_CAMPAIGN_REPAIR/);
+    expect(repairPrompt).toContain("the candidate worktree has no implementation diff");
+    const repairLogCall = (store.logEntry as any).mock.calls.find(
+      ([, message]: [string, string]) => message.includes("[ccc-campaign:repair]"),
+    );
+    expect(repairLogCall).toBeDefined();
+    expect(repairLogCall[1]).toContain("the candidate worktree has no implementation diff");
+    expect(result.outcome).toBe("success");
+  });
+
   it("eager_verify_blocked: invalidates a phase signal followed by same-turn tool activity", async () => {
     const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
       "",
