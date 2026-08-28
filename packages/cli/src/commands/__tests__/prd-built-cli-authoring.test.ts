@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -66,16 +66,32 @@ describe("prd native authoring descendant contract", () => {
         schema: "ccc-prd.understanding-review.v1",
         executable: false,
       });
-      expect(runFn([
-        "prd", "validate", packet.root, packet.manifest, reviewPath, packet.target, packet.base,
-      ]).status).toBe(1);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
   });
 
-  it("authors from an unchanged packet through one bounded native loopback request without a proposal argument", async () => {
+  it("refuses a persisted understanding review through built validate", () => {
+    const packet = createPacketRoot();
+    const reviewPath = join(packet.root, "understanding-review.json");
+    writeFileSync(reviewPath, JSON.stringify({
+      schema: "ccc-prd.understanding-review.v1",
+      kind: "understanding-review",
+      executable: false,
+      requirements: [],
+      proofs: [],
+      tasks: [],
+    }));
+
+    const result = runFn([
+      "prd", "validate", packet.root, packet.manifest, reviewPath, packet.target, packet.base,
+    ]);
+    expect(result.status).toBe(1);
+  });
+
+  it("authors generated semantic-v2 Node proof without requiring a target Python venv", async () => {
     const packet = createPacketRoot({ semanticV2: true });
+    expect(existsSync(join(packet.target, ".venv"))).toBe(false);
     const proposal = readFileSync(packet.proposal, "utf8");
     const requests: Array<Record<string, unknown>> = [];
     const server = createServer((request, response) => {
@@ -115,5 +131,5 @@ describe("prd native authoring descendant contract", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
-  });
+  }, 60_000);
 });

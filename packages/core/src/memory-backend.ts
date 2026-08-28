@@ -1110,7 +1110,9 @@ interface QmdExecError extends Error {
   stderr?: string;
 }
 
-async function getDefaultExecFileAsync(): Promise<ExecFileAsync> {
+async function getDefaultExecFileAsync(
+  executorOptions: { keepProcessAlive?: boolean } = {},
+): Promise<ExecFileAsync> {
   const { spawn } = await import("node:child_process");
 
   return (file, args, options) =>
@@ -1120,10 +1122,13 @@ async function getDefaultExecFileAsync(): Promise<ExecFileAsync> {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
-      // FNXC:ProjectMemory 2026-07-08-00:00: unref synchronously right after spawn —
-      // see the doc comment above this function for why this must NOT go through
-      // promisify(execFile).
-      unrefQmdChildProcess(child);
+      // Background refresh/search callers stay unref'd by default so they cannot
+      // pin a short-lived CLI process. A command that explicitly awaits this probe
+      // may opt into keeping the child referenced until its promise settles.
+      // See the doc comment above for why this must not use promisify(execFile).
+      if (!executorOptions.keepProcessAlive) {
+        unrefQmdChildProcess(child);
+      }
 
       let stdout = "";
       let stderr = "";
@@ -1134,6 +1139,11 @@ async function getDefaultExecFileAsync(): Promise<ExecFileAsync> {
       const timeoutHandle = options?.timeout
         ? setTimeout(() => {
             child.kill("SIGTERM");
+            if (!settled) {
+              settled = true;
+              unrefQmdChildProcess(child);
+              reject(new Error(`Command timed out: ${file} ${args.join(" ")}`));
+            }
           }, options.timeout)
         : undefined;
       timeoutHandle?.unref?.();
@@ -1299,9 +1309,13 @@ export function scheduleQmdAgentMemoryRefresh(rootDir: string, agentId: string):
   });
 }
 
-export async function isQmdAvailable(): Promise<boolean> {
+export async function isQmdAvailable(
+  options: { keepProcessAlive?: boolean } = {},
+): Promise<boolean> {
   try {
-    const execFileAsync = await getDefaultExecFileAsync();
+    const execFileAsync = await getDefaultExecFileAsync({
+      keepProcessAlive: options.keepProcessAlive ?? true,
+    });
     await execFileAsync("qmd", ["--help"], {
       timeout: 3000,
       maxBuffer: 128 * 1024,
@@ -1349,11 +1363,18 @@ export async function ensureQmdInstalled(
   return qmdInstallPromise;
 }
 
-export async function ensureQmdInstalledAndRefresh(rootDir: string): Promise<void> {
-  const available = await ensureQmdInstalled();
+async function ensureQmdInstalledAndRefreshWithAvailability(
+  rootDir: string,
+  isAvailable: () => Promise<boolean>,
+): Promise<void> {
+  const available = await ensureQmdInstalled({ isAvailable });
   if (available) {
     await refreshQmdProjectMemoryIndex(rootDir, { force: true });
   }
+}
+
+export async function ensureQmdInstalledAndRefresh(rootDir: string): Promise<void> {
+  await ensureQmdInstalledAndRefreshWithAvailability(rootDir, isQmdAvailable);
 }
 
 export function scheduleQmdInstallAndRefresh(rootDir: string): void {
@@ -1361,7 +1382,10 @@ export function scheduleQmdInstallAndRefresh(rootDir: string): void {
     return;
   }
 
-  void ensureQmdInstalledAndRefresh(rootDir).catch(() => {
+  void ensureQmdInstalledAndRefreshWithAvailability(
+    rootDir,
+    () => isQmdAvailable({ keepProcessAlive: false }),
+  ).catch(() => {
     // qmd remains optional at runtime. Search falls back to local file scanning.
   });
 }

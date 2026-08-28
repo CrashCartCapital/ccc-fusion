@@ -30,6 +30,7 @@ import {
   type CccCampaignRouteFallbackPolicy,
   type CccCampaignRouteLimits,
   type CccCampaignRouteReasoningEffort,
+  type CccCampaignRouteReceiptAdapterId,
   type CccCampaignRouteSensitivityClass,
   type CccCampaignRouteServiceTier,
   type CccCampaignTransport,
@@ -39,6 +40,7 @@ import {
 
 const ROUTE_KEYS = ["modelId", "providerId", "taskId", "transport"] as const;
 const WORKFLOW_ROUTE_KEYS = [...ROUTE_KEYS, "workflowExtensionId"] as const;
+const ROUTE_RECEIPT_KEYS = [...ROUTE_KEYS, "receiptAdapterId"] as const;
 const PRODUCT_ROUTE_KEYS = [
   "allowedWriteRoots",
   "commitPolicy",
@@ -52,6 +54,7 @@ const PRODUCT_ROUTE_KEYS = [
   "worktreeMode",
 ] as const;
 const PRODUCT_CLI_ROUTE_KEYS = [...PRODUCT_ROUTE_KEYS, "cliAdapterId"] as const;
+const PRODUCT_ROUTE_RECEIPT_KEYS = [...PRODUCT_ROUTE_KEYS, "receiptAdapterId"] as const;
 const PRODUCT_ROUTE_V3_KEYS = [
   "accessTier",
   "allowedWriteRoots",
@@ -76,6 +79,10 @@ const PRODUCT_ROUTE_V3_KEYS = [
   "worktreeMode",
 ] as const;
 const PRODUCT_CLI_ROUTE_V3_KEYS = [...PRODUCT_ROUTE_V3_KEYS, "cliAdapterId"] as const;
+const PRODUCT_ROUTE_RECEIPT_V3_KEYS = [...PRODUCT_ROUTE_V3_KEYS, "receiptAdapterId"] as const;
+const RECEIPT_ADAPTER_IDS = new Set<CccCampaignRouteReceiptAdapterId>([
+  "terminal-route-sse-comments.v1",
+]);
 const EGRESS_POLICY_LOOPBACK_KEYS = ["kind"] as const;
 const EGRESS_POLICY_ALLOWLISTED_KEYS = ["kind", "providers"] as const;
 const FALLBACK_POLICY_KEYS = ["kind"] as const;
@@ -181,6 +188,24 @@ function exactIdentifier(value: unknown, label: string): string {
   return value;
 }
 
+function assertReceiptAdapterModelIdentity(
+  modelId: string,
+  receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
+  label: string,
+): void {
+  if (receiptAdapterId === undefined) return;
+  const separator = modelId.indexOf("/");
+  if (
+    separator <= 0
+    || separator === modelId.length - 1
+    || modelId.indexOf("/", separator + 1) !== -1
+  ) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} receipt adapter requires a provider-qualified model in provider/model form`,
+    );
+  }
+}
+
 function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new CccCampaignExecutionPolicyError(
@@ -198,6 +223,12 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
     );
   }
   const isWorkflowTransport = transport === "workflow";
+  const hasReceiptAdapter = Object.prototype.hasOwnProperty.call(route, "receiptAdapterId");
+  if (hasReceiptAdapter && transport !== "pi") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} receiptAdapterId is forbidden for ${transport} transport`,
+    );
+  }
   if (!isWorkflowTransport && Object.prototype.hasOwnProperty.call(route, "workflowExtensionId")) {
     throw new CccCampaignExecutionPolicyError(
       `CCC campaign execution route ${index} workflowExtensionId is forbidden for ${transport} transport`,
@@ -208,19 +239,37 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
   }
   exactKeys(
     route,
-    isWorkflowTransport ? WORKFLOW_ROUTE_KEYS : ROUTE_KEYS,
+    isWorkflowTransport
+      ? WORKFLOW_ROUTE_KEYS
+      : hasReceiptAdapter
+        ? ROUTE_RECEIPT_KEYS
+        : ROUTE_KEYS,
     `CCC campaign execution route ${index}`,
   );
   const workflowExtensionId = isWorkflowTransport ? route.workflowExtensionId as string : undefined;
+  const receiptAdapterId = hasReceiptAdapter
+    ? exactEnum(
+      route.receiptAdapterId,
+      RECEIPT_ADAPTER_IDS,
+      `CCC campaign execution route ${index} unsupported receipt adapter`,
+    )
+    : undefined;
+  const modelId = exactIdentifier(route.modelId, `CCC campaign execution route ${index} modelId`);
+  assertReceiptAdapterModelIdentity(
+    modelId,
+    receiptAdapterId,
+    `CCC campaign execution route ${index}`,
+  );
   return {
     taskId: exactIdentifier(route.taskId, `CCC campaign execution route ${index} taskId`),
     providerId: exactIdentifier(
       route.providerId,
       `CCC campaign execution route ${index} providerId`,
     ),
-    modelId: exactIdentifier(route.modelId, `CCC campaign execution route ${index} modelId`),
+    modelId,
     transport: transport as CccCampaignTransport,
     ...(workflowExtensionId ? { workflowExtensionId } : {}),
+    ...(receiptAdapterId ? { receiptAdapterId } : {}),
   };
 }
 
@@ -247,6 +296,11 @@ function exactTargetRelativePaths(
     ) {
       throw new CccCampaignExecutionPolicyError(
         `CCC campaign execution route ${index} ${field}[${pathIndex}] must be a canonical target-relative path`,
+      );
+    }
+    if (candidate === ".fusion" || candidate.startsWith(".fusion/")) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC campaign execution route ${index} ${field}[${pathIndex}] targets a reserved controller path`,
       );
     }
     return candidate;
@@ -289,9 +343,19 @@ function parseProductRoute(
       `CCC campaign execution route ${index} product transport must be pi or cli`,
     );
   }
+  const hasReceiptAdapter = Object.prototype.hasOwnProperty.call(route, "receiptAdapterId");
+  if (hasReceiptAdapter && transport !== "pi") {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign execution route ${index} receiptAdapterId is forbidden for ${transport} transport`,
+    );
+  }
   exactKeys(
     route,
-    transport === "cli" ? PRODUCT_CLI_ROUTE_KEYS : PRODUCT_ROUTE_KEYS,
+    transport === "cli"
+      ? PRODUCT_CLI_ROUTE_KEYS
+      : hasReceiptAdapter
+        ? PRODUCT_ROUTE_RECEIPT_KEYS
+        : PRODUCT_ROUTE_KEYS,
     `CCC campaign execution route ${index}`,
   );
   const executor = exactIdentifier(
@@ -329,6 +393,19 @@ function parseProductRoute(
     index,
     "allowedWriteRoots",
   );
+  const receiptAdapterId = hasReceiptAdapter
+    ? exactEnum(
+      route.receiptAdapterId,
+      RECEIPT_ADAPTER_IDS,
+      `CCC campaign execution route ${index} unsupported receipt adapter`,
+    )
+    : undefined;
+  const modelId = exactIdentifier(route.modelId, `CCC campaign execution route ${index} modelId`);
+  assertReceiptAdapterModelIdentity(
+    modelId,
+    receiptAdapterId,
+    `CCC campaign execution route ${index}`,
+  );
   for (const allowedRoot of allowedWriteRoots) {
     if (!ownedPaths.some((ownedPath) => pathContains(ownedPath, allowedRoot))) {
       throw new CccCampaignExecutionPolicyError(
@@ -351,7 +428,7 @@ function parseProductRoute(
       route.providerId,
       `CCC campaign execution route ${index} providerId`,
     ),
-    modelId: exactIdentifier(route.modelId, `CCC campaign execution route ${index} modelId`),
+    modelId,
     transport,
     executor: executor as CccCampaignProductExecutionRoute["executor"],
     toolMode: "coding",
@@ -367,6 +444,7 @@ function parseProductRoute(
         ),
       }
       : {}),
+    ...(receiptAdapterId ? { receiptAdapterId } : {}),
   };
 }
 
@@ -414,6 +492,11 @@ function exactTargetRelativePathsV3(
     ) {
       throw new CccCampaignExecutionPolicyError(
         `${label} ${field}[${pathIndex}] must be a canonical target-relative path`,
+      );
+    }
+    if (candidate === ".fusion" || candidate.startsWith(".fusion/")) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} ${field}[${pathIndex}] targets a reserved controller path`,
       );
     }
     return candidate;
@@ -573,9 +656,17 @@ function parseProductRouteV3(
   if (transport !== "pi" && transport !== "cli") {
     throw new CccCampaignExecutionPolicyError(`${label} product transport must be pi or cli`);
   }
+  const hasReceiptAdapter = Object.prototype.hasOwnProperty.call(route, "receiptAdapterId");
+  if (hasReceiptAdapter && transport !== "pi") {
+    throw new CccCampaignExecutionPolicyError(`${label} receiptAdapterId is forbidden for ${transport} transport`);
+  }
   exactKeys(
     route,
-    transport === "cli" ? PRODUCT_CLI_ROUTE_V3_KEYS : PRODUCT_ROUTE_V3_KEYS,
+    transport === "cli"
+      ? PRODUCT_CLI_ROUTE_V3_KEYS
+      : hasReceiptAdapter
+        ? PRODUCT_ROUTE_RECEIPT_V3_KEYS
+        : PRODUCT_ROUTE_V3_KEYS,
     label,
   );
   const executor = exactIdentifier(route.executor, `${label} executor`);
@@ -608,10 +699,15 @@ function parseProductRouteV3(
   const fallbackPolicy = parseFallbackPolicy(route.fallbackPolicy, label);
   const catalogDigest = parseCatalogDigest(route.catalogDigest, label);
   const decidedAt = parseDecidedAt(route.decidedAt, label);
+  const receiptAdapterId = hasReceiptAdapter
+    ? exactEnum(route.receiptAdapterId, RECEIPT_ADAPTER_IDS, `${label} unsupported receipt adapter`)
+    : undefined;
+  const modelId = exactIdentifier(route.modelId, `${label} modelId`);
+  assertReceiptAdapterModelIdentity(modelId, receiptAdapterId, label);
   return {
     taskId,
     providerId: exactIdentifier(route.providerId, `${label} providerId`),
-    modelId: exactIdentifier(route.modelId, `${label} modelId`),
+    modelId,
     transport,
     executor: executor as CccCampaignProductExecutionRouteV3["executor"],
     toolMode: "coding",
@@ -635,6 +731,7 @@ function parseProductRouteV3(
         cliAdapterId: exactIdentifier(route.cliAdapterId, `${label} cliAdapterId`),
       }
       : {}),
+    ...(receiptAdapterId ? { receiptAdapterId } : {}),
   };
 }
 
@@ -873,6 +970,24 @@ export function createCccPrdProductExecutionPlan(input: {
       );
     }
     const selection = routeSelectionForTask(task.id);
+    if (
+      selection.receiptAdapterId !== undefined
+      && !RECEIPT_ADAPTER_IDS.has(selection.receiptAdapterId)
+    ) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC PRD task ${task.id} has unsupported receipt adapter ${JSON.stringify(selection.receiptAdapterId)}`,
+      );
+    }
+    if (selection.transport === "cli" && selection.receiptAdapterId !== undefined) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC PRD task ${task.id} receiptAdapterId is forbidden for cli transport`,
+      );
+    }
+    assertReceiptAdapterModelIdentity(
+      selection.modelId,
+      selection.receiptAdapterId,
+      `CCC PRD task ${task.id}`,
+    );
     return {
       taskId: task.id,
       providerId: selection.providerId,
@@ -886,6 +1001,9 @@ export function createCccPrdProductExecutionPlan(input: {
       commitPolicy: "required" as const,
       ...(selection.transport === "cli"
         ? { cliAdapterId: selection.cliAdapterId }
+        : {}),
+      ...(selection.transport === "pi" && selection.receiptAdapterId
+        ? { receiptAdapterId: selection.receiptAdapterId }
         : {}),
     };
   });

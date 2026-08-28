@@ -26,11 +26,14 @@ import {
   CccProviderAttemptLimitError,
   CccProviderAttemptStateError,
   type CccCampaignAuthorityBinding,
+  type CccCampaignRouteReceiptAdapterId,
   type CccCampaignTaskContext,
   type CccCampaignWorkItemFence,
   type CccProviderAttemptCost,
   type CccProviderAttemptEffectiveRoute,
   type CccProviderAttemptEffectiveRouteInput,
+  type CccProviderAttemptOmniRouteReceipt,
+  type CccProviderAttemptOmniRouteObservation,
   type CccProviderAttemptReceiptSource,
   type CccProviderAttemptReconciliation,
   type CccProviderAttemptDispatchDecision,
@@ -242,7 +245,66 @@ function requireReceiptSource(value: unknown): CccProviderAttemptReceiptSource {
 }
 
 /** Shared field parsing between the settlement-input boundary and the audit read-back boundary. */
-function parseEffectiveRouteFields(value: Record<string, unknown>): CccProviderAttemptEffectiveRoute {
+type ReceiptParseError = (message: string) => never;
+
+function parseOmniRouteText(value: unknown, label: string, error: ReceiptParseError): string {
+  try {
+    return requireCanonicalText(value, `OmniRoute ${label}`);
+  } catch {
+    return error(`CCC provider attempt OmniRoute ${label} must be a non-empty canonical string`);
+  }
+}
+
+function parseOmniRouteObservation(
+  value: unknown,
+  label: string,
+  error: ReceiptParseError,
+): CccProviderAttemptOmniRouteObservation {
+  if (!isRecord(value)) {
+    return error(`CCC provider attempt OmniRoute ${label} observation must be an object`);
+  }
+  const keys = Object.keys(value).sort();
+  if (!sameCanonicalValue(keys, ["model", "provider"])) {
+    return error(`CCC provider attempt OmniRoute ${label} observation fields must be exactly model, provider`);
+  }
+  return Object.freeze({
+    provider: parseOmniRouteText(value.provider, `${label} provider`, error),
+    model: parseOmniRouteText(value.model, `${label} model`, error),
+  });
+}
+
+function parseOmniRouteReceipt(
+  value: unknown,
+  error: ReceiptParseError = (message) => {
+    throw new CccProviderAttemptIdentityError("invalid-input", message);
+  },
+): CccProviderAttemptOmniRouteReceipt {
+  if (!isRecord(value)) {
+    return error("CCC provider attempt OmniRoute receipt must be an object");
+  }
+  /*
+   * `initial` is the header-derived observation and is optional: a keepalive-first
+   * OmniRoute response commits its headers before an upstream is chosen, so only
+   * the trailing SSE comments carry the route. `final` is always required.
+   */
+  const keys = Object.keys(value).sort();
+  if (!sameCanonicalValue(keys, ["final", "initial"]) && !sameCanonicalValue(keys, ["final"])) {
+    return error("CCC provider attempt OmniRoute receipt fields must be exactly final, or final and initial");
+  }
+  return Object.freeze({
+    ...(Object.prototype.hasOwnProperty.call(value, "initial")
+      ? { initial: parseOmniRouteObservation(value.initial, "initial", error) }
+      : {}),
+    final: parseOmniRouteObservation(value.final, "final", error),
+  });
+}
+
+function parseEffectiveRouteFields(
+  value: Record<string, unknown>,
+  error: ReceiptParseError = (message) => {
+    throw new CccProviderAttemptIdentityError("invalid-input", message);
+  },
+): CccProviderAttemptEffectiveRoute {
   return Object.freeze({
     effectiveProvider: requireCanonicalText(value.effectiveProvider, "effective provider"),
     effectiveModel: requireCanonicalText(value.effectiveModel, "effective model"),
@@ -255,6 +317,9 @@ function parseEffectiveRouteFields(value: Record<string, unknown>): CccProviderA
     usage: requireUsage(value.usage),
     cost: requireCost(value.cost),
     receiptSource: requireReceiptSource(value.receiptSource),
+    ...(Object.prototype.hasOwnProperty.call(value, "omniRoute")
+      ? { omniRoute: parseOmniRouteReceipt(value.omniRoute, error) }
+      : {}),
   });
 }
 
@@ -268,8 +333,61 @@ function assertNoCostWithoutReceipt(receipt: CccProviderAttemptEffectiveRoute): 
 }
 
 const EFFECTIVE_ROUTE_REQUIRED_KEYS = ["effectiveProvider", "effectiveModel", "usage", "cost", "receiptSource"] as const;
-const EFFECTIVE_ROUTE_INPUT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "fallbackReason"] as const;
-const EFFECTIVE_ROUTE_RECEIPT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier"] as const;
+const EFFECTIVE_ROUTE_INPUT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "fallbackReason", "omniRoute"] as const;
+const EFFECTIVE_ROUTE_RECEIPT_OPTIONAL_KEYS = ["effectiveReasoningEffort", "effectiveServiceTier", "omniRoute"] as const;
+
+function splitProviderQualifiedModel(modelId: string): { provider: string; model: string } | undefined {
+  const separator = modelId.indexOf("/");
+  if (separator <= 0 || separator === modelId.length - 1 || modelId.indexOf("/", separator + 1) !== -1) {
+    return undefined;
+  }
+  if (modelId !== modelId.trim()) return undefined;
+  const provider = modelId.slice(0, separator);
+  const model = modelId.slice(separator + 1);
+  if (provider !== provider.trim() || model !== model.trim()) return undefined;
+  return { provider, model };
+}
+
+function assertTerminalRouteReceipt(
+  receipt: CccProviderAttemptEffectiveRoute,
+  requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
+  receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
+): void {
+  if (receiptAdapterId === undefined) return;
+  const requestedUpstream = splitProviderQualifiedModel(requestedIdentity.modelId);
+  if (!requestedUpstream) {
+    throw new CccProviderAttemptIdentityError(
+      "invalid-input",
+      "CCC terminal route receipt adapter requires a provider-qualified requested model",
+    );
+  }
+  const observed = receipt.omniRoute;
+  if (!observed) {
+    throw new CccProviderAttemptIdentityError(
+      "invalid-input",
+      "CCC terminal route receipt adapter requires a final terminal route receipt",
+    );
+  }
+  if (
+    observed.initial
+    && (observed.initial.provider !== observed.final.provider
+      || observed.initial.model !== observed.final.model)
+  ) {
+    throw new CccProviderAttemptIdentityError(
+      "route-drift",
+      "CCC initial and final terminal route receipts conflict",
+    );
+  }
+  if (
+    observed.final.provider !== requestedUpstream.provider
+    || observed.final.model !== requestedUpstream.model
+  ) {
+    throw new CccProviderAttemptIdentityError(
+      "route-drift",
+      "CCC final terminal provider/model receipt does not match the requested provider-qualified route",
+    );
+  }
+}
 
 function assertExactEffectiveRouteKeys(
   value: Record<string, unknown>,
@@ -300,8 +418,23 @@ function assertExactEffectiveRouteKeys(
 export function assertCccProviderAttemptEffectiveRoute(
   input: CccProviderAttemptEffectiveRouteInput | undefined,
   requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
+  options: Readonly<{
+    receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
+    terminalReceiptRequired?: boolean;
+  }> = {},
 ): CccProviderAttemptEffectiveRoute | undefined {
-  if (input === undefined) return undefined;
+  if (input === undefined) {
+    if (
+      options.receiptAdapterId !== undefined
+      && options.terminalReceiptRequired !== false
+    ) {
+      throw new CccProviderAttemptIdentityError(
+        "invalid-input",
+        "CCC terminal route receipt adapter requires an effective route terminal receipt",
+      );
+    }
+    return undefined;
+  }
   if (!isRecord(input)) {
     throw new CccProviderAttemptIdentityError(
       "invalid-input",
@@ -327,6 +460,9 @@ export function assertCccProviderAttemptEffectiveRoute(
       "CCC provider attempt effective route does not match its requested provider and model identity; "
         + "campaign fallback is not an admitted behavior",
     );
+  }
+  if (options.terminalReceiptRequired !== false || receipt.omniRoute !== undefined) {
+    assertTerminalRouteReceipt(receipt, requestedIdentity, options.receiptAdapterId);
   }
   assertNoCostWithoutReceipt(receipt);
   return receipt;
@@ -358,7 +494,9 @@ function parseEffectiveRouteReceipt(value: unknown): CccProviderAttemptEffective
   assertExactEffectiveRouteKeys(value, EFFECTIVE_ROUTE_RECEIPT_OPTIONAL_KEYS, (message) => {
     throw new CccCampaignContextError(message);
   });
-  const receipt = parseEffectiveRouteFields(value);
+  const receipt = parseEffectiveRouteFields(value, (message) => {
+    throw new CccCampaignContextError(message);
+  });
   assertNoCostWithoutReceipt(receipt);
   return receipt;
 }
@@ -682,6 +820,7 @@ function bindingFromAuditRow(
 
 function assertAuditRow(
   row: typeof schema.project.runAuditEvents.$inferSelect,
+  receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
 ): { stage: AttemptStage; metadata: ProviderAttemptMetadata; scope: CccProviderAttemptScope } {
   const stage = stageForMutationType(row.mutationType);
   const metadata = parseMetadata(row.metadata, stage);
@@ -697,7 +836,14 @@ function assertAuditRow(
   ) {
     throw new CccCampaignContextError("CCC provider attempt history has inconsistent audit custody");
   }
-  const effectiveRoute = metadata.terminal?.kind === "reconciled" ? metadata.terminal.effectiveRoute : undefined;
+  /*
+   * A route receipt can only exist on a reconciled settlement. "reserved" and
+   * "dispatched" rows carry no terminal at all, and a "not-dispatched" terminal
+   * has no effectiveRoute field by construction, so requiring a receipt from
+   * those stages is unsatisfiable rather than strict.
+   */
+  const reconciledTerminal = stage === "terminal" && metadata.terminal?.kind === "reconciled";
+  const effectiveRoute = reconciledTerminal ? metadata.terminal!.effectiveRoute : undefined;
   if (
     effectiveRoute
     && (effectiveRoute.effectiveProvider !== binding.providerId || effectiveRoute.effectiveModel !== binding.modelId)
@@ -705,6 +851,32 @@ function assertAuditRow(
     throw new CccCampaignContextError(
       "CCC provider attempt history has an effective route that does not match its persisted binding",
     );
+  }
+  if (
+    reconciledTerminal
+    && metadata.terminal?.state === "committed"
+    && receiptAdapterId !== undefined
+    && !effectiveRoute
+  ) {
+    throw new CccCampaignContextError(
+      "CCC provider attempt history has no required terminal route receipt",
+    );
+  }
+  if (
+    effectiveRoute
+    && receiptAdapterId !== undefined
+    && (metadata.terminal?.state === "committed" || effectiveRoute.omniRoute !== undefined)
+  ) {
+    try {
+      assertTerminalRouteReceipt(effectiveRoute, {
+        providerId: binding.providerId,
+        modelId: binding.modelId,
+      }, receiptAdapterId);
+    } catch (error) {
+      throw new CccCampaignContextError(
+        `CCC provider attempt history has an invalid terminal route receipt: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   assertCanonicalTimestamp(row.timestamp, "audit timestamp");
   return {
@@ -742,7 +914,7 @@ function assembleHistory(
 ): ProviderAttemptHistory {
   const attempts = new Map<string, StoredAttempt>();
   for (const row of rows) {
-    const { stage, metadata, scope } = assertAuditRow(row);
+    const { stage, metadata, scope } = assertAuditRow(row, context.route.receiptAdapterId);
     let attempt = attempts.get(scope.attemptKey);
     if (!attempt) {
       attempt = {
@@ -874,14 +1046,39 @@ async function databaseNow(tx: DbTransaction): Promise<string> {
   return assertCanonicalTimestamp(rows[0]?.now, "database clock");
 }
 
-function assertBeforeDeadline(context: CccCampaignTaskContext, now: string): void {
-  const { deadlineAt } = admittedBounds(context);
-  if (Date.parse(now) >= deadlineAt) {
+/**
+ * Every provider task's executor phase machine requires the full MUTATE
+ * turn to actually run before its outcome can be observed, so a reservation
+ * granted with less than this much time left before the database-clock
+ * campaign deadline can never complete honestly. This is a pure launch-time
+ * headroom floor -- it does not touch `campaignStartedAt`/`campaignDeadlineAt`,
+ * digests, or leases.
+ */
+export const CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS = 30_000 as const;
+
+export function assertCccProviderAttemptLaunchHeadroom(
+  deadlineAtMs: number,
+  nowMs: number,
+  taskId: string,
+): void {
+  if (nowMs >= deadlineAtMs) {
     throw new CccProviderAttemptLimitError(
       "deadline",
-      `CCC provider attempt for ${context.taskId} is outside its database-clock campaign deadline`,
+      `CCC provider attempt for ${taskId} is outside its database-clock campaign deadline`,
     );
   }
+  const remainingMs = deadlineAtMs - nowMs;
+  if (remainingMs < CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS) {
+    throw new CccProviderAttemptLimitError(
+      "deadline",
+      `CCC provider attempt for ${taskId} has less than the minimum launch headroom (${remainingMs}ms remaining, floor ${CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS}ms) before its database-clock campaign deadline`,
+    );
+  }
+}
+
+function assertBeforeDeadline(context: CccCampaignTaskContext, now: string): void {
+  const { deadlineAt } = admittedBounds(context);
+  assertCccProviderAttemptLaunchHeadroom(deadlineAt, Date.parse(now), context.taskId);
 }
 
 function assertRequestRoute(
@@ -1241,10 +1438,17 @@ export async function reconcileCccProviderAttempt(
   return withinWriteTransaction(input, async (tx) => {
     const context = await lockedContext(input, tx, input.reconciliation.taskId);
     const attempt = transitionAttempt(await loadHistory(tx, context), input.reconciliation, context.taskId);
-    const effectiveRoute = assertCccProviderAttemptEffectiveRoute(input.reconciliation.effectiveRoute, {
-      providerId: attempt.scope.binding.providerId,
-      modelId: attempt.scope.binding.modelId,
-    });
+    const effectiveRoute = assertCccProviderAttemptEffectiveRoute(
+      input.reconciliation.effectiveRoute,
+      {
+        providerId: attempt.scope.binding.providerId,
+        modelId: attempt.scope.binding.modelId,
+      },
+      {
+        receiptAdapterId: context.route.receiptAdapterId,
+        terminalReceiptRequired: outcome === "committed",
+      },
+    );
     if (attempt.terminal) {
       if (
         attempt.terminal.kind === "reconciled"

@@ -8,8 +8,10 @@ import {
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
   CCC_PRD_PROOF_V2_SCHEMA_VERSION,
+  CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+  CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION,
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
   computeCccPrdProofDefinitionSha256,
@@ -171,6 +173,20 @@ const PROOF_ADMISSION_V2_FIELDS = [
 ] as const;
 const PROOF_PHASES = new Set(["task", "final_integrated"]);
 const VERIFIER_CLOSURE_ROLES = new Set(["task_runner", "harness", "fixture", "config"]);
+const PYTHON_RUNTIME_MANIFEST_KEYS = new Set([
+  "schema",
+  "interpreter",
+  "stdlibRoot",
+  "pythonHomeRoot",
+  "sitePackagesRoots",
+  "extensionModuleRoots",
+  "runtimeSupport",
+  "stdlib",
+  "sitePackages",
+  "extensionModules",
+  "dylibClosure",
+]);
+const MAX_PYTHON_RUNTIME_ROOTS = 16;
 
 function validateExactKeys(
   label: string,
@@ -282,6 +298,176 @@ function validateExecutableIdentity(
   return valid;
 }
 
+function validatePythonRuntimeFile(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+): boolean {
+  if (!isPlainRecord(value)) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be an object`));
+    return false;
+  }
+  validateExactKeys(label, value, ["path", "sha256", "requestedPaths"], diagnostics);
+  const valid = isNonEmptyString(value.path)
+    && isAbsolute(value.path)
+    && /^[0-9a-f]{64}$/u.test(String(value.sha256));
+  if (!valid) diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} path or digest is malformed`));
+  let requestedPathsValid = true;
+  if (value.requestedPaths !== undefined) {
+    requestedPathsValid = Array.isArray(value.requestedPaths)
+      && value.requestedPaths.length > 0
+      && value.requestedPaths.length <= 16
+      && value.requestedPaths.every((requestedPath) => (
+        typeof requestedPath === "string"
+        && requestedPath.length > 0
+        && requestedPath === requestedPath.trim()
+        && /^(?:\/|@(rpath|loader_path|executable_path)\/)[^\0\\\s]+$/u.test(requestedPath)
+      ))
+      && new Set(value.requestedPaths).size === value.requestedPaths.length;
+    if (!requestedPathsValid) {
+      diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} requestedPaths are malformed`));
+    }
+  }
+  return valid && requestedPathsValid;
+}
+
+function validatePythonRuntimeFiles(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+): boolean {
+  if (!Array.isArray(value)) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be an array manifest`));
+    return false;
+  }
+  const paths = new Set<string>();
+  let valid = true;
+  for (const [index, entry] of value.entries()) {
+    if (!validatePythonRuntimeFile(`${label}[${index}]`, entry, diagnostics)) valid = false;
+    const path = isPlainRecord(entry) ? String(entry.path) : "";
+    if (paths.has(path)) {
+      diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} contains duplicate path ${path}`));
+      valid = false;
+    }
+    paths.add(path);
+  }
+  return valid;
+}
+
+function validatePythonRuntimeRoots(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+  options: { nonEmpty?: boolean } = {},
+): boolean {
+  if (
+    !Array.isArray(value)
+    || (options.nonEmpty === true && value.length === 0)
+    || value.length > MAX_PYTHON_RUNTIME_ROOTS
+    || value.some((item) => (
+      !isNonEmptyString(item)
+      || !isAbsolute(item)
+      || item !== item.trim()
+      || item.endsWith("/")
+    ))
+  ) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_INVALID",
+      `${label} must be a bounded array of canonical absolute roots`,
+    ));
+    return false;
+  }
+  if (new Set(value).size !== value.length) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} contains duplicate roots`));
+    return false;
+  }
+  return true;
+}
+
+function validatePythonRuntimeRoot(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+): boolean {
+  const valid = isNonEmptyString(value)
+    && isAbsolute(value)
+    && value === value.trim()
+    && !value.endsWith("/");
+  if (!valid) diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be a canonical absolute root`));
+  return valid;
+}
+
+function validatePythonExecutionToolchain(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+): boolean {
+  if (!isPlainRecord(value)) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be an object`));
+    return false;
+  }
+  validateExactKeys(label, value, [
+    "executablePath",
+    "executableSha256",
+    "version",
+    "versionOutputSha256",
+    "runtimeManifest",
+  ], diagnostics);
+  let valid = validateExecutableIdentity(label, {
+    executablePath: value.executablePath,
+    executableSha256: value.executableSha256,
+    version: value.version,
+    versionOutputSha256: value.versionOutputSha256,
+  }, diagnostics, false);
+  if (!isPlainRecord(value.runtimeManifest)) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} runtimeManifest must be an object`));
+    return false;
+  }
+  validateExactKeys(`${label} runtimeManifest`, value.runtimeManifest, [...PYTHON_RUNTIME_MANIFEST_KEYS], diagnostics);
+  if (value.runtimeManifest.schema !== CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} runtimeManifest schema is unsupported`));
+    valid = false;
+  }
+  if (!validatePythonRuntimeRoot(`${label} runtimeManifest stdlibRoot`, value.runtimeManifest.stdlibRoot, diagnostics)) valid = false;
+  if (!validatePythonRuntimeRoot(`${label} runtimeManifest pythonHomeRoot`, value.runtimeManifest.pythonHomeRoot, diagnostics)) valid = false;
+  if (!validatePythonRuntimeRoots(`${label} runtimeManifest sitePackagesRoots`, value.runtimeManifest.sitePackagesRoots, diagnostics)) valid = false;
+  if (!validatePythonRuntimeRoots(`${label} runtimeManifest extensionModuleRoots`, value.runtimeManifest.extensionModuleRoots, diagnostics)) valid = false;
+  if (!validatePythonRuntimeFiles(`${label} runtimeManifest runtimeSupport`, value.runtimeManifest.runtimeSupport, diagnostics)) valid = false;
+  if (!validatePythonRuntimeFile(`${label} runtimeManifest interpreter`, value.runtimeManifest.interpreter, diagnostics)) valid = false;
+  for (const category of ["stdlib", "sitePackages", "extensionModules", "dylibClosure"] as const) {
+    if (!validatePythonRuntimeFiles(`${label} runtimeManifest ${category}`, value.runtimeManifest[category], diagnostics)) valid = false;
+  }
+  if (
+    isPlainRecord(value.runtimeManifest.interpreter)
+    && (
+      value.runtimeManifest.interpreter.path !== value.executablePath
+      || value.runtimeManifest.interpreter.sha256 !== value.executableSha256
+    )
+  ) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} runtimeManifest interpreter does not match executable identity`));
+    valid = false;
+  }
+  return valid;
+}
+
+function validatePythonVerifierProfile(
+  label: string,
+  value: unknown,
+  diagnostics: CccPrdDiagnostic[],
+): boolean {
+  if (!isPlainRecord(value)) {
+    diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be an object`));
+    return false;
+  }
+  validateExactKeys(label, value, ["schema", "adapterPath", "targetPath"], diagnostics);
+  const valid = value.schema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
+    && isCanonicalRootRelativeSource(value.adapterPath)
+    && isCanonicalRootRelativeSource(value.targetPath)
+    && value.adapterPath !== value.targetPath;
+  if (!valid) diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} is malformed`));
+  return valid;
+}
+
 function validateV2ProofShape(
   proof: Record<string, unknown>,
   diagnostics: CccPrdDiagnostic[],
@@ -360,7 +546,7 @@ function validateV2ProofShape(
   validateExactKeys(
     `${label} executionToolchain`,
     proof.executionToolchain,
-    ["task", "node", "proofHost", "linkedRuntime"],
+    ["task", "node", "proofHost", "linkedRuntime", "python"],
     diagnostics,
   );
   if (!validateExecutableIdentity(`${label} Task identity`, proof.executionToolchain.task, diagnostics, false)) valid = false;
@@ -370,6 +556,28 @@ function validateV2ProofShape(
     diagnostics.push(diagnostic(
       "CCC_PRD_PROOF_INVALID",
       `${label} executionToolchain linkedRuntime must be an array manifest`,
+    ));
+    valid = false;
+  }
+  if (proof.executionToolchain.python !== undefined
+    && !validatePythonExecutionToolchain(`${label} Python identity`, proof.executionToolchain.python, diagnostics)) {
+    valid = false;
+  }
+  if (proof.verifierProfile !== undefined
+    && !validatePythonVerifierProfile(`${label} verifierProfile`, proof.verifierProfile, diagnostics)) {
+    valid = false;
+  }
+  if (proof.verifierProfile !== undefined && proof.executionToolchain.python === undefined) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_INVALID",
+      `${label} Python verifierProfile requires executionToolchain.python`,
+    ));
+    valid = false;
+  }
+  if (proof.verifierProfile === undefined && proof.executionToolchain.python !== undefined) {
+    diagnostics.push(diagnostic(
+      "CCC_PRD_PROOF_INVALID",
+      `${label} executionToolchain.python requires verifierProfile`,
     ));
     valid = false;
   }
@@ -1415,6 +1623,7 @@ function validateSidecar(
         "verifierClosure",
         "candidateInputs",
         "executionToolchain",
+        "verifierProfile",
         "spans",
         "confidence",
         "admission",

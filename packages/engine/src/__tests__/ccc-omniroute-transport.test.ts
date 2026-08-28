@@ -138,6 +138,7 @@ type ProviderConfig = {
   baseUrl: string;
   api: string;
   apiKey?: string;
+  streamSimple?: typeof streamSimple;
   models: Array<{
     id: string;
     name: string;
@@ -152,6 +153,7 @@ type ProviderConfig = {
 
 class TestModelRegistry {
   readonly configs = new Map<string, ProviderConfig>();
+  readonly runtimeOptions: Record<string, unknown>[] = [];
   readonly modelRuntime = {
     getAuth: vi.fn(async () => ({ auth: { headers: {} } })),
     hasConfiguredAuth: vi.fn(() => true),
@@ -161,15 +163,23 @@ class TestModelRegistry {
       model: Model,
       context: Context,
       options: Record<string, unknown> = {},
-    ) => streamSimple(model, context, {
-      ...options,
-      apiKey: "synthetic-loopback-only",
-      maxRetries: 0,
-    })),
+    ) => {
+      this.runtimeOptions.push(options);
+      const providerStream = this.configs.get(model.provider)?.streamSimple ?? streamSimple;
+      return providerStream(model, context, {
+        ...options,
+        apiKey: "synthetic-loopback-only",
+        maxRetries: 0,
+      });
+    }),
   };
 
   registerProvider(name: string, config: ProviderConfig): void {
-    this.configs.set(name, structuredClone(config));
+    this.configs.set(name, {
+      ...config,
+      models: structuredClone(config.models),
+      ...(config.streamSimple ? { streamSimple: config.streamSimple } : {}),
+    });
   }
 
   async refresh(): Promise<void> {}
@@ -363,6 +373,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
   let incrementalRelease: Deferred;
   let incrementalFirstChunk: Deferred;
   let abortClosed: Deferred;
+  let transientRequestCount: number;
   const sockets = new Set<Socket>();
   const durableRestartPg: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_ccc_executor_restart",
@@ -386,9 +397,24 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
         body,
         responseModel: reportedModel,
       });
+      if (userText(body).includes("CCC_TRANSIENT_RETRY")) {
+        transientRequestCount += 1;
+        if (transientRequestCount === 1) {
+          response.writeHead(503, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: { message: "synthetic permanent failure" } }));
+          return;
+        }
+      }
+      const isOmniRouteRequest = reportedModel === "minimax/MiniMax-M3";
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
+        ...(isOmniRouteRequest
+          ? {
+              "x-omniroute-provider": "minimax",
+              "x-omniroute-model": "MiniMax-M3",
+            }
+          : {}),
       });
 
       if (userText(body).includes("CCC_INCREMENTAL")) {
@@ -508,7 +534,11 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
 
       writeSse(response, startChunk(model, { role: "assistant", content: `identity:${model}` }));
       writeSse(response, startChunk(model, {}, "stop"));
-      finishSse(response);
+      if (isOmniRouteRequest) {
+        response.end(": x-omniroute-provider=minimax\n: x-omniroute-model=MiniMax-M3\ndata: [DONE]\n\n");
+      } else {
+        finishSse(response);
+      }
     });
     server.on("connection", (socket) => {
       sockets.add(socket);
@@ -538,6 +568,7 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     incrementalRelease = deferred();
     incrementalFirstChunk = deferred();
     abortClosed = deferred();
+    transientRequestCount = 0;
     registry = new TestModelRegistry();
     providers = [
       {
@@ -1802,6 +1833,133 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
     ]);
   });
 
+  it("GREEN-RECEIPT-PI-1: explicit adapter binds the terminal SSE receipt for a neutrally named provider", async () => {
+    const omniProvider: CustomProvider = {
+      id: "route-receipt-gateway-pinned",
+      name: "Route Receipt Gateway Pinned",
+      apiType: "openai-compatible",
+      baseUrl,
+      apiKey: "synthetic-loopback-only",
+      models: [{ id: "minimax/MiniMax-M3", name: "MiniMax M3" }],
+    };
+    providers = [omniProvider];
+    registry = new TestModelRegistry();
+    await registerCustomProviders(registry, providers, vi.fn());
+    harness.customProviders = providers;
+    harness.modelRegistry = registry;
+    harness.createAgentSession.mockReset();
+    harness.createAgentSession.mockImplementation(harness.actualCreateAgentSession!);
+
+    const model = registeredModel(omniProvider);
+    const registryKey = customProviderRegistryKey(omniProvider, providers);
+    const authorityBinding = Object.freeze({
+      projectId: "project-receipt",
+      importId: "import-receipt",
+      campaignId: "campaign-receipt",
+      taskId: "TASK-RECEIPT",
+      actionId: "ACTION-RECEIPT",
+      actionTarget: "provider://receipt",
+      idempotencyKey: "receipt-idempotency",
+      packetHash: "a".repeat(64),
+      sidecarHash: "b".repeat(64),
+      bundleHash: "c".repeat(64),
+      targetRepository: "/tmp/ccc-omniroute-receipt",
+      targetBase: "d".repeat(40),
+      providerId: registryKey,
+      modelId: model.id,
+      transport: "pi" as const,
+      manifestHash: "e".repeat(64),
+      bindingHash: "f".repeat(64),
+    });
+    const controller = Object.freeze({
+      preDispatch: vi.fn(async (request) => ({
+        kind: "dispatch-permit" as const,
+        scope: {
+          attemptKey: `ccc-provider-attempt-${"1".repeat(64)}`,
+          controllerToken: "ccc-provider-controller-00000000-0000-4000-8000-000000000001",
+          taskId: authorityBinding.taskId,
+          semanticTaskId: "SEMANTIC-RECEIPT",
+          campaignDeadlineAt: "2026-08-27T00:00:00.000Z",
+          turnKey: request.turnKey,
+          dispatchKey: request.dispatchKey,
+          attemptOrdinal: 1,
+          requestCount: 1,
+          workItemFence: null,
+          state: "dispatched_unknown" as const,
+          binding: authorityBinding,
+        },
+      })),
+      reconcile: vi.fn(async (reconciliation) => ({
+        ...reconciliation,
+        state: "committed" as const,
+        terminal: {
+          kind: "reconciled" as const,
+          state: "committed" as const,
+          evidenceDigest: reconciliation.evidenceDigest,
+          observerId: reconciliation.observerId,
+          effectiveRoute: reconciliation.effectiveRoute,
+        },
+      })),
+    });
+    const { createFnAgent } = await import("../pi.js");
+    const created = await createFnAgent({
+      cwd: "/tmp/ccc-omniroute-receipt",
+      systemPrompt: "synthetic OmniRoute loopback only",
+      tools: "readonly",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+      cccProviderAttemptBinding: Object.freeze({
+        turnKey: "turn-receipt-1",
+        controller,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+      }),
+    });
+
+    await expect((created.session as unknown as { promptWithFallback(value: string): Promise<void> })
+      .promptWithFallback("CCC_OMNI_ROUTE_RECEIPT"))
+      .resolves.toBeUndefined();
+    const assistant = [...((created.session as unknown as { messages?: unknown[] }).messages ?? [])]
+      .reverse()
+      .find((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && entry.role === "assistant");
+    expect(assistant?.omniRoute).toEqual({ provider: "minimax", model: "MiniMax-M3" });
+    expect(assistant).not.toHaveProperty("responseModel");
+    expect(registry.runtimeOptions[0]).toMatchObject({ maxRetries: 0 });
+    expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests.at(-1)?.body.model).toBe("minimax/MiniMax-M3");
+    expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+      effectiveRoute: expect.objectContaining({
+        effectiveProvider: registryKey,
+        effectiveModel: "minimax/MiniMax-M3",
+        omniRoute: {
+          final: { provider: "minimax", model: "MiniMax-M3" },
+        },
+      }),
+    }));
+  });
+
+  it("RED-CCC-RETRY-1: disables agent lifecycle retries for a ccc transient provider failure", async () => {
+    const provider = providers[0]!;
+    const model = registeredModel(provider);
+    const registryKey = customProviderRegistryKey(provider, providers);
+    const { createFnAgent } = await import("../pi.js");
+    const created = await createFnAgent({
+      cwd: "/tmp/ccc-retry-boundary",
+      systemPrompt: "synthetic loopback only",
+      tools: "readonly",
+      defaultProvider: registryKey,
+      defaultModelId: model.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    });
+
+    await expect((created.session as unknown as { promptWithFallback(value: string): Promise<void> })
+      .promptWithFallback("CCC_TRANSIENT_RETRY")).rejects.toThrow();
+    expect(transientRequestCount).toBe(1);
+    expect(capturedRequests).toHaveLength(1);
+  });
+
   it("refuses a ccc response model that differs from the configured request model", async () => {
     const provider = providers[0]!;
     const model = registeredModel(provider);
@@ -1942,6 +2100,29 @@ describe("ccc OmniRoute-style custom-provider transport", () => {
       subscriptionReady: true,
     })).rejects.toThrow(
       `Configured model ${registryKey}/alpha-7b-alias (primary selection) was not found in the pi model registry`,
+    );
+    expect(harness.createAgentSession).not.toHaveBeenCalled();
+    expect(capturedRequests).toHaveLength(0);
+  });
+
+  it("RED-CCC-FALLBACK-1: refuses missing primary before opening a configured fallback session", async () => {
+    const fallback = providers[0]!;
+    const fallbackModel = registeredModel(fallback);
+    const fallbackKey = customProviderRegistryKey(fallback, providers);
+    const { createFnAgent } = await import("../pi.js");
+
+    await expect(createFnAgent({
+      cwd: "/tmp/ccc-primary-required",
+      systemPrompt: "must fail before fallback session creation",
+      tools: "readonly",
+      defaultProvider: "pi-claude-cli",
+      defaultModelId: "missing-primary-model",
+      fallbackProvider: fallbackKey,
+      fallbackModelId: fallbackModel.id,
+      profile: "ccc-fusion",
+      subscriptionReady: true,
+    })).rejects.toThrow(
+      "Configured model pi-claude-cli/missing-primary-model (primary selection) was not found in the pi model registry",
     );
     expect(harness.createAgentSession).not.toHaveBeenCalled();
     expect(capturedRequests).toHaveLength(0);

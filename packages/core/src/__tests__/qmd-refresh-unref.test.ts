@@ -65,7 +65,7 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
       [
         "#!/usr/bin/env bash",
         'case "$1" in',
-        "  update|embed)",
+        "  --help|update|embed)",
         "    sleep 8",
         "    ;;",
         "esac",
@@ -77,7 +77,7 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
     chmodSync(stubPath, 0o755);
   }
 
-  async function runFixture(mode: "project" | "agent", rootDir: string, stubDir: string) {
+  async function runFixture(mode: "project" | "agent" | "install", rootDir: string, stubDir: string) {
     const fixturePath = join(import.meta.dirname, "fixtures", "qmd-refresh-fixture.mjs");
     const startedAt = Date.now();
     return new Promise<{ code: number | null; elapsedMs: number; stdout: string }>((resolvePromise, reject) => {
@@ -132,5 +132,19 @@ describe("qmd background refresh does not keep a short-lived caller alive (sympt
     // refreshQmdAgentMemoryIndex routes through the same default executor as the
     // project path; this proves the agent surface inherits the unref fix too.
     expect(exitInfo.elapsedMs).toBeLessThan(5_000);
+  }, 15_000);
+
+  it("install probe: fixture process exits promptly while the background qmd availability check is still sleeping", async () => {
+    const stubDir = mkdtempSync(join(tmpdir(), "fn-7706-qmd-install-stub-"));
+    tempDirs.push(stubDir);
+    const rootDir = mkdtempSync(join(tmpdir(), "fn-7706-qmd-install-root-"));
+    tempDirs.push(rootDir);
+    writeSlowQmdStub(stubDir);
+
+    const exitInfo = await runFixture("install", rootDir, stubDir);
+
+    expect(exitInfo.stdout).toContain("qmd-refresh-fixture:scheduled");
+    expect(exitInfo.code).toBe(0);
+    expect(exitInfo.elapsedMs).toBeLessThan(2_000);
   }, 15_000);
 });

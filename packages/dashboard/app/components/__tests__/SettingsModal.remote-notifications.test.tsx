@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
-import type { PluginUiContributionEntry } from "../../api";
+import type { PluginUiContributionEntry, RemoteStatus } from "../../api";
 import {
   mockFetchSettings,
   mockFetchSettingsByScope,
@@ -587,11 +587,22 @@ describe("SettingsModal", () => {
     });
 
     it("shows lifecycle state changes for start and stop actions, including error state", async () => {
-      mockFetchRemoteStatus
-        .mockResolvedValueOnce({ provider: null, state: "stopped", url: null, lastError: null })
-        .mockResolvedValueOnce({ provider: "tailscale", state: "starting", url: null, lastError: null })
-        .mockResolvedValueOnce({ provider: "tailscale", state: "running", url: "https://tail.example", lastError: null })
-        .mockResolvedValueOnce({ provider: "tailscale", state: "error", url: null, lastError: "Tunnel crashed" });
+      type TestRemoteStatus = Omit<RemoteStatus, "state"> & { state: RemoteStatus["state"] | "error" };
+      let remoteStatus: TestRemoteStatus = { provider: null, state: "stopped", url: null, lastError: null };
+      mockFetchRemoteStatus.mockImplementation(async () => remoteStatus as RemoteStatus);
+      mockStartRemoteTunnel.mockImplementation(async () => {
+        remoteStatus = { provider: "tailscale", state: "starting", url: null, lastError: null };
+        return { state: "starting", provider: "tailscale" };
+      });
+      mockStopRemoteTunnel
+        .mockImplementationOnce(async () => {
+          remoteStatus = { provider: "tailscale", state: "running", url: "https://tail.example", lastError: null };
+          return { state: "stopped", provider: "tailscale" };
+        })
+        .mockImplementationOnce(async () => {
+          remoteStatus = { provider: "tailscale", state: "error", url: null, lastError: "Tunnel crashed" };
+          return { state: "stopped", provider: null };
+        });
 
       await renderModalSection("remote", "Remote Access");
 

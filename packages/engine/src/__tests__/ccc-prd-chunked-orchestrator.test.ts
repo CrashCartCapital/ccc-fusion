@@ -139,6 +139,11 @@ describe("buildCccPrdChunkPrompt", () => {
     expect(prompt).toContain('"acceptanceClauses"');
     expect(prompt).toContain('"acceptanceDispositions"');
     expect(prompt).toContain('"clauseIds"');
+    expect(prompt).toContain('"pythonHomeRoot"');
+    expect(prompt).toContain('"stdlibRoot"');
+    expect(prompt).toContain('"sitePackagesRoots"');
+    expect(prompt).toContain('"extensionModuleRoots"');
+    expect(prompt).toContain('"runtimeSupport"');
     expect(prompt).toContain("clause IDs and text must be copied exactly from the source grammar");
     expect(prompt).toContain("fuzzy quote recovery never applies to acceptance clauses");
   });

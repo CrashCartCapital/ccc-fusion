@@ -18,6 +18,7 @@ interface LaneResult {
 interface RunQualityTestsModule {
   qualityLanes: QualityLane[];
   resolveConcurrency(env?: Record<string, string | undefined>): number;
+  createLaneEnv(env?: Record<string, string | undefined>): Record<string, string | undefined>;
   runQualityTests(options?: {
     group?: "all" | "app" | "api";
     concurrency?: number;
@@ -42,6 +43,17 @@ describe("dashboard quality orchestrator", () => {
     expect(resolveConcurrency({ FUSION_DASHBOARD_TEST_CONCURRENCY: "1" })).toBe(1);
     expect(resolveConcurrency({ FUSION_DASHBOARD_TEST_CONCURRENCY: "5" })).toBe(2);
     expect(resolveConcurrency({ FUSION_DASHBOARD_TEST_CONCURRENCY: "not-a-number" })).toBe(2);
+  });
+
+  it("caps Vitest workers only for serial dashboard runs and preserves overrides", async () => {
+    const { createLaneEnv } = await loadModule();
+
+    expect(createLaneEnv({ FUSION_DASHBOARD_TEST_CONCURRENCY: "1" }).VITEST_MAX_WORKERS).toBe("1");
+    expect(
+      createLaneEnv({ FUSION_DASHBOARD_TEST_CONCURRENCY: "1", VITEST_MAX_WORKERS: "4" }).VITEST_MAX_WORKERS,
+    ).toBe("4");
+    expect(createLaneEnv({ FUSION_DASHBOARD_TEST_CONCURRENCY: "2" }).VITEST_MAX_WORKERS).toBeUndefined();
+    expect(createLaneEnv({}).VITEST_MAX_WORKERS).toBeUndefined();
   });
 
   it("runs only up to the configured concurrency and does not invoke artifact bootstrap per lane", async () => {

@@ -43,7 +43,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --silent=passed-only --reporter=dot",
     "test:embedded-postgres": "vitest run src/__tests__/postgres/embedded-lifecycle.test.ts --silent=passed-only --reporter=dot",
-    "test:pg-gate": "vitest run --config vitest.pg.config.ts src/__tests__/postgres/handoff-to-review-atomicity.pg.test.ts src/__tests__/postgres/task-lifecycle-e2e.pg.test.ts --silent=passed-only --reporter=dot"
+    "test:pg-gate": "vitest run --config vitest.pg.config.ts src/__tests__/postgres/handoff-to-review-atomicity.pg.test.ts src/__tests__/postgres/task-lifecycle-e2e.pg.test.ts --silent=passed-only --reporter=dot",
+    "test:python-runtime-integration": "FUSION_TEST_PYTHON_RUNTIME_INTEGRATION=1 vitest run src/__tests__/ccc-prd-semantic-proof-custody.test.ts -t RED-R1-python-discovery-controller-pythonpath --silent=passed-only --reporter=dot"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.81.1",

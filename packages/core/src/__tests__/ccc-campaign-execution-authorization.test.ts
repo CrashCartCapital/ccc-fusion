@@ -105,6 +105,49 @@ describe("CCC sealed execution-authorization identity", () => {
     expect(routeDrift.authorizationDigest).not.toBe(original.authorizationDigest);
   });
 
+  it.each([
+    ["task member set", (input: CccCampaignExecutionAuthorizationIdentityInput) => ({
+      ...input,
+      members: input.members.slice(0, 1),
+    })],
+    ["workflow dependency graph", (input: CccCampaignExecutionAuthorizationIdentityInput) => ({
+      ...input,
+      workflowIrHash: HASH_B,
+    })],
+    ["owned-path route", (input: CccCampaignExecutionAuthorizationIdentityInput) => ({
+      ...input,
+      members: input.members.map((member) => member.ordinal === 0
+        ? { ...member, routeSha256: HASH_F }
+        : member),
+    })],
+    ["target repository", (input: CccCampaignExecutionAuthorizationIdentityInput) => ({
+      ...input,
+      targetRepository: "/tmp/ccc-authorization-target-moved",
+    })],
+    ["target base", (input: CccCampaignExecutionAuthorizationIdentityInput) => ({
+      ...input,
+      targetBase: "2".repeat(40),
+    })],
+  ] as const)("RED-W1-structural-digest: %s drift changes parent identity", (_label, mutate) => {
+    const input = identityInput();
+    const original = createCccCampaignExecutionAuthorizationIdentity(input);
+    const drifted = createCccCampaignExecutionAuthorizationIdentity(mutate(input));
+
+    expect(drifted.authorizationId).not.toBe(original.authorizationId);
+    expect(drifted.authorizationDigest).not.toBe(original.authorizationDigest);
+  });
+
+  it("RED-W1-structural-digest: identical re-derivation is idempotent", () => {
+    const input = identityInput();
+    const first = createCccCampaignExecutionAuthorizationIdentity(input);
+    const replay = createCccCampaignExecutionAuthorizationIdentity({
+      ...input,
+      members: input.members.map((member) => ({ ...member })),
+    });
+
+    expect(replay).toEqual(first);
+  });
+
   it("RED-S2-identity: refuses duplicate or non-contiguous canonical ordinals", () => {
     const input = identityInput();
     expect(() => createCccCampaignExecutionAuthorizationIdentity({

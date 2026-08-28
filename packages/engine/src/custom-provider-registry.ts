@@ -99,7 +99,15 @@ export function buildCustomProviderModels(
   return (provider.models ?? []).map((model) => ({
     id: model.id,
     name: model.name,
-    reasoning: false,
+    /*
+     * FNXC:ProviderReasoning 2026-08-24-02:30:
+     * pi-ai gates every reasoning branch on this flag, so hardcoding `false`
+     * made reasoning unreachable for ALL custom gateways: a pinned reasoning
+     * model ran as a plain chat model and no `reasoning_effort`/`thinking`
+     * parameter was ever emitted. Honor only an explicit `true` so providers
+     * configured before this field existed keep their exact registration.
+     */
+    reasoning: model.reasoning === true,
     input: ["text" as const],
     cost: {
       input: 0,

@@ -12,6 +12,8 @@ import type {
   CccPrdProofCase,
   CccPrdProofExecutionToolchain,
   CccPrdProofV2,
+  CccPrdPythonExecutionToolchain,
+  CccPrdPythonRuntimeFile,
   CccPrdProtectedActionIntent,
   CccPrdProtectedActionKind,
   CccPrdRefusalBundle,
@@ -155,12 +157,37 @@ function sortedLinkedRuntime(
   return sortByCanonicalValue(linkedRuntime);
 }
 
+function sortedPythonRuntimeFiles(
+  files: readonly CccPrdPythonRuntimeFile[],
+): CccPrdPythonRuntimeFile[] {
+  return sortByCanonicalValue(files);
+}
+
+function canonicalPythonExecutionToolchain(
+  python: CccPrdPythonExecutionToolchain,
+): CccPrdPythonExecutionToolchain {
+  return {
+    ...python,
+    runtimeManifest: {
+      ...python.runtimeManifest,
+      sitePackagesRoots: sortedStrings(python.runtimeManifest.sitePackagesRoots),
+      extensionModuleRoots: sortedStrings(python.runtimeManifest.extensionModuleRoots),
+      runtimeSupport: sortedPythonRuntimeFiles(python.runtimeManifest.runtimeSupport),
+      stdlib: sortedPythonRuntimeFiles(python.runtimeManifest.stdlib),
+      sitePackages: sortedPythonRuntimeFiles(python.runtimeManifest.sitePackages),
+      extensionModules: sortedPythonRuntimeFiles(python.runtimeManifest.extensionModules),
+      dylibClosure: sortedPythonRuntimeFiles(python.runtimeManifest.dylibClosure),
+    },
+  };
+}
+
 function canonicalExecutionToolchain(toolchain: CccPrdProofExecutionToolchain) {
   return {
     task: toolchain.task,
     node: toolchain.node,
     proofHost: toolchain.proofHost,
     linkedRuntime: sortedLinkedRuntime(toolchain.linkedRuntime),
+    ...(toolchain.python ? { python: canonicalPythonExecutionToolchain(toolchain.python) } : {}),
   };
 }
 
@@ -213,6 +240,7 @@ export function projectCccPrdProofV2DefinitionForHash(proof: CccPrdProofV2) {
     verifierClosure: sortedVerifierClosure(proof.verifierClosure),
     candidateInputs: sortedStrings(proof.candidateInputs),
     executionToolchain: canonicalExecutionToolchain(proof.executionToolchain),
+    ...(proof.verifierProfile ? { verifierProfile: proof.verifierProfile } : {}),
     spans: sortedSpans(proof.spans),
     confidence: proof.confidence,
   };

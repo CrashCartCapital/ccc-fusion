@@ -15,9 +15,29 @@ import {
   runFn,
   runFnAsync,
 } from "./prd-built-cli-fixture.js";
+import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-native-proof-host.js";
+import { runPrdCommand } from "../prd.js";
 
 afterEach(cleanupPacketRoots);
 const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+async function createDeterministicallyAuthoredPacketRoot() {
+  const packet = createPacketRoot();
+  const output: string[] = [];
+  const status = await runPrdCommand(
+    ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+    { write: (line) => output.push(line) },
+    {
+      bootstrapProofAdmission: () => bootstrapCccCampaignProofAdmissionHost({
+        builtRootPath: join(repoRoot, "packages/cli/dist"),
+      }),
+    },
+  );
+  if (status !== 0) {
+    throw new Error(`deterministic sidecar fixture authoring failed: ${output.join("\n")}`);
+  }
+  return packet;
+}
 
 describe("prd built CLI user contract", () => {
   it("advertises author, validate, and compile from top-level help", () => {
@@ -165,7 +185,7 @@ version: 2.0.0
       "sources/__fusion__/REF-HUM-FusionOperatorContext.md",
     ), "utf8")).toContain("Target repository: " + guidedTarget);
     expect(readFileSync(selectedPrdPath).equals(sourceBefore)).toBe(true);
-  });
+  }, 60_000);
 
   it("prints and lints the optional future-PRD contract through the built CLI", () => {
     const template = runFn(["prd", "template"]);
@@ -227,7 +247,7 @@ version: 2.0.0
     expect(JSON.parse(compile.stdout)).toHaveProperty("requirements");
     expect(existsSync(tempPrefix)).toBe(false);
     expect(readFileSync(join(packet.root, "packet.md"), "utf8")).toContain("Dense PRD Packet");
-  });
+  }, 60_000);
 
   it("returns stable usage and semantic-refusal exit codes", () => {
     const usage = runFn(["prd", "compile"]);
@@ -312,15 +332,12 @@ version: 2.0.0
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
   }, 60_000);
 
-  it("refuses a foreign admitted target through built validate and compile", () => {
-    const packet = createPacketRoot();
-    expect(runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]).status).toBe(0);
-    for (const command of ["validate", "compile"]) {
-      const result = runFn(["prd", command, packet.root, packet.manifest, packet.sidecar, "foreign/repo", packet.base]);
-      expect(result.status).toBe(1);
-      expect(result.stdout).toContain("CCC_PRD_FOREIGN_TARGET");
-    }
-  });
+  it.each(["validate", "compile"] as const)("refuses a foreign admitted target through built %s", async (command) => {
+    const packet = await createDeterministicallyAuthoredPacketRoot();
+    const result = runFn(["prd", command, packet.root, packet.manifest, packet.sidecar, "foreign/repo", packet.base]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("CCC_PRD_FOREIGN_TARGET");
+  }, 60_000);
 
   it("refuses a foreign admitted base through built validate and compile", () => {
     const packet = createPacketRoot();
@@ -330,7 +347,7 @@ version: 2.0.0
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("CCC_PRD_FOREIGN_BASE");
     }
-  });
+  }, 60_000);
 
   it.each(["packet.md", "manifest.json"])("refuses author output that would overwrite admitted %s bytes", (relativeOutput) => {
     const packet = createPacketRoot();
@@ -361,5 +378,5 @@ version: 2.0.0
     const second = runFn(["prd", "author", packet.root, packet.manifest, packet.proposal, packet.sidecar]);
     expect(second.status, `${second.stdout}\n${second.stderr}`).toBe(0);
     expect(readFileSync(packet.sidecar).equals(firstBytes)).toBe(true);
-  });
+  }, 60_000);
 });

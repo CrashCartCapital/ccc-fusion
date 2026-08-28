@@ -333,9 +333,16 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
   });
 
   it("does not let one runtime-owned provider attempt hide separate manual work", async () => {
+    // Reserving a live provider attempt needs the campaign window to exceed
+    // the minimum launch headroom floor; the fixture default (1 s) is only
+    // meant for deadline-expiry tests.
     const { source, imported } = await importAdmittedProduct(
       "product-status-mixed-uncertainty",
       "product-status-mixed-uncertainty",
+      (bundle) => rehashCccPrdImportTestBundle({
+        ...bundle,
+        bounds: { ...bundle.bounds, maxDurationMs: 120_000 },
+      }),
     );
     const taskId = await nativeTaskIdForImport(
       imported.importId,
@@ -466,6 +473,16 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       memberSetHash: issued.memberSetHash,
       expectedRequestCount: 0,
       status: "issued",
+      memberCustody: issued.members.map((member) => ({
+        ordinal: member.ordinal,
+        nativeTaskId: member.nativeTaskId,
+        semanticTaskId: member.semanticTaskId,
+        actionId: member.actionId,
+        actionTarget: member.actionTarget,
+        approvalRequestId: member.approvalRequestId,
+        status: "issued",
+        bindingHash: member.bindingHash,
+      })),
       members: issued.members.map((member) => ({
         nativeTaskId: member.nativeTaskId,
         approvalRequestId: member.approvalRequestId,
@@ -507,6 +524,13 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     expect(claimedStatus?.executionAuthorization).toMatchObject({
       authorizationId: issued.authorizationId,
       status: "claimed",
+      memberCustody: issued.members.map((member) => ({
+        ordinal: member.ordinal,
+        nativeTaskId: member.nativeTaskId,
+        semanticTaskId: member.semanticTaskId,
+        approvalRequestId: member.approvalRequestId,
+        status: "claimed",
+      })),
     });
     expect(claimedStatus?.approvals).toEqual(expect.arrayContaining(
       issued.members.map((member) => expect.objectContaining({
@@ -588,6 +612,45 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
     } finally {
       laggingAppClock.mockRestore();
     }
+  });
+
+  it("RED-W1-status-custody: refuses sealed parent status when a child approval binding drifts", async () => {
+    const { source, imported } = await importAdmittedProduct(
+      "product-status-live-custody-drift",
+      "product-status-live-custody-drift",
+      withLiveExecutionAction,
+    );
+    const codingTaskId = await nativeTaskIdForImport(
+      imported.importId,
+      source.tasks[0]!.id,
+    );
+    const campaign = await h.store().getCccCampaignContextForTask(codingTaskId);
+    if (!campaign) throw new Error("missing live-execution campaign context");
+    const issued = await issueCccCampaignExecutionAuthorization(h.layer(), {
+      authorityStore: h.store(),
+      rootDir: h.rootDir(),
+      taskId: codingTaskId,
+      requester: {
+        actorId: "runtime-product-status-live-custody-drift",
+        actorType: "agent",
+        actorName: "Runtime",
+      },
+      notBeforeAt: campaign.campaignStartedAt,
+      expiresAt: campaign.campaignDeadlineAt,
+    });
+    await h.layer().db.execute(sql`
+      UPDATE project.approval_requests
+      SET task_id = 'drifted-child-task'
+      WHERE id = ${issued.members[0]!.approvalRequestId}
+    `);
+
+    await expect(inspectCccPrdProductStatus({
+      idempotencyKey: "product-status-live-custody-drift",
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    })).rejects.toMatchObject({
+      code: "CCC_PRD_IMPORT_CAMPAIGN_CUSTODY_REFUSED",
+    });
   });
 
   it("keeps manifest-v1 imports on their exact per-task approval status contract", async () => {
@@ -795,8 +858,8 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       used: 5,
       remaining: 0,
       providerTasks: 2,
-      deterministicMinimum: 2,
-      headroomAboveMinimum: 3,
+      deterministicMinimum: 4,
+      headroomAboveMinimum: 1,
       completionAdequacy: "unproven",
     });
   });
@@ -1104,7 +1167,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       nextAction: {
         kind: "blocked",
         diagnostic: "CCC_CAMPAIGN_REQUEST_BUDGET_COUNTER_DRIFT",
-        safeState: expect.stringContaining("3 of 2 first-time provider-attempt reservation slots"),
+        safeState: expect.stringContaining("3 of 4 first-time provider-attempt reservation slots"),
       },
     });
   });

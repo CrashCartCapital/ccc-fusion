@@ -399,6 +399,35 @@ function v2ProductProposal() {
   return candidate;
 }
 
+function addPythonVerifierProfile(candidate: ReturnType<typeof v2ProductProposal>, proofIndex = 0) {
+  const proof = candidate.proofs[proofIndex]!;
+  proof.verifierProfile = {
+    schema: "ccc-prd.verifier.python-adapter.v1",
+    adapterPath: "verify/python_adapter.py",
+    targetPath: "fixtures/python-target",
+  };
+  (proof.executionToolchain as Record<string, unknown>).python = {
+    executablePath: "/usr/local/bin/python3",
+    executableSha256: "4".repeat(64),
+    version: "Python 3.12.10",
+    versionOutputSha256: "5".repeat(64),
+    runtimeManifest: {
+      schema: "ccc-prd.python-runtime-manifest.v1",
+      interpreter: { path: "/usr/local/bin/python3", sha256: "4".repeat(64) },
+      stdlibRoot: "/usr/local/lib/python3.12",
+      pythonHomeRoot: "/usr/local",
+      sitePackagesRoots: ["/usr/local/lib/python3.12/site-packages"],
+      extensionModuleRoots: ["/usr/local/lib/python3.12/lib-dynload"],
+      runtimeSupport: [],
+      stdlib: [{ path: "/usr/local/lib/python3.12/os.py", sha256: "6".repeat(64) }],
+      sitePackages: [],
+      extensionModules: [],
+      dylibClosure: [],
+    },
+  };
+  return candidate;
+}
+
 function productConstraints() {
   return {
     targetRepository: { path: target, baseCommit: base },
@@ -464,6 +493,66 @@ function refusalCode(result: Record<string, unknown>): string | undefined {
 }
 
 describe("ccc-prd structural sidecar", () => {
+  it("RED-R1-python-v2-authoring-shape: admits the additive Python verifier profile for review-only v2 authoring", async () => {
+    const input = packet(v2ProductSource);
+    const candidate = addPythonVerifierProfile(v2ProductProposal());
+    const authored = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      semanticProofContract: "v2",
+      adapter: {
+        id: "local-v2-python-fixture",
+        model: "fixture-v2",
+        generateCandidate: async () => candidate,
+      },
+      workflowExtensionRegistry: await proofAdmissionRegistry(input),
+    });
+
+    expect(authored.kind, JSON.stringify(authored)).toBe("candidate");
+    expect(authored.sidecar?.proofs).toEqual(expect.arrayContaining([expect.objectContaining({
+      verifierProfile: expect.objectContaining({ schema: "ccc-prd.verifier.python-adapter.v1" }),
+      executionToolchain: expect.objectContaining({
+        python: expect.objectContaining({
+          runtimeManifest: expect.objectContaining({ schema: "ccc-prd.python-runtime-manifest.v1" }),
+        }),
+      }),
+    })]));
+  });
+
+  it.each([
+    { label: "orphan Python toolchain", mutate: (proof: Record<string, unknown>) => { delete proof.verifierProfile; } },
+    { label: "orphan verifier profile", mutate: (proof: Record<string, unknown>) => {
+      delete (proof.executionToolchain as Record<string, unknown>).python;
+    } },
+    { label: "unknown toolchain field", mutate: (proof: Record<string, unknown>) => {
+      (proof.executionToolchain as Record<string, unknown>).ambientPython = {};
+    } },
+    { label: "incomplete Python runtime manifest", mutate: (proof: Record<string, unknown>) => {
+      const python = (proof.executionToolchain as Record<string, unknown>).python as Record<string, unknown>;
+      delete (python.runtimeManifest as Record<string, unknown>).runtimeSupport;
+    } },
+  ])("RED-R1-python-v2-authoring-shape: refuses $label", async ({ mutate }) => {
+    const input = packet(v2ProductSource);
+    const candidate = addPythonVerifierProfile(v2ProductProposal());
+    mutate(candidate.proofs[0]!);
+    const authored = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      semanticProofContract: "v2",
+      adapter: {
+        id: "local-v2-python-fixture",
+        model: "fixture-v2",
+        generateCandidate: async () => candidate,
+      },
+      workflowExtensionRegistry: await proofAdmissionRegistry(input),
+    });
+
+    expect(authored).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_AUTHORING_PROPOSAL_INVALID" }],
+    });
+  });
+
   it("RED-S5-v2-proposal-toolchain-shape: refuses proof executionToolchain without linkedRuntime", async () => {
     const input = packet(v2ProductSource);
     const candidate = v2ProductProposal();

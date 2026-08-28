@@ -218,6 +218,74 @@ describe("project commands", () => {
     expect(lines.some((line) => line.includes("/tmp/demo"))).toBe(false);
   });
 
+  it("runProjectAdd preserves the requested project isolation mode", async () => {
+    mockListProjects.mockResolvedValue([]);
+    mockRegisterProject.mockResolvedValue({
+      id: "proj-1",
+      name: "demo",
+      path: "/tmp/demo",
+      isolationMode: "child-process",
+    });
+
+    const { runProjectAdd } = await import("../project.js");
+    await runProjectAdd("demo", ".", { force: true, isolation: "child-process" });
+
+    expect(mockEnsureProjectForPath).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "demo",
+        path: process.cwd(),
+        isolationMode: "child-process",
+      }),
+    );
+  });
+
+  it("runProjectAdd applies the requested isolation mode to an existing project path", async () => {
+    mockListProjects.mockResolvedValue([]);
+    mockEnsureProjectForPath.mockResolvedValueOnce({
+      outcome: "existing",
+      project: {
+        id: "proj-1",
+        name: "demo",
+        path: process.cwd(),
+        status: "active",
+        isolationMode: "in-process",
+      },
+    });
+
+    const { runProjectAdd } = await import("../project.js");
+    await runProjectAdd("demo", ".", { force: true, isolation: "child-process" });
+
+    expect(mockUpdateProject).toHaveBeenCalledWith(
+      "proj-1",
+      expect.objectContaining({
+        status: "active",
+        isolationMode: "child-process",
+      }),
+    );
+  });
+
+  it("runProjectAdd preserves existing isolation when no isolation mode is requested", async () => {
+    mockListProjects.mockResolvedValue([]);
+    mockEnsureProjectForPath.mockResolvedValueOnce({
+      outcome: "existing",
+      project: {
+        id: "proj-1",
+        name: "demo",
+        path: process.cwd(),
+        status: "active",
+        isolationMode: "child-process",
+      },
+    });
+
+    const { runProjectAdd } = await import("../project.js");
+    await runProjectAdd("demo", ".", { force: true });
+
+    expect(mockUpdateProject).toHaveBeenCalledWith("proj-1", {
+      status: "active",
+      isolationMode: "child-process",
+    });
+  });
+
   it("runProjectRemove unregisters project after confirmation", async () => {
     mockGetProject.mockResolvedValue({ id: "proj-1", name: "demo", path: "/tmp/demo", status: "active", isolationMode: "in-process" });
 
@@ -754,7 +822,10 @@ describe("project commands", () => {
 
       // Project should still be registered
       expect(mockRegisterProject).toHaveBeenCalled();
-      expect(mockUpdateProject).toHaveBeenCalledWith("proj-1", { status: "active" });
+      expect(mockUpdateProject).toHaveBeenCalledWith("proj-1", {
+        status: "active",
+        isolationMode: "in-process",
+      });
 
       // Should show warning about memory failure on console.warn
       const warnOutput = consoleWarnSpy.mock.calls.map((call) => String(call[0])).join("\n");

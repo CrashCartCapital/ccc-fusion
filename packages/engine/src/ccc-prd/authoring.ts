@@ -5,8 +5,10 @@ import {
   CCC_PRD_IMPLEMENTATION_FACT_PROVENANCE_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_SCHEMA_VERSION,
   CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION,
+  CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+  CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION,
   canonicalCccPrdJson,
   canonicalizeCccPrdImplementationFactProvenance,
   computeCccPrdProofDefinitionSha256,
@@ -84,6 +86,14 @@ export type AuthorCccPrdInput = {
    * and executable identities are never executable authority.
    */
   semanticProofToolchainPaths?: CccPrdSemanticProofToolchainPaths;
+  /**
+   * Resolve executable-author custody only after the adapter's proposal has
+   * been parsed and its verifier profiles have been admitted. This keeps
+   * review-only or Node-only proposals from requiring a target Python venv.
+  */
+  resolveSemanticProofToolchainPaths?: (input: Readonly<{
+    pythonRequired: boolean;
+  }>) => CccPrdSemanticProofToolchainPaths;
 };
 
 const sha256 = (value: Buffer | string) => createHash("sha256").update(value).digest("hex");
@@ -113,6 +123,42 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
   const expected = [...keys].sort();
   return actual.length === expected.length
     && actual.every((key, index) => key === expected[index]);
+}
+
+function hasCompletePythonProposalShape(value: unknown): boolean {
+  if (!isPlainRecord(value) || !exactKeys(value, [
+    "executablePath",
+    "executableSha256",
+    "version",
+    "versionOutputSha256",
+    "runtimeManifest",
+  ])) return false;
+  const manifest = value.runtimeManifest;
+  if (!isPlainRecord(manifest) || !exactKeys(manifest, [
+    "schema",
+    "interpreter",
+    "stdlibRoot",
+    "pythonHomeRoot",
+    "sitePackagesRoots",
+    "extensionModuleRoots",
+    "runtimeSupport",
+    "stdlib",
+    "sitePackages",
+    "extensionModules",
+    "dylibClosure",
+  ])) return false;
+  return manifest.schema === CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION
+    && isPlainRecord(manifest.interpreter)
+    && exactKeys(manifest.interpreter, ["path", "sha256"])
+    && typeof manifest.stdlibRoot === "string"
+    && typeof manifest.pythonHomeRoot === "string"
+    && Array.isArray(manifest.sitePackagesRoots)
+    && Array.isArray(manifest.extensionModuleRoots)
+    && Array.isArray(manifest.runtimeSupport)
+    && Array.isArray(manifest.stdlib)
+    && Array.isArray(manifest.sitePackages)
+    && Array.isArray(manifest.extensionModules)
+    && Array.isArray(manifest.dylibClosure);
 }
 
 function sourceQuoteContainsCanonicalPath(
@@ -287,22 +333,42 @@ function describeProposalShapeViolations(
     }
     const proofs = value.proofs;
     if (Array.isArray(proofs)) {
-      const badIndex = proofs.findIndex((entry) => !(
-        isPlainRecord(entry)
-        && entry.schema === "ccc-prd.proof.v2"
-        && Array.isArray(entry.clauseIds)
-        && Array.isArray(entry.phases)
-        && Array.isArray(entry.positiveCases)
-        && Array.isArray(entry.negativeControls)
-        && Array.isArray(entry.verifierClosure)
-        && Array.isArray(entry.candidateInputs)
-        && isPlainRecord(entry.executionToolchain)
-        && exactKeys(entry.executionToolchain, ["task", "node", "proofHost", "linkedRuntime"])
-        && Array.isArray(entry.executionToolchain.linkedRuntime)
-      ));
+      const badIndex = proofs.findIndex((entry) => {
+        if (!isPlainRecord(entry) || !isPlainRecord(entry.executionToolchain)) return true;
+        const hasPython = Object.prototype.hasOwnProperty.call(entry.executionToolchain, "python");
+        const hasVerifierProfile = Object.prototype.hasOwnProperty.call(entry, "verifierProfile");
+        const verifierProfileValid = !hasVerifierProfile || (
+          isPlainRecord(entry.verifierProfile)
+          && exactKeys(entry.verifierProfile, ["schema", "adapterPath", "targetPath"])
+          && entry.verifierProfile.schema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
+          && typeof entry.verifierProfile.adapterPath === "string"
+          && entry.verifierProfile.adapterPath.length > 0
+          && typeof entry.verifierProfile.targetPath === "string"
+          && entry.verifierProfile.targetPath.length > 0
+        );
+        return !(
+          entry.schema === "ccc-prd.proof.v2"
+          && Array.isArray(entry.clauseIds)
+          && Array.isArray(entry.phases)
+          && Array.isArray(entry.positiveCases)
+          && Array.isArray(entry.negativeControls)
+          && Array.isArray(entry.verifierClosure)
+          && Array.isArray(entry.candidateInputs)
+          && exactKeys(
+            entry.executionToolchain,
+            hasPython
+              ? ["task", "node", "proofHost", "linkedRuntime", "python"]
+              : ["task", "node", "proofHost", "linkedRuntime"],
+          )
+          && Array.isArray(entry.executionToolchain.linkedRuntime)
+          && hasPython === hasVerifierProfile
+          && (!hasPython || hasCompletePythonProposalShape(entry.executionToolchain.python))
+          && verifierProfileValid
+        );
+      });
       if (badIndex >= 0) {
         violations.push(
-          `proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape, including executionToolchain task/node/proofHost/linkedRuntime`,
+          `proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape, including executionToolchain task/node/proofHost/linkedRuntime and a paired verifierProfile/executionToolchain.python when using the Python adapter`,
         );
       }
     }
@@ -1032,11 +1098,39 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
         message: "authoring proposal changed stable declaration IDs for an unchanged admitted packet",
       });
     }
+    let semanticProofToolchainPaths = input.semanticProofToolchainPaths;
+    if (
+      proposalValue.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
+      && !semanticProofToolchainPaths
+      && input.resolveSemanticProofToolchainPaths
+    ) {
+      if (!input.constraints) {
+        return createRefusalBundle({
+          code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+          message: "executable semantic-proof authoring requires controller-admitted target and bounds",
+        });
+      }
+      const pythonRequired = proposalValue.proofs.some((proof) => (
+        proof.verifierProfile?.schema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
+      ));
+      try {
+        semanticProofToolchainPaths = input.resolveSemanticProofToolchainPaths({
+          pythonRequired,
+        });
+      } catch (error) {
+        return createRefusalBundle({
+          code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+          message: error instanceof Error
+            ? error.message
+            : "semantic-proof toolchain identity could not be resolved",
+        });
+      }
+    }
     const mapped = mapProposal(proposalValue, custody.sourceBytes);
     let controllerOwnedV2Proofs: CccPrdProofV2[] | undefined;
     if (
       proposalValue.schema === CCC_PRD_AUTHORING_PROPOSAL_V2_SCHEMA_VERSION
-      && input.semanticProofToolchainPaths
+      && semanticProofToolchainPaths
     ) {
       if (!input.constraints) {
         return createRefusalBundle({
@@ -1052,7 +1146,7 @@ export async function authorCccPrdPacket(input: AuthorCccPrdInput): Promise<CccP
           ...(task.ownedPaths ?? []),
           ...(task.allowedWriteRoots ?? []),
         ]),
-        toolchainPaths: input.semanticProofToolchainPaths,
+        toolchainPaths: semanticProofToolchainPaths,
       });
     }
     let implementationFactProvenance: CccPrdImplementationFactProvenance | undefined;

@@ -19,6 +19,7 @@ import {
   hashCccCampaignManifest,
   canonicalCccPrdJson,
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+  cccCampaignRequestFloor,
   importCccPrdBundle,
   inspectCccPrdImport,
   reconcileCccPrdImport,
@@ -900,7 +901,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     })).rejects.toMatchObject({
       code: CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
       message:
-        "CCC PRD product import maxRequests 1 is below the provider-task floor 2",
+        "CCC PRD product import maxRequests 1 is below the structural floor 4 (2 per provider task: one MUTATE turn plus the single REPAIR turn; this floor is not an adequacy guarantee)",
     });
 
     await expect(inspectCccPrdImport({
@@ -938,7 +939,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     const imported = seeded;
     const legacyBundle = rehashBundle({
       ...initialBundle,
-      bounds: { maxRequests: 1, maxDurationMs: 60_000, maxConcurrency: 1 },
+      bounds: { maxRequests: 2, maxDurationMs: 60_000, maxConcurrency: 1 },
     });
     const legacyPolicy = productExecutionPolicy(legacyBundle);
     const [persistedImport] = await h.layer().db.execute(sql`
@@ -1058,7 +1059,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
     const semanticBundle = rehashProductBundleV2({
       ...initial,
-      bounds: { ...initial.bounds, maxRequests: initial.tasks.length },
+      bounds: { ...initial.bounds, maxRequests: cccCampaignRequestFloor(initial.tasks.length) },
       tasks: initial.tasks.map((task) => task.id === landingTask.id
         ? {
           ...task,
@@ -1175,7 +1176,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     };
     const semanticBundle = rehashProductBundleV2({
       ...initial,
-      bounds: { ...initial.bounds, maxRequests: initial.tasks.length },
+      bounds: { ...initial.bounds, maxRequests: cccCampaignRequestFloor(initial.tasks.length) },
       tasks: initial.tasks.map((task) => task.id === landingTask.id
         ? {
           ...task,
@@ -1802,7 +1803,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     const key = "idem-active-repair-timeout";
     const boundedBundle = rehashBundle({
       ...bundle(h.rootDir(), suffix),
-      bounds: { maxRequests: 1, maxDurationMs: 40, maxConcurrency: 1 },
+      bounds: { maxRequests: 2, maxDurationMs: 40, maxConcurrency: 1 },
     });
     const imported = await importCccPrdBundle({
       ...request(suffix, key),
@@ -1867,7 +1868,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     const key = "idem-preparation-timeout";
     const boundedBundle = rehashBundle({
       ...bundle(h.rootDir(), suffix),
-      bounds: { maxRequests: 1, maxDurationMs: 40, maxConcurrency: 1 },
+      bounds: { maxRequests: 2, maxDurationMs: 40, maxConcurrency: 1 },
     });
     let announceEntered!: () => void;
     let releaseCreator!: () => void;
@@ -2150,7 +2151,7 @@ pgTest("CCC PRD import-owned PostgreSQL/filesystem unit of work", () => {
     const key = "idem-bounded-wait";
     const boundedBundle = rehashBundle({
       ...bundle(h.rootDir(), suffix),
-      bounds: { maxRequests: 1, maxDurationMs: 40, maxConcurrency: 1 },
+      bounds: { maxRequests: 2, maxDurationMs: 40, maxConcurrency: 1 },
     });
     let announceEntered!: () => void;
     let releaseProjection!: () => void;

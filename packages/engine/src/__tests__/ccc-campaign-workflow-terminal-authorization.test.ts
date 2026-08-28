@@ -140,10 +140,10 @@ describe("sealed campaign authorization terminal cleanup", () => {
       { leaseOwner: "worker-1", leaseDurationMs: 1_000 },
     );
 
-    expect(result).toMatchObject({
-      runtime: runtimeResult,
-      diagnostics: [diagnostic],
-    });
+    // The terminal-reason diagnostic now follows the closure diagnostic; this
+    // assertion still pins the closure one and its leading position.
+    expect(result).toMatchObject({ runtime: runtimeResult });
+    expect(result.diagnostics?.[0]).toBe(diagnostic);
     expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
       workItem.id,
       "failed",
@@ -203,7 +203,8 @@ describe("sealed campaign authorization terminal cleanup", () => {
       { leaseOwner: "worker-1", leaseDurationMs: 1_000 },
     );
 
-    expect(result.diagnostics).toEqual([diagnostic]);
+    // Still the leading diagnostic; the terminal-reason line is appended after it.
+    expect(result.diagnostics?.[0]).toBe(diagnostic);
     expect(logEntry).toHaveBeenCalledWith(workItem.taskId, diagnostic);
   });
 
@@ -385,5 +386,82 @@ describe("sealed campaign authorization terminal cleanup", () => {
     expect(result.diagnostics?.[0]).toContain(
       "[ccc-campaign:execution-authorization-closure-failed]",
     );
+  });
+
+  /*
+   * A work item that ends `failed` or `cancelled` writes runtimeResult.reason to
+   * the work item's lastError column and NOWHERE else. Reading that column needs
+   * either the campaign idempotency key or database credentials, so an operator
+   * watching logs sees the item die with no explanation at all. Observed twice
+   * live against the R1 campaign: the only line emitted was the downstream
+   * authorization cleanup, which reports `terminal=failed` without the reason.
+   */
+  it("surfaces the terminal reason for a failed work item instead of burying it in lastError", async () => {
+    const { logEntry, store } = processorStore();
+    const reason = "ccc-permanent:CCC_CAMPAIGN_IMPLEMENTATION_FAILED";
+
+    const result = await processDueWorkflowWorkItem(
+      store as never,
+      { run: vi.fn(async () => ({
+        disposition: "failed",
+        outcome: "failure",
+        visitedNodeIds: ["execute"],
+        context: {},
+        reason,
+      })) } as never,
+      undefined,
+      { leaseOwner: "worker-1", leaseDurationMs: 1_000 },
+    );
+
+    const expected =
+      `[ccc-campaign:work-item-terminal] workItem=${workItem.id} `
+      + `terminal=failed reason=${reason}`;
+    expect(result.diagnostics).toContain(expected);
+    expect(logEntry).toHaveBeenCalledWith(workItem.taskId, expected);
+  });
+
+  it("says so explicitly when a failed work item carries no reason at all", async () => {
+    const { logEntry, store } = processorStore();
+
+    await processDueWorkflowWorkItem(
+      store as never,
+      { run: vi.fn(async () => ({
+        disposition: "failed",
+        outcome: "failure",
+        visitedNodeIds: ["execute"],
+        context: {},
+      })) } as never,
+      undefined,
+      { leaseOwner: "worker-1", leaseDurationMs: 1_000 },
+    );
+
+    expect(logEntry).toHaveBeenCalledWith(
+      workItem.taskId,
+      `[ccc-campaign:work-item-terminal] workItem=${workItem.id} `
+      + "terminal=failed reason=<none recorded>",
+    );
+  });
+
+  it("stays quiet on the success path, so the diagnostic cannot become noise", async () => {
+    const { logEntry, store } = processorStore();
+
+    const result = await processDueWorkflowWorkItem(
+      store as never,
+      { run: vi.fn(async () => ({
+        disposition: "completed",
+        outcome: "success",
+        visitedNodeIds: ["execute"],
+        context: {},
+      })) } as never,
+      undefined,
+      { leaseOwner: "worker-1", leaseDurationMs: 1_000 },
+    );
+
+    const emitted = [
+      ...(result.diagnostics ?? []),
+      ...logEntry.mock.calls.map((call) => String(call[1])),
+    ];
+    expect(emitted.some((line) => line.includes("[ccc-campaign:work-item-terminal]")))
+      .toBe(false);
   });
 });

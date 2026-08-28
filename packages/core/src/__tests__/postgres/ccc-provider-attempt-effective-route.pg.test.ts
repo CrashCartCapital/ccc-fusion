@@ -17,15 +17,19 @@ import {
   inspectCccProviderAttempt,
 } from "../../ccc-campaign/provider-attempt.js";
 import { CccProviderAttemptIdentityError } from "../../ccc-campaign/types.js";
+import { TaskStore } from "../../store.js";
 import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
   type SharedPgTaskStoreHarness,
 } from "../../__test-utils__/pg-test-harness.js";
 import {
+  createAdmittedCccPrdImportTestProductFixture,
   createCccPrdImportTestBundle as bundle,
   createCccPrdImportTestExecutionPolicy,
+  createCccPrdImportTestProductExecutionPolicy,
   rehashCccPrdImportTestBundle,
+  rehashCccPrdImportTestProductBundleV2,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
 import { sql } from "drizzle-orm";
 
@@ -81,6 +85,60 @@ pgDescribe("CCC provider-attempt effective-route settlement (PostgreSQL)", () =>
         dispatchKey: `dispatch-${turnKey}`,
         providerId: "deterministic-fake",
         modelId: "fixture-v1",
+        transport: "pi",
+        workItemFence: { workItemId: `work-item-${turnKey}`, runId: `run-${turnKey}`, attempt: 1 },
+      },
+    });
+    const decision = await beginCccProviderAttemptDispatch({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      transition: { taskId, attemptKey: reserved.attemptKey, controllerToken: reserved.controllerToken },
+    });
+    expect(decision.kind).toBe("dispatch-permit");
+    return reserved;
+  }
+
+  async function adapterContext(suffix: string) {
+    const admitted = await createAdmittedCccPrdImportTestProductFixture(h.rootDir(), suffix);
+    const source = rehashCccPrdImportTestProductBundleV2({
+      ...admitted.bundle,
+      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+    });
+    const executionPolicy = createCccPrdImportTestProductExecutionPolicy(source);
+    executionPolicy.routes = executionPolicy.routes.map((route) => ({
+      ...route,
+      providerId: "arbitrary-gateway",
+      modelId: "upstream/model-a",
+      receiptAdapterId: "terminal-route-sse-comments.v1",
+    }));
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: `provider-attempt-adapter-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy,
+      semanticProofToolchainPaths: admitted.semanticProofToolchainPaths,
+    });
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
+    const campaign = await h.store().getCccCampaignContextForTask(taskId);
+    if (!campaign) throw new Error(`missing adapter campaign context for ${taskId}`);
+    return { taskId, semanticTaskId, campaign };
+  }
+
+  async function reserveAndDispatchAdapter(taskId: string, turnKey: string) {
+    const reserved = await reserveCccProviderAttempt({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      request: {
+        taskId,
+        actionId: taskId,
+        actionTarget: h.rootDir(),
+        turnKey,
+        dispatchKey: `dispatch-${turnKey}`,
+        providerId: "arbitrary-gateway",
+        modelId: "upstream/model-a",
         transport: "pi",
         workItemFence: { workItemId: `work-item-${turnKey}`, runId: `run-${turnKey}`, attempt: 1 },
       },
@@ -286,5 +344,62 @@ pgDescribe("CCC provider-attempt effective-route settlement (PostgreSQL)", () =>
       evidenceDigest: "f".repeat(64),
       observerId: "settlement-worker",
     });
+  });
+
+  it("RED-RECEIPT-RESTART-1: a fresh authority-store instance reloads adapter custody and reserves the next turn", async () => {
+    const { taskId, campaign } = await adapterContext("receipt-restart");
+    expect(campaign.route.receiptAdapterId).toBe("terminal-route-sse-comments.v1");
+    const reserved = await reserveAndDispatchAdapter(taskId, "turn-receipt-restart-1");
+
+    const terminal = await reconcileCccProviderAttempt({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      reconciliation: {
+        taskId,
+        attemptKey: reserved.attemptKey,
+        controllerToken: reserved.controllerToken,
+        outcome: "committed",
+        evidenceDigest: "9".repeat(64),
+        observerId: "receipt-restart-worker",
+        effectiveRoute: {
+          effectiveProvider: "arbitrary-gateway",
+          effectiveModel: "upstream/model-a",
+          usage: { inputTokens: 8, outputTokens: 5 },
+          cost: { kind: "unknown", reason: "fixture pricing unavailable" },
+          receiptSource: "stream-usage",
+          omniRoute: { final: { provider: "upstream", model: "model-a" } },
+        },
+      },
+    });
+
+    const restarted = new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() });
+    await expect(restarted.getCccCampaignContextForTask(taskId)).resolves.toMatchObject({
+      route: { receiptAdapterId: "terminal-route-sse-comments.v1" },
+    });
+    await expect(restarted.inspectCccProviderAttempt({
+      taskId,
+      attemptKey: reserved.attemptKey,
+    })).resolves.toEqual(terminal);
+    const next = await restarted.reserveCccProviderAttempt({
+      taskId,
+      actionId: taskId,
+      actionTarget: h.rootDir(),
+      turnKey: "turn-receipt-restart-2",
+      dispatchKey: "dispatch-turn-receipt-restart-2",
+      providerId: "arbitrary-gateway",
+      modelId: "upstream/model-a",
+      transport: "pi",
+      workItemFence: {
+        workItemId: "work-item-turn-receipt-restart-2",
+        runId: "run-turn-receipt-restart-2",
+        attempt: 1,
+      },
+    });
+    await expect(restarted.beginCccProviderAttemptDispatch({
+      taskId,
+      attemptKey: next.attemptKey,
+      controllerToken: next.controllerToken,
+    })).resolves.toMatchObject({ kind: "dispatch-permit" });
+    expect(next).toMatchObject({ state: "reserved", requestCount: 2 });
   });
 });

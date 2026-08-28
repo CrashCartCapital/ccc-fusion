@@ -1,18 +1,15 @@
 diff --git a/dist/api/openai-completions.js b/dist/api/openai-completions.js
 --- a/dist/api/openai-completions.js
 +++ b/dist/api/openai-completions.js
-@@ -256,7 +256,19 @@
+@@ -256,7 +256,16 @@
                  // and each chunk in a streamed completion carries the same id.
                  output.responseId ||= chunk.id;
                  if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
 -                    output.responseModel ||= chunk.model;
-+                    // ccc-fusion patch (Stage 4, 2026-08-03): capture response identity
-+                    // only from substantive chunks (non-empty content, tool calls, or a
-+                    // finish signal). Some local OpenAI-compatible servers (oMLX) emit
-+                    // keepalive chunks during prompt processing whose model field is a
-+                    // placeholder ("keepalive"); first-differing-chunk capture froze
-+                    // that placeholder as responseModel and downstream identity gates
-+                    // refused the entire response as drifted.
++                    // Capture response identity only from substantive chunks.
++                    // Some local OpenAI-compatible servers emit keepalive chunks
++                    // whose model field is a placeholder; that transport noise is
++                    // not the provider's terminal model identity.
 +                    const identityChoice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
 +                    const identitySubstantive = identityChoice && (identityChoice.finish_reason != null
 +                        || (identityChoice.delta && (identityChoice.delta.content || identityChoice.delta.tool_calls)));

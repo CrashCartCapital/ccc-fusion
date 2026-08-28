@@ -110,6 +110,30 @@ vi.mock("../../api", () => ({
 
 installChatViewEnv();
 
+function restoreDescriptor(target: object, property: PropertyKey, original: PropertyDescriptor | undefined): void {
+  if (original) {
+    Object.defineProperty(target, property, original);
+    return;
+  }
+  Reflect.deleteProperty(target, property);
+}
+
+describe("scroll metric test cleanup", () => {
+  it("restores both absent and existing descriptors", () => {
+    const target = {} as Record<string, unknown>;
+    const absent = Object.getOwnPropertyDescriptor(target, "absent");
+    Object.defineProperty(target, "absent", { configurable: true, value: "injected" });
+    restoreDescriptor(target, "absent", absent);
+    expect(Object.getOwnPropertyDescriptor(target, "absent")).toBeUndefined();
+
+    Object.defineProperty(target, "existing", { configurable: true, value: "before", writable: true });
+    const existing = Object.getOwnPropertyDescriptor(target, "existing");
+    Object.defineProperty(target, "existing", { configurable: true, value: "after", writable: true });
+    restoreDescriptor(target, "existing", existing);
+    expect(Object.getOwnPropertyDescriptor(target, "existing")).toEqual(existing);
+  });
+});
+
 describe("ChatView project-scoped agent fetching", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -391,9 +415,9 @@ describe("Direct/Rooms scope toggle", () => {
     const originalScrollTop = Object.getOwnPropertyDescriptor(proto, "scrollTop");
     const scrollTopByNode = new WeakMap<HTMLElement, number>();
     const restoreGeometry = () => {
-      if (originalScrollHeight) Object.defineProperty(proto, "scrollHeight", originalScrollHeight);
-      if (originalClientHeight) Object.defineProperty(proto, "clientHeight", originalClientHeight);
-      if (originalScrollTop) Object.defineProperty(proto, "scrollTop", originalScrollTop);
+      restoreDescriptor(proto, "scrollHeight", originalScrollHeight);
+      restoreDescriptor(proto, "clientHeight", originalClientHeight);
+      restoreDescriptor(proto, "scrollTop", originalScrollTop);
     };
 
     try {
@@ -447,6 +471,10 @@ describe("Direct/Rooms scope toggle", () => {
     } finally {
       restoreGeometry();
     }
+
+    expect(Object.getOwnPropertyDescriptor(proto, "scrollHeight")).toEqual(originalScrollHeight);
+    expect(Object.getOwnPropertyDescriptor(proto, "clientHeight")).toEqual(originalClientHeight);
+    expect(Object.getOwnPropertyDescriptor(proto, "scrollTop")).toEqual(originalScrollTop);
   });
 
   it("restores persisted rooms scope when chatRooms experimental flag is missing", async () => {
@@ -644,32 +672,71 @@ describe("FN-5720 room re-entry anchoring", () => {
     }));
 
   it("anchors to bottom when re-entering Rooms scope", async () => {
-    const room = createRoomFixture("ops");
-    const roomMessages = makeRoomMessages(room.id, 12);
+    const proto = HTMLElement.prototype;
+    const originalScrollHeight = Object.getOwnPropertyDescriptor(proto, "scrollHeight");
+    const originalClientHeight = Object.getOwnPropertyDescriptor(proto, "clientHeight");
+    const originalScrollTop = Object.getOwnPropertyDescriptor(proto, "scrollTop");
+    const scrollTopByNode = new WeakMap<HTMLElement, number>();
+    const restoreGeometry = () => {
+      restoreDescriptor(proto, "scrollHeight", originalScrollHeight);
+      restoreDescriptor(proto, "clientHeight", originalClientHeight);
+      restoreDescriptor(proto, "scrollTop", originalScrollTop);
+    };
 
-    setupMockChat({
-      activeSession: activeSessionFixture,
-      sessions: [activeSessionFixture],
-      filteredSessions: [activeSessionFixture],
-      messages: [{ id: "dm-1", sessionId: activeSessionFixture.id, role: "assistant", content: "Direct", createdAt: "2026-04-08T00:00:00.000Z" }],
+    Object.defineProperty(proto, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.classList.contains("chat-messages") ? 2000 : (originalScrollHeight?.get?.call(this) ?? 0);
+      },
     });
-    setupMockRooms({ rooms: [room], activeRoom: room, messages: roomMessages, messagesLoading: false });
-    localStorage.setItem("fusion:chat-scope", "rooms");
-
-    rtlRender(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
-
-    const container = document.querySelector(".chat-messages") as HTMLDivElement;
-    const readScrollTop = attachScrollGeometry(container, 420);
-
-    container.scrollTop = 420;
-    fireEvent.scroll(container);
-
-    await userEvent.click(screen.getByTestId("chat-sidebar-scope-direct"));
-    await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
-
-    await waitFor(() => {
-      expect(readScrollTop()).toBe(2000);
+    Object.defineProperty(proto, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.classList.contains("chat-messages") ? 300 : (originalClientHeight?.get?.call(this) ?? 0);
+      },
     });
+    Object.defineProperty(proto, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) {
+        return scrollTopByNode.get(this) ?? (originalScrollTop?.get?.call(this) ?? 0);
+      },
+      set(this: HTMLElement, value: number) {
+        scrollTopByNode.set(this, value);
+      },
+    });
+
+    try {
+      const room = createRoomFixture("ops");
+      const roomMessages = makeRoomMessages(room.id, 12);
+
+      setupMockChat({
+        activeSession: activeSessionFixture,
+        sessions: [activeSessionFixture],
+        filteredSessions: [activeSessionFixture],
+        messages: [{ id: "dm-1", sessionId: activeSessionFixture.id, role: "assistant", content: "Direct", createdAt: "2026-04-08T00:00:00.000Z" }],
+      });
+      setupMockRooms({ rooms: [room], activeRoom: room, messages: roomMessages, messagesLoading: false });
+      localStorage.setItem("fusion:chat-scope", "rooms");
+
+      rtlRender(<ChatView projectId="proj-123" addToast={vi.fn()} experimentalFeatures={{ chatRooms: true }} />);
+
+      const container = document.querySelector(".chat-messages") as HTMLDivElement;
+      container.scrollTop = 420;
+      fireEvent.scroll(container);
+
+      await userEvent.click(screen.getByTestId("chat-sidebar-scope-direct"));
+      await userEvent.click(screen.getByTestId("chat-sidebar-scope-rooms"));
+
+      await waitFor(() => {
+        expect((document.querySelector(".chat-messages") as HTMLDivElement).scrollTop).toBe(2000);
+      });
+    } finally {
+      restoreGeometry();
+    }
+
+    expect(Object.getOwnPropertyDescriptor(proto, "scrollHeight")).toEqual(originalScrollHeight);
+    expect(Object.getOwnPropertyDescriptor(proto, "clientHeight")).toEqual(originalClientHeight);
+    expect(Object.getOwnPropertyDescriptor(proto, "scrollTop")).toEqual(originalScrollTop);
   });
 
   it("preserves scrolled-up room position on message refetch", async () => {
@@ -905,4 +972,3 @@ describe("Chat pop-out header actions", () => {
     expect(css).toMatch(/@container\s+chat-view\s+\(max-width:\s*560px\)[\s\S]*?\.chat-view-header-scope-toggle \.chat-sidebar-scope-btn span\s*\{[^}]*clip-path:\s*inset\(50%\);/);
   });
 });
-

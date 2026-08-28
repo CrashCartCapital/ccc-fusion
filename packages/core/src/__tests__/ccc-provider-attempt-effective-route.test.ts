@@ -14,9 +14,11 @@
 import { describe, expect, it } from "vitest";
 import {
   assertCccProviderAttemptEffectiveRoute,
+  assertCccProviderAttemptLaunchHeadroom,
+  CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS,
   sameCccProviderAttemptEffectiveRoute,
 } from "../ccc-campaign/provider-attempt.js";
-import { CccProviderAttemptIdentityError } from "../ccc-campaign/types.js";
+import { CccProviderAttemptIdentityError, CccProviderAttemptLimitError } from "../ccc-campaign/types.js";
 import type { CccProviderAttemptEffectiveRouteInput, CccProviderAttemptEffectiveRoute } from "../ccc-campaign/types.js";
 
 const requestedIdentity = { providerId: "anthropic", modelId: "claude-sonnet-5" };
@@ -229,6 +231,125 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       )
     ).toThrow(CccProviderAttemptIdentityError);
   });
+
+  describe("OmniRoute terminal receipt", () => {
+    const receiptAdapterOptions = {
+      receiptAdapterId: "terminal-route-sse-comments.v1",
+    } as const;
+    const omniRouteIdentity = {
+      providerId: "omniroute-minimax-m3-pinned",
+      modelId: "minimax/MiniMax-M3",
+    };
+
+    const omniRouteReceipt = {
+      initial: { provider: "minimax", model: "MiniMax-M3" },
+      final: { provider: "minimax", model: "MiniMax-M3" },
+    };
+
+    const omniRouteInput = (
+      overrides: Partial<CccProviderAttemptEffectiveRouteInput> = {},
+    ): CccProviderAttemptEffectiveRouteInput => ({
+      effectiveProvider: omniRouteIdentity.providerId,
+      effectiveModel: omniRouteIdentity.modelId,
+      usage: { inputTokens: 100, outputTokens: 40 },
+      cost: { amountUsd: 0.0123, source: "stream-usage" },
+      receiptSource: "stream-usage",
+      ...overrides,
+    });
+
+    it("allows a proved-failed settlement to omit the terminal route receipt that never arrived", () => {
+      expect(assertCccProviderAttemptEffectiveRoute(
+        undefined,
+        omniRouteIdentity,
+        { ...receiptAdapterOptions, terminalReceiptRequired: false },
+      )).toBeUndefined();
+    });
+
+    it("still requires a terminal route receipt for a committed OmniRoute settlement", () => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        undefined,
+        omniRouteIdentity,
+        { ...receiptAdapterOptions, terminalReceiptRequired: true },
+      )).toThrow(CccProviderAttemptIdentityError);
+    });
+
+    it("RED-OMNI-1: persists the exact initial/final allowlisted receipt for a provider-qualified route", () => {
+      const receipt = assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute: omniRouteReceipt }),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      );
+      expect(receipt?.omniRoute).toEqual(omniRouteReceipt);
+    });
+
+    it.each([
+      { label: "missing nested receipt", overrides: {} },
+      { label: "missing final provider", overrides: { omniRoute: { initial: omniRouteReceipt.initial, final: { model: "MiniMax-M3" } } } },
+      { label: "missing final model", overrides: { omniRoute: { initial: omniRouteReceipt.initial, final: { provider: "minimax" } } } },
+    ])("RED-OMNI-2: refuses $label for a newly declared OmniRoute route", ({ overrides }) => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput(overrides),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      ))
+        .toThrow(CccProviderAttemptIdentityError);
+    });
+
+    it.each([
+      { label: "initial/final provider conflict", omniRoute: { initial: { provider: "minimax", model: "MiniMax-M3" }, final: { provider: "opencode-go", model: "MiniMax-M3" } } },
+      { label: "initial/final model conflict", omniRoute: { initial: { provider: "minimax", model: "MiniMax-M3" }, final: { provider: "minimax", model: "minimax-m3" } } },
+      { label: "provider drift", omniRoute: { initial: { provider: "opencode-go", model: "minimax-m3" }, final: { provider: "opencode-go", model: "minimax-m3" } } },
+      { label: "model alias drift", omniRoute: { initial: { provider: "minimax", model: "minimax-m3" }, final: { provider: "minimax", model: "minimax-m3" } } },
+      { label: "fallback model", omniRoute: { initial: { provider: "minimax", model: "MiniMax-M3" }, final: { provider: "minimax", model: "glm-5.3" } } },
+    ])("RED-OMNI-3: refuses $label instead of normalizing upstream identity", ({ omniRoute }) => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute }),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      ))
+        .toThrow(CccProviderAttemptIdentityError);
+    });
+
+    /*
+     * When OmniRoute has to wait on a real upstream call it flushes an
+     * `: omniroute-keepalive` SSE comment immediately to hold the stream open,
+     * which commits the HTTP response headers before it knows which provider it
+     * will use. x-omniroute-provider/model are therefore absent from the headers
+     * on exactly the uncached calls that matter, and arrive only as trailing SSE
+     * comments. Demanding the initial observation is unsatisfiable there. The
+     * final receipt stays mandatory and carries the anti-substitution guarantee
+     * on its own; the initial one corroborates it whenever OmniRoute supplied it.
+     */
+    it("RED-OMNI-7: accepts a final-only receipt when OmniRoute stamped no initial headers", () => {
+      const receipt = assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute: { final: omniRouteReceipt.final } }),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      );
+      expect(receipt?.omniRoute).toEqual({ final: omniRouteReceipt.final });
+    });
+
+    it.each([
+      { label: "final provider drift", omniRoute: { final: { provider: "opencode-go", model: "MiniMax-M3" } } },
+      { label: "final model alias drift", omniRoute: { final: { provider: "minimax", model: "minimax-m3" } } },
+      { label: "fallback model", omniRoute: { final: { provider: "minimax", model: "glm-5.3" } } },
+    ])("RED-OMNI-8: still refuses $label on a final-only receipt", ({ omniRoute }) => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ omniRoute }),
+        omniRouteIdentity,
+        receiptAdapterOptions,
+      ))
+        .toThrow(CccProviderAttemptIdentityError);
+    });
+
+    it("RED-OMNI-4: refuses a provider-qualified OmniRoute declaration without a slash", () => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        omniRouteInput({ effectiveModel: "MiniMax-M3" }),
+        { ...omniRouteIdentity, modelId: "MiniMax-M3" },
+        receiptAdapterOptions,
+      )).toThrow(CccProviderAttemptIdentityError);
+    });
+  });
 });
 
 describe("sameCccProviderAttemptEffectiveRoute (idempotent-replay comparison)", () => {
@@ -262,5 +383,66 @@ describe("sameCccProviderAttemptEffectiveRoute (idempotent-replay comparison)", 
 
   it("present-vs-same resolves idempotently", () => {
     expect(sameCccProviderAttemptEffectiveRoute(receiptA, { ...receiptA })).toBe(true);
+  });
+
+  it("RED-OMNI-5: replay compares the nested OmniRoute receipt byte-for-byte", () => {
+    const withOmniRoute = {
+      ...receiptA,
+      omniRoute: {
+        initial: { provider: "minimax", model: "MiniMax-M3" },
+        final: { provider: "minimax", model: "MiniMax-M3" },
+      },
+    } as CccProviderAttemptEffectiveRoute;
+    expect(sameCccProviderAttemptEffectiveRoute(withOmniRoute, { ...withOmniRoute })).toBe(true);
+    expect(sameCccProviderAttemptEffectiveRoute(withOmniRoute, {
+      ...withOmniRoute,
+      omniRoute: {
+        initial: { provider: "minimax", model: "MiniMax-M3" },
+        final: { provider: "opencode-go", model: "minimax-m3" },
+      },
+    })).toBe(false);
+  });
+});
+
+describe("C4b: assertCccProviderAttemptLaunchHeadroom", () => {
+  const deadlineAtMs = Date.parse("2026-08-14T15:00:00.000Z");
+
+  it("allows a reservation with a full minute of headroom before the deadline", () => {
+    const nowMs = deadlineAtMs - 60_000;
+    expect(() => assertCccProviderAttemptLaunchHeadroom(deadlineAtMs, nowMs, "task-1"))
+      .not.toThrow();
+  });
+
+  it("refuses a reservation with only 10s of headroom before the deadline (reason: deadline)", () => {
+    const nowMs = deadlineAtMs - 10_000;
+    let thrown: unknown;
+    try {
+      assertCccProviderAttemptLaunchHeadroom(deadlineAtMs, nowMs, "task-1");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CccProviderAttemptLimitError);
+    expect((thrown as CccProviderAttemptLimitError).reason).toBe("deadline");
+    expect((thrown as Error).message).toContain("minimum launch headroom");
+    expect((thrown as Error).message).toContain("task-1");
+    expect((thrown as Error).message).toContain(String(CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS));
+  });
+
+  it("refuses (with the original message) a reservation at or past the deadline", () => {
+    let thrown: unknown;
+    try {
+      assertCccProviderAttemptLaunchHeadroom(deadlineAtMs, deadlineAtMs, "task-1");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CccProviderAttemptLimitError);
+    expect((thrown as CccProviderAttemptLimitError).reason).toBe("deadline");
+    expect((thrown as Error).message).toBe(
+      "CCC provider attempt for task-1 is outside its database-clock campaign deadline",
+    );
+  });
+
+  it("CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS floor is 30 seconds", () => {
+    expect(CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS).toBe(30_000);
   });
 });

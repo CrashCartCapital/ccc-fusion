@@ -428,12 +428,17 @@ export async function runProjectAdd(
       path: absolutePath,
       identity: identity ?? undefined,
       name: projectName,
+      isolationMode,
     });
 
-    const project = ensured.project;
+    const effectiveIsolationMode = options.isolation ?? ensured.project.isolationMode;
+    const project = { ...ensured.project, isolationMode: effectiveIsolationMode };
 
     // Activate the project (registration sets it to 'initializing')
-    await central.updateProject(project.id, { status: "active" });
+    await central.updateProject(project.id, {
+      status: "active",
+      isolationMode: effectiveIsolationMode,
+    });
 
     try {
       writeProjectIdentity(join(absolutePath, ".fusion"), {

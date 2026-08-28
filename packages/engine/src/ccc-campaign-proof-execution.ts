@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, lstat, mkdtemp, realpath, readdir, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, posix, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, posix, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -635,6 +635,19 @@ function workItemFence(context: WorkflowNodeExecutionContext) {
   };
 }
 
+function sealedPythonHome(
+  python: NonNullable<CccSemanticProofMaterialization["sealedExecutionToolchain"]["python"]>,
+): string {
+  const pythonHomeRoot = python.runtimeManifest.pythonHomeRoot;
+  if (!pythonHomeRoot) {
+    proofRefusal(
+      "CCC campaign Python semantic proof has no sealed stdlib runtime entry",
+      "CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+    );
+  }
+  return pythonHomeRoot;
+}
+
 async function assertLiveWorkItemFence(
   store: ProofExecutionStore,
   originTaskId: string,
@@ -955,6 +968,88 @@ function exactEvidenceResults(
   ));
 }
 
+type SemanticProofEvidenceMismatchReason =
+  | "not-single-json-line"
+  | "not-canonical-json"
+  | "unexpected-keys"
+  | "schema-mismatch"
+  | "proof-id-mismatch"
+  | "phase-mismatch"
+  | "source-commit-mismatch"
+  | "source-tree-mismatch"
+  | "passed-not-boolean"
+  | "clause-results-mismatch"
+  | "positive-case-results-mismatch"
+  | "negative-control-results-mismatch"
+  | "aggregate-passed-inconsistent";
+
+const SEMANTIC_PROOF_DETAIL_MAX_CHARS = 200;
+const SEMANTIC_PROOF_DETAIL_MAX_ELEMENTS = 8;
+const SEMANTIC_PROOF_DETAIL_IDENTIFIER_PATTERN = /^[A-Za-z0-9._:/-]{1,200}$/;
+
+function truncateSemanticProofDetail(value: string): string {
+  return value.length > SEMANTIC_PROOF_DETAIL_MAX_CHARS
+    ? `${value.slice(0, SEMANTIC_PROOF_DETAIL_MAX_CHARS - 1)}…`
+    : value;
+}
+
+function isSemanticProofDetailShaped(value: unknown): value is string {
+  return typeof value === "string" && SEMANTIC_PROOF_DETAIL_IDENTIFIER_PATTERN.test(value);
+}
+
+function semanticProofDetailFromScalar(value: unknown): string | undefined {
+  return isSemanticProofDetailShaped(value) ? truncateSemanticProofDetail(value) : undefined;
+}
+
+function semanticProofDetailFromIdList(ids: readonly unknown[] | undefined): string | undefined {
+  if (!ids || ids.length === 0 || ids.length > SEMANTIC_PROOF_DETAIL_MAX_ELEMENTS) return undefined;
+  if (!ids.every(isSemanticProofDetailShaped)) return undefined;
+  return truncateSemanticProofDetail([...(ids as string[])].sort().join(","));
+}
+
+function extractEvidenceResultIds(
+  value: unknown,
+  idKey: "clauseId" | "caseId" | "controlId",
+): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids: string[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry[idKey] !== "string") return undefined;
+    ids.push(entry[idKey] as string);
+  }
+  return ids;
+}
+
+class SemanticProofEvidenceMismatchError extends Error {
+  readonly reason: SemanticProofEvidenceMismatchReason;
+  readonly expected?: string;
+  readonly observed?: string;
+
+  constructor(
+    message: string,
+    reason: SemanticProofEvidenceMismatchReason,
+    details: { expected?: string; observed?: string } = {},
+  ) {
+    super(message);
+    this.name = "SemanticProofEvidenceMismatchError";
+    this.reason = reason;
+    if (details.expected !== undefined) this.expected = details.expected;
+    if (details.observed !== undefined) this.observed = details.observed;
+  }
+}
+
+const SEMANTIC_PROOF_EVIDENCE_EXPECTED_KEYS = [
+  "schema",
+  "proofId",
+  "phase",
+  "sourceCommit",
+  "sourceTree",
+  "passed",
+  "clauseResults",
+  "positiveCaseResults",
+  "negativeControlResults",
+] as const;
+
 function parseSemanticProofEvidence(
   stdout: string,
   proof: CccPrdProofV2,
@@ -963,42 +1058,127 @@ function parseSemanticProofEvidence(
 ): CccCampaignProofEvidenceV2 {
   const payload = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
   if (payload.length === 0 || payload.includes("\n")) {
-    throw new Error("semantic proof stdout is not one JSON object");
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof stdout is not one JSON object",
+      "not-single-json-line",
+    );
   }
   const parsed: unknown = JSON.parse(payload);
-  if (
-    !isRecord(parsed)
-    || !hasExactKeys(parsed, [
-      "schema",
-      "proofId",
-      "phase",
-      "sourceCommit",
-      "sourceTree",
-      "passed",
-      "clauseResults",
-      "positiveCaseResults",
-      "negativeControlResults",
-    ])
-    || canonicalCccPrdJson(parsed) !== payload
-    || parsed.schema !== "ccc-prd.proof-evidence.v2"
-    || parsed.proofId !== proof.id
-    || parsed.phase !== phase
-    || parsed.sourceCommit !== snapshot.sourceCommit
-    || parsed.sourceTree !== snapshot.sourceTree
-    || typeof parsed.passed !== "boolean"
-    || !exactEvidenceResults(parsed.clauseResults, "clauseId", proof.clauseIds)
-    || !exactEvidenceResults(
-      parsed.positiveCaseResults,
-      "caseId",
-      proof.positiveCases.map(({ id }) => id),
-    )
-    || !exactEvidenceResults(
-      parsed.negativeControlResults,
-      "controlId",
-      proof.negativeControls.map(({ id }) => id),
-    )
-  ) {
-    throw new Error("semantic proof evidence identity or result sets are malformed");
+  if (!isRecord(parsed)) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "unexpected-keys",
+    );
+  }
+  if (!hasExactKeys(parsed, SEMANTIC_PROOF_EVIDENCE_EXPECTED_KEYS)) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "unexpected-keys",
+      {
+        expected: semanticProofDetailFromIdList(SEMANTIC_PROOF_EVIDENCE_EXPECTED_KEYS),
+        observed: semanticProofDetailFromIdList(Object.keys(parsed)),
+      },
+    );
+  }
+  if (canonicalCccPrdJson(parsed) !== payload) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "not-canonical-json",
+    );
+  }
+  if (parsed.schema !== "ccc-prd.proof-evidence.v2") {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "schema-mismatch",
+      {
+        expected: semanticProofDetailFromScalar("ccc-prd.proof-evidence.v2"),
+        observed: semanticProofDetailFromScalar(parsed.schema),
+      },
+    );
+  }
+  if (parsed.proofId !== proof.id) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "proof-id-mismatch",
+      {
+        expected: semanticProofDetailFromScalar(proof.id),
+        observed: semanticProofDetailFromScalar(parsed.proofId),
+      },
+    );
+  }
+  if (parsed.phase !== phase) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "phase-mismatch",
+      {
+        expected: semanticProofDetailFromScalar(phase),
+        observed: semanticProofDetailFromScalar(parsed.phase),
+      },
+    );
+  }
+  if (parsed.sourceCommit !== snapshot.sourceCommit) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "source-commit-mismatch",
+      {
+        expected: semanticProofDetailFromScalar(snapshot.sourceCommit),
+        observed: semanticProofDetailFromScalar(parsed.sourceCommit),
+      },
+    );
+  }
+  if (parsed.sourceTree !== snapshot.sourceTree) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "source-tree-mismatch",
+      {
+        expected: semanticProofDetailFromScalar(snapshot.sourceTree),
+        observed: semanticProofDetailFromScalar(parsed.sourceTree),
+      },
+    );
+  }
+  if (typeof parsed.passed !== "boolean") {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "passed-not-boolean",
+    );
+  }
+  if (!exactEvidenceResults(parsed.clauseResults, "clauseId", proof.clauseIds)) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "clause-results-mismatch",
+      {
+        expected: semanticProofDetailFromIdList(proof.clauseIds),
+        observed: semanticProofDetailFromIdList(
+          extractEvidenceResultIds(parsed.clauseResults, "clauseId"),
+        ),
+      },
+    );
+  }
+  const positiveCaseIds = proof.positiveCases.map(({ id }) => id);
+  if (!exactEvidenceResults(parsed.positiveCaseResults, "caseId", positiveCaseIds)) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "positive-case-results-mismatch",
+      {
+        expected: semanticProofDetailFromIdList(positiveCaseIds),
+        observed: semanticProofDetailFromIdList(
+          extractEvidenceResultIds(parsed.positiveCaseResults, "caseId"),
+        ),
+      },
+    );
+  }
+  const negativeControlIds = proof.negativeControls.map(({ id }) => id);
+  if (!exactEvidenceResults(parsed.negativeControlResults, "controlId", negativeControlIds)) {
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof evidence identity or result sets are malformed",
+      "negative-control-results-mismatch",
+      {
+        expected: semanticProofDetailFromIdList(negativeControlIds),
+        observed: semanticProofDetailFromIdList(
+          extractEvidenceResultIds(parsed.negativeControlResults, "controlId"),
+        ),
+      },
+    );
   }
   const resultEntries = [
     ...(parsed.clauseResults as Array<{ passed: boolean }>),
@@ -1006,9 +1186,32 @@ function parseSemanticProofEvidence(
     ...(parsed.negativeControlResults as Array<{ passed: boolean }>),
   ];
   if (parsed.passed !== resultEntries.every(({ passed }) => passed)) {
-    throw new Error("semantic proof aggregate result is inconsistent");
+    throw new SemanticProofEvidenceMismatchError(
+      "semantic proof aggregate result is inconsistent",
+      "aggregate-passed-inconsistent",
+    );
   }
   return parsed as CccCampaignProofEvidenceV2;
+}
+
+function semanticProofEvidenceMismatchWarning(
+  reason: SemanticProofEvidenceMismatchReason,
+  expected?: string,
+  observed?: string,
+): string {
+  let warning = `proof-evidence ${reason}`;
+  if (expected !== undefined) warning += ` expected=${expected}`;
+  if (observed !== undefined) warning += ` observed=${observed}`;
+  return warning;
+}
+
+function semanticProofParseFailureWarning(error: unknown): string {
+  if (error instanceof SemanticProofEvidenceMismatchError) {
+    return semanticProofEvidenceMismatchWarning(error.reason, error.expected, error.observed);
+  }
+  return semanticProofEvidenceMismatchWarning(
+    error instanceof SyntaxError ? "not-canonical-json" : "not-single-json-line",
+  );
 }
 
 function terminalEnvelopeBase(
@@ -1059,9 +1262,11 @@ function executionRefusedEnvelope(
   result: CccSemanticProofSandboxedProcessResult,
   durationMs: number,
   code: CccCampaignProofExecutionRefusalCode,
+  warnings: readonly string[] = Object.freeze([]),
 ): CccCampaignProofTerminalEnvelopeV2 {
   return Object.freeze({
     ...terminalEnvelopeBase(proof, phase, snapshot, result, durationMs),
+    warnings,
     kind: "execution_refused",
     code,
   });
@@ -1081,7 +1286,7 @@ function semanticProofEnvelope(
   let evidence: CccCampaignProofEvidenceV2;
   try {
     evidence = parseSemanticProofEvidence(result.stdout, proof, phase, snapshot);
-  } catch {
+  } catch (error) {
     return executionRefusedEnvelope(
       proof,
       phase,
@@ -1089,6 +1294,7 @@ function semanticProofEnvelope(
       result,
       durationMs,
       "malformed_output",
+      Object.freeze([semanticProofParseFailureWarning(error)]),
     );
   }
   if (evidence.passed && result.exitCode !== 0) {
@@ -1099,6 +1305,7 @@ function semanticProofEnvelope(
       result,
       durationMs,
       "malformed_output",
+      Object.freeze([`proof-evidence passed-with-nonzero-exit exitCode=${result.exitCode}`]),
     );
   }
   const evidenceSha256 = createHash("sha256")
@@ -1245,8 +1452,38 @@ async function runSemanticProofV2(
         scratchRoot: value.scratchRoot,
         taskExecutable: value.sealedExecutionToolchain.task.executablePath,
         nodeExecutable: value.sealedExecutionToolchain.node.executablePath,
+        ...(value.sealedExecutionToolchain.python ? {
+          pythonExecutable: value.sealedExecutionToolchain.python.executablePath,
+          pythonHome: sealedPythonHome(value.sealedExecutionToolchain.python),
+          pythonPathRoots: [
+            ...value.sealedExecutionToolchain.python.runtimeManifest.sitePackagesRoots,
+            ...value.sealedExecutionToolchain.python.runtimeManifest.extensionModuleRoots,
+          ],
+          pythonRuntimeFiles: [
+            value.sealedExecutionToolchain.python.runtimeManifest.interpreter.path,
+            ...value.sealedExecutionToolchain.python.runtimeManifest.dylibClosure.map(({ path }) => path),
+            ...value.sealedExecutionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => path),
+          ],
+          pythonRuntimeExecutables: value.sealedExecutionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => path),
+        } : {}),
         deniedReadRoots: Object.freeze([
-          ...new Set([execution.snapshot.targetRoot, engineRoot]),
+          ...new Set([
+            execution.snapshot.targetRoot,
+            engineRoot,
+            ...(proof.executionToolchain.python ? [
+              proof.executionToolchain.python.runtimeManifest.stdlibRoot,
+              proof.executionToolchain.python.runtimeManifest.pythonHomeRoot,
+              ...proof.executionToolchain.python.runtimeManifest.sitePackagesRoots,
+              ...proof.executionToolchain.python.runtimeManifest.extensionModuleRoots,
+              ...proof.executionToolchain.python.runtimeManifest.dylibClosure.map(({ path }) => dirname(path)),
+              ...proof.executionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => dirname(path)),
+              dirname(proof.executionToolchain.python.executablePath),
+            ].filter((path) => ![
+              "/usr/lib",
+              "/usr/share",
+              "/System/Library",
+            ].some((systemRoot) => path === systemRoot || path.startsWith(`${systemRoot}/`))) : []),
+          ]),
         ]),
       });
       try {

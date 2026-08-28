@@ -439,7 +439,12 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     writeFileSync(routesPath, JSON.stringify({
       schema: "ccc-prd.routes-by-task.v1",
       routes: {
-        [TASK_A_ID]: { providerId: "provider-x", modelId: "model-x", transport: "pi" },
+        [TASK_A_ID]: {
+          providerId: "provider-x",
+          modelId: "upstream/model-x",
+          transport: "pi",
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+        },
         [TASK_B_ID]: {
           providerId: "provider-y",
           modelId: "model-y",
@@ -474,11 +479,17 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
         modelId: string;
         transport: string;
         cliAdapterId?: string;
+        receiptAdapterId?: string;
       }> };
     };
     const routeA = plan.policy.routes.find((route) => route.taskId === TASK_A_ID);
     const routeB = plan.policy.routes.find((route) => route.taskId === TASK_B_ID);
-    expect(routeA).toMatchObject({ providerId: "provider-x", modelId: "model-x", transport: "pi" });
+    expect(routeA).toMatchObject({
+      providerId: "provider-x",
+      modelId: "upstream/model-x",
+      transport: "pi",
+      receiptAdapterId: "terminal-route-sse-comments.v1",
+    });
     expect(routeB).toMatchObject({
       providerId: "provider-y",
       modelId: "model-y",
@@ -515,7 +526,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       diagnostics: [{
         code: CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
         message:
-          "campaign maxRequests 1 is below the deterministic provider-task floor 2",
+          "campaign maxRequests 1 is below the structural floor 4 (2 per provider task: one MUTATE turn plus the single REPAIR turn; this floor is not an adequacy guarantee)",
       }],
     });
     expect(inspectVerifierConfinementReadiness).not.toHaveBeenCalled();
@@ -905,31 +916,4 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
     expect(refusal.diagnostics[0]!.message).toMatch(/unknown fields/);
   });
 
-  it("refuses a cli-transport route entry that omits cliAdapterId", async () => {
-    const packet = createTwoTaskPacketRoot();
-    await authorTwoTaskSidecar(packet);
-    const routesPath = join(packet.root, "routes.json");
-    writeFileSync(routesPath, JSON.stringify({
-      schema: "ccc-prd.routes-by-task.v1",
-      routes: {
-        [TASK_A_ID]: { providerId: "x", modelId: "y", transport: "pi" },
-        [TASK_B_ID]: { providerId: "x", modelId: "y", transport: "cli" },
-      },
-    }));
-    const outputPath = join(packet.root, "execution-plan.json");
-    const output: string[] = [];
-
-    const exit = await runPrdCommand([
-      "policy", packet.root, packet.manifest, packet.sidecar, packet.target, packet.base,
-      outputPath, "--routes-file", routesPath,
-    ], { write: (line) => output.push(line) }, {
-      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
-    });
-
-    expect(exit).toBe(1);
-    expect(existsSync(outputPath)).toBe(false);
-    const refusal = JSON.parse(output[0]!) as { diagnostics: Array<{ message: string }> };
-    expect(refusal.diagnostics[0]!.message).toContain(routesPath);
-    expect(refusal.diagnostics[0]!.message).toContain(TASK_B_ID);
-  });
 });

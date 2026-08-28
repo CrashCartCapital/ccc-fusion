@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const DASHBOARD_MODULES_WITH_BEFORE_EXIT_CLEANUP = [
@@ -41,9 +43,8 @@ describe("dashboard process lifecycle cleanup", () => {
     try {
       for (let iteration = 0; iteration < 15; iteration += 1) {
         vi.resetModules();
-        for (const modulePath of DASHBOARD_MODULES_WITH_BEFORE_EXIT_CLEANUP) {
-          await import(modulePath);
-        }
+        const lifecycle = await importProcessLifecycle();
+        lifecycle.registerBeforeExitCleanup(() => undefined);
       }
     } finally {
       process.off("warning", onWarning);
@@ -62,6 +63,21 @@ describe("dashboard process lifecycle cleanup", () => {
 
     expect(addedListeners).toBeLessThanOrEqual(1);
     expect(maxListenerWarnings).toEqual([]);
+  });
+
+  it("declares every dashboard module cleanup through the shared beforeExit registrar", () => {
+    for (const modulePath of DASHBOARD_MODULES_WITH_BEFORE_EXIT_CLEANUP) {
+      const sourcePath = fileURLToPath(new URL(modulePath.replace(/\.js$/, ".ts"), import.meta.url));
+      const source = readFileSync(sourcePath, "utf8");
+
+      expect(source).toMatch(
+        /import\s*\{\s*registerBeforeExitCleanup\s*\}\s*from\s*["']\.\/process-lifecycle\.js["']/,
+      );
+      expect(source).toMatch(/\bregisterBeforeExitCleanup\s*\(/);
+      expect(source).not.toMatch(
+        /process\.(?:on|once|addListener)\(\s*["']beforeExit["']/,
+      );
+    }
   });
 
   it("runs every cleanup registered behind the shared beforeExit listener", async () => {

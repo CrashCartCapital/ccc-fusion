@@ -79,6 +79,14 @@ export function resolveConcurrency(env = process.env) {
   return Math.min(requested, MAX_CONCURRENCY);
 }
 
+export function createLaneEnv(env = process.env) {
+  const nextEnv = { ...env };
+  if (resolveConcurrency(env) === 1 && !env.VITEST_MAX_WORKERS) {
+    nextEnv.VITEST_MAX_WORKERS = "1";
+  }
+  return nextEnv;
+}
+
 function parseArgs(argv) {
   let group = "all";
   let list = false;
@@ -124,7 +132,7 @@ function runLane(lane) {
     const child = spawn(process.execPath, [VITEST_WRAPPER, ...lane.args], {
       cwd: new URL("..", import.meta.url),
       stdio: "inherit",
-      env: process.env,
+      env: createLaneEnv(),
     });
 
     child.on("error", (error) => {

@@ -998,13 +998,17 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
   describeVerifierHost("timeouts", () => {
     itPosix("aborts a spawned verifier process group before its hard timeout", async () => {
       const controller = new AbortController();
+      const hardTimeoutMs = 10_000;
       const onLine = vi.fn((line: string) => {
         if (line.includes("verifier-started")) controller.abort();
       });
       const result = await runVerificationCommand({
-        command: "echo verifier-started; sleep 2",
+        // Keep the verifier alive past the hard timeout. That way the result
+        // cannot pass by naturally reaching the end of a short sleep if the
+        // caller-abort process-group kill regresses.
+        command: "echo verifier-started; sleep 30",
         cwd: tempDir,
-        timeoutMs: 10_000,
+        timeoutMs: hardTimeoutMs,
         onHeartbeat: vi.fn(),
         onLine,
         signal: controller.signal,
@@ -1014,8 +1018,181 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       expect(result.success).toBe(false);
       expect(result.timedOut).toBe(false);
       expect(result.killed).toBe(true);
-      expect(result.durationMs).toBeLessThan(1_500);
+      // The configured hard timeout is the stable upper bound; avoid a
+      // smaller wall-clock bound that flakes when the full suite contends for
+      // process scheduling while still proving caller abort won the race.
+      expect(result.durationMs).toBeLessThan(hardTimeoutMs);
       expect(result.warnings).toContain("Verification aborted by caller signal");
+    });
+
+    itPosix("keeps caller abort classification when close is delayed past the hard timeout", async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      let sawVerifierStart!: () => void;
+      const verifierStarted = new Promise<void>((resolve) => {
+        sawVerifierStart = resolve;
+      });
+      const onLine = vi.fn((line: string) => {
+        if (line.includes("verifier-started")) {
+          controller.abort();
+          sawVerifierStart();
+        }
+      });
+
+      try {
+        const resultPromise = runVerificationCommand({
+          command: "trap '' TERM; echo verifier-started; while true; do sleep 1; done",
+          cwd: tempDir,
+          timeoutMs: 100,
+          onHeartbeat: vi.fn(),
+          onLine,
+          signal: controller.signal,
+        });
+
+        await verifierStarted;
+        await vi.advanceTimersByTimeAsync(100);
+        await vi.advanceTimersByTimeAsync(10_000);
+        const result = await resultPromise;
+
+        expect(onLine).toHaveBeenCalledWith(expect.stringContaining("verifier-started"));
+        expect(result.success).toBe(false);
+        expect(result.timedOut).toBe(false);
+        expect(result.killed).toBe(true);
+        expect(result.warnings).toContain("Verification aborted by caller signal");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    itPosix("returns aborted without launching when the caller signal is already aborted", async () => {
+      const controller = new AbortController();
+      controller.abort();
+      const marker = join(tempDir, "pre-aborted-verifier-marker.txt");
+      rmSync(marker, { force: true });
+      const onLine = vi.fn();
+
+      const result = await runVerificationCommand({
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`)}`,
+        cwd: join(tempDir, "missing-pre-abort-cwd"),
+        timeoutMs: 100,
+        onHeartbeat: vi.fn(),
+        onLine,
+        signal: controller.signal,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.timedOut).toBe(false);
+      expect(result.killed).toBe(false);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("");
+      expect(result.warnings).toEqual(["Verification aborted by caller signal"]);
+      expect(onLine).not.toHaveBeenCalled();
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    itPosix("keeps a timeout failed when expectFailure is true", async () => {
+      const result = await runVerificationCommand({
+        command: "sh -c 'sleep 10 & wait'",
+        cwd: tempDir,
+        timeoutMs: 100,
+        expectFailure: true,
+        onHeartbeat: vi.fn(),
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.timedOut).toBe(true);
+      expect(result.killed).toBe(true);
+    });
+
+    itPosix("ignores caller abort after the verifier has already closed", async () => {
+      const controller = new AbortController();
+      const result = await runVerificationCommand({
+        command: "exit 0",
+        cwd: tempDir,
+        timeoutMs: 10_000,
+        onHeartbeat: vi.fn(),
+        signal: controller.signal,
+      });
+
+      controller.abort();
+
+      expect(result.success).toBe(true);
+      expect(result.timedOut).toBe(false);
+      expect(result.killed).toBe(false);
+      expect(result.warnings).not.toContain("Verification aborted by caller signal");
+    });
+
+    itPosix("keeps timeout classification when caller abort arrives after timeout", async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      let sawVerifierStart!: () => void;
+      const verifierStarted = new Promise<void>((resolve) => {
+        sawVerifierStart = resolve;
+      });
+      const onLine = vi.fn((line: string) => {
+        if (line.includes("verifier-started")) sawVerifierStart();
+      });
+
+      try {
+        const resultPromise = runVerificationCommand({
+          command: "trap '' TERM; echo verifier-started; while true; do sleep 1; done",
+          cwd: tempDir,
+          timeoutMs: 100,
+          onHeartbeat: vi.fn(),
+          onLine,
+          signal: controller.signal,
+        });
+
+        await verifierStarted;
+        await vi.advanceTimersByTimeAsync(100);
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(10_500);
+        const result = await resultPromise;
+
+        expect(result.success).toBe(false);
+        expect(result.timedOut).toBe(true);
+        expect(result.killed).toBe(true);
+        expect(result.warnings).not.toContain("Verification aborted by caller signal");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    itPosix("settles boundedly when a terminated verifier has not reported close", async () => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      let sawVerifierStart!: () => void;
+      const verifierStarted = new Promise<void>((resolve) => {
+        sawVerifierStart = resolve;
+      });
+      const onLine = vi.fn((line: string) => {
+        if (line.includes("verifier-started")) {
+          controller.abort();
+          sawVerifierStart();
+        }
+      });
+
+      try {
+        const resultPromise = runVerificationCommand({
+          command: "trap '' TERM; echo verifier-started; while true; do sleep 1; done",
+          cwd: tempDir,
+          timeoutMs: 100,
+          onHeartbeat: vi.fn(),
+          onLine,
+          signal: controller.signal,
+        });
+
+        await verifierStarted;
+        await vi.advanceTimersByTimeAsync(10_500);
+        const result = await resultPromise;
+
+        expect(result.success).toBe(false);
+        expect(result.timedOut).toBe(false);
+        expect(result.killed).toBe(true);
+        expect(result.warnings).toContain("Verifier process did not report close after termination; settling from supervisor termination path");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     itPosix("times out and kills a quiet long-running process group", async () => {

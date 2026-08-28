@@ -1115,6 +1115,114 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
+  it("captures a proof-id mismatch as a warning instead of only malformed_output", async () => {
+    const f = await fixture();
+    const badEvidence = { ...evidenceFor(f, true), proofId: "PROOF-other-v2" };
+    const stdout = `${canonicalCccPrdJson(badEvidence)}\n`;
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: [`proof-evidence proof-id-mismatch expected=${f.proof.id} observed=PROOF-other-v2`],
+      }),
+    }));
+  });
+
+  it("captures a clause-results ID set mismatch as a bounded warning", async () => {
+    const f = await fixture();
+    const badEvidence = {
+      ...evidenceFor(f, true),
+      clauseResults: [{ clauseId: "CLAUSE-other", passed: true }],
+    };
+    const stdout = `${canonicalCccPrdJson(badEvidence)}\n`;
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence clause-results-mismatch expected=CLAUSE-value observed=CLAUSE-other"],
+      }),
+    }));
+  });
+
+  it("marks an entirely empty evidence payload as unexpected-keys", async () => {
+    const f = await fixture();
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult("{}\n"),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence unexpected-keys"],
+      }),
+    }));
+  });
+
+  it("captures a passed-with-nonzero-exit warning without inventing evidence", async () => {
+    const f = await fixture();
+    const stdout = `${canonicalCccPrdJson(evidenceFor(f, true))}\n`;
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout, 1),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence passed-with-nonzero-exit exitCode=1"],
+      }),
+    }));
+  });
+
+  it("names an aggregate/result inconsistency instead of a generic parse failure", async () => {
+    const f = await fixture();
+    const evidence = evidenceFor(f, true) as unknown as { passed: boolean };
+    // Every result passed, but the aggregate claims failure: identity is exact,
+    // so the only refusal left is the aggregate-consistency check.
+    const inconsistent = { ...evidence, passed: false };
+    const stdout = `${canonicalCccPrdJson(inconsistent)}\n`;
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout, 0),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence aggregate-passed-inconsistent"],
+      }),
+    }));
+  });
+
   it.each([
     ["timeout", { timedOut: true, killed: true }],
     ["killed", { killed: true }],

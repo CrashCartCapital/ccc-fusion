@@ -14,7 +14,13 @@ import {
 } from "@fusion/core/gh-cli";
 import { resolveProject, createLocalStore, closeProjectStore, type ProjectContext } from "../project-context.js";
 import { findNodeByNameOrId } from "./node.js";
-import { retryOnLock, LockRetryExhaustedError } from "../lock-retry.js";
+import {
+  closeBoardContextAndExitWithCustody,
+  resolveBoardContextWithCustody,
+  retryBoardCallWithCustody,
+  withBoardWriteCustody,
+  type BoardCommandCustodyDependencies,
+} from "./task-board-custody.js";
 
 const STEP_STATUSES: StepStatus[] = ["pending", "in-progress", "done", "skipped"];
 
@@ -188,6 +194,15 @@ function failBoardCommand(error: unknown): never {
   process.exit(1);
 }
 
+function boardCommandCustodyDependencies(): BoardCommandCustodyDependencies<ProjectContext> {
+  return {
+    resolveContext: getBoardCommandContext,
+    closeContext: closeProjectStore,
+    fail: failBoardCommand,
+    exit: (code) => process.exit(code),
+  };
+}
+
 /**
  * FNXC:CliBoardMutation 2026-07-09-00:00 (FN-7734):
  * Generalizes the FN-7731 `runTaskShow`/`runTaskMove` retry+teardown shape
@@ -218,55 +233,42 @@ async function withBoardWrite<T>(
   context: { id: string; action: string },
   fn: (ctx: ProjectContext) => Promise<T>,
 ): Promise<T> {
-  try {
-    return await retryOnLock(
-      async () => {
-        const ctx = await getBoardCommandContext(projectName);
-        try {
-          return await fn(ctx);
-        } finally {
-          await closeProjectStore(ctx);
-        }
-      },
-      context,
-    );
-  } catch (error) {
-    if (error instanceof LockRetryExhaustedError) {
-      failBoardCommand(error);
-    }
-    throw error;
-  }
+  return withBoardWriteCustody(
+    boardCommandCustodyDependencies(),
+    projectName,
+    context,
+    fn,
+  );
 }
 
 /** Resolve project/store context, retrying ONLY the resolution step (which can itself hit `database is locked` inside `TaskStore.init()`). Used by multi-step commands that must not retry already-committed writes. */
 async function resolveBoardContext(projectName: string | undefined, id: string, action = "resolve project"): Promise<ProjectContext> {
-  try {
-    return await retryOnLock(() => getBoardCommandContext(projectName), { id, action });
-  } catch (error) {
-    if (error instanceof LockRetryExhaustedError) {
-      failBoardCommand(error);
-    }
-    throw error;
-  }
+  return resolveBoardContextWithCustody(
+    boardCommandCustodyDependencies(),
+    projectName,
+    id,
+    action,
+  );
 }
 
 /** Retry a single discrete board write/read within an already-resolved multi-step flow. On lock-exhaustion, closes the resolved context before failing (mirrors `failBoardCommand`, but store-aware). */
 async function retryBoardCall<T>(context: ProjectContext, id: string, action: string, op: () => Promise<T>): Promise<T> {
-  try {
-    return await retryOnLock(op, { id, action });
-  } catch (error) {
-    if (error instanceof LockRetryExhaustedError) {
-      await closeProjectStore(context).catch(() => {});
-      failBoardCommand(error);
-    }
-    throw error;
-  }
+  return retryBoardCallWithCustody(
+    boardCommandCustodyDependencies(),
+    context,
+    id,
+    action,
+    op,
+  );
 }
 
 /** Close the resolved board context, then exit — used for exit paths reached AFTER context resolution, since `process.exit()` skips pending `finally` blocks. */
 async function closeBoardContextAndExit(context: ProjectContext, code: number): Promise<never> {
-  await closeProjectStore(context).catch(() => {});
-  process.exit(code);
+  return closeBoardContextAndExitWithCustody(
+    boardCommandCustodyDependencies(),
+    context,
+    code,
+  );
 }
 
 async function resolveNodeByNameOrId(nodeNameOrId: string): Promise<{ id: string; name?: string }> {

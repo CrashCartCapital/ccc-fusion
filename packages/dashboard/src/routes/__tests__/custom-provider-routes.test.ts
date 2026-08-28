@@ -6,6 +6,14 @@ import type { TaskStore, GlobalSettings, CustomProvider } from "@fusion/core";
 import { createApiRoutes } from "../../routes.js";
 import { request as performRequest } from "../../test-request.js";
 
+type ProviderWithModelProvenance = CustomProvider & {
+  modelProvenance?: { discoveredModelIds: string[] };
+};
+
+function withDiscoveredModelIds(provider: CustomProvider, discoveredModelIds: string[]): ProviderWithModelProvenance {
+  return { ...provider, modelProvenance: { discoveredModelIds } };
+}
+
 const { mockInvalidateAllGlobalSettingsCaches } = vi.hoisted(() => ({
   mockInvalidateAllGlobalSettingsCaches: vi.fn(),
 }));
@@ -324,6 +332,50 @@ describe("custom provider routes", () => {
     expect(persisted[0]?.apiKey).toBe("sk-brand-new-9999");
   });
 
+  it("PUT /custom-providers/:id promotes an edited discovered model to authored before refresh", async () => {
+    const pinnedModel = {
+      id: "stale-model",
+      name: "Pinned stale model",
+      contextWindow: 262144,
+      maxTokens: 32768,
+      verbatimCapable: true,
+    };
+    settings.customProviders = [withDiscoveredModelIds({
+      id: "cp-provenance-edit",
+      name: "Provenance Edit",
+      apiType: "openai-compatible",
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "sk-edit-secret",
+      models: [{ id: "stale-model", name: "Discovered stale model" }],
+    }, ["stale-model"])] as CustomProvider[];
+
+    const app = createApp(settings);
+    const put = await REQUEST(app, "PUT", "/api/custom-providers/cp-provenance-edit", {
+      models: [pinnedModel],
+    });
+
+    expect(put.status).toBe(200);
+    expect(put.body.models).toEqual([pinnedModel]);
+    const afterPut = settings.customProviders?.[0] as ProviderWithModelProvenance;
+    expect(afterPut.models).toEqual([pinnedModel]);
+    expect(afterPut).not.toHaveProperty("modelProvenance");
+
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: [{ id: "fresh-model", name: "Fresh model" }] }),
+    })));
+    const refresh = await REQUEST(app, "POST", "/api/custom-providers/cp-provenance-edit/refresh-models");
+
+    expect(refresh.status).toBe(200);
+    expect(settings.customProviders?.[0]?.models).toEqual([
+      pinnedModel,
+      { id: "fresh-model", name: "Fresh model" },
+    ]);
+    expect((settings.customProviders?.[0] as ProviderWithModelProvenance).modelProvenance).toEqual({
+      discoveredModelIds: ["fresh-model"],
+    });
+  });
+
   it("POST /custom-providers rejects a masked API key", async () => {
     const app = createApp(settings);
     const res = await REQUEST(app, "POST", "/api/custom-providers", {
@@ -373,14 +425,14 @@ describe("custom provider routes", () => {
 
   it("POST /custom-providers/:id/refresh-models uses stored keys and updates only the selected provider", async () => {
     settings.customProviders = [
-      {
+      withDiscoveredModelIds({
         id: "cp-1",
         name: "OpenAI Proxy",
         apiType: "openai-compatible",
         baseUrl: "https://api.example.com/v1",
         apiKey: "sk-stored-secret",
         models: [{ id: "stale-model", name: "Stale model" }],
-      },
+      }, ["stale-model"]),
       {
         id: "cp-2",
         name: "Sibling",
@@ -421,12 +473,79 @@ describe("custom provider routes", () => {
       }),
       modelsRefreshed: 1,
     });
+    expect(res.body.provider).not.toHaveProperty("modelProvenance");
     expect(updates).toHaveLength(1);
     expect(updates[0].customProviders).toEqual([
-      expect.objectContaining({ id: "cp-1", models: [{ id: "fresh-model", name: "Fresh model" }] }),
+      expect.objectContaining({
+        id: "cp-1",
+        models: [{ id: "fresh-model", name: "Fresh model" }],
+      }),
       expect.objectContaining({ id: "cp-2", models: [{ id: "sibling-model", name: "Sibling model" }] }),
     ]);
+    expect((settings.customProviders?.[0] as ProviderWithModelProvenance).modelProvenance).toEqual({
+      discoveredModelIds: ["fresh-model"],
+    });
     expect(mockInvalidateAllGlobalSettingsCaches).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST /custom-providers/:id/refresh-models preserves exact static models omitted by a truncated catalog", async () => {
+    const staticPinnedModel = {
+      id: "minimax/MiniMax-M3",
+      name: "Pinned MiniMax M3",
+      contextWindow: 262144,
+      maxTokens: 32768,
+      verbatimCapable: true,
+    };
+    const staticConfiguredModel = {
+      id: "configured/exact-model",
+      name: "Configured exact model",
+      contextWindow: 131072,
+      maxTokens: 16384,
+    };
+    settings.customProviders = [
+      {
+        id: "omniroute-minimax-m3-pinned",
+        name: "OmniRoute MiniMax M3 pinned",
+        apiType: "openai-compatible",
+        baseUrl: "https://omniroute.example.com/v1",
+        apiKey: "sk-omniroute-secret",
+        models: [staticPinnedModel, staticConfiguredModel],
+      },
+    ];
+    const remoteModels = Array.from({ length: 160 }, (_, index) => ({
+      id: index === 50
+        ? "configured/exact-model"
+        : index === 158
+          ? "minimax/MiniMax-M3"
+          : `catalog-model-${index}`,
+      name: index === 50
+        ? "Remote configured model alias"
+        : index === 158
+          ? "Remote MiniMax M3 alias"
+          : `Catalog model ${index}`,
+    }));
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: remoteModels }),
+    })));
+    const app = createApp(settings);
+
+    const res = await REQUEST(app, "POST", "/api/custom-providers/omniroute-minimax-m3-pinned/refresh-models");
+
+    expect(res.status).toBe(200);
+    expect(res.body.modelsRefreshed).toBe(100);
+    const persistedModels = settings.customProviders?.[0]?.models ?? [];
+    expect(persistedModels).toHaveLength(101);
+    expect(persistedModels[0]).toEqual(staticPinnedModel);
+    expect(persistedModels[1]).toEqual(staticConfiguredModel);
+    expect(persistedModels).toContainEqual({ id: "catalog-model-0", name: "Catalog model 0" });
+    expect(persistedModels).toContainEqual({ id: "catalog-model-99", name: "Catalog model 99" });
+    expect(persistedModels).not.toContainEqual(
+      expect.objectContaining({ id: "configured/exact-model", name: "Remote configured model alias" }),
+    );
+    expect(persistedModels).not.toContainEqual(
+      expect.objectContaining({ id: "minimax/MiniMax-M3", name: "Remote MiniMax M3 alias" }),
+    );
   });
 
   it("POST /custom-providers/:id/refresh-models allows intentional local provider endpoints", async () => {
@@ -456,21 +575,25 @@ describe("custom provider routes", () => {
         headers: expect.objectContaining({ Authorization: "Bearer local-secret" }),
       }),
     );
-    expect(settings.customProviders?.[0]?.models).toEqual([{ id: "local-model", name: "Local model" }]);
+    expect(settings.customProviders?.[0]?.models).toEqual([
+      { id: "stale-local", name: "Stale local" },
+      { id: "local-model", name: "Local model" },
+    ]);
   });
 
   it("POST /custom-providers/:id/refresh-models preserves concurrent provider changes made during probing", async () => {
     settings.customProviders = [
-      {
+      withDiscoveredModelIds({
         id: "cp-1",
         name: "OpenAI Proxy",
         apiType: "openai-compatible",
         baseUrl: "https://api.example.com/v1",
         apiKey: "sk-stored-secret",
         models: [{ id: "stale-model", name: "Stale model" }],
-      },
+      }, ["stale-model"]),
     ];
     vi.stubGlobal("fetch", vi.fn(async () => {
+      // Simulate a concurrent explicit models edit; PUT clears the stale marker.
       settings.customProviders = [
         {
           id: "cp-1",
@@ -505,15 +628,22 @@ describe("custom provider routes", () => {
       id: "cp-1",
       name: "Renamed While Refreshing",
       supportsDeveloperRole: true,
-      models: [{ id: "fresh-model", name: "Fresh model" }],
+      models: [
+        { id: "edited-model", name: "Edited model" },
+        { id: "fresh-model", name: "Fresh model" },
+      ],
     }));
+    expect(res.body.provider).not.toHaveProperty("modelProvenance");
     expect(updates).toHaveLength(1);
     expect(updates[0].customProviders).toEqual([
       expect.objectContaining({
         id: "cp-1",
         name: "Renamed While Refreshing",
         supportsDeveloperRole: true,
-        models: [{ id: "fresh-model", name: "Fresh model" }],
+        models: [
+          { id: "edited-model", name: "Edited model" },
+          { id: "fresh-model", name: "Fresh model" },
+        ],
       }),
       expect.objectContaining({
         id: "cp-2",
@@ -521,6 +651,9 @@ describe("custom provider routes", () => {
         models: [{ id: "added-model", name: "Added model" }],
       }),
     ]);
+    expect((settings.customProviders?.[0] as ProviderWithModelProvenance).modelProvenance).toEqual({
+      discoveredModelIds: ["fresh-model"],
+    });
   });
 
   it("POST /custom-providers/:id/refresh-models aborts when connection fields change during probing", async () => {

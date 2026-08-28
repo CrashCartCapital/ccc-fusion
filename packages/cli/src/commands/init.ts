@@ -323,7 +323,7 @@ async function ensureGitConfig(cwd: string, key: string, value: string): Promise
 }
 
 async function warnIfQmdMissing(): Promise<void> {
-  if (await isQmdAvailable()) {
+  if (await isQmdAvailable({ keepProcessAlive: true })) {
     console.log(`  ✓ qmd available for memory search`);
     return;
   }

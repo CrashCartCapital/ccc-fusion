@@ -240,6 +240,22 @@ function sealedExecutionHoldStatus() {
           { ordinal: 0, semanticTaskId: "TASK-entry", approvalRequestId: firstChildId },
           { ordinal: 1, semanticTaskId: "TASK-second", approvalRequestId: secondChildId },
         ],
+        memberCustody: [
+          {
+            ordinal: 0,
+            nativeTaskId: "FN-entry",
+            semanticTaskId: "TASK-entry",
+            approvalRequestId: firstChildId,
+            status: "issued",
+          },
+          {
+            ordinal: 1,
+            nativeTaskId: "FN-second",
+            semanticTaskId: "TASK-second",
+            approvalRequestId: secondChildId,
+            status: "issued",
+          },
+        ],
       },
       approvals: [
         { id: firstChildId, status: "issued", taskId: "FN-entry", campaign: { expiresAt: "2026-07-31T01:00:00.000Z" } },
@@ -391,6 +407,8 @@ describe("human product status rendering", () => {
       expect(commands[0]).not.toContain(member.approvalRequestId);
       expect(text).toContain(member.approvalRequestId);
     }
+    expect(text).toContain(`0: TASK-entry -> ${payload.status.executionAuthorization.memberCustody[0].approvalRequestId} (issued)`);
+    expect(text).toContain(`1: TASK-second -> ${payload.status.executionAuthorization.memberCustody[1].approvalRequestId} (issued)`);
     expect(text).toContain("Execution authorization");
     expect(text).toContain("2 exact child actions");
   });
@@ -411,6 +429,16 @@ describe("human product status rendering", () => {
     for (const confirmation of payload.liveExecutionApprovalConfirmations) {
       expect(text).toContain(confirmation.approvalRequestId);
     }
+  });
+
+  it("RED-W1-status-custody: refuses to present raw members as joined custody", () => {
+    const payload = sealedExecutionHoldStatus();
+    payload.status.executionAuthorization.memberCustody = [];
+
+    const text = renderOperatorPayload(payload).join("\n");
+
+    expect(text).toContain("Member custody unavailable");
+    expect(text).not.toContain(`0: TASK-entry -> ${payload.status.executionAuthorization.members[0].approvalRequestId}`);
   });
 
   it("prints lifecycle commands only for allowed operator controls", () => {

@@ -296,6 +296,16 @@ describe("CCC campaign local Git observation", () => {
     })).rejects.toThrow(/dirty|index.*HEAD|tracked worktree|untracked/i);
   });
 
+  it("RED-W1-acceptance-diagnostic: reports the exact nonignored untracked path", async () => {
+    const { root, base } = createRepository();
+    writeFileSync(join(root, "unexpected-runtime-file.txt"), "unexpected\n");
+
+    await expect(inspectCccCampaignLocalGit({
+      targetRoot: root,
+      expectedBaseObject: base,
+    })).rejects.toThrow(/unexpected-runtime-file\.txt/u);
+  });
+
   it.skipIf(process.platform === "win32")(
     "never admits dirty bytes through an ambient PATH Git that spoofs index and HEAD",
     async () => {
@@ -1070,6 +1080,33 @@ describe("CCC campaign local Git observation", () => {
     renameSync(replacement, join(root, ".git"));
 
     await expect(recheckCccCampaignLocalGit(snapshot)).rejects.toThrow(/physical identity/i);
+  });
+
+  /*
+   * FNXC:CampaignGuardObservability 2026-08-24-03:20:
+   * The physical-identity recheck compared volatile stat fields (size, mtime,
+   * ctime) alongside the stable ones. Any read-only `git status` refreshes
+   * .git/index's stat cache, which moves those fields and made the guard report
+   * "physical identity or HEAD changed" -- the error that killed a live campaign
+   * at turn 28 of 40 while an operator was merely inspecting worktree state.
+   *
+   * Refreshing an index is not the repository being swapped, which is what this
+   * guard exists to catch. Inode identity (dev/ino/mode/birthtime) still changes
+   * under every real substitution, so the replacement tests above keep passing.
+   *
+   * Deliberately NOT relaxed here: untracked paths still refuse with
+   * "nonignored untracked paths", so a campaign worktree stays pristine.
+   */
+  it("recheck tolerates an ordinary read-only git command refreshing the index", async () => {
+    const { root, base } = createRepository();
+    const snapshot = await inspectCccCampaignLocalGit({
+      targetRoot: root,
+      expectedBaseObject: base,
+    });
+
+    git(root, ["status", "--porcelain"]);
+
+    await expect(recheckCccCampaignLocalGit(snapshot)).resolves.toBeDefined();
   });
 
   it("honors an already-aborted signal", async () => {

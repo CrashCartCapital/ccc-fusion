@@ -2,7 +2,7 @@ import { realpathSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildCccSemanticProofDarwinProfile,
@@ -25,6 +25,41 @@ afterEach(async () => {
 });
 
 describe("CCC semantic-proof sandbox", () => {
+  it("RED-R1-python-semantic-v2-sandbox: exposes only sealed Python runtime files and denies their original roots", async () => {
+    const root = await fixtureRoot();
+    const proofRoot = join(root, "proof");
+    const scratchRoot = join(root, "scratch");
+    const sealedRuntimeRoot = join(root, "sealed-runtime");
+    const originalRuntimeRoot = join(root, "original-runtime");
+    const pythonExecutable = join(sealedRuntimeRoot, "bin/python3");
+    const pythonStdlib = join(sealedRuntimeRoot, "lib/python3.12/os.py");
+    await Promise.all([
+      mkdir(proofRoot),
+      mkdir(scratchRoot),
+      mkdir(dirname(pythonExecutable), { recursive: true }),
+      mkdir(dirname(pythonStdlib), { recursive: true }),
+      mkdir(originalRuntimeRoot),
+    ]);
+    await Promise.all([
+      writeFile(pythonExecutable, "#!/bin/sh\n", { mode: 0o755 }),
+      writeFile(pythonStdlib, "# sealed\n"),
+    ]);
+
+    const profile = await buildCccSemanticProofDarwinProfile({
+      proofRoot,
+      scratchRoot,
+      taskExecutable: "/opt/homebrew/bin/task",
+      nodeExecutable: process.execPath,
+      deniedReadRoots: [originalRuntimeRoot],
+      pythonExecutable,
+      pythonRuntimeFiles: [pythonStdlib],
+    } as any);
+
+    expect(profile).toContain(`(literal "${realpathSync(pythonExecutable)}")`);
+    expect(profile).toContain(`(allow file-read* (literal "${realpathSync(pythonStdlib)}"))`);
+    expect(profile).toContain(`(deny file-read* (subpath "${realpathSync(originalRuntimeRoot)}"))`);
+  });
+
   it("RED-S5-darwin-proof-sandbox: grants only proof reads and scratch writes while denying repositories and network", async () => {
     const root = await fixtureRoot();
     const proofRoot = join(root, "proof");

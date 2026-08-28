@@ -109,6 +109,24 @@ describe("CCC campaign execution-policy v2", () => {
     expect(parseCccCampaignProductExecutionPolicy(productPolicy(), bundle())).toEqual(productPolicy());
   });
 
+  it.each(["ownedPaths", "allowedWriteRoots"] as const)(
+    "refuses controller-reserved paths in %s",
+    (field) => {
+      for (const reservedPath of [".fusion", ".fusion/tasks", ".fusion/anything"]) {
+        const policy = productPolicy();
+        const mutated = {
+          ...policy,
+          routes: policy.routes.map((route, index) => index === 0
+            ? { ...route, [field]: [reservedPath] }
+            : route),
+        };
+
+        expect(() => parseCccCampaignProductExecutionPolicy(mutated, bundle()))
+          .toThrow(/reserved controller path/u);
+      }
+    },
+  );
+
   it("keeps v1 parseable as legacy but refuses it for the supported product route", () => {
     const semanticBundle = bundle();
     const legacy = createCccPrdImportTestExecutionPolicy(semanticBundle);

@@ -43,10 +43,15 @@ const allowlist: AllowlistEntry[] = [
   // executor.ts 17691 -> 17823). Verified as moves, not additions: each signature still occurs exactly
   // once in its file, the previously pinned lines now hold unrelated code, and the options at each new
   // line are byte-identical (same cwd/encoding/stdio bounds). No new site is sanctioned here.
+  // FNXC:EngineProcessRules 2026-08-22-17:30: re-pinned one drifted git-plumbing call-site
+  // (self-healing.ts 12929 -> 12933) after the linked-root pool-sweep guard added four lines
+  // above it. Verified as a move, not an addition: the signature still occurs exactly once in
+  // the file, the previously pinned line now holds unrelated code, and the options at the new
+  // line are byte-identical (same cwd/stdio bounds). No new site is sanctioned here.
   { file: "src/self-healing.ts", line: 4305, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/self-healing.ts", line: 4311, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/self-healing.ts", line: 4348, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 12929, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 12933, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger-workspace-test-commands.ts", line: 204, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merger-workspace-test-commands.ts", line: 301, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/integration-branch.ts", line: 71, primitive: "execSync", signature: "const stdout = execSync(\"git symbolic-ref --short refs/remotes/origin/HEAD\", {", reason: SHORT_GIT_PLUMBING },

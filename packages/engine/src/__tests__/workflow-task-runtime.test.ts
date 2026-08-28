@@ -673,14 +673,15 @@ describe("WorkflowTaskRuntime", () => {
     });
   });
 
-  it("product v2 RED: imported route custody drift refuses before any graph effect even when the mutable IR hash is rewritten", async () => {
+  it("product v2 RED: removing only the sealed receipt adapter refuses before any graph effect even when the mutable IR hash is rewritten", async () => {
     const semanticTaskId = "TASK-SEALED";
     const nativeTaskId = "FN-SEALED";
     const expectedRoute = {
       taskId: semanticTaskId,
       providerId: "provider-approved",
-      modelId: "model-approved",
+      modelId: "upstream/model-approved",
       transport: "pi" as const,
+      receiptAdapterId: "terminal-route-sse-comments.v1" as const,
       executor: "model" as const,
       toolMode: "coding" as const,
       worktreeMode: "isolated" as const,
@@ -709,8 +710,9 @@ describe("WorkflowTaskRuntime", () => {
             cccExecutionPromptSchema: "ccc-prd.execution-prompt.v1",
             cccExecutionPromptSha256: expectedPromptSha256,
             cccExecutionTransport: "pi",
-            cccExecutionProviderId: "provider-tampered",
+            cccExecutionProviderId: expectedRoute.providerId,
             cccExecutionModelId: expectedRoute.modelId,
+            // Deliberate custody mutation: the exact sealed adapter is omitted.
             cccExecutionRouteSha256: expectedRouteSha256,
             executor: expectedRoute.executor,
             toolMode: expectedRoute.toolMode,
@@ -774,6 +776,146 @@ describe("WorkflowTaskRuntime", () => {
       reason: "ccc-permanent:CCC_CAMPAIGN_EXECUTION_CUSTODY_DRIFT",
     });
     expect(promptEffect).not.toHaveBeenCalled();
+  });
+
+  it("product v2: requires live execution approval before preparing a campaign worktree", async () => {
+    const semanticTaskId = "TASK-LIVE-GATE";
+    const nativeTaskId = "FN-LIVE-GATE";
+    const route = {
+      taskId: semanticTaskId,
+      providerId: "provider-approved",
+      modelId: "upstream/model-approved",
+      transport: "pi" as const,
+      receiptAdapterId: "terminal-route-sse-comments.v1" as const,
+      executor: "model" as const,
+      toolMode: "coding" as const,
+      worktreeMode: "isolated" as const,
+      ownedPaths: ["src/owned.ts"],
+      allowedWriteRoots: ["src/owned.ts"],
+      commitPolicy: "required" as const,
+    };
+    const routeSha256 = createHash("sha256")
+      .update(canonicalCccPrdJson(route), "utf8")
+      .digest("hex");
+    const promptSha256 = createHash("sha256")
+      .update("sealed prompt", "utf8")
+      .digest("hex");
+    const ir: WorkflowIr = {
+      version: "v1",
+      name: "live-gated-imported-workflow",
+      nodes: [
+        { id: "start", kind: "start" },
+        {
+          id: "execute",
+          kind: "prompt",
+          config: {
+            prompt: "sealed prompt",
+            cccPrdTaskId: semanticTaskId,
+            cccNativeTaskId: nativeTaskId,
+            cccExecutionPromptSchema: "ccc-prd.execution-prompt.v1",
+            cccExecutionPromptSha256: promptSha256,
+            cccExecutionTransport: route.transport,
+            cccExecutionProviderId: route.providerId,
+            cccExecutionModelId: route.modelId,
+            cccExecutionReceiptAdapterId: route.receiptAdapterId,
+            cccExecutionRouteSha256: routeSha256,
+            executor: route.executor,
+            toolMode: route.toolMode,
+            worktreeMode: route.worktreeMode,
+            ownedPaths: route.ownedPaths,
+            allowedWriteRoots: route.allowedWriteRoots,
+            commitPolicy: route.commitPolicy,
+          },
+        },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "execute", condition: "success" },
+        { from: "execute", to: "end", condition: "success" },
+      ],
+    };
+    const prepareNodeExecution = vi.fn(async () => undefined);
+    const runCustomNode = vi.fn(async () => ({ outcome: "success" as const }));
+    const requireLiveExecution = vi.fn(async () => {
+      throw new PermanentError(
+        "awaiting exact live execution approval",
+        "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      );
+    });
+    const importedTask = {
+      id: nativeTaskId,
+      lineageId: "ccc-prd:0123456789abcdef01234567:TASK-LIVE-GATE",
+    } as TaskDetail;
+    const context = {
+      ...campaignProofContext(nativeTaskId, semanticTaskId),
+      projectId: "PROJECT-LIVE-GATE",
+      importId: "IMPORT-LIVE-GATE",
+      idempotencyKey: "IDEMPOTENCY-LIVE-GATE",
+      campaignId: "CAMPAIGN-LIVE-GATE",
+      packetHash: "1".repeat(64),
+      sidecarHash: "2".repeat(64),
+      bundleHash: "3".repeat(64),
+      manifestHash: "4".repeat(64),
+      sourceVersion: "v2",
+      targetRepository: {
+        path: "/tmp/live-gate",
+        baseCommit: "5".repeat(40),
+      },
+      bounds: {
+        maxRequests: 1,
+        maxConcurrency: 1,
+        maxDurationMs: 60_000,
+      },
+      executionPolicy: {
+        schema: "ccc-campaign.execution-policy.v2",
+        routes: [route],
+      },
+      route,
+      executionCustody: {
+        promptSchema: "ccc-prd.execution-prompt.v1",
+        promptSha256,
+        routeSha256,
+      },
+    } as CccCampaignTaskContext;
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-LIVE-GATE", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir }),
+        getTask: async () => importedTask,
+        getCccCampaignContextForTask: async () => context,
+        recordFencedCccCampaignProofAudit: vi.fn(),
+        assertCccCampaignWorkflowLeaseFence: async () => undefined,
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode,
+      prepareNodeExecution,
+      requireCccCampaignLiveExecutionApproval: requireLiveExecution,
+    });
+    const fence = {
+      workItemId: "WORK-LIVE-GATE",
+      leaseOwner: "worker-live-gate",
+      attempt: 1,
+      runId: "ccc-prd:import-live-gate",
+      eventTimestamp: "2026-08-22T16:00:00.000Z",
+      irHash: workflowIrSha256(ir),
+    };
+
+    const result = await runtime.run(importedTask, flagOff, {
+      signal: new AbortController().signal,
+      workItemFence: fence,
+    });
+
+    expect(result).toMatchObject({
+      disposition: "manual-required",
+      outcome: "failure",
+      reason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+    });
+    expect(requireLiveExecution).toHaveBeenCalledWith({
+      taskId: nativeTaskId,
+      runId: fence.runId,
+    });
+    expect(prepareNodeExecution).not.toHaveBeenCalled();
+    expect(runCustomNode).not.toHaveBeenCalled();
   });
 
   it("Task 4 RED: fenced campaign run identity comes from the persisted work-item fence", async () => {

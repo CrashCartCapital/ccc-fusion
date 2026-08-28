@@ -102,6 +102,26 @@ describe("CLI package.json publishing config", () => {
     expect(pkg.bin.fusion).toBe("./bin.mjs");
   });
 
+  it("runs the required dist-artifact bootstrap explicitly before the full CLI suite", () => {
+    expect(pkg.scripts?.test).toBe(
+      "node ../../scripts/ensure-test-artifacts.mjs && vitest run --silent=passed-only --reporter=dot",
+    );
+  });
+
+  it("marks the internal proof host executable in packed artifacts without exposing a public bin", () => {
+    const proofHost = "dist/ccc-campaign-proof-admission.js";
+    const publishedPkg = applyPrepackTransform(pkg);
+
+    expect(pkg.publishConfig?.executableFiles).toEqual(expect.arrayContaining([proofHost]));
+    expect(publishedPkg.publishConfig?.executableFiles).toEqual(expect.arrayContaining([proofHost]));
+    expect(pkg.bin).toEqual({
+      "agent-browser": "./agent-browser.mjs",
+      fn: "./bin.mjs",
+      fusion: "./bin.mjs",
+    });
+    expect(publishedPkg.bin).toEqual(pkg.bin);
+  });
+
   it('has "files" array with committed launcher and refined globs for dist output', () => {
     expect(pkg.files).toBeDefined();
     expect(Array.isArray(pkg.files)).toBe(true);

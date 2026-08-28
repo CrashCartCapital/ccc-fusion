@@ -1,6 +1,18 @@
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -16,10 +28,33 @@ import {
   inspectCccSemanticProofLinkedRuntime,
   verifyCccSemanticProofToolchainBeforeSpawn,
 } from "../ccc-campaign-proof-materialization.js";
+import { runCccSemanticProofSandboxedProcess } from "../ccc-campaign-proof-sandbox.js";
+
+let runtimePathToSwap: string | undefined;
+let replacementPathToSwap: string | undefined;
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    realpath: async (...args: Parameters<typeof actual.realpath>) => {
+      const [path] = args;
+      if (runtimePathToSwap && replacementPathToSwap && typeof path === "string" && path === runtimePathToSwap) {
+        await actual.rename(replacementPathToSwap, runtimePathToSwap);
+        runtimePathToSwap = undefined;
+        replacementPathToSwap = undefined;
+      }
+      return actual.realpath(...args);
+    },
+  };
+});
 
 const execFile = promisify(execFileCallback);
 const actualExecFile = execFileCallback;
 const roots: string[] = [];
+// This copies, hashes, and executes the complete host Python runtime under
+// sandbox-exec. Keep it out of the default parallel engine matrix; the
+// dedicated qualification command opts in with FUSION_TEST_REAL_PYTHON_SEAL_SMOKE=1.
+const runRealPythonSealSmoke = process.env.FUSION_TEST_REAL_PYTHON_SEAL_SMOKE === "1";
 const sha256 = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
 
 async function createGitFixture(): Promise<{
@@ -115,6 +150,126 @@ function proof(input: {
   };
 }
 
+async function createPythonMaterializationFixture(
+  additionalTaskfileLines: readonly string[] = [],
+): Promise<{
+  fixture: Awaited<ReturnType<typeof createGitFixture>>;
+  proofBaseCommit: string;
+  outputRoot: string;
+  toolRoot: string;
+  definition: CccPrdProofV2;
+  runtimeFiles: {
+    stdlib: string;
+    sitePackages: string;
+    extensionModules: string;
+    dylibClosure: string;
+  };
+}> {
+  const fixture = await createGitFixture();
+  const outputRoot = await mkdtemp(join(tmpdir(), "ccc-python-semantic-proof-output-"));
+  const toolRootRaw = await mkdtemp(join(tmpdir(), "ccc-python-semantic-proof-runtime-"));
+  const toolRoot = await realpath(toolRootRaw);
+  roots.push(outputRoot, toolRootRaw);
+  const adapterPath = "verify/python_adapter.py";
+  const targetPath = "fixtures/python-target";
+  await mkdir(join(fixture.repository, "fixtures/python-target"), { recursive: true });
+  await writeFile(join(fixture.repository, adapterPath), "print('adapter')\n");
+  await writeFile(join(fixture.repository, targetPath, "target.py"), "print('target')\n");
+  await writeFile(join(fixture.repository, "Taskfile.yml"), [
+    "version: '3'",
+    "tasks:",
+    "  verify:slugify:",
+    "    cmds:",
+    `      - python3 ${adapterPath} --target ${targetPath}`,
+    ...additionalTaskfileLines,
+    "",
+  ].join("\n"));
+  await execFile("git", ["-C", fixture.repository, "add", "Taskfile.yml", adapterPath, targetPath]);
+  await execFile("git", ["-C", fixture.repository, "commit", "-m", "python semantic proof baseline"]);
+  const baseCommit = (await execFile("git", ["-C", fixture.repository, "rev-parse", "HEAD"])).stdout.trim();
+  const gitOid = async (path: string) => (
+    await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}:${path}`])
+  ).stdout.trim();
+  const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+  const nodeIdentity = await executableIdentity(process.execPath);
+  const pythonPath = join(toolRoot, "python3");
+  await writeFile(pythonPath, "#!/bin/sh\nprintf 'Python 3.12.10\\n'\n", { mode: 0o755 });
+  await chmod(pythonPath, 0o755);
+  const pythonIdentity = await executableIdentity(pythonPath);
+  const runtimeFiles = {
+    stdlib: join(toolRoot, "lib/python3.12/os.py"),
+    sitePackages: join(toolRoot, "lib/python3.12/site-packages/fixture.py"),
+    extensionModules: join(toolRoot, "lib/python3.12/lib-dynload/fixture.so"),
+    dylibClosure: join(toolRoot, "lib/libpython3.12.dylib"),
+  } as const;
+  await Promise.all(Object.values(runtimeFiles).map(async (path) => {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `runtime:${path}\n`);
+  }));
+  const runtimeEntry = async (path: string) => ({
+    path,
+    sha256: sha256(await readFile(path)),
+  });
+  const definition = proof({
+    ...fixture,
+    taskOid: await gitOid("Taskfile.yml"),
+    taskIdentity,
+    nodeIdentity,
+    linkedRuntime: [],
+  });
+  definition.verifierClosure[0] = {
+    ...definition.verifierClosure[0],
+    baseGitBlobOid: await gitOid("Taskfile.yml"),
+    sha256: sha256(await readFile(join(fixture.repository, "Taskfile.yml"))),
+  };
+  definition.verifierClosure[1] = {
+    role: "harness",
+    path: adapterPath,
+    baseGitBlobOid: await gitOid(adapterPath),
+    sha256: sha256(await readFile(join(fixture.repository, adapterPath))),
+  };
+  definition.verifierClosure.push({
+    role: "fixture",
+    path: `${targetPath}/target.py`,
+    baseGitBlobOid: await gitOid(`${targetPath}/target.py`),
+    sha256: sha256(await readFile(join(fixture.repository, `${targetPath}/target.py`))),
+  });
+  definition.verifierProfile = {
+    schema: "ccc-prd.verifier.python-adapter.v1",
+    adapterPath,
+    targetPath,
+  };
+  definition.executionToolchain.python = {
+    ...pythonIdentity,
+    runtimeManifest: {
+      schema: "ccc-prd.python-runtime-manifest.v1",
+      interpreter: await runtimeEntry(pythonPath),
+      stdlibRoot: join(toolRoot, "lib/python3.12"),
+      pythonHomeRoot: toolRoot,
+      sitePackagesRoots: [join(toolRoot, "lib/python3.12/site-packages")],
+      extensionModuleRoots: [join(toolRoot, "lib/python3.12/lib-dynload")],
+      runtimeSupport: [await runtimeEntry(runtimeFiles.dylibClosure)],
+      stdlib: [await runtimeEntry(runtimeFiles.stdlib)],
+      sitePackages: [await runtimeEntry(runtimeFiles.sitePackages)],
+      extensionModules: [await runtimeEntry(runtimeFiles.extensionModules)],
+      dylibClosure: [],
+    },
+  };
+  definition.executionToolchain.linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
+    task: taskIdentity,
+    node: nodeIdentity,
+    proofHost: { id: "fusion-native-semantic-proof-v2", ...nodeIdentity },
+  });
+  return {
+    fixture,
+    proofBaseCommit: baseCommit,
+    outputRoot,
+    toolRoot,
+    definition,
+    runtimeFiles,
+  };
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => {
     const makeWriteable = async (path: string): Promise<void> => {
@@ -123,7 +278,7 @@ afterEach(async () => {
       await Promise.all(entries.map(async (entry) => {
         const child = join(path, entry.name);
         if (entry.isDirectory()) await makeWriteable(child);
-        else await chmod(child, 0o644).catch(() => undefined);
+        else if (!entry.isSymbolicLink()) await chmod(child, 0o644).catch(() => undefined);
       }));
     };
     await makeWriteable(root);
@@ -368,7 +523,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     })).rejects.toThrow(/includes|dependencies/u);
   });
 
-  it("RED-S5-task-target-closure: refuses unsafe behavior in an unselected verify target", async () => {
+  it("RED-S5-task-target-closure: ignores unsafe behavior in an unselected verify target", async () => {
     const fixture = await createGitFixture();
     await writeFile(join(fixture.repository, "Taskfile.yml"), [
       "version: '3'",
@@ -410,7 +565,10 @@ describe("CCC semantic-proof admission and materialization", () => {
       proof: definition,
       modelWriteRoots: ["src"],
       outputRoot,
-    })).rejects.toThrow(/dependencies/u);
+    })).resolves.toMatchObject({
+      taskTarget: "verify:slugify",
+      taskArgv: ["verify:slugify"],
+    });
   });
 
   it("RED-S5-toolchain-drift-pre-spawn: refuses executable drift immediately before spawn", async () => {
@@ -638,6 +796,459 @@ describe("CCC semantic-proof admission and materialization", () => {
     expect(await readFile(sealedToolchain!.proofHostExecutable, "utf8")).toContain("sealed-test");
     expect((await stat(sealedToolchain!.taskExecutable)).mode & 0o222).toBe(0);
   });
+
+  it("RED-R1-python-semantic-v2-task-and-runtime: admits only the closure-owned Python adapter and seals every runtime category", async () => {
+    const fixture = await createGitFixture();
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-python-semantic-proof-output-"));
+    const toolRootRaw = await mkdtemp(join(tmpdir(), "ccc-python-semantic-proof-runtime-"));
+    const toolRoot = await realpath(toolRootRaw);
+    roots.push(outputRoot, toolRootRaw);
+    const adapterPath = "verify/python_adapter.py";
+    const targetPath = "fixtures/python-target";
+    await mkdir(join(fixture.repository, "fixtures/python-target"), { recursive: true });
+    await writeFile(join(fixture.repository, adapterPath), "print('adapter')\n");
+    await writeFile(join(fixture.repository, targetPath, "target.py"), "print('target')\n");
+    await writeFile(join(fixture.repository, "Taskfile.yml"), [
+      "version: '3'",
+      "tasks:",
+      "  verify:slugify:",
+      "    cmds:",
+      `      - python3 ${adapterPath} --target ${targetPath}`,
+      "",
+    ].join("\n"));
+    await execFile("git", ["-C", fixture.repository, "add", "Taskfile.yml", adapterPath, targetPath]);
+    await execFile("git", ["-C", fixture.repository, "commit", "-m", "python semantic proof baseline"]);
+    const baseCommit = (await execFile("git", ["-C", fixture.repository, "rev-parse", "HEAD"])).stdout.trim();
+    const sourceCommit = baseCommit;
+    const gitOid = async (path: string) => (
+      await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}:${path}`])
+    ).stdout.trim();
+    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const nodeIdentity = await executableIdentity(process.execPath);
+    const pythonPath = join(toolRoot, "python3");
+    await writeFile(pythonPath, "#!/bin/sh\nprintf 'Python 3.12.10\\n'\n", { mode: 0o755 });
+    await chmod(pythonPath, 0o755);
+    const pythonIdentity = await executableIdentity(pythonPath);
+    const runtimeFiles = {
+      stdlib: join(toolRoot, "lib/python3.12/os.py"),
+      sitePackages: join(toolRoot, "lib/python3.12/site-packages/fixture.py"),
+      extensionModules: join(toolRoot, "lib/python3.12/lib-dynload/fixture.so"),
+      dylibClosure: join(toolRoot, "lib/libpython3.12.dylib"),
+    } as const;
+    await Promise.all(Object.entries(runtimeFiles).map(async ([, path]) => {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, `runtime:${path}\n`);
+    }));
+    const runtimeEntry = async (path: string) => ({
+      path,
+      sha256: sha256(await readFile(path)),
+    });
+    const definition = proof({
+      ...fixture,
+      taskOid: await gitOid("Taskfile.yml"),
+      taskIdentity,
+      nodeIdentity,
+      linkedRuntime: [],
+    }) as any;
+    definition.verifierClosure[0] = {
+      ...definition.verifierClosure[0],
+      baseGitBlobOid: await gitOid("Taskfile.yml"),
+      sha256: sha256(await readFile(join(fixture.repository, "Taskfile.yml"))),
+    };
+    definition.verifierClosure[1] = {
+      role: "harness",
+      path: adapterPath,
+      baseGitBlobOid: await gitOid(adapterPath),
+      sha256: sha256(await readFile(join(fixture.repository, adapterPath))),
+    };
+    definition.verifierClosure.push({
+      role: "fixture",
+      path: `${targetPath}/target.py`,
+      baseGitBlobOid: await gitOid(`${targetPath}/target.py`),
+      sha256: sha256(await readFile(join(fixture.repository, `${targetPath}/target.py`))),
+    });
+    definition.verifierProfile = {
+      schema: "ccc-prd.verifier.python-adapter.v1",
+      adapterPath,
+      targetPath,
+    };
+    definition.executionToolchain.python = {
+      ...pythonIdentity,
+      runtimeManifest: {
+        schema: "ccc-prd.python-runtime-manifest.v1",
+        interpreter: await runtimeEntry(pythonPath),
+        stdlibRoot: join(toolRoot, "lib/python3.12"),
+        pythonHomeRoot: toolRoot,
+        sitePackagesRoots: [join(toolRoot, "lib/python3.12/site-packages")],
+        extensionModuleRoots: [join(toolRoot, "lib/python3.12/lib-dynload")],
+        runtimeSupport: [await runtimeEntry(runtimeFiles.dylibClosure)],
+        stdlib: [await runtimeEntry(runtimeFiles.stdlib)],
+        sitePackages: [await runtimeEntry(runtimeFiles.sitePackages)],
+        extensionModules: [await runtimeEntry(runtimeFiles.extensionModules)],
+        dylibClosure: [],
+      },
+    };
+    definition.executionToolchain.linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
+      task: taskIdentity,
+      node: nodeIdentity,
+      proofHost: { id: "fusion-native-semantic-proof-v2", ...nodeIdentity },
+    });
+
+    const materialized = await admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit,
+      sourceCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    });
+
+    expect(materialized.taskArgv).toEqual(["verify:slugify"]);
+    expect(materialized.sealedExecutionToolchain.python?.executablePath)
+      .toContain(join(outputRoot, "toolchain"));
+    expect(materialized.sealedExecutionToolchain.python?.runtimeManifest.stdlib[0]?.path)
+      .toContain(join(outputRoot, "toolchain"));
+    expect(await readFile(materialized.sealedExecutionToolchain.python!.runtimeManifest.sitePackages[0]!.path, "utf8"))
+      .toContain("runtime:");
+    const sealedPython = materialized.sealedExecutionToolchain.python!;
+    expect(sealedPython.executableSha256).toBe(
+      sha256(await readFile(sealedPython.executablePath)),
+    );
+    for (const entry of [
+      ...sealedPython.runtimeManifest.stdlib,
+      ...sealedPython.runtimeManifest.sitePackages,
+      ...sealedPython.runtimeManifest.extensionModules,
+      ...sealedPython.runtimeManifest.dylibClosure,
+      ...sealedPython.runtimeManifest.runtimeSupport,
+    ]) {
+      expect(entry.sha256).toBe(sha256(await readFile(entry.path)));
+    }
+  });
+
+  it("RED-R1-taskfile-selected-target-python: validates only the selected strict Python target", async () => {
+    const {
+      fixture,
+      proofBaseCommit,
+      outputRoot,
+      definition,
+    } = await createPythonMaterializationFixture([
+      "  setup:",
+      "    desc: Install project dependencies",
+      "    cmds:",
+      "      - uv sync",
+      "  build:",
+      "    cmds:",
+      "      - make all",
+      "  verify:node:",
+      "    deps: [setup]",
+      "    cmds:",
+      "      - node verify/other.mjs src/other.js",
+    ]);
+
+    await expect(admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit: proofBaseCommit,
+      sourceCommit: proofBaseCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    })).resolves.toMatchObject({
+      taskTarget: "verify:slugify",
+      taskArgv: ["verify:slugify"],
+    });
+  });
+
+  it("RED-R1-python-runtime-canonical-path: refuses a runtime file reached through a symlinked parent", async () => {
+    const {
+      fixture,
+      proofBaseCommit,
+      outputRoot,
+      toolRoot,
+      definition,
+    } = await createPythonMaterializationFixture();
+    const stdlibRoot = join(toolRoot, "lib/python3.12");
+    const canonicalDirectory = join(stdlibRoot, "canonical");
+    const symlinkedDirectory = join(stdlibRoot, "symlinked");
+    const canonicalPath = join(canonicalDirectory, "stdlib.py");
+    const requestedPath = join(symlinkedDirectory, "stdlib.py");
+    await mkdir(canonicalDirectory, { recursive: true });
+    await writeFile(canonicalPath, "runtime:canonical\n");
+    await symlink(canonicalDirectory, symlinkedDirectory, "dir");
+    definition.executionToolchain.python!.runtimeManifest.stdlib = [{
+      path: requestedPath,
+      sha256: sha256(await readFile(canonicalPath)),
+    }];
+
+    await expect(admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit: proofBaseCommit,
+      sourceCommit: proofBaseCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    })).rejects.toThrow(/runtime path must be canonical|Python interpreter|Python runtime manifest/i);
+  });
+
+  it("RED-R1-python-runtime-identity: refuses a same-byte replacement between path metadata and open", async () => {
+    const { definition, runtimeFiles } = await createPythonMaterializationFixture();
+    const replacementPath = join(dirname(runtimeFiles.stdlib), "stdlib-replacement.py");
+    await writeFile(replacementPath, await readFile(runtimeFiles.stdlib));
+    runtimePathToSwap = runtimeFiles.stdlib;
+    replacementPathToSwap = replacementPath;
+    try {
+      await expect(verifyCccSemanticProofToolchainBeforeSpawn(
+        definition.executionToolchain,
+      )).rejects.toThrow("CCC semantic-proof Python runtime manifest drift detected before spawn");
+    } finally {
+      runtimePathToSwap = undefined;
+      replacementPathToSwap = undefined;
+    }
+  });
+
+  it.runIf(
+    runRealPythonSealSmoke
+      && process.platform === "darwin"
+      && existsSync("/usr/bin/sandbox-exec")
+      && existsSync("/opt/homebrew/bin/task"),
+  )("RED-R1-python-semantic-v2-real-sealed-smoke: runs the real sealed Python interpreter with sealed PYTHONHOME/PYTHONPATH", async () => {
+    const fixture = await createGitFixture();
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-python-real-proof-output-"));
+    roots.push(outputRoot);
+    const pythonLauncherPath = [
+      "/opt/homebrew/opt/python@3.14/bin/python3.14",
+      "/opt/homebrew/opt/python@3.13/bin/python3.13",
+      "/opt/homebrew/opt/python@3.12/bin/python3.12",
+      "/usr/bin/python3",
+    ].find(existsSync) ?? (await execFile("which", ["python3"])).stdout.trim();
+    const canonicalPythonLauncher = await realpath(pythonLauncherPath);
+    const frameworkPythonPath = resolve(
+      dirname(canonicalPythonLauncher),
+      "../Resources/Python.app/Contents/MacOS/Python",
+    );
+    const pythonPath = existsSync(frameworkPythonPath)
+      ? await realpath(frameworkPythonPath)
+      : canonicalPythonLauncher;
+    const pythonIdentity = await executableIdentity(pythonPath);
+    const discoveryRoot = await mkdtemp(join(tmpdir(), "ccc-python-real-discovery-"));
+    roots.push(discoveryRoot);
+    const discoveryPath = join(discoveryRoot, "manifest.json");
+    const discoveryScript = [
+      "import json, os, sys, sysconfig",
+      "paths = sysconfig.get_paths()",
+      "stdlib_root = os.path.realpath(paths.get('stdlib') or '')",
+      "python_home_root = os.path.realpath(sys.prefix)",
+      "site_roots = sorted({os.path.realpath(paths[k]) for k in ('purelib', 'platlib') if paths.get(k)})",
+      "framework_python = os.path.realpath(os.path.join(os.path.dirname(sys.executable), '..', 'Resources', 'Python.app', 'Contents', 'MacOS', 'Python'))",
+      "runtime_support = [framework_python] if os.path.isfile(framework_python) and not os.path.islink(framework_python) else []",
+      "def files(root):",
+      "  out = []",
+      "  if not root or not os.path.isdir(root): return out",
+      "  for base, dirs, names in os.walk(root, followlinks=False):",
+      "    dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(base, d)))",
+      "    for name in sorted(names):",
+      "      path = os.path.join(base, name)",
+      "      if os.path.isfile(path) and not os.path.islink(path): out.append(os.path.realpath(path))",
+      "  return sorted(set(out))",
+      "payload = {'stdlibRoot': stdlib_root, 'pythonHomeRoot': python_home_root, 'sitePackagesRoots': site_roots, 'extensionModuleRoots': [stdlib_root, *site_roots], 'runtimeSupport': runtime_support, 'stdlib': files(stdlib_root), 'purelib': files(paths.get('purelib')), 'platlib': files(paths.get('platlib'))}",
+      "with open(sys.argv[1], 'x', encoding='utf-8') as output:",
+      "  json.dump(payload, output, separators=(',', ':'))",
+    ].join("\n");
+    await execFile(
+      pythonIdentity.executablePath,
+      ["-c", discoveryScript, discoveryPath],
+    );
+    const discovered = JSON.parse(await readFile(discoveryPath, "utf8")) as {
+      stdlibRoot: string;
+      pythonHomeRoot: string;
+      sitePackagesRoots: string[];
+      extensionModuleRoots: string[];
+      runtimeSupport: string[];
+      stdlib: string[];
+      purelib: string[];
+      platlib: string[];
+    };
+    const runtimeFiles = async (key: "stdlib" | "purelib" | "platlib") => Promise.all(discovered[key].map(async (path) => ({
+      path,
+      sha256: sha256(await readFile(path)),
+    })));
+    const stdlib = await runtimeFiles("stdlib");
+    const purelib = await runtimeFiles("purelib");
+    const platlib = await runtimeFiles("platlib");
+    const runtimeSupport = await Promise.all(discovered.runtimeSupport.map(async (path) => ({
+      path,
+      sha256: sha256(await readFile(path)),
+    })));
+    const uniqueRuntimeFiles = (entries: readonly { path: string; sha256: string }[]) => [
+      ...new Map(entries.map((entry) => [entry.path, entry])).values(),
+    ];
+    const allSite = uniqueRuntimeFiles([...purelib, ...platlib]);
+    const extensionModules = uniqueRuntimeFiles([...stdlib, ...allSite]
+      .filter((entry) => /\.(?:so|dylib|pyd|dll)(?:\.[0-9.]+)?$/u.test(entry.path)));
+    const extensionPaths = new Set(extensionModules.map((entry) => entry.path));
+    const sitePackages = uniqueRuntimeFiles(allSite.filter((entry) => !extensionPaths.has(entry.path)));
+    const dylibPaths = new Set<string>();
+    const dylibRequestedPaths = new Map<string, Set<string>>();
+    const dylibLoaders = [
+      pythonIdentity.executablePath,
+      ...extensionModules.map((entry) => entry.path),
+      ...runtimeSupport.map((entry) => entry.path),
+    ];
+    while (dylibLoaders.length > 0) {
+      const loader = dylibLoaders.shift()!;
+      const otool = await execFile("/usr/bin/otool", ["-L", loader]);
+      for (const line of otool.stdout.split("\n").slice(1)) {
+        const path = line.trim().split(/\s+/u)[0];
+        if (path && path.startsWith("/") && !path.startsWith("/usr/lib/") && !path.startsWith("/System/Library/") && existsSync(path)) {
+          const canonical = await realpath(path);
+          const requested = dylibRequestedPaths.get(canonical) ?? new Set<string>();
+          requested.add(path);
+          dylibRequestedPaths.set(canonical, requested);
+          if (!dylibPaths.has(canonical)) {
+            dylibPaths.add(canonical);
+            dylibLoaders.push(canonical);
+          }
+        }
+      }
+    }
+    const dylibClosure = await Promise.all([...dylibPaths].sort().map(async (path) => ({
+      path,
+      sha256: sha256(await readFile(path)),
+      requestedPaths: [...(dylibRequestedPaths.get(path) ?? [])].sort(),
+    })));
+    expect(dylibClosure.some((entry) => entry.path.includes("mpdecimal"))).toBe(true);
+    const adapterPath = "verify/python_adapter.py";
+    const targetPath = "fixtures/python-target";
+    const originalStdlibFile = stdlib.find((entry) => entry.path.endsWith("/os.py"))?.path ?? stdlib[0]!.path;
+    await mkdir(join(fixture.repository, targetPath), { recursive: true });
+    await writeFile(join(fixture.repository, adapterPath), [
+      "import json, os, sys, zlib",
+      "from pathlib import Path",
+      "target = Path(sys.argv[sys.argv.index('--target') + 1]) / 'target.txt'",
+      `original = ${JSON.stringify(originalStdlibFile)}`,
+      "try:",
+      "    Path(original).read_bytes()",
+      "    original_read = True",
+      "except Exception:",
+      "    original_read = False",
+      "print(json.dumps({'target': target.read_text(), 'prefix': sys.prefix, 'zlib': zlib.ZLIB_VERSION, 'original_read': original_read, 'pythonhome': os.environ.get('PYTHONHOME', ''), 'pythonpath': os.environ.get('PYTHONPATH', '')}, sort_keys=True))",
+      "",
+    ].join("\n"));
+    await writeFile(join(fixture.repository, targetPath, "target.txt"), "sealed-python\n");
+    await writeFile(join(fixture.repository, "Taskfile.yml"), [
+      "version: '3'",
+      "tasks:",
+      "  verify:slugify:",
+      "    cmds:",
+      `      - python3 ${adapterPath} --target ${targetPath}`,
+      "",
+    ].join("\n"));
+    await execFile("git", ["-C", fixture.repository, "add", "Taskfile.yml", adapterPath, targetPath]);
+    await execFile("git", ["-C", fixture.repository, "commit", "-m", "real python semantic proof baseline"]);
+    const baseCommit = (await execFile("git", ["-C", fixture.repository, "rev-parse", "HEAD"])).stdout.trim();
+    const gitOid = async (path: string) => (
+      await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}:${path}`])
+    ).stdout.trim();
+    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const nodeIdentity = await executableIdentity(process.execPath);
+    const definition = proof({
+      ...fixture,
+      taskOid: await gitOid("Taskfile.yml"),
+      taskIdentity,
+      nodeIdentity,
+      linkedRuntime: await inspectCccSemanticProofLinkedRuntime({
+        task: taskIdentity,
+        node: nodeIdentity,
+        proofHost: { id: "fusion-native-semantic-proof-v2", ...nodeIdentity },
+      }),
+    }) as any;
+    definition.verifierClosure[0] = {
+      ...definition.verifierClosure[0],
+      baseGitBlobOid: await gitOid("Taskfile.yml"),
+      sha256: sha256(await readFile(join(fixture.repository, "Taskfile.yml"))),
+    };
+    definition.verifierClosure[1] = {
+      role: "harness",
+      path: adapterPath,
+      baseGitBlobOid: await gitOid(adapterPath),
+      sha256: sha256(await readFile(join(fixture.repository, adapterPath))),
+    };
+    definition.verifierClosure.push({
+      role: "fixture",
+      path: `${targetPath}/target.txt`,
+      baseGitBlobOid: await gitOid(`${targetPath}/target.txt`),
+      sha256: sha256(await readFile(join(fixture.repository, `${targetPath}/target.txt`))),
+    });
+    definition.verifierProfile = {
+      schema: "ccc-prd.verifier.python-adapter.v1",
+      adapterPath,
+      targetPath,
+    };
+    definition.executionToolchain.python = {
+      ...pythonIdentity,
+      runtimeManifest: {
+        schema: "ccc-prd.python-runtime-manifest.v1",
+        interpreter: { path: pythonIdentity.executablePath, sha256: pythonIdentity.executableSha256 },
+        stdlibRoot: await realpath(discovered.stdlibRoot),
+        pythonHomeRoot: await realpath(discovered.pythonHomeRoot),
+        sitePackagesRoots: await Promise.all((discovered.sitePackagesRoots ?? []).map((path) => realpath(path))),
+        extensionModuleRoots: [
+          await realpath(discovered.stdlibRoot),
+          ...await Promise.all((discovered.sitePackagesRoots ?? []).map((path) => realpath(path))),
+        ],
+        runtimeSupport,
+        stdlib,
+        sitePackages,
+        extensionModules,
+        dylibClosure,
+      },
+    };
+    const materialized = await admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit,
+      sourceCommit: baseCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    });
+    const sealedPython = materialized.sealedExecutionToolchain.python!;
+    const pythonHome = sealedPython.runtimeManifest.pythonHomeRoot;
+    const pythonPathRoots = [
+      ...sealedPython.runtimeManifest.sitePackagesRoots,
+      ...sealedPython.runtimeManifest.extensionModuleRoots,
+    ];
+    const result = await runCccSemanticProofSandboxedProcess({
+      proofRoot: materialized.proofRoot,
+      scratchRoot: materialized.scratchRoot,
+      taskExecutable: materialized.sealedExecutionToolchain.task.executablePath,
+      nodeExecutable: materialized.sealedExecutionToolchain.node.executablePath,
+      pythonExecutable: sealedPython.executablePath,
+      pythonHome,
+      pythonPathRoots,
+      pythonRuntimeFiles: [
+        sealedPython.runtimeManifest.interpreter.path,
+        ...sealedPython.runtimeManifest.dylibClosure.map(({ path }) => path),
+        ...sealedPython.runtimeManifest.runtimeSupport.map(({ path }) => path),
+      ],
+      pythonRuntimeExecutables: sealedPython.runtimeManifest.runtimeSupport.map(({ path }) => path),
+      deniedReadRoots: [fixture.repository, dirname(pythonIdentity.executablePath), dirname(originalStdlibFile)],
+      executable: materialized.sealedExecutionToolchain.task.executablePath,
+      args: materialized.taskArgv,
+      proofEnvironment: {
+        CCC_PROOF_ID: definition.id,
+        CCC_PROOF_PHASE: "task",
+        CCC_PROOF_SOURCE_COMMIT: baseCommit,
+        CCC_PROOF_SOURCE_TREE: (await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}^{tree}`])).stdout.trim(),
+      },
+      timeoutMs: 120_000,
+    });
+    expect(result.exitCode, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout.trim()) as { target: string; prefix: string; zlib: string; original_read: boolean; pythonhome: string };
+    expect(output.target).toBe("sealed-python\n");
+    expect(output.prefix).toContain(join(outputRoot, "toolchain"));
+    expect(output.zlib).toBeTruthy();
+    expect(output.pythonhome).toBe(pythonHome);
+    expect(output.original_read).toBe(false);
+  }, 120_000);
 
   it("RED-S5-transient-version-probe: retries one timed-out immutable executable probe", async () => {
     const toolRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-probe-retry-"));

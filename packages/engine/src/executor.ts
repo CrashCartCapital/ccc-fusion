@@ -10,8 +10,8 @@ const execFileAsync = promisify(execFile);
 
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
 
-import { basename, delimiter, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
 import { getUnmetSchedulingDependencies } from "./scheduler.js";
@@ -28,7 +28,7 @@ import {
   isImportedCccCampaignTask,
   isImportedCccCampaignWorkItem,
 } from "./ccc-campaign-routing.js";
-import { PermanentError } from "./engine-errors.js";
+import { EngineError, PermanentError } from "./engine-errors.js";
 import {
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
   CCC_PRD_EXECUTION_PROMPT_V1_SCHEMA_VERSION,
@@ -39,7 +39,21 @@ import {
   requireCccCampaignLiveExecutionApproval,
   requireCccCampaignMergeApproval,
 } from "./ccc-campaign-product-control.js";
-import { enforceCccCampaignRequiredCommitAfterNode } from "./ccc-campaign-required-commit.js";
+import {
+  assertCccCampaignRejectedTurnCustody,
+  assertCccCampaignRequiredCommitCandidate,
+  CCC_CAMPAIGN_REQUIRED_COMMIT_REFUSED_CODE,
+  enforceCccCampaignRequiredCommitAfterNode,
+} from "./ccc-campaign-required-commit.js";
+import {
+  createCccCampaignReadyTool,
+  fingerprintCccCampaignAllowedCandidate,
+  renderCccCampaignRepairFeedback,
+  resolveCccCampaignReadyTimeoutMs,
+  verifyCccCampaignReadyCandidate,
+} from "./ccc-campaign-ready.js";
+import type { CccCampaignReadyCommitHandoff } from "./ccc-campaign-ready.js";
+import { decideCccPhaseTransition } from "./ccc-phase-machine.js";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflow-column-boundary.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { createCodeNodeRunner } from "./code-node-runner.js";
@@ -134,6 +148,7 @@ import {
   CCC_AWAIT_OWNED_TRANSPORT_CLOSURE,
   describeModel,
   formatModelMarkerDetails,
+  isCccCampaignDiscoveryToolCall,
   promptWithFallback,
   compactSessionContext,
 } from "./pi.js";
@@ -1968,6 +1983,17 @@ export class TaskCancellationAbortError extends Error {
 
 const LOWER_HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
+/*
+FNXC:CccCampaignFastModeRefusal 2026-08-27-00:00:
+A sealed CCC campaign implementation node (isExactFencedCccCampaignImplementationNode)
+skipped by fast mode returns a success-shaped "workflow-step-skipped" result with no
+provider turn. The post-node required-commit fence then reports the misleading "no
+campaign-created commit" instead of the real cause. Fail closed and loud instead: refuse
+fast mode outright for sealed campaign implementation nodes before the generic
+prompt/script/gate skip can fire.
+*/
+const CCC_CAMPAIGN_FAST_MODE_REFUSED_CODE = "CCC_CAMPAIGN_FAST_MODE_REFUSED";
+
 function isExactFencedCccCampaignImplementationNode(
   node: WorkflowIrNode,
   execution: WorkflowNodeExecutionContext["execution"],
@@ -2015,6 +2041,26 @@ export class TaskExecutor {
   activeWorktrees tracks the worktree paths a task currently holds for liveness/owner checks. In workspace mode a single task acquires N sub-repo worktrees (foundation `task.workspaceWorktrees`), so the value is a SET of paths, not one path. A non-workspace (single-repo) task holds a one-element set — every consumer is converted to membership semantics so the single-repo path is byte-for-byte unchanged (KTD2). Helpers below add/remove/iterate the set.
   */
   private activeWorktrees = new Map<string, Set<string>>();
+  private cccPhaseVerifiedCandidateHandoffs = new Map<
+    string,
+    CccCampaignReadyCommitHandoff
+  >();
+
+  private cccPhaseVerificationKey(
+    executionContext?: WorkflowNodeExecutionContext,
+  ): string | undefined {
+    const execution = executionContext?.execution;
+    const fence = execution?.executionFence;
+    if (!execution || !fence || !execution.providerAttemptTurnKey) return undefined;
+    return [
+      execution.nativeTaskId,
+      execution.runId,
+      fence.workItemId,
+      fence.leaseOwner,
+      String(fence.attempt),
+      execution.providerAttemptTurnKey,
+    ].join("\0");
+  }
 
   /**
    * FNXC:Workspace 2026-06-21-12:00: Register a worktree path under a task's active set, creating the set on first add (KTD2). Single-repo tasks call this once → one-element set.
@@ -9500,6 +9546,7 @@ export class TaskExecutor {
     graphContext?: Record<string, unknown>,
     executionContext?: WorkflowNodeExecutionContext,
   ): Promise<WorkflowNodeResult> {
+    const phaseVerificationKey = this.cccPhaseVerificationKey(executionContext);
     const semanticTaskId = executionContext?.execution?.semanticTaskId;
     const executorKind = node.config?.executor;
     if (
@@ -9516,21 +9563,79 @@ export class TaskExecutor {
         runId: executionContext.execution.runId,
       });
     }
-    const result = await this.runGraphCustomNode(
-      node,
-      nodeTask,
-      settings,
-      columnBinding,
-      graphContext,
-      executionContext,
-    );
-    await enforceCccCampaignRequiredCommitAfterNode({
-      rootDir: this.rootDir,
-      store: this.store,
-      taskId: nodeTask.id,
-      result,
-      executionContext,
-    });
+    let result: WorkflowNodeResult;
+    try {
+      result = await this.runGraphCustomNode(
+        node,
+        nodeTask,
+        settings,
+        columnBinding,
+        graphContext,
+        executionContext,
+      );
+    } catch (error) {
+      if (phaseVerificationKey) {
+        this.cccPhaseVerifiedCandidateHandoffs.delete(phaseVerificationKey);
+      }
+      /*
+      FNXC:CccCampaignRequiredCommitFence 2026-08-25-00:00:
+      A REJECTED runGraphCustomNode call used to skip the fence entirely — the one
+      gate that inspects a dirty diff before committing it. Rejected required-commit
+      turns now receive a controller-owned custody assertion which validates any
+      surviving dirty candidate without staging, verifying, committing, or cleaning
+      it. Resolved failure results receive the same assertion below before returning.
+      An already-classified `EngineError` (PermanentError/TransientError/etc.) is a
+      distinct failure shape: some other seam already decided what it means (e.g.
+      the graph's own ccc-retry-classification park/retry bookkeeping keys off that
+      error's own code and TransientError-vs-PermanentError type). Relabeling it here
+      would erase that classification for its real owner, so it bare-rethrows
+      unchanged after custody is established. An UNCLASSIFIED rejection becomes a
+      permanent custody refusal whose honest message says "before commit custody
+      could be established" and whose original error survives as `.cause`.
+      */
+      await assertCccCampaignRejectedTurnCustody({
+        rootDir: this.rootDir,
+        store: this.store,
+        taskId: nodeTask.id,
+        executionContext,
+      });
+      if (error instanceof EngineError) throw error;
+      throw new PermanentError(
+        `CCC campaign task ${nodeTask.id} turn rejected before commit custody could `
+          + "be established",
+        CCC_CAMPAIGN_REQUIRED_COMMIT_REFUSED_CODE,
+        { worktree: nodeTask.worktree },
+        error instanceof Error ? error : undefined,
+      );
+    }
+    try {
+      if (result.outcome !== "success") {
+        await assertCccCampaignRejectedTurnCustody({
+          rootDir: this.rootDir,
+          store: this.store,
+          taskId: nodeTask.id,
+          executionContext,
+        });
+      }
+      await enforceCccCampaignRequiredCommitAfterNode({
+        rootDir: this.rootDir,
+        store: this.store,
+        taskId: nodeTask.id,
+        result,
+        executionContext,
+        verifiedCandidateHandoff: phaseVerificationKey
+          ? this.cccPhaseVerifiedCandidateHandoffs.get(phaseVerificationKey)
+          : undefined,
+        verificationCommandTimeoutMs: settings.verificationCommandTimeoutMs,
+        onVerificationHeartbeat: () => executorLog.log(
+          `${nodeTask.id}: final controller-owned campaign readiness verifier still running`,
+        ),
+      });
+    } finally {
+      if (phaseVerificationKey) {
+        this.cccPhaseVerifiedCandidateHandoffs.delete(phaseVerificationKey);
+      }
+    }
     return result;
   }
 
@@ -9663,6 +9768,13 @@ export class TaskExecutor {
     FNXC:WorkflowCompletion 2026-07-01-18:42:
     Fast mode skips review/validation work, not the agent-authored completion summary. FN-7335 reached review with "Fast mode — custom graph node 'completion-summary' skipped"; keep summary nodes executable so fast tasks still produce the same review/done card summary as standard tasks.
     */
+    if (live.executionMode === "fast" && cccCampaignImplementation) {
+      throw new PermanentError(
+        `CCC campaign sealed implementation node ${node.id} for task ${live.id} `
+          + "cannot run under fast execution mode",
+        CCC_CAMPAIGN_FAST_MODE_REFUSED_CODE,
+      );
+    }
     if (live.executionMode === "fast" && !isCompletionSummaryNode && !optionalGroupId && !cfg.seam && (node.kind === "prompt" || node.kind === "script" || node.kind === "gate")) {
       executorLog.log(`${live.id}: fast mode — skipping custom graph node '${node.id}'`);
       await this.store.logEntry(
@@ -9937,6 +10049,7 @@ export class TaskExecutor {
       : await this.executeWorkflowStep(live, step, worktreePath, settings, nodeEnv, {
           unattended,
           execution: sealedExecution,
+          executionContext,
           signal: executionContext?.signal,
           cccCampaignImplementation,
         });
@@ -17952,6 +18065,54 @@ ${scopeGuard}
     options: { isResume: boolean } = { isResume: false },
   ): Promise<void> {
     try {
+      /*
+       * FNXC:CCCCampaignFrozenBaseCapture 2026-08-24-14:42:
+       * Imported campaign tasks are projected with the sealed target base in
+       * baseCommitSha. Their isolated worktree can intentionally fork behind
+       * local main, so generic `merge-base HEAD main` recaptures an ambient
+       * integration ancestor and destroys campaign custody. Preserve the
+       * compiler-owned frozen base after proving both persisted identity and
+       * on-disk ancestry. The required-commit fence separately derives each
+       * chained task's own start commit while retaining this campaign-wide
+       * frozen-base witness.
+       */
+      if (isImportedCccCampaignTask(task)) {
+        const campaign = await this.store.getCccCampaignContextForTask(task.id);
+        const frozenBase = campaign?.targetRepository.baseCommit;
+        if (!frozenBase || task.baseCommitSha !== frozenBase) {
+          throw new PermanentError(
+            `CCC campaign task ${task.id} base capture does not match its sealed base`,
+            CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+            { persistedBase: task.baseCommitSha, frozenBase },
+          );
+        }
+        try {
+          await execFileAsync("git", ["merge-base", "--is-ancestor", frozenBase, "HEAD"], {
+            cwd: worktreePath,
+            timeout: 120_000,
+            maxBuffer: 10 * 1024 * 1024,
+          });
+        } catch (error) {
+          throw new PermanentError(
+            `CCC campaign task ${task.id} worktree does not descend from its sealed base`,
+            CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+            { worktreePath, frozenBase },
+            error instanceof Error ? error : undefined,
+          );
+        }
+        executorLog.log(`${task.id}: preserved sealed campaign baseCommitSha ${frozenBase.slice(0, 7)}`);
+        await audit.git({
+          type: "commit:create",
+          target: frozenBase,
+          metadata: {
+            purpose: "base",
+            preserved: true,
+            custody: "campaign-frozen-base",
+          },
+        });
+        return;
+      }
+
       // Preserve an existing baseCommitSha only on RESUME of the same
       // worktree, where diff-base stability across sessions of the same task
       // matters. On fresh/pooled acquisitions the branch was just
@@ -17989,6 +18150,7 @@ ${scopeGuard}
       executorLog.log(`${task.id}: captured baseCommitSha ${baseCommitSha.slice(0, 7)}`);
       await audit.git({ type: "commit:create", target: baseCommitSha, metadata: { purpose: "base", preserved: false } });
     } catch (err: unknown) {
+      if (isImportedCccCampaignTask(task)) throw err;
       const errorMessage = err instanceof Error ? err.message : String(err);
       executorLog.log(`Failed to capture baseCommitSha for ${task.id}: ${errorMessage}`);
       // Non-fatal: task can continue without baseCommitSha
@@ -18380,6 +18542,7 @@ ${scopeGuard}
     stepOptions?: {
       unattended?: boolean;
       execution?: WorkflowNodeExecutionContext["execution"];
+      executionContext?: WorkflowNodeExecutionContext;
       signal?: AbortSignal;
       cccCampaignImplementation?: boolean;
     },
@@ -18594,6 +18757,9 @@ CRITICAL SCOPING RULES — read before doing anything else:
 ## Completion Format
 
 Complete the implementation work and report what changed and what targeted verification ran.
+When the admitted implementation is complete, call fn_complete_phase by itself. This records intent;
+the controller decides the next phase only after the model turn has fully settled. Do not call
+fn_complete_phase in the same assistant turn as any other tool.
 Do not emit an APPROVE, APPROVE_WITH_NOTES, or REVISE reviewer verdict.`;
     } else if (requireVerdict) {
       verdictBlock = `
@@ -18646,6 +18812,7 @@ ${scopeBlock}${workflowStepUserCommentSection ? `\n\n${workflowStepUserCommentSe
 
 Your role:
 - Implement the admitted task completely inside its declared scope.
+- The worktree above is this task's isolated checkout of the sealed target repository at the frozen base commit. Every owned path and allowed write root in the sealed instructions resolves inside it, so edit them there directly. The sealed "Target repository" path records custody only; it is not a second copy to inspect, and it is not where you edit. Never copy files between checkouts.
 - Use coding tools to create or modify the required files and verify the result.
 - Treat the sealed instructions below as the authoritative implementation contract.
 
@@ -18676,7 +18843,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       store: this.store,
       taskId: task.id,
       agent: cccCampaignImplementation ? "executor" : "reviewer",
-      persistAgentToolOutput: settings.persistAgentToolOutput,
+      // Campaign evidence must retain the bounded, redacted tool transcript even when the
+      // project-wide opt-in is disabled; AgentLogger still enforces its normal size caps.
+      persistAgentToolOutput: cccCampaignImplementation || settings.persistAgentToolOutput,
       // Review-in-executor sessions are task-scoped ephemeral workers.
       persistAgentThinkingLog: resolvePersistAgentThinkingLog(settings, { ephemeral: true }),
       onAgentText: (taskId, delta) => {
@@ -18842,7 +19011,71 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       const codingCustomTools: ToolDefinition[] = toolMode === "coding"
         ? [this.createSpawnAgentTool(task.id, worktreePath, settings, stepEnv)]
         : [];
-      const workflowCustomTools = [...planReviewPromptTools, ...codingCustomTools];
+      const campaignReadyContext = cccCampaignImplementation
+        ? await this.store.getCccCampaignContextForTask(task.id)
+        : null;
+      if (cccCampaignImplementation && !campaignReadyContext) {
+        throw new PermanentError(
+          `CCC campaign task ${task.id} has no persisted readiness custody`,
+          "CCC_CAMPAIGN_READY_CUSTODY_REFUSED",
+        );
+      }
+      const campaignAllowedWriteRoots: readonly string[] = cccCampaignImplementation
+        && Array.isArray(campaignReadyContext!.route.allowedWriteRoots)
+        && campaignReadyContext!.route.allowedWriteRoots.length > 0
+        ? campaignReadyContext!.route.allowedWriteRoots
+        : [];
+      if (cccCampaignImplementation && campaignAllowedWriteRoots.length === 0) {
+        throw new PermanentError(
+          `CCC campaign task ${task.id} has no admitted write roots for phase custody`,
+          "CCC_CAMPAIGN_READY_CUSTODY_REFUSED",
+        );
+      }
+      const campaignPhaseReadOnlyToolNames = ["read", "grep", "find", "ls", "glob", "bash"] as const;
+      const campaignRemainingRequests = cccCampaignImplementation
+        ? Math.max(
+            1,
+            (Number.isSafeInteger(campaignReadyContext?.bounds?.maxRequests)
+              ? campaignReadyContext!.bounds!.maxRequests
+              : 1)
+              - (Number.isSafeInteger(campaignReadyContext?.requestCount)
+                ? campaignReadyContext!.requestCount
+                : 0),
+          )
+        : 1;
+      const campaignDiscoveryGuidanceToolLimit = Math.max(
+        1,
+        Math.floor(campaignRemainingRequests / 3),
+      );
+      const campaignDiscoveryRefusalToolLimit = Math.max(
+        campaignDiscoveryGuidanceToolLimit + 1,
+        Math.floor(campaignRemainingRequests / 2),
+      );
+      const campaignPhaseIntent: {
+        completionRequested: boolean;
+        invalidatedByTool?: string;
+      } = { completionRequested: false };
+      const campaignPhaseRuntime: {
+        activePhase: "DISCOVER" | "MUTATE" | "VERIFY" | "REPAIR";
+        discoverContinuations: number;
+        mutateContinuations: number;
+        readCount: number;
+        terminalFailure?: string;
+        turnConfirmedMutation?: boolean;
+      } = { activePhase: "DISCOVER", discoverContinuations: 0, mutateContinuations: 0, readCount: 0 };
+      const campaignReadyTools: ToolDefinition[] = cccCampaignImplementation
+        ? [createCccCampaignReadyTool({
+            mode: "phase-signal",
+            signalPhaseCompletion: () => {
+              campaignPhaseIntent.completionRequested = true;
+            },
+          })]
+        : [];
+      const workflowCustomTools = [
+        ...planReviewPromptTools,
+        ...codingCustomTools,
+        ...campaignReadyTools,
+      ];
       const readonlyCustomTools = toolMode === "readonly"
         ? filterCustomToolsForReadonly(workflowCustomTools, {
             allowTool: (tool) => allowPlanReviewPromptWrite && tool.name === "fn_task_prompt_write",
@@ -18876,6 +19109,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             signal: stepOptions?.signal,
           })
         : undefined;
+      let campaignTurnStartAllowedFingerprint: string | undefined;
       const { session } = await createResolvedAgentSession({
         sessionPurpose: "executor",
         runtimeHint: cccProviderAttemptBinding ? "pi" : workflowRuntimeHint,
@@ -18911,6 +19145,41 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ...(effectiveSkillSelection ? { skillSelection: effectiveSkillSelection } : {}),
         ...(additionalSkillPaths ? { additionalSkillPaths } : {}),
         ...(readonlyCustomTools.allowed.length > 0 ? { customTools: readonlyCustomTools.allowed } : {}),
+        ...(cccCampaignImplementation ? {
+          cccCampaignPhaseToolPolicy: {
+            readOnlyToolNames: campaignPhaseReadOnlyToolNames,
+            exemptToolNames: ["fn_complete_phase"],
+            maxReadOnlyToolCallsBeforeGuidance: campaignDiscoveryGuidanceToolLimit,
+            maxReadOnlyToolCallsBeforeRefusal: campaignDiscoveryRefusalToolLimit,
+            guidanceMessage:
+              "CCC_CAMPAIGN_DISCOVER_BOUNDARY: DISCOVER read/search/list allowance has been reached for this provider turn. "
+              + "Stop inspecting and proceed immediately to modify an admitted file, or call fn_complete_phase only after mutation is complete.",
+            refusalMessage:
+              "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: repeated DISCOVER read/search/list calls are phase-bounded. "
+              + "No more discovery tools will run in this turn; use write/edit/bash to make the admitted change or stop honestly.",
+            currentPhase: () => campaignPhaseRuntime.activePhase,
+            onPotentialMutationCompleted: async () => {
+              try {
+                const currentFingerprint = await fingerprintCccCampaignAllowedCandidate({
+                  worktreePath,
+                  allowedRoots: campaignAllowedWriteRoots,
+                });
+                const confirmedMutation = typeof campaignTurnStartAllowedFingerprint === "string"
+                  && currentFingerprint !== campaignTurnStartAllowedFingerprint;
+                if (confirmedMutation) {
+                  campaignPhaseRuntime.turnConfirmedMutation = true;
+                  campaignPhaseRuntime.activePhase = "MUTATE";
+                }
+                return confirmedMutation;
+              } catch (error) {
+                executorLog.warn(
+                  `${task.id}: unable to fingerprint campaign candidate after a potential mutation: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                return false;
+              }
+            },
+          },
+        } : {}),
         ...(cccProviderAttemptBinding ? { profile: CCC_FUSION_PROFILE, subscriptionReady: true as const, cccProviderAttemptBinding } : {}),
       });
 
@@ -18966,6 +19235,24 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           }
         }
         if (event.type === "tool_execution_start") {
+          if (
+            cccCampaignImplementation
+            && campaignPhaseRuntime.activePhase === "DISCOVER"
+            && isCccCampaignDiscoveryToolCall(
+              event.toolName,
+              event.args as Record<string, unknown> | undefined,
+            )
+          ) {
+            campaignPhaseRuntime.readCount += 1;
+          }
+          if (
+            cccCampaignImplementation
+            && campaignPhaseIntent.completionRequested
+            && event.toolName !== "fn_complete_phase"
+          ) {
+            campaignPhaseIntent.completionRequested = false;
+            campaignPhaseIntent.invalidatedByTool = event.toolName;
+          }
           agentLogger.onToolStart(event.toolName, event.args as Record<string, unknown> | undefined);
           if (!unattended && detectedQuestion === null) {
             const question = parseAwaitInputQuestionToolCall(
@@ -19018,14 +19305,213 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       });
 
       try {
-        const promptPromise = promptWithFallback(
-          session,
-          cccCampaignImplementation
-            ? `Implement the sealed campaign task "${workflowStep.name}" for task ${task.id}.\n\n` +
-              "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification."
-            : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
-              "Review the work done in this worktree and evaluate it against the criteria in your instructions.",
-        );
+        const initialPrompt = cccCampaignImplementation
+          ? `Implement the sealed campaign task "${workflowStep.name}" for task ${task.id}.\n\n` +
+            "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification.\n\n" +
+            "CCC_CAMPAIGN_DISCOVER_BOUNDARY: DISCOVER is phase-bounded by the admitted request budget. " +
+            `You may make at most ${campaignDiscoveryGuidanceToolLimit} read/search/list discovery tool call(s) before moving to MUTATE. ` +
+            "Do not spend the provider turn re-reading context. If the admitted task identifies exact files, create or edit them first."
+          : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
+            "Review the work done in this worktree and evaluate it against the criteria in your instructions.";
+        const promptPromise = (async () => {
+          if (cccCampaignImplementation) {
+            try {
+              campaignTurnStartAllowedFingerprint = await fingerprintCccCampaignAllowedCandidate({
+                worktreePath,
+                allowedRoots: campaignAllowedWriteRoots,
+              });
+            } catch (error) {
+              executorLog.warn(
+                `${task.id}: unable to fingerprint campaign candidate before phase execution: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+          }
+          await promptWithFallback(session, initialPrompt);
+          if (!cccCampaignImplementation) return;
+
+          /*
+           * FNXC:CCCCampaignNoDiffContinuation 2026-08-24-13:46:
+           * A no-tool-call assistant turn is a normal pi loop terminal. For a
+           * required-commit campaign that can create a false-success handoff:
+           * the executor disposes the still-useful session, and only afterward
+           * does the required-commit fence discover that the worktree is clean.
+           * Give that exact campaign shape one bounded same-session correction.
+           * Dirty work never receives the prompt, and a second clean completion
+           * falls through to the existing fail-closed commit refusal.
+           */
+          let worktreeIsClean = false;
+          let campaignTurnEndAllowedFingerprint: string | undefined;
+          try {
+            const { stdout } = await execAsync(
+              "git status --porcelain=v1 --untracked-files=all",
+              {
+                cwd: worktreePath,
+                encoding: "utf-8",
+                timeout: 10_000,
+                maxBuffer: 8 * 1024 * 1024,
+              },
+            );
+            worktreeIsClean = stdout.trim().length === 0;
+            campaignTurnEndAllowedFingerprint = await fingerprintCccCampaignAllowedCandidate({
+              worktreePath,
+              allowedRoots: campaignAllowedWriteRoots,
+            });
+          } catch (error) {
+            executorLog.warn(
+              `${task.id}: unable to inspect the campaign worktree before bounded no-diff continuation: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          const turnConfirmedMutation = !worktreeIsClean
+            && typeof campaignTurnStartAllowedFingerprint === "string"
+            && typeof campaignTurnEndAllowedFingerprint === "string"
+            && campaignTurnStartAllowedFingerprint !== campaignTurnEndAllowedFingerprint;
+          campaignPhaseRuntime.turnConfirmedMutation = turnConfirmedMutation;
+          if (campaignPhaseIntent.completionRequested) return;
+
+          if (turnConfirmedMutation) {
+            const mutateDecision = decideCccPhaseTransition({
+              phase: "MUTATE",
+              turnSettled: true,
+              explicitPhaseSignal: false,
+              hasConfirmedMutation: true,
+              readCount: campaignPhaseRuntime.readCount,
+              discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+              mutateContinuations: campaignPhaseRuntime.mutateContinuations,
+            });
+            if (mutateDecision.action !== "PROMPT_MUTATION_CONTINUATION") {
+              campaignPhaseRuntime.terminalFailure = mutateDecision.failureReason
+                ?? "MUTATE could not choose a bounded continuation";
+              return;
+            }
+            campaignPhaseRuntime.mutateContinuations += 1;
+            campaignPhaseRuntime.activePhase = "MUTATE";
+            await this.store.logEntry(
+              task.id,
+              "[ccc-campaign:mutate-cessation] MUTATE ended with a dirty candidate but no explicit phase signal; issuing the one allowed same-session continuation",
+            );
+            await promptWithFallback(
+              session,
+              "CCC_CAMPAIGN_MUTATE_CESSATION: A dirty candidate exists, but the settled MUTATE turn stopped without an explicit phase signal. "
+                + "Inspect the exact current diff and finish the admitted work. Call fn_complete_phase by itself when the phase is complete. "
+                + "This is the only MUTATE continuation; a second quiet unsignaled turn fails honestly.",
+            );
+            if (!campaignPhaseIntent.completionRequested) {
+              const exhaustedDecision = decideCccPhaseTransition({
+                phase: "MUTATE",
+                turnSettled: true,
+                explicitPhaseSignal: false,
+                hasConfirmedMutation: true,
+                readCount: campaignPhaseRuntime.readCount,
+                discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+                mutateContinuations: campaignPhaseRuntime.mutateContinuations,
+              });
+              campaignPhaseRuntime.terminalFailure = exhaustedDecision.failureReason
+                ?? "MUTATE exhausted its bounded continuation without an explicit phase signal";
+            }
+            return;
+          }
+
+          const discoverDecision = decideCccPhaseTransition({
+            phase: "DISCOVER",
+            turnSettled: true,
+            explicitPhaseSignal: false,
+            hasConfirmedMutation: false,
+            readCount: campaignPhaseRuntime.readCount,
+            discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+          });
+          if (discoverDecision.readCapWarning) {
+            await this.store.logEntry(
+              task.id,
+              `[ccc-campaign:read-cap-warning] DISCOVER observed ${campaignPhaseRuntime.readCount} read calls; warning only, no forced stop`,
+            );
+          }
+          if (discoverDecision.action !== "PROMPT_MUTATION_CONTINUATION") {
+            campaignPhaseRuntime.terminalFailure = discoverDecision.failureReason
+              ?? "DISCOVER could not choose a bounded continuation";
+            return;
+          }
+
+          await this.store.logEntry(
+            task.id,
+            "[ccc-campaign:discover-cessation] DISCOVER ended with no confirmed mutation or explicit phase signal; issuing the one allowed same-session continuation",
+          );
+          campaignPhaseRuntime.discoverContinuations += 1;
+          campaignPhaseRuntime.activePhase = "MUTATE";
+          await promptWithFallback(
+            session,
+            "CCC_CAMPAIGN_DISCOVER_CESSATION: The settled DISCOVER turn stopped making tool calls without an explicit phase signal or confirmed mutation. " +
+              "The read threshold is a warning, not permission to stop. Continue now in the same session and make the admitted change. " +
+              "Do not re-read files already read. Call fn_complete_phase by itself only after the mutation work is complete. " +
+              "This is the only DISCOVER continuation; a second quiet unsignaled turn fails honestly.",
+          );
+
+          let continuationCreatedDiff = false;
+          try {
+            const { stdout } = await execAsync(
+              "git status --porcelain=v1 --untracked-files=all",
+              {
+                cwd: worktreePath,
+                encoding: "utf-8",
+                timeout: 10_000,
+                maxBuffer: 8 * 1024 * 1024,
+              },
+            );
+            const continuationIsDirty = stdout.trim().length > 0;
+            const continuationFingerprint = await fingerprintCccCampaignAllowedCandidate({
+              worktreePath,
+              allowedRoots: campaignAllowedWriteRoots,
+            });
+            continuationCreatedDiff = continuationIsDirty
+              && typeof campaignTurnStartAllowedFingerprint === "string"
+              && continuationFingerprint !== campaignTurnStartAllowedFingerprint;
+            campaignPhaseRuntime.turnConfirmedMutation = continuationCreatedDiff;
+          } catch (error) {
+            executorLog.warn(
+              `${task.id}: unable to inspect the campaign worktree before bounded verification handoff: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          if (!continuationCreatedDiff && !campaignPhaseIntent.completionRequested) {
+            const exhaustedDecision = decideCccPhaseTransition({
+              phase: "DISCOVER",
+              turnSettled: true,
+              explicitPhaseSignal: false,
+              hasConfirmedMutation: false,
+              readCount: campaignPhaseRuntime.readCount,
+              discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+            });
+            campaignPhaseRuntime.terminalFailure = exhaustedDecision.failureReason
+              ?? "DISCOVER exhausted its bounded continuation without an explicit phase signal";
+            return;
+          }
+          if (!continuationCreatedDiff) return;
+          if (campaignPhaseIntent.completionRequested) return;
+
+          campaignPhaseRuntime.mutateContinuations += 1;
+          campaignPhaseRuntime.activePhase = "MUTATE";
+          await this.store.logEntry(
+            task.id,
+            "[ccc-campaign:mutate-cessation] DISCOVER continuation created a dirty candidate without an explicit phase signal; issuing the one allowed MUTATE continuation",
+          );
+          await promptWithFallback(
+            session,
+            "CCC_CAMPAIGN_MUTATE_CESSATION: DISCOVER created a dirty candidate, but the settled turn did not carry an explicit phase signal. "
+              + "Inspect the exact current diff and finish the admitted work. Call fn_complete_phase by itself when MUTATE is complete. "
+              + "The controller, not the model, runs VERIFY after the signal turn settles. This is the only MUTATE continuation.",
+          );
+          if (!campaignPhaseIntent.completionRequested) {
+            const exhaustedDecision = decideCccPhaseTransition({
+              phase: "MUTATE",
+              turnSettled: true,
+              explicitPhaseSignal: false,
+              hasConfirmedMutation: true,
+              readCount: campaignPhaseRuntime.readCount,
+              discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+              mutateContinuations: campaignPhaseRuntime.mutateContinuations,
+            });
+            campaignPhaseRuntime.terminalFailure = exhaustedDecision.failureReason
+              ?? "MUTATE exhausted its bounded continuation without an explicit phase signal";
+          }
+        })();
 
         const outcome = await Promise.race([
           promptPromise.then(() => "completed" as const),
@@ -19067,12 +19553,182 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
 
         // Completed within the timeout — let any post-completion errors surface.
         checkSessionError(session);
+        let campaignPhaseVerificationFailure = campaignPhaseRuntime.terminalFailure;
+        if (cccCampaignImplementation && campaignPhaseIntent.invalidatedByTool) {
+          campaignPhaseVerificationFailure =
+            `Campaign phase completion signal was invalidated by later tool activity: ${campaignPhaseIntent.invalidatedByTool}`;
+        } else if (
+          cccCampaignImplementation
+          && campaignPhaseIntent.completionRequested
+          && campaignPhaseRuntime.turnConfirmedMutation !== true
+        ) {
+          campaignPhaseVerificationFailure =
+            "Campaign phase completion signal cannot adopt an unchanged pre-existing candidate";
+        } else if (cccCampaignImplementation && campaignPhaseIntent.completionRequested) {
+          try {
+            const runControllerVerification = async () => {
+              await assertCccCampaignRequiredCommitCandidate({
+                rootDir: this.rootDir,
+                store: this.store,
+                taskId: task.id,
+                executionContext: stepOptions?.executionContext,
+              });
+              return verifyCccCampaignReadyCandidate({
+                taskId: task.id,
+                worktreePath,
+                campaign: campaignReadyContext!,
+                timeoutMs: resolveCccCampaignReadyTimeoutMs(
+                  settings.verificationCommandTimeoutMs,
+                ),
+                signal: stepOptions?.signal,
+                onHeartbeat: () => executorLog.log(
+                  `${task.id}: controller-owned campaign phase verifier still running`,
+                ),
+              });
+            };
+            let repairAttempts = 0;
+            let verification = await runControllerVerification();
+            let verificationDecision = decideCccPhaseTransition({
+              phase: "VERIFY",
+              turnSettled: true,
+              explicitPhaseSignal: true,
+              hasConfirmedMutation: true,
+              readCount: campaignPhaseRuntime.readCount,
+              discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+              mutateContinuations: campaignPhaseRuntime.mutateContinuations,
+              controllerVerification: verification.ready ? "ready" : "failed",
+              repairAttempts,
+            });
+            if (verificationDecision.action === "PROMPT_REPAIR") {
+              const repairStartFingerprint = await fingerprintCccCampaignAllowedCandidate({
+                worktreePath,
+                allowedRoots: campaignAllowedWriteRoots,
+              });
+              repairAttempts += 1;
+              campaignPhaseRuntime.activePhase = "REPAIR";
+              campaignPhaseIntent.completionRequested = false;
+              campaignPhaseIntent.invalidatedByTool = undefined;
+              // The repair-feedback envelope is only guaranteed on the
+              // sealed-verifier-failure branch; every other ready:false
+              // reason (identity mismatch, no diff, foreign paths, ...)
+              // falls back to the plain summary string.
+              const repairFeedbackText = (!verification.ready && verification.repairFeedback)
+                ? renderCccCampaignRepairFeedback(verification.repairFeedback)
+                : verification.summary.slice(-2_000);
+              await this.store.logEntry(
+                task.id,
+                `[ccc-campaign:repair] Controller VERIFY failed; issuing the one allowed REPAIR turn: ${repairFeedbackText}`,
+              );
+              await promptWithFallback(
+                session,
+                `CCC_CAMPAIGN_REPAIR: Controller VERIFY failed against the exact candidate:\n${repairFeedbackText}\n\n`
+                  + "Repair only the admitted files, rerun the targeted check needed to diagnose the failure, and call fn_complete_phase by itself when REPAIR is complete. "
+                  + "This is the only REPAIR turn; a second controller verification failure is terminal.",
+              );
+              const repairEndFingerprint = await fingerprintCccCampaignAllowedCandidate({
+                worktreePath,
+                allowedRoots: campaignAllowedWriteRoots,
+              });
+              const repairDecision = decideCccPhaseTransition({
+                phase: "REPAIR",
+                turnSettled: true,
+                explicitPhaseSignal: campaignPhaseIntent.completionRequested
+                  && !campaignPhaseIntent.invalidatedByTool,
+                hasConfirmedMutation: repairStartFingerprint !== repairEndFingerprint,
+                readCount: campaignPhaseRuntime.readCount,
+                discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+                mutateContinuations: campaignPhaseRuntime.mutateContinuations,
+                repairAttempts,
+              });
+              if (campaignPhaseIntent.invalidatedByTool) {
+                campaignPhaseVerificationFailure =
+                  `REPAIR phase completion signal was invalidated by later tool activity: ${campaignPhaseIntent.invalidatedByTool}`;
+              } else if (repairDecision.action !== "RUN_CONTROLLER_VERIFICATION") {
+                campaignPhaseVerificationFailure =
+                  `${repairDecision.failureReason ?? "REPAIR could not return to controller VERIFY"}`
+                  + (campaignPhaseIntent.completionRequested
+                    ? ` (initial VERIFY: ${verification.summary})`
+                    : "");
+              } else {
+                verification = await runControllerVerification();
+                verificationDecision = decideCccPhaseTransition({
+                  phase: "VERIFY",
+                  turnSettled: true,
+                  explicitPhaseSignal: true,
+                  hasConfirmedMutation: true,
+                  readCount: campaignPhaseRuntime.readCount,
+                  discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+                  mutateContinuations: campaignPhaseRuntime.mutateContinuations,
+                  controllerVerification: verification.ready ? "ready" : "failed",
+                  repairAttempts,
+                });
+                if (verificationDecision.action === "FAIL_TERMINAL") {
+                  campaignPhaseVerificationFailure =
+                    `${verificationDecision.failureReason ?? "Controller verification failed after REPAIR"}: ${verification.summary}`;
+                }
+              }
+            }
+            if (
+              !campaignPhaseVerificationFailure
+              && verificationDecision.action !== "HAND_OFF_READY"
+            ) {
+              campaignPhaseVerificationFailure =
+                verificationDecision.failureReason
+                ?? "Controller verification did not produce a ready candidate handoff";
+            } else if (
+              !campaignPhaseVerificationFailure
+              && verificationDecision.action === "HAND_OFF_READY"
+              && verification.ready
+            ) {
+              const phaseVerificationKey = this.cccPhaseVerificationKey(
+                stepOptions?.executionContext,
+              );
+              const liveFence = stepOptions?.executionContext?.execution?.executionFence;
+              if (
+                !phaseVerificationKey
+                || !liveFence
+                || typeof liveFence.leaseOwner !== "string"
+                || liveFence.leaseOwner.length === 0
+              ) {
+                campaignPhaseVerificationFailure =
+                  "Controller verification has no sealed phase-attempt custody key";
+              } else {
+                const verifiedCandidateHandoff: CccCampaignReadyCommitHandoff =
+                  Object.freeze({
+                    taskId: verification.taskId,
+                    verifiedWorktreePath: verification.verifiedWorktreePath,
+                    verifiedStartCommit: verification.verifiedStartCommit,
+                    frozenBaseCommit: verification.frozenBaseCommit,
+                    allowedRoots: Object.freeze([...verification.allowedRoots]),
+                    candidateFingerprint: verification.candidateFingerprint,
+                    executionFence: Object.freeze({
+                      workItemId: liveFence.workItemId,
+                      leaseOwner: liveFence.leaseOwner,
+                      attempt: liveFence.attempt,
+                      runId: liveFence.runId,
+                    }),
+                  });
+                this.cccPhaseVerifiedCandidateHandoffs.set(
+                  phaseVerificationKey,
+                  verifiedCandidateHandoff,
+                );
+              }
+            }
+          } catch (error) {
+            campaignPhaseVerificationFailure =
+              `Controller verification could not prove phase completion: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
         await accumulateSessionTokenUsage(this.store, task.id, session, {
             agentId: task.assignedAgentId ?? undefined,
             role: "executor",
           });
         session.dispose();
         await agentLogger.flush();
+
+        if (campaignPhaseVerificationFailure) {
+          return { success: false, output, error: campaignPhaseVerificationFailure };
+        }
 
         const parsed = requireVerdict ? parseWorkflowStepOutput(output) : parseWorkflowStepOutput(output, { requireVerdict: false });
         if (parsed.verdict) {
@@ -20230,7 +20886,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
     // at a worktree directory instead of the main repo — produces paths like
     // `.worktrees/green-finch/.worktrees/amber-panda` that bloat the filesystem
     // and confuse every tool that walks git state.
-    await this.assertWorktreePathNotNested(path, taskId);
+    await this.assertWorktreePathNotNested(path, taskId, settings);
 
     const installGuardOrCleanup = async () => {
       try {
@@ -20704,16 +21360,35 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
    * repo root. The repo root itself is a worktree (main branch) and must be
    * allowed — we only reject paths strictly *inside* a non-root worktree.
    */
-  private async assertWorktreePathNotNested(path: string, taskId: string): Promise<void> {
-    const target = resolvePath(path);
-    const rootResolved = resolvePath(this.rootDir);
+  private async assertWorktreePathNotNested(
+    path: string,
+    taskId: string,
+    settings: Pick<Settings, "worktreesDir"> = {},
+  ): Promise<void> {
+    const target = canonicalizePath(path);
+    const rootResolved = canonicalizePath(this.rootDir);
+    const primaryCheckoutRoot = await this.resolvePrimaryCheckoutRoot();
+    const targetUsesConfiguredWorktreeContainer = isInsideWorktreesDir(
+      this.rootDir,
+      target,
+      settings,
+    );
     const registered = await getRegisteredWorktreePaths(this.rootDir);
 
     for (const wt of registered) {
       if (wt === rootResolved) continue; // root is allowed as ancestor
+      // A linked project root defaults task worktrees to the primary checkout's
+      // configured worktree container. Permit only that derived container;
+      // arbitrary paths elsewhere inside the primary checkout remain refused.
+      if (
+        primaryCheckoutRoot
+        && wt === primaryCheckoutRoot
+        && targetUsesConfiguredWorktreeContainer
+      ) continue;
       if (wt === target) continue; // exact match handled later as "already registered"
       const rel = relative(wt, target);
-      if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+      const lexicallyNested = rel && !rel.startsWith("..") && !isAbsolute(rel);
+      if (lexicallyNested || this.hasRegisteredAncestorIdentity(path, wt)) {
         await this.store.logEntry(
           taskId,
           `Refusing to create nested worktree`,
@@ -20724,6 +21399,46 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           `This usually means the executor was launched with rootDir pointing at a worktree instead of the main repo.`,
         );
       }
+    }
+  }
+
+  private hasRegisteredAncestorIdentity(path: string, registeredPath: string): boolean {
+    let registeredIdentity: ReturnType<typeof statSync>;
+    try {
+      registeredIdentity = statSync(registeredPath);
+    } catch {
+      return false;
+    }
+    let cursor = dirname(resolvePath(path));
+    for (;;) {
+      try {
+        const identity = statSync(cursor);
+        if (
+          identity.dev === registeredIdentity.dev
+          && identity.ino === registeredIdentity.ino
+        ) return true;
+      } catch {
+        // Missing descendants are expected before a worktree is created.
+      }
+      const parent = dirname(cursor);
+      if (parent === cursor) return false;
+      cursor = parent;
+    }
+  }
+
+  private async resolvePrimaryCheckoutRoot(): Promise<string | null> {
+    try {
+      const result = await execAsync("git rev-parse --path-format=absolute --git-common-dir", {
+        cwd: this.rootDir,
+        encoding: "utf-8",
+        timeout: 5_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const commonGitDir = (typeof result === "string" ? result : result.stdout).trim();
+      if (basename(commonGitDir) !== ".git") return null;
+      return canonicalizePath(dirname(commonGitDir));
+    } catch {
+      return null;
     }
   }
 

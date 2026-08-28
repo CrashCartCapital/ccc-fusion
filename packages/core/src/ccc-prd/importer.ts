@@ -22,6 +22,7 @@ import { createCccCampaignManifest, hashCccCampaignManifest, parseCccCampaignExe
 import { reconstructCccCampaignCustody } from "../ccc-campaign/custody.js";
 import {
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+  cccCampaignRequestFloor,
 } from "../ccc-campaign/request-budget.js";
 import {
   CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_SEALED_BUNDLE_V1,
@@ -795,6 +796,9 @@ export function nativeWorkflowIr(
             cccExecutionTransport: route.transport,
             cccExecutionProviderId: route.providerId,
             cccExecutionModelId: route.modelId,
+            ...(route.receiptAdapterId
+              ? { cccExecutionReceiptAdapterId: route.receiptAdapterId }
+              : {}),
             cccExecutionRouteSha256: contentDigest(route),
             ...(route.workflowExtensionId
               ? { cccExecutionWorkflowExtensionId: route.workflowExtensionId }
@@ -1386,10 +1390,11 @@ function assertFreshProductRequestBudgetFloor(
 ): void {
   if (executionPolicy.schema !== "ccc-campaign.execution-policy.v2") return;
   const providerTaskCount = executionPolicy.routes.length;
-  if (bundle.bounds.maxRequests >= providerTaskCount) return;
+  const floor = cccCampaignRequestFloor(providerTaskCount);
+  if (bundle.bounds.maxRequests >= floor) return;
   throw new CccPrdImportError(
     CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
-    `CCC PRD product import maxRequests ${bundle.bounds.maxRequests} is below the provider-task floor ${providerTaskCount}`,
+    `CCC PRD product import maxRequests ${bundle.bounds.maxRequests} is below the structural floor ${floor} (2 per provider task: one MUTATE turn plus the single REPAIR turn; this floor is not an adequacy guarantee)`,
   );
 }
 

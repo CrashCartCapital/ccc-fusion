@@ -1,0 +1,4 @@
+{
+  "report_command": ["python3", "gen_report.py"],
+  "report_file": "verify-report.json"
+}

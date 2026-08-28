@@ -16,6 +16,10 @@ export const CCC_PRD_PROOF_ADMISSION_V1_SCHEMA_VERSION =
 export const CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION =
   "ccc-prd.proof-admission.v2" as const;
 export const CCC_PRD_PROOF_V2_SCHEMA_VERSION = "ccc-prd.proof.v2" as const;
+export const CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION =
+  "ccc-prd.verifier.python-adapter.v1" as const;
+export const CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION =
+  "ccc-prd.python-runtime-manifest.v1" as const;
 export const CCC_PRD_EXECUTION_PROMPT_V1_SCHEMA_VERSION =
   "ccc-prd.execution-prompt.v1" as const;
 export const CCC_PRD_EXECUTION_PROMPT_V2_SCHEMA_VERSION =
@@ -149,6 +153,47 @@ export type CccPrdExecutableIdentity = {
   versionOutputSha256: string;
 };
 
+export type CccPrdVerifierProfilePythonAdapterV1 = {
+  schema: typeof CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION;
+  /** Target-relative adapter path, owned by verifierClosure. */
+  adapterPath: string;
+  /** Target-relative directory containing the adapter's closure-owned target. */
+  targetPath: string;
+};
+
+export type CccPrdVerifierProfile = CccPrdVerifierProfilePythonAdapterV1;
+
+export type CccPrdPythonRuntimeFile = {
+  /** Controller-observed absolute path before sealing. */
+  path: string;
+  sha256: string;
+  /** Original Mach-O dependency spellings that resolve to this file. */
+  requestedPaths?: string[];
+};
+
+export type CccPrdPythonRuntimeManifestV1 = {
+  schema: typeof CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION;
+  interpreter: CccPrdPythonRuntimeFile;
+  /** Canonical controller-observed root containing the stdlib entries. */
+  stdlibRoot: string;
+  /** Canonical Python prefix used as PYTHONHOME (parent of stdlibRoot). */
+  pythonHomeRoot: string;
+  /** Canonical controller-observed purelib/platlib and explicit import roots; kept bounded for PYTHONPATH. */
+  sitePackagesRoots: string[];
+  /** Canonical roots that contain extension modules; kept bounded for PYTHONPATH. */
+  extensionModuleRoots: string[];
+  /** Additional regular files required by framework-backed interpreters. */
+  runtimeSupport: CccPrdPythonRuntimeFile[];
+  stdlib: CccPrdPythonRuntimeFile[];
+  sitePackages: CccPrdPythonRuntimeFile[];
+  extensionModules: CccPrdPythonRuntimeFile[];
+  dylibClosure: CccPrdPythonRuntimeFile[];
+};
+
+export type CccPrdPythonExecutionToolchain = CccPrdExecutableIdentity & {
+  runtimeManifest: CccPrdPythonRuntimeManifestV1;
+};
+
 export type CccPrdProofHostIdentity = CccPrdExecutableIdentity & {
   id: string;
 };
@@ -167,6 +212,8 @@ export type CccPrdProofExecutionToolchain = {
   node: CccPrdExecutableIdentity;
   proofHost: CccPrdProofHostIdentity;
   linkedRuntime: CccPrdLinkedRuntimeEntry[];
+  /** Present only for the versioned Python-adapter verifier profile. */
+  python?: CccPrdPythonExecutionToolchain;
 };
 
 export type CccPrdProofV2 = {
@@ -185,6 +232,8 @@ export type CccPrdProofV2 = {
   verifierClosure: CccPrdVerifierClosureEntry[];
   candidateInputs: string[];
   executionToolchain: CccPrdProofExecutionToolchain;
+  /** Absent preserves the frozen Node verifier contract byte-for-byte. */
+  verifierProfile?: CccPrdVerifierProfile;
   spans: CccPrdSourceSpan[];
   confidence: CccPrdConfidence;
   admission?: CccPrdProofAdmissionV2;

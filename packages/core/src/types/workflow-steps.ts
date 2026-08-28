@@ -226,8 +226,24 @@ export interface CustomProvider {
    * (design D-4): absent means unknown means not admitted for quote-bearing
    * CCC PRD work (extraction routes must declare capability rather than
    * auto-detecting the model architecture behind an OpenAI-compatible URL).
+   *
+   * FNXC:ProviderReasoning 2026-08-24-02:30:
+   * `reasoning` is likewise a declared operator assertion. pi-ai gates every
+   * reasoning branch (`reasoning_effort`, `thinking`, `enable_thinking`, ...) on
+   * the registered model's `reasoning` capability, so a gateway-backed reasoning
+   * model silently runs as a plain chat model until this is declared. Absent
+   * means unknown means non-reasoning, which preserves the historical
+   * registration for every provider configured before this field existed --
+   * never auto-detect it from the model id behind an OpenAI-compatible URL.
    */
-  models?: { id: string; name: string; maxTokens?: number; contextWindow?: number; verbatimCapable?: boolean }[];
+  models?: {
+    id: string;
+    name: string;
+    maxTokens?: number;
+    contextWindow?: number;
+    verbatimCapable?: boolean;
+    reasoning?: boolean;
+  }[];
 }
 
 export interface WorkflowStepInput {

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { execSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import {
   AI_MERGE_DIRNAME,
   isAiMergeContainerDir,
@@ -14,12 +17,69 @@ import {
 describe("worktree-paths", () => {
   const rootDir = "/tmp/repo-name";
 
+  function git(cwd: string, command: string): string {
+    return execSync(command, { cwd, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  }
+
   it("defaults to <rootDir>/.worktrees when unset", () => {
     expect(resolveWorktreesDir(rootDir, undefined)).toBe(join(rootDir, ".worktrees"));
   });
 
   it("defaults to <rootDir>/.worktrees when settings object is present but worktreesDir is unset", () => {
     expect(resolveWorktreesDir(rootDir, {} as any)).toBe(join(rootDir, ".worktrees"));
+  });
+
+  it("defaults linked worktree project roots to the primary checkout worktrees directory", () => {
+    const mainRoot = mkdtempSync(join(tmpdir(), "fusion-worktree-paths-main-"));
+    const linkedRoot = mkdtempSync(join(tmpdir(), "fusion-worktree-paths-linked-"));
+    rmSync(linkedRoot, { recursive: true, force: true });
+    try {
+      git(mainRoot, "git init -b main");
+      git(mainRoot, 'git config user.email "test@example.com"');
+      git(mainRoot, 'git config user.name "Test User"');
+      writeFileSync(join(mainRoot, "README.md"), "root\n", "utf-8");
+      git(mainRoot, "git add README.md");
+      git(mainRoot, 'git commit -m "init"');
+      git(mainRoot, `git worktree add -b linked-test ${JSON.stringify(linkedRoot)} HEAD`);
+      const primaryCheckoutRoot = dirname(git(linkedRoot, "git rev-parse --path-format=absolute --git-common-dir"));
+
+      expect(primaryCheckoutRoot).toContain("fusion-worktree-paths-main-");
+      expect(resolveWorktreesDir(linkedRoot, undefined)).toBe(join(primaryCheckoutRoot, ".worktrees"));
+      expect(resolveTaskWorktreePath(linkedRoot, undefined, "fn-1")).toBe(join(primaryCheckoutRoot, ".worktrees", "fn-1"));
+    } finally {
+      rmSync(linkedRoot, { recursive: true, force: true });
+      rmSync(mainRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("re-resolves a reused linked-root path instead of retaining stale repository metadata", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "fusion-worktree-paths-reuse-"));
+    const linkedRoot = join(fixtureRoot, "linked");
+    const createLinkedRepo = (mainName: string): string => {
+      const mainRoot = join(fixtureRoot, mainName);
+      mkdirSync(mainRoot, { recursive: true });
+      git(mainRoot, "git init -b main");
+      git(mainRoot, 'git config user.email "test@example.com"');
+      git(mainRoot, 'git config user.name "Test User"');
+      writeFileSync(join(mainRoot, "README.md"), `${mainName}\n`, "utf-8");
+      git(mainRoot, "git add README.md");
+      git(mainRoot, 'git commit -m "init"');
+      git(mainRoot, `git worktree add -b linked-${mainName} ${JSON.stringify(linkedRoot)} HEAD`);
+      return mainRoot;
+    };
+    try {
+      const firstMain = createLinkedRepo("main-a");
+      const firstPrimary = dirname(git(linkedRoot, "git rev-parse --path-format=absolute --git-common-dir"));
+      expect(resolveWorktreesDir(linkedRoot, undefined)).toBe(join(firstPrimary, ".worktrees"));
+      rmSync(linkedRoot, { recursive: true, force: true });
+      rmSync(firstMain, { recursive: true, force: true });
+
+      createLinkedRepo("main-b");
+      const secondPrimary = dirname(git(linkedRoot, "git rev-parse --path-format=absolute --git-common-dir"));
+      expect(resolveWorktreesDir(linkedRoot, undefined)).toBe(join(secondPrimary, ".worktrees"));
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 
   it("supports absolute path", () => {

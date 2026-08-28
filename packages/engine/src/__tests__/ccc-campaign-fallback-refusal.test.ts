@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createAgentSession, type AgentSession } from "@earendil-works/pi-coding-agent";
-import { createFnAgent } from "../pi.js";
+import {
+  createAgentSession,
+  createBashTool,
+  createGrepTool,
+  createLsTool,
+  createReadTool,
+  createWriteTool,
+  type AgentSession,
+} from "@earendil-works/pi-coding-agent";
+import { createFnAgent, isCccCampaignDiscoveryToolCall } from "../pi.js";
 
 /*
 FNXC:CCCCampaignFallback 2026-08-01-17:10:
@@ -224,6 +232,296 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
     expect((failure as { code?: string }).code).toBeUndefined();
     expect(failure instanceof Error ? failure.message : "").toBe(RETRYABLE_PRIMARY_FAILURE);
     expect(createAgentSessionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds ccc campaign discovery tools before repeated reads consume the provider turn", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const bashExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "bash result" }] });
+    const readExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "read result" }] });
+    const grepExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "grep result" }] });
+    const lsExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ls result" }] });
+    vi.mocked(createBashTool).mockReturnValueOnce({ name: "bash", execute: bashExecute } as never);
+    vi.mocked(createReadTool).mockReturnValueOnce({ name: "read", execute: readExecute } as never);
+    vi.mocked(createGrepTool).mockReturnValueOnce({ name: "grep", execute: grepExecute } as never);
+    vi.mocked(createLsTool).mockReturnValueOnce({ name: "ls", execute: lsExecute } as never);
+    createAgentSessionMock.mockResolvedValueOnce({
+      session: synthSession("ccc-loopback", "primary-model"),
+    } as never);
+
+    await createFnAgent(campaignOptions({
+      tools: "coding",
+      cccCampaignPhaseToolPolicy: {
+        readOnlyToolNames: ["bash", "read", "grep", "ls"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now",
+        refusalMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+      },
+    }) as never);
+
+    const sessionOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      customTools: Array<{
+        name: string;
+        executionMode?: string;
+        execute: (...args: any[]) => Promise<unknown>;
+      }>;
+    };
+    const bashTool = sessionOptions.customTools.find((tool) => tool.name === "bash")!;
+    expect(sessionOptions.customTools.every((tool) => tool.executionMode === "sequential")).toBe(true);
+    const readTool = sessionOptions.customTools.find((tool) => tool.name === "read")!;
+    const grepTool = sessionOptions.customTools.find((tool) => tool.name === "grep")!;
+    const lsTool = sessionOptions.customTools.find((tool) => tool.name === "ls")!;
+
+    await expect(bashTool.execute("call-0", { command: "pnpm test" }, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "bash result" }],
+    });
+    await expect(bashTool.execute("call-1", { command: "git grep needle" }, undefined)).resolves.toMatchObject({
+      isError: false,
+      content: [
+        { type: "text", text: "bash result" },
+        { type: "text", text: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now" },
+      ],
+    });
+    await expect(readTool.execute("call-2", { path: "src/a.ts" }, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    await expect(grepTool.execute("call-3", { pattern: "needle" }, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    await expect(lsTool.execute("call-4", {}, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    expect(bashExecute).toHaveBeenCalledTimes(2);
+    expect(readExecute).not.toHaveBeenCalled();
+    expect(grepExecute).not.toHaveBeenCalled();
+    expect(lsExecute).not.toHaveBeenCalled();
+  });
+
+  it("classifies only read-like campaign discovery tool calls", () => {
+    expect(isCccCampaignDiscoveryToolCall("read", { path: "src/a.ts" })).toBe(true);
+    expect(isCccCampaignDiscoveryToolCall("edit", { path: "src/a.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("write", { path: "src/a.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("fn_complete_phase", {})).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "MSG=\"hello world\" git grep needle" })).toBe(true);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "cat src/a.ts 2>/dev/null" })).toBe(true);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "cat src/a.ts 1>src/b.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "cat src/a.ts>src/b.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "sed -i '' 's/a/b/' src/a.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "find . -name '*.tmp' -delete" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "git status && pnpm test" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "cat src/a.ts | tee src/b.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "cat < src/a.ts" })).toBe(true);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "/bin/cat src/a.ts" })).toBe(true);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "env git grep needle" })).toBe(true);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "cat /dev/null & touch src/b.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "cat <(touch src/b.ts)" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "sed -i.bak 's/a/b/' src/a.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "sed -i'' 's/a/b/' src/a.ts" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "find . -name '*.ts' -fprint result.txt" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "git diff --output=result.patch" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("bash", { command: "git show --output result.patch HEAD" })).toBe(false);
+  });
+
+  it("executes an unknown Bash probe only within the bounded discovery allowance", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const bashExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "probe result" }] });
+    vi.mocked(createBashTool).mockReturnValueOnce({ name: "bash", execute: bashExecute } as never);
+    createAgentSessionMock.mockResolvedValueOnce({ session: synthSession("ccc-loopback", "primary-model") } as never);
+
+    await createFnAgent(campaignOptions({
+      tools: "coding",
+      cccCampaignPhaseToolPolicy: {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 1,
+        guidanceMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now",
+        refusalMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+        currentPhase: () => "DISCOVER",
+        onPotentialMutationCompleted: async () => false,
+      },
+    }) as never);
+
+    const sessionOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      customTools: Array<{ name: string; execute: (...args: any[]) => Promise<unknown> }>;
+    };
+    const bashTool = sessionOptions.customTools.find((tool) => tool.name === "bash")!;
+
+    await expect(bashTool.execute("call-1", { command: "pnpm test" }, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "probe result" }],
+    });
+    await expect(bashTool.execute("call-2", { command: "node inspect.js" }, undefined)).resolves.toMatchObject({
+      isError: false,
+      content: [
+        { type: "text", text: "probe result" },
+        { type: "text", text: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now" },
+      ],
+    });
+    await expect(bashTool.execute("call-3", { command: "python inspect.py" }, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    expect(bashExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("phase-bounds an unclassified custom tool instead of letting it bypass DISCOVER", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const customExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "custom result" }] });
+    createAgentSessionMock.mockResolvedValueOnce({ session: synthSession("ccc-loopback", "primary-model") } as never);
+
+    await createFnAgent(campaignOptions({
+      tools: "coding",
+      customTools: [{ name: "mcp_probe", execute: customExecute }],
+      cccCampaignPhaseToolPolicy: {
+        readOnlyToolNames: ["bash"],
+        exemptToolNames: ["fn_complete_phase"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now",
+        refusalMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+        currentPhase: () => "DISCOVER",
+        onPotentialMutationCompleted: async () => false,
+      },
+    }) as never);
+
+    const sessionOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      customTools: Array<{ name: string; execute: (...args: any[]) => Promise<unknown> }>;
+    };
+    const customTool = sessionOptions.customTools.find((tool) => tool.name === "mcp_probe")!;
+    await customTool.execute("call-1", {}, undefined);
+    await customTool.execute("call-2", {}, undefined);
+    await expect(customTool.execute("call-3", {}, undefined)).resolves.toMatchObject({ isError: true });
+    expect(customExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves DISCOVER after a successful tool mutation so verification reads are not blocked", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const readExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "read result" }], isError: false });
+    const writeExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "write result" }], isError: false });
+    vi.mocked(createReadTool).mockReturnValueOnce({ name: "read", execute: readExecute } as never);
+    vi.mocked(createWriteTool).mockReturnValueOnce({ name: "write", execute: writeExecute } as never);
+    createAgentSessionMock.mockResolvedValueOnce({ session: synthSession("ccc-loopback", "primary-model") } as never);
+    let phase = "DISCOVER";
+
+    await createFnAgent(campaignOptions({
+      tools: "coding",
+      cccCampaignPhaseToolPolicy: {
+        readOnlyToolNames: ["read", "bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now",
+        refusalMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+        currentPhase: () => phase,
+        onPotentialMutationCompleted: async () => {
+          phase = "MUTATE";
+          return true;
+        },
+      },
+    }) as never);
+
+    const sessionOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      customTools: Array<{ name: string; execute: (...args: any[]) => Promise<unknown> }>;
+    };
+    const readTool = sessionOptions.customTools.find((tool) => tool.name === "read")!;
+    const writeTool = sessionOptions.customTools.find((tool) => tool.name === "write")!;
+
+    await readTool.execute("call-1", { path: "src/a.ts" }, undefined);
+    await writeTool.execute("call-2", { path: "src/a.ts", content: "changed" }, undefined);
+    await expect(readTool.execute("call-3", { path: "src/a.ts" }, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "read result" }],
+      isError: false,
+    });
+    expect(phase).toBe("MUTATE");
+    expect(readExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("allows only one explicit mutation attempt after discovery tools are exhausted", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const bashExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "bash result" }] });
+    const readExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "read result" }] });
+    vi.mocked(createBashTool).mockReturnValueOnce({ name: "bash", execute: bashExecute } as never);
+    vi.mocked(createReadTool).mockReturnValueOnce({ name: "read", execute: readExecute } as never);
+    createAgentSessionMock.mockResolvedValueOnce({
+      session: synthSession("ccc-loopback", "primary-model"),
+    } as never);
+
+    await createFnAgent(campaignOptions({
+      tools: "coding",
+      cccCampaignPhaseToolPolicy: {
+        readOnlyToolNames: ["bash", "read"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now",
+        refusalMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+      },
+    }) as never);
+
+    const sessionOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      customTools: Array<{ name: string; execute: (...args: any[]) => Promise<unknown> }>;
+    };
+    const bashTool = sessionOptions.customTools.find((tool) => tool.name === "bash")!;
+    const readTool = sessionOptions.customTools.find((tool) => tool.name === "read")!;
+
+    await expect(readTool.execute("call-1", { path: "src/a.ts" }, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "read result" }],
+    });
+    await expect(readTool.execute("call-2", { path: "src/b.ts" }, undefined)).resolves.toMatchObject({
+      isError: false,
+      content: [
+        { type: "text", text: "read result" },
+        { type: "text", text: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now" },
+      ],
+    });
+    await expect(bashTool.execute("call-3", { command: "pnpm test" }, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    await expect(bashTool.execute("call-4", { command: "sed -i '' 's/a/b/' src/a.ts" }, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    await expect(bashTool.execute("call-5", { command: "cat src/a.ts>src/b.ts" }, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    expect(bashExecute).toHaveBeenCalledTimes(1);
+    expect(readExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("applies the campaign discovery boundary only during DISCOVER", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const readExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "read result" }] });
+    vi.mocked(createReadTool).mockReturnValueOnce({ name: "read", execute: readExecute } as never);
+    createAgentSessionMock.mockResolvedValueOnce({
+      session: synthSession("ccc-loopback", "primary-model"),
+    } as never);
+
+    await createFnAgent(campaignOptions({
+      tools: "coding",
+      cccCampaignPhaseToolPolicy: {
+        readOnlyToolNames: ["read"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now",
+        refusalMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+        currentPhase: () => "REPAIR",
+      },
+    }) as never);
+
+    const sessionOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      customTools: Array<{ name: string; execute: (...args: any[]) => Promise<unknown> }>;
+    };
+    const readTool = sessionOptions.customTools.find((tool) => tool.name === "read")!;
+
+    await expect(readTool.execute("call-1", { path: "src/a.ts" }, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "read result" }],
+    });
+    await expect(readTool.execute("call-2", { path: "src/b.ts" }, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "read result" }],
+    });
+    expect(readExecute).toHaveBeenCalledTimes(2);
   });
 
   it("keeps ordinary non-ccc sessions falling back to the configured model", async () => {

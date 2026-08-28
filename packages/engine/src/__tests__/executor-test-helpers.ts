@@ -1,5 +1,6 @@
 import { vi } from "vitest";
 import type { Mock } from "vitest";
+import { isCccCampaignDiscoveryToolCall } from "../ccc-campaign-tool-phase.js";
 import { installTaskWorktreeIdentityGuard } from "../worktree-hooks.js";
 import type * as ReviewerModule from "../reviewer.js";
 
@@ -12,6 +13,7 @@ vi.mock("../pi.js", () => ({
     const suffixes = [thinking ? `thinking effort: ${thinking}` : "", ...annotations].filter(Boolean);
     return suffixes.length ? `${model} ${suffixes.map((suffix) => `(${suffix})`).join(" ")}` : model;
   }),
+  isCccCampaignDiscoveryToolCall,
   compactSessionContext: vi.fn(async (session, instructions) => {
     if (typeof (session as any).compact === "function") {
       return (session as any).compact(instructions);
@@ -771,6 +773,7 @@ export function captureNamedTool<T extends { name: string }>(
 
 export function resetExecutorMocks() {
   vi.clearAllMocks();
+  mockedCreateFnAgent.mockReset();
   mockedExec.mockReset();
   mockedExecFile.mockReset();
   mockedExecFile.mockImplementation(((_file: string, _args: string[] | undefined, opts: unknown, cb: unknown) => {

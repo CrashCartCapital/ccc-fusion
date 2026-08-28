@@ -9,6 +9,10 @@ The pi 0.80 SDK keeps compatibility helpers under ./compat and exposes provider 
 */
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
 import { customProviderRegistryKey, type CustomProvider } from "@fusion/core";
+import {
+  CCC_TERMINAL_ROUTE_RECEIPT_API,
+  streamCccTerminalRouteReceipt,
+} from "../ccc-route-receipt-adapter.js";
 
 async function createInMemoryModelRegistry(): Promise<ModelRegistry> {
   const runtime = await ModelRuntime.create({
@@ -109,13 +113,33 @@ describe("custom providers openai-completions regression", () => {
   */
   async function streamIdentityProbe(
     sseChunks: string[],
-  ): Promise<{ responseModel?: string; model: string }> {
-    const server = createServer((request, response) => {
+    providerName = "keepalive-probe",
+    sseComments: string[] = [],
+    signal?: AbortSignal,
+    holdOpenMs = 0,
+    commentsBeforeChunks = false,
+    receiptAdapterSelected = false,
+  ): Promise<{ responseModel?: string; model: string; stopReason?: string; errorMessage?: string }> {
+    const server = createServer(async (request, response) => {
       request.on("data", () => {});
       request.on("end", () => {
         response.writeHead(200, { "content-type": "text/event-stream" });
+        if (commentsBeforeChunks) {
+          for (const comment of sseComments) {
+            response.write(`: ${comment}\n\n`);
+          }
+        }
         for (const chunk of sseChunks) {
           response.write(`data: ${chunk}\n\n`);
+        }
+        if (!commentsBeforeChunks) {
+          for (const comment of sseComments) {
+            response.write(`: ${comment}\n\n`);
+          }
+        }
+        if (holdOpenMs > 0) {
+          setTimeout(() => response.end("data: [DONE]\n\n"), holdOpenMs);
+          return;
         }
         response.end("data: [DONE]\n\n");
       });
@@ -127,20 +151,32 @@ describe("custom providers openai-completions regression", () => {
     const address = server.address() as AddressInfo;
     try {
       const modelRegistry = await createInMemoryModelRegistry();
-      modelRegistry.registerProvider("keepalive-probe", {
+      modelRegistry.registerProvider(providerName, {
         baseUrl: `http://127.0.0.1:${address.port}/v1`,
-        api: "openai-completions",
+        api: receiptAdapterSelected
+          ? CCC_TERMINAL_ROUTE_RECEIPT_API
+          : "openai-completions",
         apiKey: "CUSTOM_KEY",
-        models: [{ id: "my-model", name: "My Model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16384 }],
+        models: [{
+          id: "my-model",
+          name: "My Model",
+          api: receiptAdapterSelected ? CCC_TERMINAL_ROUTE_RECEIPT_API : "openai-completions",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 16384,
+        }],
+        ...(receiptAdapterSelected ? { streamSimple: streamCccTerminalRouteReceipt } : {}),
       });
       await modelRegistry.refresh();
-      const model = modelRegistry.find("keepalive-probe", "my-model");
-      const response = await completeSimple(
-        model!,
-        { messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
-        { apiKey: "CUSTOM_KEY" },
-      );
-      return response as { responseModel?: string; model: string };
+      const model = modelRegistry.find(providerName, "my-model");
+      const context = { messages: [{ role: "user" as const, content: "Hi", timestamp: Date.now() }] };
+      const streamOptions = { apiKey: "CUSTOM_KEY", ...(signal ? { signal } : {}) };
+      const response = receiptAdapterSelected
+        ? await streamCccTerminalRouteReceipt(model!, context, streamOptions).result()
+        : await completeSimple(model!, context, streamOptions);
+      return response as { responseModel?: string; model: string; stopReason?: string; errorMessage?: string };
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
@@ -161,6 +197,126 @@ describe("custom providers openai-completions regression", () => {
       "{\"id\":\"chatcmpl-alias\",\"object\":\"chat.completion.chunk\",\"model\":\"other-backend-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
     ]);
     expect(response.responseModel).toBe("other-backend-model");
+  });
+
+  it("RED-OMNI-STREAM-1: captures only the allowlisted final OmniRoute SSE comment pair", async () => {
+    const response = await streamIdentityProbe([
+      "{\"id\":\"chatcmpl-omni\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+      "{\"id\":\"chatcmpl-omni\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}",
+    ], "omniroute-minimax-m3-pinned", [
+      "unrelated=do-not-expose",
+      "x-omniroute-provider=minimax",
+      "x-omniroute-model=MiniMax-M3",
+    ], undefined, 0, false, true);
+    expect((response as { omniRoute?: unknown }).omniRoute).toEqual({
+      provider: "minimax",
+      model: "MiniMax-M3",
+    });
+    expect(response).not.toHaveProperty("comments");
+  });
+
+  it("RED-OMNI-STREAM-2: handles malformed primary SSE plus conflicting comments without unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const response = await streamIdentityProbe(
+        ["not-json"],
+        "omniroute-minimax-m3-pinned",
+        [
+          "x-omniroute-provider=minimax",
+        "x-omniroute-provider=opencode-go",
+          "x-omniroute-model=MiniMax-M3",
+        ],
+        undefined,
+        100,
+        true,
+        true,
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(response).toMatchObject({ stopReason: "error" });
+      expect(response.errorMessage).toMatch(/JSON|Unexpected token/u);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("RED-OMNI-STREAM-3: aborts an in-flight OmniRoute clone without unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const controller = new AbortController();
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const responsePromise = streamIdentityProbe(
+        [
+          "{\"id\":\"chatcmpl-abort\",\"object\":\"chat.completion.chunk\",\"model\":\"my-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}",
+        ],
+        "omniroute-minimax-m3-pinned",
+        ["x-omniroute-provider=minimax", "x-omniroute-model=MiniMax-M3"],
+        controller.signal,
+        100,
+        false,
+        true,
+      );
+      setTimeout(() => controller.abort(), 10);
+      const response = await responsePromise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(response).toMatchObject({ stopReason: "aborted" });
+      expect(unhandled).toEqual([]);
+    } finally {
+      controller.abort();
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("RED-OMNI-STREAM-4: consumes receipt and provider data through one reader without cloning", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    const originalFetch = globalThis.fetch;
+    const encoder = new TextEncoder();
+    const clone = vi.fn(() => { throw new Error("clone must not be called"); });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          "data: not-json\n\n: x-omniroute-provider=minimax\n: x-omniroute-model=MiniMax-M3\n\n",
+        ));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      body,
+      clone,
+    })));
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const response = await streamCccTerminalRouteReceipt(
+        {
+          provider: "arbitrary-gateway",
+          id: "my-model",
+          api: CCC_TERMINAL_ROUTE_RECEIPT_API,
+          baseUrl: "http://127.0.0.1:65535/v1",
+          headers: {},
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 16384,
+        } as never,
+        { messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+        { apiKey: "CUSTOM_KEY" },
+      ).result();
+      expect(response.stopReason).toBe("error");
+      expect(response.errorMessage).toMatch(/JSON|Unexpected token/u);
+      expect(clone).not.toHaveBeenCalled();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
   });
 
   it("uses system role when reasoning model explicitly disables developer role compat", () => {

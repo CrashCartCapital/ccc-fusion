@@ -11,7 +11,7 @@ import {
   realpath,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import {
   CCC_PRD_SEMANTIC_PROOF_HOST_ID,
@@ -20,6 +20,8 @@ import {
   wellKnownGitBinaryPaths,
   type CccPrdExecutableIdentity,
   type CccPrdLinkedRuntimeEntry,
+  type CccPrdPythonExecutionToolchain,
+  type CccPrdPythonRuntimeFile,
   type CccPrdProofExecutionToolchain,
   type CccPrdProofV2,
   type CccPrdVerifierClosureEntry,
@@ -224,9 +226,31 @@ function parseLiteralCommand(command: string): string[] {
   return tokens;
 }
 
+function parsePythonLiteralCommand(command: string): string[] {
+  if (
+    command.trim() !== command
+    || /[;&|`$<>\n\r\t'"\\*?{}()[\]!~]/u.test(command)
+  ) {
+    throw new Error("CCC semantic-proof Python Task target command must be literal and substitution-free");
+  }
+  const tokens = command.split(" ");
+  if (
+    tokens.length !== 4
+    || tokens[0] !== "python3"
+    || tokens[2] !== "--target"
+    || tokens.some((token) => token.length === 0 || !TARGET_COMMAND_TOKEN.test(token))
+  ) {
+    throw new Error(
+      "CCC semantic-proof Python Task target must be exactly python3 <adapter> --target <target>",
+    );
+  }
+  return tokens;
+}
+
 function literalTargetTokens(
   targetName: string,
   node: Node | null,
+  pythonProfile = false,
 ): string[] {
   if (!VERIFY_TARGET.test(targetName)) {
     throw new Error(`CCC semantic-proof Taskfile target is not an admitted verify target: ${targetName}`);
@@ -242,7 +266,7 @@ function literalTargetTokens(
   if (!isSeq(commands) || commands.anchor || commands.items.length !== 1) {
     throw new Error(`CCC semantic-proof Task target ${targetName} must contain exactly one literal command`);
   }
-  const tokens = parseLiteralCommand(
+  const tokens = (pythonProfile ? parsePythonLiteralCommand : parseLiteralCommand)(
     plainScalar(commands.items[0] as Node, `${targetName} command`),
   );
   for (const path of tokens.slice(1)) {
@@ -296,11 +320,29 @@ function verifyTaskfile(
   if (tasks.size === 0 || !tasks.has(commandMatch[1]!)) {
     throw new Error("CCC semantic-proof Taskfile must declare the selected verify target");
   }
-  const targetTokens = new Map<string, string[]>();
-  for (const [targetName, targetNode] of tasks) {
-    targetTokens.set(targetName, literalTargetTokens(targetName, targetNode));
+  const pythonProfile = proof.verifierProfile?.schema === "ccc-prd.verifier.python-adapter.v1";
+  const selectedTarget = commandMatch[1]!;
+  const tokens = literalTargetTokens(selectedTarget, tasks.get(selectedTarget)!, pythonProfile);
+  if (pythonProfile) {
+    const profile = proof.verifierProfile!;
+    const adapters = proof.verifierClosure
+      .filter((entry) => entry.role === "harness")
+      .map((entry) => entry.path);
+    const targets = proof.verifierClosure
+      .filter((entry) => entry.role === "fixture")
+      .map((entry) => entry.path);
+    if (
+      tokens.length !== 4
+      || tokens[1] !== profile.adapterPath
+      || tokens[3] !== profile.targetPath
+      || adapters.length !== 1
+      || adapters[0] !== profile.adapterPath
+      || !targets.some((path) => path.startsWith(`${profile.targetPath}/`))
+    ) {
+      throw new Error("CCC semantic-proof Python adapter and target must be closure-owned");
+    }
+    return { taskTarget: commandMatch[1]!, taskArgv: [commandMatch[1]!] };
   }
-  const tokens = targetTokens.get(commandMatch[1]!)!;
   const harnesses = proof.verifierClosure
     .filter((entry) => entry.role === "harness")
     .map((entry) => entry.path);
@@ -468,6 +510,90 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
       }
     } catch {
       throw new Error(`CCC semantic-proof toolchain drift detected for ${name}`);
+    }
+  }
+  if (toolchain.python) {
+    const python = toolchain.python;
+    try {
+      const observed = await inspectCccSemanticProofExecutable(
+        python.executablePath,
+        EXECUTABLE_VERSION_ARGS,
+      );
+      if (
+        observed.executablePath !== python.executablePath
+        || observed.executableSha256 !== python.executableSha256
+        || observed.version !== python.version
+        || observed.versionOutputSha256 !== python.versionOutputSha256
+      ) {
+        throw new Error("Python executable identity drifted");
+      }
+      if (basename(python.executablePath) !== "python3") {
+        const aliasPath = resolve(dirname(python.executablePath), "python3");
+        const alias = await readFile(aliasPath);
+        if (sha256(alias) !== python.executableSha256) {
+          throw new Error("Python bare interpreter alias drifted");
+        }
+      }
+      const manifest = python.runtimeManifest;
+      if (
+        manifest.interpreter.path !== python.executablePath
+        || manifest.interpreter.sha256 !== python.executableSha256
+      ) {
+        throw new Error("Python interpreter manifest identity drifted");
+      }
+      const runtimeRoots = [
+        manifest.stdlibRoot,
+        manifest.pythonHomeRoot,
+        ...manifest.sitePackagesRoots,
+        ...manifest.extensionModuleRoots,
+      ];
+      if (
+        runtimeRoots.length > 17
+        || new Set(manifest.sitePackagesRoots).size !== manifest.sitePackagesRoots.length
+        || new Set(manifest.extensionModuleRoots).size !== manifest.extensionModuleRoots.length
+        || new Set(runtimeRoots).size > 17
+        || runtimeRoots.some((root) => !isAbsolute(root) || root.endsWith(sep))
+        || !isSameOrWithin(manifest.stdlibRoot, manifest.pythonHomeRoot)
+      ) {
+        throw new Error("Python runtime roots are unbounded or malformed");
+      }
+      for (const root of runtimeRoots) {
+        const canonicalRoot = await realpath(root);
+        const metadata = await lstat(canonicalRoot);
+        if (canonicalRoot !== root || !metadata.isDirectory() || metadata.isSymbolicLink()) {
+          throw new Error("Python runtime root is not sealed");
+        }
+      }
+      const requireWithin = (
+        entries: readonly CccPrdPythonRuntimeFile[],
+        roots: readonly string[],
+        label: string,
+      ): void => {
+        for (const entry of entries) {
+          if (!roots.some((root) => isSameOrWithin(entry.path, root))) {
+            throw new Error(`${label} runtime escaped its sealed root`);
+          }
+        }
+      };
+      requireWithin(manifest.stdlib, [manifest.stdlibRoot], "stdlib");
+      requireWithin(manifest.sitePackages, manifest.sitePackagesRoots, "site-packages");
+      requireWithin(manifest.extensionModules, manifest.extensionModuleRoots, "extension module");
+      for (const [label, entries] of [
+        ["stdlib", manifest.stdlib],
+        ["site-packages", manifest.sitePackages],
+        ["extension module", manifest.extensionModules],
+        ["dylib", manifest.dylibClosure],
+        ["runtime support", manifest.runtimeSupport],
+      ] as const) {
+        for (const entry of entries) {
+          const current = await readPythonRuntimeByHandle(entry, label);
+          if (current.canonicalPath !== entry.path || sha256(current.bytes) !== entry.sha256) {
+            throw new Error(`${label} runtime drifted`);
+          }
+        }
+      }
+    } catch {
+      throw new Error("CCC semantic-proof Python runtime manifest drift detected before spawn");
     }
   }
   for (const entry of toolchain.linkedRuntime) {
@@ -641,6 +767,50 @@ async function readLinkedRuntimeByHandle(
   }
 }
 
+async function readPythonRuntimeByHandle(
+  entry: CccPrdPythonRuntimeFile,
+  label: string,
+): Promise<{ canonicalPath: string; bytes: Buffer }> {
+  if (!isAbsolute(entry.path)) {
+    throw new Error(`CCC semantic-proof Python ${label} runtime path must be absolute`);
+  }
+  const directMetadata = await lstat(entry.path, { bigint: true });
+  if (directMetadata.isSymbolicLink()) {
+    throw new Error(`CCC semantic-proof Python ${label} runtime path must not be a symlink`);
+  }
+  const canonicalPath = await realpath(entry.path);
+  if (canonicalPath !== entry.path) {
+    throw new Error(`CCC semantic-proof Python ${label} runtime path must be canonical: ${entry.path}`);
+  }
+  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  const handle = await open(entry.path, fsConstants.O_RDONLY | noFollow);
+  try {
+    const metadata = await handle.stat({ bigint: true });
+    if (
+      !metadata.isFile()
+      || metadata.dev !== directMetadata.dev
+      || metadata.ino !== directMetadata.ino
+      || metadata.mode !== directMetadata.mode
+      || metadata.size !== directMetadata.size
+      || metadata.mtimeNs !== directMetadata.mtimeNs
+      || metadata.ctimeNs !== directMetadata.ctimeNs
+      || metadata.birthtimeNs !== directMetadata.birthtimeNs
+    ) {
+      throw new Error(`CCC semantic-proof Python ${label} runtime path is not a regular file`);
+    }
+    const bytes = await handle.readFile();
+    if (BigInt(bytes.length) !== metadata.size) {
+      throw new Error(`CCC semantic-proof Python ${label} runtime size drifted: ${entry.path}`);
+    }
+    if (sha256(bytes) !== entry.sha256) {
+      throw new Error(`CCC semantic-proof Python ${label} runtime digest drifted: ${entry.path}`);
+    }
+    return { canonicalPath, bytes };
+  } finally {
+    await handle.close();
+  }
+}
+
 async function sealExecutable(
   toolchainRoot: string,
   identity: CccPrdExecutableIdentity,
@@ -652,6 +822,129 @@ async function sealExecutable(
   return {
     canonicalPath: executable.canonicalPath,
     sealedPath: await writeSealedExecutable(toolchainRoot, executable.canonicalPath, executable.bytes),
+  };
+}
+
+async function sealPythonExecutionToolchain(
+  toolchainRoot: string,
+  python: CccPrdPythonExecutionToolchain,
+  sealedByCanonicalPath: Map<string, string>,
+): Promise<CccPrdPythonExecutionToolchain> {
+  if (!/^(?:python3(?:\.\d+)*|Python)$/u.test(basename(python.executablePath))) {
+    throw new Error("CCC semantic-proof Python verifier executable must be named python3");
+  }
+  const interpreter = await readPythonRuntimeByHandle(
+    python.runtimeManifest.interpreter,
+    "interpreter",
+  );
+  if (
+    interpreter.canonicalPath !== python.executablePath
+    || sha256(interpreter.bytes) !== python.executableSha256
+  ) {
+    throw new Error("CCC semantic-proof Python runtime interpreter identity does not match executable");
+  }
+  const sealRuntimeFile = async (
+    entry: CccPrdPythonRuntimeFile,
+    label: string,
+    mode: number,
+  ): Promise<CccPrdPythonRuntimeFile> => {
+    const observed = await readPythonRuntimeByHandle(entry, label);
+    let sealedPath = sealedByCanonicalPath.get(observed.canonicalPath);
+    if (!sealedPath) {
+      sealedPath = await writeSealedFile(toolchainRoot, observed.canonicalPath, observed.bytes, mode);
+      sealedByCanonicalPath.set(observed.canonicalPath, sealedPath);
+    }
+    return {
+      path: sealedPath,
+      sha256: sha256(observed.bytes),
+      ...(entry.requestedPaths ? { requestedPaths: [...entry.requestedPaths].sort() } : {}),
+    };
+  };
+  const sealRuntimeRoot = async (root: string, label: string): Promise<string> => {
+    if (!isAbsolute(root) || root.endsWith(sep)) {
+      throw new Error(`CCC semantic-proof Python ${label} root must be canonical and absolute`);
+    }
+    const sealedRoot = resolve(toolchainRoot, sealedRelativeExecutablePath(root, `${label} root`));
+    await mkdir(sealedRoot, { recursive: true });
+    return sealedRoot;
+  };
+  const sealedInterpreter = await sealRuntimeFile(
+    python.runtimeManifest.interpreter,
+    "interpreter",
+    0o555,
+  );
+  const sealCategory = async (
+    entries: readonly CccPrdPythonRuntimeFile[],
+    label: string,
+  ) => Promise.all(entries.map((entry, index) => sealRuntimeFile(entry, `${label}[${index}]`, 0o444)));
+  // Categories can overlap (stdlib extension modules are also listed in the
+  // extension-module category). Seal them in order so the canonical-path map
+  // is populated before a second category attempts the same file.
+  const stdlib = await sealCategory(python.runtimeManifest.stdlib, "stdlib");
+  const sitePackages = await sealCategory(python.runtimeManifest.sitePackages, "site-packages");
+  const extensionModules = await sealCategory(python.runtimeManifest.extensionModules, "extension module");
+  const dylibClosure = await sealCategory(python.runtimeManifest.dylibClosure, "dylib");
+  const runtimeSupport = await Promise.all(python.runtimeManifest.runtimeSupport.map((entry, index) => (
+    sealRuntimeFile(entry, `runtime support[${index}]`, 0o555)
+  )));
+  const [stdlibRoot, pythonHomeRoot, sitePackagesRoots, extensionModuleRoots] = await Promise.all([
+    sealRuntimeRoot(python.runtimeManifest.stdlibRoot, "stdlib"),
+    sealRuntimeRoot(python.runtimeManifest.pythonHomeRoot, "python home"),
+    Promise.all(python.runtimeManifest.sitePackagesRoots.map((root) => sealRuntimeRoot(root, "site-packages"))),
+    Promise.all(python.runtimeManifest.extensionModuleRoots.map((root) => sealRuntimeRoot(root, "extension-module"))),
+  ]);
+  const sealedIdentity = await sealedExecutableIdentity(sealedInterpreter.path, EXECUTABLE_VERSION_ARGS);
+  return {
+    ...sealedIdentity,
+    runtimeManifest: {
+      schema: python.runtimeManifest.schema,
+      interpreter: sealedInterpreter,
+      stdlibRoot,
+      pythonHomeRoot,
+      sitePackagesRoots,
+      extensionModuleRoots,
+      runtimeSupport,
+      stdlib,
+      sitePackages,
+      extensionModules,
+      dylibClosure,
+    },
+  };
+}
+
+async function refreshSealedPythonExecutionToolchain(
+  python: CccPrdPythonExecutionToolchain,
+): Promise<CccPrdPythonExecutionToolchain> {
+  const identity = await sealedExecutableIdentity(python.executablePath, EXECUTABLE_VERSION_ARGS);
+  const refresh = async (entry: CccPrdPythonRuntimeFile): Promise<CccPrdPythonRuntimeFile> => ({
+    path: entry.path,
+    sha256: sha256(await readFile(entry.path)),
+    ...(entry.requestedPaths ? { requestedPaths: [...entry.requestedPaths].sort() } : {}),
+  });
+  const interpreter = {
+    path: identity.executablePath,
+    sha256: identity.executableSha256,
+  };
+  if (basename(identity.executablePath) !== "python3") {
+    const aliasPath = resolve(dirname(identity.executablePath), "python3");
+    await writeFile(aliasPath, await readFile(identity.executablePath), { flag: "wx", mode: 0o555 });
+    await chmod(aliasPath, 0o555);
+  }
+  return {
+    ...identity,
+    runtimeManifest: {
+      schema: python.runtimeManifest.schema,
+      interpreter,
+      stdlibRoot: python.runtimeManifest.stdlibRoot,
+      pythonHomeRoot: python.runtimeManifest.pythonHomeRoot,
+      sitePackagesRoots: [...python.runtimeManifest.sitePackagesRoots],
+      extensionModuleRoots: [...python.runtimeManifest.extensionModuleRoots],
+      stdlib: await Promise.all(python.runtimeManifest.stdlib.map(refresh)),
+      sitePackages: await Promise.all(python.runtimeManifest.sitePackages.map(refresh)),
+      extensionModules: await Promise.all(python.runtimeManifest.extensionModules.map(refresh)),
+      dylibClosure: await Promise.all(python.runtimeManifest.dylibClosure.map(refresh)),
+      runtimeSupport: await Promise.all(python.runtimeManifest.runtimeSupport.map(refresh)),
+    },
   };
 }
 
@@ -851,13 +1144,39 @@ async function patchDarwinInstallNames(
     if (
       linkedNames.has(entry.requestedPath)
       && (
-        entry.requestedPath.startsWith("/opt/homebrew/")
+        entry.requestedPath.startsWith("/")
+        && !entry.requestedPath.startsWith("/usr/lib/")
+        && !entry.requestedPath.startsWith("/System/Library/")
         || entry.requestedPath.startsWith("@rpath/")
         || entry.requestedPath.startsWith("@loader_path/")
         || entry.requestedPath.startsWith("@executable_path/")
       )
     ) {
       changes.set(entry.requestedPath, entry.canonicalPath);
+    }
+  }
+  // Python's extension modules frequently name a dylib through @rpath (for
+  // example @rpath/libmpdec.dylib), while the custody manifest records the
+  // controller-observed absolute closure path. Match that basename only when
+  // custody provides exactly one non-system candidate; ambiguity is a hard
+  // refusal rather than a best-effort rewrite.
+  for (const linkedName of linkedNames) {
+    if (changes.has(linkedName) || linkedName.startsWith("/usr/lib/") || linkedName.startsWith("/System/Library/")) continue;
+    const linkedBase = basename(linkedName);
+    const candidates = manifest.filter((entry) => (
+      basename(entry.requestedPath) === linkedBase
+      || basename(entry.canonicalPath) === linkedBase
+    ));
+    const uniqueCandidates = [...new Map(candidates.map((entry) => [entry.canonicalPath, entry])).values()];
+    if (uniqueCandidates.length === 1 && (
+      linkedName.startsWith("@rpath/")
+      || linkedName.startsWith("@loader_path/")
+      || linkedName.startsWith("@executable_path/")
+      || linkedName.startsWith("/")
+    )) {
+      changes.set(linkedName, uniqueCandidates[0]!.canonicalPath);
+    } else if (uniqueCandidates.length > 1) {
+      throw new Error(`CCC semantic-proof Python dylib dependency is ambiguous: ${linkedName}`);
     }
   }
   if (changes.size === 0 && !dylibId) return;
@@ -987,6 +1306,9 @@ async function sealExecutionToolchain(
   const taskExecutable = await sealOnce(toolchain.task);
   const nodeExecutable = await sealOnce(toolchain.node);
   const proofHostExecutable = await sealOnce(toolchain.proofHost);
+  const python = toolchain.python
+    ? await sealPythonExecutionToolchain(toolchainRoot, toolchain.python, sealedByCanonicalPath)
+    : undefined;
   const linkedRuntime = await sealDarwinLinkedRuntime(
     toolchainRoot,
     toolchain.linkedRuntime,
@@ -997,19 +1319,47 @@ async function sealExecutionToolchain(
     canonicalPath: sealedByCanonicalPath.get(entry.canonicalPath) ?? entry.canonicalPath,
     loaderPath: sealedByCanonicalPath.get(entry.loaderPath) ?? entry.loaderPath,
   }));
+  const pythonRewriteManifest = python
+    ? toolchain.python!.runtimeManifest.dylibClosure.flatMap((entry): CccPrdLinkedRuntimeEntry[] => {
+      const canonicalPath = sealedByCanonicalPath.get(entry.path) ?? entry.path;
+      const requestedPaths = entry.requestedPaths?.length ? entry.requestedPaths : [entry.path];
+      return requestedPaths.map((requestedPath) => ({
+        platform: "darwin",
+        loaderRole: "linked_runtime",
+        loaderPath: toolchain.python!.executablePath,
+        requestedPath,
+        canonicalPath,
+        sha256: entry.sha256,
+      }));
+    })
+    : [];
+  const allRewriteManifest = [...rewriteManifest, ...pythonRewriteManifest];
   const linkedRuntimeByCanonicalPath = new Map<string, CccPrdLinkedRuntimeEntry>();
   for (const entry of linkedRuntime) linkedRuntimeByCanonicalPath.set(entry.canonicalPath, entry);
   const machOPaths = [
     taskExecutable,
     nodeExecutable,
     proofHostExecutable,
+    ...(python ? [python.executablePath, ...[
+      ...python.runtimeManifest.stdlib,
+      ...python.runtimeManifest.sitePackages,
+      ...python.runtimeManifest.extensionModules,
+      ...python.runtimeManifest.dylibClosure,
+      ...python.runtimeManifest.runtimeSupport,
+    ].map((entry) => entry.path)] : []),
     ...linkedRuntimeByCanonicalPath.keys(),
   ];
+  const sealedPythonDylibIds = new Set(
+    toolchain.python?.runtimeManifest.dylibClosure
+      .map((entry) => sealedByCanonicalPath.get(entry.path))
+      .filter((path): path is string => path !== undefined) ?? [],
+  );
   for (const machOPath of machOPaths) {
     await patchDarwinInstallNames(
       machOPath,
-      rewriteManifest,
-      linkedRuntimeByCanonicalPath.get(machOPath)?.canonicalPath,
+      allRewriteManifest,
+      linkedRuntimeByCanonicalPath.get(machOPath)?.canonicalPath
+        ?? (sealedPythonDylibIds.has(machOPath) ? machOPath : undefined),
     );
   }
   await assertSealedDarwinLinkedRuntimeGraph(toolchainRoot, machOPaths);
@@ -1018,6 +1368,16 @@ async function sealExecutionToolchain(
     chmod(nodeExecutable, 0o555),
     chmod(proofHostExecutable, 0o555),
     ...linkedRuntime.map((entry) => chmod(entry.canonicalPath, 0o444)),
+    ...(python ? [
+      chmod(python.executablePath, 0o555),
+      ...[
+        ...python.runtimeManifest.stdlib,
+        ...python.runtimeManifest.sitePackages,
+        ...python.runtimeManifest.extensionModules,
+      ].map((entry) => chmod(entry.path, 0o444)),
+      ...python.runtimeManifest.dylibClosure.map((entry) => chmod(entry.path, 0o444)),
+      ...python.runtimeManifest.runtimeSupport.map((entry) => chmod(entry.path, 0o555)),
+    ] : []),
   ]);
   const [sealedTask, sealedNode] = await Promise.all([
     sealedExecutableIdentity(taskExecutable, EXECUTABLE_VERSION_ARGS),
@@ -1028,12 +1388,16 @@ async function sealExecutionToolchain(
     sealedNode.executablePath,
     toolchain.proofHost.id,
   );
+  const refreshedPython = python
+    ? await refreshSealedPythonExecutionToolchain(python)
+    : undefined;
   await chmod(toolchainRoot, 0o555);
   return {
     task: sealedTask,
     node: sealedNode,
     proofHost: sealedProofHost,
     linkedRuntime: await refreshedSealedLinkedRuntimeManifest(linkedRuntime),
+    ...(refreshedPython ? { python: refreshedPython } : {}),
   };
 }
 

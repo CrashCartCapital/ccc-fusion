@@ -31,7 +31,10 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import {
+  campaignClockStatus,
+  joinCccPrdProductExecutionAuthorizationMemberCustody,
   productNextAction,
+  productRequestBudgetStatus,
   providerAttemptStatusesForCampaign,
   resolveCccPrdProductStatusProviderAttemptAnchorTaskId,
   type CccPrdProductApprovalStatus,
@@ -41,7 +44,9 @@ import {
   type CccPrdProductTaskStatus,
   type CccPrdProductWorkItemStatus,
 } from "../ccc-prd/product-status.js";
+import { cccCampaignRequestFloor } from "../ccc-campaign/request-budget.js";
 import { CccCampaignContextError } from "../ccc-campaign/types.js";
+import { CccPrdImportError } from "../ccc-prd/import-error.js";
 import type { CccProviderAttemptScope } from "../ccc-campaign/types.js";
 
 function taskStatus(
@@ -213,22 +218,40 @@ function approval(
     taskId: string;
     status: string;
     actionId: string;
+    actionTarget: string;
+    bindingHash: string;
     requestedAt: string;
   }> = {},
 ): CccPrdProductApprovalStatus {
+  const taskId = overrides.taskId ?? "task-1";
+  const actionId = overrides.actionId ?? LIVE_EXECUTION_ACTION_ID;
+  const actionTarget = overrides.actionTarget ?? `/repo/${taskId}`;
+  const bindingHash = overrides.bindingHash ?? (taskId === "task-2"
+    ? "b".repeat(64)
+    : "a".repeat(64));
   return {
     id: "approval-1",
     status: "issued",
-    taskId: "task-1",
+    taskId,
     runId: "run-1",
-    actionId: LIVE_EXECUTION_ACTION_ID,
-    actionTarget: "/repo",
+    actionId,
+    actionTarget,
     requester: { actorId: "runtime", actorKind: "agent" },
     targetAction: { category: "live-execution", description: "dispatch" },
     requestedAt: "2026-08-01T00:00:00.000Z",
     createdAt: "2026-08-01T00:00:00.000Z",
     updatedAt: "2026-08-01T00:00:00.000Z",
-    campaign: {},
+    campaign: {
+      binding: {
+        ...binding,
+        taskId,
+        actionId,
+        actionTarget,
+        bindingHash,
+      },
+      expiresAt: "2999-01-01T00:00:00.000Z",
+      notBeforeAt: "2026-08-01T00:00:00.000Z",
+    },
     ...overrides,
   } as unknown as CccPrdProductApprovalStatus;
 }
@@ -255,8 +278,24 @@ function executionAuthorization(
     status,
     expiresAt: "2999-01-01T00:00:00.000Z",
     members: [
-      { nativeTaskId: "task-1", approvalRequestId: `ccc-approval-${"a".repeat(64)}` },
-      { nativeTaskId: "task-2", approvalRequestId: `ccc-approval-${"b".repeat(64)}` },
+      {
+        ordinal: 0,
+        semanticTaskId: "TASK-1",
+        nativeTaskId: "task-1",
+        actionId: LIVE_EXECUTION_ACTION_ID,
+        actionTarget: "/repo/task-1",
+        bindingHash: "a".repeat(64),
+        approvalRequestId: `ccc-approval-${"a".repeat(64)}`,
+      },
+      {
+        ordinal: 1,
+        semanticTaskId: "TASK-2",
+        nativeTaskId: "task-2",
+        actionId: `${LIVE_EXECUTION_ACTION_ID}-2`,
+        actionTarget: "/repo/task-2",
+        bindingHash: "b".repeat(64),
+        approvalRequestId: `ccc-approval-${"b".repeat(64)}`,
+      },
     ],
   } as unknown as CccPrdProductExecutionAuthorizationStatus;
 }
@@ -278,6 +317,7 @@ function nextActionInput(
   return {
     row: { state: "active", runnable: 1 } as unknown as CccPrdProductNextActionInput["row"],
     observedAt: "2026-08-01T00:00:00.000Z",
+    campaignDeadlineAt: "2026-08-08T00:00:00.000Z",
     requestBudget: overrides.requestBudget ?? {
       scope: "campaign-global",
       maximum: 24,
@@ -593,6 +633,102 @@ describe("productNextAction multi-task live-execution holds", () => {
       approvalRequestId: "approval-2",
       approvalStatus: "claimed",
     });
+  });
+});
+
+describe("sealed execution-authorization member custody", () => {
+  it("RED-W1-status-custody: joins every immutable parent member to one redacted child status", () => {
+    const authorization = executionAuthorization();
+    const custody = joinCccPrdProductExecutionAuthorizationMemberCustody(
+      authorization,
+      [
+        approval({
+          id: authorization.members[1]!.approvalRequestId,
+          taskId: "task-2",
+          status: "claimed",
+          actionId: authorization.members[1]!.actionId,
+          actionTarget: authorization.members[1]!.actionTarget,
+          bindingHash: authorization.members[1]!.bindingHash,
+        }),
+        approval({
+          id: authorization.members[0]!.approvalRequestId,
+          taskId: "task-1",
+          status: "issued",
+          actionId: authorization.members[0]!.actionId,
+          actionTarget: authorization.members[0]!.actionTarget,
+          bindingHash: authorization.members[0]!.bindingHash,
+        }),
+      ],
+    );
+
+    expect(custody).toEqual([
+      expect.objectContaining({
+        ordinal: 0,
+        semanticTaskId: "TASK-1",
+        nativeTaskId: "task-1",
+        approvalRequestId: authorization.members[0]!.approvalRequestId,
+        status: "issued",
+      }),
+      expect.objectContaining({
+        ordinal: 1,
+        semanticTaskId: "TASK-2",
+        nativeTaskId: "task-2",
+        approvalRequestId: authorization.members[1]!.approvalRequestId,
+        status: "claimed",
+      }),
+    ]);
+    expect(JSON.stringify(custody)).not.toContain("claimToken");
+  });
+
+  it("RED-W1-status-custody: refuses a missing child approval instead of hiding the member", () => {
+    const authorization = executionAuthorization();
+    expect(() => joinCccPrdProductExecutionAuthorizationMemberCustody(
+      authorization,
+      [approval({ id: authorization.members[0]!.approvalRequestId })],
+    )).toThrow(CccPrdImportError);
+  });
+
+  it("RED-W1-status-custody: refuses duplicate child approvals for one parent member", () => {
+    const authorization = executionAuthorization();
+    const child = approval({ id: authorization.members[0]!.approvalRequestId });
+    expect(() => joinCccPrdProductExecutionAuthorizationMemberCustody(
+      authorization,
+      [child, { ...child, requestedAt: "2026-08-01T00:00:01.000Z" }],
+    )).toThrow(CccPrdImportError);
+  });
+
+  it("RED-W1-status-custody: refuses non-campaign child lifecycle status", () => {
+    const authorization = executionAuthorization();
+    expect(() => joinCccPrdProductExecutionAuthorizationMemberCustody(
+      authorization,
+      [
+        approval({ id: authorization.members[0]!.approvalRequestId, status: "approved" }),
+        approval({
+          id: authorization.members[1]!.approvalRequestId,
+          taskId: "task-2",
+          actionId: authorization.members[1]!.actionId,
+          actionTarget: authorization.members[1]!.actionTarget,
+          bindingHash: authorization.members[1]!.bindingHash,
+        }),
+      ],
+    )).toThrow(CccPrdImportError);
+  });
+
+  it("RED-W1-status-custody: refuses child approval binding drift", () => {
+    const authorization = executionAuthorization();
+    expect(() => joinCccPrdProductExecutionAuthorizationMemberCustody(
+      authorization,
+      [
+        approval({ id: authorization.members[0]!.approvalRequestId, taskId: "different-task" }),
+        approval({
+          id: authorization.members[1]!.approvalRequestId,
+          taskId: "task-2",
+          actionId: authorization.members[1]!.actionId,
+          actionTarget: authorization.members[1]!.actionTarget,
+          bindingHash: authorization.members[1]!.bindingHash,
+        }),
+      ],
+    )).toThrow(CccPrdImportError);
   });
 });
 
@@ -912,5 +1048,87 @@ describe("productNextAction semantic proof v2 truth", () => {
     }));
 
     expect(action.kind).not.toBe("approve-merge");
+  });
+});
+
+describe("C3: request floor is 2x provider tasks (structural, not adequacy)", () => {
+  it("cccCampaignRequestFloor doubles provider task count", () => {
+    expect(cccCampaignRequestFloor(2)).toBe(4);
+    expect(cccCampaignRequestFloor(1)).toBe(2);
+    expect(cccCampaignRequestFloor(5)).toBe(10);
+  });
+
+  it("productRequestBudgetStatus reports the doubled deterministic minimum and headroom", () => {
+    const status = productRequestBudgetStatus(2, 4, 0);
+    expect(status).toEqual({
+      scope: "campaign-global",
+      maximum: 4,
+      used: 0,
+      remaining: 4,
+      providerTasks: 2,
+      deterministicMinimum: 4,
+      headroomAboveMinimum: 0,
+      completionAdequacy: "unproven",
+    });
+  });
+
+  it("with 2 provider tasks, maxRequests 3 is below the floor and maxRequests 4 meets it", () => {
+    const floor = cccCampaignRequestFloor(2);
+    expect(floor).toBe(4);
+    expect(3 >= floor).toBe(false);
+    expect(4 >= floor).toBe(true);
+
+    const below = productRequestBudgetStatus(2, 3, 0);
+    expect(below.deterministicMinimum).toBe(4);
+    expect(below.headroomAboveMinimum).toBe(3 - 4);
+
+    const at = productRequestBudgetStatus(2, 4, 0);
+    expect(at.deterministicMinimum).toBe(4);
+    expect(at.headroomAboveMinimum).toBe(0);
+  });
+});
+
+describe("C4a: campaign clock visibility", () => {
+  it("campaignClockStatus reports remaining ms before the deadline", () => {
+    const clock = campaignClockStatus(
+      "2026-08-01T01:00:00.000Z",
+      "2026-08-01T00:00:00.000Z",
+    );
+    expect(clock).toEqual({
+      campaignDeadlineAt: "2026-08-01T01:00:00.000Z",
+      remainingMs: 60 * 60 * 1000,
+    });
+  });
+
+  it("campaignClockStatus never goes negative once the deadline has passed", () => {
+    const clock = campaignClockStatus(
+      "2026-08-01T00:00:00.000Z",
+      "2026-08-01T01:00:00.000Z",
+    );
+    expect(clock.remainingMs).toBe(0);
+  });
+
+  it("approve-execution (sealed_bundle_v1) reason states the campaign deadline and remaining time", () => {
+    const authorization = executionAuthorization();
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: authorization,
+    }));
+
+    expect(action.kind).toBe("approve-execution");
+    expect(action.reason).toContain("campaign clock started at import");
+    expect(action.reason).toContain("2026-08-08T00:00:00.000Z");
+  });
+
+  it("approve-execution (per_task_v1) reason states the campaign deadline and remaining time", () => {
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({ taskId: "task-1" })],
+      approvals: [approval({ id: "approval-1", taskId: "task-1", status: "issued" })],
+    }));
+
+    expect(action.kind).toBe("approve-execution");
+    expect(action.reason).toContain("campaign clock started at import");
+    expect(action.reason).toContain("2026-08-08T00:00:00.000Z");
   });
 });

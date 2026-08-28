@@ -66,6 +66,12 @@ type ProductStatusOutput = Readonly<{
     approvalRequestId: string;
     confirmation: string;
   }>[];
+  liveExecutionAuthorizationConfirmation?: Readonly<{
+    authorizationId: string;
+    confirmation: string;
+    expiresAt: string;
+    status: string;
+  }>;
   mergeApprovalConfirmations?: readonly Readonly<{
     approvalRequestId: string;
     confirmation: string;
@@ -158,7 +164,8 @@ async function initializeTarget(rootDir: string): Promise<string> {
     join(rootDir, "verify.cjs"),
     [
       "const fs = require('node:fs');",
-      "const value = fs.readFileSync('src/value.txt', 'utf8').trim();",
+      "const candidatePath = process.argv[2];",
+      "const value = fs.readFileSync(candidatePath, 'utf8').trim();",
       "const accepts = candidate => candidate === 'good';",
       "if (accepts('bad')) {",
       "  console.error('NEGATIVE_CONTROL_FAIL');",
@@ -181,7 +188,7 @@ async function initializeTarget(rootDir: string): Promise<string> {
       "tasks:",
       "  verify:vertical:",
       "    cmds:",
-      "      - node verify.cjs",
+      "      - node verify.cjs src/value.txt",
       "",
     ].join("\n"),
   );
@@ -230,19 +237,27 @@ async function createPacket(
     "- Protected action: live_execution provider://vertical-fixture/TASK-VERTICAL requires explicit human approval.";
   const mergeActionLine =
     "- Protected action: merge refs/heads/main requires separate explicit human approval.";
+  const acceptanceClauseText =
+    "The exact verifier node verify.cjs must reject the planted bad value and accept the corrected good value.";
+  const acceptanceClauseBulletLine = `- [AC-REQ-VERTICAL-001] ${acceptanceClauseText}`;
   const prd = [
     "# CCC Fusion Product Vertical Slice",
     `- Target repository: ${targetRoot}`,
     `- Baseline commit: ${targetBase}`,
     `- Allowed write root: ${targetRoot}`,
     "- Allowed write root purpose: disposable product acceptance repository",
-    "- Max requests: 1",
+    "- Max requests: 2",
     "- Max duration ms: 120000",
     "- Max concurrency: 1",
     "- Non-goal: Modify any path outside src/value.txt.",
     liveActionLine,
     mergeActionLine,
     requirementLine,
+    "",
+    "### Requirement REQ-VERTICAL",
+    "",
+    "#### Acceptance clauses",
+    acceptanceClauseBulletLine,
     "",
   ].join("\n");
   const prdPath = join(packetRoot, "vertical-slice-prd.md");
@@ -264,6 +279,14 @@ async function createPacket(
     path: "vertical-slice-prd.md",
     exactQuote: mergeActionLine,
   }];
+  const acceptanceClauseRefs = [{
+    path: "vertical-slice-prd.md",
+    exactQuote: acceptanceClauseText,
+  }];
+  const acceptanceClauseBulletRefs = [{
+    path: "vertical-slice-prd.md",
+    exactQuote: acceptanceClauseBulletLine,
+  }];
 
   await writeFile(prdPath, prd);
   await writeFile(manifestPath, `${JSON.stringify({
@@ -277,7 +300,7 @@ async function createPacket(
     }],
   }, null, 2)}\n`);
   await writeFile(proposalPath, `${JSON.stringify({
-    schema: "ccc-prd.authoring-proposal.v1",
+    schema: "ccc-prd.authoring-proposal.v2",
     authorityRoles: [{
       id: "AUTHORITY-VERTICAL",
       role: "root",
@@ -293,6 +316,14 @@ async function createPacket(
       accountableProducer: "campaign-coding-agent",
       dependencies: [],
       proofIds: ["PROOF-VERTICAL"],
+      acceptanceClauses: [{
+        id: "AC-REQ-VERTICAL-001",
+        requirementId: "REQ-VERTICAL",
+        text: acceptanceClauseText,
+        proofIds: ["PROOF-VERTICAL"],
+        sourceRefs: acceptanceClauseRefs,
+      }],
+      acceptanceDispositions: [],
       sourceRefs,
       confidence: "high",
     }],
@@ -302,9 +333,29 @@ async function createPacket(
       command: "task verify:vertical",
       positiveOracle:
         "The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
-      negativeControls: [
-        "The same verifier exits nonzero for the frozen planted bad value.",
+      schema: "ccc-prd.proof.v2",
+      clauseIds: ["AC-REQ-VERTICAL-001"],
+      phases: ["task", "final_integrated"],
+      positiveCases: [{
+        id: "POS-VERTICAL-001",
+        description:
+          "The verifier prints POSITIVE_ORACLE_PASS and exits zero for the campaign commit.",
+      }],
+      negativeControls: [{
+        id: "NEG-VERTICAL-001",
+        description: "The same verifier exits nonzero for the frozen planted bad value.",
+      }],
+      verifierClosure: [
+        { role: "task_runner", path: "Taskfile.yml", baseGitBlobOid: "0".repeat(40), sha256: "0".repeat(64) },
+        { role: "harness", path: "verify.cjs", baseGitBlobOid: "0".repeat(40), sha256: "0".repeat(64) },
       ],
+      candidateInputs: ["src/value.txt"],
+      executionToolchain: {
+        task: { executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+        node: { executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+        proofHost: { id: "", executablePath: "", executableSha256: "0".repeat(64), version: "", versionOutputSha256: "0".repeat(64) },
+        linkedRuntime: [],
+      },
       sourceRefs,
       confidence: "high",
     }],
@@ -332,7 +383,14 @@ async function createPacket(
        */
       ownedPaths: ["src/value.txt"],
       allowedWriteRoots: ["src/value.txt"],
-      sourceRefs,
+      /*
+       * Also quotes the "#### Acceptance clauses" bullet so this task's
+       * resolved source span overlaps that heading's material-coverage
+       * section (`analyzeCccPrdMaterialCoverage`, ccc-prd/material-coverage.ts);
+       * otherwise `validate` refuses with CCC_PRD_MATERIAL_SECTION_UNDISPOSITIONED
+       * because nothing disposes of the new v2 acceptance-clause section.
+       */
+      sourceRefs: [...sourceRefs, ...acceptanceClauseBulletRefs],
     }],
     edges: [],
     workflows: [{
@@ -408,7 +466,7 @@ async function createPacket(
       },
     ],
     bounds: {
-      maxRequests: 1,
+      maxRequests: 2,
       maxDurationMs: 120_000,
       maxConcurrency: 1,
     },
@@ -834,7 +892,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
     try {
       let plantedFailure = "";
       try {
-        await execFile(process.execPath, ["verify.cjs"], {
+        await execFile(process.execPath, ["verify.cjs", "src/value.txt"], {
           cwd: rootDir,
           encoding: "utf8",
         });
@@ -972,7 +1030,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         "--model",
         "vertical-authoring-model",
         "--max-requests",
-        "1",
+        "2",
         "--max-duration-ms",
         "120000",
         "--max-concurrency",
@@ -1144,18 +1202,15 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
       });
       const verticalNativeTaskId = verticalTask!.nativeTaskId;
       expect(verticalNativeTaskId).not.toBe("TASK-VERTICAL");
-      const proofAdmissionAudits = (
-        await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId })
-      ).filter((event) =>
-        event.mutationType === "ccc-campaign:proof-admission");
-      expect(proofAdmissionAudits).toEqual([
-        expect.objectContaining({
-          metadata: expect.objectContaining({
-            proofId: "PROOF-VERTICAL",
-            outcome: "pass",
-          }),
-        }),
-      ]);
+      /*
+       * Deliberately unasserted here: this DB round-trip preserves the same
+       * settling delay the original (pre-migration) proof-admission check at
+       * this point provided before `liveExecutionApprovalConfirmations` is
+       * read below. The gate itself only exists downstream of
+       * approve-execution (packages/engine/src/ccc-campaign-proof-workflow.ts),
+       * so the actual strict assertion now runs after `executionDrain`.
+       */
+      await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId });
       const liveHold = firstHold;
       expect(liveHold.status.workItems).toEqual([
         expect.objectContaining({
@@ -1165,18 +1220,30 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         }),
       ]);
       expect(liveHold.status.nextAction.kind).toBe("approve-execution");
-      expect(liveHold.liveExecutionApprovalConfirmations).toHaveLength(1);
+      /*
+       * This campaign runs under `executionAuthorizationMode: "sealed_bundle_v1"`
+       * (packages/cli/src/commands/prd.ts ~2203-2218), under which the legacy
+       * plural `liveExecutionApprovalConfirmations` is unconditionally `[]` by
+       * design; the real live-execution confirmation lives in the singular
+       * `liveExecutionAuthorizationConfirmation` field instead, keyed by
+       * `authorizationId` (not `approvalRequestId`) -- the same shape the live
+       * V12-V15 runbook approves against.
+       */
+      expect(liveHold.liveExecutionAuthorizationConfirmation).toMatchObject({
+        status: "issued",
+        confirmation: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      });
       await expect(readFile(packet.providerMarkerPath, "utf8")).rejects.toMatchObject({
         code: "ENOENT",
       });
       expect(await readFile(join(rootDir, "src/value.txt"), "utf8")).toBe("bad\n");
 
       const liveConfirmation =
-        liveHold.liveExecutionApprovalConfirmations![0]!;
+        liveHold.liveExecutionAuthorizationConfirmation!;
       const executionApproved = await runProductCommand([
         "approve-execution",
         idempotencyKey,
-        liveConfirmation.approvalRequestId,
+        liveConfirmation.authorizationId,
         "--confirm",
         liveConfirmation.confirmation,
       ], dependencies);
@@ -1213,6 +1280,19 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         cwd: expect.not.stringMatching(new RegExp(`^${rootDir}/?$`)),
       });
       await executionDrain;
+
+      const proofAdmissionAudits = (
+        await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId })
+      ).filter((event) =>
+        event.mutationType === "ccc-campaign:proof-admission");
+      expect(proofAdmissionAudits).toEqual([
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            proofId: "PROOF-VERTICAL",
+            outcome: "pass",
+          }),
+        }),
+      ]);
 
       const mergeHold = await waitFor(
         async () => productStatus(await runProductCommand(

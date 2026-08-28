@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { superviseSpawn } from "@fusion/core";
 
@@ -22,6 +22,11 @@ export type CccSemanticProofSandboxPolicyInput = {
   scratchRoot: string;
   taskExecutable: string;
   nodeExecutable: string;
+  pythonExecutable?: string;
+  pythonHome?: string;
+  pythonPathRoots?: readonly string[];
+  pythonRuntimeFiles?: readonly string[];
+  pythonRuntimeExecutables?: readonly string[];
   deniedReadRoots: readonly string[];
 };
 
@@ -206,6 +211,23 @@ function assertSealedNodeResolution(
   }
 }
 
+function assertSealedPythonResolution(
+  canonical: ReturnType<typeof canonicalPolicyInput>,
+): void {
+  if (!canonical.pythonExecutable) return;
+  const pythonName = canonical.pythonExecutable.split(sep).pop() ?? "";
+  const resolvedPython = canonicalExistingPath(
+    resolve(dirname(canonical.pythonExecutable), "python3"),
+    "semantic-proof PATH Python executable",
+  );
+  if (
+    resolvedPython !== canonical.pythonExecutable
+    && !/^(?:python3\.\d+(?:\.\d+)*|Python)$/u.test(pythonName)
+  ) {
+    throw new Error("semantic-proof PATH does not resolve python3 to the sealed Python executable");
+  }
+}
+
 function validateProofEnvironment(
   environment: CccSemanticProofControllerEnvironment | undefined,
 ): CccSemanticProofControllerEnvironment | undefined {
@@ -236,6 +258,11 @@ function canonicalPolicyInput(input: CccSemanticProofSandboxPolicyInput): {
   scratchRoot: string;
   taskExecutable: string;
   nodeExecutable: string;
+  pythonExecutable?: string;
+  pythonHome?: string;
+  pythonPathRoots: string[];
+  pythonRuntimeFiles: string[];
+  pythonRuntimeExecutables: string[];
   deniedReadRoots: string[];
 } {
   const canonical = {
@@ -243,6 +270,21 @@ function canonicalPolicyInput(input: CccSemanticProofSandboxPolicyInput): {
     scratchRoot: canonicalExistingPath(input.scratchRoot, "semantic-proof scratch root"),
     taskExecutable: canonicalExistingPath(input.taskExecutable, "semantic-proof Task executable"),
     nodeExecutable: canonicalExistingPath(input.nodeExecutable, "semantic-proof Node executable"),
+    ...(input.pythonExecutable
+      ? { pythonExecutable: canonicalExistingPath(input.pythonExecutable, "semantic-proof Python executable") }
+      : {}),
+    ...(input.pythonHome
+      ? { pythonHome: canonicalExistingPath(input.pythonHome, "semantic-proof Python home") }
+      : {}),
+    pythonPathRoots: uniqueSorted((input.pythonPathRoots ?? []).map((path) => (
+      canonicalExistingPath(path, "semantic-proof Python path root")
+    ))),
+    pythonRuntimeFiles: uniqueSorted((input.pythonRuntimeFiles ?? []).map((path) => (
+      canonicalExistingPath(path, "semantic-proof Python runtime file")
+    ))),
+    pythonRuntimeExecutables: uniqueSorted((input.pythonRuntimeExecutables ?? []).map((path) => (
+      canonicalExistingPath(path, "semantic-proof Python runtime executable")
+    ))),
     deniedReadRoots: uniqueSorted(input.deniedReadRoots.map((path) => (
       canonicalExistingPath(path, "semantic-proof denied repository root")
     ))),
@@ -259,6 +301,11 @@ function canonicalPolicyInput(input: CccSemanticProofSandboxPolicyInput): {
       || isSameOrWithin(canonical.scratchRoot, deniedRoot)
       || isSameOrWithin(canonical.taskExecutable, deniedRoot)
       || isSameOrWithin(canonical.nodeExecutable, deniedRoot)
+      || (canonical.pythonExecutable !== undefined
+        && isSameOrWithin(canonical.pythonExecutable, deniedRoot))
+      || (canonical.pythonHome !== undefined && isSameOrWithin(canonical.pythonHome, deniedRoot))
+      || canonical.pythonPathRoots.some((path) => isSameOrWithin(path, deniedRoot))
+      || canonical.pythonRuntimeExecutables.some((path) => isSameOrWithin(path, deniedRoot))
     ) {
       throw new Error("semantic-proof denied roots must be disjoint from materialized and toolchain paths");
     }
@@ -279,6 +326,10 @@ export async function buildCccSemanticProofDarwinProfile(
   const linkedRuntimeFiles = await darwinLinkedRuntimeFiles([
     canonical.taskExecutable,
     canonical.nodeExecutable,
+    ...(canonical.pythonExecutable ? [canonical.pythonExecutable] : []),
+    ...(canonical.pythonExecutable && basename(canonical.pythonExecutable) !== "python3"
+      ? [resolve(dirname(canonical.pythonExecutable), "python3")]
+      : []),
     DARWIN_SHELL_EXECUTABLE,
     DARWIN_SELECTED_SHELL_EXECUTABLE,
   ]);
@@ -293,6 +344,11 @@ export async function buildCccSemanticProofDarwinProfile(
     "/private/var/db/timezone",
     canonical.proofRoot,
     canonical.scratchRoot,
+    ...(canonical.pythonExecutable ? [dirname(canonical.pythonExecutable)] : []),
+    ...(canonical.pythonHome ? [canonical.pythonHome] : []),
+    ...canonical.pythonPathRoots,
+    ...canonical.pythonRuntimeFiles.map((path) => dirname(path)),
+    ...canonical.pythonRuntimeExecutables.map((path) => dirname(path)),
     ...linkedRuntimeRoots,
   ].filter(existsSync));
   const runtimeReadFiles = uniqueSorted([
@@ -305,6 +361,12 @@ export async function buildCccSemanticProofDarwinProfile(
     "/etc/localtime",
     canonical.taskExecutable,
     canonical.nodeExecutable,
+    ...(canonical.pythonExecutable ? [canonical.pythonExecutable] : []),
+    ...(canonical.pythonExecutable && basename(canonical.pythonExecutable) !== "python3"
+      ? [resolve(dirname(canonical.pythonExecutable), "python3")]
+      : []),
+    ...canonical.pythonRuntimeFiles,
+    ...canonical.pythonRuntimeExecutables,
     ...linkedRuntimeFiles,
   ].filter(existsSync));
   const runtimeMetadataPaths = uniqueSorted([
@@ -320,6 +382,12 @@ export async function buildCccSemanticProofDarwinProfile(
     `(allow process-exec ${[
       canonical.taskExecutable,
       canonical.nodeExecutable,
+      ...(canonical.pythonExecutable ? [canonical.pythonExecutable] : []),
+      ...(canonical.pythonExecutable && basename(canonical.pythonExecutable) !== "python3"
+        ? [resolve(dirname(canonical.pythonExecutable), "python3")]
+        : []),
+      ...canonical.pythonRuntimeExecutables,
+      ...canonical.pythonRuntimeFiles,
       realpathSync(DARWIN_SHELL_EXECUTABLE),
       realpathSync(DARWIN_SELECTED_SHELL_EXECUTABLE),
     ].map(sbplLiteral).join(" ")})`,
@@ -356,6 +424,7 @@ export async function assertCccSemanticProofSandboxReady(
   }
   const canonical = canonicalPolicyInput(input);
   assertSealedNodeResolution(canonical);
+  assertSealedPythonResolution(canonical);
   await buildCccSemanticProofDarwinProfile(input);
 }
 
@@ -376,6 +445,7 @@ export async function runCccSemanticProofSandboxedProcess(
   await assertCccSemanticProofSandboxReady(input);
   const canonical = canonicalPolicyInput(input);
   assertSealedNodeResolution(canonical);
+  assertSealedPythonResolution(canonical);
   const proofEnvironment = validateProofEnvironment(input.proofEnvironment);
   const executable = canonicalExistingPath(input.executable, "semantic-proof process executable");
   if (executable !== canonical.taskExecutable && executable !== canonical.nodeExecutable) {
@@ -401,9 +471,27 @@ export async function runCccSemanticProofSandboxedProcess(
     CI: "1",
     HOME: sandboxHome,
     TMPDIR: sandboxTmp,
-    PATH: sealedPath(canonical),
+    PATH: [
+      dirname(canonical.nodeExecutable),
+      dirname(canonical.taskExecutable),
+      ...(canonical.pythonExecutable ? [dirname(canonical.pythonExecutable)] : []),
+    ].filter((path, index, paths) => paths.indexOf(path) === index).join(":"),
     LANG: "C",
     LC_ALL: "C",
+    PYTHONDONTWRITEBYTECODE: "1",
+    PYTHONHASHSEED: "0",
+    PYTHONIOENCODING: "utf8",
+    PYTHONNOUSERSITE: "1",
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1",
+    ...(canonical.pythonHome
+      ? { PYTHONHOME: canonical.pythonHome, CCC_PYTHON_HOME: canonical.pythonHome }
+      : {}),
+    ...(canonical.pythonPathRoots.length > 0
+      ? {
+        PYTHONPATH: canonical.pythonPathRoots.join(":"),
+        CCC_PYTHON_PATH: canonical.pythonPathRoots.join(":"),
+      }
+      : {}),
     OPENSSL_CONF: resolve(canonical.proofRoot, SEALED_OPENSSL_CONF),
     GIT_TERMINAL_PROMPT: "0",
     ...proofEnvironment,

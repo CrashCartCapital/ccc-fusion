@@ -1,5 +1,6 @@
+import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Settings } from "@fusion/core";
 import type { WorktreeBackendKind } from "./worktree-backend.js";
 import { canonicalizePath } from "./worktree-pool.js";
@@ -27,12 +28,29 @@ export function resolveWorktreesDir(
 ): string {
   const configured = settings?.worktreesDir;
   if (!configured) {
-    return join(rootDir, ".worktrees");
+    return join(resolveDefaultWorktreesBaseDir(rootDir), ".worktrees");
   }
 
   const expandedHome = configured.replace(/^~(?=$|[\\/])/, homedir());
   const expandedRepo = expandedHome.replaceAll("{repo}", basename(rootDir));
   return resolve(rootDir, expandedRepo);
+}
+
+function resolveDefaultWorktreesBaseDir(rootDir: string): string {
+  try {
+    const dotGit = join(rootDir, ".git");
+    const dotGitState = lstatSync(dotGit);
+    if (dotGitState.isDirectory()) return rootDir;
+    if (!dotGitState.isFile()) return rootDir;
+    const gitDirLine = readFileSync(dotGit, "utf-8").trim();
+    if (!gitDirLine.startsWith("gitdir: ")) return rootDir;
+    const gitDir = resolve(rootDir, gitDirLine.slice("gitdir: ".length).trim());
+    const commonDir = resolve(gitDir, readFileSync(join(gitDir, "commondir"), "utf-8").trim());
+    return basename(commonDir) === ".git" ? dirname(commonDir) : rootDir;
+  } catch {
+    // Non-git roots keep the historical default.
+    return rootDir;
+  }
 }
 
 export function resolveTaskWorktreePath(

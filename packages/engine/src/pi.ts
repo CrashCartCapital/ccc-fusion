@@ -76,6 +76,12 @@ import {
 import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { applyClaudeAcpEnable } from "./claude-acp-enable.js";
+import {
+  isCccCampaignDiscoveryToolCall,
+  isCccCampaignExplicitMutationToolCall,
+  isCccCampaignPotentialMutationToolCall,
+} from "./ccc-campaign-tool-phase.js";
+export { isCccCampaignDiscoveryToolCall } from "./ccc-campaign-tool-phase.js";
 import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
 import { refreshFusionModelRegistry } from "./model-registry-refresh.js";
 import { piLog, extensionsLog } from "./logger.js";
@@ -102,6 +108,10 @@ import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp-runtime-suppo
 import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp-session-tools.js";
 import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
 import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
+import {
+  CCC_TERMINAL_ROUTE_RECEIPT_API,
+  streamCccTerminalRouteReceipt,
+} from "./ccc-route-receipt-adapter.js";
 
 /**
  * A receipt is durable after its flush, but two concurrently-created agent
@@ -374,6 +384,103 @@ function clearSessionStateError(session: AgentSession): void {
 const CCC_EXPECTED_RESPONSE_MODEL = "__fusionCccExpectedResponseModel";
 const cccProviderAttemptSessions = new WeakSet<object>();
 
+type CccOmniRouteObservation = Readonly<{
+  provider: string;
+  model: string;
+}>;
+
+type CccOmniRouteReceipt = Readonly<{
+  initial?: CccOmniRouteObservation;
+  final: CccOmniRouteObservation;
+}>;
+
+type CccOmniRouteState = {
+  initial?: CccOmniRouteObservation;
+};
+
+function splitCccProviderQualifiedModel(modelId: unknown): CccOmniRouteObservation | undefined {
+  if (typeof modelId !== "string") return undefined;
+  const separator = modelId.indexOf("/");
+  if (separator <= 0 || separator === modelId.length - 1 || modelId.indexOf("/", separator + 1) !== -1) {
+    return undefined;
+  }
+  if (modelId !== modelId.trim()) return undefined;
+  const provider = modelId.slice(0, separator);
+  const model = modelId.slice(separator + 1);
+  if (provider !== provider.trim() || model !== model.trim()) return undefined;
+  return {
+    provider,
+    model,
+  };
+}
+
+function requireCccTerminalRouteRequestedIdentity(
+  receiptAdapterId: CccProviderAttemptBinding["receiptAdapterId"],
+  modelId: unknown,
+): CccOmniRouteObservation | undefined {
+  if (receiptAdapterId === undefined) return undefined;
+  const requested = splitCccProviderQualifiedModel(modelId);
+  if (!requested) {
+    throw new Error(
+      `ccc-fusion terminal route receipt adapter requires a provider-qualified requested model: ${String(modelId)}`,
+    );
+  }
+  return requested;
+}
+
+function readCccOmniRouteFinal(result: unknown): CccOmniRouteObservation | undefined {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return undefined;
+  const receipt = (result as Record<string, unknown>).omniRoute;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return undefined;
+  const provider = (receipt as Record<string, unknown>).provider;
+  const model = (receipt as Record<string, unknown>).model;
+  if (typeof provider !== "string" || provider.length === 0 || typeof model !== "string" || model.length === 0) {
+    return undefined;
+  }
+  return { provider, model };
+}
+
+function requireCccOmniRouteReceipt(
+  requested: CccOmniRouteObservation,
+  state: CccOmniRouteState | undefined,
+  result: unknown,
+): CccOmniRouteReceipt {
+  /*
+   * The initial HTTP receipt is corroborating evidence, not the proof. When
+   * OmniRoute has to wait on a real upstream it flushes an
+   * `: omniroute-keepalive` SSE comment to hold the stream open, which commits
+   * the response headers before it has chosen a provider; the route identity
+   * then arrives only as trailing SSE comments. Requiring the header receipt
+   * therefore refused exactly the uncached calls that did reach a model, while
+   * cache hits (which already know the answer) passed. The terminal receipt
+   * below stays mandatory and still carries the anti-substitution guarantee.
+   */
+  const initial = state?.initial;
+  const final = readCccOmniRouteFinal(result);
+  if (!final) {
+    throw new Error("ccc-fusion OmniRoute terminal SSE route receipt missing");
+  }
+  if (initial && (initial.provider !== requested.provider || initial.model !== requested.model)) {
+    throw new Error(
+      `ccc-fusion OmniRoute initial route mismatch: requested ${requested.provider}/${requested.model}, `
+      + `initial ${initial.provider}/${initial.model}`,
+    );
+  }
+  if (final.provider !== requested.provider || final.model !== requested.model) {
+    throw new Error(
+      `ccc-fusion OmniRoute final route mismatch: requested ${requested.provider}/${requested.model}, `
+      + `final ${final.provider}/${final.model}`,
+    );
+  }
+  if (initial && (initial.provider !== final.provider || initial.model !== final.model)) {
+    throw new Error(
+      `ccc-fusion OmniRoute initial/final route mismatch: initial ${initial.provider}/${initial.model}, `
+      + `final ${final.provider}/${final.model}`,
+    );
+  }
+  return initial ? { initial, final } : { final };
+}
+
 /** Test seam for the string-only Pi failure boundary. Production marks only
  * sessions created from a validated provider-attempt binding below. */
 export function _markCccProviderAttemptSessionForTest(session: AgentSession): void {
@@ -408,6 +515,7 @@ type CccResponseIdentitySession = AgentSession & {
   [CCC_EXPECTED_RESPONSE_MODEL]?: {
     provider: string;
     modelId: string;
+    omniRoute?: boolean;
   };
 };
 
@@ -522,6 +630,14 @@ function assertCccResponseModelIdentity(session: AgentSession): void {
     (message): message is Record<string, unknown> =>
       Boolean(message) && typeof message === "object" && (message as Record<string, unknown>).role === "assistant",
   ) : undefined;
+  if (expected.omniRoute) {
+    const requested = splitCccProviderQualifiedModel(expected.modelId);
+    if (!requested) {
+      throw new Error(`ccc-fusion OmniRoute terminal route receipt missing: configured ${expected.provider}/${expected.modelId}`);
+    }
+    requireCccOmniRouteReceipt(requested, undefined, assistant);
+    return;
+  }
   const responseModel = assistant?.responseModel;
   if (typeof responseModel !== "string" || responseModel.trim().length === 0) {
     throw new Error(
@@ -584,10 +700,23 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
   if (!Object.isFrozen(input)) {
     throw new Error("cccProviderAttemptBinding must be frozen");
   }
-  exactObjectKeys(input as Record<string, unknown>, ["controller", "turnKey"], "cccProviderAttemptBinding");
-  const binding = input as Record<string, unknown>;
+  const bindingRecord = input as Record<string, unknown>;
+  exactObjectKeys(
+    bindingRecord,
+    bindingRecord.receiptAdapterId === undefined
+      ? ["controller", "turnKey"]
+      : ["controller", "receiptAdapterId", "turnKey"],
+    "cccProviderAttemptBinding",
+  );
+  const binding = bindingRecord;
   if (typeof binding.turnKey !== "string" || binding.turnKey.trim().length === 0) {
     throw new Error("cccProviderAttemptBinding.turnKey must be a non-empty string");
+  }
+  if (
+    binding.receiptAdapterId !== undefined
+    && binding.receiptAdapterId !== "terminal-route-sse-comments.v1"
+  ) {
+    throw new Error("cccProviderAttemptBinding.receiptAdapterId is unsupported");
   }
   const controller = binding.controller;
   if (!controller || typeof controller !== "object" || Array.isArray(controller)) {
@@ -782,6 +911,7 @@ function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAtt
 function createCccProviderAttemptControlledStream(input: {
   binding: CccProviderAttemptBinding;
   state: CccProviderAttemptSessionState;
+  omniRouteRequested?: CccOmniRouteObservation;
   dispatch: (...args: any[]) => AsyncIterable<any> & { result: () => Promise<any> };
   model: any;
   dispatchModel: any;
@@ -856,6 +986,9 @@ function createCccProviderAttemptControlledStream(input: {
               // reported as a real receipt.
               const usage = result.usage;
               const hasUsage = usage != null && !(usage.input === 0 && usage.output === 0);
+              const omniRoute = input.omniRouteRequested
+                ? requireCccOmniRouteReceipt(input.omniRouteRequested, undefined, result)
+                : undefined;
               const reconciliation: CccProviderAttemptSubmittedReconciliation = {
                 ...scope,
                 outcome: "committed" as const,
@@ -867,13 +1000,19 @@ function createCccProviderAttemptControlledStream(input: {
                 }),
                 observerId: "pi",
                 effectiveRoute: {
-                  effectiveProvider: result.provider,
-                  effectiveModel: result.responseModel ?? result.model,
+                  // OmniRoute's upstream identity is a separate terminal receipt.
+                  // Keep the requested Pi registry route in the ordinary effective
+                  // fields so a body-model alias cannot replace the campaign key.
+                  effectiveProvider: input.omniRouteRequested ? input.model.provider : result.provider,
+                  effectiveModel: input.omniRouteRequested
+                    ? input.model.id
+                    : result.responseModel ?? result.model,
                   usage: hasUsage ? { inputTokens: usage.input, outputTokens: usage.output } : null,
                   cost: hasUsage
                     ? { amountUsd: usage.cost.total, source: "pi-ai" }
                     : { kind: "unknown" as const, reason: "no-usage-in-stream" },
                   receiptSource: hasUsage ? "stream-usage" as const : "none" as const,
+                  ...(omniRoute ? { omniRoute } : {}),
                 },
               };
               const reconciledScope = await input.binding.controller.reconcile(reconciliation);
@@ -1685,6 +1824,19 @@ export interface AgentOptions {
   toolsAllowlist?: string[];
   /** Optional allowlist of builtin runtime web tools to keep enabled. */
   builtinToolsAllowlist?: BuiltinWebToolName[];
+  cccCampaignPhaseToolPolicy?: {
+    readOnlyToolNames: readonly string[];
+    exemptToolNames?: readonly string[];
+    maxReadOnlyToolCallsBeforeGuidance: number;
+    maxReadOnlyToolCallsBeforeRefusal: number;
+    guidanceMessage: string;
+    refusalMessage: string;
+    currentPhase?: () => string | undefined;
+    onPotentialMutationCompleted?: (
+      toolName: string,
+      params: Record<string, unknown> | undefined,
+    ) => Promise<boolean>;
+  };
   onText?: (delta: string) => void;
   onThinking?: (delta: string) => void;
   onToolStart?: (name: string, args?: Record<string, unknown>) => void;
@@ -2529,6 +2681,131 @@ export function wrapToolsWithBoundary(
   });
 }
 
+export function wrapToolsWithCccCampaignPhaseToolPolicy(
+  tools: ToolDefinition[],
+  policy: AgentOptions["cccCampaignPhaseToolPolicy"] | undefined,
+): ToolDefinition[] {
+  if (!policy) return tools;
+  const readOnlyToolNames = new Set(
+    policy.readOnlyToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
+  );
+  if (readOnlyToolNames.size === 0) return tools;
+  const exemptToolNames = new Set(
+    (policy.exemptToolNames ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean),
+  );
+  const guidanceLimit = Number.isSafeInteger(policy.maxReadOnlyToolCallsBeforeGuidance)
+    ? Math.max(1, policy.maxReadOnlyToolCallsBeforeGuidance)
+    : 1;
+  const refusalLimit = Math.max(
+    guidanceLimit + 1,
+    Number.isSafeInteger(policy.maxReadOnlyToolCallsBeforeRefusal)
+      ? policy.maxReadOnlyToolCallsBeforeRefusal
+      : 1,
+  );
+  let readOnlyToolCalls = 0;
+  let postRefusalMutationAttempted = false;
+  const appendGuidance = (
+    result: unknown,
+    message: string,
+    details: Record<string, unknown>,
+  ): unknown => {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const value = result as Record<string, unknown>;
+    if (!Array.isArray(value.content)) return result;
+    return {
+      ...value,
+      content: [...value.content, { type: "text", text: message }],
+      isError: value.isError === true,
+      details: {
+        ...(typeof value.details === "object" && value.details ? value.details : {}),
+        ...details,
+      },
+    };
+  };
+  const refuseIfExhausted = (toolName: string) => readOnlyToolCalls > refusalLimit
+    ? boundaryRejection(policy.refusalMessage, {
+        phase: "DISCOVER",
+        toolName,
+        readOnlyToolCalls,
+        maxReadOnlyToolCallsBeforeRefusal: refusalLimit,
+      })
+    : undefined;
+  return tools.map((tool) => {
+    const normalizedToolName = tool.name.trim().toLowerCase();
+    if (exemptToolNames.has(normalizedToolName)) {
+      return { ...tool, executionMode: "sequential" as const };
+    }
+    const originalExecute = tool.execute as any;
+    return {
+      ...tool,
+      // pi-agent-core executes tool batches in parallel by default. Campaign
+      // counters and candidate fingerprints are custody state, so every tool
+      // in this policy must participate in one deterministic sequence.
+      executionMode: "sequential" as const,
+      execute: async (...args: any[]) => {
+        if ((policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
+          return originalExecute(...args);
+        }
+        const params = args[1] as Record<string, unknown> | undefined;
+        const discovery = readOnlyToolNames.has(normalizedToolName)
+          && isCccCampaignDiscoveryToolCall(tool.name, params);
+        if (discovery) {
+          readOnlyToolCalls += 1;
+          const refusal = refuseIfExhausted(tool.name);
+          if (refusal) return refusal;
+          const result = await originalExecute(...args);
+          if (readOnlyToolCalls > guidanceLimit) {
+            return appendGuidance(result, policy.guidanceMessage, {
+              phase: "DISCOVER",
+              toolName: tool.name,
+              readOnlyToolCalls,
+              maxReadOnlyToolCallsBeforeGuidance: guidanceLimit,
+            });
+          }
+          return result;
+        }
+
+        const explicitMutationTool = isCccCampaignExplicitMutationToolCall(tool.name, params);
+        if (
+          readOnlyToolCalls >= refusalLimit
+          && (!explicitMutationTool || postRefusalMutationAttempted)
+        ) {
+          return boundaryRejection(policy.refusalMessage, {
+            phase: "DISCOVER",
+            toolName: tool.name,
+            readOnlyToolCalls,
+            maxReadOnlyToolCallsBeforeRefusal: refusalLimit,
+          });
+        }
+        if (readOnlyToolCalls >= refusalLimit) postRefusalMutationAttempted = true;
+
+        const result = await originalExecute(...args);
+        if (!isCccCampaignPotentialMutationToolCall(tool.name, params)) return result;
+        const confirmedMutation = await policy.onPotentialMutationCompleted?.(tool.name, params) ?? false;
+        if (confirmedMutation || (policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
+          return result;
+        }
+
+        // Unknown Bash syntax is allowed to run once so real mutations are not
+        // blocked. If the controller fingerprint stays unchanged, count it as
+        // discovery after execution so wrappers cannot create an unbounded bypass.
+        readOnlyToolCalls += 1;
+        const refusal = refuseIfExhausted(tool.name);
+        if (refusal) return refusal;
+        if (readOnlyToolCalls > guidanceLimit) {
+          return appendGuidance(result, policy.guidanceMessage, {
+            phase: "DISCOVER",
+            toolName: tool.name,
+            readOnlyToolCalls,
+            maxReadOnlyToolCallsBeforeGuidance: guidanceLimit,
+          });
+        }
+        return result;
+      },
+    };
+  });
+}
+
 /*
 FNXC:CCCEffectReceipts 2026-07-23-20:38:
 This is the committed effect boundary: the ToolDefinition execute closure passed
@@ -2967,10 +3244,15 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       requestOptions: any,
     ) => {
       const expectedModelId = model.id as string;
+      const omniRouteRequested = requireCccTerminalRouteRequestedIdentity(
+        cccProviderAttemptBinding?.receiptAdapterId,
+        expectedModelId,
+      );
       const optionsWithBoundary = {
         ...(requestOptions ?? {}),
         profile: CCC_FUSION_PROFILE,
         subscriptionReady: true,
+        maxRetries: 0,
       };
       const priorOnPayload = optionsWithBoundary.onPayload as
         | ((payload: unknown, model: unknown) => unknown | Promise<unknown>)
@@ -2993,11 +3275,14 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
        * model on every event/result. A missing provider model stays missing, an
        * alias stays visible, and an exact echo becomes independently observable.
        */
-      const dispatchModel = { ...model, id: `__fusion_ccc_response_probe__${expectedModelId}` };
+      const dispatchModel = omniRouteRequested
+        ? model
+        : { ...model, id: `__fusion_ccc_response_probe__${expectedModelId}` };
       const source = cccProviderAttemptBinding
         ? createCccProviderAttemptControlledStream({
           binding: cccProviderAttemptBinding,
           state: cccProviderAttemptState,
+          omniRouteRequested,
           dispatch,
           model,
           dispatchModel,
@@ -3030,6 +3315,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     try {
       const registryKey = customProviderRegistryKey(provider, customProviders);
       const api = resolveCustomProviderApiType(provider.apiType);
+      const receiptAdapterSelected = cccProviderAttemptBinding?.receiptAdapterId
+        === "terminal-route-sse-comments.v1"
+        && registryKey === options.defaultProvider;
+      const registeredApi = receiptAdapterSelected
+        ? CCC_TERMINAL_ROUTE_RECEIPT_API
+        : api;
       // FNXC:ProviderAuth 2026-07-08-00:00:
       // FN-7689: reuse the shared `buildCustomProviderModels` helper (custom-provider-registry.ts)
       // instead of building the model list inline here. This is registration path B (the
@@ -3040,9 +3331,15 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       // impossible to reintroduce.
       modelRegistry.registerProvider(registryKey, {
         baseUrl: provider.baseUrl,
-        api,
+        api: registeredApi,
         apiKey: resolveCustomProviderApiKey(provider),
-        models: buildCustomProviderModels(provider, api),
+        models: buildCustomProviderModels(provider, api).map((candidate) => ({
+          ...candidate,
+          api: registeredApi,
+        })),
+        ...(receiptAdapterSelected
+          ? { streamSimple: streamCccTerminalRouteReceipt }
+          : {}),
       });
       piLog.log(`Registered custom provider "${provider.name}" (key=${registryKey}, id=${provider.id})`);
     } catch (error) {
@@ -3120,7 +3417,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   // as a reliability safeguard — disabling it would cause overflow failures.
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true },
-    retry: { enabled: true, maxRetries: 3 },
+    retry: options.profile === CCC_FUSION_PROFILE
+      ? { enabled: false, maxRetries: 0 }
+      : { enabled: true, maxRetries: 3 },
   });
 
   // Resolve explicit model selection if provider and model ID are specified.
@@ -3137,6 +3436,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       options.profile,
     );
   } catch (primaryResolutionError) {
+    if (options.profile === CCC_FUSION_PROFILE) {
+      throw primaryResolutionError;
+    }
     if (!options.fallbackProvider || !options.fallbackModelId) {
       throw primaryResolutionError;
     }
@@ -3318,6 +3620,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
   };
 
   const createSessionWithModel = async (modelOverride?: typeof selectedModel) => {
+    if (options.profile === CCC_FUSION_PROFILE && modelOverride) {
+      requireCccTerminalRouteRequestedIdentity(
+        cccProviderAttemptBinding?.receiptAdapterId,
+        modelOverride.id,
+      );
+    }
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
     // Tool instances. We need boundary-wrapped versions of the built-ins, so we
     // suppress the defaults with `noTools: "builtin"` and register our wrapped
@@ -3414,11 +3722,15 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       boundaryContext.worktreeProjectRoot,
       normalizedAdditionalSkillPaths,
     );
-    const cccBinding = await resolveCccReceiptBinding(boundaryTools);
+    const phaseBoundedTools = wrapToolsWithCccCampaignPhaseToolPolicy(
+      boundaryTools,
+      options.cccCampaignPhaseToolPolicy,
+    );
+    const cccBinding = await resolveCccReceiptBinding(phaseBoundedTools);
     const customToolList: ToolDefinition[] = options.profile === CCC_FUSION_PROFILE
       && cccBinding
       ? wrapCccToolsWithDurableEffectReceipts(
-          boundaryTools,
+          phaseBoundedTools,
           cccBinding.store,
           cccBinding.sessionId,
           {
@@ -3429,7 +3741,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
             },
           },
         )
-      : boundaryTools;
+      : phaseBoundedTools;
     // Sort tools alphabetically by name for deterministic ordering.
     // Prompt caching requires the tool list to be byte-identical across
     // sessions — reordering breaks cache prefix matching.
@@ -3531,9 +3843,12 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       refuse a provider-side alias before the turn is accepted.
       */
       if (options.profile === CCC_FUSION_PROFILE && modelOverride) {
+        const terminalRouteReceiptSelected = cccProviderAttemptBinding?.receiptAdapterId
+          === "terminal-route-sse-comments.v1";
         (result.session as CccResponseIdentitySession)[CCC_EXPECTED_RESPONSE_MODEL] = {
           provider: modelOverride.provider,
           modelId: modelOverride.id,
+          ...(terminalRouteReceiptSelected ? { omniRoute: true } : {}),
         };
       }
       return result;

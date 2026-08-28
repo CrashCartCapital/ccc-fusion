@@ -18,6 +18,7 @@ import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-wor
 import type {
   CccCampaignProviderControllerDecision,
   CccCampaignProviderDispatchInput,
+  CccCampaignRouteReceiptAdapterId,
   CccEffectReceiptStore,
   CccProviderAttemptScope,
   CccProviderAttemptSettlementInput,
@@ -77,6 +78,7 @@ export type CccProviderAttemptController = Readonly<{
 export type CccProviderAttemptBinding = Readonly<{
   turnKey: string;
   controller: CccProviderAttemptController;
+  receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
 }>;
 
 /**

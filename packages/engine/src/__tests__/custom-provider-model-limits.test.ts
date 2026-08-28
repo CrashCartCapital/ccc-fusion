@@ -71,6 +71,54 @@ describe("buildCustomProviderModels per-model limits", () => {
   });
 });
 
+/*
+R1 finding (2026-08-24): `buildCustomProviderModels` hardcoded `reasoning: false`
+for every custom-provider model, so no custom gateway could ever reach pi-ai's
+reasoning branches -- each one is gated on `model.reasoning`. A pinned
+MiniMax M3 route therefore ran as a plain chat model: two sealed campaigns
+produced 123 provider calls averaging ~51 output tokens/turn with no
+`reasoning_content` on the wire, while the same model with
+`reasoning_effort: high` returns reasoning content on the same route. Reasoning
+stays opt-in per model so every already-configured provider keeps its current
+non-reasoning registration.
+*/
+describe("buildCustomProviderModels reasoning capability", () => {
+  it("defaults to non-reasoning when a model declares nothing", () => {
+    const [model] = buildCustomProviderModels(provider([{ id: "m", name: "m" }]), "openai-completions");
+    expect(model.reasoning).toBe(false);
+  });
+
+  it("honors an explicitly declared reasoning capability", () => {
+    const [model] = buildCustomProviderModels(
+      provider([{ id: "m", name: "m", reasoning: true }]),
+      "openai-completions",
+    );
+    expect(model.reasoning).toBe(true);
+  });
+
+  it("applies the reasoning capability independently per model entry", () => {
+    const models = buildCustomProviderModels(
+      provider([
+        { id: "thinker", name: "thinker", reasoning: true },
+        { id: "plain", name: "plain" },
+      ]),
+      "openai-completions",
+    );
+    expect(models[0].reasoning).toBe(true);
+    expect(models[1].reasoning).toBe(false);
+  });
+
+  it("treats any non-true declared value as non-reasoning", () => {
+    for (const declared of [false, "true", 1, null, undefined]) {
+      const [model] = buildCustomProviderModels(
+        provider([{ id: "m", name: "m", reasoning: declared } as never]),
+        "openai-completions",
+      );
+      expect(model.reasoning, `reasoning=${String(declared)}`).toBe(false);
+    }
+  });
+});
+
 describe("resolveCustomProviderModelLimits", () => {
   const providers: CustomProvider[] = [
     {

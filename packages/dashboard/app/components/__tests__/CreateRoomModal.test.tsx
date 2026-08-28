@@ -159,6 +159,7 @@ describe("CreateRoomModal", () => {
     render(<CreateRoomModal isOpen onClose={vi.fn()} onCreate={vi.fn()} />);
 
     await screen.findByRole("button", { name: /Alpha/i });
+    await waitFor(() => expect(screen.getByLabelText("Room name")).toHaveFocus());
     await userEvent.type(screen.getByLabelText("Members"), "zzz");
 
     expect(screen.getByText("No agents match your search.")).toBeInTheDocument();

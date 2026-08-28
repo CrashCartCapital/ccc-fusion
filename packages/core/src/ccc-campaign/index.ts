@@ -67,6 +67,7 @@ export type {
   CccCampaignRouteFallbackPolicy,
   CccCampaignRouteLimits,
   CccCampaignRouteReasoningEffort,
+  CccCampaignRouteReceiptAdapterId,
   CccCampaignRouteSensitivityClass,
   CccCampaignRouteServiceTier,
   CccPrdProductExecutionPlan,
@@ -154,6 +155,8 @@ export type {
 } from "./provider-controller.js";
 export {
   listCccProviderAttemptsForCampaign,
+  assertCccProviderAttemptLaunchHeadroom,
+  CCC_PROVIDER_ATTEMPT_MIN_LAUNCH_HEADROOM_MS,
 } from "./provider-attempt.js";
 export type {
   ListCccProviderAttemptsForCampaignInput,
@@ -162,4 +165,6 @@ export {
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE,
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
+  CCC_CAMPAIGN_REQUESTS_PER_PROVIDER_TASK_FLOOR,
+  cccCampaignRequestFloor,
 } from "./request-budget.js";

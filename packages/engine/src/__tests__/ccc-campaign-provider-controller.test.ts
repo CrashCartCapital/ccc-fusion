@@ -53,7 +53,13 @@ const lease = Object.freeze({
   binding: authority,
   lease: Object.freeze({ bindingHash: authority.bindingHash, actionId: action.actionId, actionTarget: action.actionTarget, approvalRequestId: "approval-1", claimToken: "claim-1" }),
 });
-const contextFor = (route: Readonly<{ transport: "pi" | "workflow" | "cli"; providerId: string; modelId: string; workflowExtensionId?: string }>) => Object.freeze({
+const contextFor = (route: Readonly<{
+  transport: "pi" | "workflow" | "cli";
+  providerId: string;
+  modelId: string;
+  workflowExtensionId?: string;
+  receiptAdapterId?: "terminal-route-sse-comments.v1";
+}>) => Object.freeze({
   taskId: nativeTaskId,
   semanticTaskId,
   targetRepository: Object.freeze({ path: "/tmp/target", baseCommit: "a".repeat(40) }),
@@ -63,7 +69,13 @@ const contextFor = (route: Readonly<{ transport: "pi" | "workflow" | "cli"; prov
 });
 const dispatch = Object.freeze({ turnKey: "turn-1", dispatchKey: "dispatch-1", providerId: "provider-1", modelId: "model-1", transport: "pi" as const });
 
-function bindingInput(route: Readonly<{ transport: "pi" | "workflow" | "cli"; providerId: string; modelId: string; workflowExtensionId?: string }>, expectedRoute: Readonly<{ transport: "workflow" }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>) {
+function bindingInput(route: Readonly<{
+  transport: "pi" | "workflow" | "cli";
+  providerId: string;
+  modelId: string;
+  workflowExtensionId?: string;
+  receiptAdapterId?: "terminal-route-sse-comments.v1";
+}>, expectedRoute: Readonly<{ transport: "workflow" }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>) {
   const authorityStore = {
     getCccCampaignContextForTaskWithinTransaction: vi.fn(async () => contextFor(route)),
     inspectCccCampaignActionLease: vi.fn(async () => lease),
@@ -246,6 +258,27 @@ describe("CCC campaign provider controller", () => {
     }));
     expect(effects.core.mock.calls[0]?.[0]?.workItemFence).toBe(workItemFence);
     expect(effects.core.mock.calls[0]?.[0]?.workItemLeaseOwner).toBe(workItemLeaseOwner);
+  });
+
+  it("RED-RECEIPT-BINDING-1: exposes the persisted receipt adapter on the frozen Pi binding", async () => {
+    const { input } = bindingInput(
+      {
+        transport: "pi",
+        providerId: "arbitrary-gateway",
+        modelId: "upstream/model-a",
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+      },
+      {
+        transport: "pi",
+        providerId: "arbitrary-gateway",
+        modelId: "upstream/model-a",
+      },
+    );
+
+    await expect(createCccCampaignProviderAttemptBinding(input)).resolves.toMatchObject({
+      turnKey: "turn-1",
+      receiptAdapterId: "terminal-route-sse-comments.v1",
+    });
   });
 
   it("Task 6 P1 RED: refuses a reconciliation whose submitted turn is not the binding's sealed turn", async () => {

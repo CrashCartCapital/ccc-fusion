@@ -56,6 +56,7 @@ import { PluginRunner } from "../plugin-runner.js";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-campaign-proof-host.js";
 import { createCccCampaignProofSuiteHandler } from "../ccc-campaign-proof-execution.js";
 import { isImportedCccCampaignWorkItem } from "../ccc-campaign-routing.js";
+import { requireCccCampaignLiveExecutionApproval } from "../ccc-campaign-product-control.js";
 import { MissionAutopilot } from "../mission-autopilot.js";
 import { MissionExecutionLoop } from "../mission-execution-loop.js";
 import { WorkflowTaskRuntime } from "../workflow-task-runtime.js";
@@ -2083,6 +2084,13 @@ export class InProcessRuntime
       prepareNodeExecution: this.executor.createAuthoritativeWorkflowNodePreparation(settings),
       branchPersistence: this.executor.createAuthoritativeWorkflowBranchPersistence(),
       resolveNodeProviderController: this.executor.createCccCampaignWorkflowNodeProviderControllerResolver(),
+      requireCccCampaignLiveExecutionApproval: ({ taskId, runId }) =>
+        requireCccCampaignLiveExecutionApproval({
+          store: this.taskStore,
+          rootDir: this.config.workingDirectory,
+          taskId,
+          runId,
+        }),
       runCccProofSuite: createCccCampaignProofSuiteHandler({
         rootDir: this.config.workingDirectory,
         store: this.taskStore,

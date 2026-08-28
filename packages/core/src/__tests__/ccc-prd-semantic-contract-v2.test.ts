@@ -222,6 +222,47 @@ describe("CCC PRD semantic contract v2", () => {
     }
   });
 
+  it("RED-R1-python-semantic-v2-digest: optional Python profile and runtime identity are bound by generic v2 hashes", () => {
+    const base = proofV2();
+    const python = {
+      ...base,
+      verifierProfile: {
+        schema: "ccc-prd.verifier.python-adapter.v1",
+        adapterPath: "verify/python_adapter.py",
+        targetPath: "fixtures/python-target",
+      },
+      executionToolchain: {
+        ...base.executionToolchain,
+        python: {
+          ...base.executionToolchain.python,
+          executablePath: "/opt/ccc/bin/python3",
+          executableSha256: "e".repeat(64),
+          version: "3.12.10",
+          versionOutputSha256: "f".repeat(64),
+          runtimeManifest: {
+            schema: "ccc-prd.python-runtime-manifest.v1",
+            interpreter: { path: "/opt/ccc/bin/python3", sha256: "e".repeat(64) },
+            stdlibRoot: "/opt/ccc/lib/python3.12",
+            pythonHomeRoot: "/opt/ccc",
+            sitePackagesRoots: ["/opt/ccc/lib/python3.12/site-packages"],
+            extensionModuleRoots: ["/opt/ccc/lib/python3.12/lib-dynload"],
+            runtimeSupport: [],
+            stdlib: [{ path: "/opt/ccc/lib/python3.12/os.py", sha256: HASH_A }],
+            sitePackages: [{ path: "/opt/ccc/lib/python3.12/site-packages/fixture.py", sha256: HASH_B }],
+            extensionModules: [{ path: "/opt/ccc/lib/python3.12/lib-dynload/_fixture.so", sha256: HASH_C }],
+            dylibClosure: [{ path: "/opt/ccc/lib/libpython3.12.dylib", sha256: HASH_D }],
+          },
+        },
+      },
+    } as unknown as typeof base;
+
+    expect(computeCccPrdProofDefinitionSha256(python)).not.toBe(
+      computeCccPrdProofDefinitionSha256(base),
+    );
+    expect(cccPrdContract.computeCccPrdProofExecutionToolchainSha256(python.executionToolchain))
+      .not.toBe(cccPrdContract.computeCccPrdProofExecutionToolchainSha256(base.executionToolchain));
+  });
+
   it("RED-S4-proof-canonical-sets: v2 proof identity ignores caller ordering for every semantic set", () => {
     const base = proofV2();
     const reordered = {

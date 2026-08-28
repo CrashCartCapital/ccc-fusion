@@ -136,6 +136,10 @@ function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" =
     approvalRequestId: `ccc-approval-${digest.repeat(64)}`,
     memberHash: digest.repeat(64),
   });
+  const members = [
+    member(0, "TASK-coding", "TASK-1", "a"),
+    member(1, "TASK-review", "TASK-2", "b"),
+  ];
   return {
     schemaVersion: "ccc-campaign.execution-authorization.v1" as const,
     projectId: "project-1",
@@ -159,10 +163,23 @@ function sealedExecutionAuthorization(status: "issued" | "claimed" | "settled" =
     authorizationId: `ccc-execution-authorization-${authorizationDigest}`,
     authorizationDigest,
     memberSetHash: "7".repeat(64),
-    members: [
-      member(0, "TASK-coding", "TASK-1", "a"),
-      member(1, "TASK-review", "TASK-2", "b"),
-    ],
+    members,
+    memberCustody: members.map((entry) => ({
+      ordinal: entry.ordinal,
+      nativeTaskId: entry.nativeTaskId,
+      semanticTaskId: entry.semanticTaskId,
+      actionId: entry.actionId,
+      actionTarget: entry.actionTarget,
+      approvalRequestId: entry.approvalRequestId,
+      status: status === "issued"
+        ? "issued"
+        : status === "claimed"
+          ? "claimed"
+          : "consumed",
+      approvalTaskId: entry.nativeTaskId,
+      approvalRunId: "RUN-product",
+      bindingHash: entry.bindingHash,
+    })),
     expectedRequestCount: 0,
     status,
     requester: {
@@ -248,7 +265,7 @@ function snapshotPacketRoot(root: string): Record<string, string> {
 }
 
 describe("prd command exit contract", () => {
-  it("RED-S4-executable-author: generated author explicitly requests semantic v2 with controller toolchain custody", async () => {
+  it("RED-S4-executable-author: generated author defers controller toolchain custody until proposal parsing", async () => {
     const packet = createPacketRoot();
     const adapter = {
       id: "fusion-native-model-runtime-v1",
@@ -263,6 +280,7 @@ describe("prd command exit contract", () => {
         executablePath: "/controller/fusion-cli",
       },
     };
+    const resolveToolchain = vi.fn(() => toolchainPaths);
     const authorCccPrdPacket = vi.fn(async () => ({
       kind: "candidate" as const,
       sidecar: { schema: "ccc-prd.sidecar.v2" },
@@ -279,7 +297,7 @@ describe("prd command exit contract", () => {
       "--base", packet.base,
       "--provider", "loopback",
       "--model", "fixture",
-      "--max-requests", "1",
+      "--max-requests", "2",
       "--max-duration-ms", "30000",
       "--max-concurrency", "1",
       "--max-prompt-bytes", "1000000",
@@ -289,12 +307,13 @@ describe("prd command exit contract", () => {
       authorCccPrdPacket: authorCccPrdPacket as never,
       bootstrapProofAdmission: async () => ({}) as never,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
-      resolveSemanticProofToolchainPaths: () => toolchainPaths,
+      resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(0);
 
+    expect(resolveToolchain).not.toHaveBeenCalled();
     expect(authorCccPrdPacket).toHaveBeenCalledWith(expect.objectContaining({
       semanticProofContract: "v2",
-      semanticProofToolchainPaths: toolchainPaths,
+      resolveSemanticProofToolchainPaths: expect.any(Function),
       adapter,
       constraints: expect.objectContaining({
         targetRepository: { path: packet.target, baseCommit: packet.base },
@@ -305,9 +324,49 @@ describe("prd command exit contract", () => {
     });
   });
 
-  it("refuses generated executable authoring before model setup when controller toolchain custody is unavailable", async () => {
-    const packet = createPacketRoot();
-    const createAdapter = vi.fn();
+  it("RED-R1-generated-author-python: resolves the target Python venv after the model proposal", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8")) as {
+      proofs: Array<{
+        executionToolchain: Record<string, unknown>;
+        verifierProfile?: unknown;
+      }>;
+    };
+    const proof = proposal.proofs[0]!;
+    proof.executionToolchain.python = {
+      executablePath: "",
+      executableSha256: "",
+      version: "",
+      versionOutputSha256: "",
+      runtimeManifest: {
+        schema: "ccc-prd.python-runtime-manifest.v1",
+        interpreter: { path: "", sha256: "" },
+        stdlibRoot: "",
+        pythonHomeRoot: "",
+        sitePackagesRoots: [],
+        extensionModuleRoots: [],
+        runtimeSupport: [],
+        stdlib: [],
+        sitePackages: [],
+        extensionModules: [],
+        dylibClosure: [],
+      },
+    };
+    proof.verifierProfile = {
+      schema: "ccc-prd.verifier.python-adapter.v1",
+      adapterPath: "verify/python_adapter.py",
+      targetPath: "fixtures/python-target",
+    };
+    writeFileSync(packet.proposal, JSON.stringify(proposal, null, 2));
+
+    const adapter = {
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(async () => proposal),
+    };
+    const resolveToolchain = vi.fn(() => {
+      throw new Error("CCC semantic-proof active Python venv is unavailable: target/.venv");
+    });
     const output: string[] = [];
 
     expect(await runPrdCommand([
@@ -319,7 +378,124 @@ describe("prd command exit contract", () => {
       "--base", packet.base,
       "--provider", "loopback",
       "--model", "fixture",
-      "--max-requests", "1",
+      "--max-requests", "2",
+      "--max-duration-ms", "30000",
+      "--max-concurrency", "1",
+      "--max-prompt-bytes", "1000000",
+      "--max-response-bytes", "262144",
+      "--max-review-items", "8",
+    ], { write: (line) => output.push(line) }, {
+      bootstrapProofAdmission,
+      createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      resolveSemanticProofToolchainPaths: resolveToolchain,
+    })).toBe(1);
+
+    expect(adapter.generateCandidate).toHaveBeenCalledTimes(1);
+    expect(resolveToolchain).toHaveBeenCalledWith({
+      pythonRequired: true,
+      targetRoot: packet.target,
+    });
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_SEMANTIC_PROOF_CUSTODY_REFUSED",
+        message: "CCC semantic-proof active Python venv is unavailable: target/.venv",
+      }],
+    });
+  });
+
+  it("RED-R1-deterministic-author-python-semantic-v2-toolchain: requests and forwards controller-owned python3 custody", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8")) as {
+      proofs: Array<{
+        executionToolchain: Record<string, unknown>;
+        verifierProfile?: unknown;
+      }>;
+    };
+    const proof = proposal.proofs[0]!;
+    proof.executionToolchain.python = {
+      executablePath: "",
+      executableSha256: "",
+      version: "",
+      versionOutputSha256: "",
+      runtimeManifest: {
+        schema: "ccc-prd.python-runtime-manifest.v1",
+        interpreter: { path: "", sha256: "" },
+        stdlibRoot: "",
+        pythonHomeRoot: "",
+        sitePackagesRoots: [],
+        extensionModuleRoots: [],
+        runtimeSupport: [],
+        stdlib: [],
+        sitePackages: [],
+        extensionModules: [],
+        dylibClosure: [],
+      },
+    };
+    proof.verifierProfile = {
+      schema: "ccc-prd.verifier.python-adapter.v1",
+      adapterPath: "verify/python_adapter.py",
+      targetPath: "fixtures/python-target",
+    };
+    writeFileSync(packet.proposal, JSON.stringify(proposal, null, 2));
+
+    const toolchainPaths = {
+      taskExecutablePath: "/controller/task",
+      nodeExecutablePath: "/controller/node",
+      pythonExecutablePath: "/controller/python3",
+      proofHost: {
+        id: "fusion-cli-semantic-proof-host.v1" as const,
+        executablePath: "/controller/proof-host",
+      },
+    };
+    const resolveToolchain = vi.fn(() => toolchainPaths);
+    const authorCccPrdPacket = vi.fn(async () => ({
+      kind: "candidate" as const,
+      sidecar: { schema: "ccc-prd.sidecar.v2" },
+      review: { ambiguities: [], unresolvedDecisions: [], exceptions: [], protectedActions: [] },
+    }));
+    const output: string[] = [];
+
+    expect(await runPrdCommand(
+      ["author", packet.root, packet.manifest, packet.proposal, packet.sidecar],
+      { write: (line) => output.push(line) },
+      {
+        authorCccPrdPacket: authorCccPrdPacket as never,
+        bootstrapProofAdmission: async () => ({}) as never,
+        resolveSemanticProofToolchainPaths: resolveToolchain,
+      },
+    )).toBe(0);
+
+    expect(resolveToolchain).toHaveBeenCalledWith({
+      pythonRequired: true,
+      targetRoot: packet.target,
+    });
+    expect(authorCccPrdPacket).toHaveBeenCalledWith(expect.objectContaining({
+      semanticProofContract: "v2",
+      semanticProofToolchainPaths: toolchainPaths,
+    }));
+  });
+
+  it("refuses generated executable authoring after model setup when controller toolchain custody is unavailable", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8"));
+    const createAdapter = vi.fn(() => ({
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(async () => proposal),
+    }));
+    const output: string[] = [];
+
+    expect(await runPrdCommand([
+      "author",
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      "--target", packet.target,
+      "--base", packet.base,
+      "--provider", "loopback",
+      "--model", "fixture",
+      "--max-requests", "2",
       "--max-duration-ms", "30000",
       "--max-concurrency", "1",
       "--max-prompt-bytes", "1000000",
@@ -327,12 +503,13 @@ describe("prd command exit contract", () => {
       "--max-review-items", "8",
     ], { write: (line) => output.push(line) }, {
       createNativeCccPrdAuthoringAdapter: createAdapter,
+      bootstrapProofAdmission,
       resolveSemanticProofToolchainPaths: () => {
         throw new Error("built proof host missing");
       },
     })).toBe(1);
 
-    expect(createAdapter).not.toHaveBeenCalled();
+    expect(createAdapter).toHaveBeenCalledTimes(1);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "refusal",
       diagnostics: [{
@@ -572,8 +749,8 @@ describe("prd command exit contract", () => {
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --target <repository> --base <40-hex-commit> --owned-path <path> --write-root <path> --write-purpose <purpose> --max-requests <n> --max-duration-ms <n> --max-concurrency <n>",
         "       fn prd freeze <active-projects-root> <selected-prd-path> <output-dir> --context-stdin",
-        "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>]",
-        "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path> (mutually exclusive with --provider/--model/--transport/--cli-adapter; exactly one form required)",
+        "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --provider <provider> --model <model> --transport <pi|cli> [--cli-adapter <id>] [--receipt-adapter <id>]",
+        "       fn prd policy <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base> <output-path> --routes-file <path> (mutually exclusive with --provider/--model/--transport/--cli-adapter/--receipt-adapter; exactly one form required)",
         "       fn prd template",
         "       fn prd lint <prd-path>",
         "       fn prd <validate|compile> <root-dir> <manifest-path> <sidecar-path> <expected-target> <expected-base>",
@@ -1212,9 +1389,11 @@ describe("prd command exit contract", () => {
         "--provider",
         "deterministic-fake",
         "--model",
-        "fixture-v2",
+        "upstream/fixture-v2",
         "--transport",
         "pi",
+        "--receipt-adapter",
+        "terminal-route-sse-comments.v1",
       ],
       { write: (line) => output.push(line) },
       { bootstrapProofAdmission },
@@ -1232,8 +1411,9 @@ describe("prd command exit contract", () => {
         routes: [{
           taskId: "TASK-CLI-001",
           providerId: "deterministic-fake",
-          modelId: "fixture-v2",
+          modelId: "upstream/fixture-v2",
           transport: "pi",
+          receiptAdapterId: "terminal-route-sse-comments.v1",
           executor: "model",
           toolMode: "coding",
           worktreeMode: "isolated",
@@ -1416,13 +1596,13 @@ describe("prd command exit contract", () => {
       proofs: [expect.objectContaining({ id: "PF-CLI-001" })],
       requestBudget: {
         scope: "campaign-global",
-        maximum: 1,
+        maximum: 2,
         providerTasks: 1,
-        deterministicMinimum: 1,
+        deterministicMinimum: 2,
         headroomAboveMinimum: 0,
         completionAdequacy: "unproven",
         explanation:
-          "One first-time provider-attempt reservation slot per provider task is only a static admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, and completion adequacy remains unproven.",
+          "Two requests per provider task (one MUTATE turn plus the single REPAIR turn) is only a structural admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, live runs commonly cost 9-13 requests per task, and completion adequacy remains unproven.",
       },
       verifierConfinement: {
         ready: true,
@@ -1534,7 +1714,7 @@ describe("prd command exit contract", () => {
       },
     });
     expect(output[0]).not.toContain("private runner detail");
-  });
+  }, 60_000);
 
   it("refuses import before project or importer residue when readiness has no admitted backend", async () => {
     const packet = createPacketRoot({ semanticV2: true });
@@ -1953,6 +2133,18 @@ describe("prd command exit contract", () => {
           members: [
             { approvalRequestId: authorization.members[0]!.approvalRequestId },
             { approvalRequestId: authorization.members[1]!.approvalRequestId },
+          ],
+          memberCustody: [
+            {
+              approvalRequestId: authorization.members[0]!.approvalRequestId,
+              status: "issued",
+              nativeTaskId: "TASK-coding",
+            },
+            {
+              approvalRequestId: authorization.members[1]!.approvalRequestId,
+              status: "issued",
+              nativeTaskId: "TASK-review",
+            },
           ],
         },
         approvals: [
@@ -2714,7 +2906,9 @@ describe("prd command exit contract", () => {
     expect(settleAttempt).not.toHaveBeenCalled();
   });
 
-  it("previews and settles one non-CLI provider effect while routing CLI recovery to its native fence", async () => {
+  async function exerciseNonCliProviderResolution(
+    parkedState: "manual-required" | "failed",
+  ): Promise<void> {
     const attemptKey = `ccc-provider-attempt-${"a".repeat(64)}`;
     const controllerToken =
       "ccc-provider-controller-00000000-0000-4000-8000-000000000001";
@@ -2762,12 +2956,16 @@ describe("prd command exit contract", () => {
       taskId: "FN-1",
       nodeId: "node-provider",
       kind: "task",
-      state: "manual-required",
+      state: parkedState,
       attempt: workItemFence.attempt,
       leaseOwner: null,
       leaseExpiresAt: null,
-      lastError: "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
-      blockedReason: "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
+      lastError: parkedState === "failed"
+        ? "workflow-node-error:node-provider:workflow step timed out after 900000ms"
+        : "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
+      blockedReason: parkedState === "failed"
+        ? null
+        : "ccc-permanent:CCC_PROVIDER_DISPATCH_UNKNOWN",
       stableWorkflowRunId: "ccc-prd:import-1",
     };
     const before = {
@@ -2822,9 +3020,9 @@ describe("prd command exit contract", () => {
       ...before,
       workItems: [{
         ...workItem,
-        state: "runnable",
-        lastError: null,
-        blockedReason: null,
+        state: parkedState === "manual-required" ? "runnable" : "failed",
+        lastError: parkedState === "manual-required" ? null : workItem.lastError,
+        blockedReason: parkedState === "manual-required" ? null : workItem.blockedReason,
       }],
       providerAttempts: [{
         ...providerAttempt,
@@ -2888,7 +3086,9 @@ describe("prd command exit contract", () => {
       kind: "provider-resolution-preview",
       attemptKey,
       outcome: "committed",
-      consequence: expect.stringContaining("requeue"),
+      consequence: expect.stringContaining(
+        parkedState === "manual-required" ? "requeue" : "terminal failed",
+      ),
       confirmation: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(inspectAttempt).not.toHaveBeenCalled();
@@ -2926,26 +3126,32 @@ describe("prd command exit contract", () => {
       evidenceDigest,
       observerId: "operator-local-1",
     }));
-    expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
-      workItem.id,
-      "runnable",
-      {
-        expectedState: "manual-required",
-        expectedAttempt: workItem.attempt,
-        expectedLeaseOwner: null,
-        attempt: workItem.attempt,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        retryAfter: null,
-        lastError: null,
-        blockedReason: null,
-      },
-    );
+    if (parkedState === "manual-required") {
+      expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
+        workItem.id,
+        "runnable",
+        {
+          expectedState: "manual-required",
+          expectedAttempt: workItem.attempt,
+          expectedLeaseOwner: null,
+          attempt: workItem.attempt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          retryAfter: null,
+          lastError: null,
+          blockedReason: null,
+        },
+      );
+    } else {
+      expect(transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    }
     expect(JSON.parse(settleOutput[0]!)).toMatchObject({
       kind: "provider-resolved",
       attempt: { attemptKey, state: "committed" },
       status: {
-        workItems: [expect.objectContaining({ state: "runnable" })],
+        workItems: [expect.objectContaining({
+          state: parkedState === "manual-required" ? "runnable" : "failed",
+        })],
       },
     });
     expect(settleOutput[0]).not.toContain("controllerToken");
@@ -2998,7 +3204,12 @@ describe("prd command exit contract", () => {
       ]),
       nextSafeAction: expect.stringContaining("fn prd status"),
     });
-  });
+  }
+
+  it.each(["manual-required", "failed"] as const)(
+    "previews and settles one non-CLI provider effect from an unleased %s boundary while routing CLI recovery to its native fence",
+    exerciseNonCliProviderResolution,
+  );
 
   it("claims exact merge approval, lands, and settles only its parked imported work item", async () => {
     const confirmation = "9".repeat(64);
@@ -3278,6 +3489,86 @@ describe("prd command exit contract", () => {
       status: { nextAction: { kind: "wait-for-runtime" } },
     });
     expect(JSON.parse(output[0]!)).not.toHaveProperty("approvalRequestId");
+  });
+
+  it("RED-W1-structural-digest: refuses a stale parent confirmation before preflight or claim", async () => {
+    const currentConfirmation = "8".repeat(64);
+    const staleConfirmation = "7".repeat(64);
+    const authorization = sealedExecutionAuthorization();
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "TASK-coding",
+      nodeId: "node-coding",
+      kind: "task",
+      state: "manual-required",
+      attempt: 1,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const approveExecution = vi.fn();
+    const inspectReadiness = vi.fn();
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["approve-execution", "operator-key", authorization.authorizationId, "--confirm", staleConfirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => ({
+          projectId: "project-1",
+          projectPath: "/tmp/product-target",
+          projectName: "Fixture",
+          isRegistered: true,
+          store: { getAsyncLayer: () => ({}) },
+        })),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: vi.fn(async () => ({
+          schema: "ccc-prd.product-status.v1",
+          observedAt: "2026-07-31T00:00:00.000Z",
+          projectId: "project-1",
+          import: {
+            importId: "import-1",
+            idempotencyKey: "operator-key",
+            targetRepository: "/tmp/product-target",
+            targetBase: "d".repeat(40),
+            state: "active",
+            runnable: true,
+          },
+          tasks: [],
+          workItems: [workItem],
+          proofs: [],
+          orphanProofAttempts: [],
+          providerAttempts: [],
+          executionAuthorizationMode: "sealed_bundle_v1",
+          executionAuthorization: authorization,
+          approvals: [],
+          landing: { intents: [], materializations: [], terminals: [] },
+          nextAction: {
+            kind: "approve-execution",
+            reason: "Approve the one sealed campaign launch.",
+            executionAuthorizationId: authorization.authorizationId,
+            executionAuthorizationStatus: "issued",
+          },
+        })),
+        computeCccCampaignLiveExecutionApprovalConfirmation: vi.fn(() => currentConfirmation),
+        approveCccCampaignLiveExecution: approveExecution,
+        inspectVerifierConfinementReadiness: inspectReadiness,
+      },
+      { projectName: "fixture" },
+    )).toBe(1);
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_LIVE_EXECUTION_CONFIRMATION_REFUSED",
+        message: expect.stringContaining("stale or does not match"),
+      }],
+    });
+    expect(inspectReadiness).not.toHaveBeenCalled();
+    expect(approveExecution).not.toHaveBeenCalled();
   });
 
   it("RED-R11-expired-parent-approve: refuses an expired parent before verifier preflight or engine claim", async () => {

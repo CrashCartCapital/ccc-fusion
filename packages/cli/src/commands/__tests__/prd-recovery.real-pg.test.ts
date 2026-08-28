@@ -321,8 +321,21 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     )).resolves.toMatchObject({ state: "held" });
   });
 
-  it("previews and settles one uncertain PI provider attempt as proved-failed durably, then requeues only its exact work item", async () => {
-    const campaign = await importRecoveryCampaign("provider-pi");
+  async function exercisePiProviderResolution(
+    parkedState: "manual-required" | "failed",
+  ): Promise<void> {
+    const campaign = await importRecoveryCampaign(`provider-pi-${parkedState}`);
+    const parkedWorkItem = {
+      ...campaign.parkedWorkItem,
+      state: parkedState,
+      lastError: parkedState === "failed"
+        ? "workflow-node-error:node-provider:workflow step timed out after 900000ms"
+        : campaign.parkedWorkItem.lastError,
+      blockedReason: parkedState === "failed"
+        ? null
+        : campaign.parkedWorkItem.blockedReason,
+    };
+    await h.store().upsertWorkflowWorkItem(parkedWorkItem);
     const route = campaign.executionPolicy.routes.find(
       ({ taskId }) => taskId === campaign.semanticTaskId,
     )!;
@@ -336,9 +349,9 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       modelId: route.modelId,
       transport: "pi",
       workItemFence: {
-        workItemId: campaign.parkedWorkItem.id,
-        runId: campaign.parkedWorkItem.runId,
-        attempt: campaign.parkedWorkItem.attempt,
+        workItemId: parkedWorkItem.id,
+        runId: parkedWorkItem.runId,
+        attempt: parkedWorkItem.attempt,
       },
     });
     await h.store().beginCccProviderAttemptDispatch({
@@ -357,9 +370,9 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       state: workItem.state,
     }))).toEqual([
       {
-        id: campaign.parkedWorkItem.id,
+        id: parkedWorkItem.id,
         taskId: campaign.taskId,
-        state: "manual-required",
+        state: parkedState,
       },
     ]);
     expect(preResolutionStatus?.providerAttempts).toEqual([
@@ -377,8 +390,8 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     ]);
 
     await h.store().upsertWorkflowWorkItem({
-      ...campaign.parkedWorkItem,
-      attempt: campaign.parkedWorkItem.attempt + 1,
+      ...parkedWorkItem,
+      attempt: parkedWorkItem.attempt + 1,
     });
     const wrongAttempt = await runCommand([
       "resolve-provider",
@@ -396,7 +409,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
         message: expect.stringContaining("exact imported workflow work item"),
       }],
     });
-    await h.store().upsertWorkflowWorkItem(campaign.parkedWorkItem);
+    await h.store().upsertWorkflowWorkItem(parkedWorkItem);
 
     const preview = await runCommand([
       "resolve-provider",
@@ -412,7 +425,9 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       attemptKey: reserved.attemptKey,
       outcome: "proved_failed",
       confirmation: expect.stringMatching(/^[0-9a-f]{64}$/),
-      consequence: expect.stringContaining("requeue"),
+      consequence: expect.stringContaining(
+        parkedState === "manual-required" ? "requeue" : "terminal failed",
+      ),
     });
     await expect(h.store().inspectCccProviderAttempt({
       taskId: campaign.taskId,
@@ -475,11 +490,22 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     ]);
     expect(freshStatus?.workItems
       .filter(({ state }) => state === "runnable")
-      .map(({ id }) => id)).toEqual([campaign.parkedWorkItem.id]);
+      .map(({ id }) => id)).toEqual(
+        parkedState === "manual-required" ? [parkedWorkItem.id] : [],
+      );
+    await expect(h.store().getWorkflowWorkItem(parkedWorkItem.id))
+      .resolves.toMatchObject({
+        state: parkedState === "manual-required" ? "runnable" : "failed",
+      });
     await expect(h.store().getWorkflowWorkItem(
       campaign.siblingWorkItem.id,
     )).resolves.toMatchObject({ state: "held" });
-  });
+  }
+
+  it.each(["manual-required", "failed"] as const)(
+    "settles one uncertain PI provider attempt from an unleased %s boundary without reviving terminal work",
+    exercisePiProviderResolution,
+  );
 
   it("refuses generic settlement for an uncertain CLI provider attempt and preserves its fence-owned state", async () => {
     const campaign = await importRecoveryCampaign("provider-cli", "cli");

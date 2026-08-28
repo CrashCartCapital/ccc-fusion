@@ -513,6 +513,21 @@ async function capturePhysicalIdentity(input: {
   });
 }
 
+/*
+ * FNXC:CampaignGuardObservability 2026-08-24-03:20:
+ * Compare inode identity only. `size`, `mtimeNs`, and `ctimeNs` move whenever
+ * ordinary content changes -- notably, any read-only `git status` refreshes
+ * .git/index's stat cache and rewrites those three fields. Including them made
+ * the recheck report "physical identity or HEAD changed" for benign inspection
+ * and killed a live campaign mid-run.
+ *
+ * What this guard is for is detecting the target being substituted: swapped,
+ * relinked, or repointed at a different object. Every such substitution creates
+ * a new inode, so `dev`/`ino` (plus `mode` and `birthtimeNs`) still catch it --
+ * see the same-path checkout and control-directory replacement tests. Dropping
+ * the volatile fields costs no real detection and removes a false positive that
+ * fires on reads.
+ */
 function sameStatIdentity(
   left: CccCampaignStatIdentity,
   right: CccCampaignStatIdentity,
@@ -521,10 +536,27 @@ function sameStatIdentity(
     && left.dev === right.dev
     && left.ino === right.ino
     && left.mode === right.mode
-    && left.size === right.size
-    && left.mtimeNs === right.mtimeNs
-    && left.ctimeNs === right.ctimeNs
     && left.birthtimeNs === right.birthtimeNs;
+}
+
+/*
+ * FNXC:CampaignGuardObservability 2026-08-24-03:20:
+ * The index is the one entry here that Git itself replaces during ordinary use:
+ * `git status` writes index.lock and renames it over .git/index, so the file
+ * gets a brand-new inode even though nothing about the repository's identity
+ * moved. Anchoring on its inode therefore reports a substitution on every read.
+ *
+ * Location is the durable property worth asserting: the index still resolves to
+ * the same path on the same device. Substitution of the repository is caught by
+ * the surrounding entries -- swapping the checkout or the control directory
+ * gives targetRoot/gitControlPath/gitDir/gitCommonDir new inodes -- so the index
+ * carries no unique detection weight that this loosening gives up.
+ */
+function sameIndexLocation(
+  left: CccCampaignStatIdentity,
+  right: CccCampaignStatIdentity,
+): boolean {
+  return left.path === right.path && left.dev === right.dev;
 }
 
 function samePhysicalIdentity(
@@ -535,7 +567,7 @@ function samePhysicalIdentity(
     && sameStatIdentity(left.gitControlPath, right.gitControlPath)
     && sameStatIdentity(left.gitDir, right.gitDir)
     && sameStatIdentity(left.gitCommonDir, right.gitCommonDir)
-    && sameStatIdentity(left.indexPath, right.indexPath)
+    && sameIndexLocation(left.indexPath, right.indexPath)
     && sameStatIdentity(left.gitBinary, right.gitBinary);
 }
 
@@ -1050,8 +1082,12 @@ async function assertCleanGitSample(
     signal,
   );
   if (untracked.length > 0) {
+    const untrackedPaths = untracked
+      .toString("utf8")
+      .split("\0")
+      .filter((path) => path.length > 0);
     throw new CccCampaignLocalGitError(
-      "CCC campaign target worktree has nonignored untracked paths",
+      `CCC campaign target worktree has nonignored untracked paths: ${JSON.stringify(untrackedPaths)}`,
     );
   }
 }
