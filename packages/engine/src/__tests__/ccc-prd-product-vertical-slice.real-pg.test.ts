@@ -236,7 +236,7 @@ async function createPacket(
     `- Baseline commit: ${targetBase}`,
     `- Allowed write root: ${targetRoot}`,
     "- Allowed write root purpose: disposable product acceptance repository",
-    "- Max requests: 1",
+    "- Max requests: 2",
     "- Max duration ms: 120000",
     "- Max concurrency: 1",
     "- Non-goal: Modify any path outside src/value.txt.",
