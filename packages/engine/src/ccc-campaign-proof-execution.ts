@@ -826,9 +826,9 @@ async function resolveSemanticProofExecution(
       nativeTaskId,
       campaign,
       snapshot,
-      candidateOwnershipRoots: Object.freeze(
-        (campaign.route.allowedWriteRoots ?? []).map(canonicalGitPath),
-      ),
+      // Proof inputs may read already-committed outputs from prerequisite tasks.
+      // Source mutation custody remains task-local in inspectTaskGit above.
+      candidateOwnershipRoots: Object.freeze(campaignModelWriteRoots(campaign)),
       verifierDisjointRoots: campaignModelWriteRoots(campaign),
     };
   }

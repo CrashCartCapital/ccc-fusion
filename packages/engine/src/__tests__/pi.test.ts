@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { describeModel, formatModelMarkerDetails, compactSessionContext, COMPACTION_FALLBACK_INSTRUCTIONS, createFnAgent, getProjectRootFromWorktree, isModelAuthTierIncompatibilityError, isRetryableModelSelectionError, promptWithFallback, type AgentOptions } from "../pi.js";
 import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { piLog } from "../logger.js";
@@ -1171,6 +1173,32 @@ describe("session failure diagnostics", () => {
   describe("createFnAgent cccProviderAttemptBinding controller seam", () => {
     const providerModel = { provider: "pi-claude-cli", id: "claude-sonnet-4-6" } as any;
     const providerContext = { messages: [] } as any;
+    let settingsPath: string;
+    let previousSettings: Buffer | null;
+
+    beforeAll(async () => {
+      const workerHome = process.env.HOME;
+      if (!workerHome) throw new Error("Vitest worker HOME must be isolated");
+      const settingsDir = join(workerHome, ".fusion");
+      settingsPath = join(settingsDir, "settings.json");
+      previousSettings = await readFile(settingsPath).catch(() => null);
+      await mkdir(settingsDir, { recursive: true });
+      await writeFile(settingsPath, JSON.stringify({
+        customProviders: [{
+          id: "omniroute-minimax-m3-pinned",
+          name: "OmniRoute MiniMax M3 Pinned",
+          apiType: "openai-compatible",
+          baseUrl: "http://127.0.0.1:8092/v1",
+          models: [{ id: "minimax/MiniMax-M3", name: "MiniMax M3" }],
+        }],
+      }));
+    });
+
+    afterAll(async () => {
+      if (previousSettings) await writeFile(settingsPath, previousSettings);
+      else await rm(settingsPath, { force: true });
+    });
+
     const dispatchKeyForAttempt = (attemptKey: string) => `pi-stream:${attemptKey.replace(/^attempt-/, "")}`;
     const authorityBinding = Object.freeze({
       projectId: "project-pi",

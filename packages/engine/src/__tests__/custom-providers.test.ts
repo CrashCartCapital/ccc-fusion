@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readCustomProviders } from "../custom-providers.js";
 
 describe("readCustomProviders", () => {
@@ -14,6 +14,7 @@ describe("readCustomProviders", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await rm(homeDir, { recursive: true, force: true });
   });
 
@@ -57,6 +58,21 @@ describe("readCustomProviders", () => {
     );
 
     expect(readCustomProviders(homeDir)).toEqual(providers);
+  });
+
+  it("uses the runtime HOME when no explicit home directory is supplied", async () => {
+    const providers = [{
+      id: "isolated-provider",
+      name: "Isolated Provider",
+      apiType: "openai-compatible",
+      baseUrl: "http://127.0.0.1:8092/v1",
+      models: [{ id: "isolated-model", name: "Isolated Model" }],
+    }];
+    await mkdir(join(homeDir, ".fusion"), { recursive: true });
+    await writeFile(settingsPath, JSON.stringify({ customProviders: providers }), "utf-8");
+    vi.stubEnv("HOME", homeDir);
+
+    expect(readCustomProviders()).toEqual(providers);
   });
 
   it("reads from legacy ~/.pi/fusion when ~/.fusion does not exist", async () => {

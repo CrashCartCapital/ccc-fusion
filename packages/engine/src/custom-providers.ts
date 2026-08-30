@@ -3,7 +3,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveGlobalDirForHome, type CustomProvider } from "@fusion/core";
 
-export function readCustomProviders(homeDir = homedir()): CustomProvider[] {
+export function readCustomProviders(
+  homeDir = process.env.HOME || process.env.USERPROFILE || homedir(),
+): CustomProvider[] {
   try {
     const settingsPath = join(resolveGlobalDirForHome(homeDir), "settings.json");
     const raw = readFileSync(settingsPath, "utf-8");
