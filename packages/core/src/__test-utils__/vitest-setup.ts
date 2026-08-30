@@ -990,6 +990,12 @@ function cleanupTrackedSubprocess(proc: ChildProcess): void {
 }
 
 function registerTrackedSubprocess(proc: ChildProcess, commandLine: string): void {
+  // child_process.exec() delegates through the exported execFile(), so both
+  // wrappers can observe the same ChildProcess. Register it once; overwriting
+  // the map entry would orphan the first timeout timer and falsely report a
+  // quick, already-closed command as timed out.
+  if (trackedSubprocesses.has(proc)) return;
+
   const tracked: TrackedSubprocess = {
     commandLine,
     startedAt: Date.now(),

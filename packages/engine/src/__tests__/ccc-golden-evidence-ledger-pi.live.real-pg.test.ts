@@ -27,12 +27,19 @@ import {
   waitForDurableProductBoundary,
   type ProductStatusOutput,
 } from "./helpers/ccc-golden-evidence-ledger-campaign-support.js";
+import {
+  GOLDEN_PI_PROJECT_ENVELOPE,
+  resolveGoldenPiDriver,
+} from "./helpers/ccc-golden-pi-driver-matrix.js";
 
 const cliDistRoot = join(dirname(fileURLToPath(import.meta.url)), "../../../cli/dist");
-const idempotencyKey = "ccc-golden-evidence-ledger-pi-contract-r6-spec-v2";
-const providerId = "golden-omniroute-luna";
-const modelId = "cx/gpt-5.6-luna-max";
-const livePgDescribe = process.env.CCC_GOLDEN_LIVE_PI === "1"
+const livePiRequested = process.env.CCC_GOLDEN_LIVE_PI === "1";
+if (livePiRequested && !process.env.CCC_GOLDEN_PI_DRIVER) {
+  throw new Error("CCC_GOLDEN_PI_DRIVER is required when CCC_GOLDEN_LIVE_PI=1");
+}
+const driver = resolveGoldenPiDriver(process.env.CCC_GOLDEN_PI_DRIVER ?? "luna-max");
+const idempotencyKey = `ccc-golden-evidence-ledger-pi-${driver.key}-r14-project-v1`;
+const livePgDescribe = livePiRequested
   ? pgDescribe.sequential
   : pgDescribe.skip;
 
@@ -52,20 +59,20 @@ async function prepareLifecycle(root: string): Promise<PreparedLifecycle> {
   return module.prepareEvidenceLedgerPacketLifecycle({
     root,
     route: {
-      providerId,
-      modelId,
+      providerId: driver.providerId,
+      modelId: driver.modelId,
       transport: "pi",
       receiptAdapterId: "terminal-route-sse-comments.v1",
     },
-    maxRequests: 6,
-    maxDurationMs: 180_000,
+    maxRequests: GOLDEN_PI_PROJECT_ENVELOPE.maxRequests,
+    maxDurationMs: GOLDEN_PI_PROJECT_ENVELOPE.maxDurationMs,
     taskCount: 1,
   });
 }
 
-livePgDescribe("CCC Golden Evidence Ledger one-task live Pi campaign", () => {
+livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.displayName})`, () => {
   const h = createSharedPgTaskStoreTestHarness({
-    prefix: "fusion_ccc_golden_pi_contract",
+    prefix: `fusion_ccc_golden_pi_${driver.key.replaceAll(/[^a-z0-9]+/g, "_")}`,
     poolMax: 4,
   });
   let lifecycleRoot = "";
@@ -82,7 +89,7 @@ livePgDescribe("CCC Golden Evidence Ledger one-task live Pi campaign", () => {
   beforeAll(async () => {
     await h.beforeAll();
     await h.beforeEach();
-    lifecycleRoot = await mkdtemp(join(tmpdir(), "ccc-golden-pi-contract-"));
+    lifecycleRoot = await mkdtemp(join(tmpdir(), `ccc-golden-pi-${driver.key}-`));
     isolatedHome = process.env.HOME ?? "";
     expect(isolatedHome).not.toBe("");
     lifecycle = await prepareLifecycle(lifecycleRoot);
@@ -90,17 +97,18 @@ livePgDescribe("CCC Golden Evidence Ledger one-task live Pi campaign", () => {
     const liveProviderSettings = {
       openrouterModelSync: false,
       opencodeGoModelSync: false,
+      taskTokenBudget: GOLDEN_PI_PROJECT_ENVELOPE.taskTokenBudget,
       customProviders: [{
         id: "f9ad9c11-b84c-4b06-b7bb-c330f37b21f1",
-        name: providerId,
+        name: driver.providerId,
         apiType: "openai-compatible",
         baseUrl: "http://127.0.0.1:8092/v1",
         headers: { "X-OmniRoute-No-Cache": "true" },
         models: [{
-          id: modelId,
-          name: "CCC Golden Luna Max",
-          contextWindow: 200_000,
-          maxTokens: 32_768,
+          id: driver.modelId,
+          name: `CCC Golden ${driver.displayName}`,
+          contextWindow: GOLDEN_PI_PROJECT_ENVELOPE.contextWindow,
+          maxTokens: GOLDEN_PI_PROJECT_ENVELOPE.maxOutputTokens,
         }],
       }],
     };
@@ -112,9 +120,13 @@ livePgDescribe("CCC Golden Evidence Ledger one-task live Pi campaign", () => {
       "utf-8",
     );
     expect(process.env.HOME).toBe(isolatedHome);
-    expect(readCustomProviders(isolatedHome).map(({ name }) => name)).toEqual([providerId]);
-    expect(readCustomProviders().map(({ name }) => name)).toEqual([providerId]);
-    await store.updateSettings({ pollIntervalMs: 60_000, maxConcurrent: 1, maxWorktrees: 1 });
+    expect(readCustomProviders(isolatedHome).map(({ name }) => name)).toEqual([driver.providerId]);
+    expect(readCustomProviders().map(({ name }) => name)).toEqual([driver.providerId]);
+    await store.updateSettings({
+      pollIntervalMs: 60_000,
+      maxConcurrent: GOLDEN_PI_PROJECT_ENVELOPE.maxConcurrency,
+      maxWorktrees: 1,
+    });
     dependencies = {
       bootstrapProofAdmission: () => bootstrapCccCampaignProofAdmissionHost({ builtRootPath: cliDistRoot }),
       resolveProject: async () => ({
@@ -139,7 +151,7 @@ livePgDescribe("CCC Golden Evidence Ledger one-task live Pi campaign", () => {
     await h.afterAll();
   });
 
-  test("generates and proves the contract project through real Pi", { timeout: 240_000 }, async () => {
+  test("generates and proves the contract project through real Pi", { timeout: 720_000 }, async () => {
     const readAgentTrace = async () => (await store.getAgentLogs("KB-001", { limit: 200 }))
       .filter(({ type }) => type !== "tool_result" && type !== "thinking")
       .map(({ timestamp, type, text, detail, durationMs, timeToFirstTokenMs }) => ({
@@ -241,6 +253,8 @@ livePgDescribe("CCC Golden Evidence Ledger one-task live Pi campaign", () => {
     );
     const agentTrace = await readAgentTrace();
     console.error(`CCC_GOLDEN_PI_EVIDENCE=${JSON.stringify({
+      driver,
+      envelope: GOLDEN_PI_PROJECT_ENVELOPE,
       requestCount: mergeHold.status.providerAttempts.length,
       proofAttemptCount: mergeHold.status.proofs.flatMap(({ attempts }) => attempts).length,
       routes: mergeHold.status.providerAttempts.map(({ terminal }) => terminal),
@@ -249,26 +263,26 @@ livePgDescribe("CCC Golden Evidence Ledger one-task live Pi campaign", () => {
     expect(mergeHold.mergeApprovalConfirmations).toHaveLength(1);
     expect(await git(lifecycle.targetRoot, "rev-parse", "refs/heads/main")).toBe(lifecycle.baseCommit);
     expect(mergeHold.status.providerAttempts.length).toBeGreaterThan(0);
-    expect(mergeHold.status.providerAttempts.length).toBeLessThanOrEqual(6);
+    expect(mergeHold.status.providerAttempts.length).toBeLessThanOrEqual(GOLDEN_PI_PROJECT_ENVELOPE.maxRequests);
     for (const providerAttempt of mergeHold.status.providerAttempts) {
       expect(providerAttempt).toMatchObject({
         semanticTaskId: "TASK-LEDGER-CONTRACT",
         state: "committed",
         binding: {
-          providerId,
-          modelId,
+          providerId: driver.providerId,
+          modelId: driver.modelId,
           transport: "pi",
         },
         terminal: {
           kind: "reconciled",
           effectiveRoute: {
-            effectiveProvider: providerId,
-            effectiveModel: modelId,
+            effectiveProvider: driver.providerId,
+            effectiveModel: driver.modelId,
             receiptSource: "stream-usage",
             omniRoute: {
               final: {
-                provider: "cx",
-                model: "gpt-5.6-luna-max",
+                provider: driver.effectiveProvider,
+                model: driver.effectiveModel,
               },
             },
           },
