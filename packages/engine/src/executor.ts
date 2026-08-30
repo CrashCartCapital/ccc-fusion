@@ -152,6 +152,7 @@ import {
   promptWithFallback,
   compactSessionContext,
 } from "./pi.js";
+import { CCC_CAMPAIGN_APPROVED_MCP_DISCOVERY_TOOLS } from "./fusion-code-core-mcp-policy.js";
 import { buildAgentGatedActionSummary } from "./permanent-agent-gating.js";
 import { accumulateSessionTokenUsage, captureSessionTokenBaseline, mergeTokenUsagePerModel, resetSessionTokenBaseline } from "./session-token-usage.js";
 import { finalizePlanningSegment, startPlanningSegment } from "@fusion/core";
@@ -19148,6 +19149,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         ...(cccCampaignImplementation ? {
           cccCampaignPhaseToolPolicy: {
             readOnlyToolNames: campaignPhaseReadOnlyToolNames,
+            approvedMcpDiscoveryTools: CCC_CAMPAIGN_APPROVED_MCP_DISCOVERY_TOOLS,
             exemptToolNames: ["fn_complete_phase"],
             maxReadOnlyToolCallsBeforeGuidance: campaignDiscoveryGuidanceToolLimit,
             maxReadOnlyToolCallsBeforeRefusal: campaignDiscoveryRefusalToolLimit,
@@ -19157,6 +19159,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             refusalMessage:
               "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: repeated DISCOVER read/search/list calls are phase-bounded. "
               + "No more discovery tools will run in this turn; use write/edit/bash to make the admitted change or stop honestly.",
+            onApprovedMcpDiscoveryToolCall: () => {
+              campaignPhaseRuntime.readCount += 1;
+            },
             currentPhase: () => campaignPhaseRuntime.activePhase,
             onPotentialMutationCompleted: async () => {
               try {

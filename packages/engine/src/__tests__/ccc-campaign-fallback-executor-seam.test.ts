@@ -1098,6 +1098,16 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       maxReadOnlyToolCallsBeforeGuidance: 1,
       maxReadOnlyToolCallsBeforeRefusal: 2,
     });
+    expect(sessionCall.cccCampaignPhaseToolPolicy.approvedMcpDiscoveryTools).toHaveLength(28);
+    expect(sessionCall.cccCampaignPhaseToolPolicy.approvedMcpDiscoveryTools).toEqual(
+      expect.arrayContaining([
+        { serverName: "fusion-code-core", toolName: "smart-tree__search" },
+        { serverName: "fusion-code-core", toolName: "brave-search__brave_web_search" },
+        { serverName: "fusion-code-core", toolName: "serper-mcp__google_search_scholar" },
+        { serverName: "fusion-code-core", toolName: "fetch-guard__fetch" },
+      ]),
+    );
+    expect(sessionCall.cccCampaignPhaseToolPolicy.onApprovedMcpDiscoveryToolCall).toEqual(expect.any(Function));
     expect(userPrompts[0]).toContain("CCC_CAMPAIGN_DISCOVER_BOUNDARY");
     expect(userPrompts[0]).toContain("at most 1 read/search/list discovery tool call");
   });

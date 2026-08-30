@@ -8,7 +8,12 @@ import {
   createWriteTool,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
-import { createFnAgent, isCccCampaignDiscoveryToolCall } from "../pi.js";
+import {
+  createFnAgent,
+  isCccCampaignDiscoveryToolCall,
+  wrapToolsWithCccCampaignPhaseToolPolicy,
+} from "../pi.js";
+import { connectMcpSessionTools } from "../mcp-session-tools.js";
 
 /*
 FNXC:CCCCampaignFallback 2026-08-01-17:10:
@@ -68,6 +73,14 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   DefaultResourceLoader: vi.fn().mockImplementation(function () {
     return {
       reload: vi.fn().mockResolvedValue(undefined),
+      getExtensions: vi.fn(() => ({ extensions: [], errors: [], runtime: {} })),
+      getSkills: vi.fn(() => ({ skills: [], diagnostics: [] })),
+      getPrompts: vi.fn(() => ({ prompts: [], diagnostics: [] })),
+      getThemes: vi.fn(() => ({ themes: [], diagnostics: [] })),
+      getAgentsFiles: vi.fn(() => ({ agentsFiles: [] })),
+      getSystemPrompt: vi.fn(() => undefined),
+      getAppendSystemPrompt: vi.fn(() => []),
+      extendResources: vi.fn(),
       skillsOverride: undefined,
     };
   }),
@@ -104,8 +117,10 @@ vi.mock("../mcp-session-tools.js", () => ({
     tools: [],
     connected: [],
     skipped: [],
+    toolSources: [],
     dispose: vi.fn().mockResolvedValue(undefined),
   }),
+  buildMcpCapabilityPrompt: vi.fn(() => undefined),
 }));
 
 const CAMPAIGN_TURN_KEY = "ccc-provider-turn-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -300,6 +315,77 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
     expect(lsExecute).not.toHaveBeenCalled();
   });
 
+  it("applies the native discovery budget to an exact approved MCP server/tool pair", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const mcpExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "semantic result" }],
+      isError: false,
+    });
+    const onReadOnlyToolCall = vi.fn();
+    vi.mocked(connectMcpSessionTools).mockResolvedValueOnce({
+      tools: [{
+        name: "mcp__fusion-code-core__smart-tree_search",
+        label: "smart-tree search",
+        description: "compressed repository search",
+        parameters: { type: "object", properties: {} },
+        execute: mcpExecute,
+      } as never],
+      connected: ["fusion-code-core"],
+      skipped: [],
+      toolSources: [{
+        serverName: "fusion-code-core",
+        sourceToolName: "smart-tree__search",
+        exposedToolName: "mcp__fusion-code-core__smart-tree_search",
+      }],
+      dispose: vi.fn().mockResolvedValue(undefined),
+    });
+    createAgentSessionMock.mockResolvedValueOnce({
+      session: synthSession("ccc-loopback", "primary-model"),
+    } as never);
+
+    await createFnAgent(campaignOptions({
+      tools: "coding",
+      mcpServers: [{ name: "fusion-code-core", transport: "stdio", command: "fake-mcp" }],
+      cccCampaignPhaseToolPolicy: {
+        readOnlyToolNames: ["read"],
+        approvedMcpDiscoveryTools: [{
+          serverName: "fusion-code-core",
+          toolName: "smart-tree__search",
+        }],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now",
+        refusalMessage: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+        onApprovedMcpDiscoveryToolCall: onReadOnlyToolCall,
+      },
+    }) as never);
+
+    const sessionOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      customTools: Array<{ name: string; execute: (...args: any[]) => Promise<unknown> }>;
+    };
+    const mcpTool = sessionOptions.customTools.find(
+      (tool) => tool.name === "mcp__fusion-code-core__smart-tree_search",
+    )!;
+
+    await expect(mcpTool.execute("call-1", { query: "router" }, undefined)).resolves.toMatchObject({
+      isError: false,
+      content: [{ type: "text", text: "semantic result" }],
+    });
+    await expect(mcpTool.execute("call-2", { query: "budget" }, undefined)).resolves.toMatchObject({
+      isError: false,
+      content: [
+        { type: "text", text: "semantic result" },
+        { type: "text", text: "CCC_CAMPAIGN_DISCOVER_BOUNDARY: mutate now" },
+      ],
+    });
+    await expect(mcpTool.execute("call-3", { query: "more" }, undefined)).resolves.toMatchObject({
+      isError: true,
+      error: "CCC_CAMPAIGN_DISCOVER_BOUNDARY_REFUSED: discovery refused",
+    });
+    expect(mcpExecute).toHaveBeenCalledTimes(2);
+    expect(onReadOnlyToolCall).toHaveBeenCalledTimes(3);
+  });
+
   it("classifies only read-like campaign discovery tool calls", () => {
     expect(isCccCampaignDiscoveryToolCall("read", { path: "src/a.ts" })).toBe(true);
     expect(isCccCampaignDiscoveryToolCall("edit", { path: "src/a.ts" })).toBe(false);
@@ -323,6 +409,35 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
     expect(isCccCampaignDiscoveryToolCall("bash", { command: "find . -name '*.ts' -fprint result.txt" })).toBe(false);
     expect(isCccCampaignDiscoveryToolCall("bash", { command: "git diff --output=result.patch" })).toBe(false);
     expect(isCccCampaignDiscoveryToolCall("bash", { command: "git show --output result.patch HEAD" })).toBe(false);
+    expect(isCccCampaignDiscoveryToolCall("mcp__fusion-code-core__smart-tree_search", {})).toBe(false);
+  });
+
+  it("refuses a renamed or unapproved namespaced MCP tool before it executes", async () => {
+    const execute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "should not execute" }],
+      isError: false,
+    });
+    const [wrapped] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "mcp__fusion-code-core__smart-tree_search_v2", execute } as never],
+      {
+        readOnlyToolNames: ["read"],
+        approvedMcpDiscoveryTools: [{
+          serverName: "fusion-code-core",
+          toolName: "smart-tree__search",
+        }],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+      },
+      [],
+    );
+
+    await expect(wrapped!.execute("call-1", {}, undefined, undefined, {} as never)).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("UNAPPROVED_MCP_TOOL_REFUSED"),
+    });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("executes an unknown Bash probe only within the bounded discovery allowance", async () => {

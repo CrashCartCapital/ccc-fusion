@@ -2,7 +2,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { describeModel, formatModelMarkerDetails, compactSessionContext, COMPACTION_FALLBACK_INSTRUCTIONS, createFnAgent, getProjectRootFromWorktree, isModelAuthTierIncompatibilityError, isRetryableModelSelectionError, promptWithFallback, type AgentOptions } from "../pi.js";
-import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { piLog } from "../logger.js";
 import { connectMcpSessionTools } from "../mcp-session-tools.js";
 
@@ -49,6 +49,14 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   DefaultResourceLoader: vi.fn().mockImplementation(function () {
     return {
       reload: vi.fn().mockResolvedValue(undefined),
+      getExtensions: vi.fn(() => ({ extensions: [], errors: [], runtime: {} })),
+      getSkills: vi.fn(() => ({ skills: [], diagnostics: [] })),
+      getPrompts: vi.fn(() => ({ prompts: [], diagnostics: [] })),
+      getThemes: vi.fn(() => ({ themes: [], diagnostics: [] })),
+      getAgentsFiles: vi.fn(() => ({ agentsFiles: [] })),
+      getSystemPrompt: vi.fn(() => undefined),
+      getAppendSystemPrompt: vi.fn(() => ["existing dynamic prompt"]),
+      extendResources: vi.fn(),
       skillsOverride: undefined,
     };
   }),
@@ -79,8 +87,10 @@ vi.mock("../mcp-session-tools.js", () => ({
     tools: [],
     connected: [],
     skipped: [],
+    toolSources: [],
     dispose: vi.fn().mockResolvedValue(undefined),
   }),
+  buildMcpCapabilityPrompt: vi.fn(() => "## MCP capability card\nConnected: docs"),
 }));
 
 // Import mock accessors after mocking (must use dynamic import for hoisted mocks)
@@ -910,6 +920,45 @@ describe("session failure diagnostics", () => {
 
     expect(createAgentSessionMock.mock.calls[0]?.[0]).not.toHaveProperty("mcpServers");
     expect(session.prompt).toHaveBeenCalledWith("Use docs", expect.objectContaining({ mcpServers }));
+  });
+
+  it("appends the live MCP capability card without reloading the base resource loader", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const session = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    vi.mocked(connectMcpSessionTools).mockResolvedValueOnce({
+      tools: [],
+      connected: ["docs"],
+      skipped: [],
+      toolSources: [],
+      dispose: vi.fn().mockResolvedValue(undefined),
+    });
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test MCP capability prompt",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      mcpServers: [{ name: "docs", transport: "stdio", command: "fake-mcp" }],
+    });
+
+    const createOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      resourceLoader: { getAppendSystemPrompt: () => string[] };
+    };
+    expect(createOptions.resourceLoader.getAppendSystemPrompt()).toEqual([
+      "existing dynamic prompt",
+      "## MCP capability card\nConnected: docs",
+    ]);
+    expect(createOptions.resourceLoader).not.toBe(
+      vi.mocked(DefaultResourceLoader).mock.results.at(-1)?.value,
+    );
   });
 
   it("forwards ccc-fusion profile and subscription readiness through createFnAgent to the actual MCP connection seam", async () => {

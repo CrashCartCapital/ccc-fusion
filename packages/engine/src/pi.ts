@@ -35,6 +35,7 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type ResourceLoader,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -105,7 +106,13 @@ import { READONLY_ALLOWLIST, filterCustomToolsForReadonly, isReadonlyAllowed } f
 import { createStreamingDeltaNormalizer } from "./streaming-delta.js";
 import { isModelAuthTierIncompatibilityError, isProviderModelNotFoundError, isUnsupportedMessageRoleError } from "./transient-error-detector.js";
 import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp-runtime-support.js";
-import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp-session-tools.js";
+import {
+  buildMcpCapabilityPrompt,
+  connectMcpSessionTools,
+  type McpClientFactory,
+  type McpSessionToolset,
+} from "./mcp-session-tools.js";
+import type { ApprovedMcpDiscoveryTool } from "./fusion-code-core-mcp-policy.js";
 import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
 import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
 import {
@@ -1826,11 +1833,16 @@ export interface AgentOptions {
   builtinToolsAllowlist?: BuiltinWebToolName[];
   cccCampaignPhaseToolPolicy?: {
     readOnlyToolNames: readonly string[];
+    approvedMcpDiscoveryTools?: readonly ApprovedMcpDiscoveryTool[];
     exemptToolNames?: readonly string[];
     maxReadOnlyToolCallsBeforeGuidance: number;
     maxReadOnlyToolCallsBeforeRefusal: number;
     guidanceMessage: string;
     refusalMessage: string;
+    onApprovedMcpDiscoveryToolCall?: (
+      toolName: string,
+      params: Record<string, unknown> | undefined,
+    ) => void;
     currentPhase?: () => string | undefined;
     onPotentialMutationCompleted?: (
       toolName: string,
@@ -2684,6 +2696,7 @@ export function wrapToolsWithBoundary(
 export function wrapToolsWithCccCampaignPhaseToolPolicy(
   tools: ToolDefinition[],
   policy: AgentOptions["cccCampaignPhaseToolPolicy"] | undefined,
+  approvedMcpDiscoveryToolNames: readonly string[] = [],
 ): ToolDefinition[] {
   if (!policy) return tools;
   const readOnlyToolNames = new Set(
@@ -2692,6 +2705,9 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
   if (readOnlyToolNames.size === 0) return tools;
   const exemptToolNames = new Set(
     (policy.exemptToolNames ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean),
+  );
+  const approvedMcpDiscoveryNames = new Set(
+    approvedMcpDiscoveryToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
   );
   const guidanceLimit = Number.isSafeInteger(policy.maxReadOnlyToolCallsBeforeGuidance)
     ? Math.max(1, policy.maxReadOnlyToolCallsBeforeGuidance)
@@ -2747,9 +2763,25 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
           return originalExecute(...args);
         }
         const params = args[1] as Record<string, unknown> | undefined;
-        const discovery = readOnlyToolNames.has(normalizedToolName)
-          && isCccCampaignDiscoveryToolCall(tool.name, params);
+        const nativeDiscovery = (
+          readOnlyToolNames.has(normalizedToolName)
+          && isCccCampaignDiscoveryToolCall(tool.name, params)
+        );
+        const approvedMcpDiscovery = approvedMcpDiscoveryNames.has(normalizedToolName);
+        if (normalizedToolName.startsWith("mcp__") && !approvedMcpDiscovery) {
+          return boundaryRejection(
+            "CCC_CAMPAIGN_UNAPPROVED_MCP_TOOL_REFUSED: this MCP tool is not in the exact admitted discovery catalog.",
+            {
+              phase: "DISCOVER",
+              toolName: tool.name,
+            },
+          );
+        }
+        const discovery = nativeDiscovery || approvedMcpDiscovery;
         if (discovery) {
+          if (approvedMcpDiscovery) {
+            policy.onApprovedMcpDiscoveryToolCall?.(tool.name, params);
+          }
           readOnlyToolCalls += 1;
           const refusal = refuseIfExhausted(tool.name);
           if (refusal) return refusal;
@@ -2804,6 +2836,38 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
       },
     };
   });
+}
+
+function resolveApprovedMcpDiscoveryToolNames(
+  policy: AgentOptions["cccCampaignPhaseToolPolicy"] | undefined,
+  toolset: McpSessionToolset | undefined,
+): string[] {
+  if (!policy?.approvedMcpDiscoveryTools?.length || !toolset?.toolSources.length) return [];
+  const approvedSources = new Set(
+    policy.approvedMcpDiscoveryTools.map(({ serverName, toolName }) => `${serverName}\0${toolName}`),
+  );
+  return toolset.toolSources
+    .filter(({ serverName, sourceToolName }) => approvedSources.has(`${serverName}\0${sourceToolName}`))
+    .map(({ exposedToolName }) => exposedToolName);
+}
+
+function appendResourceLoaderSystemPrompt(
+  resourceLoader: ResourceLoader,
+  prompt: string | undefined,
+): ResourceLoader {
+  const extra = prompt?.trim();
+  if (!extra) return resourceLoader;
+  return {
+    getExtensions: () => resourceLoader.getExtensions(),
+    getSkills: () => resourceLoader.getSkills(),
+    getPrompts: () => resourceLoader.getPrompts(),
+    getThemes: () => resourceLoader.getThemes(),
+    getAgentsFiles: () => resourceLoader.getAgentsFiles(),
+    getSystemPrompt: () => resourceLoader.getSystemPrompt(),
+    getAppendSystemPrompt: () => [...resourceLoader.getAppendSystemPrompt(), extra],
+    extendResources: (paths) => resourceLoader.extendResources(paths),
+    reload: (options) => resourceLoader.reload(options),
+  };
 }
 
 /*
@@ -3674,6 +3738,15 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       piLog.log(`readonly session — MCP servers (${forwardedMcpServers.length}) skipped`);
     }
 
+    const approvedMcpDiscoveryToolNames = resolveApprovedMcpDiscoveryToolNames(
+      options.cccCampaignPhaseToolPolicy,
+      mcpToolset,
+    );
+    const sessionResourceLoader = appendResourceLoaderSystemPrompt(
+      resourceLoader,
+      mcpToolset ? buildMcpCapabilityPrompt(mcpToolset) : undefined,
+    );
+
     const mcpReadonlyTools = new Set(mcpToolset?.tools ?? []);
     const candidateCustomTools = [
       ...(options.customTools ?? []),
@@ -3725,6 +3798,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     const phaseBoundedTools = wrapToolsWithCccCampaignPhaseToolPolicy(
       boundaryTools,
       options.cccCampaignPhaseToolPolicy,
+      approvedMcpDiscoveryToolNames,
     );
     const cccBinding = await resolveCccReceiptBinding(phaseBoundedTools);
     const customToolList: ToolDefinition[] = options.profile === CCC_FUSION_PROFILE
@@ -3781,7 +3855,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     const createSessionOptions: NonNullable<Parameters<typeof createAgentSession>[0]> = {
       cwd: options.cwd,
       modelRuntime,
-      resourceLoader,
+      resourceLoader: sessionResourceLoader,
       noTools: "builtin",
       customTools: customToolList,
       sessionManager,

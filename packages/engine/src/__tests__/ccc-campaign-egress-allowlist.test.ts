@@ -85,8 +85,10 @@ vi.mock("../mcp-session-tools.js", () => ({
     tools: [],
     connected: [],
     skipped: [],
+    toolSources: [],
     dispose: vi.fn().mockResolvedValue(undefined),
   }),
+  buildMcpCapabilityPrompt: vi.fn(() => undefined),
 }));
 
 const SYNTHETIC_API_KEY = "synthetic-never-read";

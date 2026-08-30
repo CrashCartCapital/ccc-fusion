@@ -15,6 +15,13 @@ export interface McpSessionToolset {
   dispose: () => Promise<void>;
   connected: string[];
   skipped: Array<{ name: string; reason: string }>;
+  toolSources: McpSessionToolSource[];
+}
+
+export interface McpSessionToolSource {
+  serverName: string;
+  sourceToolName: string;
+  exposedToolName: string;
 }
 
 export interface McpSessionClient {
@@ -87,6 +94,7 @@ export async function connectMcpSessionTools(
   const connected: string[] = [];
   const skipped: Array<{ name: string; reason: string }> = [];
   const clients: McpSessionClient[] = [];
+  const toolSources: McpSessionToolSource[] = [];
   const closedClients = new WeakSet<McpSessionClient>();
   const usedToolNames = new Set<string>();
   let disposed = false;
@@ -142,7 +150,13 @@ export async function connectMcpSessionTools(
           const listedTools = listed.tools ?? [];
           opts.logger?.log?.(`MCP server connected for pi session: name=${server.name} transport=${server.transport} tools=${listedTools.length} attempt=${attempt}/${maxAttempts}`);
           for (const tool of listedTools) {
-            tools.push(wrapMcpTool(server.name, tool, client, usedToolNames));
+            const wrapped = wrapMcpTool(server.name, tool, client, usedToolNames);
+            tools.push(wrapped);
+            toolSources.push({
+              serverName: server.name,
+              sourceToolName: tool.name,
+              exposedToolName: wrapped.name,
+            });
           }
           break;
         } catch (error) {
@@ -170,7 +184,76 @@ export async function connectMcpSessionTools(
     }
   }
 
-  return { tools, connected, skipped, dispose: closeAll };
+  return { tools, connected, skipped, toolSources, dispose: closeAll };
+}
+
+const MCP_CAPABILITY_ROUTES = [
+  {
+    match: "smart-tree__",
+    text: "Smart Tree: compressed local-repository orientation and focused structure/search/read work.",
+  },
+  {
+    match: "octocode__",
+    text: "Octocode: exact local/public code search, source reads, LSP navigation, and package lookup.",
+  },
+  {
+    match: "semble__",
+    text: "Semble: semantic search when exact lexical search is insufficient.",
+  },
+  {
+    match: "context7__",
+    text: "Context7: current third-party library documentation.",
+  },
+  {
+    match: "deepwiki__",
+    text: "DeepWiki: public-repository orientation; verify important claims against source.",
+  },
+  {
+    match: "brave-search__",
+    text: "Brave: broad web, news, and image discovery.",
+  },
+  {
+    match: "serper-mcp__",
+    text: "Serper: complementary Google web, news, and scholar discovery.",
+  },
+  {
+    match: "fetch-guard__",
+    text: "Fetch Guard: extract selected URLs after search; prefer strict scanning when available.",
+  },
+] as const;
+
+/** Build a deterministic, secret-free snapshot of the MCP tools Pi actually received. */
+export function buildMcpCapabilityPrompt(
+  toolset: Pick<McpSessionToolset, "connected" | "skipped" | "toolSources">,
+): string | undefined {
+  if (toolset.connected.length === 0 && toolset.skipped.length === 0) return undefined;
+
+  const toolCountByServer = new Map<string, number>();
+  for (const source of toolset.toolSources) {
+    toolCountByServer.set(source.serverName, (toolCountByServer.get(source.serverName) ?? 0) + 1);
+  }
+  const connected = toolset.connected
+    .map((name) => `${name} (${toolCountByServer.get(name) ?? 0} tools)`)
+    .join(", ") || "none";
+  const unavailable = toolset.skipped
+    .map(({ name, reason }) => `${name} (${reason})`)
+    .join(", ") || "none";
+  const sourceNames = toolset.toolSources.map(({ sourceToolName }) => sourceToolName.toLowerCase());
+  const capabilityLines = MCP_CAPABILITY_ROUTES
+    .filter(({ match }) => sourceNames.some((name) => name.startsWith(match)))
+    .map(({ text }) => `- ${text}`);
+
+  return [
+    "## MCP capability card",
+    "This is the live session-bootstrap snapshot; unavailable servers and absent tools are not callable.",
+    `Connected: ${connected}`,
+    `Unavailable: ${unavailable}`,
+    ...(capabilityLines.length > 0 ? ["", "Preferred routing:", ...capabilityLines] : []),
+    "",
+    "Use a direct file read when the exact file is already known. Avoid overlapping searches. "
+      + "Search is discovery, not evidence: extract or read the selected source before relying on it. "
+      + "Stop discovery once you have enough evidence to mutate and verify.",
+  ].join("\n");
 }
 
 function normalizeMaxAttempts(value: number | undefined): number {
