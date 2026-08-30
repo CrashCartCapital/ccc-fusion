@@ -448,6 +448,12 @@ export class CccProviderAttemptCollisionError extends Error {
 export type CccCampaignRouteReceiptAdapterId =
   | "terminal-route-sse-comments.v1";
 
+/** Exact upstream identities admitted for one sealed combo/<alias> request. */
+export type CccCampaignTerminalRouteMember = Readonly<{
+  provider: string;
+  model: string;
+}>;
+
 export type CccCampaignExecutionRoute = {
   taskId: string;
   providerId: string;
@@ -462,6 +468,7 @@ export type CccCampaignExecutionRoute = {
   commitPolicy?: "required";
   cliAdapterId?: string;
   receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
+  terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
 };
 
 export type CccCampaignProductExecutionRoute = CccCampaignExecutionRoute & {
@@ -604,6 +611,7 @@ export type CccPrdProductExecutionRouteSelection = {
   transport: "pi" | "cli";
   cliAdapterId?: string;
   receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
+  terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
 };
 
 export type CccPrdProductExecutionPlan = {

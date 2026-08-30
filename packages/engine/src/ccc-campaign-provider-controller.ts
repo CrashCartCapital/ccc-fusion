@@ -210,6 +210,13 @@ export async function createCccCampaignProviderAttemptBinding(
     ...(context.route.receiptAdapterId
       ? { receiptAdapterId: context.route.receiptAdapterId }
       : {}),
+    ...(context.route.terminalRouteMembers
+      ? {
+        terminalRouteMembers: Object.freeze(
+          context.route.terminalRouteMembers.map((member) => Object.freeze({ ...member })),
+        ),
+      }
+      : {}),
   });
 }
 

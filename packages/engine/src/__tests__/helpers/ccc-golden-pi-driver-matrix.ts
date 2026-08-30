@@ -3,43 +3,51 @@ export type GoldenPiDriver = Readonly<{
   displayName: string;
   providerId: string;
   modelId: string;
-  effectiveProvider: string;
-  effectiveModel: string;
+  comboAlias: string;
+  attributionTerminalRouteMembers: readonly Readonly<{ provider: string; model: string }>[];
 }>;
 
 export const GOLDEN_PI_PROJECT_ENVELOPE = Object.freeze({
-  maxRequests: 14,
-  maxDurationMs: 600_000,
+  taskCount: 3,
+  maxRequests: 1_152,
+  maxDurationMs: 10_800_000,
   maxConcurrency: 1,
   contextWindow: 200_000,
   maxOutputTokens: 32_768,
-  taskTokenBudget: Object.freeze({ soft: 300_000, hard: 500_000 }),
+  taskTokenBudget: Object.freeze({ soft: 5_000_000, hard: 10_000_000 }),
 });
 
 export const GOLDEN_PI_DRIVERS: readonly GoldenPiDriver[] = Object.freeze([
   Object.freeze({
-    key: "glm-5.3",
-    displayName: "GLM 5.3",
-    providerId: "golden-omniroute-glm",
-    modelId: "glm/glm-5.3",
-    effectiveProvider: "glm",
-    effectiveModel: "glm-5.3",
+    key: "minimax-latest",
+    displayName: "MiniMax Latest",
+    providerId: "golden-omniroute-minimax-latest",
+    modelId: "combo/minimax-latest",
+    comboAlias: "minimax-latest",
+    attributionTerminalRouteMembers: Object.freeze([
+      Object.freeze({ provider: "minimax", model: "MiniMax-M3" }),
+    ]),
   }),
   Object.freeze({
-    key: "gemini-flash-3.7",
-    displayName: "Gemini 3.7 Flash High",
-    providerId: "golden-omniroute-gemini-flash",
-    modelId: "antigravity/gemini-3.7-flash-high",
-    effectiveProvider: "antigravity",
-    effectiveModel: "gemini-3.7-flash-high",
+    key: "glm-latest",
+    displayName: "GLM Latest",
+    providerId: "golden-omniroute-glm-latest",
+    modelId: "combo/glm-latest",
+    comboAlias: "glm-latest",
+    attributionTerminalRouteMembers: Object.freeze([
+      Object.freeze({ provider: "glm", model: "glm-5.3" }),
+    ]),
   }),
   Object.freeze({
-    key: "luna-max",
-    displayName: "GPT-5.6 Luna Max",
-    providerId: "golden-omniroute-luna",
-    modelId: "cx/gpt-5.6-luna-max",
-    effectiveProvider: "cx",
-    effectiveModel: "gpt-5.6-luna-max",
+    key: "gemini-flash-latest",
+    displayName: "Gemini Flash Latest",
+    providerId: "golden-omniroute-gemini-flash-latest",
+    modelId: "combo/gemini-flash-latest",
+    comboAlias: "gemini-flash-latest",
+    attributionTerminalRouteMembers: Object.freeze([
+      Object.freeze({ provider: "antigravity", model: "gemini-3.7-flash-high" }),
+      Object.freeze({ provider: "gemini", model: "gemini-flash-latest" }),
+    ]),
   }),
 ]);
 

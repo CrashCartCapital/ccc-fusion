@@ -109,6 +109,10 @@ function importedProductRouteFromNode(node: WorkflowIrNode): Record<string, unkn
       config.cccExecutionReceiptAdapterId !== undefined
       && config.cccExecutionReceiptAdapterId !== "terminal-route-sse-comments.v1"
     )
+    || (
+      config.cccExecutionTerminalRouteMembers !== undefined
+      && !Array.isArray(config.cccExecutionTerminalRouteMembers)
+    )
   ) {
     return null;
   }
@@ -128,6 +132,15 @@ function importedProductRouteFromNode(node: WorkflowIrNode): Record<string, unkn
       : {}),
     ...(config.cccExecutionReceiptAdapterId !== undefined
       ? { receiptAdapterId: config.cccExecutionReceiptAdapterId }
+      : {}),
+    ...(config.cccExecutionTerminalRouteMembers !== undefined
+      ? {
+        terminalRouteMembers: config.cccExecutionTerminalRouteMembers.map((member) => (
+          member && typeof member === "object" && !Array.isArray(member)
+            ? { ...(member as Record<string, unknown>) }
+            : member
+        )),
+      }
       : {}),
   };
 }

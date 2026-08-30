@@ -50,7 +50,45 @@ function policyWithAdapter(receiptAdapterId: string = adapterId) {
   };
 }
 
+const comboMembers = [
+  { provider: "minimax", model: "MiniMax-M3" },
+  { provider: "minimax", model: "MiniMax-M3.1" },
+] as const;
+
 describe("CCC sealed route receipt adapter", () => {
+  it("RED-ALIAS-ROUTE-1: seals an exact terminal member allowlist for a combo alias", () => {
+    const policy = policyWithAdapter();
+    policy.routes.forEach((route) => {
+      route.modelId = "combo/minimax-latest";
+      Object.assign(route, { terminalRouteMembers: comboMembers });
+    });
+
+    expect(parseCccCampaignProductExecutionPolicy(policy, custodiedBundle()))
+      .toEqual(policy);
+  });
+
+  it.each([
+    { label: "missing allowlist", members: undefined },
+    { label: "empty allowlist", members: [] },
+    { label: "duplicate member", members: [comboMembers[0], comboMembers[0]] },
+    { label: "malformed member", members: [{ provider: "minimax", model: "" }] },
+  ])("RED-ALIAS-ROUTE-2: refuses combo alias with $label", ({ members }) => {
+    const policy = policyWithAdapter();
+    policy.routes[0]!.modelId = "combo/minimax-latest";
+    if (members !== undefined) Object.assign(policy.routes[0]!, { terminalRouteMembers: members });
+
+    expect(() => parseCccCampaignProductExecutionPolicy(policy, custodiedBundle()))
+      .toThrow(/terminalRouteMembers/u);
+  });
+
+  it("RED-ALIAS-ROUTE-3: refuses an allowlist on a direct provider/model request", () => {
+    const policy = policyWithAdapter();
+    Object.assign(policy.routes[0]!, { terminalRouteMembers: comboMembers });
+
+    expect(() => parseCccCampaignProductExecutionPolicy(policy, custodiedBundle()))
+      .toThrow(/terminalRouteMembers.*combo/u);
+  });
+
   it("RED-RECEIPT-ROUTE-1: accepts an explicit adapter for an arbitrary provider and preserves it in canonical policy bytes", () => {
     const policy = policyWithAdapter();
 
@@ -140,6 +178,30 @@ describe("CCC sealed route receipt adapter", () => {
       node.config?.cccExecutionReceiptAdapterId === adapterId
     )).toBe(true);
   });
+
+  it("RED-ALIAS-ROUTE-4: native workflow IR carries sealed combo terminal members", () => {
+    const bundle = custodiedBundle();
+    const plan = createCccPrdProductExecutionPlan({
+      bundle,
+      route: {
+        providerId: "arbitrary-gateway",
+        modelId: "combo/minimax-latest",
+        transport: "pi",
+        receiptAdapterId: adapterId,
+        terminalRouteMembers: comboMembers,
+      },
+    });
+    const workflow = bundle.workflows[0]!;
+    const nativeTaskIds = new Map(
+      workflow.taskIds.map((taskId, index) => [taskId, `FN-ALIAS-${index}`]),
+    );
+
+    const ir = nativeWorkflowIr(bundle, workflow, plan.policy, nativeTaskIds);
+    expect(ir.nodes.filter((node) => node.kind === "prompt").every((node) =>
+      canonicalCccPrdJson(node.config?.cccExecutionTerminalRouteMembers)
+        === canonicalCccPrdJson(comboMembers)
+    )).toBe(true);
+  });
 });
 
 describe("CCC provider-attempt receipt adapter selection", () => {
@@ -214,5 +276,56 @@ describe("CCC provider-attempt receipt adapter selection", () => {
         modelId: "upstream/model-a",
       },
     )).toMatchObject({ effectiveProvider: "omniroute-looking-but-unselected" });
+  });
+
+  it("RED-ALIAS-ATTEMPT-1: accepts an allowlisted terminal member while preserving requested combo identity", () => {
+    const comboIdentity = { providerId: "omniroute", modelId: "combo/minimax-latest" };
+    const comboInput = {
+      ...input,
+      effectiveProvider: comboIdentity.providerId,
+      effectiveModel: comboIdentity.modelId,
+      omniRoute: { final: comboMembers[0] },
+    };
+
+    expect(assertCccProviderAttemptEffectiveRoute(
+      comboInput,
+      comboIdentity,
+      { receiptAdapterId: adapterId, terminalRouteMembers: comboMembers } as never,
+    )).toMatchObject({
+      effectiveProvider: "omniroute",
+      effectiveModel: "combo/minimax-latest",
+      omniRoute: { final: comboMembers[0] },
+    });
+  });
+
+  it.each([
+    { label: "nonmember", final: { provider: "cx", model: "gpt-5.6-luna-max" } },
+    { label: "Luna substitution", final: { provider: "cx", model: "gpt-5.6-luna-max" } },
+  ])("RED-ALIAS-ATTEMPT-2: refuses $label terminal substitution", ({ final }) => {
+    const comboIdentity = { providerId: "omniroute", modelId: "combo/minimax-latest" };
+    expect(() => assertCccProviderAttemptEffectiveRoute(
+      {
+        ...input,
+        effectiveProvider: comboIdentity.providerId,
+        effectiveModel: comboIdentity.modelId,
+        omniRoute: { final },
+      },
+      comboIdentity,
+      { receiptAdapterId: adapterId, terminalRouteMembers: comboMembers } as never,
+    )).toThrow(/terminal route member|allowlist/u);
+  });
+
+  it("RED-ALIAS-ATTEMPT-3: refuses initial/final drift even when both are allowlisted", () => {
+    const comboIdentity = { providerId: "omniroute", modelId: "combo/minimax-latest" };
+    expect(() => assertCccProviderAttemptEffectiveRoute(
+      {
+        ...input,
+        effectiveProvider: comboIdentity.providerId,
+        effectiveModel: comboIdentity.modelId,
+        omniRoute: { initial: comboMembers[0], final: comboMembers[1] },
+      },
+      comboIdentity,
+      { receiptAdapterId: adapterId, terminalRouteMembers: comboMembers } as never,
+    )).toThrow(/initial and final terminal route receipts conflict/u);
   });
 });

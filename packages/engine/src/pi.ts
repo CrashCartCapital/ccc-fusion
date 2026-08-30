@@ -401,6 +401,11 @@ type CccOmniRouteReceipt = Readonly<{
   final: CccOmniRouteObservation;
 }>;
 
+type CccOmniRouteExpectation = Readonly<{
+  requested: CccOmniRouteObservation;
+  terminalRouteMembers?: readonly CccOmniRouteObservation[];
+}>;
+
 type CccOmniRouteState = {
   initial?: CccOmniRouteObservation;
 };
@@ -424,15 +429,31 @@ function splitCccProviderQualifiedModel(modelId: unknown): CccOmniRouteObservati
 function requireCccTerminalRouteRequestedIdentity(
   receiptAdapterId: CccProviderAttemptBinding["receiptAdapterId"],
   modelId: unknown,
-): CccOmniRouteObservation | undefined {
-  if (receiptAdapterId === undefined) return undefined;
+  terminalRouteMembers: CccProviderAttemptBinding["terminalRouteMembers"],
+): CccOmniRouteExpectation | undefined {
+  if (receiptAdapterId === undefined) {
+    if (terminalRouteMembers !== undefined) {
+      throw new Error("ccc-fusion terminalRouteMembers requires a terminal route receipt adapter");
+    }
+    return undefined;
+  }
   const requested = splitCccProviderQualifiedModel(modelId);
   if (!requested) {
     throw new Error(
       `ccc-fusion terminal route receipt adapter requires a provider-qualified requested model: ${String(modelId)}`,
     );
   }
-  return requested;
+  const comboRequest = requested.provider === "combo";
+  if (comboRequest && terminalRouteMembers === undefined) {
+    throw new Error("ccc-fusion combo request requires terminalRouteMembers");
+  }
+  if (!comboRequest && terminalRouteMembers !== undefined) {
+    throw new Error("ccc-fusion terminalRouteMembers is permitted only for a combo request");
+  }
+  return {
+    requested,
+    ...(terminalRouteMembers ? { terminalRouteMembers } : {}),
+  };
 }
 
 function readCccOmniRouteFinal(result: unknown): CccOmniRouteObservation | undefined {
@@ -448,10 +469,11 @@ function readCccOmniRouteFinal(result: unknown): CccOmniRouteObservation | undef
 }
 
 function requireCccOmniRouteReceipt(
-  requested: CccOmniRouteObservation,
+  expectation: CccOmniRouteExpectation,
   state: CccOmniRouteState | undefined,
   result: unknown,
 ): CccOmniRouteReceipt {
+  const { requested, terminalRouteMembers } = expectation;
   /*
    * The initial HTTP receipt is corroborating evidence, not the proof. When
    * OmniRoute has to wait on a real upstream it flushes an
@@ -467,23 +489,34 @@ function requireCccOmniRouteReceipt(
   if (!final) {
     throw new Error("ccc-fusion OmniRoute terminal SSE route receipt missing");
   }
-  if (initial && (initial.provider !== requested.provider || initial.model !== requested.model)) {
-    throw new Error(
-      `ccc-fusion OmniRoute initial route mismatch: requested ${requested.provider}/${requested.model}, `
-      + `initial ${initial.provider}/${initial.model}`,
-    );
-  }
-  if (final.provider !== requested.provider || final.model !== requested.model) {
-    throw new Error(
-      `ccc-fusion OmniRoute final route mismatch: requested ${requested.provider}/${requested.model}, `
-      + `final ${final.provider}/${final.model}`,
-    );
-  }
   if (initial && (initial.provider !== final.provider || initial.model !== final.model)) {
     throw new Error(
       `ccc-fusion OmniRoute initial/final route mismatch: initial ${initial.provider}/${initial.model}, `
       + `final ${final.provider}/${final.model}`,
     );
+  }
+  if (terminalRouteMembers) {
+    const admitted = terminalRouteMembers.some(
+      (member) => member.provider === final.provider && member.model === final.model,
+    );
+    if (!admitted) {
+      throw new Error(
+        `ccc-fusion OmniRoute final route is not an admitted terminal member: ${final.provider}/${final.model}`,
+      );
+    }
+  } else {
+    if (initial && (initial.provider !== requested.provider || initial.model !== requested.model)) {
+      throw new Error(
+        `ccc-fusion OmniRoute initial route mismatch: requested ${requested.provider}/${requested.model}, `
+        + `initial ${initial.provider}/${initial.model}`,
+      );
+    }
+    if (final.provider !== requested.provider || final.model !== requested.model) {
+      throw new Error(
+        `ccc-fusion OmniRoute final route mismatch: requested ${requested.provider}/${requested.model}, `
+        + `final ${final.provider}/${final.model}`,
+      );
+    }
   }
   return initial ? { initial, final } : { final };
 }
@@ -523,6 +556,7 @@ type CccResponseIdentitySession = AgentSession & {
     provider: string;
     modelId: string;
     omniRoute?: boolean;
+    terminalRouteMembers?: readonly CccOmniRouteObservation[];
   };
 };
 
@@ -642,7 +676,12 @@ function assertCccResponseModelIdentity(session: AgentSession): void {
     if (!requested) {
       throw new Error(`ccc-fusion OmniRoute terminal route receipt missing: configured ${expected.provider}/${expected.modelId}`);
     }
-    requireCccOmniRouteReceipt(requested, undefined, assistant);
+    requireCccOmniRouteReceipt({
+      requested,
+      ...(expected.terminalRouteMembers
+        ? { terminalRouteMembers: expected.terminalRouteMembers }
+        : {}),
+    }, undefined, assistant);
     return;
   }
   const responseModel = assistant?.responseModel;
@@ -712,7 +751,9 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
     bindingRecord,
     bindingRecord.receiptAdapterId === undefined
       ? ["controller", "turnKey"]
-      : ["controller", "receiptAdapterId", "turnKey"],
+      : bindingRecord.terminalRouteMembers === undefined
+        ? ["controller", "receiptAdapterId", "turnKey"]
+        : ["controller", "receiptAdapterId", "terminalRouteMembers", "turnKey"],
     "cccProviderAttemptBinding",
   );
   const binding = bindingRecord;
@@ -724,6 +765,31 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
     && binding.receiptAdapterId !== "terminal-route-sse-comments.v1"
   ) {
     throw new Error("cccProviderAttemptBinding.receiptAdapterId is unsupported");
+  }
+  if (binding.terminalRouteMembers !== undefined) {
+    if (!Array.isArray(binding.terminalRouteMembers) || binding.terminalRouteMembers.length === 0) {
+      throw new Error("cccProviderAttemptBinding.terminalRouteMembers must be a non-empty frozen array");
+    }
+    if (!Object.isFrozen(binding.terminalRouteMembers)) {
+      throw new Error("cccProviderAttemptBinding.terminalRouteMembers must be frozen");
+    }
+    const seen = new Set<string>();
+    binding.terminalRouteMembers.forEach((candidate: unknown, index: number) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) || !Object.isFrozen(candidate)) {
+        throw new Error(`cccProviderAttemptBinding.terminalRouteMembers[${index}] must be a frozen object`);
+      }
+      exactObjectKeys(candidate as Record<string, unknown>, ["model", "provider"], `cccProviderAttemptBinding.terminalRouteMembers[${index}]`);
+      const { provider, model } = candidate as Record<string, unknown>;
+      if (
+        typeof provider !== "string" || provider.length === 0 || provider !== provider.trim()
+        || typeof model !== "string" || model.length === 0 || model !== model.trim()
+      ) {
+        throw new Error(`cccProviderAttemptBinding.terminalRouteMembers[${index}] must contain canonical provider/model strings`);
+      }
+      const key = `${provider}\u0000${model}`;
+      if (seen.has(key)) throw new Error("cccProviderAttemptBinding.terminalRouteMembers must not contain duplicates");
+      seen.add(key);
+    });
   }
   const controller = binding.controller;
   if (!controller || typeof controller !== "object" || Array.isArray(controller)) {
@@ -918,7 +984,7 @@ function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAtt
 function createCccProviderAttemptControlledStream(input: {
   binding: CccProviderAttemptBinding;
   state: CccProviderAttemptSessionState;
-  omniRouteRequested?: CccOmniRouteObservation;
+  omniRouteRequested?: CccOmniRouteExpectation;
   dispatch: (...args: any[]) => AsyncIterable<any> & { result: () => Promise<any> };
   model: any;
   dispatchModel: any;
@@ -3311,6 +3377,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       const omniRouteRequested = requireCccTerminalRouteRequestedIdentity(
         cccProviderAttemptBinding?.receiptAdapterId,
         expectedModelId,
+        cccProviderAttemptBinding?.terminalRouteMembers,
       );
       const optionsWithBoundary = {
         ...(requestOptions ?? {}),
@@ -3688,6 +3755,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       requireCccTerminalRouteRequestedIdentity(
         cccProviderAttemptBinding?.receiptAdapterId,
         modelOverride.id,
+        cccProviderAttemptBinding?.terminalRouteMembers,
       );
     }
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
@@ -3923,6 +3991,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           provider: modelOverride.provider,
           modelId: modelOverride.id,
           ...(terminalRouteReceiptSelected ? { omniRoute: true } : {}),
+          ...(cccProviderAttemptBinding?.terminalRouteMembers
+            ? { terminalRouteMembers: cccProviderAttemptBinding.terminalRouteMembers }
+            : {}),
         };
       }
       return result;

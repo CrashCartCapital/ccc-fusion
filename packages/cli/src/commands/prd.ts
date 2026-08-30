@@ -12,8 +12,10 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK,
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
   cccCampaignRequestFloor,
+  cccCampaignRequestSizingGuidance,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   assertCccPrdSemanticProofV2Custody,
@@ -1593,15 +1595,30 @@ function productRequestBudget(
   // MUTATE turn plus the single REPAIR turn); preview must never admit a
   // bundle that import will refuse.
   const deterministicMinimum = cccCampaignRequestFloor(providerTasks);
+  const {
+    recommendedStartingMaximum,
+    headroomAboveRecommendation,
+    sizingPosture,
+  } = cccCampaignRequestSizingGuidance(
+    providerTasks,
+    bundle.bounds.maxRequests,
+  );
+  const recommendationGap = Math.abs(headroomAboveRecommendation);
+  const recommendationPosition = headroomAboveRecommendation === 0
+    ? "meets that recommendation exactly"
+    : `is ${recommendationGap} requests ${sizingPosture === "generous" ? "above" : "below"} that recommendation`;
   return {
     scope: "campaign-global" as const,
     maximum: bundle.bounds.maxRequests,
     providerTasks,
     deterministicMinimum,
     headroomAboveMinimum: bundle.bounds.maxRequests - deterministicMinimum,
+    recommendedStartingMaximum,
+    headroomAboveRecommendation,
+    sizingPosture,
     completionAdequacy: "unproven" as const,
     explanation:
-      "Two requests per provider task (one MUTATE turn plus the single REPAIR turn) is only a structural admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, live runs commonly cost 9-13 requests per task, and completion adequacy remains unproven.",
+      `Two requests per provider task (one MUTATE turn plus the single REPAIR turn) is only a structural admission floor. Start at ${CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK} requests per provider task (${recommendedStartingMaximum} total here) unless evidence supports another finite envelope. This packet is ${sizingPosture}: it ${recommendationPosition}, but remains valid because the recommendation is guidance, not an admission or safety ceiling. The campaign cap is global, creates no per-task quota or reservation, and completion adequacy remains unproven.`,
   };
 }
 

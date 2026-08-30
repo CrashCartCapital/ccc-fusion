@@ -31,14 +31,26 @@ import {
   GOLDEN_PI_PROJECT_ENVELOPE,
   resolveGoldenPiDriver,
 } from "./helpers/ccc-golden-pi-driver-matrix.js";
+import {
+  exactCandidateFiles,
+  taskOrder,
+} from "./helpers/ccc-golden-evidence-ledger-campaign-fixture.js";
+import {
+  parseGoldenOmniRouteComboSnapshot,
+  type GoldenOmniRouteComboSnapshot,
+} from "./helpers/ccc-golden-omniroute-combo-snapshot.js";
 
 const cliDistRoot = join(dirname(fileURLToPath(import.meta.url)), "../../../cli/dist");
 const livePiRequested = process.env.CCC_GOLDEN_LIVE_PI === "1";
 if (livePiRequested && !process.env.CCC_GOLDEN_PI_DRIVER) {
   throw new Error("CCC_GOLDEN_PI_DRIVER is required when CCC_GOLDEN_LIVE_PI=1");
 }
-const driver = resolveGoldenPiDriver(process.env.CCC_GOLDEN_PI_DRIVER ?? "luna-max");
-const idempotencyKey = `ccc-golden-evidence-ledger-pi-${driver.key}-r14-project-v1`;
+if (livePiRequested && !process.env.CCC_GOLDEN_PI_EVIDENCE_PATH) {
+  throw new Error("CCC_GOLDEN_PI_EVIDENCE_PATH is required when CCC_GOLDEN_LIVE_PI=1");
+}
+const evidencePath = process.env.CCC_GOLDEN_PI_EVIDENCE_PATH ?? "";
+const driver = resolveGoldenPiDriver(process.env.CCC_GOLDEN_PI_DRIVER ?? "minimax-latest");
+const idempotencyKey = `ccc-golden-evidence-ledger-pi-${driver.key}-r${GOLDEN_PI_PROJECT_ENVELOPE.maxRequests}-multitask-v1`;
 const livePgDescribe = livePiRequested
   ? pgDescribe.sequential
   : pgDescribe.skip;
@@ -52,7 +64,10 @@ type PreparedLifecycle = Readonly<{
   executionPlanPath: string;
 }>;
 
-async function prepareLifecycle(root: string): Promise<PreparedLifecycle> {
+async function prepareLifecycle(
+  root: string,
+  comboSnapshot: GoldenOmniRouteComboSnapshot,
+): Promise<PreparedLifecycle> {
   const module = await import("../../../../scripts/lib/ccc-golden-packet-lifecycle.mjs") as {
     prepareEvidenceLedgerPacketLifecycle(input: Record<string, unknown>): Promise<PreparedLifecycle>;
   };
@@ -63,21 +78,24 @@ async function prepareLifecycle(root: string): Promise<PreparedLifecycle> {
       modelId: driver.modelId,
       transport: "pi",
       receiptAdapterId: "terminal-route-sse-comments.v1",
+      terminalRouteMembers: comboSnapshot.terminalRouteMembers,
     },
     maxRequests: GOLDEN_PI_PROJECT_ENVELOPE.maxRequests,
     maxDurationMs: GOLDEN_PI_PROJECT_ENVELOPE.maxDurationMs,
-    taskCount: 1,
+    taskCount: GOLDEN_PI_PROJECT_ENVELOPE.taskCount,
   });
 }
 
-livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.displayName})`, () => {
+livePgDescribe(`CCC Golden Evidence Ledger three-task live Pi campaign (${driver.displayName})`, () => {
   const h = createSharedPgTaskStoreTestHarness({
     prefix: `fusion_ccc_golden_pi_${driver.key.replaceAll(/[^a-z0-9]+/g, "_")}`,
     poolMax: 4,
   });
   let lifecycleRoot = "";
   let isolatedHome = "";
+  let originalHome: string | undefined;
   let lifecycle: PreparedLifecycle;
+  let comboSnapshot: GoldenOmniRouteComboSnapshot;
   let dependencies: PrdCommandDependencies;
   let store: TaskStore;
   let runtime: InProcessRuntime | undefined;
@@ -87,12 +105,24 @@ livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.d
   let commitFenceSpy: { mockRestore(): void } | undefined;
 
   beforeAll(async () => {
+    originalHome = process.env.HOME;
     await h.beforeAll();
     await h.beforeEach();
     lifecycleRoot = await mkdtemp(join(tmpdir(), `ccc-golden-pi-${driver.key}-`));
-    isolatedHome = process.env.HOME ?? "";
-    expect(isolatedHome).not.toBe("");
-    lifecycle = await prepareLifecycle(lifecycleRoot);
+    isolatedHome = join(lifecycleRoot, "home");
+    await mkdir(isolatedHome, { recursive: true });
+    process.env.HOME = isolatedHome;
+    comboSnapshot = parseGoldenOmniRouteComboSnapshot(
+      process.env.CCC_GOLDEN_OMNIROUTE_COMBO_SNAPSHOT ?? "",
+      driver.comboAlias,
+    );
+    delete process.env.CCC_GOLDEN_OMNIROUTE_COMBO_SNAPSHOT;
+    const sealedTerminalMemberKeys = new Set(comboSnapshot.terminalRouteMembers.map(({ provider, model }) =>
+      `${provider}/${model}`));
+    for (const { provider, model } of driver.attributionTerminalRouteMembers) {
+      expect(sealedTerminalMemberKeys.has(`${provider}/${model}`)).toBe(true);
+    }
+    lifecycle = await prepareLifecycle(lifecycleRoot, comboSnapshot);
     store = new TaskStore(lifecycle.targetRoot, join(isolatedHome, ".fusion"), { asyncLayer: h.layer() });
     const liveProviderSettings = {
       openrouterModelSync: false,
@@ -142,26 +172,21 @@ livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.d
   });
 
   afterAll(async () => {
-    commitFenceSpy?.mockRestore();
-    if (runtime) await runtime.stop();
-    if (central) await central.close();
-    __resetWorkflowExtensionRegistryForTests();
-    await rm(lifecycleRoot, { recursive: true, force: true });
-    await h.afterEach();
-    await h.afterAll();
+    try {
+      commitFenceSpy?.mockRestore();
+      if (runtime) await runtime.stop();
+      if (central) await central.close();
+      __resetWorkflowExtensionRegistryForTests();
+      await h.afterEach();
+      await h.afterAll();
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (lifecycleRoot) await rm(lifecycleRoot, { recursive: true, force: true });
+    }
   });
 
-  test("generates and proves the contract project through real Pi", { timeout: 720_000 }, async () => {
-    const readAgentTrace = async () => (await store.getAgentLogs("KB-001", { limit: 200 }))
-      .filter(({ type }) => type !== "tool_result" && type !== "thinking")
-      .map(({ timestamp, type, text, detail, durationMs, timeToFirstTokenMs }) => ({
-        timestamp,
-        type,
-        text: text.slice(0, 320),
-        ...(detail ? { detail: detail.slice(0, 320) } : {}),
-        durationMs,
-        timeToFirstTokenMs,
-      }));
+  test("generates and proves the full three-task project through real Pi", { timeout: 11_400_000 }, async () => {
     const common = [
       lifecycle.frozenRoot,
       lifecycle.manifestPath,
@@ -176,6 +201,69 @@ livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.d
       "import", ...common, idempotencyKey, "--confirm", digest,
     ], dependencies);
     expect(imported.exitCode).toBe(0);
+    const importedStatus = productStatus(await runProductCommand(["status", idempotencyKey], dependencies));
+    const nativeTasks = importedStatus.status.tasks.map(({ semanticTaskId, nativeTaskId }) => ({
+      semanticTaskId,
+      nativeTaskId,
+    }));
+    expect(nativeTasks.map(({ semanticTaskId }) => semanticTaskId).sort()).toEqual([...taskOrder].sort());
+    const readAgentTraces = async () => Object.fromEntries(await Promise.all(nativeTasks.map(async ({
+      semanticTaskId,
+      nativeTaskId,
+    }) => [semanticTaskId, (await store.getAgentLogs(nativeTaskId!, { limit: 200 }))
+      .filter(({ type }) => type !== "tool_result" && type !== "thinking")
+      .map(({ timestamp, type, text, detail, durationMs, timeToFirstTokenMs }) => ({
+        timestamp,
+        type,
+        text: text.slice(0, 320),
+        ...(detail ? { detail: detail.slice(0, 320) } : {}),
+        durationMs,
+        timeToFirstTokenMs,
+      })).slice(-40)])));
+    const requestCountByTask = (status: ProductStatusOutput) => Object.fromEntries(taskOrder.map((semanticTaskId) => [
+      semanticTaskId,
+      status.status.providerAttempts.filter((attempt) => attempt.semanticTaskId === semanticTaskId).length,
+    ]));
+    const persistEvidence = async (
+      outcome: "passed" | "failed",
+      status: ProductStatusOutput,
+      failure: ReturnType<typeof captureFailure> | null = null,
+    ) => {
+      const evidence = {
+        outcome,
+        failure,
+        driver,
+        envelope: GOLDEN_PI_PROJECT_ENVELOPE,
+        comboSnapshot,
+        nextAction: status.status.nextAction,
+        requestCount: status.status.providerAttempts.length,
+        requestCountByTask: requestCountByTask(status),
+        providerAttempts: status.status.providerAttempts.map(({ semanticTaskId, state, binding, terminal }) => ({
+          semanticTaskId,
+          state,
+          binding: {
+            providerId: binding.providerId,
+            modelId: binding.modelId,
+            transport: binding.transport,
+          },
+          terminal,
+        })),
+        proofs: status.status.proofs.map(({ definition, attempts }) => ({
+          proofId: definition.id,
+          attempts: attempts.map(({ state, phase, result, sourceCommit }) => ({
+            state,
+            phase,
+            sourceCommit,
+            success: result?.success,
+            exitCode: result?.exitCode,
+            stderrTail: result?.stderrTail,
+          })),
+        })),
+        agentTraces: await readAgentTraces(),
+      };
+      await writeFile(evidencePath, `${JSON.stringify(evidence)}\n`, "utf8");
+      return evidence;
+    };
 
     __resetWorkflowExtensionRegistryForTests();
     await bootstrapCccCampaignProofAdmissionHost({ builtRootPath: cliDistRoot });
@@ -208,7 +296,7 @@ livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.d
     firstHold = await waitFor(
       async () => productStatus(await runProductCommand(["status", idempotencyKey], dependencies)),
       (value) => value.status.nextAction.kind === "approve-execution",
-      "one-task sealed live-execution hold",
+      "three-task sealed live-execution hold",
       terminalDiagnostic,
     );
     const confirmation = firstHold.liveExecutionAuthorizationConfirmation!;
@@ -218,55 +306,67 @@ livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.d
     ], dependencies)).toMatchObject({ exitCode: 0 });
     await control.drainWorkflowContinuations();
 
-    const mergeHold = await waitForDurableProductBoundary(
-      async () => productStatus(await runProductCommand(["status", idempotencyKey], dependencies)),
-      (value) => value.status.nextAction.kind === "approve-merge",
-      async (status) => ({
-        capturedCommitFenceFailure,
-        providerConfig: {
-          home: process.env.HOME,
-          providerNames: readCustomProviders().map(({ name }) => name),
-        },
-        nextAction: status.status.nextAction,
-        workItems: status.status.workItems.map(({ id, state, lastError }) => ({ id, state, lastError })),
-        providerAttempts: status.status.providerAttempts.map(({ state, binding, terminal }) => ({
-          state,
-          binding: {
-            providerId: binding.providerId,
-            modelId: binding.modelId,
-            transport: binding.transport,
-            receiptAdapterId: binding.receiptAdapterId,
+    let mergeHold: ProductStatusOutput;
+    try {
+      mergeHold = await waitForDurableProductBoundary(
+        async () => productStatus(await runProductCommand(["status", idempotencyKey], dependencies)),
+        (value) => value.status.nextAction.kind === "approve-merge",
+        async (status) => ({
+          capturedCommitFenceFailure,
+          providerConfig: {
+            home: process.env.HOME,
+            providerNames: readCustomProviders().map(({ name }) => name),
           },
-          terminal,
-        })),
-        proofs: status.status.proofs.map(({ definition, attempts }) => ({
-          proofId: definition.id,
-          attempts: attempts.map(({ state, phase, result }) => ({
-            state,
-            phase,
-            exitCode: result?.exitCode,
-            stderrTail: result?.stderrTail,
+          nextAction: status.status.nextAction,
+          requestCountByTask: requestCountByTask(status),
+          workItems: status.status.workItems.map(({ id, state, lastError }) => ({ id, state, lastError })),
+          proofs: status.status.proofs.map(({ definition, attempts }) => ({
+            proofId: definition.id,
+            attempts: attempts.map(({ state, phase, result }) => ({
+              state,
+              phase,
+              exitCode: result?.exitCode,
+              stderrTail: result?.stderrTail,
+            })),
           })),
-        })),
-        agentTrace: await readAgentTrace(),
-      }),
-    );
-    const agentTrace = await readAgentTrace();
-    console.error(`CCC_GOLDEN_PI_EVIDENCE=${JSON.stringify({
-      driver,
-      envelope: GOLDEN_PI_PROJECT_ENVELOPE,
-      requestCount: mergeHold.status.providerAttempts.length,
-      proofAttemptCount: mergeHold.status.proofs.flatMap(({ attempts }) => attempts).length,
-      routes: mergeHold.status.providerAttempts.map(({ terminal }) => terminal),
-      agentTrace,
-    })}`);
+          agentTraces: await readAgentTraces(),
+        }),
+      );
+    } catch (error) {
+      const failure = captureFailure(error);
+      try {
+        const terminalStatus = productStatus(await runProductCommand(["status", idempotencyKey], dependencies));
+        await persistEvidence("failed", terminalStatus, failure);
+      } catch (evidencePersistenceError) {
+        const fallbackEvidence = {
+          outcome: "failed",
+          failure,
+          evidencePersistenceFailure: captureFailure(evidencePersistenceError),
+          driver,
+          envelope: GOLDEN_PI_PROJECT_ENVELOPE,
+          comboSnapshot,
+        };
+        try {
+          await writeFile(evidencePath, `${JSON.stringify(fallbackEvidence)}\n`, "utf8");
+        } catch (fallbackWriteError) {
+          console.error(`CCC_GOLDEN_PI_EVIDENCE_WRITE_FAILED=${JSON.stringify({
+            ...fallbackEvidence,
+            fallbackWriteFailure: captureFailure(fallbackWriteError),
+          })}`);
+        }
+      }
+      throw error;
+    }
     expect(mergeHold.mergeApprovalConfirmations).toHaveLength(1);
     expect(await git(lifecycle.targetRoot, "rev-parse", "refs/heads/main")).toBe(lifecycle.baseCommit);
     expect(mergeHold.status.providerAttempts.length).toBeGreaterThan(0);
     expect(mergeHold.status.providerAttempts.length).toBeLessThanOrEqual(GOLDEN_PI_PROJECT_ENVELOPE.maxRequests);
+    expect([...new Set(mergeHold.status.providerAttempts.map(({ semanticTaskId }) => semanticTaskId))].sort())
+      .toEqual([...taskOrder].sort());
+    const terminalMemberKeys = new Set(driver.attributionTerminalRouteMembers.map(({ provider, model }) =>
+      `${provider}/${model}`));
     for (const providerAttempt of mergeHold.status.providerAttempts) {
       expect(providerAttempt).toMatchObject({
-        semanticTaskId: "TASK-LEDGER-CONTRACT",
         state: "committed",
         binding: {
           providerId: driver.providerId,
@@ -279,23 +379,44 @@ livePgDescribe(`CCC Golden Evidence Ledger one-task live Pi campaign (${driver.d
             effectiveProvider: driver.providerId,
             effectiveModel: driver.modelId,
             receiptSource: "stream-usage",
-            omniRoute: {
-              final: {
-                provider: driver.effectiveProvider,
-                model: driver.effectiveModel,
-              },
-            },
+            omniRoute: { final: { provider: expect.any(String), model: expect.any(String) } },
           },
         },
       });
+      const final = providerAttempt.terminal.kind === "reconciled"
+        ? providerAttempt.terminal.effectiveRoute.omniRoute?.final
+        : undefined;
+      expect(final).toBeDefined();
+      if (!terminalMemberKeys.has(`${final!.provider}/${final!.model}`)) {
+        const attributionFailure = new Error(
+          `CCC_GOLDEN_ROUTE_ATTRIBUTION_FAILED ${driver.key} resolved to ${final!.provider}/${final!.model}`,
+        );
+        await persistEvidence("failed", mergeHold, captureFailure(attributionFailure));
+        throw attributionFailure;
+      }
     }
-    const proofAttempts = mergeHold.status.proofs.flatMap(({ attempts }) => attempts);
-    expect(proofAttempts).toHaveLength(2);
-    expect(proofAttempts.map(({ phase }) => phase).sort()).toEqual(["final_integrated", "task"]);
+    const evidence = await persistEvidence("passed", mergeHold);
+    console.error(`CCC_GOLDEN_PI_EVIDENCE=${JSON.stringify({
+      outcome: evidence.outcome,
+      driver: driver.key,
+      requestCount: evidence.requestCount,
+      requestCountByTask: evidence.requestCountByTask,
+      evidencePath,
+    })}`);
+    const proofAttempts = mergeHold.status.proofs.flatMap(({ definition, attempts }) =>
+      attempts.map((attempt) => ({ proofId: definition.id, ...attempt })));
+    expect(proofAttempts).toHaveLength(4);
+    expect(proofAttempts.map(({ proofId }) => proofId).sort()).toEqual([
+      "PROOF-LEDGER-CLI",
+      "PROOF-LEDGER-CONTRACT",
+      "PROOF-LEDGER-CORE",
+      "PROOF-LEDGER-INTEGRATED",
+    ]);
     expect(proofAttempts.every(({ state, result }) =>
       state === "committed" && result?.success === true && result.exitCode === 0)).toBe(true);
-    const finalAttempt = proofAttempts.find(({ phase }) => phase === "final_integrated")!;
+    const finalAttempt = proofAttempts.find(({ proofId }) => proofId === "PROOF-LEDGER-INTEGRATED")!;
+    expect(finalAttempt.phase).toBe("final_integrated");
     expect(await git(lifecycle.targetRoot, "diff", "--name-only", lifecycle.baseCommit, finalAttempt.sourceCommit))
-      .toBe("src/record.mjs\nsrc/validation.mjs");
+      .toBe(exactCandidateFiles.join("\n"));
   });
 });

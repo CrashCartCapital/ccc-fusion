@@ -19,6 +19,7 @@ import type {
   CccCampaignProviderControllerDecision,
   CccCampaignProviderDispatchInput,
   CccCampaignRouteReceiptAdapterId,
+  CccCampaignTerminalRouteMember,
   CccEffectReceiptStore,
   CccProviderAttemptScope,
   CccProviderAttemptSettlementInput,
@@ -79,6 +80,7 @@ export type CccProviderAttemptBinding = Readonly<{
   turnKey: string;
   controller: CccProviderAttemptController;
   receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
+  terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
 }>;
 
 /**

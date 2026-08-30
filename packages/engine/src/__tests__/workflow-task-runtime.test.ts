@@ -784,9 +784,12 @@ describe("WorkflowTaskRuntime", () => {
     const route = {
       taskId: semanticTaskId,
       providerId: "provider-approved",
-      modelId: "upstream/model-approved",
+      modelId: "combo/minimax-latest",
       transport: "pi" as const,
       receiptAdapterId: "terminal-route-sse-comments.v1" as const,
+      terminalRouteMembers: [
+        { provider: "minimax", model: "MiniMax-M3" },
+      ] as const,
       executor: "model" as const,
       toolMode: "coding" as const,
       worktreeMode: "isolated" as const,
@@ -818,6 +821,7 @@ describe("WorkflowTaskRuntime", () => {
             cccExecutionProviderId: route.providerId,
             cccExecutionModelId: route.modelId,
             cccExecutionReceiptAdapterId: route.receiptAdapterId,
+            cccExecutionTerminalRouteMembers: route.terminalRouteMembers,
             cccExecutionRouteSha256: routeSha256,
             executor: route.executor,
             toolMode: route.toolMode,

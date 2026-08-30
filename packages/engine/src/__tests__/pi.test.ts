@@ -1350,9 +1350,12 @@ describe("session failure diagnostics", () => {
       providerStream?: ReturnType<typeof vi.fn>;
       providerStreamSimple?: ReturnType<typeof vi.fn>;
       receiptAdapterId?: "terminal-route-sse-comments.v1";
+      terminalRouteMembers?: readonly Readonly<{ provider: string; model: string }>[];
     }) {
-      const selectedModel = input.receiptAdapterId
-        ? { provider: "omniroute-minimax-m3-pinned", id: "minimax/MiniMax-M3" }
+      const selectedModel = input.terminalRouteMembers
+        ? { provider: "omniroute-minimax-m3-pinned", id: "combo/minimax-latest" }
+        : input.receiptAdapterId
+          ? { provider: "omniroute-minimax-m3-pinned", id: "minimax/MiniMax-M3" }
         : providerModel;
       const createAgentSessionMock = vi.mocked(createAgentSession);
       const providerStream = input.providerStream ?? vi.fn(successfulAsyncStream);
@@ -1386,6 +1389,13 @@ describe("session failure diagnostics", () => {
           turnKey: "turn-stable-01",
           controller: Object.freeze(input.controller),
           ...(input.receiptAdapterId ? { receiptAdapterId: input.receiptAdapterId } : {}),
+          ...(input.terminalRouteMembers
+            ? {
+              terminalRouteMembers: Object.freeze(
+                input.terminalRouteMembers.map((member) => Object.freeze({ ...member })),
+              ),
+            }
+            : {}),
         }),
       } as any);
 
@@ -1568,6 +1578,86 @@ describe("session failure diagnostics", () => {
         },
       }));
       expect(lifecycle).toEqual(["final", "reconcile"]);
+    });
+
+    it("RED-ALIAS-PI-1: reconciles an allowlisted combo member while keeping the requested Pi route effective", async () => {
+      const comboModel = { provider: "omniroute-minimax-m3-pinned", id: "combo/minimax-latest" } as any;
+      const terminalRouteMembers = [
+        { provider: "minimax", model: "MiniMax-M3" },
+        { provider: "minimax", model: "MiniMax-M3.1" },
+      ] as const;
+      const comboMessage = {
+        ...message,
+        provider: comboModel.provider,
+        model: comboModel.id,
+        omniRoute: terminalRouteMembers[0],
+      } as any;
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => comboMessage),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "done", reason: "stop", message: comboMessage };
+        },
+      }));
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({ kind: "dispatch-permit", scope: scopeFromDispatchInput(input) })),
+        reconcile: vi.fn(async (input) => committedScope(input, {
+          binding: {
+            ...authorityBinding,
+            providerId: input.binding.providerId,
+            modelId: input.binding.modelId,
+            transport: input.binding.transport,
+          },
+        })),
+      };
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+        terminalRouteMembers,
+      });
+
+      await expect(created.modelRuntime.stream(comboModel, providerContext, {}).result())
+        .resolves.toMatchObject({ omniRoute: terminalRouteMembers[0] });
+      expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+        effectiveRoute: expect.objectContaining({
+          effectiveProvider: "omniroute-minimax-m3-pinned",
+          effectiveModel: "combo/minimax-latest",
+          omniRoute: { final: terminalRouteMembers[0] },
+        }),
+      }));
+    });
+
+    it("RED-ALIAS-PI-2: refuses a Luna terminal substitution for a sealed combo before reconciliation", async () => {
+      const comboModel = { provider: "omniroute-minimax-m3-pinned", id: "combo/minimax-latest" } as any;
+      const terminalRouteMembers = [
+        { provider: "minimax", model: "MiniMax-M3" },
+      ] as const;
+      const substitutedMessage = {
+        ...message,
+        provider: comboModel.provider,
+        model: comboModel.id,
+        omniRoute: { provider: "cx", model: "gpt-5.6-luna-max" },
+      } as any;
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => substitutedMessage),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "done", reason: "stop", message: substitutedMessage };
+        },
+      }));
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({ kind: "dispatch-permit", scope: scopeFromDispatchInput(input) })),
+        reconcile: vi.fn(),
+      };
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+        terminalRouteMembers,
+      });
+
+      await expect(created.modelRuntime.stream(comboModel, providerContext, {}).result())
+        .rejects.toThrow(/not an admitted terminal member/u);
+      expect(controller.reconcile).not.toHaveBeenCalled();
     });
 
     /*
