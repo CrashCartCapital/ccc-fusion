@@ -2481,11 +2481,9 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       },
     ],
     bounds: {
-      // Two dispatches, one per task. The import-wide provider-attempt audit
-      // history is bounded by (maxRequests * 3) + 1 rows and each attempt
-      // writes exactly three rows, so this is the smallest budget that admits
-      // a two-task chain.
-      maxRequests: 2,
+      // Two provider tasks each require one MUTATE turn plus the single
+      // controller-issued REPAIR turn, so the structural floor is four.
+      maxRequests: 4,
       maxDurationMs: verticalCampaignMaxDurationMs,
       maxConcurrency: 1,
     },
