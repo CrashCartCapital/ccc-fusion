@@ -109,9 +109,6 @@ livePgDescribe(`CCC Golden Evidence Ledger three-task live Pi campaign (${driver
     await h.beforeAll();
     await h.beforeEach();
     lifecycleRoot = await mkdtemp(join(tmpdir(), `ccc-golden-pi-${driver.key}-`));
-    isolatedHome = join(lifecycleRoot, "home");
-    await mkdir(isolatedHome, { recursive: true });
-    process.env.HOME = isolatedHome;
     comboSnapshot = parseGoldenOmniRouteComboSnapshot(
       process.env.CCC_GOLDEN_OMNIROUTE_COMBO_SNAPSHOT ?? "",
       driver.comboAlias,
@@ -123,6 +120,8 @@ livePgDescribe(`CCC Golden Evidence Ledger three-task live Pi campaign (${driver
       expect(sealedTerminalMemberKeys.has(`${provider}/${model}`)).toBe(true);
     }
     lifecycle = await prepareLifecycle(lifecycleRoot, comboSnapshot);
+    if (!originalHome) throw new Error("Vitest must provide an isolated worker HOME");
+    isolatedHome = originalHome;
     store = new TaskStore(lifecycle.targetRoot, join(isolatedHome, ".fusion"), { asyncLayer: h.layer() });
     const liveProviderSettings = {
       openrouterModelSync: false,
@@ -219,7 +218,7 @@ livePgDescribe(`CCC Golden Evidence Ledger three-task live Pi campaign (${driver
         ...(detail ? { detail: detail.slice(0, 320) } : {}),
         durationMs,
         timeToFirstTokenMs,
-      })).slice(-40)])));
+      })).slice(-200)])));
     const requestCountByTask = (status: ProductStatusOutput) => Object.fromEntries(taskOrder.map((semanticTaskId) => [
       semanticTaskId,
       status.status.providerAttempts.filter((attempt) => attempt.semanticTaskId === semanticTaskId).length,

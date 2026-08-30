@@ -64,5 +64,9 @@ export function isCccCampaignPotentialMutationToolCall(
   toolName: string,
   params: Record<string, unknown> | undefined,
 ): boolean {
+  // Bash is never custody-safe merely because its surface syntax looks
+  // read-only. Shell expansion, aliases, wrappers, and command behavior can
+  // still write, so every Bash call receives a before/after write-set check.
+  if (toolName.trim().toLowerCase() === "bash") return true;
   return !isCccCampaignDiscoveryToolCall(toolName, params);
 }

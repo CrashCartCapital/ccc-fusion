@@ -1,6 +1,7 @@
 export type CccExecutorPhase =
   | "DISCOVER"
   | "MUTATE"
+  | "AWAIT_PHASE_SIGNAL"
   | "VERIFY"
   | "REPAIR"
   | "READY_FOR_CONTROLLER"
@@ -9,6 +10,7 @@ export type CccExecutorPhase =
 export type CccPhaseAction =
   | "CONTINUE_DISCOVERY"
   | "PROMPT_MUTATION_CONTINUATION"
+  | "PROMPT_PHASE_SIGNAL"
   | "RUN_CONTROLLER_VERIFICATION"
   | "PROMPT_REPAIR"
   | "HAND_OFF_READY"
@@ -119,6 +121,26 @@ export function decideCccPhaseTransition(
     };
   }
 
+  if (observation.phase === "AWAIT_PHASE_SIGNAL") {
+    if (observation.explicitPhaseSignal && observation.hasConfirmedMutation) {
+      return {
+        phase: "VERIFY",
+        action: "RUN_CONTROLLER_VERIFICATION",
+        readCapWarning,
+        capForcedStop: false,
+      };
+    }
+    return {
+      phase: "TERMINAL_FAILURE",
+      action: "FAIL_TERMINAL",
+      noProgressClass: "class-3",
+      readCapWarning,
+      capForcedStop: false,
+      failureReason:
+        "Signal-only completion handshake ended without the required fn_complete_phase tool call",
+    };
+  }
+
   if (observation.phase === "REPAIR") {
     if (observation.explicitPhaseSignal && observation.hasConfirmedMutation) {
       return {
@@ -179,13 +201,11 @@ export function decideCccPhaseTransition(
       };
     }
     return {
-      phase: "TERMINAL_FAILURE",
-      action: "FAIL_TERMINAL",
+      phase: "AWAIT_PHASE_SIGNAL",
+      action: "PROMPT_PHASE_SIGNAL",
       noProgressClass: "class-3",
       readCapWarning,
       capForcedStop: false,
-      failureReason:
-        "MUTATE ended twice with a dirty candidate but without an explicit phase signal",
     };
   }
 

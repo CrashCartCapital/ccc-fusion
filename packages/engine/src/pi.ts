@@ -1910,6 +1910,23 @@ export interface AgentOptions {
       params: Record<string, unknown> | undefined,
     ) => void;
     currentPhase?: () => string | undefined;
+    completionSignalOnly?: () => boolean;
+    signalOnlyRefusalMessage?: string;
+    onSignalOnlyViolation?: (toolName: string) => void;
+    worktreePath?: string;
+    allowedWriteRoots?: readonly string[];
+    capturePotentialMutationBaseline?: () => Promise<unknown>;
+    onPotentialMutationSettled?: (
+      toolName: string,
+      params: Record<string, unknown> | undefined,
+      baseline: unknown,
+      result: unknown,
+    ) => Promise<Readonly<{
+      violation?: Readonly<{
+        message: string;
+        details?: Record<string, unknown>;
+      }>;
+    }>>;
     onPotentialMutationCompleted?: (
       toolName: string,
       params: Record<string, unknown> | undefined,
@@ -2786,6 +2803,16 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
   );
   let readOnlyToolCalls = 0;
   let postRefusalMutationAttempted = false;
+  const pathWithinAdmittedRoots = (path: string): boolean => {
+    if (!policy.worktreePath || !policy.allowedWriteRoots?.length) return true;
+    const worktree = resolve(policy.worktreePath);
+    const target = isAbsolute(path) ? resolve(path) : resolve(worktree, path);
+    if (!isSameOrInsidePath(worktree, target)) return false;
+    return policy.allowedWriteRoots.some((root) => {
+      const admitted = resolve(worktree, root);
+      return isSameOrInsidePath(admitted, target);
+    });
+  };
   const appendGuidance = (
     result: unknown,
     message: string,
@@ -2812,11 +2839,31 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
         maxReadOnlyToolCallsBeforeRefusal: refusalLimit,
       })
     : undefined;
+  const custodyViolationResult = (
+    result: unknown,
+    message: string,
+    details: Record<string, unknown> = {},
+  ) => {
+    const original = result && typeof result === "object" && !Array.isArray(result)
+      ? result as Record<string, unknown>
+      : {};
+    const originalContent = Array.isArray(original.content) ? original.content : [];
+    return {
+      ...original,
+      content: [...originalContent, { type: "text", text: message }],
+      details: {
+        ...details,
+        originalToolResult: result,
+      },
+      isError: true,
+      terminate: true,
+      ok: false,
+      error: message,
+    };
+  };
   return tools.map((tool) => {
     const normalizedToolName = tool.name.trim().toLowerCase();
-    if (exemptToolNames.has(normalizedToolName)) {
-      return { ...tool, executionMode: "sequential" as const };
-    }
+    const exempt = exemptToolNames.has(normalizedToolName);
     const originalExecute = tool.execute as any;
     return {
       ...tool,
@@ -2825,10 +2872,67 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
       // in this policy must participate in one deterministic sequence.
       executionMode: "sequential" as const,
       execute: async (...args: any[]) => {
-        if ((policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
-          return originalExecute(...args);
-        }
         const params = args[1] as Record<string, unknown> | undefined;
+        if (policy.completionSignalOnly?.() && !exempt) {
+          policy.onSignalOnlyViolation?.(tool.name);
+          return {
+            ...boundaryRejection(
+              policy.signalOnlyRefusalMessage
+                ?? "CCC_CAMPAIGN_PHASE_SIGNAL_ONLY_REFUSED: fn_complete_phase is the only allowed tool in this handshake.",
+              { phase: "AWAIT_PHASE_SIGNAL", toolName: tool.name },
+            ),
+            terminate: true,
+          };
+        }
+        if (exempt) return originalExecute(...args);
+        if (
+          (normalizedToolName === "write" || normalizedToolName === "edit")
+          && typeof params?.path === "string"
+          && !pathWithinAdmittedRoots(params.path)
+        ) {
+          return boundaryRejection(
+            `CCC_CAMPAIGN_WRITE_ENVELOPE_REFUSED: ${tool.name} target ${params.path} is outside the admitted write roots.`,
+            {
+              phase: policy.currentPhase?.(),
+              toolName: tool.name,
+              path: params.path,
+              allowedWriteRoots: policy.allowedWriteRoots,
+            },
+          );
+        }
+        const potentialMutation = isCccCampaignPotentialMutationToolCall(tool.name, params);
+        const executeWithCustody = async () => {
+          const baseline = potentialMutation
+            ? await policy.capturePotentialMutationBaseline?.()
+            : undefined;
+          const result = await originalExecute(...args);
+          if (potentialMutation && policy.onPotentialMutationSettled) {
+            const settlement = await policy.onPotentialMutationSettled(
+              tool.name,
+              params,
+              baseline,
+              result,
+            );
+            if (settlement.violation) {
+              return {
+                result: custodyViolationResult(
+                  result,
+                  settlement.violation.message,
+                  settlement.violation.details,
+                ),
+                custodyViolation: true,
+                confirmedMutation: false,
+              };
+            }
+          }
+          const confirmedMutation = potentialMutation
+            ? await policy.onPotentialMutationCompleted?.(tool.name, params) ?? false
+            : false;
+          return { result, custodyViolation: false, confirmedMutation };
+        };
+        if ((policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
+          return (await executeWithCustody()).result;
+        }
         const nativeDiscovery = (
           readOnlyToolNames.has(normalizedToolName)
           && isCccCampaignDiscoveryToolCall(tool.name, params)
@@ -2851,7 +2955,9 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
           readOnlyToolCalls += 1;
           const refusal = refuseIfExhausted(tool.name);
           if (refusal) return refusal;
-          const result = await originalExecute(...args);
+          const execution = await executeWithCustody();
+          const { result } = execution;
+          if (execution.custodyViolation) return result;
           if (readOnlyToolCalls > guidanceLimit) {
             return appendGuidance(result, policy.guidanceMessage, {
               phase: "DISCOVER",
@@ -2877,9 +2983,9 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
         }
         if (readOnlyToolCalls >= refusalLimit) postRefusalMutationAttempted = true;
 
-        const result = await originalExecute(...args);
-        if (!isCccCampaignPotentialMutationToolCall(tool.name, params)) return result;
-        const confirmedMutation = await policy.onPotentialMutationCompleted?.(tool.name, params) ?? false;
+        const execution = await executeWithCustody();
+        const { result, confirmedMutation } = execution;
+        if (execution.custodyViolation || !potentialMutation) return result;
         if (confirmedMutation || (policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
           return result;
         }

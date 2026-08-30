@@ -50,6 +50,7 @@ import {
   fingerprintCccCampaignAllowedCandidate,
   renderCccCampaignRepairFeedback,
   resolveCccCampaignReadyTimeoutMs,
+  snapshotCccCampaignWriteEnvelope,
   verifyCccCampaignReadyCandidate,
 } from "./ccc-campaign-ready.js";
 import type { CccCampaignReadyCommitHandoff } from "./ccc-campaign-ready.js";
@@ -18700,6 +18701,22 @@ Approved Task Contract:
 ${workflowReviewSpecText}
 --- END APPROVED PROMPT.md ---`
       : "";
+    const campaignReadyContext = cccCampaignImplementation
+      ? await this.store.getCccCampaignContextForTask(task.id)
+      : null;
+    if (cccCampaignImplementation && !campaignReadyContext) {
+      throw new PermanentError(
+        `CCC campaign task ${task.id} has no persisted readiness custody`,
+        "CCC_CAMPAIGN_READY_CUSTODY_REFUSED",
+      );
+    }
+    const implementationWriteRoots = cccCampaignImplementation
+      && Array.isArray(campaignReadyContext!.route.allowedWriteRoots)
+      ? campaignReadyContext!.route.allowedWriteRoots
+      : [];
+    const implementationWriteRootBlock = implementationWriteRoots.length > 0
+      ? implementationWriteRoots.map((path) => `- ${path}`).join("\n")
+      : "- (none declared)";
     let scopeBlock: string;
     if (cccCampaignImplementation) {
       scopeBlock = `Campaign Implementation Scope:
@@ -18707,7 +18724,10 @@ ${workflowReviewSpecText}
 - Follow the admitted task instructions exactly, including owned paths and allowed write roots.
 - Inspect the repository as needed, edit the required files, and run the narrowest relevant verification.
 - Do not merely review the current worktree or return a reviewer verdict.
-- Do not stage or commit changes; the campaign controller validates and commits the admitted change set after this session.`;
+- Do not stage or commit changes; the campaign controller validates and commits the admitted change set after this session.
+- Exact admitted write roots:
+${implementationWriteRootBlock}
+- Every file or directory created inside this worktree must be inside one of those roots. Do not create scratch files, temporary output, logs, or copies elsewhere in the worktree.`;
     } else if (isPlanReviewStep) {
       scopeBlock = `Plan Review Scope:
 - Review the task plan artifact (PROMPT.md), reproduced verbatim below, and task metadata only.
@@ -19012,15 +19032,6 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       const codingCustomTools: ToolDefinition[] = toolMode === "coding"
         ? [this.createSpawnAgentTool(task.id, worktreePath, settings, stepEnv)]
         : [];
-      const campaignReadyContext = cccCampaignImplementation
-        ? await this.store.getCccCampaignContextForTask(task.id)
-        : null;
-      if (cccCampaignImplementation && !campaignReadyContext) {
-        throw new PermanentError(
-          `CCC campaign task ${task.id} has no persisted readiness custody`,
-          "CCC_CAMPAIGN_READY_CUSTODY_REFUSED",
-        );
-      }
       const campaignAllowedWriteRoots: readonly string[] = cccCampaignImplementation
         && Array.isArray(campaignReadyContext!.route.allowedWriteRoots)
         && campaignReadyContext!.route.allowedWriteRoots.length > 0
@@ -19057,7 +19068,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         invalidatedByTool?: string;
       } = { completionRequested: false };
       const campaignPhaseRuntime: {
-        activePhase: "DISCOVER" | "MUTATE" | "VERIFY" | "REPAIR";
+        activePhase: "DISCOVER" | "MUTATE" | "AWAIT_PHASE_SIGNAL" | "VERIFY" | "REPAIR";
         discoverContinuations: number;
         mutateContinuations: number;
         readCount: number;
@@ -19163,6 +19174,54 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               campaignPhaseRuntime.readCount += 1;
             },
             currentPhase: () => campaignPhaseRuntime.activePhase,
+            completionSignalOnly: () => campaignPhaseRuntime.activePhase === "AWAIT_PHASE_SIGNAL",
+            signalOnlyRefusalMessage:
+              "CCC_CAMPAIGN_PHASE_SIGNAL_ONLY_REFUSED: fn_complete_phase is the only allowed tool in this handshake.",
+            onSignalOnlyViolation: (toolName: string) => {
+              campaignPhaseIntent.invalidatedByTool = toolName;
+            },
+            worktreePath,
+            allowedWriteRoots: campaignAllowedWriteRoots,
+            capturePotentialMutationBaseline: () => snapshotCccCampaignWriteEnvelope({
+              worktreePath,
+              allowedRoots: campaignAllowedWriteRoots,
+            }),
+            onPotentialMutationSettled: async (
+              toolName: string,
+              _params: Record<string, unknown> | undefined,
+              baseline: unknown,
+              result: unknown,
+            ) => {
+              const before = baseline as {
+                changedPaths?: readonly string[];
+                foreignPaths?: readonly string[];
+              } | undefined;
+              const after = await snapshotCccCampaignWriteEnvelope({
+                worktreePath,
+                allowedRoots: campaignAllowedWriteRoots,
+              });
+              const beforePaths = new Set(before?.changedPaths ?? []);
+              const newPaths = after.changedPaths.filter((path) => !beforePaths.has(path));
+              const foreignSet = new Set(after.foreignPaths);
+              const newForeignPaths = newPaths.filter((path) => foreignSet.has(path));
+              if (newForeignPaths.length === 0) return {};
+              const message =
+                `CCC_CAMPAIGN_WRITE_ENVELOPE_VIOLATION: ${toolName} created path(s) outside the admitted write roots: ${newForeignPaths.join(", ")}`;
+              campaignPhaseRuntime.terminalFailure = message;
+              return {
+                violation: {
+                  message,
+                  details: {
+                    toolName,
+                    newForeignPaths,
+                    allowedWriteRoots: campaignAllowedWriteRoots,
+                    originalToolResultWasError: Boolean(
+                      result && typeof result === "object" && (result as { isError?: unknown }).isError === true,
+                    ),
+                  },
+                },
+              };
+            },
             onPotentialMutationCompleted: async () => {
               try {
                 const currentFingerprint = await fingerprintCccCampaignAllowedCandidate({
@@ -19321,18 +19380,56 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         const promptPromise = (async () => {
           if (cccCampaignImplementation) {
             try {
+              const phaseEntryWriteEnvelope = await snapshotCccCampaignWriteEnvelope({
+                worktreePath,
+                allowedRoots: campaignAllowedWriteRoots,
+              });
+              if (phaseEntryWriteEnvelope.foreignPaths.length > 0) {
+                campaignPhaseRuntime.terminalFailure =
+                  `CCC_CAMPAIGN_WRITE_ENVELOPE_BASELINE_REFUSED: candidate began with path(s) outside the admitted write roots: ${phaseEntryWriteEnvelope.foreignPaths.join(", ")}`;
+                return;
+              }
               campaignTurnStartAllowedFingerprint = await fingerprintCccCampaignAllowedCandidate({
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
               });
             } catch (error) {
-              executorLog.warn(
-                `${task.id}: unable to fingerprint campaign candidate before phase execution: ${error instanceof Error ? error.message : String(error)}`,
-              );
+              const detail = error instanceof Error ? error.message : String(error);
+              campaignPhaseRuntime.terminalFailure =
+                `CCC_CAMPAIGN_WRITE_ENVELOPE_BASELINE_UNAVAILABLE: unable to establish candidate custody before provider dispatch: ${detail}`;
+              executorLog.warn(`${task.id}: ${campaignPhaseRuntime.terminalFailure}`);
+              return;
             }
           }
           await promptWithFallback(session, initialPrompt);
           if (!cccCampaignImplementation) return;
+
+          const promptForPhaseSignal = async (): Promise<void> => {
+            campaignPhaseRuntime.activePhase = "AWAIT_PHASE_SIGNAL";
+            await this.store.logEntry(
+              task.id,
+              "[ccc-campaign:phase-signal] admitted candidate is complete but unsignaled; issuing the one signal-only handshake",
+            );
+            await promptWithFallback(
+              session,
+              "CCC_CAMPAIGN_PHASE_SIGNAL_REQUIRED: The admitted candidate is already dirty and the implementation turn is complete. "
+                + "Your next action must be exactly one fn_complete_phase tool call with no other tool call. "
+                + "Do not inspect, edit, verify, or explain. The controller runs VERIFY only after this explicit signal settles.",
+            );
+            const signalDecision = decideCccPhaseTransition({
+              phase: "AWAIT_PHASE_SIGNAL",
+              turnSettled: true,
+              explicitPhaseSignal: campaignPhaseIntent.completionRequested,
+              hasConfirmedMutation: campaignPhaseRuntime.turnConfirmedMutation === true,
+              readCount: campaignPhaseRuntime.readCount,
+              discoverContinuations: campaignPhaseRuntime.discoverContinuations,
+              mutateContinuations: campaignPhaseRuntime.mutateContinuations,
+            });
+            if (signalDecision.action !== "RUN_CONTROLLER_VERIFICATION") {
+              campaignPhaseRuntime.terminalFailure = signalDecision.failureReason
+                ?? "Signal-only completion handshake did not reach controller verification";
+            }
+          };
 
           /*
            * FNXC:CCCCampaignNoDiffContinuation 2026-08-24-13:46:
@@ -19410,8 +19507,12 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
                 discoverContinuations: campaignPhaseRuntime.discoverContinuations,
                 mutateContinuations: campaignPhaseRuntime.mutateContinuations,
               });
-              campaignPhaseRuntime.terminalFailure = exhaustedDecision.failureReason
-                ?? "MUTATE exhausted its bounded continuation without an explicit phase signal";
+              if (exhaustedDecision.action === "PROMPT_PHASE_SIGNAL") {
+                await promptForPhaseSignal();
+              } else {
+                campaignPhaseRuntime.terminalFailure = exhaustedDecision.failureReason
+                  ?? "MUTATE exhausted its bounded continuation without an explicit phase signal";
+              }
             }
             return;
           }
@@ -19513,8 +19614,12 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               discoverContinuations: campaignPhaseRuntime.discoverContinuations,
               mutateContinuations: campaignPhaseRuntime.mutateContinuations,
             });
-            campaignPhaseRuntime.terminalFailure = exhaustedDecision.failureReason
-              ?? "MUTATE exhausted its bounded continuation without an explicit phase signal";
+            if (exhaustedDecision.action === "PROMPT_PHASE_SIGNAL") {
+              await promptForPhaseSignal();
+            } else {
+              campaignPhaseRuntime.terminalFailure = exhaustedDecision.failureReason
+                ?? "MUTATE exhausted its bounded continuation without an explicit phase signal";
+            }
           }
         })();
 

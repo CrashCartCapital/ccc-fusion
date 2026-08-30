@@ -511,6 +511,195 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
     expect(customExecute).toHaveBeenCalledTimes(2);
   });
 
+  it("signal_only_handshake_refuses_sibling_tools_before_execution and preserves invalidation", async () => {
+    const writeExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "must not write" }],
+      isError: false,
+    });
+    const signalExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "signal accepted" }],
+      isError: false,
+      terminate: true,
+    });
+    const onSignalOnlyViolation = vi.fn();
+    const wrapped = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [
+        { name: "write", execute: writeExecute } as never,
+        { name: "fn_complete_phase", execute: signalExecute } as never,
+      ],
+      {
+        readOnlyToolNames: ["read"],
+        exemptToolNames: ["fn_complete_phase"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "AWAIT_PHASE_SIGNAL",
+        completionSignalOnly: () => true,
+        signalOnlyRefusalMessage:
+          "CCC_CAMPAIGN_PHASE_SIGNAL_ONLY_REFUSED: call fn_complete_phase and no other tool",
+        onSignalOnlyViolation,
+      } as any,
+    );
+    const writeTool = wrapped.find((tool) => tool.name === "write")!;
+    const signalTool = wrapped.find((tool) => tool.name === "fn_complete_phase")!;
+
+    await expect(writeTool.execute("call-write", { path: "src/a.ts", content: "x" }, undefined))
+      .resolves.toMatchObject({
+        isError: true,
+        terminate: true,
+        error: expect.stringContaining("PHASE_SIGNAL_ONLY_REFUSED"),
+      });
+    expect(writeExecute).not.toHaveBeenCalled();
+    expect(onSignalOnlyViolation).toHaveBeenCalledWith("write");
+    await expect(signalTool.execute("call-signal", {}, undefined)).resolves.toMatchObject({
+      terminate: true,
+    });
+    expect(signalExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("native_write_preflight_refuses_paths outside exact admitted roots", async () => {
+    const writeExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "must not write" }],
+      isError: false,
+    });
+    const [writeTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "write", execute: writeExecute } as never],
+      {
+        readOnlyToolNames: ["read"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "MUTATE",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/record.mjs", "src/validation.mjs"],
+      } as any,
+    );
+
+    await expect(writeTool!.execute(
+      "call-write",
+      { path: "/tmp/ccc-candidate/.fusion-tmp/h2.txt", content: "scratch" },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
+    });
+    expect(writeExecute).not.toHaveBeenCalled();
+  });
+
+  it("post_tool_write_envelope_guard terminates a MUTATE tool that creates a foreign path", async () => {
+    const bashResult = {
+      content: [{ type: "text", text: "command completed" }],
+      isError: false,
+      details: { exitCode: 0 },
+    };
+    const bashExecute = vi.fn().mockResolvedValue(bashResult);
+    const capturePotentialMutationBaseline = vi.fn().mockResolvedValue({
+      changedPaths: ["src/record.mjs"],
+      foreignPaths: [],
+    });
+    const onPotentialMutationSettled = vi.fn().mockResolvedValue({
+      violation: {
+        message:
+          "CCC_CAMPAIGN_WRITE_ENVELOPE_VIOLATION: bash created .fusion-tmp/h2.txt outside admitted roots",
+        details: {
+          toolName: "bash",
+          newForeignPaths: [".fusion-tmp/h2.txt"],
+          allowedWriteRoots: ["src/record.mjs", "src/validation.mjs"],
+        },
+      },
+    });
+    const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "bash", execute: bashExecute } as never],
+      {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "MUTATE",
+        capturePotentialMutationBaseline,
+        onPotentialMutationSettled,
+      } as any,
+    );
+
+    await expect(bashTool!.execute(
+      "call-bash",
+      { command: "mkdir -p .fusion-tmp && printf x > .fusion-tmp/h2.txt" },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      terminate: true,
+      error: expect.stringContaining("WRITE_ENVELOPE_VIOLATION"),
+      content: expect.arrayContaining([
+        { type: "text", text: "command completed" },
+        { type: "text", text: expect.stringContaining(".fusion-tmp/h2.txt") },
+      ]),
+      details: expect.objectContaining({
+        originalToolResult: bashResult,
+        newForeignPaths: [".fusion-tmp/h2.txt"],
+      }),
+    });
+    expect(bashExecute).toHaveBeenCalledTimes(1);
+    expect(capturePotentialMutationBaseline).toHaveBeenCalledTimes(1);
+    expect(onPotentialMutationSettled).toHaveBeenCalledTimes(1);
+  });
+
+  it("post_tool_write_envelope_guard observes even Bash commands classified as discovery", async () => {
+    const bashResult = {
+      content: [{ type: "text", text: "file contents" }],
+      isError: false,
+      details: { exitCode: 0 },
+    };
+    const bashExecute = vi.fn().mockResolvedValue(bashResult);
+    const capturePotentialMutationBaseline = vi.fn().mockResolvedValue({
+      changedPaths: [],
+      foreignPaths: [],
+    });
+    const onPotentialMutationSettled = vi.fn().mockResolvedValue({
+      violation: {
+        message:
+          "CCC_CAMPAIGN_WRITE_ENVELOPE_VIOLATION: bash created .v_part2.txt outside admitted roots",
+        details: {
+          toolName: "bash",
+          newForeignPaths: [".v_part2.txt"],
+          allowedWriteRoots: ["src/record.mjs"],
+        },
+      },
+    });
+    const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "bash", execute: bashExecute } as never],
+      {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 2,
+        maxReadOnlyToolCallsBeforeRefusal: 4,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "DISCOVER",
+        capturePotentialMutationBaseline,
+        onPotentialMutationSettled,
+      } as any,
+    );
+
+    await expect(bashTool!.execute(
+      "call-bash",
+      { command: "cat src/record.mjs" },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      terminate: true,
+      error: expect.stringContaining("WRITE_ENVELOPE_VIOLATION"),
+      details: expect.objectContaining({
+        originalToolResult: bashResult,
+        newForeignPaths: [".v_part2.txt"],
+      }),
+    });
+    expect(bashExecute).toHaveBeenCalledTimes(1);
+    expect(capturePotentialMutationBaseline).toHaveBeenCalledTimes(1);
+    expect(onPotentialMutationSettled).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves DISCOVER after a successful tool mutation so verification reads are not blocked", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
     const readExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "read result" }], isError: false });

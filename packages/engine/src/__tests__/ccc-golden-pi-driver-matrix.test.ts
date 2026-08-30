@@ -76,6 +76,14 @@ describe("CCC golden Pi driver matrix", () => {
     expect(source).toContain("evidencePersistenceFailure");
     expect(source).toContain("taskOrder");
     expect(source).toContain("exactCandidateFiles");
+    expect(source).toContain(".slice(-200)");
+    expect(source.indexOf("comboSnapshot = parseGoldenOmniRouteComboSnapshot")).toBeLessThan(
+      source.indexOf("lifecycle = await prepareLifecycle"),
+    );
+    expect(source.indexOf("lifecycle = await prepareLifecycle")).toBeLessThan(
+      source.indexOf("isolatedHome = originalHome"),
+    );
+    expect(source).not.toContain("process.env.HOME = isolatedHome");
     expect(source).not.toMatch(/luna|maxRequests: 14|taskCount: 1/u);
     expect(source).not.toContain("maxRequests: 6");
     expect(source).not.toContain("maxDurationMs: 180_000");
