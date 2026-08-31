@@ -1295,7 +1295,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
   });
 
   it("passes exact admitted roots and full write-set custody callbacks into Pi", async () => {
-    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+    const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
       "completed",
       "/tmp/ccc-campaign-write-envelope-policy",
     );
@@ -1313,6 +1313,12 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(sessionCall.systemPrompt).toMatch(/exact admitted write roots/i);
     expect(sessionCall.systemPrompt).toContain("- src");
     expect(sessionCall.systemPrompt).toContain("- test");
+    expect(sessionCall.systemPrompt).toMatch(
+      /read sealed verifier\/support files in place or use OS temp outside the worktree/i,
+    );
+    expect(userPrompts[0]).toMatch(
+      /never copy scratch\/helper files into the candidate worktree outside the exact admitted roots/i,
+    );
     expect(sessionCall.cccCampaignPhaseToolPolicy).toMatchObject({
       worktreePath: "/tmp/ccc-campaign-write-envelope-policy",
       allowedWriteRoots: ["src", "test"],

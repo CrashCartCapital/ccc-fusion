@@ -18743,7 +18743,8 @@ ${workflowReviewSpecText}
 - Do not stage or commit changes; the campaign controller validates and commits the admitted change set after this session.
 - Exact admitted write roots:
 ${implementationWriteRootBlock}
-- Every file or directory created inside this worktree must be inside one of those roots. Do not create scratch files, temporary output, logs, or copies elsewhere in the worktree.`;
+- Every file or directory created inside this worktree must be inside one of those roots. Do not create scratch files, temporary output, logs, or copies elsewhere in the worktree.
+- Read sealed verifier/support files in place or use OS temp outside the worktree. Never copy verifier, helper, or inspection files to the worktree root or another non-admitted path.`;
     } else if (isPlanReviewStep) {
       scopeBlock = `Plan Review Scope:
 - Review the task plan artifact (PROMPT.md), reproduced verbatim below, and task metadata only.
@@ -19398,7 +19399,8 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             "Follow the exact admitted instructions, modify the isolated worktree, and run targeted verification.\n\n" +
             "CCC_CAMPAIGN_DISCOVER_BOUNDARY: DISCOVER is phase-bounded by the admitted request budget. " +
             `You may make at most ${campaignDiscoveryGuidanceToolLimit} read/search/list discovery tool call(s) before moving to MUTATE. ` +
-            "Do not spend the provider turn re-reading context. If the admitted task identifies exact files, create or edit them first."
+            "Do not spend the provider turn re-reading context. If the admitted task identifies exact files, create or edit them first. " +
+            "Read sealed verifier/support files in place or use OS temp; never copy scratch/helper files into the candidate worktree outside the exact admitted roots."
           : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
             "Review the work done in this worktree and evaluate it against the criteria in your instructions.";
         const promptPromise = (async () => {

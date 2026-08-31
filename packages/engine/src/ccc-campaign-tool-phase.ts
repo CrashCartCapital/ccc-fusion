@@ -70,3 +70,19 @@ export function isCccCampaignPotentialMutationToolCall(
   if (toolName.trim().toLowerCase() === "bash") return true;
   return !isCccCampaignDiscoveryToolCall(toolName, params);
 }
+
+/**
+ * Conservatively extract literal filesystem destinations from inline JS run
+ * through Bash. Opaque or computed targets remain covered by the mandatory
+ * post-execution write-envelope snapshot.
+ */
+export function cccCampaignVisibleBashWriteTargets(raw: string): string[] {
+  if (!/\b(?:node|bun|deno)\b/u.test(raw)) return [];
+  const command = raw.replace(/\\(["'])/gu, "$1");
+  const targets: string[] = [];
+  const singleTarget = /\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|mkdir|mkdirSync|rm|rmSync|unlink|unlinkSync|truncate|truncateSync)\s*\(\s*(["'])([^"'\\\r\n]+)\1/gu;
+  for (const match of command.matchAll(singleTarget)) targets.push(match[2]!);
+  const destinationTarget = /\b(?:copyFile|copyFileSync|cp|cpSync|rename|renameSync)\s*\(\s*(["'])([^"'\\\r\n]+)\1\s*,\s*(["'])([^"'\\\r\n]+)\3/gu;
+  for (const match of command.matchAll(destinationTarget)) targets.push(match[4]!);
+  return [...new Set(targets)];
+}
