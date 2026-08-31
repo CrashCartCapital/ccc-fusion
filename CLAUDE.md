@@ -4,13 +4,13 @@
 
 <!-- GENERATED FILE: DO NOT EDIT DIRECTLY -->
 
-<!-- Source: 30_DEVSTACK/instruction_system + 30_DEVSTACK/instruction_system/projects/PRJ-AI-InstructionOverlay-ccc-fusion.md -->
+<!-- Source: 30_DEVSTACK/surface_system + 30_DEVSTACK/surface_system/projects/PRJ-AI-InstructionOverlay-ccc-fusion.md -->
 
-<!-- Source canon: 30_DEVSTACK/instruction_system -->
+<!-- Source canon: 30_DEVSTACK/surface_system -->
 
-<!-- Build ID: 87f418663514e736 -->
+<!-- Build ID: 280e7d0228b174ee -->
 
-<!-- Regenerate with: instruction-system build -->
+<!-- Regenerate with: surface-roots build -->
 
 <!-- Regenerate from vault source instead of editing this file directly. -->
 
@@ -20,7 +20,7 @@
 
 The user is an independent U.S.-based developer and operator building modular, spec-driven AI, automation, research, and execution systems. The work spans personal software, local tooling, knowledge systems, data workflows, and domain-specific research without making any single domain the default context for every repo.
 
-The user prefers assistants that internalize durable preferences, proactively use available MCP servers, tools, skills, and ensemble-consult pathways, and minimize repetitive manual steering. The working style blends probabilistic reasoning, Bayesian inference, empirical testing, reversible changes, clear provenance, and pragmatic proof-driven iteration.
+Ryan wants ADHD-friendly, proof-driven work with reversible changes and minimal repeated steering. Lead with plain meaning and next steps; move internal labels, run IDs, hashes, permission jargon, and orchestration detail to optional evidence unless asked.
 
 Ryan's local stack is a Tailscale/LAN-connected Mac/NAS environment: the M5 Max MacBook Pro with 64 GB RAM is the personal operator/development workstation; the M4 Mac mini with 16 GB RAM is the always-on service/control node; the M2 Max MacBook Pro with 64 GB RAM now runs 24/7 headless beside it for inference/compute; the UGREEN DXP4800 NAS provides roughly 56 TB of workable RAID storage; and Home Assistant Green remains the home-automation appliance. This is orientation, not live proof: before relying on hostnames, ports, SSH identities, NAS paths, tunnels, or service-specific commands, read the target repo overlay and current SSOT/runbook, then verify the live route with the narrowest safe probe.
 
@@ -32,7 +32,7 @@ Ryan's local stack is a Tailscale/LAN-connected Mac/NAS environment: the M5 Max 
 
 - `CLAUDE.md` and `AGENTS.md` are AI-facing, self-contained control layers for the active assistant.
 - Their job is to steer how the agent thinks, prioritizes, routes, and uses tools, skills, and workflows.
-- They are not primary human operator manuals; use [[30_DEVSTACK/instruction_system/REF-HUM-InstructionSystemGuide|Instruction System Guide]] when explanation is the goal.
+- They are not primary human operator manuals; use [[30_DEVSTACK/surface_system/REF-HUM-SurfaceSystemGuide|Surface System Guide]] when explanation is the goal.
 - Keep durable behavior, strategic guidance, tool awareness, workflow defaults, and safety rules in the roots.
 
 ### Instruction Order
@@ -77,16 +77,12 @@ If the root pair drifts, follow the stricter rule and flag the mismatch.
 - Include it whenever a turn does real work, makes a decision, or moves a multi-step task forward. Skip it for short clarifying exchanges where a recap adds nothing.
 - Make it self-contained and skimmable: name the files, commands, and decisions directly instead of pointing back to earlier prose.
 
-- **Scope:** only unattended Ralph, Dagu, or equivalent roots inherit these gates.
-- **Preflight:** before dispatch or mutation, prove dependencies, paths, inputs, state handles, clean start, rollback, resume artifact, and blockers; else halt `DEPENDENCY_OPEN`.
-- **Caps:** Ralph inner loop 10 only with proven enforcement; dispatcher 3 attempts/chunk, runtime 10; global repair 1 pass, 4 chunks max. Never extend silently.
-- **Provider drift:** keep MCPJungle, OmniRoute, AgentSecrets, model-route, Hindsight-bank, and provider failures out of leaves; halt `PROVIDER_DRIFT`/`PROVIDER_BLOCKED`.
-- **Risk halt:** SafeExec prompts, shell-risk review, destructive/remote-code actions, mass permissions, and confirmations stop unattended work. Only narrow reversible alternatives; never invent or bypass confirmation.
-- **Proof halt:** missing artifacts, validation, or gate-owned proof fails; worker self-report is not proof. Never skip, fabricate, or route around gates.
-- **Product gate:** require repo/spec validation before repair, postmortem, finalization, commit, push, install, release, or promotion; chunk proof is insufficient.
-- **Authority:** the parent reviews diffs, proof, failures, repairs, and risk, then records proceed/stop; leaves never merge or push.
-- **Enforcement honesty:** limits are advisory without current gate evidence; otherwise decompose or halt.
-- **Halt-not-skip:** failed chunk, outer gate, dependency, proof, provider, SafeExec, or destructive gate stops with explicit state.
+- Only unattended Ralph/Dagu/equivalent roots. Pre-dispatch/mutation, prove dependencies, paths, inputs, state handles, clean start, rollback, resume artifact, blockers; else halt `DEPENDENCY_OPEN`.
+- Enforced caps: Ralph inner loop 10; dispatcher 3 attempts/chunk/runtime 10; global repair 1 pass/4 chunks. Unenforced caps advisory—decompose/halt; never silently extend.
+- Leaves exclude MCPJungle/OmniRoute/AgentSecrets/model-route/Hindsight-bank/provider failures; halt `PROVIDER_DRIFT`/`PROVIDER_BLOCKED`.
+- SafeExec prompt/shell-risk review/destructive/remote-code action/mass permission/confirmation halts unattended work. Narrow reversible alternatives only; never invent/bypass confirmation.
+- Missing artifact/validation/gate-owned proof fails; worker self-report/chunk proof insufficient. Repo/spec validation precedes repair/postmortem/finalization/commit/push/install/release/promotion; never skip/fabricate/bypass gates.
+- Parent reviews diffs/proof/failures/repairs/risk and records proceed/stop; leaves never merge/push. Failed chunk/outer gate/dependency/proof/provider/SafeExec/destructive gate halts explicitly.
 
 1. **Exclude archive paths from search by default.** Skip paths containing archive, sunset, or deprecated markers unless the user explicitly references them or the task requires archived material.
 2. Generate a live workspace snapshot before relying on directory assumptions. Use `rg --files`, targeted `find` or `ls`, or the current local Smart Tree CLI after checking its help. Prefer live discovery tools over static path maps.
@@ -95,6 +91,7 @@ If the root pair drifts, follow the stricter rule and flag the mismatch.
 5. For medium, cross-domain, or multi-step work, follow `PRD -> execution spec -> plan -> proof bundle`.
 6. For code or process changes, use the project's proof baseline rather than restating TDD procedure inline.
 7. Flag stale or contradictory docs before normalizing them. Do not silently rewrite archive or history notes.
+8. When `surface-feedback` is available, record actionable friction with the original wording and separate user-initiated from AI-observed origin.
 
 ### Workspace Discovery
 
@@ -126,20 +123,23 @@ SafeExec-aware posture:
 - Treat recursive/force deletion, `npm audit --force`, package-manager forced audit/fix modes where supported, remote-code shell launchers, and non-git destructive cleanup as exact-target, preview-first operations. Git-specific actions such as `reset`, `revert`, `restore`, `clean`, branch deletion, and force-with-lease are classified by Git And Repo Management.
 - Prefer reversible alternatives: inspect first; archive/move, dry-run, backup branch, or stash before destructive cleanup; do not run gated destructive commands from background or detached jobs.
 
+Read-shaped writer warning:
+- On macOS, `plutil -extract KEY xml1 FILE` rewrites `FILE` unless `-o -` is supplied. Treat non-`raw` extraction against a real file as an overwrite command, preserve or copy the target first, and use `-o -` for inspection. `plutil -lint` proves only plist syntax; it does not prove that a plist is a valid launchd job.
+
 Apply the same screen to equivalent destructive shapes such as `find ... -delete`, truncation or overwrite redirection, scripted deletes, and remote-code shell launchers. If the equivalent shape mutates Git or GitHub state, classify it by outcome under Git And Repo Management.
 
 Examples rule of thumb: project-local generated cleanup after preview can proceed; broad cleanup, unresolved variables, bypass attempts, remote pipe-to-shell, and mass permission changes cannot proceed without the appropriate gate or are forbidden. Force-push and related Git outcomes are governed by Git And Repo Management.
 
 ### Git And Repo Management
 
-Applies to non-vault code repos unless a project-local rule is stricter. It does not apply to `/Users/ryanpappal/01_VAULT/KnR-Vault`, whose overlay permits only read-only Git inspection and the narrow instruction-system install transaction below.
+Applies to non-vault code repos unless a project-local rule is stricter. It does not apply to `/Users/ryanpappal/01_VAULT/KnR-Vault`, whose overlay permits only read-only Git inspection and the narrow Surface System roots install transaction below.
 
 - **Default-deny:** an unlisted `git`, `gh`, or `gh api` outcome is at least consult-gated; anything that can discard local work, commits, reflog, stashes, refs, or repos is gated even if unlisted.
 - **Outcome-based:** aliases, refspecs, `git -c`, `gh api`, and `--admin` inherit the gate for the outcome they produce.
 - **Advisory layer:** prose does not enforce these rules. Verify hooks, deny rules, and branch protection before claiming runtime enforcement.
 - **Shared branch:** `main`, `master`, the default branch, or a branch with an open PR, second worktree, or possible external consumer. When uncertain, treat it as shared.
 
-**Vault guard (hard).** Before an intended Git/GitHub action, first run only `git rev-parse --show-toplevel`. If the resolved root is or is under `KnR-Vault`, abort unless executing the official instruction-system transaction. Never branch, worktree, generally commit, push, merge, rebase, or reset the vault.
+**Vault guard (hard).** Before an intended Git/GitHub action, first run only `git rev-parse --show-toplevel`. If the resolved root is or is under `KnR-Vault`, abort unless executing the official Surface System roots transaction. Never branch, worktree, generally commit, push, merge, rebase, or reset the vault.
 
 #### Outcome Gates
 
@@ -183,8 +183,8 @@ If the wrong category is assumed, the agent will treat advisory guards as suffic
 
 ### Enforced Runtime Gates
 
-- **AgentSecrets cwd binding** — `.agentsecrets/project.json` binds tool access to the current working directory. AgentSecrets may list names or broker authenticated calls, but never expose secret values. If binding refuses access, halt and rebind explicitly through the approved path; do not infer credentials from a different project.
-- **Hindsight bank admission guard, where configured** — the current laptop Hindsight service loads a custom operation validator that rejects missing or non-admitted banks for retain, recall, reflect, and consolidate. Verify the exact live allowlist and chosen bank before a write. This gate proves coarse admission only; it does not prove that an admitted bank is semantically correct.
+- **Credential-broker cwd binding** — Authentication brokerage is scoped to the current working directory. If binding fails, stop and use the approved rebind workflow; do not borrow authorization from another project.
+- **Hindsight bank admission guard, where configured** — the current production Hindsight service on the M2 Max loads a custom operation validator that rejects missing or non-admitted banks for retain, recall, reflect, and consolidate. Verify the exact live allowlist and chosen bank before a write. This gate proves coarse admission only; it does not prove that an admitted bank is semantically correct.
 
 ### Advisory Guards
 
@@ -209,10 +209,8 @@ If the wrong category is assumed, the agent will treat advisory guards as suffic
 
 ### Protected Paths And Local Boundaries
 
-- Never access `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/wave-3`; it is revoked. `wave-3-retry` stays read-only dependency hydration unless the operator explicitly names another action for that exact worktree.
-- The primary checkout is not the campaign writer without explicit main-targeted authority.
-- Vault reads are limited to declared CCC sources. Never access `.obsidian/`, `_KELSEY/`, `_secrets/`, or archived corpora.
-- Never expose secrets or credential/session values. Never kill port `4040` or an unproven listener.
+- Never access revoked `/Users/ryanpappal/03_CODE/ccc-fusion-worktrees/wave-3`. Keep `wave-3-retry` read-only for dependency hydration unless the operator explicitly names another exact-worktree action; the primary checkout is not the campaign writer without explicit main-targeted authority.
+- Limit vault reads to declared CCC sources; never access `.obsidian/`, `_KELSEY/`, `_secrets/`, or archived corpora. Never expose secrets or credential/session values, or kill port `4040` or an unproven listener.
 
 <!-- END SHARED CORE -->
 
@@ -251,7 +249,7 @@ Current truth anchors: [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Sta
 | Local inference and routing | oMLX, OmniRoute, Ollama-oMLX shim | Local model serving and OpenAI-compatible routing | Use MCP Server Reference or OmniRoute skills for route rules; verify SSOT or live health/model endpoints before use |
 | Prepared execution surfaces | Dagu, Ralph Orchestrator | Project-declared unattended execution routes | Only when the target project or overlay explicitly names unattended execution; Workflow Recipes owns lane selection |
 | Guard and hook surfaces | runtime hooks, shell-risk screener, market-data router, session checkpoint, broker drift detector | Diagnosing or verifying policy gates | Use **Hook Event Verification** and live runtime config before relying on a hook owner |
-| Knowledge graph / wiki surfaces | Kwipu, qmd, mdidx, llm-wiki-compiler | Indexed/wiki query and deliberate wiki promotion | Use when direct search is insufficient; Memory Surface Reference owns trust and write routing |
+| Knowledge graph / wiki surfaces | qmd, mdidx, llm-wiki-compiler | Indexed/wiki query and deliberate wiki promotion | Use when direct search is insufficient; Memory Surface Reference owns trust and write routing |
 
 ## Coding Protocols
 
@@ -299,19 +297,19 @@ Current truth anchors: [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Sta
 
 ## Instruction Pack Catalog
 
-The permanent kernel remains authoritative for safety. Use the deterministic `instruction-system select` or `load-more` command against `instruction-pack-manifest.json`, then read only the exact selected paths below. Selection is not proof of loading: a receipt may name a pack as loaded only after the runtime supplies observable load evidence. After compaction, re-run selection and re-read every still-relevant pack.
+The permanent kernel remains authoritative for safety. Use the deterministic `surface-roots select` or `surface-roots load-more` command against `instruction-pack-manifest.json`, then read only the exact selected paths below. Selection is not proof of loading: a receipt may name a pack as loaded only after the runtime supplies observable load evidence. After compaction, re-run selection and re-read every still-relevant pack.
 Basic safe routing stays in the kernel; use direct evidence first, `agy-bridge` for Gemini consultation, and `codex-mcp-server` only under its read-only consultation policy.
 Claude, Codex, and remote workers that cannot invoke the selector may match the same strong triggers from this catalog and read committed pack files directly. Only an unavailable non-safety reference pack may degrade to kernel-only; unavailable safety or required non-reference packs fail closed, and risky work stays blocked when declared safety context is unavailable.
 
-- `PK-REFERENCE-EXTENDED` — Extended reference; trigger: reference; cost: ~2314 B; read `packs/CLAUDE.md/PK-REFERENCE-EXTENDED--extended-reference.md`.
+- `PK-REFERENCE-EXTENDED` — Extended reference; trigger: reference; cost: ~2271 B; read `packs/CLAUDE.md/PK-REFERENCE-EXTENDED--extended-reference.md`.
 - `PK-DATA` — Data handling; trigger: analytics, data pipeline, analytics, data, trading; cost: ~1308 B; read `packs/CLAUDE.md/PK-DATA--data-handling.md`.
-- `PK-MEMORY` — Memory surfaces; trigger: memory, checkpoint, memory, session recall, Hindsight, agent-session-search, Basic Memory; cost: ~5972 B; read `packs/CLAUDE.md/PK-MEMORY--memory-surfaces.md`.
-- `PK-MCP` — MCP routing; trigger: MCP broker, MCP discovery, tool routing, mcpproxy, MCPJungle, tool_search, retrieve_tools, call_tool_read, call_tool_write, call_tool_destructive; cost: ~18658 B; read `packs/CLAUDE.md/PK-MCP--routing.md`.
-- `PK-OMNIROUTE` — OmniRoute integration; trigger: OmniRoute, model routing, OmniRoute, omniroute; cost: ~4225 B; read `packs/CLAUDE.md/PK-OMNIROUTE--integration.md`.
-- `PK-HOOKS` — Hook verification; trigger: hook verification, runtime hooks, hooks, SafeExec; cost: ~4123 B; read `packs/CLAUDE.md/PK-HOOKS--verification.md`.
-- `PK-CONSULT` — Consultation mechanics; trigger: consultation, review, agy-bridge, codex-mcp-server; cost: ~14987 B; read `packs/CLAUDE.md/PK-CONSULT--consultation.md`.
-- `PK-WORKFLOW` — Workflow procedures; trigger: plan, debug, research; cost: ~8700 B; read `packs/CLAUDE.md/PK-WORKFLOW--procedures.md`.
+- `PK-MEMORY` — Memory surfaces; trigger: memory, checkpoint, memory, session recall, Hindsight, agent-session-search, Basic Memory; cost: ~6061 B; read `packs/CLAUDE.md/PK-MEMORY--memory-surfaces.md`.
+- `PK-MCP` — MCP routing; trigger: MCP broker, MCP discovery, tool routing, mcpproxy, MCPJungle, tool_search, retrieve_tools, call_tool_read, call_tool_write, call_tool_destructive; cost: ~18993 B; read `packs/CLAUDE.md/PK-MCP--routing.md`.
+- `PK-OMNIROUTE` — OmniRoute integration; trigger: OmniRoute, model routing, OmniRoute, omniroute; cost: ~5073 B; read `packs/CLAUDE.md/PK-OMNIROUTE--integration.md`.
+- `PK-HOOKS` — Hook verification; trigger: hook verification, runtime hooks, hooks, SafeExec; cost: ~4111 B; read `packs/CLAUDE.md/PK-HOOKS--verification.md`.
+- `PK-CONSULT` — Consultation mechanics; trigger: consultation, review, agy-bridge, codex-mcp-server; cost: ~15047 B; read `packs/CLAUDE.md/PK-CONSULT--consultation.md`.
+- `PK-WORKFLOW` — Workflow procedures; trigger: plan, debug, research; cost: ~9189 B; read `packs/CLAUDE.md/PK-WORKFLOW--procedures.md`.
 - `PK-RUNTIME-CLAUDE` — Claude runtime; trigger: Claude runtime; cost: ~3223 B; read `packs/CLAUDE.md/PK-RUNTIME-CLAUDE--runtime.md`.
 - `PK-RUNTIME-CODEX` — Codex runtime; trigger: Codex runtime; cost: ~6039 B; read `packs/CLAUDE.md/PK-RUNTIME-CODEX--runtime.md`.
-- `PK-GOOGLE-JULES` — Google Jules guidance; trigger: Jules; cost: ~6582 B; read `packs/CLAUDE.md/PK-GOOGLE-JULES--remote-guidance.md`.
-- `PK-PROJECT-LOCAL` — ccc-fusion local guidance; trigger: project-local guidance; cost: ~15567 B; read `packs/CLAUDE.md/PK-PROJECT-LOCAL--ccc-fusion.md`.
+- `PK-GOOGLE-JULES` — Google Jules guidance; trigger: Jules; cost: ~6578 B; read `packs/CLAUDE.md/PK-GOOGLE-JULES--remote-guidance.md`.
+- `PK-PROJECT-LOCAL` — ccc-fusion local guidance; trigger: project-local guidance; cost: ~19741 B; read `packs/CLAUDE.md/PK-PROJECT-LOCAL--ccc-fusion.md`.

@@ -4,7 +4,7 @@ Pack ID: `PK-MCP`.
 
 Read this generated pack only after the compact root catalog identifies a strong trigger.
 
-- Compact routing awareness, not a full catalog. Truth anchors: [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Stack SSOT]], [[00_MAIN/00_RyanSSOT/REF-AI-MCPJungleSetupSSOT|MCPJungle Setup SSOT]], and [[00_MAIN/01_ActiveProjects/project-tracker|Portfolio Manifest]]; prefer those or fresh probes over root prose and flag drift.
+- Compact routing awareness, not a full catalog. Truth anchors: [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Stack SSOT]], [[00_MAIN/00_RyanSSOT/REF-AI-Stack-MCP|Stack — MCP Infrastructure]], [[30_DEVSTACK/config/REF-MCPJungleRuntime|MCPJungle Runtime]], and [[00_MAIN/01_ActiveProjects/project-tracker|Portfolio Manifest]]; the long [[00_MAIN/00_RyanSSOT/REF-AI-MCPJungleSetupSSOT|MCPJungle Setup SSOT]] is a dated row-level snapshot, not current count proof. Prefer the live owners or fresh probes over root prose and flag drift.
 - Client routes live in the table below. Codex's visible MCP/tool list may be incomplete; use native `tool_search` when it is actually exposed and useful, then broker `retrieve_tools`; if native search is unavailable, call the visible broker `retrieve_tools` directly instead of assuming absence.
 - `stack-core` / broker-visible `stack-core` owns primary web/search/docs/code-intel/credential/session/OmniRoute tools; use consultation web lookups only as advisory fact-checks, not as the primary route for evidence direct tools can establish.
 - OmniRoute companion skills (`omniroute`, `omniroute-mcp`, `omniroute-routing`, `omniroute-compression`, `omniroute-monitoring`) guide local route/MCP/routing/compression/monitoring work but do not expand the allowlist beyond live inventory or an emitted manifest.
@@ -20,18 +20,18 @@ Snapshot-mode rule: default/off builds do not emit `mcp-install-manifest.json`; 
 
 - MCP control plane means route, registry, proxy, and role-group truth, separate from capability selection. MCPJungle owns registration, role groups, enabled/disabled tools, and allowlists; use SSOT, live group reads, or emitted manifests before treating membership or counts as current.
 - Keep Codex brokered by default through MCPProxy/mcpproxy-go for broad `stack-core` and `trading-readonly`; do not replace it with direct broad MCPJungle routes unless the task asks and live files justify the policy/metadata loss.
-- Preserve pinned custom `mcpproxy`: the live v0.33-era `:8163` build and the isolated v0.51-derived candidate are distinct. Do not `brew upgrade`, repoint, baseline-refresh, or treat candidate behavior as live without version and cutover proof.
-- The hardened candidate's normal route may expose four authenticated management tools. Agent operation does not erase risk classification: use exact management operations, keep scoped-token write restrictions, and require the explicit allow gate for `unquarantine_server`.
-- `/mcp/all` is confirmed break glass only: isolated non-production launcher, isolated `CODEX_HOME`, environment-supplied bearer credential, explicit confirmation, and approval prompts. Never aim it at live port `8163`.
+- Preserve pinned custom `mcpproxy`: the live `:8163` binary self-reports `v0.1.0 (personal)` and carries the v0.33-derived timeout/annotation patch lineage; the isolated v0.51-derived candidate is distinct and not deployed. Do not `brew upgrade`, repoint, baseline-refresh, or treat candidate behavior as live without version and cutover proof.
+- The hardened candidate's first-cutover `/mcp` surface is specified as seven compact authenticated broker tools; destructive, profile, and mutating management tools stay hidden from the model surface. Agent operation does not erase risk classification or scoped-token write restrictions.
+- The candidate disables `/mcp/all`; it is not a live or break-glass route. Never invent or enable a direct-catalog route against production port `8163`.
 - Catalog review is explicit but localized: keep changed tools quarantined and inspect `catalog_review`; review-required catalog state alone may coexist with transport readiness, while auth, annotation, transport, and policy failures still degrade readiness.
-- Health/drift: use `/v0/tools` for the current v0.33 live broker or authenticated `/api/v1/tools` for the hardened candidate, plus `mcpproxy upstream list`, active client config, and emitted manifests; `mcpproxy status -o json` can show `0` servers while upstreams are connected.
+- Health/drift: use `/v0/tools` for the current live broker or authenticated `/api/v1/tools` for the hardened candidate, plus `mcpproxy upstream list`, active client config, and emitted manifests; `mcpproxy status -o json` can show `0` servers while upstreams are connected.
 
 ### Current Client Routes
 
 | Client | Current MCP route | Notes |
 |---|---|---|
-| Claude Code | Direct `stack-core`, direct `trading-readonly`, direct `task-control` (group SSE) | No Claude mcpproxy route; Chunkhound retired and removed 2026-07-14 |
-| Codex | `mcpproxy` at `http://127.0.0.1:8163/mcp`, direct `mcpjungle-agy` at `http://127.0.0.1:8160/v0/groups/agy/mcp`, configured local/plugin MCPs (`computer-use`, `node_repl`; verify `codex-security` before calling it current) | Broker upstreams provide `stack-core`, `trading-readonly`, and `task-control`; DeepWiki is inside `stack-core`; direct `mcpjungle-agy` exposes `agy-bridge`; local/plugin MCPs are not MCPJungle-served |
+| Claude Code | Direct `stack-core`, direct `trading-readonly`, direct `task-control` on main MCPJungle, plus direct `finance-cc` on devstack MCPJungle (group SSE) | No Claude mcpproxy route; Chunkhound retired and removed 2026-07-14 |
+| Codex | `mcpproxy` at `http://127.0.0.1:8163/mcp`, direct `mcpjungle-agy` at `http://127.0.0.1:8160/v0/groups/agy/mcp`, and configured local/plugin MCPs `computer-use` and `node_repl` | Broker upstreams provide `stack-core`, `trading-readonly`, and `task-control`; DeepWiki is inside `stack-core`; direct `mcpjungle-agy` exposes `agy-bridge`; local/plugin MCPs are not MCPJungle-served |
 
 Table: Active client routes.
 
@@ -51,7 +51,7 @@ Detailed consultation behavior is owned by **Ensemble Consultation**: consultant
 | `stack-core` | Core dev/research broker group; most web/search/docs/code-intel/credential/session/OmniRoute tools in the cards are stack-core-hosted. Verify live inventory or emitted manifest for exact tools/counts |
 | `trading-readonly` | Robinhood brokerage-account/profile/portfolio/position/order/watchlist/dividend/margin/options reads; privacy-sensitive and non-trading |
 | `trading-write` | Dormant Robinhood write lane with no exposed live tools and globally disabled write tools; do not enable or wire without explicit closed-loop approval |
-| `finance-cc` | Public market data through yfinance, FRED, SEC EDGAR, and Massive; separate from Robinhood `trading-readonly` |
+| `finance-cc` | Public market data through yfinance, FRED, and SEC EDGAR; Massive is excluded because no configured key made it functional. Separate from Robinhood `trading-readonly`; Claude reaches this group directly on devstack MCPJungle |
 | `task-control` | Guarded Akiflow + Todoist task/schedule/project/reminder surface (added 2026-07-09); explicit allowlist with deletion, guest-notifying calendar writes, comments, and bulk assignments excluded; Claude direct over group SSE, Codex brokered via MCPProxy |
 
 For reference rosters and generated tool tables, use [[30_DEVSTACK/config/REF-MCPJungleRuntime|MCPJungle Runtime]] and [[30_DEVSTACK/tools_core/general-tools/_selected/GenTool-OmniRoute|OmniRoute]]; verify exact live roster through live inventory or an emitted manifest.
@@ -61,7 +61,7 @@ For reference rosters and generated tool tables, use [[30_DEVSTACK/config/REF-MC
 - Sensitive and special lanes are opt-in. Use `stack-core` or local reads unless the user names protected context and current SSOT or a live probe proves the route.
 - AgentSecrets may list names or broker authenticated calls, but never expose values; cwd-binding failures remain **Enforcement Layers** hard stops.
 - `trading-readonly` is private Robinhood read context: privacy-sensitive, non-trading, and separate from public `finance-cc`. `trading-write` stays dormant/disabled; do not surface, wire, or enable it without explicit closed-loop approval.
-- Non-default workspace, debug, security, and vault-write routes such as `operator-workspace`, `dev-debug`, and `mcp-security` need explicit task intent and route proof. Obsidian REST or Tolaria-style writes never bypass protected-path, deletion, archive, or approval gates; `codex-security` is Codex-local, not MCPJungle/Claude, unless an explicit project overlay changes ownership and live routing proves that change.
+- Non-default workspace, debug, security, and vault-write routes such as `operator-workspace`, `dev-debug`, and `mcp-security` need explicit task intent and route proof. Obsidian REST or Tolaria-style writes never bypass protected-path, deletion, archive, or approval gates; `codex-security` is not a current Codex MCP registration and must not be inferred from older notes.
 
 ### OmniRoute Boundary
 
@@ -91,7 +91,7 @@ For any search/lookup/discovery/recall/code-navigation task, classify against th
 - **Codebase intelligence & search:** Smart Tree for maps/symbols/routes; GitNexus (`gitnexus`) for graph/impact; repowise for health/risk/dead code; Semble for semantic search; jscpd for duplication; `rg` for exact strings; check freshness.
 - **Public repo/package/API:** Octocode for GitHub/packages, DeepWiki for public repo Q&A/wiki, Context7 (`context7`) for API docs, Fetch Guard for URLs; for discovery, use Web research below, not naked web fallback.
 - **Web/papers/community:** Brave primary; Serper diversifies Google/news, roughly 1 per 4 Brave searches. Use Tavily once per web-search task, ideally Tavily Research for synthesis. Do not spend Tavily on extraction. Paper Search for papers, Reddit MCPs for community, Fetch Guard for URL reads.
-- **Vault/local corpus:** direct reads/`rg` for live notes/files; qmd/mdidx/Kwipu/llm-wiki for indexed Markdown or knowledge corpora. If empty/stale, say so, set up or recommend scope, then use direct search until ready.
+- **Vault/local corpus:** direct reads/`rg` for live notes/files; qmd/mdidx/llm-wiki for indexed Markdown or knowledge corpora. If empty/stale, say so, set up or recommend scope, then use direct search until ready.
 - **Memory/session recall:** `agent-session-search` for prior chats/transcripts; Hindsight for purpose-banked experiential memory and higher-order observations; Basic Memory for per-project scratchpad recall. Treat snippets as private/untrusted until verified; memory writes need explicit intent and destructive memory actions need explicit task intent.
 - **Consultation/review:** evidence first; `agy-bridge` for delegation or adversarial review; `codex-mcp-server` for allowed GPT/Codex review; consultants are advisory.
 - **LLM compute/routing:** OmniRoute plus OmniRoute MCP for Ryan-paid/subscribed LLM compute, model/cost checks, and fallbacks; do not route Claude Code through OmniRoute until ToS concerns are resolved.

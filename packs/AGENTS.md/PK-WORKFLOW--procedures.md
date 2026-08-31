@@ -20,6 +20,7 @@ Use Dagu/Ralph guidance only when a task needs an execution lane, not ordinary s
 
 - Treat Dagu and Ralph as tools/CLIs, not current skills; do not revive retired Dagu/Ralph skills just because the tools are installed.
 - Treat Taskfile as the repo command floor: call `task verify`, `task lint`, `task test`, or repo-specific tasks before raw shell when a task exists.
+- **Hard Rule —** CrashCartCapital CI compute is local/self-hosted by default. GitHub Actions may dispatch and report, but before pushing a new or changed workflow, inspect every `runs-on` value and the live repo runner inventory; hosted runners are failures unless Ryan explicitly authorizes them for that repository. New repositories must register an exact repo-scoped runner or keep CI disabled before the first push, and completion proof must name the runner that executed each job.
 - Use Pueue for durable background shell jobs that should outlive a terminal or obey local concurrency limits; do not treat it as a DAG, retry, cron, proof, or agent-loop engine.
 - Use Dagu as the outer conductor for dependency ordering, approvals, retries, parent/child visibility, persistent state, or crash resume. Prefer deterministic command steps on the critical path; agent/harness steps may reason, route, or prepare, but proof comes from commands, artifacts, receipts, and gates.
 - Use Ralph as the bounded leaf execution loop selected by Dagu; Ralph iterates inside the chosen work unit and emits events or proof for review.

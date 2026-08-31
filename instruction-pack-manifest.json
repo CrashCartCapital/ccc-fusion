@@ -1,18 +1,18 @@
 {
   "artifact": "instruction-pack-manifest",
-  "build_id": "87f418663514e736",
+  "build_id": "280e7d0228b174ee",
   "packs": [
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 2314,
-        "CLAUDE.md": 2314
+        "AGENTS.md": 2271,
+        "CLAUDE.md": 2271
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "b287d1573ac395ffeb1b4f13a2384a5670c96e8faa998433218b1ab705527b5d",
-        "CLAUDE.md": "b287d1573ac395ffeb1b4f13a2384a5670c96e8faa998433218b1ab705527b5d"
+        "AGENTS.md": "1d838817a262758a04e1e0ad4f78b7dd8a03b521401851528144aa6ed71e3d6a",
+        "CLAUDE.md": "1d838817a262758a04e1e0ad4f78b7dd8a03b521401851528144aa6ed71e3d6a"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -34,7 +34,7 @@
       "source_components": [
         {
           "component_id": "extended-reference",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-ExtendedReference.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-ExtendedReference.md",
           "version": 1
         }
       ],
@@ -45,13 +45,13 @@
       ],
       "title": "Extended reference",
       "tokens_estimate": {
-        "AGENTS.md": 579,
-        "CLAUDE.md": 579
+        "AGENTS.md": 568,
+        "CLAUDE.md": 568
       },
       "tool_triggers": []
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
         "AGENTS.md": 1308,
         "CLAUDE.md": 1308
@@ -84,7 +84,7 @@
       "source_components": [
         {
           "component_id": "data-handling",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-DataHandling.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-DataHandling.md",
           "version": 1
         }
       ],
@@ -102,16 +102,16 @@
       "tool_triggers": []
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 5972,
-        "CLAUDE.md": 5972
+        "AGENTS.md": 6061,
+        "CLAUDE.md": 6061
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "151147ed42e342556a7e350c21cbfd0a3b702b6e8f7adc894b720bbb94723dd1",
-        "CLAUDE.md": "151147ed42e342556a7e350c21cbfd0a3b702b6e8f7adc894b720bbb94723dd1"
+        "AGENTS.md": "fc6a7cc367575e766b924755536caa31c59fdcd486732e3f8434b25be82e376e",
+        "CLAUDE.md": "fc6a7cc367575e766b924755536caa31c59fdcd486732e3f8434b25be82e376e"
       },
       "dependencies": [],
       "domain_triggers": [
@@ -134,12 +134,12 @@
       "source_components": [
         {
           "component_id": "context-hygiene",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-ContextHygiene.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-ContextHygiene.md",
           "version": 1
         },
         {
           "component_id": "memory-surface-reference",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-MemorySurfaceReference.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-MemorySurfaceReference.md",
           "version": 1
         }
       ],
@@ -151,8 +151,8 @@
       ],
       "title": "Memory surfaces",
       "tokens_estimate": {
-        "AGENTS.md": 1493,
-        "CLAUDE.md": 1493
+        "AGENTS.md": 1516,
+        "CLAUDE.md": 1516
       },
       "tool_triggers": [
         "Hindsight",
@@ -161,16 +161,16 @@
       ]
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 18658,
-        "CLAUDE.md": 18658
+        "AGENTS.md": 18993,
+        "CLAUDE.md": 18993
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "82b99576c470f94f8a7bcdb8a9d370bc2e2f4e02f79acbad71d61d07cefdb522",
-        "CLAUDE.md": "82b99576c470f94f8a7bcdb8a9d370bc2e2f4e02f79acbad71d61d07cefdb522"
+        "AGENTS.md": "1286735219cc006e605e787e128b04ec6dacb849a59517e7dccd6c05ce368a1b",
+        "CLAUDE.md": "1286735219cc006e605e787e128b04ec6dacb849a59517e7dccd6c05ce368a1b"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -202,7 +202,6 @@
         "qmd",
         "mdidx",
         "llm-wiki",
-        "Kwipu",
         "Hindsight",
         "Basic Memory",
         "AgentSecrets",
@@ -250,12 +249,12 @@
       "source_components": [
         {
           "component_id": "mcp-server-reference",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-McpServerReference.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-McpServerReference.md",
           "version": 1
         },
         {
           "component_id": "mcp-control-plane-guidance",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-McpControlPlaneGuidance.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-McpControlPlaneGuidance.md",
           "version": 1
         }
       ],
@@ -268,8 +267,8 @@
       ],
       "title": "MCP routing",
       "tokens_estimate": {
-        "AGENTS.md": 4665,
-        "CLAUDE.md": 4665
+        "AGENTS.md": 4749,
+        "CLAUDE.md": 4749
       },
       "tool_triggers": [
         "mcpproxy",
@@ -282,16 +281,16 @@
       ]
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 4225,
-        "CLAUDE.md": 4225
+        "AGENTS.md": 5073,
+        "CLAUDE.md": 5073
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "3d5b52eb99dedc4ae000113aa4e7eff475b6ba021ed853cccace25acbc98566c",
-        "CLAUDE.md": "3d5b52eb99dedc4ae000113aa4e7eff475b6ba021ed853cccace25acbc98566c"
+        "AGENTS.md": "2b73447c7c8ea737e41e54e1e40ea00ccf75fb0cbed9d46f6d1187c67930dffe",
+        "CLAUDE.md": "2b73447c7c8ea737e41e54e1e40ea00ccf75fb0cbed9d46f6d1187c67930dffe"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -323,7 +322,7 @@
       "source_components": [
         {
           "component_id": "omniroute-integration-guidance",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-OmniRouteIntegrationGuidance.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-OmniRouteIntegrationGuidance.md",
           "version": 1
         }
       ],
@@ -335,8 +334,8 @@
       ],
       "title": "OmniRoute integration",
       "tokens_estimate": {
-        "AGENTS.md": 1057,
-        "CLAUDE.md": 1057
+        "AGENTS.md": 1269,
+        "CLAUDE.md": 1269
       },
       "tool_triggers": [
         "OmniRoute",
@@ -344,16 +343,16 @@
       ]
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 4123,
-        "CLAUDE.md": 4123
+        "AGENTS.md": 4111,
+        "CLAUDE.md": 4111
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "781924480661530eb720b9045b69d0e2e3691a1a56c105e38a76f2b9e2dc0d23",
-        "CLAUDE.md": "781924480661530eb720b9045b69d0e2e3691a1a56c105e38a76f2b9e2dc0d23"
+        "AGENTS.md": "adaa8cb0bb1d0c2795c2173ca82a73acdab26dca9e1853892ebdfad0aaa5b40d",
+        "CLAUDE.md": "adaa8cb0bb1d0c2795c2173ca82a73acdab26dca9e1853892ebdfad0aaa5b40d"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -373,7 +372,7 @@
       "source_components": [
         {
           "component_id": "hooks-reference",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-HooksReference.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-HooksReference.md",
           "version": 1
         }
       ],
@@ -385,8 +384,8 @@
       ],
       "title": "Hook verification",
       "tokens_estimate": {
-        "AGENTS.md": 1031,
-        "CLAUDE.md": 1031
+        "AGENTS.md": 1028,
+        "CLAUDE.md": 1028
       },
       "tool_triggers": [
         "hooks",
@@ -394,16 +393,16 @@
       ]
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 14987,
-        "CLAUDE.md": 14987
+        "AGENTS.md": 15047,
+        "CLAUDE.md": 15047
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "e628ec6c216bb0f974b52dd72367e3fbec7aeb7fc12a7888adcbdf37630c7c68",
-        "CLAUDE.md": "e628ec6c216bb0f974b52dd72367e3fbec7aeb7fc12a7888adcbdf37630c7c68"
+        "AGENTS.md": "95229efd5eb0030185556dccfc854663a98cb131aa9d0a0ae2835cfa8d68744a",
+        "CLAUDE.md": "95229efd5eb0030185556dccfc854663a98cb131aa9d0a0ae2835cfa8d68744a"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -438,7 +437,7 @@
       "source_components": [
         {
           "component_id": "ensemble-consultation",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-EnsembleConsultation.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-EnsembleConsultation.md",
           "version": 1
         }
       ],
@@ -450,8 +449,8 @@
       ],
       "title": "Consultation mechanics",
       "tokens_estimate": {
-        "AGENTS.md": 3747,
-        "CLAUDE.md": 3747
+        "AGENTS.md": 3762,
+        "CLAUDE.md": 3762
       },
       "tool_triggers": [
         "agy-bridge",
@@ -459,16 +458,16 @@
       ]
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 8700,
-        "CLAUDE.md": 8700
+        "AGENTS.md": 9189,
+        "CLAUDE.md": 9189
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "4f02e71e435e03d5de8a938f9bd2165b139706f2e2d05d923eba9f678f9c2841",
-        "CLAUDE.md": "4f02e71e435e03d5de8a938f9bd2165b139706f2e2d05d923eba9f678f9c2841"
+        "AGENTS.md": "5707f42b915b674a46d1416edc0cf2511bbd220c2cc25923c5c2a232a4c38683",
+        "CLAUDE.md": "5707f42b915b674a46d1416edc0cf2511bbd220c2cc25923c5c2a232a4c38683"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -488,7 +487,7 @@
       "source_components": [
         {
           "component_id": "workflow-recipes",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-WorkflowRecipes.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-WorkflowRecipes.md",
           "version": 1
         }
       ],
@@ -501,13 +500,13 @@
       ],
       "title": "Workflow procedures",
       "tokens_estimate": {
-        "AGENTS.md": 2175,
-        "CLAUDE.md": 2175
+        "AGENTS.md": 2298,
+        "CLAUDE.md": 2298
       },
       "tool_triggers": []
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
         "AGENTS.md": 3223,
         "CLAUDE.md": 3223
@@ -541,7 +540,7 @@
       "source_components": [
         {
           "component_id": "claude-runtime-addendum",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-ClaudeRuntimeAddendum.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-ClaudeRuntimeAddendum.md",
           "version": 1
         }
       ],
@@ -558,7 +557,7 @@
       "tool_triggers": []
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
         "AGENTS.md": 6039,
         "CLAUDE.md": 6039
@@ -602,7 +601,7 @@
       "source_components": [
         {
           "component_id": "codex-runtime-addendum",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-CodexRuntimeAddendum.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-CodexRuntimeAddendum.md",
           "version": 1
         }
       ],
@@ -619,16 +618,16 @@
       "tool_triggers": []
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 6582,
-        "CLAUDE.md": 6582
+        "AGENTS.md": 6578,
+        "CLAUDE.md": 6578
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "ba6a111b02cef8a130c4ee811cba3a29d22b5ace74720625db4967b0144cb716",
-        "CLAUDE.md": "ba6a111b02cef8a130c4ee811cba3a29d22b5ace74720625db4967b0144cb716"
+        "AGENTS.md": "bd96f64a3bb7aa45deb623b59d9a4e2f7c464c2e17e3088fd9695421d53c9e58",
+        "CLAUDE.md": "bd96f64a3bb7aa45deb623b59d9a4e2f7c464c2e17e3088fd9695421d53c9e58"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -659,7 +658,7 @@
       "source_components": [
         {
           "component_id": "google-jules-guidance",
-          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/instruction_system/components/_selected/Component-GoogleJulesGuidance.md",
+          "source_path": "/Users/ryanpappal/01_VAULT/KnR-Vault/30_DEVSTACK/surface_system/components/_selected/Component-GoogleJulesGuidance.md",
           "version": 1
         }
       ],
@@ -670,22 +669,22 @@
       ],
       "title": "Google Jules guidance",
       "tokens_estimate": {
-        "AGENTS.md": 1646,
-        "CLAUDE.md": 1646
+        "AGENTS.md": 1645,
+        "CLAUDE.md": 1645
       },
       "tool_triggers": []
     },
     {
-      "build_id": "87f418663514e736",
+      "build_id": "280e7d0228b174ee",
       "bytes_by_surface": {
-        "AGENTS.md": 15567,
-        "CLAUDE.md": 15567
+        "AGENTS.md": 19741,
+        "CLAUDE.md": 19741
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "2737c814ae314f688eb3399ae0b679f885373570f34bb3801309dc8b2eb94771",
-        "CLAUDE.md": "2737c814ae314f688eb3399ae0b679f885373570f34bb3801309dc8b2eb94771"
+        "AGENTS.md": "59222edda098ba9d816b02a02a295836bc243a96fa261bb773c52585e0db089e",
+        "CLAUDE.md": "59222edda098ba9d816b02a02a295836bc243a96fa261bb773c52585e0db089e"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -710,8 +709,8 @@
       ],
       "title": "ccc-fusion local guidance",
       "tokens_estimate": {
-        "AGENTS.md": 3892,
-        "CLAUDE.md": 3892
+        "AGENTS.md": 4936,
+        "CLAUDE.md": 4936
       },
       "tool_triggers": []
     }
