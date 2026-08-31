@@ -464,6 +464,51 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
   });
 
+  it("campaign implementation timeout is funded by persisted campaign maxDurationMs", async () => {
+    vi.useFakeTimers();
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-duration-funded-timeout",
+    );
+    let markPromptEntered!: () => void;
+    const promptEntered = new Promise<void>((resolve) => { markPromptEntered = resolve; });
+    mockedCreateFnAgent.mockResolvedValue({
+      session: {
+        subscribe: vi.fn(() => vi.fn()),
+        prompt: vi.fn(async () => {
+          markPromptEntered();
+          await new Promise<void>(() => {});
+        }),
+        dispose: vi.fn(),
+      },
+    });
+    const abort = new AbortController();
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const running = (executor as any).executeWorkflowStep(
+      nodeTask,
+      { ...workflowStep(), toolMode: "coding" },
+      "/tmp/ccc-campaign-duration-funded-timeout",
+      await store.getSettings(),
+      undefined,
+      {
+        execution,
+        cccCampaignImplementation: true,
+        signal: abort.signal,
+      },
+    );
+    await promptEntered;
+
+    try {
+      expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), 120_000);
+    } finally {
+      abort.abort();
+      await expect(running).resolves.toMatchObject({
+        success: false,
+        error: "workflow step cancelled",
+      });
+    }
+  });
+
   it.each([
     "ccc-prd.execution-prompt.v1",
     "ccc-prd.execution-prompt.v2",

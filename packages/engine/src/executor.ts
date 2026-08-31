@@ -18923,7 +18923,16 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       ? executorFallback
       : undefined;
 
-    const timeoutMs = Math.max(60_000, settings.workflowStepTimeoutMs ?? 900_000);
+    const genericWorkflowStepTimeoutMs = Math.max(
+      60_000,
+      settings.workflowStepTimeoutMs ?? 900_000,
+    );
+    const persistedCampaignDurationMs = campaignReadyContext?.bounds?.maxDurationMs;
+    const timeoutMs = cccCampaignImplementation
+      && Number.isSafeInteger(persistedCampaignDurationMs)
+      && persistedCampaignDurationMs! > 0
+      ? persistedCampaignDurationMs!
+      : genericWorkflowStepTimeoutMs;
 
     const runOnce = async (
       provider: string | undefined,
