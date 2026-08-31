@@ -50,10 +50,14 @@ import {
   fingerprintCccCampaignAllowedCandidate,
   renderCccCampaignRepairFeedback,
   resolveCccCampaignReadyTimeoutMs,
+  snapshotCccCampaignIgnoredBaseline,
   snapshotCccCampaignWriteEnvelope,
   verifyCccCampaignReadyCandidate,
 } from "./ccc-campaign-ready.js";
-import type { CccCampaignReadyCommitHandoff } from "./ccc-campaign-ready.js";
+import type {
+  CccCampaignIgnoredBaseline,
+  CccCampaignReadyCommitHandoff,
+} from "./ccc-campaign-ready.js";
 import { decideCccPhaseTransition } from "./ccc-phase-machine.js";
 import { createStoreIrPinPersistence, type WorkflowIrPinStoreSurface } from "./workflow-column-boundary.js";
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
@@ -2047,6 +2051,18 @@ export class TaskExecutor {
     string,
     CccCampaignReadyCommitHandoff
   >();
+  private cccControllerIgnoredBaselines = new Map<string, CccCampaignIgnoredBaseline>();
+
+  private async captureCccControllerIgnoredBaseline(
+    task: Task,
+    acquisition: AcquireTaskWorktreeResult,
+  ): Promise<void> {
+    if (!isImportedCccCampaignTask(task) || acquisition.isResume) return;
+    const baseline = await snapshotCccCampaignIgnoredBaseline({
+      worktreePath: acquisition.worktreePath,
+    });
+    this.cccControllerIgnoredBaselines.set(task.id, baseline);
+  }
 
   private cccPhaseVerificationKey(
     executionContext?: WorkflowNodeExecutionContext,
@@ -9347,6 +9363,7 @@ export class TaskExecutor {
         await this.captureBaseCommitSha(task, acquisition.worktreePath, audit, { isResume: false });
       }
       this.options.onStart?.(task, acquisition.worktreePath);
+      await this.captureCccControllerIgnoredBaseline(task, acquisition);
       executorLog.log(`${task.id}: workflow node '${nodeId}' acquired worktree at ${acquisition.worktreePath}`);
       return await this.store.getTask(task.id);
     } catch (error) {
@@ -9549,6 +9566,7 @@ export class TaskExecutor {
     executionContext?: WorkflowNodeExecutionContext,
   ): Promise<WorkflowNodeResult> {
     const phaseVerificationKey = this.cccPhaseVerificationKey(executionContext);
+    try {
     const semanticTaskId = executionContext?.execution?.semanticTaskId;
     const executorKind = node.config?.executor;
     if (
@@ -9576,9 +9594,6 @@ export class TaskExecutor {
         executionContext,
       );
     } catch (error) {
-      if (phaseVerificationKey) {
-        this.cccPhaseVerifiedCandidateHandoffs.delete(phaseVerificationKey);
-      }
       /*
       FNXC:CccCampaignRequiredCommitFence 2026-08-25-00:00:
       A REJECTED runGraphCustomNode call used to skip the fence entirely — the one
@@ -9610,16 +9625,15 @@ export class TaskExecutor {
         error instanceof Error ? error : undefined,
       );
     }
-    try {
-      if (result.outcome !== "success") {
-        await assertCccCampaignRejectedTurnCustody({
-          rootDir: this.rootDir,
-          store: this.store,
-          taskId: nodeTask.id,
-          executionContext,
-        });
-      }
-      await enforceCccCampaignRequiredCommitAfterNode({
+    if (result.outcome !== "success") {
+      await assertCccCampaignRejectedTurnCustody({
+        rootDir: this.rootDir,
+        store: this.store,
+        taskId: nodeTask.id,
+        executionContext,
+      });
+    }
+    await enforceCccCampaignRequiredCommitAfterNode({
         rootDir: this.rootDir,
         store: this.store,
         taskId: nodeTask.id,
@@ -9632,13 +9646,14 @@ export class TaskExecutor {
         onVerificationHeartbeat: () => executorLog.log(
           `${nodeTask.id}: final controller-owned campaign readiness verifier still running`,
         ),
-      });
+    });
+    return result;
     } finally {
       if (phaseVerificationKey) {
         this.cccPhaseVerifiedCandidateHandoffs.delete(phaseVerificationKey);
       }
+      this.cccControllerIgnoredBaselines.delete(nodeTask.id);
     }
-    return result;
   }
 
   /** Run a custom (non-seam) graph node on the proven WorkflowStep machinery.
@@ -13233,6 +13248,7 @@ export class TaskExecutor {
       );
 
       this.options.onStart?.(task, worktreePath);
+      await this.captureCccControllerIgnoredBaseline(task, acquisition);
 
       const detail = await this.store.getTask(task.id);
       executorLog.log(`${task.id}: fetched task detail (${detail.steps.length} steps, prompt length=${detail.prompt?.length ?? 0})`);
@@ -19037,6 +19053,12 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         && campaignReadyContext!.route.allowedWriteRoots.length > 0
         ? campaignReadyContext!.route.allowedWriteRoots
         : [];
+      const campaignTrustedIgnoredBaseline = cccCampaignImplementation
+        ? this.cccControllerIgnoredBaselines.get(task.id)
+        : undefined;
+      const campaignTrustedIgnoredOptions = campaignTrustedIgnoredBaseline
+        ? { trustedIgnoredBaseline: campaignTrustedIgnoredBaseline }
+        : {};
       if (cccCampaignImplementation && campaignAllowedWriteRoots.length === 0) {
         throw new PermanentError(
           `CCC campaign task ${task.id} has no admitted write roots for phase custody`,
@@ -19185,6 +19207,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             capturePotentialMutationBaseline: () => snapshotCccCampaignWriteEnvelope({
               worktreePath,
               allowedRoots: campaignAllowedWriteRoots,
+              ...campaignTrustedIgnoredOptions,
             }),
             onPotentialMutationSettled: async (
               toolName: string,
@@ -19199,6 +19222,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               const after = await snapshotCccCampaignWriteEnvelope({
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
+                ...campaignTrustedIgnoredOptions,
               });
               const beforePaths = new Set(before?.changedPaths ?? []);
               const newPaths = after.changedPaths.filter((path) => !beforePaths.has(path));
@@ -19380,9 +19404,24 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         const promptPromise = (async () => {
           if (cccCampaignImplementation) {
             try {
+              if (campaignTrustedIgnoredBaseline) {
+                const currentIgnoredBaseline = await snapshotCccCampaignIgnoredBaseline({
+                  worktreePath,
+                });
+                if (
+                  currentIgnoredBaseline.fingerprint
+                  !== campaignTrustedIgnoredBaseline.fingerprint
+                ) {
+                  campaignPhaseRuntime.terminalFailure =
+                    "CCC_CAMPAIGN_WRITE_ENVELOPE_BASELINE_REFUSED: "
+                    + "controller-initialized ignored paths changed before provider dispatch";
+                  return;
+                }
+              }
               const phaseEntryWriteEnvelope = await snapshotCccCampaignWriteEnvelope({
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
+                ...campaignTrustedIgnoredOptions,
               });
               if (phaseEntryWriteEnvelope.foreignPaths.length > 0) {
                 campaignPhaseRuntime.terminalFailure =
@@ -19694,6 +19733,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
                 onHeartbeat: () => executorLog.log(
                   `${task.id}: controller-owned campaign phase verifier still running`,
                 ),
+                ...campaignTrustedIgnoredOptions,
               });
             };
             let repairAttempts = 0;

@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix } from "node:path";
 import { promisify } from "node:util";
@@ -323,6 +323,11 @@ export type CccCampaignReadyCommitHandoff = Readonly<{
   }>;
 }>;
 
+export type CccCampaignIgnoredBaseline = Readonly<{
+  roots: readonly string[];
+  fingerprint: string;
+}>;
+
 export type CreateCccCampaignReadyToolOptions = Readonly<
   | {
     mode?: "verify";
@@ -342,6 +347,7 @@ export type VerifyCccCampaignReadyCandidateInput = Readonly<{
   timeoutMs: number;
   signal?: AbortSignal;
   onHeartbeat?: () => void;
+  trustedIgnoredBaseline?: CccCampaignIgnoredBaseline;
 }>;
 
 function boundedFeedback(value: unknown): string {
@@ -388,7 +394,7 @@ function canonicalGitPath(path: string): string {
   ) {
     throw new Error(`readiness check found a non-canonical Git path: ${path}`);
   }
-  return path;
+  return path.endsWith("/") ? path.slice(0, -1) : path;
 }
 
 function pathWithinRoot(path: string, root: string): boolean {
@@ -402,19 +408,108 @@ function nulPaths(output: string): string[] {
 async function listCandidatePaths(worktreePath: string): Promise<{
   changedPaths: string[];
   untrackedPaths: string[];
+  ignoredPaths: string[];
 }> {
-  const [tracked, untracked, unmerged] = await Promise.all([
+  const [tracked, untracked, ignored, unmerged] = await Promise.all([
     git(worktreePath, ["diff", "--name-only", "-z", "--no-renames", "HEAD", "--"]),
     git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z", "--"]),
+    git(worktreePath, [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "--directory",
+      "-z",
+      "--",
+    ]),
     git(worktreePath, ["diff", "--name-only", "-z", "--diff-filter=U", "--"]),
   ]);
   const unmergedPaths = nulPaths(unmerged);
   if (unmergedPaths.length > 0) {
     throw new Error(`readiness check found unmerged paths: ${unmergedPaths.join(", ")}`);
   }
-  const untrackedPaths = nulPaths(untracked);
-  const changedPaths = [...new Set([...nulPaths(tracked), ...untrackedPaths])].sort();
-  return { changedPaths, untrackedPaths };
+  const ignoredPaths = nulPaths(ignored);
+  const ignoredUntrackedPaths: string[] = [];
+  for (const path of ignoredPaths) {
+    const stat = await lstat(join(worktreePath, path));
+    if (!stat.isDirectory()) ignoredUntrackedPaths.push(path);
+  }
+  const untrackedPaths = [...new Set([
+    ...nulPaths(untracked),
+    ...ignoredUntrackedPaths,
+  ])].sort();
+  const changedPaths = [...new Set([
+    ...nulPaths(tracked),
+    ...untrackedPaths,
+    ...ignoredPaths,
+  ])].sort();
+  return { changedPaths, untrackedPaths, ignoredPaths };
+}
+
+function outsideTrustedIgnoredPaths(
+  path: string,
+  trustedIgnoredPaths: readonly string[],
+): boolean {
+  return !trustedIgnoredPaths.some((root) => pathWithinRoot(path, root));
+}
+
+export async function snapshotCccCampaignIgnoredBaseline(input: {
+  worktreePath: string;
+}): Promise<CccCampaignIgnoredBaseline> {
+  const [collapsed, expanded] = await Promise.all([
+    git(input.worktreePath, [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "--directory",
+      "-z",
+      "--",
+    ]),
+    git(input.worktreePath, [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+    ]),
+  ]);
+  const roots = nulPaths(collapsed).sort();
+  const entries = nulPaths(expanded).sort();
+  const hash = createHash("sha256");
+  const updateFramed = (label: string, value: string | Buffer): void => {
+    const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
+    const length = Buffer.allocUnsafe(8);
+    length.writeBigUInt64BE(BigInt(bytes.length));
+    hash.update(label, "utf8");
+    hash.update("\0");
+    hash.update(length);
+    hash.update(bytes);
+  };
+  for (const root of roots) updateFramed("root", root);
+  for (const entry of entries) {
+    const source = join(input.worktreePath, entry);
+    const stat = await lstat(source);
+    updateFramed("entry-path", entry);
+    updateFramed("entry-mode", String(stat.mode & 0o777));
+    if (stat.isFile()) {
+      updateFramed("entry-type", "file");
+      updateFramed("entry-size", String(stat.size));
+      updateFramed("entry-bytes", await readFile(source));
+    } else if (stat.isSymbolicLink()) {
+      updateFramed("entry-type", "symlink");
+      updateFramed("entry-target", await readlink(source));
+    } else if (stat.isDirectory()) {
+      updateFramed("entry-type", "directory");
+    } else {
+      throw new Error(`readiness check refuses special ignored path: ${entry}`);
+    }
+  }
+  return Object.freeze({
+    roots: Object.freeze(roots),
+    fingerprint: hash.digest("hex"),
+  });
 }
 
 async function fingerprintCandidate(
@@ -458,9 +553,15 @@ async function fingerprintCandidate(
 export async function fingerprintCccCampaignReadyCandidate(input: {
   worktreePath: string;
   allowedRoots: readonly string[];
+  trustedIgnoredBaseline?: CccCampaignIgnoredBaseline;
 }): Promise<string> {
   const { untrackedPaths } = await listCandidatePaths(input.worktreePath);
-  return fingerprintCandidate(input.worktreePath, input.allowedRoots, untrackedPaths);
+  const trustedIgnoredPaths = (input.trustedIgnoredBaseline?.roots ?? []).map(canonicalGitPath);
+  return fingerprintCandidate(
+    input.worktreePath,
+    input.allowedRoots,
+    untrackedPaths.filter((path) => outsideTrustedIgnoredPaths(path, trustedIgnoredPaths)),
+  );
 }
 
 /** Fingerprint only bytes admitted to drive a live phase transition. */
@@ -486,11 +587,14 @@ export type CccCampaignWriteEnvelopeSnapshot = Readonly<{
 export async function snapshotCccCampaignWriteEnvelope(input: {
   worktreePath: string;
   allowedRoots: readonly string[];
+  trustedIgnoredBaseline?: CccCampaignIgnoredBaseline;
 }): Promise<CccCampaignWriteEnvelopeSnapshot> {
   const allowedRoots = input.allowedRoots.map(canonicalGitPath);
+  const trustedIgnoredPaths = (input.trustedIgnoredBaseline?.roots ?? []).map(canonicalGitPath);
   const { changedPaths } = await listCandidatePaths(input.worktreePath);
   const foreignPaths = changedPaths.filter(
-    (path) => !allowedRoots.some((root) => pathWithinRoot(path, root)),
+    (path) => !allowedRoots.some((root) => pathWithinRoot(path, root))
+      && outsideTrustedIgnoredPaths(path, trustedIgnoredPaths),
   );
   return {
     changedPaths,
@@ -596,11 +700,29 @@ export async function verifyCccCampaignReadyCandidate(
     return { ready: false, summary: "no task-phase sealed proof command is admitted" };
   }
 
+  const trustedIgnoredPaths = (input.trustedIgnoredBaseline?.roots ?? []).map(canonicalGitPath);
+  if (input.trustedIgnoredBaseline) {
+    const currentIgnoredBaseline = await snapshotCccCampaignIgnoredBaseline({
+      worktreePath: verifiedWorktreePath,
+    });
+    if (currentIgnoredBaseline.fingerprint !== input.trustedIgnoredBaseline.fingerprint) {
+      return {
+        ready: false,
+        summary: "controller-initialized ignored paths changed after provider dispatch",
+      };
+    }
+  }
   const { changedPaths, untrackedPaths } = await listCandidatePaths(verifiedWorktreePath);
-  if (changedPaths.length === 0) {
+  const candidateChangedPaths = changedPaths.filter(
+    (path) => outsideTrustedIgnoredPaths(path, trustedIgnoredPaths),
+  );
+  const candidateUntrackedPaths = untrackedPaths.filter(
+    (path) => outsideTrustedIgnoredPaths(path, trustedIgnoredPaths),
+  );
+  if (candidateChangedPaths.length === 0) {
     return { ready: false, summary: "the candidate worktree has no implementation diff" };
   }
-  const foreignPaths = changedPaths.filter(
+  const foreignPaths = candidateChangedPaths.filter(
     (path) => !allowedRoots.some((root) => pathWithinRoot(path, root)),
   );
   if (foreignPaths.length > 0) {
@@ -612,13 +734,13 @@ export async function verifyCccCampaignReadyCandidate(
   const candidateFingerprint = await fingerprintCandidate(
     verifiedWorktreePath,
     allowedRoots,
-    untrackedPaths,
+    candidateUntrackedPaths,
   );
 
   const shadow = await materializeCandidateShadow({
     worktreePath: verifiedWorktreePath,
     allowedRoots,
-    untrackedPaths,
+    untrackedPaths: candidateUntrackedPaths,
   });
   try {
     const shadowFingerprint = await fingerprintCccCampaignReadyCandidate({
@@ -637,7 +759,7 @@ export async function verifyCccCampaignReadyCandidate(
     // change what REPAIR feedback reports.
     const observedCandidateSnapshot = await observeCccCampaignRepairCandidateFiles(
       shadow.cwd,
-      changedPaths,
+      candidateChangedPaths,
       MAX_REPAIR_OBSERVED_FILES,
     );
     for (const command of commands) {
@@ -676,7 +798,21 @@ export async function verifyCccCampaignReadyCandidate(
     const currentFingerprint = await fingerprintCccCampaignReadyCandidate({
       worktreePath: verifiedWorktreePath,
       allowedRoots,
+      ...(input.trustedIgnoredBaseline
+        ? { trustedIgnoredBaseline: input.trustedIgnoredBaseline }
+        : {}),
     });
+    if (input.trustedIgnoredBaseline) {
+      const finalIgnoredBaseline = await snapshotCccCampaignIgnoredBaseline({
+        worktreePath: verifiedWorktreePath,
+      });
+      if (finalIgnoredBaseline.fingerprint !== input.trustedIgnoredBaseline.fingerprint) {
+        return {
+          ready: false,
+          summary: "controller-initialized ignored paths changed while the sealed readiness verifier was running",
+        };
+      }
+    }
     if (currentFingerprint !== candidateFingerprint) {
       return {
         ready: false,

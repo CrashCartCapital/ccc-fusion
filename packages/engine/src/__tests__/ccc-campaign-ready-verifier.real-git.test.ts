@@ -25,6 +25,7 @@ async function fixture(value = "ready") {
   await git(root, "config", "user.email", "fusion@test.invalid");
   await mkdir(join(root, "src"));
   await writeFile(join(root, "src", "value.txt"), "base\n");
+  await writeFile(join(root, ".gitignore"), "ignored-foreign/\nnode_modules/\n");
   await writeFile(
     join(root, "Taskfile.yml"),
     [
@@ -36,7 +37,7 @@ async function fixture(value = "ready") {
       "",
     ].join("\n"),
   );
-  await git(root, "add", "Taskfile.yml", "src/value.txt");
+  await git(root, "add", ".gitignore", "Taskfile.yml", "src/value.txt");
   await git(root, "commit", "-m", "base");
   const baseCommit = await git(root, "rev-parse", "HEAD");
   await writeFile(join(root, "src", "value.txt"), `${value}\n`);
@@ -188,6 +189,77 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
     expect(result.summary).toContain("foreign.txt");
   });
 
+  it("refuses ignored foreign residue before running the sealed verifier", async () => {
+    const { root, campaign } = await fixture();
+    await mkdir(join(root, "ignored-foreign"));
+    const verifyCandidate = (readyModule as any).verifyCccCampaignReadyCandidate;
+
+    const result = await verifyCandidate({
+      taskId: campaign.taskId,
+      worktreePath: root,
+      campaign,
+      timeoutMs: 30_000,
+    });
+
+    expect(result).toMatchObject({ ready: false });
+    expect(result.summary).toContain("ignored-foreign");
+  });
+
+  it("accepts controller-initialized ignored paths but refuses later residue inside the same root", async () => {
+    const { root, campaign } = await fixture();
+    await mkdir(join(root, "node_modules"));
+    await writeFile(join(root, "node_modules", "controller-installed.js"), "module.exports = true;\n");
+    const trustedIgnoredBaseline = await readyModule.snapshotCccCampaignIgnoredBaseline({
+      worktreePath: root,
+    });
+
+    expect(trustedIgnoredBaseline).toMatchObject({
+      roots: ["node_modules"],
+      fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    });
+    await expect((readyModule as any).verifyCccCampaignReadyCandidate({
+      taskId: campaign.taskId,
+      worktreePath: root,
+      campaign,
+      timeoutMs: 30_000,
+      trustedIgnoredBaseline,
+    })).resolves.toMatchObject({ ready: true });
+
+    await writeFile(join(root, "node_modules", "model-created.js"), "module.exports = false;\n");
+    const result = await (readyModule as any).verifyCccCampaignReadyCandidate({
+      taskId: campaign.taskId,
+      worktreePath: root,
+      campaign,
+      timeoutMs: 30_000,
+      trustedIgnoredBaseline,
+    });
+
+    expect(result).toMatchObject({ ready: false });
+    expect(result.summary).toMatch(/controller-initialized ignored paths changed/i);
+  });
+
+  it("refuses content drift in an existing controller-initialized ignored file", async () => {
+    const { root, campaign } = await fixture();
+    await mkdir(join(root, "node_modules"));
+    const installedPath = join(root, "node_modules", "controller-installed.js");
+    await writeFile(installedPath, "module.exports = true;\n");
+    const trustedIgnoredBaseline = await readyModule.snapshotCccCampaignIgnoredBaseline({
+      worktreePath: root,
+    });
+
+    await writeFile(installedPath, "module.exports = false;\n");
+    const result = await (readyModule as any).verifyCccCampaignReadyCandidate({
+      taskId: campaign.taskId,
+      worktreePath: root,
+      campaign,
+      timeoutMs: 30_000,
+      trustedIgnoredBaseline,
+    });
+
+    expect(result).toMatchObject({ ready: false });
+    expect(result.summary).toMatch(/controller-initialized ignored paths changed/i);
+  });
+
   it("write_envelope_snapshot separates admitted and foreign candidate paths", async () => {
     const { root } = await fixture();
     const snapshotWriteEnvelope = (readyModule as any).snapshotCccCampaignWriteEnvelope;
@@ -201,17 +273,36 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
       foreignPaths: [],
       allowedRoots: ["src/value.txt"],
     });
+    await expect(snapshotWriteEnvelope({
+      worktreePath: root,
+      allowedRoots: ["src/"],
+    })).resolves.toEqual({
+      changedPaths: ["src/value.txt"],
+      foreignPaths: [],
+      allowedRoots: ["src"],
+    });
 
     await mkdir(join(root, ".fusion-tmp"));
     await writeFile(join(root, ".fusion-tmp", "h2.txt"), "scratch\n");
+    await mkdir(join(root, "ignored-foreign"));
     await expect(snapshotWriteEnvelope({
       worktreePath: root,
       allowedRoots: ["src/value.txt"],
     })).resolves.toEqual({
-      changedPaths: [".fusion-tmp/h2.txt", "src/value.txt"],
-      foreignPaths: [".fusion-tmp/h2.txt"],
+      changedPaths: [".fusion-tmp/h2.txt", "ignored-foreign", "src/value.txt"],
+      foreignPaths: [".fusion-tmp/h2.txt", "ignored-foreign"],
       allowedRoots: ["src/value.txt"],
     });
+  });
+
+  it("does not pass empty ignored directories to file fingerprinting", async () => {
+    const { root } = await fixture();
+    await mkdir(join(root, "ignored-foreign"));
+
+    await expect(readyModule.fingerprintCccCampaignReadyCandidate({
+      worktreePath: root,
+      allowedRoots: ["ignored-foreign"],
+    })).resolves.toMatch(/^[0-9a-f]{64}$/u);
   });
 
   it("returns verifier failure output as bounded repair feedback", async () => {
