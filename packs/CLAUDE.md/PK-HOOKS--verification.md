@@ -7,7 +7,7 @@ Read this generated pack only after the compact root catalog identifies a strong
 Current truth anchors:
 
 - Stack-level hook and lifecycle status: [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Stack SSOT]].
-- Current Hindsight checkpoint, warm-boot, candidate, and model-route contract: [[30_DEVSTACK/instruction_system/REF-AI-HindsightRuntimeSSOT-2026-07-15|Hindsight Runtime SSOT]] plus [[00_MAIN/00_RyanSSOT/REF-AI-ClaudeCodeHooksInventory|Claude Code Hooks Inventory]].
+- Current Hindsight checkpoint, warm-boot, candidate, and model-route contract: [[30_DEVSTACK/config/REF-AI-HindsightRuntimeSSOT-2026-07-15|Hindsight Runtime SSOT]] plus [[00_MAIN/00_RyanSSOT/REF-AI-ClaudeCodeHooksInventory|Claude Code Hooks Inventory]].
 - Current approved/build-state reference for Ryan's custom hooks and skills: [[FLX-HUM-SkillsHooksImplementationPlan-2026-07-03|Skills Hooks Implementation Plan]]. If a newer active sibling plan exists in that folder, prefer the newer plan. Treat [[SkillsHooksApproved-2026-07-03|Approved Skills Hooks]] as the adjudicated idea list; the implementation plan owns shipped/proven/deferred details when they differ.
 - Live registration still wins over prose. Verify the active runtime config, such as `~/.claude/settings.json`, `~/.codex/hooks.json` when present, plugin hook manifests, project overlays, or the current session-injected context before relying on a hook.
 

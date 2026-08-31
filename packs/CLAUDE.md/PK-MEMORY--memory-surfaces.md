@@ -15,8 +15,8 @@ Read this generated pack only after the compact root catalog identifies a strong
 Current truth anchors:
 
 - Use [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Stack SSOT]] for current memory/knowledge-surface health, rejected/retired status, and live-empty/stale distinctions.
-- Hindsight banks, models, tags, hooks, and operating rules are governed by [[30_DEVSTACK/instruction_system/REF-AI-HindsightRuntimeSSOT-2026-07-15|Hindsight Runtime SSOT]].
-- Treat qmd, mdidx, and llm-wiki-compiler as potentially live-empty, and treat Kwipu as corpus-bound/source-dated unless fresh proof says otherwise.
+- Hindsight banks, models, tags, hooks, and operating rules are governed by [[30_DEVSTACK/config/REF-AI-HindsightRuntimeSSOT-2026-07-15|Hindsight Runtime SSOT]].
+- Treat qmd, mdidx, and llm-wiki-compiler as potentially live-empty. Any compiled-wiki query surface is corpus-bound and source-dated unless fresh proof says otherwise. Kwipu was removed 2026-08-24 — deleted from disk and deregistered from MCPJungle.
 
 ### Surface Map
 
@@ -26,14 +26,14 @@ Current truth anchors:
 | Basic Memory | Per-project markdown notes | Project-local memory that should travel with the repo, not the vault | Cheap; file-system level |
 | Session/runtime context store (when configured) | Ephemeral session state | Within-session context routing, hook gating, transient state | Cheap; resets per session |
 | GitNexus or equivalent code graph | Code graph | Cross-repo symbol search, code archaeology, structural facts | Read-only from the agent's view |
-| Kwipu or equivalent wiki query surface | LLM-wiki query | Reads compiled wiki content; not a source of truth or memory writer | Read-only |
+| Compiled-wiki query surface (none installed) | LLM-wiki query | Reads compiled wiki content; not a source of truth or memory writer | Read-only |
 | `llm-wiki-compiler` or equivalent wiki write surface | LLM-wiki write | Promotes durable structured knowledge into the wiki | Heavy; deliberate |
 
 ### Read And Trust State
 
 - Query Hindsight or Basic Memory only after live route or SSOT says reachable. Treat Hindsight reads and writes as bank-scoped private context; verify active bank and project tags before relying on them.
 - `agent-session-search` is read-only transcript archaeology. Use exact literal queries and treat snippets as private, stale-prone leads until checked against transcript, live files, git, or runtime state.
-- Kwipu or compiled-wiki answers are corpus-bound and source-dated; do not use them for current stack, MCP, or runtime truth without matching freshness proof.
+- Compiled-wiki answers are corpus-bound and source-dated; do not use them for current stack, MCP, or runtime truth without matching freshness proof.
 - qmd, mdidx, and llm-wiki surfaces may be installed but empty. If retrieval is empty or stale, say so and fall back to scoped direct `rg` or reads with protected/archive exclusions; empty retrieval is not absence of evidence.
 - Wiki promotion is deliberate: use it only for durable, deduplicated, source-grounded knowledge after the routing rules choose the wiki write surface.
 - Hindsight vector provenance may be unknown even when dimensions match. Separately, the CCC vault corpus is BGE-M3 1024d; any embedding-model change requires full wipe and rebuild, never partial rebuild.
