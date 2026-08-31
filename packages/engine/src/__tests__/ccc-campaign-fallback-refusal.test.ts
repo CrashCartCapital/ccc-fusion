@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createAgentSession,
   createBashTool,
@@ -586,6 +589,174 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
       error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
     });
     expect(writeExecute).not.toHaveBeenCalled();
+  });
+
+  it("native_bash_preflight_refuses a visible worktree-local foreign write target before execution", async () => {
+    const bashExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "must not run" }],
+      isError: false,
+    });
+    const capturePotentialMutationBaseline = vi.fn();
+    const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "bash", execute: bashExecute } as never],
+      {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "MUTATE",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/record.mjs", "src/validation.mjs"],
+        capturePotentialMutationBaseline,
+      } as any,
+    );
+
+    await expect(bashTool!.execute(
+      "call-bash",
+      {
+        command:
+          "node -e \"const fs=require('fs');fs.writeFileSync('/tmp/ccc-candidate/.verifier.mjs','x')\"",
+      },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
+      details: expect.objectContaining({
+        path: "/tmp/ccc-candidate/.verifier.mjs",
+      }),
+    });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+
+    await expect(bashTool!.execute(
+      "call-bash-escaped-relative",
+      {
+        command: String.raw`node -e "const fs=require('fs');fs.writeFileSync(\"./.verifier.mjs\", \"x\")"`,
+      },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
+      details: expect.objectContaining({ path: "./.verifier.mjs" }),
+    });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+
+    await expect(bashTool!.execute(
+      "call-os-scratch",
+      {
+        command:
+          "node -e \"const fs=require('fs');fs.writeFileSync('/tmp/ccc-external-scratch.mjs','x')\"",
+      },
+      undefined,
+    )).resolves.toMatchObject({ isError: false });
+    expect(bashExecute).toHaveBeenCalledTimes(1);
+    expect(capturePotentialMutationBaseline).toHaveBeenCalledTimes(1);
+  });
+
+  it("native_bash_preflight canonicalizes a visible target reached through a worktree symlink", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "fusion-visible-bash-target-"));
+    const worktreePath = join(fixtureRoot, "candidate");
+    const aliasPath = join(fixtureRoot, "candidate-alias");
+    mkdirSync(worktreePath);
+    symlinkSync(worktreePath, aliasPath, "dir");
+    try {
+      const bashExecute = vi.fn().mockResolvedValue({
+        content: [{ type: "text", text: "must not run" }],
+        isError: false,
+      });
+      const capturePotentialMutationBaseline = vi.fn();
+      const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+        [{ name: "bash", execute: bashExecute } as never],
+        {
+          readOnlyToolNames: ["bash"],
+          maxReadOnlyToolCallsBeforeGuidance: 1,
+          maxReadOnlyToolCallsBeforeRefusal: 2,
+          guidanceMessage: "mutate now",
+          refusalMessage: "discovery refused",
+          currentPhase: () => "MUTATE",
+          worktreePath,
+          allowedWriteRoots: ["src/record.mjs", "src/validation.mjs"],
+          capturePotentialMutationBaseline,
+        } as any,
+      );
+
+      const aliasedTarget = join(aliasPath, ".verifier.mjs");
+      await expect(bashTool!.execute(
+        "call-bash-symlinked-target",
+        {
+          command:
+            `node -e "const fs=require('fs');fs.writeFileSync('${aliasedTarget}','x')"`,
+        },
+        undefined,
+      )).resolves.toMatchObject({
+        isError: true,
+        error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
+        details: expect.objectContaining({ path: aliasedTarget }),
+      });
+      expect(bashExecute).not.toHaveBeenCalled();
+      expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+
+      const aliasedAdmittedTarget = join(aliasPath, "src", "record.mjs");
+      await expect(bashTool!.execute(
+        "call-bash-symlinked-admitted-target",
+        {
+          command:
+            `node -e "const fs=require('fs');fs.writeFileSync('${aliasedAdmittedTarget}','x')"`,
+        },
+        undefined,
+      )).resolves.toMatchObject({ isError: false });
+      expect(bashExecute).toHaveBeenCalledTimes(1);
+      expect(capturePotentialMutationBaseline).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
+      "cpSync",
+      "node -e \"const fs=require('fs');fs.cpSync('/tmp/source','/tmp/ccc-candidate/.verifier.mjs')\"",
+    ],
+    [
+      "createWriteStream",
+      "node -e \"const fs=require('fs');fs.createWriteStream('/tmp/ccc-candidate/.verifier.mjs')\"",
+    ],
+  ])("native_bash_preflight refuses the common literal %s destination before execution", async (_api, command) => {
+    const bashExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "must not run" }],
+      isError: false,
+    });
+    const capturePotentialMutationBaseline = vi.fn();
+    const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "bash", execute: bashExecute } as never],
+      {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "MUTATE",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/record.mjs", "src/validation.mjs"],
+        capturePotentialMutationBaseline,
+      } as any,
+    );
+
+    await expect(bashTool!.execute(
+      `call-bash-${_api}`,
+      { command },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
+      details: expect.objectContaining({
+        path: "/tmp/ccc-candidate/.verifier.mjs",
+      }),
+    });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
   });
 
   it("post_tool_write_envelope_guard terminates a MUTATE tool that creates a foreign path", async () => {

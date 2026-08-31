@@ -78,6 +78,7 @@ import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { applyClaudeAcpEnable } from "./claude-acp-enable.js";
 import {
+  cccCampaignVisibleBashWriteTargets,
   isCccCampaignDiscoveryToolCall,
   isCccCampaignExplicitMutationToolCall,
   isCccCampaignPotentialMutationToolCall,
@@ -2519,6 +2520,21 @@ function normalizeExistingPathForGitComparison(path: string): string {
   }
 }
 
+function normalizePathWithExistingAncestorForComparison(path: string): string {
+  let existingAncestor = resolve(path);
+  const missingSegments: string[] = [];
+  while (!existsSync(existingAncestor)) {
+    const parent = dirname(existingAncestor);
+    if (parent === existingAncestor) return resolve(path);
+    missingSegments.unshift(basename(existingAncestor));
+    existingAncestor = parent;
+  }
+  return join(
+    normalizeExistingPathForGitComparison(existingAncestor),
+    ...missingSegments,
+  );
+}
+
 /**
  * FNXC:SkillReadBoundary 2026-07-21-12:00:
  * GitHub #2384 / FN-8466 requires the exact host-advertised additional skill
@@ -2813,6 +2829,25 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
       return isSameOrInsidePath(admitted, target);
     });
   };
+  const pathInsideCandidateWorktree = (path: string): boolean => {
+    if (!policy.worktreePath) return false;
+    const worktree = normalizePathWithExistingAncestorForComparison(policy.worktreePath);
+    const target = normalizePathWithExistingAncestorForComparison(
+      isAbsolute(path) ? path : resolve(policy.worktreePath, path),
+    );
+    return isSameOrInsidePath(worktree, target);
+  };
+  const visibleBashTargetWithinAdmittedRoots = (path: string): boolean => {
+    if (!policy.worktreePath || !policy.allowedWriteRoots?.length) return true;
+    const worktree = normalizePathWithExistingAncestorForComparison(policy.worktreePath);
+    const target = normalizePathWithExistingAncestorForComparison(
+      isAbsolute(path) ? path : resolve(policy.worktreePath, path),
+    );
+    return policy.allowedWriteRoots.some((root) => {
+      const admitted = normalizePathWithExistingAncestorForComparison(resolve(worktree, root));
+      return isSameOrInsidePath(admitted, target);
+    });
+  };
   const appendGuidance = (
     result: unknown,
     message: string,
@@ -2899,6 +2934,21 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
               allowedWriteRoots: policy.allowedWriteRoots,
             },
           );
+        }
+        if (normalizedToolName === "bash" && typeof params?.command === "string") {
+          const visibleForeignTarget = cccCampaignVisibleBashWriteTargets(params.command)
+            .find((path) => pathInsideCandidateWorktree(path) && !visibleBashTargetWithinAdmittedRoots(path));
+          if (visibleForeignTarget) {
+            return boundaryRejection(
+              `CCC_CAMPAIGN_WRITE_ENVELOPE_REFUSED: ${tool.name} target ${visibleForeignTarget} is outside the admitted write roots.`,
+              {
+                phase: policy.currentPhase?.(),
+                toolName: tool.name,
+                path: visibleForeignTarget,
+                allowedWriteRoots: policy.allowedWriteRoots,
+              },
+            );
+          }
         }
         const potentialMutation = isCccCampaignPotentialMutationToolCall(tool.name, params);
         const executeWithCustody = async () => {
