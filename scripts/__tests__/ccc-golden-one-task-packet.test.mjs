@@ -8,10 +8,11 @@ import { buildEvidenceLedgerPacketDefinition } from "../lib/ccc-golden-packet.mj
 import { prepareEvidenceLedgerPacketLifecycle } from "../lib/ccc-golden-packet-lifecycle.mjs";
 
 const route = {
-  providerId: "golden-omniroute-luna",
-  modelId: "cx/gpt-5.6-luna-max",
+  providerId: "golden-omniroute-minimax-latest",
+  modelId: "combo/minimax-latest",
   transport: "pi",
   receiptAdapterId: "terminal-route-sse-comments.v1",
+  terminalRouteMembers: [{ provider: "minimax", model: "MiniMax-M3" }],
 };
 
 test("PRD:GOLDEN-4 one-task packet isolates the contract mutation and final proof", () => {
