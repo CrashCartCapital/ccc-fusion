@@ -7,6 +7,7 @@ const PRODUCT_POLICY_ROUTE_ENTRY_PI_KEYS = new Set([
   "modelId",
   "transport",
   "receiptAdapterId",
+  "terminalRouteMembers",
 ]);
 const PRODUCT_POLICY_ROUTE_ENTRY_CLI_KEYS = new Set([
   "providerId",
@@ -14,6 +15,7 @@ const PRODUCT_POLICY_ROUTE_ENTRY_CLI_KEYS = new Set([
   "transport",
   "cliAdapterId",
 ]);
+const CANONICAL_ROUTE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u;
 
 export class PrdProductRoutesFileError extends Error {
   public constructor(
@@ -23,6 +25,50 @@ export class PrdProductRoutesFileError extends Error {
     super(message);
     this.name = "PrdProductRoutesFileError";
   }
+}
+
+function parseTerminalRouteMembers(
+  value: unknown,
+  routesFilePath: string,
+  taskId: string,
+): NonNullable<CccPrdProductExecutionRouteSelection["terminalRouteMembers"]> | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new PrdProductRoutesFileError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} route for task ${taskId} terminalRouteMembers must be a non-empty array`,
+    );
+  }
+  const members = value.map((candidate, index) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new PrdProductRoutesFileError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} terminalRouteMembers[${index}] must be an object`,
+      );
+    }
+    const member = candidate as Record<string, unknown>;
+    if (
+      JSON.stringify(Object.keys(member).sort()) !== JSON.stringify(["model", "provider"])
+      || typeof member.provider !== "string"
+      || !CANONICAL_ROUTE_IDENTIFIER.test(member.provider)
+      || typeof member.model !== "string"
+      || !CANONICAL_ROUTE_IDENTIFIER.test(member.model)
+    ) {
+      throw new PrdProductRoutesFileError(
+        "CCC_PRD_ROUTES_FILE_INVALID",
+        `routes file ${routesFilePath} route for task ${taskId} terminalRouteMembers[${index}] must declare exact canonical provider and model fields`,
+      );
+    }
+    return { provider: member.provider, model: member.model };
+  });
+  const memberKeys = members.map(({ provider, model }) => `${provider}/${model}`);
+  if (new Set(memberKeys).size !== memberKeys.length) {
+    throw new PrdProductRoutesFileError(
+      "CCC_PRD_ROUTES_FILE_INVALID",
+      `routes file ${routesFilePath} route for task ${taskId} has a duplicate terminal route member`,
+    );
+  }
+  return members;
 }
 
 export function parseProductPolicyRoutesFileContents(
@@ -101,6 +147,11 @@ export function parseProductPolicyRoutesFileContents(
     const modelId = route.modelId;
     const cliAdapterId = route.cliAdapterId;
     const receiptAdapterId = route.receiptAdapterId;
+    const terminalRouteMembers = parseTerminalRouteMembers(
+      route.terminalRouteMembers,
+      routesFilePath,
+      taskId,
+    );
     if (
       typeof providerId !== "string"
       || providerId.length === 0
@@ -110,6 +161,7 @@ export function parseProductPolicyRoutesFileContents(
       || (transport === "cli" && (typeof cliAdapterId !== "string" || cliAdapterId.length === 0))
       || (transport === "pi" && cliAdapterId !== undefined)
       || (transport === "cli" && receiptAdapterId !== undefined)
+      || (transport === "cli" && terminalRouteMembers !== undefined)
       || (
         receiptAdapterId !== undefined
         && receiptAdapterId !== "terminal-route-sse-comments.v1"
@@ -128,6 +180,7 @@ export function parseProductPolicyRoutesFileContents(
       ...(receiptAdapterId === "terminal-route-sse-comments.v1"
         ? { receiptAdapterId }
         : {}),
+      ...(terminalRouteMembers ? { terminalRouteMembers } : {}),
     };
   }
   return routesByTaskId;

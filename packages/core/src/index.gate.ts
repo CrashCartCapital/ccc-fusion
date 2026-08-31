@@ -2291,7 +2291,7 @@ export { resolveReviewLevelSteps, applyReviewLevelPreset } from "./review-level-
 export { LEGACY_STATUS_ADOPTION, resolveLegacyStatusAdoption, resolveReviewLevelBackfill, planLegacyAdoption, resolveOrphanedPendingStepResults, type LegacyAdoptionPlan, type LegacyAdoptionCandidate, type LegacyAdoptionAction, type LegacyAdoptionKind } from "./legacy-adoption.js";
 export { hashWorkflowIr, computeWorkflowIrPin, detectWorkflowDrift, type WorkflowIrPin } from "./workflow-ir-resolver.js";
 export { evaluateTransitionInvariants, evaluateMergeBlockerPostcondition, evaluateTerminalReentryPostcondition, evaluateCapacityRejection, isWipColumn, isTerminalColumn, isCompleteColumn, isHoldColumn, isHoldToWipBoundary, type CapacityFacts } from "./workflow-transition-policy.js";
-export { CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE, CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON, CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR, CCC_CAMPAIGN_REQUESTS_PER_PROVIDER_TASK_FLOOR, cccCampaignRequestFloor } from "./ccc-campaign/request-budget.js";
+export { CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_CODE, CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON, CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR, CCC_CAMPAIGN_REQUESTS_PER_PROVIDER_TASK_FLOOR, CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK, cccCampaignRecommendedStartingMaximum, cccCampaignRequestFloor, cccCampaignRequestSizingGuidance } from "./ccc-campaign/request-budget.js";
 // FNXC:GateBarrelSync 2026-07-19-12:20: stale-binary guard exports mirrored per the sync rule above (PR #2341 review).
 export { StaleBinarySchemaError, assertBinaryNotOlderThanDatabase } from "./postgres/schema-applier.js";
 export { promoteResearchFinding } from "./research-feature-promotion.js";

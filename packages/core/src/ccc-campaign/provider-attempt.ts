@@ -27,6 +27,7 @@ import {
   CccProviderAttemptStateError,
   type CccCampaignAuthorityBinding,
   type CccCampaignRouteReceiptAdapterId,
+  type CccCampaignTerminalRouteMember,
   type CccCampaignTaskContext,
   type CccCampaignWorkItemFence,
   type CccProviderAttemptCost,
@@ -352,14 +353,72 @@ function assertTerminalRouteReceipt(
   receipt: CccProviderAttemptEffectiveRoute,
   requestedIdentity: Readonly<{ providerId: string; modelId: string }>,
   receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
+  terminalRouteMembers: readonly CccCampaignTerminalRouteMember[] | undefined,
 ): void {
-  if (receiptAdapterId === undefined) return;
+  if (receiptAdapterId === undefined) {
+    if (terminalRouteMembers !== undefined) {
+      throw new CccProviderAttemptIdentityError(
+        "invalid-input",
+        "CCC terminalRouteMembers requires a terminal route receipt adapter",
+      );
+    }
+    return;
+  }
   const requestedUpstream = splitProviderQualifiedModel(requestedIdentity.modelId);
   if (!requestedUpstream) {
     throw new CccProviderAttemptIdentityError(
       "invalid-input",
       "CCC terminal route receipt adapter requires a provider-qualified requested model",
     );
+  }
+  const comboRequest = requestedUpstream.provider === "combo";
+  if (comboRequest && terminalRouteMembers === undefined) {
+    throw new CccProviderAttemptIdentityError(
+      "invalid-input",
+      "CCC combo request requires terminalRouteMembers",
+    );
+  }
+  if (!comboRequest && terminalRouteMembers !== undefined) {
+    throw new CccProviderAttemptIdentityError(
+      "invalid-input",
+      "CCC terminalRouteMembers is permitted only for a combo request",
+    );
+  }
+  let memberKeys: ReadonlySet<string> | undefined;
+  if (terminalRouteMembers !== undefined) {
+    if (!Array.isArray(terminalRouteMembers) || terminalRouteMembers.length === 0) {
+      throw new CccProviderAttemptIdentityError(
+        "invalid-input",
+        "CCC terminalRouteMembers must be a non-empty array",
+      );
+    }
+    const keys = new Set<string>();
+    terminalRouteMembers.forEach((candidate, index) => {
+      if (!isRecord(candidate)) {
+        throw new CccProviderAttemptIdentityError(
+          "invalid-input",
+          `CCC terminalRouteMembers[${index}] must be an object`,
+        );
+      }
+      const observedKeys = Object.keys(candidate).sort();
+      if (!sameCanonicalValue(observedKeys, ["model", "provider"])) {
+        throw new CccProviderAttemptIdentityError(
+          "invalid-input",
+          `CCC terminalRouteMembers[${index}] fields must be exactly model, provider`,
+        );
+      }
+      const provider = requireCanonicalText(candidate.provider, `terminalRouteMembers[${index}] provider`);
+      const model = requireCanonicalText(candidate.model, `terminalRouteMembers[${index}] model`);
+      const key = `${provider}\u0000${model}`;
+      if (keys.has(key)) {
+        throw new CccProviderAttemptIdentityError(
+          "invalid-input",
+          "CCC terminalRouteMembers must not contain duplicates",
+        );
+      }
+      keys.add(key);
+    });
+    memberKeys = keys;
   }
   const observed = receipt.omniRoute;
   if (!observed) {
@@ -378,7 +437,15 @@ function assertTerminalRouteReceipt(
       "CCC initial and final terminal route receipts conflict",
     );
   }
-  if (
+  if (memberKeys) {
+    const observedMember = `${observed.final.provider}\u0000${observed.final.model}`;
+    if (!memberKeys.has(observedMember)) {
+      throw new CccProviderAttemptIdentityError(
+        "route-drift",
+        "CCC final terminal provider/model receipt is not an admitted terminal route member",
+      );
+    }
+  } else if (
     observed.final.provider !== requestedUpstream.provider
     || observed.final.model !== requestedUpstream.model
   ) {
@@ -421,6 +488,7 @@ export function assertCccProviderAttemptEffectiveRoute(
   options: Readonly<{
     receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
     terminalReceiptRequired?: boolean;
+    terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
   }> = {},
 ): CccProviderAttemptEffectiveRoute | undefined {
   if (input === undefined) {
@@ -462,7 +530,12 @@ export function assertCccProviderAttemptEffectiveRoute(
     );
   }
   if (options.terminalReceiptRequired !== false || receipt.omniRoute !== undefined) {
-    assertTerminalRouteReceipt(receipt, requestedIdentity, options.receiptAdapterId);
+    assertTerminalRouteReceipt(
+      receipt,
+      requestedIdentity,
+      options.receiptAdapterId,
+      options.terminalRouteMembers,
+    );
   }
   assertNoCostWithoutReceipt(receipt);
   return receipt;
@@ -820,8 +893,12 @@ function bindingFromAuditRow(
 
 function assertAuditRow(
   row: typeof schema.project.runAuditEvents.$inferSelect,
-  receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
+  routeReceipt: Readonly<{
+    receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
+    terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
+  }>,
 ): { stage: AttemptStage; metadata: ProviderAttemptMetadata; scope: CccProviderAttemptScope } {
+  const receiptAdapterId = routeReceipt.receiptAdapterId;
   const stage = stageForMutationType(row.mutationType);
   const metadata = parseMetadata(row.metadata, stage);
   const binding = bindingFromAuditRow(row);
@@ -871,7 +948,7 @@ function assertAuditRow(
       assertTerminalRouteReceipt(effectiveRoute, {
         providerId: binding.providerId,
         modelId: binding.modelId,
-      }, receiptAdapterId);
+      }, receiptAdapterId, routeReceipt.terminalRouteMembers);
     } catch (error) {
       throw new CccCampaignContextError(
         `CCC provider attempt history has an invalid terminal route receipt: ${error instanceof Error ? error.message : String(error)}`,
@@ -914,7 +991,7 @@ function assembleHistory(
 ): ProviderAttemptHistory {
   const attempts = new Map<string, StoredAttempt>();
   for (const row of rows) {
-    const { stage, metadata, scope } = assertAuditRow(row, context.route.receiptAdapterId);
+    const { stage, metadata, scope } = assertAuditRow(row, context.route);
     let attempt = attempts.get(scope.attemptKey);
     if (!attempt) {
       attempt = {
@@ -1447,6 +1524,7 @@ export async function reconcileCccProviderAttempt(
       {
         receiptAdapterId: context.route.receiptAdapterId,
         terminalReceiptRequired: outcome === "committed",
+        terminalRouteMembers: context.route.terminalRouteMembers,
       },
     );
     if (attempt.terminal) {

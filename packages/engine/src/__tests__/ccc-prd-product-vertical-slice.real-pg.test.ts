@@ -167,6 +167,13 @@ async function initializeTarget(rootDir: string): Promise<string> {
       "const candidatePath = process.argv[2];",
       "const value = fs.readFileSync(candidatePath, 'utf8').trim();",
       "const accepts = candidate => candidate === 'good';",
+      "const canonicalJson = value => Array.isArray(value) ? `[${value.map(canonicalJson).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}` : JSON.stringify(value);",
+      "if (process.env.CCC_PROOF_ID) {",
+      "  const passed = accepts(value) && process.env.CCC_PROOF_ID === 'PROOF-VERTICAL' && ['task', 'final_integrated'].includes(process.env.CCC_PROOF_PHASE);",
+      "  const evidence = { schema: 'ccc-prd.proof-evidence.v2', proofId: process.env.CCC_PROOF_ID, phase: process.env.CCC_PROOF_PHASE, sourceCommit: process.env.CCC_PROOF_SOURCE_COMMIT, sourceTree: process.env.CCC_PROOF_SOURCE_TREE, passed, clauseResults: [{ clauseId: 'AC-REQ-VERTICAL-001', passed }], positiveCaseResults: [{ caseId: 'POS-VERTICAL-001', passed }], negativeControlResults: [{ controlId: 'NEG-VERTICAL-001', passed }] };",
+      "  process.stdout.write(canonicalJson(evidence) + '\\n');",
+      "  process.exit(passed ? 0 : 1);",
+      "}",
       "if (accepts('bad')) {",
       "  console.error('NEGATIVE_CONTROL_FAIL');",
       "  process.exit(2);",
@@ -1281,19 +1288,6 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
       });
       await executionDrain;
 
-      const proofAdmissionAudits = (
-        await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId })
-      ).filter((event) =>
-        event.mutationType === "ccc-campaign:proof-admission");
-      expect(proofAdmissionAudits).toEqual([
-        expect.objectContaining({
-          metadata: expect.objectContaining({
-            proofId: "PROOF-VERTICAL",
-            outcome: "pass",
-          }),
-        }),
-      ]);
-
       const mergeHold = await waitFor(
         async () => productStatus(await runProductCommand(
           ["status", idempotencyKey],
@@ -1304,31 +1298,34 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         undefined,
         mergeApprovalTerminalDiagnostic,
       );
+      const proofAdmissionAudits = (
+        await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId })
+      ).filter((event) =>
+        event.mutationType === "ccc-campaign:proof-admission");
+      expect(proofAdmissionAudits).toHaveLength(2);
+      expect(proofAdmissionAudits).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          metadata: expect.objectContaining({ proofId: "PROOF-VERTICAL", outcome: "pass" }),
+        }),
+      ]));
+      expect(proofAdmissionAudits.every((event) => event.metadata?.outcome === "pass")).toBe(true);
       const campaignSourceCommit =
         mergeHold.status.proofs[0]?.attempts[0]?.sourceCommit;
       expect(campaignSourceCommit).toEqual(
         expect.stringMatching(/^[a-f0-9]{40}$/u),
       );
       expect(await git(rootDir, "rev-parse", "refs/heads/main")).toBe(baseCommit);
-      expect(mergeHold.status.proofs).toEqual([
-        expect.objectContaining({
-          definition: expect.objectContaining({ id: "PROOF-VERTICAL" }),
-          attempts: [expect.objectContaining({
-            sourceCommit: campaignSourceCommit,
-            state: "committed",
-            result: expect.objectContaining({
-              success: true,
-              exitCode: 0,
-              stdoutTail: expect.stringContaining("NEGATIVE_CONTROL_PASS"),
-              warnings: expect.arrayContaining([
-                expect.stringMatching(
-                  process.platform === "linux" ? /bubblewrap/iu : /sandbox-exec/iu,
-                ),
-              ]),
-            }),
-          })],
-        }),
-      ]);
+      expect(mergeHold.status.proofs).toHaveLength(1);
+      const verticalProof = mergeHold.status.proofs[0]!;
+      expect(verticalProof.definition).toEqual(expect.objectContaining({ id: "PROOF-VERTICAL" }));
+      expect(verticalProof.attempts).toHaveLength(2);
+      expect(verticalProof.attempts.map(({ phase }) => phase).sort()).toEqual(["final_integrated", "task"]);
+      expect(verticalProof.attempts.every((attempt) =>
+        attempt.sourceCommit === campaignSourceCommit
+        && attempt.state === "committed"
+        && attempt.result?.success === true
+        && attempt.result.exitCode === 0
+        && attempt.result.stdoutTail.includes('"NEG-VERTICAL-001"'))).toBe(true);
       expect(mergeHold.mergeApprovalConfirmations).toHaveLength(1);
       const mergeConfirmation = mergeHold.mergeApprovalConfirmations![0]!;
       const mergeApproved = await runProductCommand([

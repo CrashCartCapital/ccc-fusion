@@ -79,6 +79,7 @@ const productTimeoutMs = Number(process.env.FUSION_PRODUCT_TIMEOUT_MS ?? 120_000
 // provider or proof effect exists. Keep one full product-poll window of
 // headroom so a clean post-merge checkout cannot expire at the cutpoint.
 const verticalCampaignMaxDurationMs = 240_000;
+const verticalCampaignMaxRequests = 4;
 const shutdownTimeoutMs = 15_000;
 const proofCutpointMarkerName = "ccc-proof-cutpoint.marker.json";
 const proofCutpointCandidateValue = "good-proof-cutpoint";
@@ -1359,7 +1360,7 @@ async function assertExactImplementationFactProvenance(
   const bindings = [
     ["targetRepository.path", provenance.targetRepository?.path, expected.targetRoot],
     ["targetRepository.baseCommit", provenance.targetRepository?.baseCommit, expected.targetBase],
-    ["bounds.maxRequests", provenance.bounds?.maxRequests, 2],
+    ["bounds.maxRequests", provenance.bounds?.maxRequests, verticalCampaignMaxRequests],
     [
       "bounds.maxDurationMs",
       provenance.bounds?.maxDurationMs,
@@ -1942,7 +1943,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
     "- Allowed write root purpose: Fusion-managed campaign state and artifacts";
   const allowedWriteRootPurposeLine =
     "- Allowed write root purpose: disposable product acceptance repository";
-  const maxRequestsLine = "- Maximum requests: 2";
+  const maxRequestsLine = `- Maximum requests: ${verticalCampaignMaxRequests}`;
   const maxDurationLine =
     `- Maximum duration in milliseconds: ${verticalCampaignMaxDurationMs}`;
   const maxConcurrencyLine = "- Maximum concurrency: 1";
@@ -2082,7 +2083,7 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
         "--write-purpose",
         "disposable product acceptance repository",
         "--max-requests",
-        "2",
+        String(verticalCampaignMaxRequests),
         "--max-duration-ms",
         String(verticalCampaignMaxDurationMs),
         "--max-concurrency",
@@ -2481,11 +2482,9 @@ async function createPacket(packetRoot, targetRoot, targetBase, env) {
       },
     ],
     bounds: {
-      // Two dispatches, one per task. The import-wide provider-attempt audit
-      // history is bounded by (maxRequests * 3) + 1 rows and each attempt
-      // writes exactly three rows, so this is the smallest budget that admits
-      // a two-task chain.
-      maxRequests: 2,
+      // Two provider tasks each require one MUTATE turn plus the single
+      // controller-issued REPAIR turn, so the structural floor is four.
+      maxRequests: verticalCampaignMaxRequests,
       maxDurationMs: verticalCampaignMaxDurationMs,
       maxConcurrency: 1,
     },
@@ -4156,7 +4155,7 @@ async function main() {
         "--model",
         "vertical-authoring-model",
         "--max-requests",
-        "2",
+        String(verticalCampaignMaxRequests),
         "--max-duration-ms",
         String(verticalCampaignMaxDurationMs),
         "--max-concurrency",

@@ -93,6 +93,8 @@ Do not build a broad OpenCode adapter until that benchmark proves a clear benefi
 
 CCC-Fusion should not have an arbitrary product ceiling like "two workers" or "twenty workers." The product goal is maximal safe parallelism, constrained empirically by hardware, provider throughput, repository contention, and review/integration capacity.
 
+CCC-Fusion should also provide generous finite execution limits by default. Size request and time envelopes from the useful job we expect the worker to finish, then retain explicit safety and cost ceilings. Prefer a session that runs long enough to produce a useful product over one cut off by an arbitrary micro-limit. The starting request recommendation is 384 requests per provider task; this is planning guidance, not a new admission gate, per-task reservation, completion guarantee, or permission to remove finite ceilings. Task evidence may justify a different envelope. Record actual requests by model and task so later defaults can reflect model-specific tool-use behavior rather than forcing every model into one low cap.
+
 The scheduler should treat these as separate resource pools:
 
 - Model/research sessions.

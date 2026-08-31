@@ -1582,6 +1582,9 @@ describe("prd command exit contract", () => {
         providerTasks: number;
         deterministicMinimum: number;
         headroomAboveMinimum: number;
+        recommendedStartingMaximum: number;
+        headroomAboveRecommendation: number;
+        sizingPosture: "tight" | "generous";
         completionAdequacy: string;
         explanation: string;
       };
@@ -1600,9 +1603,12 @@ describe("prd command exit contract", () => {
         providerTasks: 1,
         deterministicMinimum: 2,
         headroomAboveMinimum: 0,
+        recommendedStartingMaximum: 384,
+        headroomAboveRecommendation: -382,
+        sizingPosture: "tight",
         completionAdequacy: "unproven",
         explanation:
-          "Two requests per provider task (one MUTATE turn plus the single REPAIR turn) is only a structural admission floor: it creates no per-task quota or reservation, earlier tasks may exhaust the global cap, live runs commonly cost 9-13 requests per task, and completion adequacy remains unproven.",
+          "Two requests per provider task (one MUTATE turn plus the single REPAIR turn) is only a structural admission floor. Start at 384 requests per provider task (384 total here) unless evidence supports another finite envelope. This packet is tight: it is 382 requests below that recommendation, but remains valid because the recommendation is guidance, not an admission or safety ceiling. The campaign cap is global, creates no per-task quota or reservation, and completion adequacy remains unproven.",
       },
       verifierConfinement: {
         ready: true,

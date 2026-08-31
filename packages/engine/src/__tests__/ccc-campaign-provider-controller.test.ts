@@ -59,6 +59,7 @@ const contextFor = (route: Readonly<{
   modelId: string;
   workflowExtensionId?: string;
   receiptAdapterId?: "terminal-route-sse-comments.v1";
+  terminalRouteMembers?: readonly Readonly<{ provider: string; model: string }>[];
 }>) => Object.freeze({
   taskId: nativeTaskId,
   semanticTaskId,
@@ -75,6 +76,7 @@ function bindingInput(route: Readonly<{
   modelId: string;
   workflowExtensionId?: string;
   receiptAdapterId?: "terminal-route-sse-comments.v1";
+  terminalRouteMembers?: readonly Readonly<{ provider: string; model: string }>[];
 }>, expectedRoute: Readonly<{ transport: "workflow" }> | Readonly<{ transport: "pi"; providerId: string; modelId: string }>) {
   const authorityStore = {
     getCccCampaignContextForTaskWithinTransaction: vi.fn(async () => contextFor(route)),
@@ -279,6 +281,32 @@ describe("CCC campaign provider controller", () => {
       turnKey: "turn-1",
       receiptAdapterId: "terminal-route-sse-comments.v1",
     });
+  });
+
+  it("RED-ALIAS-BINDING-1: deep-freezes persisted combo terminal members on the Pi binding", async () => {
+    const terminalRouteMembers = [
+      { provider: "minimax", model: "MiniMax-M3" },
+      { provider: "minimax", model: "MiniMax-M3.1" },
+    ] as const;
+    const { input } = bindingInput(
+      {
+        transport: "pi",
+        providerId: "omniroute",
+        modelId: "combo/minimax-latest",
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+        terminalRouteMembers,
+      },
+      {
+        transport: "pi",
+        providerId: "omniroute",
+        modelId: "combo/minimax-latest",
+      },
+    );
+
+    const binding = await createCccCampaignProviderAttemptBinding(input);
+    expect(binding).toMatchObject({ terminalRouteMembers });
+    expect(Object.isFrozen(binding.terminalRouteMembers)).toBe(true);
+    expect(binding.terminalRouteMembers?.every(Object.isFrozen)).toBe(true);
   });
 
   it("Task 6 P1 RED: refuses a reconciliation whose submitted turn is not the binding's sealed turn", async () => {

@@ -188,6 +188,32 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
     expect(result.summary).toContain("foreign.txt");
   });
 
+  it("write_envelope_snapshot separates admitted and foreign candidate paths", async () => {
+    const { root } = await fixture();
+    const snapshotWriteEnvelope = (readyModule as any).snapshotCccCampaignWriteEnvelope;
+    expect(snapshotWriteEnvelope).toEqual(expect.any(Function));
+
+    await expect(snapshotWriteEnvelope({
+      worktreePath: root,
+      allowedRoots: ["src/value.txt"],
+    })).resolves.toEqual({
+      changedPaths: ["src/value.txt"],
+      foreignPaths: [],
+      allowedRoots: ["src/value.txt"],
+    });
+
+    await mkdir(join(root, ".fusion-tmp"));
+    await writeFile(join(root, ".fusion-tmp", "h2.txt"), "scratch\n");
+    await expect(snapshotWriteEnvelope({
+      worktreePath: root,
+      allowedRoots: ["src/value.txt"],
+    })).resolves.toEqual({
+      changedPaths: [".fusion-tmp/h2.txt", "src/value.txt"],
+      foreignPaths: [".fusion-tmp/h2.txt"],
+      allowedRoots: ["src/value.txt"],
+    });
+  });
+
   it("returns verifier failure output as bounded repair feedback", async () => {
     const { root, campaign } = await fixture("wrong");
     const verifyCandidate = (readyModule as any).verifyCccCampaignReadyCandidate;

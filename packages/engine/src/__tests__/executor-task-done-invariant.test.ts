@@ -872,11 +872,7 @@ pgDescribe("FN-5241 executor handoff auditing", () => {
   completion reaches in-review; an exhausted no-fn_task_done run is terminal), just via the graph seams.
   */
 
-  /*
-  FNXC:EngineTests 2026-07-20-23:55:
-  Graph-native step-execute still terminates before the merge boundary under this PG + mock-agent fixture after U10b (steps#0:step-execute failure). Skip until a dedicated graph completion harness is written; do not appease with timeouts. Same failure class observed on origin/main full-suite.
-  */
-  it.skip("moves a cleanly completed task to in-review via the merge-node boundary", async () => {
+  it("moves a cleanly completed task to in-review via the merge-node boundary", async () => {
     const { task, worktreePath } = await createExecutorTask();
     // Graph-native implementation proof: the mock agent signals completion via fn_task_done without running
     // the foreach step-execute nodes, so the merge-boundary FN-7260/FN-7271 proof gate needs an explicit
@@ -938,7 +934,7 @@ pgDescribe("FN-5241 executor handoff auditing", () => {
     expect(await store.getRunAuditEventsAsync({ taskId: task.id, mutationType: "task:handoff", limit: 10 })).toHaveLength(0);
   });
 
-  it.skip("fails a no-fn_task_done retry-budget-exhausted run in place without moving to in-review", async () => {
+  it("fails a no-fn_task_done retry-budget-exhausted run in place without moving to in-review", async () => {
     const { task, worktreePath } = await createExecutorTask(3);
     mockedExec.mockImplementation(((cmd: string, _opts: unknown, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
       if (!cb) return undefined as any;

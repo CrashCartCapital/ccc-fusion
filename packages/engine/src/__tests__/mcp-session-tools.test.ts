@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ResolvedMcpServerDefinition } from "@fusion/core";
-import { connectMcpSessionTools, uniqueMcpToolName, type McpSessionClient } from "../mcp-session-tools.js";
+import {
+  buildMcpCapabilityPrompt,
+  connectMcpSessionTools,
+  uniqueMcpToolName,
+  type McpSessionClient,
+} from "../mcp-session-tools.js";
 
 function stdioServer(name: string, enabled = true): ResolvedMcpServerDefinition {
   return { name, transport: "stdio", command: "fake", enabled };
@@ -45,6 +50,11 @@ describe("connectMcpSessionTools", () => {
 
     expect(toolset.connected).toEqual(["context7"]);
     expect(toolset.tools.map((tool) => tool.name)).toEqual(["mcp__context7__lookup"]);
+    expect(toolset.toolSources).toEqual([{
+      serverName: "context7",
+      sourceToolName: "lookup",
+      exposedToolName: "mcp__context7__lookup",
+    }]);
     expect(client.connect).toHaveBeenCalledWith(expect.anything(), { timeout: 15_000 });
     expect(client.listTools).toHaveBeenCalledWith(undefined, { timeout: 15_000 });
     expect(toolset.tools[0]!.parameters).toMatchObject({
@@ -174,5 +184,30 @@ describe("connectMcpSessionTools", () => {
     expect(uniqueMcpToolName("a.b", "bash", used)).toBe("mcp__a_b__bash");
     expect(uniqueMcpToolName("a_b", "bash", used)).toBe("mcp__a_b__bash__2");
     expect(uniqueMcpToolName("a_b", "read", used)).toBe("mcp__a_b__read");
+  });
+
+  it("builds a compact live capability card from connected and unavailable MCP servers", () => {
+    const prompt = buildMcpCapabilityPrompt({
+      connected: ["fusion-code-core"],
+      skipped: [{ name: "optional-docs", reason: "error" }],
+      toolSources: [
+        { serverName: "fusion-code-core", sourceToolName: "smart-tree__overview", exposedToolName: "mcp__fusion-code-core__smart-tree_overview" },
+        { serverName: "fusion-code-core", sourceToolName: "octocode__localSearchCode", exposedToolName: "mcp__fusion-code-core__octocode_localsearchcode" },
+        { serverName: "fusion-code-core", sourceToolName: "brave-search__brave_web_search", exposedToolName: "mcp__fusion-code-core__brave-search_brave_web_search" },
+        { serverName: "fusion-code-core", sourceToolName: "serper-mcp__google_search_scholar", exposedToolName: "mcp__fusion-code-core__serper-mcp_google_search_scholar" },
+        { serverName: "fusion-code-core", sourceToolName: "fetch-guard__fetch", exposedToolName: "mcp__fusion-code-core__fetch-guard_fetch" },
+      ],
+    });
+
+    expect(prompt).toContain("MCP capability card");
+    expect(prompt).toContain("fusion-code-core (5 tools)");
+    expect(prompt).toContain("optional-docs (error)");
+    expect(prompt).toContain("Smart Tree");
+    expect(prompt).toContain("Octocode");
+    expect(prompt).toContain("Brave");
+    expect(prompt).toContain("Serper");
+    expect(prompt).toContain("Fetch Guard");
+    expect(prompt).toContain("Search is discovery");
+    expect(prompt).not.toContain("http://");
   });
 });

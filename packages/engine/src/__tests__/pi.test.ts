@@ -1,6 +1,8 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { describeModel, formatModelMarkerDetails, compactSessionContext, COMPACTION_FALLBACK_INSTRUCTIONS, createFnAgent, getProjectRootFromWorktree, isModelAuthTierIncompatibilityError, isRetryableModelSelectionError, promptWithFallback, type AgentOptions } from "../pi.js";
-import { createAgentSession, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { piLog } from "../logger.js";
 import { connectMcpSessionTools } from "../mcp-session-tools.js";
 
@@ -47,6 +49,14 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   DefaultResourceLoader: vi.fn().mockImplementation(function () {
     return {
       reload: vi.fn().mockResolvedValue(undefined),
+      getExtensions: vi.fn(() => ({ extensions: [], errors: [], runtime: {} })),
+      getSkills: vi.fn(() => ({ skills: [], diagnostics: [] })),
+      getPrompts: vi.fn(() => ({ prompts: [], diagnostics: [] })),
+      getThemes: vi.fn(() => ({ themes: [], diagnostics: [] })),
+      getAgentsFiles: vi.fn(() => ({ agentsFiles: [] })),
+      getSystemPrompt: vi.fn(() => undefined),
+      getAppendSystemPrompt: vi.fn(() => ["existing dynamic prompt"]),
+      extendResources: vi.fn(),
       skillsOverride: undefined,
     };
   }),
@@ -77,8 +87,10 @@ vi.mock("../mcp-session-tools.js", () => ({
     tools: [],
     connected: [],
     skipped: [],
+    toolSources: [],
     dispose: vi.fn().mockResolvedValue(undefined),
   }),
+  buildMcpCapabilityPrompt: vi.fn(() => "## MCP capability card\nConnected: docs"),
 }));
 
 // Import mock accessors after mocking (must use dynamic import for hoisted mocks)
@@ -910,6 +922,45 @@ describe("session failure diagnostics", () => {
     expect(session.prompt).toHaveBeenCalledWith("Use docs", expect.objectContaining({ mcpServers }));
   });
 
+  it("appends the live MCP capability card without reloading the base resource loader", async () => {
+    const createAgentSessionMock = vi.mocked(createAgentSession);
+    const session = {
+      model: { provider: "test", id: "primary-model" },
+      prompt: vi.fn(),
+      subscribe: vi.fn(),
+      dispose: vi.fn(),
+      sessionFile: undefined,
+    } as unknown as AgentSession;
+    vi.mocked(connectMcpSessionTools).mockResolvedValueOnce({
+      tools: [],
+      connected: ["docs"],
+      skipped: [],
+      toolSources: [],
+      dispose: vi.fn().mockResolvedValue(undefined),
+    });
+    createAgentSessionMock.mockReset();
+    createAgentSessionMock.mockResolvedValueOnce({ session } as any);
+
+    await createFnAgent({
+      cwd: "/test/project",
+      systemPrompt: "Test MCP capability prompt",
+      defaultProvider: "anthropic",
+      defaultModelId: "primary-model",
+      mcpServers: [{ name: "docs", transport: "stdio", command: "fake-mcp" }],
+    });
+
+    const createOptions = createAgentSessionMock.mock.calls[0]?.[0] as {
+      resourceLoader: { getAppendSystemPrompt: () => string[] };
+    };
+    expect(createOptions.resourceLoader.getAppendSystemPrompt()).toEqual([
+      "existing dynamic prompt",
+      "## MCP capability card\nConnected: docs",
+    ]);
+    expect(createOptions.resourceLoader).not.toBe(
+      vi.mocked(DefaultResourceLoader).mock.results.at(-1)?.value,
+    );
+  });
+
   it("forwards ccc-fusion profile and subscription readiness through createFnAgent to the actual MCP connection seam", async () => {
     const createAgentSessionMock = vi.mocked(createAgentSession);
     const session = {
@@ -1171,6 +1222,32 @@ describe("session failure diagnostics", () => {
   describe("createFnAgent cccProviderAttemptBinding controller seam", () => {
     const providerModel = { provider: "pi-claude-cli", id: "claude-sonnet-4-6" } as any;
     const providerContext = { messages: [] } as any;
+    let settingsPath: string;
+    let previousSettings: Buffer | null;
+
+    beforeAll(async () => {
+      const workerHome = process.env.HOME;
+      if (!workerHome) throw new Error("Vitest worker HOME must be isolated");
+      const settingsDir = join(workerHome, ".fusion");
+      settingsPath = join(settingsDir, "settings.json");
+      previousSettings = await readFile(settingsPath).catch(() => null);
+      await mkdir(settingsDir, { recursive: true });
+      await writeFile(settingsPath, JSON.stringify({
+        customProviders: [{
+          id: "omniroute-minimax-m3-pinned",
+          name: "OmniRoute MiniMax M3 Pinned",
+          apiType: "openai-compatible",
+          baseUrl: "http://127.0.0.1:8092/v1",
+          models: [{ id: "minimax/MiniMax-M3", name: "MiniMax M3" }],
+        }],
+      }));
+    });
+
+    afterAll(async () => {
+      if (previousSettings) await writeFile(settingsPath, previousSettings);
+      else await rm(settingsPath, { force: true });
+    });
+
     const dispatchKeyForAttempt = (attemptKey: string) => `pi-stream:${attemptKey.replace(/^attempt-/, "")}`;
     const authorityBinding = Object.freeze({
       projectId: "project-pi",
@@ -1273,9 +1350,12 @@ describe("session failure diagnostics", () => {
       providerStream?: ReturnType<typeof vi.fn>;
       providerStreamSimple?: ReturnType<typeof vi.fn>;
       receiptAdapterId?: "terminal-route-sse-comments.v1";
+      terminalRouteMembers?: readonly Readonly<{ provider: string; model: string }>[];
     }) {
-      const selectedModel = input.receiptAdapterId
-        ? { provider: "omniroute-minimax-m3-pinned", id: "minimax/MiniMax-M3" }
+      const selectedModel = input.terminalRouteMembers
+        ? { provider: "omniroute-minimax-m3-pinned", id: "combo/minimax-latest" }
+        : input.receiptAdapterId
+          ? { provider: "omniroute-minimax-m3-pinned", id: "minimax/MiniMax-M3" }
         : providerModel;
       const createAgentSessionMock = vi.mocked(createAgentSession);
       const providerStream = input.providerStream ?? vi.fn(successfulAsyncStream);
@@ -1309,6 +1389,13 @@ describe("session failure diagnostics", () => {
           turnKey: "turn-stable-01",
           controller: Object.freeze(input.controller),
           ...(input.receiptAdapterId ? { receiptAdapterId: input.receiptAdapterId } : {}),
+          ...(input.terminalRouteMembers
+            ? {
+              terminalRouteMembers: Object.freeze(
+                input.terminalRouteMembers.map((member) => Object.freeze({ ...member })),
+              ),
+            }
+            : {}),
         }),
       } as any);
 
@@ -1491,6 +1578,86 @@ describe("session failure diagnostics", () => {
         },
       }));
       expect(lifecycle).toEqual(["final", "reconcile"]);
+    });
+
+    it("RED-ALIAS-PI-1: reconciles an allowlisted combo member while keeping the requested Pi route effective", async () => {
+      const comboModel = { provider: "omniroute-minimax-m3-pinned", id: "combo/minimax-latest" } as any;
+      const terminalRouteMembers = [
+        { provider: "minimax", model: "MiniMax-M3" },
+        { provider: "minimax", model: "MiniMax-M3.1" },
+      ] as const;
+      const comboMessage = {
+        ...message,
+        provider: comboModel.provider,
+        model: comboModel.id,
+        omniRoute: terminalRouteMembers[0],
+      } as any;
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => comboMessage),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "done", reason: "stop", message: comboMessage };
+        },
+      }));
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({ kind: "dispatch-permit", scope: scopeFromDispatchInput(input) })),
+        reconcile: vi.fn(async (input) => committedScope(input, {
+          binding: {
+            ...authorityBinding,
+            providerId: input.binding.providerId,
+            modelId: input.binding.modelId,
+            transport: input.binding.transport,
+          },
+        })),
+      };
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+        terminalRouteMembers,
+      });
+
+      await expect(created.modelRuntime.stream(comboModel, providerContext, {}).result())
+        .resolves.toMatchObject({ omniRoute: terminalRouteMembers[0] });
+      expect(controller.reconcile).toHaveBeenCalledWith(expect.objectContaining({
+        effectiveRoute: expect.objectContaining({
+          effectiveProvider: "omniroute-minimax-m3-pinned",
+          effectiveModel: "combo/minimax-latest",
+          omniRoute: { final: terminalRouteMembers[0] },
+        }),
+      }));
+    });
+
+    it("RED-ALIAS-PI-2: refuses a Luna terminal substitution for a sealed combo before reconciliation", async () => {
+      const comboModel = { provider: "omniroute-minimax-m3-pinned", id: "combo/minimax-latest" } as any;
+      const terminalRouteMembers = [
+        { provider: "minimax", model: "MiniMax-M3" },
+      ] as const;
+      const substitutedMessage = {
+        ...message,
+        provider: comboModel.provider,
+        model: comboModel.id,
+        omniRoute: { provider: "cx", model: "gpt-5.6-luna-max" },
+      } as any;
+      const providerStream = vi.fn(() => ({
+        result: vi.fn(async () => substitutedMessage),
+        async *[Symbol.asyncIterator]() {
+          yield { type: "done", reason: "stop", message: substitutedMessage };
+        },
+      }));
+      const controller = {
+        preDispatch: vi.fn(async (input) => ({ kind: "dispatch-permit", scope: scopeFromDispatchInput(input) })),
+        reconcile: vi.fn(),
+      };
+      const created = await createBoundAgent({
+        controller,
+        providerStream,
+        receiptAdapterId: "terminal-route-sse-comments.v1",
+        terminalRouteMembers,
+      });
+
+      await expect(created.modelRuntime.stream(comboModel, providerContext, {}).result())
+        .rejects.toThrow(/not an admitted terminal member/u);
+      expect(controller.reconcile).not.toHaveBeenCalled();
     });
 
     /*

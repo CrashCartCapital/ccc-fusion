@@ -35,6 +35,7 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type ResourceLoader,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -105,7 +106,13 @@ import { READONLY_ALLOWLIST, filterCustomToolsForReadonly, isReadonlyAllowed } f
 import { createStreamingDeltaNormalizer } from "./streaming-delta.js";
 import { isModelAuthTierIncompatibilityError, isProviderModelNotFoundError, isUnsupportedMessageRoleError } from "./transient-error-detector.js";
 import { logMcpForwardingSkipped, runtimeSupportsMcp } from "./mcp-runtime-support.js";
-import { connectMcpSessionTools, type McpClientFactory, type McpSessionToolset } from "./mcp-session-tools.js";
+import {
+  buildMcpCapabilityPrompt,
+  connectMcpSessionTools,
+  type McpClientFactory,
+  type McpSessionToolset,
+} from "./mcp-session-tools.js";
+import type { ApprovedMcpDiscoveryTool } from "./fusion-code-core-mcp-policy.js";
 import { assertCccFusionSubscriptionReady, CCC_FUSION_PROFILE } from "./cli-agent/ccc-subscription-policy.js";
 import { validateCccLoopbackHttpUrl } from "./ccc-loopback-policy.js";
 import {
@@ -394,6 +401,11 @@ type CccOmniRouteReceipt = Readonly<{
   final: CccOmniRouteObservation;
 }>;
 
+type CccOmniRouteExpectation = Readonly<{
+  requested: CccOmniRouteObservation;
+  terminalRouteMembers?: readonly CccOmniRouteObservation[];
+}>;
+
 type CccOmniRouteState = {
   initial?: CccOmniRouteObservation;
 };
@@ -417,15 +429,31 @@ function splitCccProviderQualifiedModel(modelId: unknown): CccOmniRouteObservati
 function requireCccTerminalRouteRequestedIdentity(
   receiptAdapterId: CccProviderAttemptBinding["receiptAdapterId"],
   modelId: unknown,
-): CccOmniRouteObservation | undefined {
-  if (receiptAdapterId === undefined) return undefined;
+  terminalRouteMembers: CccProviderAttemptBinding["terminalRouteMembers"],
+): CccOmniRouteExpectation | undefined {
+  if (receiptAdapterId === undefined) {
+    if (terminalRouteMembers !== undefined) {
+      throw new Error("ccc-fusion terminalRouteMembers requires a terminal route receipt adapter");
+    }
+    return undefined;
+  }
   const requested = splitCccProviderQualifiedModel(modelId);
   if (!requested) {
     throw new Error(
       `ccc-fusion terminal route receipt adapter requires a provider-qualified requested model: ${String(modelId)}`,
     );
   }
-  return requested;
+  const comboRequest = requested.provider === "combo";
+  if (comboRequest && terminalRouteMembers === undefined) {
+    throw new Error("ccc-fusion combo request requires terminalRouteMembers");
+  }
+  if (!comboRequest && terminalRouteMembers !== undefined) {
+    throw new Error("ccc-fusion terminalRouteMembers is permitted only for a combo request");
+  }
+  return {
+    requested,
+    ...(terminalRouteMembers ? { terminalRouteMembers } : {}),
+  };
 }
 
 function readCccOmniRouteFinal(result: unknown): CccOmniRouteObservation | undefined {
@@ -441,10 +469,11 @@ function readCccOmniRouteFinal(result: unknown): CccOmniRouteObservation | undef
 }
 
 function requireCccOmniRouteReceipt(
-  requested: CccOmniRouteObservation,
+  expectation: CccOmniRouteExpectation,
   state: CccOmniRouteState | undefined,
   result: unknown,
 ): CccOmniRouteReceipt {
+  const { requested, terminalRouteMembers } = expectation;
   /*
    * The initial HTTP receipt is corroborating evidence, not the proof. When
    * OmniRoute has to wait on a real upstream it flushes an
@@ -460,23 +489,34 @@ function requireCccOmniRouteReceipt(
   if (!final) {
     throw new Error("ccc-fusion OmniRoute terminal SSE route receipt missing");
   }
-  if (initial && (initial.provider !== requested.provider || initial.model !== requested.model)) {
-    throw new Error(
-      `ccc-fusion OmniRoute initial route mismatch: requested ${requested.provider}/${requested.model}, `
-      + `initial ${initial.provider}/${initial.model}`,
-    );
-  }
-  if (final.provider !== requested.provider || final.model !== requested.model) {
-    throw new Error(
-      `ccc-fusion OmniRoute final route mismatch: requested ${requested.provider}/${requested.model}, `
-      + `final ${final.provider}/${final.model}`,
-    );
-  }
   if (initial && (initial.provider !== final.provider || initial.model !== final.model)) {
     throw new Error(
       `ccc-fusion OmniRoute initial/final route mismatch: initial ${initial.provider}/${initial.model}, `
       + `final ${final.provider}/${final.model}`,
     );
+  }
+  if (terminalRouteMembers) {
+    const admitted = terminalRouteMembers.some(
+      (member) => member.provider === final.provider && member.model === final.model,
+    );
+    if (!admitted) {
+      throw new Error(
+        `ccc-fusion OmniRoute final route is not an admitted terminal member: ${final.provider}/${final.model}`,
+      );
+    }
+  } else {
+    if (initial && (initial.provider !== requested.provider || initial.model !== requested.model)) {
+      throw new Error(
+        `ccc-fusion OmniRoute initial route mismatch: requested ${requested.provider}/${requested.model}, `
+        + `initial ${initial.provider}/${initial.model}`,
+      );
+    }
+    if (final.provider !== requested.provider || final.model !== requested.model) {
+      throw new Error(
+        `ccc-fusion OmniRoute final route mismatch: requested ${requested.provider}/${requested.model}, `
+        + `final ${final.provider}/${final.model}`,
+      );
+    }
   }
   return initial ? { initial, final } : { final };
 }
@@ -516,6 +556,7 @@ type CccResponseIdentitySession = AgentSession & {
     provider: string;
     modelId: string;
     omniRoute?: boolean;
+    terminalRouteMembers?: readonly CccOmniRouteObservation[];
   };
 };
 
@@ -635,7 +676,12 @@ function assertCccResponseModelIdentity(session: AgentSession): void {
     if (!requested) {
       throw new Error(`ccc-fusion OmniRoute terminal route receipt missing: configured ${expected.provider}/${expected.modelId}`);
     }
-    requireCccOmniRouteReceipt(requested, undefined, assistant);
+    requireCccOmniRouteReceipt({
+      requested,
+      ...(expected.terminalRouteMembers
+        ? { terminalRouteMembers: expected.terminalRouteMembers }
+        : {}),
+    }, undefined, assistant);
     return;
   }
   const responseModel = assistant?.responseModel;
@@ -705,7 +751,9 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
     bindingRecord,
     bindingRecord.receiptAdapterId === undefined
       ? ["controller", "turnKey"]
-      : ["controller", "receiptAdapterId", "turnKey"],
+      : bindingRecord.terminalRouteMembers === undefined
+        ? ["controller", "receiptAdapterId", "turnKey"]
+        : ["controller", "receiptAdapterId", "terminalRouteMembers", "turnKey"],
     "cccProviderAttemptBinding",
   );
   const binding = bindingRecord;
@@ -717,6 +765,31 @@ function validateCccProviderAttemptBinding(input: unknown): CccProviderAttemptBi
     && binding.receiptAdapterId !== "terminal-route-sse-comments.v1"
   ) {
     throw new Error("cccProviderAttemptBinding.receiptAdapterId is unsupported");
+  }
+  if (binding.terminalRouteMembers !== undefined) {
+    if (!Array.isArray(binding.terminalRouteMembers) || binding.terminalRouteMembers.length === 0) {
+      throw new Error("cccProviderAttemptBinding.terminalRouteMembers must be a non-empty frozen array");
+    }
+    if (!Object.isFrozen(binding.terminalRouteMembers)) {
+      throw new Error("cccProviderAttemptBinding.terminalRouteMembers must be frozen");
+    }
+    const seen = new Set<string>();
+    binding.terminalRouteMembers.forEach((candidate: unknown, index: number) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) || !Object.isFrozen(candidate)) {
+        throw new Error(`cccProviderAttemptBinding.terminalRouteMembers[${index}] must be a frozen object`);
+      }
+      exactObjectKeys(candidate as Record<string, unknown>, ["model", "provider"], `cccProviderAttemptBinding.terminalRouteMembers[${index}]`);
+      const { provider, model } = candidate as Record<string, unknown>;
+      if (
+        typeof provider !== "string" || provider.length === 0 || provider !== provider.trim()
+        || typeof model !== "string" || model.length === 0 || model !== model.trim()
+      ) {
+        throw new Error(`cccProviderAttemptBinding.terminalRouteMembers[${index}] must contain canonical provider/model strings`);
+      }
+      const key = `${provider}\u0000${model}`;
+      if (seen.has(key)) throw new Error("cccProviderAttemptBinding.terminalRouteMembers must not contain duplicates");
+      seen.add(key);
+    });
   }
   const controller = binding.controller;
   if (!controller || typeof controller !== "object" || Array.isArray(controller)) {
@@ -911,7 +984,7 @@ function assertCccProviderAttemptProvedFailedTerminalScope(scope: CccProviderAtt
 function createCccProviderAttemptControlledStream(input: {
   binding: CccProviderAttemptBinding;
   state: CccProviderAttemptSessionState;
-  omniRouteRequested?: CccOmniRouteObservation;
+  omniRouteRequested?: CccOmniRouteExpectation;
   dispatch: (...args: any[]) => AsyncIterable<any> & { result: () => Promise<any> };
   model: any;
   dispatchModel: any;
@@ -1826,12 +1899,34 @@ export interface AgentOptions {
   builtinToolsAllowlist?: BuiltinWebToolName[];
   cccCampaignPhaseToolPolicy?: {
     readOnlyToolNames: readonly string[];
+    approvedMcpDiscoveryTools?: readonly ApprovedMcpDiscoveryTool[];
     exemptToolNames?: readonly string[];
     maxReadOnlyToolCallsBeforeGuidance: number;
     maxReadOnlyToolCallsBeforeRefusal: number;
     guidanceMessage: string;
     refusalMessage: string;
+    onApprovedMcpDiscoveryToolCall?: (
+      toolName: string,
+      params: Record<string, unknown> | undefined,
+    ) => void;
     currentPhase?: () => string | undefined;
+    completionSignalOnly?: () => boolean;
+    signalOnlyRefusalMessage?: string;
+    onSignalOnlyViolation?: (toolName: string) => void;
+    worktreePath?: string;
+    allowedWriteRoots?: readonly string[];
+    capturePotentialMutationBaseline?: () => Promise<unknown>;
+    onPotentialMutationSettled?: (
+      toolName: string,
+      params: Record<string, unknown> | undefined,
+      baseline: unknown,
+      result: unknown,
+    ) => Promise<Readonly<{
+      violation?: Readonly<{
+        message: string;
+        details?: Record<string, unknown>;
+      }>;
+    }>>;
     onPotentialMutationCompleted?: (
       toolName: string,
       params: Record<string, unknown> | undefined,
@@ -2684,6 +2779,7 @@ export function wrapToolsWithBoundary(
 export function wrapToolsWithCccCampaignPhaseToolPolicy(
   tools: ToolDefinition[],
   policy: AgentOptions["cccCampaignPhaseToolPolicy"] | undefined,
+  approvedMcpDiscoveryToolNames: readonly string[] = [],
 ): ToolDefinition[] {
   if (!policy) return tools;
   const readOnlyToolNames = new Set(
@@ -2692,6 +2788,9 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
   if (readOnlyToolNames.size === 0) return tools;
   const exemptToolNames = new Set(
     (policy.exemptToolNames ?? []).map((name) => name.trim().toLowerCase()).filter(Boolean),
+  );
+  const approvedMcpDiscoveryNames = new Set(
+    approvedMcpDiscoveryToolNames.map((name) => name.trim().toLowerCase()).filter(Boolean),
   );
   const guidanceLimit = Number.isSafeInteger(policy.maxReadOnlyToolCallsBeforeGuidance)
     ? Math.max(1, policy.maxReadOnlyToolCallsBeforeGuidance)
@@ -2704,6 +2803,16 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
   );
   let readOnlyToolCalls = 0;
   let postRefusalMutationAttempted = false;
+  const pathWithinAdmittedRoots = (path: string): boolean => {
+    if (!policy.worktreePath || !policy.allowedWriteRoots?.length) return true;
+    const worktree = resolve(policy.worktreePath);
+    const target = isAbsolute(path) ? resolve(path) : resolve(worktree, path);
+    if (!isSameOrInsidePath(worktree, target)) return false;
+    return policy.allowedWriteRoots.some((root) => {
+      const admitted = resolve(worktree, root);
+      return isSameOrInsidePath(admitted, target);
+    });
+  };
   const appendGuidance = (
     result: unknown,
     message: string,
@@ -2730,11 +2839,31 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
         maxReadOnlyToolCallsBeforeRefusal: refusalLimit,
       })
     : undefined;
+  const custodyViolationResult = (
+    result: unknown,
+    message: string,
+    details: Record<string, unknown> = {},
+  ) => {
+    const original = result && typeof result === "object" && !Array.isArray(result)
+      ? result as Record<string, unknown>
+      : {};
+    const originalContent = Array.isArray(original.content) ? original.content : [];
+    return {
+      ...original,
+      content: [...originalContent, { type: "text", text: message }],
+      details: {
+        ...details,
+        originalToolResult: result,
+      },
+      isError: true,
+      terminate: true,
+      ok: false,
+      error: message,
+    };
+  };
   return tools.map((tool) => {
     const normalizedToolName = tool.name.trim().toLowerCase();
-    if (exemptToolNames.has(normalizedToolName)) {
-      return { ...tool, executionMode: "sequential" as const };
-    }
+    const exempt = exemptToolNames.has(normalizedToolName);
     const originalExecute = tool.execute as any;
     return {
       ...tool,
@@ -2743,17 +2872,92 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
       // in this policy must participate in one deterministic sequence.
       executionMode: "sequential" as const,
       execute: async (...args: any[]) => {
-        if ((policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
-          return originalExecute(...args);
-        }
         const params = args[1] as Record<string, unknown> | undefined;
-        const discovery = readOnlyToolNames.has(normalizedToolName)
-          && isCccCampaignDiscoveryToolCall(tool.name, params);
+        if (policy.completionSignalOnly?.() && !exempt) {
+          policy.onSignalOnlyViolation?.(tool.name);
+          return {
+            ...boundaryRejection(
+              policy.signalOnlyRefusalMessage
+                ?? "CCC_CAMPAIGN_PHASE_SIGNAL_ONLY_REFUSED: fn_complete_phase is the only allowed tool in this handshake.",
+              { phase: "AWAIT_PHASE_SIGNAL", toolName: tool.name },
+            ),
+            terminate: true,
+          };
+        }
+        if (exempt) return originalExecute(...args);
+        if (
+          (normalizedToolName === "write" || normalizedToolName === "edit")
+          && typeof params?.path === "string"
+          && !pathWithinAdmittedRoots(params.path)
+        ) {
+          return boundaryRejection(
+            `CCC_CAMPAIGN_WRITE_ENVELOPE_REFUSED: ${tool.name} target ${params.path} is outside the admitted write roots.`,
+            {
+              phase: policy.currentPhase?.(),
+              toolName: tool.name,
+              path: params.path,
+              allowedWriteRoots: policy.allowedWriteRoots,
+            },
+          );
+        }
+        const potentialMutation = isCccCampaignPotentialMutationToolCall(tool.name, params);
+        const executeWithCustody = async () => {
+          const baseline = potentialMutation
+            ? await policy.capturePotentialMutationBaseline?.()
+            : undefined;
+          const result = await originalExecute(...args);
+          if (potentialMutation && policy.onPotentialMutationSettled) {
+            const settlement = await policy.onPotentialMutationSettled(
+              tool.name,
+              params,
+              baseline,
+              result,
+            );
+            if (settlement.violation) {
+              return {
+                result: custodyViolationResult(
+                  result,
+                  settlement.violation.message,
+                  settlement.violation.details,
+                ),
+                custodyViolation: true,
+                confirmedMutation: false,
+              };
+            }
+          }
+          const confirmedMutation = potentialMutation
+            ? await policy.onPotentialMutationCompleted?.(tool.name, params) ?? false
+            : false;
+          return { result, custodyViolation: false, confirmedMutation };
+        };
+        if ((policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
+          return (await executeWithCustody()).result;
+        }
+        const nativeDiscovery = (
+          readOnlyToolNames.has(normalizedToolName)
+          && isCccCampaignDiscoveryToolCall(tool.name, params)
+        );
+        const approvedMcpDiscovery = approvedMcpDiscoveryNames.has(normalizedToolName);
+        if (normalizedToolName.startsWith("mcp__") && !approvedMcpDiscovery) {
+          return boundaryRejection(
+            "CCC_CAMPAIGN_UNAPPROVED_MCP_TOOL_REFUSED: this MCP tool is not in the exact admitted discovery catalog.",
+            {
+              phase: "DISCOVER",
+              toolName: tool.name,
+            },
+          );
+        }
+        const discovery = nativeDiscovery || approvedMcpDiscovery;
         if (discovery) {
+          if (approvedMcpDiscovery) {
+            policy.onApprovedMcpDiscoveryToolCall?.(tool.name, params);
+          }
           readOnlyToolCalls += 1;
           const refusal = refuseIfExhausted(tool.name);
           if (refusal) return refusal;
-          const result = await originalExecute(...args);
+          const execution = await executeWithCustody();
+          const { result } = execution;
+          if (execution.custodyViolation) return result;
           if (readOnlyToolCalls > guidanceLimit) {
             return appendGuidance(result, policy.guidanceMessage, {
               phase: "DISCOVER",
@@ -2779,9 +2983,9 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
         }
         if (readOnlyToolCalls >= refusalLimit) postRefusalMutationAttempted = true;
 
-        const result = await originalExecute(...args);
-        if (!isCccCampaignPotentialMutationToolCall(tool.name, params)) return result;
-        const confirmedMutation = await policy.onPotentialMutationCompleted?.(tool.name, params) ?? false;
+        const execution = await executeWithCustody();
+        const { result, confirmedMutation } = execution;
+        if (execution.custodyViolation || !potentialMutation) return result;
         if (confirmedMutation || (policy.currentPhase?.() ?? "DISCOVER") !== "DISCOVER") {
           return result;
         }
@@ -2804,6 +3008,38 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
       },
     };
   });
+}
+
+function resolveApprovedMcpDiscoveryToolNames(
+  policy: AgentOptions["cccCampaignPhaseToolPolicy"] | undefined,
+  toolset: McpSessionToolset | undefined,
+): string[] {
+  if (!policy?.approvedMcpDiscoveryTools?.length || !toolset?.toolSources.length) return [];
+  const approvedSources = new Set(
+    policy.approvedMcpDiscoveryTools.map(({ serverName, toolName }) => `${serverName}\0${toolName}`),
+  );
+  return toolset.toolSources
+    .filter(({ serverName, sourceToolName }) => approvedSources.has(`${serverName}\0${sourceToolName}`))
+    .map(({ exposedToolName }) => exposedToolName);
+}
+
+function appendResourceLoaderSystemPrompt(
+  resourceLoader: ResourceLoader,
+  prompt: string | undefined,
+): ResourceLoader {
+  const extra = prompt?.trim();
+  if (!extra) return resourceLoader;
+  return {
+    getExtensions: () => resourceLoader.getExtensions(),
+    getSkills: () => resourceLoader.getSkills(),
+    getPrompts: () => resourceLoader.getPrompts(),
+    getThemes: () => resourceLoader.getThemes(),
+    getAgentsFiles: () => resourceLoader.getAgentsFiles(),
+    getSystemPrompt: () => resourceLoader.getSystemPrompt(),
+    getAppendSystemPrompt: () => [...resourceLoader.getAppendSystemPrompt(), extra],
+    extendResources: (paths) => resourceLoader.extendResources(paths),
+    reload: (options) => resourceLoader.reload(options),
+  };
 }
 
 /*
@@ -3247,6 +3483,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       const omniRouteRequested = requireCccTerminalRouteRequestedIdentity(
         cccProviderAttemptBinding?.receiptAdapterId,
         expectedModelId,
+        cccProviderAttemptBinding?.terminalRouteMembers,
       );
       const optionsWithBoundary = {
         ...(requestOptions ?? {}),
@@ -3624,6 +3861,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
       requireCccTerminalRouteRequestedIdentity(
         cccProviderAttemptBinding?.receiptAdapterId,
         modelOverride.id,
+        cccProviderAttemptBinding?.terminalRouteMembers,
       );
     }
     // pi-coding-agent 0.68+: `tools` is a string[] allowlist of tool names, not
@@ -3673,6 +3911,15 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     } else if (forwardedMcpServers.length > 0 && isReadonly) {
       piLog.log(`readonly session — MCP servers (${forwardedMcpServers.length}) skipped`);
     }
+
+    const approvedMcpDiscoveryToolNames = resolveApprovedMcpDiscoveryToolNames(
+      options.cccCampaignPhaseToolPolicy,
+      mcpToolset,
+    );
+    const sessionResourceLoader = appendResourceLoaderSystemPrompt(
+      resourceLoader,
+      mcpToolset ? buildMcpCapabilityPrompt(mcpToolset) : undefined,
+    );
 
     const mcpReadonlyTools = new Set(mcpToolset?.tools ?? []);
     const candidateCustomTools = [
@@ -3725,6 +3972,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     const phaseBoundedTools = wrapToolsWithCccCampaignPhaseToolPolicy(
       boundaryTools,
       options.cccCampaignPhaseToolPolicy,
+      approvedMcpDiscoveryToolNames,
     );
     const cccBinding = await resolveCccReceiptBinding(phaseBoundedTools);
     const customToolList: ToolDefinition[] = options.profile === CCC_FUSION_PROFILE
@@ -3781,7 +4029,7 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
     const createSessionOptions: NonNullable<Parameters<typeof createAgentSession>[0]> = {
       cwd: options.cwd,
       modelRuntime,
-      resourceLoader,
+      resourceLoader: sessionResourceLoader,
       noTools: "builtin",
       customTools: customToolList,
       sessionManager,
@@ -3849,6 +4097,9 @@ export async function createFnAgent(options: AgentOptions): Promise<AgentResult>
           provider: modelOverride.provider,
           modelId: modelOverride.id,
           ...(terminalRouteReceiptSelected ? { omniRoute: true } : {}),
+          ...(cccProviderAttemptBinding?.terminalRouteMembers
+            ? { terminalRouteMembers: cccProviderAttemptBinding.terminalRouteMembers }
+            : {}),
         };
       }
       return result;

@@ -44,7 +44,12 @@ import {
   type CccPrdProductTaskStatus,
   type CccPrdProductWorkItemStatus,
 } from "../ccc-prd/product-status.js";
-import { cccCampaignRequestFloor } from "../ccc-campaign/request-budget.js";
+import {
+  CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK,
+  cccCampaignRecommendedStartingMaximum,
+  cccCampaignRequestFloor,
+  cccCampaignRequestSizingGuidance,
+} from "../ccc-campaign/request-budget.js";
 import { CccCampaignContextError } from "../ccc-campaign/types.js";
 import { CccPrdImportError } from "../ccc-prd/import-error.js";
 import type { CccProviderAttemptScope } from "../ccc-campaign/types.js";
@@ -1085,6 +1090,28 @@ describe("C3: request floor is 2x provider tasks (structural, not adequacy)", ()
     const at = productRequestBudgetStatus(2, 4, 0);
     expect(at.deterministicMinimum).toBe(4);
     expect(at.headroomAboveMinimum).toBe(0);
+  });
+
+  it("recommends a finite generous starting maximum distinct from the admission floor", () => {
+    expect(CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK).toBe(384);
+    expect(cccCampaignRecommendedStartingMaximum(1)).toBe(384);
+    expect(cccCampaignRecommendedStartingMaximum(3)).toBe(1_152);
+    expect(cccCampaignRecommendedStartingMaximum(3)).toBeGreaterThan(
+      cccCampaignRequestFloor(3),
+    );
+  });
+
+  it("classifies floor-sized budgets as tight and recommendation-sized budgets as generous", () => {
+    expect(cccCampaignRequestSizingGuidance(1, 2)).toEqual({
+      recommendedStartingMaximum: 384,
+      headroomAboveRecommendation: -382,
+      sizingPosture: "tight",
+    });
+    expect(cccCampaignRequestSizingGuidance(1, 384)).toEqual({
+      recommendedStartingMaximum: 384,
+      headroomAboveRecommendation: 0,
+      sizingPosture: "generous",
+    });
   });
 });
 

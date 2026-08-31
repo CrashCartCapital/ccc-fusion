@@ -350,6 +350,40 @@ describe("CCC semantic-proof sandbox", () => {
   );
 
   it.skipIf(process.platform !== "darwin")(
+    "RED-GOLDEN-nested-node: an admitted Node verifier can execute the same sealed Node",
+    async () => {
+      const root = await fixtureRoot();
+      const proofRoot = join(root, "proof");
+      const scratchRoot = join(root, "scratch");
+      const deniedRoot = join(root, "denied-repository");
+      await Promise.all([mkdir(proofRoot), mkdir(scratchRoot), mkdir(deniedRoot)]);
+      await writeFile(join(proofRoot, "child.mjs"), "process.stdout.write('child-ok\\n');\n");
+      await writeFile(join(proofRoot, "parent.mjs"), [
+        'import { spawnSync } from "node:child_process";',
+        'const child = spawnSync(process.execPath, ["child.mjs"], { encoding: "utf8", env: { PATH: process.env.PATH, OPENSSL_CONF: process.env.OPENSSL_CONF } });',
+        'process.stdout.write(JSON.stringify({ status: child.status, signal: child.signal, error: child.error?.message, stdout: child.stdout, stderr: child.stderr }));',
+        'process.exitCode = child.status === 0 && child.stdout === "child-ok\\n" ? 0 : 23;',
+      ].join("\n"));
+      await chmod(proofRoot, 0o555);
+
+      const result = await runCccSemanticProofSandboxedProcess({
+        proofRoot,
+        scratchRoot,
+        taskExecutable: "/opt/homebrew/bin/task",
+        nodeExecutable: process.execPath,
+        deniedReadRoots: [deniedRoot],
+        executable: process.execPath,
+        args: ["parent.mjs"],
+        timeoutMs: 10_000,
+        maxOutputBytes: 16_384,
+      });
+
+      expect(result, JSON.stringify(result)).toMatchObject({ exitCode: 0, timedOut: false, outputOverLimit: false });
+      expect(JSON.parse(result.stdout)).toMatchObject({ status: 0, stdout: "child-ok\n", stderr: "" });
+    },
+  );
+
+  it.skipIf(process.platform !== "darwin")(
     "RED-S5-evidence-exactness: refuses bounded output overflow instead of truncating semantic evidence",
     async () => {
       const root = await fixtureRoot();

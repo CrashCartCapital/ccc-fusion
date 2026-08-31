@@ -45,6 +45,49 @@ describe("CCC provider-neutral phase decisions", () => {
     },
   );
 
+  it("phase_signal_handshake_after_dirty_continuation enters one signal-only state", () => {
+    const decision = decideCccPhaseTransition({
+      ...base,
+      phase: "MUTATE",
+      stopReason: "stop",
+      hasConfirmedMutation: true,
+      mutateContinuations: 1,
+    } as any);
+
+    expect(decision).toMatchObject({
+      phase: "AWAIT_PHASE_SIGNAL",
+      action: "PROMPT_PHASE_SIGNAL",
+      noProgressClass: "class-3",
+    });
+  });
+
+  it("routes the signal-only state to VERIFY only after an explicit phase signal", () => {
+    expect(decideCccPhaseTransition({
+      ...base,
+      phase: "AWAIT_PHASE_SIGNAL",
+      explicitPhaseSignal: true,
+      hasConfirmedMutation: true,
+      mutateContinuations: 1,
+    } as any)).toMatchObject({
+      phase: "VERIFY",
+      action: "RUN_CONTROLLER_VERIFICATION",
+    });
+  });
+
+  it("fails a settled signal-only state that still omits the explicit tool signal", () => {
+    expect(decideCccPhaseTransition({
+      ...base,
+      phase: "AWAIT_PHASE_SIGNAL",
+      explicitPhaseSignal: false,
+      hasConfirmedMutation: true,
+      mutateContinuations: 1,
+    } as any)).toMatchObject({
+      phase: "TERMINAL_FAILURE",
+      action: "FAIL_TERMINAL",
+      failureReason: expect.stringMatching(/signal-only.*fn_complete_phase/i),
+    });
+  });
+
   it.each(["stop", "length"] as const)(
     "classifies quiet %s after confirmed mutation as Class 3",
     (stopReason) => {

@@ -70,6 +70,7 @@ export type {
   CccCampaignRouteReceiptAdapterId,
   CccCampaignRouteSensitivityClass,
   CccCampaignRouteServiceTier,
+  CccCampaignTerminalRouteMember,
   CccPrdProductExecutionPlan,
   CccPrdProductExecutionRouteSelection,
   CccCampaignManifest,
@@ -166,5 +167,8 @@ export {
   CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
   CCC_CAMPAIGN_REQUESTS_PER_PROVIDER_TASK_FLOOR,
+  CCC_CAMPAIGN_RECOMMENDED_REQUESTS_PER_PROVIDER_TASK,
+  cccCampaignRecommendedStartingMaximum,
   cccCampaignRequestFloor,
+  cccCampaignRequestSizingGuidance,
 } from "./request-budget.js";

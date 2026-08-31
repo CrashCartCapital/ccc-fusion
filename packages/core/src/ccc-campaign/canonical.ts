@@ -33,6 +33,7 @@ import {
   type CccCampaignRouteReceiptAdapterId,
   type CccCampaignRouteSensitivityClass,
   type CccCampaignRouteServiceTier,
+  type CccCampaignTerminalRouteMember,
   type CccCampaignTransport,
   type CccPrdProductExecutionPlan,
   type CccPrdProductExecutionRouteSelection,
@@ -41,6 +42,7 @@ import {
 const ROUTE_KEYS = ["modelId", "providerId", "taskId", "transport"] as const;
 const WORKFLOW_ROUTE_KEYS = [...ROUTE_KEYS, "workflowExtensionId"] as const;
 const ROUTE_RECEIPT_KEYS = [...ROUTE_KEYS, "receiptAdapterId"] as const;
+const ROUTE_COMBO_RECEIPT_KEYS = [...ROUTE_RECEIPT_KEYS, "terminalRouteMembers"] as const;
 const PRODUCT_ROUTE_KEYS = [
   "allowedWriteRoots",
   "commitPolicy",
@@ -55,6 +57,7 @@ const PRODUCT_ROUTE_KEYS = [
 ] as const;
 const PRODUCT_CLI_ROUTE_KEYS = [...PRODUCT_ROUTE_KEYS, "cliAdapterId"] as const;
 const PRODUCT_ROUTE_RECEIPT_KEYS = [...PRODUCT_ROUTE_KEYS, "receiptAdapterId"] as const;
+const PRODUCT_ROUTE_COMBO_RECEIPT_KEYS = [...PRODUCT_ROUTE_RECEIPT_KEYS, "terminalRouteMembers"] as const;
 const PRODUCT_ROUTE_V3_KEYS = [
   "accessTier",
   "allowedWriteRoots",
@@ -80,6 +83,7 @@ const PRODUCT_ROUTE_V3_KEYS = [
 ] as const;
 const PRODUCT_CLI_ROUTE_V3_KEYS = [...PRODUCT_ROUTE_V3_KEYS, "cliAdapterId"] as const;
 const PRODUCT_ROUTE_RECEIPT_V3_KEYS = [...PRODUCT_ROUTE_V3_KEYS, "receiptAdapterId"] as const;
+const PRODUCT_ROUTE_COMBO_RECEIPT_V3_KEYS = [...PRODUCT_ROUTE_RECEIPT_V3_KEYS, "terminalRouteMembers"] as const;
 const RECEIPT_ADAPTER_IDS = new Set<CccCampaignRouteReceiptAdapterId>([
   "terminal-route-sse-comments.v1",
 ]);
@@ -206,6 +210,64 @@ function assertReceiptAdapterModelIdentity(
   }
 }
 
+function isComboModel(modelId: string): boolean {
+  return modelId.startsWith("combo/") && modelId.indexOf("/", "combo/".length) === -1;
+}
+
+function parseTerminalRouteMembers(
+  value: unknown,
+  present: boolean,
+  modelId: string,
+  receiptAdapterId: CccCampaignRouteReceiptAdapterId | undefined,
+  label: string,
+): readonly CccCampaignTerminalRouteMember[] | undefined {
+  const combo = isComboModel(modelId);
+  if (combo && receiptAdapterId === undefined) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} combo request requires a terminal route receipt adapter`,
+    );
+  }
+  if (combo && !present) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} combo request requires terminalRouteMembers`,
+    );
+  }
+  if (!combo && present) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} terminalRouteMembers is permitted only for a combo request`,
+    );
+  }
+  if (!present) return undefined;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new CccCampaignExecutionPolicyError(
+      `${label} terminalRouteMembers must be a non-empty array`,
+    );
+  }
+  const seen = new Set<string>();
+  const members = value.map((candidate, index) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} terminalRouteMembers[${index}] must be an object`,
+      );
+    }
+    const member = candidate as Record<string, unknown>;
+    exactKeys(member, ["model", "provider"], `${label} terminalRouteMembers[${index}]`);
+    const parsed = Object.freeze({
+      provider: exactIdentifier(member.provider, `${label} terminalRouteMembers[${index}] provider`),
+      model: exactIdentifier(member.model, `${label} terminalRouteMembers[${index}] model`),
+    });
+    const key = `${parsed.provider}\u0000${parsed.model}`;
+    if (seen.has(key)) {
+      throw new CccCampaignExecutionPolicyError(
+        `${label} terminalRouteMembers must not contain duplicates`,
+      );
+    }
+    seen.add(key);
+    return parsed;
+  });
+  return Object.freeze(members);
+}
+
 function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new CccCampaignExecutionPolicyError(
@@ -224,6 +286,7 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
   }
   const isWorkflowTransport = transport === "workflow";
   const hasReceiptAdapter = Object.prototype.hasOwnProperty.call(route, "receiptAdapterId");
+  const hasTerminalRouteMembers = Object.prototype.hasOwnProperty.call(route, "terminalRouteMembers");
   if (hasReceiptAdapter && transport !== "pi") {
     throw new CccCampaignExecutionPolicyError(
       `CCC campaign execution route ${index} receiptAdapterId is forbidden for ${transport} transport`,
@@ -241,6 +304,8 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
     route,
     isWorkflowTransport
       ? WORKFLOW_ROUTE_KEYS
+      : hasTerminalRouteMembers
+        ? ROUTE_COMBO_RECEIPT_KEYS
       : hasReceiptAdapter
         ? ROUTE_RECEIPT_KEYS
         : ROUTE_KEYS,
@@ -260,6 +325,13 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
     receiptAdapterId,
     `CCC campaign execution route ${index}`,
   );
+  const terminalRouteMembers = parseTerminalRouteMembers(
+    route.terminalRouteMembers,
+    hasTerminalRouteMembers,
+    modelId,
+    receiptAdapterId,
+    `CCC campaign execution route ${index}`,
+  );
   return {
     taskId: exactIdentifier(route.taskId, `CCC campaign execution route ${index} taskId`),
     providerId: exactIdentifier(
@@ -270,6 +342,7 @@ function parseRoute(value: unknown, index: number): CccCampaignExecutionRoute {
     transport: transport as CccCampaignTransport,
     ...(workflowExtensionId ? { workflowExtensionId } : {}),
     ...(receiptAdapterId ? { receiptAdapterId } : {}),
+    ...(terminalRouteMembers ? { terminalRouteMembers } : {}),
   };
 }
 
@@ -344,6 +417,7 @@ function parseProductRoute(
     );
   }
   const hasReceiptAdapter = Object.prototype.hasOwnProperty.call(route, "receiptAdapterId");
+  const hasTerminalRouteMembers = Object.prototype.hasOwnProperty.call(route, "terminalRouteMembers");
   if (hasReceiptAdapter && transport !== "pi") {
     throw new CccCampaignExecutionPolicyError(
       `CCC campaign execution route ${index} receiptAdapterId is forbidden for ${transport} transport`,
@@ -353,6 +427,8 @@ function parseProductRoute(
     route,
     transport === "cli"
       ? PRODUCT_CLI_ROUTE_KEYS
+      : hasTerminalRouteMembers
+        ? PRODUCT_ROUTE_COMBO_RECEIPT_KEYS
       : hasReceiptAdapter
         ? PRODUCT_ROUTE_RECEIPT_KEYS
         : PRODUCT_ROUTE_KEYS,
@@ -406,6 +482,13 @@ function parseProductRoute(
     receiptAdapterId,
     `CCC campaign execution route ${index}`,
   );
+  const terminalRouteMembers = parseTerminalRouteMembers(
+    route.terminalRouteMembers,
+    hasTerminalRouteMembers,
+    modelId,
+    receiptAdapterId,
+    `CCC campaign execution route ${index}`,
+  );
   for (const allowedRoot of allowedWriteRoots) {
     if (!ownedPaths.some((ownedPath) => pathContains(ownedPath, allowedRoot))) {
       throw new CccCampaignExecutionPolicyError(
@@ -445,6 +528,7 @@ function parseProductRoute(
       }
       : {}),
     ...(receiptAdapterId ? { receiptAdapterId } : {}),
+    ...(terminalRouteMembers ? { terminalRouteMembers } : {}),
   };
 }
 
@@ -657,6 +741,7 @@ function parseProductRouteV3(
     throw new CccCampaignExecutionPolicyError(`${label} product transport must be pi or cli`);
   }
   const hasReceiptAdapter = Object.prototype.hasOwnProperty.call(route, "receiptAdapterId");
+  const hasTerminalRouteMembers = Object.prototype.hasOwnProperty.call(route, "terminalRouteMembers");
   if (hasReceiptAdapter && transport !== "pi") {
     throw new CccCampaignExecutionPolicyError(`${label} receiptAdapterId is forbidden for ${transport} transport`);
   }
@@ -664,6 +749,8 @@ function parseProductRouteV3(
     route,
     transport === "cli"
       ? PRODUCT_CLI_ROUTE_V3_KEYS
+      : hasTerminalRouteMembers
+        ? PRODUCT_ROUTE_COMBO_RECEIPT_V3_KEYS
       : hasReceiptAdapter
         ? PRODUCT_ROUTE_RECEIPT_V3_KEYS
         : PRODUCT_ROUTE_V3_KEYS,
@@ -704,6 +791,13 @@ function parseProductRouteV3(
     : undefined;
   const modelId = exactIdentifier(route.modelId, `${label} modelId`);
   assertReceiptAdapterModelIdentity(modelId, receiptAdapterId, label);
+  const terminalRouteMembers = parseTerminalRouteMembers(
+    route.terminalRouteMembers,
+    hasTerminalRouteMembers,
+    modelId,
+    receiptAdapterId,
+    label,
+  );
   return {
     taskId,
     providerId: exactIdentifier(route.providerId, `${label} providerId`),
@@ -732,6 +826,7 @@ function parseProductRouteV3(
       }
       : {}),
     ...(receiptAdapterId ? { receiptAdapterId } : {}),
+    ...(terminalRouteMembers ? { terminalRouteMembers } : {}),
   };
 }
 
@@ -983,7 +1078,19 @@ export function createCccPrdProductExecutionPlan(input: {
         `CCC PRD task ${task.id} receiptAdapterId is forbidden for cli transport`,
       );
     }
+    if (selection.transport === "cli" && selection.terminalRouteMembers !== undefined) {
+      throw new CccCampaignExecutionPolicyError(
+        `CCC PRD task ${task.id} terminalRouteMembers is forbidden for cli transport`,
+      );
+    }
     assertReceiptAdapterModelIdentity(
+      selection.modelId,
+      selection.receiptAdapterId,
+      `CCC PRD task ${task.id}`,
+    );
+    const terminalRouteMembers = parseTerminalRouteMembers(
+      selection.terminalRouteMembers,
+      selection.terminalRouteMembers !== undefined,
       selection.modelId,
       selection.receiptAdapterId,
       `CCC PRD task ${task.id}`,
@@ -1005,6 +1112,7 @@ export function createCccPrdProductExecutionPlan(input: {
       ...(selection.transport === "pi" && selection.receiptAdapterId
         ? { receiptAdapterId: selection.receiptAdapterId }
         : {}),
+      ...(terminalRouteMembers ? { terminalRouteMembers } : {}),
     };
   });
   const policy = parseCccCampaignProductExecutionPolicy({

@@ -476,6 +476,29 @@ export async function fingerprintCccCampaignAllowedCandidate(input: {
   return fingerprintCandidate(input.worktreePath, allowedRoots, admittedUntrackedPaths);
 }
 
+export type CccCampaignWriteEnvelopeSnapshot = Readonly<{
+  changedPaths: readonly string[];
+  foreignPaths: readonly string[];
+  allowedRoots: readonly string[];
+}>;
+
+/** Observe the complete candidate write set without staging, cleaning, or verifying it. */
+export async function snapshotCccCampaignWriteEnvelope(input: {
+  worktreePath: string;
+  allowedRoots: readonly string[];
+}): Promise<CccCampaignWriteEnvelopeSnapshot> {
+  const allowedRoots = input.allowedRoots.map(canonicalGitPath);
+  const { changedPaths } = await listCandidatePaths(input.worktreePath);
+  const foreignPaths = changedPaths.filter(
+    (path) => !allowedRoots.some((root) => pathWithinRoot(path, root)),
+  );
+  return {
+    changedPaths,
+    foreignPaths,
+    allowedRoots,
+  };
+}
+
 function taskProofCommands(campaign: CccCampaignTaskContext): string[] {
   const ids = new Set(campaign.proofIds);
   return campaign.proofs
