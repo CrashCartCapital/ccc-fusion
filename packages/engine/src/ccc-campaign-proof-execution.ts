@@ -769,6 +769,47 @@ function campaignModelWriteRoots(campaign: CccCampaignTaskContext): readonly str
   ].sort());
 }
 
+async function taskProofCandidateRoots(
+  store: ProofExecutionStore,
+  task: TaskDetail,
+  campaign: CccCampaignTaskContext,
+): Promise<readonly string[]> {
+  const contexts = [campaign];
+  const pending = [...(task.dependencies ?? [])];
+  const visited = new Set<string>([task.id]);
+
+  while (pending.length > 0) {
+    const taskId = pending.shift()!;
+    if (visited.has(taskId)) continue;
+    visited.add(taskId);
+    const [predecessor, predecessorCampaign] = await Promise.all([
+      store.getTask(taskId),
+      store.getCccCampaignContextForTask(taskId),
+    ]);
+    if (
+      predecessor.id !== taskId
+      || !predecessorCampaign
+      || predecessorCampaign.taskId !== taskId
+      || predecessorCampaign.route.taskId !== predecessorCampaign.semanticTaskId
+      || !sameCampaign(campaign, predecessorCampaign)
+    ) {
+      proofRefusal(
+        `CCC campaign task proof dependency custody is missing or belongs to another campaign: ${taskId}`,
+        "CCC_CAMPAIGN_PROOF_INTEGRATION_REFUSED",
+      );
+    }
+    contexts.push(predecessorCampaign);
+    pending.push(...(predecessor.dependencies ?? []));
+  }
+
+  return Object.freeze([
+    ...new Set(contexts.flatMap(({ route }) => [
+      ...(route.ownedPaths ?? []),
+      ...(route.allowedWriteRoots ?? []),
+    ]).map(canonicalGitPath)),
+  ].sort());
+}
+
 async function resolveSemanticProofExecution(
   input: CreateCccCampaignProofSuiteHandlerInput,
   node: Parameters<WorkflowNodeHandler>[0],
@@ -820,6 +861,11 @@ async function resolveSemanticProofExecution(
       proofRefusal("CCC campaign task proof gate must execute its exact admitted task proof set");
     }
     const snapshot = await inspectTaskGit(input.rootDir, input.store, task, campaign);
+    const candidateOwnershipRoots = await taskProofCandidateRoots(
+      input.store,
+      task,
+      campaign,
+    );
     return {
       phase,
       proofIds: Object.freeze([...proofIds]),
@@ -828,7 +874,7 @@ async function resolveSemanticProofExecution(
       snapshot,
       // Proof inputs may read already-committed outputs from prerequisite tasks.
       // Source mutation custody remains task-local in inspectTaskGit above.
-      candidateOwnershipRoots: Object.freeze(campaignModelWriteRoots(campaign)),
+      candidateOwnershipRoots,
       verifierDisjointRoots: campaignModelWriteRoots(campaign),
     };
   }

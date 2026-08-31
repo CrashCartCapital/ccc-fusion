@@ -124,6 +124,24 @@ function admittedProof(): CccPrdProofV2 {
   };
 }
 
+function readmitProofDefinition(
+  proof: CccPrdProofV2,
+  overrides: Partial<Omit<CccPrdProofV2, "admission">>,
+): CccPrdProofV2 {
+  const { admission, ...definition } = proof;
+  const next = { ...definition, ...overrides };
+  const definitionSha256 = computeCccPrdProofDefinitionSha256(next);
+  const digests = computeCccPrdProofV2AdmissionDigests(next);
+  return {
+    ...next,
+    admission: {
+      ...admission!,
+      definitionSha256,
+      ...digests,
+    },
+  };
+}
+
 async function fixture() {
   const scratch = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-execution-"));
   scratchRoots.push(scratch);
@@ -639,7 +657,20 @@ function semanticHandler(
         if (!task) throw new Error(`missing fixture task ${taskId}`);
         return task;
       },
-      getCccCampaignContextForTask: async () => f.campaign,
+      getCccCampaignContextForTask: async (taskId: string) => {
+        if (!options.tasks || taskId === f.task.id) return f.campaign;
+        const task = options.tasks.get(taskId);
+        if (!task) throw new Error(`missing fixture task ${taskId}`);
+        const semanticTaskId = `TASK-${taskId}`;
+        return {
+          ...f.campaign,
+          taskId,
+          semanticTaskId,
+          proofIds: [],
+          protectedActionIds: [],
+          route: { ...f.campaign.route, taskId: semanticTaskId },
+        } as CccCampaignTaskContext;
+      },
       getAsyncLayer: () => ({}) as never,
       assertCccCampaignWorkflowLeaseFence: async () => undefined,
     },
@@ -710,6 +741,133 @@ describe("CCC semantic proof v2 execution", () => {
         changedPathsSha256: sha256(JSON.stringify(["src/value.txt"])),
       }),
     }));
+  });
+
+  it("RED-S5-task-proof-custody refuses candidate inputs owned only by a sibling route", async () => {
+    const f = await fixture();
+    const proof = readmitProofDefinition(f.proof, {
+      candidateInputs: ["sibling/result.txt"],
+    });
+    const campaign = {
+      ...f.campaign,
+      proofs: [proof],
+      executionPolicy: {
+        ...f.campaign.executionPolicy,
+        routes: [
+          f.campaign.route,
+          {
+            ...f.campaign.route,
+            taskId: "TASK-sibling",
+            ownedPaths: ["sibling"],
+            allowedWriteRoots: ["sibling"],
+          },
+        ],
+      },
+    } as CccCampaignTaskContext;
+    const attempts = attemptApi();
+    const materializeSemanticProof = vi.fn(async ({ outputRoot }: { outputRoot: string }) =>
+      materializedFixture(outputRoot, proof.admission!, proof.executionToolchain));
+    const handler = createCccCampaignProofSuiteHandler({
+      rootDir: f.repo,
+      store: {
+        getTask: async () => f.task,
+        getCccCampaignContextForTask: async () => campaign,
+        getAsyncLayer: () => ({}) as never,
+        assertCccCampaignWorkflowLeaseFence: async () => undefined,
+      },
+      semanticProofAttempts: attempts,
+      materializeSemanticProof,
+      verifySemanticProofToolchain: async () => undefined,
+      preflightSemanticProofSandbox: async () => undefined,
+      runSemanticProofSandbox: async () => processResult(""),
+    } as never);
+
+    await expect(handler(f.node, f.context)).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_PROOF_FOREIGN_PATH",
+      message: expect.stringContaining("sibling/result.txt"),
+    });
+    expect(attempts.reserve).not.toHaveBeenCalled();
+    expect(materializeSemanticProof).not.toHaveBeenCalled();
+  });
+
+  it("allows candidate inputs owned by a transitive dependency route", async () => {
+    const f = await serialSuccessorFixture();
+    const grandPredecessorId = "FN-grand-predecessor";
+    const grandPredecessorSemanticTaskId = "TASK-grand-predecessor";
+    const grandPredecessor = {
+      ...f.predecessor,
+      id: grandPredecessorId,
+      dependencies: [],
+    } as TaskDetail;
+    f.predecessor.dependencies = [grandPredecessorId];
+    f.tasks.set(grandPredecessorId, grandPredecessor);
+    const proof = readmitProofDefinition(f.proof, {
+      candidateInputs: ["grand-predecessor/result.txt"],
+    });
+    const predecessorSemanticTaskId = "TASK-predecessor";
+    const predecessorRoute = {
+      ...f.campaign.route,
+      taskId: predecessorSemanticTaskId,
+      ownedPaths: ["predecessor"],
+      allowedWriteRoots: ["predecessor"],
+    };
+    const grandPredecessorRoute = {
+      ...f.campaign.route,
+      taskId: grandPredecessorSemanticTaskId,
+      ownedPaths: ["grand-predecessor"],
+      allowedWriteRoots: ["grand-predecessor"],
+    };
+    const campaign = {
+      ...f.campaign,
+      proofs: [proof],
+      executionPolicy: {
+        ...f.campaign.executionPolicy,
+        routes: [f.campaign.route, predecessorRoute, grandPredecessorRoute],
+      },
+    } as CccCampaignTaskContext;
+    const predecessorCampaign = {
+      ...campaign,
+      taskId: f.predecessor.id,
+      semanticTaskId: predecessorSemanticTaskId,
+      proofIds: [],
+      route: predecessorRoute,
+    } as CccCampaignTaskContext;
+    const grandPredecessorCampaign = {
+      ...campaign,
+      taskId: grandPredecessorId,
+      semanticTaskId: grandPredecessorSemanticTaskId,
+      proofIds: [],
+      route: grandPredecessorRoute,
+    } as CccCampaignTaskContext;
+    const attempts = attemptApi();
+    const handler = createCccCampaignProofSuiteHandler({
+      rootDir: f.repo,
+      store: {
+        getTask: async (taskId: string) => f.tasks.get(taskId)!,
+        getCccCampaignContextForTask: async (taskId: string) => {
+          if (taskId === f.predecessor.id) return predecessorCampaign;
+          if (taskId === grandPredecessorId) return grandPredecessorCampaign;
+          return campaign;
+        },
+        getAsyncLayer: () => ({}) as never,
+        assertCccCampaignWorkflowLeaseFence: async () => undefined,
+      },
+      semanticProofAttempts: attempts,
+      materializeSemanticProof: async ({ outputRoot }: { outputRoot: string }) =>
+        materializedFixture(outputRoot, proof.admission!, proof.executionToolchain),
+      verifySemanticProofToolchain: async () => undefined,
+      preflightSemanticProofSandbox: async () => undefined,
+      runSemanticProofSandbox: async () => {
+        const stdout = `${canonicalCccPrdJson(evidenceFor(f, true))}\n`;
+        return processResult(stdout);
+      },
+    } as never);
+
+    await expect(handler(f.node, f.context)).resolves.toMatchObject({
+      outcome: "success",
+      value: "ccc-proof-suite-passed",
+    });
+    expect(attempts.reserve).toHaveBeenCalledTimes(1);
   });
 
   it("RED-S5-controller-git-custody: proof execution refuses to spawn a fake git earlier on PATH", async () => {

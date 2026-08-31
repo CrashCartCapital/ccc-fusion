@@ -4,17 +4,21 @@ const { createCccCampaignProviderAttemptBindingMock } = vi.hoisted(() => ({
   createCccCampaignProviderAttemptBindingMock: vi.fn(),
 }));
 const {
+  assertCccCampaignRejectedTurnCustodyMock,
   assertCccCampaignRequiredCommitCandidateMock,
   enforceCccCampaignRequiredCommitAfterNodeMock,
   fingerprintCccCampaignAllowedCandidateMock,
   fingerprintCccCampaignReadyCandidateMock,
+  snapshotCccCampaignIgnoredBaselineMock,
   snapshotCccCampaignWriteEnvelopeMock,
   verifyCccCampaignReadyCandidateMock,
 } = vi.hoisted(() => ({
+  assertCccCampaignRejectedTurnCustodyMock: vi.fn(),
   assertCccCampaignRequiredCommitCandidateMock: vi.fn(),
   enforceCccCampaignRequiredCommitAfterNodeMock: vi.fn(),
   fingerprintCccCampaignAllowedCandidateMock: vi.fn(),
   fingerprintCccCampaignReadyCandidateMock: vi.fn(),
+  snapshotCccCampaignIgnoredBaselineMock: vi.fn(),
   snapshotCccCampaignWriteEnvelopeMock: vi.fn(),
   verifyCccCampaignReadyCandidateMock: vi.fn(),
 }));
@@ -37,6 +41,7 @@ vi.mock("../ccc-campaign-provider-controller.js", async (importOriginal) => ({
 }));
 vi.mock("../ccc-campaign-required-commit.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../ccc-campaign-required-commit.js")>(),
+  assertCccCampaignRejectedTurnCustody: assertCccCampaignRejectedTurnCustodyMock,
   assertCccCampaignRequiredCommitCandidate: assertCccCampaignRequiredCommitCandidateMock,
   enforceCccCampaignRequiredCommitAfterNode: enforceCccCampaignRequiredCommitAfterNodeMock,
 }));
@@ -48,6 +53,7 @@ vi.mock("../ccc-campaign-ready.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../ccc-campaign-ready.js")>(),
   fingerprintCccCampaignAllowedCandidate: fingerprintCccCampaignAllowedCandidateMock,
   fingerprintCccCampaignReadyCandidate: fingerprintCccCampaignReadyCandidateMock,
+  snapshotCccCampaignIgnoredBaseline: snapshotCccCampaignIgnoredBaselineMock,
   snapshotCccCampaignWriteEnvelope: snapshotCccCampaignWriteEnvelopeMock,
   verifyCccCampaignReadyCandidate: verifyCccCampaignReadyCandidateMock,
 }));
@@ -290,6 +296,8 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     resetExecutorMocks();
     mockedExistsSync.mockReturnValue(true);
     createCccCampaignProviderAttemptBindingMock.mockReset();
+    assertCccCampaignRejectedTurnCustodyMock.mockReset();
+    assertCccCampaignRejectedTurnCustodyMock.mockResolvedValue(undefined);
     assertCccCampaignRequiredCommitCandidateMock.mockReset();
     assertCccCampaignRequiredCommitCandidateMock.mockResolvedValue(undefined);
     enforceCccCampaignRequiredCommitAfterNodeMock.mockReset();
@@ -304,6 +312,11 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     fingerprintCccCampaignAllowedCandidateMock
       .mockResolvedValueOnce("a".repeat(64))
       .mockResolvedValue("b".repeat(64));
+    snapshotCccCampaignIgnoredBaselineMock.mockReset();
+    snapshotCccCampaignIgnoredBaselineMock.mockResolvedValue(Object.freeze({
+      roots: Object.freeze([]),
+      fingerprint: "0".repeat(64),
+    }));
     snapshotCccCampaignWriteEnvelopeMock.mockReset();
     snapshotCccCampaignWriteEnvelopeMock.mockResolvedValue({
       changedPaths: ["src/slugify.js"],
@@ -520,6 +533,15 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       "/tmp/ccc-campaign-engine-verify",
     );
     const order: string[] = [];
+    const trustedIgnoredBaseline = Object.freeze({
+      roots: Object.freeze(["node_modules"]),
+      fingerprint: "c".repeat(64),
+    });
+    (executor as any).cccControllerIgnoredBaselines.set(
+      nodeTask.id,
+      trustedIgnoredBaseline,
+    );
+    snapshotCccCampaignIgnoredBaselineMock.mockResolvedValue(trustedIgnoredBaseline);
     assertCccCampaignRequiredCommitCandidateMock.mockImplementation(async () => {
       order.push("assert-candidate");
     });
@@ -561,6 +583,94 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     ]);
     expect(assertCccCampaignRequiredCommitCandidateMock).toHaveBeenCalledTimes(1);
     expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(1);
+    expect(snapshotCccCampaignWriteEnvelopeMock).toHaveBeenCalledWith({
+      worktreePath: "/tmp/ccc-campaign-engine-verify",
+      allowedRoots: ["src", "test"],
+      trustedIgnoredBaseline,
+    });
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledWith(expect.objectContaining({
+      trustedIgnoredBaseline,
+    }));
+  });
+
+  it("clears a trusted ignored baseline when the fenced campaign node throws", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-thrown-baseline",
+    );
+    (executor as any).cccControllerIgnoredBaselines.set(nodeTask.id, Object.freeze({
+      roots: Object.freeze(["node_modules"]),
+      fingerprint: "c".repeat(64),
+    }));
+    vi.spyOn(executor as any, "runGraphCustomNode").mockRejectedValueOnce(
+      new Error("provider dispatch failed"),
+    );
+
+    await expect((executor as any).runGraphCustomNodeWithRequiredCommitFence(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    )).rejects.toThrow(/turn rejected before commit custody/i);
+
+    expect((executor as any).cccControllerIgnoredBaselines.has(nodeTask.id)).toBe(false);
+  });
+
+  it("clears a trusted ignored baseline when required-commit enforcement throws", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-enforcement-baseline",
+    );
+    (executor as any).cccControllerIgnoredBaselines.set(nodeTask.id, Object.freeze({
+      roots: Object.freeze(["node_modules"]),
+      fingerprint: "c".repeat(64),
+    }));
+    vi.spyOn(executor as any, "runGraphCustomNode").mockResolvedValueOnce({
+      outcome: "success",
+      value: "campaign implementation complete",
+    });
+    enforceCccCampaignRequiredCommitAfterNodeMock.mockRejectedValueOnce(
+      new Error("required commit enforcement failed"),
+    );
+
+    await expect((executor as any).runGraphCustomNodeWithRequiredCommitFence(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    )).rejects.toThrow(/required commit enforcement failed/i);
+
+    expect((executor as any).cccControllerIgnoredBaselines.has(nodeTask.id)).toBe(false);
+  });
+
+  it("clears a trusted ignored baseline when live execution approval throws", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-approval-baseline",
+    );
+    (executor as any).cccControllerIgnoredBaselines.set(nodeTask.id, Object.freeze({
+      roots: Object.freeze(["node_modules"]),
+      fingerprint: "c".repeat(64),
+    }));
+    requireCccCampaignLiveExecutionApprovalMock.mockRejectedValueOnce(
+      new Error("live execution approval failed"),
+    );
+
+    await expect((executor as any).runGraphCustomNodeWithRequiredCommitFence(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    )).rejects.toThrow(/live execution approval failed/i);
+
+    expect((executor as any).cccControllerIgnoredBaselines.has(nodeTask.id)).toBe(false);
+    expect(mockedCreateFnAgent).not.toHaveBeenCalled();
   });
 
   it("hands the exact phase-verification fingerprint to post-node commit custody", async () => {
