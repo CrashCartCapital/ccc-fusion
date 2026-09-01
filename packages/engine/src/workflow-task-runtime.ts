@@ -269,6 +269,21 @@ function createGraphExecutionFence(fence: WorkflowWorkItemFence): WorkflowNodeEx
   });
 }
 
+const CCC_PERMANENT_WORK_ITEM_ERROR_MAX_CHARS = 512;
+
+export function formatCccPermanentWorkItemError(
+  reason: string,
+  error: PermanentError,
+): string {
+  const detail = error.message.replace(/\s+/gu, " ").trim();
+  if (detail.length === 0) return reason;
+  const prefix = `${reason}: `;
+  return `${prefix}${detail.slice(
+    0,
+    Math.max(0, CCC_PERMANENT_WORK_ITEM_ERROR_MAX_CHARS - prefix.length),
+  )}`;
+}
+
 /**
  * WorkflowTaskRuntime is the workflow-engine execution facade.
  *
@@ -872,7 +887,7 @@ export class WorkflowTaskRuntime {
             attempt,
             leaseOwner: null,
             leaseExpiresAt: null,
-            lastError: reason,
+            lastError: formatCccPermanentWorkItemError(reason, err),
             blockedReason: reason,
           });
           await this.recordWorkItemTransition(workItem, "manual-required", attempt, "ccc-permanent");

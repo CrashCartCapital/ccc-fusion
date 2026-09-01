@@ -12,6 +12,7 @@ import type {
 
 import {
   WorkflowTaskRuntime,
+  formatCccPermanentWorkItemError,
   graphFailureReason,
   type WorkflowTaskRuntimeDeps,
 } from "../workflow-task-runtime.js";
@@ -71,6 +72,24 @@ describe("graphFailureReason", () => {
     })).toBe(
       "ccc-branch-persistence-progress-failed:PostgresError: insert or update violates foreign key",
     );
+  });
+});
+
+describe("formatCccPermanentWorkItemError", () => {
+  it("keeps the machine reason while preserving a bounded single-line diagnostic", () => {
+    const reason = "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED";
+    const formatted = formatCccPermanentWorkItemError(
+      reason,
+      new PermanentError(
+        `pre-dispatch custody refused:\n${"toolchain drift ".repeat(100)}`,
+        "CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+      ),
+    );
+
+    expect(formatted.startsWith(`${reason}: pre-dispatch custody refused: toolchain drift`))
+      .toBe(true);
+    expect(formatted).not.toContain("\n");
+    expect(formatted.length).toBeLessThanOrEqual(512);
   });
 });
 
