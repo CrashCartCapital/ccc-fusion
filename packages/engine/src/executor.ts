@@ -19806,6 +19806,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
               });
+              const repairStartIgnoredFingerprint = campaignTrustedIgnoredBaseline
+                ? (await snapshotCccCampaignIgnoredBaseline({ worktreePath })).fingerprint
+                : undefined;
               repairAttempts += 1;
               campaignPhaseRuntime.activePhase = "REPAIR";
               campaignPhaseIntent.completionRequested = false;
@@ -19831,12 +19834,21 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
                 worktreePath,
                 allowedRoots: campaignAllowedWriteRoots,
               });
+              const repairEndIgnoredFingerprint = campaignTrustedIgnoredBaseline
+                ? (await snapshotCccCampaignIgnoredBaseline({ worktreePath })).fingerprint
+                : undefined;
+              const hasConfirmedIgnoredBaselineRepair =
+                typeof repairStartIgnoredFingerprint === "string"
+                && typeof repairEndIgnoredFingerprint === "string"
+                && repairStartIgnoredFingerprint !== repairEndIgnoredFingerprint
+                && repairEndIgnoredFingerprint === campaignTrustedIgnoredBaseline?.fingerprint;
               const repairDecision = decideCccPhaseTransition({
                 phase: "REPAIR",
                 turnSettled: true,
                 explicitPhaseSignal: campaignPhaseIntent.completionRequested
                   && !campaignPhaseIntent.invalidatedByTool,
                 hasConfirmedMutation: repairStartFingerprint !== repairEndFingerprint,
+                hasConfirmedRepairEffect: hasConfirmedIgnoredBaselineRepair,
                 readCount: campaignPhaseRuntime.readCount,
                 discoverContinuations: campaignPhaseRuntime.discoverContinuations,
                 mutateContinuations: campaignPhaseRuntime.mutateContinuations,

@@ -311,6 +311,9 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     fingerprintCccCampaignAllowedCandidateMock.mockReset();
     fingerprintCccCampaignAllowedCandidateMock
       .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      // REPAIR starts and ends with byte-identical admitted source files.
+      .mockResolvedValueOnce("b".repeat(64))
       .mockResolvedValue("b".repeat(64));
     snapshotCccCampaignIgnoredBaselineMock.mockReset();
     snapshotCccCampaignIgnoredBaselineMock.mockResolvedValue(Object.freeze({
@@ -957,6 +960,160 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(prompts[1]).toMatch(/CCC_CAMPAIGN_REPAIR/);
     expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(2);
     expect(result.outcome).toBe("success");
+  });
+
+  it("reruns controller verification when REPAIR restores the trusted ignored baseline", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-repair-ignored-baseline",
+    );
+    const trustedIgnoredBaseline = Object.freeze({
+      roots: Object.freeze([]),
+      fingerprint: "0".repeat(64),
+    });
+    (executor as any).cccControllerIgnoredBaselines.set(
+      nodeTask.id,
+      trustedIgnoredBaseline,
+    );
+    snapshotCccCampaignIgnoredBaselineMock.mockReset();
+    snapshotCccCampaignIgnoredBaselineMock
+      .mockResolvedValueOnce(trustedIgnoredBaseline)
+      .mockResolvedValueOnce(Object.freeze({
+        roots: Object.freeze(["data"]),
+        fingerprint: "d".repeat(64),
+      }))
+      .mockResolvedValue(trustedIgnoredBaseline);
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValue("b".repeat(64));
+    verifyCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce({
+        ready: false,
+        summary: "controller-initialized ignored paths changed after provider dispatch",
+      })
+      .mockResolvedValueOnce(
+        readyVerification(
+          "b".repeat(64),
+          "/tmp/ccc-campaign-repair-ignored-baseline",
+        ),
+      );
+    const prompts: string[] = [];
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async (prompt: string) => {
+            prompts.push(prompt);
+            await phaseTool.execute(
+              `complete-phase-${prompts.length}`,
+              {},
+              undefined,
+              () => undefined,
+            );
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toMatch(/CCC_CAMPAIGN_REPAIR/);
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(2);
+    expect(result.outcome).toBe("success");
+  });
+
+  it("keeps REPAIR terminal when ignored residue changes but does not restore the trusted baseline", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-repair-wrong-ignored-baseline",
+    );
+    const trustedIgnoredBaseline = Object.freeze({
+      roots: Object.freeze([]),
+      fingerprint: "0".repeat(64),
+    });
+    (executor as any).cccControllerIgnoredBaselines.set(
+      nodeTask.id,
+      trustedIgnoredBaseline,
+    );
+    snapshotCccCampaignIgnoredBaselineMock.mockReset();
+    snapshotCccCampaignIgnoredBaselineMock
+      .mockResolvedValueOnce(trustedIgnoredBaseline)
+      .mockResolvedValueOnce(Object.freeze({
+        roots: Object.freeze(["data"]),
+        fingerprint: "d".repeat(64),
+      }))
+      .mockResolvedValue(Object.freeze({
+        roots: Object.freeze(["cache"]),
+        fingerprint: "e".repeat(64),
+      }));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("b".repeat(64));
+    verifyCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce({
+        ready: false,
+        summary: "controller-initialized ignored paths changed after provider dispatch",
+      })
+      .mockResolvedValueOnce(
+        readyVerification(
+          "b".repeat(64),
+          "/tmp/ccc-campaign-repair-wrong-ignored-baseline",
+        ),
+      );
+    const prompts: string[] = [];
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async (prompt: string) => {
+            prompts.push(prompt);
+            await phaseTool.execute(
+              `complete-phase-${prompts.length}`,
+              {},
+              undefined,
+              () => undefined,
+            );
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toMatch(/CCC_CAMPAIGN_REPAIR/);
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: expect.stringContaining("REPAIR signalled completion without changing"),
+    });
   });
 
   it("carries the rendered repair-feedback envelope, verdict-first, into the REPAIR log entry and prompt", async () => {

@@ -228,6 +228,22 @@ describe("CCC provider-neutral phase decisions", () => {
     });
   });
 
+  it("routes a cleanup-only REPAIR with a fresh signal back to controller VERIFY", () => {
+    const decision = decideCccPhaseTransition({
+      ...base,
+      phase: "REPAIR",
+      explicitPhaseSignal: true,
+      hasConfirmedMutation: false,
+      hasConfirmedRepairEffect: true,
+      repairAttempts: 1,
+    } as any);
+
+    expect(decision).toMatchObject({
+      phase: "VERIFY",
+      action: "RUN_CONTROLLER_VERIFICATION",
+    });
+  });
+
   it.each([
     ["without a fresh signal", false, true],
     ["without changed candidate bytes", true, false],

@@ -31,6 +31,7 @@ export type CccPhaseObservation = Readonly<{
   turnSettled: boolean;
   explicitPhaseSignal: boolean;
   hasConfirmedMutation: boolean;
+  hasConfirmedRepairEffect?: boolean;
   readCount: number;
   discoverContinuations: number;
   mutateContinuations?: number;
@@ -142,7 +143,10 @@ export function decideCccPhaseTransition(
   }
 
   if (observation.phase === "REPAIR") {
-    if (observation.explicitPhaseSignal && observation.hasConfirmedMutation) {
+    if (
+      observation.explicitPhaseSignal
+      && (observation.hasConfirmedMutation || observation.hasConfirmedRepairEffect === true)
+    ) {
       return {
         phase: "VERIFY",
         action: "RUN_CONTROLLER_VERIFICATION",
