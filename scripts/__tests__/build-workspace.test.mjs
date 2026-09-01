@@ -450,6 +450,26 @@ test("CCC product acceptance binds proof cutpoint markers to its owned temp root
   );
 });
 
+test("CCC product acceptance gives the four-task fanout generous execution headroom", () => {
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+
+  assert.match(
+    source,
+    /const fanoutCampaignMaxRequests = fanTasks\.length \* 4;/,
+    "fanout request budget must provide four requests per provider task",
+  );
+  assert.match(
+    source,
+    /const fanoutCampaignMaxDurationMs = 480_000;/,
+    "fanout campaign must have enough time for four sequential task and proof phases",
+  );
+  assert.doesNotMatch(
+    source,
+    /const maxRequests = String\(fanTasks\.length\)/,
+    "one request per fanout task is below the structural mutate-plus-repair floor",
+  );
+});
+
 test("real CLI serial tsup build is recognized as bundled output only", () => {
   const packages = discoverWorkspacePackages(path.resolve("."));
   const cli = packageByName(packages, "@runfusion/fusion");

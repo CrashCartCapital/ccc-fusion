@@ -128,6 +128,8 @@ const fanTasks = Object.freeze([
     role: "join",
   }),
 ]);
+const fanoutCampaignMaxRequests = fanTasks.length * 4;
+const fanoutCampaignMaxDurationMs = 480_000;
 
 const fanoutClauseIdFor = (fanTask) =>
   `AC-${fanTask.requirementId}-001`;
@@ -2664,8 +2666,8 @@ async function createFanoutPacket(
   await writeFile(prdSourcePath, prd);
   await writeFile(supportSourcePath, support);
 
-  const maxRequests = String(fanTasks.length);
-  const maxDurationMs = "240000";
+  const maxRequests = String(fanoutCampaignMaxRequests);
+  const maxDurationMs = String(fanoutCampaignMaxDurationMs);
   const frozen = jsonOutput(
     await run(
       process.execPath,
@@ -2946,8 +2948,9 @@ async function createFanoutPacket(
       },
     ],
     bounds: {
-      // One dispatch per task; the audit history bound is (maxRequests * 3) + 1
-      // rows, so four is the smallest budget that admits the diamond.
+      // Four provider tasks need an eight-request structural floor. Keep a
+      // second full floor of headroom so the fixture exercises the product's
+      // generous-envelope policy rather than balancing on minimum admission.
       maxRequests: Number(maxRequests),
       maxDurationMs: Number(maxDurationMs),
       maxConcurrency: 1,
