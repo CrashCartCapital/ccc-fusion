@@ -711,6 +711,15 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       { task: nodeTask, settings: undefined, context: {}, execution },
     )).rejects.toThrow(/turn rejected before commit custody/i);
 
+    expect(store.logEntry).toHaveBeenCalledWith(
+      nodeTask.id,
+      expect.stringContaining(
+        "[ccc-campaign:turn-rejected] provider dispatch failed",
+      ),
+      undefined,
+      undefined,
+    );
+
     expect((executor as any).cccControllerIgnoredBaselines.has(nodeTask.id)).toBe(false);
   });
 

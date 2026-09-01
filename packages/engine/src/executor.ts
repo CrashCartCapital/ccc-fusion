@@ -9617,6 +9617,13 @@ export class TaskExecutor {
         executionContext,
       });
       if (error instanceof EngineError) throw error;
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.store.logEntry(
+        nodeTask.id,
+        `[ccc-campaign:turn-rejected] ${detail}`,
+        undefined,
+        this.getRunContextFor(nodeTask.id),
+      ).catch(() => undefined);
       throw new PermanentError(
         `CCC campaign task ${nodeTask.id} turn rejected before commit custody could `
           + "be established",
