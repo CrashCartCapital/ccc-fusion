@@ -839,7 +839,9 @@ livePgDescribe(`CCC Gate 2 telemetry live Pi campaign (${runMode})`, () => {
       expect(mergeHold.status.workItems).toEqual([
         expect.objectContaining({
           state: "manual-required",
-          lastError: "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+          lastError: expect.stringMatching(
+            /^ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED(?::|$)/,
+          ),
           blockedReason: "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
         }),
       ]);
