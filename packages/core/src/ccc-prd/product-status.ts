@@ -929,6 +929,18 @@ export type CccPrdProductNextActionInput = Readonly<{
   mergeActionIds: ReadonlySet<string>;
 }>;
 
+export function cccPermanentWorkItemHasReason(
+  item: Pick<CccPrdProductWorkItemStatus, "state" | "lastError" | "blockedReason">,
+  reason: string,
+): boolean {
+  return item.state === "manual-required"
+    && item.blockedReason === reason
+    && (
+      item.lastError === reason
+      || item.lastError?.startsWith(`${reason}: `) === true
+    );
+}
+
 export function productNextAction(
   input: CccPrdProductNextActionInput,
 ): CccPrdProductStatus["nextAction"] {
@@ -965,25 +977,25 @@ export function productNextAction(
   const reservedProvider = reservedProviders[0];
   const unknownProvider = unknownProviders[0];
   const liveExecutionApprovalWorkItem = input.workItems.find((item) =>
-    item.state === "manual-required"
-    && item.lastError ===
-      CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON
-    && item.blockedReason ===
-      CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON);
+    cccPermanentWorkItemHasReason(
+      item,
+      CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON,
+    ));
   const verifierConfinementWorkItem = input.workItems.find((item) =>
-    item.state === "manual-required"
-    && item.lastError ===
-      CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON
-    && item.blockedReason ===
-      CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON);
+    cccPermanentWorkItemHasReason(
+      item,
+      CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON,
+    ));
   const requestBudgetExhaustionWorkItem = input.workItems.find((item) =>
-    item.state === "manual-required"
-    && item.lastError === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
-    && item.blockedReason === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON);
+    cccPermanentWorkItemHasReason(
+      item,
+      CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+    ));
   const proofDeadlineExpiredWorkItem = input.workItems.find((item) =>
-    item.state === "manual-required"
-    && item.lastError === CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON
-    && item.blockedReason === CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON);
+    cccPermanentWorkItemHasReason(
+      item,
+      CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON,
+    ));
   if (verifierConfinementWorkItem) {
     return {
       kind: "blocked",
@@ -1006,9 +1018,18 @@ export function productNextAction(
   }
   const uncertainManualWorkItem = input.workItems.find((item) =>
     item.state === "manual-required"
-    && item.lastError !== CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON
-    && item.lastError !== CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
-    && item.lastError !== CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON
+    && !cccPermanentWorkItemHasReason(
+      item,
+      CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON,
+    )
+    && !cccPermanentWorkItemHasReason(
+      item,
+      CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+    )
+    && !cccPermanentWorkItemHasReason(
+      item,
+      CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_REASON,
+    )
     && item.id !== liveExecutionApprovalWorkItem?.id);
   // Only an unexpired lease matching the full persisted work-item fence proves
   // that the runtime still owns an uncertain effect. Task identity alone is
@@ -1214,9 +1235,9 @@ export function productNextAction(
     input.workItems.length > 0
     && input.workItems.every((item) =>
       item.state === "succeeded"
-      || (
-        item.state === "manual-required"
-        && item.lastError === CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON
+      || cccPermanentWorkItemHasReason(
+        item,
+        CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED_REASON,
       ));
   if (input.landingTerminals.length > 0) {
     if (
@@ -1903,9 +1924,10 @@ export async function inspectCccPrdProductStatus(
       );
     } catch (error) {
       const hasBudgetExhaustionMarker = workItems.some((item) =>
-        item.state === "manual-required"
-        && item.lastError === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON
-        && item.blockedReason === CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON);
+        cccPermanentWorkItemHasReason(
+          item,
+          CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+        ));
       if (
         !(error instanceof CccCampaignContextError)
         || !error.message.includes("request count")

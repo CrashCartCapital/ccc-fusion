@@ -37,6 +37,7 @@ export {
 } from "./importer.js";
 export {
   CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION,
+  cccPermanentWorkItemHasReason,
   inspectCccPrdProductStatus,
 } from "./product-status.js";
 export {
