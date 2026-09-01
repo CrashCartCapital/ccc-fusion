@@ -116,7 +116,8 @@ describe("CCC Gate 2 telemetry live Pi harness source contract", () => {
     expect(source).toContain("sourceTree: integrated.sourceTree");
     expect(source).toContain('expect(usefulnessEvidence.finalTargetStatus).toBe("passed")');
     expect(source).toContain('runMode === "clean" || runMode === "recovery"');
-    expect(source).toContain("buildGate2UsefulnessEvidenceState(runMode, usefulnessEvidence)");
+    expect(source).toContain("buildGate2UsefulnessEvidenceState(");
+    expect(source).toContain("recoveryBoundary,");
     expect(source).toContain("usefulnessEvidence");
   });
 

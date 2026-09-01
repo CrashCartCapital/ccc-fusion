@@ -55,7 +55,7 @@ describe("CCC Gate 2 telemetry Pi matrix", () => {
   it("RED-G2-evidence: emits explicit usefulness applicability and status for every live mode", async () => {
     const helpers = await import("./helpers/ccc-gate2-telemetry-pi-matrix.js") as Record<string, unknown>;
     const buildState = helpers.buildGate2UsefulnessEvidenceState as
-      | ((mode: "clean" | "recovery" | "stop", evidence: unknown) => unknown)
+      | ((mode: "clean" | "recovery" | "stop", evidence: unknown, recoveryBoundary?: unknown) => unknown)
       | undefined;
     expect(typeof buildState).toBe("function");
 
@@ -68,6 +68,14 @@ describe("CCC Gate 2 telemetry Pi matrix", () => {
       applicability: "required",
       status: "passed",
       reason: "usefulness_probe_passed",
+    });
+    expect(JSON.parse(JSON.stringify(buildState!("recovery", null, {
+      recoveryKind: "installed_runtime_restart",
+      providerExecution: "not_required",
+    })))).toEqual({
+      applicability: "not_applicable_operational_recovery_lane",
+      status: "not_applicable",
+      reason: "operational_recovery_lane_has_no_landed_candidate",
     });
     expect(JSON.parse(JSON.stringify(buildState!("stop", null)))).toEqual({
       applicability: "not_applicable_stop_mode",

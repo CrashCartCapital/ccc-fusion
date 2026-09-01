@@ -30,12 +30,26 @@ export type Gate2LiveMode = "clean" | "recovery" | "stop";
 export function buildGate2UsefulnessEvidenceState(
   mode: Gate2LiveMode,
   evidence: unknown,
+  recoveryBoundary?: unknown,
 ) {
   if (mode === "stop") {
     return {
       applicability: "not_applicable_stop_mode",
       status: "not_applicable",
       reason: "campaign_stopped_before_landing",
+    } as const;
+  }
+  if (
+    mode === "recovery"
+    && typeof recoveryBoundary === "object"
+    && recoveryBoundary !== null
+    && (recoveryBoundary as { recoveryKind?: unknown }).recoveryKind === "installed_runtime_restart"
+    && (recoveryBoundary as { providerExecution?: unknown }).providerExecution === "not_required"
+  ) {
+    return {
+      applicability: "not_applicable_operational_recovery_lane",
+      status: "not_applicable",
+      reason: "operational_recovery_lane_has_no_landed_candidate",
     } as const;
   }
   const passed = typeof evidence === "object"

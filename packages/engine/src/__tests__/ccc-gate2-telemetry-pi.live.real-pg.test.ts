@@ -739,7 +739,11 @@ livePgDescribe(`CCC Gate 2 telemetry live Pi campaign (${runMode})`, () => {
         recoveryEvidenceState: buildGate2RecoveryEvidenceState(runMode, recoveryBoundary),
         recoveryBoundary,
         stopBoundary,
-        usefulnessEvidenceState: buildGate2UsefulnessEvidenceState(runMode, usefulnessEvidence),
+        usefulnessEvidenceState: buildGate2UsefulnessEvidenceState(
+          runMode,
+          usefulnessEvidence,
+          recoveryBoundary,
+        ),
         usefulnessEvidence,
         landingEvidence,
         nextAction: status?.status.nextAction ?? null,
