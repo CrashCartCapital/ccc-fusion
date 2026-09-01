@@ -420,18 +420,18 @@ test("CCC product acceptance binds proof cutpoint markers to its owned temp root
   );
   assert.match(
     readMarkers,
+    /ccc-semantic-proof-execution-/,
+    "proof cutpoint marker polling must discover the semantic proof execution root",
+  );
+  assert.match(
+    readMarkers,
+    /path\.join\(scratchRoot, "home"\)/,
+    "semantic proof markers must come from the proof sandbox's scratch home",
+  );
+  assert.doesNotMatch(
+    readMarkers,
     /fusion-verifier-sandbox-/,
-    "proof cutpoint marker polling must discover the verifier command's nested sandbox home",
-  );
-  assert.match(
-    readMarkers,
-    /verifierSandboxRoot/,
-    "verifier-sandbox markers must keep their own ownership root separate from semantic proof roots",
-  );
-  assert.match(
-    readMarkers,
-    /cleanupRoot/,
-    "proof cutpoint markers must carry the exact root that cleanup is allowed to remove",
+    "semantic proof marker polling must not look in the ordinary readiness-verifier sandbox",
   );
   assert.match(
     source,
@@ -443,10 +443,10 @@ test("CCC product acceptance binds proof cutpoint markers to its owned temp root
     /!semanticProofId && candidates\['src\/value\.txt'\]/,
     "the ordinary readiness verifier must accept the planted cutpoint candidate without hanging",
   );
-  assert.match(
+  assert.doesNotMatch(
     cleanupMarkers,
-    /marker\.cleanupRoot/,
-    "proof cutpoint cleanup must remove each marker's validated owned cleanup root",
+    /\brm\(/,
+    "marker cleanup must leave semantic proof roots for the final owned-root cleanup",
   );
 });
 
