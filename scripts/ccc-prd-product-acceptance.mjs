@@ -1805,7 +1805,18 @@ async function initializeTarget(
         files: fanTasks.map(({ file, value }) => ({ file, value })),
       })};`,
       "const candidates = Object.fromEntries(process.argv.slice(2).map(candidate => [candidate, fs.readFileSync(candidate, 'utf8').trim()]));",
-      "const proofId = process.env.CCC_PROOF_ID;",
+      `const localProofIds = ${JSON.stringify({
+        ...Object.fromEntries(
+          fanTasks.map((fanTask) => [
+            fanTask.file,
+            fanoutTaskProofIdFor(fanTask),
+          ]),
+        ),
+        [fanTasks.map(({ file }) => file).sort().join(",")]: "PROOF-FANOUT-INTEGRATED",
+      })};`,
+      "const semanticProofId = process.env.CCC_PROOF_ID;",
+      "const localProofId = localProofIds[Object.keys(candidates).sort().join(',')];",
+      "const proofId = semanticProofId || localProofId;",
       "const definition = proofId === 'PROOF-FANOUT-INTEGRATED' ? integrated : expectations[proofId];",
       "if (!definition) { console.error(`UNKNOWN_PROOF:${proofId}`); process.exit(3); }",
       "const filePassed = Object.fromEntries(definition.files.map(({ file, value }) => [file, candidates[file] === value]));",

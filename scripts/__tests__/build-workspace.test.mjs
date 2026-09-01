@@ -475,6 +475,24 @@ test("CCC product acceptance gives the four-task fanout generous execution headr
   );
 });
 
+test("CCC fanout verifier supports both readiness and semantic proof execution", () => {
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+  const fanoutStart = source.indexOf('path.join(targetRoot, "verify-fanout.cjs")');
+  const fanoutEnd = source.indexOf('path.join(targetRoot, "Taskfile.yml")', fanoutStart);
+  const fanoutVerifier = source.slice(fanoutStart, fanoutEnd);
+
+  assert.match(
+    fanoutVerifier,
+    /const semanticProofId = process\.env\.CCC_PROOF_ID;/,
+    "semantic proof execution must keep using the controller-supplied proof identity",
+  );
+  assert.match(
+    fanoutVerifier,
+    /const proofId = semanticProofId \|\| localProofId;/,
+    "ordinary required-commit readiness must infer the exact task proof from candidate paths",
+  );
+});
+
 test("real CLI serial tsup build is recognized as bundled output only", () => {
   const packages = discoverWorkspacePackages(path.resolve("."));
   const cli = packageByName(packages, "@runfusion/fusion");
