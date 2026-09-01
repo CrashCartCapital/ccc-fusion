@@ -16,6 +16,10 @@ import {
   isCccCampaignDiscoveryToolCall,
   wrapToolsWithCccCampaignPhaseToolPolicy,
 } from "../pi.js";
+import {
+  cccCampaignVisibleBashTraversalRoots,
+  cccCampaignVisibleBashWriteTargets,
+} from "../ccc-campaign-tool-phase.js";
 import { connectMcpSessionTools } from "../mcp-session-tools.js";
 
 /*
@@ -415,6 +419,16 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
     expect(isCccCampaignDiscoveryToolCall("mcp__fusion-code-core__smart-tree_search", {})).toBe(false);
   });
 
+  it("extracts visible traversal roots from broad read-only shell searches", () => {
+    expect(cccCampaignVisibleBashTraversalRoots(
+      'find / -name "tsconfig.json" 2>/dev/null | head -5; echo "---"; find / -name "tsx" 2>/dev/null | grep -v proc | head -5',
+    )).toEqual(["/"]);
+    expect(cccCampaignVisibleBashTraversalRoots('find -L / -name "tsconfig.json"')).toEqual(["/"]);
+    expect(cccCampaignVisibleBashTraversalRoots('find src / -name "tsconfig.json"')).toEqual(["src", "/"]);
+    expect(cccCampaignVisibleBashTraversalRoots("rg tsconfig /")).toEqual(["/"]);
+    expect(cccCampaignVisibleBashTraversalRoots("grep -R tsconfig /")).toEqual(["/"]);
+  });
+
   it("refuses a renamed or unapproved namespaced MCP tool before it executes", async () => {
     const execute = vi.fn().mockResolvedValue({
       content: [{ type: "text", text: "should not execute" }],
@@ -649,6 +663,202 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
         command:
           "node -e \"const fs=require('fs');fs.writeFileSync('/tmp/ccc-external-scratch.mjs','x')\"",
       },
+      undefined,
+    )).resolves.toMatchObject({ isError: false });
+    expect(bashExecute).toHaveBeenCalledTimes(1);
+    expect(capturePotentialMutationBaseline).toHaveBeenCalledTimes(1);
+  });
+
+  it("RED-G2-EARLY-SCRATCH: detects and refuses a shell redirect outside admitted roots before execution", async () => {
+    expect(cccCampaignVisibleBashWriteTargets(
+      "node --test tests/telemetry.test.ts > .test.log 2>&1; tail -20 .test.log",
+    )).toEqual([".test.log"]);
+    expect(cccCampaignVisibleBashWriteTargets(
+      "node --test tests/telemetry.test.ts >/dev/null 2>&1",
+    )).toEqual([]);
+
+    const bashExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "must not run" }],
+      isError: false,
+    });
+    const capturePotentialMutationBaseline = vi.fn();
+    const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "bash", execute: bashExecute } as never],
+      {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "MUTATE",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/app.ts", "tests/telemetry.test.ts"],
+        capturePotentialMutationBaseline,
+      } as any,
+    );
+
+    await expect(bashTool!.execute(
+      "call-bash-redirect",
+      { command: "node --test tests/telemetry.test.ts > .test.log 2>&1" },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
+      details: expect.objectContaining({ path: ".test.log" }),
+    });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+  });
+
+  it("RED-G2-MUTATION-SLOT: OS-temp redirects do not consume the post-discovery candidate mutation", async () => {
+    const readExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "read" }] });
+    const bashExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "scratch" }] });
+    const writeExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "written" }] });
+    const tools = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [
+        { name: "read", execute: readExecute },
+        { name: "bash", execute: bashExecute },
+        { name: "write", execute: writeExecute },
+      ] as never,
+      {
+        readOnlyToolNames: ["read", "bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "DISCOVER",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/app.ts"],
+        capturePotentialMutationBaseline: async () => ({}),
+        onPotentialMutationCompleted: async (toolName: string) => toolName === "write",
+      } as any,
+    );
+    const readTool = tools.find(({ name }) => name === "read")!;
+    const bashTool = tools.find(({ name }) => name === "bash")!;
+    const writeTool = tools.find(({ name }) => name === "write")!;
+
+    await readTool.execute("read-1", { path: "src/a.ts" }, undefined);
+    await readTool.execute("read-2", { path: "src/b.ts" }, undefined);
+    await expect(bashTool.execute(
+      "scratch-redirect",
+      { command: "node test.mjs > /tmp/ccc-output.log 2>&1" },
+      undefined,
+    )).resolves.toMatchObject({ isError: true, error: "discovery refused" });
+    await expect(writeTool.execute(
+      "candidate-write",
+      { path: "src/app.ts", content: "export const ready = true;\n" },
+      undefined,
+    )).resolves.toEqual({ content: [{ type: "text", text: "written" }] });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(writeExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("RED-G2-FD-REDIRECT-SLOT: descriptor-only redirects do not consume the post-discovery candidate mutation", async () => {
+    const readExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "read" }] });
+    const bashExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "test output" }] });
+    const writeExecute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "written" }] });
+    const tools = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [
+        { name: "read", execute: readExecute },
+        { name: "bash", execute: bashExecute },
+        { name: "write", execute: writeExecute },
+      ] as never,
+      {
+        readOnlyToolNames: ["read", "bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "DISCOVER",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/app.ts"],
+        capturePotentialMutationBaseline: async () => ({}),
+        onPotentialMutationCompleted: async (toolName: string) => toolName === "write",
+      } as any,
+    );
+    const readTool = tools.find(({ name }) => name === "read")!;
+    const bashTool = tools.find(({ name }) => name === "bash")!;
+    const writeTool = tools.find(({ name }) => name === "write")!;
+
+    await readTool.execute("read-1", { path: "src/a.ts" }, undefined);
+    await readTool.execute("read-2", { path: "src/b.ts" }, undefined);
+    await expect(bashTool.execute(
+      "descriptor-redirect",
+      { command: "node --test tests/telemetry.test.ts 2>&1" },
+      undefined,
+    )).resolves.toMatchObject({ isError: true, error: "discovery refused" });
+    await expect(writeTool.execute(
+      "candidate-write",
+      { path: "src/app.ts", content: "export const ready = true;\n" },
+      undefined,
+    )).resolves.toEqual({ content: [{ type: "text", text: "written" }] });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(writeExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("RED-G2-BASH-SCOPE: refuses broad filesystem traversal before execution in every campaign phase", async () => {
+    const bashExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "must not run" }],
+      isError: false,
+    });
+    const capturePotentialMutationBaseline = vi.fn();
+    const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "bash", execute: bashExecute } as never],
+      {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "MUTATE",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/audit.ts"],
+        capturePotentialMutationBaseline,
+      } as any,
+    );
+
+    await expect(bashTool!.execute(
+      "call-bash-root-find",
+      {
+        command:
+          "find / -name \"tsconfig.json\" 2>/dev/null | head -5; find / -name \"tsx\" 2>/dev/null | head -5",
+      },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("BASH_SCOPE_REFUSED"),
+      details: expect.objectContaining({ path: "/" }),
+    });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+
+    await expect(bashTool!.execute(
+      "call-bash-root-cd-rg",
+      { command: "cd / && rg needle ." },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("BASH_SCOPE_REFUSED"),
+      details: expect.objectContaining({ path: "/" }),
+    });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+
+    await expect(bashTool!.execute(
+      "call-bash-home-rg",
+      { command: 'rg needle "$HOME"' },
+      undefined,
+    )).resolves.toMatchObject({
+      isError: true,
+      error: expect.stringContaining("BASH_SCOPE_REFUSED"),
+      details: expect.objectContaining({ path: process.env.HOME }),
+    });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+
+    await expect(bashTool!.execute(
+      "call-bash-worktree-find",
+      { command: "find . -name '*.ts' | head -5" },
       undefined,
     )).resolves.toMatchObject({ isError: false });
     expect(bashExecute).toHaveBeenCalledTimes(1);

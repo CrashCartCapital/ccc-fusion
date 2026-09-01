@@ -1,10 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { expect } from "vitest";
-import {
-  runPrdCommand,
-  type PrdCommandDependencies,
-} from "../../../../cli/src/commands/prd.js";
 import type { CccPrdProductStatus } from "@fusion/core";
 
 const execFile = promisify(execFileCallback);
@@ -93,21 +89,6 @@ export async function waitForDurableProductBoundary(
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-}
-
-export async function runProductCommand(
-  args: string[],
-  dependencies: PrdCommandDependencies,
-  runPrdCommandImpl: typeof runPrdCommand = runPrdCommand,
-): Promise<CommandResult> {
-  const output: string[] = [];
-  const exitCode = await runPrdCommandImpl(
-    [...args, "--json"],
-    { write: (line) => output.push(line) },
-    dependencies,
-    { projectName: "ccc-golden-evidence-ledger" },
-  );
-  return { exitCode, values: output.map((line) => JSON.parse(line) as unknown) };
 }
 
 export function productStatus(result: CommandResult): ProductStatusOutput {

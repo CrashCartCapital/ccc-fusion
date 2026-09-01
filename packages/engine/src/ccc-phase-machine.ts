@@ -182,7 +182,7 @@ export function decideCccPhaseTransition(
       readCapWarning,
       capForcedStop: false,
       failureReason:
-        "DISCOVER ended twice without confirmed mutation or an explicit phase signal",
+        `DISCOVER exhausted ${maxDiscoverContinuations} bounded DISCOVER continuation${maxDiscoverContinuations === 1 ? "" : "s"} without confirmed mutation or an explicit phase signal`,
     };
   }
 

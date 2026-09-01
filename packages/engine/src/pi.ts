@@ -78,6 +78,7 @@ import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { applyClaudeAcpEnable } from "./claude-acp-enable.js";
 import {
+  cccCampaignVisibleBashTraversalRoots,
   cccCampaignVisibleBashWriteTargets,
   isCccCampaignDiscoveryToolCall,
   isCccCampaignExplicitMutationToolCall,
@@ -2848,6 +2849,22 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
       return isSameOrInsidePath(admitted, target);
     });
   };
+  const isCandidateMutationAttempt = (
+    toolName: string,
+    params: Record<string, unknown> | undefined,
+  ): boolean => {
+    if (!isCccCampaignExplicitMutationToolCall(toolName, params)) return false;
+    const normalized = toolName.trim().toLowerCase();
+    if (normalized === "write" || normalized === "edit") {
+      return typeof params?.path === "string" && pathWithinAdmittedRoots(params.path);
+    }
+    if (normalized !== "bash" || typeof params?.command !== "string") return true;
+    const visibleTargets = cccCampaignVisibleBashWriteTargets(params.command);
+    if (!policy.worktreePath || !policy.allowedWriteRoots?.length) return true;
+    if (visibleTargets.length === 0) return false;
+    return visibleTargets.some((path) =>
+      pathInsideCandidateWorktree(path) && visibleBashTargetWithinAdmittedRoots(path));
+  };
   const appendGuidance = (
     result: unknown,
     message: string,
@@ -2936,6 +2953,19 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
           );
         }
         if (normalizedToolName === "bash" && typeof params?.command === "string") {
+          const visibleTraversalRoot = cccCampaignVisibleBashTraversalRoots(params.command)
+            .find((path) => !pathInsideCandidateWorktree(path));
+          if (visibleTraversalRoot) {
+            return boundaryRejection(
+              `CCC_CAMPAIGN_BASH_SCOPE_REFUSED: ${tool.name} traversal root ${visibleTraversalRoot} is outside the assigned campaign worktree.`,
+              {
+                phase: policy.currentPhase?.(),
+                toolName: tool.name,
+                path: visibleTraversalRoot,
+                worktreePath: policy.worktreePath,
+              },
+            );
+          }
           const visibleForeignTarget = cccCampaignVisibleBashWriteTargets(params.command)
             .find((path) => pathInsideCandidateWorktree(path) && !visibleBashTargetWithinAdmittedRoots(path));
           if (visibleForeignTarget) {
@@ -3019,10 +3049,10 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
           return result;
         }
 
-        const explicitMutationTool = isCccCampaignExplicitMutationToolCall(tool.name, params);
+        const candidateMutationAttempt = isCandidateMutationAttempt(tool.name, params);
         if (
           readOnlyToolCalls >= refusalLimit
-          && (!explicitMutationTool || postRefusalMutationAttempted)
+          && (!candidateMutationAttempt || postRefusalMutationAttempted)
         ) {
           return boundaryRejection(policy.refusalMessage, {
             phase: "DISCOVER",
@@ -3031,7 +3061,9 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
             maxReadOnlyToolCallsBeforeRefusal: refusalLimit,
           });
         }
-        if (readOnlyToolCalls >= refusalLimit) postRefusalMutationAttempted = true;
+        if (readOnlyToolCalls >= refusalLimit && candidateMutationAttempt) {
+          postRefusalMutationAttempted = true;
+        }
 
         const execution = await executeWithCustody();
         const { result, confirmedMutation } = execution;

@@ -527,6 +527,92 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     expect(await persistedRequestCount(campaign.importId)).toBe(2);
   });
 
+  it("keeps global request count coherent under multi-task Pi turn churn", async () => {
+    const { taskId: firstTaskId, campaign } = await context("gate2-request-history", {
+      maxRequests: 96, maxDurationMs: 60_000, maxConcurrency: 3,
+    });
+    const secondTaskId = await nativeTaskIdForImport(
+      campaign.importId,
+      "TASK-terminal-gate2-request-history",
+    );
+    const store = api(h.store());
+    const taskIds = [firstTaskId, secondTaskId] as const;
+    const settled: ProviderAttemptScope[] = [];
+
+    for (let batch = 0; batch < 16; batch += 1) {
+      const reservations = await Promise.all(
+        [0, 1, 2].map(async (offset) => {
+          const ordinal = (batch * 3) + offset + 1;
+          const targetTaskId = taskIds[ordinal % taskIds.length]!;
+          return store.reserveCccProviderAttempt(
+            request(targetTaskId, h.rootDir(), `turn-gate2-churn-${ordinal}`, {
+              dispatchKey: `dispatch-gate2-churn-${ordinal}`,
+              workItemFence: {
+                workItemId: `work-item-gate2-churn-${ordinal}`,
+                runId: `run-gate2-churn-${batch}`,
+                attempt: offset + 1,
+              },
+            }),
+          );
+        }),
+      );
+
+      for (const reserved of reservations) {
+        await dispatch(store, {
+          taskId: reserved.taskId,
+          attemptKey: reserved.attemptKey,
+          controllerToken: reserved.controllerToken,
+        });
+      }
+
+      await Promise.all(reservations.map((reserved, index) =>
+        store.reconcileCccProviderAttempt({
+          taskId: reserved.taskId,
+          attemptKey: reserved.attemptKey,
+          controllerToken: reserved.controllerToken,
+          outcome: "committed",
+          evidenceDigest: createHash("sha256")
+            .update(`gate2-churn-${batch}-${index}`, "utf8")
+            .digest("hex"),
+          observerId: `gate2-churn-observer-${index}`,
+        })));
+      settled.push(...reservations);
+
+      const restarted = api(new TaskStore(h.rootDir(), undefined, { asyncLayer: h.layer() }));
+      await expect(restarted.inspectCccProviderAttempt({
+        taskId: settled[0]!.taskId,
+        attemptKey: settled[0]!.attemptKey,
+      })).resolves.toMatchObject({ state: "committed" });
+      expect(await persistedRequestCount(campaign.importId)).toBe(settled.length);
+    }
+
+    expect((await auditRows()).filter((row) =>
+      String(row.metadata?.["attemptKey"] ?? "").includes("ccc-provider-attempt-"))).toHaveLength(settled.length * 3);
+    expect(await persistedRequestCount(campaign.importId)).toBe(settled.length);
+  });
+
+  it("RED-G2-request-history-diagnostic: reports persisted and observed request-count facts", async () => {
+    const { taskId, campaign } = await context("gate2-request-history-diagnostic", {
+      maxRequests: 4, maxDurationMs: 60_000, maxConcurrency: 1,
+    });
+    const store = api(h.store());
+    const first = await store.reserveCccProviderAttempt(
+      request(taskId, h.rootDir(), "turn-gate2-diagnostic"),
+    );
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET request_count = request_count + 1
+      WHERE import_id = ${campaign.importId}
+    `);
+
+    await expect(store.inspectCccProviderAttempt({
+      taskId,
+      attemptKey: first.attemptKey,
+    })).rejects.toThrow(
+      /persisted request count=2; observed provider attempts=1; observed request counts=1/u,
+    );
+  });
+
   it("collision-refuses a changed action target for one logical attempt without another audit or request", async () => {
     const { taskId, campaign } = await context("action-collision");
     const store = api(h.store());
@@ -1045,6 +1131,34 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     return { taskId, semanticTaskId };
   }
 
+  async function omniRouteComboContext(suffix: string) {
+    const source = rehashCccPrdImportTestBundle({
+      ...bundle(h.rootDir(), suffix),
+      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+    });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: `provider-attempt-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy: {
+        ...createCccPrdImportTestExecutionPolicy(source),
+        routes: source.tasks.map(({ id }) => ({
+          taskId: id,
+          providerId: "golden-omniroute-glm-latest",
+          modelId: "combo/glm-latest",
+          transport: "pi" as const,
+          receiptAdapterId: "terminal-route-sse-comments.v1" as const,
+          terminalRouteMembers: [{ provider: "glm", model: "glm-5.3" }],
+        })),
+      },
+    });
+    const semanticTaskId = `TASK-${suffix}`;
+    const taskId = await nativeTaskIdForImport(imported.importId, semanticTaskId);
+    return { taskId, semanticTaskId };
+  }
+
   function omniRouteRequest(taskId: string, turnKey: string) {
     return request(taskId, h.rootDir(), turnKey, {
       providerId: "omniroute-minimax-m3-pinned",
@@ -1135,6 +1249,57 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     })).resolves.toMatchObject({
       state: "proved_failed",
       terminal: { kind: "reconciled", state: "proved_failed" },
+    });
+  });
+
+  it("reads back a committed combo-alias settlement whose final route is an admitted terminal member", async () => {
+    const { taskId } = await omniRouteComboContext("omniroute-combo-terminal-member");
+    const store = api(h.store());
+    const reserved = await store.reserveCccProviderAttempt(
+      request(taskId, h.rootDir(), "turn-omniroute-combo-terminal-member", {
+        providerId: "golden-omniroute-glm-latest",
+        modelId: "combo/glm-latest",
+      }),
+    );
+    await dispatch(store, {
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+    });
+
+    await expect(store.reconcileCccProviderAttempt({
+      taskId,
+      attemptKey: reserved.attemptKey,
+      controllerToken: reserved.controllerToken,
+      outcome: "committed",
+      evidenceDigest: "8".repeat(64),
+      observerId: "omniroute-combo-observer",
+      effectiveRoute: {
+        effectiveProvider: "golden-omniroute-glm-latest",
+        effectiveModel: "combo/glm-latest",
+        usage: { inputTokens: 100, outputTokens: 40 },
+        cost: { amountUsd: 0, source: "pi-ai" },
+        receiptSource: "stream-usage",
+        omniRoute: { final: { provider: "glm", model: "glm-5.3" } },
+      },
+    } as never)).resolves.toMatchObject({
+      state: "committed",
+      terminal: { kind: "reconciled", state: "committed" },
+    });
+    await expect(store.inspectCccProviderAttempt({
+      taskId,
+      attemptKey: reserved.attemptKey,
+    })).resolves.toMatchObject({
+      state: "committed",
+      terminal: {
+        kind: "reconciled",
+        state: "committed",
+        effectiveRoute: {
+          effectiveProvider: "golden-omniroute-glm-latest",
+          effectiveModel: "combo/glm-latest",
+          omniRoute: { final: { provider: "glm", model: "glm-5.3" } },
+        },
+      },
     });
   });
 });

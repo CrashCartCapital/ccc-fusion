@@ -185,6 +185,40 @@ describe("CCC terminal route receipt request transport", () => {
     }
   });
 
+  it("RED-G2-RECEIPT-CLEANUP: preserves the primary request failure when response cleanup also fails", async () => {
+    const originalFetch = globalThis.fetch;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: not-json\n\n"));
+      },
+      cancel() {
+        throw new Error("fixture response cleanup failed");
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })));
+
+    try {
+      const result = await streamCccTerminalRouteReceipt(
+        receiptModel(),
+        receiptContext,
+        { apiKey: "fixture-key", maxRetries: 0 },
+      ).result() as typeof receiptContext & {
+        stopReason: string;
+        errorMessage?: string;
+        cleanupErrorMessage?: string;
+      };
+
+      expect(result.stopReason).toBe("error");
+      expect(result.errorMessage).toMatch(/not-json|JSON/u);
+      expect(result.cleanupErrorMessage).toBe("fixture response cleanup failed");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("RED-RECEIPT-TRANSPORT-3: closes reasoning and text blocks before starting the next event kind", async () => {
     const server = createServer((request, response) => {
       request.resume();

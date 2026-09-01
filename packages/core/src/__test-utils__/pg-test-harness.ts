@@ -856,6 +856,7 @@ export interface SharedPgTaskStoreHarness {
   readonly store: () => TaskStore;
   readonly layer: () => AsyncDataLayer;
   readonly adminDb: () => PostgresJsDatabase;
+  readonly testUrl: () => string;
   readonly beforeAll: () => Promise<void>;
   readonly beforeEach: () => Promise<void>;
   readonly afterEach: () => Promise<void>;
@@ -931,6 +932,10 @@ export function createSharedPgTaskStoreTestHarness(options?: {
     adminDb: () => {
       if (!harness) throw new Error("SharedPgTaskStoreHarness: beforeAll not called yet");
       return harness.adminDb;
+    },
+    testUrl: () => {
+      if (!harness) throw new Error("SharedPgTaskStoreHarness: beforeAll not called yet");
+      return harness.testUrl;
     },
     beforeAll: async () => {
       if (harness) return;

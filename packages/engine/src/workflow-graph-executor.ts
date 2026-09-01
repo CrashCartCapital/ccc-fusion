@@ -36,12 +36,14 @@ import type { WorkflowRuntimePrimitives } from "./runtime-primitives.js";
 import type { PrNodeDeps } from "./pr-nodes.js";
 import {
   runSplitJoin,
+  isWorkflowNodeFrontierBranchId,
   type BranchEnvironment,
   type WorkflowBranchPersistence,
   type WorkflowBranchProgress,
   type WorkflowBranchRunState,
   type WorkflowBranchSemaphore,
 } from "./workflow-graph-branches.js";
+
 import {
   runForeach,
   type ForeachEnvironment,
@@ -51,6 +53,8 @@ import { runLoop, runOptionalGroup } from "./workflow-graph-loop.js";
 import type { WorkflowNodeRunnerRegistry } from "./workflow-node-runner.js";
 import { workflowNodeRequiresWorktree } from "./workflow-node-execution-needs.js";
 import type { WorkflowColumnBoundary } from "./workflow-column-boundary.js";
+
+const CCC_SEQUENTIAL_FRONTIER_BRANCH_PREFIX = "__ccc_frontier__:";
 
 export type WorkflowNodeOutcome = "success" | "failure";
 
@@ -62,9 +66,37 @@ type WorkflowNodeSettings = Pick<Settings, "experimentalFeatures"> & {
 export const PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE = "plan-review-provider-failure-hold";
 /** Node-ID-independent CCC terminal checkpoint classification for the outer executor. */
 export const CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY = "ccc:branch-persistence-failure";
+/** Bounded cause captured when the CCC durable-frontier checkpoint cannot be persisted. */
+export const CCC_BRANCH_PERSISTENCE_ERROR_CONTEXT_KEY = "ccc:branch-persistence-error";
 export const CCC_RETRY_CLASSIFICATION_CONTEXT_KEY = "ccc:retry-classification";
 /** Actual total handler calls consumed by a terminal CCC retry classification. */
 export const CCC_RETRY_ATTEMPT_CONTEXT_KEY = "ccc:retry-attempt";
+
+export function formatCccBranchPersistenceError(error: unknown): string {
+  const diagnostics: string[] = [];
+  const visited = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth += 1) {
+    if (visited.has(current)) break;
+    visited.add(current);
+    if (current instanceof Error) {
+      const code = Reflect.get(current, "code");
+      const codeSuffix = typeof code === "string" && code.trim().length > 0
+        ? `[${code.trim()}]`
+        : "";
+      diagnostics.push(`${current.name || "Error"}${codeSuffix}: ${current.message}`);
+      current = current.cause;
+      continue;
+    }
+    diagnostics.push(String(current));
+    break;
+  }
+  const causeFirst = diagnostics.reverse().join(" <- ") || "unknown error";
+  const normalized = causeFirst.replaceAll(/[\r\n]+/gu, " ");
+  return normalized.length > 500
+    ? `${normalized.slice(0, 497)}...`
+    : normalized;
+}
 
 /*
 FNXC:PlanReviewLease 2026-07-18-23:45:
@@ -916,20 +948,31 @@ export class WorkflowGraphExecutor {
       }) as WorkflowMaterializedVisitIdentity;
     };
 
-    // On resume, completed branch nodes (from a prior crashed run) are skipped
-    // so their handlers do not re-fire (idempotency).
+    // Ordinary workflows skip completed branch nodes on resume. CCC branch rows
+    // do not persist contextPatch bytes, so their fenced/idempotent nodes replay
+    // to reconstruct downstream context; only the separate sequential frontier
+    // remains safe to skip.
+    const cccFusionTask = isCccCampaignTask(task);
     let completedNodeIds: Set<string> | undefined;
     let completedBranchIds: Set<string> | undefined;
     const persisted = await this.deps.branchPersistence?.loadBranchStates?.(task.id, runId);
     if (persisted && persisted.length > 0) {
       completedNodeIds = new Set(
         persisted
-          .filter((s: WorkflowBranchRunState) => s.status === "completed")
+          .filter((s: WorkflowBranchRunState) =>
+            s.status === "completed"
+            && !isWorkflowNodeFrontierBranchId(s.branchId)
+            && (!cccFusionTask || s.branchId.startsWith(CCC_SEQUENTIAL_FRONTIER_BRANCH_PREFIX))
+          )
           .map((s) => s.currentNodeId),
       );
       completedBranchIds = new Set(
         persisted
-          .filter((s: WorkflowBranchRunState) => s.status === "completed")
+          .filter((s: WorkflowBranchRunState) =>
+            s.status === "completed"
+            && !isWorkflowNodeFrontierBranchId(s.branchId)
+            && !cccFusionTask
+          )
           .map((s) => s.branchId),
       );
     }
@@ -940,24 +983,25 @@ export class WorkflowGraphExecutor {
     after its checkpoint commits; recovery therefore never replays A before a
     split, and a failed checkpoint routes failure before any successor effect.
     */
-    const cccFusionTask = isCccCampaignTask(task);
     const checkpointCccFrontier = async (node: WorkflowIrNode): Promise<string | undefined> => {
       if (!cccFusionTask || node.kind === "start" || node.kind === "end") return undefined;
       if (typeof this.deps.branchPersistence?.saveBranchState !== "function") {
+        context[CCC_BRANCH_PERSISTENCE_ERROR_CONTEXT_KEY] = "saveBranchState unavailable";
         return "ccc-branch-persistence-progress-failed";
       }
       try {
         await this.deps.branchPersistence.saveBranchState({
           taskId: task.id,
           runId,
-          branchId: `__ccc_frontier__:${node.id}`,
+          branchId: `${CCC_SEQUENTIAL_FRONTIER_BRANCH_PREFIX}${node.id}`,
           currentNodeId: node.id,
           status: "completed",
         });
         completedNodeIds ??= new Set<string>();
         completedNodeIds.add(node.id);
         return undefined;
-      } catch {
+      } catch (error) {
+        context[CCC_BRANCH_PERSISTENCE_ERROR_CONTEXT_KEY] = formatCccBranchPersistenceError(error);
         return "ccc-branch-persistence-progress-failed";
       }
     };
@@ -977,14 +1021,15 @@ export class WorkflowGraphExecutor {
       task,
       settings,
       runId,
+      context,
       signal: this.deps.signal,
       nodeMap,
       outgoingMap,
-      runBranchNode: (node, signal) => this.executeNodeWithRetries(
+      runBranchNode: (node, signal, branchContext) => this.executeNodeWithRetries(
         node,
         task,
         settings,
-        context,
+        branchContext,
         ir,
         signal,
         true,
@@ -1048,9 +1093,14 @@ export class WorkflowGraphExecutor {
             else context[SPLIT_ACTIVE_CONTEXT_KEY] = priorSplitActive;
           }
           visitedNodeIds.push(...splitResult.visitedNodeIds);
+          if (splitResult.contextPatch) Object.assign(context, splitResult.contextPatch);
           context[`node:${node.id}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:outcome`] = splitResult.outcome;
           context[`node:${splitResult.joinNodeId}:branchOutcomes`] = splitResult.branchOutcomes;
+          if (splitResult.diagnosticReason) {
+            context[`node:${node.id}:error`] = splitResult.diagnosticReason;
+            context[`node:${splitResult.joinNodeId}:error`] = splitResult.diagnosticReason;
+          }
           if (splitResult.failureReason) {
             if (splitResult.failureReason.startsWith("ccc-branch-persistence-")) {
               context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY] = splitResult.failureReason;

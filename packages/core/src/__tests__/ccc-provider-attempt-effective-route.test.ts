@@ -329,6 +329,50 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       expect(receipt?.omniRoute).toEqual({ final: omniRouteReceipt.final });
     });
 
+    it("RED-OMNI-COMBO-1: accepts a combo alias when the final route is an admitted terminal member", () => {
+      const receipt = assertCccProviderAttemptEffectiveRoute(
+        {
+          effectiveProvider: "golden-omniroute-glm-latest",
+          effectiveModel: "combo/glm-latest",
+          usage: { inputTokens: 100, outputTokens: 40 },
+          cost: { amountUsd: 0, source: "pi-ai" },
+          receiptSource: "stream-usage",
+          omniRoute: { final: { provider: "glm", model: "glm-5.3" } },
+        },
+        { providerId: "golden-omniroute-glm-latest", modelId: "combo/glm-latest" },
+        {
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+          terminalRouteMembers: [{ provider: "glm", model: "glm-5.3" }],
+        },
+      );
+      expect(receipt?.omniRoute).toEqual({ final: { provider: "glm", model: "glm-5.3" } });
+    });
+
+    it("RED-OMNI-COMBO-2: reports the observed and admitted terminal members on combo drift", () => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        {
+          effectiveProvider: "golden-omniroute-gemini-flash-latest",
+          effectiveModel: "combo/gemini-flash-latest",
+          usage: { inputTokens: 100, outputTokens: 40 },
+          cost: { amountUsd: 0, source: "pi-ai" },
+          receiptSource: "stream-usage",
+          omniRoute: { final: { provider: "antigravity", model: "gemini-3.7-flash-medium" } },
+        },
+        { providerId: "golden-omniroute-gemini-flash-latest", modelId: "combo/gemini-flash-latest" },
+        {
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+          terminalRouteMembers: [
+            { provider: "antigravity", model: "gemini-3.7-flash-high" },
+            { provider: "gemini", model: "gemini-flash-latest" },
+          ],
+        },
+      )).toThrow(
+        "CCC final terminal provider/model receipt is not an admitted terminal route member: "
+        + "observed=antigravity/gemini-3.7-flash-medium; "
+        + "admitted=antigravity/gemini-3.7-flash-high,gemini/gemini-flash-latest",
+      );
+    });
+
     it.each([
       { label: "final provider drift", omniRoute: { final: { provider: "opencode-go", model: "MiniMax-M3" } } },
       { label: "final model alias drift", omniRoute: { final: { provider: "minimax", model: "minimax-m3" } } },

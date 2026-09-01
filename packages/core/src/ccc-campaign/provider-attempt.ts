@@ -440,9 +440,13 @@ function assertTerminalRouteReceipt(
   if (memberKeys) {
     const observedMember = `${observed.final.provider}\u0000${observed.final.model}`;
     if (!memberKeys.has(observedMember)) {
+      const admittedMembers = [...memberKeys]
+        .map((member) => member.replace("\u0000", "/"))
+        .join(",");
       throw new CccProviderAttemptIdentityError(
         "route-drift",
-        "CCC final terminal provider/model receipt is not an admitted terminal route member",
+        "CCC final terminal provider/model receipt is not an admitted terminal route member: "
+        + `observed=${observed.final.provider}/${observed.final.model}; admitted=${admittedMembers}`,
       );
     }
   } else if (
@@ -891,16 +895,33 @@ function bindingFromAuditRow(
   });
 }
 
+function routeReceiptForHistoryRow(
+  context: CccCampaignTaskContext,
+  metadata: ProviderAttemptMetadata,
+): Readonly<{
+  receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
+  terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
+}> {
+  const route = context.executionPolicy.routes.find(({ taskId }) => taskId === metadata.semanticTaskId);
+  if (!route) {
+    throw new CccCampaignContextError(
+      "CCC provider attempt history has no persisted campaign route for its semantic task",
+    );
+  }
+  return {
+    receiptAdapterId: route.receiptAdapterId,
+    terminalRouteMembers: route.terminalRouteMembers,
+  };
+}
+
 function assertAuditRow(
   row: typeof schema.project.runAuditEvents.$inferSelect,
-  routeReceipt: Readonly<{
-    receiptAdapterId?: CccCampaignRouteReceiptAdapterId;
-    terminalRouteMembers?: readonly CccCampaignTerminalRouteMember[];
-  }>,
+  context: CccCampaignTaskContext,
 ): { stage: AttemptStage; metadata: ProviderAttemptMetadata; scope: CccProviderAttemptScope } {
-  const receiptAdapterId = routeReceipt.receiptAdapterId;
   const stage = stageForMutationType(row.mutationType);
   const metadata = parseMetadata(row.metadata, stage);
+  const routeReceipt = routeReceiptForHistoryRow(context, metadata);
+  const receiptAdapterId = routeReceipt.receiptAdapterId;
   const binding = bindingFromAuditRow(row);
   if (
     row.domain !== "database"
@@ -991,7 +1012,7 @@ function assembleHistory(
 ): ProviderAttemptHistory {
   const attempts = new Map<string, StoredAttempt>();
   for (const row of rows) {
-    const { stage, metadata, scope } = assertAuditRow(row, context.route);
+    const { stage, metadata, scope } = assertAuditRow(row, context);
     let attempt = attempts.get(scope.attemptKey);
     if (!attempt) {
       attempt = {
@@ -1064,7 +1085,13 @@ function assembleHistory(
     throw new CccCampaignContextError("CCC provider attempt history request counts are not a contiguous reservation sequence");
   }
   if (context.requestCount !== sortedCounts.length) {
-    throw new CccCampaignContextError("CCC provider attempt history does not match persisted campaign request count");
+    const observedCounts = sortedCounts.join(",");
+    throw new CccCampaignContextError(
+      "CCC provider attempt history does not match persisted campaign request count: "
+      + `persisted request count=${context.requestCount}; `
+      + `observed provider attempts=${sortedCounts.length}; `
+      + `observed request counts=${observedCounts}`,
+    );
   }
   return { attempts, activeCount };
 }

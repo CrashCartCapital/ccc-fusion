@@ -656,13 +656,30 @@ pgTest("CCC campaign product merge approval", () => {
         actorName: "Operator",
       },
     };
+    const reflogBeforeLanding = (await git(
+      fixture.rootDir,
+      "reflog",
+      "show",
+      "--format=%H",
+      "refs/heads/main",
+    )).split("\n").filter(Boolean);
 
-    await expect(approveCccCampaignMerge(input)).resolves.toMatchObject({
+    const firstLanding = await approveCccCampaignMerge(input);
+    expect(firstLanding).toMatchObject({
       merged: true,
+      noOp: false,
       reason: "ccc-campaign-native-git-landed",
     });
     const landedCommit = await git(fixture.rootDir, "rev-parse", "refs/heads/main");
+    const reflogAfterLanding = (await git(
+      fixture.rootDir,
+      "reflog",
+      "show",
+      "--format=%H",
+      "refs/heads/main",
+    )).split("\n").filter(Boolean);
     expect(landedCommit).not.toBe(fixture.baseCommit);
+    expect(reflogAfterLanding).toHaveLength(reflogBeforeLanding.length + 1);
     await expect(getApprovalRequest(h.layer().db, approval.id))
       .resolves.toMatchObject({ status: "consumed" });
     const status = await inspectCccPrdProductStatus({
@@ -671,6 +688,9 @@ pgTest("CCC campaign product merge approval", () => {
       rootDir: fixture.rootDir,
     });
     const workItem = status!.workItems[0]!;
+    expect(status!.landing.intents).toHaveLength(1);
+    expect(status!.landing.materializations).toHaveLength(1);
+    expect(status!.landing.terminals).toHaveLength(1);
     await h.store().transitionWorkflowWorkItem(workItem.id, "succeeded", {
       expectedState: "manual-required",
       expectedAttempt: workItem.attempt,
@@ -682,11 +702,31 @@ pgTest("CCC campaign product merge approval", () => {
     });
 
     await expect(approveCccCampaignMerge(input)).resolves.toMatchObject({
-      merged: true,
-      reason: "ccc-campaign-native-git-landed",
+      branch: firstLanding.branch,
+      merged: firstLanding.merged,
+      noOp: firstLanding.noOp,
+      reason: firstLanding.reason,
+      worktreeRemoved: firstLanding.worktreeRemoved,
+      branchDeleted: firstLanding.branchDeleted,
+      campaignControlled: firstLanding.campaignControlled,
     });
     expect(await git(fixture.rootDir, "rev-parse", "refs/heads/main"))
       .toBe(landedCommit);
+    expect((await git(
+      fixture.rootDir,
+      "reflog",
+      "show",
+      "--format=%H",
+      "refs/heads/main",
+    )).split("\n").filter(Boolean)).toEqual(reflogAfterLanding);
+    const replayStatus = await inspectCccPrdProductStatus({
+      idempotencyKey: "semantic-merge-landing",
+      layer: h.layer(),
+      rootDir: fixture.rootDir,
+    });
+    expect(replayStatus!.landing.intents).toEqual(status!.landing.intents);
+    expect(replayStatus!.landing.materializations).toEqual(status!.landing.materializations);
+    expect(replayStatus!.landing.terminals).toEqual(status!.landing.terminals);
 
     await driftSemanticReceiptDuration(fixture.reservations[0]!.attemptKey);
     await expect(approveCccCampaignMerge(input))

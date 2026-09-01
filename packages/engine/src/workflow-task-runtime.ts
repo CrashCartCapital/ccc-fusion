@@ -9,6 +9,8 @@ import {
 } from "@fusion/core";
 
 import {
+  CCC_BRANCH_PERSISTENCE_ERROR_CONTEXT_KEY,
+  CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY,
   CCC_RETRY_CLASSIFICATION_CONTEXT_KEY,
   WorkflowGraphExecutor,
   type WorkflowNodeExecutionFence,
@@ -63,11 +65,22 @@ export interface WorkflowTaskRuntimeResult {
   reason?: string;
 }
 
-function graphFailureReason(result: {
+export function graphFailureReason(result: {
   visitedNodeIds: readonly string[];
   context: Readonly<Record<string, unknown>>;
 }): string {
+  const branchPersistenceFailure = result.context[CCC_BRANCH_PERSISTENCE_FAILURE_CONTEXT_KEY];
+  if (typeof branchPersistenceFailure === "string" && branchPersistenceFailure.trim().length > 0) {
+    const branchPersistenceError = result.context[CCC_BRANCH_PERSISTENCE_ERROR_CONTEXT_KEY];
+    return typeof branchPersistenceError === "string" && branchPersistenceError.trim().length > 0
+      ? `${branchPersistenceFailure.trim()}:${branchPersistenceError.trim()}`
+      : branchPersistenceFailure.trim();
+  }
+
+  let failedNodeId: string | undefined;
   for (const nodeId of [...result.visitedNodeIds].reverse()) {
+    if (result.context[`node:${nodeId}:outcome`] !== "failure") continue;
+    failedNodeId ??= nodeId;
     const error = result.context[`node:${nodeId}:error`];
     if (typeof error === "string" && error.trim().length > 0) {
       return `workflow-node-error:${nodeId}:${error.trim()}`;
@@ -77,7 +90,37 @@ function graphFailureReason(result: {
       return `workflow-node-failed:${nodeId}:${value.trim()}`;
     }
   }
-  return "workflow-graph-failed";
+  for (const [key, value] of Object.entries(result.context).reverse()) {
+    const match = /^node:(.+):error$/u.exec(key);
+    if (
+      match
+      && typeof value === "string"
+      && value.trim().length > 0
+      && result.context[`node:${match[1]}:outcome`] === "failure"
+    ) {
+      return `workflow-node-error:${match[1]}:${value.trim()}`;
+    }
+  }
+  if (failedNodeId) return `workflow-node-failed:${failedNodeId}`;
+
+  const nodeState = Object.fromEntries(
+    Object.entries(result.context)
+      .filter(([key, value]) =>
+        /^node:.+:(?:outcome|value|error)$/u.test(key)
+        && (value === null || ["string", "number", "boolean"].includes(typeof value)))
+      .sort(([left], [right]) => left.localeCompare(right))
+      .slice(-12)
+      .map(([key, value]) => [
+        key,
+        typeof value === "string" && value.length > 240
+          ? `${value.slice(0, 237)}...`
+          : value,
+      ]),
+  );
+  return `workflow-graph-failed:${JSON.stringify({
+    visitedNodeIds: result.visitedNodeIds.slice(-12),
+    nodeState,
+  })}`;
 }
 
 function sha256Text(value: string): string {

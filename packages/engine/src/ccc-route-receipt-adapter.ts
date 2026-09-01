@@ -133,6 +133,7 @@ type TransportOutput = {
   responseId?: string;
   responseModel?: string;
   errorMessage?: string;
+  cleanupErrorMessage?: string;
 };
 
 function createTransportOutput(model: Model<Api>): TransportOutput {
@@ -224,22 +225,25 @@ async function runCccTerminalRouteReceiptRequest(
     stream.push({ type: "done", reason: output.stopReason, message: output as never });
     stream.end();
   } catch (error) {
-    let terminalError = error;
+    let abortReason = error;
     if (responseBody && !responseBody.locked) {
       try {
         await responseBody.cancel(error);
       } catch (cancelError) {
-        terminalError = new AggregateError(
+        output.cleanupErrorMessage = cancelError instanceof Error
+          ? cancelError.message
+          : String(cancelError);
+        abortReason = new AggregateError(
           [error, cancelError],
           "CCC terminal route receipt request and response cleanup both failed",
         );
       }
     }
-    if (!requestController.signal.aborted) requestController.abort(terminalError);
+    if (!requestController.signal.aborted) requestController.abort(abortReason);
     if (options.signal?.aborted === true) output.stopReason = "aborted";
     else output.stopReason = "error";
     for (const block of output.content) delete block.partialArgs;
-    output.errorMessage = terminalError instanceof Error ? terminalError.message : String(terminalError);
+    output.errorMessage = error instanceof Error ? error.message : String(error);
     stream.push({ type: "error", reason: output.stopReason, error: output as never });
     stream.end();
   } finally {

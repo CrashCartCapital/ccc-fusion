@@ -77,12 +77,88 @@ export function isCccCampaignPotentialMutationToolCall(
  * post-execution write-envelope snapshot.
  */
 export function cccCampaignVisibleBashWriteTargets(raw: string): string[] {
-  if (!/\b(?:node|bun|deno)\b/u.test(raw)) return [];
   const command = raw.replace(/\\(["'])/gu, "$1");
   const targets: string[] = [];
-  const singleTarget = /\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|mkdir|mkdirSync|rm|rmSync|unlink|unlinkSync|truncate|truncateSync)\s*\(\s*(["'])([^"'\\\r\n]+)\1/gu;
-  for (const match of command.matchAll(singleTarget)) targets.push(match[2]!);
-  const destinationTarget = /\b(?:copyFile|copyFileSync|cp|cpSync|rename|renameSync)\s*\(\s*(["'])([^"'\\\r\n]+)\1\s*,\s*(["'])([^"'\\\r\n]+)\3/gu;
-  for (const match of command.matchAll(destinationTarget)) targets.push(match[4]!);
+  const redirectTarget = /(?:^|[\s;|])\d*>>?\s*(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s;&|]+))/gu;
+  for (const match of command.matchAll(redirectTarget)) {
+    const target = match[1] ?? match[2] ?? match[3];
+    if (!target || target === "/dev/null" || /^&\d+$/u.test(target) || target.startsWith("(")) continue;
+    targets.push(target);
+  }
+  if (/\b(?:node|bun|deno)\b/u.test(raw)) {
+    const singleTarget = /\b(?:writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|mkdir|mkdirSync|rm|rmSync|unlink|unlinkSync|truncate|truncateSync)\s*\(\s*(["'])([^"'\\\r\n]+)\1/gu;
+    for (const match of command.matchAll(singleTarget)) targets.push(match[2]!);
+    const destinationTarget = /\b(?:copyFile|copyFileSync|cp|cpSync|rename|renameSync)\s*\(\s*(["'])([^"'\\\r\n]+)\1\s*,\s*(["'])([^"'\\\r\n]+)\3/gu;
+    for (const match of command.matchAll(destinationTarget)) targets.push(match[4]!);
+  }
   return [...new Set(targets)];
+}
+
+/**
+ * Extract literal roots from common shell search commands. Campaign workers are
+ * worktree-scoped, so a search rooted outside that worktree is never a valid
+ * substitute for targeted project discovery. Keep this deliberately narrow:
+ * opaque shell syntax remains governed by the normal tool and custody guards.
+ */
+export function cccCampaignVisibleBashTraversalRoots(raw: string): string[] {
+  const command = raw.replace(/\\(["'])/gu, "$1");
+  const roots: string[] = [];
+  const searchCommand = /(?:^|[;&|]\s*|\$\(\s*)(?:(?:env|command)\s+)*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+))\s+)*(?:\S*\/)?(cd|find|rg|grep)\s+([^;&|\n]+)/gu;
+  const tokenPattern = /"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s]+)/gu;
+  const expandToken = (token: string): string => {
+    if (token === "~" || token.startsWith("~/")) {
+      return `${process.env.HOME ?? "/__ccc_unresolved_shell_home__"}${token.slice(1)}`;
+    }
+    const environment = token.match(/^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))(\/.*)?$/u);
+    if (!environment) return token;
+    const name = environment[1] ?? environment[2]!;
+    const base = process.env[name] ?? `/__ccc_unresolved_shell_variable__/${name}`;
+    return `${base}${environment[3] ?? ""}`;
+  };
+  for (const match of command.matchAll(searchCommand)) {
+    const executable = match[1]!;
+    const tail = match[2] ?? "";
+    const tokens = [...tail.matchAll(tokenPattern)]
+      .map((tokenMatch) => tokenMatch[1] ?? tokenMatch[2] ?? tokenMatch[3] ?? "")
+      .filter(Boolean);
+    if (executable === "cd") {
+      const root = tokens.find((token) => token !== "--" && !token.startsWith("-"));
+      if (root) roots.push(expandToken(root));
+      continue;
+    }
+    if (executable === "find") {
+      let sawRoot = false;
+      for (const token of tokens) {
+        if (token === "--") continue;
+        if (token.startsWith("-")) {
+          if (sawRoot) break;
+          continue;
+        }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=.*/u.test(token)) {
+          if (sawRoot) break;
+          continue;
+        }
+        if (token.includes("*") || token.includes("?")) continue;
+        roots.push(token);
+        sawRoot = true;
+      }
+      continue;
+    }
+    for (const token of tokens) {
+      if (token === "--") continue;
+      if (token.startsWith("-")) continue;
+      if (token === "/dev/null") continue;
+      const expanded = expandToken(token);
+      if (
+        expanded.startsWith("/")
+        || expanded === "."
+        || expanded === ".."
+        || expanded.startsWith("./")
+        || expanded.startsWith("../")
+      ) {
+        roots.push(expanded);
+      }
+    }
+  }
+  return [...new Set(roots)];
 }

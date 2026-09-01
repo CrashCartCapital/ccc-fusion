@@ -999,19 +999,38 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
     && actual.every((key, index) => key === expected[index]);
 }
 
-function exactEvidenceResults(
+export function exactEvidenceResults(
   value: unknown,
   idKey: "clauseId" | "caseId" | "controlId",
   expectedIds: readonly string[],
 ): boolean {
   if (!Array.isArray(value) || value.length !== expectedIds.length) return false;
+  const observed: string[] = [];
+  for (const entry of value) {
+    if (
+      !isRecord(entry)
+      || !hasExactKeys(entry, [idKey, "passed"])
+      || typeof entry[idKey] !== "string"
+      || typeof entry.passed !== "boolean"
+    ) {
+      return false;
+    }
+    observed.push(entry[idKey] as string);
+  }
   const expected = [...expectedIds].sort();
-  return value.every((entry, index) => (
-    isRecord(entry)
-    && hasExactKeys(entry, [idKey, "passed"])
-    && entry[idKey] === expected[index]
-    && typeof entry.passed === "boolean"
-  ));
+  observed.sort();
+  return observed.every((id, index) => id === expected[index]);
+}
+
+function canonicalEvidenceResults<T extends Record<string, unknown>>(
+  value: readonly T[],
+  idKey: "clauseId" | "caseId" | "controlId",
+): readonly T[] {
+  return Object.freeze([...value].sort((left, right) => {
+    const leftId = left[idKey] as string;
+    const rightId = right[idKey] as string;
+    return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+  }));
 }
 
 type SemanticProofEvidenceMismatchReason =
@@ -1237,7 +1256,21 @@ function parseSemanticProofEvidence(
       "aggregate-passed-inconsistent",
     );
   }
-  return parsed as CccCampaignProofEvidenceV2;
+  return Object.freeze({
+    ...parsed,
+    clauseResults: canonicalEvidenceResults(
+      parsed.clauseResults as CccCampaignProofEvidenceV2["clauseResults"],
+      "clauseId",
+    ),
+    positiveCaseResults: canonicalEvidenceResults(
+      parsed.positiveCaseResults as CccCampaignProofEvidenceV2["positiveCaseResults"],
+      "caseId",
+    ),
+    negativeControlResults: canonicalEvidenceResults(
+      parsed.negativeControlResults as CccCampaignProofEvidenceV2["negativeControlResults"],
+      "controlId",
+    ),
+  }) as CccCampaignProofEvidenceV2;
 }
 
 function semanticProofEvidenceMismatchWarning(
