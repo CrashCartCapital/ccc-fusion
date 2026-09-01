@@ -433,6 +433,15 @@ function isTransientExecutableProbeTimeout(error: unknown): boolean {
     && candidate.signal === "SIGTERM";
 }
 
+function toolchainDrift(name: string, error: unknown): Error {
+  const detail = (error instanceof Error ? error.message : String(error))
+    .replace(/[\r\n]+/gu, " ")
+    .slice(0, 240);
+  return new Error(
+    `CCC semantic-proof toolchain drift detected for ${name}${detail ? `: ${detail}` : ""}`,
+  );
+}
+
 async function runExecutableVersionProbe(
   executablePath: string,
   args: readonly string[],
@@ -474,8 +483,8 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
         throw new Error("executable bytes differ");
       }
       verifiedPaths.set(name, observed.canonicalPath);
-    } catch {
-      throw new Error(`CCC semantic-proof toolchain drift detected for ${name}`);
+    } catch (error) {
+      throw toolchainDrift(name, error);
     }
   }
   for (const [name, identity] of identities) {
@@ -508,8 +517,8 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
       ) {
         throw new Error("version output differs");
       }
-    } catch {
-      throw new Error(`CCC semantic-proof toolchain drift detected for ${name}`);
+    } catch (error) {
+      throw toolchainDrift(name, error);
     }
   }
   if (toolchain.python) {
@@ -1306,6 +1315,17 @@ async function sealExecutionToolchain(
   const taskExecutable = await sealOnce(toolchain.task);
   const nodeExecutable = await sealOnce(toolchain.node);
   const proofHostExecutable = await sealOnce(toolchain.proofHost);
+  const proofHostModuleContext = toolchain.proofHost.id === CCC_PRD_SEMANTIC_PROOF_HOST_ID
+    ? join(dirname(proofHostExecutable), "package.json")
+    : undefined;
+  if (proofHostModuleContext) {
+    await writeFile(
+      proofHostModuleContext,
+      '{"type":"module"}\n',
+      { flag: "wx", mode: 0o444 },
+    );
+    await chmod(proofHostModuleContext, 0o444);
+  }
   const python = toolchain.python
     ? await sealPythonExecutionToolchain(toolchainRoot, toolchain.python, sealedByCanonicalPath)
     : undefined;
@@ -1367,6 +1387,7 @@ async function sealExecutionToolchain(
     chmod(taskExecutable, 0o555),
     chmod(nodeExecutable, 0o555),
     chmod(proofHostExecutable, 0o555),
+    ...(proofHostModuleContext ? [chmod(proofHostModuleContext, 0o444)] : []),
     ...linkedRuntime.map((entry) => chmod(entry.canonicalPath, 0o444)),
     ...(python ? [
       chmod(python.executablePath, 0o555),

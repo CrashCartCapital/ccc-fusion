@@ -15,8 +15,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
+  CCC_PRD_SEMANTIC_PROOF_HOST_ID,
   computeCccPrdCandidateInputsSha256,
   computeCccPrdVerifierClosureSha256,
   type CccPrdProofV2,
@@ -585,7 +587,9 @@ describe("CCC semantic-proof admission and materialization", () => {
       task: identity,
       node: identity,
       proofHost: { id: "test-host", ...identity },
-    })).rejects.toThrow("toolchain drift");
+    })).rejects.toThrow(
+      "CCC semantic-proof toolchain drift detected for Task: executable bytes differ",
+    );
   });
 
   it("RED-S5-toolchain-drift-pre-spawn: compares changed bytes before executing a replacement", async () => {
@@ -627,7 +631,9 @@ describe("CCC semantic-proof admission and materialization", () => {
       task: identity,
       node: identity,
       proofHost: { id: "test-host", ...identity },
-    })).rejects.toThrow("toolchain drift");
+    })).rejects.toThrow(
+      "CCC semantic-proof toolchain drift detected for Task: version output differs",
+    );
   });
 
   it("RED-S5-node-launched-proof-host: probes a sealed JavaScript proof host through sealed Node", async () => {
@@ -795,6 +801,88 @@ describe("CCC semantic-proof admission and materialization", () => {
     expect(await readFile(sealedToolchain!.nodeExecutable, "utf8")).toContain("sealed-test");
     expect(await readFile(sealedToolchain!.proofHostExecutable, "utf8")).toContain("sealed-test");
     expect((await stat(sealedToolchain!.taskExecutable)).mode & 0o222).toBe(0);
+  });
+
+  it("preserves ESM proof-host version identity after sealing outside its package", async () => {
+    const fixture = await createGitFixture();
+    const outputRoot = await mkdtemp("/private/tmp/ccc-semantic-proof-output-");
+    const hostPackageRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-esm-host-"));
+    roots.push(outputRoot, hostPackageRoot);
+    const proofHostPath = join(hostPackageRoot, "proof-host.js");
+    await writeFile(join(hostPackageRoot, "package.json"), '{"type":"module"}\n');
+    await writeFile(
+      proofHostPath,
+      await readFile(resolve(
+        dirname(fileURLToPath(import.meta.url)),
+        "../../../cli/dist/ccc-campaign-proof-admission.js",
+      )),
+    );
+    await chmod(proofHostPath, 0o755);
+
+    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const nodeIdentity = await executableIdentity(process.execPath);
+    const canonicalProofHost = await realpath(proofHostPath);
+    const proofHostProbe = await execFile(
+      nodeIdentity.executablePath,
+      [canonicalProofHost, "--version"],
+      { encoding: "buffer", env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" } },
+    );
+    const proofHostVersionOutput = Buffer.concat([
+      proofHostProbe.stdout,
+      proofHostProbe.stderr,
+    ]);
+    expect(proofHostProbe.stderr.toString("utf8")).toBe("");
+    const proofHostIdentity = {
+      id: CCC_PRD_SEMANTIC_PROOF_HOST_ID,
+      executablePath: canonicalProofHost,
+      executableSha256: sha256(await readFile(canonicalProofHost)),
+      version: proofHostVersionOutput.toString("utf8").trim(),
+      versionOutputSha256: sha256(proofHostVersionOutput),
+    };
+    const linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
+      task: taskIdentity,
+      node: nodeIdentity,
+      proofHost: proofHostIdentity,
+    });
+    const definition = proof({
+      ...fixture,
+      taskIdentity,
+      nodeIdentity,
+      linkedRuntime,
+    });
+    definition.executionToolchain.proofHost = proofHostIdentity;
+
+    const materialized = await admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit: fixture.baseCommit,
+      sourceCommit: fixture.candidateCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    });
+
+    expect(materialized.sealedExecutionToolchain.proofHost).toMatchObject({
+      executableSha256: proofHostIdentity.executableSha256,
+      version: proofHostIdentity.version,
+      versionOutputSha256: proofHostIdentity.versionOutputSha256,
+    });
+    const sealedModuleContext = join(
+      dirname(materialized.sealedExecutionToolchain.proofHost.executablePath),
+      "package.json",
+    );
+    expect(JSON.parse(await readFile(sealedModuleContext, "utf8"))).toEqual({
+      type: "module",
+    });
+    expect((await stat(sealedModuleContext)).mode & 0o222).toBe(0);
+    const sealedProofHostProbe = await execFile(
+      materialized.sealedExecutionToolchain.node.executablePath,
+      [materialized.sealedExecutionToolchain.proofHost.executablePath, "--version"],
+      { encoding: "buffer", env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" } },
+    );
+    expect(sealedProofHostProbe.stderr.toString("utf8")).toBe("");
+    await expect(verifyCccSemanticProofToolchainBeforeSpawn(
+      materialized.sealedExecutionToolchain,
+    )).resolves.toBeUndefined();
   });
 
   it("RED-R1-python-semantic-v2-task-and-runtime: admits only the closure-owned Python adapter and seals every runtime category", async () => {
