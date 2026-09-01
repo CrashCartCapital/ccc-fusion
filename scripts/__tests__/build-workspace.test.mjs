@@ -338,10 +338,20 @@ test("CCC product acceptance binds proof cutpoint markers to its owned temp root
   const readMarkers = extractFunctionSource(source, "readOwnedProofCutpointMarkers");
   const cleanupMarkers = extractFunctionSource(source, "cleanupOwnedProofCutpointMarkers");
 
-  assert.match(
+  assert.doesNotMatch(
     cleanEnvironment,
-    /TMPDIR:\s*proofExecutionTmpRoot/,
+    /TMPDIR/,
+    "one-shot CLI commands must not share the served runtime's engine-socket temp root",
+  );
+  assert.match(
+    source,
+    /const serveEnv = Object\.freeze\(\{ \.\.\.env, TMPDIR: proofExecutionTmpRoot \}\)/,
     "served runtime must create semantic proof temp roots under the acceptance-owned temp root",
+  );
+  assert.doesNotMatch(
+    source,
+    /await startServe\(targetRoot, env,/,
+    "every served runtime must use the isolated server-only temp root",
   );
   assert.match(
     source,

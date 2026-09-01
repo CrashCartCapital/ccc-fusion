@@ -1071,13 +1071,12 @@ async function poll(label, read, accept, diagnose, timeoutMs = productTimeoutMs)
   );
 }
 
-function cleanEnvironment(isolatedHome, fakeBin, proofExecutionTmpRoot) {
+function cleanEnvironment(isolatedHome, fakeBin) {
   const env = {
     ...process.env,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
     CODEX_HOME: path.join(isolatedHome, ".codex"),
-    TMPDIR: proofExecutionTmpRoot,
     PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
     FUSION_SKIP_ONBOARDING: "1",
   };
@@ -3508,7 +3507,8 @@ async function main() {
     );
     await writeFakeCodex(fakeBin);
     ownedFakeCodexPath = path.join(fakeBin, "codex");
-    const env = cleanEnvironment(isolatedHome, fakeBin, proofExecutionTmpRoot);
+    const env = cleanEnvironment(isolatedHome, fakeBin);
+    const serveEnv = Object.freeze({ ...env, TMPDIR: proofExecutionTmpRoot });
     const providerCutpointActivation = path.join(
       fakeBin,
       "provider-cutpoint.activate",
@@ -4773,7 +4773,7 @@ async function main() {
     );
 
     const port = await availablePort();
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
 
     const preview = jsonOutput(
       await prd(["preview", ...commonPacketArgs]),
@@ -5001,7 +5001,7 @@ async function main() {
     );
     const readProviderCutpointStatus = async () =>
       readStatusFor(providerCutpointKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const providerAuthorizationHold = await awaitSealedExecutionAuthorization(
       "provider cutpoint execution approval",
       readProviderCutpointStatus,
@@ -5071,7 +5071,7 @@ async function main() {
       [providerMarker.pid],
       "CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATION_DRIFT",
     );
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const recoveredProviderCutpoint = await poll(
       "provider uncertainty parked after restart",
       readProviderCutpointStatus,
@@ -5202,7 +5202,7 @@ async function main() {
     );
     const readProofCutpointStatus = async () =>
       readStatusFor(proofCutpointKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const proofAuthorizationHold = await awaitSealedExecutionAuthorization(
       "proof cutpoint execution approval",
       readProofCutpointStatus,
@@ -5322,7 +5322,7 @@ async function main() {
         proofCutpointToken,
         canonicalProofRoot,
       );
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const recoveredProofCutpoint = await poll(
       "proof uncertainty parked after restart",
       readProofCutpointStatus,
@@ -5539,7 +5539,7 @@ async function main() {
     });
 
     const readStatus = async () => readStatusFor(idempotencyKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     assert(
       (
         importedServer.child.exitCode !== null
@@ -6393,7 +6393,7 @@ async function main() {
     const landingServerBeforeRestart = server;
     await stopServe(landingServerBeforeRestart);
     server = undefined;
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     assert(
       landingServerBeforeRestart.child.pid !== server.child.pid,
       "CCC_PRODUCT_GIT_LANDING_RESTART_PROCESS_INVALID",
@@ -6558,7 +6558,7 @@ async function main() {
 
     await stopServe(server);
     server = undefined;
-    restartedServer = await startServe(targetRoot, env, port);
+    restartedServer = await startServe(targetRoot, serveEnv, port);
     const recovered = await poll(
       "terminal status after restart",
       readStatus,
@@ -6914,7 +6914,7 @@ async function main() {
     });
 
     const readFanoutStatus = async () => readStatusFor(fanoutKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
 
     // One parent decision seals all four exact fan-out members. Every child ID
     // remains diagnostic only and is independently refused by the CLI.
