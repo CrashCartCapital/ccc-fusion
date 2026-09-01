@@ -468,6 +468,11 @@ test("CCC product acceptance gives the four-task fanout generous execution headr
     /const maxRequests = String\(fanTasks\.length\)/,
     "one request per fanout task is below the structural mutate-plus-repair floor",
   );
+  assert.match(
+    source,
+    /"--max-requests",\s*String\(fanoutCampaignMaxRequests\),\s*"--max-duration-ms",\s*String\(fanoutCampaignMaxDurationMs\)/,
+    "fanout authoring must use the same generous bounds as freeze and preview",
+  );
 });
 
 test("real CLI serial tsup build is recognized as bundled output only", () => {

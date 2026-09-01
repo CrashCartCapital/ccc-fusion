@@ -6664,9 +6664,9 @@ async function main() {
         // and must byte-match the proposal's bounds (authoring refuses with
         // CCC_PRD_AUTHORING_BOUNDS_DRIFT otherwise).
         "--max-requests",
-        "4",
+        String(fanoutCampaignMaxRequests),
         "--max-duration-ms",
-        "240000",
+        String(fanoutCampaignMaxDurationMs),
         "--max-concurrency",
         "1",
         "--max-prompt-bytes",
