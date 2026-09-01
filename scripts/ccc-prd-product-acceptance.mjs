@@ -3471,6 +3471,46 @@ async function cleanupOwnedProofCutpointMarkers(token, proofExecutionTmpRoot = t
   }
 }
 
+async function cleanupOwnedProofExecutionTmpRoot(proofExecutionTmpRoot) {
+  if (!proofExecutionTmpRoot) return;
+  const canonicalShortTmpParent = await realpath("/tmp");
+  const canonicalRoot = await realpath(proofExecutionTmpRoot).catch(() => undefined);
+  if (!canonicalRoot) return;
+  if (
+    path.dirname(canonicalRoot) !== canonicalShortTmpParent
+    || !path.basename(canonicalRoot).startsWith("ccc-prd-proof-")
+  ) {
+    throw new Error(`CCC_PRODUCT_PROOF_TMP_CLEANUP_ROOT_REFUSED: ${canonicalRoot}`);
+  }
+  const makeWriteable = async (ownedPath) => {
+    const fromRoot = path.relative(canonicalRoot, ownedPath);
+    if (
+      fromRoot === ".."
+      || fromRoot.startsWith(`..${path.sep}`)
+      || path.isAbsolute(fromRoot)
+    ) {
+      throw new Error(`CCC_PRODUCT_PROOF_TMP_CLEANUP_ESCAPE: ${ownedPath}`);
+    }
+    const metadata = await lstat(ownedPath).catch(() => undefined);
+    if (!metadata) return;
+    if (metadata.isSymbolicLink()) {
+      await unlink(ownedPath);
+      return;
+    }
+    if (!metadata.isDirectory()) {
+      await chmod(ownedPath, 0o600);
+      return;
+    }
+    await chmod(ownedPath, 0o700);
+    const entries = await readdir(ownedPath, { withFileTypes: true });
+    await Promise.all(entries.map((entry) => (
+      makeWriteable(path.join(ownedPath, entry.name))
+    )));
+  };
+  await makeWriteable(canonicalRoot);
+  await rm(canonicalRoot, { recursive: true, force: true });
+}
+
 async function main() {
   const ledger = new AcceptanceLedger(expectedChecks);
   const startedAt = new Date();
@@ -3501,9 +3541,9 @@ async function main() {
     );
     const fakeBin = path.join(tempRoot, "fake-bin");
     const worktreesRoot = path.join(tempRoot, "worktrees");
+    const shortProofTmpParent = await realpath("/tmp");
     proofExecutionTmpRoot = await realpath(
-      await mkdir(path.join(tempRoot, "proof-tmp"), { recursive: true })
-        .then(() => path.join(tempRoot, "proof-tmp")),
+      await mkdtemp(path.join(shortProofTmpParent, "ccc-prd-proof-")),
     );
     await writeFakeCodex(fakeBin);
     ownedFakeCodexPath = path.join(fakeBin, "codex");
@@ -7513,6 +7553,8 @@ async function main() {
       ownedProofCutpointToken,
       proofExecutionTmpRoot,
     ).catch(() => undefined);
+    await cleanupOwnedProofExecutionTmpRoot(proofExecutionTmpRoot)
+      .catch(() => undefined);
     if (tempRoot && process.env.CCC_PRD_PRODUCT_KEEP_TMP !== "1") {
       await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
     }

@@ -348,6 +348,16 @@ test("CCC product acceptance binds proof cutpoint markers to its owned temp root
     /const serveEnv = Object\.freeze\(\{ \.\.\.env, TMPDIR: proofExecutionTmpRoot \}\)/,
     "served runtime must create semantic proof temp roots under the acceptance-owned temp root",
   );
+  assert.match(
+    source,
+    /mkdtemp\(path\.join\(shortProofTmpParent, "ccc-prd-proof-"\)\)/,
+    "the owned proof temp root must stay short enough for the macOS engine socket path",
+  );
+  assert.match(
+    source,
+    /cleanupOwnedProofExecutionTmpRoot\(proofExecutionTmpRoot\)/,
+    "the separately owned short proof temp root must be removed on every exit",
+  );
   assert.doesNotMatch(
     source,
     /await startServe\(targetRoot, env,/,
