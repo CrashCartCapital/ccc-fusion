@@ -1556,7 +1556,7 @@ pgDescribe("CCC PRD product status (PostgreSQL)", () => {
       leaseOwner: null,
       leaseExpiresAt: null,
       lastError: MERGE_APPROVAL_REQUIRED,
-      blockedReason: "exact human merge approval required",
+      blockedReason: MERGE_APPROVAL_REQUIRED,
       waitReason: null,
     });
 
