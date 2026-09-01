@@ -273,9 +273,11 @@ const CCC_PERMANENT_WORK_ITEM_ERROR_MAX_CHARS = 512;
 
 export function formatCccPermanentWorkItemError(
   reason: string,
-  error: PermanentError,
+  error: unknown,
 ): string {
-  const detail = error.message.replace(/\s+/gu, " ").trim();
+  const detail = (error instanceof Error ? error.message : String(error ?? ""))
+    .replace(/\s+/gu, " ")
+    .trim();
   if (detail.length === 0) return reason;
   const prefix = `${reason}: `;
   return `${prefix}${detail.slice(
@@ -460,6 +462,14 @@ export class WorkflowTaskRuntime {
       && retryClassification.startsWith("ccc-permanent:")
         ? retryClassification
         : undefined;
+    const permanentCampaignDetail = permanentCampaignReason
+      ? [...Object.entries(result.context)].reverse().find(
+        ([key, value]) =>
+          key.startsWith("node:")
+          && key.endsWith(":error")
+          && typeof value === "string",
+      )?.[1]
+      : undefined;
     const disposition: WorkflowTaskRuntimeDisposition = result.outcome === "success"
       ? "completed"
       : permanentCampaignReason
@@ -467,7 +477,11 @@ export class WorkflowTaskRuntime {
         : "failed";
     this.emit("terminal", task.id, disposition);
     const reason = permanentCampaignReason
-      ?? (result.outcome === "failure" && runOptions.signal?.aborted
+      ? formatCccPermanentWorkItemError(
+        permanentCampaignReason,
+        permanentCampaignDetail,
+      )
+      : (result.outcome === "failure" && runOptions.signal?.aborted
         ? "workflow-aborted"
         : result.outcome === "failure"
           ? graphFailureReason(result)

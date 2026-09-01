@@ -638,7 +638,7 @@ describe("WorkflowTaskRuntime", () => {
     expect(result).toMatchObject({
       disposition: "manual-required",
       outcome: "failure",
-      reason: "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+      reason: "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN: A previously dispatched proof command has no terminal receipt.",
       context: {
         "ccc:retry-classification": "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
       },
@@ -1094,7 +1094,7 @@ describe("WorkflowTaskRuntime", () => {
     expect(result).toMatchObject({
       disposition: "manual-required",
       outcome: "failure",
-      reason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      reason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED: awaiting exact live execution approval",
     });
     expect(requireLiveExecution).toHaveBeenCalledWith({
       taskId: nativeTaskId,
