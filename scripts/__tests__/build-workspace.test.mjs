@@ -82,7 +82,8 @@ function writePluginDist(root, dir = "plugins/fusion-plugin-alpha") {
 }
 
 function extractFunctionSource(source, name) {
-  const start = source.indexOf(`async function ${name}(`);
+  const asyncStart = source.indexOf(`async function ${name}(`);
+  const start = asyncStart === -1 ? source.indexOf(`function ${name}(`) : asyncStart;
   assert.notEqual(start, -1, `expected to find ${name}`);
   const bodyStart = source.indexOf("{", start);
   assert.notEqual(bodyStart, -1, `expected to find ${name} body`);
@@ -329,6 +330,59 @@ test("CCC product acceptance builds the current CLI through the root workspace b
   );
   assert.match(buildCurrentCli, /CCC_PRODUCT_STALE_DASHBOARD_BUILD/);
   assert.match(buildCurrentCli, /body\.type === "agent-turn-complete"/);
+});
+
+test("CCC product acceptance binds proof cutpoint markers to its owned temp root", () => {
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+  const cleanEnvironment = extractFunctionSource(source, "cleanEnvironment");
+  const readMarkers = extractFunctionSource(source, "readOwnedProofCutpointMarkers");
+  const cleanupMarkers = extractFunctionSource(source, "cleanupOwnedProofCutpointMarkers");
+
+  assert.match(
+    cleanEnvironment,
+    /TMPDIR:\s*proofExecutionTmpRoot/,
+    "served runtime must create semantic proof temp roots under the acceptance-owned temp root",
+  );
+  assert.match(
+    source,
+    /readOwnedProofCutpointMarkers\(proofCutpointToken,\s*proofExecutionTmpRoot\)/,
+    "proof cutpoint marker polling must read from the same temp root given to the served runtime",
+  );
+  assert.match(
+    source,
+    /cleanupOwnedProofCutpointMarkers\(\s*ownedProofCutpointToken,\s*proofExecutionTmpRoot,\s*\)/,
+    "proof cutpoint cleanup must use the same owned temp root",
+  );
+  assert.match(
+    readMarkers,
+    /fusion-verifier-sandbox-/,
+    "proof cutpoint marker polling must discover the verifier command's nested sandbox home",
+  );
+  assert.match(
+    readMarkers,
+    /verifierSandboxRoot/,
+    "verifier-sandbox markers must keep their own ownership root separate from semantic proof roots",
+  );
+  assert.match(
+    readMarkers,
+    /cleanupRoot/,
+    "proof cutpoint markers must carry the exact root that cleanup is allowed to remove",
+  );
+  assert.match(
+    source,
+    /semanticProofId === 'PROOF-VERTICAL-VALUE-TASK'/,
+    "the cutpoint hang must arm only inside the semantic proof process",
+  );
+  assert.match(
+    source,
+    /!semanticProofId && candidates\['src\/value\.txt'\]/,
+    "the ordinary readiness verifier must accept the planted cutpoint candidate without hanging",
+  );
+  assert.match(
+    cleanupMarkers,
+    /marker\.cleanupRoot/,
+    "proof cutpoint cleanup must remove each marker's validated owned cleanup root",
+  );
 });
 
 test("real CLI serial tsup build is recognized as bundled output only", () => {

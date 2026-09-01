@@ -1071,12 +1071,13 @@ async function poll(label, read, accept, diagnose, timeoutMs = productTimeoutMs)
   );
 }
 
-function cleanEnvironment(isolatedHome, fakeBin) {
+function cleanEnvironment(isolatedHome, fakeBin, proofExecutionTmpRoot) {
   const env = {
     ...process.env,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
     CODEX_HOME: path.join(isolatedHome, ".codex"),
+    TMPDIR: proofExecutionTmpRoot,
     PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
     FUSION_SKIP_ONBOARDING: "1",
   };
@@ -1719,7 +1720,8 @@ async function initializeTarget(
       `const cutpointToken = ${JSON.stringify(proofCutpointToken)};`,
       `const cutpointMarkerName = ${JSON.stringify(proofCutpointMarkerName)};`,
       "const candidates = Object.fromEntries(process.argv.slice(2).map(candidate => [candidate, fs.readFileSync(candidate, 'utf8').trim()]));",
-      `if (Object.values(candidates).includes(${JSON.stringify(proofCutpointCandidateValue)})) {`,
+      "const semanticProofId = process.env.CCC_PROOF_ID;",
+      `if (semanticProofId === 'PROOF-VERTICAL-VALUE-TASK' && Object.values(candidates).includes(${JSON.stringify(proofCutpointCandidateValue)})) {`,
       "  const home = process.env.HOME;",
       "  if (!home) {",
       "    console.error('PROOF_CUTPOINT_HOME_MISSING');",
@@ -1742,11 +1744,13 @@ async function initializeTarget(
       "  console.log('PROOF_CUTPOINT_READY');",
       "  setInterval(() => {}, 1000);",
       "} else {",
-      "  const proofId = process.env.CCC_PROOF_ID;",
+      "  const localProofId = ({ 'src/value.txt': 'PROOF-VERTICAL-VALUE-TASK', 'src/second.txt': 'PROOF-VERTICAL-SECOND-TASK', 'src/second.txt,src/value.txt': 'PROOF-VERTICAL-INTEGRATED' })[Object.keys(candidates).sort().join(',')];",
+      "  const proofId = semanticProofId || localProofId;",
+      `  const acceptedValue = candidates['src/value.txt'] === 'good' || (!semanticProofId && candidates['src/value.txt'] === ${JSON.stringify(proofCutpointCandidateValue)});`,
       "  const definitions = {",
       "    'PROOF-VERTICAL-INTEGRATED': {",
-      "      clauses: { 'AC-REQ-VERTICAL-001': candidates['src/value.txt'] === 'good', 'AC-REQ-VERTICAL-SECOND-001': candidates['src/second.txt'] === 'second-good' },",
-      "      cases: { 'CASE-VERTICAL-INTEGRATED': candidates['src/value.txt'] === 'good' && candidates['src/second.txt'] === 'second-good' },",
+      "      clauses: { 'AC-REQ-VERTICAL-001': acceptedValue, 'AC-REQ-VERTICAL-SECOND-001': candidates['src/second.txt'] === 'second-good' },",
+      "      cases: { 'CASE-VERTICAL-INTEGRATED': acceptedValue && candidates['src/second.txt'] === 'second-good' },",
       "      controls: { 'CONTROL-VERTICAL-INTEGRATED': 'bad' !== 'good' && 'pending' !== 'second-good' },",
       "    },",
       "    'PROOF-VERTICAL-SECOND-TASK': {",
@@ -1755,8 +1759,8 @@ async function initializeTarget(
       "      controls: { 'CONTROL-VERTICAL-PENDING': 'pending' !== 'second-good' },",
       "    },",
       "    'PROOF-VERTICAL-VALUE-TASK': {",
-      "      clauses: { 'AC-REQ-VERTICAL-001': candidates['src/value.txt'] === 'good' },",
-      "      cases: { 'CASE-VERTICAL-VALUE': candidates['src/value.txt'] === 'good' },",
+      "      clauses: { 'AC-REQ-VERTICAL-001': acceptedValue },",
+      "      cases: { 'CASE-VERTICAL-VALUE': acceptedValue },",
       "      controls: { 'CONTROL-VERTICAL-BAD': 'bad' !== 'good' },",
       "    },",
       "  };",
@@ -3286,34 +3290,55 @@ async function cleanupOwnedCutpointProcess(marker, fakeCodexPath) {
   }
 }
 
-async function readOwnedProofCutpointMarkers(token) {
+async function readOwnedProofCutpointMarkers(token, proofExecutionTmpRoot = tmpdir()) {
   if (!token) return [];
-  const canonicalTmp = await realpath(tmpdir());
+  const canonicalTmp = await realpath(proofExecutionTmpRoot);
   const scratchEntries = await readdir(canonicalTmp, { withFileTypes: true });
   const markers = [];
-  for (const executionEntry of scratchEntries) {
+  for (const verifierEntry of scratchEntries) {
     if (
-      !executionEntry.isDirectory()
-      || !executionEntry.name.startsWith("ccc-semantic-proof-execution-")
+      !verifierEntry.isDirectory()
+      || !verifierEntry.name.startsWith("fusion-verifier-sandbox-")
     ) {
       continue;
     }
-    const executionRoot = path.join(canonicalTmp, executionEntry.name);
-    const proofRoot = path.join(executionRoot, "proof");
-    const scratchRoot = path.join(executionRoot, "scratch");
-    const home = path.join(scratchRoot, "home");
-    const markerPath = path.join(home, proofCutpointMarkerName);
-    if (!await pathExists(markerPath)) continue;
-    const marker = JSON.parse(await readFile(markerPath, "utf8"));
-    if (marker?.token !== token) continue;
-    markers.push(Object.freeze({
-      ...marker,
-      executionRoot,
-      proofRoot,
-      scratchRoot,
-      home,
-      markerPath,
-    }));
+    const verifierSandboxRoot = await realpath(
+      path.join(canonicalTmp, verifierEntry.name),
+    );
+    if (path.dirname(verifierSandboxRoot) !== canonicalTmp) continue;
+    const verifierEntries = await readdir(verifierSandboxRoot, {
+      withFileTypes: true,
+    });
+    for (const homeEntry of verifierEntries) {
+      if (!homeEntry.isDirectory() || !homeEntry.name.startsWith("home-")) {
+        continue;
+      }
+      const verifierHome = path.join(verifierSandboxRoot, homeEntry.name);
+      const markerPath = path.join(verifierHome, proofCutpointMarkerName);
+      if (!await pathExists(markerPath)) continue;
+      const marker = JSON.parse(await readFile(markerPath, "utf8"));
+      if (marker?.token !== token || typeof marker.cwd !== "string") continue;
+      const proofRoot = await realpath(marker.cwd);
+      const executionRoot = path.dirname(proofRoot);
+      if (
+        path.dirname(executionRoot) !== canonicalTmp
+        || !path.basename(executionRoot)
+          .startsWith("ccc-semantic-proof-execution-")
+        || path.basename(proofRoot) !== "proof"
+      ) {
+        continue;
+      }
+      markers.push(Object.freeze({
+        ...marker,
+        executionRoot,
+        proofRoot,
+        scratchRoot: path.join(executionRoot, "scratch"),
+        verifierSandboxRoot,
+        verifierHome,
+        markerPath,
+        cleanupRoot: verifierSandboxRoot,
+      }));
+    }
   }
   return markers.sort((left, right) => left.pid - right.pid);
 }
@@ -3334,7 +3359,9 @@ async function terminateOwnedProofCutpointProcess(
       && await realpath(marker.proofRoot) === expectedProofRoot
       && path.dirname(expectedProofRoot) === marker.executionRoot
       && marker.scratchRoot === path.join(marker.executionRoot, "scratch")
-      && marker.home === path.join(marker.scratchRoot, "home"),
+      && marker.verifierHome === path.dirname(marker.markerPath)
+      && marker.verifierSandboxRoot === marker.cleanupRoot
+      && path.dirname(marker.verifierHome) === marker.verifierSandboxRoot,
     "CCC_PRODUCT_PROOF_CUTPOINT_MARKER_INVALID",
     JSON.stringify({ marker, expectedProofRoot }),
   );
@@ -3367,9 +3394,10 @@ async function terminateOwnedProofCutpointProcess(
   return inspected.stdout.trim();
 }
 
-async function cleanupOwnedProofCutpointMarkers(token) {
-  const markers = await readOwnedProofCutpointMarkers(token);
-  const removableExecutionRoots = new Set();
+async function cleanupOwnedProofCutpointMarkers(token, proofExecutionTmpRoot = tmpdir()) {
+  const canonicalTmp = await realpath(proofExecutionTmpRoot);
+  const markers = await readOwnedProofCutpointMarkers(token, canonicalTmp);
+  const removableCleanupRoots = new Set();
   for (const marker of markers) {
     const inspected = await run(
       "/bin/ps",
@@ -3377,7 +3405,7 @@ async function cleanupOwnedProofCutpointMarkers(token) {
       { allowedExitCodes: [0, 1] },
     );
     if (inspected.code === 1) {
-      removableExecutionRoots.add(marker.executionRoot);
+      removableCleanupRoots.add(marker.cleanupRoot);
       continue;
     }
     const expectedTitle = `cccp-${token.slice(0, 8)}`;
@@ -3400,23 +3428,22 @@ async function cleanupOwnedProofCutpointMarkers(token) {
         undefined,
         shutdownTimeoutMs,
       );
-      removableExecutionRoots.add(marker.executionRoot);
+      removableCleanupRoots.add(marker.cleanupRoot);
     }
   }
-  for (const executionRoot of removableExecutionRoots) {
-    const canonicalTmp = await realpath(tmpdir());
-    const canonicalExecutionRoot = await realpath(executionRoot);
+  for (const cleanupRoot of removableCleanupRoots) {
+    const canonicalCleanupRoot = await realpath(cleanupRoot);
     if (
-      path.dirname(canonicalExecutionRoot) !== canonicalTmp
-      || !path.basename(canonicalExecutionRoot)
-        .startsWith("ccc-semantic-proof-execution-")
+      path.dirname(canonicalCleanupRoot) !== canonicalTmp
+      || !path.basename(canonicalCleanupRoot)
+        .startsWith("fusion-verifier-sandbox-")
     ) {
       throw new Error(
-        `CCC_PRODUCT_PROOF_CLEANUP_ROOT_REFUSED: ${canonicalExecutionRoot}`,
+        `CCC_PRODUCT_PROOF_CLEANUP_ROOT_REFUSED: ${canonicalCleanupRoot}`,
       );
     }
     const makeWriteable = async (ownedPath) => {
-      const fromRoot = path.relative(canonicalExecutionRoot, ownedPath);
+      const fromRoot = path.relative(canonicalCleanupRoot, ownedPath);
       if (
         fromRoot === ".."
         || fromRoot.startsWith(`..${path.sep}`)
@@ -3440,8 +3467,8 @@ async function cleanupOwnedProofCutpointMarkers(token) {
         makeWriteable(path.join(ownedPath, entry.name))
       )));
     };
-    await makeWriteable(canonicalExecutionRoot);
-    await rm(canonicalExecutionRoot, { recursive: true, force: true });
+    await makeWriteable(canonicalCleanupRoot);
+    await rm(canonicalCleanupRoot, { recursive: true, force: true });
   }
 }
 
@@ -3455,6 +3482,7 @@ async function main() {
   let ownedCutpointMarker;
   let ownedFakeCodexPath;
   let ownedProofCutpointToken;
+  let proofExecutionTmpRoot;
   let landingCommand;
   let landingCutpoint;
   let repositoryStart;
@@ -3474,9 +3502,13 @@ async function main() {
     );
     const fakeBin = path.join(tempRoot, "fake-bin");
     const worktreesRoot = path.join(tempRoot, "worktrees");
+    proofExecutionTmpRoot = await realpath(
+      await mkdir(path.join(tempRoot, "proof-tmp"), { recursive: true })
+        .then(() => path.join(tempRoot, "proof-tmp")),
+    );
     await writeFakeCodex(fakeBin);
     ownedFakeCodexPath = path.join(fakeBin, "codex");
-    const env = cleanEnvironment(isolatedHome, fakeBin);
+    const env = cleanEnvironment(isolatedHome, fakeBin, proofExecutionTmpRoot);
     const providerCutpointActivation = path.join(
       fakeBin,
       "provider-cutpoint.activate",
@@ -5196,12 +5228,15 @@ async function main() {
     );
     const proofMarkersAtDispatch = await poll(
       "verifier process reached post-dispatch cutpoint",
-      () => readOwnedProofCutpointMarkers(proofCutpointToken),
+      () => readOwnedProofCutpointMarkers(proofCutpointToken, proofExecutionTmpRoot),
       (markers) => markers.length === 1,
       async () => ({
         serve: tail(server.output()),
         status: await readProofCutpointStatus(),
-        markers: await readOwnedProofCutpointMarkers(proofCutpointToken),
+        markers: await readOwnedProofCutpointMarkers(
+          proofCutpointToken,
+          proofExecutionTmpRoot,
+        ),
       }),
     );
     const proofMarker = proofMarkersAtDispatch[0];
@@ -5211,8 +5246,10 @@ async function main() {
       && path.basename(canonicalProofRoot) === "proof"
       && path.basename(proofMarker.executionRoot)
         .startsWith("ccc-semantic-proof-execution-")
-      && proofMarker.home
-        === path.join(proofMarker.executionRoot, "scratch", "home"),
+      && path.basename(proofMarker.verifierSandboxRoot)
+        .startsWith("fusion-verifier-sandbox-")
+      && path.dirname(proofMarker.verifierHome)
+        === proofMarker.verifierSandboxRoot,
       "CCC_PRODUCT_PROOF_CUTPOINT_SANDBOX_INVALID",
       JSON.stringify({ proofMarker, canonicalProofRoot }),
     );
@@ -5326,7 +5363,10 @@ async function main() {
     );
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     exactArray(
-      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+      (await readOwnedProofCutpointMarkers(
+        proofCutpointToken,
+        proofExecutionTmpRoot,
+      ))
         .map(({ pid }) => pid),
       [proofMarker.pid],
       "CCC_PRODUCT_PROOF_EFFECT_RETRIED_AFTER_RESTART",
@@ -5426,7 +5466,10 @@ async function main() {
       JSON.stringify(proofStopped),
     );
     exactArray(
-      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+      (await readOwnedProofCutpointMarkers(
+        proofCutpointToken,
+        proofExecutionTmpRoot,
+      ))
         .map(({ pid }) => pid),
       [proofMarker.pid],
       "CCC_PRODUCT_PROOF_EFFECT_RERUN_DURING_REFUSAL",
@@ -5469,7 +5512,7 @@ async function main() {
     await stopServe(server);
     server = undefined;
     await rm(proofCutpointActivation, { force: true });
-    await cleanupOwnedProofCutpointMarkers(proofCutpointToken);
+    await cleanupOwnedProofCutpointMarkers(proofCutpointToken, proofExecutionTmpRoot);
     ownedProofCutpointToken = undefined;
 
     const imported = jsonOutput(
@@ -7468,6 +7511,7 @@ async function main() {
     ).catch(() => undefined);
     await cleanupOwnedProofCutpointMarkers(
       ownedProofCutpointToken,
+      proofExecutionTmpRoot,
     ).catch(() => undefined);
     if (tempRoot && process.env.CCC_PRD_PRODUCT_KEEP_TMP !== "1") {
       await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
