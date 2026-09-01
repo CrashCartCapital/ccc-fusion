@@ -236,6 +236,7 @@ export async function prepareGate2InstalledRuntime(input) {
     cwd: path.resolve(input.cliRoot), env, label: "fresh CLI package build", allowStderr: true,
   });
   let packFailure = null;
+  let restoreFailure = null;
   try {
     run("corepack", ["pnpm", "pack", "--pack-destination", packRoot], {
       cwd: path.resolve(input.cliRoot), env, label: "pnpm pack",
@@ -247,15 +248,16 @@ export async function prepareGate2InstalledRuntime(input) {
       run(process.execPath, ["./scripts/prepare-publish-manifest.mjs", "postpack"], {
         cwd: path.resolve(input.cliRoot), env, label: "restore CLI package manifest after pack", allowStderr: true,
       });
-    } catch (restoreError) {
-      if (packFailure) {
-        throw new Error(`${packFailure.message}\npostpack restore failed:\n${restoreError.message}`, {
-          cause: restoreError,
-        });
-      }
-      throw restoreError;
+    } catch (error) {
+      restoreFailure = error;
     }
   }
+  if (packFailure && restoreFailure) {
+    throw new Error(`${packFailure.message}\npostpack restore failed:\n${restoreFailure.message}`, {
+      cause: restoreFailure,
+    });
+  }
+  if (restoreFailure) throw restoreFailure;
   if (packFailure) throw packFailure;
   const tarballs = (await readdir(packRoot)).filter((name) =>
     name.startsWith("runfusion-fusion-") && name.endsWith(".tgz"));
