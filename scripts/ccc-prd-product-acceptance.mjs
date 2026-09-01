@@ -130,6 +130,7 @@ const fanTasks = Object.freeze([
 ]);
 const fanoutCampaignMaxRequests = fanTasks.length * 4;
 const fanoutCampaignMaxDurationMs = 480_000;
+const fanoutCampaignMaxConcurrency = 2;
 
 const fanoutClauseIdFor = (fanTask) =>
   `AC-${fanTask.requirementId}-001`;
@@ -2702,7 +2703,7 @@ async function createFanoutPacket(
         "--max-duration-ms",
         maxDurationMs,
         "--max-concurrency",
-        "1",
+        String(fanoutCampaignMaxConcurrency),
       ],
       { cwd: targetRoot, env },
     ),
@@ -2750,7 +2751,7 @@ async function createFanoutPacket(
     ),
     contextRef(`- Maximum requests: ${maxRequests}`),
     contextRef(`- Maximum duration in milliseconds: ${maxDurationMs}`),
-    contextRef("- Maximum concurrency: 1"),
+    contextRef(`- Maximum concurrency: ${fanoutCampaignMaxConcurrency}`),
   ];
   const requirementLineByTaskId = new Map(
     fanTasks.map((fanTask, index) => [fanTask.taskId, requirementLines[index]]),
@@ -2964,7 +2965,7 @@ async function createFanoutPacket(
       // generous-envelope policy rather than balancing on minimum admission.
       maxRequests: Number(maxRequests),
       maxDurationMs: Number(maxDurationMs),
-      maxConcurrency: 1,
+      maxConcurrency: fanoutCampaignMaxConcurrency,
     },
     admittedWriteRoots: [
       {
@@ -6679,7 +6680,7 @@ async function main() {
         "--max-duration-ms",
         String(fanoutCampaignMaxDurationMs),
         "--max-concurrency",
-        "1",
+        String(fanoutCampaignMaxConcurrency),
         "--max-prompt-bytes",
         "262144",
         "--max-response-bytes",
@@ -6752,10 +6753,9 @@ async function main() {
     authoringServer = undefined;
 
     // Authoring configuration rewrote the isolated HOME settings file, and the
-    // diamond needs capacity for four simultaneous custody worktrees, so the
-    // settings are re-imported before the lane's serve. maxConcurrent stays at
-    // 1: the fan-out proof is about graph shape and join ancestry, not about
-    // parallel scheduling.
+    // diamond needs capacity for four simultaneous custody worktrees plus two
+    // simultaneous branch provider attempts, so the settings are re-imported
+    // before the lane's serve with the admitted branch width.
     const fanoutSettingsPath = path.join(fanoutPacketRoot, "settings.json");
     await writeFile(fanoutSettingsPath, `${JSON.stringify({
       version: 2,
@@ -6766,7 +6766,7 @@ async function main() {
         experimentalFeatures: { cliAgentExecutor: true },
       },
       project: {
-        maxConcurrent: 1,
+        maxConcurrent: fanoutCampaignMaxConcurrency,
         maxWorktrees: 8,
         pollIntervalMs: 500,
         worktreesDir: worktreesRoot,

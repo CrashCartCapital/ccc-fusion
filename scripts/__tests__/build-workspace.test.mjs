@@ -463,6 +463,11 @@ test("CCC product acceptance gives the four-task fanout generous execution headr
     /const fanoutCampaignMaxDurationMs = 480_000;/,
     "fanout campaign must have enough time for four sequential task and proof phases",
   );
+  assert.match(
+    source,
+    /const fanoutCampaignMaxConcurrency = 2;/,
+    "the two admitted branch tasks must be allowed to dispatch together",
+  );
   assert.doesNotMatch(
     source,
     /const maxRequests = String\(fanTasks\.length\)/,
@@ -472,6 +477,11 @@ test("CCC product acceptance gives the four-task fanout generous execution headr
     source,
     /"--max-requests",\s*String\(fanoutCampaignMaxRequests\),\s*"--max-duration-ms",\s*String\(fanoutCampaignMaxDurationMs\)/,
     "fanout authoring must use the same generous bounds as freeze and preview",
+  );
+  assert.match(
+    source,
+    /"--max-concurrency",\s*String\(fanoutCampaignMaxConcurrency\)/,
+    "fanout freeze and authoring must share the admitted branch-width concurrency",
   );
 });
 
