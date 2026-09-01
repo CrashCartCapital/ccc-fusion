@@ -19,6 +19,7 @@ import {
   runPlannedBuilds,
   wantsFullCliPackage,
 } from "../build-workspace.mjs";
+import { workItemHasCccPermanentReason } from "../lib/ccc-permanent-reason.mjs";
 
 function createWorkspace() {
   const root = mkdtempSync(path.join(tmpdir(), "fn-7290-build-workspace-"));
@@ -308,6 +309,50 @@ test("root package build script points at the workspace build wrapper", () => {
   const rootPackage = JSON.parse(readFileSync(path.resolve("package.json"), "utf8"));
 
   assert.equal(rootPackage.scripts.build, "node scripts/build-workspace.mjs");
+});
+
+test("CCC product acceptance recognizes permanent holds by stable machine code", () => {
+  const reasonCode = "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+  const machineReason = `ccc-permanent:${reasonCode}`;
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+
+  assert.equal(
+    workItemHasCccPermanentReason(
+      { blockedReason: machineReason, lastError: machineReason },
+      reasonCode,
+    ),
+    true,
+  );
+  assert.equal(
+    workItemHasCccPermanentReason(
+      {
+        blockedReason: machineReason,
+        lastError: `${machineReason}: exact human diagnostic`,
+      },
+      reasonCode,
+    ),
+    true,
+  );
+  assert.equal(
+    workItemHasCccPermanentReason(
+      {
+        blockedReason: `${machineReason}_OTHER`,
+        lastError: `${machineReason}: exact human diagnostic`,
+      },
+      reasonCode,
+    ),
+    false,
+  );
+  assert.equal(workItemHasCccPermanentReason(undefined, reasonCode), false);
+  assert.doesNotMatch(
+    source,
+    /lastError\s*\n\s*=== "ccc-permanent:CCC_CAMPAIGN_(?:LIVE_EXECUTION|MERGE)_APPROVAL_REQUIRED"/,
+  );
+  assert.equal(
+    source.match(/workItemHasCccPermanentReason\(/g)?.length,
+    5,
+    "all five approval-hold assertions must use the stable reason predicate",
+  );
 });
 
 test("CCC product acceptance builds the current CLI through the root workspace build", () => {

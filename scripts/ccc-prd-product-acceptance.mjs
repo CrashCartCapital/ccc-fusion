@@ -23,6 +23,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { workItemHasCccPermanentReason } from "./lib/ccc-permanent-reason.mjs";
+
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -3723,8 +3725,10 @@ async function main() {
           const pending = issuedFor(value);
           return value.status?.workItems?.length === 1
             && value.status.workItems[0]?.state === "manual-required"
-            && value.status.workItems[0]?.lastError
-              === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
+            && workItemHasCccPermanentReason(
+              value.status.workItems[0],
+              "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+            )
             && Boolean(pending)
             && value.status.executionAuthorizationMode === "sealed_bundle_v1"
             && value.status.executionAuthorization?.members?.length
@@ -5670,8 +5674,10 @@ async function main() {
     assert(
       liveHold.status.workItems.length === 1
       && liveHold.status.workItems[0].state === "manual-required"
-      && liveHold.status.workItems[0].lastError
-        === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      && workItemHasCccPermanentReason(
+        liveHold.status.workItems[0],
+        "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      ),
       "CCC_PRODUCT_LIVE_EXECUTION_HOLD_INVALID",
       JSON.stringify(liveHold.status.workItems),
     );
@@ -6238,8 +6244,10 @@ async function main() {
     };
     assert(
       mergeHold.status.workItems[0].state === "manual-required"
-      && mergeHold.status.workItems[0].lastError
-        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && workItemHasCccPermanentReason(
+        mergeHold.status.workItems[0],
+        "CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      )
       && mergeConfirmation
       && /^[0-9a-f]{64}$/.test(mergeConfirmation.confirmation)
       && mergeApproval?.campaign?.binding?.actionTarget === "refs/heads/main"
@@ -6408,8 +6416,10 @@ async function main() {
     );
     assert(
       interruptedLanding.status.workItems[0]?.state === "manual-required"
-      && interruptedLanding.status.workItems[0]?.lastError
-        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && workItemHasCccPermanentReason(
+        interruptedLanding.status.workItems[0],
+        "CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      )
       && interruptedApproval?.status === "claimed"
       && interruptedLanding.status.landing.intents.length === 1
       && interruptedLanding.status.landing.materializations.length === 1
@@ -7391,8 +7401,10 @@ async function main() {
     assert(
       fanoutMergeHold.status.workItems.length === 1
       && fanoutMergeHold.status.workItems[0].state === "manual-required"
-      && fanoutMergeHold.status.workItems[0].lastError
-        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && workItemHasCccPermanentReason(
+        fanoutMergeHold.status.workItems[0],
+        "CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      )
       && fanoutMergeConfirmation
       && fanoutMergeApproval?.campaign?.binding?.actionTarget
         === "refs/heads/main"
