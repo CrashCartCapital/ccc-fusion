@@ -77,6 +77,10 @@ test("PRD:GATE2-01 telemetry packet freezes the six-task peer DAG without verifi
     assert.match(definition.prd, new RegExp(publicContract.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
   assert.doesNotMatch(definition.prd, /write .* by request|do not read the verifier|verifyIntegratedBehavior|semanticByPhase/i);
+  assert.match(definition.prd, /CCC_PROOF_LOOPBACK_PORT/);
+  assert.match(definition.prd, /CCC_PROOF_LOOPBACK_PORT[\s\S]*\bonly\b/i);
+  assert.match(definition.prd, /CCC_PROOF_LOOPBACK_PORT[\s\S]*\bnever\b/i);
+  assert.match(definition.support, /CCC_PROOF_LOOPBACK_PORT/);
   for (const spec of definition.proposal.requirements) {
     assert.match(definition.prd, new RegExp(`### Requirement ${spec.id}\\n`));
     assert.doesNotMatch(definition.prd, new RegExp(`### ${spec.id}\\n`));

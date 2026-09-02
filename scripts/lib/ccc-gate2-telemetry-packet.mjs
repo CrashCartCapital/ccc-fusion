@@ -26,7 +26,7 @@ const actionLine = (spec) => `- Protected action: live_execution provider://gate
 const integratedPositiveOracle = "The installed service passes the complete binary project rubric on one joined commit.";
 const integratedNegativeControl = "Partial joins, duplicate audit records, rejected-event broadcasts, and unavailable-service probe success are rejected.";
 const integratedLine = `The final command task verify:integrated proves every admitted clause on the joined candidate commit. Positive oracle: ${integratedPositiveOracle} Negative control: ${integratedNegativeControl}`;
-const runtimeContract = "Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events and emits only accepted events. Every HTTP request must use the same long-lived createApp service instance. Pass the inbound GET /stream request to that shared instance so its subscriber is registered before calling response.flushHeaders(), then flush those headers before awaiting the first event. Do not create a throwaway startup stream or a second per-route service instance.";
+const runtimeContract = "Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events and emits only accepted events. Every HTTP request must use the same long-lived createApp service instance. Pass the inbound GET /stream request to that shared instance so its subscriber is registered before calling response.flushHeaders(), then flush those headers before awaiting the first event. Do not create a throwaway startup stream or a second per-route service instance. Any worker-authored test that performs real loopback HTTP must bind only the port in process.env.CCC_PROOF_LOOPBACK_PORT (parse it as an integer); never bind port 0, an ephemeral port, or a hardcoded port, because the verifier sandbox denies every other bind and the test will fail with listen EPERM.";
 const nonGoals = [
   "Remote delivery by ordinary workers",
   "Writes outside admitted telemetry project paths",
@@ -261,7 +261,7 @@ export function buildGate2TelemetryPacketDefinition(input) {
     prdFileName,
     supportRelativePath,
     prd,
-    support: "# Gate 2 Telemetry Verifier\n\nThe baseline-owned verifier checks observable service behavior independently from worker-authored tests.\n",
+    support: "# Gate 2 Telemetry Verifier\n\nThe baseline-owned verifier checks observable service behavior independently from worker-authored tests.\n\nAny worker-authored test that performs real loopback HTTP must bind only the port in process.env.CCC_PROOF_LOOPBACK_PORT (parse it as an integer); never bind port 0, an ephemeral port, or a hardcoded port, because the verifier sandbox denies every other bind and the test will fail with listen EPERM.\n",
     proposal,
     routes: { schema: "ccc-prd.routes-by-task.v1", routes: routesByTask },
     operatorContext: {
