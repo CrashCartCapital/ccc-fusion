@@ -611,14 +611,17 @@ test("wantsFullCliPackage matches CLI packaging env rules", () => {
   assert.equal(wantsFullCliPackage({ npm_lifecycle_event: "prepack" }, { fullFlag: false }), true);
 });
 
-test("Gate 2 golden campaigns give installed CLI commands project-sized subprocess headroom", () => {
+test("Gate 2 golden campaigns outlive the maximum controller verifier lifetime", () => {
   const source = readFileSync(
     path.resolve("packages/engine/vitest.golden-pg.config.ts"),
     "utf8",
   );
-  assert.match(
-    source,
-    /FUSION_TEST_SUBPROCESS_TIMEOUT_MS:\s*"600000"/,
-    "whole-product golden campaigns must not inherit the ordinary 120-second child guard",
+  const configuredTimeout = source.match(
+    /FUSION_TEST_SUBPROCESS_TIMEOUT_MS:\s*"(\d+)"/,
+  );
+  assert.ok(configuredTimeout, "golden campaigns must configure a child-process guard");
+  assert.ok(
+    Number(configuredTimeout[1]) >= 1_802_000,
+    "the outer child guard must not expire before the 30-minute controller verifier plus termination grace",
   );
 });

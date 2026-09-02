@@ -7,10 +7,11 @@ const merged = mergeConfig(baseConfig, defineConfig({
   test: {
     maxWorkers: 1,
     minWorkers: 1,
-    // Installed whole-product commands can legitimately run behind long model
-    // and PostgreSQL work; keep this guard generous while remaining finite.
+    // A controller verifier can legitimately use the full 30-minute project
+    // limit plus its termination grace. Keep the outer test guard longer so it
+    // detects a true orphan instead of pre-failing a still-bounded verifier.
     env: {
-      FUSION_TEST_SUBPROCESS_TIMEOUT_MS: "600000",
+      FUSION_TEST_SUBPROCESS_TIMEOUT_MS: "1830000",
     },
   },
 }));
