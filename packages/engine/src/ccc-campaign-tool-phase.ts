@@ -71,6 +71,193 @@ export function isCccCampaignPotentialMutationToolCall(
   return !isCccCampaignDiscoveryToolCall(toolName, params);
 }
 
+export type CccCampaignUnsafeBashProcessReason = "background_process" | "process_kill";
+
+/**
+ * Reject process shapes that can outlive a Bash tool's before/after custody
+ * snapshot or kill an unrelated controller/verifier process. Quoted program
+ * text and descriptor redirections are ignored; direct shell control remains
+ * foreground-only for campaign workers.
+ */
+function classifyCccCampaignUnsafeBashProcess(
+  raw: string,
+  recursionDepth: number,
+): CccCampaignUnsafeBashProcessReason | undefined {
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  let word = "";
+  let segment: string[] = [];
+  const segments: string[][] = [];
+  const finishWord = (): void => {
+    if (word.length > 0) segment.push(word);
+    word = "";
+  };
+  const finishSegment = (): void => {
+    finishWord();
+    if (segment.length > 0) segments.push(segment);
+    segment = [];
+  };
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index]!;
+    if (escaped) {
+      word += character;
+      escaped = false;
+      continue;
+    }
+    if (quote) {
+      if (quote === '"' && character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = undefined;
+      } else {
+        word += character;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      // Bash/Zsh ANSI-C and locale-translated quotes pass only the quoted
+      // payload as the argument; the `$` prefix is not part of argv.
+      if (word === "$") word = "";
+      quote = character;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    const commandBoundary = /[;&|(){}]/u.test(character) || character === "\n" || character === "\r";
+    if (/\s/u.test(character) || /[;&|(){}<>]/u.test(character)) finishWord();
+    if (character === "&") {
+      const previous = raw[index - 1];
+      const next = raw[index + 1];
+      if (
+        previous !== "&"
+        && next !== "&"
+        && previous !== ">"
+        && previous !== "<"
+        && next !== ">"
+      ) {
+        return "background_process";
+      }
+    }
+    if (commandBoundary) {
+      finishSegment();
+      continue;
+    }
+    if (!/\s/u.test(character) && !/[;&|(){}<>]/u.test(character)) word += character;
+  }
+  if (escaped) word += "\\";
+  finishSegment();
+  const processKillCommands = new Set(["kill", "killall", "pkill"]);
+  const executableName = (candidate: string): string | undefined =>
+    candidate.split("/").at(-1)?.toLowerCase();
+  const isProcessKill = (candidate: string): boolean => {
+    const executable = executableName(candidate);
+    return executable !== undefined && processKillCommands.has(executable);
+  };
+  const shellCommandFlag = /^-[A-Za-z]*c[A-Za-z]*$/u;
+  const nestedShellKills = (tokens: string[]): boolean => {
+    for (let shellIndex = 0; shellIndex < tokens.length; shellIndex += 1) {
+      const shell = executableName(tokens[shellIndex] ?? "");
+      if (!shell || !["bash", "sh", "zsh"].includes(shell)) continue;
+      const relativeFlagIndex = tokens
+        .slice(shellIndex + 1)
+        .findIndex((token) => shellCommandFlag.test(token));
+      if (relativeFlagIndex < 0) continue;
+      const nested = tokens[shellIndex + relativeFlagIndex + 2];
+      if (!nested) continue;
+      // Fail closed on deliberately deep nested shell command strings rather
+      // than allowing recursion to become an evasion or resource sink.
+      if (recursionDepth >= 8) return true;
+      if (classifyCccCampaignUnsafeBashProcess(nested, recursionDepth + 1) === "process_kill") {
+        return true;
+      }
+    }
+    return false;
+  };
+  const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/u;
+  const controlPrefixes = new Set(["!", "do", "elif", "else", "if", "then", "until", "while"]);
+  const commandWrappers = new Set([
+    "builtin", "command", "env", "exec", "parallel", "sudo", "time", "xargs",
+  ]);
+  const isCommandWrapper = (command: string): boolean =>
+    commandWrappers.has(command) || /^nohu[p]$/u.test(command);
+  const wrapperOptionsWithSeparateValue: Readonly<Record<string, ReadonlySet<string>>> = {
+    env: new Set(["-C", "-S", "-u", "--chdir", "--split-string", "--unset"]),
+    exec: new Set(["-a"]),
+    parallel: new Set(["-a", "-j", "-L", "-N", "--arg-file", "--jobs", "--max-args", "--max-lines"]),
+    sudo: new Set([
+      "-C", "-D", "-R", "-T", "-a", "-c", "-g", "-h", "-p", "-r", "-t", "-u",
+      "--chdir", "--close-from", "--group", "--host", "--other-user", "--prompt", "--role",
+      "--type", "--user",
+    ]),
+    time: new Set(["-f", "-o", "--format", "--output"]),
+    xargs: new Set([
+      "-E", "-I", "-L", "-P", "-S", "-a", "-d", "-n", "-s",
+      "--arg-file", "--delimiter", "--eof", "--max-args", "--max-chars", "--max-lines",
+      "--max-procs", "--process-slot-var", "--replace",
+    ]),
+  };
+  const unwrapCommandWrapper = (wrapper: string, tokens: string[]): string[] => {
+    const optionsWithValue = wrapperOptionsWithSeparateValue[wrapper] ?? new Set<string>();
+    let index = 0;
+    while (index < tokens.length) {
+      const token = tokens[index]!;
+      if (token === "--") {
+        index += 1;
+        break;
+      }
+      if (wrapper === "env" && assignment.test(token)) {
+        index += 1;
+        continue;
+      }
+      if (!token.startsWith("-") || token === "-") break;
+      const optionName = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+      const hasInlineValue = token.includes("=")
+        || [...optionsWithValue].some((option) => option.length === 2
+          && token.startsWith(option)
+          && token.length > option.length);
+      index += optionsWithValue.has(optionName) && !hasInlineValue ? 2 : 1;
+    }
+    return tokens.slice(index);
+  };
+  const commandTokensKill = (tokens: string[], wrapperDepth = 0): boolean => {
+    if (wrapperDepth >= 8 || tokens.length === 0) return wrapperDepth >= 8;
+    const command = executableName(tokens[0] ?? "");
+    if (!command) return false;
+    if (isProcessKill(tokens[0]!)) return true;
+    if (["bash", "sh", "zsh"].includes(command)) return nestedShellKills(tokens);
+    const remaining = tokens.slice(1);
+    if (isCommandWrapper(command)) {
+      if (command === "command" && remaining.some((token) => token === "-v" || token === "-V")) {
+        return false;
+      }
+      return commandTokensKill(unwrapCommandWrapper(command, remaining), wrapperDepth + 1);
+    }
+    if (command === "find") {
+      return remaining.some((token, index) => /^-(?:exec|execdir|ok|okdir)$/u.test(token)
+        && commandTokensKill(remaining.slice(index + 1), wrapperDepth + 1));
+    }
+    return false;
+  };
+  for (const commandSegment of segments) {
+    let commandIndex = 0;
+    while (assignment.test(commandSegment[commandIndex] ?? "")) commandIndex += 1;
+    while (controlPrefixes.has(executableName(commandSegment[commandIndex] ?? "") ?? "")) {
+      commandIndex += 1;
+      while (assignment.test(commandSegment[commandIndex] ?? "")) commandIndex += 1;
+    }
+    if (commandTokensKill(commandSegment.slice(commandIndex))) return "process_kill";
+  }
+  return undefined;
+}
+
+export function cccCampaignUnsafeBashProcessReason(
+  raw: string,
+): CccCampaignUnsafeBashProcessReason | undefined {
+  return classifyCccCampaignUnsafeBashProcess(raw, 0);
+}
+
 /**
  * Conservatively extract literal filesystem destinations from inline JS run
  * through Bash. Opaque or computed targets remain covered by the mandatory

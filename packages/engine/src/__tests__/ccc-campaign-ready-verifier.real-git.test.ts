@@ -25,7 +25,7 @@ async function fixture(value = "ready") {
   await git(root, "config", "user.email", "fusion@test.invalid");
   await mkdir(join(root, "src"));
   await writeFile(join(root, "src", "value.txt"), "base\n");
-  await writeFile(join(root, ".gitignore"), "ignored-foreign/\nnode_modules/\n");
+  await writeFile(join(root, ".gitignore"), "ignored-foreign/\nnode_modules/\ndata/\n");
   await writeFile(
     join(root, "Taskfile.yml"),
     [
@@ -251,6 +251,27 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
 
     expect(result).toMatchObject({ ready: false });
     expect(result.summary).toMatch(/controller-initialized ignored paths changed/i);
+    expect(result.summary).toContain("content or metadata changed under ignored roots: node_modules");
+  });
+
+  it("names a newly added ignored runtime root in the custody refusal", async () => {
+    const { root, campaign } = await fixture();
+    const trustedIgnoredBaseline = await readyModule.snapshotCccCampaignIgnoredBaseline({
+      worktreePath: root,
+    });
+    await mkdir(join(root, "data"));
+    await writeFile(join(root, "data", "events.jsonl"), "runtime residue\n");
+
+    const result = await (readyModule as any).verifyCccCampaignReadyCandidate({
+      taskId: campaign.taskId,
+      worktreePath: root,
+      campaign,
+      timeoutMs: 30_000,
+      trustedIgnoredBaseline,
+    });
+
+    expect(result).toMatchObject({ ready: false });
+    expect(result.summary).toContain("added ignored roots: data");
   });
 
   it("refuses content drift in an existing controller-initialized ignored file", async () => {
@@ -273,6 +294,7 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
 
     expect(result).toMatchObject({ ready: false });
     expect(result.summary).toMatch(/controller-initialized ignored paths changed/i);
+    expect(result.summary).toContain("content or metadata changed under ignored roots: node_modules");
   });
 
   it("write_envelope_snapshot separates admitted and foreign candidate paths", async () => {

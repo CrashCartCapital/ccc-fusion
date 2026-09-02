@@ -19444,6 +19444,8 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
             "Do not read the sealed verifier before the first targeted proof failure; the task contract and owned paths are sufficient to begin. " +
             "If a targeted proof fails, read only the relevant verifier/support section in place or use OS temp; never copy scratch/helper files into the candidate worktree outside the exact admitted roots. " +
             "Do not redirect verifier or test output to files, and do not use tee or scratch logs; inspect the direct tool result. " +
+            "Keep every Bash check foreground-only; never start background processes or use kill/pkill/killall. " +
+            "Route all runtime state to an explicit OS temp path; never create or modify ignored worktree roots such as data/, .fusion/, .fusion-global-settings/, .worktrees/, or node_modules/. " +
             "After final targeted verification passes, call fn_complete_phase as the next and only tool. Do not rerun a green verifier merely to reformat or re-read its output."
           : `Execute the workflow step "${workflowStep.name}" for task ${task.id}.\n\n` +
             "Review the work done in this worktree and evaluate it against the criteria in your instructions.";
@@ -19827,7 +19829,8 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
               await promptWithFallback(
                 session,
                 `CCC_CAMPAIGN_REPAIR: Controller VERIFY failed against the exact candidate:\n${repairFeedbackText}\n\n`
-                  + "Repair only the admitted files, rerun the targeted check needed to diagnose the failure, and call fn_complete_phase by itself when REPAIR is complete. "
+                  + "Repair only the admitted files, then rerun only the exact verifier command named above in the foreground and call fn_complete_phase by itself when REPAIR is complete. "
+                  + "Never launch the app manually, start background processes, or use kill/pkill/killall. Route every runtime state file to an explicit OS temp path and never create or modify ignored worktree roots. "
                   + "This is the only REPAIR turn; a second controller verification failure is terminal.",
               );
               const repairEndFingerprint = await fingerprintCccCampaignAllowedCandidate({

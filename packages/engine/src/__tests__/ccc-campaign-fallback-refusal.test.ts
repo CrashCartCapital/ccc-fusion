@@ -17,6 +17,7 @@ import {
   wrapToolsWithCccCampaignPhaseToolPolicy,
 } from "../pi.js";
 import {
+  cccCampaignUnsafeBashProcessReason,
   cccCampaignVisibleBashTraversalRoots,
   cccCampaignVisibleBashWriteTargets,
 } from "../ccc-campaign-tool-phase.js";
@@ -738,6 +739,83 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
         isError: true,
         error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
         details: expect.objectContaining({ path: target }),
+      });
+    }
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+  });
+
+  it("RED-G2-ASYNC-CUSTODY: refuses background launches and process-kill commands before execution", async () => {
+    expect(cccCampaignUnsafeBashProcessReason("node src/app.ts --port 37000 &")).toBe("background_process");
+    const processKillCommands = [
+      "pkill -f src/app.ts",
+      "killall node",
+      "kill -9 1234",
+      '"kill" -9 1234',
+      "'pkill' -f src/app.ts",
+      '"/bin/kill" 1234',
+      String.raw`\kill -9 1234`,
+      "(kill -9 1234)",
+      "{ kill -9 1234; }",
+      "if kill -0 1234; then echo live; fi",
+      "exec kill 1234",
+      "time kill 1234",
+      "env -i kill 1234",
+      "sudo -u operator kill 1234",
+      "printf '1234\\n' | xargs kill",
+      "bash -lc 'kill -9 1234'",
+      "zsh -lc 'kill -9 1234'",
+      "bash -c $'kill -9 1234'",
+      "zsh -c $'kill -9 1234'",
+      String.raw`find . -exec sh -c 'kill -9 1234' \;`,
+      "printf '1234\\n' | xargs sh -c 'kill -9 $1' sh",
+    ] as const;
+    for (const command of processKillCommands) {
+      expect(cccCampaignUnsafeBashProcessReason(command)).toBe("process_kill");
+    }
+    expect(cccCampaignUnsafeBashProcessReason("echo ok && task verify:candidate")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("echo ok 2>&1")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("read value <&3; exec 3<&-")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("echo kill")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("rg kill src")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("time grep kill src/app.ts")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("xargs grep kill")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("find . -exec grep kill {} +")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("sudo grep kill /var/log/app.log")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("node -e \"process.on('SIGTERM',()=>{})\"")).toBeUndefined();
+    expect(cccCampaignUnsafeBashProcessReason("curl 'http://localhost/?a=1&b=2'")).toBeUndefined();
+
+    const bashExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "must not run" }],
+      isError: false,
+    });
+    const capturePotentialMutationBaseline = vi.fn();
+    const [bashTool] = wrapToolsWithCccCampaignPhaseToolPolicy(
+      [{ name: "bash", execute: bashExecute } as never],
+      {
+        readOnlyToolNames: ["bash"],
+        maxReadOnlyToolCallsBeforeGuidance: 1,
+        maxReadOnlyToolCallsBeforeRefusal: 2,
+        guidanceMessage: "mutate now",
+        refusalMessage: "discovery refused",
+        currentPhase: () => "REPAIR",
+        worktreePath: "/tmp/ccc-candidate",
+        allowedWriteRoots: ["src/app.ts", "tests/telemetry.test.ts"],
+        capturePotentialMutationBaseline,
+      } as any,
+    );
+
+    for (const command of [
+      "node src/app.ts --port 37000 &",
+      ...processKillCommands,
+    ]) {
+      await expect(bashTool!.execute(
+        `call-bash-unsafe-process-${command}`,
+        { command },
+        undefined,
+      )).resolves.toMatchObject({
+        isError: true,
+        error: expect.stringContaining("PROCESS_CONTROL_REFUSED"),
       });
     }
     expect(bashExecute).not.toHaveBeenCalled();

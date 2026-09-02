@@ -10,7 +10,10 @@ export const GATE2_TELEMETRY_PI_ENVELOPE = Object.freeze({
   maxConcurrency: 3,
   contextWindow: 200_000,
   maxOutputTokens: 32_768,
-  taskTokenBudget: Object.freeze({ soft: 5_000_000, hard: 10_000_000 }),
+  // Request count and wall time are the campaign's real runaway guards. Keep
+  // the task token budget above the theoretical full shared request envelope
+  // so repeated long-context MiniMax turns cannot preempt a useful product.
+  taskTokenBudget: Object.freeze({ soft: 500_000_000, hard: 600_000_000 }),
 });
 
 function peer(key: string): GoldenPiDriver {

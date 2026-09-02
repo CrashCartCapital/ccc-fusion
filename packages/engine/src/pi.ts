@@ -78,6 +78,7 @@ import type { CccProviderAttemptBinding } from "./agent-runtime.js";
 import { isContextLimitError } from "./context-limit-detector.js";
 import { applyClaudeAcpEnable } from "./claude-acp-enable.js";
 import {
+  cccCampaignUnsafeBashProcessReason,
   cccCampaignVisibleBashTraversalRoots,
   cccCampaignVisibleBashWriteTargets,
   isCccCampaignDiscoveryToolCall,
@@ -2953,6 +2954,17 @@ export function wrapToolsWithCccCampaignPhaseToolPolicy(
           );
         }
         if (normalizedToolName === "bash" && typeof params?.command === "string") {
+          const unsafeProcessReason = cccCampaignUnsafeBashProcessReason(params.command);
+          if (unsafeProcessReason) {
+            return boundaryRejection(
+              "CCC_CAMPAIGN_PROCESS_CONTROL_REFUSED: campaign Bash must stay foreground-only and cannot kill host processes.",
+              {
+                phase: policy.currentPhase?.(),
+                toolName: tool.name,
+                reason: unsafeProcessReason,
+              },
+            );
+          }
           const visibleTraversalRoot = cccCampaignVisibleBashTraversalRoots(params.command)
             .find((path) => !pathInsideCandidateWorktree(path));
           if (visibleTraversalRoot) {

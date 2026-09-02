@@ -17,8 +17,12 @@ describe("CCC Gate 2 telemetry Pi matrix", () => {
       maxConcurrency: 3,
       contextWindow: 200_000,
       maxOutputTokens: 32_768,
-      taskTokenBudget: { soft: 5_000_000, hard: 10_000_000 },
+      taskTokenBudget: { soft: 500_000_000, hard: 600_000_000 },
     });
+    expect(GATE2_TELEMETRY_PI_ENVELOPE.taskTokenBudget.hard).toBeGreaterThan(
+      GATE2_TELEMETRY_PI_ENVELOPE.maxRequests
+        * (GATE2_TELEMETRY_PI_ENVELOPE.contextWindow + GATE2_TELEMETRY_PI_ENVELOPE.maxOutputTokens),
+    );
   });
 
   it("uses MiniMax, GLM, and Gemini Flash as exact peers with no Luna fallback", () => {

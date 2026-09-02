@@ -1235,6 +1235,9 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(repairPrompt).toContain("src/slugify.js");
     expect(repairPrompt).toContain("42 bytes");
     expect(repairPrompt).toContain("endsWithNewline=false");
+    expect(repairPrompt).toMatch(/rerun only the exact verifier command named above.*foreground/i);
+    expect(repairPrompt).toMatch(/never launch the app manually.*background processes.*kill\/pkill\/killall/i);
+    expect(repairPrompt).toMatch(/runtime state.*OS temp.*ignored worktree roots/i);
 
     const repairLogCall = (store.logEntry as any).mock.calls.find(
       ([, message]: [string, string]) => message.includes("[ccc-campaign:repair]"),
@@ -1552,6 +1555,8 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(userPrompts[0]).toContain("at most 4 read/search/list discovery tool call");
     expect(userPrompts[0]).toContain("Do not read the sealed verifier before the first targeted proof failure");
     expect(userPrompts[0]).toContain("Do not redirect verifier or test output to files");
+    expect(userPrompts[0]).toMatch(/foreground-only.*never start background processes/i);
+    expect(userPrompts[0]).toMatch(/runtime state.*OS temp.*ignored worktree roots/i);
     expect(userPrompts[0]).toContain("call fn_complete_phase as the next and only tool");
   });
 

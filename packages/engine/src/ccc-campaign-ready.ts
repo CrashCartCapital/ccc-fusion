@@ -517,6 +517,29 @@ export async function snapshotCccCampaignIgnoredBaseline(input: {
   });
 }
 
+function describeIgnoredBaselineDrift(
+  expected: CccCampaignIgnoredBaseline,
+  current: CccCampaignIgnoredBaseline,
+): string {
+  const expectedRoots = new Set(expected.roots);
+  const currentRoots = new Set(current.roots);
+  const added = current.roots.filter((root) => !expectedRoots.has(root));
+  const removed = expected.roots.filter((root) => !currentRoots.has(root));
+  const bounded = (roots: readonly string[]): string => {
+    const visible = roots.slice(0, 8);
+    return `${visible.join(", ")}${roots.length > visible.length ? `, +${roots.length - visible.length} more` : ""}`;
+  };
+  const changes: string[] = [];
+  if (added.length > 0) changes.push(`added ignored roots: ${bounded(added)}`);
+  if (removed.length > 0) changes.push(`removed ignored roots: ${bounded(removed)}`);
+  if (changes.length === 0) {
+    changes.push(
+      `content or metadata changed under ignored roots: ${bounded(expected.roots) || "<none>"}`,
+    );
+  }
+  return changes.join("; ");
+}
+
 async function fingerprintCandidate(
   worktreePath: string,
   allowedRoots: readonly string[],
@@ -720,7 +743,9 @@ export async function verifyCccCampaignReadyCandidate(
     if (currentIgnoredBaseline.fingerprint !== input.trustedIgnoredBaseline.fingerprint) {
       return {
         ready: false,
-        summary: "controller-initialized ignored paths changed after provider dispatch",
+        summary:
+          "controller-initialized ignored paths changed after provider dispatch"
+          + ` (${describeIgnoredBaselineDrift(input.trustedIgnoredBaseline, currentIgnoredBaseline)})`,
       };
     }
   }
@@ -825,7 +850,9 @@ export async function verifyCccCampaignReadyCandidate(
       if (finalIgnoredBaseline.fingerprint !== input.trustedIgnoredBaseline.fingerprint) {
         return {
           ready: false,
-          summary: "controller-initialized ignored paths changed while the sealed readiness verifier was running",
+          summary:
+            "controller-initialized ignored paths changed while the sealed readiness verifier was running"
+            + ` (${describeIgnoredBaselineDrift(input.trustedIgnoredBaseline, finalIgnoredBaseline)})`,
         };
       }
     }
