@@ -45,7 +45,7 @@ export const GOLDEN_PI_DRIVERS: readonly GoldenPiDriver[] = Object.freeze([
     modelId: "combo/gemini-flash-latest",
     comboAlias: "gemini-flash-latest",
     attributionTerminalRouteMembers: Object.freeze([
-      Object.freeze({ provider: "antigravity", model: "gemini-3.7-flash-high" }),
+      Object.freeze({ provider: "antigravity", model: "gemini-3.8-flash-high" }),
       Object.freeze({ provider: "gemini", model: "gemini-flash-latest" }),
     ]),
   }),
