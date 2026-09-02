@@ -242,6 +242,41 @@ async function requestBody(response) {
   return text.length > 0 ? JSON.parse(text) : null;
 }
 
+async function within(promise, label, durationMs = 1_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label + " timed out")), durationMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readSseDataFrame(reader) {
+  const decoder = new TextDecoder();
+  let received = "";
+  while (true) {
+    const boundary = received.match(/\\r?\\n\\r?\\n/);
+    if (boundary?.index !== undefined) {
+      const frame = received.slice(0, boundary.index);
+      received = received.slice(boundary.index + boundary[0].length);
+      if (frame.split(/\\r?\\n/).some((line) => line.startsWith("data:"))) return frame;
+      continue;
+    }
+    const next = await reader.read();
+    if (next.done) {
+      received += decoder.decode();
+      break;
+    }
+    received += decoder.decode(next.value, { stream: true });
+  }
+  throw new Error("GET /stream ended before an SSE data frame");
+}
+
 async function checkCandidate() {
   await checkIngest();
   await checkAudit();
@@ -270,6 +305,16 @@ async function checkCandidate() {
     assert.equal(typeof service.close, "function", "createApp must return a close hook");
     const health = await service.handle(new Request("http://local.test/health"));
     assert.equal(health.status, 200, "GET /health must succeed");
+    const stream = await service.handle(new Request("http://local.test/stream"));
+    assert.equal(stream.status, 200, "GET /stream must expose the SSE endpoint");
+    assert.match(
+      stream.headers.get("content-type") ?? "",
+      /^text\\/event-stream(?:;|$)/,
+      "GET /stream must return an SSE content type",
+    );
+    assert.ok(stream.body, "GET /stream must return a readable body");
+    const streamReader = stream.body.getReader();
+    const pendingFrame = within(readSseDataFrame(streamReader), "GET /stream event");
     const accepted = await service.handle(new Request("http://local.test/events", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -277,6 +322,13 @@ async function checkCandidate() {
     }));
     assert.equal(accepted.status, 202, "valid event POST must be accepted");
     assert.equal((await requestBody(accepted)).id, "evt-http");
+    const streamed = await pendingFrame;
+    assert.match(
+      streamed,
+      /evt-http/,
+      "GET /stream must deliver the accepted event",
+    );
+    await streamReader.cancel();
     const rejected = await service.handle(new Request("http://local.test/events", {
       method: "POST",
       headers: { "content-type": "application/json" },

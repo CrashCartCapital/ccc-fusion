@@ -168,6 +168,49 @@ test("PRD:GATE2-06 integrated verifier independently proves a known-good telemet
   }
 });
 
+test("PRD:GATE2-06 integrated verifier accepts SSE comment and control preambles", async () => {
+  const { createGate2TelemetryBaseline } = await loadBaselineBuilder();
+  const candidateModule = await import("./helpers/ccc-gate2-telemetry-candidate.mjs");
+  const scratch = await mkdtemp(path.join(tmpdir(), "ccc-gate2-sse-preamble-test-"));
+  const target = path.join(scratch, "target");
+  try {
+    await createGate2TelemetryBaseline(target);
+    await candidateModule.writeGate2TelemetryCandidate(target);
+    const appPath = path.join(target, "src/app.ts");
+    const appSource = await readFile(appPath, "utf8");
+    const withPreamble = appSource.replace(
+      "        return new Response(new ReadableStream<Uint8Array>({\n          async pull(controller) {",
+      "        return new Response(new ReadableStream<Uint8Array>({\n"
+        + "          start(controller) {\n"
+        + "            controller.enqueue(new TextEncoder().encode(\": connected\\r\\n\\r\\nretry: 1000\\r\\n\\r\\n\"));\n"
+        + "          },\n"
+        + "          async pull(controller) {",
+    );
+    assert.notEqual(withPreamble, appSource, "preamble fixture did not patch the SSE stream");
+    await writeFile(appPath, withPreamble);
+
+    const result = spawnSync(process.execPath, [
+      "verify/project-verifier.mjs",
+      "src/contract.ts", "src/ingest.ts", "src/audit.ts", "src/broadcast.ts",
+      "src/health-cli.ts", "README.md", "src/app.ts", "tests/telemetry.test.ts",
+    ], {
+      cwd: target,
+      encoding: "utf8",
+      timeout: 20_000,
+      env: {
+        ...process.env,
+        CCC_PROOF_ID: "PROOF-TELEMETRY-INTEGRATED",
+        CCC_PROOF_PHASE: "final_integrated",
+        CCC_PROOF_SOURCE_COMMIT: "e".repeat(40),
+        CCC_PROOF_SOURCE_TREE: "f".repeat(40),
+      },
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
 test("RED-G2-USEFULNESS-CLI: integrated verifier rejects an executable that ignores --audit", async () => {
   const { createGate2TelemetryBaseline } = await loadBaselineBuilder();
   const candidateModule = await import("./helpers/ccc-gate2-telemetry-candidate.mjs");
@@ -281,6 +324,45 @@ test("RED-G2-USEFULNESS-SSE-RACE: integrated verifier rejects headers flushed be
       },
     });
     assert.notEqual(result.status, 0, "verifier accepted headers flushed before SSE subscriber registration");
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("RED-G2-USEFULNESS-SSE-ROUTE: integrated verifier rejects SSE exposed anywhere except GET /stream", async () => {
+  const { createGate2TelemetryBaseline } = await loadBaselineBuilder();
+  const candidateModule = await import("./helpers/ccc-gate2-telemetry-candidate.mjs");
+  const scratch = await mkdtemp(path.join(tmpdir(), "ccc-gate2-sse-route-red-"));
+  const target = path.join(scratch, "target");
+  try {
+    await createGate2TelemetryBaseline(target);
+    await candidateModule.writeGate2TelemetryCandidate(target);
+    const appPath = path.join(target, "src/app.ts");
+    const appSource = await readFile(appPath, "utf8");
+    const wrongRoute = appSource.replace(
+      'request.method === "GET" && url.pathname === "/stream"',
+      'request.method === "GET" && url.pathname === "/events"',
+    );
+    assert.notEqual(wrongRoute, appSource, "route fixture did not replace GET /stream");
+    await writeFile(appPath, wrongRoute);
+
+    const result = spawnSync(process.execPath, [
+      "verify/project-verifier.mjs",
+      "src/contract.ts", "src/ingest.ts", "src/audit.ts", "src/broadcast.ts",
+      "src/health-cli.ts", "README.md", "src/app.ts", "tests/telemetry.test.ts",
+    ], {
+      cwd: target,
+      encoding: "utf8",
+      timeout: 20_000,
+      env: {
+        ...process.env,
+        CCC_PROOF_ID: "PROOF-TELEMETRY-INTEGRATED",
+        CCC_PROOF_PHASE: "final_integrated",
+        CCC_PROOF_SOURCE_COMMIT: "9".repeat(40),
+        CCC_PROOF_SOURCE_TREE: "a".repeat(40),
+      },
+    });
+    assert.notEqual(result.status, 0, "verifier accepted SSE on the wrong HTTP route");
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
