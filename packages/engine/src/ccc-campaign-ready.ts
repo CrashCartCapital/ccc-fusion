@@ -6,8 +6,13 @@ import { dirname, isAbsolute, join, posix } from "node:path";
 import { promisify } from "node:util";
 import { Type } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { CccCampaignProofEvidenceV2, CccCampaignTaskContext } from "@fusion/core";
+import {
+  CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION,
+  type CccCampaignProofEvidenceV2,
+  type CccCampaignTaskContext,
+} from "@fusion/core";
 import { runVerificationCommand } from "./run-verification-tool.js";
+import { acquireCccSemanticProofLoopbackPort } from "./ccc-campaign-proof-sandbox.js";
 
 const MAX_READY_FEEDBACK_CHARS = 4_000;
 const MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -603,12 +608,19 @@ export async function snapshotCccCampaignWriteEnvelope(input: {
   };
 }
 
-function taskProofCommands(campaign: CccCampaignTaskContext): string[] {
+function taskProofVerifiers(campaign: CccCampaignTaskContext): Array<{
+  command: string;
+  requiresLoopback: boolean;
+}> {
   const ids = new Set(campaign.proofIds);
   return campaign.proofs
     .filter((proof) => ids.has(proof.id))
     .filter((proof) => !("phases" in proof) || proof.phases.includes("task"))
-    .map((proof) => proof.command);
+    .map((proof) => ({
+      command: proof.command,
+      requiresLoopback: "verifierProfile" in proof
+        && proof.verifierProfile?.schema === CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION,
+    }));
 }
 
 async function materializeCandidateShadow(input: {
@@ -695,8 +707,8 @@ export async function verifyCccCampaignReadyCandidate(
   if (!GIT_OBJECT_ID.test(verifiedStartCommit)) {
     return { ready: false, summary: "readiness resolved a non-canonical candidate HEAD" };
   }
-  const commands = taskProofCommands(input.campaign);
-  if (commands.length === 0) {
+  const verifiers = taskProofVerifiers(input.campaign);
+  if (verifiers.length === 0) {
     return { ready: false, summary: "no task-phase sealed proof command is admitted" };
   }
 
@@ -762,13 +774,17 @@ export async function verifyCccCampaignReadyCandidate(
       candidateChangedPaths,
       MAX_REPAIR_OBSERVED_FILES,
     );
-    for (const command of commands) {
+    for (const { command, requiresLoopback } of verifiers) {
+      const loopbackPort = requiresLoopback
+        ? await acquireCccSemanticProofLoopbackPort()
+        : undefined;
       const result = await runVerificationCommand({
         command,
         cwd: shadow.cwd,
         timeoutMs: input.timeoutMs,
         signal: input.signal,
         onHeartbeat: input.onHeartbeat ?? (() => undefined),
+        ...(loopbackPort !== undefined ? { loopbackPort } : {}),
       });
       if (!result.success) {
         const diagnosticRaw = [result.stderr, result.stdout]
@@ -821,7 +837,7 @@ export async function verifyCccCampaignReadyCandidate(
     }
     return {
       ready: true,
-      summary: `sealed verifier passed in isolated candidate: ${commands.join(", ")}`,
+      summary: `sealed verifier passed in isolated candidate: ${verifiers.map(({ command }) => command).join(", ")}`,
       taskId: input.taskId,
       verifiedWorktreePath,
       verifiedStartCommit,

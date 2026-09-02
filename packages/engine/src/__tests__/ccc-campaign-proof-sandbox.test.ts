@@ -163,11 +163,27 @@ describe("CCC semantic-proof sandbox", () => {
         '  adjacent.once("error", (error) => resolve(error.code ?? "ERROR"));',
         '  adjacent.listen(adjacentPort, "127.0.0.1", () => adjacent.close(() => resolve("ALLOWED")));',
         '});',
-        'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
-        'await new Promise((resolve) => setTimeout(resolve, 25));',
+        'const childSource = "const {createServer}=require(\\"node:net\\");const server=createServer((socket)=>socket.end(\\"child-ok\\"));server.listen(Number(process.env.PORT),\\"127.0.0.1\\",()=>process.stdout.write(\\"ready\\\\n\\"));";',
+        'const child = spawn(process.execPath, ["-e", childSource], { env: { ...process.env, PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });',
+        'await new Promise((resolve, reject) => { child.stdout.once("data", resolve); child.once("exit", (code, signal) => reject(new Error(`child server exited before ready: ${code}/${signal}`))); });',
+        'const childReceived = await new Promise((resolve, reject) => {',
+        '  const socket = createConnection(port, "127.0.0.1");',
+        '  let text = "";',
+        '  socket.on("data", (chunk) => { text += String(chunk); });',
+        '  socket.once("end", () => resolve(text));',
+        '  socket.once("error", reject);',
+        '});',
         'const signalSent = child.kill("SIGTERM");',
         'const childSignal = await new Promise((resolve) => child.once("exit", (_code, signal) => resolve(signal)));',
-        'process.stdout.write(JSON.stringify({ port, received, adjacentResult, signalSent, childSignal }));',
+        'process.stdout.write(JSON.stringify({ port, received, adjacentResult, childReceived, signalSent, childSignal }));',
+      ].join("\n"));
+      await writeFile(join(proofRoot, "Taskfile.yml"), [
+        "version: '3'",
+        "tasks:",
+        "  loopback:",
+        "    cmds:",
+        "      - node loopback.mjs",
+        "",
       ].join("\n"));
 
       const result = await runCccSemanticProofSandboxedProcess({
@@ -177,8 +193,8 @@ describe("CCC semantic-proof sandbox", () => {
         nodeExecutable: process.execPath,
         deniedReadRoots: [deniedRoot],
         loopbackPort,
-        executable: process.execPath,
-        args: ["loopback.mjs"],
+        executable: "/opt/homebrew/bin/task",
+        args: ["loopback"],
         timeoutMs: 10_000,
         maxOutputBytes: 16_384,
       } as never);
@@ -188,6 +204,7 @@ describe("CCC semantic-proof sandbox", () => {
         port: loopbackPort,
         received: "ok",
         adjacentResult: "EPERM",
+        childReceived: "child-ok",
         signalSent: true,
         childSignal: "SIGTERM",
       });
