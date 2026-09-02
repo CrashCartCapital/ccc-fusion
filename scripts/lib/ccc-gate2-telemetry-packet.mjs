@@ -40,7 +40,7 @@ function buildPrd() {
     "Build a small local telemetry service with typed HTTP event ingest, append-only JSONL audit storage, live server-sent event broadcast, and a CLI health probe.", "",
     "The service must be runnable from the documented commands, preserve accepted events across restart, and provide tests and operator guidance. Choose a clear implementation within the admitted paths; the behavioral contract is authoritative.", "",
     "## Public runtime contract", "",
-    "Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events, emits only accepted events, and calls response.flushHeaders() before awaiting the first event.", "",
+    "Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events and emits only accepted events. The executable must obtain the stream response so its subscriber is registered before calling response.flushHeaders(), then flush those headers before awaiting the first event.", "",
     "This project executes TypeScript source directly with Node 24 and has no transpile step, so local source imports must use .ts specifiers rather than .js specifiers.", "",
     "Discovery commands must stay inside the project root.",
     "Do not search /, /tmp, /private/tmp, parent directories, home directories, or dependency caches for templates, tsconfig.json, examples, or tooling.",
@@ -98,7 +98,7 @@ function sourceRefsFor(spec, input) {
   if (spec.taskId === "TASK-TELEMETRY-INTEGRATE") {
     references.push(
       prdRef("Build a small local telemetry service with typed HTTP event ingest, append-only JSONL audit storage, live server-sent event broadcast, and a CLI health probe."),
-      prdRef("Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events, emits only accepted events, and calls response.flushHeaders() before awaiting the first event."),
+      prdRef("Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events and emits only accepted events. The executable must obtain the stream response so its subscriber is registered before calling response.flushHeaders(), then flush those headers before awaiting the first event."),
       prdRef(integratedLine),
       prdRef(`[[${supportRelativePath}]] documents the baseline-owned behavioral verifier.`),
     );

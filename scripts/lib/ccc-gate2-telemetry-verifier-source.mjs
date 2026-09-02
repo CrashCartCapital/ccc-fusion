@@ -251,6 +251,14 @@ async function checkCandidate() {
   assert.match(appSource, /import\\.meta\\.url/, "real server entry must be behind an import.meta.url main guard");
   assert.ok(appSource.includes("." + "listen("), "guarded executable must serve the documented HTTP contract");
   assert.ok(appSource.includes("." + "flushHeaders("), "GET /stream must flush response headers before awaiting the first event");
+  const executableSource = appSource.slice(appSource.lastIndexOf("import.meta.url"));
+  const handleIndex = executableSource.indexOf("." + "handle(");
+  const flushIndex = executableSource.indexOf("." + "flushHeaders(");
+  assert.ok(handleIndex >= 0, "guarded executable must obtain the service response");
+  assert.ok(
+    handleIndex < flushIndex,
+    "GET /stream must register its SSE subscriber before flushing response headers",
+  );
   await checkExecutableArguments();
   const app = await loadModule("src/app.ts");
   assert.equal(typeof app.createApp, "function", "createApp must be exported");

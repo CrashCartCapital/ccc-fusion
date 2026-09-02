@@ -239,6 +239,53 @@ test("RED-G2-USEFULNESS-SSE: integrated verifier rejects a server that does not 
   }
 });
 
+test("RED-G2-USEFULNESS-SSE-RACE: integrated verifier rejects headers flushed before subscriber registration", async () => {
+  const { createGate2TelemetryBaseline } = await loadBaselineBuilder();
+  const candidateModule = await import("./helpers/ccc-gate2-telemetry-candidate.mjs");
+  const scratch = await mkdtemp(path.join(tmpdir(), "ccc-gate2-sse-order-red-"));
+  const target = path.join(scratch, "target");
+  try {
+    await createGate2TelemetryBaseline(target);
+    await candidateModule.writeGate2TelemetryCandidate(target);
+    const appPath = path.join(target, "src/app.ts");
+    const appSource = await readFile(appPath, "utf8");
+    const handleBlock = `    const handled = await app.handle(new Request("http://127.0.0.1" + (request.url ?? "/"), {
+      method: request.method,
+      headers: request.headers as HeadersInit,
+      body: request.method === "GET" || request.method === "HEAD" ? undefined : body,
+    }));
+`;
+    assert.ok(appSource.includes(handleBlock), "known-good candidate handle block drifted");
+    const withoutHandle = appSource.replace(handleBlock, "");
+    const raceCandidate = withoutHandle.replace(
+      "    response.flushHeaders();\n",
+      `    response.flushHeaders();\n${handleBlock}`,
+    );
+    assert.notEqual(raceCandidate, appSource, "race fixture did not reorder the handle call");
+    await writeFile(appPath, raceCandidate);
+
+    const result = spawnSync(process.execPath, [
+      "verify/project-verifier.mjs",
+      "src/contract.ts", "src/ingest.ts", "src/audit.ts", "src/broadcast.ts",
+      "src/health-cli.ts", "README.md", "src/app.ts", "tests/telemetry.test.ts",
+    ], {
+      cwd: target,
+      encoding: "utf8",
+      timeout: 20_000,
+      env: {
+        ...process.env,
+        CCC_PROOF_ID: "PROOF-TELEMETRY-INTEGRATED",
+        CCC_PROOF_PHASE: "final_integrated",
+        CCC_PROOF_SOURCE_COMMIT: "7".repeat(40),
+        CCC_PROOF_SOURCE_TREE: "8".repeat(40),
+      },
+    });
+    assert.notEqual(result.status, 0, "verifier accepted headers flushed before SSE subscriber registration");
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
 test("PRD:GATE2-06 integrated verifier executes the worker-authored telemetry test file", async () => {
   const { createGate2TelemetryBaseline } = await loadBaselineBuilder();
   const candidateModule = await import("./helpers/ccc-gate2-telemetry-candidate.mjs");
