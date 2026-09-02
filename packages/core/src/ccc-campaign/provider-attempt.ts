@@ -1596,7 +1596,11 @@ export async function inspectCccProviderAttempt(
   const taskId = requireCanonicalText(input.taskId, "task ID");
   const attemptKey = requireAttemptKey(input.attemptKey);
   const inspect = async (tx: DbTransaction): Promise<CccProviderAttemptScope | null> => {
-    const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, taskId, tx);
+    // The import request counter and provider-attempt audit rows form one
+    // custody snapshot. Lock the shared import row before reading history so
+    // another fanout task cannot reserve between these two statements under
+    // PostgreSQL READ COMMITTED.
+    const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, taskId, tx, true);
     if (!context) return null;
     return (await loadHistory(tx, context)).attempts.get(attemptKey)?.scope ?? null;
   };
@@ -1609,7 +1613,7 @@ export async function listCccProviderAttemptsForCampaign(
 ): Promise<readonly CccProviderAttemptScope[]> {
   const taskId = requireCanonicalText(input.taskId, "task ID");
   const list = async (tx: DbTransaction): Promise<readonly CccProviderAttemptScope[]> => {
-    const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, taskId, tx);
+    const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, taskId, tx, true);
     if (!context) return Object.freeze([]);
     const history = await loadHistory(tx, context);
     return Object.freeze([...history.attempts.values()]

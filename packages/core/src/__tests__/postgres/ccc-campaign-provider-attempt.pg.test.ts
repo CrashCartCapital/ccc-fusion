@@ -25,6 +25,7 @@ import {
   rehashCccPrdImportTestBundle,
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
 import { canonicalCccPrdJson } from "../../ccc-prd/contract.js";
+import { inspectCccProviderAttempt } from "../../ccc-campaign/provider-attempt.js";
 import type { ApprovalRequestActorSnapshot } from "../../types.js";
 
 const providerWorker: ApprovalRequestActorSnapshot = {
@@ -525,6 +526,58 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
     expect(results.map((result) => result.attemptOrdinal).sort()).toEqual([1, 2]);
     expect(results.map((result) => result.requestCount).sort()).toEqual([1, 2]);
     expect(await persistedRequestCount(campaign.importId)).toBe(2);
+  });
+
+  it("holds the shared campaign snapshot stable while an in-transaction attempt inspection is open", async () => {
+    const { taskId: firstTaskId, campaign } = await context("inspect-snapshot-lock", {
+      maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 2,
+    });
+    const secondTaskId = await nativeTaskIdForImport(
+      campaign.importId,
+      "TASK-terminal-inspect-snapshot-lock",
+    );
+    const store = api(h.store());
+    const first = await store.reserveCccProviderAttempt(
+      request(firstTaskId, h.rootDir(), "turn-inspect-snapshot-lock"),
+    );
+    let releaseInspection!: () => void;
+    const inspectionRelease = new Promise<void>((resolve) => {
+      releaseInspection = resolve;
+    });
+    let inspectionReady!: (value: ProviderAttemptScope | null) => void;
+    const inspected = new Promise<ProviderAttemptScope | null>((resolve) => {
+      inspectionReady = resolve;
+    });
+    const inspectionTransaction = h.layer().transactionImmediate(async (tx) => {
+      const value = await inspectCccProviderAttempt({
+        layer: h.layer(),
+        rootDir: h.rootDir(),
+        tx,
+        taskId: firstTaskId,
+        attemptKey: first.attemptKey,
+      }) as ProviderAttemptScope | null;
+      inspectionReady(value);
+      await inspectionRelease;
+    });
+
+    await expect(inspected).resolves.toMatchObject({ attemptKey: first.attemptKey });
+    const concurrentReservation = api(new TaskStore(
+      h.rootDir(),
+      undefined,
+      { asyncLayer: h.layer() },
+    )).reserveCccProviderAttempt(
+      request(secondTaskId, h.rootDir(), "turn-concurrent-after-inspect"),
+    );
+    try {
+      await expect(Promise.race([
+        concurrentReservation.then(() => "reserved"),
+        new Promise((resolve) => setTimeout(() => resolve("blocked"), 100)),
+      ])).resolves.toBe("blocked");
+    } finally {
+      releaseInspection();
+    }
+    await inspectionTransaction;
+    await expect(concurrentReservation).resolves.toMatchObject({ requestCount: 2 });
   });
 
   it("keeps global request count coherent under multi-task Pi turn churn", async () => {
