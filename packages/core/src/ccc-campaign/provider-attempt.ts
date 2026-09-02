@@ -1591,37 +1591,67 @@ export async function reconcileCccProviderAttempt(
 }
 
 export async function inspectCccProviderAttempt(
-  input: ProviderAttemptStoreInput & Readonly<{ taskId: string; attemptKey: string }>,
+  input: ProviderAttemptStoreInput & Readonly<{
+    taskId: string;
+    attemptKey: string;
+    lockForUpdate?: boolean;
+  }>,
 ): Promise<CccProviderAttemptScope | null> {
   const taskId = requireCanonicalText(input.taskId, "task ID");
   const attemptKey = requireAttemptKey(input.attemptKey);
-  const inspect = async (tx: DbTransaction): Promise<CccProviderAttemptScope | null> => {
+  const inspect = async (
+    tx: DbTransaction,
+    lockForUpdate: boolean,
+  ): Promise<CccProviderAttemptScope | null> => {
     // The import request counter and provider-attempt audit rows form one
-    // custody snapshot. Lock the shared import row before reading history so
-    // another fanout task cannot reserve between these two statements under
-    // PostgreSQL READ COMMITTED.
-    const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, taskId, tx, true);
+    // custody snapshot. Settlement callers lock the shared import row; plain
+    // readers use the repeatable-read transaction below.
+    const context = await loadCccCampaignContextForTask(
+      input.layer,
+      input.rootDir,
+      taskId,
+      tx,
+      lockForUpdate,
+    );
     if (!context) return null;
     return (await loadHistory(tx, context)).attempts.get(attemptKey)?.scope ?? null;
   };
-  if (input.tx) return inspect(input.tx);
-  return input.layer.transaction(inspect);
+  if (input.tx) return inspect(input.tx, input.lockForUpdate === true);
+  if (input.lockForUpdate === true) {
+    return input.layer.transactionImmediate((tx) => inspect(tx, true));
+  }
+  return input.layer.transaction(
+    (tx) => inspect(tx, false),
+    { isolationLevel: "repeatable read", accessMode: "read only" },
+  );
 }
 
 export async function listCccProviderAttemptsForCampaign(
   input: ListCccProviderAttemptsForCampaignInput,
 ): Promise<readonly CccProviderAttemptScope[]> {
   const taskId = requireCanonicalText(input.taskId, "task ID");
-  const list = async (tx: DbTransaction): Promise<readonly CccProviderAttemptScope[]> => {
-    const context = await loadCccCampaignContextForTask(input.layer, input.rootDir, taskId, tx, true);
+  const list = async (
+    tx: DbTransaction,
+    lockForUpdate: boolean,
+  ): Promise<readonly CccProviderAttemptScope[]> => {
+    const context = await loadCccCampaignContextForTask(
+      input.layer,
+      input.rootDir,
+      taskId,
+      tx,
+      lockForUpdate,
+    );
     if (!context) return Object.freeze([]);
     const history = await loadHistory(tx, context);
     return Object.freeze([...history.attempts.values()]
       .map((attempt) => attempt.scope)
       .sort((left, right) => left.requestCount - right.requestCount || left.attemptKey.localeCompare(right.attemptKey)));
   };
-  if (input.tx) return list(input.tx);
-  return input.layer.transaction(list);
+  if (input.tx) return list(input.tx, false);
+  return input.layer.transaction(
+    (tx) => list(tx, false),
+    { isolationLevel: "repeatable read", accessMode: "read only" },
+  );
 }
 
 /**

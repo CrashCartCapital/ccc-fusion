@@ -1048,7 +1048,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
     if (!this.asyncLayer) throw new Error("CCC provider attempts require a PostgreSQL-backed TaskStore");
     return this.asyncLayer.transactionImmediate(async (tx) => {
       const initial = await inspectCccProviderAttempt({
-        layer: this.asyncLayer!, rootDir: this.rootDir, tx,
+        layer: this.asyncLayer!, rootDir: this.rootDir, tx, lockForUpdate: true,
         taskId: input.taskId, attemptKey: input.attemptKey,
       });
       if (!initial) throw new Error("CCC provider attempt settlement requires an exact dispatched attempt");

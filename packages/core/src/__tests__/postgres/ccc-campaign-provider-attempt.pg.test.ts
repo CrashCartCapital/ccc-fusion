@@ -555,6 +555,7 @@ pgDescribe("CCC campaign provider-attempt admission (PostgreSQL)", () => {
         tx,
         taskId: firstTaskId,
         attemptKey: first.attemptKey,
+        lockForUpdate: true,
       }) as ProviderAttemptScope | null;
       inspectionReady(value);
       await inspectionRelease;
