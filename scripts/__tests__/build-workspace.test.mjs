@@ -610,3 +610,15 @@ test("wantsFullCliPackage matches CLI packaging env rules", () => {
   assert.equal(wantsFullCliPackage({ FUSION_CLI_FULL_PACKAGE: "0", CI: "true" }, { fullFlag: true }), false);
   assert.equal(wantsFullCliPackage({ npm_lifecycle_event: "prepack" }, { fullFlag: false }), true);
 });
+
+test("Gate 2 golden campaigns give installed CLI commands project-sized subprocess headroom", () => {
+  const source = readFileSync(
+    path.resolve("packages/engine/vitest.golden-pg.config.ts"),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /FUSION_TEST_SUBPROCESS_TIMEOUT_MS:\s*"600000"/,
+    "whole-product golden campaigns must not inherit the ordinary 120-second child guard",
+  );
+});
