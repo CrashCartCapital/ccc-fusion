@@ -77,8 +77,11 @@ test("PRD:GATE2-02 telemetry baseline owns only config, fixtures, and the extern
       assert.ok(verifier.includes(literal), `verifier must independently exercise ${literal}`);
     }
     assert.match(verifier, /mkdtemp/);
-    assert.doesNotMatch(verifier, /node:(?:http|https|net)|createServer|\.listen\s*\(/);
-    assert.doesNotMatch(verifier, /fetch\s*\(\s*[`'"]http/);
+    assert.match(verifier, /node:net/);
+    assert.match(verifier, /spawn\(process\.execPath/);
+    assert.match(verifier, /fetch\(baseUrl \+ "\/stream"\)/);
+    assert.match(verifier, /fetch\(baseUrl \+ "\/events"/);
+    assert.doesNotMatch(verifier, /node:(?:http|https)|response\.writeHead|response\.flushHeaders/);
     assert.doesNotMatch(verifier, /src\/contract\.ts[\s\S]*export /);
   } finally {
     await rm(scratch, { recursive: true, force: true });
@@ -324,6 +327,54 @@ test("RED-G2-USEFULNESS-SSE-RACE: integrated verifier rejects headers flushed be
       },
     });
     assert.notEqual(result.status, 0, "verifier accepted headers flushed before SSE subscriber registration");
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("RED-G2-USEFULNESS-SSE-ADAPTER: integrated verifier rejects a stream wired to a different service instance", async () => {
+  const { createGate2TelemetryBaseline } = await loadBaselineBuilder();
+  const candidateModule = await import("./helpers/ccc-gate2-telemetry-candidate.mjs");
+  const scratch = await mkdtemp(path.join(tmpdir(), "ccc-gate2-sse-adapter-red-"));
+  const target = path.join(scratch, "target");
+  try {
+    await createGate2TelemetryBaseline(target);
+    await candidateModule.writeGate2TelemetryCandidate(target);
+    const appPath = path.join(target, "src/app.ts");
+    const appSource = await readFile(appPath, "utf8");
+    const sharedHandler = "    const handled = await app.handle(new Request(\"http://127.0.0.1\" + (request.url ?? \"/\"), {\n";
+    const disconnectedHandler = `    const requestApp = request.url === "/stream"
+      ? await createApp({ auditPath: argument("--audit") })
+      : app;
+    const handled = await requestApp.handle(new Request("http://127.0.0.1" + (request.url ?? "/"), {
+`;
+    assert.ok(appSource.includes(sharedHandler), "known-good candidate shared handler drifted");
+    const disconnectedCandidate = appSource.replace(sharedHandler, disconnectedHandler);
+    assert.notEqual(disconnectedCandidate, appSource, "disconnected adapter fixture did not patch the server handler");
+    await writeFile(appPath, disconnectedCandidate);
+
+    const result = spawnSync(process.execPath, [
+      "verify/project-verifier.mjs",
+      "src/contract.ts", "src/ingest.ts", "src/audit.ts", "src/broadcast.ts",
+      "src/health-cli.ts", "README.md", "src/app.ts", "tests/telemetry.test.ts",
+    ], {
+      cwd: target,
+      encoding: "utf8",
+      timeout: 20_000,
+      env: {
+        ...process.env,
+        CCC_PROOF_ID: "PROOF-TELEMETRY-INTEGRATED",
+        CCC_PROOF_PHASE: "final_integrated",
+        CCC_PROOF_SOURCE_COMMIT: "b".repeat(40),
+        CCC_PROOF_SOURCE_TREE: "c".repeat(40),
+      },
+    });
+    assert.notEqual(result.status, 0, "verifier accepted an SSE adapter disconnected from event ingest");
+    assert.match(
+      result.stderr,
+      /worker executable SSE event timed out/u,
+      "disconnected adapter was not rejected by the executable SSE proof",
+    );
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

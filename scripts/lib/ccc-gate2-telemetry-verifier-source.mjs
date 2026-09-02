@@ -2,9 +2,10 @@ export function buildGate2TelemetryVerifierSource(phaseCandidateInputs) {
   const phaseEntries = Object.entries(phaseCandidateInputs);
   return `#!/usr/bin/env node
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -256,6 +257,129 @@ async function within(promise, label, durationMs = 1_000) {
   }
 }
 
+const delay = (durationMs) => new Promise((resolve) => setTimeout(resolve, durationMs));
+
+async function acquireLoopbackPort() {
+  return new Promise((resolve, reject) => {
+    const reservation = createTcpServer();
+    reservation.unref();
+    reservation.once("error", reject);
+    reservation.listen(0, "127.0.0.1", () => {
+      const address = reservation.address();
+      if (!address || typeof address === "string") {
+        reservation.close();
+        reject(new Error("failed to reserve an executable proof port"));
+        return;
+      }
+      reservation.close((error) => error ? reject(error) : resolve(address.port));
+    });
+  });
+}
+
+function executableStopped(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function waitForExecutableStop(child, durationMs) {
+  if (executableStopped(child)) return true;
+  return new Promise((resolve) => {
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      resolve(executableStopped(child));
+    }, durationMs);
+    child.once("exit", onExit);
+    if (executableStopped(child)) {
+      child.off("exit", onExit);
+      clearTimeout(timer);
+      resolve(true);
+    }
+  });
+}
+
+async function stopExecutable(child) {
+  if (!child || executableStopped(child)) return;
+  child.kill("SIGTERM");
+  if (await waitForExecutableStop(child, 1_000)) return;
+  if (!executableStopped(child)) child.kill("SIGKILL");
+  assert.equal(await waitForExecutableStop(child, 1_000), true, "worker executable did not stop");
+}
+
+async function checkExecutableHttp() {
+  const scratch = await mkdtemp(path.join(tmpdir(), "gate2-executable-http-"));
+  const auditPath = path.join(scratch, "events.jsonl");
+  const port = await acquireLoopbackPort();
+  const baseUrl = "http://127.0.0.1:" + port;
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  let stderr = "";
+  let child;
+  let reader;
+  try {
+    child = spawn(process.execPath, [
+      "--experimental-strip-types",
+      "src/app.ts",
+      "--port",
+      String(port),
+      "--audit",
+      auditPath,
+    ], {
+      cwd: process.cwd(),
+      env: environment,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr = (stderr + String(chunk)).slice(-4_096);
+    });
+    const startupDeadline = Date.now() + 5_000;
+    let healthy = false;
+    while (Date.now() < startupDeadline) {
+      if (executableStopped(child)) break;
+      try {
+        const response = await fetch(baseUrl + "/health");
+        if (response.ok) {
+          healthy = true;
+          break;
+        }
+      } catch {}
+      await delay(25);
+    }
+    assert.equal(
+      healthy,
+      true,
+      "worker executable did not become healthy; exitCode=" + child.exitCode + " signalCode=" + child.signalCode + " stderr=" + stderr,
+    );
+
+    const stream = await within(fetch(baseUrl + "/stream"), "worker executable GET /stream", 5_000);
+    assert.equal(stream.status, 200, "worker executable GET /stream must return 200");
+    assert.match(
+      stream.headers.get("content-type") ?? "",
+      /^text\\/event-stream(?:;|$)/,
+      "worker executable GET /stream must return an SSE content type",
+    );
+    assert.ok(stream.body, "worker executable GET /stream must return a body");
+    reader = stream.body.getReader();
+    const pendingFrame = readSseDataFrame(reader);
+
+    const accepted = await within(fetch(baseUrl + "/events", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(validEvent("evt-executable-http")),
+    }), "worker executable POST /events", 5_000);
+    assert.equal(accepted.status, 202, "worker executable must accept a valid event");
+    assert.equal((await requestBody(accepted)).id, "evt-executable-http", "worker executable response must include the event id");
+    const streamed = await within(pendingFrame, "worker executable SSE event", 5_000);
+    assert.match(streamed, /evt-executable-http/, "worker executable stream must receive the accepted event");
+  } finally {
+    await reader?.cancel().catch(() => {});
+    await stopExecutable(child);
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 async function readSseDataFrame(reader) {
   const decoder = new TextDecoder();
   let received = "";
@@ -344,6 +468,7 @@ async function checkCandidate() {
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+  await checkExecutableHttp();
   const workerTestEnvironment = { ...process.env };
   delete workerTestEnvironment.NODE_TEST_CONTEXT;
   const workerTests = spawnSync(process.execPath, ["--test", "--experimental-strip-types", "tests/telemetry.test.ts"], {

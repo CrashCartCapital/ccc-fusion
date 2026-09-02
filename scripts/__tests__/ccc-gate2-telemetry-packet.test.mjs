@@ -55,6 +55,7 @@ test("PRD:GATE2-01 telemetry packet freezes the six-task peer DAG without verifi
 	    "GET /health",
 	    "POST /events",
 	    "GET /stream",
+	    "Every HTTP request must use the same long-lived createApp service instance.",
 	    "--port <port>",
 	    "--audit <path>",
 	    "health-cli.ts <base-url>",

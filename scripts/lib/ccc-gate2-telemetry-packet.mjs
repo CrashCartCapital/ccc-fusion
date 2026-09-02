@@ -26,6 +26,7 @@ const actionLine = (spec) => `- Protected action: live_execution provider://gate
 const integratedPositiveOracle = "The installed service passes the complete binary project rubric on one joined commit.";
 const integratedNegativeControl = "Partial joins, duplicate audit records, rejected-event broadcasts, and unavailable-service probe success are rejected.";
 const integratedLine = `The final command task verify:integrated proves every admitted clause on the joined candidate commit. Positive oracle: ${integratedPositiveOracle} Negative control: ${integratedNegativeControl}`;
+const runtimeContract = "Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events and emits only accepted events. Every HTTP request must use the same long-lived createApp service instance. Pass the inbound GET /stream request to that shared instance so its subscriber is registered before calling response.flushHeaders(), then flush those headers before awaiting the first event. Do not create a throwaway startup stream or a second per-route service instance.";
 const nonGoals = [
   "Remote delivery by ordinary workers",
   "Writes outside admitted telemetry project paths",
@@ -40,7 +41,7 @@ function buildPrd() {
     "Build a small local telemetry service with typed HTTP event ingest, append-only JSONL audit storage, live server-sent event broadcast, and a CLI health probe.", "",
     "The service must be runnable from the documented commands, preserve accepted events across restart, and provide tests and operator guidance. Choose a clear implementation within the admitted paths; the behavioral contract is authoritative.", "",
     "## Public runtime contract", "",
-    "Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events and emits only accepted events. The executable must obtain the stream response so its subscriber is registered before calling response.flushHeaders(), then flush those headers before awaiting the first event.", "",
+    runtimeContract, "",
     "This project executes TypeScript source directly with Node 24 and has no transpile step, so local source imports must use .ts specifiers rather than .js specifiers.", "",
     "Discovery commands must stay inside the project root.",
     "Do not search /, /tmp, /private/tmp, parent directories, home directories, or dependency caches for templates, tsconfig.json, examples, or tooling.",
@@ -98,7 +99,7 @@ function sourceRefsFor(spec, input) {
   if (spec.taskId === "TASK-TELEMETRY-INTEGRATE") {
     references.push(
       prdRef("Build a small local telemetry service with typed HTTP event ingest, append-only JSONL audit storage, live server-sent event broadcast, and a CLI health probe."),
-      prdRef("Start the service with node --experimental-strip-types src/app.ts --port <port> --audit <path>. It must expose GET /health, POST /events, and GET /stream. The stream uses server-sent events and emits only accepted events. The executable must obtain the stream response so its subscriber is registered before calling response.flushHeaders(), then flush those headers before awaiting the first event."),
+      prdRef(runtimeContract),
       prdRef(integratedLine),
       prdRef(`[[${supportRelativePath}]] documents the baseline-owned behavioral verifier.`),
     );
