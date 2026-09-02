@@ -304,6 +304,7 @@ function buildStrictDarwinVerifierProfile(input: {
     "(deny default)",
     "(allow process*)",
     "(allow signal (target self))",
+    ...(input.loopbackPort !== undefined ? ["(allow signal (target children))"] : []),
     "(allow sysctl-read)",
     `(allow file-write* ${sbplLiteral("/dev/null")})`,
   ];

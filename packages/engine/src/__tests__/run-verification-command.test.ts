@@ -1016,6 +1016,36 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       expect(result.warnings.join("\n")).toContain("exact loopback port 40411");
     });
 
+    itDarwinVerifierHost("lets a node-loopback verifier stop its own spawned child process", async () => {
+      // Mirrors the Gate 2 telemetry verifier: it spawns the candidate
+      // service as a child, probes it over loopback, then stops it via
+      // child.kill(). A sandbox that omits `(allow signal (target
+      // children))` fails that stop with EPERM (pueue 1526 on 53b367cf8).
+      const result = await runVerificationCommand({
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify([
+          "const { spawn } = require('node:child_process');",
+          "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });",
+          "setTimeout(() => {",
+          "  try {",
+          "    child.kill('SIGTERM');",
+          "    process.exit(0);",
+          "  } catch (error) {",
+          "    console.error(String((error && error.code) || error));",
+          "    process.exit(17);",
+          "  }",
+          "}, 300);",
+        ].join(" "))}`,
+        cwd: tempDir,
+        timeoutMs: 30_000,
+        onHeartbeat: vi.fn(),
+        bypassVerificationSlot: true,
+        loopbackPort: 40_412,
+      });
+
+      expect(result.stderr).not.toContain("EPERM");
+      expect(result.success).toBe(true);
+    });
+
     itLinux("fails closed when exact-port loopback verification is requested on Linux", async () => {
       const result = await runVerificationCommand({
         command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.exit(23)")}`,
