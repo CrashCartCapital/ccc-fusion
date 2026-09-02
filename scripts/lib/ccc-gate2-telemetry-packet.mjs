@@ -143,6 +143,9 @@ export function buildGate2TelemetryPacketDefinition(input) {
     negativeControls: [{ id: `CONTROL-${spec.taskId.slice(5)}`, description: spec.negativeControl }],
     fixturePaths,
     candidateInputs: candidateInputsFor(spec),
+    ...(spec.taskId === "TASK-TELEMETRY-INTEGRATE" ? {
+      verifierProfile: { schema: "ccc-prd.verifier.node-loopback.v1" },
+    } : {}),
     sourceRefs: [prdRef(proofLine(spec))],
   }));
   proofs.push(buildSemanticProof({
@@ -156,6 +159,7 @@ export function buildGate2TelemetryPacketDefinition(input) {
     negativeControls: [{ id: "CONTROL-TELEMETRY-INTEGRATED", description: integratedNegativeControl }],
     fixturePaths,
     candidateInputs: allOwnedPaths,
+    verifierProfile: { schema: "ccc-prd.verifier.node-loopback.v1" },
     sourceRefs: [prdRef(integratedLine)],
   }));
   const tasks = taskSpecs.map((spec) => ({

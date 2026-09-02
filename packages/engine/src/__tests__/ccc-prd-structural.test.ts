@@ -428,6 +428,16 @@ function addPythonVerifierProfile(candidate: ReturnType<typeof v2ProductProposal
   return candidate;
 }
 
+function addNodeLoopbackVerifierProfile(
+  candidate: ReturnType<typeof v2ProductProposal>,
+  proofIndex = 0,
+) {
+  candidate.proofs[proofIndex]!.verifierProfile = {
+    schema: "ccc-prd.verifier.node-loopback.v1",
+  };
+  return candidate;
+}
+
 function productConstraints() {
   return {
     targetRepository: { path: target, baseCommit: base },
@@ -493,6 +503,80 @@ function refusalCode(result: Record<string, unknown>): string | undefined {
 }
 
 describe("ccc-prd structural sidecar", () => {
+  it("RED-G2-node-loopback-v2-shape: admits the exact Node loopback profile without Python custody", async () => {
+    const input = packet(v2ProductSource);
+    const candidate = addNodeLoopbackVerifierProfile(v2ProductProposal());
+    const authored = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      semanticProofContract: "v2",
+      adapter: {
+        id: "local-v2-node-loopback-fixture",
+        model: "fixture-v2",
+        generateCandidate: async () => candidate,
+      },
+      workflowExtensionRegistry: await proofAdmissionRegistry(input),
+    });
+
+    expect(authored.kind, JSON.stringify(authored)).toBe("candidate");
+    expect(authored.sidecar?.proofs).toEqual(expect.arrayContaining([expect.objectContaining({
+      verifierProfile: { schema: "ccc-prd.verifier.node-loopback.v1" },
+      executionToolchain: expect.not.objectContaining({ python: expect.anything() }),
+    })]));
+
+    const sidecarPath = write(
+      input.root,
+      "candidate-node-loopback.sidecar.json",
+      JSON.stringify(authored.sidecar),
+    );
+    const compiled = ccc.compileCccPrdPacket({ ...input, sidecarPath }) as {
+      diagnostics?: Array<{ code: string; message: string }>;
+    };
+    expect(compiled.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "CCC_PRD_PROOF_ADMISSION_MISSING" }),
+    ]));
+    expect(compiled.diagnostics).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "CCC_PRD_PROOF_INVALID" }),
+    ]));
+  });
+
+  it.each([
+    {
+      label: "extra Node loopback profile field",
+      mutate: (proof: Record<string, unknown>) => {
+        (proof.verifierProfile as Record<string, unknown>).adapterPath = "verify/loopback.js";
+      },
+    },
+    {
+      label: "Node loopback profile paired with Python custody",
+      mutate: (proof: Record<string, unknown>) => {
+        const pythonCandidate = addPythonVerifierProfile(v2ProductProposal());
+        (proof.executionToolchain as Record<string, unknown>).python =
+          (pythonCandidate.proofs[0]!.executionToolchain as Record<string, unknown>).python;
+      },
+    },
+  ])("RED-G2-node-loopback-v2-shape: refuses $label", async ({ mutate }) => {
+    const input = packet(v2ProductSource);
+    const candidate = addNodeLoopbackVerifierProfile(v2ProductProposal());
+    mutate(candidate.proofs[0]!);
+    const authored = await ccc.authorCccPrdPacket({
+      rootDir: input.root,
+      manifestPath: input.manifestPath,
+      semanticProofContract: "v2",
+      adapter: {
+        id: "local-v2-node-loopback-fixture",
+        model: "fixture-v2",
+        generateCandidate: async () => candidate,
+      },
+      workflowExtensionRegistry: await proofAdmissionRegistry(input),
+    });
+
+    expect(authored).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{ code: "CCC_PRD_AUTHORING_PROPOSAL_INVALID" }],
+    });
+  });
+
   it("RED-R1-python-v2-authoring-shape: admits the additive Python verifier profile for review-only v2 authoring", async () => {
     const input = packet(v2ProductSource);
     const candidate = addPythonVerifierProfile(v2ProductProposal());

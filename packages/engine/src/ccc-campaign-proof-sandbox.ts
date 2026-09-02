@@ -3,6 +3,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { createServer as createTcpServer } from "node:net";
 import { promisify } from "node:util";
 import { superviseSpawn } from "@fusion/core";
 
@@ -17,6 +18,23 @@ const OTOOL_TIMEOUT_MS = 10_000;
 const SEALED_OPENSSL_CONF = ".ccc-empty-openssl.cnf";
 const execFile = promisify(execFileCallback);
 
+export async function acquireCccSemanticProofLoopbackPort(): Promise<number> {
+  const reservation = createTcpServer();
+  reservation.unref();
+  return new Promise<number>((resolvePort, reject) => {
+    reservation.once("error", reject);
+    reservation.listen(0, "127.0.0.1", () => {
+      const address = reservation.address();
+      if (!address || typeof address === "string" || address.port === 4_040) {
+        reservation.close();
+        reject(new Error("semantic-proof controller could not reserve an admissible loopback port"));
+        return;
+      }
+      reservation.close((error) => error ? reject(error) : resolvePort(address.port));
+    });
+  });
+}
+
 export type CccSemanticProofSandboxPolicyInput = {
   proofRoot: string;
   scratchRoot: string;
@@ -27,6 +45,8 @@ export type CccSemanticProofSandboxPolicyInput = {
   pythonPathRoots?: readonly string[];
   pythonRuntimeFiles?: readonly string[];
   pythonRuntimeExecutables?: readonly string[];
+  /** Controller-selected IPv4 loopback port for an admitted node-loopback verifier profile. */
+  loopbackPort?: number;
   deniedReadRoots: readonly string[];
 };
 
@@ -263,8 +283,20 @@ function canonicalPolicyInput(input: CccSemanticProofSandboxPolicyInput): {
   pythonPathRoots: string[];
   pythonRuntimeFiles: string[];
   pythonRuntimeExecutables: string[];
+  loopbackPort?: number;
   deniedReadRoots: string[];
 } {
+  if (
+    input.loopbackPort !== undefined
+    && (
+      !Number.isSafeInteger(input.loopbackPort)
+      || input.loopbackPort <= 0
+      || input.loopbackPort > 65_535
+      || input.loopbackPort === 4_040
+    )
+  ) {
+    throw new Error("semantic-proof loopback port must be an integer from 1 through 65535 and port 4040 is reserved");
+  }
   const canonical = {
     proofRoot: canonicalExistingPath(input.proofRoot, "semantic-proof root"),
     scratchRoot: canonicalExistingPath(input.scratchRoot, "semantic-proof scratch root"),
@@ -285,6 +317,7 @@ function canonicalPolicyInput(input: CccSemanticProofSandboxPolicyInput): {
     pythonRuntimeExecutables: uniqueSorted((input.pythonRuntimeExecutables ?? []).map((path) => (
       canonicalExistingPath(path, "semantic-proof Python runtime executable")
     ))),
+    ...(input.loopbackPort !== undefined ? { loopbackPort: input.loopbackPort } : {}),
     deniedReadRoots: uniqueSorted(input.deniedReadRoots.map((path) => (
       canonicalExistingPath(path, "semantic-proof denied repository root")
     ))),
@@ -392,11 +425,19 @@ export async function buildCccSemanticProofDarwinProfile(
       realpathSync(DARWIN_SELECTED_SHELL_EXECUTABLE),
     ].map(sbplLiteral).join(" ")})`,
     "(allow signal (target self))",
+    ...(canonical.loopbackPort !== undefined ? ["(allow signal (target children))"] : []),
     "(allow sysctl-read)",
     "(allow mach*)",
     "(allow ipc-posix-shm*)",
     "(allow system-socket)",
     "(deny network*)",
+    // sandbox-exec requires the hostname form here; the proof still binds and connects
+    // to the literal IPv4 loopback address, and the port remains controller-selected.
+    ...(canonical.loopbackPort !== undefined ? [
+      `(allow network-bind (local tcp "localhost:${canonical.loopbackPort}"))`,
+      `(allow network-inbound (local tcp "localhost:${canonical.loopbackPort}"))`,
+      `(allow network-outbound (remote tcp "localhost:${canonical.loopbackPort}"))`,
+    ] : []),
   ];
   for (const deniedRoot of canonical.deniedReadRoots) {
     lines.push(`(deny file-read* ${sbplSubpath(deniedRoot)})`);
@@ -494,6 +535,9 @@ export async function runCccSemanticProofSandboxedProcess(
       : {}),
     OPENSSL_CONF: resolve(canonical.proofRoot, SEALED_OPENSSL_CONF),
     GIT_TERMINAL_PROMPT: "0",
+    ...(canonical.loopbackPort !== undefined
+      ? { CCC_PROOF_LOOPBACK_PORT: String(canonical.loopbackPort) }
+      : {}),
     ...proofEnvironment,
   };
   // This repeats the preflight at the last possible point before dispatch so a

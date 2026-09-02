@@ -7,6 +7,7 @@ import { dirname, isAbsolute, join, relative, posix, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
+  CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION,
   CCC_PRD_PROOF_TERMINAL_ENVELOPE_V2_SCHEMA_VERSION,
   CCC_CAMPAIGN_PROOF_DEADLINE_EXPIRED_CODE,
   CccCampaignProofAttemptLimitError,
@@ -34,6 +35,7 @@ import {
   type CccSemanticProofMaterializationInput,
 } from "./ccc-campaign-proof-materialization.js";
 import {
+  acquireCccSemanticProofLoopbackPort,
   assertCccSemanticProofSandboxReady,
   runCccSemanticProofSandboxedProcess,
   type CccSemanticProofSandboxPolicyInput,
@@ -64,6 +66,10 @@ const MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 10_000;
 const MAX_SEMANTIC_PROOF_OUTPUT_BYTES = 128 * 1024;
 const PROOF_OUTPUT_TAIL_CHARS = 8_000;
+function proofRequiresNodeLoopback(proof: CccPrdProofV2): boolean {
+  return proof.verifierProfile?.schema
+    === CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION;
+}
 
 type ProofAttemptSnapshot = Readonly<{
   attemptKey: string;
@@ -1642,8 +1648,12 @@ async function runSemanticProofV2(
       const startedAt = Date.now();
       let terminalEnvelope: CccCampaignProofTerminalEnvelopeV2;
       try {
+        const loopbackPort = proofRequiresNodeLoopback(proof)
+          ? await acquireCccSemanticProofLoopbackPort()
+          : undefined;
         const processResult = await dependencies.runSandbox({
           ...sandboxPolicyFor(materialized),
+          ...(loopbackPort !== undefined ? { loopbackPort } : {}),
           executable: materialized.sealedExecutionToolchain.task.executablePath,
           args: materialized.taskArgv,
           proofEnvironment: {

@@ -260,6 +260,18 @@ async function within(promise, label, durationMs = 1_000) {
 const delay = (durationMs) => new Promise((resolve) => setTimeout(resolve, durationMs));
 
 async function acquireLoopbackPort() {
+  if (process.env.CCC_PROOF_LOOPBACK_PORT !== undefined) {
+    const controllerPort = Number(process.env.CCC_PROOF_LOOPBACK_PORT);
+    if (
+      !Number.isSafeInteger(controllerPort)
+      || controllerPort <= 0
+      || controllerPort > 65_535
+      || controllerPort === 4_040
+    ) {
+      throw new Error("controller supplied an invalid semantic-proof loopback port");
+    }
+    return controllerPort;
+  }
   return new Promise((resolve, reject) => {
     const reservation = createTcpServer();
     reservation.unref();

@@ -138,6 +138,16 @@ test("PRD:GATE2-01 telemetry packet freezes the six-task peer DAG without verifi
   });
   assert.equal(definition.proposal.proofs.at(-1).id, "PROOF-TELEMETRY-INTEGRATED");
   assert.equal(definition.proposal.proofs.at(-1).command, "task verify:integrated");
+  assert.deepEqual(
+    definition.proposal.proofs
+      .filter((proof) => proof.verifierProfile?.schema === "ccc-prd.verifier.node-loopback.v1")
+      .map(({ id }) => id),
+    ["PROOF-TELEMETRY-CANDIDATE", "PROOF-TELEMETRY-INTEGRATED"],
+  );
+  assert.equal(
+    definition.proposal.proofs.filter((proof) => proof.verifierProfile !== undefined).length,
+    2,
+  );
   for (const proof of definition.proposal.proofs) {
     assert.deepEqual(
       proof.verifierClosure.filter(({ role }) => role === "fixture").map(({ path }) => path),

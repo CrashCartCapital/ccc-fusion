@@ -155,6 +155,8 @@ describe("CCC PRD semantic contract v2", () => {
       CCC_PRD_PROOF_ADMISSION_V1_SCHEMA_VERSION: "ccc-prd.proof-admission.v1",
       CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION: "ccc-prd.proof-admission.v2",
       CCC_PRD_PROOF_V2_SCHEMA_VERSION: "ccc-prd.proof.v2",
+      CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION:
+        "ccc-prd.verifier.node-loopback.v1",
     });
     expect(cccPrdTypes.CCC_PRD_AUTHORING_PROPOSAL_SCHEMA_VERSION)
       .toBe("ccc-prd.authoring-proposal.v1");
@@ -167,10 +169,26 @@ describe("CCC PRD semantic contract v2", () => {
     expect(cccPrdPublic).toMatchObject({
       CCC_PRD_BUNDLE_V2_SCHEMA_VERSION: "ccc-prd.bundle.v2",
       CCC_PRD_EXECUTION_PROMPT_V2_SCHEMA_VERSION: "ccc-prd.execution-prompt.v2",
+      CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION:
+        "ccc-prd.verifier.node-loopback.v1",
       computeCccPrdProofDefinitionSha256: expect.any(Function),
       computeCccPrdProofV2AdmissionDigests: expect.any(Function),
       buildCccPrdTaskExecutionPrompt: expect.any(Function),
     });
+  });
+
+  it("RED-G2-node-loopback-definition-hash: binds the optional immutable Node loopback profile", () => {
+    const base = proofV2();
+    const nodeLoopback = {
+      ...base,
+      verifierProfile: {
+        schema: "ccc-prd.verifier.node-loopback.v1",
+      },
+    };
+
+    expect(computeCccPrdProofDefinitionSha256(nodeLoopback as never)).not.toBe(
+      computeCccPrdProofDefinitionSha256(base as never),
+    );
   });
 
   it("RED-S4-proof-custody: v2 proof identity binds every semantic and execution input", () => {

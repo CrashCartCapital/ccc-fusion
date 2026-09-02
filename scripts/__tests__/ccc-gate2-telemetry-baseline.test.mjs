@@ -79,6 +79,7 @@ test("PRD:GATE2-02 telemetry baseline owns only config, fixtures, and the extern
     assert.match(verifier, /mkdtemp/);
     assert.match(verifier, /node:net/);
     assert.match(verifier, /spawn\(process\.execPath/);
+    assert.match(verifier, /process\.env\.CCC_PROOF_LOOPBACK_PORT/);
     assert.match(verifier, /fetch\(baseUrl \+ "\/stream"\)/);
     assert.match(verifier, /fetch\(baseUrl \+ "\/events"/);
     assert.doesNotMatch(verifier, /node:(?:http|https)|response\.writeHead|response\.flushHeaders/);

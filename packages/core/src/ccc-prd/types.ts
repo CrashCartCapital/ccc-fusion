@@ -18,6 +18,8 @@ export const CCC_PRD_PROOF_ADMISSION_V2_SCHEMA_VERSION =
 export const CCC_PRD_PROOF_V2_SCHEMA_VERSION = "ccc-prd.proof.v2" as const;
 export const CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION =
   "ccc-prd.verifier.python-adapter.v1" as const;
+export const CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION =
+  "ccc-prd.verifier.node-loopback.v1" as const;
 export const CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION =
   "ccc-prd.python-runtime-manifest.v1" as const;
 export const CCC_PRD_EXECUTION_PROMPT_V1_SCHEMA_VERSION =
@@ -161,7 +163,18 @@ export type CccPrdVerifierProfilePythonAdapterV1 = {
   targetPath: string;
 };
 
-export type CccPrdVerifierProfile = CccPrdVerifierProfilePythonAdapterV1;
+export type CccPrdVerifierProfileNodeLoopbackV1 = {
+  schema: typeof CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION;
+};
+
+export type CccPrdVerifierProfile =
+  | CccPrdVerifierProfilePythonAdapterV1
+  | (CccPrdVerifierProfileNodeLoopbackV1 & {
+    /** Forbidden by the exact Node-loopback schema; retained only for safe union access. */
+    adapterPath?: never;
+    /** Forbidden by the exact Node-loopback schema; retained only for safe union access. */
+    targetPath?: never;
+  });
 
 export type CccPrdPythonRuntimeFile = {
   /** Controller-observed absolute path before sealing. */
