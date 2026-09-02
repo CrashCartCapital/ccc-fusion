@@ -205,15 +205,28 @@ async function startService() {
   throw new Error("service did not become healthy");
 }
 
-async function readSseFrame(reader) {
+async function readSseDataFrame(reader) {
   const decoder = new TextDecoder();
   let received = "";
-  while (!received.includes("\n\n")) {
+
+  while (true) {
+    const boundary = received.match(/\r?\n\r?\n/);
+    if (boundary?.index !== undefined) {
+      const frame = received.slice(0, boundary.index);
+      received = received.slice(boundary.index + boundary[0].length);
+      if (frame.split(/\r?\n/).some((line) => line.startsWith("data:"))) return frame;
+      continue;
+    }
+
     const next = await reader.read();
-    if (next.done) break;
+    if (next.done) {
+      received += decoder.decode();
+      break;
+    }
     received += decoder.decode(next.value, { stream: true });
   }
-  return received;
+
+  throw new Error("SSE stream ended before a data frame");
 }
 
 try {
@@ -221,7 +234,7 @@ try {
   const stream = await within(fetch(baseUrl + "/stream"), "SSE connect");
   if (!stream.ok || !stream.body) throw new Error("SSE endpoint was unavailable");
   const reader = stream.body.getReader();
-  const pendingFrame = readSseFrame(reader);
+  const pendingFrame = readSseDataFrame(reader);
 
   const invalid = await fetch(baseUrl + "/events", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fixture.invalid) });
   if (invalid.status < 400 || invalid.status >= 500) throw new Error("invalid event did not return 4xx");

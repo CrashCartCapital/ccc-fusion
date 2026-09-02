@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -118,6 +118,15 @@ describe("CCC Gate 2 real-loopback usefulness probe", () => {
       };
       await baseline.createGate2TelemetryBaseline(targetRoot);
       await candidate.writeGate2TelemetryCandidate(targetRoot);
+      const appPath = path.join(targetRoot, "src/app.ts");
+      const appSource = await readFile(appPath, "utf8");
+      const appWithControlFrames = appSource.replace(
+        "    response.flushHeaders();",
+        "    response.flushHeaders();\n"
+          + "    if (request.url === \"/stream\") response.write(\": connected\\r\\n\\r\\nretry: 1000\\r\\n\\r\\n\");",
+      );
+      expect(appWithControlFrames).not.toBe(appSource);
+      await writeFile(appPath, appWithControlFrames);
       execFileSync("git", ["init", "--initial-branch=main"], { cwd: targetRoot, stdio: "ignore" });
       execFileSync("git", ["config", "user.name", "Gate 2 Test"], { cwd: targetRoot });
       execFileSync("git", ["config", "user.email", "gate2@example.invalid"], { cwd: targetRoot });
