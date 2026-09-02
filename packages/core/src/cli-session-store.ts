@@ -520,6 +520,7 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
           layer: this.layer,
           rootDir,
           tx,
+          lockForUpdate: true,
           taskId: input.reconciliation.taskId,
           attemptKey: input.reconciliation.attemptKey,
         });
@@ -540,6 +541,7 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
             layer: this.layer,
             rootDir,
             tx,
+            lockForUpdate: true,
             taskId: input.reconciliation.taskId,
             attemptKey: input.reconciliation.attemptKey,
           });

@@ -34,6 +34,7 @@ import {
 } from "../../__test-utils__/ccc-prd-import-fixture.js";
 import type { CccPrdSemanticBundle } from "../../ccc-prd/types.js";
 import type { CccProviderAttemptReconciliation, CccProviderAttemptScope } from "../../ccc-campaign/types.js";
+import type { CccCampaignAuthorityStore } from "../../ccc-campaign/store.js";
 import type { CliTerminationReason } from "../../cli-session-types.js";
 import type { ApprovalRequestActorSnapshot } from "../../types.js";
 import {
@@ -59,10 +60,13 @@ const campaignWorker: ApprovalRequestActorSnapshot = {
   actorName: "Effect worker",
 };
 
-function campaignBundle(source: CccPrdSemanticBundle): CccPrdSemanticBundle {
+function campaignBundle(
+  source: CccPrdSemanticBundle,
+  bounds = { maxRequests: 2, maxDurationMs: 120_000, maxConcurrency: 1 },
+): CccPrdSemanticBundle {
   return rehashCccPrdImportTestBundle({
     ...source,
-    bounds: { maxRequests: 2, maxDurationMs: 120_000, maxConcurrency: 1 },
+    bounds,
     tasks: source.tasks.map((task, index) => index === 0
       ? { ...task, protectedActionIds: [campaignAction.actionId] }
       : task),
@@ -127,8 +131,9 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     suffix: string,
     claimToken = `claim-${suffix}`,
     transport: "pi" | "cli" = "pi",
+    bounds?: Readonly<{ maxRequests: number; maxDurationMs: number; maxConcurrency: number }>,
   ) {
-    const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), suffix));
+    const source = campaignBundle(createCccPrdImportTestBundle(h.rootDir(), suffix), bounds);
     const idempotencyKey = `effect-${suffix}`;
     await importCccPrdBundle({
       bundle: source,
@@ -163,7 +168,7 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
       runId: `effect-claim:${suffix}`,
       claimToken,
     });
-    return { taskId, rootDir, issued, claimed, claimToken };
+    return { taskId, rootDir, issued, claimed, claimToken, idempotencyKey };
   }
 
   type AtomicProviderAttemptSettlementStore = {
@@ -178,8 +183,16 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     return store as unknown as AtomicProviderAttemptSettlementStore;
   }
 
-  async function dispatchedCliProviderAttempt(suffix: string) {
-    const claimed = await claimedCampaignAuthority(`provider-settlement-${suffix}`, undefined, "cli");
+  async function dispatchedCliProviderAttempt(
+    suffix: string,
+    bounds?: Readonly<{ maxRequests: number; maxDurationMs: number; maxConcurrency: number }>,
+  ) {
+    const claimed = await claimedCampaignAuthority(
+      `provider-settlement-${suffix}`,
+      undefined,
+      "cli",
+      bounds,
+    );
     const [workItem] = await h.store().listWorkflowWorkItemsForTask(
       claimed.taskId,
       { kinds: ["task"] },
@@ -225,9 +238,10 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     suffix: string,
     provider: CccProviderAttemptScope,
     taskId: string,
+    campaignAuthorityStore: CccCampaignAuthorityStore = h.store(),
   ) {
     const store = await CliSessionStore.create(h.layer(), "__legacy_unscoped__", {
-      campaignAuthorityStore: h.store(),
+      campaignAuthorityStore,
       rootDir: h.rootDir(),
     });
     const id = `cli-pg-provider-settlement-${suffix}`;
@@ -307,6 +321,91 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
     });
     await expect(getApprovalRequest(h.layer().db, claimed.issued.id)).resolves.toMatchObject({ status: "consumed" });
     await expect(h.store().inspectCccCampaignActionLease(claimed.taskId, campaignAction)).resolves.toBeNull();
+  });
+
+  it("holds the campaign attempt snapshot stable during CLI settlement", async () => {
+    const { claimed, provider } = await dispatchedCliProviderAttempt(
+      "snapshot-lock",
+      { maxRequests: 3, maxDurationMs: 120_000, maxConcurrency: 2 },
+    );
+    let releaseLeaseInspection!: () => void;
+    const leaseInspectionRelease = new Promise<void>((resolve) => {
+      releaseLeaseInspection = resolve;
+    });
+    let leaseInspectionReady!: () => void;
+    const leaseInspectionStarted = new Promise<void>((resolve) => {
+      leaseInspectionReady = resolve;
+    });
+    const baseAuthorityStore = h.store();
+    const heldLease = await baseAuthorityStore.inspectCccCampaignActionLease(
+      claimed.taskId,
+      campaignAction,
+    );
+    expect(heldLease).not.toBeNull();
+    const blockingAuthorityStore = new Proxy(
+      baseAuthorityStore as unknown as CccCampaignAuthorityStore,
+      {
+        get(target, property) {
+          if (property === "inspectCccCampaignActionLease") {
+            return async () => {
+              leaseInspectionReady();
+              await leaseInspectionRelease;
+              return heldLease;
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      },
+    );
+    const { store } = await heldCliProviderSession(
+      "snapshot-lock",
+      provider,
+      claimed.taskId,
+      blockingAuthorityStore,
+    );
+    const settlement = atomicSettlement(store).settleCccProviderAttemptAndFence({
+      reconciliation: {
+        taskId: claimed.taskId,
+        attemptKey: provider.attemptKey,
+        controllerToken: provider.controllerToken,
+        outcome: "committed",
+        evidenceDigest: "2".repeat(64),
+        observerId: "snapshot-lock-observer",
+      },
+      terminationReason: "completed",
+    });
+    await leaseInspectionStarted;
+    const concurrentReservation = h.store().reserveCccProviderAttempt({
+      taskId: claimed.taskId,
+      actionId: campaignAction.actionId,
+      actionTarget: campaignAction.actionTarget,
+      turnKey: "provider-settlement-turn-concurrent-snapshot-lock",
+      dispatchKey: "provider-settlement-dispatch-concurrent-snapshot-lock",
+      providerId: "deterministic-fake",
+      modelId: "fixture-v1",
+      transport: "cli",
+      workItemFence: {
+        ...provider.workItemFence!,
+        attempt: provider.workItemFence!.attempt + 1,
+      },
+    });
+    const reservationState = await Promise.race([
+      concurrentReservation.then(() => "reserved" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]);
+    releaseLeaseInspection();
+    const [settlementResult, reservationResult] = await Promise.allSettled([
+      settlement,
+      concurrentReservation,
+    ]);
+
+    expect(reservationState).toBe("blocked");
+    expect(settlementResult).toMatchObject({ status: "fulfilled" });
+    expect(reservationResult).toMatchObject({
+      status: "fulfilled",
+      value: expect.objectContaining({ requestCount: 2 }),
+    });
   });
 
   it("replays identical CLI provider settlement without changing its truthful terminal scope", async () => {
