@@ -684,6 +684,18 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
     expect(cccCampaignVisibleBashWriteTargets(
       "node --test tests/telemetry.test.ts >/dev/null 2>&1",
     )).toEqual([]);
+    const copiedScratchCommands = [
+      ["cp /tmp/verify.err ./verify_err.log; cat ./verify_err.log", "./verify_err.log"],
+      ["cp /tmp/verify.err ./verify_err.log > /dev/null 2>&1", "./verify_err.log"],
+      ["echo start\ncp /tmp/verify.err ./verify_err.log", "./verify_err.log"],
+      ["cp -t ./logs /tmp/verify.err", "./logs"],
+      ["cp -t./logs /tmp/verify.err /tmp/verify2.err", "./logs"],
+      ["cp --target-directory=./logs /tmp/verify.err", "./logs"],
+      ["cp -- -source_file ./verify_err.log", "./verify_err.log"],
+    ] as const;
+    for (const [command, target] of copiedScratchCommands) {
+      expect(cccCampaignVisibleBashWriteTargets(command)).toContain(target);
+    }
 
     const bashExecute = vi.fn().mockResolvedValue({
       content: [{ type: "text", text: "must not run" }],
@@ -714,6 +726,20 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
       error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
       details: expect.objectContaining({ path: ".test.log" }),
     });
+    expect(bashExecute).not.toHaveBeenCalled();
+    expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
+
+    for (const [index, [command, target]] of copiedScratchCommands.entries()) {
+      await expect(bashTool!.execute(
+        `call-bash-copy-scratch-${index}`,
+        { command },
+        undefined,
+      )).resolves.toMatchObject({
+        isError: true,
+        error: expect.stringContaining("WRITE_ENVELOPE_REFUSED"),
+        details: expect.objectContaining({ path: target }),
+      });
+    }
     expect(bashExecute).not.toHaveBeenCalled();
     expect(capturePotentialMutationBaseline).not.toHaveBeenCalled();
   });

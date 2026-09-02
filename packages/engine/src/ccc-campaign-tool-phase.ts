@@ -91,6 +91,46 @@ export function cccCampaignVisibleBashWriteTargets(raw: string): string[] {
     const destinationTarget = /\b(?:copyFile|copyFileSync|cp|cpSync|rename|renameSync)\s*\(\s*(["'])([^"'\\\r\n]+)\1\s*,\s*(["'])([^"'\\\r\n]+)\3/gu;
     for (const match of command.matchAll(destinationTarget)) targets.push(match[4]!);
   }
+  const shellCopy = /(?:^|[;&|]\s*|[\r\n]\s*)(?:(?:env|command)\s+)*(?:\S*\/)?cp\s+([^;&|\r\n]+)/gu;
+  const shellToken = /"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s]+)/gu;
+  for (const match of command.matchAll(shellCopy)) {
+    const tokens: string[] = [];
+    for (const tokenMatch of (match[1] ?? "").matchAll(shellToken)) {
+      const quoted = tokenMatch[1] !== undefined || tokenMatch[2] !== undefined;
+      const token = tokenMatch[1] ?? tokenMatch[2] ?? tokenMatch[3] ?? "";
+      if (!token) continue;
+      const redirectIndex = quoted ? -1 : token.search(/[<>]/u);
+      if (redirectIndex < 0) {
+        tokens.push(token);
+        continue;
+      }
+      const prefix = token.slice(0, redirectIndex);
+      if (prefix && !/^\d+$/u.test(prefix)) tokens.push(prefix);
+      break;
+    }
+    let optionsEnded = false;
+    let target: string | undefined;
+    const operands: string[] = [];
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index]!;
+      if (!optionsEnded && token === "--") {
+        optionsEnded = true;
+      } else if (!optionsEnded && (token === "-t" || token === "--target-directory")) {
+        target = tokens[index + 1];
+        break;
+      } else if (!optionsEnded && /^-t.+/u.test(token)) {
+        target = token.slice(2);
+        break;
+      } else if (!optionsEnded && token.startsWith("--target-directory=")) {
+        target = token.slice("--target-directory=".length);
+        break;
+      } else if (optionsEnded || token === "-" || !token.startsWith("-")) {
+        operands.push(token);
+      }
+    }
+    target ??= operands.length >= 2 ? operands.at(-1) : undefined;
+    if (target && !/[`$*?{}()[\]]/u.test(target)) targets.push(target);
+  }
   return [...new Set(targets)];
 }
 
