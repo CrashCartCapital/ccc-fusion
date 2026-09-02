@@ -105,6 +105,24 @@ export function cccCampaignVisibleBashTraversalRoots(raw: string): string[] {
   const roots: string[] = [];
   const searchCommand = /(?:^|[;&|]\s*|\$\(\s*)(?:(?:env|command)\s+)*(?:(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|]+))\s+)*(?:\S*\/)?(cd|find|rg|grep)\s+([^;&|\n]+)/gu;
   const tokenPattern = /"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s]+)/gu;
+  const searchOptionsWithValue = new Set([
+    "-e", "--regexp",
+    "-f", "--file",
+    "-g", "--glob",
+    "--iglob",
+    "--type",
+    "-t",
+    "-T",
+    "--type-not",
+    "--context",
+    "-C",
+    "--before-context",
+    "-B",
+    "--after-context",
+    "-A",
+    "--max-count",
+    "-m",
+  ]);
   const expandToken = (token: string): string => {
     if (token === "~" || token.startsWith("~/")) {
       return `${process.env.HOME ?? "/__ccc_unresolved_shell_home__"}${token.slice(1)}`;
@@ -144,9 +162,26 @@ export function cccCampaignVisibleBashTraversalRoots(raw: string): string[] {
       }
       continue;
     }
+    let sawPattern = false;
+    let skipNextOptionValue = false;
     for (const token of tokens) {
       if (token === "--") continue;
-      if (token.startsWith("-")) continue;
+      if (skipNextOptionValue) {
+        skipNextOptionValue = false;
+        continue;
+      }
+      if (token.startsWith("-")) {
+        const optionName = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+        if (searchOptionsWithValue.has(optionName) && !token.includes("=")) skipNextOptionValue = true;
+        if (optionName === "-e" || optionName === "--regexp" || optionName === "-f" || optionName === "--file") {
+          sawPattern = true;
+        }
+        continue;
+      }
+      if (!sawPattern) {
+        sawPattern = true;
+        continue;
+      }
       if (token === "/dev/null") continue;
       const expanded = expandToken(token);
       if (

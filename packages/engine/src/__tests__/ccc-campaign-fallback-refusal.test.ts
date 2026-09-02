@@ -429,6 +429,14 @@ describe("ccc-fusion campaign sessions refuse the settings-derived fallback", ()
     expect(cccCampaignVisibleBashTraversalRoots("grep -R tsconfig /")).toEqual(["/"]);
   });
 
+  it("does not treat slash-prefixed search patterns as traversal roots", () => {
+    expect(cccCampaignVisibleBashTraversalRoots('rg "/stream" .')).toEqual(["."]);
+    expect(cccCampaignVisibleBashTraversalRoots('rg "/health" src')).toEqual([]);
+    expect(cccCampaignVisibleBashTraversalRoots('grep -R "/health" src')).toEqual([]);
+    expect(cccCampaignVisibleBashTraversalRoots("rg needle /")).toEqual(["/"]);
+    expect(cccCampaignVisibleBashTraversalRoots("grep -R needle /")).toEqual(["/"]);
+  });
+
   it("refuses a renamed or unapproved namespaced MCP tool before it executes", async () => {
     const execute = vi.fn().mockResolvedValue({
       content: [{ type: "text", text: "should not execute" }],

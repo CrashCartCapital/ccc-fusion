@@ -215,7 +215,9 @@ async function startService() {
   forward(child.stderr, process.stderr);
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error("service exited during startup with " + child.exitCode);
+    if (serviceExited(child)) {
+      throw new Error("service exited during startup with exitCode=" + child.exitCode + " signalCode=" + child.signalCode);
+    }
     try { const response = await fetch(baseUrl + "/health"); if (response.ok) return; } catch {}
     await delay(50);
   }

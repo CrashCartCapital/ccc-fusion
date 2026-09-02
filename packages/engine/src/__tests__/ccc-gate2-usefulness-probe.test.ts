@@ -104,6 +104,15 @@ describe("CCC Gate 2 real-loopback usefulness probe", () => {
     expect(source).toContain('within(fetch(baseUrl + "/stream"), "SSE connect")');
     expect(source).toContain("async function waitForServiceExit(child)");
     expect(source).toContain("child.signalCode !== null");
+    const startServiceSource = source.slice(
+      source.indexOf("async function startService()"),
+      source.indexOf("async function readSseDataFrame(reader)"),
+    );
+    expect(startServiceSource).toContain("if (serviceExited(child))");
+    expect(startServiceSource).toContain(
+      '"service exited during startup with exitCode=" + child.exitCode + " signalCode=" + child.signalCode',
+    );
+    expect(startServiceSource).not.toContain("if (child.exitCode !== null)");
     const exitArmedAt = source.indexOf("const serviceExit = waitForServiceExit(child)");
     const gracefulKillAt = source.indexOf('child.kill("SIGTERM")');
     const forceKillAt = source.indexOf('child.kill("SIGKILL")');
