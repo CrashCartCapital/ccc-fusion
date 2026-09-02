@@ -194,6 +194,12 @@ function resolveRunMode(value: string | undefined): Gate2LiveMode {
 const runMode = resolveRunMode(process.env.CCC_GATE2_LIVE_MODE);
 const evidencePath = process.env.CCC_GATE2_LIVE_EVIDENCE_PATH ?? "";
 const runId = process.env.CCC_GATE2_RUN_ID ?? "";
+// The live lane's setup runs twelve child processes (git baseline freeze plus
+// five installed-CLI `prd` invocations) and its teardown stops the installed
+// runtime and the real Postgres harness. That is ~12s on an idle host, but the
+// package-wide 45s hookTimeout (packages/engine/vitest.config.ts:44) leaves no
+// room for host contention, and an overrun strands the worker inside spawnSync.
+const GATE2_LIVE_HOOK_TIMEOUT_MS = 900_000;
 if (livePiRequested && !evidencePath) {
   throw new Error("CCC_GATE2_LIVE_EVIDENCE_PATH is required when CCC_GATE2_LIVE_PI=1");
 }
@@ -664,7 +670,7 @@ livePgDescribe(`CCC Gate 2 telemetry live Pi campaign (${runMode})`, () => {
       maxConcurrent: GATE2_TELEMETRY_PI_ENVELOPE.maxConcurrency,
       maxWorktrees: GATE2_TELEMETRY_PI_ENVELOPE.maxConcurrency,
     });
-  });
+  }, GATE2_LIVE_HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     try {
@@ -676,7 +682,7 @@ livePgDescribe(`CCC Gate 2 telemetry live Pi campaign (${runMode})`, () => {
       else process.env.HOME = originalHome;
       if (runRoot) await rm(runRoot, { recursive: true, force: true });
     }
-  });
+  }, GATE2_LIVE_HOOK_TIMEOUT_MS);
 
   test("runs the selected installed-runtime Gate 2 lane", {
     timeout: GATE2_TELEMETRY_PI_ENVELOPE.maxDurationMs + 600_000,
