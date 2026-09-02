@@ -175,16 +175,33 @@ const within = async (promise, label, durationMs = 5000) => {
 };
 const forward = (stream, destination) => stream?.on("data", (chunk) => destination.write(chunk));
 
+const serviceExited = (child) => child.exitCode !== null || child.signalCode !== null;
+
+async function waitForServiceExit(child) {
+  if (serviceExited(child)) return;
+  await new Promise((resolve) => {
+    const onExit = () => resolve();
+    child.once("exit", onExit);
+    if (serviceExited(child)) {
+      child.off("exit", onExit);
+      resolve();
+    }
+  });
+}
+
 async function stopService() {
   const child = service;
   service = undefined;
-  if (!child || child.exitCode !== null) return;
+  if (!child || serviceExited(child)) return;
+  const serviceExit = waitForServiceExit(child);
   child.kill("SIGTERM");
-  await Promise.race([new Promise((resolve) => child.once("exit", resolve)), delay(2000)]);
-  if (child.exitCode === null) {
-    child.kill("SIGKILL");
-    await new Promise((resolve) => child.once("exit", resolve));
-  }
+  const stoppedGracefully = await Promise.race([
+    serviceExit.then(() => true),
+    delay(2000).then(() => false),
+  ]);
+  if (stoppedGracefully) return;
+  if (!serviceExited(child)) child.kill("SIGKILL");
+  await within(serviceExit, "service force-stop", 2000);
 }
 
 async function startService() {

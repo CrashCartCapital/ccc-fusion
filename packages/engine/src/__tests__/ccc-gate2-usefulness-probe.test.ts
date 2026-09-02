@@ -102,6 +102,14 @@ describe("CCC Gate 2 real-loopback usefulness probe", () => {
     expect(source).toContain("127.0.0.1");
     expect(source).toContain("SIGTERM");
     expect(source).toContain('within(fetch(baseUrl + "/stream"), "SSE connect")');
+    expect(source).toContain("async function waitForServiceExit(child)");
+    expect(source).toContain("child.signalCode !== null");
+    const exitArmedAt = source.indexOf("const serviceExit = waitForServiceExit(child)");
+    const gracefulKillAt = source.indexOf('child.kill("SIGTERM")');
+    const forceKillAt = source.indexOf('child.kill("SIGKILL")');
+    expect(exitArmedAt).toBeGreaterThanOrEqual(0);
+    expect(gracefulKillAt).toBeGreaterThan(exitArmedAt);
+    expect(forceKillAt).toBeGreaterThan(gracefulKillAt);
     expect(source).not.toMatch(/(?:127\.0\.0\.1|localhost):4040/);
   });
 
