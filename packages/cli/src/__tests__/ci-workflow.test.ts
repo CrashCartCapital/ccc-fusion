@@ -809,6 +809,65 @@ describe("Canonical Fusion runner verifier contract", () => {
   });
 });
 
+describe("Go Task npm install puts the real binary directory on PATH", () => {
+  // @go-task/cli ships as an npm shim: `npm install -g --prefix <prefix>`
+  // creates <prefix>/bin/task as a symlink to
+  // <prefix>/lib/node_modules/@go-task/cli/run-task.js (a Node ESM launcher,
+  // not an executable image). The package's own postinstall (lib.js
+  // `install()`) downloads the real platform binary to
+  // <prefix>/lib/node_modules/@go-task/cli/bin/task. Anything that seals and
+  // execs the resolved `task` executable directly -- such as
+  // ccc-prd semantic-proof custody's --version probe -- must resolve the
+  // real binary, not the launcher script, or the exec fails.
+  const workflowFiles = [
+    "ccc-prd-product-gate.yml",
+    "pr-checks.yml",
+    "full-suite.yml",
+  ];
+
+  function findGoTaskInstallStep(workflow: any): any {
+    const jobs = Object.values(workflow.jobs ?? {}) as any[];
+    for (const job of jobs) {
+      const steps = (job.steps ?? []) as any[];
+      const step = steps.find(
+        (s) => typeof s.run === "string" && s.run.includes("@go-task/cli@"),
+      );
+      if (step) return step;
+    }
+    return undefined;
+  }
+
+  for (const file of workflowFiles) {
+    it(`${file} adds the real go-task binary directory to GITHUB_PATH, not the npm shim dir`, () => {
+      const { parsed } = loadYamlFile(".github", "workflows", file);
+      const step = findGoTaskInstallStep(parsed);
+      expect(step, `${file}: no step installs @go-task/cli`).toBeDefined();
+      const run: string = step.run;
+
+      // Must add the directory holding the real platform binary.
+      expect(run).toContain(
+        '"$RUNNER_TEMP/go-task/lib/node_modules/@go-task/cli/bin" >> "$GITHUB_PATH"',
+      );
+
+      // Must never add the bare npm shim `bin/` directory -- that only
+      // contains the `task` symlink to the non-executable run-task.js
+      // launcher.
+      expect(run).not.toMatch(
+        /echo "\$RUNNER_TEMP\/go-task\/bin" >> "\$GITHUB_PATH"/,
+      );
+
+      // The sanity-check version probe must exec the same real binary that
+      // was just put on PATH.
+      expect(run).toContain(
+        '"$RUNNER_TEMP/go-task/lib/node_modules/@go-task/cli/bin/task" --version',
+      );
+      expect(run).not.toMatch(
+        /"\$RUNNER_TEMP\/go-task\/bin\/task" --version/,
+      );
+    });
+  }
+});
+
 describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
   let workflow: any;
   let content: string;

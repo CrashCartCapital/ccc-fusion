@@ -286,8 +286,8 @@ jobs:
       - name: Install verifier toolchain (Go Task + bubblewrap)
         run: |
           npm install -g --prefix "$RUNNER_TEMP/go-task" @go-task/cli@3.52.0
-          echo "$RUNNER_TEMP/go-task/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/go-task/bin/task" --version
+          echo "$RUNNER_TEMP/go-task/lib/node_modules/@go-task/cli/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/go-task/lib/node_modules/@go-task/cli/bin/task" --version
           if ! command -v bwrap >/dev/null 2>&1; then
             sudo -n apt-get update -qq
             sudo -n apt-get install -y -qq bubblewrap
