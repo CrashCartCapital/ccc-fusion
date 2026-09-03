@@ -77,10 +77,59 @@ jobs:
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup-node-pnpm
 
+      # CI always runs the CLI's tsup build in "full package" mode
+      # (wantsFullCliPackage() treats CI=true as an implicit --full), which
+      # stages the desktop Electron runtime by spawning
+      # `pnpm --filter @fusion/desktop build` as a CHILD of the still-live CLI
+      # tsup process (packages/cli/tsup.config.ts
+      # ensureDesktopRuntimeAssetsBuilt, invoked from its onSuccess hook).
+      # Both processes inherit this job's NODE_OPTIONS and can be resident at
+      # once inside the runner's 2.5 GiB container cap (whose own processes
+      # already use ~640 MiB) — PR Checks run 33704433491 OOMed there with
+      # "Ineffective mark-compacts near heap limit" from
+      # `[desktop:build] vite build --base ./`. desktop-packaging.yml proves
+      # the SAME 1664 MB cap is sufficient for this exact command run ALONE
+      # (no sibling tsup process alive), so build it here as its own step
+      # BEFORE `pnpm build`: ensureDesktopRuntimeAssetsBuilt() short-circuits
+      # once packages/desktop/dist already exists, so the nested spawn — and
+      # the two-process memory contention that caused the OOM — never
+      # happens. Do NOT raise this above 1664; that is the proven-safe
+      # ceiling, not an arbitrary choice.
+      - name: Build desktop runtime (staged ahead of CLI full packaging)
+        run: pnpm --filter @fusion/desktop build
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1664"
+
       - name: Build
         run: pnpm build
         env:
           NODE_OPTIONS: "--max-old-space-size=1664"
+
+      # Publish the complete dist set (mirrors full-suite.yml's
+      # fusion-dist-v2- producer, own key prefix so the two workflows can
+      # never hand each other a partial path list) so Gate below can restore
+      # it instead of repeating this build. Exact-match key only, no
+      # restore-keys (stale dist is the known failure mode, FN-4232/FN-4605).
+      # Never node_modules.
+      - name: Compute dist source hash
+        id: dist-hash
+        run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
+
+      - name: Save built dist artifacts
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            packages/core/dist
+            packages/dashboard/dist
+            packages/engine/dist
+            packages/cli/dist
+            packages/plugin-sdk/dist
+            plugins/fusion-plugin-dependency-graph/dist
+            plugins/fusion-plugin-hermes-runtime/dist
+            plugins/fusion-plugin-openclaw-runtime/dist
+            plugins/fusion-plugin-paperclip-runtime/dist
+            plugins/fusion-plugin-compound-engineering/dist
+          key: fusion-pr-dist-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
 
   # The only merge-blocking TEST signal (R3). Runs the boot smoke (the app
   # starts and serves) plus the curated engine-core suite, the focused CCC PRD
@@ -89,6 +138,14 @@ jobs:
   # allow-list in packages/engine/vitest.config.ts (engine-core project).
   gate:
     name: Gate
+    # Gate now reuses Build's dist instead of rebuilding it: Build already runs
+    # the identical `pnpm build`, and Gate's own copy of that build was ~5 of
+    # its ~8 min slot time (measured run 33738197262 on 9ed3acc02). Lint and
+    # Typecheck stay independent (no `needs`): they are short, and the shared
+    # host-level admission service already globally serializes runner slots —
+    # more `needs` edges there would only add latency without saving a
+    # redundant build.
+    needs: build
     # The verifier-confinement readiness probe below runs bubblewrap, which
     # needs full-capability unprivileged user namespaces. Only the dedicated
     # ccc-fusion-bwrap runner lane (container started with relaxed
@@ -129,34 +186,44 @@ jobs:
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup-node-pnpm
 
-      # Dist-artifact cache (same contract as full-suite.yml): exact-match
-      # key only, NO restore-keys (stale dist is the known failure mode,
-      # FN-4232/FN-4605), NEVER node_modules (breaks Windows pnpm junctions).
+      # Restore the exact dist set Build's "Save built dist artifacts" step
+      # just published (identical key, identical path list — including
+      # packages/cli/dist, which the old Gate-only cache list omitted, so a
+      # HIT here now actually makes boot-smoke's packages/cli/bin.mjs valid).
+      # Exact-match key only, NO restore-keys (stale dist is the known
+      # failure mode, FN-4232/FN-4605), NEVER node_modules (breaks Windows
+      # pnpm junctions). Deliberately NO fail-on-cache-miss: unlike
+      # full-suite.yml's shard/slow consumers, Gate keeps `pnpm build` below
+      # as a graceful fallback (fast content-hash skip on a hit, full build on
+      # a miss) rather than hard-failing a merge-blocking PR check on a miss.
       - name: Compute dist source hash
         id: dist-hash
         run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache built dist artifacts
+      - name: Restore built dist artifacts
         id: dist-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             packages/core/dist
             packages/dashboard/dist
             packages/engine/dist
+            packages/cli/dist
             packages/plugin-sdk/dist
             plugins/fusion-plugin-dependency-graph/dist
             plugins/fusion-plugin-hermes-runtime/dist
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
-          key: dist-${{ runner.os }}-${{ steps.dist-hash.outputs.hash }}
+            plugins/fusion-plugin-compound-engineering/dist
+          key: fusion-pr-dist-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
 
       - name: Seed artifact hash-cache on cache hit
         if: steps.dist-cache.outputs.cache-hit == 'true'
         run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
 
-      # Boot smoke needs the full built workspace (CLI dist is not in the
-      # cache list above); cached packages make this incremental-fast.
+      # Boot smoke needs the full built workspace; a restore hit above
+      # (including packages/cli/dist now) plus this graceful-fallback build
+      # make this incremental-fast instead of a second full cold build.
       - name: Build
         run: pnpm build
 
