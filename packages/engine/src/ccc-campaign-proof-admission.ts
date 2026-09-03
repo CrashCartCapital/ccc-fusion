@@ -4,6 +4,7 @@ import type {
   CccPrdProofExecutionToolchain,
   CccPrdProofV2,
   CccPrdPythonExecutionToolchain,
+  CccPrdPythonRuntimeFile,
   WorkflowProofAdmissionEvaluatorInput,
   WorkflowProofAdmissionEvaluatorResult,
   WorkflowProofAdmissionExtensionContribution,
@@ -215,6 +216,40 @@ function computeCccPrdProofDefinitionSha256(proof: CccPrdProof): string {
     .digest("hex");
 }
 
+function cloneAndFreezeCccPrdPythonRuntimeFiles(
+  files: readonly CccPrdPythonRuntimeFile[],
+): readonly CccPrdPythonRuntimeFile[] {
+  return Object.freeze(files.map((file) => Object.freeze({
+    ...file,
+    ...(file.requestedPaths ? { requestedPaths: Object.freeze([...file.requestedPaths]) } : {}),
+  })));
+}
+
+/*
+ * Deep-clones and freezes the sealed proof's optional Python toolchain,
+ * mirroring how executionToolchain.linkedRuntime is handled below, so the
+ * python member is not silently dropped and cannot be mutated through the
+ * seed reference after admission input is built.
+ */
+function cloneAndFreezeCccPrdPythonExecutionToolchain(
+  python: CccPrdPythonExecutionToolchain,
+): CccPrdPythonExecutionToolchain {
+  return Object.freeze({
+    ...python,
+    runtimeManifest: Object.freeze({
+      ...python.runtimeManifest,
+      interpreter: Object.freeze({ ...python.runtimeManifest.interpreter }),
+      sitePackagesRoots: Object.freeze([...python.runtimeManifest.sitePackagesRoots]),
+      extensionModuleRoots: Object.freeze([...python.runtimeManifest.extensionModuleRoots]),
+      runtimeSupport: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.runtimeSupport),
+      stdlib: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.stdlib),
+      sitePackages: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.sitePackages),
+      extensionModules: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.extensionModules),
+      dylibClosure: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.dylibClosure),
+    }),
+  });
+}
+
 function cloneAndFreezeCccPrdProof(
   proof: Readonly<CccPrdProof>,
 ): Readonly<CccPrdProof> {
@@ -234,8 +269,12 @@ function cloneAndFreezeCccPrdProof(
         proofHost: Object.freeze({ ...proof.executionToolchain.proofHost }),
         linkedRuntime: proof.executionToolchain.linkedRuntime.map((entry) =>
           Object.freeze({ ...entry })),
+        ...(proof.executionToolchain.python
+          ? { python: cloneAndFreezeCccPrdPythonExecutionToolchain(proof.executionToolchain.python) }
+          : {}),
       }),
       spans: proof.spans.map((span) => Object.freeze({ ...span })),
+      ...(proof.verifierProfile ? { verifierProfile: Object.freeze({ ...proof.verifierProfile }) } : {}),
       ...(proof.admission ? { admission: Object.freeze({ ...proof.admission }) } : {}),
     }
     : {
