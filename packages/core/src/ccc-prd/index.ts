@@ -196,3 +196,26 @@ export type {
   CccPrdProductWorkItemStatus,
   InspectCccPrdProductStatusInput,
 } from "./product-status.js";
+export {
+  CCC_PRD_OSS_REUSE_EVIDENCE_SCHEMA_VERSION,
+  CCC_PRD_OSS_REUSE_POLICY_V1,
+  CccPrdOssReuseContractError,
+  canonicalizeCccPrdOssReuseEvidence,
+  classifyCccPrdOssReuseProject,
+  computeCccPrdOssReuseEvidenceSha256,
+  parseCccPrdOssReuseEvidence,
+} from "./oss-reuse-contract.js";
+export type {
+  CccPrdOssAdaptationPlan,
+  CccPrdOssCostConfidence,
+  CccPrdOssEvidenceOutcome,
+  CccPrdOssEvidenceState,
+  CccPrdOssGateEvidence,
+  CccPrdOssProjectEvidence,
+  CccPrdOssReferenceEvidence,
+  CccPrdOssReuseCandidateEvidence,
+  CccPrdOssReuseCostEstimate,
+  CccPrdOssReuseEvidence,
+  CccPrdOssReuseKind,
+  CccPrdOssReuseProjectMode,
+} from "./oss-reuse-contract.js";
