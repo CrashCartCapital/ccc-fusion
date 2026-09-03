@@ -129,6 +129,8 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --memory 1g
+          --cpus 1
     # Backstop for a wedged shard. The per-invocation watchdog (L2,
     # scripts/lib/run-vitest-watchdog.mjs) kills any single hung invocation at
     # its budget ceiling (<=30min), so this job budget only fires if L2 itself
@@ -330,6 +332,8 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --memory 1g
+          --cpus 1
     # Real-git slow suites; same backstop rationale as test-shards. Sits above
     # the L2 per-invocation ceiling so the watchdog fires first on a single hang.
     timeout-minutes: 60
