@@ -278,6 +278,218 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
   });
 
   /*
+  FNXC:CIFastGate 2026-09-03:
+  Measured ground truth (run 33738197262 on 9ed3acc02): Gate paid ~5 min of its ~8 min
+  slot time on a redundant `pnpm build` because its dist-cache key missed on every PR
+  whose sources differ from main, and its path list omitted packages/cli/dist anyway —
+  so a HIT could never make boot-smoke's `packages/cli/bin.mjs` valid. Build already
+  does the identical `pnpm build` first; publish its FULL dist set (Build's existing
+  Gate-mirrored list PLUS packages/cli/dist, which boot-smoke and ensure-test-artifacts.mjs
+  REQUIRED_BUILD_PACKAGES both need, PLUS plugins/fusion-plugin-compound-engineering/dist,
+  which REQUIRED_BUILD_PACKAGES also needs but the OLD Gate cache list omitted) and have
+  Gate restore that exact set instead of rebuilding it. Exact-match key only, no
+  restore-keys (stale dist is the known failure mode, FN-4232/FN-4605).
+  packages/i18n was NOT added despite the plan's initial text: it has no "build" script
+  and its exports resolve straight to ./src/*.ts (source-only workspace package), so
+  `pnpm build` never produces packages/i18n/dist — verified via packages/i18n/package.json.
+
+  Adjudicated critique (2026-09-03), two corrections to the first cut:
+
+  1. Key on ${{ github.sha }}, not a source-hash. ensure-test-artifacts.mjs's
+     --print-source-hash only covers REQUIRED_BUILD_PACKAGES' source dirs, so a
+     commit that changes an un-hashed path (packages/i18n, an unbundled plugin,
+     etc.) would keep the SAME hash as an unrelated commit and Gate could restore
+     a stale dist saved by that other commit's Build run. Keying on the literal
+     commit sha makes save/restore commit-exact: within one PR-check run, Gate
+     (needs: build) restores under the SAME github.sha Build just saved under, so
+     the restore is guaranteed to be this exact commit's own output — never
+     another commit's. A rerun of the same commit still hits; any other commit
+     runs its own Build first, so Gate is never handed a save it doesn't own.
+  2. Gate's `pnpm build` fallback must be conditional on a MISS, not run
+     unconditionally as a harmless no-op on a HIT. Verified two independent
+     reasons `pnpm build` is NOT a fast skip even with dist fully restored:
+     - build-workspace.mjs's OWN skip-cache lives at
+       .fusion/cache/plugin-build-cache.json (BUILD_CACHE_FILE), which is
+       git-ignored (see .gitignore) and NOT the same file
+       --seed-artifact-cache writes (that's ensure-test-artifacts.mjs's
+       separate artifact-cache.json, consumed only by ensureTestArtifacts(),
+       which none of test:gate's actual constituent package.json scripts call).
+       On a fresh checkout that file doesn't exist, so evaluatePackageBuild's
+       cache lookup always returns "no-cache" => shouldBuild: true for every
+       package, restored dist or not.
+     - wantsFullCliPackage() in packages/cli/tsup.config.ts treats CI=true as
+       an implicit --full regardless of any cache state, and
+       ensureFullPackageCliPlanned() then force-includes @runfusion/fusion in
+       the planned build even when its own cache entry says "unchanged" — so
+       the CLI's full tsup packaging pass (which is the pass that risks the
+       nested desktop OOM) runs on every Gate `pnpm build` invocation
+       regardless of the dist restore.
+     So: the "Build" step is now `if: steps.dist-cache.outputs.cache-hit != 'true'`
+     (today's full-build behavior, unchanged, on a genuine miss). A single
+     unconditional `--assert-artifacts-present` step after the conditional
+     Build step proves the required dist is actually present on EITHER path
+     (hit or miss) before boot-smoke/gate-tests run, with a clear failure
+     message instead of an opaque "file not found" deep inside boot-smoke or
+     a test.
+  3. Desktop OOM fix (Build job only, as of this cut) is unchanged from the
+     first cut and already evidence-backed: packages/cli/tsup.config.ts line
+     ~346, ensureDesktopRuntimeAssetsBuilt() — `if (existsSync(desktopRuntimeSrc)) return;`
+     where desktopRuntimeSrc = packages/desktop/dist. Building desktop as its
+     own standalone step before `pnpm build` makes that check true, so the
+     nested `pnpm --filter @fusion/desktop build` child (which shares the 2.5
+     GiB container with the still-live parent tsup process) never spawns.
+     packages/desktop/scripts/build.ts (via workspace-tools.ts) is fully
+     self-contained — it builds its own @fusion/core / @fusion/engine /
+     dashboard-runtime dist internally — so it needs nothing pre-built to run
+     standalone. Heap stays at the desktop-packaging.yml-proven-safe 1664 MB;
+     it is not raised (a bigger nested child would still get OOM-killed inside
+     the same shared cgroup, not rescued by a higher per-process ceiling). See
+     the pre-merge review round below for why Gate later gets the same step.
+  4. `needs: build` means Gate enters the shared two-slot cross-repo admission
+     queue only AFTER Build releases its own slot — so worst-case wall clock
+     under heavy cross-repo contention is unchanged (~15 min observed), while
+     the common case (queue not contended) drops from ~15 min toward ~11 min
+     (Build ~8 min + Gate ~3 min on a restore hit) and total slot-minutes fall
+     by Gate's old ~5 min redundant build (~27.5 -> ~22.5 across the two jobs).
+
+  Pre-merge review round (2026-09-03), two more corrections before merge:
+
+  5. Gate's own `pnpm build` miss-path fallback has the SAME nested-OOM shape
+     as the original Build-job bug (CI's full CLI packaging mode spawns
+     `pnpm --filter @fusion/desktop build` as a child of the still-live CLI
+     tsup process) — a prior cut of this PR left that unfixed on Gate as an
+     "accepted, rare-path" gap. Reviewed and reversed: isolating the nested
+     spawn costs nothing (the step is gated on the same cache-miss condition,
+     so it doesn't run at all on the common hit path), so Gate now gets its
+     own standalone "Build desktop runtime" step too, immediately before its
+     conditional "Build" step, same `if` condition. Unlike Build's copy it
+     carries NO NODE_OPTIONS cap: Gate runs on the ccc-fusion-bwrap lane's
+     4 GiB container, not Build's 2.5 GiB, so there is no proven heap ceiling
+     to pin here the way desktop-packaging.yml pins Build's 1664 MB.
+  6. Dropped .fusion/cache/plugin-build-cache.json from both Build's saved and
+     Gate's restored path list. It was added on the (wrong) premise that a
+     restore hit would give Gate real "already built" provenance for
+     build-workspace.mjs — but Gate's own `pnpm build` never runs on a hit at
+     all (see point 2), so a hit never reads that file, and on a miss nothing
+     restored it in the first place. Caching it only produced a false
+     "already built" record for the ~9 plugin packages that are NOT in this
+     10 (now 9)-path dist list — actively misleading if build-workspace.mjs
+     were ever invoked again downstream of Gate. Also verified by grep
+     (scripts/boot-smoke.mjs, scripts/check-verifier-confinement.mjs, and
+     every test file `test:gate` actually runs — engine's engine-core
+     project, core's test:pg-gate pair, and the four test:ccc-prd-safety
+     suites) that nothing in Gate's own scope reads any `plugins/<name>/dist`
+     outside the 5 already in this list: plugin packages resolve through
+     vitest path aliases (packages/cli/vitest.config.ts,
+     packages/droid-cli/vitest.config.ts) straight to `src/`, not `dist/`,
+     everywhere test:gate's suites touch them; the one real dynamic
+     `import("@fusion-plugin-examples/claude-runtime")` in the repo
+     (packages/cli/src/__tests__/vitest-workspace-resolution.test.ts) is not
+     part of test:gate's invocation chain.
+  */
+  it("makes Gate depend on Build and restore Build's commit-exact dist cache instead of rebuilding it", () => {
+    // Canonical order matches full-suite.yml's fusion-dist-v2- list (same
+    // REQUIRED_BUILD_PACKAGES-derived set) so a reader comparing both cache
+    // contracts sees one consistent shape. No build-workspace.mjs skip-cache
+    // file rides alongside — see point 6 above for why that was dropped.
+    const requiredDistPaths = [
+      "packages/core/dist",
+      "packages/dashboard/dist",
+      "packages/engine/dist",
+      "packages/cli/dist",
+      "packages/plugin-sdk/dist",
+      "plugins/fusion-plugin-dependency-graph/dist",
+      "plugins/fusion-plugin-hermes-runtime/dist",
+      "plugins/fusion-plugin-openclaw-runtime/dist",
+      "plugins/fusion-plugin-paperclip-runtime/dist",
+      "plugins/fusion-plugin-compound-engineering/dist",
+    ];
+    const expectedKey = "fusion-pr-dist-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}";
+
+    const gateNeeds = Array.isArray(workflow.jobs?.gate?.needs)
+      ? workflow.jobs.gate.needs
+      : [workflow.jobs?.gate?.needs];
+    expect(gateNeeds).toContain("build");
+
+    const buildSteps = workflow.jobs?.build?.steps ?? [];
+    const gateSteps = workflow.jobs?.gate?.steps ?? [];
+
+    const buildSave = buildSteps.find((step: any) => step.uses === "actions/cache/save@v4");
+    const gateRestore = gateSteps.find((step: any) => step.uses === "actions/cache/restore@v4");
+    // The Gate job must no longer use the plain (restore-or-save) cache action —
+    // Build owns saving now, so Gate only ever restores.
+    const gatePlainCache = gateSteps.find((step: any) => step.uses === "actions/cache@v4");
+
+    expect(buildSave, "Build must save its dist artifacts").toBeDefined();
+    expect(gateRestore, "Gate must restore the dist artifacts Build saved").toBeDefined();
+    expect(gatePlainCache).toBeUndefined();
+
+    expect(buildSave.with?.path.trim().split("\n")).toEqual(requiredDistPaths);
+    expect(gateRestore.with?.path.trim().split("\n")).toEqual(requiredDistPaths);
+    expect(buildSave.with?.path).not.toContain("node_modules");
+    expect(gateRestore.with?.path).not.toContain("node_modules");
+
+    // Commit-exact key, not a source-hash: a source-hash key could collide
+    // across two unrelated commits that happen to leave REQUIRED_BUILD_PACKAGES
+    // untouched, handing Gate a stale save from a different commit.
+    expect(buildSave.with?.key).toBe(expectedKey);
+    expect(gateRestore.with?.key).toBe(expectedKey);
+    expect(buildSave.with?.["restore-keys"]).toBeUndefined();
+    expect(gateRestore.with?.["restore-keys"]).toBeUndefined();
+
+    // Graceful degrade, not a hard failure: Gate keeps its own `pnpm build` as a
+    // fallback on a genuine miss, so it must NOT set fail-on-cache-miss.
+    expect(gateRestore.with?.["fail-on-cache-miss"]).not.toBe(true);
+
+    const restoreIndex = gateSteps.indexOf(gateRestore);
+    const seedIndex = gateSteps.findIndex(
+      (step: any) => step.run === "node scripts/ensure-test-artifacts.mjs --seed-artifact-cache",
+    );
+    const gateBuildStep = gateSteps.find(
+      (step: any) => step.name === "Build" && step.run === "pnpm build",
+    );
+    const gateBuildIndex = gateSteps.indexOf(gateBuildStep);
+    const assertIndex = gateSteps.findIndex(
+      (step: any) => step.run === "node scripts/ensure-test-artifacts.mjs --assert-artifacts-present",
+    );
+    const readinessIndex = gateSteps.findIndex(
+      (step: any) => step.name === "Verifier confinement readiness",
+    );
+
+    expect(seedIndex).toBeGreaterThan(restoreIndex);
+    expect(gateBuildIndex).toBeGreaterThan(seedIndex);
+    expect(gateSteps[seedIndex]?.if).toBe("steps.dist-cache.outputs.cache-hit == 'true'");
+
+    // The real fix: `pnpm build` must NOT run unconditionally on a hit — it is
+    // not a fast skip (build-workspace.mjs's own cache file is empty on a
+    // fresh checkout regardless of dist, and wantsFullCliPackage() force-plans
+    // the CLI's full tsup pass under CI=true either way) — so it would silently
+    // redo the whole Build-job build inside Gate even when dist was restored.
+    expect(gateBuildStep?.if).toBe("steps.dist-cache.outputs.cache-hit != 'true'");
+
+    // A single unconditional assertion proves the required dist is actually
+    // present on EITHER path (hit or the just-ran miss-build) before the
+    // verifier/boot-smoke/gate-tests steps that need it.
+    expect(assertIndex).toBeGreaterThan(gateBuildIndex);
+    expect(assertIndex).toBeLessThan(readinessIndex);
+    expect(gateSteps[assertIndex]?.if).toBeUndefined();
+
+    // Pre-merge review point 5: Gate's miss-path fallback build gets the SAME
+    // desktop-isolation treatment as Build, gated on the identical cache-miss
+    // condition, immediately before Gate's own conditional "Build" step —
+    // and, unlike Build's copy, no NODE_OPTIONS cap (Gate's 4 GiB
+    // ccc-fusion-bwrap container has no proven-safe ceiling to pin here).
+    const gateDesktopStep = gateSteps.find(
+      (step: any) => step.run === "pnpm --filter @fusion/desktop build",
+    );
+    const gateDesktopIndex = gateSteps.indexOf(gateDesktopStep);
+    expect(gateDesktopIndex).toBeGreaterThan(-1);
+    expect(gateDesktopIndex).toBeLessThan(gateBuildIndex);
+    expect(gateDesktopStep?.if).toBe("steps.dist-cache.outputs.cache-hit != 'true'");
+    expect(gateDesktopStep?.env?.NODE_OPTIONS).toBeUndefined();
+  });
+
+  /*
   FNXC:CITestGate 2026-06-26-06:40:
   The merge gate is the thin trusted CI surface. ci-workflow.test.ts must pin not only that the Gate job invokes `pnpm test:gate`, but also test:gate's internal composition (guards + engine test:core + cli test:ci-shape) and that engine test:core references the engine-core vitest project — otherwise a rename could hollow the gate while this CI-shape test stays green (FN-7059).
   */
@@ -315,17 +527,26 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(compositeAction.inputs?.["install-args"]?.default).toBe("--frozen-lockfile");
   });
 
-  it("caps memory only on the standalone Typecheck and Build command steps", () => {
+  it("caps memory on Typecheck, Build, and the desktop pre-build command steps", () => {
     const heapLimit = "--max-old-space-size=1664";
     const typecheckStep = (workflow.jobs?.typecheck?.steps ?? []).find(
       (step: any) => step.name === "Typecheck" && step.run === "pnpm typecheck",
     );
-    const buildStep = (workflow.jobs?.build?.steps ?? []).find(
+    const buildSteps = workflow.jobs?.build?.steps ?? [];
+    const buildStep = buildSteps.find(
       (step: any) => step.name === "Build" && step.run === "pnpm build",
+    );
+    const desktopPrebuildStep = buildSteps.find(
+      (step: any) => step.run === "pnpm --filter @fusion/desktop build",
     );
 
     expect(typecheckStep?.env?.NODE_OPTIONS).toBe(heapLimit);
     expect(buildStep?.env?.NODE_OPTIONS).toBe(heapLimit);
+    // FNXC:CIFastGate 2026-09-03: the desktop pre-build step carries the SAME
+    // proven-safe cap as desktop-packaging.yml (which runs this exact command
+    // alone and passes) rather than a raised job-wide heap — see the OOM test
+    // below for why it must run standalone instead.
+    expect(desktopPrebuildStep?.env?.NODE_OPTIONS).toBe(heapLimit);
     expect(workflow.env?.NODE_OPTIONS).toBeUndefined();
     expect(workflow.jobs?.typecheck?.env?.NODE_OPTIONS).toBeUndefined();
     expect(workflow.jobs?.build?.env?.NODE_OPTIONS).toBeUndefined();
@@ -338,6 +559,38 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
         `${jobName} steps must not receive the build heap cap`,
       ).toBe(true);
     }
+  });
+
+  /*
+  FNXC:CIFastGate 2026-09-03:
+  PR Checks run 33704433491 OOMed the Build job: `[desktop:build] vite build --base ./`
+  hit "Ineffective mark-compacts near heap limit" inside `@runfusion/fusion build:
+  build:tsup:serial`. Root cause: CI always runs the CLI's tsup build in "full package"
+  mode (wantsFullCliPackage() treats CI=true as an implicit --full), and full-package
+  mode stages the desktop Electron runtime by spawning `pnpm --filter @fusion/desktop
+  build` as a CHILD of the still-live CLI tsup process (packages/cli/tsup.config.ts
+  ensureDesktopRuntimeAssetsBuilt, invoked from onSuccess — see
+  packages/cli/scripts/ensure-desktop-runtime.ts and desktopRuntimeSrc). Both
+  processes inherit NODE_OPTIONS and can be resident at once inside the runner's
+  2.5 GiB container cap (whose own processes already use ~640 MiB).
+  desktop-packaging.yml proves the SAME 1664 MB cap is sufficient for
+  `pnpm --filter @fusion/desktop build` run ALONE. The fix is to build desktop as
+  its own standalone step before `pnpm build`: ensureDesktopRuntimeAssetsBuilt()
+  short-circuits on existsSync(packages/desktop/dist), so the nested spawn (and the
+  two-process memory contention that caused the OOM) never happens.
+  */
+  it("builds the desktop runtime standalone before Build, so CLI full packaging never nests a second live Node heap", () => {
+    const buildSteps = workflow.jobs?.build?.steps ?? [];
+    const desktopPrebuildIndex = buildSteps.findIndex(
+      (step: any) => step.run === "pnpm --filter @fusion/desktop build",
+    );
+    const buildIndex = buildSteps.findIndex(
+      (step: any) => step.name === "Build" && step.run === "pnpm build",
+    );
+
+    expect(desktopPrebuildIndex).toBeGreaterThan(-1);
+    expect(buildIndex).toBeGreaterThan(-1);
+    expect(desktopPrebuildIndex).toBeLessThan(buildIndex);
   });
 
   it("keeps lint as install + lint only, without Bun/setup build coupling", () => {
