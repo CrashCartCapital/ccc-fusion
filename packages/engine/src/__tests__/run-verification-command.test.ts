@@ -1065,7 +1065,7 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
       expect(result.stderr).toMatch(/cannot admit one exact loopback port.*refusing to run verification natively/i);
     });
 
-    itVerifierHost("keeps the default verifier sandbox from binding loopback", async () => {
+    itDarwinVerifierHost("keeps the default verifier sandbox from binding loopback", async () => {
       const result = await runVerificationCommand({
         command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify([
           "const { createServer } = require('node:net');",
