@@ -35,6 +35,20 @@ function loadWorkflow(name: string): any {
   return loadYamlFile(".github", "workflows", name);
 }
 
+// Every postgres service container runs inside the M2 Colima VM next to the
+// capped runner containers; without its own cap it is the only uncapped
+// memory consumer in the VM. Keep every declared service pinned.
+function expectPostgresServiceCapped(workflow: any) {
+  const jobs = Object.entries(workflow.jobs ?? {}) as Array<[string, any]>;
+  const withPostgres = jobs.filter(([, job]) => job?.services?.postgres);
+  expect(withPostgres.length).toBeGreaterThan(0);
+  for (const [name, job] of withPostgres) {
+    const options = String(job.services.postgres.options ?? "");
+    expect(options, `${name}.services.postgres.options`).toMatch(/--memory 1g\b/);
+    expect(options, `${name}.services.postgres.options`).toMatch(/--cpus 1\b/);
+  }
+}
+
 function findCompositeSetupStep(steps: any[]) {
   return steps.find((step) => step.uses === "./.github/actions/setup-node-pnpm");
 }
@@ -265,6 +279,10 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     );
     expect(toolchainIndex).toBeGreaterThan(buildIndex);
     expect(toolchainIndex).toBeLessThan(readinessIndex);
+  });
+
+  it("caps every PostgreSQL service container's memory and CPU", () => {
+    expectPostgresServiceCapped(workflow);
   });
 
   it("keeps the PostgreSQL service off the laptop's fixed 5432 tunnel", () => {
@@ -799,6 +817,10 @@ describe("Full suite workflow (.github/workflows/full-suite.yml)", () => {
     const result = loadWorkflow("full-suite.yml");
     workflow = result.parsed;
     content = result.content;
+  });
+
+  it("caps every PostgreSQL service container's memory and CPU", () => {
+    expectPostgresServiceCapped(workflow);
   });
 
   it("is valid YAML", () => {
