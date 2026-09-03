@@ -399,6 +399,28 @@ function proofAttempt(
 }
 
 describe("productNextAction multi-task live-execution holds", () => {
+  it("keeps approval guidance when lastError includes a bounded diagnostic", () => {
+    const authorization = executionAuthorization();
+    const action = productNextAction(nextActionInput({
+      workItems: [workItem({
+        lastError:
+          `${LIVE_EXECUTION_APPROVAL_REQUIRED_REASON}: awaiting exact authorization ${authorization.authorizationId}`,
+      })],
+      executionAuthorizationMode: "sealed_bundle_v1",
+      executionAuthorization: authorization,
+      approvals: authorization.members.map((member) => approval({
+        id: member.approvalRequestId,
+        taskId: member.nativeTaskId,
+      })),
+    }));
+
+    expect(action).toMatchObject({
+      kind: "approve-execution",
+      executionAuthorizationId: authorization.authorizationId,
+      executionAuthorizationStatus: "issued",
+    });
+  });
+
   it("surfaces one sealed parent authorization instead of either diagnostic child approval", () => {
     const authorization = executionAuthorization();
     const action = productNextAction(nextActionInput({

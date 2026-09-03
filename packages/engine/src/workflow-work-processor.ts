@@ -16,6 +16,7 @@ import { WorkflowTaskRuntime, type WorkflowTaskRuntimeResult } from "./workflow-
 import { ensureWorkflowCompletionSummary } from "./workflow-completion-summary.js";
 import { isImportedCccCampaignWorkItem } from "./ccc-campaign-routing.js";
 import { CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON } from "./ccc-campaign-product-control.js";
+import { CCC_RETRY_CLASSIFICATION_CONTEXT_KEY } from "./workflow-graph-executor.js";
 
 export interface WorkflowWorkProcessorOptions {
   leaseOwner: string;
@@ -413,7 +414,9 @@ async function transitionCampaignTerminal(
       leaseExpiresAt: null,
       lastError: runtimeResult.reason ?? null,
       blockedReason: terminalState === "manual-required"
-        ? runtimeResult.reason ?? "manual-required"
+        ? typeof runtimeResult.context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY] === "string"
+          ? runtimeResult.context[CCC_RETRY_CLASSIFICATION_CONTEXT_KEY] as string
+          : runtimeResult.reason ?? "manual-required"
         : null,
     });
   } catch (err) {

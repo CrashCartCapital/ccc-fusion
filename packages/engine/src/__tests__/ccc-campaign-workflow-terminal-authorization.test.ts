@@ -294,7 +294,9 @@ describe("sealed campaign authorization terminal cleanup", () => {
   });
 
   it("closes unopened members for a non-live-approval manual-required terminal", async () => {
-    const { store } = processorStore();
+    const { store, transitionWorkflowWorkItem } = processorStore();
+    const reasonCode = "ccc-permanent:CCC_CAMPAIGN_PROOF_FAILED";
+    const diagnosticReason = `${reasonCode}: semantic proof toolchain identity drifted`;
 
     const result = await processDueWorkflowWorkItem(
       store as never,
@@ -302,14 +304,22 @@ describe("sealed campaign authorization terminal cleanup", () => {
         disposition: "manual-required",
         outcome: "failure",
         visitedNodeIds: ["execute"],
-        context: {},
-        reason: "ccc-permanent:CCC_CAMPAIGN_PROOF_FAILED",
+        context: { "ccc:retry-classification": reasonCode },
+        reason: diagnosticReason,
       })) } as never,
       undefined,
       { leaseOwner: "worker-1", leaseDurationMs: 1_000 },
     );
 
     expect(result.runtime?.disposition).toBe("manual-required");
+    expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(
+      workItem.id,
+      "manual-required",
+      expect.objectContaining({
+        lastError: diagnosticReason,
+        blockedReason: reasonCode,
+      }),
+    );
     expect(authorizationMocks.closeUnopened).toHaveBeenCalledOnce();
   });
 

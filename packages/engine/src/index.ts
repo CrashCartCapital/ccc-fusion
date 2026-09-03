@@ -304,6 +304,9 @@ export {
   type WorkflowTaskRuntimeResult,
 } from "./workflow-task-runtime.js";
 export {
+  InProcessRuntime,
+} from "./runtimes/in-process-runtime.js";
+export {
   isCccCampaignTask,
   isImportedCccCampaignTask,
 } from "./ccc-campaign-routing.js";
@@ -321,6 +324,9 @@ export {
   bootstrapCccCampaignProofAdmissionHost,
   type BootstrapCccCampaignProofAdmissionHostInput,
 } from "./ccc-campaign-proof-host.js";
+export {
+  readCustomProviders,
+} from "./custom-providers.js";
 export {
   admitAndMaterializeCccSemanticProof,
   inspectCccSemanticProofExecutable,

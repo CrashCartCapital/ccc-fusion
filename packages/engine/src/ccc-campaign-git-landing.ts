@@ -11,6 +11,7 @@ import {
   assertActiveClaimedCccCampaignApprovalWithinTransaction,
   assertClaimedCccCampaignApprovalWithinTransaction,
   canonicalCccPrdJson,
+  cccPermanentWorkItemHasReason,
   compareCccPrdCodeUnits,
   consumeCccCampaignApprovalWithinTransaction,
   computeCccPrdProofDefinitionSha256,
@@ -426,9 +427,10 @@ async function requireImportedWorkflowWorkItemFence(
   const expectedRunId = `ccc-prd:${context.importId}`;
   const hasNoLiveLease = workItem.leaseOwner === null && workItem.leaseExpiresAt === null;
   const hasCompleteLiveLease = workItem.leaseOwner !== null && workItem.leaseExpiresAt !== null;
-  const isParkedForMergeApproval = workItem.state === "manual-required"
-    && workItem.lastError === MERGE_APPROVAL_REQUIRED
-    && workItem.blockedReason === MERGE_APPROVAL_REQUIRED;
+  const isParkedForMergeApproval = cccPermanentWorkItemHasReason(
+    workItem,
+    MERGE_APPROVAL_REQUIRED,
+  );
   const isIssuanceRuntime = mode === "issuance"
     && workItem.state === "running"
     && hasCompleteLiveLease;

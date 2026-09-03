@@ -23,20 +23,31 @@ export async function saveWorkflowRunBranchImpl(store: TaskStore, state: { taskI
     /*
     FNXC:PostgresOnlyDataAccess 2026-07-16-12:15:
     Backend mode previously swallowed the sync throw, so parallel-branch
-    checkpoints were never persisted on PostgreSQL. ON CONFLICT targets the PK
-    by constraint name because project-schema PKs lead with project_id (which
-    itself comes from the column's current_setting default under RLS).
+    checkpoints were never persisted on PostgreSQL. A project-bound data layer
+    must write its explicit project_id: maintenance/test connections can carry
+    a different current_setting default even though TaskStore correctly scopes
+    the parent task row to asyncLayer.projectId.
     */
     if (store.backendMode) {
-      await store.asyncLayer!.db.execute(sql`
-        INSERT INTO project.workflow_run_branches
-          (task_id, run_id, branch_id, current_node_id, status, updated_at)
-        VALUES (${state.taskId}, ${state.runId}, ${state.branchId}, ${state.currentNodeId}, ${state.status}, ${new Date().toISOString()})
-        ON CONFLICT ON CONSTRAINT workflow_run_branches_pkey DO UPDATE SET
-          current_node_id = EXCLUDED.current_node_id,
-          status = EXCLUDED.status,
-          updated_at = EXCLUDED.updated_at
-      `);
+      const layer = store.asyncLayer!;
+      const table = schema.project.workflowRunBranches;
+      const updatedAt = new Date().toISOString();
+      await layer.db.insert(table).values({
+        ...(layer.projectId ? { projectId: layer.projectId } : {}),
+        taskId: state.taskId,
+        runId: state.runId,
+        branchId: state.branchId,
+        currentNodeId: state.currentNodeId,
+        status: state.status,
+        updatedAt,
+      }).onConflictDoUpdate({
+        target: [table.projectId, table.taskId, table.runId, table.branchId],
+        set: {
+          currentNodeId: state.currentNodeId,
+          status: state.status,
+          updatedAt,
+        },
+      });
       return;
     }
     try {

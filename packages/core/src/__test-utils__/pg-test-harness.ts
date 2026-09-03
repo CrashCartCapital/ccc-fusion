@@ -352,6 +352,50 @@ async function withMaintenanceSql<T>(
   }
 }
 
+/**
+ * FNXC:PgTestHarnessTeardownStraggler 2026-09-02:
+ * Terminate any straggler backends attached to `dbName`, then drop it via the
+ * existing bounded `adminExecAsync` (JS-side timeout + force-close socket),
+ * retrying on the transient "being accessed by other users" contention
+ * window the same way the template-copy path already does for `CREATE
+ * DATABASE ... TEMPLATE` (:637-659 below: terminate -> action -> retry with
+ * short backoff, only on that exact contention error). The per-test
+ * teardown previously ran a single one-shot 15s `DROP DATABASE ... WITH
+ * (FORCE)` with no terminate/retry step; a straggler backend left by the
+ * runtime's bounded stop drain (pueue 1556) could make that one-shot DROP
+ * fail in teardown after a test's own assertions had already passed.
+ */
+async function terminateBackendsAndDropDatabase(
+  dbName: string,
+  maxAttempts = 5,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await withMaintenanceSql(async (client) => {
+        await client`
+          SELECT pg_terminate_backend(pid)
+          FROM pg_stat_activity
+          WHERE datname = ${dbName} AND pid <> pg_backend_pid()
+        `;
+      });
+      // FNXC:PgTestHarness 2026-07-18-17:27: FORCE so open pool sockets cannot block drop after close races.
+      await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
+      lastError = undefined;
+      break;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      const contended = /being accessed by other users/i.test(message);
+      if (!contended || attempt === maxAttempts) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25 * attempt));
+    }
+  }
+  if (lastError) throw lastError;
+}
+
 /** Test-only lifecycle controls for deterministic template-state regression tests. */
 export const __pgTestTemplateTestHooks = {
   templateName: templateDbName,
@@ -723,7 +767,8 @@ export async function createTaskStoreForTest(options?: {
     }
     try {
       // FNXC:PgTestHarness 2026-07-18-17:27: FORCE so open pool sockets cannot block drop after close races.
-      await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
+      // FNXC:PgTestHarnessTeardownStraggler 2026-09-02: terminate + retry, mirroring :637-659.
+      await terminateBackendsAndDropDatabase(dbName);
     } catch (error) {
       recordFailure("drop-database", error);
     }
@@ -856,6 +901,7 @@ export interface SharedPgTaskStoreHarness {
   readonly store: () => TaskStore;
   readonly layer: () => AsyncDataLayer;
   readonly adminDb: () => PostgresJsDatabase;
+  readonly testUrl: () => string;
   readonly beforeAll: () => Promise<void>;
   readonly beforeEach: () => Promise<void>;
   readonly afterEach: () => Promise<void>;
@@ -931,6 +977,10 @@ export function createSharedPgTaskStoreTestHarness(options?: {
     adminDb: () => {
       if (!harness) throw new Error("SharedPgTaskStoreHarness: beforeAll not called yet");
       return harness.adminDb;
+    },
+    testUrl: () => {
+      if (!harness) throw new Error("SharedPgTaskStoreHarness: beforeAll not called yet");
+      return harness.testUrl;
     },
     beforeAll: async () => {
       if (harness) return;

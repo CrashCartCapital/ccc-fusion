@@ -400,6 +400,8 @@ const cliBuildConfig = {
     extension: "src/extension.ts",
     "child-process-worker": "../engine/src/runtimes/child-process-worker.ts",
     "ccc-route-receipt-adapter": "../engine/src/ccc-route-receipt-adapter.ts",
+    "ccc-prd-controller": "src/commands/prd.ts",
+    "ccc-gate2-runtime-host": "src/ccc-gate2-runtime-host.ts",
   },
   format: ["esm"],
   platform: "node",

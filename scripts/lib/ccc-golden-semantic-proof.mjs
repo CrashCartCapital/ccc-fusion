@@ -39,6 +39,7 @@ export function buildSemanticProof(input) {
       })),
     ],
     candidateInputs: [...input.candidateInputs],
+    ...(input.verifierProfile ? { verifierProfile: { ...input.verifierProfile } } : {}),
     executionToolchain: {
       task: {
         executablePath: "/model-untrusted/task",

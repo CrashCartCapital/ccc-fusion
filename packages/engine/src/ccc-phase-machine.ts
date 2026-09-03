@@ -31,6 +31,7 @@ export type CccPhaseObservation = Readonly<{
   turnSettled: boolean;
   explicitPhaseSignal: boolean;
   hasConfirmedMutation: boolean;
+  hasConfirmedRepairEffect?: boolean;
   readCount: number;
   discoverContinuations: number;
   mutateContinuations?: number;
@@ -142,7 +143,10 @@ export function decideCccPhaseTransition(
   }
 
   if (observation.phase === "REPAIR") {
-    if (observation.explicitPhaseSignal && observation.hasConfirmedMutation) {
+    if (
+      observation.explicitPhaseSignal
+      && (observation.hasConfirmedMutation || observation.hasConfirmedRepairEffect === true)
+    ) {
       return {
         phase: "VERIFY",
         action: "RUN_CONTROLLER_VERIFICATION",
@@ -182,7 +186,7 @@ export function decideCccPhaseTransition(
       readCapWarning,
       capForcedStop: false,
       failureReason:
-        "DISCOVER ended twice without confirmed mutation or an explicit phase signal",
+        `DISCOVER exhausted ${maxDiscoverContinuations} bounded DISCOVER continuation${maxDiscoverContinuations === 1 ? "" : "s"} without confirmed mutation or an explicit phase signal`,
     };
   }
 

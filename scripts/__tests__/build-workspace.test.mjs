@@ -19,6 +19,7 @@ import {
   runPlannedBuilds,
   wantsFullCliPackage,
 } from "../build-workspace.mjs";
+import { workItemHasCccPermanentReason } from "../lib/ccc-permanent-reason.mjs";
 
 function createWorkspace() {
   const root = mkdtempSync(path.join(tmpdir(), "fn-7290-build-workspace-"));
@@ -82,7 +83,8 @@ function writePluginDist(root, dir = "plugins/fusion-plugin-alpha") {
 }
 
 function extractFunctionSource(source, name) {
-  const start = source.indexOf(`async function ${name}(`);
+  const asyncStart = source.indexOf(`async function ${name}(`);
+  const start = asyncStart === -1 ? source.indexOf(`function ${name}(`) : asyncStart;
   assert.notEqual(start, -1, `expected to find ${name}`);
   const bodyStart = source.indexOf("{", start);
   assert.notEqual(bodyStart, -1, `expected to find ${name} body`);
@@ -309,6 +311,50 @@ test("root package build script points at the workspace build wrapper", () => {
   assert.equal(rootPackage.scripts.build, "node scripts/build-workspace.mjs");
 });
 
+test("CCC product acceptance recognizes permanent holds by stable machine code", () => {
+  const reasonCode = "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
+  const machineReason = `ccc-permanent:${reasonCode}`;
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+
+  assert.equal(
+    workItemHasCccPermanentReason(
+      { blockedReason: machineReason, lastError: machineReason },
+      reasonCode,
+    ),
+    true,
+  );
+  assert.equal(
+    workItemHasCccPermanentReason(
+      {
+        blockedReason: machineReason,
+        lastError: `${machineReason}: exact human diagnostic`,
+      },
+      reasonCode,
+    ),
+    true,
+  );
+  assert.equal(
+    workItemHasCccPermanentReason(
+      {
+        blockedReason: `${machineReason}_OTHER`,
+        lastError: `${machineReason}: exact human diagnostic`,
+      },
+      reasonCode,
+    ),
+    false,
+  );
+  assert.equal(workItemHasCccPermanentReason(undefined, reasonCode), false);
+  assert.doesNotMatch(
+    source,
+    /lastError\s*\n\s*=== "ccc-permanent:CCC_CAMPAIGN_(?:LIVE_EXECUTION|MERGE)_APPROVAL_REQUIRED"/,
+  );
+  assert.equal(
+    source.match(/workItemHasCccPermanentReason\(/g)?.length,
+    5,
+    "all five approval-hold assertions must use the stable reason predicate",
+  );
+});
+
 test("CCC product acceptance builds the current CLI through the root workspace build", () => {
   const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
   const buildCurrentCli = extractFunctionSource(source, "buildCurrentCli");
@@ -329,6 +375,132 @@ test("CCC product acceptance builds the current CLI through the root workspace b
   );
   assert.match(buildCurrentCli, /CCC_PRODUCT_STALE_DASHBOARD_BUILD/);
   assert.match(buildCurrentCli, /body\.type === "agent-turn-complete"/);
+});
+
+test("CCC product acceptance binds proof cutpoint markers to its owned temp root", () => {
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+  const cleanEnvironment = extractFunctionSource(source, "cleanEnvironment");
+  const readMarkers = extractFunctionSource(source, "readOwnedProofCutpointMarkers");
+  const cleanupMarkers = extractFunctionSource(source, "cleanupOwnedProofCutpointMarkers");
+
+  assert.doesNotMatch(
+    cleanEnvironment,
+    /TMPDIR/,
+    "one-shot CLI commands must not share the served runtime's engine-socket temp root",
+  );
+  assert.match(
+    source,
+    /const serveEnv = Object\.freeze\(\{ \.\.\.env, TMPDIR: proofExecutionTmpRoot \}\)/,
+    "served runtime must create semantic proof temp roots under the acceptance-owned temp root",
+  );
+  assert.match(
+    source,
+    /mkdtemp\(path\.join\(shortProofTmpParent, "ccc-prd-proof-"\)\)/,
+    "the owned proof temp root must stay short enough for the macOS engine socket path",
+  );
+  assert.match(
+    source,
+    /cleanupOwnedProofExecutionTmpRoot\(proofExecutionTmpRoot\)/,
+    "the separately owned short proof temp root must be removed on every exit",
+  );
+  assert.doesNotMatch(
+    source,
+    /await startServe\(targetRoot, env,/,
+    "every served runtime must use the isolated server-only temp root",
+  );
+  assert.match(
+    source,
+    /readOwnedProofCutpointMarkers\(proofCutpointToken,\s*proofExecutionTmpRoot\)/,
+    "proof cutpoint marker polling must read from the same temp root given to the served runtime",
+  );
+  assert.match(
+    source,
+    /cleanupOwnedProofCutpointMarkers\(\s*ownedProofCutpointToken,\s*proofExecutionTmpRoot,\s*\)/,
+    "proof cutpoint cleanup must use the same owned temp root",
+  );
+  assert.match(
+    readMarkers,
+    /ccc-semantic-proof-execution-/,
+    "proof cutpoint marker polling must discover the semantic proof execution root",
+  );
+  assert.match(
+    readMarkers,
+    /path\.join\(scratchRoot, "home"\)/,
+    "semantic proof markers must come from the proof sandbox's scratch home",
+  );
+  assert.doesNotMatch(
+    readMarkers,
+    /fusion-verifier-sandbox-/,
+    "semantic proof marker polling must not look in the ordinary readiness-verifier sandbox",
+  );
+  assert.match(
+    source,
+    /semanticProofId === 'PROOF-VERTICAL-VALUE-TASK'/,
+    "the cutpoint hang must arm only inside the semantic proof process",
+  );
+  assert.match(
+    source,
+    /!semanticProofId && candidates\['src\/value\.txt'\]/,
+    "the ordinary readiness verifier must accept the planted cutpoint candidate without hanging",
+  );
+  assert.doesNotMatch(
+    cleanupMarkers,
+    /\brm\(/,
+    "marker cleanup must leave semantic proof roots for the final owned-root cleanup",
+  );
+});
+
+test("CCC product acceptance gives the four-task fanout generous execution headroom", () => {
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+
+  assert.match(
+    source,
+    /const fanoutCampaignMaxRequests = fanTasks\.length \* 4;/,
+    "fanout request budget must provide four requests per provider task",
+  );
+  assert.match(
+    source,
+    /const fanoutCampaignMaxDurationMs = 480_000;/,
+    "fanout campaign must have enough time for four sequential task and proof phases",
+  );
+  assert.match(
+    source,
+    /const fanoutCampaignMaxConcurrency = 2;/,
+    "the two admitted branch tasks must be allowed to dispatch together",
+  );
+  assert.doesNotMatch(
+    source,
+    /const maxRequests = String\(fanTasks\.length\)/,
+    "one request per fanout task is below the structural mutate-plus-repair floor",
+  );
+  assert.match(
+    source,
+    /"--max-requests",\s*String\(fanoutCampaignMaxRequests\),\s*"--max-duration-ms",\s*String\(fanoutCampaignMaxDurationMs\)/,
+    "fanout authoring must use the same generous bounds as freeze and preview",
+  );
+  assert.match(
+    source,
+    /"--max-concurrency",\s*String\(fanoutCampaignMaxConcurrency\)/,
+    "fanout freeze and authoring must share the admitted branch-width concurrency",
+  );
+});
+
+test("CCC fanout verifier supports both readiness and semantic proof execution", () => {
+  const source = readFileSync(path.resolve("scripts/ccc-prd-product-acceptance.mjs"), "utf8");
+  const fanoutStart = source.indexOf('path.join(targetRoot, "verify-fanout.cjs")');
+  const fanoutEnd = source.indexOf('path.join(targetRoot, "Taskfile.yml")', fanoutStart);
+  const fanoutVerifier = source.slice(fanoutStart, fanoutEnd);
+
+  assert.match(
+    fanoutVerifier,
+    /const semanticProofId = process\.env\.CCC_PROOF_ID;/,
+    "semantic proof execution must keep using the controller-supplied proof identity",
+  );
+  assert.match(
+    fanoutVerifier,
+    /const proofId = semanticProofId \|\| localProofId;/,
+    "ordinary required-commit readiness must infer the exact task proof from candidate paths",
+  );
 });
 
 test("real CLI serial tsup build is recognized as bundled output only", () => {
@@ -437,4 +609,19 @@ test("wantsFullCliPackage matches CLI packaging env rules", () => {
   assert.equal(wantsFullCliPackage({ FUSION_CLI_FULL_PACKAGE: "1" }, { fullFlag: false }), true);
   assert.equal(wantsFullCliPackage({ FUSION_CLI_FULL_PACKAGE: "0", CI: "true" }, { fullFlag: true }), false);
   assert.equal(wantsFullCliPackage({ npm_lifecycle_event: "prepack" }, { fullFlag: false }), true);
+});
+
+test("Gate 2 golden campaigns outlive the maximum controller verifier lifetime", () => {
+  const source = readFileSync(
+    path.resolve("packages/engine/vitest.golden-pg.config.ts"),
+    "utf8",
+  );
+  const configuredTimeout = source.match(
+    /FUSION_TEST_SUBPROCESS_TIMEOUT_MS:\s*"(\d+)"/,
+  );
+  assert.ok(configuredTimeout, "golden campaigns must configure a child-process guard");
+  assert.ok(
+    Number(configuredTimeout[1]) >= 1_802_000,
+    "the outer child guard must not expire before the 30-minute controller verifier plus termination grace",
+  );
 });

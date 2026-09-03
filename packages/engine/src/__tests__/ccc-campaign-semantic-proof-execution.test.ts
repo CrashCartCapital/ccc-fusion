@@ -22,7 +22,10 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
 } from "../ccc-campaign-proof-admission.js";
-import { createCccCampaignProofSuiteHandler } from "../ccc-campaign-proof-execution.js";
+import {
+  createCccCampaignProofSuiteHandler,
+  exactEvidenceResults,
+} from "../ccc-campaign-proof-execution.js";
 import { ensureCccCampaignJoinBaseBranch } from "../ccc-campaign-join-base.js";
 import {
   inspectCccSemanticProofExecutable,
@@ -638,8 +641,8 @@ function semanticHandler(
       input: { outputRoot: string },
     ) => Promise<ReturnType<typeof materializedFixture>>;
     verifyToolchain?: () => Promise<void>;
-    preflightSemanticProofSandbox?: () => Promise<void>;
-    runSandbox?: () => Promise<ReturnType<typeof processResult>>;
+    preflightSemanticProofSandbox?: (input: Record<string, unknown>) => Promise<void>;
+    runSandbox?: (input: Record<string, unknown>) => Promise<ReturnType<typeof processResult>>;
   } = {},
 ) {
   const attempts = options.attempts ?? attemptApi();
@@ -648,6 +651,8 @@ function semanticHandler(
     const stdout = `${canonicalCccPrdJson(evidenceFor(f, true))}\n`;
     return processResult(stdout);
   }));
+  const preflightSandbox = vi.fn(options.preflightSemanticProofSandbox
+    ?? (async () => undefined));
   const handler = createCccCampaignProofSuiteHandler({
     rootDir: f.repo,
     store: {
@@ -679,11 +684,10 @@ function semanticHandler(
       ?? (async ({ outputRoot }: { outputRoot: string }) =>
         materializedFixture(outputRoot, admission, f.proof.executionToolchain)),
     verifySemanticProofToolchain: options.verifyToolchain ?? (async () => undefined),
-    preflightSemanticProofSandbox: options.preflightSemanticProofSandbox
-      ?? (async () => undefined),
+    preflightSemanticProofSandbox: preflightSandbox,
     runSemanticProofSandbox: runSandbox,
   } as never);
-  return { handler, attempts, runSandbox };
+  return { handler, attempts, preflightSandbox, runSandbox };
 }
 
 afterEach(async () => {
@@ -691,6 +695,104 @@ afterEach(async () => {
 });
 
 describe("CCC semantic proof v2 execution", () => {
+  it("RED-G2-node-loopback-dispatch: gives only an opted-in proof one controller-selected port", async () => {
+    const original = await fixture();
+    const proof = readmitProofDefinition(original.proof, {
+      verifierProfile: { schema: "ccc-prd.verifier.node-loopback.v1" } as never,
+    });
+    const f = {
+      ...original,
+      proof,
+      campaign: { ...original.campaign, proofs: [proof] } as CccCampaignTaskContext,
+    };
+    const { handler, preflightSandbox, runSandbox } = semanticHandler(f, {
+      runSandbox: async (input) => {
+        expect(input.loopbackPort).toEqual(expect.any(Number));
+        expect(input.loopbackPort).not.toBe(4_040);
+        const stdout = `${canonicalCccPrdJson(evidenceFor(f, true))}\n`;
+        return processResult(stdout);
+      },
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toMatchObject({
+      outcome: "success",
+      value: "ccc-proof-suite-passed",
+    });
+    expect(preflightSandbox).toHaveBeenCalledWith(expect.not.objectContaining({ loopbackPort: expect.anything() }));
+    expect(runSandbox).toHaveBeenCalledWith(expect.objectContaining({
+      loopbackPort: expect.any(Number),
+    }));
+  });
+
+  it("RED-G2-node-loopback-dispatch: keeps the default semantic proof network-denied", async () => {
+    const f = await fixture();
+    const { handler, runSandbox } = semanticHandler(f);
+
+    await expect(handler(f.node, f.context)).resolves.toMatchObject({
+      outcome: "success",
+      value: "ccc-proof-suite-passed",
+    });
+    expect(runSandbox).toHaveBeenCalledWith(expect.not.objectContaining({
+      loopbackPort: expect.anything(),
+    }));
+  });
+
+  it("RED-G2-integrated-clause-order: compares exact evidence identifiers as a set", () => {
+    expect(exactEvidenceResults([
+      { clauseId: "AC-REQ-Z", passed: true },
+      { clauseId: "AC-REQ-A", passed: true },
+      { clauseId: "AC-REQ-M", passed: true },
+    ], "clauseId", ["AC-REQ-A", "AC-REQ-M", "AC-REQ-Z"])).toBe(true);
+  });
+
+  it("RED-G2-final-envelope-order: canonicalizes validated result sets before settlement", async () => {
+    const original = await fixture();
+    const proof = readmitProofDefinition(original.proof, {
+      clauseIds: ["AC-REQ-A", "AC-REQ-M", "AC-REQ-Z"],
+    });
+    const f = {
+      ...original,
+      proof,
+      campaign: { ...original.campaign, proofs: [proof] },
+      node: {
+        ...original.node,
+        config: {
+          cccProofSuite: true,
+          cccProofPhase: "final_integrated",
+          cccProofIds: [proof.id],
+          cccPrdTaskIds: [original.campaign.semanticTaskId],
+          cccNativeTaskIds: [original.task.id],
+          cccPrdTaskId: original.campaign.semanticTaskId,
+          cccNativeTaskId: original.task.id,
+        },
+      },
+    };
+    const reorderedEvidence = {
+      ...evidenceFor(f, true, "final_integrated"),
+      clauseResults: [
+        { clauseId: "AC-REQ-Z", passed: true },
+        { clauseId: "AC-REQ-A", passed: true },
+        { clauseId: "AC-REQ-M", passed: true },
+      ],
+    };
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(`${canonicalCccPrdJson(reorderedEvidence)}\n`),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toMatchObject({ outcome: "success" });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        evidence: expect.objectContaining({
+          clauseResults: [
+            { clauseId: "AC-REQ-A", passed: true },
+            { clauseId: "AC-REQ-M", passed: true },
+            { clauseId: "AC-REQ-Z", passed: true },
+          ],
+        }),
+      }),
+    }));
+  });
+
   it("RED-R11-proof-preflight-concurrency: serializes sealed toolchain preparation across concurrent proof nodes", async () => {
     const first = await fixture();
     const second = await fixture();

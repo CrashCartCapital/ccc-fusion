@@ -102,7 +102,7 @@ pgDescribe("CCC provider-attempt effective-route settlement (PostgreSQL)", () =>
     const admitted = await createAdmittedCccPrdImportTestProductFixture(h.rootDir(), suffix);
     const source = rehashCccPrdImportTestProductBundleV2({
       ...admitted.bundle,
-      bounds: { maxRequests: 3, maxDurationMs: 60_000, maxConcurrency: 1 },
+      bounds: { maxRequests: 4, maxDurationMs: 60_000, maxConcurrency: 1 },
     });
     const executionPolicy = createCccPrdImportTestProductExecutionPolicy(source);
     executionPolicy.routes = executionPolicy.routes.map((route) => ({
@@ -125,6 +125,47 @@ pgDescribe("CCC provider-attempt effective-route settlement (PostgreSQL)", () =>
     const campaign = await h.store().getCccCampaignContextForTask(taskId);
     if (!campaign) throw new Error(`missing adapter campaign context for ${taskId}`);
     return { taskId, semanticTaskId, campaign };
+  }
+
+  async function twoTaskComboContext(suffix: string) {
+    const admitted = await createAdmittedCccPrdImportTestProductFixture(h.rootDir(), suffix);
+    const source = rehashCccPrdImportTestProductBundleV2({
+      ...admitted.bundle,
+      bounds: { maxRequests: 4, maxDurationMs: 60_000, maxConcurrency: 1 },
+    });
+    const executionPolicy = createCccPrdImportTestProductExecutionPolicy(source);
+    executionPolicy.routes = executionPolicy.routes.map((route, index) => index === 0
+      ? {
+          ...route,
+          providerId: "golden-omniroute-glm-latest",
+          modelId: "combo/glm-latest",
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+          terminalRouteMembers: [{ provider: "glm", model: "glm-5.3" }],
+        }
+      : {
+          ...route,
+          providerId: "golden-omniroute-minimax-latest",
+          modelId: "combo/minimax-latest",
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+          terminalRouteMembers: [{ provider: "minimax", model: "MiniMax-M3" }],
+        });
+    const imported = await importCccPrdBundle({
+      bundle: source,
+      idempotencyKey: `provider-attempt-combo-${suffix}`,
+      store: h.store(),
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      executionPolicy,
+      semanticProofToolchainPaths: admitted.semanticProofToolchainPaths,
+    });
+    const firstSemanticTaskId = source.tasks[0]!.id;
+    const secondSemanticTaskId = source.tasks[1]!.id;
+    return {
+      firstTaskId: await nativeTaskIdForImport(imported.importId, firstSemanticTaskId),
+      firstSemanticTaskId,
+      secondTaskId: await nativeTaskIdForImport(imported.importId, secondSemanticTaskId),
+      secondSemanticTaskId,
+    };
   }
 
   async function reserveAndDispatchAdapter(taskId: string, turnKey: string) {
@@ -401,5 +442,72 @@ pgDescribe("CCC provider-attempt effective-route settlement (PostgreSQL)", () =>
       controllerToken: next.controllerToken,
     })).resolves.toMatchObject({ kind: "dispatch-permit" });
     expect(next).toMatchObject({ state: "reserved", requestCount: 2 });
+  });
+
+  it("RED-G2-route-history-scope: sibling combo routes validate terminal receipts against their own task route", async () => {
+    const { firstTaskId, secondTaskId } = await twoTaskComboContext("sibling-route-receipt");
+    const first = await reserveCccProviderAttempt({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      request: {
+        taskId: firstTaskId,
+        actionId: firstTaskId,
+        actionTarget: h.rootDir(),
+        turnKey: "turn-sibling-route-receipt-glm",
+        dispatchKey: "dispatch-sibling-route-receipt-glm",
+        providerId: "golden-omniroute-glm-latest",
+        modelId: "combo/glm-latest",
+        transport: "pi",
+        workItemFence: { workItemId: "work-item-sibling-route-receipt-glm", runId: "run-sibling-route-receipt", attempt: 1 },
+      },
+    });
+    await expect(beginCccProviderAttemptDispatch({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      transition: { taskId: firstTaskId, attemptKey: first.attemptKey, controllerToken: first.controllerToken },
+    })).resolves.toMatchObject({ kind: "dispatch-permit" });
+    await expect(reconcileCccProviderAttempt({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      reconciliation: {
+        taskId: firstTaskId,
+        attemptKey: first.attemptKey,
+        controllerToken: first.controllerToken,
+        outcome: "committed",
+        evidenceDigest: "7".repeat(64),
+        observerId: "sibling-route-receipt-worker",
+        effectiveRoute: {
+          effectiveProvider: "golden-omniroute-glm-latest",
+          effectiveModel: "combo/glm-latest",
+          usage: { inputTokens: 8, outputTokens: 5 },
+          cost: { kind: "unknown", reason: "fixture pricing unavailable" },
+          receiptSource: "stream-usage",
+          omniRoute: { final: { provider: "glm", model: "glm-5.3" } },
+        },
+      },
+    })).resolves.toMatchObject({ state: "committed" });
+
+    await expect(reserveCccProviderAttempt({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      request: {
+        taskId: secondTaskId,
+        actionId: secondTaskId,
+        actionTarget: h.rootDir(),
+        turnKey: "turn-sibling-route-receipt-minimax",
+        dispatchKey: "dispatch-sibling-route-receipt-minimax",
+        providerId: "golden-omniroute-minimax-latest",
+        modelId: "combo/minimax-latest",
+        transport: "pi",
+        workItemFence: { workItemId: "work-item-sibling-route-receipt-minimax", runId: "run-sibling-route-receipt", attempt: 1 },
+      },
+    })).resolves.toMatchObject({
+      state: "reserved",
+      requestCount: 2,
+      binding: {
+        providerId: "golden-omniroute-minimax-latest",
+        modelId: "combo/minimax-latest",
+      },
+    });
   });
 });

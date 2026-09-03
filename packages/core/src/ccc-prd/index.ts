@@ -37,6 +37,7 @@ export {
 } from "./importer.js";
 export {
   CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION,
+  cccPermanentWorkItemHasReason,
   inspectCccPrdProductStatus,
 } from "./product-status.js";
 export {
@@ -68,6 +69,7 @@ export {
   CCC_PRD_SIDECAR_V1_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
+  CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION,
   CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION,
 } from "./types.js";
 export type {
@@ -163,6 +165,7 @@ export type {
   CccPrdValidationResult,
   CccPrdVerifierClosureEntry,
   CccPrdVerifierProfile,
+  CccPrdVerifierProfileNodeLoopbackV1,
   CccPrdVerifierProfilePythonAdapterV1,
   CccPrdWorkflow,
 } from "./types.js";

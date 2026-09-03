@@ -10,8 +10,16 @@ import type {
   WorkflowWorkItemState,
 } from "@fusion/core";
 
-import { WorkflowTaskRuntime, type WorkflowTaskRuntimeDeps } from "../workflow-task-runtime.js";
-import type { WorkflowNodeResult } from "../workflow-graph-executor.js";
+import {
+  WorkflowTaskRuntime,
+  formatCccPermanentWorkItemError,
+  graphFailureReason,
+  type WorkflowTaskRuntimeDeps,
+} from "../workflow-task-runtime.js";
+import {
+  formatCccBranchPersistenceError,
+  type WorkflowNodeResult,
+} from "../workflow-graph-executor.js";
 import type { PreparedWorktree, WorkflowRuntimePrimitives } from "../runtime-primitives.js";
 import { PermanentError } from "../engine-errors.js";
 
@@ -19,6 +27,71 @@ const task = { id: "FN-9002" } as TaskDetail;
 const nativeSemanticTaskId = "FN-9003";
 const flagOff = { experimentalFeatures: {} } as unknown as Pick<Settings, "experimentalFeatures">;
 const promptWithOneStep = "# Task: FN-9002 - Runtime default\n\n## Steps\n\n### Step 1: Implement runtime default\n- Exercise the default workflow.\n";
+
+describe("graphFailureReason", () => {
+  it("RED-G2-frontier-nested-cause: reports the deepest database cause before the query wrapper", () => {
+    const postgresError = Object.assign(
+      new Error("insert or update violates foreign key constraint workflow_run_branches_task_id_fkey"),
+      { name: "PostgresError", code: "23503" },
+    );
+    const queryError = new Error(
+      `Failed query: ${"INSERT INTO project.workflow_run_branches ".repeat(20)}`,
+      { cause: postgresError },
+    );
+
+    const diagnostic = formatCccBranchPersistenceError(queryError);
+    expect(diagnostic).toMatch(/^PostgresError\[23503\]: insert or update violates foreign key constraint workflow_run_branches_task_id_fkey <- Error: Failed query:/u);
+    expect(diagnostic).toHaveLength(500);
+    expect(diagnostic.endsWith("...")).toBe(true);
+  });
+
+  it("RED-G2-contextless-failure: preserves bounded node state when no node owns the failure", () => {
+    expect(graphFailureReason({
+      visitedNodeIds: ["start", "implementation", "proof"],
+      context: {
+        "node:implementation:outcome": "success",
+        "node:implementation:value": "passed",
+        "node:proof:outcome": "success",
+        "node:proof:value": "ccc-proof-suite-passed",
+        "workflow:id": "WORKFLOW-TELEMETRY",
+      },
+    })).toBe(
+      'workflow-graph-failed:{"visitedNodeIds":["start","implementation","proof"],"nodeState":{"node:implementation:outcome":"success","node:implementation:value":"passed","node:proof:outcome":"success","node:proof:value":"ccc-proof-suite-passed"}}',
+    );
+  });
+
+  it("RED-G2-frontier-diagnostic: prefers the exact bounded branch persistence cause", () => {
+    expect(graphFailureReason({
+      visitedNodeIds: ["start", "implementation"],
+      context: {
+        "ccc:branch-persistence-failure": "ccc-branch-persistence-progress-failed",
+        "ccc:branch-persistence-error": "PostgresError: insert or update violates foreign key",
+        "node:implementation:outcome": "success",
+        "node:implementation:value": "passed",
+      },
+    })).toBe(
+      "ccc-branch-persistence-progress-failed:PostgresError: insert or update violates foreign key",
+    );
+  });
+});
+
+describe("formatCccPermanentWorkItemError", () => {
+  it("keeps the machine reason while preserving a bounded single-line diagnostic", () => {
+    const reason = "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED";
+    const formatted = formatCccPermanentWorkItemError(
+      reason,
+      new PermanentError(
+        `pre-dispatch custody refused:\n${"toolchain drift ".repeat(100)}`,
+        "CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+      ),
+    );
+
+    expect(formatted.startsWith(`${reason}: pre-dispatch custody refused: toolchain drift`))
+      .toBe(true);
+    expect(formatted).not.toContain("\n");
+    expect(formatted.length).toBeLessThanOrEqual(512);
+  });
+});
 
 const parseStepsDeps = {
   readArtifact: async (_task: TaskDetail, key: string) => key === "PROMPT.md" ? promptWithOneStep : undefined,
@@ -147,6 +220,45 @@ function selectedTaskProofGateIr(): WorkflowIr {
       { from: "implementation", to: "task-proof", condition: "success" },
       { from: "task-proof", to: "downstream", condition: "success" },
       { from: "downstream", to: "end", condition: "success" },
+    ],
+  };
+}
+
+function selectedTaskProofSplitIr(): WorkflowIr {
+  return {
+    version: "v2",
+    name: "selected-task-proof-split",
+    columns: [],
+    nodes: [
+      { id: "start", kind: "start" },
+      { id: "implementation", kind: "prompt", config: { prompt: "implement" } },
+      {
+        id: "task-proof",
+        kind: "gate",
+        config: {
+          cccProofGate: true,
+          cccProofPhase: "task",
+          cccProofIds: ["PROOF-1"],
+          cccPrdTaskId: "TASK-1",
+          cccNativeTaskId: task.id,
+        },
+      },
+      { id: "fanout", kind: "split" },
+      { id: "audit", kind: "prompt", config: { prompt: "audit" } },
+      { id: "ingest", kind: "prompt", config: { prompt: "ingest" } },
+      { id: "join", kind: "join", config: { mode: "all", onBranchFailure: "fail-fast" } },
+      { id: "end", kind: "end" },
+    ],
+    edges: [
+      { from: "start", to: "implementation", condition: "success" },
+      { from: "implementation", to: "task-proof", condition: "success" },
+      { from: "task-proof", to: "fanout", condition: "success" },
+      { from: "fanout", to: "audit", condition: "success" },
+      { from: "fanout", to: "ingest", condition: "success" },
+      { from: "audit", to: "join", condition: "success" },
+      { from: "ingest", to: "join", condition: "success" },
+      { from: "join", to: "end", condition: "success" },
+      { from: "join", to: "end", condition: "failure" },
     ],
   };
 }
@@ -388,6 +500,76 @@ describe("WorkflowTaskRuntime", () => {
     expect(prompt.mock.calls[0]![0]).toMatchObject({ id: "implementation" });
   });
 
+  it("RED-G2-failure-reason: downstream failure after proof success does not blame the proof pass value", async () => {
+    const prompt = vi.fn(async (node: { id: string }) => {
+      if (node.id === "downstream") return { outcome: "failure" as const };
+      return { outcome: "success" as const };
+    });
+    const runCccProofSuite = vi.fn(async () => ({
+      outcome: "success" as const,
+      value: "ccc-proof-suite-passed",
+    }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-TASK-PROOF", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedTaskProofGateIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: { prompt },
+      runCccProofSuite,
+    });
+
+    const result = await runtime.run(task, flagOff, { deferCompletionSummary: true });
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "workflow-node-failed:downstream",
+      context: {
+        "node:task-proof:outcome": "success",
+        "node:task-proof:value": "ccc-proof-suite-passed",
+        "node:downstream:outcome": "failure",
+      },
+    });
+    expect(prompt.mock.calls.map(([node]) => node.id)).toEqual(["implementation", "downstream"]);
+  });
+
+  it("RED-G2-failure-reason: split failure after proof success surfaces the failed branch diagnostic", async () => {
+    const prompt = vi.fn(async (node: { id: string }) => {
+      if (node.id === "audit") return { outcome: "failure" as const };
+      return { outcome: "success" as const };
+    });
+    const runCccProofSuite = vi.fn(async () => ({
+      outcome: "success" as const,
+      value: "ccc-proof-suite-passed",
+    }));
+    const runtime = new WorkflowTaskRuntime({
+      store: {
+        getTaskWorkflowSelection: () => ({ workflowId: "WF-TASK-PROOF-SPLIT", stepIds: [] }),
+        getWorkflowDefinition: async () => ({ ir: selectedTaskProofSplitIr() }),
+      },
+      primitives: recordingPrimitives([]),
+      runCustomNode: async () => ({ outcome: "success" }),
+      handlers: { prompt },
+      runCccProofSuite,
+    });
+
+    const result = await runtime.run(task, flagOff, { deferCompletionSummary: true });
+
+    expect(result).toMatchObject({
+      disposition: "failed",
+      outcome: "failure",
+      reason: "workflow-node-error:join:workflow-branch-failed:audit:node-returned-failure",
+      context: {
+        "node:task-proof:outcome": "success",
+        "node:task-proof:value": "ccc-proof-suite-passed",
+        "node:fanout:error": "workflow-branch-failed:audit:node-returned-failure",
+        "node:join:outcome": "failure",
+      },
+    });
+  });
+
   it("RED-S5-task-gate-release: dispatches a unified final proof-phase marker", async () => {
     const runCccProofSuite = vi.fn(async () => ({ outcome: "success" as const }));
     const runtime = new WorkflowTaskRuntime({
@@ -456,7 +638,7 @@ describe("WorkflowTaskRuntime", () => {
     expect(result).toMatchObject({
       disposition: "manual-required",
       outcome: "failure",
-      reason: "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+      reason: "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN: A previously dispatched proof command has no terminal receipt.",
       context: {
         "ccc:retry-classification": "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
       },
@@ -912,7 +1094,7 @@ describe("WorkflowTaskRuntime", () => {
     expect(result).toMatchObject({
       disposition: "manual-required",
       outcome: "failure",
-      reason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      reason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED: awaiting exact live execution approval",
     });
     expect(requireLiveExecution).toHaveBeenCalledWith({
       taskId: nativeTaskId,

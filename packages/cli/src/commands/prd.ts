@@ -16,6 +16,7 @@ import {
   CCC_PRD_REQUEST_BUDGET_BELOW_PROVIDER_TASK_FLOOR,
   cccCampaignRequestFloor,
   cccCampaignRequestSizingGuidance,
+  cccPermanentWorkItemHasReason,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
   assertCccPrdSemanticProofV2Custody,
@@ -2089,9 +2090,10 @@ function exactImportedProductWorkItem(status: CccPrdProductStatus) {
 
 function exactMergeWorkItem(status: CccPrdProductStatus) {
   const workItem = exactImportedProductWorkItem(status);
-  const exactHold = workItem.state === "manual-required"
-    && workItem.lastError === CCC_PRODUCT_MERGE_HOLD
-    && workItem.blockedReason === CCC_PRODUCT_MERGE_HOLD;
+  const exactHold = cccPermanentWorkItemHasReason(
+    workItem,
+    CCC_PRODUCT_MERGE_HOLD,
+  );
   if (!exactHold && workItem.state !== "succeeded") {
     throw new PrdProductCommandError(
       "CCC_PRD_MERGE_WORK_ITEM_REFUSED",
@@ -2103,9 +2105,10 @@ function exactMergeWorkItem(status: CccPrdProductStatus) {
 
 function exactLiveExecutionWorkItem(status: CccPrdProductStatus) {
   const workItem = exactImportedProductWorkItem(status);
-  const exactHold = workItem.state === "manual-required"
-    && workItem.lastError === CCC_PRODUCT_LIVE_EXECUTION_HOLD
-    && workItem.blockedReason === CCC_PRODUCT_LIVE_EXECUTION_HOLD;
+  const exactHold = cccPermanentWorkItemHasReason(
+    workItem,
+    CCC_PRODUCT_LIVE_EXECUTION_HOLD,
+  );
   if (
     !exactHold
     && workItem.state !== "runnable"

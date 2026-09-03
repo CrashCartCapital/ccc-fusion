@@ -8,6 +8,7 @@ import {
   CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+  CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION,
   CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION,
   canonicalCccPrdJson,
   canonicalizeCccPrdImplementationFactProvenance,
@@ -337,7 +338,7 @@ function describeProposalShapeViolations(
         if (!isPlainRecord(entry) || !isPlainRecord(entry.executionToolchain)) return true;
         const hasPython = Object.prototype.hasOwnProperty.call(entry.executionToolchain, "python");
         const hasVerifierProfile = Object.prototype.hasOwnProperty.call(entry, "verifierProfile");
-        const verifierProfileValid = !hasVerifierProfile || (
+        const pythonVerifierProfile = hasVerifierProfile && (
           isPlainRecord(entry.verifierProfile)
           && exactKeys(entry.verifierProfile, ["schema", "adapterPath", "targetPath"])
           && entry.verifierProfile.schema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
@@ -346,6 +347,14 @@ function describeProposalShapeViolations(
           && typeof entry.verifierProfile.targetPath === "string"
           && entry.verifierProfile.targetPath.length > 0
         );
+        const nodeLoopbackVerifierProfile = hasVerifierProfile && (
+          isPlainRecord(entry.verifierProfile)
+          && exactKeys(entry.verifierProfile, ["schema"])
+          && entry.verifierProfile.schema === CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION
+        );
+        const verifierProfileValid = !hasVerifierProfile
+          || pythonVerifierProfile
+          || nodeLoopbackVerifierProfile;
         return !(
           entry.schema === "ccc-prd.proof.v2"
           && Array.isArray(entry.clauseIds)
@@ -361,14 +370,14 @@ function describeProposalShapeViolations(
               : ["task", "node", "proofHost", "linkedRuntime"],
           )
           && Array.isArray(entry.executionToolchain.linkedRuntime)
-          && hasPython === hasVerifierProfile
+          && hasPython === pythonVerifierProfile
           && (!hasPython || hasCompletePythonProposalShape(entry.executionToolchain.python))
           && verifierProfileValid
         );
       });
       if (badIndex >= 0) {
         violations.push(
-          `proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape, including executionToolchain task/node/proofHost/linkedRuntime and a paired verifierProfile/executionToolchain.python when using the Python adapter`,
+          `proofs[${badIndex}] must carry the complete ccc-prd.proof.v2 shape, including executionToolchain task/node/proofHost/linkedRuntime, an exact Node-loopback profile without Python, or a paired Python verifierProfile/executionToolchain.python`,
         );
       }
     }

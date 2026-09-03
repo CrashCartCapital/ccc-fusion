@@ -311,6 +311,9 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     fingerprintCccCampaignAllowedCandidateMock.mockReset();
     fingerprintCccCampaignAllowedCandidateMock
       .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      // REPAIR starts and ends with byte-identical admitted source files.
+      .mockResolvedValueOnce("b".repeat(64))
       .mockResolvedValue("b".repeat(64));
     snapshotCccCampaignIgnoredBaselineMock.mockReset();
     snapshotCccCampaignIgnoredBaselineMock.mockResolvedValue(Object.freeze({
@@ -638,6 +641,57 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     }));
   });
 
+  it("RED-G2-PHASE-DIAGNOSTIC: persists the exact controller verification failure before graph collapse", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-phase-diagnostic",
+    );
+    verifyCccCampaignReadyCandidateMock.mockRejectedValueOnce(
+      new Error("semantic sandbox startup failed: exact fixture cause"),
+    );
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async () => {
+            await phaseTool.execute("complete-phase", {}, undefined, () => undefined);
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: expect.stringContaining(
+        "semantic sandbox startup failed: exact fixture cause",
+      ),
+      contextPatch: {
+        "node:ccc-task-implementation:error": expect.stringContaining(
+          "semantic sandbox startup failed: exact fixture cause",
+        ),
+      },
+    });
+    expect(store.logEntry).toHaveBeenCalledWith(
+      nodeTask.id,
+      expect.stringContaining(
+        "[ccc-campaign:phase-verification-failed] Controller verification could not prove phase completion: semantic sandbox startup failed: exact fixture cause",
+      ),
+    );
+  });
+
   it("clears a trusted ignored baseline when the fenced campaign node throws", async () => {
     const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
       "",
@@ -660,6 +714,15 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       { task: nodeTask, settings: undefined, context: {}, execution },
     )).rejects.toThrow(/turn rejected before commit custody/i);
 
+    expect(store.logEntry).toHaveBeenCalledWith(
+      nodeTask.id,
+      expect.stringContaining(
+        "[ccc-campaign:turn-rejected] provider dispatch failed",
+      ),
+      undefined,
+      undefined,
+    );
+
     expect((executor as any).cccControllerIgnoredBaselines.has(nodeTask.id)).toBe(false);
   });
 
@@ -680,14 +743,30 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
       new Error("required commit enforcement failed"),
     );
 
-    await expect((executor as any).runGraphCustomNodeWithRequiredCommitFence(
-      campaignModelNode(execution),
-      nodeTask,
-      await store.getSettings(),
-      undefined,
-      undefined,
-      { task: nodeTask, settings: undefined, context: {}, execution },
-    )).rejects.toThrow(/required commit enforcement failed/i);
+    let refusal: unknown;
+    try {
+      await (executor as any).runGraphCustomNodeWithRequiredCommitFence(
+        campaignModelNode(execution),
+        nodeTask,
+        await store.getSettings(),
+        undefined,
+        undefined,
+        { task: nodeTask, settings: undefined, context: {}, execution },
+      );
+    } catch (error) {
+      refusal = error;
+    }
+
+    expect(refusal).toMatchObject({
+      code: "CCC_CAMPAIGN_REQUIRED_COMMIT_REFUSED",
+      cause: expect.objectContaining({ message: "required commit enforcement failed" }),
+    });
+    expect(store.logEntry).toHaveBeenCalledWith(
+      nodeTask.id,
+      expect.stringContaining(
+        "[ccc-campaign:required-commit-refused] required commit enforcement failed",
+      ),
+    );
 
     expect((executor as any).cccControllerIgnoredBaselines.has(nodeTask.id)).toBe(false);
   });
@@ -798,7 +877,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
 
     expect(result).toMatchObject({
       outcome: "failure",
-      value: "failed",
+      value: expect.stringContaining("AC-002 failed"),
       contextPatch: {
         "node:ccc-task-implementation:error": expect.stringContaining("AC-002 failed"),
       },
@@ -881,6 +960,160 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(prompts[1]).toMatch(/CCC_CAMPAIGN_REPAIR/);
     expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(2);
     expect(result.outcome).toBe("success");
+  });
+
+  it("reruns controller verification when REPAIR restores the trusted ignored baseline", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-repair-ignored-baseline",
+    );
+    const trustedIgnoredBaseline = Object.freeze({
+      roots: Object.freeze([]),
+      fingerprint: "0".repeat(64),
+    });
+    (executor as any).cccControllerIgnoredBaselines.set(
+      nodeTask.id,
+      trustedIgnoredBaseline,
+    );
+    snapshotCccCampaignIgnoredBaselineMock.mockReset();
+    snapshotCccCampaignIgnoredBaselineMock
+      .mockResolvedValueOnce(trustedIgnoredBaseline)
+      .mockResolvedValueOnce(Object.freeze({
+        roots: Object.freeze(["data"]),
+        fingerprint: "d".repeat(64),
+      }))
+      .mockResolvedValue(trustedIgnoredBaseline);
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValue("b".repeat(64));
+    verifyCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce({
+        ready: false,
+        summary: "controller-initialized ignored paths changed after provider dispatch",
+      })
+      .mockResolvedValueOnce(
+        readyVerification(
+          "b".repeat(64),
+          "/tmp/ccc-campaign-repair-ignored-baseline",
+        ),
+      );
+    const prompts: string[] = [];
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async (prompt: string) => {
+            prompts.push(prompt);
+            await phaseTool.execute(
+              `complete-phase-${prompts.length}`,
+              {},
+              undefined,
+              () => undefined,
+            );
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toMatch(/CCC_CAMPAIGN_REPAIR/);
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(2);
+    expect(result.outcome).toBe("success");
+  });
+
+  it("keeps REPAIR terminal when ignored residue changes but does not restore the trusted baseline", async () => {
+    const { execution, executor, nodeTask, store } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-repair-wrong-ignored-baseline",
+    );
+    const trustedIgnoredBaseline = Object.freeze({
+      roots: Object.freeze([]),
+      fingerprint: "0".repeat(64),
+    });
+    (executor as any).cccControllerIgnoredBaselines.set(
+      nodeTask.id,
+      trustedIgnoredBaseline,
+    );
+    snapshotCccCampaignIgnoredBaselineMock.mockReset();
+    snapshotCccCampaignIgnoredBaselineMock
+      .mockResolvedValueOnce(trustedIgnoredBaseline)
+      .mockResolvedValueOnce(Object.freeze({
+        roots: Object.freeze(["data"]),
+        fingerprint: "d".repeat(64),
+      }))
+      .mockResolvedValue(Object.freeze({
+        roots: Object.freeze(["cache"]),
+        fingerprint: "e".repeat(64),
+      }));
+    fingerprintCccCampaignAllowedCandidateMock.mockReset();
+    fingerprintCccCampaignAllowedCandidateMock
+      .mockResolvedValueOnce("a".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValueOnce("b".repeat(64))
+      .mockResolvedValue("b".repeat(64));
+    verifyCccCampaignReadyCandidateMock
+      .mockResolvedValueOnce({
+        ready: false,
+        summary: "controller-initialized ignored paths changed after provider dispatch",
+      })
+      .mockResolvedValueOnce(
+        readyVerification(
+          "b".repeat(64),
+          "/tmp/ccc-campaign-repair-wrong-ignored-baseline",
+        ),
+      );
+    const prompts: string[] = [];
+    mockedCreateFnAgent.mockImplementation(async (options: any) => {
+      const phaseTool = options.customTools.find(
+        (tool: { name: string }) => tool.name === "fn_complete_phase",
+      );
+      return {
+        session: {
+          subscribe: vi.fn(() => vi.fn()),
+          prompt: vi.fn(async (prompt: string) => {
+            prompts.push(prompt);
+            await phaseTool.execute(
+              `complete-phase-${prompts.length}`,
+              {},
+              undefined,
+              () => undefined,
+            );
+          }),
+          dispose: vi.fn(),
+        },
+      };
+    });
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toMatch(/CCC_CAMPAIGN_REPAIR/);
+    expect(verifyCccCampaignReadyCandidateMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: expect.stringContaining("REPAIR signalled completion without changing"),
+    });
   });
 
   it("carries the rendered repair-feedback envelope, verdict-first, into the REPAIR log entry and prompt", async () => {
@@ -1002,6 +1235,9 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(repairPrompt).toContain("src/slugify.js");
     expect(repairPrompt).toContain("42 bytes");
     expect(repairPrompt).toContain("endsWithNewline=false");
+    expect(repairPrompt).toMatch(/rerun only the exact verifier command named above.*foreground/i);
+    expect(repairPrompt).toMatch(/never launch the app manually.*background processes.*kill\/pkill\/killall/i);
+    expect(repairPrompt).toMatch(/runtime state.*OS temp.*ignored worktree roots/i);
 
     const repairLogCall = (store.logEntry as any).mock.calls.find(
       ([, message]: [string, string]) => message.includes("[ccc-campaign:repair]"),
@@ -1152,7 +1388,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       outcome: "failure",
-      value: "failed",
+      value: expect.stringMatching(/phase completion signal.*later tool activity/i),
       contextPatch: {
         "node:ccc-task-implementation:error": expect.stringMatching(/phase completion signal.*later tool activity/i),
       },
@@ -1229,7 +1465,50 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       outcome: "failure",
-      value: "failed",
+      value: expect.stringMatching(/DISCOVER.*explicit phase signal/i),
+      contextPatch: {
+        "node:ccc-task-implementation:error": expect.stringMatching(/DISCOVER.*explicit phase signal/i),
+      },
+    });
+  });
+
+  it("RED-G2-discover-envelope: gives a large remaining request envelope eight bounded quiet continuations", async () => {
+    const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
+      "Still inspecting the admitted task.",
+      "/tmp/ccc-campaign-generous-discover",
+      { signalPhaseCompletion: false },
+    );
+    store.getCccCampaignContextForTask.mockResolvedValueOnce({
+      ...(await store.getCccCampaignContextForTask(nodeTask.id)),
+      bounds: { maxRequests: 2_304, maxDurationMs: 21_600_000, maxConcurrency: 3 },
+      requestCount: 1,
+    });
+    mockedExec.mockImplementation(((command: string, _options: unknown, callback: any) => {
+      if (command === "git status --porcelain=v1 --untracked-files=all") {
+        callback(null, "", "");
+        return {} as any;
+      }
+      callback(null, "", "");
+      return {} as any;
+    }) as any);
+
+    const result = await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect(userPrompts).toHaveLength(9);
+    expect(userPrompts.slice(1)).toEqual(
+      Array.from({ length: 8 }, (_, index) =>
+        expect.stringMatching(new RegExp(`DISCOVER_CESSATION.*continuation ${index + 1} of 8`, "is"))),
+    );
+    expect(result).toMatchObject({
+      outcome: "failure",
+      value: expect.stringMatching(/DISCOVER.*explicit phase signal/i),
       contextPatch: {
         "node:ccc-task-implementation:error": expect.stringMatching(/DISCOVER.*explicit phase signal/i),
       },
@@ -1259,8 +1538,8 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     const sessionCall = mockedCreateFnAgent.mock.calls[0]?.[0] as Record<string, any>;
     expect(sessionCall.cccCampaignPhaseToolPolicy).toMatchObject({
       readOnlyToolNames: ["read", "grep", "find", "ls", "glob", "bash"],
-      maxReadOnlyToolCallsBeforeGuidance: 1,
-      maxReadOnlyToolCallsBeforeRefusal: 2,
+      maxReadOnlyToolCallsBeforeGuidance: 4,
+      maxReadOnlyToolCallsBeforeRefusal: 8,
     });
     expect(sessionCall.cccCampaignPhaseToolPolicy.approvedMcpDiscoveryTools).toHaveLength(28);
     expect(sessionCall.cccCampaignPhaseToolPolicy.approvedMcpDiscoveryTools).toEqual(
@@ -1273,7 +1552,12 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     );
     expect(sessionCall.cccCampaignPhaseToolPolicy.onApprovedMcpDiscoveryToolCall).toEqual(expect.any(Function));
     expect(userPrompts[0]).toContain("CCC_CAMPAIGN_DISCOVER_BOUNDARY");
-    expect(userPrompts[0]).toContain("at most 1 read/search/list discovery tool call");
+    expect(userPrompts[0]).toContain("at most 4 read/search/list discovery tool call");
+    expect(userPrompts[0]).toContain("Do not read the sealed verifier before the first targeted proof failure");
+    expect(userPrompts[0]).toContain("Do not redirect verifier or test output to files");
+    expect(userPrompts[0]).toMatch(/foreground-only.*never start background processes/i);
+    expect(userPrompts[0]).toMatch(/runtime state.*OS temp.*ignored worktree roots/i);
+    expect(userPrompts[0]).toContain("call fn_complete_phase as the next and only tool");
   });
 
   it("fails closed to the minimum discovery boundary when persisted request bounds are absent", async () => {
@@ -1301,6 +1585,34 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
         maxReadOnlyToolCallsBeforeGuidance: 1,
         maxReadOnlyToolCallsBeforeRefusal: 2,
       });
+  });
+
+  it("keeps discovery generous and bounded when the whole-product request envelope is generous", async () => {
+    const { execution, executor, nodeTask, store, userPrompts } = makeCampaignNodeHarness(
+      "",
+      "/tmp/ccc-campaign-generous-request-bounds",
+    );
+    store.getCccCampaignContextForTask.mockResolvedValueOnce({
+      ...(await store.getCccCampaignContextForTask(nodeTask.id)),
+      bounds: { maxRequests: 2_304, maxDurationMs: 21_600_000, maxConcurrency: 3 },
+      requestCount: 0,
+    });
+
+    await (executor as any).runGraphCustomNode(
+      campaignModelNode(execution),
+      nodeTask,
+      await store.getSettings(),
+      undefined,
+      undefined,
+      { task: nodeTask, settings: undefined, context: {}, execution },
+    );
+
+    expect((mockedCreateFnAgent.mock.calls[0]?.[0] as Record<string, any>).cccCampaignPhaseToolPolicy)
+      .toMatchObject({
+        maxReadOnlyToolCallsBeforeGuidance: 96,
+        maxReadOnlyToolCallsBeforeRefusal: 192,
+      });
+    expect(userPrompts[0]).toContain("at most 96 read/search/list discovery tool call");
   });
 
   it("moves the live controller policy to MUTATE only after admitted candidate bytes change", async () => {
@@ -1512,7 +1824,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       outcome: "failure",
-      value: "failed",
+      value: expect.stringMatching(/signal-only.*fn_complete_phase/i),
       contextPatch: {
         "node:ccc-task-implementation:error": expect.stringMatching(/signal-only.*fn_complete_phase/i),
       },
@@ -1649,7 +1961,7 @@ describe("CCC campaign workflow steps never inherit the executor fallback pair",
     expect(verifyCccCampaignReadyCandidateMock).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       outcome: "failure",
-      value: "failed",
+      value: expect.stringMatching(/unchanged pre-existing candidate/i),
       contextPatch: {
         "node:ccc-task-implementation:error": expect.stringMatching(/unchanged pre-existing candidate/i),
       },

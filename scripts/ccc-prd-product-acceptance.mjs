@@ -23,6 +23,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { workItemHasCccPermanentReason } from "./lib/ccc-permanent-reason.mjs";
+
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -126,6 +128,9 @@ const fanTasks = Object.freeze([
     role: "join",
   }),
 ]);
+const fanoutCampaignMaxRequests = fanTasks.length * 4;
+const fanoutCampaignMaxDurationMs = 480_000;
+const fanoutCampaignMaxConcurrency = 2;
 
 const fanoutClauseIdFor = (fanTask) =>
   `AC-${fanTask.requirementId}-001`;
@@ -1719,7 +1724,8 @@ async function initializeTarget(
       `const cutpointToken = ${JSON.stringify(proofCutpointToken)};`,
       `const cutpointMarkerName = ${JSON.stringify(proofCutpointMarkerName)};`,
       "const candidates = Object.fromEntries(process.argv.slice(2).map(candidate => [candidate, fs.readFileSync(candidate, 'utf8').trim()]));",
-      `if (Object.values(candidates).includes(${JSON.stringify(proofCutpointCandidateValue)})) {`,
+      "const semanticProofId = process.env.CCC_PROOF_ID;",
+      `if (semanticProofId === 'PROOF-VERTICAL-VALUE-TASK' && Object.values(candidates).includes(${JSON.stringify(proofCutpointCandidateValue)})) {`,
       "  const home = process.env.HOME;",
       "  if (!home) {",
       "    console.error('PROOF_CUTPOINT_HOME_MISSING');",
@@ -1742,11 +1748,13 @@ async function initializeTarget(
       "  console.log('PROOF_CUTPOINT_READY');",
       "  setInterval(() => {}, 1000);",
       "} else {",
-      "  const proofId = process.env.CCC_PROOF_ID;",
+      "  const localProofId = ({ 'src/value.txt': 'PROOF-VERTICAL-VALUE-TASK', 'src/second.txt': 'PROOF-VERTICAL-SECOND-TASK', 'src/second.txt,src/value.txt': 'PROOF-VERTICAL-INTEGRATED' })[Object.keys(candidates).sort().join(',')];",
+      "  const proofId = semanticProofId || localProofId;",
+      `  const acceptedValue = candidates['src/value.txt'] === 'good' || (!semanticProofId && candidates['src/value.txt'] === ${JSON.stringify(proofCutpointCandidateValue)});`,
       "  const definitions = {",
       "    'PROOF-VERTICAL-INTEGRATED': {",
-      "      clauses: { 'AC-REQ-VERTICAL-001': candidates['src/value.txt'] === 'good', 'AC-REQ-VERTICAL-SECOND-001': candidates['src/second.txt'] === 'second-good' },",
-      "      cases: { 'CASE-VERTICAL-INTEGRATED': candidates['src/value.txt'] === 'good' && candidates['src/second.txt'] === 'second-good' },",
+      "      clauses: { 'AC-REQ-VERTICAL-001': acceptedValue, 'AC-REQ-VERTICAL-SECOND-001': candidates['src/second.txt'] === 'second-good' },",
+      "      cases: { 'CASE-VERTICAL-INTEGRATED': acceptedValue && candidates['src/second.txt'] === 'second-good' },",
       "      controls: { 'CONTROL-VERTICAL-INTEGRATED': 'bad' !== 'good' && 'pending' !== 'second-good' },",
       "    },",
       "    'PROOF-VERTICAL-SECOND-TASK': {",
@@ -1755,8 +1763,8 @@ async function initializeTarget(
       "      controls: { 'CONTROL-VERTICAL-PENDING': 'pending' !== 'second-good' },",
       "    },",
       "    'PROOF-VERTICAL-VALUE-TASK': {",
-      "      clauses: { 'AC-REQ-VERTICAL-001': candidates['src/value.txt'] === 'good' },",
-      "      cases: { 'CASE-VERTICAL-VALUE': candidates['src/value.txt'] === 'good' },",
+      "      clauses: { 'AC-REQ-VERTICAL-001': acceptedValue },",
+      "      cases: { 'CASE-VERTICAL-VALUE': acceptedValue },",
       "      controls: { 'CONTROL-VERTICAL-BAD': 'bad' !== 'good' },",
       "    },",
       "  };",
@@ -1798,7 +1806,18 @@ async function initializeTarget(
         files: fanTasks.map(({ file, value }) => ({ file, value })),
       })};`,
       "const candidates = Object.fromEntries(process.argv.slice(2).map(candidate => [candidate, fs.readFileSync(candidate, 'utf8').trim()]));",
-      "const proofId = process.env.CCC_PROOF_ID;",
+      `const localProofIds = ${JSON.stringify({
+        ...Object.fromEntries(
+          fanTasks.map((fanTask) => [
+            fanTask.file,
+            fanoutTaskProofIdFor(fanTask),
+          ]),
+        ),
+        [fanTasks.map(({ file }) => file).sort().join(",")]: "PROOF-FANOUT-INTEGRATED",
+      })};`,
+      "const semanticProofId = process.env.CCC_PROOF_ID;",
+      "const localProofId = localProofIds[Object.keys(candidates).sort().join(',')];",
+      "const proofId = semanticProofId || localProofId;",
       "const definition = proofId === 'PROOF-FANOUT-INTEGRATED' ? integrated : expectations[proofId];",
       "if (!definition) { console.error(`UNKNOWN_PROOF:${proofId}`); process.exit(3); }",
       "const filePassed = Object.fromEntries(definition.files.map(({ file, value }) => [file, candidates[file] === value]));",
@@ -2659,8 +2678,8 @@ async function createFanoutPacket(
   await writeFile(prdSourcePath, prd);
   await writeFile(supportSourcePath, support);
 
-  const maxRequests = String(fanTasks.length);
-  const maxDurationMs = "240000";
+  const maxRequests = String(fanoutCampaignMaxRequests);
+  const maxDurationMs = String(fanoutCampaignMaxDurationMs);
   const frozen = jsonOutput(
     await run(
       process.execPath,
@@ -2684,7 +2703,7 @@ async function createFanoutPacket(
         "--max-duration-ms",
         maxDurationMs,
         "--max-concurrency",
-        "1",
+        String(fanoutCampaignMaxConcurrency),
       ],
       { cwd: targetRoot, env },
     ),
@@ -2732,7 +2751,7 @@ async function createFanoutPacket(
     ),
     contextRef(`- Maximum requests: ${maxRequests}`),
     contextRef(`- Maximum duration in milliseconds: ${maxDurationMs}`),
-    contextRef("- Maximum concurrency: 1"),
+    contextRef(`- Maximum concurrency: ${fanoutCampaignMaxConcurrency}`),
   ];
   const requirementLineByTaskId = new Map(
     fanTasks.map((fanTask, index) => [fanTask.taskId, requirementLines[index]]),
@@ -2941,11 +2960,12 @@ async function createFanoutPacket(
       },
     ],
     bounds: {
-      // One dispatch per task; the audit history bound is (maxRequests * 3) + 1
-      // rows, so four is the smallest budget that admits the diamond.
+      // Four provider tasks need an eight-request structural floor. Keep a
+      // second full floor of headroom so the fixture exercises the product's
+      // generous-envelope policy rather than balancing on minimum admission.
       maxRequests: Number(maxRequests),
       maxDurationMs: Number(maxDurationMs),
-      maxConcurrency: 1,
+      maxConcurrency: fanoutCampaignMaxConcurrency,
     },
     admittedWriteRoots: [
       {
@@ -3286,32 +3306,45 @@ async function cleanupOwnedCutpointProcess(marker, fakeCodexPath) {
   }
 }
 
-async function readOwnedProofCutpointMarkers(token) {
+async function readOwnedProofCutpointMarkers(token, proofExecutionTmpRoot = tmpdir()) {
   if (!token) return [];
-  const canonicalTmp = await realpath(tmpdir());
-  const scratchEntries = await readdir(canonicalTmp, { withFileTypes: true });
+  const canonicalTmp = await realpath(proofExecutionTmpRoot);
+  const executionEntries = await readdir(canonicalTmp, { withFileTypes: true });
   const markers = [];
-  for (const executionEntry of scratchEntries) {
+  for (const executionEntry of executionEntries) {
     if (
       !executionEntry.isDirectory()
       || !executionEntry.name.startsWith("ccc-semantic-proof-execution-")
     ) {
       continue;
     }
-    const executionRoot = path.join(canonicalTmp, executionEntry.name);
-    const proofRoot = path.join(executionRoot, "proof");
-    const scratchRoot = path.join(executionRoot, "scratch");
-    const home = path.join(scratchRoot, "home");
-    const markerPath = path.join(home, proofCutpointMarkerName);
-    if (!await pathExists(markerPath)) continue;
+    const executionRoot = await realpath(
+      path.join(canonicalTmp, executionEntry.name),
+    );
+    if (path.dirname(executionRoot) !== canonicalTmp) continue;
+    const proofRoot = await realpath(path.join(executionRoot, "proof"))
+      .catch(() => undefined);
+    const scratchRoot = await realpath(path.join(executionRoot, "scratch"))
+      .catch(() => undefined);
+    if (!proofRoot || !scratchRoot || path.basename(proofRoot) !== "proof") {
+      continue;
+    }
+    const verifierHome = await realpath(path.join(scratchRoot, "home"))
+      .catch(() => undefined);
+    if (!verifierHome || path.dirname(verifierHome) !== scratchRoot) continue;
+    const markerPath = path.join(verifierHome, proofCutpointMarkerName);
+    const markerMetadata = await lstat(markerPath).catch(() => undefined);
+    if (!markerMetadata?.isFile() || markerMetadata.isSymbolicLink()) continue;
     const marker = JSON.parse(await readFile(markerPath, "utf8"));
-    if (marker?.token !== token) continue;
+    if (marker?.token !== token || typeof marker.cwd !== "string") continue;
+    const markerProofRoot = await realpath(marker.cwd).catch(() => undefined);
+    if (markerProofRoot !== proofRoot) continue;
     markers.push(Object.freeze({
       ...marker,
       executionRoot,
       proofRoot,
       scratchRoot,
-      home,
+      verifierHome,
       markerPath,
     }));
   }
@@ -3334,7 +3367,8 @@ async function terminateOwnedProofCutpointProcess(
       && await realpath(marker.proofRoot) === expectedProofRoot
       && path.dirname(expectedProofRoot) === marker.executionRoot
       && marker.scratchRoot === path.join(marker.executionRoot, "scratch")
-      && marker.home === path.join(marker.scratchRoot, "home"),
+      && marker.verifierHome === path.dirname(marker.markerPath)
+      && path.dirname(marker.verifierHome) === marker.scratchRoot,
     "CCC_PRODUCT_PROOF_CUTPOINT_MARKER_INVALID",
     JSON.stringify({ marker, expectedProofRoot }),
   );
@@ -3367,19 +3401,16 @@ async function terminateOwnedProofCutpointProcess(
   return inspected.stdout.trim();
 }
 
-async function cleanupOwnedProofCutpointMarkers(token) {
-  const markers = await readOwnedProofCutpointMarkers(token);
-  const removableExecutionRoots = new Set();
+async function cleanupOwnedProofCutpointMarkers(token, proofExecutionTmpRoot = tmpdir()) {
+  const canonicalTmp = await realpath(proofExecutionTmpRoot);
+  const markers = await readOwnedProofCutpointMarkers(token, canonicalTmp);
   for (const marker of markers) {
     const inspected = await run(
       "/bin/ps",
       ["-p", String(marker.pid), "-o", "command="],
       { allowedExitCodes: [0, 1] },
     );
-    if (inspected.code === 1) {
-      removableExecutionRoots.add(marker.executionRoot);
-      continue;
-    }
+    if (inspected.code === 1) continue;
     const expectedTitle = `cccp-${token.slice(0, 8)}`;
     if (
       marker.processTitle === expectedTitle
@@ -3400,49 +3431,48 @@ async function cleanupOwnedProofCutpointMarkers(token) {
         undefined,
         shutdownTimeoutMs,
       );
-      removableExecutionRoots.add(marker.executionRoot);
     }
   }
-  for (const executionRoot of removableExecutionRoots) {
-    const canonicalTmp = await realpath(tmpdir());
-    const canonicalExecutionRoot = await realpath(executionRoot);
+}
+
+async function cleanupOwnedProofExecutionTmpRoot(proofExecutionTmpRoot) {
+  if (!proofExecutionTmpRoot) return;
+  const canonicalShortTmpParent = await realpath("/tmp");
+  const canonicalRoot = await realpath(proofExecutionTmpRoot).catch(() => undefined);
+  if (!canonicalRoot) return;
+  if (
+    path.dirname(canonicalRoot) !== canonicalShortTmpParent
+    || !path.basename(canonicalRoot).startsWith("ccc-prd-proof-")
+  ) {
+    throw new Error(`CCC_PRODUCT_PROOF_TMP_CLEANUP_ROOT_REFUSED: ${canonicalRoot}`);
+  }
+  const makeWriteable = async (ownedPath) => {
+    const fromRoot = path.relative(canonicalRoot, ownedPath);
     if (
-      path.dirname(canonicalExecutionRoot) !== canonicalTmp
-      || !path.basename(canonicalExecutionRoot)
-        .startsWith("ccc-semantic-proof-execution-")
+      fromRoot === ".."
+      || fromRoot.startsWith(`..${path.sep}`)
+      || path.isAbsolute(fromRoot)
     ) {
-      throw new Error(
-        `CCC_PRODUCT_PROOF_CLEANUP_ROOT_REFUSED: ${canonicalExecutionRoot}`,
-      );
+      throw new Error(`CCC_PRODUCT_PROOF_TMP_CLEANUP_ESCAPE: ${ownedPath}`);
     }
-    const makeWriteable = async (ownedPath) => {
-      const fromRoot = path.relative(canonicalExecutionRoot, ownedPath);
-      if (
-        fromRoot === ".."
-        || fromRoot.startsWith(`..${path.sep}`)
-        || path.isAbsolute(fromRoot)
-      ) {
-        throw new Error(`CCC_PRODUCT_PROOF_CLEANUP_ESCAPE: ${ownedPath}`);
-      }
-      const metadata = await lstat(ownedPath).catch(() => undefined);
-      if (!metadata) return;
-      if (metadata.isSymbolicLink()) {
-        await unlink(ownedPath);
-        return;
-      }
-      if (!metadata.isDirectory()) {
-        await chmod(ownedPath, 0o600);
-        return;
-      }
-      await chmod(ownedPath, 0o700);
-      const entries = await readdir(ownedPath, { withFileTypes: true });
-      await Promise.all(entries.map((entry) => (
-        makeWriteable(path.join(ownedPath, entry.name))
-      )));
-    };
-    await makeWriteable(canonicalExecutionRoot);
-    await rm(canonicalExecutionRoot, { recursive: true, force: true });
-  }
+    const metadata = await lstat(ownedPath).catch(() => undefined);
+    if (!metadata) return;
+    if (metadata.isSymbolicLink()) {
+      await unlink(ownedPath);
+      return;
+    }
+    if (!metadata.isDirectory()) {
+      await chmod(ownedPath, 0o600);
+      return;
+    }
+    await chmod(ownedPath, 0o700);
+    const entries = await readdir(ownedPath, { withFileTypes: true });
+    await Promise.all(entries.map((entry) => (
+      makeWriteable(path.join(ownedPath, entry.name))
+    )));
+  };
+  await makeWriteable(canonicalRoot);
+  await rm(canonicalRoot, { recursive: true, force: true });
 }
 
 async function main() {
@@ -3455,6 +3485,7 @@ async function main() {
   let ownedCutpointMarker;
   let ownedFakeCodexPath;
   let ownedProofCutpointToken;
+  let proofExecutionTmpRoot;
   let landingCommand;
   let landingCutpoint;
   let repositoryStart;
@@ -3474,9 +3505,14 @@ async function main() {
     );
     const fakeBin = path.join(tempRoot, "fake-bin");
     const worktreesRoot = path.join(tempRoot, "worktrees");
+    const shortProofTmpParent = await realpath("/tmp");
+    proofExecutionTmpRoot = await realpath(
+      await mkdtemp(path.join(shortProofTmpParent, "ccc-prd-proof-")),
+    );
     await writeFakeCodex(fakeBin);
     ownedFakeCodexPath = path.join(fakeBin, "codex");
     const env = cleanEnvironment(isolatedHome, fakeBin);
+    const serveEnv = Object.freeze({ ...env, TMPDIR: proofExecutionTmpRoot });
     const providerCutpointActivation = path.join(
       fakeBin,
       "provider-cutpoint.activate",
@@ -3651,8 +3687,10 @@ async function main() {
           const pending = issuedFor(value);
           return value.status?.workItems?.length === 1
             && value.status.workItems[0]?.state === "manual-required"
-            && value.status.workItems[0]?.lastError
-              === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED"
+            && workItemHasCccPermanentReason(
+              value.status.workItems[0],
+              "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+            )
             && Boolean(pending)
             && value.status.executionAuthorizationMode === "sealed_bundle_v1"
             && value.status.executionAuthorization?.members?.length
@@ -4741,7 +4779,7 @@ async function main() {
     );
 
     const port = await availablePort();
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
 
     const preview = jsonOutput(
       await prd(["preview", ...commonPacketArgs]),
@@ -4969,7 +5007,7 @@ async function main() {
     );
     const readProviderCutpointStatus = async () =>
       readStatusFor(providerCutpointKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const providerAuthorizationHold = await awaitSealedExecutionAuthorization(
       "provider cutpoint execution approval",
       readProviderCutpointStatus,
@@ -5039,7 +5077,7 @@ async function main() {
       [providerMarker.pid],
       "CCC_PRODUCT_PROVIDER_CUTPOINT_INVOCATION_DRIFT",
     );
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const recoveredProviderCutpoint = await poll(
       "provider uncertainty parked after restart",
       readProviderCutpointStatus,
@@ -5170,7 +5208,7 @@ async function main() {
     );
     const readProofCutpointStatus = async () =>
       readStatusFor(proofCutpointKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const proofAuthorizationHold = await awaitSealedExecutionAuthorization(
       "proof cutpoint execution approval",
       readProofCutpointStatus,
@@ -5196,12 +5234,15 @@ async function main() {
     );
     const proofMarkersAtDispatch = await poll(
       "verifier process reached post-dispatch cutpoint",
-      () => readOwnedProofCutpointMarkers(proofCutpointToken),
+      () => readOwnedProofCutpointMarkers(proofCutpointToken, proofExecutionTmpRoot),
       (markers) => markers.length === 1,
       async () => ({
         serve: tail(server.output()),
         status: await readProofCutpointStatus(),
-        markers: await readOwnedProofCutpointMarkers(proofCutpointToken),
+        markers: await readOwnedProofCutpointMarkers(
+          proofCutpointToken,
+          proofExecutionTmpRoot,
+        ),
       }),
     );
     const proofMarker = proofMarkersAtDispatch[0];
@@ -5211,8 +5252,10 @@ async function main() {
       && path.basename(canonicalProofRoot) === "proof"
       && path.basename(proofMarker.executionRoot)
         .startsWith("ccc-semantic-proof-execution-")
-      && proofMarker.home
-        === path.join(proofMarker.executionRoot, "scratch", "home"),
+      && proofMarker.scratchRoot
+        === path.join(proofMarker.executionRoot, "scratch")
+      && proofMarker.verifierHome
+        === path.join(proofMarker.scratchRoot, "home"),
       "CCC_PRODUCT_PROOF_CUTPOINT_SANDBOX_INVALID",
       JSON.stringify({ proofMarker, canonicalProofRoot }),
     );
@@ -5285,7 +5328,7 @@ async function main() {
         proofCutpointToken,
         canonicalProofRoot,
       );
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     const recoveredProofCutpoint = await poll(
       "proof uncertainty parked after restart",
       readProofCutpointStatus,
@@ -5326,7 +5369,10 @@ async function main() {
     );
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     exactArray(
-      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+      (await readOwnedProofCutpointMarkers(
+        proofCutpointToken,
+        proofExecutionTmpRoot,
+      ))
         .map(({ pid }) => pid),
       [proofMarker.pid],
       "CCC_PRODUCT_PROOF_EFFECT_RETRIED_AFTER_RESTART",
@@ -5426,7 +5472,10 @@ async function main() {
       JSON.stringify(proofStopped),
     );
     exactArray(
-      (await readOwnedProofCutpointMarkers(proofCutpointToken))
+      (await readOwnedProofCutpointMarkers(
+        proofCutpointToken,
+        proofExecutionTmpRoot,
+      ))
         .map(({ pid }) => pid),
       [proofMarker.pid],
       "CCC_PRODUCT_PROOF_EFFECT_RERUN_DURING_REFUSAL",
@@ -5469,7 +5518,7 @@ async function main() {
     await stopServe(server);
     server = undefined;
     await rm(proofCutpointActivation, { force: true });
-    await cleanupOwnedProofCutpointMarkers(proofCutpointToken);
+    await cleanupOwnedProofCutpointMarkers(proofCutpointToken, proofExecutionTmpRoot);
     ownedProofCutpointToken = undefined;
 
     const imported = jsonOutput(
@@ -5496,7 +5545,7 @@ async function main() {
     });
 
     const readStatus = async () => readStatusFor(idempotencyKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     assert(
       (
         importedServer.child.exitCode !== null
@@ -5587,8 +5636,10 @@ async function main() {
     assert(
       liveHold.status.workItems.length === 1
       && liveHold.status.workItems[0].state === "manual-required"
-      && liveHold.status.workItems[0].lastError
-        === "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      && workItemHasCccPermanentReason(
+        liveHold.status.workItems[0],
+        "CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      ),
       "CCC_PRODUCT_LIVE_EXECUTION_HOLD_INVALID",
       JSON.stringify(liveHold.status.workItems),
     );
@@ -6155,8 +6206,10 @@ async function main() {
     };
     assert(
       mergeHold.status.workItems[0].state === "manual-required"
-      && mergeHold.status.workItems[0].lastError
-        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && workItemHasCccPermanentReason(
+        mergeHold.status.workItems[0],
+        "CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      )
       && mergeConfirmation
       && /^[0-9a-f]{64}$/.test(mergeConfirmation.confirmation)
       && mergeApproval?.campaign?.binding?.actionTarget === "refs/heads/main"
@@ -6325,8 +6378,10 @@ async function main() {
     );
     assert(
       interruptedLanding.status.workItems[0]?.state === "manual-required"
-      && interruptedLanding.status.workItems[0]?.lastError
-        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && workItemHasCccPermanentReason(
+        interruptedLanding.status.workItems[0],
+        "CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      )
       && interruptedApproval?.status === "claimed"
       && interruptedLanding.status.landing.intents.length === 1
       && interruptedLanding.status.landing.materializations.length === 1
@@ -6350,7 +6405,7 @@ async function main() {
     const landingServerBeforeRestart = server;
     await stopServe(landingServerBeforeRestart);
     server = undefined;
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
     assert(
       landingServerBeforeRestart.child.pid !== server.child.pid,
       "CCC_PRODUCT_GIT_LANDING_RESTART_PROCESS_INVALID",
@@ -6515,7 +6570,7 @@ async function main() {
 
     await stopServe(server);
     server = undefined;
-    restartedServer = await startServe(targetRoot, env, port);
+    restartedServer = await startServe(targetRoot, serveEnv, port);
     const recovered = await poll(
       "terminal status after restart",
       readStatus,
@@ -6621,11 +6676,11 @@ async function main() {
         // and must byte-match the proposal's bounds (authoring refuses with
         // CCC_PRD_AUTHORING_BOUNDS_DRIFT otherwise).
         "--max-requests",
-        "4",
+        String(fanoutCampaignMaxRequests),
         "--max-duration-ms",
-        "240000",
+        String(fanoutCampaignMaxDurationMs),
         "--max-concurrency",
-        "1",
+        String(fanoutCampaignMaxConcurrency),
         "--max-prompt-bytes",
         "262144",
         "--max-response-bytes",
@@ -6698,10 +6753,9 @@ async function main() {
     authoringServer = undefined;
 
     // Authoring configuration rewrote the isolated HOME settings file, and the
-    // diamond needs capacity for four simultaneous custody worktrees, so the
-    // settings are re-imported before the lane's serve. maxConcurrent stays at
-    // 1: the fan-out proof is about graph shape and join ancestry, not about
-    // parallel scheduling.
+    // diamond needs capacity for four simultaneous custody worktrees plus two
+    // simultaneous branch provider attempts, so the settings are re-imported
+    // before the lane's serve with the admitted branch width.
     const fanoutSettingsPath = path.join(fanoutPacketRoot, "settings.json");
     await writeFile(fanoutSettingsPath, `${JSON.stringify({
       version: 2,
@@ -6712,7 +6766,7 @@ async function main() {
         experimentalFeatures: { cliAgentExecutor: true },
       },
       project: {
-        maxConcurrent: 1,
+        maxConcurrent: fanoutCampaignMaxConcurrency,
         maxWorktrees: 8,
         pollIntervalMs: 500,
         worktreesDir: worktreesRoot,
@@ -6871,7 +6925,7 @@ async function main() {
     });
 
     const readFanoutStatus = async () => readStatusFor(fanoutKey);
-    server = await startServe(targetRoot, env, port);
+    server = await startServe(targetRoot, serveEnv, port);
 
     // One parent decision seals all four exact fan-out members. Every child ID
     // remains diagnostic only and is independently refused by the CLI.
@@ -7308,8 +7362,10 @@ async function main() {
     assert(
       fanoutMergeHold.status.workItems.length === 1
       && fanoutMergeHold.status.workItems[0].state === "manual-required"
-      && fanoutMergeHold.status.workItems[0].lastError
-        === "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED"
+      && workItemHasCccPermanentReason(
+        fanoutMergeHold.status.workItems[0],
+        "CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      )
       && fanoutMergeConfirmation
       && fanoutMergeApproval?.campaign?.binding?.actionTarget
         === "refs/heads/main"
@@ -7468,7 +7524,10 @@ async function main() {
     ).catch(() => undefined);
     await cleanupOwnedProofCutpointMarkers(
       ownedProofCutpointToken,
+      proofExecutionTmpRoot,
     ).catch(() => undefined);
+    await cleanupOwnedProofExecutionTmpRoot(proofExecutionTmpRoot)
+      .catch(() => undefined);
     if (tempRoot && process.env.CCC_PRD_PRODUCT_KEEP_TMP !== "1") {
       await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
     }

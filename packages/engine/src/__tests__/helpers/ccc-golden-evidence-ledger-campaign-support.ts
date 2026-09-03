@@ -98,9 +98,10 @@ export async function waitForDurableProductBoundary(
 export async function runProductCommand(
   args: string[],
   dependencies: PrdCommandDependencies,
+  runPrdCommandImpl: typeof runPrdCommand = runPrdCommand,
 ): Promise<CommandResult> {
   const output: string[] = [];
-  const exitCode = await runPrdCommand(
+  const exitCode = await runPrdCommandImpl(
     [...args, "--json"],
     { write: (line) => output.push(line) },
     dependencies,

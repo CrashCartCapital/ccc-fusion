@@ -91,6 +91,126 @@ describe("CCC semantic-proof sandbox", () => {
     expect(profile).toContain(realpathSync(engineRepository));
   });
 
+  it("RED-G2-node-loopback-profile: grants only one controller-selected IPv4 loopback port", async () => {
+    const root = await fixtureRoot();
+    const proofRoot = join(root, "proof");
+    const scratchRoot = join(root, "scratch");
+    const deniedRoot = join(root, "denied-repository");
+    await Promise.all([mkdir(proofRoot), mkdir(scratchRoot), mkdir(deniedRoot)]);
+
+    const profile = await buildCccSemanticProofDarwinProfile({
+      proofRoot,
+      scratchRoot,
+      taskExecutable: "/opt/homebrew/bin/task",
+      nodeExecutable: process.execPath,
+      deniedReadRoots: [deniedRoot],
+      loopbackPort: 43_219,
+    } as never);
+
+    expect(profile).toContain("(deny network*)");
+    expect(profile).toContain('(allow network-bind (local tcp "localhost:43219"))');
+    expect(profile).toContain('(allow network-inbound (local tcp "localhost:43219"))');
+    expect(profile).toContain('(allow network-outbound (remote tcp "localhost:43219"))');
+    expect(profile).toContain("(allow signal (target children))");
+    expect(profile).not.toContain('localhost:43220');
+    expect(profile.split("\n")).not.toContain("(allow network-outbound)");
+
+    await expect(buildCccSemanticProofDarwinProfile({
+      proofRoot,
+      scratchRoot,
+      taskExecutable: "/opt/homebrew/bin/task",
+      nodeExecutable: process.execPath,
+      deniedReadRoots: [deniedRoot],
+      loopbackPort: 4_040,
+    } as never)).rejects.toThrow(/loopback.*4040|4040.*reserved/iu);
+  });
+
+  it.skipIf(process.platform !== "darwin")(
+    "RED-G2-node-loopback-profile: injects its controller port and permits a self-contained loopback exchange",
+    async () => {
+      const root = await fixtureRoot();
+      const proofRoot = join(root, "proof");
+      const scratchRoot = join(root, "scratch");
+      const deniedRoot = join(root, "denied-repository");
+      await Promise.all([mkdir(proofRoot), mkdir(scratchRoot), mkdir(deniedRoot)]);
+      const reservation = createServer();
+      await new Promise<void>((resolve, reject) => {
+        reservation.once("error", reject);
+        reservation.listen(0, "127.0.0.1", resolve);
+      });
+      const address = reservation.address();
+      if (!address || typeof address === "string") throw new Error("loopback fixture did not reserve a port");
+      const loopbackPort = address.port;
+      await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+      await writeFile(join(proofRoot, "loopback.mjs"), [
+        'import { spawn } from "node:child_process";',
+        'import { createConnection, createServer } from "node:net";',
+        'const port = Number(process.env.CCC_PROOF_LOOPBACK_PORT);',
+        'if (!Number.isSafeInteger(port) || port <= 0) throw new Error("missing controller loopback port");',
+        'const server = createServer((socket) => socket.end("ok"));',
+        'await new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", resolve); });',
+        'const received = await new Promise((resolve, reject) => {',
+        '  const socket = createConnection(port, "127.0.0.1");',
+        '  let text = "";',
+        '  socket.on("data", (chunk) => { text += String(chunk); });',
+        '  socket.once("end", () => resolve(text));',
+        '  socket.once("error", reject);',
+        '});',
+        'await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));',
+        'const adjacent = createServer();',
+        'const adjacentPort = port === 65535 ? port - 1 : port + 1;',
+        'const adjacentResult = await new Promise((resolve) => {',
+        '  adjacent.once("error", (error) => resolve(error.code ?? "ERROR"));',
+        '  adjacent.listen(adjacentPort, "127.0.0.1", () => adjacent.close(() => resolve("ALLOWED")));',
+        '});',
+        'const childSource = "const {createServer}=require(\\"node:net\\");const server=createServer((socket)=>socket.end(\\"child-ok\\"));server.listen(Number(process.env.PORT),\\"127.0.0.1\\",()=>process.stdout.write(\\"ready\\\\n\\"));";',
+        'const child = spawn(process.execPath, ["-e", childSource], { env: { ...process.env, PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });',
+        'await new Promise((resolve, reject) => { child.stdout.once("data", resolve); child.once("exit", (code, signal) => reject(new Error(`child server exited before ready: ${code}/${signal}`))); });',
+        'const childReceived = await new Promise((resolve, reject) => {',
+        '  const socket = createConnection(port, "127.0.0.1");',
+        '  let text = "";',
+        '  socket.on("data", (chunk) => { text += String(chunk); });',
+        '  socket.once("end", () => resolve(text));',
+        '  socket.once("error", reject);',
+        '});',
+        'const signalSent = child.kill("SIGTERM");',
+        'const childSignal = await new Promise((resolve) => child.once("exit", (_code, signal) => resolve(signal)));',
+        'process.stdout.write(JSON.stringify({ port, received, adjacentResult, childReceived, signalSent, childSignal }));',
+      ].join("\n"));
+      await writeFile(join(proofRoot, "Taskfile.yml"), [
+        "version: '3'",
+        "tasks:",
+        "  loopback:",
+        "    cmds:",
+        "      - node loopback.mjs",
+        "",
+      ].join("\n"));
+
+      const result = await runCccSemanticProofSandboxedProcess({
+        proofRoot,
+        scratchRoot,
+        taskExecutable: "/opt/homebrew/bin/task",
+        nodeExecutable: process.execPath,
+        deniedReadRoots: [deniedRoot],
+        loopbackPort,
+        executable: "/opt/homebrew/bin/task",
+        args: ["loopback"],
+        timeoutMs: 10_000,
+        maxOutputBytes: 16_384,
+      } as never);
+
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        port: loopbackPort,
+        received: "ok",
+        adjacentResult: "EPERM",
+        childReceived: "child-ok",
+        signalSent: true,
+        childSignal: "SIGTERM",
+      });
+    },
+  );
+
   it.skipIf(process.platform !== "darwin")(
     "RED-S5-darwin-proof-sandbox: functionally denies original-repository reads and proof-root writes",
     async () => {
@@ -212,10 +332,12 @@ describe("CCC semantic-proof sandbox", () => {
         "  sourceCommit: process.env.CCC_PROOF_SOURCE_COMMIT,",
         "  sourceTree: process.env.CCC_PROOF_SOURCE_TREE,",
         "  ambientSecret: process.env.CCC_AMBIENT_SECRET,",
+        "  ambientLoopbackPort: process.env.CCC_PROOF_LOOPBACK_PORT,",
         "}));",
       ].join("\n"));
       await chmod(proofRoot, 0o555);
       process.env.CCC_AMBIENT_SECRET = "must-not-leak";
+      process.env.CCC_PROOF_LOOPBACK_PORT = "54321";
       try {
         const result = await runCccSemanticProofSandboxedProcess({
           proofRoot,
@@ -242,6 +364,7 @@ describe("CCC semantic-proof sandbox", () => {
         });
       } finally {
         delete process.env.CCC_AMBIENT_SECRET;
+        delete process.env.CCC_PROOF_LOOPBACK_PORT;
       }
     },
   );

@@ -25,7 +25,7 @@ async function fixture(value = "ready") {
   await git(root, "config", "user.email", "fusion@test.invalid");
   await mkdir(join(root, "src"));
   await writeFile(join(root, "src", "value.txt"), "base\n");
-  await writeFile(join(root, ".gitignore"), "ignored-foreign/\nnode_modules/\n");
+  await writeFile(join(root, ".gitignore"), "ignored-foreign/\nnode_modules/\ndata/\n");
   await writeFile(
     join(root, "Taskfile.yml"),
     [
@@ -34,10 +34,25 @@ async function fixture(value = "ready") {
       "  verify:ready:",
       "    cmds:",
       "      - node -e \"const fs=require('fs'); if(fs.readFileSync('src/value.txt','utf8').trim()!=='ready') process.exit(1); fs.writeFileSync('verifier-side-effect.txt','verified')\"",
+      "  verify:loopback:",
+      "    cmds:",
+      "      - node verify-loopback.cjs",
       "",
     ].join("\n"),
   );
-  await git(root, "add", ".gitignore", "Taskfile.yml", "src/value.txt");
+  await writeFile(
+    join(root, "verify-loopback.cjs"),
+    [
+      "const { spawn } = require('node:child_process');",
+      "const port = Number(process.env.CCC_PROOF_LOOPBACK_PORT);",
+      "if (!Number.isSafeInteger(port) || port <= 0 || port === 4040) process.exit(21);",
+      "const source = `const net=require('node:net');const port=Number(process.env.CCC_PROOF_LOOPBACK_PORT);const server=net.createServer((socket)=>socket.end('ok'));server.listen(port,'127.0.0.1',()=>server.close(()=>process.exit(0)));`;",
+      "const child = spawn(process.execPath, ['-e', source], { env: process.env, stdio: 'inherit' });",
+      "child.on('exit', (code, signal) => process.exit(code ?? (signal ? 22 : 1)));",
+      "",
+    ].join("\n"),
+  );
+  await git(root, "add", ".gitignore", "Taskfile.yml", "src/value.txt", "verify-loopback.cjs");
   await git(root, "commit", "-m", "base");
   const baseCommit = await git(root, "rev-parse", "HEAD");
   await writeFile(join(root, "src", "value.txt"), `${value}\n`);
@@ -236,6 +251,27 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
 
     expect(result).toMatchObject({ ready: false });
     expect(result.summary).toMatch(/controller-initialized ignored paths changed/i);
+    expect(result.summary).toContain("content or metadata changed under ignored roots: node_modules");
+  });
+
+  it("names a newly added ignored runtime root in the custody refusal", async () => {
+    const { root, campaign } = await fixture();
+    const trustedIgnoredBaseline = await readyModule.snapshotCccCampaignIgnoredBaseline({
+      worktreePath: root,
+    });
+    await mkdir(join(root, "data"));
+    await writeFile(join(root, "data", "events.jsonl"), "runtime residue\n");
+
+    const result = await (readyModule as any).verifyCccCampaignReadyCandidate({
+      taskId: campaign.taskId,
+      worktreePath: root,
+      campaign,
+      timeoutMs: 30_000,
+      trustedIgnoredBaseline,
+    });
+
+    expect(result).toMatchObject({ ready: false });
+    expect(result.summary).toContain("added ignored roots: data");
   });
 
   it("refuses content drift in an existing controller-initialized ignored file", async () => {
@@ -258,6 +294,7 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
 
     expect(result).toMatchObject({ ready: false });
     expect(result.summary).toMatch(/controller-initialized ignored paths changed/i);
+    expect(result.summary).toContain("content or metadata changed under ignored roots: node_modules");
   });
 
   it("write_envelope_snapshot separates admitted and foreign candidate paths", async () => {
@@ -318,6 +355,32 @@ describeIfTools("CCC campaign readiness shadow verifier", () => {
 
     expect(result).toMatchObject({ ready: false });
     expect(result.summary).toMatch(/verify:ready|exit 1/i);
+  });
+
+  it.runIf(process.platform === "darwin")("runs task-phase node-loopback proof with a controller-selected exact port", async () => {
+    const { root, campaign } = await fixture();
+    campaign.proofIds = ["PROOF-LOOPBACK"];
+    campaign.proofs = [{
+      ...campaign.proofs[0]!,
+      schema: "ccc-prd.proof.v2",
+      id: "PROOF-LOOPBACK",
+      command: "task verify:loopback",
+      phases: ["task"],
+      verifierProfile: { schema: "ccc-prd.verifier.node-loopback.v1" },
+    } as any];
+    const verifyCandidate = (readyModule as any).verifyCccCampaignReadyCandidate;
+
+    const result = await verifyCandidate({
+      taskId: campaign.taskId,
+      worktreePath: root,
+      campaign,
+      timeoutMs: 30_000,
+    });
+
+    expect(result).toMatchObject({
+      ready: true,
+      summary: expect.stringContaining("task verify:loopback"),
+    });
   });
 
   it("fails closed when a legacy route has no allowed write roots", async () => {

@@ -139,6 +139,31 @@ describe("CCC provider-neutral phase decisions", () => {
     expect(decision.action).toBe("PROMPT_MUTATION_CONTINUATION");
   });
 
+  it("keeps an explicit three-continuation DISCOVER budget bounded", () => {
+    expect(decideCccPhaseTransition({
+      ...base,
+      phase: "DISCOVER",
+      hasConfirmedMutation: false,
+      discoverContinuations: 2,
+      maxDiscoverContinuations: 3,
+    })).toMatchObject({
+      phase: "DISCOVER",
+      action: "PROMPT_MUTATION_CONTINUATION",
+    });
+
+    expect(decideCccPhaseTransition({
+      ...base,
+      phase: "DISCOVER",
+      hasConfirmedMutation: false,
+      discoverContinuations: 3,
+      maxDiscoverContinuations: 3,
+    })).toMatchObject({
+      phase: "TERMINAL_FAILURE",
+      action: "FAIL_TERMINAL",
+      failureReason: expect.stringMatching(/3 bounded DISCOVER continuations/i),
+    });
+  });
+
   it("routes the first failed controller VERIFY to the one allowed REPAIR", () => {
     const decision = decideCccPhaseTransition({
       ...base,
@@ -194,6 +219,22 @@ describe("CCC provider-neutral phase decisions", () => {
       phase: "REPAIR",
       explicitPhaseSignal: true,
       hasConfirmedMutation: true,
+      repairAttempts: 1,
+    } as any);
+
+    expect(decision).toMatchObject({
+      phase: "VERIFY",
+      action: "RUN_CONTROLLER_VERIFICATION",
+    });
+  });
+
+  it("routes a cleanup-only REPAIR with a fresh signal back to controller VERIFY", () => {
+    const decision = decideCccPhaseTransition({
+      ...base,
+      phase: "REPAIR",
+      explicitPhaseSignal: true,
+      hasConfirmedMutation: false,
+      hasConfirmedRepairEffect: true,
       repairAttempts: 1,
     } as any);
 

@@ -11,6 +11,7 @@ import {
   CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_SCHEMA_VERSION,
   CCC_PRD_SIDECAR_V2_SCHEMA_VERSION,
+  CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION,
   CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION,
   canonicalCccPrdJson,
   compareCccPrdCodeUnits,
@@ -450,7 +451,7 @@ function validatePythonExecutionToolchain(
   return valid;
 }
 
-function validatePythonVerifierProfile(
+function validateVerifierProfile(
   label: string,
   value: unknown,
   diagnostics: CccPrdDiagnostic[],
@@ -458,6 +459,10 @@ function validatePythonVerifierProfile(
   if (!isPlainRecord(value)) {
     diagnostics.push(diagnostic("CCC_PRD_PROOF_INVALID", `${label} must be an object`));
     return false;
+  }
+  if (value.schema === CCC_PRD_VERIFIER_NODE_LOOPBACK_V1_SCHEMA_VERSION) {
+    validateExactKeys(label, value, ["schema"], diagnostics);
+    return true;
   }
   validateExactKeys(label, value, ["schema", "adapterPath", "targetPath"], diagnostics);
   const valid = value.schema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
@@ -564,20 +569,29 @@ function validateV2ProofShape(
     valid = false;
   }
   if (proof.verifierProfile !== undefined
-    && !validatePythonVerifierProfile(`${label} verifierProfile`, proof.verifierProfile, diagnostics)) {
+    && !validateVerifierProfile(`${label} verifierProfile`, proof.verifierProfile, diagnostics)) {
     valid = false;
   }
-  if (proof.verifierProfile !== undefined && proof.executionToolchain.python === undefined) {
+  const verifierProfileSchema = isPlainRecord(proof.verifierProfile)
+    ? proof.verifierProfile.schema
+    : undefined;
+  if (
+    verifierProfileSchema === CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
+    && proof.executionToolchain.python === undefined
+  ) {
     diagnostics.push(diagnostic(
       "CCC_PRD_PROOF_INVALID",
       `${label} Python verifierProfile requires executionToolchain.python`,
     ));
     valid = false;
   }
-  if (proof.verifierProfile === undefined && proof.executionToolchain.python !== undefined) {
+  if (
+    verifierProfileSchema !== CCC_PRD_VERIFIER_PYTHON_ADAPTER_V1_SCHEMA_VERSION
+    && proof.executionToolchain.python !== undefined
+  ) {
     diagnostics.push(diagnostic(
       "CCC_PRD_PROOF_INVALID",
-      `${label} executionToolchain.python requires verifierProfile`,
+      `${label} executionToolchain.python requires the Python verifierProfile`,
     ));
     valid = false;
   }

@@ -57,6 +57,8 @@ function canExecuteVerifierSandbox(): boolean {
 const verifierSandboxAvailable = canExecuteVerifierSandbox();
 const describeVerifierHost = verifierSandboxAvailable ? describe : describe.skip;
 const itVerifierHost = verifierSandboxAvailable ? it : it.skip;
+const itDarwinVerifierHost = process.platform === "darwin" && verifierSandboxAvailable ? it : it.skip;
+const itLinux = process.platform === "linux" ? it : it.skip;
 const itUnsupportedLinux = process.platform === "linux" && !verifierSandboxAvailable ? it : it.skip;
 
 function sleep(ms: number): Promise<void> {
@@ -992,6 +994,97 @@ describe("runVerificationCommand", { timeout: 30000 }, () => {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         rmSync(cwd, { recursive: true, force: true });
       }
+    });
+
+    itDarwinVerifierHost("admits only a controller-selected exact loopback port when requested", async () => {
+      const result = await runVerificationCommand({
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify([
+          "const { createServer } = require('node:net');",
+          "const port = Number(process.env.CCC_PROOF_LOOPBACK_PORT);",
+          "if (!Number.isSafeInteger(port) || port <= 0 || port === 4040) process.exit(21);",
+          "const server = createServer((socket) => { socket.end('ok'); });",
+          "server.listen(port, '127.0.0.1', () => server.close(() => process.exit(0)));",
+        ].join(" "))}`,
+        cwd: tempDir,
+        timeoutMs: 30_000,
+        onHeartbeat: vi.fn(),
+        bypassVerificationSlot: true,
+        loopbackPort: 40_411,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.warnings.join("\n")).toContain("exact loopback port 40411");
+    });
+
+    itDarwinVerifierHost("lets a node-loopback verifier stop its own spawned child process", async () => {
+      // Mirrors the Gate 2 telemetry verifier: it spawns the candidate
+      // service as a child, probes it over loopback, then stops it via
+      // child.kill(). A sandbox that omits `(allow signal (target
+      // children))` fails that stop with EPERM (pueue 1526 on 53b367cf8).
+      const result = await runVerificationCommand({
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify([
+          "const { spawn } = require('node:child_process');",
+          "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });",
+          "setTimeout(() => {",
+          "  try {",
+          "    child.kill('SIGTERM');",
+          "    process.exit(0);",
+          "  } catch (error) {",
+          "    console.error(String((error && error.code) || error));",
+          "    process.exit(17);",
+          "  }",
+          "}, 300);",
+        ].join(" "))}`,
+        cwd: tempDir,
+        timeoutMs: 30_000,
+        onHeartbeat: vi.fn(),
+        bypassVerificationSlot: true,
+        loopbackPort: 40_412,
+      });
+
+      expect(result.stderr).not.toContain("EPERM");
+      expect(result.success).toBe(true);
+    });
+
+    itLinux("fails closed when exact-port loopback verification is requested on Linux", async () => {
+      const result = await runVerificationCommand({
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.exit(23)")}`,
+        cwd: tempDir,
+        timeoutMs: 30_000,
+        onHeartbeat: vi.fn(),
+        bypassVerificationSlot: true,
+        loopbackPort: 40_411,
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        exitCode: null,
+        timedOut: false,
+        killed: false,
+      });
+      expect(result.stderr).toMatch(/cannot admit one exact loopback port.*refusing to run verification natively/i);
+    });
+
+    itDarwinVerifierHost("keeps the default verifier sandbox from binding loopback", async () => {
+      const result = await runVerificationCommand({
+        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify([
+          "const { createServer } = require('node:net');",
+          "const server = createServer();",
+          "server.once('error', (error) => {",
+          "  if (error && error.code === 'EPERM') process.exit(0);",
+          "  console.error(error && error.code || error);",
+          "  process.exit(22);",
+          "});",
+          "server.listen(0, '127.0.0.1', () => server.close(() => process.exit(23)));",
+        ].join(" "))}`,
+        cwd: tempDir,
+        timeoutMs: 30_000,
+        onHeartbeat: vi.fn(),
+        bypassVerificationSlot: true,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.warnings.join("\n")).toContain("network disabled");
     });
   });
 

@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import type {
   CccPrdProof,
+  CccPrdProofExecutionToolchain,
   CccPrdProofV2,
+  CccPrdPythonExecutionToolchain,
+  CccPrdPythonRuntimeFile,
   WorkflowProofAdmissionEvaluatorInput,
   WorkflowProofAdmissionEvaluatorResult,
   WorkflowProofAdmissionExtensionContribution,
@@ -126,6 +129,46 @@ function sortByCanonicalValue<T>(values: readonly T[]): T[] {
 }
 
 /*
+ * Mirrors core's canonicalPythonExecutionToolchain (contract.ts) so the
+ * sealed evaluator's local hash stays byte-equivalent without importing
+ * @fusion/core at runtime; see the provenance note below.
+ */
+function canonicalPythonExecutionToolchain(
+  python: CccPrdPythonExecutionToolchain,
+): CccPrdPythonExecutionToolchain {
+  return {
+    ...python,
+    runtimeManifest: {
+      ...python.runtimeManifest,
+      sitePackagesRoots: sortedStrings(python.runtimeManifest.sitePackagesRoots),
+      extensionModuleRoots: sortedStrings(python.runtimeManifest.extensionModuleRoots),
+      runtimeSupport: sortByCanonicalValue(python.runtimeManifest.runtimeSupport),
+      stdlib: sortByCanonicalValue(python.runtimeManifest.stdlib),
+      sitePackages: sortByCanonicalValue(python.runtimeManifest.sitePackages),
+      extensionModules: sortByCanonicalValue(python.runtimeManifest.extensionModules),
+      dylibClosure: sortByCanonicalValue(python.runtimeManifest.dylibClosure),
+    },
+  };
+}
+
+/*
+ * Mirrors core's canonicalExecutionToolchain (contract.ts) so the sealed
+ * evaluator's local hash stays byte-equivalent without importing
+ * @fusion/core at runtime; see the provenance note below.
+ */
+function canonicalExecutionToolchain(
+  toolchain: CccPrdProofExecutionToolchain,
+): CccPrdProofExecutionToolchain {
+  return {
+    task: toolchain.task,
+    node: toolchain.node,
+    proofHost: toolchain.proofHost,
+    linkedRuntime: sortByCanonicalValue(toolchain.linkedRuntime),
+    ...(toolchain.python ? { python: canonicalPythonExecutionToolchain(toolchain.python) } : {}),
+  };
+}
+
+/*
  * The fixed proof-admission entry is loaded from custodied bytes and is
  * deliberately self-contained: its provenance gate permits only node:crypto.
  * Keep this projection byte-equivalent to the public core helper and pin that
@@ -149,7 +192,8 @@ function computeCccPrdProofDefinitionSha256(proof: CccPrdProof): string {
       negativeControls: sortByCanonicalValue(semanticProof.negativeControls),
       verifierClosure: sortByCanonicalValue(semanticProof.verifierClosure),
       candidateInputs: sortedStrings(semanticProof.candidateInputs),
-      executionToolchain: semanticProof.executionToolchain,
+      executionToolchain: canonicalExecutionToolchain(semanticProof.executionToolchain),
+      ...(semanticProof.verifierProfile ? { verifierProfile: semanticProof.verifierProfile } : {}),
       spans: sortByCanonicalValue(semanticProof.spans),
       confidence: semanticProof.confidence,
     };
@@ -172,6 +216,63 @@ function computeCccPrdProofDefinitionSha256(proof: CccPrdProof): string {
     .digest("hex");
 }
 
+function cloneAndFreezeCccPrdPythonRuntimeFile(
+  file: CccPrdPythonRuntimeFile,
+): CccPrdPythonRuntimeFile {
+  const clonedFile: CccPrdPythonRuntimeFile = {
+    ...file,
+    ...(file.requestedPaths ? { requestedPaths: [...file.requestedPaths] } : {}),
+  };
+  if (clonedFile.requestedPaths) Object.freeze(clonedFile.requestedPaths);
+  return Object.freeze(clonedFile);
+}
+
+function cloneAndFreezeCccPrdPythonRuntimeFiles(
+  files: readonly CccPrdPythonRuntimeFile[],
+): CccPrdPythonRuntimeFile[] {
+  const clonedFiles = files.map((file) => cloneAndFreezeCccPrdPythonRuntimeFile(file));
+  Object.freeze(clonedFiles);
+  return clonedFiles;
+}
+
+/*
+ * Deep-clones and freezes the sealed proof's optional Python toolchain,
+ * mirroring how executionToolchain.linkedRuntime is handled below, so the
+ * python member is not silently dropped and cannot be mutated through the
+ * seed reference after admission input is built. Mutable array fields are
+ * cloned first and frozen via a discarded Object.freeze() statement, not by
+ * assigning Object.freeze()'s own return value, because TypeScript's array
+ * overload of Object.freeze narrows to ReadonlyArray -- which is not
+ * assignable back into the source type's plain mutable array fields.
+ */
+function cloneAndFreezeCccPrdPythonExecutionToolchain(
+  python: CccPrdPythonExecutionToolchain,
+): CccPrdPythonExecutionToolchain {
+  const interpreter: CccPrdPythonRuntimeFile = cloneAndFreezeCccPrdPythonRuntimeFile(
+    python.runtimeManifest.interpreter,
+  );
+  const sitePackagesRoots = [...python.runtimeManifest.sitePackagesRoots];
+  const extensionModuleRoots = [...python.runtimeManifest.extensionModuleRoots];
+  Object.freeze(sitePackagesRoots);
+  Object.freeze(extensionModuleRoots);
+
+  const runtimeManifest = {
+    ...python.runtimeManifest,
+    interpreter,
+    sitePackagesRoots,
+    extensionModuleRoots,
+    runtimeSupport: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.runtimeSupport),
+    stdlib: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.stdlib),
+    sitePackages: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.sitePackages),
+    extensionModules: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.extensionModules),
+    dylibClosure: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.dylibClosure),
+  };
+  Object.freeze(runtimeManifest);
+
+  const clonedPython: CccPrdPythonExecutionToolchain = { ...python, runtimeManifest };
+  return Object.freeze(clonedPython);
+}
+
 function cloneAndFreezeCccPrdProof(
   proof: Readonly<CccPrdProof>,
 ): Readonly<CccPrdProof> {
@@ -191,8 +292,12 @@ function cloneAndFreezeCccPrdProof(
         proofHost: Object.freeze({ ...proof.executionToolchain.proofHost }),
         linkedRuntime: proof.executionToolchain.linkedRuntime.map((entry) =>
           Object.freeze({ ...entry })),
+        ...(proof.executionToolchain.python
+          ? { python: cloneAndFreezeCccPrdPythonExecutionToolchain(proof.executionToolchain.python) }
+          : {}),
       }),
       spans: proof.spans.map((span) => Object.freeze({ ...span })),
+      ...(proof.verifierProfile ? { verifierProfile: Object.freeze({ ...proof.verifierProfile }) } : {}),
       ...(proof.admission ? { admission: Object.freeze({ ...proof.admission }) } : {}),
     }
     : {

@@ -269,6 +269,7 @@ function buildStrictDarwinVerifierProfile(input: {
   sandboxHome: string;
   sandboxTmp: string;
   hostHome?: string;
+  loopbackPort?: number;
 }): string {
   const cwd = maybeRealpath(input.cwd);
   const sandboxHome = maybeRealpath(input.sandboxHome);
@@ -303,6 +304,7 @@ function buildStrictDarwinVerifierProfile(input: {
     "(deny default)",
     "(allow process*)",
     "(allow signal (target self))",
+    ...(input.loopbackPort !== undefined ? ["(allow signal (target children))"] : []),
     "(allow sysctl-read)",
     `(allow file-write* ${sbplLiteral("/dev/null")})`,
   ];
@@ -322,6 +324,15 @@ function buildStrictDarwinVerifierProfile(input: {
   }
 
   lines.push("(deny network*)");
+  if (input.loopbackPort !== undefined) {
+    // sandbox-exec accepts the hostname form here; the verifier still binds and
+    // connects to literal 127.0.0.1 on this controller-selected port.
+    lines.push(
+      `(allow network-bind (local tcp "localhost:${input.loopbackPort}"))`,
+      `(allow network-inbound (local tcp "localhost:${input.loopbackPort}"))`,
+      `(allow network-outbound (remote tcp "localhost:${input.loopbackPort}"))`,
+    );
+  }
   return `${lines.join("\n")}\n`;
 }
 
@@ -329,6 +340,7 @@ interface VerificationSandboxInput {
   command: string;
   cwd: string;
   childEnv: NodeJS.ProcessEnv;
+  loopbackPort?: number;
 }
 
 const PROTECTED_VERIFIER_ENTRY_NAMES = new Set([
@@ -452,6 +464,12 @@ function buildStrictLinuxVerifierLaunch(
   input: VerificationSandboxInput,
   bubblewrap: BwrapDetectResult,
 ): VerificationSandboxLaunch | { error: string } {
+  if (input.loopbackPort !== undefined) {
+    return {
+      error:
+        "Linux verifier confinement cannot admit one exact loopback port without broad network sharing; refusing to run verification natively.",
+    };
+  }
   if (!bubblewrap.available || !bubblewrap.path) {
     return {
       error:
@@ -547,6 +565,17 @@ async function buildVerificationSandboxLaunch(
   input: VerificationSandboxInput,
   probe?: VerificationSandboxProbe,
 ): Promise<VerificationSandboxLaunch | { error: string }> {
+  if (
+    input.loopbackPort !== undefined
+    && (
+      !Number.isSafeInteger(input.loopbackPort)
+      || input.loopbackPort <= 0
+      || input.loopbackPort > 65_535
+      || input.loopbackPort === 4_040
+    )
+  ) {
+    return { error: "verifier loopback port must be a positive safe TCP port other than 4040" };
+  }
   const platform = probe?.platform ?? process.platform;
   if (platform === "linux") {
     const bubblewrap = probe?.bubblewrap ?? detectTrustedVerifierBwrap();
@@ -588,12 +617,16 @@ async function buildVerificationSandboxLaunch(
     npm_config_cache: join(actualTmp, "npm-cache"),
     PNPM_HOME: input.childEnv.PNPM_HOME ?? join(actualHome, ".local", "share", "pnpm"),
     COREPACK_HOME: input.childEnv.COREPACK_HOME ?? join(actualHome, ".cache", "node", "corepack"),
+    ...(input.loopbackPort !== undefined
+      ? { CCC_PROOF_LOOPBACK_PORT: String(input.loopbackPort) }
+      : {}),
   };
   const profile = buildStrictDarwinVerifierProfile({
     cwd: input.cwd,
     sandboxHome: actualHome,
     sandboxTmp: actualTmp,
     hostHome: input.childEnv.HOME,
+    loopbackPort: input.loopbackPort,
   });
 
   return {
@@ -601,7 +634,9 @@ async function buildVerificationSandboxLaunch(
     args: [],
     shell: true,
     env,
-    warning: "verification command ran under sandbox-exec with network disabled and isolated HOME/TMPDIR",
+    warning: input.loopbackPort === undefined
+      ? "verification command ran under sandbox-exec with network disabled and isolated HOME/TMPDIR"
+      : `verification command ran under sandbox-exec with network disabled except exact loopback port ${input.loopbackPort} and isolated HOME/TMPDIR`,
     cleanup: () => {
       rmSync(scratchRoot, { recursive: true, force: true });
     },
@@ -1081,6 +1116,8 @@ export interface RunVerificationOptions {
   bypassVerificationSlot?: boolean;
   /** Optional abort signal — cancels while queued for a verification slot and during the command. */
   signal?: AbortSignal;
+  /** Controller-selected exact IPv4 loopback port for admitted local verifier profiles. */
+  loopbackPort?: number;
 }
 
 function createCallerAbortedVerificationResult(
@@ -1220,7 +1257,12 @@ async function runVerificationCommandUnlocked(
   const sensitiveValues = collectExcludedSensitiveValues(process.env, childEnv);
   const redactCapturedText = (text: string): string =>
     redactExcludedSensitiveValues(text, sensitiveValues);
-  const launch = await buildVerificationSandboxLaunch({ command, cwd, childEnv });
+  const launch = await buildVerificationSandboxLaunch({
+    command,
+    cwd,
+    childEnv,
+    ...(opts.loopbackPort !== undefined ? { loopbackPort: opts.loopbackPort } : {}),
+  });
   if ("error" in launch) {
     return {
       success: false,

@@ -59,6 +59,34 @@ function twoBranchIr(joinConfig: Record<string, unknown>): WorkflowIr {
   };
 }
 
+function sequentialBranchIr(): WorkflowIr {
+  return {
+    version: "v2",
+    name: "sequential-branch-context",
+    columns: [],
+    nodes: [
+      { id: "start", kind: "start" },
+      { id: "split", kind: "split" },
+      { id: "branchA1", kind: "prompt", config: {} },
+      { id: "branchA2", kind: "prompt", config: {} },
+      { id: "branchB", kind: "prompt", config: {} },
+      { id: "join", kind: "join", config: { mode: "all", onBranchFailure: "collect" } },
+      { id: "tail", kind: "prompt", config: {} },
+      { id: "end", kind: "end" },
+    ],
+    edges: [
+      { from: "start", to: "split" },
+      { from: "split", to: "branchA1" },
+      { from: "split", to: "branchB" },
+      { from: "branchA1", to: "branchA2", condition: "success" },
+      { from: "branchA2", to: "join", condition: "success" },
+      { from: "branchB", to: "join", condition: "success" },
+      { from: "join", to: "tail", condition: "success" },
+      { from: "tail", to: "end", condition: "success" },
+    ],
+  };
+}
+
 describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
   it("Wave 4 RED: CCC frontier checkpoint failure does not traverse an authored failure effect", async () => {
     const calls: string[] = [];
@@ -258,6 +286,82 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(tail).toHaveBeenCalledTimes(1);
   });
 
+  it("RED-G2-context: preserves successful branch patches with lexical branch collision order", async () => {
+    const releaseBranchA = deferred<void>();
+    const branchBCompleted = deferred<void>();
+    let tailContext: Record<string, unknown> | undefined;
+    const prompt: WorkflowNodeHandler = async (node, executionContext) => {
+      if (node.id === "branchA") {
+        await releaseBranchA.promise;
+        return {
+          outcome: "success" as const,
+          contextPatch: { branchAOnly: true, sharedBranchValue: "A" },
+        };
+      }
+      if (node.id === "branchB") {
+        branchBCompleted.resolve();
+        return {
+          outcome: "success" as const,
+          contextPatch: { branchBOnly: true, sharedBranchValue: "B" },
+        };
+      }
+      if (node.id === "tail") tailContext = { ...executionContext.context };
+      return { outcome: "success" as const };
+    };
+    const running = new WorkflowGraphExecutor({ handlers: { prompt } })
+      .run(task, settingsOn(), twoBranchIr({ mode: "all", onBranchFailure: "collect" }));
+
+    await branchBCompleted.promise;
+    releaseBranchA.resolve();
+    const result = await running;
+
+    expect(result.outcome).toBe("success");
+    expect(tailContext).toMatchObject({
+      branchAOnly: true,
+      branchBOnly: true,
+      sharedBranchValue: "B",
+    });
+  });
+
+  it("RED-G2-context: exposes an earlier context patch to the next node in the same branch", async () => {
+    let branchA2Context: Record<string, unknown> | undefined;
+    const prompt: WorkflowNodeHandler = async (node, executionContext) => {
+      if (node.id === "branchA1") {
+        return { outcome: "success", contextPatch: { branchLocalReceipt: "A1" } };
+      }
+      if (node.id === "branchA2") branchA2Context = { ...executionContext.context };
+      return { outcome: "success" };
+    };
+
+    const result = await new WorkflowGraphExecutor({ handlers: { prompt } })
+      .run(task, settingsOn(), sequentialBranchIr());
+
+    expect(result.outcome).toBe("success");
+    expect(branchA2Context).toMatchObject({ branchLocalReceipt: "A1" });
+  });
+
+  it("RED-G2-context: isolates mutable execution context between concurrent branches", async () => {
+    const branchAMutated = deferred<void>();
+    let branchBObserved: unknown;
+    const prompt: WorkflowNodeHandler = async (node, executionContext) => {
+      if (node.id === "branchA") {
+        executionContext.context.branchAInternal = "must-not-leak";
+        branchAMutated.resolve();
+      }
+      if (node.id === "branchB") {
+        await branchAMutated.promise;
+        branchBObserved = executionContext.context.branchAInternal;
+      }
+      return { outcome: "success" };
+    };
+
+    const result = await new WorkflowGraphExecutor({ handlers: { prompt } })
+      .run(task, settingsOn(), twoBranchIr({ mode: "all", onBranchFailure: "collect" }));
+
+    expect(result.outcome).toBe("success");
+    expect(branchBObserved).toBeUndefined();
+  });
+
   it("mode:any with collect — first completion fires join; slower branch finishes without re-firing", async () => {
     const slow = deferred<void>();
     const tail = vi.fn(async () => ({ outcome: "success" as const }));
@@ -400,6 +504,30 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(result.outcome).toBe("failure");
     expect(result.visitedNodeIds).not.toContain("tail");
     expect(siblingAborted).toBe(true);
+    expect(result.context["node:split:error"]).toBe(
+      "workflow-branch-failed:branchA:boom",
+    );
+  });
+
+  it("preserves a branch node's explicit error over its generic failed value", async () => {
+    const prompt: WorkflowNodeHandler = async (node) => node.id === "branchA"
+      ? {
+          outcome: "failure" as const,
+          value: "failed",
+          contextPatch: { "node:branchA:error": "provider session failed before dispatch" },
+        }
+      : { outcome: "success" as const };
+    const executor = new WorkflowGraphExecutor({ handlers: { prompt } });
+
+    const result = await executor.run(
+      task,
+      settingsOn(),
+      twoBranchIr({ mode: "all", onBranchFailure: "fail-fast" }),
+    );
+
+    expect(result.context["node:split:error"]).toBe(
+      "workflow-branch-failed:branchA:provider session failed before dispatch",
+    );
   });
 
   it("branch failure collect — all branches finish; join evaluates combined outcomes", async () => {
@@ -558,6 +686,151 @@ describe("WorkflowGraphExecutor fan-out/join (U13)", () => {
     expect(calls).toContain("run2:branchB");
     hang.resolve();
     await run1.catch(() => {});
+  });
+
+  it("RED-G2-resume: replays a completed intermediate branch context producer after a crash", async () => {
+    const calls: string[] = [];
+    const store: WorkflowBranchRunState[] = [];
+    const persistence: WorkflowBranchPersistence = {
+      saveBranchState: (state) => {
+        const index = store.findIndex((row) => row.branchId === state.branchId);
+        if (index >= 0) store[index] = { ...state };
+        else store.push({ ...state });
+      },
+      loadBranchStates: () => store.map((row) => ({ ...row })),
+    };
+    const workflow: WorkflowIr = {
+      version: "v2",
+      name: "intermediate-branch-resume",
+      columns: [],
+      nodes: [
+        { id: "start", kind: "start" },
+        { id: "split", kind: "split" },
+        { id: "branchA1", kind: "prompt", config: {} },
+        { id: "branchA2", kind: "prompt", config: {} },
+        { id: "branchB", kind: "prompt", config: {} },
+        { id: "join", kind: "join", config: { mode: "all", onBranchFailure: "collect" } },
+        { id: "tail", kind: "prompt", config: {} },
+        { id: "end", kind: "end" },
+      ],
+      edges: [
+        { from: "start", to: "split" },
+        { from: "split", to: "branchA1" },
+        { from: "split", to: "branchB" },
+        { from: "branchA1", to: "branchA2", condition: "success" },
+        { from: "branchA2", to: "join", condition: "success" },
+        { from: "branchB", to: "join", condition: "success" },
+        { from: "join", to: "tail", condition: "success" },
+        { from: "tail", to: "end", condition: "success" },
+      ],
+    };
+    const branchA2Entered = deferred<void>();
+    const hangBranchA2 = deferred<void>();
+    const firstRunPersistence: WorkflowBranchPersistence = {
+      saveBranchState: (state) => {
+        persistence.saveBranchState!(state);
+      },
+      loadBranchStates: persistence.loadBranchStates,
+    };
+    const firstRun = new WorkflowGraphExecutor({
+      branchPersistence: firstRunPersistence,
+      handlers: {
+        prompt: async (node) => {
+          calls.push(`run1:${node.id}`);
+          if (node.id === "branchA2") {
+            branchA2Entered.resolve();
+            await hangBranchA2.promise;
+          }
+          return node.id === "branchA1"
+            ? { outcome: "success" as const, contextPatch: { branchA1Receipt: "durable-context" } }
+            : { outcome: "success" as const };
+        },
+      },
+    }).run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } },
+      settingsOn(),
+      workflow,
+    );
+
+    await branchA2Entered.promise;
+    expect(store).toContainEqual(expect.objectContaining({
+      currentNodeId: "branchA1",
+      status: "completed",
+    }));
+    expect(store.find((row) => row.branchId === "branchA1")?.status).toBe("running");
+
+    const resumed = await new WorkflowGraphExecutor({
+      branchPersistence: persistence,
+      handlers: {
+        prompt: async (node, context) => {
+          calls.push(`run2:${node.id}`);
+          if (node.id === "branchA1") {
+            return { outcome: "success" as const, contextPatch: { branchA1Receipt: "durable-context" } };
+          }
+          if (node.id === "tail" && context.context.branchA1Receipt !== "durable-context") {
+            return { outcome: "failure" as const, value: "missing-branchA1-context" };
+          }
+          return { outcome: "success" as const };
+        },
+      },
+    }).run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } },
+      settingsOn(),
+      workflow,
+    );
+
+    expect(resumed.outcome, JSON.stringify(resumed)).toBe("success");
+    // An intermediate frontier row has no durable contextPatch payload. Replay
+    // it rather than silently skipping the only producer of downstream context.
+    expect(calls).toContain("run2:branchA1");
+    expect(calls).toContain("run2:branchA2");
+    expect(calls).toContain("run2:tail");
+    expect(store.find((row) => row.branchId === "branchA1")?.status).toBe("completed");
+
+    hangBranchA2.resolve();
+    await firstRun.catch(() => {});
+  });
+
+  it("RED-G2-resume: replays a completed CCC branch whose context patch is not durable", async () => {
+    const calls: string[] = [];
+    const store: WorkflowBranchRunState[] = [{
+      taskId: task.id,
+      runId: `${task.id}:run`,
+      branchId: "branchA",
+      currentNodeId: "branchA",
+      status: "completed",
+    }];
+    const persistence: WorkflowBranchPersistence = {
+      saveBranchState: (state) => {
+        const index = store.findIndex((row) => row.branchId === state.branchId);
+        if (index >= 0) store[index] = { ...state };
+        else store.push({ ...state });
+      },
+      loadBranchStates: () => store.map((row) => ({ ...row })),
+    };
+    const result = await new WorkflowGraphExecutor({
+      branchPersistence: persistence,
+      handlers: {
+        prompt: async (node, executionContext) => {
+          calls.push(node.id);
+          if (node.id === "branchA") {
+            return { outcome: "success", contextPatch: { completedBranchReceipt: "replayed" } };
+          }
+          if (node.id === "tail" && executionContext.context.completedBranchReceipt !== "replayed") {
+            return { outcome: "failure", value: "missing-completed-branch-context" };
+          }
+          return { outcome: "success" };
+        },
+      },
+    }).run(
+      { ...task, customFields: { cccFusionProfile: "ccc-fusion" } },
+      settingsOn(),
+      twoBranchIr({ mode: "all", onBranchFailure: "collect" }),
+    );
+
+    expect(result.outcome, JSON.stringify(result)).toBe("success");
+    expect(calls).toContain("branchA");
+    expect(calls).toContain("tail");
   });
 
   it("card-position invariant — no column move occurs during the parallel window", async () => {

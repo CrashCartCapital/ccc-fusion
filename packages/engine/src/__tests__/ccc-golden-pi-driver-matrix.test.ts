@@ -42,7 +42,7 @@ describe("CCC golden Pi driver matrix", () => {
         comboAlias: "gemini-flash-latest",
         modelId: "combo/gemini-flash-latest",
         attributionTerminalRouteMembers: [
-          { provider: "antigravity", model: "gemini-3.7-flash-high" },
+          { provider: "antigravity", model: "gemini-3.8-flash-high" },
           { provider: "gemini", model: "gemini-flash-latest" },
         ],
       },

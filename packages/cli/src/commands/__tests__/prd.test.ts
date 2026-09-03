@@ -3277,7 +3277,8 @@ describe("prd command exit contract", () => {
       attempt: 3,
       leaseOwner: null,
       leaseExpiresAt: null,
-      lastError: "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
+      lastError:
+        "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED: exact merge approval is still required",
       blockedReason: "ccc-permanent:CCC_CAMPAIGN_MERGE_APPROVAL_REQUIRED",
       stableWorkflowRunId: "ccc-prd:import-1",
     };
@@ -3392,7 +3393,8 @@ describe("prd command exit contract", () => {
       attempt: 1,
       leaseOwner: null,
       leaseExpiresAt: null,
-      lastError: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+      lastError:
+        "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED: exact live-execution approval is still required",
       blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
       stableWorkflowRunId: "ccc-prd:import-1",
     };

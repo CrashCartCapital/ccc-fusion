@@ -29,6 +29,16 @@ export interface WorkflowBranchRunState {
   status: "running" | "completed" | "failed" | "aborted";
 }
 
+const WORKFLOW_NODE_FRONTIER_BRANCH_PREFIX = "__fusion_node_frontier__:";
+
+export function isWorkflowNodeFrontierBranchId(branchId: string): boolean {
+  return branchId.startsWith(WORKFLOW_NODE_FRONTIER_BRANCH_PREFIX);
+}
+
+function workflowNodeFrontierBranchId(branchId: string, nodeId: string): string {
+  return `${WORKFLOW_NODE_FRONTIER_BRANCH_PREFIX}${branchId}:${nodeId}`;
+}
+
 /**
  * Persistence callback surface. Kept as an injected interface so the executor
  * stays DI-pure and fake-friendly; the PostgreSQL-backed implementation is wired
@@ -105,6 +115,8 @@ export interface BranchEnvironment {
   task: TaskDetail;
   settings: Pick<Settings, "experimentalFeatures"> | undefined;
   runId: string;
+  /** Parent context snapshot copied once per branch before concurrent execution. */
+  context: Readonly<Record<string, unknown>>;
   /** Top-level executor cancellation, bridged into the split's branch controller. */
   signal?: AbortSignal;
   nodeMap: Map<string, WorkflowIrNode>;
@@ -113,15 +125,16 @@ export interface BranchEnvironment {
   runBranchNode: (
     node: WorkflowIrNode,
     signal: AbortSignal,
+    context: Record<string, unknown>,
   ) => Promise<WorkflowNodeResult>;
   shouldTraverseEdge: (edge: WorkflowIrEdge, source: WorkflowNodeResult) => boolean;
   persistence?: WorkflowBranchPersistence;
   semaphore?: WorkflowBranchSemaphore;
   /** Reports live per-branch progress for the card (no column move). */
   onBranchProgress?: (progress: WorkflowBranchProgress) => void;
-  /** Node IDs already completed in a prior (crashed) run — skipped on resume. */
+  /** Node IDs whose effects and required context are durably reconstructible — skipped on resume. */
   completedNodeIds?: Set<string>;
-  /** Branch IDs with a durable terminal row — never re-admit or re-walk them. */
+  /** Branch IDs with durably reconstructible terminal output — never re-admit or re-walk them. */
   completedBranchIds?: Set<string>;
   /** Parent split notification used only to abort nested CCC terminal failures immediately. */
   onCccTerminalFailure?: (reason: string) => void;
@@ -140,6 +153,10 @@ export interface SplitJoinResult {
   failureReason?: string;
   /** Exact handler attempts consumed by the terminal CCC branch failure. */
   terminalAttempt?: number;
+  /** First ordinary branch failure retained for operator diagnostics. */
+  diagnosticReason?: string;
+  /** Successful branch patches merged by lexical branch ID; later IDs win collisions. */
+  contextPatch?: Record<string, unknown>;
 }
 
 interface ResolvedJoinConfig {
@@ -218,10 +235,12 @@ export async function runSplitJoin(
 
   const visitedNodeIds: string[] = [];
   const branchOutcomes: SplitJoinResult["branchOutcomes"] = [];
+  const successfulBranchContextPatches = new Map<string, Record<string, unknown>>();
   let succeeded = 0;
   let failed = 0;
   let failureReason: string | undefined;
   let terminalAttempt: number | undefined;
+  let diagnosticReason: string | undefined;
   let settled = false;
   let resolveJoin!: (outcome: WorkflowNodeOutcome) => void;
   const joinReached = new Promise<WorkflowNodeOutcome>((res) => {
@@ -286,13 +305,17 @@ export async function runSplitJoin(
     return walkBranch(branchId, join, env, controller.signal, visitedNodeIds, failClosedCccTerminal)
       .then((result) => {
         branchOutcomes.push({ branchId, outcome: result.outcome, nodeId: result.lastNodeId });
-        if (result.outcome === "success") succeeded += 1;
-        else failed += 1;
+        if (result.outcome === "success") {
+          succeeded += 1;
+          if (result.contextPatch) successfulBranchContextPatches.set(branchId, result.contextPatch);
+        } else failed += 1;
+        diagnosticReason ??= result.diagnosticReason;
         if (result.failureReason) failClosedCccTerminal(result.failureReason, result.terminalAttempt);
         evaluateJoin(result.outcome === "failure", result.failureReason !== undefined);
       })
       .catch((err) => {
         const persistenceFailure = err instanceof CccBranchPersistenceError;
+        const message = err instanceof Error ? err.message : String(err);
         // FNXC:CCCBranchPersistence 2026-07-24-15:05: a terminal durable
         // checkpoint can reject after a competing ordinary fail-fast abort;
         // classify it before treating the shared signal as an ordinary abort.
@@ -303,6 +326,8 @@ export async function runSplitJoin(
           branchOutcomes.push({ branchId, outcome: "failure", nodeId: branchId });
           return;
         }
+        diagnosticReason ??= `workflow-branch-error:${branchId}:${message}`;
+        schedulerLog.error(`workflow branch ${branchId} failed before join ${join}: ${message}`);
         failed += 1;
         branchOutcomes.push({ branchId, outcome: "failure", nodeId: branchId });
         evaluateJoin(true, persistenceFailure);
@@ -319,8 +344,22 @@ export async function runSplitJoin(
   try {
     const outcome = await joinReached;
     await Promise.allSettled(branchPromises);
+    const contextPatch = Object.fromEntries(
+      [...successfulBranchContextPatches.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .flatMap(([, patch]) => Object.entries(patch)),
+    );
 
-    return { joinNodeId: join, outcome, branchOutcomes, visitedNodeIds, failureReason, terminalAttempt };
+    return {
+      joinNodeId: join,
+      outcome,
+      branchOutcomes,
+      visitedNodeIds,
+      failureReason,
+      terminalAttempt,
+      diagnosticReason,
+      ...(Object.keys(contextPatch).length > 0 ? { contextPatch } : {}),
+    };
   } finally {
     parentSignal?.removeEventListener("abort", abortForParentSignal);
   }
@@ -333,6 +372,10 @@ interface BranchWalkResult {
   failureReason?: string;
   /** Exact handler attempts consumed by a terminal CCC retry classification. */
   terminalAttempt?: number;
+  /** Ordinary failure detail which must survive the split boundary. */
+  diagnosticReason?: string;
+  /** Context emitted by successful nodes in this branch, in traversal order. */
+  contextPatch?: Record<string, unknown>;
 }
 
 function cccTerminalBranchFailure(
@@ -365,6 +408,8 @@ async function walkBranch(
 ): Promise<BranchWalkResult> {
   let currentId = startNodeId;
   let lastResult: WorkflowNodeResult = { outcome: "success" };
+  const contextPatch: Record<string, unknown> = {};
+  const branchContext: Record<string, unknown> = { ...env.context };
 
   for (;;) {
     if (signal.aborted) return { outcome: "failure", lastNodeId: currentId };
@@ -377,6 +422,7 @@ async function walkBranch(
       // Nested split: resolve its inner window, then continue from the inner join.
       const inner = await runSplitJoin(node, {
         ...env,
+        context: branchContext,
         onCccTerminalFailure: onCccTerminalFailure ?? env.onCccTerminalFailure,
       });
       visitedNodeIds.push(...inner.visitedNodeIds);
@@ -389,11 +435,16 @@ async function walkBranch(
           lastNodeId: inner.joinNodeId,
           failureReason: inner.failureReason,
           terminalAttempt: inner.terminalAttempt,
+          diagnosticReason: inner.diagnosticReason,
         };
       }
       lastResult = { outcome: inner.outcome };
+      if (inner.outcome === "success" && inner.contextPatch) {
+        Object.assign(contextPatch, inner.contextPatch);
+        Object.assign(branchContext, inner.contextPatch);
+      }
       const next = nextEdge(inner.joinNodeId, env, lastResult);
-      if (!next) return { outcome: inner.outcome, lastNodeId: inner.joinNodeId };
+      if (!next) return { outcome: inner.outcome, lastNodeId: inner.joinNodeId, contextPatch };
       currentId = next;
       continue;
     }
@@ -404,8 +455,21 @@ async function walkBranch(
     if (alreadyDone) {
       lastResult = { outcome: "success" };
     } else {
-      const exec = async (): Promise<WorkflowNodeResult> => env.runBranchNode(node, signal);
+      const exec = async (): Promise<WorkflowNodeResult> => env.runBranchNode(node, signal, branchContext);
       lastResult = env.semaphore ? await env.semaphore.run(exec) : await exec();
+      if (lastResult.outcome === "success" && lastResult.contextPatch) {
+        Object.assign(contextPatch, lastResult.contextPatch);
+        Object.assign(branchContext, lastResult.contextPatch);
+      }
+      if (lastResult.outcome === "success") {
+        await persistBranchState(env.persistence, {
+          taskId: env.task.id,
+          runId: env.runId,
+          branchId: workflowNodeFrontierBranchId(startNodeId, currentId),
+          currentNodeId: currentId,
+          status: "completed",
+        }, "progress", isCccCampaignTask(env.task));
+      }
       await persistBranchState(env.persistence, {
         taskId: env.task.id,
         runId: env.runId,
@@ -437,18 +501,24 @@ async function walkBranch(
       */
       const terminalFailure = cccTerminalBranchFailure(env.task, lastResult);
       if (terminalFailure) onCccTerminalFailure?.(terminalFailure.reason);
+      const explicitNodeError = lastResult.contextPatch?.[`node:${currentId}:error`];
+      const diagnostic = typeof explicitNodeError === "string" && explicitNodeError.trim().length > 0
+        ? explicitNodeError.trim()
+        : lastResult.value ?? "node-returned-failure";
       return {
         outcome: "failure",
         lastNodeId: currentId,
         failureReason: terminalFailure?.reason,
         terminalAttempt: terminalFailure?.attempt,
+        diagnosticReason: `workflow-branch-failed:${currentId}:${diagnostic}`,
+        contextPatch,
       };
     }
 
     const next = nextEdge(currentId, env, lastResult);
     if (!next) {
       // Dead-end before the join — treat as branch completion.
-      return { outcome: lastResult.outcome, lastNodeId: currentId };
+      return { outcome: lastResult.outcome, lastNodeId: currentId, contextPatch };
     }
     if (next === joinId) {
       await persistBranchState(env.persistence, {
@@ -459,7 +529,7 @@ async function walkBranch(
         status: "completed",
       }, "terminal", isCccCampaignTask(env.task));
       env.onBranchProgress?.({ branchId: startNodeId, nodeId: currentId, status: "completed" });
-      return { outcome: lastResult.outcome, lastNodeId: currentId };
+      return { outcome: lastResult.outcome, lastNodeId: currentId, contextPatch };
     }
     currentId = next;
   }

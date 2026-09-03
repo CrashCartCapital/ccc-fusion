@@ -59,6 +59,33 @@ pgDescribe("sync-db residue surfaces in backend mode (PostgreSQL)", () => {
     }
   });
 
+  it("RED-G2-project-bound-frontier: persists a branch for a task in the layer project partition", async () => {
+    const h = await makeHarness();
+    try {
+      (h.layer as { projectId?: string }).projectId = "gate2-project";
+      const task = await h.store.createTask({ description: "project-bound branch persistence" });
+
+      await h.store.saveWorkflowRunBranch({
+        taskId: task.id,
+        runId: "ccc-prd:gate2",
+        branchId: "__ccc_frontier__:implementation",
+        currentNodeId: "implementation",
+        status: "completed",
+      });
+
+      expect(await h.store.loadWorkflowRunBranches(task.id, "ccc-prd:gate2")).toEqual([
+        expect.objectContaining({
+          taskId: task.id,
+          branchId: "__ccc_frontier__:implementation",
+          currentNodeId: "implementation",
+          status: "completed",
+        }),
+      ]);
+    } finally {
+      await teardown();
+    }
+  });
+
   it("persists, upserts, loads, and prunes foreach step instances", async () => {
     const h = await makeHarness();
     try {
