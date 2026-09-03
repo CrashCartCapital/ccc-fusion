@@ -254,6 +254,20 @@ jobs:
       # restores .fusion/cache/plugin-build-cache.json too, so build-workspace
       # itself would see "unchanged" if anything downstream ever does invoke
       # it again.
+      #
+      # This miss-path fallback deliberately does NOT get the Build job's
+      # "Build desktop runtime" isolation step: on a genuine miss it can still
+      # nest the same `pnpm --filter @fusion/desktop build` spawn inside the
+      # still-live CLI tsup process. Accepted, not fixed here: (a) it now
+      # requires a genuine cache miss, which should be rare — the cache key is
+      # commit-exact (${{ github.sha }}) and Gate always runs after Build in
+      # the same workflow run via `needs: build`, so a miss means Build's own
+      # save didn't complete, not routine operation; (b) this job runs on the
+      # ccc-fusion-bwrap runner lane at a 4 GiB container cap, not Build's
+      # 2.5 GiB, so there is more headroom than the container where the OOM
+      # was actually observed. Deliberately not adding a second standalone
+      # desktop step for this rare-miss edge case; revisit if this path is
+      # ever observed to OOM in practice.
       - name: Build
         if: steps.dist-cache.outputs.cache-hit != 'true'
         run: pnpm build
