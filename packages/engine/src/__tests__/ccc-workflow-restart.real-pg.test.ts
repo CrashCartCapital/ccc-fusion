@@ -5,7 +5,10 @@ import { expect, it, vi } from "vitest";
 import type { TaskDetail, WorkflowIr } from "@fusion/core";
 import { createTaskStoreForTest, pgDescribe } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import { WorkflowGraphExecutor } from "../workflow-graph-executor.js";
-import type { WorkflowBranchPersistence } from "../workflow-graph-branches.js";
+import {
+  isWorkflowNodeFrontierBranchId,
+  type WorkflowBranchPersistence,
+} from "../workflow-graph-branches.js";
 
 const wave4Ir: WorkflowIr = {
   version: "v2",
@@ -184,7 +187,20 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
         branchPersistence: {
           ...pgBranchPersistence(harness.store),
           saveBranchState: async (state) => {
-            if (!state.branchId.startsWith("__ccc_frontier__:") && state.status === "completed" && ++terminalWrites === 1) {
+            // Only the branch's own terminal (join-crossing) checkpoint is under
+            // test here. Exclude both the top-level sequential frontier
+            // (__ccc_frontier__:) and the per-node frontier bookkeeping rows
+            // walkBranch also persists as "completed" for every successful node
+            // (isWorkflowNodeFrontierBranchId) — neither is the terminal write,
+            // and without this exclusion the injected failure fires on the
+            // per-node frontier row instead, misclassifying it as
+            // ccc-branch-persistence-progress-failed.
+            if (
+              !state.branchId.startsWith("__ccc_frontier__:")
+              && !isWorkflowNodeFrontierBranchId(state.branchId)
+              && state.status === "completed"
+              && ++terminalWrites === 1
+            ) {
               throw new Error("injected terminal checkpoint failure");
             }
             await harness.store.saveWorkflowRunBranch(state);
@@ -209,7 +225,7 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
     }
   });
 
-  it("Wave 4 RED: PostgreSQL death during B and C resumes only unfinished branch work", async () => {
+  it("Wave 4 RED: PostgreSQL death during B and C resumes the split by replaying its branches", async () => {
     const harness = await createTaskStoreForTest({ prefix: "fusion_ccc_wave4_death", copyFromGolden: true });
     const runId = "wave4-stable-run";
     const events: Array<{ event: string; node: string }> = [];
@@ -283,9 +299,20 @@ pgDescribe("CCC Wave 4 PostgreSQL branch persistence", () => {
       expect(events).toContainEqual({ event: "effect", node: "A" });
       expect(events).toContainEqual({ event: "effect", node: "B" });
       expect(events).not.toContainEqual({ event: "effect", node: "C" });
+      // CCC branch rows are a durable frontier for the *sequential* path only
+      // (workflow-graph-executor.ts's completedBranchIds/completedNodeIds
+      // construction deliberately excludes every split-branch row for a CCC
+      // task via `&& !cccFusionTask`, and always excludes frontier-prefixed
+      // rows via isWorkflowNodeFrontierBranchId). They do not persist a
+      // branch's contextPatch bytes, so a concurrent branch's node(s) replay
+      // on resume even when that branch had already reached a durable
+      // "completed" checkpoint — replay is how downstream context gets
+      // reconstructed, and CCC branch node handlers are fenced/idempotent so
+      // replaying them is safe. Only the pre-split sequential node (A) is
+      // skipped, via the separate __ccc_frontier__ checkpoint.
       expect(resumedCalls).not.toContain("A");
-      expect(resumedCalls).not.toContain("B");
-      expect(resumedCalls).toEqual(expect.arrayContaining(["C", "D"]));
+      expect(resumedCalls).toEqual(expect.arrayContaining(["B", "C", "D"]));
+      expect(resumedCalls.indexOf("D")).toBeGreaterThan(resumedCalls.indexOf("B"));
       expect(resumedCalls.indexOf("D")).toBeGreaterThan(resumedCalls.indexOf("C"));
     } finally {
       if (child && child.exitCode === null) {

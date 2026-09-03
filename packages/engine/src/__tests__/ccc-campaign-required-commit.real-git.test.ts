@@ -220,6 +220,14 @@ describeIfGit("CCC campaign required-commit post-node fence", { timeout: 30_000 
       getCccCampaignContextForTask: vi.fn(async (id: string) =>
         id === taskId ? context : null),
       assertCccCampaignWorkflowLeaseFence: vi.fn(async () => undefined),
+      // TaskExecutor's runGraphCustomNodeWithRequiredCommitFence writes a
+      // best-effort `[ccc-campaign:turn-rejected]` breadcrumb via
+      // this.store.logEntry(...).catch(...) before rethrowing a rejected
+      // turn as a PermanentError. Real TaskStore always has logEntry
+      // (store.ts:1694); this ad hoc TaskStore fixture needs it too or the
+      // executor's raw (uncaught-if-synchronous) call throws a TypeError
+      // that masks the refusal this suite exists to assert.
+      logEntry: vi.fn(async () => task),
     } as unknown as TaskStore;
 
     return { baseCommit, branch, context, rootDir, store, task, worktree };
