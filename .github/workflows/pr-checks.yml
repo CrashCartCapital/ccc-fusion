@@ -111,10 +111,23 @@ jobs:
       # it instead of repeating this build. Exact-match key only, no
       # restore-keys (stale dist is the known failure mode, FN-4232/FN-4605).
       # Never node_modules.
-      - name: Compute dist source hash
-        id: dist-hash
-        run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
-
+      #
+      # Keyed on the literal commit (${{ github.sha }}), NOT a source-content
+      # hash: ensure-test-artifacts.mjs's --print-source-hash only covers
+      # REQUIRED_BUILD_PACKAGES' own source dirs, so two different commits
+      # that only differ in an un-hashed path (packages/i18n, an unbundled
+      # plugin, etc.) would collide on the same hash — and Gate could then
+      # restore a save that belongs to a DIFFERENT commit. Gate (needs: build)
+      # always runs in the same workflow run as this job, so restoring under
+      # the identical github.sha guarantees it gets THIS commit's own output,
+      # never another one's.
+      #
+      # Also saves .fusion/cache/plugin-build-cache.json — build-workspace.mjs
+      # (what `pnpm build` runs) keeps its OWN separate skip-cache there
+      # (distinct from ensure-test-artifacts.mjs's artifact-cache.json), and
+      # it is git-ignored / absent on a fresh checkout. Publishing it gives
+      # Gate the literal "already built this exact source" record Build
+      # itself just wrote, not only the dist bytes.
       - name: Save built dist artifacts
         uses: actions/cache/save@v4
         with:
@@ -129,7 +142,8 @@ jobs:
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
             plugins/fusion-plugin-compound-engineering/dist
-          key: fusion-pr-dist-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+            .fusion/cache/plugin-build-cache.json
+          key: fusion-pr-dist-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
 
   # The only merge-blocking TEST signal (R3). Runs the boot smoke (the app
   # starts and serves) plus the curated engine-core suite, the focused CCC PRD
@@ -145,6 +159,16 @@ jobs:
     # host-level admission service already globally serializes runner slots —
     # more `needs` edges there would only add latency without saving a
     # redundant build.
+    #
+    # `needs: build` means Gate only enters the shared two-slot cross-repo
+    # admission queue AFTER Build releases its own slot, so worst-case wall
+    # clock under heavy cross-repo contention is UNCHANGED (~15 min, same as
+    # measured run 33738197262) — Gate still has to wait its turn, just later.
+    # The win shows up in the common case (queue not contended): total wall
+    # clock drops from ~15 min toward ~11 min (Build ~8 min + Gate ~3 min on a
+    # restore hit instead of Gate's own ~8 min rebuild), and total slot-minutes
+    # across the two jobs fall by Gate's old ~5 min redundant build
+    # (~27.5 -> ~22.5 slot-minutes).
     needs: build
     # The verifier-confinement readiness probe below runs bubblewrap, which
     # needs full-capability unprivileged user namespaces. Only the dedicated
@@ -192,14 +216,9 @@ jobs:
       # HIT here now actually makes boot-smoke's packages/cli/bin.mjs valid).
       # Exact-match key only, NO restore-keys (stale dist is the known
       # failure mode, FN-4232/FN-4605), NEVER node_modules (breaks Windows
-      # pnpm junctions). Deliberately NO fail-on-cache-miss: unlike
-      # full-suite.yml's shard/slow consumers, Gate keeps `pnpm build` below
-      # as a graceful fallback (fast content-hash skip on a hit, full build on
-      # a miss) rather than hard-failing a merge-blocking PR check on a miss.
-      - name: Compute dist source hash
-        id: dist-hash
-        run: echo "hash=$(node scripts/ensure-test-artifacts.mjs --print-source-hash)" >> "$GITHUB_OUTPUT"
-
+      # pnpm junctions). Deliberately NO fail-on-cache-miss: Gate keeps
+      # `pnpm build` below as a graceful fallback on a genuine miss rather than
+      # hard-failing a merge-blocking PR check.
       - name: Restore built dist artifacts
         id: dist-cache
         uses: actions/cache/restore@v4
@@ -215,17 +234,36 @@ jobs:
             plugins/fusion-plugin-openclaw-runtime/dist
             plugins/fusion-plugin-paperclip-runtime/dist
             plugins/fusion-plugin-compound-engineering/dist
-          key: fusion-pr-dist-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.dist-hash.outputs.hash }}
+            .fusion/cache/plugin-build-cache.json
+          key: fusion-pr-dist-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
 
       - name: Seed artifact hash-cache on cache hit
         if: steps.dist-cache.outputs.cache-hit == 'true'
         run: node scripts/ensure-test-artifacts.mjs --seed-artifact-cache
 
-      # Boot smoke needs the full built workspace; a restore hit above
-      # (including packages/cli/dist now) plus this graceful-fallback build
-      # make this incremental-fast instead of a second full cold build.
+      # `pnpm build` is NOT a fast no-op on a hit even with dist fully
+      # restored: build-workspace.mjs's own skip-cache
+      # (.fusion/cache/plugin-build-cache.json) is separate from
+      # ensure-test-artifacts.mjs's artifact-cache.json (what
+      # --seed-artifact-cache above seeds), and wantsFullCliPackage() treats
+      # CI=true as an implicit --full regardless of any cache state — so the
+      # CLI's full tsup packaging pass (the one that risks the nested desktop
+      # OOM — see the Build job's "Build desktop runtime" step) would run
+      # again on every Gate invocation if this ran unconditionally. Only run
+      # it on a genuine miss (today's full-build behavior, unchanged); a hit
+      # restores .fusion/cache/plugin-build-cache.json too, so build-workspace
+      # itself would see "unchanged" if anything downstream ever does invoke
+      # it again.
       - name: Build
+        if: steps.dist-cache.outputs.cache-hit != 'true'
         run: pnpm build
+
+      # Prove the required dist is actually present on EITHER path (a restore
+      # hit, or the miss-build just above) before the verifier/boot-smoke/
+      # gate-tests steps below need it — a clear failure message here instead
+      # of an opaque "file not found" deep inside one of them.
+      - name: Assert required dist artifacts are present
+        run: node scripts/ensure-test-artifacts.mjs --assert-artifacts-present
 
       # The readiness probe fails closed without the verifier toolchain:
       # Go Task on PATH plus bubblewrap at a trusted path (/usr/bin/bwrap).
