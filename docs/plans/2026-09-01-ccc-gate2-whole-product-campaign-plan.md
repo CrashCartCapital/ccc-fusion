@@ -81,7 +81,7 @@ Tasks 2-4 must have disjoint owned paths and overlapping dispatch windows. A sep
 
 ### Task 6: Run installed live Lane B
 
-- Per-run envelope: concurrency `3`, requests `2,304`, duration `21,600,000ms`, context `200,000`, max output `32,768`, task tokens `5,000,000` soft / `10,000,000` hard.
+- Per-run envelope: concurrency `3`, requests `2,304`, duration `21,600,000ms`, context `200,000`, max output `32,768`, task tokens `500,000,000` soft / `600,000,000` hard.
 - Runs: full real-model clean success, focused installed-runtime restart continuity, and focused pre-provider pause/resume/stop, each fully isolated.
 - Done when: the clean run records all effective upstream identities with no Luna and passes the binary project rubric; deterministic acceptance proves post-dispatch/post-commit recovery cutpoints; the installed-runtime recovery run preserves the durable approval state exactly; and stop leaves no hidden runnable work. No single operational lane may claim whole-product readiness by itself.
 
