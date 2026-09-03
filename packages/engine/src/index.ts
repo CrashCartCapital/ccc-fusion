@@ -1290,3 +1290,5 @@ export {
   type CccPrdIntakeLintResult,
   type LintCccPrdIntakeMarkdownInput,
 } from "./ccc-prd/intake-contract.js";
+export * from "./ccc-model-boundary-telemetry.js";
+export * from "./ccc-model-admission.js";
