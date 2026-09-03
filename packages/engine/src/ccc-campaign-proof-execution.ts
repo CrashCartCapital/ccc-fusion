@@ -37,9 +37,12 @@ import {
 import {
   acquireCccSemanticProofLoopbackPort,
   assertCccSemanticProofSandboxReady,
+  inspectCccSemanticProofSandboxReadiness,
+  isCccSemanticProofSandboxReady,
   runCccSemanticProofSandboxedProcess,
   type CccSemanticProofSandboxPolicyInput,
   type CccSemanticProofSandboxedProcessResult,
+  type CccSemanticProofSandboxReadiness,
   type RunCccSemanticProofSandboxedProcessInput,
 } from "./ccc-campaign-proof-sandbox.js";
 import { AgentSemaphore, PRIORITY_EXECUTE } from "./concurrency.js";
@@ -171,6 +174,13 @@ export interface CreateCccCampaignProofSuiteHandlerInput {
     input: CccSemanticProofMaterializationInput,
   ) => Promise<CccSemanticProofMaterialization>;
   verifySemanticProofToolchain?: (toolchain: CccPrdProofV2["executionToolchain"]) => Promise<void>;
+  /**
+   * Readiness gate for the semantic-v2 proof sandbox backend specifically —
+   * distinct from `inspectVerifierConfinementReadiness` above, which reports
+   * the agent verification-tool sandbox that the v2 path never dispatches
+   * into. See docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md §4.
+   */
+  inspectSemanticProofSandboxReadiness?: () => Promise<CccSemanticProofSandboxReadiness>;
   preflightSemanticProofSandbox?: (
     input: CccSemanticProofSandboxPolicyInput,
   ) => void | Promise<void>;
@@ -1454,6 +1464,7 @@ type SemanticProofRuntimeDependencies = Readonly<{
     input: CccSemanticProofMaterializationInput,
   ) => Promise<CccSemanticProofMaterialization>;
   verifyToolchain: (toolchain: CccPrdProofV2["executionToolchain"]) => Promise<void>;
+  inspectSandboxReadiness: () => Promise<CccSemanticProofSandboxReadiness>;
   preflightSandbox: (input: CccSemanticProofSandboxPolicyInput) => void | Promise<void>;
   runSandbox: (
     input: RunCccSemanticProofSandboxedProcessInput,
@@ -1485,6 +1496,13 @@ async function runSemanticProofV2(
   context: WorkflowNodeExecutionContext,
 ): Promise<WorkflowNodeResult> {
   context.signal?.throwIfAborted();
+  const sandboxReadiness = await dependencies.inspectSandboxReadiness();
+  if (!isCccSemanticProofSandboxReady(sandboxReadiness)) {
+    proofRefusal(
+      `CCC campaign semantic proof sandbox is unavailable (${sandboxReadiness.code}): ${sandboxReadiness.message}`,
+      "CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+    );
+  }
   const layer = input.store.getAsyncLayer();
   if (!layer) {
     proofRefusal("CCC campaign semantic proof execution requires PostgreSQL custody");
@@ -1672,7 +1690,7 @@ async function runSemanticProofV2(
           processResult,
           Math.max(0, Date.now() - startedAt),
         );
-      } catch {
+      } catch (error) {
         terminalEnvelope = executionRefusedEnvelope(
           proof,
           execution.phase,
@@ -1680,6 +1698,9 @@ async function runSemanticProofV2(
           sandboxRefusedResult(),
           Math.max(0, Date.now() - startedAt),
           "sandbox_refused",
+          Object.freeze([
+            `sandbox launch refused: ${error instanceof Error ? error.message : String(error)}`,
+          ]),
         );
       }
 
@@ -1726,6 +1747,8 @@ export function createCccCampaignProofSuiteHandler(
     materialize: input.materializeSemanticProof ?? admitAndMaterializeCccSemanticProof,
     verifyToolchain: input.verifySemanticProofToolchain
       ?? verifyCccSemanticProofToolchainBeforeSpawn,
+    inspectSandboxReadiness: input.inspectSemanticProofSandboxReadiness
+      ?? inspectCccSemanticProofSandboxReadiness,
     preflightSandbox: input.preflightSemanticProofSandbox
       ?? assertCccSemanticProofSandboxReady,
     runSandbox: input.runSemanticProofSandbox ?? runCccSemanticProofSandboxedProcess,

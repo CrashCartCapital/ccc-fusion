@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildCccSemanticProofDarwinProfile,
+  inspectCccSemanticProofSandboxReadiness,
+  isCccSemanticProofSandboxReady,
   runCccSemanticProofSandboxedProcess,
 } from "../ccc-campaign-proof-sandbox.js";
 
@@ -25,6 +27,32 @@ afterEach(async () => {
 });
 
 describe("CCC semantic-proof sandbox", () => {
+  it.skipIf(process.platform === "darwin")(
+    "reports the semantic-proof sandbox as unavailable on a platform with no backend",
+    async () => {
+      const readiness = await inspectCccSemanticProofSandboxReadiness();
+      expect(readiness).toMatchObject({
+        ready: false,
+        backend: null,
+        code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      });
+      expect(isCccSemanticProofSandboxReady(readiness)).toBe(false);
+    },
+  );
+
+  it.skipIf(process.platform !== "darwin")(
+    "reports the semantic-proof sandbox as ready when sandbox-exec is present on Darwin",
+    async () => {
+      const readiness = await inspectCccSemanticProofSandboxReadiness();
+      expect(readiness).toMatchObject({
+        ready: true,
+        backend: "sandbox-exec",
+        code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+      });
+      expect(isCccSemanticProofSandboxReady(readiness)).toBe(true);
+    },
+  );
+
   it("RED-R1-python-semantic-v2-sandbox: exposes only sealed Python runtime files and denies their original roots", async () => {
     const root = await fixtureRoot();
     const proofRoot = join(root, "proof");

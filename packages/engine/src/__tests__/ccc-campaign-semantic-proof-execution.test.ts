@@ -31,6 +31,7 @@ import {
   inspectCccSemanticProofExecutable,
   inspectCccSemanticProofLinkedRuntime,
 } from "../ccc-campaign-proof-materialization.js";
+import { PermanentError } from "../engine-errors.js";
 
 const execFile = promisify(execFileCallback);
 const scratchRoots: string[] = [];
@@ -695,6 +696,46 @@ afterEach(async () => {
 });
 
 describe("CCC semantic proof v2 execution", () => {
+  it("refuses an unavailable semantic-proof sandbox before materializing or reserving a proof attempt", async () => {
+    const f = await fixture();
+    const attempts = attemptApi();
+    const materializeSemanticProof = vi.fn(async ({ outputRoot }: { outputRoot: string }) =>
+      materializedFixture(outputRoot, f.proof.admission!, f.proof.executionToolchain));
+    const inspectSemanticProofSandboxReadiness = vi.fn(async () => ({
+      ready: false as const,
+      backend: null,
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: "semantic-proof sandbox backend is unavailable on linux",
+      trustedPaths: [] as const,
+      detail: "no Linux (or other non-Darwin) backend exists yet for the CCC semantic-v2 proof sandbox",
+    }));
+    const handler = createCccCampaignProofSuiteHandler({
+      rootDir: f.repo,
+      store: {
+        getTask: async () => f.task,
+        getCccCampaignContextForTask: async () => f.campaign,
+        getAsyncLayer: () => ({}) as never,
+        assertCccCampaignWorkflowLeaseFence: async () => undefined,
+      },
+      semanticProofAttempts: attempts,
+      materializeSemanticProof,
+      verifySemanticProofToolchain: async () => undefined,
+      preflightSemanticProofSandbox: async () => undefined,
+      runSemanticProofSandbox: async () => processResult(""),
+      inspectSemanticProofSandboxReadiness,
+    } as never);
+
+    await expect(handler(f.node, f.context)).rejects.toMatchObject({
+      name: PermanentError.name,
+      code: "CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+    });
+    expect(inspectSemanticProofSandboxReadiness).toHaveBeenCalledTimes(1);
+    expect(materializeSemanticProof).not.toHaveBeenCalled();
+    expect(attempts.reserve).not.toHaveBeenCalled();
+    expect(attempts.begin).not.toHaveBeenCalled();
+    expect(attempts.settle).not.toHaveBeenCalled();
+  });
+
   it("RED-G2-node-loopback-dispatch: gives only an opted-in proof one controller-selected port", async () => {
     const original = await fixture();
     const proof = readmitProofDefinition(original.proof, {
@@ -1523,6 +1564,7 @@ describe("CCC semantic proof v2 execution", () => {
       terminalEnvelope: expect.objectContaining({
         kind: "execution_refused",
         code: "sandbox_refused",
+        warnings: [expect.stringContaining("sandbox backend refused launch")],
       }),
     }));
   });

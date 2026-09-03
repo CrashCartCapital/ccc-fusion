@@ -809,6 +809,92 @@ describe("Canonical Fusion runner verifier contract", () => {
   });
 });
 
+describe("CCC PRD product acceptance gate (.github/workflows/ccc-prd-product-gate.yml)", () => {
+  let workflow: any;
+  let content: string;
+  let job: any;
+
+  beforeAll(() => {
+    const result = loadWorkflow("ccc-prd-product-gate.yml");
+    workflow = result.parsed;
+    content = result.content;
+    job = workflow.jobs["product-acceptance"];
+  });
+
+  it("is valid YAML and stays workflow_dispatch-only", () => {
+    expect(workflow).toBeDefined();
+    expect(workflow.on).toEqual({ workflow_dispatch: {} });
+    expect(workflow.on?.pull_request).toBeUndefined();
+    expect(workflow.on?.push).toBeUndefined();
+  });
+
+  it("still runs on the bwrap-capable self-hosted lane, unchanged", () => {
+    expect(job?.["runs-on"]).toEqual(["self-hosted", "linux", "ARM64", "ccc-fusion-bwrap"]);
+  });
+
+  it("documents the diagnosed Linux semantic-proof sandbox gap in its header, citing the findings doc", () => {
+    expect(content).toContain(
+      "docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md",
+    );
+    expect(content).toMatch(/semantic-v2 proof sandbox/i);
+    expect(content).toMatch(/no Linux (implementation|backend)/i);
+    // The header must no longer describe this as an open, undiagnosed
+    // mystery -- that diagnosis now exists.
+    expect(content).not.toContain("pending verifier-dispatch diagnosis");
+  });
+
+  it("does not touch FUSION_PRODUCT_TIMEOUT_MS -- the timeout was never the problem", () => {
+    const acceptanceStep = (job.steps as any[]).find(
+      (step) => typeof step.run === "string" && step.run.includes("verify:ccc-prd-product"),
+    );
+    expect(acceptanceStep?.env?.FUSION_PRODUCT_TIMEOUT_MS).toBe("600000");
+  });
+
+  it("runs a non-Darwin guard step before Checkout, naming the Linux backend gap", () => {
+    const steps = job.steps as any[];
+    const guardIndex = steps.findIndex(
+      (step) => typeof step.if === "string" && step.if.includes("runner.os"),
+    );
+    const checkoutIndex = steps.findIndex((step) => step.uses === "actions/checkout@v4");
+    expect(guardIndex).toBeGreaterThanOrEqual(0);
+    expect(checkoutIndex).toBeGreaterThan(guardIndex);
+
+    const guard = steps[guardIndex];
+    expect(guard.if).toContain("macOS");
+    expect(guard.run).toContain("semantic-proof sandbox");
+    expect(guard.run).toContain("docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md");
+    expect(guard.run).toMatch(/exit 1\s*$/);
+  });
+
+  it("functionally fails fast with a named cause instead of polling to timeout", () => {
+    const steps = job.steps as any[];
+    const guard = steps.find(
+      (step) => typeof step.if === "string" && step.if.includes("runner.os"),
+    );
+    expect(guard).toBeDefined();
+
+    const summaryPath = join(
+      mkdtempSync(join(tmpdir(), "fusion-product-gate-guard-")),
+      "summary.md",
+    );
+    // GitHub Actions substitutes `${{ ... }}` expressions before invoking the
+    // shell -- they are not valid bash syntax on their own. Simulate that
+    // substitution the same way the real runner would for a Linux job.
+    const script: string = guard.run.replace(/\$\{\{\s*runner\.os\s*\}\}/g, "Linux");
+    const result = spawnSync("bash", ["-c", script], {
+      cwd: workspaceRoot,
+      encoding: "utf8",
+      env: { ...process.env, GITHUB_STEP_SUMMARY: summaryPath },
+      timeout: 15_000,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toMatch(/semantic-proof sandbox/i);
+    expect(result.stdout).toContain("docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md");
+    expect(readFileSync(summaryPath, "utf8")).toMatch(/semantic-proof sandbox/i);
+  });
+});
+
 describe("Go Task npm install puts the real binary directory on PATH", () => {
   // @go-task/cli ships as an npm shim: `npm install -g --prefix <prefix>`
   // creates <prefix>/bin/task as a symlink to

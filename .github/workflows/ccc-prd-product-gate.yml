@@ -6,22 +6,34 @@ name: CCC PRD Product Acceptance (non-blocking)
 # touch pr-checks.yml's required job set (Lint, Typecheck, Build, Gate), so
 # this job is not and never was a required status check.
 #
-# DISPATCH-ONLY, NOT wired to pull_request: three runs on this runner all hit
-# the identical failure signature, ruling out flake or job contention:
+# DISPATCH-ONLY, NOT wired to pull_request: the root cause is now diagnosed,
+# not flake or job contention. The CCC semantic-v2 proof sandbox
+# (packages/engine/src/ccc-campaign-proof-sandbox.ts) has exactly one
+# execution backend — macOS `sandbox-exec` — and no Linux implementation has
+# ever existed (true since the file's first commit, d12614d53, 2026-08-13; an
+# original limitation, not a regression). On this job's runner (self-hosted
+# linux ARM64 ccc-fusion-bwrap) the semantic-proof sandbox preflight throws
+# immediately, the verifier subprocess the acceptance script's marker-poll
+# waits on is therefore never spawned, and the poll stalls until timeout
+# instead of failing with the real cause. Three runs on this runner all hit
+# the identical signature, ruling out flake:
 #   - https://github.com/CrashCartCapital/ccc-fusion/actions/runs/30856906922/job/91829936007
 #     (120s default poll timeout)
 #   - job 91841475110, same run (rerun attempt, runner exclusive, 120s)
 #   - https://github.com/CrashCartCapital/ccc-fusion/actions/runs/30861839426/job/91845282837
 #     (600s override via FUSION_PRODUCT_TIMEOUT_MS below -- ran far longer and
-#     still failed identically; the diagnostic tail at expiry shows only the
-#     CLI's own idle background self-healing maintenance loop cycling, with no
-#     visible verifier-specific activity -- a functional failure, not a slow
-#     runner needing more budget)
-# All three: CCC_PRODUCT_POLL_TIMEOUT: verifier process reached post-dispatch
-# cutpoint. Known failing at the product acceptance step on this runner
-# pending verifier-dispatch diagnosis; tracked by the campaign ledger. Run via
-# workflow_dispatch only until that diagnosis lands and this trigger is
-# revisited.
+#     still failed identically, ruling out "needs more time")
+#
+# Full finding, evidence trail, and the tracked plan to add a Linux
+# (bubblewrap) backend: docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md
+#
+# The job below now fails fast with a named cause on any non-Darwin runner
+# (see the "Refuse non-Darwin runners" guard step) instead of appearing to
+# test something it structurally cannot and then stalling for the full poll
+# timeout. This workflow stays workflow_dispatch-only, and stays in the repo
+# unremoved, as the place the gate will run once a Linux semantic-proof
+# sandbox backend lands — it must keep working unmodified if this fleet ever
+# gains a Darwin runner.
 
 on:
   workflow_dispatch: {}
@@ -63,6 +75,22 @@ jobs:
     # generous headroom above the observed local runtime.
     timeout-minutes: 45
     steps:
+      # Fails in seconds with the real, named cause instead of letting the
+      # acceptance script poll to its ~12-minute timeout and report a
+      # misleading "poll timeout" that reads like a hung verifier. Runs
+      # before checkout because the runner's platform is already knowable
+      # from `runner.os`, and this must fail as fast as possible.
+      - name: Refuse non-Darwin runners (no Linux semantic-proof sandbox backend)
+        if: runner.os != 'macOS'
+        run: |
+          {
+            echo "::error::CCC PRD product acceptance cannot pass on this runner (runner.os=${{ runner.os }})."
+            echo "::error::The CCC semantic-proof sandbox (packages/engine/src/ccc-campaign-proof-sandbox.ts) has exactly one execution backend: macOS sandbox-exec. No Linux backend exists yet, so the verifier subprocess this gate's marker-poll waits on is never spawned."
+            echo "::error::Without this guard, the acceptance script would instead poll to its timeout and report a misleading poll-timeout failure that looks like a hung verifier."
+            echo "::error::See docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md for the full finding and the tracked plan to add a Linux (bubblewrap) backend."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
         with:

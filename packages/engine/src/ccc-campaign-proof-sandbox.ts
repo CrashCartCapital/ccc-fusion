@@ -50,6 +50,70 @@ export type CccSemanticProofSandboxPolicyInput = {
   deniedReadRoots: readonly string[];
 };
 
+/**
+ * Readiness envelope for the CCC semantic-v2 proof sandbox specifically — a
+ * distinct backend from the agent verification-tool sandbox reported by
+ * `inspectVerifierConfinementReadiness` in run-verification-tool.ts. The two
+ * must stay separate: wiring the semantic-v2 path to the verification-tool
+ * readiness probe would report ready on a platform where the semantic-proof
+ * backend (sandbox-exec only, no Linux implementation yet) cannot actually
+ * run it. See docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md §4.
+ */
+export interface CccSemanticProofSandboxReadiness {
+  ready: boolean;
+  backend: "sandbox-exec" | null;
+  code: string;
+  message: string;
+  trustedPaths: readonly string[];
+  detail?: string;
+}
+
+export function isCccSemanticProofSandboxReady(
+  value: unknown,
+): value is CccSemanticProofSandboxReadiness & { ready: true; backend: "sandbox-exec" } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const readiness = value as { ready?: unknown; backend?: unknown };
+  return readiness.ready === true && readiness.backend === "sandbox-exec";
+}
+
+/**
+ * Cheap, proof-independent readiness check for the semantic-v2 proof sandbox
+ * backend: is this platform Darwin, and is `sandbox-exec` present. Does not
+ * build a policy profile or require a materialized proof, so it can run
+ * before any per-proof work (mkdtemp, materialization) starts.
+ */
+export async function inspectCccSemanticProofSandboxReadiness(): Promise<CccSemanticProofSandboxReadiness> {
+  if (process.platform !== "darwin") {
+    return {
+      ready: false,
+      backend: null,
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: `semantic-proof sandbox backend is unavailable on ${process.platform}`,
+      trustedPaths: [],
+      detail: "no Linux (or other non-Darwin) backend exists yet for the CCC semantic-v2 proof sandbox",
+    };
+  }
+  if (!existsSync(DARWIN_SANDBOX_EXECUTABLE)) {
+    return {
+      ready: false,
+      backend: "sandbox-exec",
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: "semantic-proof sandbox-exec backend is unavailable",
+      trustedPaths: [DARWIN_SANDBOX_EXECUTABLE],
+      detail: `${DARWIN_SANDBOX_EXECUTABLE} does not exist`,
+    };
+  }
+  return {
+    ready: true,
+    backend: "sandbox-exec",
+    code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+    message: "semantic-proof sandbox-exec backend is available",
+    trustedPaths: [DARWIN_SANDBOX_EXECUTABLE],
+  };
+}
+
 export type RunCccSemanticProofSandboxedProcessInput =
   CccSemanticProofSandboxPolicyInput & {
     executable: string;
