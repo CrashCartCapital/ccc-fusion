@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import type {
   CccPrdProof,
+  CccPrdProofExecutionToolchain,
   CccPrdProofV2,
+  CccPrdPythonExecutionToolchain,
   WorkflowProofAdmissionEvaluatorInput,
   WorkflowProofAdmissionEvaluatorResult,
   WorkflowProofAdmissionExtensionContribution,
@@ -126,6 +128,46 @@ function sortByCanonicalValue<T>(values: readonly T[]): T[] {
 }
 
 /*
+ * Mirrors core's canonicalPythonExecutionToolchain (contract.ts) so the
+ * sealed evaluator's local hash stays byte-equivalent without importing
+ * @fusion/core at runtime; see the provenance note below.
+ */
+function canonicalPythonExecutionToolchain(
+  python: CccPrdPythonExecutionToolchain,
+): CccPrdPythonExecutionToolchain {
+  return {
+    ...python,
+    runtimeManifest: {
+      ...python.runtimeManifest,
+      sitePackagesRoots: sortedStrings(python.runtimeManifest.sitePackagesRoots),
+      extensionModuleRoots: sortedStrings(python.runtimeManifest.extensionModuleRoots),
+      runtimeSupport: sortByCanonicalValue(python.runtimeManifest.runtimeSupport),
+      stdlib: sortByCanonicalValue(python.runtimeManifest.stdlib),
+      sitePackages: sortByCanonicalValue(python.runtimeManifest.sitePackages),
+      extensionModules: sortByCanonicalValue(python.runtimeManifest.extensionModules),
+      dylibClosure: sortByCanonicalValue(python.runtimeManifest.dylibClosure),
+    },
+  };
+}
+
+/*
+ * Mirrors core's canonicalExecutionToolchain (contract.ts) so the sealed
+ * evaluator's local hash stays byte-equivalent without importing
+ * @fusion/core at runtime; see the provenance note below.
+ */
+function canonicalExecutionToolchain(
+  toolchain: CccPrdProofExecutionToolchain,
+): CccPrdProofExecutionToolchain {
+  return {
+    task: toolchain.task,
+    node: toolchain.node,
+    proofHost: toolchain.proofHost,
+    linkedRuntime: sortByCanonicalValue(toolchain.linkedRuntime),
+    ...(toolchain.python ? { python: canonicalPythonExecutionToolchain(toolchain.python) } : {}),
+  };
+}
+
+/*
  * The fixed proof-admission entry is loaded from custodied bytes and is
  * deliberately self-contained: its provenance gate permits only node:crypto.
  * Keep this projection byte-equivalent to the public core helper and pin that
@@ -149,7 +191,8 @@ function computeCccPrdProofDefinitionSha256(proof: CccPrdProof): string {
       negativeControls: sortByCanonicalValue(semanticProof.negativeControls),
       verifierClosure: sortByCanonicalValue(semanticProof.verifierClosure),
       candidateInputs: sortedStrings(semanticProof.candidateInputs),
-      executionToolchain: semanticProof.executionToolchain,
+      executionToolchain: canonicalExecutionToolchain(semanticProof.executionToolchain),
+      ...(semanticProof.verifierProfile ? { verifierProfile: semanticProof.verifierProfile } : {}),
       spans: sortByCanonicalValue(semanticProof.spans),
       confidence: semanticProof.confidence,
     };

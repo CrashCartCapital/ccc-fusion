@@ -63,7 +63,7 @@ function evaluatorInput(proof = admittedProof(), signal = new AbortController().
   });
 }
 
-function semanticProofV2(): CccPrdProofV2 {
+function semanticProofV2(overrides: Partial<CccPrdProofV2> = {}): CccPrdProofV2 {
   const definition: CccPrdProofV2 = {
     schema: "ccc-prd.proof.v2",
     id: "PROOF-SEMANTIC-1",
@@ -87,6 +87,7 @@ function semanticProofV2(): CccPrdProofV2 {
     },
     spans: [],
     confidence: "high",
+    ...overrides,
   };
   return {
     ...definition,
@@ -108,6 +109,52 @@ function semanticProofV2(): CccPrdProofV2 {
 describe("CCC native campaign proof admission", () => {
   it("keeps the self-contained evaluator byte-identical to core's semantic-v2 definition hash", async () => {
     const proof = semanticProofV2();
+    const input = evaluatorInput(proof);
+
+    expect(input.proofDefinitionSha256).toBe(computeCccPrdProofDefinitionSha256(proof));
+    await expect(evaluateCccCampaignProofAdmission(input)).resolves.toEqual({
+      outcome: "pass",
+      evaluatedInputSha256: input.inputSha256,
+      summary: "semantic proof v2 declaration is admissible; command not executed",
+    });
+  });
+
+  it("keeps the self-contained evaluator byte-identical to core's hash with an unsorted linked runtime and a verifier profile", async () => {
+    const linkedRuntime: CccPrdProofV2["executionToolchain"]["linkedRuntime"] = [
+      {
+        platform: "darwin",
+        loaderRole: "proof_host",
+        loaderPath: "/tool/host",
+        requestedPath: "@rpath/libssl.3.dylib",
+        canonicalPath: "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+        sha256: "b".repeat(64),
+      },
+      {
+        platform: "darwin",
+        loaderRole: "task",
+        loaderPath: "/tool/task",
+        requestedPath: "@rpath/libSystem.B.dylib",
+        canonicalPath: "/usr/lib/libSystem.B.dylib",
+        sha256: "c".repeat(64),
+      },
+      {
+        platform: "darwin",
+        loaderRole: "node",
+        loaderPath: "/tool/node",
+        requestedPath: "@rpath/libicuuc.75.dylib",
+        canonicalPath: "/opt/homebrew/opt/icu4c/lib/libicuuc.75.dylib",
+        sha256: "d".repeat(64),
+      },
+    ];
+    const proof = semanticProofV2({
+      executionToolchain: {
+        task: { executablePath: "/tool/task", executableSha256: "5".repeat(64), version: "task 1", versionOutputSha256: "6".repeat(64) },
+        node: { executablePath: "/tool/node", executableSha256: "7".repeat(64), version: "node 24", versionOutputSha256: "8".repeat(64) },
+        proofHost: { id: "fusion-proof-host", executablePath: "/tool/host", executableSha256: "9".repeat(64), version: "host 1", versionOutputSha256: "a".repeat(64) },
+        linkedRuntime,
+      },
+      verifierProfile: { schema: "ccc-prd.verifier.node-loopback.v1" },
+    });
     const input = evaluatorInput(proof);
 
     expect(input.proofDefinitionSha256).toBe(computeCccPrdProofDefinitionSha256(proof));
