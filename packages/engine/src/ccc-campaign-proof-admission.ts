@@ -216,38 +216,61 @@ function computeCccPrdProofDefinitionSha256(proof: CccPrdProof): string {
     .digest("hex");
 }
 
+function cloneAndFreezeCccPrdPythonRuntimeFile(
+  file: CccPrdPythonRuntimeFile,
+): CccPrdPythonRuntimeFile {
+  const clonedFile: CccPrdPythonRuntimeFile = {
+    ...file,
+    ...(file.requestedPaths ? { requestedPaths: [...file.requestedPaths] } : {}),
+  };
+  if (clonedFile.requestedPaths) Object.freeze(clonedFile.requestedPaths);
+  return Object.freeze(clonedFile);
+}
+
 function cloneAndFreezeCccPrdPythonRuntimeFiles(
   files: readonly CccPrdPythonRuntimeFile[],
-): readonly CccPrdPythonRuntimeFile[] {
-  return Object.freeze(files.map((file) => Object.freeze({
-    ...file,
-    ...(file.requestedPaths ? { requestedPaths: Object.freeze([...file.requestedPaths]) } : {}),
-  })));
+): CccPrdPythonRuntimeFile[] {
+  const clonedFiles = files.map((file) => cloneAndFreezeCccPrdPythonRuntimeFile(file));
+  Object.freeze(clonedFiles);
+  return clonedFiles;
 }
 
 /*
  * Deep-clones and freezes the sealed proof's optional Python toolchain,
  * mirroring how executionToolchain.linkedRuntime is handled below, so the
  * python member is not silently dropped and cannot be mutated through the
- * seed reference after admission input is built.
+ * seed reference after admission input is built. Mutable array fields are
+ * cloned first and frozen via a discarded Object.freeze() statement, not by
+ * assigning Object.freeze()'s own return value, because TypeScript's array
+ * overload of Object.freeze narrows to ReadonlyArray -- which is not
+ * assignable back into the source type's plain mutable array fields.
  */
 function cloneAndFreezeCccPrdPythonExecutionToolchain(
   python: CccPrdPythonExecutionToolchain,
 ): CccPrdPythonExecutionToolchain {
-  return Object.freeze({
-    ...python,
-    runtimeManifest: Object.freeze({
-      ...python.runtimeManifest,
-      interpreter: Object.freeze({ ...python.runtimeManifest.interpreter }),
-      sitePackagesRoots: Object.freeze([...python.runtimeManifest.sitePackagesRoots]),
-      extensionModuleRoots: Object.freeze([...python.runtimeManifest.extensionModuleRoots]),
-      runtimeSupport: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.runtimeSupport),
-      stdlib: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.stdlib),
-      sitePackages: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.sitePackages),
-      extensionModules: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.extensionModules),
-      dylibClosure: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.dylibClosure),
-    }),
-  });
+  const interpreter: CccPrdPythonRuntimeFile = cloneAndFreezeCccPrdPythonRuntimeFile(
+    python.runtimeManifest.interpreter,
+  );
+  const sitePackagesRoots = [...python.runtimeManifest.sitePackagesRoots];
+  const extensionModuleRoots = [...python.runtimeManifest.extensionModuleRoots];
+  Object.freeze(sitePackagesRoots);
+  Object.freeze(extensionModuleRoots);
+
+  const runtimeManifest = {
+    ...python.runtimeManifest,
+    interpreter,
+    sitePackagesRoots,
+    extensionModuleRoots,
+    runtimeSupport: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.runtimeSupport),
+    stdlib: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.stdlib),
+    sitePackages: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.sitePackages),
+    extensionModules: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.extensionModules),
+    dylibClosure: cloneAndFreezeCccPrdPythonRuntimeFiles(python.runtimeManifest.dylibClosure),
+  };
+  Object.freeze(runtimeManifest);
+
+  const clonedPython: CccPrdPythonExecutionToolchain = { ...python, runtimeManifest };
+  return Object.freeze(clonedPython);
 }
 
 function cloneAndFreezeCccPrdProof(
