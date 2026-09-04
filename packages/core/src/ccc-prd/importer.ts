@@ -81,7 +81,44 @@ export type CccPrdImportFailureCheckpoint =
   | "after_activation"
   | "lost_response_after_commit";
 
-export type CccPrdImportState = "prepared" | "projecting" | "active";
+/**
+ * Terminal state for an import an operator has closed.
+ *
+ * Nothing transitions out of it. It exists so a closed campaign stops being a
+ * projection source: `reconcileCccPrdImport` re-projects `.fusion/tasks/<id>`
+ * for any task directory that is missing, which is how a campaign the operator
+ * believed finished keeps writing itself back into the owner's repository.
+ */
+export const CCC_PRD_IMPORT_STOPPED_STATE = "stopped";
+
+export type CccPrdImportState =
+  | "prepared"
+  | "projecting"
+  | "active"
+  | typeof CCC_PRD_IMPORT_STOPPED_STATE;
+
+/**
+ * Refuses any reconcile or replay of a stopped import.
+ *
+ * The recorded `lastError` carries the operator's stop marker and, for a
+ * campaign closed because its custody drifted, the drift reason. Both are
+ * repeated in the refusal so the operator sees why the campaign is closed
+ * rather than an opaque state name.
+ */
+export function assertCccPrdImportNotStopped(
+  row: Readonly<{
+    idempotencyKey: string;
+    state: string;
+    lastError: string | null;
+  }>,
+): void {
+  if (row.state !== CCC_PRD_IMPORT_STOPPED_STATE) return;
+  const recorded = row.lastError?.trim();
+  throw new CccPrdImportError(
+    "CCC_PRD_IMPORT_STOPPED",
+    `CCC PRD import ${JSON.stringify(row.idempotencyKey)} was terminally stopped by the operator and will not be reconciled or re-projected${recorded ? `: ${recorded}` : ""}`,
+  );
+}
 
 export type CccPrdImportTransactionWitness = {
   transactionId: string;
@@ -2655,6 +2692,18 @@ export async function reconcileCccPrdImport(
       `CCC PRD import not found for ${JSON.stringify(input.idempotencyKey)}`,
     );
   }
+  if (inspected.state === CCC_PRD_IMPORT_STOPPED_STATE) {
+    const stoppedRow = await selectImportRow(
+      input.layer.db,
+      projectIdFor(input.layer),
+      input.idempotencyKey,
+    );
+    assertCccPrdImportNotStopped({
+      idempotencyKey: input.idempotencyKey,
+      state: inspected.state,
+      lastError: stoppedRow?.lastError ?? null,
+    });
+  }
   invalidateImportReadCaches(input.store);
   const reconciled = await reconcileOwned(input);
   return { ...reconciled, replayed: inspected.state === "active" };
@@ -2669,6 +2718,15 @@ export async function importCccPrdBundle(
     projectIdFor(input.layer),
     input.idempotencyKey,
   );
+  if (existing) {
+    // A stopped campaign is closed for good. Replaying its key would re-import
+    // and re-project the very rows the operator terminated.
+    assertCccPrdImportNotStopped({
+      idempotencyKey: input.idempotencyKey,
+      state: existing.state,
+      lastError: existing.lastError,
+    });
+  }
   if (existing && existing.bundleHash !== input.bundle.bundleHash) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_IDEMPOTENCY_COLLISION",

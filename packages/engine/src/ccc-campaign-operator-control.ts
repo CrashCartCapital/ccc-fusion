@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX,
   canonicalCccPrdJson,
   closeUnopenedCccCampaignExecutionAuthorizationMembers,
   type CccPrdProductStatus,
@@ -9,8 +10,12 @@ import {
 
 export const CCC_CAMPAIGN_OPERATOR_PAUSED_REASON =
   "ccc-operator:campaign-paused";
-export const CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX =
-  "ccc-operator:campaign-stopped:";
+/*
+ * Re-exported rather than restated. Product status detects a terminally stopped
+ * campaign by this prefix, so a second copy here could drift from the one that
+ * decides what an operator is told.
+ */
+export { CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX };
 
 export type CccCampaignOperatorControlAction = "pause" | "resume" | "stop";
 

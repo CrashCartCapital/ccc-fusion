@@ -66,7 +66,12 @@ const CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED_REASON =
   "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED";
 const CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE_REASON =
   "ccc-permanent:CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE";
-const CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX =
+/**
+ * Marker an operator stop writes onto the cancelled workflow work item. Exported
+ * so the terminal state a stop records and the status that reports it are read
+ * from one definition rather than two copies that can drift apart.
+ */
+export const CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX =
   "ccc-operator:campaign-stopped:";
 
 export type CccPrdProductNextActionKind =
@@ -944,20 +949,29 @@ export function cccPermanentWorkItemHasReason(
 export function productNextAction(
   input: CccPrdProductNextActionInput,
 ): CccPrdProductStatus["nextAction"] {
+  const operatorStopped = input.workItems.find((item) =>
+    item.state === "cancelled"
+    && item.lastError?.startsWith(CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX));
+  /*
+   * Terminal stop outranks the reconcile advice below. A stopped campaign is
+   * left non-active on purpose, and reconcile is exactly the command that
+   * re-projects its task directories back into the owner's repository, so
+   * advising it here would undo the stop the operator just performed.
+   */
+  if (operatorStopped) {
+    const closure = operatorStopped.blockedReason?.includes("custody-drift:")
+      ? ` Stop reason: ${operatorStopped.blockedReason}.`
+      : "";
+    return {
+      kind: "abandoned",
+      reason:
+        `Workflow work item ${operatorStopped.id} was terminally stopped by the operator; worktrees, approvals, proof receipts, and any uncertain-effect evidence remain preserved for review.${closure}`,
+    };
+  }
   if (input.row.state !== "active" || input.row.runnable !== 1) {
     return {
       kind: "reconcile-import",
       reason: `Import is ${input.row.state} and must become active before runtime work.`,
-    };
-  }
-  const operatorStopped = input.workItems.find((item) =>
-    item.state === "cancelled"
-    && item.lastError?.startsWith(CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX));
-  if (operatorStopped) {
-    return {
-      kind: "abandoned",
-      reason:
-        `Workflow work item ${operatorStopped.id} was terminally stopped by the operator; worktrees, approvals, proof receipts, and any uncertain-effect evidence remain preserved for review.`,
     };
   }
   const proofAttempts = [

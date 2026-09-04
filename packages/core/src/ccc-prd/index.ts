@@ -36,6 +36,23 @@ export {
   reconcileCccPrdImport,
 } from "./importer.js";
 export {
+  CCC_PRD_IMPORT_STOPPED_STATE,
+  assertCccPrdImportNotStopped,
+} from "./importer.js";
+export {
+  CCC_PRD_CAMPAIGN_DRIFT_STOP_PLAN_SCHEMA,
+  computeCccPrdCampaignDriftStopConfirmation,
+  markCccPrdImportStopped,
+  planCccPrdCampaignDriftStop,
+} from "./campaign-drift-stop.js";
+export type {
+  CccPrdCampaignDriftStopPlan,
+  CccPrdCampaignDriftStopWorkItem,
+  MarkCccPrdImportStoppedInput,
+  PlanCccPrdCampaignDriftStopInput,
+} from "./campaign-drift-stop.js";
+export {
+  CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX,
   CCC_PRD_PRODUCT_STATUS_SCHEMA_VERSION,
   cccPermanentWorkItemHasReason,
   inspectCccPrdProductStatus,

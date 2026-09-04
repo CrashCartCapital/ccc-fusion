@@ -761,6 +761,8 @@ describe("prd command exit contract", () => {
         "       fn prd status <idempotency-key> [--project <id|name>]",
         "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
         "       fn prd <stop|abandon> <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]",
+        "       fn prd stop-drifted <idempotency-key> [--project <id|name>]",
+        "       fn prd stop-drifted <idempotency-key> --reason <reason> --confirm <drift-stop-digest> [--project <id|name>]",
         "       fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]",
         "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
         "       fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id> --confirm <approval-digest> [--project <id|name>]",
