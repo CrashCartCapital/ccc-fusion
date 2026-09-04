@@ -1,0 +1,7 @@
+---
+"@runfusion/fusion": patch
+---
+
+summary: Python-verified CCC campaign proofs no longer halt at proof admission with a stale definition hash.
+category: fix
+dev: `createCccCampaignManifest` in `packages/core/src/ccc-campaign/canonical.ts` deep-copies every admitted proof, and its v2 branch rebuilt `executionToolchain` field by field as `{ task, node, proofHost, linkedRuntime }`, silently dropping the optional `python` sub-object that the Python-adapter verifier profile populates. Because `loadCccCampaignContextForTask` serves `context.proofs` from `manifest.proofs`, the engine held a python-less proof at admission time, so `computeCccPrdProofDefinitionSha256` recomputed a different digest than the one pinned into `proof.admission.definitionSha256` at compile, and `requireProofEvaluator` refused with `CCC_PROOF_ADMISSION_REFUSED ... admission identity or definition is stale`. Observed live on a Python target repo: pin `ce6dbec8…`, runtime recomputation `be34f3c0…`. The copy now spreads before overriding in every branch, deep-copies the python runtime manifest, and ends with a guard that refuses at manifest creation if a copy is ever not byte-identical to its admitted definition. Existing imports whose stored manifest was written by the old copy will now fail custody reconstruction as manifest drift and must be re-imported; campaigns without a python toolchain are byte-identical to before, so their manifest hashes are unchanged.
