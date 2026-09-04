@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { canonicalCccPrdJson, compareCccPrdCodeUnits } from "../ccc-prd/contract.js";
-import type { CccPrdSemanticBundle } from "../ccc-prd/types.js";
+import type {
+  CccPrdProof,
+  CccPrdPythonExecutionToolchain,
+  CccPrdSemanticBundle,
+} from "../ccc-prd/types.js";
 import {
   CCC_CAMPAIGN_CONTEXT_SCHEMA_VERSION,
   CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_MODE_PER_TASK_V1,
@@ -1227,6 +1231,83 @@ export function executionAuthorizationModeFromManifest(
   );
 }
 
+function copyPythonExecutionToolchain(
+  python: CccPrdPythonExecutionToolchain,
+): CccPrdPythonExecutionToolchain {
+  const manifest = python.runtimeManifest;
+  const copyFiles = (files: CccPrdPythonExecutionToolchain["runtimeManifest"]["stdlib"]) =>
+    files.map((file) => ({
+      ...file,
+      ...(file.requestedPaths ? { requestedPaths: [...file.requestedPaths] } : {}),
+    }));
+  return {
+    ...python,
+    runtimeManifest: {
+      ...manifest,
+      interpreter: { ...manifest.interpreter },
+      sitePackagesRoots: [...manifest.sitePackagesRoots],
+      extensionModuleRoots: [...manifest.extensionModuleRoots],
+      runtimeSupport: copyFiles(manifest.runtimeSupport),
+      stdlib: copyFiles(manifest.stdlib),
+      sitePackages: copyFiles(manifest.sitePackages),
+      extensionModules: copyFiles(manifest.extensionModules),
+      dylibClosure: copyFiles(manifest.dylibClosure),
+    },
+  };
+}
+
+/*
+The manifest deep-copies every admitted proof so a caller cannot mutate campaign
+custody through the bundle it handed in. That copy is also the object the engine
+holds at proof-admission time, and `computeCccPrdProofDefinitionSha256` is
+recomputed from it and compared against the pin frozen at compile. So any field
+this copy fails to carry is not a cosmetic omission: it silently changes the
+recomputed definition hash and halts a live campaign at
+CCC_PROOF_ADMISSION_REFUSED, far from the code that dropped it. Every branch
+below therefore spreads before it overrides, so an unmodelled field survives,
+and the closing guard is the fail-closed backstop: if a later edit reintroduces
+a field-by-field pick, the drift surfaces here rather than in a live campaign.
+*/
+function copyAdmittedCampaignProof(proof: CccPrdProof): CccPrdProof {
+  const copied: CccPrdProof = proof.schema === "ccc-prd.proof.v2"
+    ? {
+      ...proof,
+      requirementIds: [...proof.requirementIds],
+      clauseIds: [...proof.clauseIds],
+      phases: [...proof.phases],
+      positiveCases: proof.positiveCases.map((proofCase) => ({ ...proofCase })),
+      negativeControls: proof.negativeControls.map((control) => ({ ...control })),
+      verifierClosure: proof.verifierClosure.map((entry) => ({ ...entry })),
+      candidateInputs: [...proof.candidateInputs],
+      executionToolchain: {
+        ...proof.executionToolchain,
+        task: { ...proof.executionToolchain.task },
+        node: { ...proof.executionToolchain.node },
+        proofHost: { ...proof.executionToolchain.proofHost },
+        linkedRuntime: proof.executionToolchain.linkedRuntime.map((entry) => ({ ...entry })),
+        ...(proof.executionToolchain.python
+          ? { python: copyPythonExecutionToolchain(proof.executionToolchain.python) }
+          : {}),
+      },
+      ...(proof.verifierProfile ? { verifierProfile: { ...proof.verifierProfile } } : {}),
+      spans: proof.spans.map((span) => ({ ...span })),
+      ...(proof.admission ? { admission: { ...proof.admission } } : {}),
+    }
+    : {
+      ...proof,
+      requirementIds: [...proof.requirementIds],
+      negativeControls: [...proof.negativeControls],
+      spans: proof.spans.map((span) => ({ ...span })),
+      ...(proof.admission ? { admission: { ...proof.admission } } : {}),
+    };
+  if (canonicalCccPrdJson(copied) !== canonicalCccPrdJson(proof)) {
+    throw new CccCampaignExecutionPolicyError(
+      `CCC campaign proof ${String(proof.id)} manifest copy is not byte-identical to its admitted definition`,
+    );
+  }
+  return copied;
+}
+
 export function createCccCampaignManifest(
   input: CreateCccCampaignManifestInput,
 ): CccCampaignManifest {
@@ -1285,34 +1366,7 @@ export function createCccCampaignManifest(
       startedAt + input.bundle.bounds.maxDurationMs,
     ).toISOString(),
     admittedWriteRoots: input.bundle.admittedWriteRoots.map((root) => ({ ...root })),
-    proofs: input.bundle.proofs.map((proof) => (
-      proof.schema === "ccc-prd.proof.v2"
-        ? {
-          ...proof,
-          requirementIds: [...proof.requirementIds],
-          clauseIds: [...proof.clauseIds],
-          phases: [...proof.phases],
-          positiveCases: proof.positiveCases.map((proofCase) => ({ ...proofCase })),
-          negativeControls: proof.negativeControls.map((control) => ({ ...control })),
-          verifierClosure: proof.verifierClosure.map((entry) => ({ ...entry })),
-          candidateInputs: [...proof.candidateInputs],
-          executionToolchain: {
-            task: { ...proof.executionToolchain.task },
-            node: { ...proof.executionToolchain.node },
-            proofHost: { ...proof.executionToolchain.proofHost },
-            linkedRuntime: proof.executionToolchain.linkedRuntime.map((entry) => ({ ...entry })),
-          },
-          spans: proof.spans.map((span) => ({ ...span })),
-          ...(proof.admission ? { admission: { ...proof.admission } } : {}),
-        }
-        : {
-          ...proof,
-          requirementIds: [...proof.requirementIds],
-          negativeControls: [...proof.negativeControls],
-          spans: proof.spans.map((span) => ({ ...span })),
-          ...(proof.admission ? { admission: { ...proof.admission } } : {}),
-        }
-    )),
+    proofs: input.bundle.proofs.map(copyAdmittedCampaignProof),
     protectedActions: input.bundle.protectedActions.map((action) => ({
       ...action,
       spans: action.spans.map((span) => ({ ...span })),
