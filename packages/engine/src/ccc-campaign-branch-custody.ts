@@ -107,16 +107,23 @@ export async function inspectCccCampaignBranchCustody(input: {
     };
   }
 
+  /*
+  Order matters. Absence is settled FIRST, because a branch that does not exist
+  yet is the normal path for every campaign task and must never be refused for
+  want of a sealed base — that would block dispatch outright. Only an EXISTING
+  branch raises the custody question, and only then does a missing sealed base
+  become a refusal.
+  */
+  if (!await branchExists(repoDir, branchName)) {
+    return { ok: true, reason: "branch-absent" };
+  }
+
   if (!sealedBase) {
     return {
       ok: false,
       reason: "custody-unknown",
-      detail: `campaign task ${task.id} has no sealed base commit, so descent of ${branchName} cannot be proven`,
+      detail: `branch ${branchName} already exists and campaign task ${task.id} has no sealed base commit, so its descent cannot be proven`,
     };
-  }
-
-  if (!await branchExists(repoDir, branchName)) {
-    return { ok: true, reason: "branch-absent" };
   }
 
   if (!await descendsFrom(repoDir, sealedBase, branchName)) {
@@ -141,8 +148,10 @@ export async function inspectCccCampaignBranchCustody(input: {
  * produce — so this refuses loudly rather than silently suffixing onto a
  * neighbouring name.
  *
- * `sealedBase` being null means the task is not under campaign custody at all
- * (no frozen base was resolved), which is the pre-campaign path and passes.
+ * `sealedBase` may be null for a non-entry campaign task, because only the entry
+ * task re-derives a frozen base. That is not an exemption: the token test still
+ * runs, an absent branch is still created freely, and an EXISTING branch is
+ * refused as `custody-unknown` rather than adopted or force-reset.
  */
 export async function assertCccCampaignBranchNotForeign(input: {
   task: Pick<Task, "id"> & Partial<Pick<Task, "lineageId">>;
@@ -152,13 +161,27 @@ export async function assertCccCampaignBranchNotForeign(input: {
   makeError: (message: string, detail: Record<string, unknown>) => Error;
 }): Promise<void> {
   const { task, repoDir, branchName, sealedBase, makeError } = input;
-  if (!sealedBase) return;
 
+  /*
+  FNXC:CccCampaignBranchCustody 2026-09-03-02:00:
+  This used to return early whenever `sealedBase` was null, on the assumption
+  that a null base meant "not under campaign custody". It does not.
+  `assertCccCampaignEntryFrozenBaseCustody` re-derives a base only for the ENTRY
+  task and returns null for every campaign task with dependencies, so the early
+  return silently exempted the majority of a real campaign from acquisition-level
+  custody — including the cheap name-level token test, which needs no base at
+  all. The in-review rebinder meanwhile refused the identical situation as
+  `custody-unknown`, so the two writers disagreed about the same branch.
+
+  The check now always runs. A campaign task with no sealed base still creates
+  an absent branch freely (`branch-absent`), but may not take over an EXISTING
+  one, matching the rebinder exactly.
+  */
   const verdict = await inspectCccCampaignBranchCustody({ task, repoDir, branchName, sealedBase });
   if (verdict.ok) return;
 
   throw makeError(
-    `CCC campaign task ${task.id} refuses branch ${branchName}: it already exists and does not descend from the sealed base`,
+    `CCC campaign task ${task.id} refuses branch ${branchName}: ${verdict.detail}`,
     { branchName, sealedBase, custodyReason: verdict.reason, custodyDetail: verdict.detail },
   );
 }

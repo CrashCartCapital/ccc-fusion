@@ -25,6 +25,7 @@ import {
   mockedExecSync,
   mockedExistsSync,
   resetExecutorMocks,
+  mockedExecFile,
 } from "./executor-test-helpers.js";
 
 const IMPORT_ID = "0123456789abcdef01234567";
@@ -97,6 +98,29 @@ function makeHarness(rows: Record<string, Row>, existingRefs: readonly string[])
     .mockImplementation(createWorktree as never);
   vi.spyOn(executor as never as { captureBaseCommitSha: unknown }, "captureBaseCommitSha")
     .mockResolvedValue(undefined as never);
+  /*
+  FNXC:CccCampaignBranchCustody 2026-09-03-02:00:
+  The shared harness stubs execFile to succeed for everything, so a
+  `git rev-parse --verify refs/heads/<b>` probe used to report every branch as
+  existing — including branches this fixture never declared. Campaign branch
+  custody asks exactly that question, so answer it from `existingRefs` and let
+  every other execFile call keep the default success stub.
+  */
+  mockedExecFile.mockImplementation(((file: string, args: string[] | undefined, opts: unknown, cb: unknown) => {
+    const callback = typeof opts === "function" ? opts : cb;
+    const argv = args ?? [];
+    const isRefProbe = file === "git" && argv[0] === "rev-parse" && argv.includes("--verify");
+    const ref = argv[argv.length - 1] ?? "";
+    const shortRef = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+    if (isRefProbe && !existingRefs.includes(shortRef) && !existingRefs.includes(ref)) {
+      const err = Object.assign(new Error(`fatal: Needed a single revision: ${ref}`), { code: 128 });
+      if (typeof callback === "function") (callback as (e: unknown, o: string, s: string) => void)(err, "", "");
+      return;
+    }
+    // Every other call keeps the shared default: success with empty output.
+    if (typeof callback === "function") (callback as (e: unknown, o: string, s: string) => void)(null, "", "");
+  }) as never);
+
   const resolveWorktreeStartPoint = vi.fn(async (startPoint: string) =>
     existingRefs.includes(startPoint) ? `sha-for-${startPoint}` : null);
   vi.spyOn(executor as never as { resolveWorktreeStartPoint: unknown }, "resolveWorktreeStartPoint")

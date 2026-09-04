@@ -13,6 +13,7 @@ import {
   resolveTrustedTaskBranchName,
 } from "../worktree-names.js";
 import { SelfHealingManager } from "../self-healing.js";
+import { inspectCccCampaignBranchCustody } from "../ccc-campaign-branch-custody.js";
 import { buildIdentityGuardHook } from "../worktree-hooks.js";
 
 /*
@@ -732,5 +733,149 @@ describe("the refusal gate against a REGISTERED foreign worktree", () => {
     const logged = store.logEntry.mock.calls.map((call: unknown[]) => String(call[1] ?? "")).join("\n");
     expect(logged).not.toMatch(/relocated preserved worktree/i);
     expect(logged).not.toMatch(/relocat/i);
+  });
+});
+
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-02:00:
+Acquisition-level custody was reachable only by ENTRY tasks.
+
+`assertCccCampaignEntryFrozenBaseCustody` returns null for any campaign task
+with dependencies, and `assertCccCampaignBranchNotForeign` then returned early
+on that null sealed base. So every non-entry campaign task — the majority of a
+real campaign — got no acquisition-level check at all, not even the cheap
+name-level token test, while the in-review rebinder refused the very same
+situation as `custody-unknown`. The docstring claimed a token test that never
+ran.
+
+That gap is reachable: with recycling on, `prepareForTask` force-resets an
+existing branch with `git checkout -B <branch> <base>`, so an unattached
+leftover branch carrying the same campaign token is destroyed rather than
+refused.
+*/
+describe("non-entry campaign tasks get the same acquisition custody as entry tasks", () => {
+  let store: any;
+
+  beforeEach(() => {
+    store = {
+      updateTask: vi.fn().mockResolvedValue(undefined),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+    };
+  });
+
+  /** A campaign task with dependencies: NOT the entry task, so no sealed base is re-derived. */
+  function dependentCampaignTask(overrides: Record<string, unknown> = {}): any {
+    return campaignTask({ dependencies: ["KB-001"], ...overrides });
+  }
+
+  it("RED-L14 refuses an unattached tokened branch at a non-descendant commit", async () => {
+    const { rootDir, sealedBase, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
+
+    // A leftover branch carrying THIS campaign's token, forked before the base,
+    // with no worktree attached — exactly what `git checkout -B` would reset.
+    const leftoverFork = git(rootDir, ["rev-parse", `${sealedBase}~1`]);
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", leftoverFork]);
+    const leftoverTip = git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"]);
+    expect(() => git(rootDir, ["merge-base", "--is-ancestor", sealedBase, "fusion/kb-005-f03f47757404"])).toThrow();
+
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await expect(acquireTaskWorktree({
+      task: dependentCampaignTask({ baseCommitSha: sealedBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir, recycleWorktrees: true },
+    })).rejects.toMatchObject({ code: "CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED" });
+
+    // Refused, not force-reset: the leftover tip is exactly where it was.
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(leftoverTip);
+    expect(leftoverTip).toBe(leftoverFork);
+  });
+
+  it("RED-L14 runs the token test for a non-entry task even with no sealed base", async () => {
+    const { rootDir, sealedBase, foreignHead, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
+
+    // A poisoned pointer: the bare canonical name, which is the STRANGER's branch.
+    // The token test alone is enough to refuse this, with or without a sealed base.
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await expect(acquireTaskWorktree({
+      task: dependentCampaignTask({ branch: "fusion/kb-005", baseCommitSha: sealedBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir, recycleWorktrees: true },
+    })).rejects.toMatchObject({ code: "CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED" });
+
+    // The stranger's branch is untouched.
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005"])).toBe(foreignHead);
+  });
+
+  it("RED-L14 still dispatches a non-entry campaign task when nothing collides", async () => {
+    const { rootDir, sealedBase, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    // Absent branch is the normal path and must NOT be refused just because a
+    // non-entry task has no sealed base to compare against.
+    const result = await acquireTaskWorktree({
+      task: dependentCampaignTask({ baseCommitSha: sealedBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir },
+    });
+
+    expect(result.branch).toBe("fusion/kb-005-f03f47757404");
+    expect(git(result.worktreePath, ["branch", "--show-current"])).toBe("fusion/kb-005-f03f47757404");
+  });
+
+  it("RED-L14 matches the rebinder: an existing branch with no sealed base is custody-unknown", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+
+    // Same shape the in-review rebinder already refuses. The two writers must
+    // agree, which was the whole point of the shared choke point.
+    const verdict = await inspectCccCampaignBranchCustody({
+      task: dependentCampaignTask(),
+      repoDir: rootDir,
+      branchName: "fusion/kb-005-f03f47757404",
+      sealedBase: null,
+    });
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict).toMatchObject({ reason: "custody-unknown" });
+  });
+
+  it("RED-L14 leaves an absent branch adoptable with no sealed base, so dispatch is not blocked", async () => {
+    const { rootDir } = makeOwnerRepoWithPriorCampaignBranch();
+
+    const verdict = await inspectCccCampaignBranchCustody({
+      task: dependentCampaignTask(),
+      repoDir: rootDir,
+      branchName: "fusion/kb-005-f03f47757404",
+      sealedBase: null,
+    });
+
+    expect(verdict).toMatchObject({ ok: true, reason: "branch-absent" });
+  });
+
+  it("leaves ordinary non-campaign tasks unaffected by the always-on token test", async () => {
+    const { rootDir } = makeOwnerRepoWithPriorCampaignBranch();
+
+    const verdict = await inspectCccCampaignBranchCustody({
+      task: { id: "FN-1234" } as any,
+      repoDir: rootDir,
+      branchName: "fusion/fn-1234",
+      sealedBase: null,
+    });
+
+    expect(verdict).toMatchObject({ ok: true, reason: "not-a-campaign-task" });
   });
 });
