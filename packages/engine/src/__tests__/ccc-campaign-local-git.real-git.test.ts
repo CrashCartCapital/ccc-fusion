@@ -1109,6 +1109,110 @@ describe("CCC campaign local Git observation", () => {
     await expect(recheckCccCampaignLocalGit(snapshot)).resolves.toBeDefined();
   });
 
+  /*
+   * FNXC:CampaignFenceScope 2026-09-03-19:30:
+   * The untracked-path fence above is scoped to the tree it is asked to
+   * inspect. Gate 3's first campaign against a real developer checkout halted
+   * before any model was called, because the dispatch path inspects the
+   * OWNER'S repository root (`context.targetRepository.path`) while the tree
+   * the campaign actually writes into is the linked worktree Fusion creates.
+   * 195 ordinary untracked files in the owner's checkout refused the campaign.
+   *
+   * The fence is correct; only its scope was wrong. A campaign worktree must
+   * still be pristine, so the strict behaviour stays the DEFAULT and every
+   * caller that lands objects into the repository keeps it. Only a caller that
+   * declares it is observing the owner's repository -- reading base/HEAD object
+   * identity, never writing the tree -- may tolerate untracked paths, and it
+   * must say so explicitly at the call site.
+   */
+  function addCampaignWorktree(root: string, base: string, branch: string): string {
+    const worktree = track(`${root}-campaign-worktree`);
+    git(root, ["worktree", "add", "-q", "-b", branch, worktree, base]);
+    return realpathSync(worktree);
+  }
+
+  it("scopes the untracked-path fence to the inspected tree, not the owner's repository", async () => {
+    const { root, base } = createRepository();
+    // Ordinary developer state in the owner's checkout: nonignored, untracked.
+    writeFileSync(join(root, "owner-scratch.txt"), "work in progress\n");
+    mkdirSync(join(root, "notes"), { recursive: true });
+    writeFileSync(join(root, "notes", "todo.md"), "notes\n");
+    const worktreeRoot = addCampaignWorktree(root, base, "fusion/fence-scope");
+
+    // The campaign worktree Fusion created is pristine.
+    expect(git(worktreeRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe("");
+
+    // 1. Dispatch-path inspection observes the owner's repository and accepts
+    //    it, because the campaign never writes that tree.
+    await expect(inspectCccCampaignLocalGit({
+      targetRoot: root,
+      expectedBaseObject: base,
+      untrackedPathCustody: "owner-repository",
+    })).resolves.toMatchObject({
+      targetRoot: root,
+      head: base,
+      untrackedPathCustody: "owner-repository",
+    });
+
+    // 2. The strict default still refuses that same root, unchanged.
+    await expect(inspectCccCampaignLocalGit({
+      targetRoot: root,
+      expectedBaseObject: base,
+    })).rejects.toThrow(/nonignored untracked paths/);
+
+    // 3. The pristine campaign worktree passes the strict default, even though
+    //    its own repository root is full of untracked files.
+    await expect(inspectCccCampaignLocalGit({
+      targetRoot: worktreeRoot,
+      expectedBaseObject: base,
+    })).resolves.toMatchObject({
+      targetRoot: worktreeRoot,
+      head: base,
+      untrackedPathCustody: "pristine",
+    });
+
+    // 4. One untracked path in that worktree still refuses, same message.
+    writeFileSync(join(worktreeRoot, "stray.txt"), "stray\n");
+    await expect(inspectCccCampaignLocalGit({
+      targetRoot: worktreeRoot,
+      expectedBaseObject: base,
+    })).rejects.toThrow(
+      /CCC campaign target worktree has nonignored untracked paths: \["stray\.txt"\]/,
+    );
+  });
+
+  it("carries untracked-path custody through recheck instead of re-deriving it", async () => {
+    const { root, base } = createRepository();
+    const snapshot = await inspectCccCampaignLocalGit({
+      targetRoot: root,
+      expectedBaseObject: base,
+      untrackedPathCustody: "owner-repository",
+    });
+
+    // The owner keeps working while the campaign runs. Every dispatch rechecks
+    // this snapshot; re-deriving strict custody here would refuse mid-campaign.
+    writeFileSync(join(root, "owner-scratch.txt"), "work in progress\n");
+
+    await expect(recheckCccCampaignLocalGit(snapshot)).resolves.toMatchObject({
+      targetRoot: root,
+      untrackedPathCustody: "owner-repository",
+    });
+  });
+
+  it("recheck of a pristine-custody snapshot still refuses a new untracked path", async () => {
+    const { root, base } = createRepository();
+    const worktreeRoot = addCampaignWorktree(root, base, "fusion/fence-scope-recheck");
+    const snapshot = await inspectCccCampaignLocalGit({
+      targetRoot: worktreeRoot,
+      expectedBaseObject: base,
+    });
+
+    writeFileSync(join(worktreeRoot, "stray.txt"), "stray\n");
+
+    await expect(recheckCccCampaignLocalGit(snapshot))
+      .rejects.toThrow(/nonignored untracked paths/);
+  });
+
   it("honors an already-aborted signal", async () => {
     const { root, base } = createRepository();
     const controller = new AbortController();

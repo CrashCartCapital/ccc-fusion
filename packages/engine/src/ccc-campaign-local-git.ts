@@ -76,11 +76,36 @@ type CccCampaignPhysicalIdentity = Readonly<{
   gitBinary: CccCampaignStatIdentity;
 }>;
 
+/**
+ * Which tree the caller is inspecting, and therefore whose untracked paths the
+ * observation is entitled to refuse.
+ *
+ * Every other check -- expected base object, HEAD descent, index-matches-HEAD,
+ * tracked bytes matching the index, Git filters, physical identity -- is
+ * unaffected by this choice and applies identically under both values.
+ */
+export type CccCampaignUntrackedPathCustody =
+  /**
+   * Default. The inspected tree is under campaign custody: the campaign
+   * worktree Fusion creates, or a repository whose checkout a landing is about
+   * to materialize into. It must hold no nonignored untracked path.
+   */
+  | "pristine"
+  /**
+   * The inspected tree is the owner's repository, observed only for base/HEAD
+   * object identity. The campaign writes its linked worktree, never this tree,
+   * so ordinary untracked developer files here are outside campaign custody
+   * and must not refuse the campaign.
+   */
+  | "owner-repository";
+
 export type InspectCccCampaignLocalGitInput = Readonly<{
   targetRoot: string;
   expectedBaseObject: string;
   expectedHeadObject?: string;
   expectedCheckoutObject?: string;
+  /** Defaults to "pristine"; an omitted value never widens what is admitted. */
+  untrackedPathCustody?: CccCampaignUntrackedPathCustody;
 }>;
 
 export type CccCampaignLocalGitSnapshot = Readonly<{
@@ -92,6 +117,7 @@ export type CccCampaignLocalGitSnapshot = Readonly<{
   head: string;
   headDescendsFromExpectedBase: true;
   dirty: false;
+  untrackedPathCustody: CccCampaignUntrackedPathCustody;
   physicalIdentity: CccCampaignPhysicalIdentity;
 }>;
 
@@ -998,6 +1024,7 @@ async function assertCleanGitSample(
   head: string,
   environment: Readonly<NodeJS.ProcessEnv>,
   signal: AbortSignal,
+  untrackedPathCustody: CccCampaignUntrackedPathCustody,
 ): Promise<void> {
   const configuredNames = splitNullRecords(
     await runGitRaw(
@@ -1074,6 +1101,15 @@ async function assertCleanGitSample(
     signal.throwIfAborted();
   }
 
+  /*
+   * Scoped deliberately. `git ls-files --others` reports the untracked paths of
+   * THIS tree only, so the same call means "the campaign worktree is pristine"
+   * for a worktree under campaign custody and "the owner may not keep scratch
+   * files" for the owner's own checkout. Only the first is a custody rule, so
+   * the caller declares which tree it handed us.
+   */
+  if (untrackedPathCustody === "owner-repository") return;
+
   const untracked = await runGitRaw(
     gitBinary,
     targetRoot,
@@ -1121,6 +1157,12 @@ async function inspectCccCampaignLocalGitWithAuthority(
   const expectedCheckoutObject = input.expectedCheckoutObject === undefined
     ? undefined
     : requireCanonicalObjectId(input.expectedCheckoutObject, "expected checkout object");
+  const untrackedPathCustody = input.untrackedPathCustody ?? "pristine";
+  if (untrackedPathCustody !== "pristine" && untrackedPathCustody !== "owner-repository") {
+    throw new CccCampaignLocalGitError(
+      "CCC campaign untracked-path custody must be pristine or owner-repository",
+    );
+  }
   const targetRoot = await resolvePhysicalPath(input.targetRoot, "target root");
   const gitControlPath = join(targetRoot, ".git");
   const initialTargetRootIdentity = await captureStatIdentity(
@@ -1298,6 +1340,7 @@ async function inspectCccCampaignLocalGitWithAuthority(
     expectedCheckoutObject ?? head,
     environment,
     signal,
+    untrackedPathCustody,
   );
 
   const stableHead = requireCanonicalObjectId(
@@ -1321,6 +1364,7 @@ async function inspectCccCampaignLocalGitWithAuthority(
     expectedCheckoutObject ?? head,
     environment,
     signal,
+    untrackedPathCustody,
   );
   const finalHead = requireCanonicalObjectId(
     await runGit(
@@ -1360,6 +1404,7 @@ async function inspectCccCampaignLocalGitWithAuthority(
     head,
     headDescendsFromExpectedBase: true as const,
     dirty: false as const,
+    untrackedPathCustody,
     physicalIdentity,
   });
 }
@@ -1373,6 +1418,12 @@ export async function recheckCccCampaignLocalGit(
     {
       targetRoot: snapshot.targetRoot,
       expectedBaseObject: snapshot.expectedBaseObject,
+      /*
+       * Carried, never re-derived. The dispatch path rechecks this snapshot
+       * before every provider call; re-deriving strict custody here would
+       * refuse mid-campaign the moment the owner touched their own checkout.
+       */
+      untrackedPathCustody: snapshot.untrackedPathCustody,
     },
     inspectionSignal,
     {
@@ -1387,6 +1438,7 @@ export async function recheckCccCampaignLocalGit(
     || current.expectedBaseObject !== snapshot.expectedBaseObject
     || current.head !== snapshot.head
     || current.gitBinary !== snapshot.gitBinary
+    || current.untrackedPathCustody !== snapshot.untrackedPathCustody
     || !samePhysicalIdentity(current.physicalIdentity, snapshot.physicalIdentity)
   ) {
     throw new CccCampaignLocalGitError(

@@ -143,9 +143,18 @@ export async function createCccCampaignProviderAttemptBinding(
       taskId: context.taskId,
       action,
     }));
+  /*
+   * `rootDir` is the OWNER'S repository root -- line 111 above enforces that it
+   * equals `context.targetRepository.path`. The tree the campaign writes is the
+   * linked worktree Fusion creates for the task, not this one. So this
+   * observation exists to pin base/HEAD object identity, and it must not refuse
+   * on the owner's ordinary untracked files. Pristine-worktree custody stays the
+   * default everywhere else, including every landing caller.
+   */
   const initialGitSnapshot = await inspectCccCampaignLocalGit({
     targetRoot: rootDir,
     expectedBaseObject: context.targetRepository.baseCommit,
+    untrackedPathCustody: "owner-repository",
   });
   const controller = Object.freeze({
     preDispatch: async (dispatch: CccCampaignProviderDispatchInput) => {
