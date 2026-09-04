@@ -452,7 +452,16 @@ So custody has to hold at the write, not only at acquisition, and the consumers
 have to re-check what they read. These are the RED tests for that.
 */
 describe("branch custody holds at the rebind write, not only at acquisition", () => {
-  function rebindStore(task: Record<string, unknown>) {
+  /*
+  `sealedBase` is what the compiler sealed for this campaign, which is the only
+  evidence the rebinder is allowed to judge custody by. Passing null models a
+  campaign whose seal cannot be read; the row's own `baseCommitSha` is never a
+  substitute for it.
+  */
+  function rebindStore(
+    task: Record<string, unknown>,
+    sealedBase: string | null = (task.baseCommitSha as string | null) ?? null,
+  ) {
     const updateTask = vi.fn().mockResolvedValue(undefined);
     return {
       updateTask,
@@ -460,6 +469,9 @@ describe("branch custody holds at the rebind write, not only at acquisition", ()
       listTasks: vi.fn().mockResolvedValue([task]),
       recordRunAuditEvent: vi.fn().mockResolvedValue(undefined),
       logEntry: vi.fn().mockResolvedValue(undefined),
+      getCccCampaignContextForTask: vi.fn().mockResolvedValue(
+        sealedBase ? { targetRepository: { baseCommit: sealedBase } } : null,
+      ),
     } as any;
   }
 
@@ -542,6 +554,99 @@ describe("branch custody holds at the rebind write, not only at acquisition", ()
 
     expect(store.updateTask).not.toHaveBeenCalled();
     expect(result.outcomes[0]).toMatchObject({ result: "skipped", reason: expect.stringContaining("custody") });
+  });
+
+  it("RED-L17 refuses to rebind when the row's base disagrees with the seal", async () => {
+    const { rootDir, sealedBase, foreignHead } = makeOwnerRepoWithPriorCampaignBranch();
+
+    /*
+     * The exact shape PR #67 fixed at acquisition and left standing here. The
+     * branch carries this campaign's token, so the name test passes, and its
+     * tip descends from `foreignHead` — the poisoned value on the mutable task
+     * row — but NOT from the sealed base.
+     *
+     * Judging by the row admits it. Judging by the seal refuses it. Until both
+     * writers read the seal, acquisition and the rebinder disagree about the
+     * same branch, which is the same class of split the campaign already hit
+     * twice, in the opposite direction.
+     */
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", foreignHead]);
+    const poisonedWorktree = join(rootDir, ".worktrees", "poisoned-lineage");
+    git(rootDir, ["worktree", "add", poisonedWorktree, "fusion/kb-005-f03f47757404"]);
+    commit(poisonedWorktree, "labels.py", "rows\n", "feat(KB-005): label rows");
+
+    const task = campaignTask({
+      column: "in-review",
+      branch: null,
+      baseBranch: "main",
+      baseCommitSha: foreignHead,
+    });
+    const store = rebindStore(task, sealedBase);
+    const manager = new SelfHealingManager(store, { rootDir } as any);
+
+    const result = await manager.reconcileInReviewBranchRebind();
+
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(result.repaired).toBe(0);
+    expect(result.outcomes[0]).toMatchObject({
+      result: "skipped",
+      reason: expect.stringContaining("custody"),
+    });
+  });
+
+  it("RED-L17 still rebinds when the row's base agrees with the seal", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+    const ownWorktree = join(rootDir, ".worktrees", "agreeing-lineage");
+    git(rootDir, ["worktree", "add", ownWorktree, "fusion/kb-005-f03f47757404"]);
+    const ownTip = commit(ownWorktree, "labels.py", "rows\n", "feat(KB-005): label rows");
+
+    // Guards the fix from over-refusing: a legitimate chained task whose row
+    // matches its seal must still be repairable.
+    const task = campaignTask({
+      column: "in-review",
+      branch: null,
+      baseBranch: "main",
+      baseCommitSha: sealedBase,
+    });
+    const store = rebindStore(task, sealedBase);
+    const manager = new SelfHealingManager(store, { rootDir } as any);
+
+    const result = await manager.reconcileInReviewBranchRebind();
+
+    expect(result.repaired).toBe(1);
+    expect(store.updateTask).toHaveBeenCalledWith(
+      "KB-005",
+      expect.objectContaining({ branch: "fusion/kb-005-f03f47757404" }),
+    );
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(ownTip);
+  });
+
+  it("RED-L17 refuses when the seal cannot be read, even with a base on the row", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+    const ownWorktree = join(rootDir, ".worktrees", "unreadable-seal");
+    git(rootDir, ["worktree", "add", ownWorktree, "fusion/kb-005-f03f47757404"]);
+    commit(ownWorktree, "labels.py", "rows\n", "feat(KB-005): label rows");
+
+    // An unreadable seal proves nothing. The row agreeing with what the seal
+    // would have said is not evidence, because nothing read the seal.
+    const task = campaignTask({
+      column: "in-review",
+      branch: null,
+      baseBranch: "main",
+      baseCommitSha: sealedBase,
+    });
+    const store = rebindStore(task, null);
+    const manager = new SelfHealingManager(store, { rootDir } as any);
+
+    const result = await manager.reconcileInReviewBranchRebind();
+
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(result.outcomes[0]).toMatchObject({
+      result: "skipped",
+      reason: expect.stringContaining("custody"),
+    });
   });
 
   it("leaves ordinary non-campaign rebind behaviour unchanged", async () => {

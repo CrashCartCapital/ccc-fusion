@@ -79,7 +79,10 @@ import { CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON } from "./ccc-campaign-st
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { isAiMergeContainerDir, resolveAiMergeRootPath, resolveLegacyAiMergeRootPath, resolveWorktreesDir } from "./worktree-paths.js";
 import { campaignScopedFusionBranchName, canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
-import { inspectCccCampaignBranchCustody } from "./ccc-campaign-branch-custody.js";
+import {
+  inspectCccCampaignBranchCustody,
+  resolveCccCampaignCustodyBase,
+} from "./ccc-campaign-branch-custody.js";
 import { preservedWorktreeTargetPathForTask } from "./worktree-pinning.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
 import { resolveBranchGroupMergeRouting } from "./group-merge-coordinator.js";
@@ -4930,7 +4933,36 @@ export class SelfHealingManager {
         Every candidate therefore passes the SAME custody check acquisition
         uses: carries this campaign's identity token, and descends from the
         sealed base. Missing proof is refusal. Ordinary tasks are unaffected.
+
+        The base comes from resolveCccCampaignCustodyBase, the same helper
+        acquisition calls, so both writers read the SEAL. Judging by
+        `task.baseCommitSha` here would let a poisoned row admit a branch that
+        acquisition refuses, which is the same split in the opposite direction.
+        A seal that cannot be read, or that disagrees with the row, is refusal
+        for the whole task rather than an exception that would abandon the rest
+        of the sweep.
         */
+        let campaignCustodyBase: string | null;
+        try {
+          campaignCustodyBase = await resolveCccCampaignCustodyBase(task, this.store, null);
+        } catch (custodyErr) {
+          const detail = custodyErr instanceof Error ? custodyErr.message : String(custodyErr);
+          await this.emitBranchRebindAuditEvent({
+            taskId: task.id,
+            mutationType: "task:auto-rebind-skipped",
+            metadata: {
+              taskId: task.id,
+              reason: "unsafe-to-auto-mutate:campaign-branch-custody",
+              custodyRefusals: [detail],
+            },
+          });
+          result.outcomes.push({
+            taskId: task.id,
+            result: "skipped",
+            reason: "unsafe-to-auto-mutate:campaign-branch-custody",
+          });
+          continue;
+        }
         const custodyRefusals: string[] = [];
         for (const branch of candidates) {
           let branchSha: string;
@@ -4949,7 +4981,7 @@ export class SelfHealingManager {
             task,
             repoDir: this.options.rootDir,
             branchName: branch,
-            sealedBase: task.baseCommitSha,
+            sealedBase: campaignCustodyBase,
           });
           if (!custody.ok) {
             custodyRefusals.push(`${branch} (${custody.reason})`);

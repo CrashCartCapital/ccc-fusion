@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { Task } from "@fusion/core";
+import type { Task, TaskStore } from "@fusion/core";
 import { branchCarriesCampaignToken, cccCampaignBranchToken } from "./worktree-names.js";
+import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
+import { PermanentError } from "./engine-errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -9,6 +11,7 @@ const GIT_TIMEOUT_MS = 30_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
 
 export const CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE = "CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED";
+export const CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE = "CCC_CAMPAIGN_FROZEN_BASE_REFUSED";
 
 /*
 FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
@@ -184,4 +187,54 @@ export async function assertCccCampaignBranchNotForeign(input: {
     `CCC campaign task ${task.id} refuses branch ${branchName}: ${verdict.detail}`,
     { branchName, sealedBase, custodyReason: verdict.reason, custodyDetail: verdict.detail },
   );
+}
+
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-03:00:
+The base every campaign writer must judge a branch against.
+
+`assertCccCampaignEntryFrozenBaseCustody` re-derives the seal for the ENTRY task
+only. For a dependent task it returns null, and custody previously fell back to
+`task.baseCommitSha`. That is the wrong source: the row is mutable state, while
+the seal is compiler-owned. A row carrying an arbitrary commit A would let this
+adopt — or, with recycling on, `git checkout -B` over — a branch descending from
+A but not from the sealed base, and the refusal landed only later in the
+executor, after the branch had already been taken.
+
+So the seal is read here too, for every imported campaign task. The row is not
+an independent source of truth: the executor already requires
+`task.baseCommitSha === frozenBase` for every imported campaign task, and the
+entry path refuses the same mismatch. This pins that invariant at the FIRST
+writer that can touch a branch instead of the last.
+
+Returning null is fail-closed, not permissive: an existing branch with no
+provable base is refused as `custody-unknown`, while an absent branch is still
+created freely so dispatch is never blocked.
+*/
+export async function resolveCccCampaignCustodyBase(
+  task: Task,
+  store: TaskStore,
+  entryFrozenBase: string | null,
+): Promise<string | null> {
+  if (entryFrozenBase) return entryFrozenBase;
+  if (!isImportedCccCampaignTask(task)) return null;
+
+  let context;
+  try {
+    context = await store.getCccCampaignContextForTask(task.id);
+  } catch {
+    // Unreadable seal proves nothing. Fail closed rather than fall back to the row.
+    return null;
+  }
+  const sealedBase = context?.targetRepository?.baseCommit ?? null;
+  if (!sealedBase) return null;
+
+  if (task.baseCommitSha != null && task.baseCommitSha !== sealedBase) {
+    throw new PermanentError(
+      `CCC campaign task ${task.id} persisted base does not match its sealed base`,
+      CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+      { persistedBase: task.baseCommitSha, sealedBase },
+    );
+  }
+  return sealedBase;
 }
