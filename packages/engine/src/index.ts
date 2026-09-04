@@ -1258,6 +1258,7 @@ export {
   inspectCccCampaignLocalGit,
   recheckCccCampaignLocalGit,
   type CccCampaignLocalGitSnapshot,
+  type CccCampaignUntrackedPathCustody,
   type InspectCccCampaignLocalGitInput,
 } from "./ccc-campaign-local-git.js";
 export {

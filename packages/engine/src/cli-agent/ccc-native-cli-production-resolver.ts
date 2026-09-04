@@ -78,9 +78,17 @@ export function createCccNativeCliProductionResolver(
     ) {
       throw new Error("CCC native CLI resolver requires one exact active action lease");
     }
+    /*
+     * Same dispatch-path scope as the PI provider controller: `rootDir` is the
+     * owner's repository root, checked above against the persisted campaign
+     * target. The native CLI writes the task's linked worktree, so this
+     * observation pins base/HEAD identity and leaves the owner's untracked
+     * files alone.
+     */
     const initialGitSnapshot = await inspectCccCampaignLocalGit({
       targetRoot: rootDir,
       expectedBaseObject: context.targetRepository.baseCommit,
+      untrackedPathCustody: "owner-repository",
     });
     const limits = oneShotLimits(context.bounds.maxDurationMs);
     const route = Object.freeze({ ...input.expectedRoute });
