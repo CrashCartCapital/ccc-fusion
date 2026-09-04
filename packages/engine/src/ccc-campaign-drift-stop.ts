@@ -89,11 +89,19 @@ export function cccCampaignDriftStopClosure(
 export async function applyCccCampaignDriftStop(
   input: ApplyCccCampaignDriftStopInput,
 ): Promise<CccCampaignDriftStopResult> {
+  // The same bounds the ordinary stop enforces. A closure sentence is the only
+  // durable record of why a drifted campaign was ended, so an empty, untrimmed,
+  // or unbounded one is not acceptable evidence.
   const reason = input.reason.trim();
-  if (reason.length < 10) {
+  if (
+    !reason
+    || reason !== input.reason
+    || reason.length < 10
+    || reason.length > 1_000
+  ) {
     throw new CccCampaignDriftStopError(
       "CCC_CAMPAIGN_DRIFT_STOP_REASON_REFUSED",
-      "Closing a drifted campaign requires an operator reason of at least 10 characters.",
+      "Closing a drifted campaign requires a 10-1000 character canonical operator reason.",
     );
   }
   const expected = computeCccCampaignDriftStopConfirmation(input.plan);
@@ -108,6 +116,29 @@ export async function applyCccCampaignDriftStop(
   const closureDigest = createHash("sha256").update(closure, "utf8").digest("hex");
   const stoppedMarker = `${CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX}${closureDigest}`;
   const workItem = input.plan.workItem;
+
+  /*
+   * The import row goes FIRST, and nothing else is written if it fails.
+   *
+   * This is the write that stops the campaign re-projecting its task
+   * directories, which is the only ongoing harm. A campaign that has stopped
+   * projecting but still holds a live work item is recoverable. The reverse
+   * leaves the operator believing the campaign is closed while it keeps writing
+   * itself back into the owner's repository, which is exactly the state this
+   * whole path exists to end.
+   */
+  try {
+    await markCccPrdImportStopped({
+      layer: input.layer,
+      idempotencyKey: input.plan.idempotencyKey,
+      stoppedReason: `${stoppedMarker} ${closure}`,
+    });
+  } catch (error) {
+    throw new CccCampaignDriftStopError(
+      "CCC_CAMPAIGN_DRIFT_STOP_IMPORT_CLOSE_FAILED",
+      `Campaign import could not be marked terminal, so nothing was cancelled or paused and the close can be retried whole: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 
   await input.store.transitionWorkflowWorkItem(workItem.id, "cancelled", {
     expectedState: workItem.state as WorkflowWorkItemState,
@@ -132,17 +163,6 @@ export async function applyCccCampaignDriftStop(
       taskPauseError ??= error;
     }
   }
-
-  /*
-   * Written last and unconditionally. This is the only write that stops the
-   * campaign re-projecting its task directories, so a task-pause failure must
-   * not leave the import active and projecting.
-   */
-  await markCccPrdImportStopped({
-    layer: input.layer,
-    idempotencyKey: input.plan.idempotencyKey,
-    stoppedReason: `${stoppedMarker} ${closure}`,
-  });
 
   if (taskPauseError !== null) {
     throw new CccCampaignDriftStopError(

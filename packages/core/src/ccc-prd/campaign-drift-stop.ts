@@ -59,6 +59,71 @@ export type PlanCccPrdCampaignDriftStopInput = Readonly<{
   idempotencyKey: string;
 }>;
 
+/** Work-item states nothing transitions out of. */
+const TERMINAL_WORK_ITEM_STATES: ReadonlySet<string> = new Set([
+  "cancelled",
+  "completed",
+  "failed",
+]);
+
+/**
+ * Whether this work item may be closed by the drifted-campaign path.
+ *
+ * Three refusals, in the order that matters.
+ *
+ * Custody: the item must be exactly this import's, matched the same way the
+ * ordinary operator control matches it.
+ *
+ * Lease: the ordinary control refuses any item the runtime still owns, and
+ * reaches that check through a product status this path cannot build. A null
+ * lease owner is not proof the lease is gone, so a lease expiry or a running
+ * state refuses just as an owner does.
+ *
+ * Terminal: a second close would overwrite the first one's recorded stop
+ * reason. That reason is the only durable record of why the campaign was ended,
+ * so it is written once and never rewritten.
+ */
+export function assertCccPrdCampaignDriftStopWorkItem(
+  workItem: Readonly<{
+    id: string;
+    kind: string;
+    state: string;
+    attempt: number;
+    stableWorkflowRunId: string | null;
+    leaseOwner: string | null;
+    leaseExpiresAt: string | null;
+  }>,
+  runId: string,
+): void {
+  if (
+    workItem.kind !== "task"
+    || workItem.stableWorkflowRunId !== runId
+    || !Number.isSafeInteger(workItem.attempt)
+    || workItem.attempt < 0
+  ) {
+    throw new CccPrdImportError(
+      "CCC_PRD_CAMPAIGN_DRIFT_STOP_CUSTODY_REFUSED",
+      `Workflow work item ${workItem.id} does not match exact imported campaign custody.`,
+    );
+  }
+  if (TERMINAL_WORK_ITEM_STATES.has(workItem.state)) {
+    throw new CccPrdImportError(
+      "CCC_PRD_CAMPAIGN_DRIFT_STOP_ALREADY_TERMINAL",
+      `Workflow work item ${workItem.id} is already ${workItem.state}; its recorded stop reason will not be overwritten.`,
+    );
+  }
+  if (
+    workItem.leaseOwner !== null
+    || workItem.leaseExpiresAt !== null
+    || workItem.state === "running"
+  ) {
+    throw new CccPrdImportError(
+      "CCC_PRD_CAMPAIGN_DRIFT_STOP_LEASED",
+      `Workflow work item ${workItem.id} still has runtime lease custody; wait for the next unleased safe boundary.`,
+    );
+  }
+}
+
 function projectIdFor(layer: AsyncDataLayer): string {
   return layer.projectId?.trim() || "__legacy_unscoped__";
 }
@@ -166,17 +231,7 @@ export async function planCccPrdCampaignDriftStop(
       );
     }
     const workItem = workItems[0]!;
-    if (
-      workItem.kind !== "task"
-      || workItem.stableWorkflowRunId !== runId
-      || !Number.isSafeInteger(workItem.attempt)
-      || workItem.attempt < 0
-    ) {
-      throw new CccPrdImportError(
-        "CCC_PRD_CAMPAIGN_DRIFT_STOP_CUSTODY_REFUSED",
-        `Workflow work item ${workItem.id} does not match exact imported campaign custody.`,
-      );
-    }
+    assertCccPrdCampaignDriftStopWorkItem(workItem, runId);
 
     return {
       schema: CCC_PRD_CAMPAIGN_DRIFT_STOP_PLAN_SCHEMA,
@@ -189,7 +244,9 @@ export async function planCccPrdCampaignDriftStop(
       workItem: {
         id: workItem.id,
         runId: workItem.runId,
-        stableWorkflowRunId: workItem.stableWorkflowRunId,
+        // The guard above proved this equals runId, which TypeScript cannot see
+        // through the call.
+        stableWorkflowRunId: runId,
         kind: workItem.kind,
         state: workItem.state,
         attempt: workItem.attempt,

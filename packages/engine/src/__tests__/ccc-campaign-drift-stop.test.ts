@@ -110,6 +110,7 @@ describe("closing a drifted CCC campaign", () => {
       "pauseTask",
       "pauseTask",
     ]);
+    expect(markImportStopped).toHaveBeenCalledTimes(1);
   });
 
   it("RED-L16-c: records the drift reason in the terminal state", async () => {
@@ -161,7 +162,7 @@ describe("closing a drifted CCC campaign", () => {
     expect(markImportStopped).not.toHaveBeenCalled();
   });
 
-  it("RED-L16-d: marks the import terminal only after the workflow is cancelled", async () => {
+  it("RED-L16-d: marks the import terminal on every close", async () => {
     markImportStopped.mockReset().mockResolvedValue(undefined);
     const { store } = recordingStore();
     const order: string[] = [];
@@ -184,7 +185,107 @@ describe("closing a drifted CCC campaign", () => {
       layer,
     });
 
-    expect(order).toEqual(["transition", "mark-import-stopped"]);
+    expect(order).toEqual(["mark-import-stopped", "transition"]);
+  });
+
+  it("RED-L18-3: enforces the same 10-1000 canonical reason bounds as ordinary stop", async () => {
+    const current = plan();
+    const confirmation = computeCccCampaignDriftStopConfirmation(current);
+
+    // Anything the ordinary stop refuses must be refused here too. A closure
+    // sentence is the only durable record of why a drifted campaign was ended,
+    // so an empty, untrimmed, or unbounded one is not acceptable evidence.
+    for (const reason of ["", "too short", " padded reason text ", "x".repeat(1001)]) {
+      markImportStopped.mockReset().mockResolvedValue(undefined);
+      const { store, calls } = recordingStore();
+      const rejection = await applyCccCampaignDriftStop({
+        plan: current,
+        reason,
+        confirmation,
+        store: store as never,
+        layer,
+      }).catch((error: unknown) => error);
+
+      expect((rejection as CccCampaignDriftStopError).code)
+        .toBe("CCC_CAMPAIGN_DRIFT_STOP_REASON_REFUSED");
+      expect(calls).toEqual([]);
+      expect(markImportStopped).not.toHaveBeenCalled();
+    }
+  });
+
+  it("RED-L18-3: accepts a reason at exactly 1000 characters", async () => {
+    markImportStopped.mockReset().mockResolvedValue(undefined);
+    const { store } = recordingStore();
+    const current = plan();
+
+    const result = await applyCccCampaignDriftStop({
+      plan: current,
+      reason: "y".repeat(1000),
+      confirmation: computeCccCampaignDriftStopConfirmation(current),
+      store: store as never,
+      layer,
+    });
+
+    expect(result.workItemState).toBe("cancelled");
+  });
+
+  it("RED-L18-blocker: stops re-projection before cancelling the workflow", async () => {
+    markImportStopped.mockReset().mockResolvedValue(undefined);
+    const { store } = recordingStore();
+    const order: string[] = [];
+    (store.transitionWorkflowWorkItem as ReturnType<typeof vi.fn>)
+      .mockImplementation(() => {
+        order.push("transition");
+        return Promise.resolve();
+      });
+    (store.pauseTask as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      order.push("pause");
+      return Promise.resolve();
+    });
+    markImportStopped.mockImplementation(() => {
+      order.push("mark-import-stopped");
+      return Promise.resolve();
+    });
+    const current = plan();
+
+    await applyCccCampaignDriftStop({
+      plan: current,
+      reason: "campaign manifest drift blocks every ordinary control",
+      confirmation: computeCccCampaignDriftStopConfirmation(current),
+      store: store as never,
+      layer,
+    });
+
+    /*
+     * The import row goes first on purpose. It is the write that stops the
+     * campaign re-projecting its task directories, and it is the only ongoing
+     * harm. If a later write fails, a campaign that has stopped projecting but
+     * still holds a live work item is recoverable; the reverse leaves the
+     * operator believing the campaign is closed while it keeps writing itself
+     * back into the owner's repository.
+     */
+    expect(order).toEqual(["mark-import-stopped", "transition", "pause", "pause"]);
+  });
+
+  it("RED-L18-blocker: reports a failed import-row write without cancelling anything", async () => {
+    markImportStopped.mockReset()
+      .mockRejectedValue(new Error("new row violates check constraint"));
+    const { store, calls } = recordingStore();
+    const current = plan();
+
+    const rejection = await applyCccCampaignDriftStop({
+      plan: current,
+      reason: "campaign manifest drift blocks every ordinary control",
+      confirmation: computeCccCampaignDriftStopConfirmation(current),
+      store: store as never,
+      layer,
+    }).catch((error: unknown) => error);
+
+    // The exact live failure a missing migration produces. Nothing else may
+    // have been written, so the operator can retry a whole close.
+    expect((rejection as CccCampaignDriftStopError).code)
+      .toBe("CCC_CAMPAIGN_DRIFT_STOP_IMPORT_CLOSE_FAILED");
+    expect(calls).toEqual([]);
   });
 
   it("RED-L16-b: a confirmation cannot be replayed across campaigns", () => {

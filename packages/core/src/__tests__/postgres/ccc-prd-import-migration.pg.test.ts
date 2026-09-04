@@ -70,7 +70,11 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
       DROP TABLE project.ccc_prd_import_sources;
       DROP TABLE project.ccc_prd_import_entities;
       DROP TABLE project.ccc_prd_imports;
-      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037', '0038', '0039');
+      -- 0041 widens ccc_prd_imports_state_check, so it has to be replayed
+      -- alongside the 0035 that recreates the table it constrains. Leaving it
+      -- recorded would rebuild the table with the pre-0041 check, and this
+      -- upgrade would no longer match a fresh baseline.
+      DELETE FROM public.fusion_schema_migrations WHERE version IN ('0035', '0036', '0037', '0038', '0039', '0041');
     `));
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0034");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0035");
@@ -78,6 +82,7 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0037");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0038");
     expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0039");
+    expect(await getAppliedMigrations(upgraded.adminDb)).not.toContain("0041");
 
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] }))
       .toMatchObject({ applied: true });
@@ -86,6 +91,7 @@ pgDescribe("CCC PRD import migration 0034 to 0035", () => {
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0037");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0038");
     expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0039");
+    expect(await getAppliedMigrations(upgraded.adminDb)).toContain("0041");
     expect(await applySchemaBaseline(upgraded.adminDb, { pluginHooks: [] })).toEqual({
       applied: false,
       pluginHooksRun: 0,

@@ -82,6 +82,7 @@ import {
   CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
   CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
   CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
+  CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -221,12 +222,13 @@ describe("schema-applier: immutable migration identities", () => {
     expect(applierSource).toMatch(/applied\.includes\(\s*BIGINT_COUNTERS_VERSION\s*\)/);
   });
 
-  it("registers campaign governance through semantic proof v2 at 0040", () => {
+  it("registers campaign governance through the stopped import state at 0041", () => {
     expect(CCC_CAMPAIGN_GOVERNANCE_VERSION).toBe("0037");
     expect(CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION).toBe("0038");
     expect(CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION).toBe("0039");
     expect(CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION).toBe("0040");
-    expect(SCHEMA_BASELINE_VERSION).toBe("0040");
+    expect(CCC_PRD_IMPORT_STOPPED_STATE_VERSION).toBe("0041");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0041");
     const applierSource = readFileSync(
       fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
       "utf8",
@@ -239,6 +241,11 @@ describe("schema-applier: immutable migration identities", () => {
     expect(applierSource).toMatch(/cccCampaignProofAttemptsAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION\s*,?\s*\)/);
     expect(applierSource).toMatch(/cccCampaignExecutionAuthorizationAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION\s*,?\s*\)/);
     expect(applierSource).toMatch(/cccCampaignSemanticProofV2AlreadyApplied\s*=\s*applied\.includes\(\s*CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION\s*,?\s*\)/);
+    // The terminal import state a drifted-campaign close writes. Without this
+    // migration the write is rejected by ccc_prd_imports_state_check and the
+    // campaign keeps re-projecting its task directories.
+    expect(applierSource).toContain("0041_ccc_prd_import_stopped_state.sql");
+    expect(applierSource).toMatch(/cccPrdImportStoppedStateAlreadyApplied\s*=\s*applied\.includes\(\s*CCC_PRD_IMPORT_STOPPED_STATE_VERSION\s*,?\s*\)/);
   });
 });
 
@@ -1667,6 +1674,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
+      CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1731,6 +1739,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
+      CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
     ]);
   });
 
@@ -1931,6 +1940,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
+      CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
     ]);
   });
 
@@ -2009,6 +2019,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
+      CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
     ]);
   });
 
@@ -2087,6 +2098,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION,
       CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION,
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
+      CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
     ]);
   });
 });
