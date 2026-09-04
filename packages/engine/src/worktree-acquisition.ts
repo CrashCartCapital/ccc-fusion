@@ -49,6 +49,19 @@ import { PermanentError } from "./engine-errors.js";
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 export const CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE = "CCC_CAMPAIGN_FROZEN_BASE_REFUSED";
+/*
+FNXC:CccCampaignBranchScope 2026-09-03-00:00:
+Distinct from FROZEN_BASE_REFUSED, which is about a worktree already bound to
+this task. This one fires BEFORE any binding: a branch carrying this campaign's
+identity token exists with foreign history, so acquisition refuses rather than
+adopting or rewriting someone else's ref.
+*/
+export { CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE } from "./ccc-campaign-branch-custody.js";
+import {
+  CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE,
+  assertCccCampaignBranchNotForeign as assertCccCampaignBranchCustody,
+} from "./ccc-campaign-branch-custody.js";
+
 const CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS = 30_000;
 const CCC_CAMPAIGN_GIT_CUSTODY_MAX_BUFFER = 10 * 1024 * 1024;
 
@@ -339,6 +352,41 @@ export async function assertCccCampaignEntryFrozenBaseCustody(
     }
   }
   return frozenBase;
+}
+
+/**
+ * Refuse a campaign-scoped branch that already exists and does not descend from
+ * the sealed base.
+ *
+ * The adoption rule this enforces, stated once: a sealed campaign task adopts an
+ * existing branch or worktree only when (1) the branch name carries this
+ * campaign's identity token, which holds by construction because
+ * `campaignScopedFusionBranchName` derives it from the task's own `lineageId`,
+ * AND (2) the branch tip descends from the sealed base, AND (3) every commit
+ * after that base belongs to this task inside this campaign window, which
+ * `assertCccCampaignEntryFrozenBaseCustody` proves against the live worktree.
+ * Failing any of those, the branch is foreign: it is never adopted, moved,
+ * pruned, reset, or force-created over.
+ *
+ * A collision here means a branch carrying THIS campaign's identity token has a
+ * different history, which no ordinary reuse can produce — so this refuses
+ * loudly instead of silently suffixing onto a neighbouring name.
+ */
+async function assertCccCampaignBranchNotForeign(input: {
+  task: Task;
+  rootDir: string;
+  branchName: string;
+  frozenBase: string | null;
+}): Promise<void> {
+  const { task, rootDir, branchName, frozenBase } = input;
+  await assertCccCampaignBranchCustody({
+    task,
+    repoDir: rootDir,
+    branchName,
+    sealedBase: frozenBase,
+    makeError: (message, detail) =>
+      new PermanentError(message, CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE, detail),
+  });
 }
 
 export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Promise<AcquireTaskWorktreeResult> {
@@ -813,6 +861,24 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
     return reuseWarmWorktree(worktreePath, resumedBranch, "existing");
   }
 
+  /*
+  FNXC:CccCampaignBranchScope 2026-09-03-00:00:
+  Last gate before anything is created, recycled, moved, or pruned. A sealed
+  campaign task may only take over a branch it can PROVE is its own: the name
+  already carries this campaign's identity token, and the tip must descend from
+  the sealed base. Anything else belongs to another owner — refuse without
+  touching it, rather than adopting it on a name match and relocating its
+  worktree (the L12 round-2 failure). Resume and pinned reuse have already
+  returned above; their custody is proven by
+  assertCccCampaignEntryFrozenBaseCustody against the live worktree.
+  */
+  await assertCccCampaignBranchNotForeign({
+    task,
+    rootDir,
+    branchName,
+    frozenBase: campaignFrozenBase,
+  });
+
   if (!isResume && pool && settings.recycleWorktrees) {
     let pooled: string | null = null;
     try {
@@ -832,6 +898,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
           allowSiblingBranchRename,
           repoDir: rootDir,
           requestingTaskId: task.id,
+          requiredAncestorSha: campaignFrozenBase ?? undefined,
         });
         const prepared = typeof preparedRaw === "string"
           ? { branch: preparedRaw, worktreePath: pooled, reclaimed: false as const }

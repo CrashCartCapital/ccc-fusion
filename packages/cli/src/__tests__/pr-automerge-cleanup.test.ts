@@ -23,6 +23,22 @@ vi.mock("../project-context.js", () => ({
 
 vi.mock("@fusion/engine", () => ({
   releaseHeldTaskByEvent: vi.fn(),
+  /*
+  FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+  pr.ts resolves its head branch through this helper; the hand-written engine
+  mock must carry it (scripts/check-mock-completeness.mjs gate). Mirrors the real
+  campaign-token semantics: a campaign task's persisted branch is honoured only
+  when it carries that campaign's identity token.
+  */
+  resolveTrustedTaskBranchName: (task: { id: string; branch?: string | null; lineageId?: string | null }) => {
+    const canonical = `fusion/${task.id.toLowerCase()}`;
+    const persisted = typeof task.branch === "string" ? task.branch.trim() : "";
+    const match = /^ccc-prd:([0-9a-f]{24}):/u.exec((task.lineageId ?? "").trim());
+    if (!match) return persisted || canonical;
+    const token = match[1].slice(0, 12);
+    if (persisted && persisted.toLowerCase().endsWith(`-${token}`)) return persisted;
+    return `${canonical}-${token}`;
+  },
 }));
 
 vi.mock("@fusion/dashboard", () => ({

@@ -716,7 +716,7 @@ export {
   type BranchConflictInspectionResult,
   type InspectBranchConflictInput,
 } from "./branch-conflicts.js";
-export { generateReservedWorktreeName, generateWorktreeName, planTaskWorktreePath, slugify } from "./worktree-names.js";
+export { branchCarriesCampaignToken, campaignScopedFusionBranchName, cccCampaignBranchToken, generateReservedWorktreeName, generateWorktreeName, planTaskWorktreePath, resolveTrustedTaskBranchName, slugify } from "./worktree-names.js";
 export { createLogger, type Logger } from "./logger.js";
 export {
   validateExternalIntegrationManifest,

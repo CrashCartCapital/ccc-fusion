@@ -45,9 +45,12 @@ export interface EnsureCccCampaignJoinBaseBranchInput {
 
 /**
  * Controller-owned branch that holds the merged start point for a fan-in join
- * task. Task working branches are `fusion/<taskid>`; native task ids end in
- * digits, so the `-ccc-join-base` suffix can never collide with another
- * task's working branch.
+ * task. Task working branches are `fusion/<taskid>` for ordinary tasks and
+ * `fusion/<taskid>-<12 hex campaign token>` for imported campaign tasks (see
+ * campaignScopedFusionBranchName); native task ids end in digits and the
+ * campaign token is hex, so the `-ccc-join-base` suffix can never collide with
+ * another task's working branch. This name is derived identically on write
+ * (executor) and read (required-commit), so it deliberately stays canonical.
  */
 export function cccCampaignJoinBaseBranchName(taskId: string): string {
   return `${canonicalFusionBranchName(taskId)}-ccc-join-base`;

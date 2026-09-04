@@ -86,6 +86,15 @@ if [ "$HEAD_BRANCH_CANONICAL" = "$EXPECTED_BRANCH_CANONICAL" ]; then
   exit 0
 fi
 
+# An imported CCC campaign task works on its own campaign-scoped branch,
+# "<expected>-<12 lowercase hex>" — see campaignScopedFusionBranchName in
+# worktree-names.ts. The suffix is fixed-width hex so this stays as narrow as
+# the exact-match check above; any other suffix is still refused. The expanded
+# variable is quoted, so only the literal hex classes act as a pattern.
+case "$HEAD_BRANCH_CANONICAL" in
+  "$EXPECTED_BRANCH_CANONICAL"-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) exit 0 ;;
+esac
+
 case "$HEAD_BRANCH" in
 ${allowChecks}
 esac

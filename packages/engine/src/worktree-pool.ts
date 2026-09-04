@@ -683,7 +683,17 @@ export class WorktreePool {
     worktreePath: string,
     branchName: string,
     startPoint?: string,
-    options?: { allowSiblingBranchRename?: boolean; repoDir?: string; requestingTaskId?: string },
+    options?: {
+      allowSiblingBranchRename?: boolean;
+      repoDir?: string;
+      requestingTaskId?: string;
+      /*
+      FNXC:CccCampaignBranchScope 2026-09-03-00:00:
+      A sealed CCC campaign task's frozen base. When present, a colliding branch
+      is adopted only if it provably descends from this commit.
+      */
+      requiredAncestorSha?: string;
+    },
   ): Promise<PrepareForTaskResult> {
     // Clean tracked modifications
     try {
@@ -766,6 +776,7 @@ export class WorktreePool {
         ownerTaskId: taskId,
         startPoint: base,
         integrationRef: await resolveIntegrationBranch(repoDir, undefined),
+        requiredAncestorSha: options?.requiredAncestorSha,
       });
       if (inspection.kind === "stale" || inspection.kind === "stale-resolved" || inspection.kind === "tip-already-merged") {
         const backend = resolveWorktreeBackendViaSettings({}, { logger: worktreePoolLog });

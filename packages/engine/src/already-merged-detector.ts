@@ -1,7 +1,7 @@
 import { exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
 
-import { canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
+import { campaignScopedFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
 
 const execAsync = promisify(exec);
 
@@ -190,8 +190,8 @@ export async function findAlreadyMergedTaskCommit(
   }
 
   let branchTip: string | null = null;
-  const branchName = resolveTaskWorkingBranch({ id: taskId, branch: taskBranch });
-  const canonicalBranchName = canonicalFusionBranchName(taskId);
+  const branchName = resolveTaskWorkingBranch({ id: taskId, branch: taskBranch, lineageId });
+  const canonicalBranchName = campaignScopedFusionBranchName({ id: taskId, lineageId });
   /*
   FNXC:WorkflowRecovery 2026-06-28-21:36:
   FN-7143/FN-7187 proved patch-id and tree-equal fallbacks need branch identity proof, not just content equivalence. Only the canonical task branch may imply ownership for fallback matches, and any explicit foreign Fusion trailer on the branch tip or candidate commit rejects the recovery.
@@ -338,7 +338,7 @@ export async function findAlreadyMergedTaskCommit(
   }
 
   try {
-    const treeBranchName = resolveTaskWorkingBranch({ id: taskId, branch: taskBranch });
+    const treeBranchName = resolveTaskWorkingBranch({ id: taskId, branch: taskBranch, lineageId });
     if (treeBranchName !== canonicalBranchName) {
       return null;
     }
