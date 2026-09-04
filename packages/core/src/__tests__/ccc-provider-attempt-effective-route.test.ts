@@ -348,6 +348,56 @@ describe("assertCccProviderAttemptEffectiveRoute", () => {
       expect(receipt?.omniRoute).toEqual({ final: { provider: "glm", model: "glm-5.3" } });
     });
 
+    it("RED-OMNI-COMBO-3: accepts the newly admitted glm-flash-latest route on its live-sealed primary member", () => {
+      const receipt = assertCccProviderAttemptEffectiveRoute(
+        {
+          effectiveProvider: "golden-omniroute-glm-flash-latest",
+          effectiveModel: "combo/glm-flash-latest",
+          usage: { inputTokens: 100, outputTokens: 40 },
+          cost: { amountUsd: 0, source: "pi-ai" },
+          receiptSource: "stream-usage",
+          omniRoute: { final: { provider: "glm", model: "glm-5.3-flash" } },
+        },
+        { providerId: "golden-omniroute-glm-flash-latest", modelId: "combo/glm-flash-latest" },
+        {
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+          // Live OmniRoute combo sealed 2026-09-03 (combo updatedAt
+          // 2026-08-26T19:16:42.851Z): glm-flash-latest's terminal closure is
+          // glm/glm-5.3-flash with an opencode-go/glm-5.3-flash fallback.
+          terminalRouteMembers: [
+            { provider: "glm", model: "glm-5.3-flash" },
+            { provider: "opencode-go", model: "glm-5.3-flash" },
+          ],
+        },
+      );
+      expect(receipt?.omniRoute).toEqual({ final: { provider: "glm", model: "glm-5.3-flash" } });
+    });
+
+    it("RED-OMNI-COMBO-4: refuses glm-flash-latest drift to a non-admitted terminal member", () => {
+      expect(() => assertCccProviderAttemptEffectiveRoute(
+        {
+          effectiveProvider: "golden-omniroute-glm-flash-latest",
+          effectiveModel: "combo/glm-flash-latest",
+          usage: { inputTokens: 100, outputTokens: 40 },
+          cost: { amountUsd: 0, source: "pi-ai" },
+          receiptSource: "stream-usage",
+          omniRoute: { final: { provider: "minimax", model: "MiniMax-M3" } },
+        },
+        { providerId: "golden-omniroute-glm-flash-latest", modelId: "combo/glm-flash-latest" },
+        {
+          receiptAdapterId: "terminal-route-sse-comments.v1",
+          terminalRouteMembers: [
+            { provider: "glm", model: "glm-5.3-flash" },
+            { provider: "opencode-go", model: "glm-5.3-flash" },
+          ],
+        },
+      )).toThrow(
+        "CCC final terminal provider/model receipt is not an admitted terminal route member: "
+        + "observed=minimax/MiniMax-M3; "
+        + "admitted=glm/glm-5.3-flash,opencode-go/glm-5.3-flash",
+      );
+    });
+
     it("RED-OMNI-COMBO-2: reports the observed and admitted terminal members on combo drift", () => {
       expect(() => assertCccProviderAttemptEffectiveRoute(
         {
