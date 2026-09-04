@@ -242,6 +242,72 @@ describe("acquisition against a repository that already owns fusion/kb-005", () 
     expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(squatterTip);
   });
 
+  /*
+   * The real residue, from
+   * .archive/l12-live-campaign/target-residue-inventory.txt: FIFTEEN `fusion/kb-*`
+   * branches in the owner's repository, every one of them checked out in a
+   * registered worktree. Fourteen sit at d1314bb, which does not descend from the
+   * sealed base dabe4181. The single exception is `fusion/kb-002`, left at the
+   * sealed base by the campaign's own previous run — which is why round 1
+   * dispatched at all: it collided with its own lineage by luck. Both shapes
+   * therefore coexist in ONE repository, and they must be told apart there.
+   */
+  it("RED-L13-a/b tells a foreign collision from its own lineage inside one repository", async () => {
+    const { rootDir, sealedBase, foreignWorktreePath, foreignHead, campaignWorktreesDir } =
+      makeOwnerRepoWithPriorCampaignBranch();
+
+    // The campaign's own previous run, preserved at the sealed base.
+    const ownPreservedPath = join(campaignWorktreesDir, "maple-trout");
+    git(rootDir, ["worktree", "add", "-b", "fusion/kb-002-f03f47757404", ownPreservedPath, sealedBase]);
+    const ownPreservedHead = git(ownPreservedPath, ["rev-parse", "HEAD"]);
+
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    // The foreign collision: a fresh worktree on the campaign's own branch.
+    const result = await acquireTaskWorktree({
+      task: campaignTask({ baseCommitSha: sealedBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir },
+    });
+    expect(result.branch).toBe("fusion/kb-005-f03f47757404");
+
+    // Neither neighbour moved: not the owner's, and not the campaign's own.
+    expect(existsSync(foreignWorktreePath)).toBe(true);
+    expect(git(foreignWorktreePath, ["rev-parse", "HEAD"])).toBe(foreignHead);
+    expect(existsSync(ownPreservedPath)).toBe(true);
+    expect(git(ownPreservedPath, ["rev-parse", "HEAD"])).toBe(ownPreservedHead);
+
+    // The campaign's own lineage is still adoptable in that same repository.
+    const own = await inspectBranchConflict({
+      repoDir: rootDir,
+      branchName: "fusion/kb-002-f03f47757404",
+      conflictingWorktreePath: ownPreservedPath,
+      requestingTaskId: "KB-002",
+      ownerTaskId: "KB-002",
+      startPoint: sealedBase,
+      integrationRef: "main",
+      requiredAncestorSha: sealedBase,
+    });
+    expect(own.kind).not.toBe("live-foreign");
+
+    // The stranger's is not.
+    const stranger = await inspectBranchConflict({
+      repoDir: rootDir,
+      branchName: "fusion/kb-005",
+      conflictingWorktreePath: foreignWorktreePath,
+      requestingTaskId: "KB-005",
+      ownerTaskId: "KB-005",
+      startPoint: sealedBase,
+      integrationRef: "main",
+      requiredAncestorSha: sealedBase,
+    });
+    expect(stranger.kind).toBe("live-foreign");
+  });
+
   it("RED-L13-a keeps the identity guard hook refusing a genuinely foreign branch", () => {
     const hook = buildIdentityGuardHook("KB-005");
     expect(hook).toContain("fusion/kb-005");
