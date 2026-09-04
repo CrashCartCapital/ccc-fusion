@@ -48,10 +48,17 @@ const allowlist: AllowlistEntry[] = [
   // above it. Verified as a move, not an addition: the signature still occurs exactly once in
   // the file, the previously pinned line now holds unrelated code, and the options at the new
   // line are byte-identical (same cwd/stdio bounds). No new site is sanctioned here.
-  { file: "src/self-healing.ts", line: 4305, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4311, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4348, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 12933, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  // FNXC:EngineProcessRules 2026-09-03-00:00: re-pinned four drifted git-plumbing
+  // call-sites (self-healing.ts 4305/4311/4348/12933 -> 4308/4314/4351/12949) after the
+  // campaign-scoped branch-name change added comment and candidate lines above them.
+  // Verified as moves, not additions: each signature still occurs exactly once in the
+  // file, the previously pinned lines now hold unrelated code (blank / an options line /
+  // a closing brace / a doc comment), and the options at each new line are byte-identical
+  // (same cwd/encoding/stdio bounds). No new site is sanctioned here.
+  { file: "src/self-healing.ts", line: 4308, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4314, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4351, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 12949, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger-workspace-test-commands.ts", line: 204, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merger-workspace-test-commands.ts", line: 301, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/integration-branch.ts", line: 71, primitive: "execSync", signature: "const stdout = execSync(\"git symbolic-ref --short refs/remotes/origin/HEAD\", {", reason: SHORT_GIT_PLUMBING },

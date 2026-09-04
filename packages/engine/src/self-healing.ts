@@ -78,7 +78,7 @@ import { CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON } from "./ccc-campaign-st
 
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { isAiMergeContainerDir, resolveAiMergeRootPath, resolveLegacyAiMergeRootPath, resolveWorktreesDir } from "./worktree-paths.js";
-import { canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
+import { campaignScopedFusionBranchName, canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
 import { preservedWorktreeTargetPathForTask } from "./worktree-pinning.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
 import { resolveBranchGroupMergeRouting } from "./group-merge-coordinator.js";
@@ -1019,7 +1019,10 @@ export class SelfHealingManager {
         : { ok: false, classification: cls.classification, reason: cls.reason };
       worktreeUnusable = !cls.ok;
     } else {
-      const expected = canonicalFusionBranchName(task.id);
+      // FNXC:CccCampaignBranchScope 2026-09-03-00:00: an imported campaign task's
+      // registered worktree sits on its campaign-scoped branch, so re-deriving the
+      // bare canonical name here scored it "no worktree" and passed the requeue proof.
+      const expected = resolveTaskWorkingBranch(task).toLowerCase();
       const registeredPaths = await getRegisteredWorktreePaths(this.options.rootDir);
       const registeredBranchMap = await getRegisteredWorktreeBranchMap(this.options.rootDir);
       const matchingRegisteredPaths = [...registeredPaths].filter((path) => {
@@ -4887,10 +4890,19 @@ export class SelfHealingManager {
         }
 
         const normalizedId = task.id.toLowerCase();
-        const candidates = new Set<string>([canonicalFusionBranchName(task.id), `fusion/`.concat(task.id)]);
+        // FNXC:CccCampaignBranchScope 2026-09-03-00:00: campaignScopedFusionBranchName
+        // is the name an imported campaign task actually owns; without it a broken
+        // binding could never be repaired, or could rebind to a stray canonical branch.
+        const campaignScopedId = campaignScopedFusionBranchName(task);
+        const candidates = new Set<string>([
+          canonicalFusionBranchName(task.id),
+          campaignScopedId,
+          `fusion/`.concat(task.id),
+        ]);
+        const campaignScopedStem = campaignScopedId.slice("fusion/".length).toLowerCase();
         for (const branch of fusionBranches) {
           const stem = branch.startsWith("fusion/") ? branch.slice("fusion/".length) : "";
-          if (stem.toLowerCase() === normalizedId) candidates.add(branch);
+          if (stem.toLowerCase() === normalizedId || stem.toLowerCase() === campaignScopedStem) candidates.add(branch);
         }
 
         const integrationBase = task.baseBranch || await resolveIntegrationBranch(this.options.rootDir, undefined);
@@ -4901,7 +4913,7 @@ export class SelfHealingManager {
         // distinct refs with distinct SHAs → keep both, so downstream detects
         // the ambiguity rather than silently picking one.
         const candidateByRefSha = new Map<string, { branch: string; aheadCount: number }>();
-        const normalizedCandidate = canonicalFusionBranchName(task.id);
+        const normalizedCandidate = campaignScopedId;
         for (const branch of candidates) {
           let branchSha: string;
           try {
@@ -5076,7 +5088,11 @@ export class SelfHealingManager {
         if (executingIds.has(task.id)) continue;
         if (activeSessionRegistry.isPathActive(task.worktree)) continue;
 
-        const normalizedBranch = canonicalFusionBranchName(task.id);
+        // FNXC:CccCampaignBranchScope 2026-09-03-00:00: look the live worktree up by
+        // the branch the task actually owns. The bare canonical name misses every
+        // imported campaign task, which then had its worktree metadata cleared instead
+        // of rebound — or, worse, rebound onto an unrelated `fusion/<id>` branch.
+        const normalizedBranch = campaignScopedFusionBranchName(task);
         const resolvedTaskWorktree = resolve(task.worktree);
         const realpathTaskWorktree = safeRealpath(resolvedTaskWorktree);
         const stale = !existsSync(task.worktree) || !registeredRealpaths.has(realpathTaskWorktree);

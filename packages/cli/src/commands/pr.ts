@@ -192,8 +192,10 @@ export async function runPrCreate(id: string, options: PrCreateOptions = {}, pro
       process.exit(1);
     }
 
-    // Build branch name using the established project convention
-    const branchName = `fusion/${id.toLowerCase()}`;
+    // Prefer the branch the engine persisted at acquisition. An imported CCC
+    // campaign task works on a campaign-scoped branch and an operator can pick a
+    // custom one, so the bare `fusion/<id>` convention is only the fallback.
+    const branchName = task.branch || `fusion/${id.toLowerCase()}`;
 
     // Build deterministic fallback PR title
     const fallbackTitle = options.title

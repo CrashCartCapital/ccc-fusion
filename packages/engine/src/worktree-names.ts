@@ -33,6 +33,52 @@ export function canonicalFusionBranchName(taskId: string): string {
   return `fusion/${taskId.toLowerCase()}`;
 }
 
+/*
+FNXC:CccCampaignBranchScope 2026-09-03-00:00:
+`fusion/<task-id>` is unique only within ONE task database. A CCC campaign is
+imported into a FRESH database, so it re-allocates native ids from the start and
+`fusion/kb-005` collides with whatever a previous campaign left in the target
+repository. The L12 round-2 run hit exactly that: the owner's August
+`fusion/kb-005` branch (with a registered worktree) was found by branch name,
+adopted, and relocated out of the owner's repository before the frozen-base
+guard refused. The working branch therefore carries the campaign's own identity
+token so two campaigns can never name the same branch.
+
+The token is a pure function of the compiler-minted `lineageId`
+(`ccc-prd:<identityHash[0:24]>:<semanticTaskId>`, see packages/core/src/ccc-prd/projection.ts),
+which is persisted on the task row. Restart and recovery therefore re-derive the
+same branch with no extra state, even after `task.branch` has been cleared.
+*/
+const CCC_CAMPAIGN_LINEAGE_PATTERN = /^ccc-prd:([0-9a-f]{24}):/u;
+
+/** Hex characters of the campaign identity hash carried in the branch name. */
+export const CCC_CAMPAIGN_BRANCH_TOKEN_LENGTH = 12;
+
+/**
+ * The campaign identity token for an imported CCC campaign task, or `null` for
+ * every ordinary task. Lowercase hex, {@link CCC_CAMPAIGN_BRANCH_TOKEN_LENGTH}
+ * characters.
+ */
+export function cccCampaignBranchToken(lineageId: string | null | undefined): string | null {
+  if (typeof lineageId !== "string") return null;
+  const match = CCC_CAMPAIGN_LINEAGE_PATTERN.exec(lineageId.trim());
+  if (!match) return null;
+  return match[1].slice(0, CCC_CAMPAIGN_BRANCH_TOKEN_LENGTH);
+}
+
+/**
+ * The branch name a task owns by construction: `fusion/<task-id>` for ordinary
+ * tasks, `fusion/<task-id>-<campaign-token>` for an imported CCC campaign task.
+ * Deterministic from the persisted task row alone.
+ */
+export function campaignScopedFusionBranchName(
+  task: Pick<Task, "id"> & Partial<Pick<Task, "lineageId">>,
+): string {
+  const canonical = canonicalFusionBranchName(task.id);
+  const token = cccCampaignBranchToken(task.lineageId);
+  return token ? `${canonical}-${token}` : canonical;
+}
+
 /**
  * Canonical per-instance branch name for a worktree-isolated foreach step
  * (step-inversion KTD-11, U10): `fusion/<task>-step-<i>`. Deterministic from the
@@ -44,11 +90,13 @@ export function canonicalStepInstanceBranchName(taskId: string, stepIndex: numbe
   return `${canonicalFusionBranchName(taskId)}-step-${stepIndex}`;
 }
 
-export function resolveTaskWorkingBranch(task: Pick<Task, "id" | "branch" | "branchContext">): string {
+export function resolveTaskWorkingBranch(
+  task: Pick<Task, "id" | "branch" | "branchContext"> & Partial<Pick<Task, "lineageId">>,
+): string {
   if (task.branchContext?.assignmentMode === "shared") {
-    return canonicalFusionBranchName(task.id);
+    return campaignScopedFusionBranchName(task);
   }
-  return task.branch || canonicalFusionBranchName(task.id);
+  return task.branch || campaignScopedFusionBranchName(task);
 }
 
 /**

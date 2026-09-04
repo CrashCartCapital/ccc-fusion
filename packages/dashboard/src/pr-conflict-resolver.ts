@@ -52,8 +52,10 @@ export interface ResolvePrConflictsResult {
   message: string;
 }
 
-function getHeadBranch(taskId: string): string {
-  return `fusion/${taskId.toLowerCase()}`;
+// Prefer the branch the engine persisted at acquisition; an imported CCC
+// campaign task works on a campaign-scoped branch, not bare `fusion/<id>`.
+function getHeadBranch(task: { id: string; branch?: string | null }): string {
+  return task.branch || `fusion/${task.id.toLowerCase()}`;
 }
 
 function getDefaultSessionModel(settings: Settings): { provider: string | undefined; modelId: string | undefined } {
@@ -219,7 +221,7 @@ async function runResolutionAgent(params: {
 export async function resolvePrConflicts(input: ResolvePrConflictsInput): Promise<ResolvePrConflictsResult> {
   const { taskId, baseRef, rootDir, store } = input;
   const task = await store.getTask(taskId);
-  const branchName = getHeadBranch(taskId);
+  const branchName = getHeadBranch(task);
   const reusableWorktree = await resolveUsableWorktree(task.worktree, branchName);
   const tempWorktreePath = join(rootDir, ".fusion", "worktrees", `conflict-${taskId.toLowerCase()}`);
   const cwd = reusableWorktree ?? tempWorktreePath;

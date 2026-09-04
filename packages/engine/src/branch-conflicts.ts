@@ -91,6 +91,15 @@ export interface InspectBranchConflictInput {
   ownerTaskId?: string;
   startPoint?: string;
   integrationRef?: string;
+  /*
+  FNXC:CccCampaignBranchScope 2026-09-03-00:00:
+  A sealed CCC campaign task supplies its frozen base commit here. Adoption of an
+  existing branch/worktree then requires PROVABLE lineage — the branch tip must
+  descend from this exact commit — instead of the branch-name coincidence that
+  let the L12 run adopt (and relocate) a stranger's `fusion/kb-005` worktree.
+  Omitted by every non-campaign caller, whose classification is unchanged.
+  */
+  requiredAncestorSha?: string;
 }
 
 export type BranchConflictInspectionResult =
@@ -897,8 +906,15 @@ export async function autoRecoverCrossContamination(
   };
 }
 
+/*
+FNXC:CccCampaignBranchScope 2026-09-03-00:00:
+The optional `-<12 hex>` tail is the campaign identity token added by
+campaignScopedFusionBranchName. Only the token shape is admitted — the task-id
+half stays as narrow as before, because a wider match here would make MORE
+branches look self-owned, which is the opposite of what this change is for.
+*/
 export function deriveTaskIdFromFusionBranch(branchName: string): string | null {
-  const match = /^fusion\/(fn-\d+)$/i.exec(branchName.trim());
+  const match = /^fusion\/(fn-\d+)(?:-[0-9a-f]{12})?$/i.exec(branchName.trim());
   if (!match) return null;
   return match[1].toUpperCase();
 }
@@ -985,6 +1001,25 @@ export async function inspectBareBranchCollision(
   const uniqueCommitResult = await listUniqueBranchCommits(input.repoDir, startPoint, input.branchName);
   const requestedIntegrationRef = input.integrationRef ?? await resolveIntegrationBranch(input.repoDir, undefined);
   const integrationRef = await resolveBranchComparisonRef(input.repoDir, requestedIntegrationRef, input.branchName);
+
+  // FNXC:CccCampaignBranchScope 2026-09-03-00:00: same lineage gate as
+  // inspectBranchConflict — a branch that does not descend from the sealed base
+  // is never reclaimable, and `foreign-unmerged` is the preserve-and-refuse verdict.
+  if (input.requiredAncestorSha && !await isAncestor(input.repoDir, input.requiredAncestorSha, input.branchName)) {
+    return {
+      kind: "foreign-unmerged",
+      tipSha,
+      uniqueCommitCount: uniqueCommitResult.commits.length,
+      error: new BranchConflictError({
+        branchName: input.branchName,
+        conflictingWorktreePath: livePath ?? input.conflictingWorktreePath,
+        existingTipSha: tipSha,
+        strandedCommits: uniqueCommitResult.commits,
+        startPoint: input.requiredAncestorSha,
+        recommendedAction: `Branch ${input.branchName} does not descend from the sealed base ${input.requiredAncestorSha}; it belongs to another owner. Leave it alone and use a campaign-scoped branch name.`,
+      }),
+    };
+  }
 
   if (livePath && existsSync(livePath)) {
     return {
@@ -1091,6 +1126,30 @@ export async function inspectBranchConflict(
   }
 
   const existingTipSha = await revParse(input.repoDir, input.branchName);
+
+  /*
+  FNXC:CccCampaignBranchScope 2026-09-03-00:00:
+  Lineage gate, ahead of every adoption verdict. A branch that does not descend
+  from the caller's sealed base is not this campaign's branch no matter what it
+  is called, so it can never be classified reclaimable, fully-subsumed, or
+  already-merged. `live-foreign` is the existing non-adopting verdict: the pool
+  surfaces its error rather than moving, pruning, or resetting the checkout.
+  */
+  if (input.requiredAncestorSha && !await isAncestor(input.repoDir, input.requiredAncestorSha, input.branchName)) {
+    return {
+      kind: "live-foreign",
+      livePath,
+      error: new BranchConflictError({
+        branchName: input.branchName,
+        conflictingWorktreePath: livePath,
+        existingTipSha,
+        strandedCommits: (await listUniqueBranchCommits(input.repoDir, startPoint, input.branchName)).commits,
+        startPoint: input.requiredAncestorSha,
+        recommendedAction: `Branch ${input.branchName} does not descend from the sealed base ${input.requiredAncestorSha}; it belongs to another owner. Leave it alone and use a campaign-scoped branch name.`,
+      }),
+    };
+  }
+
   const requestedIntegrationRef = input.integrationRef ?? await resolveIntegrationBranch(input.repoDir, undefined);
   const integrationRef = await resolveBranchComparisonRef(input.repoDir, requestedIntegrationRef, input.branchName);
   if (await isAncestor(input.repoDir, existingTipSha, integrationRef)) {

@@ -98,11 +98,18 @@ export function getMergeStrategy(settings: Pick<Settings, "mergeStrategy">): Non
 }
 
 /**
- * Generate the git branch name for a task.
- * Format: fusion/{task-id-lowercase}
+ * The git branch name for a task.
+ *
+ * Prefers the branch the engine actually persisted at acquisition, falling back
+ * to `fusion/{task-id-lowercase}` when only an id is available. An imported CCC
+ * campaign task works on a campaign-scoped branch
+ * (`fusion/<id>-<campaign token>`, see campaignScopedFusionBranchName in the
+ * engine), and an operator can pick a custom branch, so re-deriving the bare
+ * canonical name here would push, PR, or clean up the wrong branch.
  */
-export function getTaskBranchName(taskId: string): string {
-  return `fusion/${taskId.toLowerCase()}`;
+export function getTaskBranchName(task: string | { id: string; branch?: string | null }): string {
+  if (typeof task === "string") return `fusion/${task.toLowerCase()}`;
+  return task.branch || `fusion/${task.id.toLowerCase()}`;
 }
 
 /**
@@ -282,7 +289,7 @@ export function createGroupPrCallback(
     const membersWithBranch = members.map((member) => ({
       id: member.id,
       title: member.title,
-      branchName: getTaskBranchName(member.id),
+      branchName: getTaskBranchName(member),
     }));
     const created = await github.createPr({
       owner: repo.owner,
@@ -305,7 +312,7 @@ function buildGroupPrSyncBody(group: BranchGroup, members: Task[]): string {
   const membersWithBranch = members.map((member) => ({
     id: member.id,
     title: member.title,
-    branchName: getTaskBranchName(member.id),
+    branchName: getTaskBranchName(member),
   }));
   const landedById = new Map(members.map((member) => [member.id, isBranchGroupMemberLanded(member, group)]));
   return buildGroupPullRequestBody(group, membersWithBranch, {
@@ -453,7 +460,7 @@ export function createPrNodeGithubOps(
         sourceType: "task",
         sourceId: task.id,
         repo: `${repo.owner}/${repo.repo}`,
-        headBranch: getTaskBranchName(task.id),
+        headBranch: getTaskBranchName(task),
       };
     },
     createPr: async ({ task, entity }) => {
@@ -461,7 +468,7 @@ export function createPrNodeGithubOps(
       // Git ops run in the task worktree when known; process.cwd() only as the
       // single-project fallback.
       const cwd = options.getTaskWorktree?.(entity.sourceId) ?? task.worktree ?? process.cwd();
-      const headBranch = entity.headBranch || getTaskBranchName(task.id);
+      const headBranch = entity.headBranch || getTaskBranchName(task);
       await pushTaskBranchToOrigin(cwd, headBranch);
       const { owner, name } = splitRepoSlug(entity.repo);
       const created = await github.createPr({
@@ -601,10 +608,10 @@ async function hasCommitsRelativeToBranch(cwd: string, branch: string, baseBranc
  */
 export async function cleanupMergedTaskArtifacts(
   cwd: string,
-  task: Pick<TaskDetail, "id" | "worktree">,
+  task: Pick<TaskDetail, "id" | "worktree"> & Partial<Pick<TaskDetail, "branch">>,
   options?: { pool?: WorktreePool },
 ): Promise<void> {
-  const branch = getTaskBranchName(task.id);
+  const branch = getTaskBranchName(task);
 
   if (task.worktree) {
     if (options?.pool) {
@@ -668,7 +675,7 @@ async function finalizePullRequestMerge(
   });
   store.emit("task:merged", {
     task: mergedTask,
-    branch: mergedTask.branch ?? getTaskBranchName(task.id),
+    branch: getTaskBranchName(mergedTask),
     merged: true,
     worktreeRemoved: false,
     branchDeleted: false,
@@ -693,7 +700,7 @@ async function finalizeNoOpMergeTask(
   reason: string,
   pool?: WorktreePool,
 ): Promise<void> {
-  const branch = task.branch ?? getTaskBranchName(task.id);
+  const branch = getTaskBranchName(task);
   await cleanupMergedTaskArtifacts(cwd, task, { pool });
   await store.updateTask(task.id, { status: null, mergeRetries: 0 });
   const movedTask = await store.moveTask(task.id, "done");
@@ -782,7 +789,7 @@ export async function processPullRequestMergeTask(
     throw new Error("processPullRequestMergeTask: could not determine repository");
   }
 
-  const branch = getTaskBranchName(task.id);
+  const branch = getTaskBranchName(task);
   const settings = await store.getSettings();
   // `requirePrApproval` MOVED to workflow settings (U4): resolve the task's
   // effective workflow settings and overlay them onto the project/global base so
@@ -811,7 +818,7 @@ export async function processPullRequestMergeTask(
     const members = await store.listTasksByBranchGroup(branchGroup.id);
     const membersWithCommits: Array<Pick<Task, "id" | "title"> & { branchName: string }> = [];
     for (const member of members) {
-      const memberBranch = getTaskBranchName(member.id);
+      const memberBranch = getTaskBranchName(member);
       const hasCommits = await hasCommitsRelativeToBranch(cwd, memberBranch, branchGroup.branchName);
       if (hasCommits || member.id === task.id) {
         membersWithCommits.push({ id: member.id, title: member.title, branchName: memberBranch });
