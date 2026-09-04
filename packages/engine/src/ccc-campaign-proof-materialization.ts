@@ -1133,9 +1133,92 @@ async function sealDarwinLinkedRuntime(
   ));
 }
 
+// Node's execFile rejection carries only "Command failed: <argv>" in `message`;
+// the reason a Mach-O tool refused lives in `stderr`. Custody refusals stringify
+// `error.message`, so without this the operator sees the command and never the
+// linker's explanation. Surface exit status and captured output in the message
+// itself, bounded so a pathological tool cannot flood a refusal record.
+const SEALED_MACH_O_TOOL_OUTPUT_LIMIT = 4096;
+
+function sealedMachOToolFailureDetail(error: unknown): string {
+  const failure = error as {
+    code?: number | string;
+    signal?: string;
+    stderr?: Buffer | string;
+    stdout?: Buffer | string;
+  } | null;
+  const readStream = (value: Buffer | string | undefined): string => {
+    if (value === undefined) return "";
+    // Refusals are read from single-line campaign records, so fold the tool's
+    // multi-line output rather than letting the first newline hide the reason.
+    const text = (typeof value === "string" ? value : value.toString("utf8"))
+      .replace(/\s+/gu, " ")
+      .trim();
+    return text.length > SEALED_MACH_O_TOOL_OUTPUT_LIMIT
+      ? `${text.slice(0, SEALED_MACH_O_TOOL_OUTPUT_LIMIT)}… (truncated)`
+      : text;
+  };
+  const parts: string[] = [];
+  if (failure?.code !== undefined) parts.push(`exit ${String(failure.code)}`);
+  if (failure?.signal) parts.push(`signal ${failure.signal}`);
+  const stderr = readStream(failure?.stderr);
+  const stdout = readStream(failure?.stdout);
+  if (stderr.length > 0) parts.push(`stderr: ${stderr}`);
+  if (stdout.length > 0) parts.push(`stdout: ${stdout}`);
+  if (parts.length === 0 && error instanceof Error) parts.push(error.message);
+  return parts.join("; ");
+}
+
+async function runSealedMachOTool(
+  executable: string,
+  args: readonly string[],
+): Promise<void> {
+  try {
+    await execFile(executable, [...args], {
+      encoding: "buffer",
+      maxBuffer: 1024 * 1024,
+      timeout: INSTALL_NAME_TOOL_TIMEOUT_MS,
+      windowsHide: true,
+    });
+  } catch (error) {
+    const detail = sealedMachOToolFailureDetail(error);
+    throw new Error(
+      `CCC semantic-proof Mach-O sealing command failed: ${executable} ${args.join(" ")}${
+        detail.length > 0 ? ` (${detail})` : ""
+      }`,
+      { cause: error },
+    );
+  }
+}
+
+// `install_name_tool -change` can only rewrite a load command in place when the
+// replacement fits the space the linker reserved. A uv/python-build-standalone
+// interpreter names libpython through a 43-byte relative
+// `@executable_path/../lib/libpython3.N.dylib` and leaves room for about 70
+// bytes, while the sealed mirror of the original absolute path is far longer,
+// so the rewrite can never fit and the seal used to refuse. The seal mirrors
+// every file under its full absolute path, so `bin/` and `lib/` stay siblings
+// inside the sealed root and the original relative name already points at the
+// sealed dylib. When that is provably true we keep the load command untouched:
+// no rewrite, no relink, byte-identical load commands, and the dependency still
+// resolves only inside the sealed root.
+function sealedRelativeNameAlreadySealed(
+  linkedName: string,
+  sealedPath: string,
+  machOPath: string,
+  mainExecutablePath: string,
+): boolean {
+  if (!linkedName.startsWith("@executable_path/") && !linkedName.startsWith("@loader_path/")) {
+    return false;
+  }
+  const resolved = resolveDarwinLinkedPath(linkedName, machOPath, mainExecutablePath);
+  return resolved !== undefined && resolve(resolved) === resolve(sealedPath);
+}
+
 async function patchDarwinInstallNames(
   machOPath: string,
   manifest: readonly CccPrdLinkedRuntimeEntry[],
+  mainExecutablePath: string,
   dylibId?: string,
 ): Promise<void> {
   if (process.platform !== "darwin") return;
@@ -1161,6 +1244,14 @@ async function patchDarwinInstallNames(
         || entry.requestedPath.startsWith("@executable_path/")
       )
     ) {
+      if (sealedRelativeNameAlreadySealed(
+        entry.requestedPath,
+        entry.canonicalPath,
+        machOPath,
+        mainExecutablePath,
+      )) {
+        continue;
+      }
       changes.set(entry.requestedPath, entry.canonicalPath);
     }
   }
@@ -1183,6 +1274,14 @@ async function patchDarwinInstallNames(
       || linkedName.startsWith("@executable_path/")
       || linkedName.startsWith("/")
     )) {
+      if (sealedRelativeNameAlreadySealed(
+        linkedName,
+        uniqueCandidates[0]!.canonicalPath,
+        machOPath,
+        mainExecutablePath,
+      )) {
+        continue;
+      }
       changes.set(linkedName, uniqueCandidates[0]!.canonicalPath);
     } else if (uniqueCandidates.length > 1) {
       throw new Error(`CCC semantic-proof Python dylib dependency is ambiguous: ${linkedName}`);
@@ -1191,38 +1290,25 @@ async function patchDarwinInstallNames(
   if (changes.size === 0 && !dylibId) return;
   await chmod(machOPath, 0o755);
   if (dylibId) {
-    await execFile("/usr/bin/install_name_tool", ["-id", dylibId, machOPath], {
-      encoding: "buffer",
-      maxBuffer: 1024 * 1024,
-      timeout: INSTALL_NAME_TOOL_TIMEOUT_MS,
-      windowsHide: true,
-    });
+    await runSealedMachOTool("/usr/bin/install_name_tool", ["-id", dylibId, machOPath]);
   }
   for (const [requestedPath, sealedPath] of changes) {
-    await execFile("/usr/bin/install_name_tool", ["-change", requestedPath, sealedPath, machOPath], {
-      encoding: "buffer",
-      maxBuffer: 1024 * 1024,
-      timeout: INSTALL_NAME_TOOL_TIMEOUT_MS,
-      windowsHide: true,
-    });
+    await runSealedMachOTool(
+      "/usr/bin/install_name_tool",
+      ["-change", requestedPath, sealedPath, machOPath],
+    );
   }
-  await execFile("/usr/bin/codesign", ["--force", "--sign", "-", "--timestamp=none", machOPath], {
-    encoding: "buffer",
-    maxBuffer: 1024 * 1024,
-    timeout: INSTALL_NAME_TOOL_TIMEOUT_MS,
-    windowsHide: true,
-  });
-  await execFile("/usr/bin/codesign", ["--verify", machOPath], {
-    encoding: "buffer",
-    maxBuffer: 1024 * 1024,
-    timeout: INSTALL_NAME_TOOL_TIMEOUT_MS,
-    windowsHide: true,
-  });
+  await runSealedMachOTool(
+    "/usr/bin/codesign",
+    ["--force", "--sign", "-", "--timestamp=none", machOPath],
+  );
+  await runSealedMachOTool("/usr/bin/codesign", ["--verify", machOPath]);
 }
 
 async function assertSealedDarwinLinkedRuntimeGraph(
   toolchainRoot: string,
   machOPaths: readonly string[],
+  mainExecutableFor: (machOPath: string) => string,
 ): Promise<void> {
   if (process.platform !== "darwin") return;
   for (const machOPath of machOPaths) {
@@ -1238,7 +1324,11 @@ async function assertSealedDarwinLinkedRuntimeGraph(
       ) {
         continue;
       }
-      const resolved = resolveDarwinLinkedPath(dependency, machOPath, machOPath);
+      const resolved = resolveDarwinLinkedPath(
+        dependency,
+        machOPath,
+        mainExecutableFor(machOPath),
+      );
       if (resolved?.startsWith(`${toolchainRoot}/`)) continue;
       throw new Error(`CCC semantic-proof sealed runtime graph escaped toolchain root: ${dependency}`);
     }
@@ -1356,19 +1446,30 @@ async function sealExecutionToolchain(
   const allRewriteManifest = [...rewriteManifest, ...pythonRewriteManifest];
   const linkedRuntimeByCanonicalPath = new Map<string, CccPrdLinkedRuntimeEntry>();
   for (const entry of linkedRuntime) linkedRuntimeByCanonicalPath.set(entry.canonicalPath, entry);
-  const machOPaths = [
-    taskExecutable,
-    nodeExecutable,
-    proofHostExecutable,
-    ...(python ? [python.executablePath, ...[
+  const pythonMachOPaths = python
+    ? [python.executablePath, ...[
       ...python.runtimeManifest.stdlib,
       ...python.runtimeManifest.sitePackages,
       ...python.runtimeManifest.extensionModules,
       ...python.runtimeManifest.dylibClosure,
       ...python.runtimeManifest.runtimeSupport,
-    ].map((entry) => entry.path)] : []),
+    ].map((entry) => entry.path)]
+    : [];
+  const machOPaths = [
+    taskExecutable,
+    nodeExecutable,
+    proofHostExecutable,
+    ...pythonMachOPaths,
     ...linkedRuntimeByCanonicalPath.keys(),
   ];
+  // `@executable_path` is anchored to the main executable that dyld launched,
+  // not to the file holding the load command. Every sealed Python runtime file
+  // is loaded by the sealed interpreter, so resolve against it; the standalone
+  // sealed executables anchor to themselves.
+  const sealedPythonMachOPaths = new Set(pythonMachOPaths);
+  const mainExecutableFor = (machOPath: string): string => (
+    python && sealedPythonMachOPaths.has(machOPath) ? python.executablePath : machOPath
+  );
   const sealedPythonDylibIds = new Set(
     toolchain.python?.runtimeManifest.dylibClosure
       .map((entry) => sealedByCanonicalPath.get(entry.path))
@@ -1378,11 +1479,12 @@ async function sealExecutionToolchain(
     await patchDarwinInstallNames(
       machOPath,
       allRewriteManifest,
+      mainExecutableFor(machOPath),
       linkedRuntimeByCanonicalPath.get(machOPath)?.canonicalPath
         ?? (sealedPythonDylibIds.has(machOPath) ? machOPath : undefined),
     );
   }
-  await assertSealedDarwinLinkedRuntimeGraph(toolchainRoot, machOPaths);
+  await assertSealedDarwinLinkedRuntimeGraph(toolchainRoot, machOPaths, mainExecutableFor);
   await Promise.all([
     chmod(taskExecutable, 0o555),
     chmod(nodeExecutable, 0o555),

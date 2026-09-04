@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFile as execFileCallback, execFileSync } from "node:child_process";
+import { existsSync, readdirSync } from "node:fs";
 import {
   chmod,
+  cp,
   mkdtemp,
   mkdir,
   readFile,
@@ -13,8 +14,8 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -58,6 +59,68 @@ const roots: string[] = [];
 // dedicated qualification command opts in with FUSION_TEST_REAL_PYTHON_SEAL_SMOKE=1.
 const runRealPythonSealSmoke = process.env.FUSION_TEST_REAL_PYTHON_SEAL_SMOKE === "1";
 const sha256 = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+
+const EXECUTABLE_PATH_PREFIX = "@executable_path/";
+
+type RelativeInstallNameCPython = {
+  interpreterPath: string;
+  dylibPath: string;
+  requestedPath: string;
+  installRoot: string;
+  stdlibDirectoryName: string;
+};
+
+// python-build-standalone interpreters (what `uv python install` ships) name
+// libpython through a short relative `@executable_path/../lib/libpython3.N.dylib`
+// with only a few dozen spare bytes in the load command. Homebrew and framework
+// interpreters use absolute install names and never exercise that headroom, so a
+// real interpreter of this shape is the only binary that proves the seal works.
+// Discovery is synchronous so `it.runIf` can gate at collection time.
+function findRelativeInstallNameCPython(): RelativeInstallNameCPython | undefined {
+  if (process.platform !== "darwin") return undefined;
+  const installDir = process.env.UV_PYTHON_INSTALL_DIR
+    ?? join(homedir(), ".local", "share", "uv", "python");
+  let distributions: string[];
+  try {
+    distributions = readdirSync(installDir).filter((name) => !name.startsWith(".")).sort();
+  } catch {
+    return undefined;
+  }
+  for (const distribution of distributions) {
+    const binDirectory = join(installDir, distribution, "bin");
+    let launchers: string[];
+    try {
+      launchers = readdirSync(binDirectory).filter((name) => /^python3\.\d+$/u.test(name)).sort();
+    } catch {
+      continue;
+    }
+    for (const launcher of launchers) {
+      const interpreterPath = join(binDirectory, launcher);
+      let linked: string;
+      try {
+        linked = execFileSync("/usr/bin/otool", ["-L", interpreterPath], { encoding: "utf8" });
+      } catch {
+        continue;
+      }
+      for (const line of linked.split("\n").slice(1)) {
+        const requestedPath = line.trim().split(/\s+/u)[0];
+        if (!requestedPath?.startsWith(EXECUTABLE_PATH_PREFIX)) continue;
+        const dylibPath = resolve(
+          dirname(interpreterPath),
+          requestedPath.slice(EXECUTABLE_PATH_PREFIX.length),
+        );
+        if (!existsSync(dylibPath)) continue;
+        const installRoot = dirname(binDirectory);
+        const stdlibDirectoryName = launcher;
+        if (!existsSync(join(installRoot, "lib", stdlibDirectoryName))) continue;
+        return { interpreterPath, dylibPath, requestedPath, installRoot, stdlibDirectoryName };
+      }
+    }
+  }
+  return undefined;
+}
+
+const relativeInstallNameCPython = findRelativeInstallNameCPython();
 
 async function createGitFixture(): Promise<{
   repository: string;
@@ -1470,4 +1533,269 @@ describe("CCC semantic-proof admission and materialization", () => {
       vi.resetModules();
     }
   });
+
+  const realCPythonSealRunnable = relativeInstallNameCPython !== undefined
+    && process.platform === "darwin"
+    && existsSync("/opt/homebrew/bin/task");
+
+  // Copies the discovered interpreter and its libpython into a throwaway tree so
+  // the seal never touches the operator's live toolchain. `dylibDirectoryName`
+  // decides whether the copy preserves the bin/../lib relationship the relative
+  // install name depends on.
+  async function createRealCPythonMaterializationFixture(options: {
+    dylibDirectoryName: string;
+    copyStdlib: boolean;
+  }) {
+    const source = relativeInstallNameCPython!;
+    const fixture = await createGitFixture();
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-real-cpython-proof-output-"));
+    const toolRootRaw = await mkdtemp(join(tmpdir(), "ccc-real-cpython-proof-runtime-"));
+    const toolRoot = await realpath(toolRootRaw);
+    roots.push(outputRoot, toolRootRaw);
+    const interpreterPath = join(toolRoot, "bin", basename(source.interpreterPath));
+    // The copied interpreter must stay runnable in its own tree, so libpython
+    // always lands where its relative install name points. `dylibDirectoryName`
+    // only changes where the manifest *declares* the dylib: pointing it
+    // elsewhere breaks the bin/../lib relationship inside the seal and forces
+    // the rewrite the fix normally avoids.
+    const runnableDylibPath = join(toolRoot, "lib", basename(source.dylibPath));
+    const dylibPath = join(toolRoot, options.dylibDirectoryName, basename(source.dylibPath));
+    const stdlibRoot = join(toolRoot, "lib", source.stdlibDirectoryName);
+    const sitePackagesRoot = join(stdlibRoot, "site-packages");
+    const extensionModuleRoot = join(stdlibRoot, "lib-dynload");
+    await mkdir(dirname(interpreterPath), { recursive: true });
+    await mkdir(dirname(runnableDylibPath), { recursive: true });
+    await mkdir(dirname(dylibPath), { recursive: true });
+    await cp(source.interpreterPath, interpreterPath);
+    await cp(source.dylibPath, runnableDylibPath);
+    if (dylibPath !== runnableDylibPath) await cp(source.dylibPath, dylibPath);
+    await chmod(interpreterPath, 0o755);
+    await chmod(runnableDylibPath, 0o644);
+    await chmod(dylibPath, 0o644);
+    if (options.copyStdlib) {
+      // Startup only needs the pure-Python core, and sealing hashes every file
+      // it is handed, so leave out the large subtrees an interpreter identity
+      // probe never touches.
+      const skippedStdlibDirectories = new Set([
+        "__pycache__",
+        "ensurepip",
+        "idlelib",
+        "lib2to3",
+        "site-packages",
+        "test",
+        "tests",
+        "tkinter",
+      ]);
+      await cp(join(source.installRoot, "lib", source.stdlibDirectoryName), stdlibRoot, {
+        recursive: true,
+        dereference: false,
+        filter: (from) => !skippedStdlibDirectories.has(basename(from)),
+      });
+    }
+    await mkdir(sitePackagesRoot, { recursive: true });
+    await mkdir(extensionModuleRoot, { recursive: true });
+
+    const adapterPath = "verify/python_adapter.py";
+    const targetPath = "fixtures/python-target";
+    await mkdir(join(fixture.repository, targetPath), { recursive: true });
+    await writeFile(join(fixture.repository, adapterPath), "print('adapter')\n");
+    await writeFile(join(fixture.repository, targetPath, "target.py"), "print('target')\n");
+    await writeFile(join(fixture.repository, "Taskfile.yml"), [
+      "version: '3'",
+      "tasks:",
+      "  verify:slugify:",
+      "    cmds:",
+      `      - python3 ${adapterPath} --target ${targetPath}`,
+      "",
+    ].join("\n"));
+    await execFile("git", ["-C", fixture.repository, "add", "Taskfile.yml", adapterPath, targetPath]);
+    await execFile("git", ["-C", fixture.repository, "commit", "-m", "real cpython proof baseline"]);
+    const baseCommit = (await execFile("git", ["-C", fixture.repository, "rev-parse", "HEAD"])).stdout.trim();
+    const gitOid = async (path: string) => (
+      await execFile("git", ["-C", fixture.repository, "rev-parse", `${baseCommit}:${path}`])
+    ).stdout.trim();
+
+    const runtimeEntry = async (path: string) => ({ path, sha256: sha256(await readFile(path)) });
+    const walkFiles = async (root: string): Promise<string[]> => {
+      const collected: string[] = [];
+      const visit = async (directory: string): Promise<void> => {
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          const child = join(directory, entry.name);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory()) await visit(child);
+          else if (entry.isFile()) collected.push(child);
+        }
+      };
+      await visit(root);
+      return collected.sort();
+    };
+    const stdlibFiles = options.copyStdlib
+      ? (await walkFiles(stdlibRoot)).filter((path) => !path.startsWith(`${extensionModuleRoot}/`))
+      : [];
+
+    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const nodeIdentity = await executableIdentity(process.execPath);
+    const pythonIdentity = await executableIdentity(interpreterPath);
+    const definition = proof({
+      ...fixture,
+      taskOid: await gitOid("Taskfile.yml"),
+      taskIdentity,
+      nodeIdentity,
+      linkedRuntime: [],
+    });
+    definition.verifierClosure[0] = {
+      ...definition.verifierClosure[0],
+      baseGitBlobOid: await gitOid("Taskfile.yml"),
+      sha256: sha256(await readFile(join(fixture.repository, "Taskfile.yml"))),
+    };
+    definition.verifierClosure[1] = {
+      role: "harness",
+      path: adapterPath,
+      baseGitBlobOid: await gitOid(adapterPath),
+      sha256: sha256(await readFile(join(fixture.repository, adapterPath))),
+    };
+    definition.verifierClosure.push({
+      role: "fixture",
+      path: `${targetPath}/target.py`,
+      baseGitBlobOid: await gitOid(`${targetPath}/target.py`),
+      sha256: sha256(await readFile(join(fixture.repository, `${targetPath}/target.py`))),
+    });
+    definition.verifierProfile = {
+      schema: "ccc-prd.verifier.python-adapter.v1",
+      adapterPath,
+      targetPath,
+    };
+    definition.executionToolchain.python = {
+      ...pythonIdentity,
+      runtimeManifest: {
+        schema: "ccc-prd.python-runtime-manifest.v1",
+        interpreter: await runtimeEntry(interpreterPath),
+        stdlibRoot,
+        pythonHomeRoot: toolRoot,
+        sitePackagesRoots: [sitePackagesRoot],
+        extensionModuleRoots: [extensionModuleRoot],
+        // When the declared dylib sits outside `lib/`, the runnable copy still
+        // has to reach the seal so the interpreter can answer its identity
+        // probe; declaring it as runtime support does that without making it
+        // the rewrite target.
+        runtimeSupport: dylibPath === runnableDylibPath
+          ? []
+          : [await runtimeEntry(runnableDylibPath)],
+        stdlib: await Promise.all(stdlibFiles.map(runtimeEntry)),
+        sitePackages: [],
+        extensionModules: [],
+        dylibClosure: [{
+          ...(await runtimeEntry(dylibPath)),
+          requestedPaths: [source.requestedPath],
+        }],
+      },
+    };
+    definition.executionToolchain.linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
+      task: taskIdentity,
+      node: nodeIdentity,
+      proofHost: { id: "fusion-native-semantic-proof-v2", ...nodeIdentity },
+    });
+    return { fixture, definition, outputRoot, proofBaseCommit: baseCommit, source, toolRoot };
+  }
+
+  it.runIf(realCPythonSealRunnable)(
+    "RED-L17-headerpad: seals a real relative-install-name CPython without relinking its load commands",
+    async () => {
+      const { fixture, definition, outputRoot, proofBaseCommit, source } =
+        await createRealCPythonMaterializationFixture({
+          dylibDirectoryName: "lib",
+          copyStdlib: true,
+        });
+
+      const materialization = await admitAndMaterializeCccSemanticProof({
+        repositoryRoot: fixture.repository,
+        baseCommit: proofBaseCommit,
+        sourceCommit: proofBaseCommit,
+        proof: definition,
+        modelWriteRoots: ["src"],
+        outputRoot,
+      });
+
+      const toolchainRoot = join(await realpath(outputRoot), "toolchain");
+      // The sealed root is far longer than the ~70 bytes of spare load-command
+      // space, which is exactly why rewriting to an absolute mirrored path is
+      // impossible here.
+      expect(toolchainRoot.length).toBeGreaterThan(70);
+
+      const sealedPython = materialization.sealedExecutionToolchain.python!;
+      const sealedInterpreter = sealedPython.executablePath;
+      expect(sealedInterpreter.startsWith(`${toolchainRoot}/`)).toBe(true);
+
+      const linked = await execFile("/usr/bin/otool", ["-L", sealedInterpreter]);
+      expect(linked.stdout).toContain(source.requestedPath);
+      const resolvedDylib = resolve(
+        dirname(sealedInterpreter),
+        source.requestedPath.slice(EXECUTABLE_PATH_PREFIX.length),
+      );
+      expect(resolvedDylib.startsWith(`${toolchainRoot}/`)).toBe(true);
+      expect(existsSync(resolvedDylib)).toBe(true);
+
+      const sealedHome = sealedPython.runtimeManifest.pythonHomeRoot;
+      const probe = await execFile(sealedInterpreter, ["-c", "import sys; print(sys.prefix)"], {
+        env: {
+          HOME: dirname(outputRoot),
+          TMPDIR: dirname(outputRoot),
+          LANG: "C",
+          LC_ALL: "C",
+          PYTHONHOME: sealedHome,
+          PYTHONNOUSERSITE: "1",
+          PYTHONDONTWRITEBYTECODE: "1",
+          DYLD_PRINT_LIBRARIES: "1",
+        },
+      });
+      expect(probe.stdout.trim()).toBe(sealedHome);
+
+      const canonicalToolchainRoot = await realpath(toolchainRoot);
+      const loadedLibraries = probe.stderr
+        .split("\n")
+        .filter((line) => line.includes("dyld["))
+        .map((line) => line.trim().split(/\s+/u).at(-1))
+        .filter((path): path is string => Boolean(path?.startsWith("/")));
+      expect(loadedLibraries.length).toBeGreaterThan(0);
+      const escaped = loadedLibraries.filter((path) => !(
+        path.startsWith("/usr/lib/")
+        || path.startsWith("/System/")
+        || path.startsWith(`${toolchainRoot}/`)
+        || path.startsWith(`${canonicalToolchainRoot}/`)
+      ));
+      expect(escaped).toEqual([]);
+      expect(loadedLibraries.some((path) => path.endsWith(basename(source.dylibPath)))).toBe(true);
+    },
+    120_000,
+  );
+
+  it.runIf(realCPythonSealRunnable)(
+    "RED-L17-headerpad: carries the install_name_tool stderr into the refusal when a rewrite cannot fit",
+    async () => {
+      const { fixture, definition, outputRoot, proofBaseCommit } =
+        await createRealCPythonMaterializationFixture({
+          dylibDirectoryName: "dylibs",
+          copyStdlib: false,
+        });
+
+      const rejection = await admitAndMaterializeCccSemanticProof({
+        repositoryRoot: fixture.repository,
+        baseCommit: proofBaseCommit,
+        sourceCommit: proofBaseCommit,
+        proof: definition,
+        modelWriteRoots: ["src"],
+        outputRoot,
+      }).then(() => undefined, (error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(Error);
+      const message = (rejection as Error).message;
+      expect(message).toContain("/usr/bin/install_name_tool");
+      expect(message).toContain("-change");
+      expect(message).toContain("exit 1");
+      expect(message).toContain("stderr:");
+      expect(message).toContain("larger updated load commands do not fit");
+      expect(message).toContain("headerpad");
+    },
+    120_000,
+  );
 });
