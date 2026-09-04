@@ -48,7 +48,12 @@ import { PermanentError } from "./engine-errors.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-export const CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE = "CCC_CAMPAIGN_FROZEN_BASE_REFUSED";
+/*
+Defined in ccc-campaign-branch-custody.ts and re-exported here so the existing
+import path keeps working. The custody choke point throws it, and custody may
+not import this module: acquisition already imports custody.
+*/
+export { CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE };
 /*
 FNXC:CccCampaignBranchScope 2026-09-03-00:00:
 Distinct from FROZEN_BASE_REFUSED, which is about a worktree already bound to
@@ -58,8 +63,10 @@ adopting or rewriting someone else's ref.
 */
 export { CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE } from "./ccc-campaign-branch-custody.js";
 import {
-  CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE,
   assertCccCampaignBranchNotForeign as assertCccCampaignBranchCustody,
+  resolveCccCampaignCustodyBase,
+  CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE,
+  CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
 } from "./ccc-campaign-branch-custody.js";
 
 const CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS = 30_000;
@@ -387,56 +394,6 @@ async function assertCccCampaignBranchNotForeign(input: {
     makeError: (message, detail) =>
       new PermanentError(message, CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE, detail),
   });
-}
-
-/*
-FNXC:CccCampaignBranchCustody 2026-09-03-03:00:
-The base every campaign writer must judge a branch against.
-
-`assertCccCampaignEntryFrozenBaseCustody` re-derives the seal for the ENTRY task
-only. For a dependent task it returns null, and custody previously fell back to
-`task.baseCommitSha`. That is the wrong source: the row is mutable state, while
-the seal is compiler-owned. A row carrying an arbitrary commit A would let this
-adopt — or, with recycling on, `git checkout -B` over — a branch descending from
-A but not from the sealed base, and the refusal landed only later in the
-executor, after the branch had already been taken.
-
-So the seal is read here too, for every imported campaign task. The row is not
-an independent source of truth: the executor already requires
-`task.baseCommitSha === frozenBase` for every imported campaign task, and the
-entry path refuses the same mismatch. This pins that invariant at the FIRST
-writer that can touch a branch instead of the last.
-
-Returning null is fail-closed, not permissive: an existing branch with no
-provable base is refused as `custody-unknown`, while an absent branch is still
-created freely so dispatch is never blocked.
-*/
-async function resolveCccCampaignCustodyBase(
-  task: Task,
-  store: TaskStore,
-  entryFrozenBase: string | null,
-): Promise<string | null> {
-  if (entryFrozenBase) return entryFrozenBase;
-  if (!isImportedCccCampaignTask(task)) return null;
-
-  let context;
-  try {
-    context = await store.getCccCampaignContextForTask(task.id);
-  } catch {
-    // Unreadable seal proves nothing. Fail closed rather than fall back to the row.
-    return null;
-  }
-  const sealedBase = context?.targetRepository?.baseCommit ?? null;
-  if (!sealedBase) return null;
-
-  if (task.baseCommitSha != null && task.baseCommitSha !== sealedBase) {
-    throw new PermanentError(
-      `CCC campaign task ${task.id} persisted base does not match its sealed base`,
-      CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
-      { persistedBase: task.baseCommitSha, sealedBase },
-    );
-  }
-  return sealedBase;
 }
 
 export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Promise<AcquireTaskWorktreeResult> {
@@ -923,14 +880,15 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
   assertCccCampaignEntryFrozenBaseCustody against the live worktree.
   */
   /*
-  FNXC:CccCampaignBranchCustody 2026-09-03-02:00:
+  FNXC:CccCampaignBranchCustody 2026-09-04-01:00:
   `campaignFrozenBase` is re-derived for the ENTRY task only, so it is null for
-  every campaign task with dependencies. The in-review rebinder proves custody
-  against `task.baseCommitSha`, so acquisition falls back to the same value:
-  otherwise the two writers judge the same branch by different evidence, and a
-  legitimate chained task with a persisted base would be refused as
-  custody-unknown on re-dispatch. A task with neither is genuinely unprovable
-  and is still refused for an EXISTING branch.
+  every campaign task with dependencies. For those, the base comes from the
+  SEAL, never from `task.baseCommitSha`: the row is mutable state and the seal
+  is compiler-owned.
+
+  The in-review rebinder resolves its base through the same helper, so both
+  writers judge the same branch by the same evidence. A task whose seal cannot
+  be read is genuinely unprovable and is still refused for an EXISTING branch.
   */
   const campaignCustodyBase = await resolveCccCampaignCustodyBase(task, store, campaignFrozenBase);
 
