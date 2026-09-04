@@ -795,11 +795,18 @@ describe("non-entry campaign tasks get the same acquisition custody as entry tas
     expect(leftoverTip).toBe(leftoverFork);
   });
 
-  it("RED-L14 runs the token test for a non-entry task even with no sealed base", async () => {
+  it("RED-L14 refuses a non-entry task whose persisted branch lacks the campaign token", async () => {
     const { rootDir, sealedBase, foreignHead, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
 
-    // A poisoned pointer: the bare canonical name, which is the STRANGER's branch.
-    // The token test alone is enough to refuse this, with or without a sealed base.
+    /*
+     * A poisoned pointer: the bare canonical name, which is the STRANGER's
+     * branch. The token test refuses it on the NAME alone.
+     *
+     * This supplies a base, so it does not exercise the null-base path despite
+     * what its earlier title claimed. The `custody-unknown` case is covered by
+     * the direct `inspectCccCampaignBranchCustody` test above, which passes
+     * `sealedBase: null` against an existing branch.
+     */
     store.getCccCampaignContextForTask = vi.fn(async () => ({
       targetRepository: { path: rootDir, baseCommit: sealedBase },
       campaignStartedAt: "2000-01-01T00:00:00.000Z",
@@ -877,5 +884,198 @@ describe("non-entry campaign tasks get the same acquisition custody as entry tas
     });
 
     expect(verdict).toMatchObject({ ok: true, reason: "not-a-campaign-task" });
+  });
+});
+
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-03:00:
+Custody for a non-entry campaign task was proven against the TASK ROW's
+`baseCommitSha`, while the entry path and the executor both prove against the
+SEAL (`store.getCccCampaignContextForTask`). The row is mutable state; the seal
+is compiler-owned. A row carrying an arbitrary commit A therefore let
+acquisition adopt — or, with recycling on, `git checkout -B` over — a branch
+that descends from A but not from the sealed base, and the refusal only landed
+later in the executor, after the branch had already been taken.
+
+The row is not an independent source of truth: the executor already requires
+`task.baseCommitSha === frozenBase` for every imported campaign task. These
+tests pin that same invariant at acquisition, which is the first writer that can
+touch a branch.
+*/
+describe("non-entry custody is proven against the seal, not the task row", () => {
+  let store: any;
+
+  beforeEach(() => {
+    store = {
+      updateTask: vi.fn().mockResolvedValue(undefined),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+    };
+  });
+
+  function dependentCampaignTask(overrides: Record<string, unknown> = {}): any {
+    return campaignTask({ dependencies: ["KB-001"], ...overrides });
+  }
+
+  /**
+   * A repository where a branch carrying this campaign's token descends from
+   * `poisonBase` — a real commit that the seal does not name.
+   */
+  function repoWithBranchOffAForeignBase() {
+    const fixture = makeOwnerRepoWithPriorCampaignBranch();
+    const { rootDir, sealedBase } = fixture;
+    // The commit the sealed base was built on. Real, reachable, and NOT the seal.
+    const poisonBase = git(rootDir, ["rev-parse", `${sealedBase}~1`]);
+    const sideWorktree = join(rootDir, ".worktrees", "off-base");
+    git(rootDir, ["worktree", "add", "-b", "fusion/kb-005-f03f47757404", sideWorktree, poisonBase]);
+    const branchTip = commit(sideWorktree, "offbase.txt", "off base\n", "feat(KB-005): work off a foreign base");
+    // Descends from the poisoned row value, but not from the seal.
+    expect(() => git(rootDir, ["merge-base", "--is-ancestor", poisonBase, "fusion/kb-005-f03f47757404"])).not.toThrow();
+    expect(() => git(rootDir, ["merge-base", "--is-ancestor", sealedBase, "fusion/kb-005-f03f47757404"])).toThrow();
+    return { ...fixture, poisonBase, branchTip, sideWorktree };
+  }
+
+  it("RED-L15 refuses a poisoned row whose base the seal does not name", async () => {
+    const { rootDir, sealedBase, poisonBase, branchTip, campaignWorktreesDir } = repoWithBranchOffAForeignBase();
+
+    // The seal names the real base. The row has been poisoned to an arbitrary commit.
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await expect(acquireTaskWorktree({
+      task: dependentCampaignTask({ baseCommitSha: poisonBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir, recycleWorktrees: true },
+    })).rejects.toMatchObject({ code: "CCC_CAMPAIGN_FROZEN_BASE_REFUSED" });
+
+    // Refused before anything touched it.
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(branchTip);
+    expect(readFileSync(join(rootDir, ".worktrees", "off-base", "offbase.txt"), "utf8")).toBe("off base\n");
+  });
+
+  it("RED-L15 still refuses when the row is absent and only the seal can decide", async () => {
+    const { rootDir, sealedBase, branchTip, campaignWorktreesDir } = repoWithBranchOffAForeignBase();
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    // No row value at all: the seal is the only base, and the branch does not
+    // descend from it.
+    await expect(acquireTaskWorktree({
+      task: dependentCampaignTask({ baseCommitSha: null }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir, recycleWorktrees: true },
+    })).rejects.toMatchObject({ code: "CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED" });
+
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(branchTip);
+  });
+
+  it("RED-L15 clears custody for a non-entry task whose row agrees with the seal", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    // The campaign's own branch, descending from the seal.
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+
+    const verdict = await inspectCccCampaignBranchCustody({
+      task: dependentCampaignTask({ baseCommitSha: sealedBase }),
+      repoDir: rootDir,
+      branchName: "fusion/kb-005-f03f47757404",
+      sealedBase,
+    });
+
+    expect(verdict).toMatchObject({ ok: true, reason: "descends-from-sealed-base" });
+  });
+
+  /*
+   * KNOWN GAP, pinned deliberately rather than hidden.
+   *
+   * Custody now clears the case above, but a FRESH create still cannot adopt
+   * that branch: `WorktreeBackend` runs its own `inspectBranchConflict` /
+   * `inspectBareBranchCollision` without an ancestor, so the fail-closed
+   * classifier refuses any campaign-scoped name. Threading the sealed base into
+   * that call means widening `WorktreeCreateInput` AND the positional
+   * `createWorktree(branch, path, taskId, startPoint, allowRename)` signature
+   * the executor owns and supplies — i.e. it requires editing executor.ts,
+   * which is out of scope here.
+   *
+   * The pool path is already correct: acquisition passes the seal-derived base
+   * as `requiredAncestorSha`. Only the fresh-create path is affected, and only
+   * when the branch already exists.
+   *
+   * Replace this test with a success assertion when the backend learns the
+   * ancestor. It exists so the gap cannot drift silently.
+   */
+  it("documents that fresh create still refuses an existing campaign branch (needs executor.ts)", async () => {
+    const { rootDir, sealedBase, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+    const tipBefore = git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"]);
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await expect(acquireTaskWorktree({
+      task: dependentCampaignTask({ baseCommitSha: sealedBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir },
+    })).rejects.toThrow(/no sealed base was supplied to prove custody/);
+
+    // Refusing is the safe direction, and it costs the branch nothing.
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(tipBefore);
+  });
+
+  it("RED-L15 reads the seal for a non-entry task rather than trusting the row", async () => {
+    const { rootDir, sealedBase, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
+    const getContext = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+    store.getCccCampaignContextForTask = getContext;
+
+    await acquireTaskWorktree({
+      task: dependentCampaignTask({ baseCommitSha: sealedBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir },
+    });
+
+    // The entry path returns null for a dependent task, so the ONLY way custody
+    // can be seal-derived is an explicit read here.
+    expect(getContext).toHaveBeenCalledWith("KB-005");
+  });
+
+  it("RED-L15 fails closed on an existing branch when the seal cannot be read", async () => {
+    const { rootDir, branchTip, campaignWorktreesDir } = repoWithBranchOffAForeignBase();
+    store.getCccCampaignContextForTask = vi.fn(async () => {
+      throw new Error("sealed campaign storage unavailable");
+    });
+
+    await expect(acquireTaskWorktree({
+      task: dependentCampaignTask({ baseCommitSha: null }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir, recycleWorktrees: true },
+    })).rejects.toMatchObject({ code: "CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED" });
+
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(branchTip);
+  });
+
+  it("leaves ordinary non-campaign tasks off the seal path entirely", async () => {
+    const { rootDir, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
+    const getContext = vi.fn(async () => null);
+    store.getCccCampaignContextForTask = getContext;
+
+    const result = await acquireTaskWorktree({
+      task: { id: "FN-4242", dependencies: ["FN-1"], branch: null, worktree: null } as any,
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir },
+    });
+
+    expect(result.branch).toBe("fusion/fn-4242");
   });
 });

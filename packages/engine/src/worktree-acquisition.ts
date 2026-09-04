@@ -389,6 +389,56 @@ async function assertCccCampaignBranchNotForeign(input: {
   });
 }
 
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-03:00:
+The base every campaign writer must judge a branch against.
+
+`assertCccCampaignEntryFrozenBaseCustody` re-derives the seal for the ENTRY task
+only. For a dependent task it returns null, and custody previously fell back to
+`task.baseCommitSha`. That is the wrong source: the row is mutable state, while
+the seal is compiler-owned. A row carrying an arbitrary commit A would let this
+adopt — or, with recycling on, `git checkout -B` over — a branch descending from
+A but not from the sealed base, and the refusal landed only later in the
+executor, after the branch had already been taken.
+
+So the seal is read here too, for every imported campaign task. The row is not
+an independent source of truth: the executor already requires
+`task.baseCommitSha === frozenBase` for every imported campaign task, and the
+entry path refuses the same mismatch. This pins that invariant at the FIRST
+writer that can touch a branch instead of the last.
+
+Returning null is fail-closed, not permissive: an existing branch with no
+provable base is refused as `custody-unknown`, while an absent branch is still
+created freely so dispatch is never blocked.
+*/
+async function resolveCccCampaignCustodyBase(
+  task: Task,
+  store: TaskStore,
+  entryFrozenBase: string | null,
+): Promise<string | null> {
+  if (entryFrozenBase) return entryFrozenBase;
+  if (!isImportedCccCampaignTask(task)) return null;
+
+  let context;
+  try {
+    context = await store.getCccCampaignContextForTask(task.id);
+  } catch {
+    // Unreadable seal proves nothing. Fail closed rather than fall back to the row.
+    return null;
+  }
+  const sealedBase = context?.targetRepository?.baseCommit ?? null;
+  if (!sealedBase) return null;
+
+  if (task.baseCommitSha != null && task.baseCommitSha !== sealedBase) {
+    throw new PermanentError(
+      `CCC campaign task ${task.id} persisted base does not match its sealed base`,
+      CCC_CAMPAIGN_FROZEN_BASE_REFUSED_CODE,
+      { persistedBase: task.baseCommitSha, sealedBase },
+    );
+  }
+  return sealedBase;
+}
+
 export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Promise<AcquireTaskWorktreeResult> {
   const { task, rootDir, store, settings, pool, logger, audit, runContext, createWorktree, runConfiguredCommand, runInitCommand, taskEnv, secretsStore } = opts;
   const notifyFallback = async (op: WorktrunkOpName, stderr?: string) => {
@@ -882,11 +932,13 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
   custody-unknown on re-dispatch. A task with neither is genuinely unprovable
   and is still refused for an EXISTING branch.
   */
+  const campaignCustodyBase = await resolveCccCampaignCustodyBase(task, store, campaignFrozenBase);
+
   await assertCccCampaignBranchNotForeign({
     task,
     rootDir,
     branchName,
-    frozenBase: campaignFrozenBase ?? task.baseCommitSha ?? null,
+    frozenBase: campaignCustodyBase,
   });
 
   if (!isResume && pool && settings.recycleWorktrees) {
@@ -908,7 +960,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
           allowSiblingBranchRename,
           repoDir: rootDir,
           requestingTaskId: task.id,
-          requiredAncestorSha: campaignFrozenBase ?? undefined,
+          requiredAncestorSha: campaignCustodyBase ?? undefined,
         });
         const prepared = typeof preparedRaw === "string"
           ? { branch: preparedRaw, worktreePath: pooled, reclaimed: false as const }
