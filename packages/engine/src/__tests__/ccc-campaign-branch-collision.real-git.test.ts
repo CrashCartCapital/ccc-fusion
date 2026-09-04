@@ -795,11 +795,18 @@ describe("non-entry campaign tasks get the same acquisition custody as entry tas
     expect(leftoverTip).toBe(leftoverFork);
   });
 
-  it("RED-L14 runs the token test for a non-entry task even with no sealed base", async () => {
+  it("RED-L14 refuses a non-entry task whose persisted branch lacks the campaign token", async () => {
     const { rootDir, sealedBase, foreignHead, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
 
-    // A poisoned pointer: the bare canonical name, which is the STRANGER's branch.
-    // The token test alone is enough to refuse this, with or without a sealed base.
+    /*
+     * A poisoned pointer: the bare canonical name, which is the STRANGER's
+     * branch. The token test refuses it on the NAME alone.
+     *
+     * This supplies a base, so it does not exercise the null-base path despite
+     * what its earlier title claimed. The `custody-unknown` case is covered by
+     * the direct `inspectCccCampaignBranchCustody` test above, which passes
+     * `sealedBase: null` against an existing branch.
+     */
     store.getCccCampaignContextForTask = vi.fn(async () => ({
       targetRepository: { path: rootDir, baseCommit: sealedBase },
       campaignStartedAt: "2000-01-01T00:00:00.000Z",
