@@ -872,11 +872,21 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
   returned above; their custody is proven by
   assertCccCampaignEntryFrozenBaseCustody against the live worktree.
   */
+  /*
+  FNXC:CccCampaignBranchCustody 2026-09-03-02:00:
+  `campaignFrozenBase` is re-derived for the ENTRY task only, so it is null for
+  every campaign task with dependencies. The in-review rebinder proves custody
+  against `task.baseCommitSha`, so acquisition falls back to the same value:
+  otherwise the two writers judge the same branch by different evidence, and a
+  legitimate chained task with a persisted base would be refused as
+  custody-unknown on re-dispatch. A task with neither is genuinely unprovable
+  and is still refused for an EXISTING branch.
+  */
   await assertCccCampaignBranchNotForeign({
     task,
     rootDir,
     branchName,
-    frozenBase: campaignFrozenBase,
+    frozenBase: campaignFrozenBase ?? task.baseCommitSha ?? null,
   });
 
   if (!isResume && pool && settings.recycleWorktrees) {
