@@ -38,6 +38,12 @@ describe("CCC golden Pi driver matrix", () => {
         attributionTerminalRouteMembers: [{ provider: "glm", model: "glm-5.3" }],
       },
       {
+        key: "glm-flash-latest",
+        comboAlias: "glm-flash-latest",
+        modelId: "combo/glm-flash-latest",
+        attributionTerminalRouteMembers: [{ provider: "glm", model: "glm-5.3-flash" }],
+      },
+      {
         key: "gemini-flash-latest",
         comboAlias: "gemini-flash-latest",
         modelId: "combo/gemini-flash-latest",
@@ -47,12 +53,13 @@ describe("CCC golden Pi driver matrix", () => {
         ],
       },
     ]);
-    expect(new Set(GOLDEN_PI_DRIVERS.map(({ providerId }) => providerId)).size).toBe(3);
+    expect(new Set(GOLDEN_PI_DRIVERS.map(({ providerId }) => providerId)).size).toBe(4);
     expect(JSON.stringify(GOLDEN_PI_DRIVERS)).not.toMatch(/luna|cx\/|gpt-5\.6/u);
   });
 
   it("requires an explicit known driver key", () => {
     expect(resolveGoldenPiDriver("glm-latest").modelId).toBe("combo/glm-latest");
+    expect(resolveGoldenPiDriver("glm-flash-latest").modelId).toBe("combo/glm-flash-latest");
     expect(() => resolveGoldenPiDriver(undefined)).toThrow(/CCC_GOLDEN_PI_DRIVER must be one of/);
     expect(() => resolveGoldenPiDriver("auto")).toThrow(/CCC_GOLDEN_PI_DRIVER must be one of/);
   });

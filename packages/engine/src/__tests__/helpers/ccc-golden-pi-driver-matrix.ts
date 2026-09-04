@@ -39,6 +39,16 @@ export const GOLDEN_PI_DRIVERS: readonly GoldenPiDriver[] = Object.freeze([
     ]),
   }),
   Object.freeze({
+    key: "glm-flash-latest",
+    displayName: "GLM Flash Latest",
+    providerId: "golden-omniroute-glm-flash-latest",
+    modelId: "combo/glm-flash-latest",
+    comboAlias: "glm-flash-latest",
+    attributionTerminalRouteMembers: Object.freeze([
+      Object.freeze({ provider: "glm", model: "glm-5.3-flash" }),
+    ]),
+  }),
+  Object.freeze({
     key: "gemini-flash-latest",
     displayName: "Gemini Flash Latest",
     providerId: "golden-omniroute-gemini-flash-latest",

@@ -13,12 +13,12 @@ The product Ryan wants is a software factory, not a chat wrapper. It should do u
 
 CCC-Fusion's worker policy is separate from Ryan's personal interactive coding preferences.
 
-Default worker and orchestrator compute should run through OmniRoute endpoints, predominantly:
+Default worker and orchestrator compute should run through OmniRoute endpoints, admitted per role rather than as one interchangeable pool:
 
-- `minimax` / MiniMax M3
-- `glm` / GLM 5.2
-
-These routes should handle most normal implementation, research, review, and orchestration work when the task is sized correctly.
+- `glm-latest` / GLM 5.3 — spec- and contract-shaped tasks and authoring: PRD understanding, execution-plan/spec writing, and other work where the output's shape and precision matter more than raw throughput.
+- `glm-flash-latest` / GLM 5.3 Flash — routine implementation: the default worker route for normal-sized coding tasks once the spec is clear. This is CCC-Fusion's golden implementation route; it must stay admitted the same way `glm-latest` and `gemini-flash-latest` are (a sealed OmniRoute combo snapshot plus an admission test in the golden Pi driver matrix).
+- `minimax-latest` / MiniMax M3 — review, validation, brainstorming, and summarization roles only. Do not assign it routine implementation: it is a known no-commit risk on write-shaped tasks (see the MiniMax M3 never-writes evidence), so keep it out of the implementer seat even though it stays an admitted route.
+- `gemini-flash-latest` / Gemini Flash — glue and integration work: wiring pieces together, small cross-cutting fixes, and other connective tasks between larger implementation or review passes.
 
 Escalation is allowed when the task evidence justifies it:
 
@@ -46,7 +46,7 @@ At minimum, every worker attempt should leave auditable facts:
 - reviewer decision;
 - failed check text when relevant.
 
-The system should use this evidence to adjust chunk size and model routing. If MiniMax M3 or GLM 5.2 fails because the task is too broad, the first repair should usually be smaller, cleaner tasks before escalating to expensive models.
+The system should use this evidence to adjust chunk size and model routing. If GLM 5.3 Flash fails an implementation task because it is too broad, the first repair should usually be smaller, cleaner tasks before escalating to expensive models.
 
 ## Current harness truth
 
