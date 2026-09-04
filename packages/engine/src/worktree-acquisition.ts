@@ -56,7 +56,12 @@ this task. This one fires BEFORE any binding: a branch carrying this campaign's
 identity token exists with foreign history, so acquisition refuses rather than
 adopting or rewriting someone else's ref.
 */
-export const CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE = "CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED";
+export { CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE } from "./ccc-campaign-branch-custody.js";
+import {
+  CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE,
+  assertCccCampaignBranchNotForeign as assertCccCampaignBranchCustody,
+} from "./ccc-campaign-branch-custody.js";
+
 const CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS = 30_000;
 const CCC_CAMPAIGN_GIT_CUSTODY_MAX_BUFFER = 10 * 1024 * 1024;
 
@@ -374,35 +379,14 @@ async function assertCccCampaignBranchNotForeign(input: {
   frozenBase: string | null;
 }): Promise<void> {
   const { task, rootDir, branchName, frozenBase } = input;
-  if (!frozenBase) return;
-
-  try {
-    await execFileAsync("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName}`], {
-      cwd: rootDir,
-      encoding: "utf-8",
-      timeout: CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS,
-      maxBuffer: CCC_CAMPAIGN_GIT_CUSTODY_MAX_BUFFER,
-    });
-  } catch {
-    // No such branch — the campaign creates its own. This is the normal path.
-    return;
-  }
-
-  try {
-    await execFileAsync("git", ["merge-base", "--is-ancestor", frozenBase, branchName], {
-      cwd: rootDir,
-      encoding: "utf-8",
-      timeout: CCC_CAMPAIGN_GIT_CUSTODY_TIMEOUT_MS,
-      maxBuffer: CCC_CAMPAIGN_GIT_CUSTODY_MAX_BUFFER,
-    });
-  } catch (error) {
-    throw new PermanentError(
-      `CCC campaign task ${task.id} refuses branch ${branchName}: it already exists and does not descend from the sealed base`,
-      CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE,
-      { branchName, frozenBase },
-      error instanceof Error ? error : undefined,
-    );
-  }
+  await assertCccCampaignBranchCustody({
+    task,
+    repoDir: rootDir,
+    branchName,
+    sealedBase: frozenBase,
+    makeError: (message, detail) =>
+      new PermanentError(message, CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED_CODE, detail),
+  });
 }
 
 export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Promise<AcquireTaskWorktreeResult> {

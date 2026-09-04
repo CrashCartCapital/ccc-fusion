@@ -48,6 +48,24 @@ export function createEngineMock(overrides: AnyModule = {}): AnyModule {
     createFnAgent: vi.fn(),
     promptWithFallback: vi.fn(),
     /*
+    FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+    Dashboard PR routes resolve the head branch through this helper. The generic
+    fallback would hand them `undefined` and every PR route would silently push
+    and query the wrong ref, so mirror the real campaign-token semantics here:
+    an imported campaign task's persisted branch is honoured only when it carries
+    that campaign's identity token, otherwise the campaign-scoped name is
+    re-derived. Ordinary tasks keep whatever was persisted.
+    */
+    resolveTrustedTaskBranchName: vi.fn((task: { id: string; branch?: string | null; lineageId?: string | null }) => {
+      const canonical = `fusion/${task.id.toLowerCase()}`;
+      const persisted = typeof task.branch === "string" ? task.branch.trim() : "";
+      const match = /^ccc-prd:([0-9a-f]{24}):/u.exec((task.lineageId ?? "").trim());
+      if (!match) return persisted || canonical;
+      const token = match[1].slice(0, 12);
+      if (persisted && persisted.toLowerCase().endsWith(`-${token}`)) return persisted;
+      return `${canonical}-${token}`;
+    }),
+    /*
     FNXC:TestSkills 2026-06-17-19:33:
     Dashboard route tests mock @fusion/engine wholesale, so skill-aware planning lanes need a shaped session-skill helper result instead of the fallback vi.fn() returning undefined.
     */

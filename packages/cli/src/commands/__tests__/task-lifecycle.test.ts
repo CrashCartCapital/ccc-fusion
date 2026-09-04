@@ -1953,3 +1953,36 @@ describe("createPrNodeGithubOps repo resolution (gh-4)", () => {
   });
 });
 
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+`getTaskBranchName` feeds `git branch -D` in `cleanupMergedTaskArtifacts`, the PR
+head, and the push target. A campaign task's `task.branch` is not self-certifying:
+`reconcileInReviewBranchRebind` can write a live `fusion/*` branch onto a row whose
+binding is absent, which for a fresh campaign import is the bare `fusion/<id>` a
+PREVIOUS campaign left in the target repository. Reading that pointer back without
+re-checking it would force-delete a stranger's branch after merge.
+*/
+describe("getTaskBranchName custody", () => {
+  const CAMPAIGN_LINEAGE = "ccc-prd:f03f47757404104c6aa38579:TASK-EVIDENCE-LABELS";
+
+  it("ignores a poisoned branch pointer on a campaign task", () => {
+    expect(getTaskBranchName({ id: "KB-005", branch: "fusion/kb-005", lineageId: CAMPAIGN_LINEAGE }))
+      .toBe("fusion/kb-005-f03f47757404");
+  });
+
+  it("honours a campaign task's own branch", () => {
+    expect(getTaskBranchName({ id: "KB-005", branch: "fusion/kb-005-f03f47757404", lineageId: CAMPAIGN_LINEAGE }))
+      .toBe("fusion/kb-005-f03f47757404");
+  });
+
+  it("derives the campaign-scoped name when nothing is persisted", () => {
+    expect(getTaskBranchName({ id: "KB-005", branch: null, lineageId: CAMPAIGN_LINEAGE }))
+      .toBe("fusion/kb-005-f03f47757404");
+  });
+
+  it("leaves non-campaign tasks exactly as they were", () => {
+    expect(getTaskBranchName({ id: "FN-9001", branch: null })).toBe("fusion/fn-9001");
+    expect(getTaskBranchName({ id: "FN-9001", branch: "release/hotfix" })).toBe("release/hotfix");
+    expect(getTaskBranchName("FN-9001")).toBe("fusion/fn-9001");
+  });
+});

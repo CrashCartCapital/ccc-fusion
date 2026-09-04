@@ -72,11 +72,50 @@ export function cccCampaignBranchToken(lineageId: string | null | undefined): st
  * Deterministic from the persisted task row alone.
  */
 export function campaignScopedFusionBranchName(
-  task: Pick<Task, "id"> & Partial<Pick<Task, "lineageId">>,
+  task: { id: string; lineageId?: string | null },
 ): string {
   const canonical = canonicalFusionBranchName(task.id);
   const token = cccCampaignBranchToken(task.lineageId);
   return token ? `${canonical}-${token}` : canonical;
+}
+
+/**
+ * Does `branchName` carry `token` as its campaign-identity suffix?
+ *
+ * The token is fixed-width lowercase hex, so this is an exact suffix test, not
+ * a substring one: `fusion/kb-005` never matches, `fusion/kb-005-f03f47757404`
+ * does.
+ */
+export function branchCarriesCampaignToken(branchName: string, token: string): boolean {
+  return branchName.trim().toLowerCase().endsWith(`-${token.toLowerCase()}`);
+}
+
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+`task.branch` is NOT self-certifying. `reconcileInReviewBranchRebind` rebinds an
+absent or broken binding to a live `fusion/*` branch on a name + unique-work
+match, and a fresh campaign import (branch `null`) is exactly its trigger. If a
+previous campaign left `fusion/kb-005` in the target repository, that stranger's
+branch can land on the row — and from there it flows into `git branch -D` at
+merge cleanup, into the PR head, and into push.
+
+So a consumer that reads the pointer must re-check it. For a campaign task the
+pointer is honoured only when it carries this campaign's identity token; the
+deterministic campaign-scoped name wins otherwise. Ordinary tasks keep whatever
+was persisted (operators do choose custom branches) and fall back to the bare
+canonical name, exactly as before.
+
+This is defence in depth, not the primary gate: the primary gate is the git
+custody proof in ccc-campaign-branch-custody.ts, enforced at every write.
+*/
+export function resolveTrustedTaskBranchName(
+  task: { id: string; branch?: string | null; lineageId?: string | null },
+): string {
+  const persisted = typeof task.branch === "string" ? task.branch.trim() : "";
+  const token = cccCampaignBranchToken(task.lineageId);
+  if (!token) return persisted || canonicalFusionBranchName(task.id);
+  if (persisted && branchCarriesCampaignToken(persisted, token)) return persisted;
+  return campaignScopedFusionBranchName(task);
 }
 
 /**

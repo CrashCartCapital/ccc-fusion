@@ -33,6 +33,22 @@ vi.mock("../project-context.js", () => ({
 const releaseHeldTaskByEvent = vi.fn();
 vi.mock("@fusion/engine", () => ({
   releaseHeldTaskByEvent: (...args: unknown[]) => releaseHeldTaskByEvent(...args),
+  /*
+  FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+  The PR path resolves its head branch through this helper, so the hand-written
+  engine mock must carry it or every PR test targets `undefined`. Mirrors the
+  real campaign-token semantics: an imported campaign task's persisted branch is
+  honoured only when it carries that campaign's identity token.
+  */
+  resolveTrustedTaskBranchName: (task: { id: string; branch?: string | null; lineageId?: string | null }) => {
+    const canonical = `fusion/${task.id.toLowerCase()}`;
+    const persisted = typeof task.branch === "string" ? task.branch.trim() : "";
+    const match = /^ccc-prd:([0-9a-f]{24}):/u.exec((task.lineageId ?? "").trim());
+    if (!match) return persisted || canonical;
+    const token = match[1].slice(0, 12);
+    if (persisted && persisted.toLowerCase().endsWith(`-${token}`)) return persisted;
+    return `${canonical}-${token}`;
+  },
 }));
 
 // @fusion/dashboard is touched by runPrCreate; stub it so importing the module

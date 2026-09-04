@@ -10,7 +10,9 @@ import {
   canonicalFusionBranchName,
   cccCampaignBranchToken,
   resolveTaskWorkingBranch,
+  resolveTrustedTaskBranchName,
 } from "../worktree-names.js";
+import { SelfHealingManager } from "../self-healing.js";
 import { buildIdentityGuardHook } from "../worktree-hooks.js";
 
 /*
@@ -433,5 +435,302 @@ describe("adoption is gated on provable lineage, not branch-name coincidence", (
     });
 
     expect(inspection.kind).toBe("reclaimable");
+  });
+});
+
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+Making four consumers PREFER `task.branch` only moved the trust boundary; it did
+not establish one. `reconcileInReviewBranchRebind` writes `task.branch` on a
+name+SHA match, and its candidate set still contains the BARE canonical name —
+which for a campaign task is precisely the stranger's branch. Its trigger is a
+falsy `task.branch`, i.e. the fresh-import case. Once poisoned, the persisted
+pointer flows into `git branch -D` at merge cleanup and into PR head/push.
+
+So custody has to hold at the write, not only at acquisition, and the consumers
+have to re-check what they read. These are the RED tests for that.
+*/
+describe("branch custody holds at the rebind write, not only at acquisition", () => {
+  function rebindStore(task: Record<string, unknown>) {
+    const updateTask = vi.fn().mockResolvedValue(undefined);
+    return {
+      updateTask,
+      getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false }),
+      listTasks: vi.fn().mockResolvedValue([task]),
+      recordRunAuditEvent: vi.fn().mockResolvedValue(undefined),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+    } as any;
+  }
+
+  it("RED-L13-1 refuses to rebind a fresh-import campaign task onto a stranger's branch", async () => {
+    const { rootDir, sealedBase, foreignHead } = makeOwnerRepoWithPriorCampaignBranch();
+
+    // Exactly the fresh-import shape the rebinder triggers on: in-review, no
+    // branch pointer yet. The only live `fusion/*` branch carrying unique work
+    // is the owner's `fusion/kb-005`, which does not descend from the sealed base.
+    const task = campaignTask({
+      column: "in-review",
+      branch: null,
+      baseBranch: "main",
+      baseCommitSha: sealedBase,
+    });
+    const store = rebindStore(task);
+    const manager = new SelfHealingManager(store, { rootDir } as any);
+
+    const result = await manager.reconcileInReviewBranchRebind();
+
+    // The stranger's branch must never become this task's branch.
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(result.repaired).toBe(0);
+    expect(result.outcomes[0]).toMatchObject({
+      taskId: "KB-005",
+      result: "skipped",
+      reason: expect.stringContaining("custody"),
+    });
+    // And the branch itself is untouched.
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005"])).toBe(foreignHead);
+  });
+
+  it("RED-L13-1 still rebinds a campaign task onto its own campaign-scoped branch", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+
+    // The campaign's own branch, descending from the sealed base, with work on it.
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+    const ownWorktree = join(rootDir, ".worktrees", "own-lineage");
+    git(rootDir, ["worktree", "add", ownWorktree, "fusion/kb-005-f03f47757404"]);
+    const ownTip = commit(ownWorktree, "labels.py", "rows\n", "feat(KB-005): label rows");
+
+    const task = campaignTask({
+      column: "in-review",
+      branch: null,
+      baseBranch: "main",
+      baseCommitSha: sealedBase,
+    });
+    const store = rebindStore(task);
+    const manager = new SelfHealingManager(store, { rootDir } as any);
+
+    const result = await manager.reconcileInReviewBranchRebind();
+
+    expect(result.repaired).toBe(1);
+    expect(store.updateTask).toHaveBeenCalledWith(
+      "KB-005",
+      expect.objectContaining({ branch: "fusion/kb-005-f03f47757404" }),
+    );
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(ownTip);
+  });
+
+  it("RED-L13-1 fails closed when a campaign task has no sealed base to prove custody against", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+    const ownWorktree = join(rootDir, ".worktrees", "own-lineage");
+    git(rootDir, ["worktree", "add", ownWorktree, "fusion/kb-005-f03f47757404"]);
+    commit(ownWorktree, "labels.py", "rows\n", "feat(KB-005): label rows");
+
+    // Same repository, same correctly-named branch — but nothing to prove
+    // descent against. Custody is unknown, so the rebind must not happen.
+    const task = campaignTask({
+      column: "in-review",
+      branch: null,
+      baseBranch: "main",
+      baseCommitSha: null,
+    });
+    const store = rebindStore(task);
+    const manager = new SelfHealingManager(store, { rootDir } as any);
+
+    const result = await manager.reconcileInReviewBranchRebind();
+
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(result.outcomes[0]).toMatchObject({ result: "skipped", reason: expect.stringContaining("custody") });
+  });
+
+  it("leaves ordinary non-campaign rebind behaviour unchanged", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    git(rootDir, ["branch", "fusion/fn-4242", sealedBase]);
+    const wt = join(rootDir, ".worktrees", "fn-4242");
+    git(rootDir, ["worktree", "add", wt, "fusion/fn-4242"]);
+    commit(wt, "work.txt", "work\n", "feat(FN-4242): work");
+
+    const task = {
+      id: "FN-4242",
+      column: "in-review",
+      branch: null,
+      baseBranch: "main",
+      dependencies: [],
+      worktree: null,
+    };
+    const store = rebindStore(task);
+    const manager = new SelfHealingManager(store, { rootDir } as any);
+
+    const result = await manager.reconcileInReviewBranchRebind();
+
+    expect(result.repaired).toBe(1);
+    expect(store.updateTask).toHaveBeenCalledWith("FN-4242", expect.objectContaining({ branch: "fusion/fn-4242" }));
+  });
+});
+
+describe("consumers re-check the persisted branch before trusting it", () => {
+  it("RED-L13-1 ignores a poisoned branch pointer on a campaign task", () => {
+    // A rebind (or any other writer) put a stranger's branch on the row.
+    const poisoned = campaignTask({ branch: "fusion/kb-005" });
+    expect(resolveTrustedTaskBranchName(poisoned)).toBe("fusion/kb-005-f03f47757404");
+    expect(resolveTrustedTaskBranchName(poisoned)).not.toBe("fusion/kb-005");
+  });
+
+  it("RED-L13-1 honours a campaign task's own persisted branch", () => {
+    const healthy = campaignTask({ branch: "fusion/kb-005-f03f47757404" });
+    expect(resolveTrustedTaskBranchName(healthy)).toBe("fusion/kb-005-f03f47757404");
+  });
+
+  it("RED-L13-1 falls back to the campaign-scoped name when nothing is persisted", () => {
+    expect(resolveTrustedTaskBranchName(campaignTask({ branch: null }))).toBe("fusion/kb-005-f03f47757404");
+  });
+
+  it("keeps operator-chosen and canonical branches for non-campaign tasks", () => {
+    expect(resolveTrustedTaskBranchName({ id: "FN-1234", branch: "release/hotfix" } as any)).toBe("release/hotfix");
+    expect(resolveTrustedTaskBranchName({ id: "FN-1234", branch: null } as any)).toBe("fusion/fn-1234");
+  });
+});
+
+describe("the classifier fails closed on a campaign branch with no proof of custody", () => {
+  /*
+   * `requiredAncestorSha` is threaded through exactly one caller chain. The
+   * older `handleWorktreeConflict` in executor.ts calls `inspectBranchConflict`
+   * with no ancestor at all, and executor.ts is off-limits. So the safety
+   * property cannot live in the caller: a campaign-scoped branch name with no
+   * sealed base supplied must be non-adoptable in the CLASSIFIER.
+   */
+  it("RED-L13-2 refuses to reclaim a campaign-scoped branch when no sealed base is supplied", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    const squatterFork = git(rootDir, ["rev-parse", `${sealedBase}~1`]);
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", squatterFork]);
+    const squatterWorktree = join(rootDir, ".worktrees", "squatter");
+    git(rootDir, ["worktree", "add", squatterWorktree, "fusion/kb-005-f03f47757404"]);
+    commit(squatterWorktree, "squat.txt", "squat\n", "feat(KB-005): squatter work");
+
+    const inspection = await inspectBranchConflict({
+      repoDir: rootDir,
+      branchName: "fusion/kb-005-f03f47757404",
+      conflictingWorktreePath: squatterWorktree,
+      requestingTaskId: "KB-005",
+      ownerTaskId: "KB-005",
+      startPoint: sealedBase,
+      integrationRef: "main",
+      // deliberately no requiredAncestorSha — the executor.ts call shape
+    });
+
+    expect(inspection.kind).not.toBe("reclaimable");
+    expect(inspection.kind).not.toBe("fully-subsumed");
+    expect(inspection.kind).toBe("live-foreign");
+  });
+
+  it("RED-L13-2 refuses the same in the bare branch-collision classifier", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    const squatterFork = git(rootDir, ["rev-parse", `${sealedBase}~1`]);
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", squatterFork]);
+
+    const inspection = await inspectBareBranchCollision({
+      repoDir: rootDir,
+      branchName: "fusion/kb-005-f03f47757404",
+      conflictingWorktreePath: null as unknown as string,
+      requestingTaskId: "KB-005",
+      ownerTaskId: "KB-005",
+      startPoint: sealedBase,
+      integrationRef: "main",
+    });
+
+    expect(inspection.kind).not.toBe("reclaimable");
+    expect(inspection.kind).not.toBe("fully-subsumed");
+  });
+
+  it("still adopts a campaign-scoped branch when the sealed base IS supplied and proves descent", async () => {
+    const { rootDir, sealedBase } = makeOwnerRepoWithPriorCampaignBranch();
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", sealedBase]);
+    const ownWorktree = join(rootDir, ".worktrees", "own-lineage");
+    git(rootDir, ["worktree", "add", ownWorktree, "fusion/kb-005-f03f47757404"]);
+
+    const inspection = await inspectBranchConflict({
+      repoDir: rootDir,
+      branchName: "fusion/kb-005-f03f47757404",
+      conflictingWorktreePath: ownWorktree,
+      requestingTaskId: "KB-005",
+      ownerTaskId: "KB-005",
+      startPoint: sealedBase,
+      integrationRef: "main",
+      requiredAncestorSha: sealedBase,
+    });
+
+    expect(inspection.kind).not.toBe("live-foreign");
+  });
+
+  it("leaves ordinary fusion branch names classifying exactly as before", async () => {
+    const { rootDir, sealedBase, foreignWorktreePath } = makeOwnerRepoWithPriorCampaignBranch();
+
+    const inspection = await inspectBranchConflict({
+      repoDir: rootDir,
+      branchName: "fusion/kb-005",
+      conflictingWorktreePath: foreignWorktreePath,
+      requestingTaskId: "KB-005",
+      ownerTaskId: "KB-005",
+      startPoint: sealedBase,
+      integrationRef: "main",
+    });
+
+    expect(inspection.kind).toBe("reclaimable");
+  });
+});
+
+describe("the refusal gate against a REGISTERED foreign worktree", () => {
+  let store: any;
+
+  beforeEach(() => {
+    store = {
+      updateTask: vi.fn().mockResolvedValue(undefined),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+    };
+  });
+
+  /*
+   * The L12 failure needed a REGISTERED worktree, not a bare ref: that is what
+   * made the pool adopt and then relocate the owner's checkout. This is that
+   * exact shape aimed at the campaign-token branch, so the acquisition gate is
+   * the thing under test rather than the pool's own conflict handling.
+   */
+  it("RED-L13-3 refuses a registered foreign worktree and leaves it byte-identical", async () => {
+    const { rootDir, sealedBase, campaignWorktreesDir } = makeOwnerRepoWithPriorCampaignBranch();
+
+    // A stranger holds the campaign-token branch AND has it checked out.
+    const squatterFork = git(rootDir, ["rev-parse", `${sealedBase}~1`]);
+    git(rootDir, ["branch", "fusion/kb-005-f03f47757404", squatterFork]);
+    const squatterWorktree = join(rootDir, ".worktrees", "squatter");
+    git(rootDir, ["worktree", "add", squatterWorktree, "fusion/kb-005-f03f47757404"]);
+    const squatterHead = commit(squatterWorktree, "squat.txt", "squat\n", "feat(KB-005): squatter work");
+    expect(() => git(rootDir, ["merge-base", "--is-ancestor", sealedBase, "fusion/kb-005-f03f47757404"])).toThrow();
+
+    const registrationsBefore = git(rootDir, ["worktree", "list", "--porcelain"]);
+    const squatFileBefore = readFileSync(join(squatterWorktree, "squat.txt"), "utf8");
+    store.getCccCampaignContextForTask = vi.fn(async () => ({
+      targetRepository: { path: rootDir, baseCommit: sealedBase },
+      campaignStartedAt: "2000-01-01T00:00:00.000Z",
+    }));
+
+    await expect(acquireTaskWorktree({
+      task: campaignTask({ baseCommitSha: sealedBase }),
+      rootDir,
+      store,
+      settings: { worktreesDir: campaignWorktreesDir },
+    })).rejects.toMatchObject({ code: "CCC_CAMPAIGN_FOREIGN_BRANCH_REFUSED" });
+
+    // Path, HEAD, branch, contents and registration are all exactly as they were.
+    expect(existsSync(squatterWorktree)).toBe(true);
+    expect(git(squatterWorktree, ["rev-parse", "HEAD"])).toBe(squatterHead);
+    expect(git(squatterWorktree, ["branch", "--show-current"])).toBe("fusion/kb-005-f03f47757404");
+    expect(readFileSync(join(squatterWorktree, "squat.txt"), "utf8")).toBe(squatFileBefore);
+    expect(git(rootDir, ["worktree", "list", "--porcelain"])).toBe(registrationsBefore);
+    expect(git(rootDir, ["rev-parse", "fusion/kb-005-f03f47757404"])).toBe(squatterHead);
+
+    // Nothing was relocated. The L12 log line must not exist.
+    const logged = store.logEntry.mock.calls.map((call: unknown[]) => String(call[1] ?? "")).join("\n");
+    expect(logged).not.toMatch(/relocated preserved worktree/i);
+    expect(logged).not.toMatch(/relocat/i);
   });
 });

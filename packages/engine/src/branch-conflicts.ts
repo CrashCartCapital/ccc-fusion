@@ -8,6 +8,37 @@ const FUSION_TASK_ID_TRAILER_KEY = "Fusion-Task-Id";
 const GIT_TIMEOUT_MS = 120_000;
 const GIT_MAX_BUFFER = 10 * 1024 * 1024;
 
+/*
+FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+`requiredAncestorSha` is threaded through exactly ONE caller chain
+(worktree-acquisition -> worktree-pool -> here). The older
+`handleWorktreeConflict` in executor.ts calls `inspectBranchConflict` with no
+ancestor at all, and executor.ts is off-limits to this change. A safety property
+that only holds when one caller remembers to pass an argument is not a safety
+property, so it lives HERE instead.
+
+A campaign-scoped branch is self-identifying: `fusion/<task-id>-<12 hex>`. When
+the classifier sees that shape and was given nothing to prove descent against,
+it fails closed — no `reclaimable`, no `fully-subsumed`, nothing adoptable —
+rather than assuming the caller checked. A caller that CAN prove custody passes
+`requiredAncestorSha` and gets the ordinary verdicts back.
+
+The suffix test is deliberately shape-based, not lineage-based, because the
+classifier is given a branch name and no task. It can therefore also fire on a
+hand-made branch that happens to end in twelve hex characters; that direction is
+safe (refuse to reclaim someone else's branch) and fusion never creates such a
+name itself.
+*/
+const CCC_CAMPAIGN_SCOPED_BRANCH_PATTERN = /^fusion\/.+-[0-9a-f]{12}$/u;
+
+function isCccCampaignScopedBranchName(branchName: string): boolean {
+  return CCC_CAMPAIGN_SCOPED_BRANCH_PATTERN.test(branchName.trim().toLowerCase());
+}
+
+function cccCampaignCustodyUnproven(input: InspectBranchConflictInput): boolean {
+  return !input.requiredAncestorSha && isCccCampaignScopedBranchName(input.branchName);
+}
+
 export interface BranchConflictCommit {
   sha: string;
   subject: string;
@@ -1005,7 +1036,10 @@ export async function inspectBareBranchCollision(
   // FNXC:CccCampaignBranchScope 2026-09-03-00:00: same lineage gate as
   // inspectBranchConflict — a branch that does not descend from the sealed base
   // is never reclaimable, and `foreign-unmerged` is the preserve-and-refuse verdict.
-  if (input.requiredAncestorSha && !await isAncestor(input.repoDir, input.requiredAncestorSha, input.branchName)) {
+  if (
+    cccCampaignCustodyUnproven(input)
+    || (input.requiredAncestorSha && !await isAncestor(input.repoDir, input.requiredAncestorSha, input.branchName))
+  ) {
     return {
       kind: "foreign-unmerged",
       tipSha,
@@ -1015,8 +1049,10 @@ export async function inspectBareBranchCollision(
         conflictingWorktreePath: livePath ?? input.conflictingWorktreePath,
         existingTipSha: tipSha,
         strandedCommits: uniqueCommitResult.commits,
-        startPoint: input.requiredAncestorSha,
-        recommendedAction: `Branch ${input.branchName} does not descend from the sealed base ${input.requiredAncestorSha}; it belongs to another owner. Leave it alone and use a campaign-scoped branch name.`,
+        startPoint: input.requiredAncestorSha ?? input.startPoint ?? "",
+        recommendedAction: input.requiredAncestorSha
+          ? `Branch ${input.branchName} does not descend from the sealed base ${input.requiredAncestorSha}; it belongs to another owner. Leave it alone and use a campaign-scoped branch name.`
+          : `Branch ${input.branchName} is campaign-scoped and no sealed base was supplied to prove custody; it is not adoptable. Leave it alone.`,
       }),
     };
   }
@@ -1135,7 +1171,10 @@ export async function inspectBranchConflict(
   already-merged. `live-foreign` is the existing non-adopting verdict: the pool
   surfaces its error rather than moving, pruning, or resetting the checkout.
   */
-  if (input.requiredAncestorSha && !await isAncestor(input.repoDir, input.requiredAncestorSha, input.branchName)) {
+  if (
+    cccCampaignCustodyUnproven(input)
+    || (input.requiredAncestorSha && !await isAncestor(input.repoDir, input.requiredAncestorSha, input.branchName))
+  ) {
     return {
       kind: "live-foreign",
       livePath,
@@ -1144,8 +1183,10 @@ export async function inspectBranchConflict(
         conflictingWorktreePath: livePath,
         existingTipSha,
         strandedCommits: (await listUniqueBranchCommits(input.repoDir, startPoint, input.branchName)).commits,
-        startPoint: input.requiredAncestorSha,
-        recommendedAction: `Branch ${input.branchName} does not descend from the sealed base ${input.requiredAncestorSha}; it belongs to another owner. Leave it alone and use a campaign-scoped branch name.`,
+        startPoint: input.requiredAncestorSha ?? input.startPoint ?? "",
+        recommendedAction: input.requiredAncestorSha
+          ? `Branch ${input.branchName} does not descend from the sealed base ${input.requiredAncestorSha}; it belongs to another owner. Leave it alone and use a campaign-scoped branch name.`
+          : `Branch ${input.branchName} is campaign-scoped and no sealed base was supplied to prove custody; it is not adoptable. Leave it alone.`,
       }),
     };
   }

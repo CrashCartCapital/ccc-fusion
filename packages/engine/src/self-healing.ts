@@ -79,6 +79,7 @@ import { CCC_CAMPAIGN_UNCERTAIN_EFFECT_RECOVERY_REASON } from "./ccc-campaign-st
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { isAiMergeContainerDir, resolveAiMergeRootPath, resolveLegacyAiMergeRootPath, resolveWorktreesDir } from "./worktree-paths.js";
 import { campaignScopedFusionBranchName, canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
+import { inspectCccCampaignBranchCustody } from "./ccc-campaign-branch-custody.js";
 import { preservedWorktreeTargetPathForTask } from "./worktree-pinning.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
 import { resolveBranchGroupMergeRouting } from "./group-merge-coordinator.js";
@@ -652,6 +653,7 @@ type RebindOutcome =
       | "binding-intact"
       | "no-live-branch"
       | "ambiguous-candidates"
+      | "unsafe-to-auto-mutate:campaign-branch-custody"
       | "no-unique-work"
       | "unsafe-to-auto-mutate:user-paused"
       | "unsafe-to-auto-mutate:checked-out"
@@ -4914,6 +4916,22 @@ export class SelfHealingManager {
         // the ambiguity rather than silently picking one.
         const candidateByRefSha = new Map<string, { branch: string; aheadCount: number }>();
         const normalizedCandidate = campaignScopedId;
+        /*
+        FNXC:CccCampaignBranchCustody 2026-09-03-01:00:
+        The candidate set is built from NAMES — the bare canonical name included,
+        which for an imported campaign task is exactly the branch a PREVIOUS
+        campaign left behind in the target repository. Rebinding is "only
+        metadata", but the metadata is authority: the persisted branch becomes
+        the PR head, the push target, and the argument to `git branch -D` in
+        merge cleanup. A fresh import (branch `null`) is precisely this
+        reconciler's trigger, so without a custody proof here a stranger's
+        branch can be adopted and later force-deleted.
+
+        Every candidate therefore passes the SAME custody check acquisition
+        uses: carries this campaign's identity token, and descends from the
+        sealed base. Missing proof is refusal. Ordinary tasks are unaffected.
+        */
+        const custodyRefusals: string[] = [];
         for (const branch of candidates) {
           let branchSha: string;
           try {
@@ -4926,6 +4944,17 @@ export class SelfHealingManager {
             continue;
           }
           if (!branchSha) continue;
+
+          const custody = await inspectCccCampaignBranchCustody({
+            task,
+            repoDir: this.options.rootDir,
+            branchName: branch,
+            sealedBase: task.baseCommitSha,
+          });
+          if (!custody.ok) {
+            custodyRefusals.push(`${branch} (${custody.reason})`);
+            continue;
+          }
 
           let comparisonBase = integrationBase;
           try {
@@ -4962,12 +4991,20 @@ export class SelfHealingManager {
         const existingCandidates = [...candidateByRefSha.values()];
 
         if (existingCandidates.length === 0) {
+          const refusedForCustody = custodyRefusals.length > 0;
+          const reason = refusedForCustody
+            ? "unsafe-to-auto-mutate:campaign-branch-custody"
+            : "no-live-branch";
           await this.emitBranchRebindAuditEvent({
             taskId: task.id,
             mutationType: "task:auto-rebind-skipped",
-            metadata: { taskId: task.id, reason: "no-live-branch" },
+            metadata: {
+              taskId: task.id,
+              reason,
+              ...(refusedForCustody ? { custodyRefusals } : {}),
+            },
           });
-          result.outcomes.push({ taskId: task.id, result: "skipped", reason: "no-live-branch" });
+          result.outcomes.push({ taskId: task.id, result: "skipped", reason });
           continue;
         }
 

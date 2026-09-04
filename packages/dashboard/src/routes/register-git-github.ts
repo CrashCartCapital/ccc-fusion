@@ -27,6 +27,7 @@ import {
   stashUnrelatedRootDirChanges,
   tryFastForwardFromOrigin,
   type MergerOptions,
+  resolveTrustedTaskBranchName,
 } from "@fusion/engine";
 import {
   ApiError,
@@ -363,7 +364,7 @@ async function computePrPreflight(task: Task, repoRoot: string, requestedBase?: 
   const defaultBaseBranch = requestedBase?.trim()
     ? ensureSafeGitRef(requestedBase, "base branch")
     : await resolveDefaultPrBaseBranch(task, repoRoot);
-  const head = task.branch || `fusion/${task.id.toLowerCase()}`;
+  const head = resolveTrustedTaskBranchName(task);
   const safeHead = ensureSafeGitRef(head, "head branch");
   const response: PrPreflightResponse = {
     branchOnRemote: false,
@@ -5327,7 +5328,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       const existingPrs = getTaskPrList(task);
 
       // Determine branch name from task
-      const branchName = task.branch || `fusion/${task.id.toLowerCase()}`;
+      const branchName = resolveTrustedTaskBranchName(task);
 
       // Get owner/repo from git remote or GITHUB_REPOSITORY env
       let owner: string;
@@ -5428,7 +5429,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       const requestedBase = typeof req.body?.base === "string" ? req.body.base.trim() : "";
       const defaultBaseBranch = requestedBase || await resolveDefaultPrBaseBranch(task, repoRoot);
       const baseBranch = ensureSafeGitRef(defaultBaseBranch, "base branch");
-      const head = ensureSafeGitRef(task.branch || `fusion/${task.id.toLowerCase()}`, "head branch");
+      const head = ensureSafeGitRef(resolveTrustedTaskBranchName(task), "head branch");
       const headRef = `refs/heads/${head}`;
       const baseRef = await resolvePrBaseRef(repoRoot, baseBranch).catch(() => baseBranch);
 
@@ -5508,7 +5509,7 @@ export function registerGitGitHubRoutes(ctx: ApiRoutesContext): void {
       const requestedBase = typeof req.body?.base === "string" ? req.body.base.trim() : "";
       const defaultBaseBranch = requestedBase || await resolveDefaultPrBaseBranch(task, repoRoot);
       const baseBranch = ensureSafeGitRef(defaultBaseBranch, "base branch");
-      const head = ensureSafeGitRef(task.branch || `fusion/${task.id.toLowerCase()}`, "head branch");
+      const head = ensureSafeGitRef(resolveTrustedTaskBranchName(task), "head branch");
       const baseRef = await resolvePrBaseRef(repoRoot, baseBranch).catch(() => baseBranch);
 
       /*

@@ -34,7 +34,7 @@ import {
   WorkspaceTaskMergeError,
 } from "@fusion/core";
 import type { Settings, TaskDetail, PrInfo, MergeResult, BranchGroup, BranchGroupPrState, Task } from "@fusion/core";
-import { activeSessionRegistry, resolveIntegrationBranch } from "@fusion/engine";
+import { activeSessionRegistry, resolveIntegrationBranch, resolveTrustedTaskBranchName } from "@fusion/engine";
 import type {
   CreateGroupPrFn,
   SyncGroupPrFn,
@@ -103,13 +103,21 @@ export function getMergeStrategy(settings: Pick<Settings, "mergeStrategy">): Non
  * Prefers the branch the engine actually persisted at acquisition, falling back
  * to `fusion/{task-id-lowercase}` when only an id is available. An imported CCC
  * campaign task works on a campaign-scoped branch
- * (`fusion/<id>-<campaign token>`, see campaignScopedFusionBranchName in the
- * engine), and an operator can pick a custom branch, so re-deriving the bare
- * canonical name here would push, PR, or clean up the wrong branch.
+ * (`fusion/<id>-<campaign token>`), and an operator can pick a custom branch, so
+ * re-deriving the bare canonical name here would push, PR, or clean up the wrong
+ * branch.
+ *
+ * The pointer is not taken on trust. `resolveTrustedTaskBranchName` re-derives
+ * the campaign-scoped name for a campaign task whose persisted branch does not
+ * carry its identity token, because this value reaches `git branch -D` in
+ * `cleanupMergedTaskArtifacts` and a poisoned pointer would force-delete a
+ * stranger's branch.
  */
-export function getTaskBranchName(task: string | { id: string; branch?: string | null }): string {
+export function getTaskBranchName(
+  task: string | { id: string; branch?: string | null; lineageId?: string | null },
+): string {
   if (typeof task === "string") return `fusion/${task.toLowerCase()}`;
-  return task.branch || `fusion/${task.id.toLowerCase()}`;
+  return resolveTrustedTaskBranchName(task);
 }
 
 /**

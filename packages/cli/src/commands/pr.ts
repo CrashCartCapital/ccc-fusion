@@ -7,7 +7,7 @@ import {
   type PrThreadState,
 } from "@fusion/core";
 import { classifyGhError, getGhErrorMessage, getCurrentRepo, isGhAuthenticated, isGhAvailable } from "@fusion/core/gh-cli";
-import { releaseHeldTaskByEvent } from "@fusion/engine";
+import { releaseHeldTaskByEvent, resolveTrustedTaskBranchName } from "@fusion/engine";
 import * as dashboard from "@fusion/dashboard";
 import { resolveProject, createLocalStore, closeProjectStore, asLocalProjectContext, type ProjectContext } from "../project-context.js";
 import { retryOnLock, LockRetryExhaustedError } from "../lock-retry.js";
@@ -195,7 +195,10 @@ export async function runPrCreate(id: string, options: PrCreateOptions = {}, pro
     // Prefer the branch the engine persisted at acquisition. An imported CCC
     // campaign task works on a campaign-scoped branch and an operator can pick a
     // custom one, so the bare `fusion/<id>` convention is only the fallback.
-    const branchName = task.branch || `fusion/${id.toLowerCase()}`;
+    // Not taken on trust: a campaign task's pointer is only honoured when it
+    // carries that campaign's identity token, so a poisoned rebind cannot make
+    // this open a PR against, or push to, a stranger's branch.
+    const branchName = resolveTrustedTaskBranchName({ id, branch: task.branch, lineageId: task.lineageId });
 
     // Build deterministic fallback PR title
     const fallbackTitle = options.title

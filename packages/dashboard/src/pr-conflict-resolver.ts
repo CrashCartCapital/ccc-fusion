@@ -1,7 +1,7 @@
 import { access, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Settings, TaskStore } from "@fusion/core";
-import { createResolvedAgentSession, resolveMcpServersForStore, type PluginRunner } from "@fusion/engine";
+import { createResolvedAgentSession, resolveMcpServersForStore, resolveTrustedTaskBranchName, type PluginRunner } from "@fusion/engine";
 import { runGitCommand } from "./routes/resolve-diff-base.js";
 
 const GIT_TIMEOUT_MS = 60_000;
@@ -54,8 +54,10 @@ export interface ResolvePrConflictsResult {
 
 // Prefer the branch the engine persisted at acquisition; an imported CCC
 // campaign task works on a campaign-scoped branch, not bare `fusion/<id>`.
-function getHeadBranch(task: { id: string; branch?: string | null }): string {
-  return task.branch || `fusion/${task.id.toLowerCase()}`;
+// The pointer is re-checked rather than trusted: for a campaign task it is
+// honoured only when it carries that campaign's identity token.
+function getHeadBranch(task: { id: string; branch?: string | null; lineageId?: string | null }): string {
+  return resolveTrustedTaskBranchName(task);
 }
 
 function getDefaultSessionModel(settings: Settings): { provider: string | undefined; modelId: string | undefined } {
