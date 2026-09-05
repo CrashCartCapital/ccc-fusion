@@ -27,6 +27,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   admitAndMaterializeCccSemanticProof,
+  EXECUTABLE_PROBE_TIMEOUT_MS,
   inspectCccSemanticProofExecutable,
   inspectCccSemanticProofLinkedRuntime,
   verifyCccSemanticProofToolchainBeforeSpawn,
@@ -1592,6 +1593,97 @@ describe("CCC semantic-proof admission and materialization", () => {
       vi.doUnmock("node:child_process");
       vi.resetModules();
     }
+  });
+
+  it("RED-S6-version-probe-diagnostics: reports exit code, signal, and stderr on a non-transient probe failure", async () => {
+    const toolRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-probe-diag-"));
+    roots.push(toolRoot);
+    const toolPath = join(toolRoot, "tool");
+    await writeFile(toolPath, "#!/bin/sh\nprintf 'boom' 1>&2\nexit 7\n", { mode: 0o755 });
+    await chmod(toolPath, 0o755);
+
+    // A plain non-zero exit with no timeout must not be mistaken for one, and
+    // the killed/exit/stderr fields the raw execFile rejection carries must
+    // survive into the message that campaign custody-refusal actually reads
+    // (it only ever looks at `error.message`).
+    await expect(inspectCccSemanticProofExecutable(toolPath, ["--version"])).rejects.toThrow(
+      /exit=7 signal=null timedOut=false after \d+ms stderr: "boom"/,
+    );
+  });
+
+  it("RED-S6-version-probe-diagnostics: labels a double SIGTERM-timeout instead of a bare 'Command failed'", async () => {
+    const toolRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-probe-timeout-diag-"));
+    roots.push(toolRoot);
+    const toolPath = join(toolRoot, "tool");
+    await writeFile(toolPath, "#!/bin/sh\nprintf 'proof-tool 1.0\\n'\n", { mode: 0o755 });
+    await chmod(toolPath, 0o755);
+    const canonicalToolPath = await realpath(toolPath);
+    let probeCount = 0;
+    const timeoutError = () => Object.assign(new Error(`Command failed: ${canonicalToolPath} --version`), {
+      code: null,
+      killed: true,
+      signal: "SIGTERM",
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    });
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const fakeExecFile = (
+        file: string,
+        args: readonly string[] = [],
+        options: unknown,
+        callback?: (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void,
+      ) => {
+        const cb = typeof options === "function"
+          ? options as (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void
+          : callback;
+        if (file === canonicalToolPath && args[0] === "--version") {
+          probeCount++;
+          queueMicrotask(() => cb?.(timeoutError(), Buffer.alloc(0), Buffer.alloc(0)));
+          return {} as never;
+        }
+        return actualExecFile(file, args as string[], options as never, cb as never);
+      };
+      Object.assign(fakeExecFile, {
+        [promisify.custom]: async (
+          file: string,
+          args: readonly string[] = [],
+          options: unknown,
+        ) => {
+          if (file === canonicalToolPath && args[0] === "--version") {
+            probeCount++;
+            throw timeoutError();
+          }
+          return execFile(file, args as string[], options as never);
+        },
+      });
+      return { execFile: fakeExecFile };
+    });
+    try {
+      const materialization = await import("../ccc-campaign-proof-materialization.js");
+      // Both attempts (the original probe and the existing transient-timeout
+      // retry) time out here, matching the live halt where the retry raced
+      // the same contention and lost twice. This must still be exactly one
+      // retry, not more: the fix is a longer bound per attempt, not extra
+      // attempts that could mask a real hang.
+      await expect(materialization.inspectCccSemanticProofExecutable(
+        canonicalToolPath,
+        ["--version"],
+      )).rejects.toThrow(/exit=null signal=SIGTERM timedOut=true after \d+ms/);
+      expect(probeCount).toBe(2);
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("RED-S6-version-probe-timeout: sealed-executable version probes keep a cold-start-safe margin", () => {
+    // Pinned to the 2026-09-05 measurement (see EXECUTABLE_PROBE_TIMEOUT_MS's
+    // doc comment): 20 concurrent seal+probe operations pushed several real
+    // cold-start probes past the previous 10s bound and up to ~9.9s among the
+    // survivors, matching a live double-timeout halt at that same bound.
+    expect(EXECUTABLE_PROBE_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000);
   });
 
   it("RED-S5-linked-runtime-otool-custody: refuses a Mach-O dependency graph when otool inspection fails", async () => {

@@ -37,7 +37,22 @@ const TARGET_COMMAND_TOKEN = /^[A-Za-z0-9._/-]+$/u;
 const TOP_LEVEL_TASKFILE_KEYS = new Set(["version", "tasks"]);
 const TARGET_KEYS = new Set(["cmds"]);
 const EXECUTABLE_VERSION_ARGS = Object.freeze(["--version"] as const);
-const EXECUTABLE_PROBE_TIMEOUT_MS = 10_000;
+// A `--version` probe against a just-copied, freshly ad-hoc-signed executable
+// (task/node/proof-host, or a sealed Python runtime file) is a cold first
+// launch every time: mkdtemp always allocates a brand-new path, so the
+// kernel's code-signature validation can never warm up across proof rounds.
+// Isolated, that validation is ~0.6s. Measured 2026-09-05: 12 concurrent
+// seal+probe operations (a realistic proxy for multiple in-flight proof
+// preparations in one campaign round) pushed a single probe as high as 7.6s;
+// 20 concurrent pushed 5/20 probes past the previous 10s bound outright, with
+// surviving probes up to 9.9s. The live halt this timeout is sized against
+// (Gate 3 campaign round, 2026-09-04 22:03:36 -0700) shows the exact same
+// probe, on the exact same temp root, starting a cold sealed-node launch and
+// then failing a double SIGTERM-timeout ~22s later — consistent with two
+// consecutive ~10-11s stalls under sustained contention, not a hung process.
+// 30s keeps ~3x margin over the worst measured concurrent cold start while
+// still bounding a genuinely hung probe.
+export const EXECUTABLE_PROBE_TIMEOUT_MS = 30_000;
 const GIT_TIMEOUT_MS = 10_000;
 const OTOOL_TIMEOUT_MS = 10_000;
 const INSTALL_NAME_TOOL_TIMEOUT_MS = 10_000;
@@ -442,6 +457,42 @@ function toolchainDrift(name: string, error: unknown): Error {
   );
 }
 
+const EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES = 4096;
+
+// A raw execFile rejection carries `code`, `signal`, `killed`, and `stderr`,
+// but every caller of runExecutableVersionProbe (including the campaign
+// custody-refusal path, which surfaces only `error.message`) only ever sees
+// `.message`. That collapsed a SIGTERM-timeout, a SIGKILL, and a plain
+// non-zero exit with empty stderr into the same single-line
+// "Command failed: <cmd>" text, with no way to tell them apart after the
+// fact. This folds the dropped fields back into the message itself.
+function executableProbeFailureError(originalError: unknown, elapsedMs: number): Error {
+  const candidate = originalError as {
+    code?: unknown;
+    signal?: unknown;
+    killed?: unknown;
+    stderr?: unknown;
+  } | null;
+  const exitCode = typeof candidate?.code === "number" || typeof candidate?.code === "string"
+    ? candidate.code
+    : null;
+  const signal = typeof candidate?.signal === "string" ? candidate.signal : null;
+  // Reuse the exact predicate the retry logic already trusts to mean "this is
+  // our own timeout kill" rather than re-deriving it from elapsed wall-clock
+  // time, which a synthetic or fast-failing probe would never satisfy.
+  const timedOut = isTransientExecutableProbeTimeout(originalError);
+  const stderrBuffer = Buffer.isBuffer(candidate?.stderr) ? candidate.stderr : Buffer.alloc(0);
+  const stderrExcerpt = stderrBuffer.subarray(0, EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES).toString("utf8");
+  const baseMessage = originalError instanceof Error ? originalError.message.trim() : String(originalError);
+  const stderrNote = stderrExcerpt.length > 0 ? ` stderr: ${JSON.stringify(stderrExcerpt)}` : "";
+  const wrapped = new Error(
+    `${baseMessage} (exit=${exitCode === null ? "null" : exitCode} `
+      + `signal=${signal ?? "null"} timedOut=${timedOut} after ${elapsedMs}ms${stderrNote})`,
+  );
+  wrapped.cause = originalError;
+  return wrapped;
+}
+
 async function runExecutableVersionProbe(
   executablePath: string,
   args: readonly string[],
@@ -453,11 +504,19 @@ async function runExecutableVersionProbe(
     timeout: EXECUTABLE_PROBE_TIMEOUT_MS,
     windowsHide: true,
   });
+  const firstAttemptStartedAt = Date.now();
   try {
     return await run();
-  } catch (error) {
-    if (!isTransientExecutableProbeTimeout(error)) throw error;
-    return run();
+  } catch (firstError) {
+    if (!isTransientExecutableProbeTimeout(firstError)) {
+      throw executableProbeFailureError(firstError, Date.now() - firstAttemptStartedAt);
+    }
+  }
+  const retryStartedAt = Date.now();
+  try {
+    return await run();
+  } catch (secondError) {
+    throw executableProbeFailureError(secondError, Date.now() - retryStartedAt);
   }
 }
 
