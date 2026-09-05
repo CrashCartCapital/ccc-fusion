@@ -1000,6 +1000,74 @@ async function inspectDarwinLinkedLibraries(path: string): Promise<string | unde
   }
 }
 
+// A Mach-O dylib carries its own name in LC_ID_DYLIB, and `otool -L` prints
+// that name as the first entry of every architecture section. maturin and other
+// Rust-built CPython extension modules ship as MH_DYLIB with an id of
+// @rpath/<package>.<module>.so and no LC_RPATH at all, so the id resolves
+// nowhere on disk. Reading it as a load command made the sealer refuse its own
+// sealed files. `otool -D` reports exactly that id, so the id is identified by
+// value rather than by line position.
+async function inspectDarwinInstallNameIds(path: string): Promise<ReadonlySet<string>> {
+  try {
+    const { stdout } = await execFile("/usr/bin/otool", ["-D", path], {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024,
+      timeout: OTOOL_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    return new Set(
+      stdout
+        .split("\n")
+        .map((line) => line.trim())
+        // Section headers are `<path>:` or `<path> (architecture <arch>):`.
+        // An install name never ends in a colon.
+        .filter((line) => line.length > 0 && !line.endsWith(":")),
+    );
+  } catch (error) {
+    if (await isDarwinMachOFile(path)) {
+      throw new Error(`CCC semantic-proof otool inspection failed for Mach-O file: ${path}`, {
+        cause: error,
+      });
+    }
+    return new Set();
+  }
+}
+
+// Parses `otool -L` output into the Mach-O's real load-command dependencies.
+// Dependency lines are tab-indented; unindented lines start a new architecture
+// section. Within each section the first dependency is dropped only when it is
+// exactly one of the ids reported by `otool -D`; every other line, including a
+// later repeat of that same name, stays a dependency.
+function parseDarwinLinkedDependencies(
+  output: string,
+  installNameIds: ReadonlySet<string>,
+): string[] {
+  const dependencies: string[] = [];
+  let sectionInstallNameSeen = false;
+  let sectionStarted = false;
+  for (const line of output.split("\n")) {
+    if (line.length === 0) continue;
+    if (!/^\s/u.test(line)) {
+      sectionInstallNameSeen = false;
+      sectionStarted = true;
+      continue;
+    }
+    if (!sectionStarted) continue;
+    const dependency = line.trim().split(/\s+/u)[0];
+    if (!dependency) continue;
+    if (!sectionInstallNameSeen) {
+      sectionInstallNameSeen = true;
+      if (installNameIds.has(dependency)) continue;
+    }
+    dependencies.push(dependency);
+  }
+  return dependencies;
+}
+
+async function darwinLinkedDependencies(machOPath: string, output: string): Promise<string[]> {
+  return parseDarwinLinkedDependencies(output, await inspectDarwinInstallNameIds(machOPath));
+}
+
 async function darwinHomebrewLinkedRuntimeManifest(
   roots: readonly DarwinRuntimeLoader[],
 ): Promise<CccPrdLinkedRuntimeEntry[]> {
@@ -1224,13 +1292,7 @@ async function patchDarwinInstallNames(
   if (process.platform !== "darwin") return;
   const output = await inspectDarwinLinkedLibraries(machOPath) ?? "";
   if (output.length === 0) return;
-  const linkedNames = new Set(
-    output
-      .split("\n")
-      .slice(1)
-      .map((line) => line.trim().split(/\s+/u)[0])
-      .filter((name): name is string => Boolean(name)),
-  );
+  const linkedNames = new Set(await darwinLinkedDependencies(machOPath, output));
   const changes = new Map<string, string>();
   for (const entry of manifest) {
     if (
@@ -1314,9 +1376,7 @@ async function assertSealedDarwinLinkedRuntimeGraph(
   for (const machOPath of machOPaths) {
     const output = await inspectDarwinLinkedLibraries(machOPath) ?? "";
     if (output.length === 0) continue;
-    for (const line of output.split("\n").slice(1)) {
-      const dependency = line.trim().split(/\s+/u)[0];
-      if (!dependency) continue;
+    for (const dependency of await darwinLinkedDependencies(machOPath, output)) {
       if (
         dependency.startsWith("/usr/lib/")
         || dependency.startsWith("/System/Library/")
