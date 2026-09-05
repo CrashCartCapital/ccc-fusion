@@ -27,6 +27,7 @@ import {
   inspectCccPrdImport,
   inspectCccPrdProductStatus,
   parseCccPrdProductExecutionPlan,
+  planCccPrdCampaignDriftStop,
   reconcileCccPrdImport,
   settleCccCampaignProofAttempt,
   type ApprovalRequest,
@@ -176,6 +177,9 @@ export type PrdCommandDependencies = {
   computeCccCampaignOperatorControlConfirmation?: typeof engine.computeCccCampaignOperatorControlConfirmation;
   describeCccCampaignOperatorControls?: typeof engine.describeCccCampaignOperatorControls;
   applyCccCampaignOperatorControl?: typeof engine.applyCccCampaignOperatorControl;
+  planCccPrdCampaignDriftStop?: typeof planCccPrdCampaignDriftStop;
+  computeCccCampaignDriftStopConfirmation?: typeof engine.computeCccCampaignDriftStopConfirmation;
+  applyCccCampaignDriftStop?: typeof engine.applyCccCampaignDriftStop;
 };
 export type PrdCommandContext = {
   projectName?: string;
@@ -239,6 +243,8 @@ const usage = [
   "       fn prd status <idempotency-key> [--project <id|name>]",
   "       fn prd <pause|resume> <idempotency-key> --confirm <status-digest> [--project <id|name>]",
   "       fn prd <stop|abandon> <idempotency-key> --reason <reason> --confirm <status-digest> [--project <id|name>]",
+  "       fn prd stop-drifted <idempotency-key> [--project <id|name>]",
+  "       fn prd stop-drifted <idempotency-key> --reason <reason> --confirm <drift-stop-digest> [--project <id|name>]",
   "       fn prd resolve-proof <idempotency-key> <attempt-key> <evidence-path> [--confirm <resolution-digest>] [--project <id|name>]",
   "       fn prd resolve-provider <idempotency-key> <attempt-key> <committed|proved-failed> <observer-id> <evidence-sha256> [--confirm <resolution-digest>] [--project <id|name>]",
   "       fn prd approve-execution <idempotency-key> <execution-authorization-or-legacy-approval-id> --confirm <approval-digest> [--project <id|name>]",
@@ -1186,6 +1192,13 @@ function writeProductRefusal(
   message: string,
   json = true,
 ): number {
+  /*
+   * Custody drift makes the ordinary advice circular: stop needs a fresh status
+   * digest, and status is the very command that just refused. Name the one
+   * control such a campaign can still reach.
+   */
+  const custodyDrifted = /campaign manifest drift|campaign custody cannot reconstruct/i
+    .test(message);
   writeRefusalPayload(io, json, {
     kind: "refusal",
     diagnostics: [{ code, message }],
@@ -1199,9 +1212,15 @@ function writeProductRefusal(
       "Run fn prd status <idempotency-key> to inspect durable work, receipts, approvals, and the next safe action.",
       "Correct the cited input or custody problem and request a fresh confirmation.",
       "Use fn prd stop with a fresh status digest to abandon an unleased campaign while preserving evidence.",
+      ...(custodyDrifted
+        ? [
+          "This campaign's persisted custody no longer reconstructs, so status and every control that needs it will keep refusing. Run fn prd stop-drifted <idempotency-key> to see the close plan and its confirmation, then repeat it with --reason and --confirm. It preserves worktrees, branches, approvals, and receipts, and stops the import re-projecting its task directories.",
+        ]
+        : []),
     ],
-    nextSafeAction:
-      "Run fn prd status <idempotency-key> and follow its fresh operator controls; do not blindly retry an uncertain effect.",
+    nextSafeAction: custodyDrifted
+      ? "Run fn prd stop-drifted <idempotency-key> to inspect the close plan; status cannot recover a campaign whose custody no longer reconstructs."
+      : "Run fn prd status <idempotency-key> and follow its fresh operator controls; do not blindly retry an uncertain effect.",
   });
   return 1;
 }
@@ -2463,6 +2482,102 @@ async function runProductControlCommand(
   });
 }
 
+/**
+ * Closes a campaign whose stored manifest no longer reconstructs.
+ *
+ * Every ordinary control asks for a fresh product status first, and status
+ * rebuilds campaign custody, so a campaign imported by a superseded copier can
+ * reach none of them. This command reads the import row instead, proves the
+ * drift with the unchanged custody reconstruction, and refuses any campaign
+ * whose custody is intact.
+ *
+ * With no flags it prints the plan and the confirmation an operator must echo
+ * back. With `--reason` and `--confirm` it performs the close. It disposes no
+ * worktree, deletes no branch, and consumes no approval.
+ */
+async function runCampaignDriftStopCommand(
+  args: string[],
+  io: PrdCommandIo,
+  dependencies: PrdCommandDependencies,
+  commandContext: PrdCommandContext,
+): Promise<number> {
+  const [, idempotencyKey] = args;
+  const planning = args.length === 2;
+  const reason = args[2] === "--reason" ? args[3] : undefined;
+  const confirmation = args[5];
+  if (
+    !idempotencyKey
+    || (!planning && (
+      args.length !== 6
+      || args[2] !== "--reason"
+      || typeof reason !== "string"
+      || reason.trim() !== reason
+      || reason.length < 10
+      || args[4] !== "--confirm"
+      || !confirmation
+      || !/^[0-9a-f]{64}$/.test(confirmation)
+    ))
+  ) {
+    io.write(usage);
+    return 2;
+  }
+  return withPrdProject(io, dependencies, commandContext, async (project) => {
+    const layer = project.store.getAsyncLayer();
+    if (!layer) {
+      throw new PrdProductCommandError(
+        "CCC_PRD_POSTGRES_UNAVAILABLE",
+        `PostgreSQL AsyncDataLayer unavailable for ${project.projectPath}`,
+      );
+    }
+    const plan = await (
+      dependencies.planCccPrdCampaignDriftStop ?? planCccPrdCampaignDriftStop
+    )({
+      layer,
+      rootDir: project.projectPath,
+      idempotencyKey,
+    });
+    if (!plan) {
+      writeOperatorPayload(io, commandContext, {
+        kind: "campaign-drift-stop-plan",
+        found: false,
+        idempotencyKey,
+      });
+      return 1;
+    }
+    const computeConfirmation =
+      dependencies.computeCccCampaignDriftStopConfirmation
+      ?? engine.computeCccCampaignDriftStopConfirmation;
+    if (planning) {
+      writeOperatorPayload(io, commandContext, {
+        kind: "campaign-drift-stop-plan",
+        found: true,
+        plan,
+        confirmation: computeConfirmation(plan),
+        consequence:
+          "Cancels the campaign workflow, pauses its imported tasks, and marks the import terminal so it never re-projects its task directories again.",
+        preserved:
+          "Worktrees, branches, approvals, execution authorizations, proof receipts, and every uncertain-effect record are left untouched for review.",
+      });
+      return 0;
+    }
+    const result = await (
+      dependencies.applyCccCampaignDriftStop ?? engine.applyCccCampaignDriftStop
+    )({
+      plan,
+      reason: reason!,
+      confirmation: confirmation!,
+      store: project.store,
+      layer,
+    });
+    writeOperatorPayload(io, commandContext, {
+      kind: "campaign-drift-stopped",
+      result,
+      plan,
+    });
+    return 0;
+  });
+}
+
 async function runCampaignLifecycleCommand(
   args: string[],
   io: PrdCommandIo,
@@ -3446,6 +3561,9 @@ export async function runPrdCommand(
     || args[0] === "approve-merge"
   ) {
     return runProductControlCommand(args, io, dependencies, commandContext);
+  }
+  if (args[0] === "stop-drifted") {
+    return runCampaignDriftStopCommand(args, io, dependencies, commandContext);
   }
   if (
     args[0] === "pause"

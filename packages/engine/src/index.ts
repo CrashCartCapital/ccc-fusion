@@ -436,6 +436,16 @@ export {
   type CccCampaignOperatorControlDescriptor,
   type CccCampaignOperatorControlResult,
 } from "./ccc-campaign-operator-control.js";
+// The one control a campaign with a drifted manifest can still reach: it never
+// rebuilds custody, and it never disposes worktrees, branches, or approvals.
+export {
+  CccCampaignDriftStopError,
+  applyCccCampaignDriftStop,
+  cccCampaignDriftStopClosure,
+  computeCccCampaignDriftStopConfirmation,
+  type ApplyCccCampaignDriftStopInput,
+  type CccCampaignDriftStopResult,
+} from "./ccc-campaign-drift-stop.js";
 // FNXC:Workspace 2026-06-22-14:10 (Phase D review G): canonical landed predicate now lives in its
 // own dependency-free module (self-healing ↔ merger-ai cycle dissolved). Public export preserved.
 export { isRepoLanded } from "./workspace-land-predicate.js";

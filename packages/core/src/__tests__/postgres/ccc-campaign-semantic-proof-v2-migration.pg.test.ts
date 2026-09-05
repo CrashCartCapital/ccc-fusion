@@ -62,7 +62,7 @@ describe("CCC campaign semantic-proof v2 migration registry", () => {
       fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
       "utf8",
     );
-    expect(SCHEMA_BASELINE_VERSION).toBe("0040");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0041");
     expect(applierSource).toContain("0040_ccc_campaign_semantic_proof_v2.sql");
   });
 });

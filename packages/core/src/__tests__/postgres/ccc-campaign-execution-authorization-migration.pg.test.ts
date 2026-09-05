@@ -163,7 +163,7 @@ describe("CCC campaign execution-authorization migration registry", () => {
       fileURLToPath(new URL("../../postgres/schema-applier.ts", import.meta.url)),
       "utf8",
     );
-    expect(SCHEMA_BASELINE_VERSION).toBe("0040");
+    expect(SCHEMA_BASELINE_VERSION).toBe("0041");
     expect(applierSource).toContain("0039_ccc_campaign_execution_authorization.sql");
     expect(projectTableNames).toEqual(expect.arrayContaining(AUTHORIZATION_TABLES));
     expect(new Set(projectTableNames).size).toBe(projectTableNames.length);

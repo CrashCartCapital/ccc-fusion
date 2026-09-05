@@ -57,8 +57,13 @@ exact child-approval membership map.
 FNXC:CCCCampaignSemanticProofV2 2026-08-12:
 Advance the ceiling to 0040 for phase-bound verifier-owned proof receipts while
 preserving every existing v1 receipt and deterministic key.
+
+FNXC:CccPrdImportStoppedState 2026-09-04:
+Advance the ceiling to 0041 so an operator can close a campaign whose stored
+manifest no longer reconstructs. Without it the terminal write is rejected by
+ccc_prd_imports_state_check and the campaign keeps re-projecting.
 */
-export const SCHEMA_BASELINE_VERSION = "0040";
+export const SCHEMA_BASELINE_VERSION = "0041";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -168,6 +173,8 @@ export const CCC_CAMPAIGN_PROOF_ATTEMPTS_VERSION = "0038";
 export const CCC_CAMPAIGN_EXECUTION_AUTHORIZATION_VERSION = "0039";
 /** Phase-bound semantic proof receipts and canonical verifier evidence. */
 export const CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION = "0040";
+/** Terminal 'stopped' state for an import an operator has closed. */
+export const CCC_PRD_IMPORT_STOPPED_STATE_VERSION = "0041";
 
 /** SECURITY DEFINER helper that only inserts LEGACY_ADOPTION_DRAINED_MARKER. */
 export const LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION = "fusion_mark_legacy_adoption_drained";
@@ -394,6 +401,10 @@ const CCC_CAMPAIGN_SEMANTIC_PROOF_V2_MIGRATION_PATH = join(
   MIGRATIONS_DIR,
   "0040_ccc_campaign_semantic_proof_v2.sql",
 );
+const CCC_PRD_IMPORT_STOPPED_STATE_MIGRATION_PATH = join(
+  MIGRATIONS_DIR,
+  "0041_ccc_prd_import_stopped_state.sql",
+);
 
 /**
  * Ensure the migration bookkeeping table exists. Lives in the public schema so
@@ -513,6 +524,9 @@ export async function applySchemaBaseline(
     );
     const cccCampaignSemanticProofV2AlreadyApplied = applied.includes(
       CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION,
+    );
+    const cccPrdImportStoppedStateAlreadyApplied = applied.includes(
+      CCC_PRD_IMPORT_STOPPED_STATE_VERSION,
     );
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
@@ -1079,6 +1093,18 @@ export async function applySchemaBaseline(
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(
         sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${CCC_CAMPAIGN_SEMANTIC_PROOF_V2_VERSION}) ON CONFLICT (version) DO NOTHING`,
+      );
+      schemaChanged = true;
+    }
+
+    if (!cccPrdImportStoppedStateAlreadyApplied) {
+      const migrationSql = await readFile(
+        CCC_PRD_IMPORT_STOPPED_STATE_MIGRATION_PATH,
+        "utf8",
+      );
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(
+        sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${CCC_PRD_IMPORT_STOPPED_STATE_VERSION}) ON CONFLICT (version) DO NOTHING`,
       );
       schemaChanged = true;
     }

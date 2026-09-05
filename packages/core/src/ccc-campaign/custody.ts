@@ -171,3 +171,35 @@ export function reconstructCccCampaignCustody(
     );
   }
 }
+
+/**
+ * Whether a campaign's persisted custody can still be reconstructed.
+ *
+ * This is a read-only probe around the unchanged reconstruction above. It adds
+ * no tolerance of its own: a campaign counts as drifted here only when
+ * `reconstructCccCampaignCustody` refuses it, and the refusal message is
+ * carried through verbatim so a terminal state can record why.
+ *
+ * It exists because refusal is the one state an operator cannot act on. Stop
+ * needs a fresh status digest, status reconstructs custody, and custody
+ * refuses, so a campaign whose manifest was written by a superseded copier can
+ * neither run nor be closed. Callers may use this to reach a terminal state.
+ * None may use it to admit work.
+ */
+export type CccCampaignCustodyDrift =
+  | Readonly<{ drifted: false }>
+  | Readonly<{ drifted: true; reason: string }>;
+
+export function inspectCccCampaignCustodyDrift(
+  row: CccCampaignCustodyRecord,
+): CccCampaignCustodyDrift {
+  try {
+    reconstructCccCampaignCustody(row);
+    return { drifted: false };
+  } catch (error) {
+    if (error instanceof CccCampaignCustodyError) {
+      return { drifted: true, reason: error.message };
+    }
+    throw error;
+  }
+}
