@@ -335,6 +335,68 @@ async function createPythonMaterializationFixture(
   };
 }
 
+// maturin / Rust-built CPython extension modules ship as MH_DYLIB with an
+// LC_ID_DYLIB of @rpath/<package>.<module>.so and no LC_RPATH, so the id never
+// resolves on disk. otool -L prints that id as its own first dependency line.
+const MACH_O_FIXTURE_SELF_ID = "@rpath/ccc_fixture.fixture.abi3.so";
+const MACH_O_FIXTURE_MISSING_DEPENDENCY = "@rpath/ccc_fixture_missing.dylib";
+const darwinMachOFixtureRunnable = process.platform === "darwin"
+  && existsSync("/usr/bin/clang")
+  && existsSync("/usr/bin/otool")
+  && existsSync("/opt/homebrew/bin/task");
+
+async function darwinInstallNameIds(machOPath: string): Promise<string[]> {
+  const { stdout } = await execFile("/usr/bin/otool", ["-D", machOPath]);
+  return stdout
+    .split("\n")
+    .slice(1)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("Architecture:"));
+}
+
+async function compileDarwinFixtureDylib(
+  installName: string,
+  missingDependencyInstallName?: string,
+): Promise<Buffer> {
+  const buildRoot = await mkdtemp(join(tmpdir(), "ccc-macho-fixture-"));
+  roots.push(buildRoot);
+  const sourcePath = join(buildRoot, "fixture.c");
+  const outputPath = join(buildRoot, "fixture.so");
+  const linkArgs: string[] = [];
+  if (missingDependencyInstallName) {
+    const stubSourcePath = join(buildRoot, "stub.c");
+    await writeFile(stubSourcePath, "int ccc_fixture_stub_symbol(void) { return 7; }\n");
+    await execFile("/usr/bin/clang", [
+      "-dynamiclib",
+      "-install_name",
+      missingDependencyInstallName,
+      "-o",
+      join(buildRoot, "libcccfixturestub.dylib"),
+      stubSourcePath,
+    ]);
+    await writeFile(sourcePath, [
+      "extern int ccc_fixture_stub_symbol(void);",
+      "int ccc_fixture_symbol(void) { return ccc_fixture_stub_symbol() + 1; }",
+      "",
+    ].join("\n"));
+    // The stub is linked but never sealed, so its @rpath name stays a genuine
+    // unresolvable LOAD dependency inside the sealed root.
+    linkArgs.push(`-L${buildRoot}`, "-lcccfixturestub");
+  } else {
+    await writeFile(sourcePath, "int ccc_fixture_symbol(void) { return 1; }\n");
+  }
+  await execFile("/usr/bin/clang", [
+    "-dynamiclib",
+    "-install_name",
+    installName,
+    "-o",
+    outputPath,
+    sourcePath,
+    ...linkArgs,
+  ]);
+  return readFile(outputPath);
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => {
     const makeWriteable = async (path: string): Promise<void> => {
@@ -1155,6 +1217,79 @@ describe("CCC semantic-proof admission and materialization", () => {
       replacementPathToSwap = undefined;
     }
   });
+
+  it.runIf(darwinMachOFixtureRunnable)(
+    "RED-L18-self-id-dylib: seals a maturin-shaped extension module whose LC_ID_DYLIB is an unresolvable @rpath name",
+    async () => {
+      const {
+        fixture,
+        proofBaseCommit,
+        outputRoot,
+        definition,
+        runtimeFiles,
+      } = await createPythonMaterializationFixture();
+      const bytes = await compileDarwinFixtureDylib(MACH_O_FIXTURE_SELF_ID);
+      await writeFile(runtimeFiles.extensionModules, bytes);
+      definition.executionToolchain.python!.runtimeManifest.extensionModules = [{
+        path: runtimeFiles.extensionModules,
+        sha256: sha256(bytes),
+      }];
+
+      const materialized = await admitAndMaterializeCccSemanticProof({
+        repositoryRoot: fixture.repository,
+        baseCommit: proofBaseCommit,
+        sourceCommit: proofBaseCommit,
+        proof: definition,
+        modelWriteRoots: ["src"],
+        outputRoot,
+      });
+
+      const sealedExtensionModule = materialized.sealedExecutionToolchain.python!
+        .runtimeManifest.extensionModules[0]!.path;
+      expect(sealedExtensionModule).toContain(join(outputRoot, "toolchain"));
+      // The sealed bytes are untouched: no -id rewrite, no relink, no re-sign.
+      expect(sha256(await readFile(sealedExtensionModule))).toBe(sha256(bytes));
+      expect(await darwinInstallNameIds(sealedExtensionModule))
+        .toEqual([MACH_O_FIXTURE_SELF_ID]);
+      // otool -L still reports the self id as its first line; only the parser
+      // now knows that line is the file's own identity, not a dependency.
+      const linkedOutput = (await execFile("/usr/bin/otool", ["-L", sealedExtensionModule])).stdout;
+      expect(linkedOutput.split("\n")[1]?.trim().split(/\s+/u)[0]).toBe(MACH_O_FIXTURE_SELF_ID);
+    },
+  );
+
+  it.runIf(darwinMachOFixtureRunnable)(
+    "RED-L18-genuine-unresolvable-load-dependency: still refuses an @rpath LOAD dependency that is not the Mach-O's own id",
+    async () => {
+      const {
+        fixture,
+        proofBaseCommit,
+        outputRoot,
+        definition,
+        runtimeFiles,
+      } = await createPythonMaterializationFixture();
+      const bytes = await compileDarwinFixtureDylib(
+        MACH_O_FIXTURE_SELF_ID,
+        MACH_O_FIXTURE_MISSING_DEPENDENCY,
+      );
+      await writeFile(runtimeFiles.extensionModules, bytes);
+      definition.executionToolchain.python!.runtimeManifest.extensionModules = [{
+        path: runtimeFiles.extensionModules,
+        sha256: sha256(bytes),
+      }];
+
+      await expect(admitAndMaterializeCccSemanticProof({
+        repositoryRoot: fixture.repository,
+        baseCommit: proofBaseCommit,
+        sourceCommit: proofBaseCommit,
+        proof: definition,
+        modelWriteRoots: ["src"],
+        outputRoot,
+      })).rejects.toThrow(
+        `CCC semantic-proof sealed runtime graph escaped toolchain root: ${MACH_O_FIXTURE_MISSING_DEPENDENCY}`,
+      );
+    },
+  );
 
   it.runIf(
     runRealPythonSealSmoke
