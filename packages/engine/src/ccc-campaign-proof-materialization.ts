@@ -475,6 +475,7 @@ function toolchainDrift(name: string, error: unknown): Error {
 }
 
 const EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES = 4096;
+const EXECUTABLE_PROBE_STDERR_TRUNCATED_MARKER = "...[truncated]";
 const EXECUTABLE_PROBE_TOTAL_ATTEMPTS = 2;
 
 // A raw execFile rejection's `.message` already embeds the FULL stderr (up
@@ -485,6 +486,43 @@ const EXECUTABLE_PROBE_TOTAL_ATTEMPTS = 2;
 function executableProbeCommandLine(originalError: unknown): string {
   const message = originalError instanceof Error ? originalError.message : String(originalError);
   return (message.split(/\r?\n/u)[0] ?? "").trim();
+}
+
+// Bounds `buffer` to at most `maxBytes` raw bytes without ever splitting a
+// multi-byte UTF-8 sequence in half. Cutting mid-sequence and calling
+// `.toString("utf8")` on the result can silently drop or replace (U+FFFD)
+// the sheared tail, corrupting the last character instead of just omitting
+// it -- so the bound here is on real byte length, not `string.length`
+// (UTF-16 code units), and the cut point always lands on a code-point
+// boundary.
+function boundedUtf8Excerpt(buffer: Buffer, maxBytes: number): { excerpt: string; truncated: boolean } {
+  if (buffer.length <= maxBytes) {
+    return { excerpt: buffer.toString("utf8"), truncated: false };
+  }
+  let cut = maxBytes;
+  // UTF-8 sequences are at most 4 bytes (1 lead byte + up to 3 continuation
+  // bytes, each shaped 0b10xxxxxx). Walk back from the cut point over any
+  // trailing continuation bytes to find that sequence's lead byte, then
+  // drop the whole sequence if it would otherwise be cut in half.
+  for (let back = 0; back < 4 && cut - back > 0; back++) {
+    const byte = buffer[cut - 1 - back];
+    if (byte === undefined) break;
+    if ((byte & 0xc0) !== 0x80) {
+      const sequenceLength = (byte & 0x80) === 0x00
+        ? 1
+        : (byte & 0xe0) === 0xc0
+          ? 2
+          : (byte & 0xf0) === 0xe0
+            ? 3
+            : (byte & 0xf8) === 0xf0
+              ? 4
+              : 1;
+      const leadBytePosition = cut - 1 - back;
+      if (leadBytePosition + sequenceLength > cut) cut = leadBytePosition;
+      break;
+    }
+  }
+  return { excerpt: buffer.subarray(0, cut).toString("utf8"), truncated: true };
 }
 
 // A raw execFile rejection carries `code`, `signal`, `killed`, and `stderr`,
@@ -515,26 +553,38 @@ function executableProbeFailureError(
   // our own timeout kill" rather than re-deriving it from elapsed wall-clock
   // time, which a synthetic or fast-failing probe would never satisfy.
   const timedOut = isTransientExecutableProbeTimeout(originalError);
-  const stderrValue = Buffer.isBuffer(candidate?.stderr)
-    ? candidate.stderr.toString("utf8")
+  // Use the raw Buffer directly when execFile already handed us one (the
+  // production { encoding: "buffer" } path): a Buffer -> string -> Buffer
+  // round trip both wastes work and, since the first `.toString("utf8")`
+  // already happens on the FULL untruncated stderr, defeats the point of
+  // bounding by byte length rather than string length.
+  const stderrBuffer = Buffer.isBuffer(candidate?.stderr)
+    ? candidate.stderr
     : typeof candidate?.stderr === "string"
-      ? candidate.stderr
-      : "";
-  const stderrExcerpt = stderrValue.length > EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES
-    ? Buffer.from(stderrValue, "utf8").subarray(0, EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES).toString("utf8")
-    : stderrValue;
+      ? Buffer.from(candidate.stderr, "utf8")
+      : Buffer.alloc(0);
+  const { excerpt: stderrExcerpt, truncated: stderrTruncated } = boundedUtf8Excerpt(
+    stderrBuffer,
+    EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES,
+  );
+  const stderrText = stderrTruncated
+    ? `${stderrExcerpt}${EXECUTABLE_PROBE_STDERR_TRUNCATED_MARKER}`
+    : stderrExcerpt;
   const commandLine = executableProbeCommandLine(originalError);
-  const stderrNote = stderrExcerpt.length > 0 ? ` stderr: ${JSON.stringify(stderrExcerpt)}` : "";
+  const stderrNote = stderrText.length > 0 ? ` stderr: ${JSON.stringify(stderrText)}` : "";
   // The envelope goes first and the (potentially very long, path-bearing)
   // command line goes last: toolchainDrift slices this whole message to 240
   // chars, and a sealed-toolchain path alone can run past 150-200 chars, so
   // anything placed after it would already be clipped. Leading with the
   // short, fixed-shape envelope is what keeps timedOut/exit/signal/attempt
   // legible regardless of how long the trailing path or stderr excerpt is.
+  // commandLine is only prefixed with a space when non-empty, so an empty
+  // command line and no stderr never leave a dangling trailing space.
   const wrapped = new Error(
     `(timedOut=${timedOut} exit=${exitCode === null ? "null" : exitCode} `
       + `signal=${signal ?? "null"} attempt=${context.attemptNumber}/${context.totalAttempts} `
-      + `after ${context.elapsedMs}ms totalElapsedMs=${context.totalElapsedMs}ms) ${commandLine}${stderrNote}`,
+      + `after ${context.elapsedMs}ms totalElapsedMs=${context.totalElapsedMs}ms)`
+      + `${commandLine ? ` ${commandLine}` : ""}${stderrNote}`,
   );
   wrapped.cause = originalError;
   return wrapped;

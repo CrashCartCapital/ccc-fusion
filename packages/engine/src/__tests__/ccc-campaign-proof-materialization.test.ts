@@ -1657,7 +1657,7 @@ describe("CCC semantic-proof admission and materialization", () => {
     expect(message).not.toMatch(/E{4097}/u);
     expect(message.length).toBeLessThan(4400);
     expect(message).toMatch(
-      /^\(timedOut=false exit=3 signal=null attempt=1\/2 after \d+ms totalElapsedMs=\d+ms\) Command failed: \S+ --version stderr: "E{4096}"$/,
+      /^\(timedOut=false exit=3 signal=null attempt=1\/2 after \d+ms totalElapsedMs=\d+ms\) Command failed: \S+ --version stderr: "E{4096}\.\.\.\[truncated\]"$/,
     );
   });
 
@@ -1884,6 +1884,218 @@ describe("CCC semantic-proof admission and materialization", () => {
         ["--version"],
       )).rejects.toThrow(/^\(timedOut=false exit=null signal=SIGKILL attempt=1\/2 after \d+ms totalElapsedMs=\d+ms\)/);
       expect(probeCount).toBe(1);
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("RED-S6-version-probe-diagnostics: bounds a multi-byte stderr excerpt to whole UTF-8 characters, never emitting U+FFFD", async () => {
+    const toolRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-probe-utf8-"));
+    roots.push(toolRoot);
+    const toolPath = join(toolRoot, "tool");
+    await writeFile(toolPath, "#!/bin/sh\nprintf 'proof-tool 1.0\\n'\n", { mode: 0o755 });
+    await chmod(toolPath, 0o755);
+    const canonicalToolPath = await realpath(toolPath);
+    // 3000 three-byte UTF-8 characters ("日", U+65E5) = 9000 bytes, well
+    // past the 4096-byte excerpt cap. 4096 is not a multiple of 3, so the
+    // byte cap lands mid-character -- exactly the shape that shears a code
+    // point in half if the cap is applied to string length (UTF-16 code
+    // units, which this string also happens to have 3000 of) instead of
+    // raw byte length.
+    const stderrBuffer = Buffer.from("日".repeat(3000), "utf8");
+    expect(stderrBuffer.length).toBe(9000);
+    const nonTransientError = () => Object.assign(
+      new Error(`Command failed: ${canonicalToolPath} --version`),
+      { code: 1, killed: false, signal: null, stderr: stderrBuffer },
+    );
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const fakeExecFile = (
+        file: string,
+        args: readonly string[] = [],
+        options: unknown,
+        callback?: (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void,
+      ) => {
+        const cb = typeof options === "function"
+          ? options as (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void
+          : callback;
+        if (file === canonicalToolPath && args[0] === "--version") {
+          queueMicrotask(() => cb?.(nonTransientError(), Buffer.alloc(0), stderrBuffer));
+          return {} as never;
+        }
+        return actualExecFile(file, args as string[], options as never, cb as never);
+      };
+      Object.assign(fakeExecFile, {
+        [promisify.custom]: async (
+          file: string,
+          args: readonly string[] = [],
+          options: unknown,
+        ) => {
+          if (file === canonicalToolPath && args[0] === "--version") {
+            throw nonTransientError();
+          }
+          return execFile(file, args as string[], options as never);
+        },
+      });
+      return { execFile: fakeExecFile };
+    });
+    try {
+      const materialization = await import("../ccc-campaign-proof-materialization.js");
+      let thrown: unknown;
+      try {
+        await materialization.inspectCccSemanticProofExecutable(canonicalToolPath, ["--version"]);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      const stderrJsonStart = message.indexOf('stderr: "');
+      expect(stderrJsonStart).toBeGreaterThan(-1);
+      const stderrText: string = JSON.parse(message.slice(stderrJsonStart + "stderr: ".length));
+      // A split multi-byte sequence decodes to U+FFFD; a correct byte-safe
+      // cut never produces one.
+      expect(stderrText).not.toContain("�");
+      expect(stderrText).toContain("[truncated]");
+      const withoutMarker = stderrText.replace(/\.\.\.\[truncated\]$/u, "");
+      const excerptBytes = Buffer.byteLength(withoutMarker, "utf8");
+      expect(excerptBytes).toBeLessThanOrEqual(4096);
+      expect(excerptBytes).toBeGreaterThan(4000);
+      // Every character in the excerpt must be a complete, undamaged "日" --
+      // not just "no U+FFFD" (a shift-by-one byte error could still decode
+      // to some other valid-looking character without producing U+FFFD).
+      expect(withoutMarker).toBe("日".repeat(withoutMarker.length));
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("RED-S6-version-probe-diagnostics: reports a plain string stderr (no Buffer anywhere) exactly once", async () => {
+    const toolRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-probe-string-stderr-"));
+    roots.push(toolRoot);
+    const toolPath = join(toolRoot, "tool");
+    await writeFile(toolPath, "#!/bin/sh\nprintf 'proof-tool 1.0\\n'\n", { mode: 0o755 });
+    await chmod(toolPath, 0o755);
+    const canonicalToolPath = await realpath(toolPath);
+    // A raw execFile rejection's stderr is a Buffer only when { encoding:
+    // "buffer" } is passed; other candidates (including a hand-constructed
+    // error) may carry a plain string instead. This must not be silently
+    // dropped by a Buffer.isBuffer(...) check, nor duplicated.
+    const stringStderrError = () => Object.assign(
+      new Error(`Command failed: ${canonicalToolPath} --version`),
+      { code: 1, killed: false, signal: null, stderr: "plain-string-stderr" },
+    );
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const fakeExecFile = (
+        file: string,
+        args: readonly string[] = [],
+        options: unknown,
+        callback?: (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void,
+      ) => {
+        const cb = typeof options === "function"
+          ? options as (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void
+          : callback;
+        if (file === canonicalToolPath && args[0] === "--version") {
+          queueMicrotask(() => cb?.(stringStderrError(), Buffer.alloc(0), "plain-string-stderr"));
+          return {} as never;
+        }
+        return actualExecFile(file, args as string[], options as never, cb as never);
+      };
+      Object.assign(fakeExecFile, {
+        [promisify.custom]: async (
+          file: string,
+          args: readonly string[] = [],
+          options: unknown,
+        ) => {
+          if (file === canonicalToolPath && args[0] === "--version") {
+            throw stringStderrError();
+          }
+          return execFile(file, args as string[], options as never);
+        },
+      });
+      return { execFile: fakeExecFile };
+    });
+    try {
+      const materialization = await import("../ccc-campaign-proof-materialization.js");
+      let thrown: unknown;
+      try {
+        await materialization.inspectCccSemanticProofExecutable(canonicalToolPath, ["--version"]);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      expect(message).toMatch(/ stderr: "plain-string-stderr"$/);
+      expect(message.match(/plain-string-stderr/gu)).toHaveLength(1);
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("RED-S6-version-probe-diagnostics: leaves no dangling space when the command line and stderr are both empty", async () => {
+    const toolRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-probe-empty-"));
+    roots.push(toolRoot);
+    const toolPath = join(toolRoot, "tool");
+    await writeFile(toolPath, "#!/bin/sh\nprintf 'proof-tool 1.0\\n'\n", { mode: 0o755 });
+    await chmod(toolPath, 0o755);
+    const canonicalToolPath = await realpath(toolPath);
+    // A raw rejection with an empty `.message` (so the derived command line
+    // is "") and no stderr must not leave a trailing space after the
+    // envelope's closing paren.
+    const emptyMessageError = () => Object.assign(new Error(""), {
+      code: 1,
+      killed: false,
+      signal: null,
+    });
+
+    vi.resetModules();
+    vi.doMock("node:child_process", () => {
+      const fakeExecFile = (
+        file: string,
+        args: readonly string[] = [],
+        options: unknown,
+        callback?: (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void,
+      ) => {
+        const cb = typeof options === "function"
+          ? options as (error: Error | null, stdout: Buffer | string, stderr: Buffer | string) => void
+          : callback;
+        if (file === canonicalToolPath && args[0] === "--version") {
+          queueMicrotask(() => cb?.(emptyMessageError(), Buffer.alloc(0), Buffer.alloc(0)));
+          return {} as never;
+        }
+        return actualExecFile(file, args as string[], options as never, cb as never);
+      };
+      Object.assign(fakeExecFile, {
+        [promisify.custom]: async (
+          file: string,
+          args: readonly string[] = [],
+          options: unknown,
+        ) => {
+          if (file === canonicalToolPath && args[0] === "--version") {
+            throw emptyMessageError();
+          }
+          return execFile(file, args as string[], options as never);
+        },
+      });
+      return { execFile: fakeExecFile };
+    });
+    try {
+      const materialization = await import("../ccc-campaign-proof-materialization.js");
+      let thrown: unknown;
+      try {
+        await materialization.inspectCccSemanticProofExecutable(canonicalToolPath, ["--version"]);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      expect(message).toMatch(/^\(timedOut=false exit=1 signal=null attempt=1\/2 after \d+ms totalElapsedMs=\d+ms\)$/);
+      expect(message).not.toMatch(/\s$/u);
     } finally {
       vi.doUnmock("node:child_process");
       vi.resetModules();
