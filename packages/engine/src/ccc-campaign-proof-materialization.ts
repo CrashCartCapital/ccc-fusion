@@ -41,18 +41,35 @@ const EXECUTABLE_VERSION_ARGS = Object.freeze(["--version"] as const);
 // (task/node/proof-host, or a sealed Python runtime file) is a cold first
 // launch every time: mkdtemp always allocates a brand-new path, so the
 // kernel's code-signature validation can never warm up across proof rounds.
-// Isolated, that validation is ~0.6s. Measured 2026-09-05: 12 concurrent
-// seal+probe operations (a realistic proxy for multiple in-flight proof
-// preparations in one campaign round) pushed a single probe as high as 7.6s;
-// 20 concurrent pushed 5/20 probes past the previous 10s bound outright, with
-// surviving probes up to 9.9s. The live halt this timeout is sized against
-// (Gate 3 campaign round, 2026-09-04 22:03:36 -0700) shows the exact same
-// probe, on the exact same temp root, starting a cold sealed-node launch and
-// then failing a double SIGTERM-timeout ~22s later — consistent with two
-// consecutive ~10-11s stalls under sustained contention, not a hung process.
-// 30s keeps ~3x margin over the worst measured concurrent cold start while
-// still bounding a genuinely hung probe.
-export const EXECUTABLE_PROBE_TIMEOUT_MS = 30_000;
+// This is an availability bound on a single probe attempt, not a concurrency
+// margin: semantic-proof preparation is serialized to exactly one in flight
+// at a time host-wide (semanticProofPreparationSemaphore in
+// ccc-campaign-proof-execution.ts), so this probe is never racing a sibling
+// proof round for CPU or amfid's attention.
+//
+// What actually drives the cost is amfid validating each file in the
+// executable's linked-dylib closure the first time that exact (freshly
+// signed) file content is ever presented to it, sequentially, at roughly
+// 1-2s per file. Once amfid has an opinion on a given file's bytes, later
+// launches of that same content are cheap; a brand-new mkdtemp path does not
+// force revalidation of unchanged dylib bytes, only genuinely new content
+// (a Node/Python version bump, or a fresh, never-before-signed host) does.
+// Isolated single-probe measurements taken 2026-09-05 against this file's
+// own dylib closure, warm (10 sequential trials, no concurrency, load
+// average 3.5-8.2 during measurement): node-probe launch alone took
+// 3.60-4.24s (mean ~3.77s); see .archive/l19-node-seal/10-isolated-node-probe-timing.log.
+// The live halt this timeout is sized against (Gate 3 campaign round,
+// 2026-09-04 22:03:36 -0700) hit the *cold* case: the unified log shows
+// amfid rejecting node's binary and all 17 of its linked dylibs, one at a
+// time, as "adhoc signed or signed by an unknown certificate chain"
+// (Code=-423), spanning 22:03:35.230 to 22:03:53.646 -0700 -- 18.417s for a
+// single full closure, with no syspolicyd activity at all for this root; see
+// .archive/l19-node-seal/11-fsgn7w-log-analysis.log. The prior 10s bound
+// covered neither attempt of that chain, so both the first probe and its one
+// retry failed. 45s keeps just over 2x margin above that single directly
+// observed worst-case cold chain, while still bounding a genuinely hung
+// probe rather than waiting indefinitely.
+export const EXECUTABLE_PROBE_TIMEOUT_MS = 45_000;
 const GIT_TIMEOUT_MS = 10_000;
 const OTOOL_TIMEOUT_MS = 10_000;
 const INSTALL_NAME_TOOL_TIMEOUT_MS = 10_000;
@@ -458,15 +475,32 @@ function toolchainDrift(name: string, error: unknown): Error {
 }
 
 const EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES = 4096;
+const EXECUTABLE_PROBE_TOTAL_ATTEMPTS = 2;
+
+// A raw execFile rejection's `.message` already embeds the FULL stderr (up
+// to maxBuffer) that Node's own child_process internals append after
+// "Command failed: <cmd>\n". Keeping only the first line here, and adding
+// back a separately bounded excerpt below, is what keeps the excerpt to one
+// copy instead of two, and bounded instead of maxBuffer-sized.
+function executableProbeCommandLine(originalError: unknown): string {
+  const message = originalError instanceof Error ? originalError.message : String(originalError);
+  return (message.split(/\r?\n/u)[0] ?? "").trim();
+}
 
 // A raw execFile rejection carries `code`, `signal`, `killed`, and `stderr`,
 // but every caller of runExecutableVersionProbe (including the campaign
-// custody-refusal path, which surfaces only `error.message`) only ever sees
+// custody-refusal path, which surfaces only `error.message`, and
+// toolchainDrift, which slices `.message` to 240 chars) only ever sees
 // `.message`. That collapsed a SIGTERM-timeout, a SIGKILL, and a plain
 // non-zero exit with empty stderr into the same single-line
 // "Command failed: <cmd>" text, with no way to tell them apart after the
-// fact. This folds the dropped fields back into the message itself.
-function executableProbeFailureError(originalError: unknown, elapsedMs: number): Error {
+// fact. This folds the dropped fields back into the message itself,
+// `timedOut=` first and stderr last, so the most load-bearing field is the
+// one most likely to survive a downstream length cap.
+function executableProbeFailureError(
+  originalError: unknown,
+  context: { attemptNumber: number; totalAttempts: number; elapsedMs: number; totalElapsedMs: number },
+): Error {
   const candidate = originalError as {
     code?: unknown;
     signal?: unknown;
@@ -481,13 +515,26 @@ function executableProbeFailureError(originalError: unknown, elapsedMs: number):
   // our own timeout kill" rather than re-deriving it from elapsed wall-clock
   // time, which a synthetic or fast-failing probe would never satisfy.
   const timedOut = isTransientExecutableProbeTimeout(originalError);
-  const stderrBuffer = Buffer.isBuffer(candidate?.stderr) ? candidate.stderr : Buffer.alloc(0);
-  const stderrExcerpt = stderrBuffer.subarray(0, EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES).toString("utf8");
-  const baseMessage = originalError instanceof Error ? originalError.message.trim() : String(originalError);
+  const stderrValue = Buffer.isBuffer(candidate?.stderr)
+    ? candidate.stderr.toString("utf8")
+    : typeof candidate?.stderr === "string"
+      ? candidate.stderr
+      : "";
+  const stderrExcerpt = stderrValue.length > EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES
+    ? Buffer.from(stderrValue, "utf8").subarray(0, EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES).toString("utf8")
+    : stderrValue;
+  const commandLine = executableProbeCommandLine(originalError);
   const stderrNote = stderrExcerpt.length > 0 ? ` stderr: ${JSON.stringify(stderrExcerpt)}` : "";
+  // The envelope goes first and the (potentially very long, path-bearing)
+  // command line goes last: toolchainDrift slices this whole message to 240
+  // chars, and a sealed-toolchain path alone can run past 150-200 chars, so
+  // anything placed after it would already be clipped. Leading with the
+  // short, fixed-shape envelope is what keeps timedOut/exit/signal/attempt
+  // legible regardless of how long the trailing path or stderr excerpt is.
   const wrapped = new Error(
-    `${baseMessage} (exit=${exitCode === null ? "null" : exitCode} `
-      + `signal=${signal ?? "null"} timedOut=${timedOut} after ${elapsedMs}ms${stderrNote})`,
+    `(timedOut=${timedOut} exit=${exitCode === null ? "null" : exitCode} `
+      + `signal=${signal ?? "null"} attempt=${context.attemptNumber}/${context.totalAttempts} `
+      + `after ${context.elapsedMs}ms totalElapsedMs=${context.totalElapsedMs}ms) ${commandLine}${stderrNote}`,
   );
   wrapped.cause = originalError;
   return wrapped;
@@ -504,19 +551,30 @@ async function runExecutableVersionProbe(
     timeout: EXECUTABLE_PROBE_TIMEOUT_MS,
     windowsHide: true,
   });
+  const probeStartedAt = Date.now();
   const firstAttemptStartedAt = Date.now();
   try {
     return await run();
   } catch (firstError) {
     if (!isTransientExecutableProbeTimeout(firstError)) {
-      throw executableProbeFailureError(firstError, Date.now() - firstAttemptStartedAt);
+      throw executableProbeFailureError(firstError, {
+        attemptNumber: 1,
+        totalAttempts: EXECUTABLE_PROBE_TOTAL_ATTEMPTS,
+        elapsedMs: Date.now() - firstAttemptStartedAt,
+        totalElapsedMs: Date.now() - probeStartedAt,
+      });
     }
   }
   const retryStartedAt = Date.now();
   try {
     return await run();
   } catch (secondError) {
-    throw executableProbeFailureError(secondError, Date.now() - retryStartedAt);
+    throw executableProbeFailureError(secondError, {
+      attemptNumber: 2,
+      totalAttempts: EXECUTABLE_PROBE_TOTAL_ATTEMPTS,
+      elapsedMs: Date.now() - retryStartedAt,
+      totalElapsedMs: Date.now() - probeStartedAt,
+    });
   }
 }
 
