@@ -37,7 +37,39 @@ const TARGET_COMMAND_TOKEN = /^[A-Za-z0-9._/-]+$/u;
 const TOP_LEVEL_TASKFILE_KEYS = new Set(["version", "tasks"]);
 const TARGET_KEYS = new Set(["cmds"]);
 const EXECUTABLE_VERSION_ARGS = Object.freeze(["--version"] as const);
-const EXECUTABLE_PROBE_TIMEOUT_MS = 10_000;
+// A `--version` probe against a just-copied, freshly ad-hoc-signed executable
+// (task/node/proof-host, or a sealed Python runtime file) is a cold first
+// launch every time: mkdtemp always allocates a brand-new path, so the
+// kernel's code-signature validation can never warm up across proof rounds.
+// This is an availability bound on a single probe attempt, not a concurrency
+// margin: semantic-proof preparation is serialized to exactly one in flight
+// at a time host-wide (semanticProofPreparationSemaphore in
+// ccc-campaign-proof-execution.ts), so this probe is never racing a sibling
+// proof round for CPU or amfid's attention.
+//
+// What actually drives the cost is amfid validating each file in the
+// executable's linked-dylib closure the first time that exact (freshly
+// signed) file content is ever presented to it, sequentially, at roughly
+// 1-2s per file. Once amfid has an opinion on a given file's bytes, later
+// launches of that same content are cheap; a brand-new mkdtemp path does not
+// force revalidation of unchanged dylib bytes, only genuinely new content
+// (a Node/Python version bump, or a fresh, never-before-signed host) does.
+// Isolated single-probe measurements taken 2026-09-05 against this file's
+// own dylib closure, warm (10 sequential trials, no concurrency, load
+// average 3.5-8.2 during measurement): node-probe launch alone took
+// 3.60-4.24s (mean ~3.77s); see .archive/l19-node-seal/10-isolated-node-probe-timing.log.
+// The live halt this timeout is sized against (Gate 3 campaign round,
+// 2026-09-04 22:03:36 -0700) hit the *cold* case: the unified log shows
+// amfid rejecting node's binary and all 17 of its linked dylibs, one at a
+// time, as "adhoc signed or signed by an unknown certificate chain"
+// (Code=-423), spanning 22:03:35.230 to 22:03:53.646 -0700 -- 18.417s for a
+// single full closure, with no syspolicyd activity at all for this root; see
+// .archive/l19-node-seal/11-fsgn7w-log-analysis.log. The prior 10s bound
+// covered neither attempt of that chain, so both the first probe and its one
+// retry failed. 45s keeps just over 2x margin above that single directly
+// observed worst-case cold chain, while still bounding a genuinely hung
+// probe rather than waiting indefinitely.
+export const EXECUTABLE_PROBE_TIMEOUT_MS = 45_000;
 const GIT_TIMEOUT_MS = 10_000;
 const OTOOL_TIMEOUT_MS = 10_000;
 const INSTALL_NAME_TOOL_TIMEOUT_MS = 10_000;
@@ -442,6 +474,122 @@ function toolchainDrift(name: string, error: unknown): Error {
   );
 }
 
+const EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES = 4096;
+const EXECUTABLE_PROBE_STDERR_TRUNCATED_MARKER = "...[truncated]";
+const EXECUTABLE_PROBE_TOTAL_ATTEMPTS = 2;
+
+// A raw execFile rejection's `.message` already embeds the FULL stderr (up
+// to maxBuffer) that Node's own child_process internals append after
+// "Command failed: <cmd>\n". Keeping only the first line here, and adding
+// back a separately bounded excerpt below, is what keeps the excerpt to one
+// copy instead of two, and bounded instead of maxBuffer-sized.
+function executableProbeCommandLine(originalError: unknown): string {
+  const message = originalError instanceof Error ? originalError.message : String(originalError);
+  return (message.split(/\r?\n/u)[0] ?? "").trim();
+}
+
+// Bounds `buffer` to at most `maxBytes` raw bytes without ever splitting a
+// multi-byte UTF-8 sequence in half. Cutting mid-sequence and calling
+// `.toString("utf8")` on the result can silently drop or replace (U+FFFD)
+// the sheared tail, corrupting the last character instead of just omitting
+// it -- so the bound here is on real byte length, not `string.length`
+// (UTF-16 code units), and the cut point always lands on a code-point
+// boundary.
+function boundedUtf8Excerpt(buffer: Buffer, maxBytes: number): { excerpt: string; truncated: boolean } {
+  if (buffer.length <= maxBytes) {
+    return { excerpt: buffer.toString("utf8"), truncated: false };
+  }
+  let cut = maxBytes;
+  // UTF-8 sequences are at most 4 bytes (1 lead byte + up to 3 continuation
+  // bytes, each shaped 0b10xxxxxx). Walk back from the cut point over any
+  // trailing continuation bytes to find that sequence's lead byte, then
+  // drop the whole sequence if it would otherwise be cut in half.
+  for (let back = 0; back < 4 && cut - back > 0; back++) {
+    const byte = buffer[cut - 1 - back];
+    if (byte === undefined) break;
+    if ((byte & 0xc0) !== 0x80) {
+      const sequenceLength = (byte & 0x80) === 0x00
+        ? 1
+        : (byte & 0xe0) === 0xc0
+          ? 2
+          : (byte & 0xf0) === 0xe0
+            ? 3
+            : (byte & 0xf8) === 0xf0
+              ? 4
+              : 1;
+      const leadBytePosition = cut - 1 - back;
+      if (leadBytePosition + sequenceLength > cut) cut = leadBytePosition;
+      break;
+    }
+  }
+  return { excerpt: buffer.subarray(0, cut).toString("utf8"), truncated: true };
+}
+
+// A raw execFile rejection carries `code`, `signal`, `killed`, and `stderr`,
+// but every caller of runExecutableVersionProbe (including the campaign
+// custody-refusal path, which surfaces only `error.message`, and
+// toolchainDrift, which slices `.message` to 240 chars) only ever sees
+// `.message`. That collapsed a SIGTERM-timeout, a SIGKILL, and a plain
+// non-zero exit with empty stderr into the same single-line
+// "Command failed: <cmd>" text, with no way to tell them apart after the
+// fact. This folds the dropped fields back into the message itself,
+// `timedOut=` first and stderr last, so the most load-bearing field is the
+// one most likely to survive a downstream length cap.
+function executableProbeFailureError(
+  originalError: unknown,
+  context: { attemptNumber: number; totalAttempts: number; elapsedMs: number; totalElapsedMs: number },
+): Error {
+  const candidate = originalError as {
+    code?: unknown;
+    signal?: unknown;
+    killed?: unknown;
+    stderr?: unknown;
+  } | null;
+  const exitCode = typeof candidate?.code === "number" || typeof candidate?.code === "string"
+    ? candidate.code
+    : null;
+  const signal = typeof candidate?.signal === "string" ? candidate.signal : null;
+  // Reuse the exact predicate the retry logic already trusts to mean "this is
+  // our own timeout kill" rather than re-deriving it from elapsed wall-clock
+  // time, which a synthetic or fast-failing probe would never satisfy.
+  const timedOut = isTransientExecutableProbeTimeout(originalError);
+  // Use the raw Buffer directly when execFile already handed us one (the
+  // production { encoding: "buffer" } path): a Buffer -> string -> Buffer
+  // round trip both wastes work and, since the first `.toString("utf8")`
+  // already happens on the FULL untruncated stderr, defeats the point of
+  // bounding by byte length rather than string length.
+  const stderrBuffer = Buffer.isBuffer(candidate?.stderr)
+    ? candidate.stderr
+    : typeof candidate?.stderr === "string"
+      ? Buffer.from(candidate.stderr, "utf8")
+      : Buffer.alloc(0);
+  const { excerpt: stderrExcerpt, truncated: stderrTruncated } = boundedUtf8Excerpt(
+    stderrBuffer,
+    EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES,
+  );
+  const stderrText = stderrTruncated
+    ? `${stderrExcerpt}${EXECUTABLE_PROBE_STDERR_TRUNCATED_MARKER}`
+    : stderrExcerpt;
+  const commandLine = executableProbeCommandLine(originalError);
+  const stderrNote = stderrText.length > 0 ? ` stderr: ${JSON.stringify(stderrText)}` : "";
+  // The envelope goes first and the (potentially very long, path-bearing)
+  // command line goes last: toolchainDrift slices this whole message to 240
+  // chars, and a sealed-toolchain path alone can run past 150-200 chars, so
+  // anything placed after it would already be clipped. Leading with the
+  // short, fixed-shape envelope is what keeps timedOut/exit/signal/attempt
+  // legible regardless of how long the trailing path or stderr excerpt is.
+  // commandLine is only prefixed with a space when non-empty, so an empty
+  // command line and no stderr never leave a dangling trailing space.
+  const wrapped = new Error(
+    `(timedOut=${timedOut} exit=${exitCode === null ? "null" : exitCode} `
+      + `signal=${signal ?? "null"} attempt=${context.attemptNumber}/${context.totalAttempts} `
+      + `after ${context.elapsedMs}ms totalElapsedMs=${context.totalElapsedMs}ms)`
+      + `${commandLine ? ` ${commandLine}` : ""}${stderrNote}`,
+  );
+  wrapped.cause = originalError;
+  return wrapped;
+}
+
 async function runExecutableVersionProbe(
   executablePath: string,
   args: readonly string[],
@@ -453,11 +601,30 @@ async function runExecutableVersionProbe(
     timeout: EXECUTABLE_PROBE_TIMEOUT_MS,
     windowsHide: true,
   });
+  const probeStartedAt = Date.now();
+  const firstAttemptStartedAt = Date.now();
   try {
     return await run();
-  } catch (error) {
-    if (!isTransientExecutableProbeTimeout(error)) throw error;
-    return run();
+  } catch (firstError) {
+    if (!isTransientExecutableProbeTimeout(firstError)) {
+      throw executableProbeFailureError(firstError, {
+        attemptNumber: 1,
+        totalAttempts: EXECUTABLE_PROBE_TOTAL_ATTEMPTS,
+        elapsedMs: Date.now() - firstAttemptStartedAt,
+        totalElapsedMs: Date.now() - probeStartedAt,
+      });
+    }
+  }
+  const retryStartedAt = Date.now();
+  try {
+    return await run();
+  } catch (secondError) {
+    throw executableProbeFailureError(secondError, {
+      attemptNumber: 2,
+      totalAttempts: EXECUTABLE_PROBE_TOTAL_ATTEMPTS,
+      elapsedMs: Date.now() - retryStartedAt,
+      totalElapsedMs: Date.now() - probeStartedAt,
+    });
   }
 }
 
