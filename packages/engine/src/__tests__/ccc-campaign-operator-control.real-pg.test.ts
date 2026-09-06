@@ -12,7 +12,10 @@ import {
   createSharedPgTaskStoreTestHarness,
   pgDescribe,
 } from "../../../core/src/__test-utils__/pg-test-harness.js";
-import { applyCccCampaignOperatorControl } from "../ccc-campaign-operator-control.js";
+import {
+  applyCccCampaignOperatorControl,
+  CccCampaignOperatorControlError,
+} from "../ccc-campaign-operator-control.js";
 
 /*
  * Review item 5: the ordinary `fn prd stop` close-out path (campaign l12r7's
@@ -131,5 +134,77 @@ pgDescribe("the ordinary stop control closing an already-failed campaign against
     expect(item.state).toBe("failed");
     expect(item.last_error).toBe(originalFailure);
     expect(item.blocked_reason).toBe(originalFailure);
+  });
+
+  /*
+   * Live proof (l12r7/l12r8, 2026-09-06 against main 2681e7309): `fn prd stop`
+   * committed exactly the write proved above, then refused with
+   * CCC_CAMPAIGN_CONTEXT_REFUSED ("Task KB-019 belongs to a non-runnable CCC
+   * campaign import") instead of returning the campaign-closed-after-terminal-
+   * failure receipt. `runCampaignLifecycleCommand` (packages/cli/src/commands/
+   * prd.ts) re-derives `completedStatus` with a second real
+   * `inspectCccPrdProductStatus` call after the close-out write to build that
+   * receipt -- exactly the call this test makes below. The operator got a
+   * refusal after their durable state had already changed.
+   */
+  it("a status read after the close-out write does not refuse, and reports the campaign closed -- not merely the workflow item", async () => {
+    const key = "operator-control-closeout-status-after-write";
+    await importedCampaign(key);
+    const originalFailure = "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN";
+    await forceWorkItemFailed(key, originalFailure);
+
+    const status = await inspectCccPrdProductStatus({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    if (!status) throw new Error("missing product status for closeout fixture");
+
+    const result = await applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: STOP_REASON,
+      status,
+      store: h.store(),
+    });
+    expect(result.closedAfterTerminalFailure).toBe(true);
+
+    // This is the exact step `runCampaignLifecycleCommand` takes to build the
+    // receipt's `completedStatus` right after the write above. Before the fix
+    // this throws CccCampaignContextError("... belongs to a non-runnable CCC
+    // campaign import") because the import row it just wrote is no longer
+    // active/runnable, and `withPrdProject` converts that thrown error into a
+    // refusal payload instead of ever reaching the receipt-writing code.
+    const completedStatus = await inspectCccPrdProductStatus({
+      idempotencyKey: key,
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+    });
+    if (!completedStatus) throw new Error("product status disappeared after close-out");
+    expect(completedStatus.import.state).toBe("stopped");
+    expect(completedStatus.import.runnable).toBe(false);
+    // The workflow item itself is untouched by the close-out write (proved
+    // above); the receipt distinguishes "closed after terminal failure" from
+    // an ordinary stop using `result.closedAfterTerminalFailure`, not by the
+    // work item state, which stays exactly what the workflow runtime left it.
+    expect(completedStatus.workItems[0]?.state).toBe("failed");
+
+    // Idempotency: repeating `stop` against this now-closed status must give
+    // a clear, typed refusal -- not the confusing per-task
+    // CCC_CAMPAIGN_CONTEXT_REFUSED, and not an unhandled crash.
+    let repeatedStopError: unknown;
+    try {
+      await applyCccCampaignOperatorControl({
+        action: "stop",
+        reason: STOP_REASON,
+        status: completedStatus,
+        store: h.store(),
+      });
+    } catch (error) {
+      repeatedStopError = error;
+    }
+    expect(repeatedStopError).toBeInstanceOf(CccCampaignOperatorControlError);
+    expect((repeatedStopError as CccCampaignOperatorControlError).code).toBe(
+      "CCC_CAMPAIGN_OPERATOR_CONTROL_IMPORT_REFUSED",
+    );
   });
 });
