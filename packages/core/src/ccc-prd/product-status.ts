@@ -1927,44 +1927,29 @@ export async function inspectCccPrdProductStatus(
     );
     let providerAttempts: readonly CccPrdProductProviderAttemptStatus[] = [];
     let providerAttemptHistoryConsistent = true;
-    if (row.state !== "active") {
-      // `row` was read moments ago in this same transaction, so this is not a
-      // stale guess: the import itself is already terminal (most commonly
-      // `stop` just closed it as part of building this very status snapshot
-      // for the operator receipt). `loadCccCampaignContextForTask` (reached
-      // through `listCccProviderAttemptsForCampaign`) refuses any task whose
-      // import is not active/runnable -- correct when an ACTIVE import's task
-      // binding is genuinely broken, but here the closure is expected and
-      // already known, so re-deriving it through the per-task loader would
-      // only turn a status read into a crash. Report the history as
-      // unavailable instead of re-asserting custody a closed campaign no
-      // longer has by design.
-      providerAttemptHistoryConsistent = false;
-    } else {
-      try {
-        providerAttempts = providerAttemptStatusesForCampaign(
-          await listCccProviderAttemptsForCampaign({
-            layer: input.layer,
-            rootDir,
-            taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
-            tx,
-          }),
-        );
-      } catch (error) {
-        const hasBudgetExhaustionMarker = workItems.some((item) =>
-          cccPermanentWorkItemHasReason(
-            item,
-            CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
-          ));
-        if (
-          !(error instanceof CccCampaignContextError)
-          || !error.message.includes("request count")
-          || !hasBudgetExhaustionMarker
-        ) {
-          throw error;
-        }
-        providerAttemptHistoryConsistent = false;
+    try {
+      providerAttempts = providerAttemptStatusesForCampaign(
+        await listCccProviderAttemptsForCampaign({
+          layer: input.layer,
+          rootDir,
+          taskId: resolveCccPrdProductStatusProviderAttemptAnchorTaskId(taskStatuses),
+          tx,
+        }),
+      );
+    } catch (error) {
+      const hasBudgetExhaustionMarker = workItems.some((item) =>
+        cccPermanentWorkItemHasReason(
+          item,
+          CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED_REASON,
+        ));
+      if (
+        !(error instanceof CccCampaignContextError)
+        || !error.message.includes("request count")
+        || !hasBudgetExhaustionMarker
+      ) {
+        throw error;
       }
+      providerAttemptHistoryConsistent = false;
     }
     // Read the authority clock after collecting the status snapshot so an
     // authorization that expires during inspection is never advertised as

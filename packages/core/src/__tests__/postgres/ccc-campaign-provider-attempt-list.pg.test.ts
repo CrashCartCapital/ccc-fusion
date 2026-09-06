@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
+  CccCampaignContextError,
   importCccPrdBundle,
   listCccProviderAttemptsForCampaign,
 } from "../../index.js";
@@ -100,6 +101,23 @@ pgDescribe("CCC campaign provider-attempt listing (PostgreSQL)", () => {
       WHERE mutation_type LIKE 'ccc-campaign:provider-attempt:%'
     `) as unknown as Array<{ count: number }>;
     return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * Mirrors exactly what `markCccPrdImportStopped` writes (state, runnable,
+   * updated_at as an ISO string) without going through the operator-control
+   * layer -- this file unit-tests `listCccProviderAttemptsForCampaign` in
+   * isolation, the same way its sibling tests exercise it directly.
+   */
+  async function closeImportRow(taskId: string): Promise<void> {
+    await h.layer().db.execute(sql`
+      UPDATE project.ccc_prd_imports
+      SET state = 'stopped', runnable = 0, updated_at = ${new Date().toISOString()}
+      WHERE import_id = (
+        SELECT import_id FROM project.ccc_prd_import_entities
+        WHERE entity_type = 'task' AND native_id = ${taskId}
+      )
+    `);
   }
 
   it("returns an immutable empty list without writes when the campaign context is missing", async () => {
@@ -206,4 +224,44 @@ pgDescribe("CCC campaign provider-attempt listing (PostgreSQL)", () => {
     }).toThrow(TypeError);
     expect(await providerAttemptAuditCount()).toBe(before);
   });
+
+  it(
+    "still lists a closed import's provider-attempt history (read-only tolerance) while a write-path call against the same closed import keeps refusing",
+    async () => {
+      const { taskId } = await context("closed-readonly");
+      const store = api(h.store());
+      const seeded = await store.reserveCccProviderAttempt(request(taskId, "turn-before-close"));
+
+      await closeImportRow(taskId);
+
+      // The read-only listing path (`listCccProviderAttemptsForCampaign` ->
+      // `loadCccCampaignContextForTask(..., allowNonRunnable: true)`) must
+      // still surface the attempt recorded while the campaign was active --
+      // closing an import does not erase its provider-attempt audit rows, and
+      // a status read of a closed campaign must not have to pretend they are
+      // gone.
+      const attemptsAfterClose = await listCccProviderAttemptsForCampaign({
+        layer: h.layer(),
+        rootDir: h.rootDir(),
+        taskId,
+      });
+      expect(attemptsAfterClose).toHaveLength(1);
+      expect(attemptsAfterClose[0]?.attemptKey).toBe(seeded.attemptKey);
+      expect(attemptsAfterClose[0]?.state).toBe("reserved");
+
+      // The read-only tolerance must never reach a write/leasing path: a
+      // second reservation attempt against the same now-closed import must
+      // still refuse exactly as it did before this change.
+      let writeError: unknown;
+      try {
+        await store.reserveCccProviderAttempt(request(taskId, "turn-after-close"));
+      } catch (error) {
+        writeError = error;
+      }
+      expect(writeError).toBeInstanceOf(CccCampaignContextError);
+      expect((writeError as CccCampaignContextError).message).toContain(
+        "belongs to a non-runnable CCC campaign import",
+      );
+    },
+  );
 });

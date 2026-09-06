@@ -1634,12 +1634,20 @@ export async function listCccProviderAttemptsForCampaign(
     tx: DbTransaction,
     lockForUpdate: boolean,
   ): Promise<readonly CccProviderAttemptScope[]> => {
+    // Every call site below passes `lockForUpdate: false` -- this listing
+    // never leases or writes, only reads the persisted provider-attempt
+    // ledger -- so it also passes `allowNonRunnable: true`: a campaign `stop`
+    // closes the import (state/runnable columns only) without touching its
+    // provider-attempt audit rows, and a status read built right after that
+    // close must still be able to list them instead of re-refusing a closure
+    // it already knows about.
     const context = await loadCccCampaignContextForTask(
       input.layer,
       input.rootDir,
       taskId,
       tx,
       lockForUpdate,
+      true,
     );
     if (!context) return Object.freeze([]);
     const history = await loadHistory(tx, context);
