@@ -574,6 +574,94 @@ describe("CCC semantic-proof admission and materialization", () => {
     });
   });
 
+  async function nestedMissingCandidateFixture() {
+    const fixture = await createGitFixture();
+    // Rebind the verify:slugify Task target to a candidate path that is
+    // absent from the fixture repo's entire history -- not even its
+    // containing directory exists -- mirroring a real preflight where the
+    // model has not written any implementation yet (e.g. a fresh
+    // src/qe_evidence/ package). This is the state a conforming verifier's
+    // own two-tier check expects to distinguish from "harness misconfigured,
+    // src/ absent entirely."
+    const taskfile = [
+      "version: '3'",
+      "tasks:",
+      "  verify:slugify:",
+      "    cmds:",
+      "      - node verify/slugify.mjs src/qe_evidence/verdict.py",
+      "  verify:other:",
+      "    cmds:",
+      "      - node verify/other.mjs src/other.js",
+      "",
+    ].join("\n");
+    await writeFile(join(fixture.repository, "Taskfile.yml"), taskfile);
+    await execFile("git", ["-C", fixture.repository, "add", "Taskfile.yml"]);
+    await execFile("git", ["-C", fixture.repository, "commit", "-m", "rebind to a not-yet-written candidate"]);
+    const baseCommit = (await execFile(
+      "git",
+      ["-C", fixture.repository, "rev-parse", "HEAD"],
+    )).stdout.trim();
+    const taskOid = (await execFile(
+      "git",
+      ["-C", fixture.repository, "rev-parse", `${baseCommit}:Taskfile.yml`],
+    )).stdout.trim();
+    const taskIdentity = await executableIdentity("/opt/homebrew/bin/task");
+    const nodeIdentity = await executableIdentity(process.execPath);
+    const definition = proof({
+      ...fixture,
+      taskOid,
+      taskIdentity,
+      nodeIdentity,
+      linkedRuntime: await inspectCccSemanticProofLinkedRuntime({
+        task: taskIdentity,
+        node: nodeIdentity,
+        proofHost: { id: "fusion-native-semantic-proof-v2", ...nodeIdentity },
+      }),
+    });
+    definition.verifierClosure[0] = {
+      ...definition.verifierClosure[0]!,
+      baseGitBlobOid: taskOid,
+      sha256: sha256(taskfile),
+    };
+    definition.candidateInputs = ["src/qe_evidence/verdict.py"];
+    return { fixture, baseCommit, definition };
+  }
+
+  it("RED-L27-preflight-directory-closure: preflight materializes the missing candidate's parent directory chain, never the file", async () => {
+    const { fixture, baseCommit, definition } = await nestedMissingCandidateFixture();
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
+    roots.push(outputRoot);
+
+    const materialized = await admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit,
+      sourceCommit: baseCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+      allowMissingCandidates: true,
+    });
+
+    expect(existsSync(join(materialized.proofRoot, "src", "qe_evidence"))).toBe(true);
+    expect(existsSync(join(materialized.proofRoot, "src", "qe_evidence", "verdict.py"))).toBe(false);
+    expect(existsSync(join(materialized.proofRoot, "src"))).toBe(true);
+  });
+
+  it("RED-L27-preflight-directory-closure: a real attempt (allowMissingCandidates unset) still refuses a missing candidate outright", async () => {
+    const { fixture, baseCommit, definition } = await nestedMissingCandidateFixture();
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
+    roots.push(outputRoot);
+
+    await expect(admitAndMaterializeCccSemanticProof({
+      repositoryRoot: fixture.repository,
+      baseCommit,
+      sourceCommit: baseCommit,
+      proof: definition,
+      modelWriteRoots: ["src"],
+      outputRoot,
+    })).rejects.toThrow(/is missing, non-regular, or ambiguous/);
+  });
+
   it("RED-S5-closure-git-custody: refuses verifier closure inside a model-owned root", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
