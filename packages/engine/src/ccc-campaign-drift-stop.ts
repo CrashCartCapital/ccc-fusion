@@ -10,18 +10,25 @@ import {
 import { CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX } from "./ccc-campaign-operator-control.js";
 
 /**
- * Terminally closing a campaign whose persisted custody no longer reconstructs.
+ * Terminally closing a campaign whose persisted custody no longer reconstructs,
+ * or whose single workflow work item has already ended terminally on its own.
  *
  * The ordinary operator stop needs a full product status, and product status
  * rebuilds campaign custody, so a campaign with a drifted manifest cannot reach
  * any control at all. This path takes the drift plan instead, which is built
  * from import-row columns alone.
  *
- * What it deliberately does not do: it never removes or relocates a worktree,
- * never deletes a branch, never resolves or expires an approval, and never
- * closes an execution authorization. A drifted campaign's evidence is the only
- * record of what it did, and closing it must not consume any of that. Every
- * unresolved effect is reported as preserved.
+ * A `"cancel"` plan behaves as before: the import row is marked terminal, then
+ * the workflow work item is cancelled and its tasks paused. A `"close-out"`
+ * plan writes only the import row -- the work item already ended (`failed` or
+ * `cancelled`) on its own, so there is nothing to cancel and its recorded
+ * reason is preserved verbatim rather than overwritten.
+ *
+ * What neither plan kind does: remove or relocate a worktree, delete a branch,
+ * resolve or expire an approval, or close an execution authorization. A
+ * drifted campaign's evidence is the only record of what it did, and closing
+ * it must not consume any of that. Every unresolved effect is reported as
+ * preserved.
  */
 
 const DRIFT_STOP_ACTOR = "ccc-fusion-local-operator";
@@ -42,7 +49,15 @@ export class CccCampaignDriftStopError extends Error {
 
 export type CccCampaignDriftStopResult = Readonly<{
   workItemId: string;
-  workItemState: "cancelled";
+  /**
+   * The work item's final state. For a `"cancel"` plan this is always
+   * `"cancelled"`. For a `"close-out"` plan this is unchanged from the plan --
+   * the work item was never written -- so it reports the terminal state it
+   * already held (`"failed"` or `"cancelled"`).
+   */
+  workItemState: WorkflowWorkItemState;
+  /** Whether the workflow work item was written. False for a close-out. */
+  workItemWritten: boolean;
   taskIds: readonly string[];
   driftReason: string;
   stoppedReason: string;
@@ -117,13 +132,44 @@ export async function applyCccCampaignDriftStop(
   const stoppedMarker = `${CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX}${closureDigest}`;
   const workItem = input.plan.workItem;
 
+  if (input.plan.kind === "close-out") {
+    // The workflow work item already ended terminally on its own. There is
+    // nothing to cancel, and touching it would overwrite the only durable
+    // record of why it ended, so that reason is carried through verbatim.
+    const preserved = workItem.blockedReason ?? workItem.lastError
+      ?? "no recorded reason";
+    try {
+      await markCccPrdImportStopped({
+        layer: input.layer,
+        idempotencyKey: input.plan.idempotencyKey,
+        stoppedReason:
+          `${stoppedMarker} ${closure} | terminal-work-item(${workItem.state}): ${preserved}`,
+      });
+    } catch (error) {
+      throw new CccCampaignDriftStopError(
+        "CCC_CAMPAIGN_DRIFT_STOP_IMPORT_CLOSE_FAILED",
+        `Campaign import could not be marked terminal, so nothing was written: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return {
+      workItemId: workItem.id,
+      workItemState: workItem.state as WorkflowWorkItemState,
+      workItemWritten: false,
+      taskIds: input.plan.taskIds,
+      driftReason: input.plan.driftReason,
+      stoppedReason: closure,
+      unresolvedEffectsPreserved: true,
+    };
+  }
+
   /*
    * The import row goes FIRST, and nothing else is written if it fails.
    *
    * This is the write that stops the campaign re-projecting its task
    * directories, which is the only ongoing harm. A campaign that has stopped
-   * projecting but still holds a live work item is recoverable. The reverse
-   * leaves the operator believing the campaign is closed while it keeps writing
+   * projecting but still holds a live work item is recoverable: re-running
+   * `stop-drifted` resumes and finishes the cancel below. The reverse leaves
+   * the operator believing the campaign is closed while it keeps writing
    * itself back into the owner's repository, which is exactly the state this
    * whole path exists to end.
    */
@@ -140,17 +186,25 @@ export async function applyCccCampaignDriftStop(
     );
   }
 
-  await input.store.transitionWorkflowWorkItem(workItem.id, "cancelled", {
-    expectedState: workItem.state as WorkflowWorkItemState,
-    expectedAttempt: workItem.attempt,
-    expectedLeaseOwner: null,
-    attempt: workItem.attempt,
-    retryAfter: null,
-    leaseOwner: null,
-    leaseExpiresAt: null,
-    lastError: stoppedMarker,
-    blockedReason: `${stoppedMarker} ${closure}`,
-  });
+  try {
+    await input.store.transitionWorkflowWorkItem(workItem.id, "cancelled", {
+      expectedState: workItem.state as WorkflowWorkItemState,
+      expectedAttempt: workItem.attempt,
+      expectedLeaseOwner: null,
+      attempt: workItem.attempt,
+      retryAfter: null,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: stoppedMarker,
+      blockedReason: `${stoppedMarker} ${closure}`,
+    });
+  } catch (error) {
+    throw new CccCampaignDriftStopError(
+      "CCC_CAMPAIGN_DRIFT_STOP_WORK_ITEM_TRANSITION_FAILED",
+      `Campaign import is already marked terminally stopped, so it will never re-project again, but the workflow work item could not be cancelled: ${error instanceof Error ? error.message : String(error)}. Re-run stop-drifted with a fresh plan and confirmation to finish the cancel.`,
+      { workItemId: workItem.id, workItemState: workItem.state },
+    );
+  }
 
   let taskPauseError: unknown = null;
   for (const taskId of input.plan.taskIds) {
@@ -175,6 +229,7 @@ export async function applyCccCampaignDriftStop(
   return {
     workItemId: workItem.id,
     workItemState: "cancelled",
+    workItemWritten: true,
     taskIds: input.plan.taskIds,
     driftReason: input.plan.driftReason,
     stoppedReason: closure,

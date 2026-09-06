@@ -7,17 +7,19 @@ import {
 } from "../ccc-campaign-operator-control.js";
 
 const closeUnopenedExecutionAuthorizationMembers = vi.hoisted(() => vi.fn());
+const markImportStopped = vi.hoisted(() => vi.fn());
 
 vi.mock("@fusion/core", async (importOriginal) => ({
   ...await importOriginal<typeof import("@fusion/core")>(),
   closeUnopenedCccCampaignExecutionAuthorizationMembers:
     closeUnopenedExecutionAuthorizationMembers,
+  markCccPrdImportStopped: markImportStopped,
 }));
 
 const PAUSED_REASON = "ccc-operator:campaign-paused";
 
 function status(
-  state: "runnable" | "held" | "manual-required" | "cancelled" = "runnable",
+  state: "runnable" | "held" | "manual-required" | "cancelled" | "failed" = "runnable",
   overrides: Record<string, unknown> = {},
 ): CccPrdProductStatus {
   const workItem = {
@@ -136,6 +138,7 @@ function store() {
 describe("CCC campaign operator lifecycle controls", () => {
   beforeEach(() => {
     closeUnopenedExecutionAuthorizationMembers.mockReset();
+    markImportStopped.mockReset().mockResolvedValue(undefined);
   });
 
   it("[PRD:Slice3] closes unopened claimed sealed members only after stop is durable", async () => {
@@ -506,5 +509,122 @@ describe("CCC campaign operator lifecycle controls", () => {
     });
     expect(taskStore.transitionWorkflowWorkItem).not.toHaveBeenCalled();
     expect(taskStore.pauseTask).not.toHaveBeenCalled();
+  });
+
+  /*
+   * Campaign l12r7: a proof was proved failed (terminalAttemptResult), the
+   * runtime moved the workflow work item to `failed` on its own, and the
+   * import row was never touched by anything -- it stays `active` forever.
+   * `stop` used to refuse outright ("Campaign cannot stop from terminal
+   * workflow state failed."), with no control that would ever move it.
+   */
+  it("RED-L23-a: describes stop as allowed to close an already-failed campaign", () => {
+    const failedStatus = status("failed", {
+      lastError: "ccc-proof-failed:PROOF-1",
+      blockedReason: "ccc-proof-failed:PROOF-1",
+    });
+    expect(describeCccCampaignOperatorControls(failedStatus)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "stop",
+          allowed: true,
+          reason: expect.stringContaining("already ended as failed"),
+          confirmation: expect.stringMatching(/^[0-9a-f]{64}$/),
+        }),
+        // Pause and resume are unaffected: there is still nothing to pause or
+        // resume once the workflow has already ended.
+        expect.objectContaining({ action: "pause", allowed: false }),
+        expect.objectContaining({ action: "resume", allowed: false }),
+      ]),
+    );
+  });
+
+  it("RED-L23-a: closes the campaign's import instead of cancelling an already-failed workflow", async () => {
+    const originalFailure = "ccc-proof-failed:PROOF-1";
+    const current = status("failed", {
+      lastError: originalFailure,
+      blockedReason: originalFailure,
+    });
+    const taskStore = store();
+
+    const result = await applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator closes this campaign after its proof was proved failed.",
+      status: current,
+      store: taskStore,
+    });
+
+    expect(result).toMatchObject({
+      action: "stop",
+      workItemId: "work-1",
+      workItemState: "failed",
+      closedAfterTerminalFailure: true,
+      unresolvedEffectsPreserved: true,
+    });
+    // Nothing was written to the already-terminal workflow or its tasks; only
+    // the import row closes.
+    expect(taskStore.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    expect(taskStore.pauseTask).not.toHaveBeenCalled();
+    expect(closeUnopenedExecutionAuthorizationMembers).not.toHaveBeenCalled();
+    expect(markImportStopped).toHaveBeenCalledTimes(1);
+    const [call] = markImportStopped.mock.calls;
+    expect((call![0] as { idempotencyKey: string }).idempotencyKey)
+      .toBe("operator-key");
+    const stoppedReason = String(
+      (call![0] as { stoppedReason: string }).stoppedReason,
+    );
+    expect(stoppedReason).toContain(originalFailure);
+    expect(stoppedReason).toContain(
+      "Operator closes this campaign after its proof was proved failed.",
+    );
+  });
+
+  it("RED-L23-a: also closes an already-cancelled campaign's import, not only a failed one", async () => {
+    const current = status("cancelled");
+    const taskStore = store();
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Closing out a campaign that was already cancelled.",
+      status: current,
+      store: taskStore,
+    })).resolves.toMatchObject({
+      workItemState: "cancelled",
+      closedAfterTerminalFailure: true,
+    });
+    expect(taskStore.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+  });
+
+  it("RED-L23-a: refuses without PostgreSQL custody to close the import", async () => {
+    const current = status("failed");
+    const taskStore = store();
+    taskStore.getAsyncLayer = vi.fn(() => undefined);
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator closes this campaign after its proof was proved failed.",
+      status: current,
+      store: taskStore as never,
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_OPERATOR_CONTROL_IMPORT_CLOSE_UNAVAILABLE",
+    });
+    expect(markImportStopped).not.toHaveBeenCalled();
+  });
+
+  it("RED-L23-a: reports a failed import close instead of silently succeeding", async () => {
+    markImportStopped.mockReset().mockRejectedValue(
+      new Error("new row violates check constraint"),
+    );
+    const current = status("failed");
+    const taskStore = store();
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator closes this campaign after its proof was proved failed.",
+      status: current,
+      store: taskStore,
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_OPERATOR_CONTROL_IMPORT_CLOSE_FAILED",
+    });
   });
 });

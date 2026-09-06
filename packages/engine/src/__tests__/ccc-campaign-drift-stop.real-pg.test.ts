@@ -87,6 +87,38 @@ pgDescribe("closing a drifted CCC campaign against a real database", () => {
     return rows[0]!;
   }
 
+  async function workItemRow(key: string) {
+    const rows = (await h.layer().db.execute(drizzleSql`
+      SELECT state, last_error, blocked_reason
+      FROM project.workflow_work_items
+      WHERE run_id = (
+        SELECT 'ccc-prd:' || import_id FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+      )
+    `)) as unknown as Array<
+      { state: string; last_error: string | null; blocked_reason: string | null }
+    >;
+    return rows[0]!;
+  }
+
+  /**
+   * Forces the campaign's one workflow work item to a terminal-with-failure
+   * state directly, the way the workflow runtime itself would after a proof
+   * is proved failed (`terminalAttemptResult`) -- never through this module,
+   * which must never be the thing that produces this state.
+   */
+  async function forceWorkItemFailed(key: string, reason: string): Promise<void> {
+    await h.layer().db.execute(drizzleSql`
+      UPDATE project.workflow_work_items
+      SET state = 'failed', last_error = ${reason}, blocked_reason = ${reason},
+        lease_owner = NULL, lease_expires_at = NULL
+      WHERE run_id = (
+        SELECT 'ccc-prd:' || import_id FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+      )
+    `);
+  }
+
   it("RED-L18-blocker: writes the terminal state the check constraint must allow", async () => {
     const key = "drift-stop-terminal";
     await importedCampaign(key);
@@ -197,5 +229,159 @@ pgDescribe("closing a drifted CCC campaign against a real database", () => {
     const row = await importRow(key);
     expect(row.state).toBe("active");
     expect(Number(row.runnable)).toBe(1);
+  });
+
+  /*
+   * Campaign l12: drifted custody AND a work item that already ended in
+   * failure. `stop-drifted` used to refuse this with
+   * CCC_PRD_CAMPAIGN_DRIFT_STOP_ALREADY_TERMINAL, and the ordinary control was
+   * never reachable because custody would not reconstruct, so the import row
+   * was stranded `active` forever.
+   */
+  it("RED-L23-b: closes a drifted campaign whose work item already failed, preserving its reason verbatim", async () => {
+    const key = "drift-stop-failed-workitem";
+    await importedCampaign(key);
+    await driftTheStoredManifest(key);
+    const originalFailure = "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN";
+    await forceWorkItemFailed(key, originalFailure);
+
+    const plan = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    });
+    expect(plan).not.toBeNull();
+    expect(plan!.kind).toBe("close-out");
+    expect(plan!.workItem.state).toBe("failed");
+    expect(plan!.workItem.lastError).toBe(originalFailure);
+
+    const result = await applyCccCampaignDriftStop({
+      plan: plan!,
+      reason: STOP_REASON,
+      confirmation: computeCccCampaignDriftStopConfirmation(plan!),
+      store: h.store(),
+      layer: h.layer(),
+    });
+
+    expect(result.workItemWritten).toBe(false);
+    expect(result.workItemState).toBe("failed");
+
+    const row = await importRow(key);
+    expect(row.state).toBe("stopped");
+    expect(Number(row.runnable)).toBe(0);
+    expect(row.last_error).toContain(originalFailure);
+    expect(row.last_error).toContain("custody-drift: campaign manifest drift");
+
+    // The workflow work item was never touched: its own recorded failure
+    // reason is exactly what it was before the close.
+    const item = await workItemRow(key);
+    expect(item.state).toBe("failed");
+    expect(item.last_error).toBe(originalFailure);
+    expect(item.blocked_reason).toBe(originalFailure);
+  });
+
+  /*
+   * Followup section 1: `transitionWorkflowWorkItem` used to be unwrapped
+   * after the import-row write. If it throws -- an optimistic-concurrency
+   * conflict, a transient DB error -- the import row is already permanently
+   * `stopped` with no reverse transition, and the old refusal
+   * (CCC_PRD_IMPORT_STOPPED unconditionally once row.state === 'stopped')
+   * meant `stop-drifted` could never be run again to finish the cancel.
+   */
+  it("RED-L23-c: a re-run finishes an interrupted cancel when the import is already stopped", async () => {
+    const key = "drift-stop-partial-apply";
+    await importedCampaign(key);
+    await driftTheStoredManifest(key);
+
+    const firstPlan = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    });
+    expect(firstPlan!.kind).toBe("cancel");
+    expect(firstPlan!.workItem.state).toBe("runnable");
+
+    // Reproduce the exact partial-apply state: the import row already moved
+    // to 'stopped' (the write that stops re-projection), but the work-item
+    // cancel never landed, as if transitionWorkflowWorkItem had thrown
+    // between the two writes.
+    await h.layer().db.execute(drizzleSql`
+      UPDATE project.ccc_prd_imports
+      SET state = 'stopped', runnable = 0,
+        last_error = 'ccc-operator:campaign-stopped:' || repeat('a', 64)
+          || ' campaign manifest drift blocks every ordinary control | custody-drift: campaign manifest drift'
+      WHERE idempotency_key = ${key}
+    `);
+
+    const resumedRefusal = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    });
+    // Not a refusal at all: the work item is still short of its own terminal
+    // state, so there is something left to finish.
+    expect(resumedRefusal).not.toBeNull();
+    expect(resumedRefusal!.kind).toBe("cancel");
+    expect(resumedRefusal!.importState).toBe("stopped");
+    expect(resumedRefusal!.workItem.state).toBe("runnable");
+
+    const result = await applyCccCampaignDriftStop({
+      plan: resumedRefusal!,
+      reason: STOP_REASON,
+      confirmation: computeCccCampaignDriftStopConfirmation(resumedRefusal!),
+      store: h.store(),
+      layer: h.layer(),
+    });
+
+    expect(result.workItemWritten).toBe(true);
+    expect(result.workItemState).toBe("cancelled");
+
+    const item = await workItemRow(key);
+    expect(item.state).toBe("cancelled");
+
+    // A further re-run now correctly sees nothing left to finish.
+    const fullyClosedRefusal = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    }).catch((error: unknown) => error);
+    expect((fullyClosedRefusal as CccPrdImportError).code)
+      .toBe("CCC_PRD_IMPORT_STOPPED");
+  });
+
+  it("RED-L23-e: a second close-out refuses instead of overwriting the first stop", async () => {
+    const key = "drift-stop-closeout-twice";
+    await importedCampaign(key);
+    await driftTheStoredManifest(key);
+    await forceWorkItemFailed(key, "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN");
+
+    const plan = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    });
+    expect(plan!.kind).toBe("close-out");
+    await applyCccCampaignDriftStop({
+      plan: plan!,
+      reason: STOP_REASON,
+      confirmation: computeCccCampaignDriftStopConfirmation(plan!),
+      store: h.store(),
+      layer: h.layer(),
+    });
+    const afterFirst = await importRow(key);
+
+    const refusal = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    }).catch((error: unknown) => error);
+
+    expect((refusal as CccPrdImportError).code).toBe("CCC_PRD_IMPORT_STOPPED");
+    // The first close-out's recorded reason is still exactly what it was.
+    expect((await importRow(key)).last_error).toBe(afterFirst.last_error);
+    // Idempotent all the way down: the work item was never written by either
+    // attempt.
+    const item = await workItemRow(key);
+    expect(item.state).toBe("failed");
   });
 });

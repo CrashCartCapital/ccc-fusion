@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { assertCccPrdCampaignDriftStopWorkItem } from "../ccc-prd/campaign-drift-stop.js";
+import {
+  assertCccPrdCampaignDriftStopWorkItem,
+  assertCccPrdCampaignDriftStopWorkItemCustody,
+} from "../ccc-prd/campaign-drift-stop.js";
 import { CccPrdImportError } from "../ccc-prd/import-error.js";
 
 /*
@@ -90,5 +93,59 @@ describe("drifted-campaign stop work-item guards", () => {
       .toBe("CCC_PRD_CAMPAIGN_DRIFT_STOP_CUSTODY_REFUSED");
     expect(refusalFrom(workItem({ attempt: -1 })).code)
       .toBe("CCC_PRD_CAMPAIGN_DRIFT_STOP_CUSTODY_REFUSED");
+  });
+});
+
+/*
+ * The custody-only half of the guard above, used by the close-out plan for a
+ * work item that already ended terminally on its own (`failed` or
+ * `cancelled`). A close-out never writes the work item, so the terminal and
+ * lease checks in the full guard do not apply to it -- but custody still
+ * must, or a close-out could be built for a work item that is not this
+ * import's at all.
+ */
+describe("RED-L23: drifted-campaign close-out custody-only guard", () => {
+  it("admits a terminal-with-failure work item the full guard would refuse", () => {
+    // This is the entire reason the custody-only guard exists: the full guard
+    // refuses any terminal state, but a close-out is built exactly because
+    // the work item already ended in failure.
+    expect(() =>
+      assertCccPrdCampaignDriftStopWorkItemCustody(
+        workItem({ state: "failed" }),
+        runId,
+      )
+    ).not.toThrow();
+    expect(() =>
+      assertCccPrdCampaignDriftStopWorkItemCustody(
+        workItem({ state: "cancelled" }),
+        runId,
+      )
+    ).not.toThrow();
+  });
+
+  it("still refuses custody mismatches on a terminal work item", () => {
+    const refusal = (() => {
+      try {
+        assertCccPrdCampaignDriftStopWorkItemCustody(
+          workItem({ state: "failed", stableWorkflowRunId: "ccc-prd:other" }),
+          runId,
+        );
+      } catch (error) {
+        return error as CccPrdImportError;
+      }
+      throw new Error("expected a refusal");
+    })();
+    expect(refusal.code).toBe("CCC_PRD_CAMPAIGN_DRIFT_STOP_CUSTODY_REFUSED");
+  });
+
+  it("does not inspect lease fields at all", () => {
+    // A leased-looking terminal work item is still just a terminal work item;
+    // the custody-only guard has no lease concept to refuse it with.
+    expect(() =>
+      assertCccPrdCampaignDriftStopWorkItemCustody(
+        { id: "work-1", kind: "task", attempt: 2, stableWorkflowRunId: runId },
+        runId,
+      )
+    ).not.toThrow();
   });
 });

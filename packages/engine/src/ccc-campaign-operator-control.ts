@@ -3,10 +3,24 @@ import {
   CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX,
   canonicalCccPrdJson,
   closeUnopenedCccCampaignExecutionAuthorizationMembers,
+  markCccPrdImportStopped,
   type CccPrdProductStatus,
   type TaskStore,
   type WorkflowWorkItemState,
 } from "@fusion/core";
+
+/**
+ * Terminal-with-failure states an ordinary stop may close the import for
+ * instead of cancelling. The work item already ended on its own (a proof that
+ * was proved failed, for instance), so there is nothing left to cancel; the
+ * import row is marked terminal so it stops advertising `reconcile-import`
+ * forever, and the workflow's own recorded reason is preserved verbatim.
+ *
+ * `"completed"` is deliberately excluded: that work item ended by succeeding,
+ * not failing, and this path exists only to close out a failure.
+ */
+const OPERATOR_STOP_CLOSE_OUT_STATES: ReadonlySet<string> =
+  new Set<WorkflowWorkItemState>(["cancelled", "failed"]);
 
 export const CCC_CAMPAIGN_OPERATOR_PAUSED_REASON =
   "ccc-operator:campaign-paused";
@@ -47,12 +61,26 @@ export type ApplyCccCampaignOperatorControlInput = Readonly<{
 export type CccCampaignOperatorControlResult = Readonly<{
   action: CccCampaignOperatorControlAction;
   workItemId: string;
+  /**
+   * For an ordinary stop or pause/resume this reflects the write this control
+   * just made. For a stop that closed an already-terminal work item
+   * (`closedAfterTerminalFailure: true`), the work item was never written, so
+   * this reports the terminal state it already held.
+   */
   workItemState: Extract<
     WorkflowWorkItemState,
-    "held" | "runnable" | "cancelled"
+    "held" | "runnable" | "cancelled" | "failed"
   >;
   taskIds: readonly string[];
   unresolvedEffectsPreserved: boolean;
+  /**
+   * True when `stop` closed the campaign's import instead of cancelling its
+   * workflow: the work item had already reached `failed` or `cancelled` on
+   * its own, so there was nothing left to cancel. Callers use this to choose
+   * a distinct receipt kind -- "closed after terminal failure", not
+   * "stopped" -- since no workflow write actually happened.
+   */
+  closedAfterTerminalFailure: boolean;
 }>;
 
 export class CccCampaignOperatorControlError extends Error {
@@ -189,21 +217,29 @@ function controlDisposition(
             `Campaign cannot resume from workflow state ${workItem.state} without the exact operator pause receipt.`,
         };
   }
-  return (
+  if (
     workItem.state === "runnable"
     || workItem.state === "retrying"
     || workItem.state === "held"
     || workItem.state === "manual-required"
-  )
-    ? {
-        allowed: true,
-        reason:
-          "Campaign is unleased and can be terminally stopped without deleting worktrees or receipts.",
-      }
-    : {
-        allowed: false,
-        reason: `Campaign cannot stop from terminal workflow state ${workItem.state}.`,
-      };
+  ) {
+    return {
+      allowed: true,
+      reason:
+        "Campaign is unleased and can be terminally stopped without deleting worktrees or receipts.",
+    };
+  }
+  if (OPERATOR_STOP_CLOSE_OUT_STATES.has(workItem.state)) {
+    return {
+      allowed: true,
+      reason:
+        `Workflow work item ${workItem.id} already ended as ${workItem.state}; stop closes the campaign's import instead of cancelling an already-terminal workflow.`,
+    };
+  }
+  return {
+    allowed: false,
+    reason: `Campaign cannot stop from terminal workflow state ${workItem.state}.`,
+  };
 }
 
 function confirmationIdentity(
@@ -410,6 +446,7 @@ export async function applyCccCampaignOperatorControl(
       workItemState: "held",
       taskIds,
       unresolvedEffectsPreserved: unresolvedEffects(input.status),
+      closedAfterTerminalFailure: false,
     };
   }
   if (input.action === "resume") {
@@ -442,11 +479,48 @@ export async function applyCccCampaignOperatorControl(
       workItemState: "runnable",
       taskIds,
       unresolvedEffectsPreserved: unresolvedEffects(input.status),
+      closedAfterTerminalFailure: false,
     };
   }
   const reason = stopReason(input.reason);
   const reasonDigest = createHash("sha256").update(reason, "utf8").digest("hex");
   const stoppedMarker = `${CCC_CAMPAIGN_OPERATOR_STOPPED_PREFIX}${reasonDigest}`;
+  if (OPERATOR_STOP_CLOSE_OUT_STATES.has(workItem.state)) {
+    // The workflow already ended terminally on its own; there is nothing to
+    // cancel. Close only the import row so it stops advertising
+    // reconcile-import forever, and preserve the workflow's own recorded
+    // reason verbatim rather than overwriting it.
+    const layer = input.store.getAsyncLayer();
+    if (!layer) {
+      throw new CccCampaignOperatorControlError(
+        "CCC_CAMPAIGN_OPERATOR_CONTROL_IMPORT_CLOSE_UNAVAILABLE",
+        `PostgreSQL AsyncDataLayer unavailable to close import ${input.status.import.importId} after an already-${workItem.state} workflow.`,
+      );
+    }
+    const preserved = workItem.blockedReason ?? workItem.lastError
+      ?? "no recorded reason";
+    try {
+      await markCccPrdImportStopped({
+        layer,
+        idempotencyKey: input.status.import.idempotencyKey,
+        stoppedReason:
+          `${stoppedMarker} ${reason} | terminal-work-item(${workItem.state}): ${preserved}`,
+      });
+    } catch (error) {
+      throw new CccCampaignOperatorControlError(
+        "CCC_CAMPAIGN_OPERATOR_CONTROL_IMPORT_CLOSE_FAILED",
+        `Campaign import could not be marked terminal after an already-${workItem.state} workflow: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return {
+      action: input.action,
+      workItemId: workItem.id,
+      workItemState: workItem.state as "cancelled" | "failed",
+      taskIds,
+      unresolvedEffectsPreserved: true,
+      closedAfterTerminalFailure: true,
+    };
+  }
   await input.store.transitionWorkflowWorkItem(workItem.id, "cancelled", {
     ...commonPatch,
     lastError: stoppedMarker,
@@ -525,6 +599,7 @@ export async function applyCccCampaignOperatorControl(
     workItemId: workItem.id,
     workItemState: "cancelled",
     taskIds,
+    closedAfterTerminalFailure: false,
     unresolvedEffectsPreserved:
       sealedOpenedEffects || unresolvedEffects(input.status),
   };
