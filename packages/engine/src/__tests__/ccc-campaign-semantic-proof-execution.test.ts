@@ -25,7 +25,9 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
 } from "../ccc-campaign-proof-admission.js";
 import {
+  CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE,
   CCC_PRD_PROOF_VERIFIER_NONCONFORMING,
+  CccCampaignSemanticProofSandboxUnavailableError,
   CccPrdProofVerifierNonconformingError,
   assertCccSemanticProofVerifierConformance,
   createCccCampaignProofSuiteHandler,
@@ -2414,5 +2416,42 @@ describe("CCC semantic proof verifier conformance preflight (dependency-injected
 
     await expect(attempt).rejects.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
     await expect(attempt).rejects.toThrow(/not-canonical-json/);
+  });
+
+  it("throws a distinct sandbox-unavailable error, never the nonconforming code, and never runs the verifier when the sandbox is not ready", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task"] });
+    const materialize = vi.fn();
+    const verifyToolchain = vi.fn();
+    const preflightSandbox = vi.fn();
+    const runSandbox = vi.fn();
+    const notReadySandbox = {
+      ready: false as const,
+      backend: null,
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: "semantic-proof sandbox backend is unavailable on linux",
+      trustedPaths: [] as readonly string[],
+      detail: "no Linux (or other non-Darwin) backend exists yet",
+    };
+
+    const attempt = assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize,
+        verifyToolchain,
+        inspectSandboxReadiness: vi.fn(async () => notReadySandbox),
+        preflightSandbox,
+        runSandbox,
+      },
+    );
+
+    await expect(attempt).rejects.toBeInstanceOf(CccCampaignSemanticProofSandboxUnavailableError);
+    await expect(attempt).rejects.not.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
+    await expect(attempt).rejects.toMatchObject({ code: CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE });
+    await expect(attempt).rejects.toThrow(/CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE/);
+    expect(materialize).not.toHaveBeenCalled();
+    expect(verifyToolchain).not.toHaveBeenCalled();
+    expect(preflightSandbox).not.toHaveBeenCalled();
+    expect(runSandbox).not.toHaveBeenCalled();
   });
 });

@@ -1542,6 +1542,17 @@ describe("prd command exit contract", () => {
       readTargetHead: vi.fn(async () => packet.base),
       importCccPrdBundle: importBundle,
       inspectVerifierConfinementReadiness,
+      // The verifier-conformance preflight needs the semantic-proof-v2
+      // sandbox specifically, a distinct backend from the agent-verification
+      // confinement above; this test's DI custody/conformance mocks below
+      // stay platform-independent only if this is pinned ready too.
+      inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+        message: "semantic-proof sandbox readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
       resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
       // Controller custody is exercised by the dedicated changed-executable
       // regression above. This service-seam test starts from that admitted
@@ -1702,6 +1713,18 @@ describe("prd command exit contract", () => {
           trustedPaths: ["/usr/bin/bwrap", "/bin/bwrap"] as const,
           detail: "private runner detail must not reach operator output",
         })),
+        // verifierConformanceChecked is gated on the semantic-proof-v2
+        // sandbox specifically, not the agent-verification confinement
+        // above, so this must be pinned not-ready too for this scenario's
+        // "the preflight never ran" assertions below to hold regardless of
+        // platform (see RED-L22-preflight-gate below for the converse case).
+        inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+          ready: false,
+          backend: null,
+          code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+          message: "semantic-proof sandbox backend is unavailable on this platform",
+          trustedPaths: [] as const,
+        })),
         assertSemanticProofVerifierConformance: assertVerifierConformance,
       },
       { projectName: "fixture" },
@@ -1736,6 +1759,104 @@ describe("prd command exit contract", () => {
     });
     expect(output[0]).not.toContain("private runner detail");
   }, 60_000);
+
+  it("RED-L22-preflight-gate: gates the verifier-conformance preflight and checked flag on the semantic-proof sandbox, not agent-verification confinement", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    await authorSemanticV2Packet(packet);
+    const policyPath = await createExecutionPlan(packet);
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store: { getAsyncLayer: vi.fn(() => ({})) },
+    };
+    const importBundle = vi.fn();
+    const assertVerifierConformance = vi.fn(async () => undefined);
+    // Agent-verification confinement (bubblewrap/sandbox-exec) is ready --
+    // e.g. a Linux host with a working bwrap -- but the distinct
+    // semantic-proof-v2 sandbox (sandbox-exec only, Darwin-only today) is
+    // not. The preflight, the checked flag, and import's refusal must all
+    // follow the semantic-proof sandbox, never the agent confinement above.
+    const inspectVerifierConfinementReadiness = vi.fn(async () => ({
+      ready: true,
+      backend: "bubblewrap" as const,
+      code: "VERIFIER_CONFINEMENT_READY",
+      message: "trusted bubblewrap confinement is ready",
+      trustedPaths: ["/usr/bin/bwrap"] as const,
+    }));
+    const inspectSemanticProofSandboxReadiness = vi.fn(async () => ({
+      ready: false,
+      backend: null,
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: "semantic-proof sandbox backend is unavailable on linux",
+      trustedPaths: [] as const,
+      detail: "private runner detail must not reach operator output",
+    }));
+    const dependencies = {
+      resolveProject: vi.fn(async () => context),
+      closeProjectStore: vi.fn(async () => undefined),
+      readTargetHead: vi.fn(async () => packet.base),
+      importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness,
+      inspectSemanticProofSandboxReadiness,
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+      assertSemanticProofV2Custody: vi.fn(async () => undefined),
+      assertSemanticProofVerifierConformance: assertVerifierConformance,
+    };
+    const common = [
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      policyPath,
+      packet.target,
+      packet.base,
+    ];
+
+    const previewOutput: string[] = [];
+    expect(await runPrdJson(
+      ["preview", ...common],
+      { write: (line) => previewOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(0);
+    expect(assertVerifierConformance).not.toHaveBeenCalled();
+    const preview = JSON.parse(previewOutput[0]!) as {
+      confirmationDigest: string;
+      verifierConfinement: {
+        ready: boolean;
+        backend: string;
+        verifierConformanceChecked: boolean;
+        verifierConformanceWarning: string;
+      };
+    };
+    expect(preview.verifierConfinement).toMatchObject({
+      ready: true,
+      backend: "bubblewrap",
+      verifierConformanceChecked: false,
+      verifierConformanceWarning: expect.stringContaining("could not run the declared proof verifiers"),
+    });
+    expect(previewOutput[0]).not.toContain("private runner detail");
+
+    const importOutput: string[] = [];
+    expect(await runPrdJson(
+      ["import", ...common, "operator-key", "--confirm", preview.confirmationDigest],
+      { write: (line) => importOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(1);
+    expect(JSON.parse(importOutput[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_CAMPAIGN_VERIFIER_CONFINEMENT_UNAVAILABLE",
+        message: "Exact requirement verification is unavailable: semantic-proof sandbox backend is unavailable on linux",
+      }],
+    });
+    expect(importOutput[0]).not.toContain("private runner detail");
+    expect(importOutput[0]).not.toContain("CCC_PRD_PROOF_VERIFIER_NONCONFORMING");
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(assertVerifierConformance).not.toHaveBeenCalled();
+  });
 
   it("refuses import before project or importer residue when readiness has no admitted backend", async () => {
     const packet = createPacketRoot({ semanticV2: true });

@@ -157,6 +157,7 @@ export type PrdCommandDependencies = {
   readTargetHead?: (targetRoot: string) => Promise<string>;
   importCccPrdBundle?: typeof importCccPrdBundle;
   inspectVerifierConfinementReadiness?: typeof engine.inspectVerifierConfinementReadiness;
+  inspectSemanticProofSandboxReadiness?: typeof engine.inspectCccSemanticProofSandboxReadiness;
   inspectCccPrdImport?: typeof inspectCccPrdImport;
   reconcileCccPrdImport?: typeof reconcileCccPrdImport;
   inspectCccPrdProductStatus?: typeof inspectCccPrdProductStatus;
@@ -1657,18 +1658,28 @@ function assertProductRequestBudgetFloor(
 
 function operatorVerifierConfinementReadiness(
   readiness: VerifierConfinementReadiness,
+  semanticProofSandboxReadiness: engine.CccSemanticProofSandboxReadiness,
 ) {
   const operatorReadiness = sanitizedVerifierConfinementReadiness(readiness);
-  if (engine.isVerifierConfinementReady(readiness)) {
+  // verifierConformanceChecked reports whether the verifier-conformance
+  // preflight actually ran, so it must be driven by the readiness of the
+  // sandbox that preflight itself needs (the semantic-proof-v2 sandbox --
+  // sandbox-exec only, Darwin-only today), never by the unrelated
+  // agent-verification confinement (bubblewrap on Linux, sandbox-exec on
+  // Darwin) reported in `readiness`. Conflating the two would report a
+  // check as having run on a host (e.g. Linux with bwrap) where the
+  // semantic-proof sandbox has no backend at all. See
+  // docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md.
+  if (engine.isCccSemanticProofSandboxReady(semanticProofSandboxReadiness)) {
     return { ...operatorReadiness, verifierConformanceChecked: true as const };
   }
   return {
     ...operatorReadiness,
-    // Trusted confinement is required to run a declared proof's verify
-    // command at all, so the verifier-conformance preflight below is
+    // The semantic-proof sandbox is required to run a declared proof's
+    // verify command at all, so the verifier-conformance preflight below is
     // skipped entirely for this preview -- never silently, this field says
-    // so, and import cannot proceed until confinement is ready (refused
-    // above isVerifierConfinementReady) and re-runs the real check then.
+    // so, and import cannot proceed until that sandbox is ready (refused
+    // above) and re-runs the real check then.
     verifierConformanceChecked: false as const,
     verifierConformanceWarning:
       "Trusted verifier confinement is unavailable, so this preview could not run the declared proof verifiers to check their evidence output shape. Fusion will run that check again, and refuse on a nonconforming verifier, at import once confinement is repaired.",
@@ -1711,6 +1722,7 @@ function productPreview(
   identity: ReturnType<typeof productPreviewIdentity>,
   bundle: CccPrdSemanticBundle,
   verifierConfinement: VerifierConfinementReadiness,
+  semanticProofSandboxReadiness: engine.CccSemanticProofSandboxReadiness,
 ) {
   return {
     kind: "preview" as const,
@@ -1729,6 +1741,7 @@ function productPreview(
     materialCoverage: bundle.materialCoverage,
     verifierConfinement: operatorVerifierConfinementReadiness(
       verifierConfinement,
+      semanticProofSandboxReadiness,
     ),
   };
 }
@@ -1893,6 +1906,31 @@ async function runProductPacketCommand(
       operatorJson(commandContext),
     );
   }
+  // Probed once here and threaded through preview/import below: the
+  // verifier-conformance preflight needs the semantic-proof-v2 sandbox
+  // (sandbox-exec, Darwin-only today), a distinct backend from the
+  // agent-verification confinement checked just above. A campaign cannot
+  // run any declared proof's verify command without this sandbox, so import
+  // refuses here too when it isn't ready -- using the same confinement-
+  // unavailable refusal shape as above, never the verifier-nonconforming
+  // code, since no verifier has been judged yet. See
+  // docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md.
+  const semanticProofSandboxReadiness = await (
+    dependencies.inspectSemanticProofSandboxReadiness
+    ?? compiler.inspectCccSemanticProofSandboxReadiness
+  )();
+  if (
+    importing
+    && bundle.schema === "ccc-prd.bundle.v2"
+    && bundle.proofs.length > 0
+    && !engine.isCccSemanticProofSandboxReady(semanticProofSandboxReadiness)
+  ) {
+    return writeVerifierConfinementImportRefusal(
+      io,
+      semanticProofSandboxReadiness,
+      operatorJson(commandContext),
+    );
+  }
 
   return withPrdProject(io, dependencies, commandContext, async (project) => {
     const layer = project.store.getAsyncLayer();
@@ -1935,16 +1973,16 @@ async function runProductPacketCommand(
       // produce, so those proof definitions are already the correct input
       // for the conformance preflight below -- no second hydration pass.
       //
-      // Running a declared proof's real verify command needs the same
-      // trusted confinement a live attempt needs, so this follows the same
-      // isVerifierConfinementReady gate as the importing-side refusal
-      // above. `import` cannot reach this line with confinement
+      // Running a declared proof's real verify command needs the
+      // semantic-proof-v2 sandbox, so this follows the same
+      // isCccSemanticProofSandboxReady gate as the importing-side refusal
+      // above. `import` cannot reach this line with that sandbox
       // unavailable (already refused above); `preview` is allowed to
-      // continue without running real verifiers when confinement isn't
+      // continue without running real verifiers when the sandbox isn't
       // ready -- productPreview's verifierConfinement carries an explicit
       // verifierConformanceChecked:false warning instead of silently
       // claiming a check happened.
-      if (engine.isVerifierConfinementReady(verifierConfinement)) {
+      if (engine.isCccSemanticProofSandboxReady(semanticProofSandboxReadiness)) {
         await (
           dependencies.assertSemanticProofVerifierConformance
           ?? engine.assertCccSemanticProofVerifierConformance
@@ -1982,7 +2020,12 @@ async function runProductPacketCommand(
       bundle,
       executionPolicy,
     });
-    const currentPreview = productPreview(identity, bundle, verifierConfinement);
+    const currentPreview = productPreview(
+      identity,
+      bundle,
+      verifierConfinement,
+      semanticProofSandboxReadiness,
+    );
     if (preview) {
       if (operatorJson(commandContext)) {
         io.write(JSON.stringify(currentPreview));

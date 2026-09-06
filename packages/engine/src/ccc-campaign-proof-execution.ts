@@ -1458,6 +1458,30 @@ export class CccPrdProofVerifierNonconformingError extends Error {
   }
 }
 
+// Shared with runSemanticProofV2's own identical-condition refusal below, so
+// both the live per-attempt path and this preflight report one refusal
+// identity for "this host lacks the semantic-proof-v2 sandbox backend".
+export const CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE =
+  "CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE" as const;
+
+/**
+ * The semantic-proof-v2 sandbox backend (sandbox-exec, Darwin-only today --
+ * see docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md) this host
+ * would need to run a declared proof's verify command is not available.
+ * Nothing about the verifier itself has been judged yet when this is thrown,
+ * so it must never be confused with CccPrdProofVerifierNonconformingError:
+ * that code means the verifier ran and failed the contract, this one means
+ * the host cannot run it at all.
+ */
+export class CccCampaignSemanticProofSandboxUnavailableError extends Error {
+  readonly code = CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CccCampaignSemanticProofSandboxUnavailableError";
+  }
+}
+
 export type CccSemanticProofVerifierPreflightInput = Readonly<{
   repositoryRoot: string;
   baseCommit: string;
@@ -1583,7 +1607,7 @@ export async function assertCccSemanticProofVerifierConformance(
 
   const sandboxReadiness = await inspectSandboxReadiness();
   if (!isCccSemanticProofSandboxReady(sandboxReadiness)) {
-    throw new CccPrdProofVerifierNonconformingError(
+    throw new CccCampaignSemanticProofSandboxUnavailableError(
       `CCC semantic-proof verifier preflight sandbox is unavailable (${sandboxReadiness.code}): ${sandboxReadiness.message}`,
     );
   }
@@ -1794,7 +1818,7 @@ async function runSemanticProofV2(
   if (!isCccSemanticProofSandboxReady(sandboxReadiness)) {
     proofRefusal(
       `CCC campaign semantic proof sandbox is unavailable (${sandboxReadiness.code}): ${sandboxReadiness.message}`,
-      "CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE,
     );
   }
   const layer = input.store.getAsyncLayer();

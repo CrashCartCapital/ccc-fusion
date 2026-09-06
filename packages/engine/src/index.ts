@@ -336,13 +336,18 @@ export {
 } from "./ccc-campaign-proof-materialization.js";
 export {
   buildCccSemanticProofDarwinProfile,
+  inspectCccSemanticProofSandboxReadiness,
+  isCccSemanticProofSandboxReady,
   runCccSemanticProofSandboxedProcess,
   type CccSemanticProofSandboxPolicyInput,
   type CccSemanticProofSandboxedProcessResult,
+  type CccSemanticProofSandboxReadiness,
   type RunCccSemanticProofSandboxedProcessInput,
 } from "./ccc-campaign-proof-sandbox.js";
 export {
+  CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE,
   CCC_PRD_PROOF_VERIFIER_NONCONFORMING,
+  CccCampaignSemanticProofSandboxUnavailableError,
   CccPrdProofVerifierNonconformingError,
   assertCccSemanticProofVerifierConformance,
   type CccSemanticProofVerifierPreflightDependencies,
