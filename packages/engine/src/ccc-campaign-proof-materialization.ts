@@ -92,6 +92,18 @@ export type CccSemanticProofMaterializationInput = {
   proof: CccPrdProofV2;
   modelWriteRoots: readonly string[];
   outputRoot: string;
+  /**
+   * Default false, preserving exact real-attempt behavior: every declared
+   * candidate must resolve to a real blob at sourceCommit, or materialization
+   * refuses. Set true only for a pre-dispatch verifier-conformance preflight
+   * that intentionally runs the verifier against the pinned base commit
+   * before any candidate has been written -- a candidate path absent there is
+   * an expected, not-yet-implemented state, not a custody defect. This never
+   * relaxes closure verification, digest pinning, disjointness, or toolchain
+   * sealing; it only lets an absent (not merely unreadable) candidate blob be
+   * skipped instead of refusing materialization outright.
+   */
+  allowMissingCandidates?: boolean;
 };
 
 export type CccSemanticProofMaterialization = {
@@ -147,6 +159,15 @@ function assertDisjointClosure(
   }
 }
 
+/**
+ * Thrown by gitBytes specifically when the requested path is absent (or
+ * non-regular/ambiguous) at the given commit, distinct from a Git or I/O
+ * failure. Callers that can legitimately tolerate a missing candidate (the
+ * verifier-conformance preflight, which runs before any candidate has been
+ * written) match on this type rather than string-matching the message.
+ */
+class CccSemanticProofGitPathMissingError extends Error {}
+
 async function gitBytes(
   repositoryRoot: string,
   commit: string,
@@ -167,7 +188,9 @@ async function gitBytes(
   const tree = treeOutput.toString("utf8");
   const match = /^(100644|100755) blob ([0-9a-f]{40}|[0-9a-f]{64})\t([^\0]+)\0$/u.exec(tree);
   if (!match || match[3] !== path) {
-    throw new Error(`CCC semantic-proof path is missing, non-regular, or ambiguous at ${commit}: ${path}`);
+    throw new CccSemanticProofGitPathMissingError(
+      `CCC semantic-proof path is missing, non-regular, or ambiguous at ${commit}: ${path}`,
+    );
   }
   const oid = match[2]!;
   const { stdout } = await execFile(
@@ -495,7 +518,7 @@ function executableProbeCommandLine(originalError: unknown): string {
 // it -- so the bound here is on real byte length, not `string.length`
 // (UTF-16 code units), and the cut point always lands on a code-point
 // boundary.
-function boundedUtf8Excerpt(buffer: Buffer, maxBytes: number): { excerpt: string; truncated: boolean } {
+export function boundedUtf8Excerpt(buffer: Buffer, maxBytes: number): { excerpt: string; truncated: boolean } {
   if (buffer.length <= maxBytes) {
     return { excerpt: buffer.toString("utf8"), truncated: false };
   }
@@ -1792,7 +1815,18 @@ export async function admitAndMaterializeCccSemanticProof(
       throw new Error(`CCC semantic-proof candidate path is duplicated or overlaps closure: ${path}`);
     }
     candidatePaths.add(path);
-    candidates.push({ path, bytes: (await gitBytes(repositoryRoot, input.sourceCommit, path)).bytes });
+    try {
+      candidates.push({ path, bytes: (await gitBytes(repositoryRoot, input.sourceCommit, path)).bytes });
+    } catch (error) {
+      if (!input.allowMissingCandidates || !(error instanceof CccSemanticProofGitPathMissingError)) {
+        throw error;
+      }
+      // Preflight only: the candidate has not been written yet at the pinned
+      // base commit. Leave it absent from the sealed root rather than
+      // refusing -- a conforming verifier must still emit valid evidence
+      // (very likely reporting failing results) when the implementation it
+      // judges does not exist yet.
+    }
   }
   const proofRoot = join(outputRoot, "proof");
   const scratchRoot = join(outputRoot, "scratch");

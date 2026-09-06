@@ -3,15 +3,17 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
+  CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
   CccCampaignProofAttemptLimitError,
   canonicalCccPrdJson,
   computeCccPrdProofDefinitionSha256,
   computeCccPrdProofV2AdmissionDigests,
   type CccCampaignTaskContext,
   type CccPrdProofV2,
+  type CccPrdPythonExecutionToolchain,
   type TaskDetail,
   type WorkflowIrNode,
 } from "@fusion/core";
@@ -23,6 +25,11 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
 } from "../ccc-campaign-proof-admission.js";
 import {
+  CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE,
+  CCC_PRD_PROOF_VERIFIER_NONCONFORMING,
+  CccCampaignSemanticProofSandboxUnavailableError,
+  CccPrdProofVerifierNonconformingError,
+  assertCccSemanticProofVerifierConformance,
   createCccCampaignProofSuiteHandler,
   exactEvidenceResults,
 } from "../ccc-campaign-proof-execution.js";
@@ -1416,6 +1423,55 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
+  it("distinguishes stdout that is not JSON at all from JSON that is merely non-canonical", async () => {
+    // Regression for halt ten (docs/plans/2026-09-03-ccc-gate3-campaign-ledger.md,
+    // 2026-09-06 ~04:50Z): a verifier that prints a human-readable summary
+    // line instead of the JSON evidence contract exited zero and was refused
+    // only as "not-canonical-json", which reads as a formatting nit rather
+    // than "this harness never emits the contract at all".
+    const f = await fixture();
+    const stdout = "PROOF PASSED: labels (7 checks: vocabulary_frozen, canonical_labels_positive)\n";
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence not-json"],
+      }),
+    }));
+  });
+
+  it("keeps not-canonical-json for stdout that parses but is not the canonical byte form", async () => {
+    const f = await fixture();
+    // Valid, parseable JSON on a single line, but with a trailing space the
+    // canonical serializer would never emit: a successful parse that fails
+    // only the byte-canonical check, distinct from stdout that was never
+    // JSON syntax at all.
+    const stdout = `${canonicalCccPrdJson(evidenceFor(f, true))} \n`;
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence not-canonical-json"],
+      }),
+    }));
+  });
+
   it("captures a proof-id mismatch as a warning instead of only malformed_output", async () => {
     const f = await fixture();
     const badEvidence = { ...evidenceFor(f, true), proofId: "PROOF-other-v2" };
@@ -1959,5 +2015,443 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.reserve).not.toHaveBeenCalled();
     expect(attempts.begin).not.toHaveBeenCalled();
     expect(attempts.settle).not.toHaveBeenCalled();
+  });
+});
+
+// Regression coverage for the Gate 3 preflight: a proof's declared verifier
+// must be refused at preview/import time -- before any campaign dispatches a
+// task against it -- if its stdout does not conform to the
+// ccc-prd.proof-evidence.v2 contract. Halt ten
+// (docs/plans/2026-09-03-ccc-gate3-campaign-ledger.md, 2026-09-06 ~04:50Z) hit
+// this exact defect only after a real task had already burned a live turn.
+describe("CCC semantic proof verifier conformance preflight", () => {
+  async function preflightFixture(harnessSource: string) {
+    const scratch = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-fixture-"));
+    scratchRoots.push(scratch);
+    const repo = join(scratch, "target");
+    await mkdir(join(repo, "proof"), { recursive: true });
+    await execFile("git", ["init", "--initial-branch=main", repo]);
+    await writeFile(join(repo, "README.md"), "preflight fixture repository\n", "utf8");
+    await writeFile(join(repo, "Taskfile.yml"), [
+      "version: '3'",
+      "tasks:",
+      "  verify:labels:",
+      "    cmds:",
+      "      - node proof/verify.mjs src/labels.py",
+      "",
+    ].join("\n"), "utf8");
+    await writeFile(join(repo, "proof", "verify.mjs"), harnessSource, "utf8");
+    // src/labels.py is deliberately never written: the whole point of this
+    // preflight is to prove the verifier's *output shape* is correct before
+    // any candidate implementation exists.
+    const baseCommit = await commit(repo, "base");
+
+    const taskPath = (await execFile("which", ["task"])).stdout.trim();
+    const [taskIdentity, nodeIdentity, taskRunner, harness] = await Promise.all([
+      inspectCccSemanticProofExecutable(taskPath, ["--version"]),
+      inspectCccSemanticProofExecutable(process.execPath, ["--version"]),
+      verifierClosureEntry(repo, baseCommit, "Taskfile.yml", "task_runner"),
+      verifierClosureEntry(repo, baseCommit, "proof/verify.mjs", "harness"),
+    ]);
+    const proofHostIdentity = { id: "proof-host-node", ...nodeIdentity };
+    const linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
+      task: taskIdentity,
+      node: nodeIdentity,
+      proofHost: proofHostIdentity,
+    });
+    const definition = {
+      schema: "ccc-prd.proof.v2",
+      id: "PROOF-EVIDENCE-LABELS",
+      requirementIds: ["REQ-labels"],
+      clauseIds: ["CLAUSE-labels"],
+      phases: ["task"],
+      command: "task verify:labels",
+      positiveOracle: "Canonical labels are accepted.",
+      positiveCases: [{ id: "CASE-good", description: "The expected labels pass." }],
+      negativeControls: [{ id: "CONTROL-bad", description: "A planted bad label fails." }],
+      verifierClosure: [taskRunner, harness],
+      candidateInputs: ["src/labels.py"],
+      executionToolchain: {
+        task: taskIdentity,
+        node: nodeIdentity,
+        proofHost: proofHostIdentity,
+        linkedRuntime,
+      },
+      spans: [],
+      confidence: "high",
+    } satisfies Omit<CccPrdProofV2, "admission">;
+    const digests = computeCccPrdProofV2AdmissionDigests(definition);
+    const proof: CccPrdProofV2 = {
+      ...definition,
+      admission: {
+        schema: "ccc-prd.proof-admission.v2",
+        pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+        pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+        extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+        proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+        extensionRootRelativeSource: "src/ccc-campaign-proof-admission.ts",
+        extensionSourceSha256: "b".repeat(64),
+        extensionManifestSha256: "c".repeat(64),
+        definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+        ...digests,
+      },
+    };
+    return { repo, baseCommit, proof };
+  }
+
+  const NONCONFORMING_HARNESS = [
+    "console.log('PROOF PASSED: labels (7 checks: vocabulary_frozen, canonical_labels_positive)');",
+    "process.exitCode = 0;",
+    "",
+  ].join("\n");
+
+  const CONFORMING_HARNESS = [
+    "import { existsSync } from 'node:fs';",
+    // The candidate does not exist yet at the pinned base commit; a
+    // conforming harness must still emit valid evidence, reporting the
+    // clauses it could not verify as failing rather than crashing or
+    // printing anything other than the JSON contract.
+    "const candidateExists = existsSync('src/labels.py');",
+    "const passed = candidateExists;",
+    "const evidence = {",
+    "  clauseResults: [{ clauseId: 'CLAUSE-labels', passed }],",
+    "  negativeControlResults: [{ controlId: 'CONTROL-bad', passed }],",
+    "  passed,",
+    "  phase: process.env.CCC_PROOF_PHASE,",
+    "  positiveCaseResults: [{ caseId: 'CASE-good', passed }],",
+    "  proofId: process.env.CCC_PROOF_ID,",
+    "  schema: 'ccc-prd.proof-evidence.v2',",
+    "  sourceCommit: process.env.CCC_PROOF_SOURCE_COMMIT,",
+    "  sourceTree: process.env.CCC_PROOF_SOURCE_TREE,",
+    "};",
+    "process.stdout.write(`${JSON.stringify(evidence)}\\n`);",
+    "process.exitCode = passed ? 0 : 1;",
+    "",
+  ].join("\n");
+
+  itSemanticHost(
+    "refuses a verifier that never emits the proof-evidence contract, naming the proof and the first stdout line",
+    async () => {
+      const { repo, baseCommit, proof } = await preflightFixture(NONCONFORMING_HARNESS);
+
+      const attempt = assertCccSemanticProofVerifierConformance({
+        repositoryRoot: repo,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src"],
+        timeoutMs: 30_000,
+      });
+
+      await expect(attempt).rejects.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
+      await expect(attempt).rejects.toMatchObject({
+        code: CCC_PRD_PROOF_VERIFIER_NONCONFORMING,
+      });
+      await expect(attempt).rejects.toThrow(/PROOF-EVIDENCE-LABELS/);
+      await expect(attempt).rejects.toThrow(/not-json/);
+      await expect(attempt).rejects.toThrow(/PROOF PASSED: labels/);
+    },
+  );
+
+  itSemanticHost(
+    "passes a verifier that emits valid evidence even before any candidate exists",
+    async () => {
+      const { repo, baseCommit, proof } = await preflightFixture(CONFORMING_HARNESS);
+
+      await expect(assertCccSemanticProofVerifierConformance({
+        repositoryRoot: repo,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src"],
+        timeoutMs: 30_000,
+      })).resolves.toBeUndefined();
+    },
+  );
+});
+
+// Dependency-injected: stubs materialize/verifyToolchain/inspectSandboxReadiness/
+// preflightSandbox/runSandbox, so these run on every platform and in CI with no
+// real sandbox-exec, task binary, or Python toolchain required -- unlike the
+// itSemanticHost-gated block above (kept for genuine end-to-end coverage), CI
+// runs zero of these assertions today without this block.
+describe("CCC semantic proof verifier conformance preflight (dependency-injected)", () => {
+  function stubReadySandbox() {
+    return {
+      ready: true as const,
+      backend: "sandbox-exec" as const,
+      code: "STUB_SANDBOX_READY",
+      message: "stub sandbox ready",
+      trustedPaths: [] as readonly string[],
+    };
+  }
+
+  async function minimalGitRepo(): Promise<{ repo: string; baseCommit: string }> {
+    const scratch = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-di-"));
+    scratchRoots.push(scratch);
+    const repo = join(scratch, "target");
+    await mkdir(repo, { recursive: true });
+    await execFile("git", ["init", "--initial-branch=main", repo]);
+    await writeFile(join(repo, "README.md"), "preflight dependency-injected fixture\n", "utf8");
+    const baseCommit = await commit(repo, "genesis");
+    return { repo, baseCommit };
+  }
+
+  function pythonToolchainFixture(): CccPrdPythonExecutionToolchain {
+    return {
+      executablePath: "/sealed/toolchain/python/bin/python3.11",
+      executableSha256: "d".repeat(64),
+      version: "python fixture",
+      versionOutputSha256: "e".repeat(64),
+      runtimeManifest: {
+        schema: CCC_PRD_PYTHON_RUNTIME_MANIFEST_V1_SCHEMA_VERSION,
+        interpreter: { path: "/sealed/toolchain/python/bin/python3.11", sha256: "f".repeat(64) },
+        stdlibRoot: "/usr/host/python3.11/lib/python3.11",
+        pythonHomeRoot: "/usr/host/python3.11",
+        sitePackagesRoots: ["/usr/host/python3.11/lib/python3.11/site-packages"],
+        extensionModuleRoots: ["/usr/host/python3.11/lib/python3.11/lib-dynload"],
+        runtimeSupport: [{ path: "/usr/host/python3.11/lib/libpython3.11.dylib", sha256: "1".repeat(64) }],
+        stdlib: [],
+        sitePackages: [],
+        extensionModules: [],
+        dylibClosure: [{ path: "/usr/host/python3.11/lib/libssl.3.dylib", sha256: "2".repeat(64) }],
+      },
+    };
+  }
+
+  async function freshOutputRoot(): Promise<string> {
+    const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-di-materialized-"));
+    scratchRoots.push(outputRoot);
+    return outputRoot;
+  }
+
+  function canonicalEvidenceFor(
+    proofId: string,
+    input: { proofEnvironment: { CCC_PROOF_PHASE: string; CCC_PROOF_SOURCE_COMMIT: string; CCC_PROOF_SOURCE_TREE: string } },
+    passed: boolean,
+  ) {
+    return {
+      schema: "ccc-prd.proof-evidence.v2" as const,
+      proofId,
+      phase: input.proofEnvironment.CCC_PROOF_PHASE,
+      sourceCommit: input.proofEnvironment.CCC_PROOF_SOURCE_COMMIT,
+      sourceTree: input.proofEnvironment.CCC_PROOF_SOURCE_TREE,
+      passed,
+      clauseResults: [{ clauseId: "CLAUSE-value", passed }],
+      positiveCaseResults: [{ caseId: "CASE-good", passed }],
+      negativeControlResults: [{ controlId: "CONTROL-bad", passed: true }],
+    };
+  }
+
+  it("denies the same host Python roots the live per-attempt path denies (sealing parity)", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const python = pythonToolchainFixture();
+    const baseProof = admittedProof();
+    const proof = readmitProofDefinition(baseProof, {
+      phases: ["task"],
+      executionToolchain: { ...baseProof.executionToolchain, python },
+    });
+    const outputRoot = await freshOutputRoot();
+    const base = materializedFixture(outputRoot, proof.admission!, proof.executionToolchain);
+    const materialized = {
+      ...base,
+      sealedExecutionToolchain: { ...base.sealedExecutionToolchain, python },
+    };
+    let capturedDeniedReadRoots: readonly string[] | undefined;
+
+    await assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize: vi.fn(async () => materialized),
+        verifyToolchain: vi.fn(async () => undefined),
+        inspectSandboxReadiness: vi.fn(async () => stubReadySandbox()),
+        preflightSandbox: vi.fn(async (policy: { deniedReadRoots: readonly string[] }) => {
+          capturedDeniedReadRoots = policy.deniedReadRoots;
+        }),
+        runSandbox: vi.fn(async (input: Parameters<typeof canonicalEvidenceFor>[1]) => (
+          processResult(`${canonicalCccPrdJson(canonicalEvidenceFor(proof.id, input, true))}\n`)
+        )),
+      },
+    );
+
+    expect(capturedDeniedReadRoots).toBeDefined();
+    const expectedDeniedPythonRoots = [
+      python.runtimeManifest.stdlibRoot,
+      python.runtimeManifest.pythonHomeRoot,
+      ...python.runtimeManifest.sitePackagesRoots,
+      ...python.runtimeManifest.extensionModuleRoots,
+      ...python.runtimeManifest.dylibClosure.map(({ path }) => dirname(path)),
+      ...python.runtimeManifest.runtimeSupport.map(({ path }) => dirname(path)),
+      dirname(python.executablePath),
+    ];
+    for (const root of expectedDeniedPythonRoots) {
+      expect(capturedDeniedReadRoots).toContain(root);
+    }
+  });
+
+  it("seals the toolchain exactly once per proof even across multiple phases", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task", "final_integrated"] });
+    const outputRoot = await freshOutputRoot();
+    const materialized = materializedFixture(outputRoot, proof.admission!, proof.executionToolchain);
+    const materialize = vi.fn(async () => materialized);
+    const verifyToolchain = vi.fn(async () => undefined);
+    const runSandbox = vi.fn(async (input: Parameters<typeof canonicalEvidenceFor>[1]) => (
+      processResult(`${canonicalCccPrdJson(canonicalEvidenceFor(proof.id, input, true))}\n`)
+    ));
+
+    await assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize,
+        verifyToolchain,
+        inspectSandboxReadiness: vi.fn(async () => stubReadySandbox()),
+        preflightSandbox: vi.fn(async () => undefined),
+        runSandbox,
+      },
+    );
+
+    // One proof, two phases: the toolchain must be sealed once for the proof,
+    // not once per phase, while each phase still gets its own sandboxed run
+    // (and its own independent 300s bound, unaffected by this hoist).
+    expect(materialize).toHaveBeenCalledTimes(1);
+    expect(verifyToolchain).toHaveBeenCalledTimes(1);
+    expect(runSandbox).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses prose stdout with the structured code, proof id, phase, not-json warning, first stdout line, and a bounded stderr excerpt", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task"] });
+    const outputRoot = await freshOutputRoot();
+    const materialized = materializedFixture(outputRoot, proof.admission!, proof.executionToolchain);
+    const longStderr = `boom detail ${"x".repeat(5_000)}`;
+
+    const attempt = assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize: vi.fn(async () => materialized),
+        verifyToolchain: vi.fn(async () => undefined),
+        inspectSandboxReadiness: vi.fn(async () => stubReadySandbox()),
+        preflightSandbox: vi.fn(async () => undefined),
+        runSandbox: vi.fn(async () => ({
+          ...processResult("PROOF PASSED: value (3 checks)\n"),
+          stderr: longStderr,
+          stderrSha256: sha256(longStderr),
+        })),
+      },
+    );
+
+    await expect(attempt).rejects.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
+    await expect(attempt).rejects.toMatchObject({ code: CCC_PRD_PROOF_VERIFIER_NONCONFORMING });
+    await expect(attempt).rejects.toThrow(new RegExp(proof.id));
+    await expect(attempt).rejects.toThrow(/phase task/);
+    await expect(attempt).rejects.toThrow(/malformed_output/);
+    await expect(attempt).rejects.toThrow(/not-json/);
+    await expect(attempt).rejects.toThrow(/PROOF PASSED: value/);
+    await expect(attempt).rejects.toThrow(/boom detail x{100,}/);
+    await expect(attempt).rejects.toThrow(/\.\.\.\[truncated\]/);
+    // Bounded: the full 5000+ char stderr must never appear verbatim.
+    await expect(attempt).rejects.not.toThrow(new RegExp(`x{5000}`));
+  });
+
+  it("accepts canonical evidence reporting passed:false as conforming", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task"] });
+    const outputRoot = await freshOutputRoot();
+    const materialized = materializedFixture(outputRoot, proof.admission!, proof.executionToolchain);
+
+    await expect(assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize: vi.fn(async () => materialized),
+        verifyToolchain: vi.fn(async () => undefined),
+        inspectSandboxReadiness: vi.fn(async () => stubReadySandbox()),
+        preflightSandbox: vi.fn(async () => undefined),
+        runSandbox: vi.fn(async (input: Parameters<typeof canonicalEvidenceFor>[1]) => (
+          processResult(`${canonicalCccPrdJson(canonicalEvidenceFor(proof.id, input, false))}\n`, 1)
+        )),
+      },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses empty stdout on a nonzero exit as no_output", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task"] });
+    const outputRoot = await freshOutputRoot();
+    const materialized = materializedFixture(outputRoot, proof.admission!, proof.executionToolchain);
+
+    const attempt = assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize: vi.fn(async () => materialized),
+        verifyToolchain: vi.fn(async () => undefined),
+        inspectSandboxReadiness: vi.fn(async () => stubReadySandbox()),
+        preflightSandbox: vi.fn(async () => undefined),
+        runSandbox: vi.fn(async () => processResult("", 2)),
+      },
+    );
+
+    await expect(attempt).rejects.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
+    await expect(attempt).rejects.toThrow(/no_output/);
+  });
+
+  it("keeps not-canonical-json for stdout that parses but is not the canonical byte form", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task"] });
+    const outputRoot = await freshOutputRoot();
+    const materialized = materializedFixture(outputRoot, proof.admission!, proof.executionToolchain);
+
+    const attempt = assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize: vi.fn(async () => materialized),
+        verifyToolchain: vi.fn(async () => undefined),
+        inspectSandboxReadiness: vi.fn(async () => stubReadySandbox()),
+        preflightSandbox: vi.fn(async () => undefined),
+        runSandbox: vi.fn(async (input: Parameters<typeof canonicalEvidenceFor>[1]) => (
+          // Trailing space after the canonical JSON: parses fine, but is not
+          // the canonical byte form -- a distinct defect class from not-json.
+          processResult(`${canonicalCccPrdJson(canonicalEvidenceFor(proof.id, input, true))} \n`)
+        )),
+      },
+    );
+
+    await expect(attempt).rejects.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
+    await expect(attempt).rejects.toThrow(/not-canonical-json/);
+  });
+
+  it("throws a distinct sandbox-unavailable error, never the nonconforming code, and never runs the verifier when the sandbox is not ready", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task"] });
+    const materialize = vi.fn();
+    const verifyToolchain = vi.fn();
+    const preflightSandbox = vi.fn();
+    const runSandbox = vi.fn();
+    const notReadySandbox = {
+      ready: false as const,
+      backend: null,
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: "semantic-proof sandbox backend is unavailable on linux",
+      trustedPaths: [] as readonly string[],
+      detail: "no Linux (or other non-Darwin) backend exists yet",
+    };
+
+    const attempt = assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize,
+        verifyToolchain,
+        inspectSandboxReadiness: vi.fn(async () => notReadySandbox),
+        preflightSandbox,
+        runSandbox,
+      },
+    );
+
+    await expect(attempt).rejects.toBeInstanceOf(CccCampaignSemanticProofSandboxUnavailableError);
+    await expect(attempt).rejects.not.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
+    await expect(attempt).rejects.toMatchObject({ code: CCC_CAMPAIGN_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE });
+    await expect(attempt).rejects.toThrow(/CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE/);
+    expect(materialize).not.toHaveBeenCalled();
+    expect(verifyToolchain).not.toHaveBeenCalled();
+    expect(preflightSandbox).not.toHaveBeenCalled();
+    expect(runSandbox).not.toHaveBeenCalled();
   });
 });
