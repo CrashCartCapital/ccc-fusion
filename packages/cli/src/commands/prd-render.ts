@@ -282,6 +282,11 @@ function payloadLines(value: unknown): string[] {
       return campaignControlLines(payload, "Campaign resumed");
     case "campaign-stopped":
       return campaignControlLines(payload, "Campaign stopped");
+    case "campaign-closed-after-terminal-failure":
+      return campaignControlLines(
+        payload,
+        "Campaign closed after terminal failure",
+      );
     case "proof-resolution-preview":
       return resolutionPreviewLines(payload, "Proof resolution preview");
     case "provider-resolution-preview":

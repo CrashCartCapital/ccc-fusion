@@ -21,6 +21,7 @@ function plan(
 ): CccPrdCampaignDriftStopPlan {
   return {
     schema: "ccc-prd.campaign-drift-stop-plan.v1",
+    kind: "cancel",
     projectId: "project-1",
     importId: "import-1",
     idempotencyKey: "ccc-gate3-quant-engine-l12-20260903",
@@ -34,6 +35,8 @@ function plan(
       kind: "task",
       state: "runnable",
       attempt: 2,
+      lastError: null,
+      blockedReason: null,
     },
     taskIds: ["KB-005", "KB-006"],
     ...overrides,
@@ -286,6 +289,84 @@ describe("closing a drifted CCC campaign", () => {
     expect((rejection as CccCampaignDriftStopError).code)
       .toBe("CCC_CAMPAIGN_DRIFT_STOP_IMPORT_CLOSE_FAILED");
     expect(calls).toEqual([]);
+  });
+
+  it("RED-L23-d: wraps a failed work-item transition instead of leaving it unhandled", async () => {
+    // Followup section 1: the import row is already durably closed by this
+    // point (markImportStopped succeeded), so an unhandled rejection here
+    // would surface as a raw store error with no code an operator or CLI can
+    // key off, and no hint that a re-run is what finishes the close.
+    markImportStopped.mockReset().mockResolvedValue(undefined);
+    const { store, calls } = recordingStore();
+    (store.transitionWorkflowWorkItem as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(
+        new Error("optimistic concurrency conflict: work item advanced"),
+      );
+    const current = plan();
+
+    const rejection = await applyCccCampaignDriftStop({
+      plan: current,
+      reason: "campaign manifest drift blocks every ordinary control",
+      confirmation: computeCccCampaignDriftStopConfirmation(current),
+      store: store as never,
+      layer,
+    }).catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(CccCampaignDriftStopError);
+    expect((rejection as CccCampaignDriftStopError).code)
+      .toBe("CCC_CAMPAIGN_DRIFT_STOP_WORK_ITEM_TRANSITION_FAILED");
+    expect((rejection as CccCampaignDriftStopError).message)
+      .toContain("Re-run stop-drifted");
+    expect((rejection as CccCampaignDriftStopError).safeState).toMatchObject({
+      workItemId: "work-1",
+      workItemState: "runnable",
+    });
+    // The import row write already happened (that is what this error is
+    // reporting around); no task pause was attempted after the failed
+    // transition.
+    expect(markImportStopped).toHaveBeenCalledTimes(1);
+    expect(store.transitionWorkflowWorkItem).toHaveBeenCalledTimes(1);
+    expect(store.pauseTask).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it("RED-L23-b: a close-out plan writes only the import row, preserving the work item verbatim", async () => {
+    markImportStopped.mockReset().mockResolvedValue(undefined);
+    const { store, calls, forbidden } = recordingStore();
+    const originalFailure = "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN";
+    const closeOutPlan = plan({
+      kind: "close-out",
+      workItem: {
+        id: "work-1",
+        runId: "ccc-prd:import-1",
+        stableWorkflowRunId: "ccc-prd:import-1",
+        kind: "task",
+        state: "failed",
+        attempt: 2,
+        lastError: originalFailure,
+        blockedReason: originalFailure,
+      },
+    });
+
+    const result = await applyCccCampaignDriftStop({
+      plan: closeOutPlan,
+      reason: "campaign manifest drift blocks every ordinary control",
+      confirmation: computeCccCampaignDriftStopConfirmation(closeOutPlan),
+      store: store as never,
+      layer,
+    });
+
+    expect(result.workItemWritten).toBe(false);
+    expect(result.workItemState).toBe("failed");
+    // No workflow write, no task pause -- only the import row closes.
+    expect(calls).toEqual([]);
+    for (const method of forbidden) {
+      expect(store[method]).not.toHaveBeenCalled();
+    }
+    expect(markImportStopped).toHaveBeenCalledTimes(1);
+    const [importCall] = markImportStopped.mock.calls;
+    expect(String((importCall![0] as { stoppedReason: string }).stoppedReason))
+      .toContain(originalFailure);
   });
 
   it("RED-L16-b: a confirmation cannot be replayed across campaigns", () => {

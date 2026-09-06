@@ -2572,6 +2572,293 @@ describe("prd command exit contract", () => {
     });
   });
 
+  it("RED-L23-a: reports a distinct receipt kind when stop closes an already-terminal workflow", async () => {
+    const confirmation = "8".repeat(64);
+    const reason = "Operator closes this campaign after its proof was proved failed.";
+    const workItem = {
+      id: "work-item-1",
+      runId: "ccc-prd:import-1",
+      taskId: "FN-1",
+      nodeId: "node-entry",
+      kind: "task",
+      state: "failed",
+      attempt: 2,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastError: "ccc-proof-failed:PROOF-1",
+      blockedReason: "ccc-proof-failed:PROOF-1",
+      stableWorkflowRunId: "ccc-prd:import-1",
+    };
+    const before = {
+      schema: "ccc-prd.product-status.v1",
+      projectId: "project-1",
+      import: {
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        targetRepository: "/tmp/product-target",
+        targetBase: "d".repeat(40),
+        state: "active",
+        runnable: true,
+      },
+      tasks: [{
+        semanticTaskId: "TASK-1",
+        nativeTaskId: "FN-1",
+        present: true,
+      }],
+      workItems: [workItem],
+      proofs: [],
+      orphanProofAttempts: [],
+      approvals: [],
+      landing: { intents: [], terminals: [] },
+      nextAction: { kind: "blocked", reason: "Workflow work item work-item-1 ended as failed." },
+    };
+    const layer = {};
+    const context = {
+      projectId: "project-1",
+      projectPath: "/tmp/product-target",
+      projectName: "Fixture",
+      isRegistered: true,
+      store: {
+        getAsyncLayer: () => layer,
+        transitionWorkflowWorkItem: vi.fn(),
+        pauseTask: vi.fn(),
+      },
+    };
+    const applyControl = vi.fn(async () => ({
+      action: "stop",
+      workItemId: "work-item-1",
+      workItemState: "failed",
+      taskIds: ["FN-1"],
+      unresolvedEffectsPreserved: true,
+      closedAfterTerminalFailure: true,
+    }));
+    const inspectStatus = vi.fn()
+      .mockResolvedValueOnce(before)
+      .mockResolvedValueOnce(before);
+    const output: string[] = [];
+
+    expect(await runPrdJson(
+      ["stop", "operator-key", "--reason", reason, "--confirm", confirmation],
+      { write: (line) => output.push(line) },
+      {
+        resolveProject: vi.fn(async () => context),
+        closeProjectStore: vi.fn(async () => undefined),
+        inspectCccPrdProductStatus: inspectStatus,
+        computeCccCampaignOperatorControlConfirmation: vi.fn(() => confirmation),
+        applyCccCampaignOperatorControl: applyControl,
+        describeCccCampaignOperatorControls: vi.fn(() => []),
+      },
+      { projectName: "fixture" },
+    )).toBe(0);
+
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "campaign-closed-after-terminal-failure",
+      result: {
+        workItemState: "failed",
+        closedAfterTerminalFailure: true,
+      },
+    });
+  });
+
+  describe("RED-L23-f: stop-drifted argument parsing", () => {
+    // Followup section 2: `runCampaignDriftStopCommand`'s positional
+    // --reason/--confirm checks, hex digest regex, and plan-vs-apply branch
+    // had no direct test; coverage existed only at the engine/core layer.
+    function driftStopPlan() {
+      return {
+        schema: "ccc-prd.campaign-drift-stop-plan.v1",
+        kind: "cancel",
+        projectId: "project-1",
+        importId: "import-1",
+        idempotencyKey: "operator-key",
+        importState: "active",
+        targetRepository: "/tmp/product-target",
+        driftReason: "campaign manifest drift",
+        workItem: {
+          id: "work-item-1",
+          runId: "ccc-prd:import-1",
+          stableWorkflowRunId: "ccc-prd:import-1",
+          kind: "task",
+          state: "runnable",
+          attempt: 2,
+          lastError: null,
+          blockedReason: null,
+        },
+        taskIds: ["FN-1"],
+      };
+    }
+
+    function driftStopContext() {
+      const layer = {};
+      return {
+        projectId: "project-1",
+        projectPath: "/tmp/product-target",
+        projectName: "Fixture",
+        isRegistered: true,
+        store: {
+          getAsyncLayer: () => layer,
+          transitionWorkflowWorkItem: vi.fn(),
+          pauseTask: vi.fn(),
+        },
+      };
+    }
+
+    it.each([
+      ["missing idempotency key", ["stop-drifted"]],
+      [
+        "reason flag misspelled",
+        ["stop-drifted", "operator-key", "--reasons", "x".repeat(20), "--confirm", "a".repeat(64)],
+      ],
+      [
+        "confirm flag missing",
+        ["stop-drifted", "operator-key", "--reason", "x".repeat(20)],
+      ],
+      [
+        "confirmation not 64 lowercase hex",
+        ["stop-drifted", "operator-key", "--reason", "x".repeat(20), "--confirm", "NOT-HEX"],
+      ],
+      [
+        "reason shorter than 10 characters",
+        ["stop-drifted", "operator-key", "--reason", "short", "--confirm", "a".repeat(64)],
+      ],
+      [
+        "reason not trimmed",
+        ["stop-drifted", "operator-key", "--reason", " padded reason text ", "--confirm", "a".repeat(64)],
+      ],
+      [
+        "extra trailing argument",
+        [
+          "stop-drifted",
+          "operator-key",
+          "--reason",
+          "x".repeat(20),
+          "--confirm",
+          "a".repeat(64),
+          "--extra",
+        ],
+      ],
+    ])("returns usage and exit 2 for %s", async (_label, args) => {
+      const output: string[] = [];
+      const resolveProject = vi.fn();
+
+      expect(await runPrdJson(
+        args,
+        { write: (line) => output.push(line) },
+        { resolveProject },
+        { projectName: "fixture" },
+      )).toBe(2);
+
+      expect(output[0]).toContain("fn prd stop-drifted <idempotency-key>");
+      expect(resolveProject).not.toHaveBeenCalled();
+    });
+
+    it("plans without applying when no --reason/--confirm are given", async () => {
+      const plan = driftStopPlan();
+      const planFn = vi.fn(async () => plan);
+      const computeConfirmation = vi.fn(() => "b".repeat(64));
+      const applyFn = vi.fn();
+      const context = driftStopContext();
+      const output: string[] = [];
+
+      expect(await runPrdJson(
+        ["stop-drifted", "operator-key"],
+        { write: (line) => output.push(line) },
+        {
+          resolveProject: vi.fn(async () => context),
+          closeProjectStore: vi.fn(async () => undefined),
+          planCccPrdCampaignDriftStop: planFn,
+          computeCccCampaignDriftStopConfirmation: computeConfirmation,
+          applyCccCampaignDriftStop: applyFn,
+        },
+        { projectName: "fixture" },
+      )).toBe(0);
+
+      expect(planFn).toHaveBeenCalledWith({
+        layer: context.store.getAsyncLayer(),
+        rootDir: context.projectPath,
+        idempotencyKey: "operator-key",
+      });
+      expect(computeConfirmation).toHaveBeenCalledWith(plan);
+      expect(applyFn).not.toHaveBeenCalled();
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        kind: "campaign-drift-stop-plan",
+        found: true,
+        plan,
+        confirmation: "b".repeat(64),
+      });
+    });
+
+    it("reports not found without calling the confirmation or apply path", async () => {
+      const planFn = vi.fn(async () => null);
+      const computeConfirmation = vi.fn();
+      const context = driftStopContext();
+      const output: string[] = [];
+
+      expect(await runPrdJson(
+        ["stop-drifted", "operator-key"],
+        { write: (line) => output.push(line) },
+        {
+          resolveProject: vi.fn(async () => context),
+          closeProjectStore: vi.fn(async () => undefined),
+          planCccPrdCampaignDriftStop: planFn,
+          computeCccCampaignDriftStopConfirmation: computeConfirmation,
+        },
+        { projectName: "fixture" },
+      )).toBe(1);
+
+      expect(computeConfirmation).not.toHaveBeenCalled();
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        kind: "campaign-drift-stop-plan",
+        found: false,
+        idempotencyKey: "operator-key",
+      });
+    });
+
+    it("applies the close only with a fresh plan, an explicit reason, and a matching confirmation", async () => {
+      const plan = driftStopPlan();
+      const confirmation = "c".repeat(64);
+      const reason = "Operator closes this drifted campaign after review.";
+      const planFn = vi.fn(async () => plan);
+      const result = {
+        workItemId: "work-item-1",
+        workItemState: "cancelled",
+        workItemWritten: true,
+        taskIds: ["FN-1"],
+        driftReason: "campaign manifest drift",
+        stoppedReason: `${reason} | custody-drift: campaign manifest drift`,
+        unresolvedEffectsPreserved: true,
+      };
+      const applyFn = vi.fn(async () => result);
+      const context = driftStopContext();
+      const output: string[] = [];
+
+      expect(await runPrdJson(
+        ["stop-drifted", "operator-key", "--reason", reason, "--confirm", confirmation],
+        { write: (line) => output.push(line) },
+        {
+          resolveProject: vi.fn(async () => context),
+          closeProjectStore: vi.fn(async () => undefined),
+          planCccPrdCampaignDriftStop: planFn,
+          applyCccCampaignDriftStop: applyFn,
+        },
+        { projectName: "fixture" },
+      )).toBe(0);
+
+      expect(applyFn).toHaveBeenCalledWith({
+        plan,
+        reason,
+        confirmation,
+        store: context.store,
+        layer: context.store.getAsyncLayer(),
+      });
+      expect(JSON.parse(output[0]!)).toMatchObject({
+        kind: "campaign-drift-stopped",
+        result,
+        plan,
+      });
+    });
+  });
+
   it("previews and settles one uncertain proof before requeueing its exact work item", async () => {
     const packet = createPacketRoot();
     const evidencePath = join(packet.root, "proof-resolution.json");

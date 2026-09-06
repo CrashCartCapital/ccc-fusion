@@ -2664,7 +2664,11 @@ async function runCampaignLifecycleCommand(
         ? "campaign-paused"
         : exactAction === "resume"
           ? "campaign-resumed"
-          : "campaign-stopped",
+          // A closed-after-terminal-failure stop never wrote the workflow, so
+          // the receipt says so rather than claiming an ordinary cancel.
+          : result.closedAfterTerminalFailure
+            ? "campaign-closed-after-terminal-failure"
+            : "campaign-stopped",
       result,
       status: completedStatus,
       operatorControls: describeControls(completedStatus),
