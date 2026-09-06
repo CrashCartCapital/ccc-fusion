@@ -311,7 +311,24 @@ export async function loadCccCampaignContextForTask(
   taskId: string,
   tx?: DbTransaction,
   lockForUpdate = false,
+  /**
+   * Read-only escape hatch for a caller that is only ever listing history,
+   * never leasing or writing: tolerates an import that is not
+   * `active`/`runnable` (most commonly a campaign `stop` already closed) so a
+   * status read of a closed campaign does not have to re-derive the fact that
+   * it is closed through a refusal. Every other structural check below still
+   * runs -- a row whose custody is genuinely corrupt or inconsistent still
+   * throws. Never combine with `lockForUpdate`: locking a row for update
+   * means a caller is about to write through this context, and a closed
+   * import must keep refusing every write path.
+   */
+  allowNonRunnable = false,
 ): Promise<CccCampaignTaskContext | null> {
+  if (allowNonRunnable && lockForUpdate) {
+    throw new CccCampaignContextError(
+      `Task ${taskId} CCC campaign context requested a locked read with the read-only non-runnable allowance; this combination is never valid`,
+    );
+  }
   const projectId = projectIdFor(layer);
   const query = tx ?? layer.db;
   const selection = query
@@ -376,7 +393,7 @@ export async function loadCccCampaignContextForTask(
   }
 
   const row = rows[0]!;
-  if (row.state !== "active" || row.runnable !== 1) {
+  if ((row.state !== "active" || row.runnable !== 1) && !allowNonRunnable) {
     throw new CccCampaignContextError(
       `Task ${taskId} belongs to a non-runnable CCC campaign import`,
     );
