@@ -119,6 +119,82 @@ pgDescribe("closing a drifted CCC campaign against a real database", () => {
     `);
   }
 
+  /**
+   * A terminal-with-failure work item that still carries a live runtime
+   * lease -- not a state the workflow runtime should ever actually leave
+   * behind, but the close-out guard must refuse it defensively rather than
+   * assume the invariant always holds.
+   */
+  async function forceWorkItemFailedLeased(
+    key: string,
+    reason: string,
+  ): Promise<void> {
+    await h.layer().db.execute(drizzleSql`
+      UPDATE project.workflow_work_items
+      SET state = 'failed', last_error = ${reason}, blocked_reason = ${reason},
+        lease_owner = 'stale-runtime-owner',
+        lease_expires_at = '2099-01-01T00:00:00.000Z'
+      WHERE run_id = (
+        SELECT 'ccc-prd:' || import_id FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+      )
+    `);
+  }
+
+  /**
+   * Duplicates the one workflow work item so the run has two, ambiguously.
+   * The duplicate is forced to `failed` rather than copying the original's
+   * state: `idx_workflow_work_items_one_active_task_continuation` allows only
+   * one row per task in an active state (`runnable`, `running`, `held`,
+   * `retrying`), and this helper must not depend on which active state the
+   * original happens to hold.
+   */
+  async function duplicateWorkItem(key: string): Promise<void> {
+    await h.layer().db.execute(drizzleSql`
+      INSERT INTO project.workflow_work_items (
+        project_id, id, run_id, task_id, node_id, kind, state, attempt,
+        retry_after, lease_owner, lease_expires_at, last_error, blocked_reason,
+        stable_workflow_run_id, continuation_sequence, wait_reason,
+        source_column, target_column, ir_hash, created_at, updated_at
+      )
+      SELECT
+        project_id, id || '-dup', run_id, task_id, node_id || '-dup', kind,
+        'failed', attempt, retry_after, NULL, NULL, last_error,
+        blocked_reason, stable_workflow_run_id, continuation_sequence,
+        wait_reason, source_column, target_column, ir_hash, created_at,
+        updated_at
+      FROM project.workflow_work_items
+      WHERE run_id = (
+        SELECT 'ccc-prd:' || import_id FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+      )
+    `);
+  }
+
+  /** Removes the one workflow work item entirely. */
+  async function deleteWorkItem(key: string): Promise<void> {
+    await h.layer().db.execute(drizzleSql`
+      DELETE FROM project.workflow_work_items
+      WHERE run_id = (
+        SELECT 'ccc-prd:' || import_id FROM project.ccc_prd_imports
+        WHERE idempotency_key = ${key}
+      )
+    `);
+  }
+
+  /** Forces the import row itself to a bare `stopped` state, without going
+   * through a real close -- reproducing an already-stopped import for the
+   * resumed-plan tests without depending on `applyCccCampaignDriftStop`. */
+  async function forceImportStopped(key: string): Promise<void> {
+    await h.layer().db.execute(drizzleSql`
+      UPDATE project.ccc_prd_imports
+      SET state = 'stopped', runnable = 0,
+        last_error = 'ccc-operator:campaign-stopped:' || repeat('a', 64)
+          || ' forced stopped for a resumed-plan test'
+      WHERE idempotency_key = ${key}
+    `);
+  }
+
   it("RED-L18-blocker: writes the terminal state the check constraint must allow", async () => {
     const key = "drift-stop-terminal";
     await importedCampaign(key);
@@ -383,5 +459,95 @@ pgDescribe("closing a drifted CCC campaign against a real database", () => {
     // attempt.
     const item = await workItemRow(key);
     expect(item.state).toBe("failed");
+  });
+
+  /*
+   * Review finding: a campaign whose custody still reconstructs must never
+   * be closeable through `stop-drifted`, even when its work item has already
+   * ended in failure. That campaign can always reach `fn prd stop`, which has
+   * its own close-out path for exactly this state; `stop-drifted` exists only
+   * for a campaign no ordinary control can reach.
+   */
+  it("RED-review-1: refuses a non-drifted campaign's already-failed work item; that belongs to fn prd stop, not stop-drifted", async () => {
+    const key = "drift-stop-intact-terminal";
+    await importedCampaign(key);
+    // Deliberately no driftTheStoredManifest(key): custody stays intact.
+    await forceWorkItemFailed(key, "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN");
+
+    const refusal = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    }).catch((error: unknown) => error);
+
+    expect((refusal as CccPrdImportError).code)
+      .toBe("CCC_PRD_CAMPAIGN_CUSTODY_INTACT");
+    // Nothing was touched: the campaign is exactly as fn prd stop would find it.
+    const row = await importRow(key);
+    expect(row.state).toBe("active");
+    expect(Number(row.runnable)).toBe(1);
+    const item = await workItemRow(key);
+    expect(item.state).toBe("failed");
+  });
+
+  it("RED-review-2: refuses a close-out through stop-drifted when the terminal work item still carries a live lease", async () => {
+    const key = "drift-stop-closeout-leased";
+    await importedCampaign(key);
+    await driftTheStoredManifest(key);
+    await forceWorkItemFailedLeased(
+      key,
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_DISPATCH_UNKNOWN",
+    );
+
+    const refusal = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    }).catch((error: unknown) => error);
+
+    expect((refusal as CccPrdImportError).code)
+      .toBe("CCC_PRD_CAMPAIGN_DRIFT_STOP_LEASED");
+    // Nothing was closed: the import is still exactly as it was.
+    const row = await importRow(key);
+    expect(row.state).toBe("active");
+    expect(Number(row.runnable)).toBe(1);
+  });
+
+  /*
+   * Review finding: resumedDriftStopPlan used to collapse "no work item",
+   * "more than one work item", and "one, already terminal" into the same
+   * CCC_PRD_IMPORT_STOPPED refusal. Ambiguity is a distinct, more serious
+   * problem than a fully closed campaign, and must not be reported as one.
+   */
+  it("RED-review-3: a resumed plan refuses distinctly when the stopped import's work items are ambiguous", async () => {
+    const key = "drift-stop-resume-ambiguous";
+    await importedCampaign(key);
+    await duplicateWorkItem(key);
+    await forceImportStopped(key);
+
+    const refusal = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    }).catch((error: unknown) => error);
+
+    expect((refusal as CccPrdImportError).code)
+      .toBe("CCC_PRD_CAMPAIGN_DRIFT_STOP_WORK_ITEM_AMBIGUOUS");
+  });
+
+  it("RED-review-4: a resumed plan refuses distinctly when the stopped import has no work item at all", async () => {
+    const key = "drift-stop-resume-missing";
+    await importedCampaign(key);
+    await deleteWorkItem(key);
+    await forceImportStopped(key);
+
+    const refusal = await planCccPrdCampaignDriftStop({
+      layer: h.layer(),
+      rootDir: h.rootDir(),
+      idempotencyKey: key,
+    }).catch((error: unknown) => error);
+
+    expect((refusal as CccPrdImportError).code)
+      .toBe("CCC_PRD_CAMPAIGN_DRIFT_STOP_WORK_ITEM_AMBIGUOUS");
   });
 });

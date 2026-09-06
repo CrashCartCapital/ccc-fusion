@@ -686,3 +686,31 @@ describe("rendering resilience", () => {
     expect(() => renderOperatorPayload("plain")).not.toThrow();
   });
 });
+
+describe("RED-review: campaign-closed-after-terminal-failure rendering", () => {
+  it("renders a structured heading and result, not the unknown-payload fallback", () => {
+    const payload = {
+      kind: "campaign-closed-after-terminal-failure",
+      result: {
+        action: "stop",
+        workItemId: "work-1",
+        workItemState: "failed",
+        taskIds: ["FN-1"],
+        unresolvedEffectsPreserved: true,
+        closedAfterTerminalFailure: true,
+      },
+      status: mergeHoldStatus().status,
+      operatorControls: [],
+    };
+
+    const lines = renderOperatorPayload(payload);
+    const rendered = lines.join("\n");
+
+    expect(lines[0]).toBe("Campaign closed after terminal failure");
+    expect(rendered).toContain("failed");
+    // Not the generic fallback used for a payload kind this module does not
+    // recognize.
+    expect(rendered).not.toContain("Operator payload (");
+    expect(jsonObjectLines(lines)).toEqual([]);
+  });
+});

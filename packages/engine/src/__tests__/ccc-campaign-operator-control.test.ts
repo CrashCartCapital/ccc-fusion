@@ -627,4 +627,33 @@ describe("CCC campaign operator lifecycle controls", () => {
       code: "CCC_CAMPAIGN_OPERATOR_CONTROL_IMPORT_CLOSE_FAILED",
     });
   });
+
+  /*
+   * Review finding (item 2, second entry point): the close-out guard must
+   * refuse a live runtime lease, not just custody mismatches. `stop`'s
+   * lease check already runs before any state-specific disposition (see
+   * "refuses pause, resume, or stop while runtime lease custody is live"
+   * above, which only exercises it via `running`); this locks the same
+   * refusal in for a `failed` work item that still carries a lease -- a
+   * state the runtime should never actually leave behind, but the guard
+   * must not assume that invariant holds.
+   */
+  it("RED-review: refuses to close-out a failed campaign that still carries a live runtime lease", async () => {
+    const leasedFailed = status("failed", {
+      leaseOwner: "stale-runtime-owner",
+      leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const taskStore = store();
+
+    await expect(applyCccCampaignOperatorControl({
+      action: "stop",
+      reason: "Operator closes this campaign after its proof was proved failed.",
+      status: leasedFailed,
+      store: taskStore,
+    })).rejects.toMatchObject({
+      code: "CCC_CAMPAIGN_OPERATOR_CONTROL_LEASED",
+    });
+    expect(markImportStopped).not.toHaveBeenCalled();
+    expect(taskStore.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+  });
 });

@@ -12,9 +12,7 @@ import { CCC_PRD_IMPORT_STOPPED_STATE } from "./importer.js";
 import { physicalCccPrdImportRoot } from "./import-admission.js";
 
 /**
- * Closing a campaign whose persisted custody no longer reconstructs, or whose
- * workflow work item has already ended terminally with no operator control
- * able to reach it.
+ * Closing a campaign whose persisted custody no longer reconstructs.
  *
  * `fn prd stop` asks for a fresh product status, and product status rebuilds
  * campaign custody from the stored manifest. A campaign imported by a copier
@@ -22,20 +20,19 @@ import { physicalCccPrdImportRoot } from "./import-admission.js";
  * one command it can never reach. The campaign then sits active forever and
  * every reconcile re-projects its task directories into the owner's repository.
  *
- * A second, narrower gap exists even without drift: the ordinary operator
- * control refuses `stop` once its one workflow work item has reached `failed`
- * or `cancelled` on its own (a proof that was proved failed, for instance),
- * because there is nothing left to cancel. The import row is then left
- * `active` forever with no control that will ever move it, even though
- * custody reconstructs perfectly well.
+ * This module reaches that campaign directly. It reads only columns the
+ * import row already holds and proves drift with the unchanged custody
+ * reconstruction, and refuses outright (`CCC_PRD_CAMPAIGN_CUSTODY_INTACT`)
+ * for any campaign whose custody still reconstructs -- whatever state its
+ * workflow work item is in. A campaign whose custody is intact can always
+ * reach `fn prd stop`, which handles its own separate gap: once that one
+ * workflow work item has reached `failed` or `cancelled` on its own (a proof
+ * that was proved failed, for instance), there is nothing left to cancel, so
+ * the ordinary stop control closes the import instead of refusing it.
  *
- * This module handles both. It reads only columns the import row already
- * holds, proves drift with the unchanged custody reconstruction when relevant,
- * and refuses outright for any campaign whose custody is intact AND whose
- * workflow work item is not already terminal. It never disposes a worktree,
- * deletes a branch, resolves an approval, or closes an execution
- * authorization; every unresolved effect is left exactly where the operator
- * can still inspect it.
+ * This module never disposes a worktree, deletes a branch, resolves an
+ * approval, or closes an execution authorization; every unresolved effect is
+ * left exactly where the operator can still inspect it.
  */
 
 export const CCC_PRD_CAMPAIGN_DRIFT_STOP_PLAN_SCHEMA =
@@ -251,9 +248,13 @@ async function taskIdsForImport(
  * cancelled. Re-running `stop-drifted` must finish that cancel rather than
  * refuse outright, or the campaign is permanently half-closed.
  *
- * Returns null (via the outer refusal) when there is nothing left to finish:
- * no work item, more than one, or one that already reached its own terminal
- * state. Both are treated as fully closed already.
+ * Three distinct outcomes, not one collapsed refusal: zero or more than one
+ * matching work item is `CCC_PRD_CAMPAIGN_DRIFT_STOP_WORK_ITEM_AMBIGUOUS` --
+ * the same custody ambiguity a fresh plan refuses, and never mistaken for a
+ * closed campaign. Exactly one work item that already reached its own
+ * terminal state is `CCC_PRD_IMPORT_STOPPED`: the campaign is fully closed
+ * already, and this refusal is idempotent. Only a single non-terminal work
+ * item has anything left to finish.
  */
 async function resumedDriftStopPlan(
   tx: DbTransaction,
@@ -269,8 +270,14 @@ async function resumedDriftStopPlan(
       eq(schema.project.workflowWorkItems.projectId, projectId),
       eq(schema.project.workflowWorkItems.runId, runId),
     ));
-  const workItem = workItems[0];
-  if (!workItem || workItems.length !== 1 || TERMINAL_WORK_ITEM_STATES.has(workItem.state)) {
+  if (workItems.length !== 1) {
+    throw new CccPrdImportError(
+      "CCC_PRD_CAMPAIGN_DRIFT_STOP_WORK_ITEM_AMBIGUOUS",
+      `Closing a drifted campaign requires exactly one imported workflow work item for ${runId}; found ${workItems.length}.`,
+    );
+  }
+  const workItem = workItems[0]!;
+  if (TERMINAL_WORK_ITEM_STATES.has(workItem.state)) {
     throw new CccPrdImportError(
       "CCC_PRD_IMPORT_STOPPED",
       `CCC PRD import ${JSON.stringify(idempotencyKey)} is already terminally stopped`,
@@ -346,6 +353,16 @@ export async function planCccPrdCampaignDriftStop(
     const drift = inspectCccCampaignCustodyDrift(
       row as unknown as CccCampaignCustodyRecord,
     );
+    if (!drift.drifted) {
+      // Intact custody means the ordinary operator control can build a full
+      // product status and reach every one of its own checks -- terminal
+      // work item or not. This path exists only for a campaign that control
+      // can never reach.
+      throw new CccPrdImportError(
+        "CCC_PRD_CAMPAIGN_CUSTODY_INTACT",
+        `CCC PRD import ${JSON.stringify(input.idempotencyKey)} reconstructs its campaign custody; stop it through the ordinary operator control instead`,
+      );
+    }
 
     const taskIds = await taskIdsForImport(tx, projectId, row.importId);
 
@@ -365,18 +382,19 @@ export async function planCccPrdCampaignDriftStop(
     }
     const workItem = workItems[0]!;
 
-    if (!drift.drifted && !CLOSE_OUT_ELIGIBLE_STATES.has(workItem.state)) {
-      throw new CccPrdImportError(
-        "CCC_PRD_CAMPAIGN_CUSTODY_INTACT",
-        `CCC PRD import ${JSON.stringify(input.idempotencyKey)} reconstructs its campaign custody; stop it through the ordinary operator control instead`,
-      );
-    }
-
     if (CLOSE_OUT_ELIGIBLE_STATES.has(workItem.state)) {
-      // Nothing to cancel: the workflow already ended on its own. Only match
-      // custody -- the terminal and lease guards below do not apply to a work
-      // item this path will never write.
+      // Drifted custody AND a work item that already ended on its own: there
+      // is nothing to cancel, and no ordinary control can ever reach this
+      // campaign. Match custody and confirm no runtime lease remains -- the
+      // terminal check below does not apply to a work item this path will
+      // never write.
       assertCccPrdCampaignDriftStopWorkItemCustody(workItem, runId);
+      if (workItem.leaseOwner !== null || workItem.leaseExpiresAt !== null) {
+        throw new CccPrdImportError(
+          "CCC_PRD_CAMPAIGN_DRIFT_STOP_LEASED",
+          `Workflow work item ${workItem.id} still has runtime lease custody; wait for the next unleased safe boundary.`,
+        );
+      }
       return {
         schema: CCC_PRD_CAMPAIGN_DRIFT_STOP_PLAN_SCHEMA,
         kind: "close-out",
@@ -385,9 +403,7 @@ export async function planCccPrdCampaignDriftStop(
         idempotencyKey: row.idempotencyKey,
         importState: row.state,
         targetRepository: row.targetRepository,
-        driftReason: drift.drifted
-          ? drift.reason
-          : `workflow work item ${workItem.id} already ended as ${workItem.state}`,
+        driftReason: drift.reason,
         workItem: {
           id: workItem.id,
           runId: workItem.runId,
@@ -403,14 +419,6 @@ export async function planCccPrdCampaignDriftStop(
     }
 
     assertCccPrdCampaignDriftStopWorkItem(workItem, runId);
-    // Reaching here with intact custody is impossible: the guard above
-    // already refused any non-close-out-eligible state under intact custody.
-    if (!drift.drifted) {
-      throw new CccPrdImportError(
-        "CCC_PRD_CAMPAIGN_CUSTODY_INTACT",
-        `CCC PRD import ${JSON.stringify(input.idempotencyKey)} reconstructs its campaign custody; stop it through the ordinary operator control instead`,
-      );
-    }
 
     return {
       schema: CCC_PRD_CAMPAIGN_DRIFT_STOP_PLAN_SCHEMA,
