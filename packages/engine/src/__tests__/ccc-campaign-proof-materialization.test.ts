@@ -30,6 +30,7 @@ import {
   EXECUTABLE_PROBE_TIMEOUT_MS,
   inspectCccSemanticProofExecutable,
   inspectCccSemanticProofLinkedRuntime,
+  resolveWithinCccSemanticProofRoot,
   verifyCccSemanticProofToolchainBeforeSpawn,
 } from "../ccc-campaign-proof-materialization.js";
 import { runCccSemanticProofSandboxedProcess } from "../ccc-campaign-proof-sandbox.js";
@@ -660,6 +661,26 @@ describe("CCC semantic-proof admission and materialization", () => {
       modelWriteRoots: ["src"],
       outputRoot,
     })).rejects.toThrow(/is missing, non-regular, or ambiguous/);
+  });
+
+  it("RED-L27-preflight-directory-closure: the shared isolated-root guard rejects an absolute or escaping directory path", () => {
+    // The production route (candidateInputs -> canonicalRelativePath) can never
+    // hand the missing-candidate-directory loop a bad path: canonicalRelativePath
+    // already refuses absolute paths and ".."-segments before the loop sees it.
+    // Exercise the shared containment guard directly instead, with the exact
+    // label the directory loop passes it, so this can never silently pass just
+    // because canonicalRelativePath happened to filter the input upstream.
+    const root = "/tmp/ccc-semantic-proof-root-fixture";
+    expect(() => resolveWithinCccSemanticProofRoot(root, "/etc/passwd", "directory materialization"))
+      .toThrow(/CCC semantic-proof directory materialization escaped its isolated root/);
+    expect(() => resolveWithinCccSemanticProofRoot(root, "../escape", "directory materialization"))
+      .toThrow(/CCC semantic-proof directory materialization escaped its isolated root/);
+    expect(() => resolveWithinCccSemanticProofRoot(root, "..", "directory materialization"))
+      .toThrow(/CCC semantic-proof directory materialization escaped its isolated root/);
+    // Positive control: a genuine nested directory resolves inside root and
+    // does not throw, proving the guard doesn't just reject everything.
+    expect(resolveWithinCccSemanticProofRoot(root, "src/qe_evidence", "directory materialization"))
+      .toBe(join(root, "src", "qe_evidence"));
   });
 
   it("RED-S5-closure-git-custody: refuses verifier closure inside a model-owned root", async () => {

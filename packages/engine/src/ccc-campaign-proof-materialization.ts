@@ -807,16 +807,28 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
   }
 }
 
+/**
+ * Resolves `path` against `root` and asserts the result never escapes `root`
+ * -- via an absolute path, a `..`-climbing relative path, or (on Windows) a
+ * drive-relative path that `relative()` reports as already-absolute. Shared
+ * by every caller that writes into or creates directories under an isolated
+ * proof root, so the containment check cannot drift between them.
+ */
+export function resolveWithinCccSemanticProofRoot(root: string, path: string, label: string): string {
+  const destination = resolve(root, path);
+  const fromRoot = relative(root, destination);
+  if (fromRoot.startsWith(`..${sep}`) || fromRoot === ".." || isAbsolute(fromRoot)) {
+    throw new Error(`CCC semantic-proof ${label} escaped its isolated root`);
+  }
+  return destination;
+}
+
 async function materialize(
   root: string,
   path: string,
   bytes: Buffer,
 ): Promise<void> {
-  const destination = resolve(root, path);
-  const fromRoot = relative(root, destination);
-  if (fromRoot.startsWith(`..${sep}`) || fromRoot === ".." || isAbsolute(fromRoot)) {
-    throw new Error("CCC semantic-proof materialization escaped its isolated root");
-  }
+  const destination = resolveWithinCccSemanticProofRoot(root, path, "materialization");
   await mkdir(dirname(destination), { recursive: true });
   await writeFile(destination, bytes, { flag: "wx", mode: 0o444 });
   await chmod(destination, 0o444);
@@ -1850,12 +1862,9 @@ export async function admitAndMaterializeCccSemanticProof(
   await chmod(join(proofRoot, SEALED_OPENSSL_CONF), 0o444);
   for (const item of closure) await materialize(proofRoot, item.entry.path, item.bytes);
   for (const item of candidates) await materialize(proofRoot, item.path, item.bytes);
-  // path is already a canonicalRelativePath (no "..", not absolute), and
-  // dirname() of a canonical relative path cannot escape proofRoot, so no
-  // separate isolated-root check is needed here (unlike materialize(), which
-  // guards a caller-controlled destination file path).
   for (const directory of missingCandidateDirectories) {
-    await mkdir(resolve(proofRoot, directory), { recursive: true });
+    const target = resolveWithinCccSemanticProofRoot(proofRoot, directory, "directory materialization");
+    await mkdir(target, { recursive: true });
   }
   const observedLinkedRuntime = await inspectCccSemanticProofLinkedRuntime(input.proof.executionToolchain);
   if (
