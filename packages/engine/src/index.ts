@@ -342,6 +342,13 @@ export {
   type RunCccSemanticProofSandboxedProcessInput,
 } from "./ccc-campaign-proof-sandbox.js";
 export {
+  CCC_PRD_PROOF_VERIFIER_NONCONFORMING,
+  CccPrdProofVerifierNonconformingError,
+  assertCccSemanticProofVerifierConformance,
+  type CccSemanticProofVerifierPreflightDependencies,
+  type CccSemanticProofVerifierPreflightInput,
+} from "./ccc-campaign-proof-execution.js";
+export {
   createCccCampaignProofNodeAdmission,
   type CccCampaignProofNodeAdmission,
   type CccCampaignProofWorkflowStore,

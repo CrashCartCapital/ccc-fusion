@@ -170,6 +170,7 @@ export type PrdCommandDependencies = {
     targetRoot?: string;
   }) => CccPrdSemanticProofToolchainPaths;
   assertSemanticProofV2Custody?: typeof assertCccPrdSemanticProofV2Custody;
+  assertSemanticProofVerifierConformance?: typeof engine.assertCccSemanticProofVerifierConformance;
   computeCccCampaignLiveExecutionApprovalConfirmation?: typeof engine.computeCccCampaignLiveExecutionApprovalConfirmation;
   computeCccCampaignMergeApprovalConfirmation?: typeof engine.computeCccCampaignMergeApprovalConfirmation;
   approveCccCampaignLiveExecution?: typeof engine.approveCccCampaignLiveExecution;
@@ -1905,6 +1906,10 @@ async function runProductPacketCommand(
       );
     }
     if (bundle.schema === "ccc-prd.bundle.v2") {
+      const modelWriteRoots = executionPolicy.routes.flatMap((route) => [
+        ...(route.ownedPaths ?? []),
+        ...(route.allowedWriteRoots ?? []),
+      ]);
       await (
         dependencies.assertSemanticProofV2Custody
         ?? assertCccPrdSemanticProofV2Custody
@@ -1912,11 +1917,21 @@ async function runProductPacketCommand(
         repositoryRoot: project.projectPath,
         baseCommit: bundle.targetRepository.baseCommit,
         proofs: bundle.proofs,
-        modelWriteRoots: executionPolicy.routes.flatMap((route) => [
-          ...(route.ownedPaths ?? []),
-          ...(route.allowedWriteRoots ?? []),
-        ]),
+        modelWriteRoots,
         toolchainPaths: semanticProofToolchainPaths!,
+      });
+      // Custody above proves the closure/candidate/toolchain shape on
+      // bundle.proofs is exactly what a fresh Git re-derivation would
+      // produce, so those proof definitions are already the correct input
+      // for the conformance preflight below -- no second hydration pass.
+      await (
+        dependencies.assertSemanticProofVerifierConformance
+        ?? engine.assertCccSemanticProofVerifierConformance
+      )({
+        repositoryRoot: project.projectPath,
+        baseCommit: bundle.targetRepository.baseCommit,
+        proofs: bundle.proofs,
+        modelWriteRoots,
       });
     } else {
       const inspected = await (

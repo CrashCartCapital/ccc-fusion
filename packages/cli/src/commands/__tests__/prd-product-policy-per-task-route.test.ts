@@ -606,6 +606,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       // The proposal-authoring and semantic-custody suites own executable
       // revalidation. These cases pin only the core import delegation result.
       assertSemanticProofV2Custody: vi.fn(async () => undefined),
+      assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
     })).toBe(0);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "imported",
@@ -676,6 +677,7 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       importCccPrdBundle,
       resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
       assertSemanticProofV2Custody: vi.fn(async () => undefined),
+      assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
     })).toBe(1);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "refusal",

@@ -23,6 +23,9 @@ import {
   CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
 } from "../ccc-campaign-proof-admission.js";
 import {
+  CCC_PRD_PROOF_VERIFIER_NONCONFORMING,
+  CccPrdProofVerifierNonconformingError,
+  assertCccSemanticProofVerifierConformance,
   createCccCampaignProofSuiteHandler,
   exactEvidenceResults,
 } from "../ccc-campaign-proof-execution.js";
@@ -1416,6 +1419,55 @@ describe("CCC semantic proof v2 execution", () => {
     }));
   });
 
+  it("distinguishes stdout that is not JSON at all from JSON that is merely non-canonical", async () => {
+    // Regression for halt ten (docs/plans/2026-09-03-ccc-gate3-campaign-ledger.md,
+    // 2026-09-06 ~04:50Z): a verifier that prints a human-readable summary
+    // line instead of the JSON evidence contract exited zero and was refused
+    // only as "not-canonical-json", which reads as a formatting nit rather
+    // than "this harness never emits the contract at all".
+    const f = await fixture();
+    const stdout = "PROOF PASSED: labels (7 checks: vocabulary_frozen, canonical_labels_positive)\n";
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence not-json"],
+      }),
+    }));
+  });
+
+  it("keeps not-canonical-json for stdout that parses but is not the canonical byte form", async () => {
+    const f = await fixture();
+    // Valid, parseable JSON on a single line, but with a trailing space the
+    // canonical serializer would never emit: a successful parse that fails
+    // only the byte-canonical check, distinct from stdout that was never
+    // JSON syntax at all.
+    const stdout = `${canonicalCccPrdJson(evidenceFor(f, true))} \n`;
+    const { handler, attempts } = semanticHandler(f, {
+      runSandbox: async () => processResult(stdout),
+    });
+
+    await expect(handler(f.node, f.context)).resolves.toEqual({
+      outcome: "failure",
+      value: `ccc-proof-failed:${f.proof.id}`,
+    });
+    expect(attempts.settle).toHaveBeenCalledWith(expect.objectContaining({
+      terminalEnvelope: expect.objectContaining({
+        kind: "execution_refused",
+        code: "malformed_output",
+        warnings: ["proof-evidence not-canonical-json"],
+      }),
+    }));
+  });
+
   it("captures a proof-id mismatch as a warning instead of only malformed_output", async () => {
     const f = await fixture();
     const badEvidence = { ...evidenceFor(f, true), proofId: "PROOF-other-v2" };
@@ -1960,4 +2012,154 @@ describe("CCC semantic proof v2 execution", () => {
     expect(attempts.begin).not.toHaveBeenCalled();
     expect(attempts.settle).not.toHaveBeenCalled();
   });
+});
+
+// Regression coverage for the Gate 3 preflight: a proof's declared verifier
+// must be refused at preview/import time -- before any campaign dispatches a
+// task against it -- if its stdout does not conform to the
+// ccc-prd.proof-evidence.v2 contract. Halt ten
+// (docs/plans/2026-09-03-ccc-gate3-campaign-ledger.md, 2026-09-06 ~04:50Z) hit
+// this exact defect only after a real task had already burned a live turn.
+describe("CCC semantic proof verifier conformance preflight", () => {
+  async function preflightFixture(harnessSource: string) {
+    const scratch = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-fixture-"));
+    scratchRoots.push(scratch);
+    const repo = join(scratch, "target");
+    await mkdir(join(repo, "proof"), { recursive: true });
+    await execFile("git", ["init", "--initial-branch=main", repo]);
+    await writeFile(join(repo, "README.md"), "preflight fixture repository\n", "utf8");
+    await writeFile(join(repo, "Taskfile.yml"), [
+      "version: '3'",
+      "tasks:",
+      "  verify:labels:",
+      "    cmds:",
+      "      - node proof/verify.mjs src/labels.py",
+      "",
+    ].join("\n"), "utf8");
+    await writeFile(join(repo, "proof", "verify.mjs"), harnessSource, "utf8");
+    // src/labels.py is deliberately never written: the whole point of this
+    // preflight is to prove the verifier's *output shape* is correct before
+    // any candidate implementation exists.
+    const baseCommit = await commit(repo, "base");
+
+    const taskPath = (await execFile("which", ["task"])).stdout.trim();
+    const [taskIdentity, nodeIdentity, taskRunner, harness] = await Promise.all([
+      inspectCccSemanticProofExecutable(taskPath, ["--version"]),
+      inspectCccSemanticProofExecutable(process.execPath, ["--version"]),
+      verifierClosureEntry(repo, baseCommit, "Taskfile.yml", "task_runner"),
+      verifierClosureEntry(repo, baseCommit, "proof/verify.mjs", "harness"),
+    ]);
+    const proofHostIdentity = { id: "proof-host-node", ...nodeIdentity };
+    const linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
+      task: taskIdentity,
+      node: nodeIdentity,
+      proofHost: proofHostIdentity,
+    });
+    const definition = {
+      schema: "ccc-prd.proof.v2",
+      id: "PROOF-EVIDENCE-LABELS",
+      requirementIds: ["REQ-labels"],
+      clauseIds: ["CLAUSE-labels"],
+      phases: ["task"],
+      command: "task verify:labels",
+      positiveOracle: "Canonical labels are accepted.",
+      positiveCases: [{ id: "CASE-good", description: "The expected labels pass." }],
+      negativeControls: [{ id: "CONTROL-bad", description: "A planted bad label fails." }],
+      verifierClosure: [taskRunner, harness],
+      candidateInputs: ["src/labels.py"],
+      executionToolchain: {
+        task: taskIdentity,
+        node: nodeIdentity,
+        proofHost: proofHostIdentity,
+        linkedRuntime,
+      },
+      spans: [],
+      confidence: "high",
+    } satisfies Omit<CccPrdProofV2, "admission">;
+    const digests = computeCccPrdProofV2AdmissionDigests(definition);
+    const proof: CccPrdProofV2 = {
+      ...definition,
+      admission: {
+        schema: "ccc-prd.proof-admission.v2",
+        pluginId: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_ID,
+        pluginVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PLUGIN_VERSION,
+        extensionId: CCC_CAMPAIGN_PROOF_ADMISSION_EXTENSION_ID,
+        proofVersion: CCC_CAMPAIGN_PROOF_ADMISSION_PROOF_VERSION,
+        extensionRootRelativeSource: "src/ccc-campaign-proof-admission.ts",
+        extensionSourceSha256: "b".repeat(64),
+        extensionManifestSha256: "c".repeat(64),
+        definitionSha256: computeCccPrdProofDefinitionSha256(definition),
+        ...digests,
+      },
+    };
+    return { repo, baseCommit, proof };
+  }
+
+  const NONCONFORMING_HARNESS = [
+    "console.log('PROOF PASSED: labels (7 checks: vocabulary_frozen, canonical_labels_positive)');",
+    "process.exitCode = 0;",
+    "",
+  ].join("\n");
+
+  const CONFORMING_HARNESS = [
+    "import { existsSync } from 'node:fs';",
+    // The candidate does not exist yet at the pinned base commit; a
+    // conforming harness must still emit valid evidence, reporting the
+    // clauses it could not verify as failing rather than crashing or
+    // printing anything other than the JSON contract.
+    "const candidateExists = existsSync('src/labels.py');",
+    "const passed = candidateExists;",
+    "const evidence = {",
+    "  clauseResults: [{ clauseId: 'CLAUSE-labels', passed }],",
+    "  negativeControlResults: [{ controlId: 'CONTROL-bad', passed }],",
+    "  passed,",
+    "  phase: process.env.CCC_PROOF_PHASE,",
+    "  positiveCaseResults: [{ caseId: 'CASE-good', passed }],",
+    "  proofId: process.env.CCC_PROOF_ID,",
+    "  schema: 'ccc-prd.proof-evidence.v2',",
+    "  sourceCommit: process.env.CCC_PROOF_SOURCE_COMMIT,",
+    "  sourceTree: process.env.CCC_PROOF_SOURCE_TREE,",
+    "};",
+    "process.stdout.write(`${JSON.stringify(evidence)}\\n`);",
+    "process.exitCode = passed ? 0 : 1;",
+    "",
+  ].join("\n");
+
+  itSemanticHost(
+    "refuses a verifier that never emits the proof-evidence contract, naming the proof and the first stdout line",
+    async () => {
+      const { repo, baseCommit, proof } = await preflightFixture(NONCONFORMING_HARNESS);
+
+      const attempt = assertCccSemanticProofVerifierConformance({
+        repositoryRoot: repo,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src"],
+        timeoutMs: 30_000,
+      });
+
+      await expect(attempt).rejects.toBeInstanceOf(CccPrdProofVerifierNonconformingError);
+      await expect(attempt).rejects.toMatchObject({
+        code: CCC_PRD_PROOF_VERIFIER_NONCONFORMING,
+      });
+      await expect(attempt).rejects.toThrow(/PROOF-EVIDENCE-LABELS/);
+      await expect(attempt).rejects.toThrow(/not-json/);
+      await expect(attempt).rejects.toThrow(/PROOF PASSED: labels/);
+    },
+  );
+
+  itSemanticHost(
+    "passes a verifier that emits valid evidence even before any candidate exists",
+    async () => {
+      const { repo, baseCommit, proof } = await preflightFixture(CONFORMING_HARNESS);
+
+      await expect(assertCccSemanticProofVerifierConformance({
+        repositoryRoot: repo,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src"],
+        timeoutMs: 30_000,
+      })).resolves.toBeUndefined();
+    },
+  );
 });

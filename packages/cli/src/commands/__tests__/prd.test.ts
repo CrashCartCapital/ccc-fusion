@@ -617,6 +617,7 @@ describe("prd command exit contract", () => {
     };
     const resolveToolchain = vi.fn();
     const assertCustody = vi.fn();
+    const assertVerifierConformance = vi.fn();
     const inspectImport = vi.fn(async () => ({
       bundleHash: legacyPlan.bundleHash,
       targetRepository: packet.target,
@@ -642,6 +643,7 @@ describe("prd command exit contract", () => {
       readTargetHead: vi.fn(async () => packet.base),
       resolveSemanticProofToolchainPaths: resolveToolchain,
       assertSemanticProofV2Custody: assertCustody,
+      assertSemanticProofVerifierConformance: assertVerifierConformance,
       inspectCccPrdImport: inspectImport as never,
       importCccPrdBundle: importBundle,
       inspectVerifierConfinementReadiness: vi.fn(async () => ({
@@ -1545,6 +1547,7 @@ describe("prd command exit contract", () => {
       // regression above. This service-seam test starts from that admitted
       // sidecar and stays focused on preview/import identity and delegation.
       assertSemanticProofV2Custody: vi.fn(async () => undefined),
+      assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
     };
     const common = [
       packet.root,
@@ -1698,6 +1701,7 @@ describe("prd command exit contract", () => {
           trustedPaths: ["/usr/bin/bwrap", "/bin/bwrap"] as const,
           detail: "private runner detail must not reach operator output",
         })),
+        assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
       },
       { projectName: "fixture" },
     )).toBe(0);
@@ -1763,6 +1767,7 @@ describe("prd command exit contract", () => {
       // The dedicated executable-drift tests own the real custody probe. This
       // case isolates confinement refusal without re-running toolchain probes.
       assertSemanticProofV2Custody: vi.fn(async () => undefined),
+      assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
     };
     const common = [
       packet.root,
@@ -1858,6 +1863,7 @@ describe("prd command exit contract", () => {
         // Digest mismatch is the authority under test; executable custody has
         // dedicated drift and pre-launch coverage elsewhere in this suite.
         assertSemanticProofV2Custody: vi.fn(async () => undefined),
+        assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
       },
       { projectName: "fixture" },
     )).toBe(1);

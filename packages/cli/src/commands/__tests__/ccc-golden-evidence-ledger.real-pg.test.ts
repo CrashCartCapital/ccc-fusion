@@ -215,7 +215,12 @@ pgDescribe.sequential("CCC golden Evidence Ledger import (PostgreSQL)", () => {
       confirmationDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
 
-  });
+  // Preview now sandboxes and runs every declared proof's verifier against
+  // the pinned baseline (assertCccSemanticProofVerifierConformance), so it
+  // legitimately spawns real subprocesses per proof per phase instead of
+  // only reconstructing and hashing the target; the default 5s test timeout
+  // is too short for this real, sealed work.
+  }, 60_000);
 
   it("transactionally imports the three-task campaign", async () => {
     const imported = await runCommand([
@@ -235,7 +240,7 @@ pgDescribe.sequential("CCC golden Evidence Ledger import (PostgreSQL)", () => {
         directCounts: { campaigns: 1, tasks: 3, dependencyEdges: 2, workflows: 1, workItems: 1, runAudits: 1 },
       },
     });
-  });
+  }, 60_000);
 
   it("idempotently replays without duplicate provider effects", async () => {
     const replay = await runCommand([
@@ -247,7 +252,7 @@ pgDescribe.sequential("CCC golden Evidence Ledger import (PostgreSQL)", () => {
     ]);
     expect(replay.exitCode, replay.output.join("\n")).toBe(0);
     expect(replay.json).toMatchObject({ kind: "imported", result: { replayed: true } });
-  });
+  }, 60_000);
 
   it("reports all three tasks with zero provider attempts", async () => {
     const status = await runCommand(["status", idempotencyKey]);
