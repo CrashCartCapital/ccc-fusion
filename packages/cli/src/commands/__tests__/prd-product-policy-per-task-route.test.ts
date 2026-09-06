@@ -607,6 +607,13 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       // revalidation. These cases pin only the core import delegation result.
       assertSemanticProofV2Custody: vi.fn(async () => undefined),
       assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
+      inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+        message: "semantic-proof sandbox readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
     })).toBe(0);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "imported",
@@ -678,6 +685,13 @@ describe("fn prd policy --routes-file (per-task route selection)", () => {
       resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths,
       assertSemanticProofV2Custody: vi.fn(async () => undefined),
       assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
+      inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+        message: "semantic-proof sandbox readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
     })).toBe(1);
     expect(JSON.parse(output[0]!)).toMatchObject({
       kind: "refusal",

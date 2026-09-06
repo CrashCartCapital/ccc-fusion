@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +32,20 @@ type CommandJson = {
   result?: unknown;
   status?: unknown;
 };
+
+// This suite's import (unlike preview) never mocks the verifier-conformance
+// preflight, so it genuinely spawns the sealed semantic-proof-v2 sandbox
+// (sandbox-exec, Darwin-only today; see
+// docs/plans/2026-09-03-semantic-proof-sandbox-linux-gap.md). The tests that
+// depend on a successful real import can only pass on a host with that
+// backend, mirroring the same itSemanticHost gate the engine's own real
+// end-to-end proof tests use, rather than faking readiness via DI and
+// letting the real sandbox spawn fail differently underneath.
+const itSemanticHost = process.platform === "darwin"
+  && existsSync("/usr/bin/sandbox-exec")
+  && existsSync("/opt/homebrew/bin/task")
+  ? it
+  : it.skip;
 
 async function prepareLifecycle(root: string): Promise<PreparedLifecycle> {
   const module = await import("../../../../../scripts/lib/ccc-golden-packet-lifecycle.mjs") as {
@@ -222,7 +237,7 @@ pgDescribe.sequential("CCC golden Evidence Ledger import (PostgreSQL)", () => {
   // is too short for this real, sealed work.
   }, 60_000);
 
-  it("transactionally imports the three-task campaign", async () => {
+  itSemanticHost("transactionally imports the three-task campaign", async () => {
     const imported = await runCommand([
       "import",
       ...packetArgs,
@@ -242,7 +257,7 @@ pgDescribe.sequential("CCC golden Evidence Ledger import (PostgreSQL)", () => {
     });
   }, 60_000);
 
-  it("idempotently replays without duplicate provider effects", async () => {
+  itSemanticHost("idempotently replays without duplicate provider effects", async () => {
     const replay = await runCommand([
       "import",
       ...packetArgs,
@@ -254,7 +269,7 @@ pgDescribe.sequential("CCC golden Evidence Ledger import (PostgreSQL)", () => {
     expect(replay.json).toMatchObject({ kind: "imported", result: { replayed: true } });
   }, 60_000);
 
-  it("reports all three tasks with zero provider attempts", async () => {
+  itSemanticHost("reports all three tasks with zero provider attempts", async () => {
     const status = await runCommand(["status", idempotencyKey]);
     expect(status.exitCode, status.output.join("\n")).toBe(0);
     expect(status.json).toMatchObject({
