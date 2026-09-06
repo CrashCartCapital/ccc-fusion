@@ -1659,9 +1659,19 @@ function operatorVerifierConfinementReadiness(
   readiness: VerifierConfinementReadiness,
 ) {
   const operatorReadiness = sanitizedVerifierConfinementReadiness(readiness);
-  if (engine.isVerifierConfinementReady(readiness)) return operatorReadiness;
+  if (engine.isVerifierConfinementReady(readiness)) {
+    return { ...operatorReadiness, verifierConformanceChecked: true as const };
+  }
   return {
     ...operatorReadiness,
+    // Trusted confinement is required to run a declared proof's verify
+    // command at all, so the verifier-conformance preflight below is
+    // skipped entirely for this preview -- never silently, this field says
+    // so, and import cannot proceed until confinement is ready (refused
+    // above isVerifierConfinementReady) and re-runs the real check then.
+    verifierConformanceChecked: false as const,
+    verifierConformanceWarning:
+      "Trusted verifier confinement is unavailable, so this preview could not run the declared proof verifiers to check their evidence output shape. Fusion will run that check again, and refuse on a nonconforming verifier, at import once confinement is repaired.",
     safeState:
       "The frozen PRD preview is intact; no campaign, approval, provider effect, or source change was created.",
     decisionOwner: "Fusion host or CI runner operator",
@@ -1924,15 +1934,27 @@ async function runProductPacketCommand(
       // bundle.proofs is exactly what a fresh Git re-derivation would
       // produce, so those proof definitions are already the correct input
       // for the conformance preflight below -- no second hydration pass.
-      await (
-        dependencies.assertSemanticProofVerifierConformance
-        ?? engine.assertCccSemanticProofVerifierConformance
-      )({
-        repositoryRoot: project.projectPath,
-        baseCommit: bundle.targetRepository.baseCommit,
-        proofs: bundle.proofs,
-        modelWriteRoots,
-      });
+      //
+      // Running a declared proof's real verify command needs the same
+      // trusted confinement a live attempt needs, so this follows the same
+      // isVerifierConfinementReady gate as the importing-side refusal
+      // above. `import` cannot reach this line with confinement
+      // unavailable (already refused above); `preview` is allowed to
+      // continue without running real verifiers when confinement isn't
+      // ready -- productPreview's verifierConfinement carries an explicit
+      // verifierConformanceChecked:false warning instead of silently
+      // claiming a check happened.
+      if (engine.isVerifierConfinementReady(verifierConfinement)) {
+        await (
+          dependencies.assertSemanticProofVerifierConformance
+          ?? engine.assertCccSemanticProofVerifierConformance
+        )({
+          repositoryRoot: project.projectPath,
+          baseCommit: bundle.targetRepository.baseCommit,
+          proofs: bundle.proofs,
+          modelWriteRoots,
+        });
+      }
     } else {
       const inspected = await (
         dependencies.inspectCccPrdImport ?? inspectCccPrdImport

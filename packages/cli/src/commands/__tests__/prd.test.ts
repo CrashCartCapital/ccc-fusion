@@ -1676,6 +1676,7 @@ describe("prd command exit contract", () => {
       store: { getAsyncLayer: vi.fn(() => ({})) },
     };
     const output: string[] = [];
+    const assertVerifierConformance = vi.fn(async () => undefined);
 
     expect(await runPrdJson(
       [
@@ -1701,10 +1702,16 @@ describe("prd command exit contract", () => {
           trustedPaths: ["/usr/bin/bwrap", "/bin/bwrap"] as const,
           detail: "private runner detail must not reach operator output",
         })),
-        assertSemanticProofVerifierConformance: vi.fn(async () => undefined),
+        assertSemanticProofVerifierConformance: assertVerifierConformance,
       },
       { projectName: "fixture" },
     )).toBe(0);
+
+    // RED-S6-preview-without-sandbox: preview must still succeed when
+    // confinement is unavailable (only import refuses), so the real
+    // verifier-conformance preflight -- which needs that same confinement
+    // to run a proof's verify command at all -- must never be invoked here.
+    expect(assertVerifierConformance).not.toHaveBeenCalled();
 
     const preview = JSON.parse(output[0]!);
     expect(preview).toMatchObject({
@@ -1715,6 +1722,8 @@ describe("prd command exit contract", () => {
         ready: false,
         backend: "bubblewrap",
         code: "VERIFIER_CONFINEMENT_UNAVAILABLE",
+        verifierConformanceChecked: false,
+        verifierConformanceWarning: expect.stringContaining("could not run the declared proof verifiers"),
         safeState: "The frozen PRD preview is intact; no campaign, approval, provider effect, or source change was created.",
         decisionOwner: "Fusion host or CI runner operator",
         consequence: "Campaign import and live execution remain blocked because exact requirement proof cannot run safely.",

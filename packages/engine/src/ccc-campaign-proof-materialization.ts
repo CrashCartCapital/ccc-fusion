@@ -518,7 +518,7 @@ function executableProbeCommandLine(originalError: unknown): string {
 // it -- so the bound here is on real byte length, not `string.length`
 // (UTF-16 code units), and the cut point always lands on a code-point
 // boundary.
-function boundedUtf8Excerpt(buffer: Buffer, maxBytes: number): { excerpt: string; truncated: boolean } {
+export function boundedUtf8Excerpt(buffer: Buffer, maxBytes: number): { excerpt: string; truncated: boolean } {
   if (buffer.length <= maxBytes) {
     return { excerpt: buffer.toString("utf8"), truncated: false };
   }

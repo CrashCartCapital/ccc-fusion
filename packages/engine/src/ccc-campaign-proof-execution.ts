@@ -30,6 +30,7 @@ import {
 } from "@fusion/core";
 import {
   admitAndMaterializeCccSemanticProof,
+  boundedUtf8Excerpt,
   verifyCccSemanticProofToolchainBeforeSpawn,
   type CccSemanticProofMaterialization,
   type CccSemanticProofMaterializationInput,
@@ -1486,9 +1487,21 @@ export type CccSemanticProofVerifierPreflightDependencies = Readonly<{
 // proven proof.command names exactly one admitted verify target.
 const PREFLIGHT_PROOF_COMMAND = /^task (verify:[a-z0-9][a-z0-9:-]{0,63})$/u;
 
-function preflightSandboxPolicyFor(
+// Bounds a refusal message's stderr excerpt the same way the materialization
+// module bounds its own executable-probe stderr excerpts: a fixed byte cap
+// that never splits a multi-byte UTF-8 sequence.
+const PREFLIGHT_STDERR_EXCERPT_BYTES = 4096;
+
+// Shared by both the live per-attempt path (runSemanticProofV2) and this
+// preflight: the deny-list a verifier is sandboxed against must be identical
+// in both places, or a verifier that leans on host Python site-packages
+// (denied live, but only if this list matches) could pass preflight and then
+// fail -- or worse, silently read outside the sealed closure -- for real.
+function semanticProofSandboxPolicyFor(
   materialized: CccSemanticProofMaterialization,
-  deniedReadRoots: readonly string[],
+  proof: CccPrdProofV2,
+  targetRoot: string,
+  engineRoot: string,
 ): CccSemanticProofSandboxPolicyInput {
   return {
     proofRoot: materialized.proofRoot,
@@ -1510,7 +1523,25 @@ function preflightSandboxPolicyFor(
       pythonRuntimeExecutables:
         materialized.sealedExecutionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => path),
     } : {}),
-    deniedReadRoots: Object.freeze([...new Set(deniedReadRoots)]),
+    deniedReadRoots: Object.freeze([
+      ...new Set([
+        targetRoot,
+        engineRoot,
+        ...(proof.executionToolchain.python ? [
+          proof.executionToolchain.python.runtimeManifest.stdlibRoot,
+          proof.executionToolchain.python.runtimeManifest.pythonHomeRoot,
+          ...proof.executionToolchain.python.runtimeManifest.sitePackagesRoots,
+          ...proof.executionToolchain.python.runtimeManifest.extensionModuleRoots,
+          ...proof.executionToolchain.python.runtimeManifest.dylibClosure.map(({ path }) => dirname(path)),
+          ...proof.executionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => dirname(path)),
+          dirname(proof.executionToolchain.python.executablePath),
+        ].filter((path) => ![
+          "/usr/lib",
+          "/usr/share",
+          "/System/Library",
+        ].some((systemRoot) => path === systemRoot || path.startsWith(`${systemRoot}/`))) : []),
+      ]),
+    ]),
   };
 }
 
@@ -1580,30 +1611,37 @@ export async function assertCccSemanticProofVerifierConformance(
         `CCC semantic-proof verifier preflight refused a non-canonical command for ${proof.id}`,
       );
     }
-    for (const phase of proof.phases) {
-      const tempRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-"));
+    const tempRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-"));
+    try {
+      // Materialize and seal the toolchain exactly once per proof, not once
+      // per phase: a proof's closure, candidates, and executionToolchain do
+      // not vary by phase (only the CCC_PROOF_PHASE env var the harness
+      // reads at runtime does), so re-sealing per phase would be redundant
+      // work, not additional safety -- and the live per-attempt path also
+      // seals exactly once per attempt. The per-phase 300s runSandbox bound
+      // below is unaffected.
+      let materialized: CccSemanticProofMaterialization;
       try {
-        let materialized: CccSemanticProofMaterialization;
-        try {
-          materialized = await materialize({
-            repositoryRoot,
-            baseCommit: input.baseCommit,
-            sourceCommit: input.baseCommit,
-            proof,
-            modelWriteRoots: input.modelWriteRoots,
-            outputRoot: tempRoot,
-            allowMissingCandidates: true,
-          });
-          await verifyToolchain(materialized.sealedExecutionToolchain);
-        } catch (error) {
-          throw new CccPrdProofVerifierNonconformingError(
-            `CCC semantic-proof verifier preflight for ${proof.id} could not seal the verifier: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-            { cause: error },
-          );
-        }
-        const policy = preflightSandboxPolicyFor(materialized, [repositoryRoot, engineRoot]);
+        materialized = await materialize({
+          repositoryRoot,
+          baseCommit: input.baseCommit,
+          sourceCommit: input.baseCommit,
+          proof,
+          modelWriteRoots: input.modelWriteRoots,
+          outputRoot: tempRoot,
+          allowMissingCandidates: true,
+        });
+        await verifyToolchain(materialized.sealedExecutionToolchain);
+      } catch (error) {
+        throw new CccPrdProofVerifierNonconformingError(
+          `CCC semantic-proof verifier preflight for ${proof.id} could not seal the verifier: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          { cause: error },
+        );
+      }
+      for (const phase of proof.phases) {
+        const policy = semanticProofSandboxPolicyFor(materialized, proof, repositoryRoot, engineRoot);
         try {
           await preflightSandbox(policy);
         } catch (error) {
@@ -1651,17 +1689,22 @@ export async function assertCccSemanticProofVerifierConformance(
         );
         if (envelope.kind === "execution_refused") {
           const firstStdoutLine = (result.stdout.split("\n")[0] ?? "").slice(0, 500);
+          const { excerpt: stderrExcerpt, truncated: stderrTruncated } = boundedUtf8Excerpt(
+            Buffer.from(result.stderr, "utf8"),
+            PREFLIGHT_STDERR_EXCERPT_BYTES,
+          );
           throw new CccPrdProofVerifierNonconformingError(
             `CCC semantic-proof verifier for ${proof.id} (phase ${phase}) is nonconforming: `
               + `${envelope.code}${
                 envelope.warnings.length > 0 ? ` (${envelope.warnings.join("; ")})` : ""
-              }; first stdout line: ${JSON.stringify(firstStdoutLine)}`,
+              }; first stdout line: ${JSON.stringify(firstStdoutLine)}`
+              + `; stderr: ${JSON.stringify(`${stderrExcerpt}${stderrTruncated ? "...[truncated]" : ""}`)}`,
           );
         }
-      } finally {
-        await makeTempTreeWriteable(tempRoot);
-        await rm(tempRoot, { recursive: true, force: true });
       }
+    } finally {
+      await makeTempTreeWriteable(tempRoot);
+      await rm(tempRoot, { recursive: true, force: true });
     }
   }
 }
@@ -1799,47 +1842,6 @@ async function runSemanticProofV2(
     const tempRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-execution-"));
     try {
       let materialized: CccSemanticProofMaterialization;
-      const sandboxPolicyFor = (
-        value: CccSemanticProofMaterialization,
-      ): CccSemanticProofSandboxPolicyInput => ({
-        proofRoot: value.proofRoot,
-        scratchRoot: value.scratchRoot,
-        taskExecutable: value.sealedExecutionToolchain.task.executablePath,
-        nodeExecutable: value.sealedExecutionToolchain.node.executablePath,
-        ...(value.sealedExecutionToolchain.python ? {
-          pythonExecutable: value.sealedExecutionToolchain.python.executablePath,
-          pythonHome: sealedPythonHome(value.sealedExecutionToolchain.python),
-          pythonPathRoots: [
-            ...value.sealedExecutionToolchain.python.runtimeManifest.sitePackagesRoots,
-            ...value.sealedExecutionToolchain.python.runtimeManifest.extensionModuleRoots,
-          ],
-          pythonRuntimeFiles: [
-            value.sealedExecutionToolchain.python.runtimeManifest.interpreter.path,
-            ...value.sealedExecutionToolchain.python.runtimeManifest.dylibClosure.map(({ path }) => path),
-            ...value.sealedExecutionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => path),
-          ],
-          pythonRuntimeExecutables: value.sealedExecutionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => path),
-        } : {}),
-        deniedReadRoots: Object.freeze([
-          ...new Set([
-            execution.snapshot.targetRoot,
-            engineRoot,
-            ...(proof.executionToolchain.python ? [
-              proof.executionToolchain.python.runtimeManifest.stdlibRoot,
-              proof.executionToolchain.python.runtimeManifest.pythonHomeRoot,
-              ...proof.executionToolchain.python.runtimeManifest.sitePackagesRoots,
-              ...proof.executionToolchain.python.runtimeManifest.extensionModuleRoots,
-              ...proof.executionToolchain.python.runtimeManifest.dylibClosure.map(({ path }) => dirname(path)),
-              ...proof.executionToolchain.python.runtimeManifest.runtimeSupport.map(({ path }) => dirname(path)),
-              dirname(proof.executionToolchain.python.executablePath),
-            ].filter((path) => ![
-              "/usr/lib",
-              "/usr/share",
-              "/System/Library",
-            ].some((systemRoot) => path === systemRoot || path.startsWith(`${systemRoot}/`))) : []),
-          ]),
-        ]),
-      });
       try {
         materialized = await withSerializedSemanticProofPreparation(async () => {
           const prepared = await dependencies.materialize({
@@ -1857,7 +1859,9 @@ async function runSemanticProofV2(
             throw new Error("materialized proof digests differ from immutable admission");
           }
           await dependencies.verifyToolchain(prepared.sealedExecutionToolchain);
-          await dependencies.preflightSandbox(sandboxPolicyFor(prepared));
+          await dependencies.preflightSandbox(
+            semanticProofSandboxPolicyFor(prepared, proof, execution.snapshot.targetRoot, engineRoot),
+          );
           return prepared;
         }, context.signal);
       } catch (error) {
@@ -1921,7 +1925,7 @@ async function runSemanticProofV2(
           ? await acquireCccSemanticProofLoopbackPort()
           : undefined;
         const processResult = await dependencies.runSandbox({
-          ...sandboxPolicyFor(materialized),
+          ...semanticProofSandboxPolicyFor(materialized, proof, execution.snapshot.targetRoot, engineRoot),
           ...(loopbackPort !== undefined ? { loopbackPort } : {}),
           executable: materialized.sealedExecutionToolchain.task.executablePath,
           args: materialized.taskArgv,
