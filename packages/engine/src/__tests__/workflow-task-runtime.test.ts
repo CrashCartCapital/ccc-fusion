@@ -153,7 +153,13 @@ describe("formatCccPermanentWorkItemError", () => {
       "empty supplied reason",
       "",
       "diagnostic without a machine reason",
-      "diagnostic without a machine reason",
+      ": diagnostic without a machine reason",
+    ],
+    [
+      "empty supplied reason with bounded detail",
+      "",
+      "x".repeat(1_000),
+      `: ${"x".repeat(510)}`,
     ],
   ])("guards %s without an empty-prefix loop", (_label, reason, detail, expected) => {
     expect(formatCccPermanentWorkItemError(

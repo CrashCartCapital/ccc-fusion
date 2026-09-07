@@ -1219,13 +1219,17 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
        */
       await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId });
       const liveHold = firstHold;
+      const liveAuthorization = liveHold.liveExecutionAuthorizationConfirmation;
+      expect(liveAuthorization).toMatchObject({
+        status: "issued",
+        confirmation: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      });
       expect(liveHold.status.workItems).toEqual([
         expect.objectContaining({
           state: "manual-required",
-          lastError: expect.stringContaining(
-            "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED: "
-              + "CCC campaign CAMPAIGN-VERTICAL is awaiting exact human live-execution authorization ",
-          ),
+          lastError:
+            `ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED: `
+              + `CCC campaign CAMPAIGN-VERTICAL is awaiting exact human live-execution authorization ${liveAuthorization!.authorizationId}`,
           blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
         }),
       ]);
@@ -1239,10 +1243,6 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
        * `authorizationId` (not `approvalRequestId`) -- the same shape the live
        * V12-V15 runbook approves against.
        */
-      expect(liveHold.liveExecutionAuthorizationConfirmation).toMatchObject({
-        status: "issued",
-        confirmation: expect.stringMatching(/^[a-f0-9]{64}$/u),
-      });
       await expect(readFile(packet.providerMarkerPath, "utf8")).rejects.toMatchObject({
         code: "ENOENT",
       });

@@ -279,7 +279,12 @@ export function formatCccPermanentWorkItemError(
     .replace(/\s+/gu, " ")
     .trim();
   if (reason.length === 0) {
-    return detail.slice(0, CCC_PERMANENT_WORK_ITEM_ERROR_MAX_CHARS);
+    if (detail.length === 0) return reason;
+    const emptyReasonPrefix = `${reason}: `;
+    return `${emptyReasonPrefix}${detail.slice(
+      0,
+      Math.max(0, CCC_PERMANENT_WORK_ITEM_ERROR_MAX_CHARS - emptyReasonPrefix.length),
+    )}`;
   }
   const prefix = `${reason}: `;
   for (;;) {
