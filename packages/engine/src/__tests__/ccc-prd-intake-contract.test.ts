@@ -6,6 +6,7 @@ import {
   lintCccPrdIntakeMarkdown,
   renderCccPrdIntakeTemplate,
 } from "../ccc-prd/intake-contract.js";
+import { computeCccPrdMaterialInventory } from "../ccc-prd/material-coverage.js";
 
 const completePrd = `# Example product
 
@@ -58,6 +59,38 @@ The verifier command task verify:product passes only when the normal CLI execute
 `;
 
 describe("optional CCC PRD Intake Contract", () => {
+  it("keeps empty optional containers out of coverage while retaining authored material", () => {
+    const optionalHeadings = [
+      "Constraints and dependencies",
+      "Risks",
+      "Open questions",
+    ] as const;
+    const template = renderCccPrdIntakeTemplate();
+    const scaffoldInventory = computeCccPrdMaterialInventory(
+      "template.md",
+      Buffer.from(template, "utf8"),
+    );
+    const scaffoldTitles = new Set(scaffoldInventory.map(({ title }) => title));
+    for (const heading of optionalHeadings) {
+      expect(scaffoldTitles.has(heading), heading).toBe(false);
+    }
+
+    const authored = optionalHeadings.reduce((markdown, heading, index) => (
+      markdown.replace(
+        `## ${heading}\n`,
+        `## ${heading}\n\nUser-authored material ${index + 1} must remain covered.\n`,
+      )
+    ), template);
+    const authoredInventory = computeCccPrdMaterialInventory(
+      "authored-template.md",
+      Buffer.from(authored, "utf8"),
+    );
+    const authoredTitles = new Set(authoredInventory.map(({ title }) => title));
+    for (const heading of optionalHeadings) {
+      expect(authoredTitles.has(heading), heading).toBe(true);
+    }
+  });
+
   it("accepts the optional template without rewriting an existing PRD", () => {
     const template = renderCccPrdIntakeTemplate();
     expect(template).toContain("# <Product or change name>");
