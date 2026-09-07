@@ -142,12 +142,21 @@ function generatedAuthorHarness(
       review: { ambiguities: [], unresolvedDecisions: [], exceptions: [], protectedActions: [] },
     };
   });
+  const bootstrapProofAdmission = vi.fn(async () => ({}) as never);
   const readTargetHead = vi.fn(async () => packet.base);
   const resolveSemanticProofToolchainPaths = vi.fn(() => packet.semanticProofToolchainPaths!);
+  const inspectSemanticProofSandboxReadiness = vi.fn(async () => ({
+    ready: true,
+    backend: "sandbox-exec" as const,
+    code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+    message: "semantic-proof sandbox-exec backend is available",
+    trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+  }));
   const dependencies = {
     authorCccPrdPacket: authorCccPrdPacket as never,
-    bootstrapProofAdmission: async () => ({}) as never,
+    bootstrapProofAdmission,
     createNativeCccPrdAuthoringAdapter,
+    inspectSemanticProofSandboxReadiness,
     readTargetHead,
     resolveSemanticProofToolchainPaths,
     ...overrides,
@@ -155,7 +164,9 @@ function generatedAuthorHarness(
   return {
     adapter,
     authorCccPrdPacket,
+    bootstrapProofAdmission,
     createNativeCccPrdAuthoringAdapter,
+    inspectSemanticProofSandboxReadiness,
     readTargetHead,
     resolveSemanticProofToolchainPaths,
     dependencies,
@@ -400,6 +411,56 @@ describe("prd command exit contract", () => {
         readyForAuthoring: false,
         checks: expect.arrayContaining([
           expect.objectContaining({ id: "platform", status: "fail" }),
+        ]),
+      },
+    });
+    expect(snapshotPacketRoot(packet.root)).toEqual(before);
+  });
+
+  it("generated author preflight refuses a missing Darwin sandbox backend before any authoring dispatch", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const inspectSemanticProofSandboxReadiness = vi.fn(async () => ({
+      ready: false,
+      backend: "sandbox-exec" as const,
+      code: "CCC_SEMANTIC_PROOF_SANDBOX_UNAVAILABLE",
+      message: "semantic-proof sandbox-exec backend is unavailable",
+      trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      detail: "/usr/bin/sandbox-exec does not exist",
+    }));
+    const harness = generatedAuthorHarness(packet, {
+      preflightPlatform: "darwin",
+      inspectSemanticProofSandboxReadiness,
+    });
+    const output: string[] = [];
+    const before = snapshotPacketRoot(packet.root);
+
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => output.push(line) },
+      harness.dependencies,
+    )).toBe(1);
+
+    expect(inspectSemanticProofSandboxReadiness).toHaveBeenCalledTimes(1);
+    expect(harness.createNativeCccPrdAuthoringAdapter).not.toHaveBeenCalled();
+    expect(harness.bootstrapProofAdmission).not.toHaveBeenCalled();
+    expect(harness.authorCccPrdPacket).not.toHaveBeenCalled();
+    expect(harness.adapter.generateCandidate).not.toHaveBeenCalled();
+    expect(JSON.parse(output[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [{
+        code: "CCC_PRD_AUTHORING_PREFLIGHT_SANDBOX_UNAVAILABLE",
+        message: expect.stringContaining("/usr/bin/sandbox-exec does not exist"),
+      }],
+      preflight: {
+        schema: "ccc-prd.authoring-preflight.v1",
+        readyForAuthoring: false,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "platform", status: "pass" }),
+          expect.objectContaining({
+            id: "sandbox",
+            status: "fail",
+            message: expect.stringContaining("/usr/bin/sandbox-exec does not exist"),
+          }),
         ]),
       },
     });
