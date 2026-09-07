@@ -67,23 +67,17 @@ const TEMPLATE = `# <Product or change name>
 
 ## Constraints and dependencies
 
-- <Constraint or dependency, or None>
-
 ## Non-goals
 
 - <Explicitly excluded work, or None>
 
 ## Risks
 
-- <Material failure or safety risk, or None>
-
 ## Protected actions
 
 - <Human approval boundary such as merge, production access, spending, or None>
 
 ## Open questions
-
-- <Implementation-changing question, or None>
 `;
 
 function withoutFencedCode(markdown: string): string {
