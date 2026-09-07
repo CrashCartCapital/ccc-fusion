@@ -807,16 +807,28 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
   }
 }
 
+/**
+ * Resolves `path` against `root` and asserts the result never escapes `root`
+ * -- via an absolute path, a `..`-climbing relative path, or (on Windows) a
+ * drive-relative path that `relative()` reports as already-absolute. Shared
+ * by every caller that writes into or creates directories under an isolated
+ * proof root, so the containment check cannot drift between them.
+ */
+export function resolveWithinCccSemanticProofRoot(root: string, path: string, label: string): string {
+  const destination = resolve(root, path);
+  const fromRoot = relative(root, destination);
+  if (fromRoot.startsWith(`..${sep}`) || fromRoot === ".." || isAbsolute(fromRoot)) {
+    throw new Error(`CCC semantic-proof ${label} escaped its isolated root`);
+  }
+  return destination;
+}
+
 async function materialize(
   root: string,
   path: string,
   bytes: Buffer,
 ): Promise<void> {
-  const destination = resolve(root, path);
-  const fromRoot = relative(root, destination);
-  if (fromRoot.startsWith(`..${sep}`) || fromRoot === ".." || isAbsolute(fromRoot)) {
-    throw new Error("CCC semantic-proof materialization escaped its isolated root");
-  }
+  const destination = resolveWithinCccSemanticProofRoot(root, path, "materialization");
   await mkdir(dirname(destination), { recursive: true });
   await writeFile(destination, bytes, { flag: "wx", mode: 0o444 });
   await chmod(destination, 0o444);
@@ -1809,6 +1821,19 @@ export async function admitAndMaterializeCccSemanticProof(
   const task = verifyTaskfile(runners[0]!.bytes, input.proof);
 
   const candidates: Array<{ path: string; bytes: Buffer }> = [];
+  // Preflight only (allowMissingCandidates): directories for a candidate
+  // skipped below because it has not been written yet at the pinned base
+  // commit. A live attempt never reaches a running verifier in that state --
+  // it either has the candidate already (materialize()'s own mkdir creates
+  // this same directory as a side effect of writing the file) or refuses
+  // upstream before dispatch. Recreating just the directory half of that
+  // same materialize() here keeps the preflight tree's directory closure
+  // identical to what a live tree always has once any candidate exists, so
+  // a conforming verifier sees the same "src/ present, file absent" shape
+  // either way instead of "src/ absent entirely" -- a state live can never
+  // produce and a conforming verifier's own harness-vs-candidate distinction
+  // does not expect.
+  const missingCandidateDirectories = new Set<string>();
   for (const rawPath of input.proof.candidateInputs) {
     const path = canonicalRelativePath(rawPath, "CCC semantic-proof candidate path");
     if (candidatePaths.has(path) || closurePaths.has(path)) {
@@ -1826,6 +1851,8 @@ export async function admitAndMaterializeCccSemanticProof(
       // refusing -- a conforming verifier must still emit valid evidence
       // (very likely reporting failing results) when the implementation it
       // judges does not exist yet.
+      const parent = dirname(path);
+      if (parent !== ".") missingCandidateDirectories.add(parent);
     }
   }
   const proofRoot = join(outputRoot, "proof");
@@ -1835,6 +1862,10 @@ export async function admitAndMaterializeCccSemanticProof(
   await chmod(join(proofRoot, SEALED_OPENSSL_CONF), 0o444);
   for (const item of closure) await materialize(proofRoot, item.entry.path, item.bytes);
   for (const item of candidates) await materialize(proofRoot, item.path, item.bytes);
+  for (const directory of missingCandidateDirectories) {
+    const target = resolveWithinCccSemanticProofRoot(proofRoot, directory, "directory materialization");
+    await mkdir(target, { recursive: true });
+  }
   const observedLinkedRuntime = await inspectCccSemanticProofLinkedRuntime(input.proof.executionToolchain);
   if (
     canonicalLinkedRuntimeJson(observedLinkedRuntime)

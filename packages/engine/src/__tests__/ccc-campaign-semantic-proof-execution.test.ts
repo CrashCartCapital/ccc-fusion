@@ -2166,6 +2166,55 @@ describe("CCC semantic proof verifier conformance preflight", () => {
       })).resolves.toBeUndefined();
     },
   );
+
+  // Mirrors the real ccc-quant-engine referee's own locate_candidate
+  // two-tier check (docs/plans/gate3-quant-engine-setup-draft/verify/
+  // qe_evidence_adapter.py): a missing "src" directory means the harness
+  // is not running against a real candidate tree at all (dispatch/harness
+  // defect -- refuse hard, no stdout), which is a *different* outcome from
+  // "src/ exists but the specific candidate file inside it is missing"
+  // (a graded proof failure -- emit the evidence contract with passed:
+  // false). CONFORMING_HARNESS above never distinguishes these two states
+  // (it only ever does a *file* existsSync check), so it cannot catch a
+  // preflight tree that omits "src/" altogether. This harness can.
+  const DIRECTORY_AWARE_HARNESS = [
+    "import { existsSync } from 'node:fs';",
+    "if (!existsSync('src')) {",
+    "  // No stdout at all -- a harness/dispatch defect, not a graded result.",
+    "  process.exit(2);",
+    "}",
+    "const candidateExists = existsSync('src/labels.py');",
+    "const passed = candidateExists;",
+    "const evidence = {",
+    "  clauseResults: [{ clauseId: 'CLAUSE-labels', passed }],",
+    "  negativeControlResults: [{ controlId: 'CONTROL-bad', passed }],",
+    "  passed,",
+    "  phase: process.env.CCC_PROOF_PHASE,",
+    "  positiveCaseResults: [{ caseId: 'CASE-good', passed }],",
+    "  proofId: process.env.CCC_PROOF_ID,",
+    "  schema: 'ccc-prd.proof-evidence.v2',",
+    "  sourceCommit: process.env.CCC_PROOF_SOURCE_COMMIT,",
+    "  sourceTree: process.env.CCC_PROOF_SOURCE_TREE,",
+    "};",
+    "process.stdout.write(`${JSON.stringify(evidence)}\\n`);",
+    "process.exitCode = passed ? 0 : 1;",
+    "",
+  ].join("\n");
+
+  itSemanticHost(
+    "passes a verifier that refuses (exit 2, no stdout) only when src/ itself is absent, distinguishing that from a merely-missing candidate file",
+    async () => {
+      const { repo, baseCommit, proof } = await preflightFixture(DIRECTORY_AWARE_HARNESS);
+
+      await expect(assertCccSemanticProofVerifierConformance({
+        repositoryRoot: repo,
+        baseCommit,
+        proofs: [proof],
+        modelWriteRoots: ["src"],
+        timeoutMs: 30_000,
+      })).resolves.toBeUndefined();
+    },
+  );
 });
 
 // Dependency-injected: stubs materialize/verifyToolchain/inspectSandboxReadiness/
