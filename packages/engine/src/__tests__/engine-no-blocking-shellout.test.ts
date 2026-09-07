@@ -66,10 +66,19 @@ const allowlist: AllowlistEntry[] = [
   // settings fallback expression, a stdio options line, an error-message declaration), and the
   // options at each new line are byte-identical (same cwd/encoding/stdio bounds). No new site
   // is sanctioned here.
-  { file: "src/self-healing.ts", line: 4347, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4353, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4390, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 13052, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  // FNXC:EngineProcessRules 2026-09-06-01:00: re-pinned the same four drifted git-plumbing
+  // call-sites again (self-healing.ts 4347/4353/4390/13052 -> 4363/4369/4406/13068) after the
+  // review-requested fix at both findLandedTaskCommit call sites (slice+join the tokens after
+  // the author fields instead of destructuring positionally, so an embedded 0x1f byte in a
+  // commit body can no longer truncate it, plus a consistent trimEnd() on the body). Verified
+  // as moves, not additions: each signature still occurs exactly once in the file, the
+  // previously pinned lines now hold unrelated code (a closing brace, a return statement, a
+  // local variable declaration, a doc comment), and the options at each new line are
+  // byte-identical (same cwd/encoding/stdio bounds). No new site is sanctioned here.
+  { file: "src/self-healing.ts", line: 4363, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4369, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4406, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 13068, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger-workspace-test-commands.ts", line: 204, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merger-workspace-test-commands.ts", line: 301, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/integration-branch.ts", line: 71, primitive: "execSync", signature: "const stdout = execSync(\"git symbolic-ref --short refs/remotes/origin/HEAD\", {", reason: SHORT_GIT_PLUMBING },

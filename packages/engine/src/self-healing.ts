@@ -2142,7 +2142,16 @@ export class SelfHealingManager {
           `git log -1 --format=%H%x1f%s%x1f%an%x1f%ae%x1f%b ${shellQuote(storedSha)}`,
           { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
         );
-        const [sha, subject = "", authorName = "", authorEmail = "", body = ""] = stdout.trim().split("\x1f");
+        // %b (body) is the LAST field and may itself contain a literal 0x1f
+        // byte (however unlikely) — a plain destructuring split would silently
+        // drop everything after the first such byte. Slice+rejoin the
+        // remaining tokens instead of taking split(...)[4] directly.
+        const parts = stdout.split("\x1f");
+        const sha = (parts[0] ?? "").trim();
+        const subject = parts[1] ?? "";
+        const authorName = parts[2] ?? "";
+        const authorEmail = parts[3] ?? "";
+        const body = parts.slice(4).join("\x1f").trimEnd();
         if (sha && commitOwnedByTask(task.id, task.lineageId, subject, body, { name: authorName, email: authorEmail })) {
           const commit: LandedTaskCommit = { sha, subject, rebaseBaseSha };
           try {
@@ -2239,7 +2248,14 @@ export class SelfHealingManager {
           `git log -1 --format=%an%x1f%ae%x1f%b ${shellQuote(candidateSha)}`,
           { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
         );
-        const [candidateAuthorName = "", candidateAuthorEmail = "", bodyOut = ""] = authorAndBodyOut.split("\x1f");
+        // Same slice+rejoin treatment as the stored-sha lookup above: %b is
+        // last and must not be truncated at an embedded 0x1f byte, and
+        // trimEnd() keeps an empty body "" instead of git's trailing "\n"
+        // (this call had no trim at all before, unlike the stored-sha path).
+        const bodyParts = authorAndBodyOut.split("\x1f");
+        const candidateAuthorName = bodyParts[0] ?? "";
+        const candidateAuthorEmail = bodyParts[1] ?? "";
+        const bodyOut = bodyParts.slice(2).join("\x1f").trimEnd();
         if (
           commitOwnedByTask(task.id, task.lineageId, candidateSubject, bodyOut, {
             name: candidateAuthorName,
