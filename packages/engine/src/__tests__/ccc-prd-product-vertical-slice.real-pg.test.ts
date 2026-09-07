@@ -1222,8 +1222,11 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
       expect(liveHold.status.workItems).toEqual([
         expect.objectContaining({
           state: "manual-required",
-          lastError:
-            "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
+          lastError: expect.stringContaining(
+            "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED: "
+              + "CCC campaign CAMPAIGN-VERTICAL is awaiting exact human live-execution authorization ",
+          ),
+          blockedReason: "ccc-permanent:CCC_CAMPAIGN_LIVE_EXECUTION_APPROVAL_REQUIRED",
         }),
       ]);
       expect(liveHold.status.nextAction.kind).toBe("approve-execution");

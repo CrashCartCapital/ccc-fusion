@@ -91,6 +91,76 @@ describe("formatCccPermanentWorkItemError", () => {
     expect(formatted).not.toContain("\n");
     expect(formatted.length).toBeLessThanOrEqual(512);
   });
+
+  it.each([
+    [
+      "plain detail",
+      "plain diagnostic",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: plain diagnostic",
+    ],
+    [
+      "already-prefixed detail",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: plain diagnostic",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: plain diagnostic",
+    ],
+    [
+      "repeated same-code prefix",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: plain diagnostic",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: plain diagnostic",
+    ],
+    [
+      "detail equal to the supplied reason",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+    ],
+    [
+      "empty detail",
+      "",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+    ],
+    [
+      "different-code diagnostic",
+      "ccc-permanent:OTHER_CODE: preserve this diagnostic",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: ccc-permanent:OTHER_CODE: preserve this diagnostic",
+    ],
+    [
+      "bounded detail",
+      "x".repeat(1_000),
+      `ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: ${"x".repeat(512 - "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: ".length)}`,
+    ],
+  ])("normalizes %s without changing the supplied machine reason", (_label, detail, expected) => {
+    const reason = "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED";
+    expect(formatCccPermanentWorkItemError(
+      reason,
+      new PermanentError(detail, detail.startsWith("ccc-permanent:OTHER_CODE") ? "OTHER_CODE" : "CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED"),
+    )).toBe(expected);
+  });
+
+  it.each([
+    [
+      "trailing delimiter after exact reason",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED:",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+    ],
+    [
+      "near-prefix without the exact delimiter",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED:near-match",
+      "ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED: ccc-permanent:CCC_CAMPAIGN_PROOF_CUSTODY_REFUSED:near-match",
+    ],
+    [
+      "empty supplied reason",
+      "",
+      "diagnostic without a machine reason",
+      "diagnostic without a machine reason",
+    ],
+  ])("guards %s without an empty-prefix loop", (_label, reason, detail, expected) => {
+    expect(formatCccPermanentWorkItemError(
+      reason,
+      new PermanentError(detail, "TEST_CODE"),
+    )).toBe(expected);
+  });
 });
 
 const parseStepsDeps = {
