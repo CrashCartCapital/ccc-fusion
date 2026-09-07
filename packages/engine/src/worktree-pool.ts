@@ -4,7 +4,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, realpathSync 
 import { mkdir } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ColumnId, SecretsStore, Settings, TaskStore, WorktrunkSettings } from "@fusion/core";
-import { assertCleanBranchAtBase, inspectBranchConflict } from "./branch-conflicts.js";
+import { assertCleanBranchAtBase, deriveTaskIdFromFusionBranch, inspectBranchConflict } from "./branch-conflicts.js";
 import { worktreePoolLog } from "./logger.js";
 import { isAiMergeContainerDir, isInsideConfiguredWorktreesDir, resolveWorktreesDir } from "./worktree-paths.js";
 import { canonicalFusionBranchName } from "./worktree-names.js";
@@ -897,21 +897,67 @@ export async function scanIdleWorktrees(
   const registeredWorktrees = await getRegisteredWorktreePaths(rootDir);
   const registeredDirs = dirs.filter((dir) => registeredWorktrees.has(resolve(dir)));
 
-  // Find worktree paths assigned to non-done tasks (active worktrees)
-  const tasks = await store.listTasks({ slim: true, includeArchived: false, startupMemo: true });
+  // Fetch every task this store knows about — including done/archived — so a
+  // worktree can be recognized as ours even after the task that made it is
+  // long since finished. `includeArchived: true` is load-bearing for the
+  // ownership guard immediately below, not just the active-worktree check.
+  const tasks = await store.listTasks({ slim: true, includeArchived: true, startupMemo: true });
+
+  /*
+  FNXC:SelfHealingOwnershipGuard 2026-09-06 (worktree-sweep incident): a
+  worktree is only a legitimate cleanup/reuse candidate — surfaced here for
+  every caller (cleanupOrphans, enforceWorktreeCap, cleanupOrphanedWorktrees,
+  pool warm-load) — if THIS engine has a durable record that it created it:
+  either a task row (any column, so a done/archived task's former worktree
+  still counts) whose `worktree` field names this exact path, or the
+  checked-out branch matches this engine's own `fusion/<task-id>` naming AND
+  that task id exists in the store (any column). A worktree that fails both
+  checks was never this engine's to make, let alone remove or repurpose —
+  e.g. an `agent/<name>` worktree created by a human/agent workflow outside
+  Fusion task management, or (as in the incident) a `serve` process that
+  auto-registered its own source checkout as a project and found zero task
+  rows at all, which would otherwise have made EVERY real worktree under
+  `.worktrees/` look "idle". Foreign paths are dropped before any caller
+  ever sees them, and logged once for observability.
+  */
+  const boundWorktreePaths = new Set<string>();
+  const knownTaskIds = new Set<string>();
+  for (const task of tasks) {
+    knownTaskIds.add(task.id.toUpperCase());
+    if (task.worktree) boundWorktreePaths.add(resolve(task.worktree));
+  }
+  const branchByPath = new Map<string, string>();
+  for (const entry of await getRegisteredWorktreeBranches(rootDir)) {
+    branchByPath.set(resolve(entry.worktreePath), entry.branch);
+  }
+  const ownedDirs = registeredDirs.filter((dir) => {
+    const resolved = resolve(dir);
+    if (boundWorktreePaths.has(resolved)) return true;
+    const branch = branchByPath.get(resolved);
+    const derivedTaskId = branch ? deriveTaskIdFromFusionBranch(branch) : null;
+    if (derivedTaskId && knownTaskIds.has(derivedTaskId)) return true;
+    worktreePoolLog.warn(
+      `worktree-foreign-skipped: ${resolved} is a registered git worktree with no durable Fusion task record — leaving it alone`,
+    );
+    return false;
+  });
+
+  // Find worktree paths assigned to non-done, non-archived tasks (active worktrees)
   const activeWorktrees = new Set<string>();
   for (const task of tasks) {
-    if (task.worktree && task.column !== "done" && registeredWorktrees.has(resolve(task.worktree))) {
+    if (task.column === "done" || task.column === "archived") continue;
+    if (task.worktree && registeredWorktrees.has(resolve(task.worktree))) {
       activeWorktrees.add(resolve(task.worktree));
-    } else if (task.worktree && task.column !== "done") {
+    } else if (task.worktree) {
       worktreePoolLog.log(`Ignoring task ${task.id} worktree metadata because it is not a registered git worktree: ${task.worktree}`);
     }
   }
 
-  // Return registered worktrees on disk that are NOT active. Unregistered
-  // directories are intentionally excluded here so recycle mode never adds a
-  // broken directory to the warm pool; cleanup handles those separately.
-  return registeredDirs.filter((dir) => !activeWorktrees.has(resolve(dir)));
+  // Return owned, registered worktrees on disk that are NOT active.
+  // Unregistered directories are intentionally excluded here so recycle mode
+  // never adds a broken directory to the warm pool; cleanup handles those
+  // separately.
+  return ownedDirs.filter((dir) => !activeWorktrees.has(resolve(dir)));
 }
 
 /**

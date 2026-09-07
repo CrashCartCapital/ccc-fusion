@@ -860,11 +860,15 @@ describe("scanIdleWorktrees", () => {
     const store = createMockStore([
       makeTask("FN-001", "in-progress", "/root/.worktrees/swift-falcon"),
       makeTask("FN-002", "done", "/root/.worktrees/calm-river"),
+      // Durable-ownership record for bold-eagle (see the worktree-sweep
+      // incident fix comment above) — otherwise it is treated as foreign and
+      // excluded, defeating the "idle vs active" comparison this test makes.
+      makeTask("FN-003", "archived", "/root/.worktrees/bold-eagle"),
     ]);
 
     const idle = await scanIdleWorktrees("/root", store);
 
-    expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: false, startupMemo: true });
+    expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: true, startupMemo: true });
     expect(idle).toContain("/root/.worktrees/calm-river");
     expect(idle).toContain("/root/.worktrees/bold-eagle");
     expect(idle).not.toContain("/root/.worktrees/swift-falcon");
@@ -900,7 +904,17 @@ describe("scanIdleWorktrees", () => {
     expect(idle).not.toContain("/root/.worktrees/review-wt");
   });
 
-  it("returns all worktrees when no tasks exist", async () => {
+  it("treats every worktree as foreign and refuses to reclaim any of them when no tasks exist (worktree-sweep incident fix)", async () => {
+    /*
+     * Reproduces the 2026-09-06 incident directly: `serve` launched with its
+     * cwd inside the Fusion source checkout auto-registered a brand-new
+     * project with an empty database, then that engine's maintenance swept
+     * `.worktrees/l12-live-campaign` and `.worktrees/l8-live-campaign` —
+     * real, unrelated git worktrees it had zero task rows for — as "idle".
+     * Before the fix, an empty task store made EVERY registered worktree
+     * look idle/orphaned; after the fix, zero task rows means zero durable
+     * ownership records, so nothing is eligible for cleanup at all.
+     */
     mockedReaddirSync.mockReturnValue([
       makeDirEntry("wt-1"),
       makeDirEntry("wt-2"),
@@ -910,9 +924,9 @@ describe("scanIdleWorktrees", () => {
     const store = createMockStore([]);
 
     const idle = await scanIdleWorktrees("/root", store);
-    expect(idle).toHaveLength(2);
-    expect(idle).toContain("/root/.worktrees/wt-1");
-    expect(idle).toContain("/root/.worktrees/wt-2");
+    expect(idle).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("worktree-foreign-skipped: /root/.worktrees/wt-1"));
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("worktree-foreign-skipped: /root/.worktrees/wt-2"));
   });
 
   it("returns empty array when readdirSync throws", async () => {
@@ -935,7 +949,12 @@ describe("scanIdleWorktrees", () => {
     ] as any);
     mockRegisteredWorktrees("/root", [".ai-merge/fusion-ai-merge-fn-1-active", "registered-wt"]);
 
-    const store = createMockStore([]);
+    // Durable-ownership record for registered-wt (see the worktree-sweep
+    // incident fix comment above) so this test keeps exercising .ai-merge
+    // exclusion rather than the (unrelated) ownership guard.
+    const store = createMockStore([
+      makeTask("FN-001", "done", "/root/.worktrees/registered-wt"),
+    ]);
 
     const idle = await scanIdleWorktrees("/root", store);
     expect(idle).toEqual(["/root/.worktrees/registered-wt"]);
@@ -951,6 +970,9 @@ describe("scanIdleWorktrees", () => {
 
     const store = createMockStore([
       makeTask("FN-001", "in-progress", "/root/.worktrees/broken-wt"),
+      // Durable-ownership record for registered-wt (see the worktree-sweep
+      // incident fix comment above).
+      makeTask("FN-007", "done", "/root/.worktrees/registered-wt"),
     ]);
 
     const idle = await scanIdleWorktrees("/root", store);
@@ -975,7 +997,14 @@ describe("cleanupOrphanedWorktrees", () => {
     ] as any);
     mockRegisteredWorktrees("/root", ["orphan-1", "orphan-2"]);
 
-    const store = createMockStore([]);
+    // Since the worktree-sweep incident fix, a worktree with zero durable
+    // Fusion task record (any column) is left alone rather than reclaimed —
+    // bind each orphan to a done task so this still exercises "idle but
+    // Fusion-owned, therefore reclaimable".
+    const store = createMockStore([
+      makeTask("FN-002", "done", "/root/.worktrees/orphan-1"),
+      makeTask("FN-003", "done", "/root/.worktrees/orphan-2"),
+    ]);
 
     const cleaned = await cleanupOrphanedWorktrees("/root", store);
 
@@ -997,6 +1026,9 @@ describe("cleanupOrphanedWorktrees", () => {
 
     const store = createMockStore([
       makeTask("FN-001", "in-progress", "/root/.worktrees/active-wt"),
+      // Durable-ownership record for the otherwise-unbound orphan (see the
+      // worktree-sweep incident fix comment above).
+      makeTask("FN-004", "done", "/root/.worktrees/orphan-wt"),
     ]);
 
     const cleaned = await cleanupOrphanedWorktrees("/root", store);
@@ -1040,7 +1072,13 @@ describe("cleanupOrphanedWorktrees", () => {
       return Buffer.from("");
     });
 
-    const store = createMockStore([]);
+    // Durable-ownership records for both worktrees (see the worktree-sweep
+    // incident fix comment above) — otherwise scanIdleWorktrees treats them
+    // as foreign and neither removal is even attempted.
+    const store = createMockStore([
+      makeTask("FN-005", "done", "/root/.worktrees/fail-wt"),
+      makeTask("FN-006", "done", "/root/.worktrees/ok-wt"),
+    ]);
 
     const cleaned = await cleanupOrphanedWorktrees("/root", store);
 
