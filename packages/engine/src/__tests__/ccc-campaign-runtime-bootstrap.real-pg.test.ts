@@ -559,7 +559,8 @@ pgTest("Task 5 RED: bootstraps one fixed proof host and one authoritative campai
       "product-v2 preparation campaign terminal state",
     );
     expect(terminal).toMatchObject({
-      blockedReason: "ccc-permanent:CCC_PROOF_ADMISSION_REFUSED",
+      blockedReason: "ccc-permanent:CCC_CAMPAIGN_PROOF_EXECUTION_REFUSED",
+      lastError: "ccc-permanent:CCC_CAMPAIGN_PROOF_EXECUTION_REFUSED: CCC campaign task proof has no isolated worktree",
       leaseOwner: null,
       leaseExpiresAt: null,
     });
