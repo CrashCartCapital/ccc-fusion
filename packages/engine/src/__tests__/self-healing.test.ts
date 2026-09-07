@@ -4262,8 +4262,8 @@ describe("SelfHealingManager", () => {
           // Ownership-verification body fetch (FN-5441/5446): the real commit
           // located via trailer grep carries the anchored trailer in its body,
           // so commitOwnedByTask accepts it though the subject lacks the task ID.
-          if (cmd.includes("--format=%b") && cmd.includes("trailerSha123")) {
-            return "Fusion-Task-Id: FN-2900\n" as any;
+          if (cmd.includes("--format=%an%x1f%ae%x1f%b") && cmd.includes("trailerSha123")) {
+            return "Test\u001ftest@example.com\u001fFusion-Task-Id: FN-2900\n" as any;
           }
           if (cmd.includes("--fixed-strings")) return "" as any;
         }
@@ -4324,8 +4324,8 @@ describe("SelfHealingManager", () => {
         }
         // Ownership-verification body fetch (FN-5441/5446): real trailer-grep
         // hit carries the anchored trailer in its body.
-        if (cmd.includes("git log") && cmd.includes("--format=%b") && cmd.includes("rangeSha901")) {
-          return "Fusion-Task-Id: FN-2901\n" as any;
+        if (cmd.includes("git log") && cmd.includes("--format=%an%x1f%ae%x1f%b") && cmd.includes("rangeSha901")) {
+          return "Test\u001ftest@example.com\u001fFusion-Task-Id: FN-2901\n" as any;
         }
         if (cmd.includes("git diff --shortstat") && cmd.includes("rebasebase901..rangeSha901")) {
           return " 4 files changed, 104 insertions(+), 1 deletion(-)\n" as any;
@@ -5966,7 +5966,7 @@ describe("SelfHealingManager", () => {
         if (cmd.includes("Fusion-Task-Id: FN-stuck")) return "abc12345\x1fRecovered subject\n" as any;
         // FN-5441 ownership verification: post-grep body fetch must contain
         // the anchored trailer so commitOwnedByTask accepts the candidate.
-        if (cmd.includes("--format=%b") && cmd.includes("abc12345")) return "Fusion-Task-Id: FN-stuck\n" as any;
+        if (cmd.includes("--format=%an%x1f%ae%x1f%b") && cmd.includes("abc12345")) return "Test\u001ftest@example.com\u001fFusion-Task-Id: FN-stuck\n" as any;
         if (cmd.includes("--shortstat")) return " 2 files changed, 3 insertions(+), 1 deletions(-)\n" as any;
         return "" as any;
       });
@@ -6126,8 +6126,8 @@ describe("SelfHealingManager", () => {
         // grep step finds the unrelated FN-5483 commit whose body mentions FN-5441 in prose
         if (cmd.includes("FN-5441") && cmd.includes("--grep")) return "e3dbfaae\x1ffix(FN-5483): allow merger commits past identity-guard\n" as any;
         // ownership-verification body fetch returns prose-mention body, no anchored trailer
-        if (cmd.includes("--format=%b") && cmd.includes("e3dbfaae")) {
-          return "The refusal surfaced as merge-deadlock-detected on FN-5441 and FN-5446. ...\n" as any;
+        if (cmd.includes("--format=%an%x1f%ae%x1f%b") && cmd.includes("e3dbfaae")) {
+          return "Test\u001ftest@example.com\u001fThe refusal surfaced as merge-deadlock-detected on FN-5441 and FN-5446. ...\n" as any;
         }
         return "" as any;
       });
@@ -6168,9 +6168,9 @@ describe("SelfHealingManager", () => {
         if (cmd.includes("Fusion-Task-Id: FN-3829")) return "0d3f51b6\x1fthree\n" as any;
         // FN-5441 ownership verification: post-grep body fetch must contain
         // the anchored trailer so commitOwnedByTask accepts each candidate.
-        if (cmd.includes("--format=%b") && cmd.includes("278a2825")) return "Fusion-Task-Id: FN-3794\n" as any;
-        if (cmd.includes("--format=%b") && cmd.includes("69c25e2b")) return "Fusion-Task-Id: FN-3814\n" as any;
-        if (cmd.includes("--format=%b") && cmd.includes("0d3f51b6")) return "Fusion-Task-Id: FN-3829\n" as any;
+        if (cmd.includes("--format=%an%x1f%ae%x1f%b") && cmd.includes("278a2825")) return "Test\u001ftest@example.com\u001fFusion-Task-Id: FN-3794\n" as any;
+        if (cmd.includes("--format=%an%x1f%ae%x1f%b") && cmd.includes("69c25e2b")) return "Test\u001ftest@example.com\u001fFusion-Task-Id: FN-3814\n" as any;
+        if (cmd.includes("--format=%an%x1f%ae%x1f%b") && cmd.includes("0d3f51b6")) return "Test\u001ftest@example.com\u001fFusion-Task-Id: FN-3829\n" as any;
         return "" as any;
       });
 
@@ -9672,8 +9672,8 @@ describe("recoverDoneTaskMergeMetadata", () => {
     mockedExecSync.mockImplementation((command) => {
       const cmd = String(command);
       if (cmd.includes("merge-base --is-ancestor 'merge1' HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 'merge1'")) {
-        return "merge1\u001ffix(FN-3862): canonical merge\u001fFusion-Task-Id: FN-3862" as any;
+      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%an%x1f%ae%x1f%b 'merge1'")) {
+        return "merge1\u001ffix(FN-3862): canonical merge\u001fTest\u001ftest@example.com\u001fFusion-Task-Id: FN-3862" as any;
       }
       if (cmd.includes("show --shortstat --format= merge1")) {
         return "3 files changed, 10 insertions(+), 1 deletions(-)" as any;
@@ -9714,7 +9714,7 @@ describe("recoverDoneTaskMergeMetadata", () => {
     mockedExecSync.mockImplementation((command) => {
       const cmd = String(command);
       if (cmd.includes("merge-base --is-ancestor 'merge1' HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 'merge1'")) return "merge1\u001ffix(FN-4646): canonical merge\u001fFusion-Task-Id: FN-4646-A" as any;
+      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%an%x1f%ae%x1f%b 'merge1'")) return "merge1\u001ffix(FN-4646): canonical merge\u001fTest\u001ftest@example.com\u001fFusion-Task-Id: FN-4646-A" as any;
       if (cmd.includes("show --shortstat --format=") && cmd.includes("merge1")) return "2 files changed, 3 insertions(+), 1 deletion(-)" as any;
       if (cmd.includes("Fusion-Task-Id: FN-4646-A")) return "merge1\u001ffix(FN-4646): canonical merge\n" as any;
       return "" as any;
@@ -9746,7 +9746,7 @@ describe("recoverDoneTaskMergeMetadata", () => {
     mockedExecSync.mockImplementation((command) => {
       const cmd = String(command);
       if (cmd.includes("merge-base --is-ancestor 'merge1' HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 'merge1'")) return "merge1\u001ffix(FN-4646): canonical merge\u001fFusion-Task-Id: FN-4646-B" as any;
+      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%an%x1f%ae%x1f%b 'merge1'")) return "merge1\u001ffix(FN-4646): canonical merge\u001fTest\u001ftest@example.com\u001fFusion-Task-Id: FN-4646-B" as any;
       if (cmd.includes("show --shortstat --format=") && cmd.includes("merge1")) return "2 files changed, 3 insertions(+), 1 deletion(-)" as any;
       if (cmd.includes("Fusion-Task-Id: FN-4646-B")) return "merge1\u001ffix(FN-4646): canonical merge\n" as any;
       return "" as any;
@@ -9789,7 +9789,7 @@ describe("recoverDoneTaskMergeMetadata", () => {
     mockedExecSync.mockImplementation((command) => {
       const cmd = String(command);
       if (cmd.includes("merge-base --is-ancestor") && cmd.includes("merge1")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b") && cmd.includes("merge1")) return "merge1\u001ffix(FN-7231): stale proof\u001fFusion-Task-Id: FN-7231" as any;
+      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%an%x1f%ae%x1f%b") && cmd.includes("merge1")) return "merge1\u001ffix(FN-7231): stale proof\u001fTest\u001ftest@example.com\u001fFusion-Task-Id: FN-7231" as any;
       if (cmd.includes("show --shortstat --format=") && cmd.includes("merge1")) return "1 file changed, 1 insertion(+)" as any;
       if (cmd.includes("show --name-only --format=") && cmd.includes("merge1")) return "packages/engine/src/executor.ts\n" as any;
       if (cmd.includes("Fusion-Task-Id: FN-7231")) return "merge1\u001ffix(FN-7231): stale proof\n" as any;
@@ -10020,8 +10020,8 @@ describe("recoverDoneTaskMergeMetadata", () => {
     mockedExecSync.mockImplementation((command) => {
       const cmd = String(command);
       if (cmd.includes("merge-base --is-ancestor 196adbd HEAD")) return "" as any;
-      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%b 196adbd")) {
-        return "196adbd\u001ffeat(FN-3372): add safety net\u001fFusion-Task-Id: FN-3372" as any;
+      if (cmd.includes("log -1 --format=%H%x1f%s%x1f%an%x1f%ae%x1f%b 196adbd")) {
+        return "196adbd\u001ffeat(FN-3372): add safety net\u001fTest\u001ftest@example.com\u001fFusion-Task-Id: FN-3372" as any;
       }
       return "" as any;
     });

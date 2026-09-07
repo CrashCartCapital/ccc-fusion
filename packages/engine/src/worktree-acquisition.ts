@@ -76,6 +76,32 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/*
+FNXC:CommitOwnedByTask 2026-09-06-00:00:
+The literal shape of the controller commit produced by
+`ccc-campaign-required-commit.ts` (`git commit -m "ccc-fusion campaign
+<taskId>"`, author `ccc-fusion <ccc-fusion@localhost>`). Exported as its own
+named predicate — rather than left inline inside
+`isCccCampaignTaskOwnedCommit` — so self-healing.ts's `commitOwnedByTask` can
+recognize this exact shape too (self-healing.ts:701 previously had no way to
+attribute this commit to its task, since it carries no trailer and its
+subject anchors to no conventional-commit/`id:` form) without duplicating the
+regex-equivalent comparison and risking the two definitions drifting apart.
+Do not widen this beyond the exact subject+author+email match: it is
+intentionally narrower than the trailer/conventional-commit checks below,
+which each caller may or may not also want.
+*/
+export function isCccCampaignControllerCommit(input: {
+  taskId: string;
+  subject: string;
+  authorName: string;
+  authorEmail: string;
+}): boolean {
+  return input.subject === `ccc-fusion campaign ${input.taskId}`
+    && input.authorName === "ccc-fusion"
+    && input.authorEmail === "ccc-fusion@localhost";
+}
+
 function isCccCampaignTaskOwnedCommit(input: {
   taskId: string;
   subject: string;
@@ -92,10 +118,7 @@ function isCccCampaignTaskOwnedCommit(input: {
     `(?:^|\\n)(?:Fusion-Task-Id|Task-Id):\\s*${taskId}\\s*(?:\\n|$)`,
     "iu",
   );
-  const controllerCommit = input.subject === `ccc-fusion campaign ${input.taskId}`
-    && input.authorName === "ccc-fusion"
-    && input.authorEmail === "ccc-fusion@localhost";
-  return controllerCommit || subject.test(input.subject) || trailer.test(input.body);
+  return isCccCampaignControllerCommit(input) || subject.test(input.subject) || trailer.test(input.body);
 }
 
 /**

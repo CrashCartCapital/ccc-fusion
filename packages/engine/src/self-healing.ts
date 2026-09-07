@@ -36,6 +36,7 @@ import type { MeshLeaseManager } from "./mesh-lease-manager.js";
 import { createLogger, schedulerLog } from "./logger.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
 import { RemovalReason, classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isRepoRootPath, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "./worktree-pool.js";
+import { isCccCampaignControllerCommit } from "./worktree-acquisition.js";
 import {
   classifyMissingWorktreeSessionStartFailure,
   extractMissingWorktreePathFromSessionStartFailure,
@@ -697,12 +698,39 @@ interface LandedTaskCommit {
  *  - `Fusion-Task-Id: <taskId>` as a complete trailer line in the body
  *  - Subject anchored on the task ID in conventional-commit form:
  *      `<type>(<taskId>): …` or `<taskId>: …` or `<type>(<taskId>/...): …`
+ *  - The literal CCC campaign controller commit shape (`ccc-fusion campaign
+ *    <taskId>`, author `ccc-fusion <ccc-fusion@localhost>`), when `author` is
+ *    supplied. FNXC:CommitOwnedByTask 2026-09-06-00:00 (see
+ *    .archive/l28-landing-readiness/01-audit-findings.md "Fix sizing"): this
+ *    commit carries no trailer and its bare subject anchors to none of the
+ *    conventional-commit/`id:` forms above, so it was previously invisible to
+ *    `findLandedTaskCommit`'s four self-healing recovery callers. Reuses
+ *    `isCccCampaignControllerCommit` (worktree-acquisition.ts) — the same
+ *    exact-shape predicate `isCccCampaignTaskOwnedCommit` already exercises
+ *    on the worktree-acquisition custody path — rather than duplicating the
+ *    subject/author/email comparison, so the two cannot drift. Deliberately
+ *    does NOT reuse `isCccCampaignTaskOwnedCommit` wholesale: that predicate
+ *    also accepts a bare `Task-Id:` trailer and a broader conventional-commit
+ *    scope match that this function does not otherwise accept, and widening
+ *    ownership beyond the exact controller-commit shape here is out of scope.
  */
-function commitOwnedByTask(taskId: string, lineageId: string | undefined, subject: string, body: string): boolean {
+function commitOwnedByTask(
+  taskId: string,
+  lineageId: string | undefined,
+  subject: string,
+  body: string,
+  author?: { name: string; email: string },
+): boolean {
   if (lineageId && new RegExp(`(?:^|\\n)Fusion-Task-Lineage: ${escapeRegex(lineageId)}\\s*(?:\\n|$)`).test(body)) {
     return true;
   }
   if (new RegExp(`(?:^|\\n)Fusion-Task-Id: ${escapeRegex(taskId)}\\s*(?:\\n|$)`).test(body)) {
+    return true;
+  }
+  if (
+    author
+    && isCccCampaignControllerCommit({ taskId, subject, authorName: author.name, authorEmail: author.email })
+  ) {
     return true;
   }
   // Subject anchor: `<type>(<…taskId…>): …` or `<taskId>: …` at start.
@@ -2111,11 +2139,20 @@ export class SelfHealingManager {
           { cwd: this.options.rootDir },
         );
         const { stdout } = await execAsync(
-          `git log -1 --format=%H%x1f%s%x1f%b ${shellQuote(storedSha)}`,
+          `git log -1 --format=%H%x1f%s%x1f%an%x1f%ae%x1f%b ${shellQuote(storedSha)}`,
           { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
         );
-        const [sha, subject = "", body = ""] = stdout.trim().split("\x1f");
-        if (sha && commitOwnedByTask(task.id, task.lineageId, subject, body)) {
+        // %b (body) is the LAST field and may itself contain a literal 0x1f
+        // byte (however unlikely) — a plain destructuring split would silently
+        // drop everything after the first such byte. Slice+rejoin the
+        // remaining tokens instead of taking split(...)[4] directly.
+        const parts = stdout.split("\x1f");
+        const sha = (parts[0] ?? "").trim();
+        const subject = parts[1] ?? "";
+        const authorName = parts[2] ?? "";
+        const authorEmail = parts[3] ?? "";
+        const body = parts.slice(4).join("\x1f").trimEnd();
+        if (sha && commitOwnedByTask(task.id, task.lineageId, subject, body, { name: authorName, email: authorEmail })) {
           const commit: LandedTaskCommit = { sha, subject, rebaseBaseSha };
           try {
             const shortstat = await this.readShortstatForSha(sha, rebaseBaseSha);
@@ -2207,11 +2244,24 @@ export class SelfHealingManager {
       const [candidateSha, candidateSubject = ""] = line.split("\x1f");
       if (!candidateSha) continue;
       try {
-        const { stdout: bodyOut } = await execAsync(
-          `git log -1 --format=%b ${shellQuote(candidateSha)}`,
+        const { stdout: authorAndBodyOut } = await execAsync(
+          `git log -1 --format=%an%x1f%ae%x1f%b ${shellQuote(candidateSha)}`,
           { cwd: this.options.rootDir, maxBuffer: 1024 * 1024 },
         );
-        if (commitOwnedByTask(task.id, task.lineageId, candidateSubject, bodyOut)) {
+        // Same slice+rejoin treatment as the stored-sha lookup above: %b is
+        // last and must not be truncated at an embedded 0x1f byte, and
+        // trimEnd() keeps an empty body "" instead of git's trailing "\n"
+        // (this call had no trim at all before, unlike the stored-sha path).
+        const bodyParts = authorAndBodyOut.split("\x1f");
+        const candidateAuthorName = bodyParts[0] ?? "";
+        const candidateAuthorEmail = bodyParts[1] ?? "";
+        const bodyOut = bodyParts.slice(2).join("\x1f").trimEnd();
+        if (
+          commitOwnedByTask(task.id, task.lineageId, candidateSubject, bodyOut, {
+            name: candidateAuthorName,
+            email: candidateAuthorEmail,
+          })
+        ) {
           sha = candidateSha;
           subject = candidateSubject;
           break;
