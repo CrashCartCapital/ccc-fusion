@@ -1961,6 +1961,131 @@ describe("prd command exit contract", () => {
     expect(inspectVerifierConfinementReadiness).toHaveBeenCalledTimes(2);
   });
 
+  it("R5-generated-v2-route-nonconforming-proof-refuses-before-import", async () => {
+    const packet = createPacketRoot({ semanticV2: true });
+    const proposal = JSON.parse(readFileSync(packet.proposal, "utf8"));
+    const nativeAdapter = {
+      id: "fusion-native-model-runtime-v1",
+      model: "loopback/fixture",
+      generateCandidate: vi.fn(async () => proposal),
+    };
+    const createNativeCccPrdAuthoringAdapter = vi.fn(() => nativeAdapter);
+    const generatedAuthorOutput: string[] = [];
+    expect(await runPrdCommand(
+      generatedAuthorArgs(packet),
+      { write: (line) => generatedAuthorOutput.push(line) },
+      {
+        bootstrapProofAdmission,
+        createNativeCccPrdAuthoringAdapter,
+        inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+          ready: true,
+          backend: "sandbox-exec" as const,
+          code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+          message: "semantic-proof sandbox-exec backend is available",
+          trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+        })),
+        readTargetHead: vi.fn(async () => packet.base),
+        resolveSemanticProofToolchainPaths: vi.fn(() => packet.semanticProofToolchainPaths!),
+        // Keep the engine authoring function real: it must hydrate controller
+        // proof custody and emit the complete admissible semantic-v2 sidecar.
+      },
+    )).toBe(0);
+    expect(createNativeCccPrdAuthoringAdapter).toHaveBeenCalledTimes(1);
+    expect(nativeAdapter.generateCandidate).toHaveBeenCalledTimes(1);
+    expect(generatedAuthorOutput.join("\n")).toContain('"kind":"candidate"');
+    const authoredSidecar = JSON.parse(readFileSync(packet.sidecar, "utf8")) as {
+      schema: string;
+      provenance: { authoringModel?: string };
+    };
+    expect(authoredSidecar).toMatchObject({
+      schema: "ccc-prd.sidecar.v2",
+      provenance: { authoringModel: "loopback/fixture" },
+    });
+    expect(authoredSidecar.provenance.authoringModel).not.toBe("proposal-file-v2");
+    const policyPath = await createExecutionPlan(packet);
+    const layer = {};
+    const store = { getAsyncLayer: vi.fn(() => layer) };
+    const context = {
+      projectId: "project-1",
+      projectPath: resolve(packet.target),
+      projectName: "Fixture",
+      isRegistered: true,
+      store,
+    };
+    const importBundle = vi.fn();
+    const closeProjectStore = vi.fn(async () => undefined);
+    const conformanceInputs: unknown[] = [];
+    const assertSemanticProofVerifierConformance = vi.fn(async (input: unknown) => {
+      conformanceInputs.push(input);
+    });
+    const dependencies = {
+      resolveProject: vi.fn(async () => context),
+      closeProjectStore,
+      readTargetHead: vi.fn(async () => packet.base),
+      importCccPrdBundle: importBundle,
+      inspectVerifierConfinementReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "VERIFIER_CONFINEMENT_READY",
+        message: "verifier confinement readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
+      inspectSemanticProofSandboxReadiness: vi.fn(async () => ({
+        ready: true,
+        backend: "sandbox-exec" as const,
+        code: "CCC_SEMANTIC_PROOF_SANDBOX_READY",
+        message: "semantic-proof sandbox readiness probe executed successfully",
+        trustedPaths: ["/usr/bin/sandbox-exec"] as const,
+      })),
+      resolveSemanticProofToolchainPaths: () => packet.semanticProofToolchainPaths!,
+      assertSemanticProofV2Custody: vi.fn(async () => undefined),
+      assertSemanticProofVerifierConformance,
+    };
+    const common = [
+      packet.root,
+      packet.manifest,
+      packet.sidecar,
+      policyPath,
+      packet.target,
+      packet.base,
+    ];
+    const previewOutput: string[] = [];
+    expect(await runPrdJson(
+      ["preview", ...common],
+      { write: (line) => previewOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(0);
+    const preview = JSON.parse(previewOutput[0]!) as { confirmationDigest: string };
+    expect(conformanceInputs).toHaveLength(1);
+
+    assertSemanticProofVerifierConformance.mockImplementationOnce(async (input: unknown) => {
+      conformanceInputs.push(input);
+      const error = new Error("fixture verifier output is not ccc-prd.proof-evidence.v2");
+      Object.assign(error, { code: "CCC_PRD_PROOF_VERIFIER_NONCONFORMING" });
+      throw error;
+    });
+
+    const importOutput: string[] = [];
+    expect(await runPrdJson(
+      ["import", ...common, "operator-key", "--confirm", preview.confirmationDigest],
+      { write: (line) => importOutput.push(line) },
+      dependencies,
+      { projectName: "fixture" },
+    )).toBe(1);
+    expect(JSON.parse(importOutput[0]!)).toMatchObject({
+      kind: "refusal",
+      diagnostics: [expect.objectContaining({ code: "CCC_PRD_PROOF_VERIFIER_NONCONFORMING" })],
+    });
+    // Preview and import send the same generated v2 proof set through the
+    // controller conformance seam; the refusal happens before importer,
+    // campaign, provider, or proof-attempt effects can begin.
+    expect(conformanceInputs).toHaveLength(2);
+    expect(conformanceInputs[1]).toEqual(conformanceInputs[0]);
+    expect(importBundle).not.toHaveBeenCalled();
+    expect(closeProjectStore).toHaveBeenCalledTimes(2);
+  });
+
   it("shows extracted PRD work and actionable verifier guidance when confinement is unavailable", async () => {
     const packet = createPacketRoot({ semanticV2: true });
     await authorSemanticV2Packet(packet);
