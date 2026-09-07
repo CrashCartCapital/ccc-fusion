@@ -33,6 +33,7 @@ describeIfGit("detectFusionSourceCheckout (real git)", { timeout: 30_000 }, () =
   async function setupRepo(options: {
     packageName?: string;
     privatePackage?: boolean;
+    omitPackageJson?: boolean;
     marker?: "tracked-exact" | "tracked-wrong" | "untracked-exact";
   } = {}): Promise<string> {
     const repo = await mkdtemp(join(tmpdir(), "fusion-source-checkout-"));
@@ -40,15 +41,18 @@ describeIfGit("detectFusionSourceCheckout (real git)", { timeout: 30_000 }, () =
     git(repo, ["init", "-b", "main"]);
     git(repo, ["config", "user.email", "test@example.com"]);
     git(repo, ["config", "user.name", "Fusion Test"]);
+    const initialFile = options.omitPackageJson ? "README.md" : "package.json";
     await writeFile(
-      join(repo, "package.json"),
-      `${JSON.stringify({
-        name: options.packageName ?? "fusion-workspace",
-        private: options.privatePackage ?? true,
-      }, null, 2)}\n`,
+      join(repo, initialFile),
+      options.omitPackageJson
+        ? "generic repository\n"
+        : `${JSON.stringify({
+          name: options.packageName ?? "fusion-workspace",
+          private: options.privatePackage ?? true,
+        }, null, 2)}\n`,
       "utf8",
     );
-    git(repo, ["add", "package.json"]);
+    git(repo, ["add", initialFile]);
     git(repo, ["commit", "-m", "init"]);
 
     if (options.marker) {
@@ -66,6 +70,15 @@ describeIfGit("detectFusionSourceCheckout (real git)", { timeout: 30_000 }, () =
     return repo;
   }
 
+  async function setupEmptyRepo(): Promise<string> {
+    const repo = await mkdtemp(join(tmpdir(), "fusion-source-empty-"));
+    repos.push(repo);
+    git(repo, ["init", "-b", "main"]);
+    git(repo, ["config", "user.email", "test@example.com"]);
+    git(repo, ["config", "user.name", "Fusion Test"]);
+    return repo;
+  }
+
   it("recognizes the source checkout from its root and a nested directory", async () => {
     const repo = await setupRepo({ marker: "tracked-exact" });
     const canonicalRepo = await realpath(repo);
@@ -80,7 +93,15 @@ describeIfGit("detectFusionSourceCheckout (real git)", { timeout: 30_000 }, () =
       reason: FUSION_SOURCE_CHECKOUT_PROJECT_REFUSED,
       rootPath: canonicalRepo,
       identity: { matches: true },
-      marker: { exact: true, tracked: true },
+      marker: {
+        exact: true,
+        tracked: true,
+        committed: true,
+        headExact: true,
+        indexExact: true,
+        worktreeExact: true,
+        diverged: false,
+      },
     });
     expect(nestedResult).toMatchObject({
       kind: "source",
@@ -146,6 +167,62 @@ describeIfGit("detectFusionSourceCheckout (real git)", { timeout: 30_000 }, () =
     });
   });
 
+  it("treats a generic repository without package.json or a marker as normal", async () => {
+    const repo = await setupRepo({ omitPackageJson: true });
+
+    const result = await detectFusionSourceCheckout(repo);
+
+    expect(result).toMatchObject({
+      kind: "normal",
+      reason: "NORMAL_PROJECT",
+      identity: { name: null, private: null, matches: false },
+      marker: { exact: false, tracked: false, committed: false, state: "missing" },
+    });
+  });
+
+  it("treats an empty no-HEAD repository without a marker as normal", async () => {
+    const repo = await setupEmptyRepo();
+
+    const result = await detectFusionSourceCheckout(repo);
+
+    expect(result).toMatchObject({
+      kind: "normal",
+      reason: "NORMAL_PROJECT",
+      identity: { name: null, private: null, matches: false },
+      marker: { exact: false, tracked: false, committed: false, state: "missing" },
+    });
+  });
+
+  it("does not recognize an exact marker staged without a committed HEAD marker", async () => {
+    const repo = await setupRepo();
+    await writeFile(join(repo, ".fusion-source"), FUSION_SOURCE_MARKER_CONTENT, "utf8");
+    git(repo, ["add", ".fusion-source"]);
+
+    const result = await detectFusionSourceCheckout(repo);
+
+    expect(result).toMatchObject({
+      kind: "incomplete",
+      reason: FUSION_SOURCE_CHECKOUT_IDENTITY_INCOMPLETE,
+      identity: { matches: true },
+      marker: { exact: true, tracked: true, committed: false, state: "staged" },
+    });
+  });
+
+  it("leaves a normal identity normal when only a lookalike marker is staged", async () => {
+    const repo = await setupRepo({ packageName: "ordinary-project", privatePackage: false });
+    await writeFile(join(repo, ".fusion-source"), FUSION_SOURCE_MARKER_CONTENT, "utf8");
+    git(repo, ["add", ".fusion-source"]);
+
+    const result = await detectFusionSourceCheckout(repo);
+
+    expect(result).toMatchObject({
+      kind: "normal",
+      reason: "NORMAL_PROJECT",
+      identity: { matches: false },
+      marker: { exact: true, tracked: true, committed: false, state: "staged" },
+    });
+  });
+
   it("refuses a different project that carries the committed exact marker", async () => {
     const repo = await setupRepo({ packageName: "ordinary-project", privatePackage: false, marker: "tracked-exact" });
 
@@ -169,6 +246,48 @@ describeIfGit("detectFusionSourceCheckout (real git)", { timeout: 30_000 }, () =
       reason: "NORMAL_PROJECT",
       identity: { matches: false },
       marker: { exact: false, tracked: true, state: "wrong" },
+    });
+  });
+
+  it("refuses to treat a committed marker with an index mismatch as a stable source", async () => {
+    const repo = await setupRepo({ marker: "tracked-exact" });
+    await writeFile(join(repo, ".fusion-source"), "wrong-source-marker\n", "utf8");
+    git(repo, ["add", ".fusion-source"]);
+    await writeFile(join(repo, ".fusion-source"), FUSION_SOURCE_MARKER_CONTENT, "utf8");
+
+    const result = await detectFusionSourceCheckout(repo);
+
+    expect(result).toMatchObject({
+      kind: "incomplete",
+      reason: FUSION_SOURCE_CHECKOUT_IDENTITY_INCOMPLETE,
+      identity: { matches: true },
+      marker: {
+        exact: true,
+        tracked: true,
+        committed: true,
+        diverged: true,
+        state: "diverged",
+      },
+    });
+  });
+
+  it("retains conflict when a committed marker is removed from the index", async () => {
+    const repo = await setupRepo({ packageName: "ordinary-project", privatePackage: false, marker: "tracked-exact" });
+    git(repo, ["rm", "--cached", ".fusion-source"]);
+
+    const result = await detectFusionSourceCheckout(repo);
+
+    expect(result).toMatchObject({
+      kind: "conflict",
+      reason: FUSION_SOURCE_CHECKOUT_IDENTITY_CONFLICT,
+      identity: { matches: false },
+      marker: {
+        exact: true,
+        tracked: false,
+        committed: true,
+        diverged: true,
+        state: "diverged",
+      },
     });
   });
 
@@ -227,6 +346,21 @@ describeIfGit("detectFusionSourceCheckout (real git)", { timeout: 30_000 }, () =
       kind: "error",
       reason: FUSION_SOURCE_CHECKOUT_PROBE_ERROR,
       error: { stage: "package-json" },
+    });
+  });
+
+  it("maps a Git index failure to conflict after a committed marker signal", async () => {
+    const repo = await setupRepo({ packageName: "ordinary-project", privatePackage: false, marker: "tracked-exact" });
+    await writeFile(join(repo, ".git", "index"), "corrupt-index\n", "utf8");
+
+    const result = await detectFusionSourceCheckout(repo);
+
+    expect(result).toMatchObject({
+      kind: "conflict",
+      reason: FUSION_SOURCE_CHECKOUT_IDENTITY_CONFLICT,
+      identity: { matches: false },
+      marker: { committed: true, state: "probe-error" },
+      error: { stage: "marker-tracking" },
     });
   });
 
