@@ -383,6 +383,7 @@ type GeneratedAuthorArgs = {
 
 type AuthoringPreflightCheckId =
   | "platform"
+  | "sandbox"
   | "target_repository"
   | "baseline_head"
   | "fixed_host_toolchain"
@@ -956,6 +957,29 @@ async function runAuthoringPreflight(
     });
   }
 
+  try {
+    const readiness = await (
+      dependencies.inspectSemanticProofSandboxReadiness
+      ?? compiler.inspectCccSemanticProofSandboxReadiness
+    )();
+    const message = readiness.detail
+      ? `${readiness.message}; ${readiness.detail}`
+      : readiness.message;
+    checks.push({
+      id: "sandbox",
+      status: readiness.ready ? "pass" : "fail",
+      message,
+    });
+  } catch (error) {
+    checks.push({
+      id: "sandbox",
+      status: "fail",
+      message: error instanceof Error
+        ? `semantic-proof sandbox readiness probe failed: ${error.message}`
+        : "semantic-proof sandbox readiness probe failed",
+    });
+  }
+
   let targetHead: string | undefined;
   try {
     targetHead = await (
@@ -1035,6 +1059,8 @@ async function runAuthoringPreflight(
   if (!failed) return { report };
   const code = failed.id === "platform"
     ? "CCC_PRD_AUTHORING_PREFLIGHT_UNSUPPORTED_PLATFORM"
+    : failed.id === "sandbox"
+      ? "CCC_PRD_AUTHORING_PREFLIGHT_SANDBOX_UNAVAILABLE"
     : failed.id === "baseline_head"
       ? "CCC_PRD_AUTHORING_PREFLIGHT_BASELINE_MISMATCH"
       : failed.id === "fixed_host_toolchain"
