@@ -150,6 +150,9 @@ describe("sealed campaign authorization terminal cleanup", () => {
       expect.objectContaining({ lastError: runtimeResult.reason }),
     );
     expect(logEntry).toHaveBeenCalledWith(workItem.taskId, diagnostic);
+    const loggedDiagnostics = logEntry.mock.calls.map((call) => String(call[1]));
+    expect(loggedDiagnostics).toEqual(result.diagnostics);
+    expect(loggedDiagnostics).toHaveLength(result.diagnostics?.length ?? 0);
   });
 
   it("Slice 3 RED: fallback terminal persistence after a runtime exception also closes unopened members", async () => {
@@ -206,6 +209,9 @@ describe("sealed campaign authorization terminal cleanup", () => {
     // Still the leading diagnostic; the terminal-reason line is appended after it.
     expect(result.diagnostics?.[0]).toBe(diagnostic);
     expect(logEntry).toHaveBeenCalledWith(workItem.taskId, diagnostic);
+    const loggedDiagnostics = logEntry.mock.calls.map((call) => String(call[1]));
+    expect(loggedDiagnostics).toEqual(result.diagnostics);
+    expect(loggedDiagnostics).toHaveLength(result.diagnostics?.length ?? 0);
   });
 
   it("Slice 3 RED: a concurrent durable cancellation still triggers sealed unopened-member closure", async () => {
@@ -428,6 +434,9 @@ describe("sealed campaign authorization terminal cleanup", () => {
       + `terminal=failed reason=${reason}`;
     expect(result.diagnostics).toContain(expected);
     expect(logEntry).toHaveBeenCalledWith(workItem.taskId, expected);
+    const loggedDiagnostics = logEntry.mock.calls.map((call) => String(call[1]));
+    expect(loggedDiagnostics).toEqual(result.diagnostics);
+    expect(loggedDiagnostics).toHaveLength(result.diagnostics?.length ?? 0);
   });
 
   it("says so explicitly when a failed work item carries no reason at all", async () => {

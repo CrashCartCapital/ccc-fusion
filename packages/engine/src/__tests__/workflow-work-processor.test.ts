@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { beginTaskMoveDisposal, getTaskMoveDisposer, registerTaskMoveDisposer } from "@fusion/core";
+import { __setTaskMoveDisposalTimeoutForTesting } from "../../../core/src/task-move-disposer.js";
 import { processDueWorkflowWorkItem } from "../workflow-work-processor.js";
 
 type ProcessorStore = Parameters<typeof processDueWorkflowWorkItem>[0];
@@ -475,6 +476,222 @@ describe("processDueWorkflowWorkItem symbol lock renewal", () => {
       expectedLeaseOwner: "worker",
       expectedAttempt: item.attempt,
     }));
+  });
+
+  it("user cancellation releases the move before an awaited terminal diagnostic flush", async () => {
+    __setTaskMoveDisposalTimeoutForTesting(100);
+    try {
+      for (const rejectDiagnostic of [false, true]) {
+        let releaseDiagnosticGate!: () => void;
+        let rejectDiagnosticGate!: (error: Error) => void;
+        let diagnosticGateSettled = false;
+        const diagnosticGate = new Promise<void>((resolve, reject) => {
+          releaseDiagnosticGate = () => {
+            if (diagnosticGateSettled) return;
+            diagnosticGateSettled = true;
+            resolve();
+          };
+          rejectDiagnosticGate = (error: Error) => {
+            if (diagnosticGateSettled) return;
+            diagnosticGateSettled = true;
+            reject(error);
+          };
+        });
+        let lockTail = Promise.resolve();
+        const withTaskLock = vi.fn(async (_taskId: string, operation: () => Promise<unknown>) => {
+          const previous = lockTail;
+          let release!: () => void;
+          lockTail = new Promise<void>((resolve) => { release = resolve; });
+          await previous;
+          try {
+            return await operation();
+          } finally {
+            release();
+          }
+        });
+        const task = { id: item.taskId, title: "Campaign task", column: "in-progress", userPaused: false };
+        const loggedDiagnostics: string[] = [];
+        let movePublished = false;
+        const transitionWorkflowWorkItem = vi.fn(async (_id: string, state: string, options?: Record<string, unknown>) => ({
+          ...item,
+          state,
+          leaseOwner: options?.leaseOwner ?? null,
+          leaseExpiresAt: options?.leaseExpiresAt ?? null,
+        }));
+        const logEntry = vi.fn(async (_taskId: string, diagnostic: string) => {
+          await withTaskLock(item.taskId, async () => {
+            await diagnosticGate;
+            loggedDiagnostics.push(diagnostic);
+          });
+        });
+        const run = vi.fn((_task: unknown, _settings: unknown, options: { signal: AbortSignal }) => new Promise<unknown>((resolve) => {
+          options.signal.addEventListener("abort", () => {
+            resolve({ disposition: "completed", outcome: "success", visitedNodeIds: [], context: {} });
+          }, { once: true });
+        }));
+        const store = {
+          listDueWorkflowWorkItems: async () => [item],
+          acquireWorkflowWorkItemLease: async () => item,
+          transitionWorkflowWorkItem,
+          renewWorkflowWorkItemLease: vi.fn(async () => item),
+          getCccCampaignContextForTask: vi.fn(async () => campaignContext()),
+          getTask: vi.fn(async () => task),
+          withTaskLock,
+          logEntry,
+        };
+
+        let processing: ReturnType<typeof processDueWorkflowWorkItem> | undefined;
+        let move: Promise<unknown> | undefined;
+        let processingSettled = false;
+        try {
+          processing = processDueWorkflowWorkItem(store as unknown as ProcessorStore, { run } as unknown as ProcessorRuntime, undefined, {
+            leaseOwner: "worker",
+            leaseDurationMs: 1_000,
+          });
+          void processing.catch(() => undefined);
+          await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+
+          move = withTaskLock(item.taskId, async () => {
+            const release = await beginTaskMoveDisposal(store as never, {
+              task: task as never,
+              from: "in-progress",
+              to: "todo",
+              source: "user",
+            });
+            try {
+              task.column = "todo";
+              task.userPaused = true;
+              movePublished = true;
+              return "todo";
+            } finally {
+              release();
+            }
+          });
+          void move.catch(() => undefined);
+          void processing.then(() => { processingSettled = true; }, () => { processingSettled = true; });
+
+          await vi.waitFor(() => expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(item.id, "cancelled", expect.objectContaining({
+            expectedState: "running",
+            expectedLeaseOwner: "worker",
+            expectedAttempt: item.attempt,
+          })));
+          await expect(move).resolves.toBe("todo");
+          expect(movePublished).toBe(true);
+          expect(task.column).toBe("todo");
+          expect(task.userPaused).toBe(true);
+          await vi.waitFor(() => expect(logEntry).toHaveBeenCalledOnce());
+          expect(processingSettled).toBe(false);
+
+          if (rejectDiagnostic) {
+            rejectDiagnosticGate(new Error("controlled diagnostic failure"));
+          } else {
+            releaseDiagnosticGate();
+          }
+          const result = await processing;
+          expect(result.runtime).toMatchObject({
+            disposition: "cancelled",
+            reason: "workflow-user-cancelled",
+          });
+          expect(result.diagnostics).toHaveLength(1);
+          expect(result.diagnostics?.[0]).toContain("[ccc-campaign:work-item-terminal]");
+          expect(logEntry).toHaveBeenCalledTimes(1);
+          if (rejectDiagnostic) {
+            expect(loggedDiagnostics).toEqual([]);
+          } else {
+            expect(loggedDiagnostics).toEqual(result.diagnostics);
+          }
+          expect(task.column).toBe("todo");
+          expect(task.userPaused).toBe(true);
+        } finally {
+          releaseDiagnosticGate();
+          rejectDiagnosticGate(new Error("test cleanup diagnostic failure"));
+          await move?.catch(() => undefined);
+          await processing?.catch(() => undefined);
+        }
+      }
+    } finally {
+      __setTaskMoveDisposalTimeoutForTesting();
+    }
+  });
+
+  it("registered disposer propagates a non-cancelled terminal CAS failure without publishing Todo", async () => {
+    __setTaskMoveDisposalTimeoutForTesting(100);
+    let lockTail = Promise.resolve();
+    const withTaskLock = vi.fn(async (_taskId: string, operation: () => Promise<unknown>) => {
+      const previous = lockTail;
+      let release!: () => void;
+      lockTail = new Promise<void>((resolve) => { release = resolve; });
+      await previous;
+      try {
+        return await operation();
+      } finally {
+        release();
+      }
+    });
+    const task = { id: item.taskId, title: "Campaign task", column: "in-progress", userPaused: false };
+    const terminalCasError = new Error("terminal compare-and-swap lost");
+    const transitionWorkflowWorkItem = vi.fn(async () => { throw terminalCasError; });
+    const run = vi.fn((_task: unknown, _settings: unknown, options: { signal: AbortSignal }) => new Promise<unknown>((resolve) => {
+      options.signal.addEventListener("abort", () => {
+        resolve({ disposition: "completed", outcome: "success", visitedNodeIds: [], context: {} });
+      }, { once: true });
+    }));
+    const store = {
+      listDueWorkflowWorkItems: async () => [item],
+      acquireWorkflowWorkItemLease: async () => item,
+      transitionWorkflowWorkItem,
+      renewWorkflowWorkItemLease: vi.fn(async () => item),
+      getCccCampaignContextForTask: vi.fn(async () => campaignContext()),
+      getTask: vi.fn(async () => task),
+      getWorkflowWorkItem: vi.fn(async () => ({ ...item, state: "running" })),
+      withTaskLock,
+    };
+
+    let movePublished = false;
+    let processing: ReturnType<typeof processDueWorkflowWorkItem> | undefined;
+    let move: Promise<unknown> | undefined;
+    try {
+      processing = processDueWorkflowWorkItem(store as unknown as ProcessorStore, { run } as unknown as ProcessorRuntime, undefined, {
+        leaseOwner: "worker",
+        leaseDurationMs: 1_000,
+      });
+      void processing.catch(() => undefined);
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+
+      move = withTaskLock(item.taskId, async () => {
+        let release: (() => void) | undefined;
+        try {
+          release = await beginTaskMoveDisposal(store as never, {
+            task: task as never,
+            from: "in-progress",
+            to: "todo",
+            source: "user",
+          });
+          task.column = "todo";
+          task.userPaused = true;
+          movePublished = true;
+          return "todo";
+        } finally {
+          release?.();
+        }
+      });
+      void move.catch(() => undefined);
+
+      await expect(move).rejects.toThrow("terminal compare-and-swap lost");
+      await expect(processing).rejects.toThrow("terminal compare-and-swap lost");
+      expect(movePublished).toBe(false);
+      expect(task.column).toBe("in-progress");
+      expect(task.userPaused).toBe(false);
+      expect(transitionWorkflowWorkItem).toHaveBeenCalledWith(item.id, "cancelled", expect.objectContaining({
+        expectedState: "running",
+        expectedLeaseOwner: "worker",
+        expectedAttempt: item.attempt,
+      }));
+    } finally {
+      await move?.catch(() => undefined);
+      await processing?.catch(() => undefined);
+      __setTaskMoveDisposalTimeoutForTesting();
+    }
   });
 
   it("Task 6: a user cancellation wins when lease loss aborted the controller first", async () => {
