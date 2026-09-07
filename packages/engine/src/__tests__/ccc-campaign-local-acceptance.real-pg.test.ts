@@ -550,13 +550,13 @@ pgTest("Task 6 local CCC campaign acceptance (real PostgreSQL)", () => {
       runtime: {
         disposition: "manual-required",
         outcome: "failure",
-        reason: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+        reason: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED: CCC provider attempt for KB-001 exceeds its admitted request bound",
       },
     });
     await expect(h.store().getWorkflowWorkItem(campaign.id)).resolves.toMatchObject({
       state: "manual-required",
       attempt: 1,
-      lastError: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
+      lastError: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED: CCC provider attempt for KB-001 exceeds its admitted request bound",
       blockedReason: "ccc-permanent:CCC_CAMPAIGN_REQUEST_BUDGET_EXHAUSTED",
     });
     expect(pi.modelCalls).toEqual([]);
