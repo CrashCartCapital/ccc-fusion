@@ -1,9 +1,9 @@
 {
   "artifact": "instruction-pack-manifest",
-  "build_id": "280e7d0228b174ee",
+  "build_id": "eadf6df465c265bf",
   "packs": [
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
         "AGENTS.md": 2271,
         "CLAUDE.md": 2271
@@ -51,7 +51,7 @@
       "tool_triggers": []
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
         "AGENTS.md": 1308,
         "CLAUDE.md": 1308
@@ -102,7 +102,7 @@
       "tool_triggers": []
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
         "AGENTS.md": 6061,
         "CLAUDE.md": 6061
@@ -161,16 +161,16 @@
       ]
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
-        "AGENTS.md": 18993,
-        "CLAUDE.md": 18993
+        "AGENTS.md": 19213,
+        "CLAUDE.md": 19213
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "1286735219cc006e605e787e128b04ec6dacb849a59517e7dccd6c05ce368a1b",
-        "CLAUDE.md": "1286735219cc006e605e787e128b04ec6dacb849a59517e7dccd6c05ce368a1b"
+        "AGENTS.md": "e232789f17c2938336e8b1122cc354f8f3da342ef08b7b3aedf90bde1fc108e0",
+        "CLAUDE.md": "e232789f17c2938336e8b1122cc354f8f3da342ef08b7b3aedf90bde1fc108e0"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -229,14 +229,11 @@
         "Ralph",
         "finance-cc",
         "agy-bridge",
-        "mcpjungle-agy",
         "delegate",
         "adversarial_review",
         "follow_up",
         "agent-session-search",
         "search_sessions",
-        "gitnexus",
-        "context7",
         "MCP control plane",
         "MCPJungle",
         "MCPProxy",
@@ -267,8 +264,8 @@
       ],
       "title": "MCP routing",
       "tokens_estimate": {
-        "AGENTS.md": 4749,
-        "CLAUDE.md": 4749
+        "AGENTS.md": 4804,
+        "CLAUDE.md": 4804
       },
       "tool_triggers": [
         "mcpproxy",
@@ -281,7 +278,7 @@
       ]
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
         "AGENTS.md": 5073,
         "CLAUDE.md": 5073
@@ -343,7 +340,7 @@
       ]
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
         "AGENTS.md": 4111,
         "CLAUDE.md": 4111
@@ -393,16 +390,16 @@
       ]
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
-        "AGENTS.md": 15047,
-        "CLAUDE.md": 15047
+        "AGENTS.md": 14363,
+        "CLAUDE.md": 14416
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "95229efd5eb0030185556dccfc854663a98cb131aa9d0a0ae2835cfa8d68744a",
-        "CLAUDE.md": "95229efd5eb0030185556dccfc854663a98cb131aa9d0a0ae2835cfa8d68744a"
+        "AGENTS.md": "f46a8b2747a77305a470b812981785734f60ccdf5ea19609808a7fcbf3ad717c",
+        "CLAUDE.md": "c461c75c9bc23afcc6decd9a9f7dc646440815057c9f762319bb5cc1deee1968"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -449,8 +446,8 @@
       ],
       "title": "Consultation mechanics",
       "tokens_estimate": {
-        "AGENTS.md": 3762,
-        "CLAUDE.md": 3762
+        "AGENTS.md": 3591,
+        "CLAUDE.md": 3604
       },
       "tool_triggers": [
         "agy-bridge",
@@ -458,16 +455,16 @@
       ]
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
-        "AGENTS.md": 9189,
-        "CLAUDE.md": 9189
+        "AGENTS.md": 9454,
+        "CLAUDE.md": 9454
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "5707f42b915b674a46d1416edc0cf2511bbd220c2cc25923c5c2a232a4c38683",
-        "CLAUDE.md": "5707f42b915b674a46d1416edc0cf2511bbd220c2cc25923c5c2a232a4c38683"
+        "AGENTS.md": "ec9a50a96b8f5efaea872718421a46f40368631631a64732263adc2d6ec2822d",
+        "CLAUDE.md": "ec9a50a96b8f5efaea872718421a46f40368631631a64732263adc2d6ec2822d"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -500,22 +497,22 @@
       ],
       "title": "Workflow procedures",
       "tokens_estimate": {
-        "AGENTS.md": 2298,
-        "CLAUDE.md": 2298
+        "AGENTS.md": 2364,
+        "CLAUDE.md": 2364
       },
       "tool_triggers": []
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
-        "AGENTS.md": 3223,
-        "CLAUDE.md": 3223
+        "AGENTS.md": 3268,
+        "CLAUDE.md": 3268
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "1f6a2d70af7791c5ee9cd8794116d98c742ef06ae7d0aa7a98706e0815c935ca",
-        "CLAUDE.md": "1f6a2d70af7791c5ee9cd8794116d98c742ef06ae7d0aa7a98706e0815c935ca"
+        "AGENTS.md": "64ccfe9e77aeaa06c8759666b5d9154ceab635102a59045d44ac4347c0e80212",
+        "CLAUDE.md": "64ccfe9e77aeaa06c8759666b5d9154ceab635102a59045d44ac4347c0e80212"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -551,22 +548,22 @@
       ],
       "title": "Claude runtime",
       "tokens_estimate": {
-        "AGENTS.md": 806,
-        "CLAUDE.md": 806
+        "AGENTS.md": 817,
+        "CLAUDE.md": 817
       },
       "tool_triggers": []
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
-        "AGENTS.md": 6039,
-        "CLAUDE.md": 6039
+        "AGENTS.md": 6167,
+        "CLAUDE.md": 6167
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "ac640f102fb8dc147953fa9201897b962172de3d012d425115604dce7e6a929a",
-        "CLAUDE.md": "ac640f102fb8dc147953fa9201897b962172de3d012d425115604dce7e6a929a"
+        "AGENTS.md": "b2f9685cf96cf6c2e4a70ae8918f1731a6beb99a95a84e07588a32a1dd320769",
+        "CLAUDE.md": "b2f9685cf96cf6c2e4a70ae8918f1731a6beb99a95a84e07588a32a1dd320769"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -587,11 +584,9 @@
         "retrieve_tools",
         "call_tool_read",
         "quarantine_security",
-        "/mcp/all",
         "stack-core",
         "trading-readonly",
         "agy-bridge",
-        "mcpjungle-agy",
         "delegate",
         "adversarial_review",
         "codex-mcp-server"
@@ -612,13 +607,13 @@
       ],
       "title": "Codex runtime",
       "tokens_estimate": {
-        "AGENTS.md": 1510,
-        "CLAUDE.md": 1510
+        "AGENTS.md": 1542,
+        "CLAUDE.md": 1542
       },
       "tool_triggers": []
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
         "AGENTS.md": 6578,
         "CLAUDE.md": 6578
@@ -675,16 +670,16 @@
       "tool_triggers": []
     },
     {
-      "build_id": "280e7d0228b174ee",
+      "build_id": "eadf6df465c265bf",
       "bytes_by_surface": {
-        "AGENTS.md": 19741,
-        "CLAUDE.md": 19741
+        "AGENTS.md": 20211,
+        "CLAUDE.md": 20211
       },
       "compaction_policy": "Re-read the root catalog and exact pack after compaction when still relevant.",
       "conflicts": [],
       "content_hashes": {
-        "AGENTS.md": "59222edda098ba9d816b02a02a295836bc243a96fa261bb773c52585e0db089e",
-        "CLAUDE.md": "59222edda098ba9d816b02a02a295836bc243a96fa261bb773c52585e0db089e"
+        "AGENTS.md": "be347fb6c40dbc8c6b894f3d826b1d2c1becbd0f7c2124d280bb2ddaa1d29629",
+        "CLAUDE.md": "be347fb6c40dbc8c6b894f3d826b1d2c1becbd0f7c2124d280bb2ddaa1d29629"
       },
       "dependencies": [],
       "domain_triggers": [],
@@ -709,8 +704,8 @@
       ],
       "title": "ccc-fusion local guidance",
       "tokens_estimate": {
-        "AGENTS.md": 4936,
-        "CLAUDE.md": 4936
+        "AGENTS.md": 5053,
+        "CLAUDE.md": 5053
       },
       "tool_triggers": []
     }

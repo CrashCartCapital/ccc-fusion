@@ -4,8 +4,6 @@ Pack ID: `PK-CONSULT`.
 
 Read this generated pack only after the compact root catalog identifies a strong trigger.
 
-### Shared (both variants)
-
 For complex design decisions, ambiguous requirements, architectural tradeoffs, risk assessment, or when stuck on a hard problem, consult other AI agents to triangulate when the runtime and user constraints permit. Also use bounded lightweight consultation during ordinary planning and execution when an outside view can materially improve the next local step. The primary agent still owns execution; ensemble partners provide second opinions, not co-ownership.
 
 **Default rule:** consult proactively at the checkpoints below when consultation is available and allowed. If the user, runtime, policy, or task constraint forbids consultation, skip it, proceed from direct evidence, and state that the consult was intentionally skipped.
@@ -65,15 +63,7 @@ The stock consultant preamble is an advisory behavior constraint, not an enforce
 - **GPT model and effort routing:** Apply the `codex-model-router` policy to every `codex` consultation, with a consultation floor of `reasoningEffort: medium` for narrow confirm-checks, `high` for routine code review, spec consultation, and planning, and a short `xhigh` pulse for the hardest multi-system architecture, deep cross-cutting review, high-stakes plan critique, or same-family Codex self-consultation. Do not assume `max` or `ultra` improves the result, and do not transfer an effort value between model families unless the live caller exposes it. **Always pass `model` explicitly on every `codex` call; never omit it and never accept the tool's advertised default.** The advertised schema can lag the live server, while the live server registration (read it with `mcpjungle list servers`, never from `~/.mcpjungle/configs/codex-mcp-server.json`, which is only the input to registration and can sit unapplied for weeks) describes fallback runtime state — not a quality ranking or permission to use that route. Verify available non-Spark model IDs through the live caller/catalog plus the SSOT major GPT tier, select the minimum safe route for the task, and use the router's requested-versus-effective route check after the call. The `model` argument is a free-form string, not an enum, so a model absent from the description's Options list may still be valid; never let a stale Options list block a live-proven model, and note that advertised `-codex` IDs can be rejected on a ChatGPT-account backend. Prefer the `review` tool for diff- or commit-scoped code review. Codex Spark, including any `codex-spark` or "codex spark" model label, is forbidden; do not select it, recommend it, accept it as an automatic fallback, or rely on `reasoningEffort` alone as a model selector. If the active tool schema/help cannot confirm a non-Spark route and exposes no model override, skip the GPT/Codex lane and use another allowed review path or ask the user.
 - Source of truth: Antigravity/Gemini routing is owned by `agy-bridge`; GPT/Codex consultation is owned by the `codex-mcp-server` MCP in `stack-core`. Runtime addenda own which effort tiers each surface may call.
 
-### CLAUDE.md variant
-
-- Claude Code may use the `codex-mcp-server` GPT/Codex lane for checkpoint consultation when the user request and runtime policy allow it. Use `codex` with `sandbox: "read-only"`, select the explicit model and minimum safe effort through the GPT routing rule above, and prefer the `review` tool for code review. Treat `CODEX_DEFAULT_MODEL` as fallback runtime state rather than "best model" evidence; verify availability through the live caller and confirm the effective route after the call. The GPT/Codex model guardrail above applies: never use Codex Spark or a Spark fallback.
-
-### AGENTS.md variant
-
 - Codex may use the `codex-mcp-server` GPT/Codex lane for high-stakes external review when the user request and runtime policy allow it: call `codex` with `sandbox: "read-only"` and an explicit live-proven route selected by the GPT routing rule above, or use the `review` tool for code review. Reserve `xhigh` for genuinely high-stakes checks and verify the effective route. The GPT/Codex model guardrail above applies: never use Codex Spark or a Spark fallback. Use `agy-bridge` for Gemini/Antigravity consultation by default.
-
-### Shared (both variants)
 
 ### Consultation session constraints
 

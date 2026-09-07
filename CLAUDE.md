@@ -8,7 +8,7 @@
 
 <!-- Source canon: 30_DEVSTACK/surface_system -->
 
-<!-- Build ID: 280e7d0228b174ee -->
+<!-- Build ID: eadf6df465c265bf -->
 
 <!-- Regenerate with: surface-roots build -->
 
@@ -224,32 +224,35 @@ If the wrong category is assumed, the agent will treat advisory guards as suffic
 
 ## MCP Server Reference
 
+- **Hard Rule — minimum adequate capability.** Use matching specialist MCPs first; native tools for exact paths, Git/tests, or fallback. See `PK-MCP`.
+
 ## Ensemble Consultation
 
 ## General Tools
 
-Local CLI tools and stack surfaces that complement MCP servers and skills. This is an awareness index only; detailed orchestration, hook, enforcement, and memory rules live in their owning components.
+Local CLI and non-MCP index. Detailed orchestration, hook, enforcement, and memory rules stay with their owners.
 
-Current truth anchors: [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Stack SSOT]] for stack/runtime truth, including non-MCP tool approvals/rejections; [[00_MAIN/01_ActiveProjects/project-tracker|Portfolio Manifest]] and [[project-status-260704|Project Status 2026-07-04]] for active plans; **Hook Event Verification** for hook/skill build state; **MCP Server Reference** plus [[00_MAIN/00_RyanSSOT/REF-AI-MCPJungleSetupSSOT|MCPJungle Setup SSOT]] for MCP catalogs and client routes.
+Truth anchors: [[00_MAIN/00_RyanSSOT/REF-HUM-RyanFinalStackSSOT|Ryan Stack SSOT]] for stack/runtime state and tool decisions; [[30_DEVSTACK/config/REF-HUM-GitHubActionsM2RunnerStandard|GitHub Actions M2 Runner Standard]] for CI runners; [[00_MAIN/01_ActiveProjects/project-tracker|Portfolio Manifest]] and [[project-status-260704|Project Status 2026-07-04]] for active plans; **Hook Event Verification** for hook/skill state; **MCP Server Reference** and [[00_MAIN/00_RyanSSOT/REF-AI-MCPJungleSetupSSOT|MCPJungle Setup SSOT]] for MCP routes.
 
 #### Default Tools
 
 | Tool | Command | Use For |
 |---|---|---|
-| Taskfile | `task` | Project task runner; `task --list` for available tasks |
-| SafeExec | (active shell shim) | Advisory shell-risk guard; apply Shell Risk Screening before relying on it |
+| Taskfile | `task` | Project tasks; discover with `task --list` |
+| SafeExec | (shell shim) | Advisory only; apply Shell Risk Screening |
 | Agnix | `agnix validate` | Validate instruction files for quality issues |
-| Pueue | `pueue` | Durable background shell queue for deliberate long-running local work; not a DAG, retry, proof, or agent-loop engine |
-| Worktrunk | `wt` | Isolated worktree/change-track helper when the target repo's git model permits it |
+| Pueue | `pueue` | Durable background shell queue, not a DAG or proof engine |
+| Worktrunk | `wt` | Worktree/change helper when repo rules permit |
 
 #### Active Stack Surfaces
 
 | Surface | Examples | Use For | When to Reach |
 |---|---|---|---|
-| Local inference and routing | oMLX, OmniRoute, Ollama-oMLX shim | Local model serving and OpenAI-compatible routing | Use MCP Server Reference or OmniRoute skills for route rules; verify SSOT or live health/model endpoints before use |
-| Prepared execution surfaces | Dagu, Ralph Orchestrator | Project-declared unattended execution routes | Only when the target project or overlay explicitly names unattended execution; Workflow Recipes owns lane selection |
-| Guard and hook surfaces | runtime hooks, shell-risk screener, market-data router, session checkpoint, broker drift detector | Diagnosing or verifying policy gates | Use **Hook Event Verification** and live runtime config before relying on a hook owner |
-| Knowledge graph / wiki surfaces | qmd, mdidx, llm-wiki-compiler | Indexed/wiki query and deliberate wiki promotion | Use when direct search is insufficient; Memory Surface Reference owns trust and write routing |
+| Local inference/routing | oMLX, OmniRoute, Ollama-oMLX shim | Local model serving/routing | Follow MCP/OmniRoute rules; verify live health and models |
+| Prepared execution | Dagu, Ralph Orchestrator | Declared unattended routes | Use only when the project/overlay names them; Workflow Recipes chooses the lane |
+| Continuous integration | GitHub Actions, repo-scoped M2 Max runners | PR/branch checks | Read `docs/ci-runtime.md`; verify live runner and executor; global rules live in the M2 standard |
+| Guards and hooks | runtime hooks, shell-risk, market-data, checkpoint, broker-drift guards | Diagnose policy gates | Check **Hook Event Verification** and live config first |
+| Knowledge graph/wiki | qmd, mdidx, llm-wiki-compiler | Indexed queries and wiki promotion | Use when direct search is insufficient; Memory Surface Reference owns trust/writes |
 
 ## Coding Protocols
 
@@ -304,12 +307,12 @@ Claude, Codex, and remote workers that cannot invoke the selector may match the 
 - `PK-REFERENCE-EXTENDED` — Extended reference; trigger: reference; cost: ~2271 B; read `packs/CLAUDE.md/PK-REFERENCE-EXTENDED--extended-reference.md`.
 - `PK-DATA` — Data handling; trigger: analytics, data pipeline, analytics, data, trading; cost: ~1308 B; read `packs/CLAUDE.md/PK-DATA--data-handling.md`.
 - `PK-MEMORY` — Memory surfaces; trigger: memory, checkpoint, memory, session recall, Hindsight, agent-session-search, Basic Memory; cost: ~6061 B; read `packs/CLAUDE.md/PK-MEMORY--memory-surfaces.md`.
-- `PK-MCP` — MCP routing; trigger: MCP broker, MCP discovery, tool routing, mcpproxy, MCPJungle, tool_search, retrieve_tools, call_tool_read, call_tool_write, call_tool_destructive; cost: ~18993 B; read `packs/CLAUDE.md/PK-MCP--routing.md`.
+- `PK-MCP` — MCP routing; trigger: MCP broker, MCP discovery, tool routing, mcpproxy, MCPJungle, tool_search, retrieve_tools, call_tool_read, call_tool_write, call_tool_destructive; cost: ~19213 B; read `packs/CLAUDE.md/PK-MCP--routing.md`.
 - `PK-OMNIROUTE` — OmniRoute integration; trigger: OmniRoute, model routing, OmniRoute, omniroute; cost: ~5073 B; read `packs/CLAUDE.md/PK-OMNIROUTE--integration.md`.
 - `PK-HOOKS` — Hook verification; trigger: hook verification, runtime hooks, hooks, SafeExec; cost: ~4111 B; read `packs/CLAUDE.md/PK-HOOKS--verification.md`.
-- `PK-CONSULT` — Consultation mechanics; trigger: consultation, review, agy-bridge, codex-mcp-server; cost: ~15047 B; read `packs/CLAUDE.md/PK-CONSULT--consultation.md`.
-- `PK-WORKFLOW` — Workflow procedures; trigger: plan, debug, research; cost: ~9189 B; read `packs/CLAUDE.md/PK-WORKFLOW--procedures.md`.
-- `PK-RUNTIME-CLAUDE` — Claude runtime; trigger: Claude runtime; cost: ~3223 B; read `packs/CLAUDE.md/PK-RUNTIME-CLAUDE--runtime.md`.
-- `PK-RUNTIME-CODEX` — Codex runtime; trigger: Codex runtime; cost: ~6039 B; read `packs/CLAUDE.md/PK-RUNTIME-CODEX--runtime.md`.
+- `PK-CONSULT` — Consultation mechanics; trigger: consultation, review, agy-bridge, codex-mcp-server; cost: ~14416 B; read `packs/CLAUDE.md/PK-CONSULT--consultation.md`.
+- `PK-WORKFLOW` — Workflow procedures; trigger: plan, debug, research; cost: ~9454 B; read `packs/CLAUDE.md/PK-WORKFLOW--procedures.md`.
+- `PK-RUNTIME-CLAUDE` — Claude runtime; trigger: Claude runtime; cost: ~3268 B; read `packs/CLAUDE.md/PK-RUNTIME-CLAUDE--runtime.md`.
+- `PK-RUNTIME-CODEX` — Codex runtime; trigger: Codex runtime; cost: ~6167 B; read `packs/CLAUDE.md/PK-RUNTIME-CODEX--runtime.md`.
 - `PK-GOOGLE-JULES` — Google Jules guidance; trigger: Jules; cost: ~6578 B; read `packs/CLAUDE.md/PK-GOOGLE-JULES--remote-guidance.md`.
-- `PK-PROJECT-LOCAL` — ccc-fusion local guidance; trigger: project-local guidance; cost: ~19741 B; read `packs/CLAUDE.md/PK-PROJECT-LOCAL--ccc-fusion.md`.
+- `PK-PROJECT-LOCAL` — ccc-fusion local guidance; trigger: project-local guidance; cost: ~20211 B; read `packs/CLAUDE.md/PK-PROJECT-LOCAL--ccc-fusion.md`.
