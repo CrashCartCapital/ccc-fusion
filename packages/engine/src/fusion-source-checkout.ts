@@ -41,9 +41,14 @@ export type FusionSourceIdentity = Readonly<{
 
 export type FusionSourceMarkerObservation = Readonly<{
   path: string;
-  state: "missing" | "wrong" | "untracked" | "exact" | "probe-error";
+  state: "missing" | "wrong" | "untracked" | "staged" | "exact" | "diverged" | "probe-error";
   exact: boolean;
   tracked: boolean;
+  committed: boolean;
+  headExact: boolean;
+  indexExact: boolean;
+  worktreeExact: boolean;
+  diverged: boolean;
 }>;
 
 type SourceRootResult = Readonly<{
@@ -168,15 +173,6 @@ async function resolveCanonicalGitRoot(inputPath: string): Promise<SourceRootRes
   }
 }
 
-function markerObservation(
-  rootPath: string,
-  state: FusionSourceMarkerObservation["state"],
-  tracked: boolean,
-  exact: boolean,
-): FusionSourceMarkerObservation {
-  return { path: join(rootPath, FUSION_SOURCE_MARKER_PATH), state, tracked, exact };
-}
-
 async function readBoundedFile(path: string, stage: FusionSourceProbeStage): Promise<string> {
   const stats = await withTimeout(lstat(path), stage, FILE_PROBE_TIMEOUT_MS);
   if (!stats.isFile()) {
@@ -194,6 +190,12 @@ async function probePackageIdentity(rootPath: string): Promise<PackageProbeResul
   try {
     packageText = await readBoundedFile(packagePath, "package-file");
   } catch (error) {
+    if (errorCode(error) === "ENOENT") {
+      return {
+        ok: true,
+        identity: { name: null, private: null, matches: false },
+      };
+    }
     return { ok: false, error: probeError("package-file", error) };
   }
 
@@ -223,40 +225,144 @@ async function probePackageIdentity(rootPath: string): Promise<PackageProbeResul
   };
 }
 
-async function markerIsTracked(rootPath: string): Promise<boolean> {
+type MarkerBlobProbe =
+  | Readonly<{ kind: "absent"; present: false; exact: false }>
+  | Readonly<{ kind: "present"; present: true; exact: boolean }>
+  | Readonly<{ kind: "error"; error: FusionSourceProbeError }>;
+
+function absentMarkerBlob(): MarkerBlobProbe {
+  return { kind: "absent", present: false, exact: false };
+}
+
+function presentMarkerBlob(exact: boolean): MarkerBlobProbe {
+  return { kind: "present", present: true, exact };
+}
+
+function isRegularGitFile(mode: string, objectType?: string): boolean {
+  return (mode === "100644" || mode === "100755") && (objectType === undefined || objectType === "blob");
+}
+
+async function probeHeadMarker(rootPath: string): Promise<MarkerBlobProbe> {
   try {
-    const result = await runGit(["ls-files", "--error-unmatch", "--", FUSION_SOURCE_MARKER_PATH], rootPath);
-    return result.stdout.split(/\r?\n/u).some((line) => line.trim() === FUSION_SOURCE_MARKER_PATH);
+    await runGit(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], rootPath);
   } catch (error) {
-    if (errorCode(error) === 1) return false;
-    throw error;
+    if (errorCode(error) === 1) return absentMarkerBlob();
+    return { kind: "error", error: probeError("marker-tracking", error) };
+  }
+
+  try {
+    const result = await runGit(["ls-tree", "-r", "HEAD", "--", FUSION_SOURCE_MARKER_PATH], rootPath);
+    const entry = result.stdout
+      .split(/\r?\n/u)
+      .find((line) => line.slice(line.indexOf("\t") + 1) === FUSION_SOURCE_MARKER_PATH);
+    if (!entry) return absentMarkerBlob();
+
+    const tabIndex = entry.indexOf("\t");
+    const [mode, objectType] = entry.slice(0, tabIndex).split(/\s+/u);
+    if (!isRegularGitFile(mode, objectType)) return presentMarkerBlob(false);
+
+    const content = (await runGit(["show", `HEAD:${FUSION_SOURCE_MARKER_PATH}`], rootPath)).stdout;
+    return presentMarkerBlob(content === FUSION_SOURCE_MARKER_CONTENT);
+  } catch (error) {
+    return { kind: "error", error: probeError("marker-tracking", error) };
   }
 }
 
-async function probeMarker(rootPath: string): Promise<MarkerProbeResult> {
-  let tracked: boolean;
+async function probeIndexMarker(rootPath: string): Promise<MarkerBlobProbe> {
   try {
-    tracked = await markerIsTracked(rootPath);
-  } catch (error) {
-    const marker = markerObservation(rootPath, "probe-error", false, false);
-    return { ok: false, marker, error: probeError("marker-tracking", error) };
-  }
+    const result = await runGit(["ls-files", "--stage", "--error-unmatch", "--", FUSION_SOURCE_MARKER_PATH], rootPath);
+    const entry = result.stdout
+      .split(/\r?\n/u)
+      .find((line) => line.slice(line.indexOf("\t") + 1) === FUSION_SOURCE_MARKER_PATH);
+    if (!entry) return absentMarkerBlob();
 
+    const tabIndex = entry.indexOf("\t");
+    const [mode, _objectId, stage] = entry.slice(0, tabIndex).split(/\s+/u);
+    if (!isRegularGitFile(mode) || stage !== "0") return presentMarkerBlob(false);
+
+    const content = (await runGit(["show", `:0:${FUSION_SOURCE_MARKER_PATH}`], rootPath)).stdout;
+    return presentMarkerBlob(content === FUSION_SOURCE_MARKER_CONTENT);
+  } catch (error) {
+    if (errorCode(error) === 1) return absentMarkerBlob();
+    return { kind: "error", error: probeError("marker-tracking", error) };
+  }
+}
+
+async function probeWorktreeMarker(rootPath: string): Promise<MarkerBlobProbe> {
   const markerPath = join(rootPath, FUSION_SOURCE_MARKER_PATH);
-  let markerText: string;
   try {
-    markerText = await readBoundedFile(markerPath, "marker-file");
+    const markerText = await readBoundedFile(markerPath, "marker-file");
+    return presentMarkerBlob(markerText === FUSION_SOURCE_MARKER_CONTENT);
   } catch (error) {
-    const candidate = errorCode(error) === "ENOENT"
-      ? markerObservation(rootPath, "missing", tracked, false)
-      : markerObservation(rootPath, "probe-error", tracked, false);
-    if (candidate.state === "missing") return { ok: true, marker: candidate };
-    return { ok: false, marker: candidate, error: probeError("marker-file", error) };
+    if (errorCode(error) === "ENOENT") return absentMarkerBlob();
+    return { kind: "error", error: probeError("marker-file", error) };
+  }
+}
+
+function buildMarkerObservation(
+  rootPath: string,
+  head: MarkerBlobProbe,
+  index: MarkerBlobProbe,
+  worktree: MarkerBlobProbe,
+): { marker: FusionSourceMarkerObservation; error?: FusionSourceProbeError } {
+  const headPresent = head.kind === "present" && head.present;
+  const indexTracked = index.kind === "present" && index.present;
+  const worktreePresent = worktree.kind === "present" && worktree.present;
+  const headExact = head.kind === "present" && head.exact;
+  const indexExact = index.kind === "present" && index.exact;
+  const worktreeExact = worktree.kind === "present" && worktree.exact;
+  const headIndexDiverged = headPresent !== indexTracked
+    || (headPresent && indexTracked && headExact !== indexExact);
+  const indexWorktreeDiverged = indexTracked
+    && (!worktreePresent || (worktreePresent && indexExact !== worktreeExact));
+  const diverged = headIndexDiverged || indexWorktreeDiverged;
+  const error = [head, index, worktree].find(
+    (probe): probe is Readonly<{ kind: "error"; error: FusionSourceProbeError }> => probe.kind === "error",
+  )?.error;
+
+  let state: FusionSourceMarkerObservation["state"];
+  if (error) {
+    state = "probe-error";
+  } else if (!headExact && indexTracked && indexExact && worktreeExact) {
+    state = "staged";
+  } else if (diverged) {
+    state = "diverged";
+  } else if (headExact && indexTracked && indexExact && worktreeExact) {
+    state = "exact";
+  } else if (!indexTracked && worktreePresent) {
+    state = "untracked";
+  } else if (!worktreePresent) {
+    state = "missing";
+  } else {
+    state = "wrong";
   }
 
-  const exact = markerText === FUSION_SOURCE_MARKER_CONTENT;
-  const state = exact ? (tracked ? "exact" : "untracked") : (tracked ? "wrong" : "untracked");
-  return { ok: true, marker: markerObservation(rootPath, state, tracked, exact) };
+  return {
+    marker: {
+      path: join(rootPath, FUSION_SOURCE_MARKER_PATH),
+      state,
+      exact: worktreeExact,
+      tracked: indexTracked,
+      committed: headExact,
+      headExact,
+      indexExact,
+      worktreeExact,
+      diverged,
+    },
+    error,
+  };
+}
+
+async function probeMarker(rootPath: string): Promise<MarkerProbeResult> {
+  const [head, index, worktree] = await Promise.all([
+    probeHeadMarker(rootPath),
+    probeIndexMarker(rootPath),
+    probeWorktreeMarker(rootPath),
+  ]);
+  const outcome = buildMarkerObservation(rootPath, head, index, worktree);
+  return outcome.error
+    ? { ok: false, marker: outcome.marker, error: outcome.error }
+    : { ok: true, marker: outcome.marker };
 }
 
 function classifyProbeResults(
@@ -266,10 +372,11 @@ function classifyProbeResults(
 ): FusionSourceCheckoutResult {
   const markerError = markerProbe.ok ? undefined : markerProbe.error;
   const marker = markerProbe.marker;
-  const exactTracked = marker.exact && marker.tracked;
+  const stableExactMarker = marker.exact && marker.tracked && marker.committed && !marker.diverged;
+  const committedMarkerSignal = marker.committed;
 
   if (!packageProbe.ok) {
-    if (exactTracked) {
+    if (committedMarkerSignal) {
       return {
         kind: "conflict",
         reason: FUSION_SOURCE_CHECKOUT_IDENTITY_CONFLICT,
@@ -299,6 +406,16 @@ function classifyProbeResults(
         error: markerError,
       };
     }
+    if (committedMarkerSignal) {
+      return {
+        kind: "conflict",
+        reason: FUSION_SOURCE_CHECKOUT_IDENTITY_CONFLICT,
+        rootPath,
+        identity,
+        marker,
+        error: markerError,
+      };
+    }
     return {
       kind: "error",
       reason: FUSION_SOURCE_CHECKOUT_PROBE_ERROR,
@@ -309,13 +426,13 @@ function classifyProbeResults(
     };
   }
 
-  if (identity.matches && exactTracked) {
+  if (identity.matches && stableExactMarker) {
     return { kind: "source", reason: FUSION_SOURCE_CHECKOUT_PROJECT_REFUSED, rootPath, identity, marker };
   }
   if (identity.matches) {
     return { kind: "incomplete", reason: FUSION_SOURCE_CHECKOUT_IDENTITY_INCOMPLETE, rootPath, identity, marker };
   }
-  if (exactTracked) {
+  if (committedMarkerSignal) {
     return { kind: "conflict", reason: FUSION_SOURCE_CHECKOUT_IDENTITY_CONFLICT, rootPath, identity, marker };
   }
   return { kind: "normal", reason: FUSION_SOURCE_CHECKOUT_NORMAL, rootPath, identity, marker };
