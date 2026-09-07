@@ -1,0 +1,16 @@
+# CCC-Fusion semantic-proof targets. Exactly one literal command each, no desc, no deps.
+  verify:evidence-labels:
+    cmds:
+      - python3 verify/qe_evidence_adapter.py --target verify/cases/labels
+
+  verify:evidence-verdict:
+    cmds:
+      - python3 verify/qe_evidence_adapter.py --target verify/cases/verdict
+
+  verify:evidence-candidate:
+    cmds:
+      - python3 verify/qe_evidence_adapter.py --target verify/cases/candidate
+
+  verify:evidence-integrated:
+    cmds:
+      - python3 verify/qe_evidence_adapter.py --target verify/cases/integrated

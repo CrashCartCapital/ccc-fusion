@@ -1,0 +1,109 @@
+# ccc-fusion Modification Report & Architectural Analysis
+
+**Target Repository:** `/Users/ryanpappal/03_CODE/ccc-fusion`
+**Upstream Base:** `https://github.com/Runfusion/Fusion.git` (v0.73.0-beta.4)
+**Target Audience:** Lead Architect / Developer
+
+This technical report provides a heavy, substantive, and highly detailed analysis of the `ccc-fusion` fork modifications across four primary dimensions.
+
+---
+
+## Dimension 1: Subsystem Alignment & File Diff
+
+`ccc-fusion` introduces 7 distinct progression waves (`CCC-W1` through `CCC-W7`) alongside customized `KB-` capabilities. Net diffs relative to upstream span **11,950+ line insertions** across 62+ files.
+
+### 1. `@fusion/core` Subsystem Analysis
+* **Database Schema & PostgreSQL Migration Baseline (`0034_ccc_effect_receipts.sql`)**:
+  * Advances baseline to `0034`, introducing `ccc_effect_receipts` and `ccc_effect_turns` tables for deterministic execution records and tool call state tracking.
+  * Incorporates Multi-Tenant Row-Level Security (RLS) and Drizzle ORM integration.
+* **CLI Session Store & Transactional Lifecycle**: Extends `cli-session-store.ts` for atomic update/close of effect turn receipts in PostgreSQL transactions.
+* **Speculative Campaign & PRD Compiler Contracts**: Introduces speculative campaign contracts (`ccc-campaign/contract.ts`) and pure compiler contracts/schema assertions (`ccc-prd/`).
+
+### 2. `@fusion/engine` Subsystem Analysis
+* **Profile Isolation & Environment Security Fence**:
+  * `ccc-subscription-policy.ts` configures profile `ccc-fusion` and strips sensitive credentials from child process environments.
+  * Durable Autonomy Posture maintains profiles across engine restarts and sanitizes sensitive text (`_KELSEY`, `_secrets`).
+* **Native MCP HTTP Loopback Proxy**:
+  * Internal loopback proxy on `127.0.0.1` intercepts JSON-RPC tool calls. Implements effect/read differentiation, turn keying, and socket tracking.
+* **Proof Gates & Integration Controls**:
+  * Verification checks before candidate admission (`ccc-proof/gate.ts`), mutation boundaries preventing cross-monorepo pollution, and state reconciliation for merge injections.
+* **Execution & Session Management**:
+  * `executor.ts` (+744 lines) integrates native MCP proxying and effect turns. `pi.ts` (+458 lines) supports PI agent fallback disposal and receipt recovery.
+
+### 3. `@fusion/dashboard` Subsystem Analysis
+* **Planning Mode & Sequential Q&A**: Replaces legacy single-prompt planning with a sequential Q&A pipeline, resolving context-overflow issues.
+* **Custom UI Features**: Integrates mission tracking (`KB-636`), Git Manager Dashboard (`KB-030`), file diff viewers (`KB-617`), and responsive mobile CSS scroll-snap layouts.
+* **Dynamic Plugin Routing**: Dispatches plugin routes dynamically per request without engine restarts.
+
+---
+
+## Dimension 2: Substrate vs. Policy Strategy
+
+System design is governed by a strict structural boundary separating the **Non-Configurable Substrate** from the **Configurable Execution Policy**.
+
+### 1. Non-Configurable Substrate
+The hard safety infrastructure overseeing multi-process exclusion, data persistence, and crash recovery.
+* **Git Mechanics & Worktree Management**: Ensures physical Git worktree isolation per active task. Uses branch attribution for strict Fork Point diff bounding, and local integration rebases.
+* **PostgreSQL Persistence**: Fully cuts over from SQLite to a centralized PostgreSQL core backed by `AsyncCentralCore`, implementing durable symbol locks for workspace invariants.
+* **Singleton Locking & Self-Healing**: Enforces per-project engine singletons. Includes automated background sweeps to reconcile orphaned step results and reclaim stale worktree leases safely.
+* **API Boundary**: Exposed safely via the typed `WorkflowRuntimePrimitives` API, ensuring all deep operations honor `AbortSignal` cancellations.
+
+### 2. Configurable Execution Policy
+The domain layer empowering developers to dictate lifecycle stages, task metadata, and sandbox execution rules without touching core substrate.
+* **Declarative Workflow Graphs (IR)**: Supports custom workflow columns, dynamic trait assignment (e.g., `merge-blocker`), and parallel `foreach` rework loops.
+* **Review Gates & Approvals**: Evaluates explicit task-level overrides over global auto-merge settings.
+* **Settings Cascading & Tombstones**: Computes effective settings dynamically (`Task Override -> Project Baseline -> Global -> Workflow -> Engine`). Enforces a U4 hard-move tombstone allowlist (`MOVED_SETTINGS_KEYS`) to reject patches from stale clients.
+* **Sandbox Backends**: Verification fail-closed sandbox policies ensure unverified code is never automatically merged.
+
+---
+
+## Dimension 3: Rationale & Operator Tailoring
+
+The overarching architectural rationale of `ccc-fusion` is the transformation of a multi-tenant enterprise framework into an aggressive **local-first, zero-trust, single-operator development workstation**.
+
+### 1. Local-First Execution & Embedded State
+To eliminate SaaS API latency and external dependency, the architecture brings execution entirely on-host:
+* Uses an embedded PostgreSQL engine (with hardened crash recovery across macOS/Windows) alongside isolated local Git `.worktrees`.
+* Offline-first model execution utilizing packages like `@fusion/pi-llama-cpp` for local GGUF models.
+
+### 2. Custom Providers & Multi-Model Engine Layering
+* Transforms model provider selection into a dynamic four-tier fallback hierarchy (e.g., Claude for refactoring, Grok for ideation, local models for offline execution).
+* Implements robust local CLI runtimes and custom UI provider badges for instant visual branding.
+
+### 3. Localized Memory Compaction
+* Migrates away from centralized cloud vector databases to an OpenClaw layered markdown memory contract (`.fusion/memory/`).
+* Uses a local `QMD` Search Backend and background `memory-insights.ts` scripts to distill daily memory compactly into `.md` formats, utilizing deterministic deduplication logic.
+
+### 4. Custom MCP Infrastructure
+* Employs declarative MCP registrations per plugin.
+* Implements a **Zero-Trust Secret Reference System** where sensitive keys are stored in local encrypted stores, materializing in-memory solely on spawn. Scans `mcp.json` host tools securely.
+
+### 5. Rootless Sandboxing & Static Guards
+* Defense-in-depth isolation utilizing unprivileged Linux `bubblewrap` (`bwrap`) and macOS `sandbox-exec` (Seatbelt).
+* Statically analyzes code at build time (via `engine-no-blocking-shellout.test.ts`) to prevent unconstrained synchronous shellouts from bypassing event loops or sandbox policies. Actively guards Port 4040.
+
+---
+
+## Dimension 4: Unresolved Technical Debt & Gaps
+
+While recent cutovers modernized the platform, legacy technical debt and architectural friction points require vetting before further execution.
+
+### 1. Debt Markers & Deprecation Audits
+* **Secrets Sync (`TODO(FN-4867)`)**: Still utilizes legacy key derivation algorithms; deferred Argon2id migration.
+* **Merge Conflicts (`TODO(autostash-conflict)`)**: Autostash resolution currently injects TODO markers into developer files when hunk placement fails.
+* **Deprecated Legacies**: Hardcoded board configurations, legacy single-project server routes, and legacy merge strategies (`smart-prefer-branch`) remain but are marked inert.
+
+### 2. Architectural Friction (God Files)
+* `packages/dashboard/src/routes.ts` **(~10,340 lines)**: Consolidates over 210 HTTP endpoint handlers; inconsistent error taxonomies.
+* `packages/cli/src/extension.ts` **(~5,695 lines)**: Utilizes global `console.log` monkey-patching to capture tool outputs, posing concurrent execution interleaving risks.
+* `packages/engine/src/executor.ts` **(~3,172 lines)**: Single-session task execution pipeline bottlenecks.
+
+### 3. Fragile State & Resource Leaks
+* **AI Automation Timeouts**: `cron-runner.ts` utilizes `Promise.race` for timeouts but fails to dispatch an `AbortSignal` to the underlying AI model request, causing compute leaks post-timeout.
+* **Signal Accumulation**: Dashboard CLI components attach `process.on("SIGINT")` without teardowns, risking `MaxListenersExceededWarning` in daemon sessions.
+* **Stranded Execution States**: Setup failures (e.g., worktree lock contention) mark a task as `failed` but can strand it in the `in-progress` column until background sweeps reconcile it.
+
+### 4. High-Risk Operations (Direct User Vetting Required)
+* **Database Migrations (`fn db migrate`)**: Cutover strictly mandates PostgreSQL. Migrations run direct, meaning rollbacks are restore-only.
+* **Forced Worktree Teardowns (`git worktree remove --force`)**: Risk of destroying uncommitted local state if utilized by stuck-task cleanup mechanisms.
+* **Concurrency Floors**: Adjusting embedded PostgreSQL `/dev/shm` shared memory boundaries can trigger mmap failure crashes on nodes under 16GB RAM.
