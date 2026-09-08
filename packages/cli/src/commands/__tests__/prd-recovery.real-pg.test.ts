@@ -36,6 +36,20 @@ const PROVIDER_EVIDENCE = createHash("sha256")
   .update("operator-observed-provider-failure", "utf8")
   .digest("hex");
 
+let recoveryTimingStartedAt: number | undefined;
+
+function markRecoveryTiming(label: string): void {
+  if (recoveryTimingStartedAt === undefined) return;
+  process.stderr.write(
+    `[recovery-timing] ${label} +${Date.now() - recoveryTimingStartedAt}ms\n`,
+  );
+}
+
+function startRecoveryTiming(label: string): void {
+  recoveryTimingStartedAt = Date.now();
+  markRecoveryTiming(label);
+}
+
 pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
   const h = createSharedPgTaskStoreTestHarness({
     prefix: "fusion_ccc_prd_cli_recovery",
@@ -81,9 +95,11 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     contract: "semantic-v2" | "legacy-v1-proof" = "semantic-v2",
   ) {
     const legacySource = createCccPrdImportTestProductBundle(h.rootDir(), suffix);
+    markRecoveryTiming("fixture:admission:start");
     const admitted = contract === "semantic-v2"
       ? await admitCccPrdImportTestProductBundle(legacySource, suffix)
       : null;
+    markRecoveryTiming("fixture:admission:end");
     const source = admitted?.bundle ?? legacySource;
     const basePolicy =
       contract === "semantic-v2"
@@ -109,6 +125,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
         }
         : basePolicy;
     const idempotencyKey = `cli-recovery-${suffix}`;
+    markRecoveryTiming("fixture:import:start");
     const imported = await importCccPrdBundle({
       bundle: source,
       executionPolicy,
@@ -118,6 +135,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       layer: h.layer(),
       rootDir: h.rootDir(),
     });
+    markRecoveryTiming("fixture:import:end");
     const ledgerBackedStatus = await inspectCccPrdProductStatus({
       idempotencyKey,
       layer: h.layer(),
@@ -324,6 +342,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
   async function exercisePiProviderResolution(
     parkedState: "manual-required" | "failed",
   ): Promise<void> {
+    startRecoveryTiming("pi:test:start");
     const campaign = await importRecoveryCampaign(`provider-pi-${parkedState}`);
     const parkedWorkItem = {
       ...campaign.parkedWorkItem,
@@ -393,6 +412,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       ...parkedWorkItem,
       attempt: parkedWorkItem.attempt + 1,
     });
+    markRecoveryTiming("pi:wrong-attempt:start");
     const wrongAttempt = await runCommand([
       "resolve-provider",
       campaign.idempotencyKey,
@@ -401,6 +421,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       "operator-pg-provider",
       PROVIDER_EVIDENCE,
     ]);
+    markRecoveryTiming("pi:wrong-attempt:end");
     expect(wrongAttempt.exitCode).toBe(1);
     expect(wrongAttempt.json).toMatchObject({
       kind: "refusal",
@@ -411,6 +432,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     });
     await h.store().upsertWorkflowWorkItem(parkedWorkItem);
 
+    markRecoveryTiming("pi:preview:start");
     const preview = await runCommand([
       "resolve-provider",
       campaign.idempotencyKey,
@@ -419,6 +441,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       "operator-pg-provider",
       PROVIDER_EVIDENCE,
     ]);
+    markRecoveryTiming("pi:preview:end");
     expect(preview.exitCode, preview.output.join("\n")).toBe(0);
     expect(preview.json).toMatchObject({
       kind: "provider-resolution-preview",
@@ -435,6 +458,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
     })).resolves.toMatchObject({ state: "dispatched_unknown" });
     assertNoControllerToken(preview.output, reserved.controllerToken);
 
+    markRecoveryTiming("pi:settlement:start");
     const settled = await runCommand([
       "resolve-provider",
       campaign.idempotencyKey,
@@ -445,6 +469,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       "--confirm",
       String(preview.json!.confirmation),
     ]);
+    markRecoveryTiming("pi:settlement:end");
     expect(settled.exitCode, settled.output.join("\n")).toBe(0);
     expect(settled.json).toMatchObject({
       kind: "provider-resolved",
@@ -508,6 +533,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
   );
 
   it("refuses generic settlement for an uncertain CLI provider attempt and preserves its fence-owned state", async () => {
+    startRecoveryTiming("cli:test:start");
     const campaign = await importRecoveryCampaign("provider-cli", "cli");
     const route = campaign.executionPolicy.routes.find(
       ({ taskId }) => taskId === campaign.semanticTaskId,
@@ -533,6 +559,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       controllerToken: reserved.controllerToken,
     });
 
+    markRecoveryTiming("cli:refusal:start");
     const refused = await runCommand([
       "resolve-provider",
       campaign.idempotencyKey,
@@ -541,6 +568,7 @@ pgDescribe("CCC PRD normal CLI recovery path (PostgreSQL)", () => {
       "operator-pg-provider",
       PROVIDER_EVIDENCE,
     ]);
+    markRecoveryTiming("cli:refusal:end");
     expect(refused.exitCode).toBe(1);
     expect(refused.json).toMatchObject({
       kind: "refusal",
