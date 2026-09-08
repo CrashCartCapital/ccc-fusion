@@ -31,6 +31,7 @@ import {
 import {
   admitAndMaterializeCccSemanticProof,
   boundedUtf8Excerpt,
+  CccSemanticProofOwnedProcessCleanupError,
   verifyCccSemanticProofToolchainBeforeSpawn,
   type CccSemanticProofMaterialization,
   type CccSemanticProofMaterializationInput,
@@ -174,7 +175,11 @@ export interface CreateCccCampaignProofSuiteHandlerInput {
   materializeSemanticProof?: (
     input: CccSemanticProofMaterializationInput,
   ) => Promise<CccSemanticProofMaterialization>;
-  verifySemanticProofToolchain?: (toolchain: CccPrdProofV2["executionToolchain"]) => Promise<void>;
+  verifySemanticProofToolchain?: (
+    toolchain: CccPrdProofV2["executionToolchain"],
+    signal?: AbortSignal,
+    outputRoot?: string,
+  ) => Promise<void>;
   /**
    * Readiness gate for the semantic-v2 proof sandbox backend specifically —
    * distinct from `inspectVerifierConfinementReadiness` above, which reports
@@ -1495,7 +1500,11 @@ export type CccSemanticProofVerifierPreflightDependencies = Readonly<{
   materialize: (
     input: CccSemanticProofMaterializationInput,
   ) => Promise<CccSemanticProofMaterialization>;
-  verifyToolchain: (toolchain: CccPrdProofV2["executionToolchain"]) => Promise<void>;
+  verifyToolchain: (
+    toolchain: CccPrdProofV2["executionToolchain"],
+    signal?: AbortSignal,
+    outputRoot?: string,
+  ) => Promise<void>;
   inspectSandboxReadiness: () => Promise<CccSemanticProofSandboxReadiness>;
   preflightSandbox: (input: CccSemanticProofSandboxPolicyInput) => void | Promise<void>;
   runSandbox: (
@@ -1636,6 +1645,7 @@ export async function assertCccSemanticProofVerifierConformance(
       );
     }
     const tempRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-"));
+    let retainTempRoot = false;
     try {
       // Materialize and seal the toolchain exactly once per proof, not once
       // per phase: a proof's closure, candidates, and executionToolchain do
@@ -1657,6 +1667,10 @@ export async function assertCccSemanticProofVerifierConformance(
         });
         await verifyToolchain(materialized.sealedExecutionToolchain);
       } catch (error) {
+        if (error instanceof CccSemanticProofOwnedProcessCleanupError) {
+          retainTempRoot = true;
+          throw error;
+        }
         throw new CccPrdProofVerifierNonconformingError(
           `CCC semantic-proof verifier preflight for ${proof.id} could not seal the verifier: ${
             error instanceof Error ? error.message : String(error)
@@ -1727,8 +1741,10 @@ export async function assertCccSemanticProofVerifierConformance(
         }
       }
     } finally {
-      await makeTempTreeWriteable(tempRoot);
-      await rm(tempRoot, { recursive: true, force: true });
+      if (!retainTempRoot) {
+        await makeTempTreeWriteable(tempRoot);
+        await rm(tempRoot, { recursive: true, force: true });
+      }
     }
   }
 }
@@ -1781,7 +1797,11 @@ type SemanticProofRuntimeDependencies = Readonly<{
   materialize: (
     input: CccSemanticProofMaterializationInput,
   ) => Promise<CccSemanticProofMaterialization>;
-  verifyToolchain: (toolchain: CccPrdProofV2["executionToolchain"]) => Promise<void>;
+  verifyToolchain: (
+    toolchain: CccPrdProofV2["executionToolchain"],
+    signal?: AbortSignal,
+    outputRoot?: string,
+  ) => Promise<void>;
   inspectSandboxReadiness: () => Promise<CccSemanticProofSandboxReadiness>;
   preflightSandbox: (input: CccSemanticProofSandboxPolicyInput) => void | Promise<void>;
   runSandbox: (
@@ -1864,6 +1884,7 @@ async function runSemanticProofV2(
     }
 
     const tempRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-execution-"));
+    let retainTempRoot = false;
     try {
       let materialized: CccSemanticProofMaterialization;
       try {
@@ -1875,6 +1896,7 @@ async function runSemanticProofV2(
             proof,
             modelWriteRoots: execution.verifierDisjointRoots,
             outputRoot: tempRoot,
+            signal: context.signal,
           });
           if (
             prepared.closureSha256 !== digests.verifierClosureSha256
@@ -1882,14 +1904,23 @@ async function runSemanticProofV2(
           ) {
             throw new Error("materialized proof digests differ from immutable admission");
           }
-          await dependencies.verifyToolchain(prepared.sealedExecutionToolchain);
+          await dependencies.verifyToolchain(
+            prepared.sealedExecutionToolchain,
+            context.signal,
+            tempRoot,
+          );
+          context.signal?.throwIfAborted();
           await dependencies.preflightSandbox(
             semanticProofSandboxPolicyFor(prepared, proof, execution.snapshot.targetRoot, engineRoot),
           );
           return prepared;
         }, context.signal);
       } catch (error) {
-        if (error instanceof Error && error.name === "AbortError") throw error;
+        if (error instanceof CccSemanticProofOwnedProcessCleanupError) {
+          retainTempRoot = true;
+          throw error;
+        }
+        if (context.signal?.aborted) context.signal.throwIfAborted();
         proofRefusal(
           `CCC campaign semantic proof ${proof.id} pre-dispatch custody refused: ${
             error instanceof Error ? error.message : String(error)
@@ -1898,7 +1929,9 @@ async function runSemanticProofV2(
         );
       }
 
+      context.signal?.throwIfAborted();
       await assertLiveWorkItemFence(input.store, originTaskId, fence);
+      context.signal?.throwIfAborted();
       const reserved = await withSemanticProofDeadlineTranslation(() => (
         dependencies.proofAttempts.reserve({
         layer,
@@ -1999,8 +2032,10 @@ async function runSemanticProofV2(
         );
       }
     } finally {
-      await makeTempTreeWriteable(tempRoot);
-      await rm(tempRoot, { recursive: true, force: true });
+      if (!retainTempRoot) {
+        await makeTempTreeWriteable(tempRoot);
+        await rm(tempRoot, { recursive: true, force: true });
+      }
     }
   }
 

@@ -1,7 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -35,6 +35,7 @@ import {
 } from "../ccc-campaign-proof-execution.js";
 import { ensureCccCampaignJoinBaseBranch } from "../ccc-campaign-join-base.js";
 import {
+  CccSemanticProofOwnedProcessCleanupError,
   inspectCccSemanticProofExecutable,
   inspectCccSemanticProofLinkedRuntime,
 } from "../ccc-campaign-proof-materialization.js";
@@ -646,9 +647,12 @@ function semanticHandler(
     attempts?: ReturnType<typeof attemptApi>;
     tasks?: ReadonlyMap<string, TaskDetail>;
     materializeSemanticProof?: (
-      input: { outputRoot: string },
+      input: { outputRoot: string; signal?: AbortSignal },
     ) => Promise<ReturnType<typeof materializedFixture>>;
-    verifyToolchain?: () => Promise<void>;
+    verifyToolchain?: (
+      toolchain: CccPrdProofV2["executionToolchain"],
+      signal?: AbortSignal,
+    ) => Promise<void>;
     preflightSemanticProofSandbox?: (input: Record<string, unknown>) => Promise<void>;
     runSandbox?: (input: Record<string, unknown>) => Promise<ReturnType<typeof processResult>>;
   } = {},
@@ -738,6 +742,84 @@ describe("CCC semantic proof v2 execution", () => {
     });
     expect(inspectSemanticProofSandboxReadiness).toHaveBeenCalledTimes(1);
     expect(materializeSemanticProof).not.toHaveBeenCalled();
+    expect(attempts.reserve).not.toHaveBeenCalled();
+    expect(attempts.begin).not.toHaveBeenCalled();
+    expect(attempts.settle).not.toHaveBeenCalled();
+  });
+
+  it("cancellation during semantic proof preparation", async () => {
+    const f = await fixture();
+    const attempts = attemptApi();
+    const controller = new AbortController();
+    const reason = new Error("semantic proof preparation cancellation sentinel");
+    let materializeSignal: AbortSignal | undefined;
+    let verifySignal: AbortSignal | undefined;
+    const materializeSemanticProof = vi.fn(async ({
+      outputRoot,
+      signal,
+    }: { outputRoot: string; signal?: AbortSignal }) => {
+      materializeSignal = signal;
+      controller.abort(reason);
+      return materializedFixture(outputRoot, f.proof.admission!, f.proof.executionToolchain);
+    });
+    const verifyToolchain = vi.fn(async (
+      _toolchain: CccPrdProofV2["executionToolchain"],
+      signal?: AbortSignal,
+    ) => {
+      verifySignal = signal;
+    });
+    const { handler, preflightSandbox, runSandbox } = semanticHandler(f, {
+      attempts,
+      materializeSemanticProof,
+      verifyToolchain,
+    });
+    const context = Object.assign({}, f.context as object, { signal: controller.signal }) as never;
+
+    await expect(handler(f.node, context)).rejects.toBe(reason);
+    expect(materializeSignal).toBe(controller.signal);
+    expect(verifySignal).toBe(controller.signal);
+    expect(materializeSemanticProof).toHaveBeenCalledTimes(1);
+    expect(verifyToolchain).toHaveBeenCalledTimes(1);
+    expect(preflightSandbox).not.toHaveBeenCalled();
+    expect(runSandbox).not.toHaveBeenCalled();
+    expect(attempts.reserve).not.toHaveBeenCalled();
+    expect(attempts.begin).not.toHaveBeenCalled();
+    expect(attempts.settle).not.toHaveBeenCalled();
+  });
+
+  it("retains the exact temp root when owned process cleanup is unproven", async () => {
+    const f = await fixture();
+    const attempts = attemptApi();
+    let retainedRoot: string | undefined;
+    const receipt = {
+      stopCause: "cancel" as const,
+      directClose: { code: 0, signal: null },
+      pgid: 42,
+      termSent: true,
+      killSent: true,
+      groupAbsent: false,
+    };
+    const materializeSemanticProof = vi.fn(async ({ outputRoot }: { outputRoot: string }) => {
+      retainedRoot = outputRoot;
+      throw new CccSemanticProofOwnedProcessCleanupError(
+        outputRoot,
+        receipt,
+        new Error("descendant cleanup remained unproven"),
+      );
+    });
+    const { handler, preflightSandbox, runSandbox } = semanticHandler(f, {
+      attempts,
+      materializeSemanticProof,
+    });
+
+    await expect(handler(f.node, f.context)).rejects.toMatchObject({
+      code: "DEPENDENCY_OPEN",
+      receipt,
+    });
+    expect(retainedRoot).toBeDefined();
+    await expect(stat(retainedRoot!)).resolves.toBeDefined();
+    expect(preflightSandbox).not.toHaveBeenCalled();
+    expect(runSandbox).not.toHaveBeenCalled();
     expect(attempts.reserve).not.toHaveBeenCalled();
     expect(attempts.begin).not.toHaveBeenCalled();
     expect(attempts.settle).not.toHaveBeenCalled();
@@ -2364,6 +2446,48 @@ describe("CCC semantic proof verifier conformance preflight (dependency-injected
     expect(materialize).toHaveBeenCalledTimes(1);
     expect(verifyToolchain).toHaveBeenCalledTimes(1);
     expect(runSandbox).toHaveBeenCalledTimes(2);
+  });
+
+  it("conformance preserves typed owned-process cleanup and the exact root", async () => {
+    const { repo, baseCommit } = await minimalGitRepo();
+    const proof = readmitProofDefinition(admittedProof(), { phases: ["task"] });
+    const receipt = {
+      stopCause: "cancel" as const,
+      directClose: { code: 0, signal: null },
+      pgid: 4242,
+      termSent: true,
+      killSent: true,
+      groupAbsent: false,
+    };
+    let retainedRoot: string | undefined;
+    const attempt = assertCccSemanticProofVerifierConformance(
+      { repositoryRoot: repo, baseCommit, proofs: [proof], modelWriteRoots: [] },
+      {
+        materialize: vi.fn(async ({ outputRoot }: { outputRoot: string }) => {
+          retainedRoot = outputRoot;
+          throw new CccSemanticProofOwnedProcessCleanupError(
+            outputRoot,
+            receipt,
+            new Error("owned probe group remained live"),
+          );
+        }),
+        verifyToolchain: vi.fn(async () => undefined),
+        inspectSandboxReadiness: vi.fn(async () => stubReadySandbox()),
+        preflightSandbox: vi.fn(async () => undefined),
+        runSandbox: vi.fn(),
+      },
+    );
+
+    let thrown: unknown;
+    try {
+      await attempt;
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CccSemanticProofOwnedProcessCleanupError);
+    expect(thrown).toMatchObject({ code: "DEPENDENCY_OPEN", receipt, outputRoot: retainedRoot });
+    expect(retainedRoot).toBeDefined();
+    await expect(stat(retainedRoot!)).resolves.toBeDefined();
   });
 
   it("refuses prose stdout with the structured code, proof id, phase, not-json warning, first stdout line, and a bounded stderr excerpt", async () => {

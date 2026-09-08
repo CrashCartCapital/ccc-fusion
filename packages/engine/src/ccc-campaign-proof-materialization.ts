@@ -17,6 +17,7 @@ import {
   CCC_PRD_SEMANTIC_PROOF_HOST_ID,
   computeCccPrdCandidateInputsSha256,
   computeCccPrdVerifierClosureSha256,
+  superviseSpawn,
   wellKnownGitBinaryPaths,
   type CccPrdExecutableIdentity,
   type CccPrdLinkedRuntimeEntry,
@@ -25,6 +26,8 @@ import {
   type CccPrdProofExecutionToolchain,
   type CccPrdProofV2,
   type CccPrdVerifierClosureEntry,
+  type SupervisedChild,
+  type SupervisedExit,
 } from "@fusion/core";
 import { isAlias, isMap, isScalar, isSeq, parseDocument, type Node, type Pair } from "yaml";
 
@@ -70,6 +73,11 @@ const EXECUTABLE_VERSION_ARGS = Object.freeze(["--version"] as const);
 // observed worst-case cold chain, while still bounding a genuinely hung
 // probe rather than waiting indefinitely.
 export const EXECUTABLE_PROBE_TIMEOUT_MS = 45_000;
+export const EXECUTABLE_PROBE_TERMINATION_GRACE_MS = 1_000;
+export const EXECUTABLE_PROBE_GROUP_DRAIN_MS = 1_000;
+export const EXECUTABLE_PROBE_GROUP_POLL_MS = 25;
+const EXECUTABLE_PROBE_MAX_BUFFER_BYTES = 1024 * 1024;
+const EXECUTABLE_PROBE_TOTAL_ATTEMPTS = 2;
 const GIT_TIMEOUT_MS = 10_000;
 const OTOOL_TIMEOUT_MS = 10_000;
 const INSTALL_NAME_TOOL_TIMEOUT_MS = 10_000;
@@ -85,6 +93,46 @@ const MACH_O_MAGICS = new Set([
   0xbfbafeca,
 ]);
 
+export type CccSemanticProofProbeClosureReceipt = Readonly<{
+  stopCause: "natural" | "cancel" | "timeout" | "output-limit" | "spawn-error";
+  directClose: Readonly<{ code: number | null; signal: NodeJS.Signals | null }> | null;
+  pgid: number | null;
+  termSent: boolean;
+  killSent: boolean;
+  groupAbsent: boolean;
+}>;
+
+class CccSemanticProofProbeQuiescenceError extends Error {
+  readonly code = "DEPENDENCY_OPEN" as const;
+  readonly receipt: CccSemanticProofProbeClosureReceipt;
+
+  constructor(message: string, receipt: CccSemanticProofProbeClosureReceipt, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CccSemanticProofProbeQuiescenceError";
+    this.receipt = receipt;
+  }
+}
+
+export class CccSemanticProofOwnedProcessCleanupError extends Error {
+  readonly code = "DEPENDENCY_OPEN" as const;
+  readonly outputRoot: string;
+  readonly receipt: CccSemanticProofProbeClosureReceipt;
+
+  constructor(
+    outputRoot: string,
+    receipt: CccSemanticProofProbeClosureReceipt,
+    cause: unknown,
+  ) {
+    super(
+      `CCC semantic-proof owned process cleanup could not prove group absence for ${outputRoot}`,
+      { cause },
+    );
+    this.name = "CccSemanticProofOwnedProcessCleanupError";
+    this.outputRoot = outputRoot;
+    this.receipt = receipt;
+  }
+}
+
 export type CccSemanticProofMaterializationInput = {
   repositoryRoot: string;
   baseCommit: string;
@@ -92,6 +140,7 @@ export type CccSemanticProofMaterializationInput = {
   proof: CccPrdProofV2;
   modelWriteRoots: readonly string[];
   outputRoot: string;
+  signal?: AbortSignal;
   /**
    * Default false, preserving exact real-attempt behavior: every declared
    * candidate must resolve to a real blob at sourceCommit, or materialization
@@ -418,6 +467,7 @@ function verifyTaskfile(
 export async function inspectCccSemanticProofExecutable(
   executablePath: string,
   versionArgs: readonly string[],
+  signal?: AbortSignal,
 ): Promise<CccPrdExecutableIdentity> {
   if (
     versionArgs.length !== EXECUTABLE_VERSION_ARGS.length
@@ -426,7 +476,7 @@ export async function inspectCccSemanticProofExecutable(
     throw new Error("CCC semantic-proof executable identity requires the canonical --version probe");
   }
   const observedBytes = await inspectExecutableBytes(executablePath);
-  const version = await inspectExecutableVersion(observedBytes.canonicalPath, versionArgs);
+  const version = await inspectExecutableVersion(observedBytes.canonicalPath, versionArgs, signal);
   return {
     executablePath: observedBytes.canonicalPath,
     executableSha256: observedBytes.executableSha256,
@@ -451,8 +501,9 @@ async function inspectExecutableBytes(executablePath: string): Promise<{
 async function inspectExecutableVersion(
   canonicalPath: string,
   versionArgs: readonly string[],
+  signal?: AbortSignal,
 ): Promise<Pick<CccPrdExecutableIdentity, "version" | "versionOutputSha256">> {
-  const { stdout, stderr } = await runExecutableVersionProbe(canonicalPath, versionArgs);
+  const { stdout, stderr } = await runExecutableVersionProbe(canonicalPath, versionArgs, signal);
   const versionOutput = Buffer.concat([stdout, stderr]);
   const version = versionOutput.toString("utf8").trim();
   if (version.length === 0) throw new Error("CCC semantic-proof executable version output is empty");
@@ -466,10 +517,12 @@ async function inspectProofHostVersion(
   proofHostPath: string,
   nodePath: string,
   versionArgs: readonly string[],
+  signal?: AbortSignal,
 ): Promise<Pick<CccPrdExecutableIdentity, "version" | "versionOutputSha256">> {
   const { stdout, stderr } = await runExecutableVersionProbe(
     nodePath,
     [proofHostPath, ...versionArgs],
+    signal,
   );
   const versionOutput = Buffer.concat([stdout, stderr]);
   const version = versionOutput.toString("utf8").trim();
@@ -482,8 +535,14 @@ async function inspectProofHostVersion(
 
 function isTransientExecutableProbeTimeout(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
-  const candidate = error as { code?: unknown; killed?: unknown; signal?: unknown };
-  return candidate.code === null
+  const candidate = error as {
+    code?: unknown;
+    killed?: unknown;
+    signal?: unknown;
+    probeStopCause?: unknown;
+  };
+  return (candidate.probeStopCause === undefined || candidate.probeStopCause === "timeout")
+    && candidate.code === null
     && candidate.killed === true
     && candidate.signal === "SIGTERM";
 }
@@ -497,9 +556,19 @@ function toolchainDrift(name: string, error: unknown): Error {
   );
 }
 
+function throwOwnedProbeCleanupError(error: unknown, outputRoot?: string): never {
+  if (error instanceof CccSemanticProofOwnedProcessCleanupError) throw error;
+  if (error instanceof CccSemanticProofProbeQuiescenceError) {
+    if (outputRoot !== undefined) {
+      throw new CccSemanticProofOwnedProcessCleanupError(outputRoot, error.receipt, error);
+    }
+    throw error;
+  }
+  throw error;
+}
+
 const EXECUTABLE_PROBE_STDERR_EXCERPT_BYTES = 4096;
 const EXECUTABLE_PROBE_STDERR_TRUNCATED_MARKER = "...[truncated]";
-const EXECUTABLE_PROBE_TOTAL_ATTEMPTS = 2;
 
 // A raw execFile rejection's `.message` already embeds the FULL stderr (up
 // to maxBuffer) that Node's own child_process internals append after
@@ -613,22 +682,322 @@ function executableProbeFailureError(
   return wrapped;
 }
 
+type ProbeBuffers = {
+  stdout: Buffer[];
+  stderr: Buffer[];
+  stdoutBytes: number;
+  stderrBytes: number;
+};
+
+type ProbeGroupState = "absent" | "present" | "unproven";
+
+let probeGroupObservationOverride:
+  | ((pgid: number | null, started: boolean) => ProbeGroupState)
+  | undefined;
+
+/** Narrow test seam for proving bounded group-observation failure behavior. */
+export function __setCccSemanticProofProbeGroupObservationForTests(
+  observer: ((pgid: number | null, started: boolean) => ProbeGroupState) | undefined,
+): () => void {
+  const previous = probeGroupObservationOverride;
+  probeGroupObservationOverride = observer;
+  return () => {
+    probeGroupObservationOverride = previous;
+  };
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason === undefined
+    ? new DOMException("The operation was aborted", "AbortError")
+    : signal.reason;
+}
+
+function throwIfProbeAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+function observeProbeGroup(pgid: number | null, started: boolean): ProbeGroupState {
+  if (probeGroupObservationOverride) return probeGroupObservationOverride(pgid, started);
+  if (pgid === null) {
+    return started && process.platform !== "win32" ? "unproven" : "absent";
+  }
+  try {
+    process.kill(-pgid, 0);
+    return "present";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "absent";
+    return "unproven";
+  }
+}
+
+function appendProbeChunk(
+  chunks: Buffer[],
+  currentBytes: number,
+  chunk: Buffer,
+): { bytes: number; overLimit: boolean } {
+  if (currentBytes >= EXECUTABLE_PROBE_MAX_BUFFER_BYTES) {
+    return { bytes: currentBytes, overLimit: true };
+  }
+  const remaining = EXECUTABLE_PROBE_MAX_BUFFER_BYTES - currentBytes;
+  if (chunk.length > remaining) {
+    if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+    return { bytes: EXECUTABLE_PROBE_MAX_BUFFER_BYTES, overLimit: true };
+  }
+  chunks.push(chunk);
+  return { bytes: currentBytes + chunk.length, overLimit: false };
+}
+
+async function waitForProbeClose(
+  directClose: { value: SupervisedExit | null },
+  waitExit: Promise<SupervisedExit>,
+  deadlineAt: number,
+): Promise<void> {
+  while (directClose.value === null && Date.now() < deadlineAt) {
+    await Promise.race([
+      waitExit,
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, Math.min(EXECUTABLE_PROBE_GROUP_POLL_MS, Math.max(1, deadlineAt - Date.now())));
+        timer.unref();
+      }),
+    ]);
+  }
+}
+
+async function drainProbeGroup(
+  supervised: SupervisedChild,
+  directClose: { value: SupervisedExit | null },
+  waitExit: Promise<SupervisedExit>,
+): Promise<{
+  directClose: SupervisedExit | null;
+  pgid: number | null;
+  termSent: boolean;
+  killSent: boolean;
+  groupAbsent: boolean;
+  survivingDescendant: boolean;
+}> {
+  const started = typeof supervised.pid === "number";
+  const pgid = supervised.pgid;
+  let state = observeProbeGroup(pgid, started);
+  const survivingDescendant = state === "present";
+  let termSent = false;
+  let killSent = false;
+
+  if (state === "present") {
+    supervised.kill("SIGTERM");
+    termSent = true;
+    const termDeadlineAt = Date.now() + EXECUTABLE_PROBE_TERMINATION_GRACE_MS;
+    while (Date.now() < termDeadlineAt) {
+      state = observeProbeGroup(pgid, started);
+      if (state === "absent") break;
+      await waitForProbeClose(directClose, waitExit, Math.min(termDeadlineAt, Date.now() + EXECUTABLE_PROBE_GROUP_POLL_MS));
+      if (Date.now() < termDeadlineAt) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, Math.min(EXECUTABLE_PROBE_GROUP_POLL_MS, termDeadlineAt - Date.now()));
+          timer.unref();
+        });
+      }
+    }
+  }
+
+  state = observeProbeGroup(pgid, started);
+  if (state === "present") {
+    supervised.kill("SIGKILL");
+    killSent = true;
+    const drainDeadlineAt = Date.now() + EXECUTABLE_PROBE_GROUP_DRAIN_MS;
+    while (Date.now() < drainDeadlineAt) {
+      state = observeProbeGroup(pgid, started);
+      if (state === "absent" && directClose.value !== null) break;
+      await waitForProbeClose(directClose, waitExit, Math.min(drainDeadlineAt, Date.now() + EXECUTABLE_PROBE_GROUP_POLL_MS));
+      if (Date.now() < drainDeadlineAt) await new Promise((resolve) => setTimeout(resolve, EXECUTABLE_PROBE_GROUP_POLL_MS));
+    }
+  } else if (state === "absent" && directClose.value === null) {
+    await waitForProbeClose(directClose, waitExit, Date.now() + EXECUTABLE_PROBE_GROUP_DRAIN_MS);
+  }
+
+  state = observeProbeGroup(pgid, started);
+  return {
+    directClose: directClose.value,
+    pgid,
+    termSent,
+    killSent,
+    groupAbsent: state === "absent" && directClose.value !== null,
+    survivingDescendant,
+  };
+}
+
+function probeError(
+  executablePath: string,
+  args: readonly string[],
+  directClose: SupervisedExit | null,
+  buffers: ProbeBuffers,
+  stopCause: CccSemanticProofProbeClosureReceipt["stopCause"],
+  spawnError?: unknown,
+): Error {
+  const command = `${executablePath}${args.length > 0 ? ` ${args.join(" ")}` : ""}`;
+  const original = spawnError instanceof Error
+    ? spawnError
+    : new Error(`Command failed: ${command}`);
+  const originalStreams = spawnError as { stderr?: Buffer | string; stdout?: Buffer | string } | undefined;
+  const stdout = buffers.stdout.length > 0
+    ? Buffer.concat(buffers.stdout)
+    : Buffer.isBuffer(originalStreams?.stdout)
+      ? originalStreams.stdout
+      : typeof originalStreams?.stdout === "string"
+        ? Buffer.from(originalStreams.stdout, "utf8")
+        : Buffer.alloc(0);
+  const stderr = buffers.stderr.length > 0
+    ? Buffer.concat(buffers.stderr)
+    : Buffer.isBuffer(originalStreams?.stderr)
+      ? originalStreams.stderr
+      : typeof originalStreams?.stderr === "string"
+        ? Buffer.from(originalStreams.stderr, "utf8")
+        : Buffer.alloc(0);
+  const candidate = Object.assign(original, {
+    code: directClose && directClose.code !== null
+      ? directClose.code
+      : (spawnError as { code?: unknown } | undefined)?.code ?? directClose?.code ?? null,
+    signal: directClose?.signal ?? (spawnError as { signal?: unknown } | undefined)?.signal ?? null,
+    killed: stopCause === "timeout" || stopCause === "cancel" || stopCause === "output-limit"
+      || (spawnError as { killed?: unknown } | undefined)?.killed === true,
+    probeStopCause: stopCause,
+    stderr,
+    stdout,
+  });
+  return candidate;
+}
+
+async function runExecutableVersionProbeAttempt(
+  executablePath: string,
+  args: readonly string[],
+  signal: AbortSignal | undefined,
+): Promise<{ stdout: Buffer; stderr: Buffer }> {
+  throwIfProbeAborted(signal);
+  const buffers: ProbeBuffers = { stdout: [], stderr: [], stdoutBytes: 0, stderrBytes: 0 };
+  let stopCause: CccSemanticProofProbeClosureReceipt["stopCause"] = "natural";
+  let stopRequested = false;
+  let resolveStop: (() => void) | null = null;
+  const stopPromise = new Promise<void>((resolve) => {
+    resolveStop = resolve;
+  });
+  let spawnError: unknown;
+  let supervised: SupervisedChild;
+  try {
+    supervised = superviseSpawn(executablePath, [...args], {
+      env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
+      stdio: ["ignore", "pipe", "pipe"],
+      diagnosticLabel: "ccc-semantic-proof-version-probe",
+      maxLifetimeMs: Number.POSITIVE_INFINITY,
+    });
+  } catch (error) {
+    const directClose = null;
+    throwIfProbeAborted(signal);
+    throw probeError(executablePath, args, directClose, buffers, "spawn-error", error);
+  }
+
+  const directClose: { value: SupervisedExit | null } = { value: null };
+  const waitExit = supervised.waitExit().then((exit) => {
+    directClose.value = exit;
+    return exit;
+  });
+  let outputOverLimit = false;
+  const requestStop = (cause: CccSemanticProofProbeClosureReceipt["stopCause"]): void => {
+    if (stopRequested) return;
+    stopRequested = true;
+    stopCause = cause;
+    resolveStop?.();
+  };
+  const onAbort = () => requestStop("cancel");
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) requestStop("cancel");
+  const timeout = setTimeout(() => requestStop("timeout"), EXECUTABLE_PROBE_TIMEOUT_MS);
+  timeout.unref();
+  supervised.child.stdout?.on("data", (chunk: Buffer | string) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const result = appendProbeChunk(buffers.stdout, buffers.stdoutBytes, bytes);
+    buffers.stdoutBytes = result.bytes;
+    if (result.overLimit) {
+      outputOverLimit = true;
+      requestStop("output-limit");
+    }
+  });
+  supervised.child.stderr?.on("data", (chunk: Buffer | string) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const result = appendProbeChunk(buffers.stderr, buffers.stderrBytes, bytes);
+    buffers.stderrBytes = result.bytes;
+    if (result.overLimit) {
+      outputOverLimit = true;
+      requestStop("output-limit");
+    }
+  });
+  supervised.child.once("error", (error) => {
+    spawnError = error;
+    requestStop(isTransientExecutableProbeTimeout(error) ? "timeout" : "spawn-error");
+  });
+
+  try {
+    await Promise.race([
+      waitExit,
+      stopPromise,
+    ]);
+    if (directClose.value !== null && !stopRequested) {
+      // Freeze natural completion before draining the process group. A late
+      // timeout/error callback must not reclassify an already-closed leader.
+      stopRequested = true;
+      stopCause = "natural";
+      clearTimeout(timeout);
+    }
+    const drained = await drainProbeGroup(supervised, directClose, waitExit);
+    const receipt: CccSemanticProofProbeClosureReceipt = {
+      stopCause,
+      directClose: drained.directClose,
+      pgid: drained.pgid,
+      termSent: drained.termSent,
+      killSent: drained.killSent,
+      groupAbsent: drained.groupAbsent,
+    };
+    const finalStopCause = stopCause as CccSemanticProofProbeClosureReceipt["stopCause"];
+    if (!receipt.groupAbsent) {
+      throw new CccSemanticProofProbeQuiescenceError(
+        "CCC semantic-proof owned version probe cleanup did not prove group absence",
+        receipt,
+      );
+    }
+    if (drained.survivingDescendant && finalStopCause === "natural") {
+      throw new CccSemanticProofProbeQuiescenceError(
+        "CCC semantic-proof owned version probe exited while its process group survived",
+        receipt,
+      );
+    }
+    if (signal?.aborted || finalStopCause === "cancel") throw abortReason(signal!);
+    if (finalStopCause === "timeout" || outputOverLimit || finalStopCause === "output-limit" || finalStopCause === "spawn-error") {
+      const original = probeError(executablePath, args, drained.directClose, buffers, finalStopCause, spawnError);
+      throw original;
+    }
+    if (!drained.directClose || drained.directClose.code !== 0 || drained.directClose.signal !== null) {
+      const original = probeError(executablePath, args, drained.directClose, buffers, finalStopCause);
+      throw original;
+    }
+    return { stdout: Buffer.concat(buffers.stdout), stderr: Buffer.concat(buffers.stderr) };
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 async function runExecutableVersionProbe(
   executablePath: string,
   args: readonly string[],
+  signal?: AbortSignal,
 ) {
-  const run = () => execFile(executablePath, [...args], {
-    encoding: "buffer",
-    maxBuffer: 1024 * 1024,
-    env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
-    timeout: EXECUTABLE_PROBE_TIMEOUT_MS,
-    windowsHide: true,
-  });
+  throwIfProbeAborted(signal);
   const probeStartedAt = Date.now();
   const firstAttemptStartedAt = Date.now();
   try {
-    return await run();
+    return await runExecutableVersionProbeAttempt(executablePath, args, signal);
   } catch (firstError) {
+    if (firstError instanceof CccSemanticProofProbeQuiescenceError) throw firstError;
+    if (signal?.aborted) throw abortReason(signal);
     if (!isTransientExecutableProbeTimeout(firstError)) {
       throw executableProbeFailureError(firstError, {
         attemptNumber: 1,
@@ -638,10 +1007,13 @@ async function runExecutableVersionProbe(
       });
     }
   }
+  throwIfProbeAborted(signal);
   const retryStartedAt = Date.now();
   try {
-    return await run();
+    return await runExecutableVersionProbeAttempt(executablePath, args, signal);
   } catch (secondError) {
+    if (secondError instanceof CccSemanticProofProbeQuiescenceError) throw secondError;
+    if (signal?.aborted) throw abortReason(signal);
     throw executableProbeFailureError(secondError, {
       attemptNumber: 2,
       totalAttempts: EXECUTABLE_PROBE_TOTAL_ATTEMPTS,
@@ -653,6 +1025,8 @@ async function runExecutableVersionProbe(
 
 export async function verifyCccSemanticProofToolchainBeforeSpawn(
   toolchain: CccPrdProofExecutionToolchain,
+  signal?: AbortSignal,
+  outputRoot?: string,
 ): Promise<void> {
   const identities = [
     ["Task", toolchain.task],
@@ -661,6 +1035,7 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
   ] as const;
   const verifiedPaths = new Map<(typeof identities)[number][0], string>();
   for (const [name, identity] of identities) {
+    throwIfProbeAborted(signal);
     if (!LOWER_SHA256.test(identity.executableSha256) || !LOWER_SHA256.test(identity.versionOutputSha256)) {
       throw new Error(`CCC semantic-proof ${name} identity is malformed`);
     }
@@ -674,10 +1049,15 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
       }
       verifiedPaths.set(name, observed.canonicalPath);
     } catch (error) {
+      if (error instanceof CccSemanticProofProbeQuiescenceError) {
+        throwOwnedProbeCleanupError(error, outputRoot);
+      }
+      if (signal?.aborted) throw abortReason(signal);
       throw toolchainDrift(name, error);
     }
   }
   for (const [name, identity] of identities) {
+    throwIfProbeAborted(signal);
     try {
       const canonicalPath = verifiedPaths.get(name)!;
       const immediateBytes = await inspectExecutableBytes(canonicalPath);
@@ -698,9 +1078,9 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
           ) {
             throw new Error("sealed Node bytes changed before proof-host version probe");
           }
-          return inspectProofHostVersion(canonicalPath, nodePath, EXECUTABLE_VERSION_ARGS);
+          return inspectProofHostVersion(canonicalPath, nodePath, EXECUTABLE_VERSION_ARGS, signal);
         })()
-        : await inspectExecutableVersion(canonicalPath, EXECUTABLE_VERSION_ARGS);
+        : await inspectExecutableVersion(canonicalPath, EXECUTABLE_VERSION_ARGS, signal);
       if (
         observedVersion.version !== identity.version
         || observedVersion.versionOutputSha256 !== identity.versionOutputSha256
@@ -708,15 +1088,21 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
         throw new Error("version output differs");
       }
     } catch (error) {
+      if (error instanceof CccSemanticProofProbeQuiescenceError) {
+        throwOwnedProbeCleanupError(error, outputRoot);
+      }
+      if (signal?.aborted) throw abortReason(signal);
       throw toolchainDrift(name, error);
     }
   }
   if (toolchain.python) {
     const python = toolchain.python;
     try {
+      throwIfProbeAborted(signal);
       const observed = await inspectCccSemanticProofExecutable(
         python.executablePath,
         EXECUTABLE_VERSION_ARGS,
+        signal,
       );
       if (
         observed.executablePath !== python.executablePath
@@ -791,7 +1177,11 @@ export async function verifyCccSemanticProofToolchainBeforeSpawn(
           }
         }
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof CccSemanticProofProbeQuiescenceError) {
+        throwOwnedProbeCleanupError(error, outputRoot);
+      }
+      if (signal?.aborted) throw abortReason(signal);
       throw new Error("CCC semantic-proof Python runtime manifest drift detected before spawn");
     }
   }
@@ -1040,6 +1430,7 @@ async function sealPythonExecutionToolchain(
   toolchainRoot: string,
   python: CccPrdPythonExecutionToolchain,
   sealedByCanonicalPath: Map<string, string>,
+  signal?: AbortSignal,
 ): Promise<CccPrdPythonExecutionToolchain> {
   if (!/^(?:python3(?:\.\d+)*|Python)$/u.test(basename(python.executablePath))) {
     throw new Error("CCC semantic-proof Python verifier executable must be named python3");
@@ -1104,7 +1495,7 @@ async function sealPythonExecutionToolchain(
     Promise.all(python.runtimeManifest.sitePackagesRoots.map((root) => sealRuntimeRoot(root, "site-packages"))),
     Promise.all(python.runtimeManifest.extensionModuleRoots.map((root) => sealRuntimeRoot(root, "extension-module"))),
   ]);
-  const sealedIdentity = await sealedExecutableIdentity(sealedInterpreter.path, EXECUTABLE_VERSION_ARGS);
+  const sealedIdentity = await sealedExecutableIdentity(sealedInterpreter.path, EXECUTABLE_VERSION_ARGS, signal);
   return {
     ...sealedIdentity,
     runtimeManifest: {
@@ -1125,8 +1516,9 @@ async function sealPythonExecutionToolchain(
 
 async function refreshSealedPythonExecutionToolchain(
   python: CccPrdPythonExecutionToolchain,
+  signal?: AbortSignal,
 ): Promise<CccPrdPythonExecutionToolchain> {
-  const identity = await sealedExecutableIdentity(python.executablePath, EXECUTABLE_VERSION_ARGS);
+  const identity = await sealedExecutableIdentity(python.executablePath, EXECUTABLE_VERSION_ARGS, signal);
   const refresh = async (entry: CccPrdPythonRuntimeFile): Promise<CccPrdPythonRuntimeFile> => ({
     path: entry.path,
     sha256: sha256(await readFile(entry.path)),
@@ -1600,9 +1992,10 @@ async function assertSealedDarwinLinkedRuntimeGraph(
 async function sealedExecutableIdentity(
   path: string,
   versionArgs: readonly string[],
+  signal?: AbortSignal,
 ): Promise<CccPrdExecutableIdentity> {
   const observed = await inspectExecutableBytes(path);
-  const version = await inspectExecutableVersion(observed.canonicalPath, versionArgs);
+  const version = await inspectExecutableVersion(observed.canonicalPath, versionArgs, signal);
   return {
     executablePath: observed.canonicalPath,
     executableSha256: observed.executableSha256,
@@ -1614,15 +2007,17 @@ async function sealedProofHostIdentity(
   proofHostPath: string,
   sealedNodePath: string,
   id: string,
+  signal?: AbortSignal,
 ): Promise<CccPrdProofExecutionToolchain["proofHost"]> {
   const observed = await inspectExecutableBytes(proofHostPath);
   const isMachOProofHost = await isDarwinMachOFile(observed.canonicalPath);
   const version = isMachOProofHost
-    ? await inspectExecutableVersion(observed.canonicalPath, EXECUTABLE_VERSION_ARGS)
+    ? await inspectExecutableVersion(observed.canonicalPath, EXECUTABLE_VERSION_ARGS, signal)
     : await (async (): Promise<Pick<CccPrdExecutableIdentity, "version" | "versionOutputSha256">> => {
       const { stdout, stderr } = await runExecutableVersionProbe(
         sealedNodePath,
         [observed.canonicalPath, ...EXECUTABLE_VERSION_ARGS],
+        signal,
       );
       const versionOutput = Buffer.concat([stdout, stderr]);
       const versionText = versionOutput.toString("utf8").trim();
@@ -1652,6 +2047,7 @@ async function refreshedSealedLinkedRuntimeManifest(
 async function sealExecutionToolchain(
   outputRoot: string,
   toolchain: CccPrdProofExecutionToolchain,
+  signal?: AbortSignal,
 ): Promise<CccSemanticProofMaterialization["sealedExecutionToolchain"]> {
   const toolchainRoot = join(outputRoot, "toolchain");
   await mkdir(toolchainRoot, { mode: 0o755 });
@@ -1679,7 +2075,7 @@ async function sealExecutionToolchain(
     await chmod(proofHostModuleContext, 0o444);
   }
   const python = toolchain.python
-    ? await sealPythonExecutionToolchain(toolchainRoot, toolchain.python, sealedByCanonicalPath)
+    ? await sealPythonExecutionToolchain(toolchainRoot, toolchain.python, sealedByCanonicalPath, signal)
     : undefined;
   const linkedRuntime = await sealDarwinLinkedRuntime(
     toolchainRoot,
@@ -1764,17 +2160,59 @@ async function sealExecutionToolchain(
       ...python.runtimeManifest.runtimeSupport.map((entry) => chmod(entry.path, 0o555)),
     ] : []),
   ]);
-  const [sealedTask, sealedNode] = await Promise.all([
-    sealedExecutableIdentity(taskExecutable, EXECUTABLE_VERSION_ARGS),
-    sealedExecutableIdentity(nodeExecutable, EXECUTABLE_VERSION_ARGS),
-  ]);
+  const taskController = new AbortController();
+  const nodeController = new AbortController();
+  const abortSiblings = (reason: unknown): void => {
+    if (!taskController.signal.aborted) taskController.abort(reason);
+    if (!nodeController.signal.aborted) nodeController.abort(reason);
+  };
+  const onExternalAbort = () => abortSiblings(signal ? abortReason(signal) : new DOMException("The operation was aborted", "AbortError"));
+  signal?.addEventListener("abort", onExternalAbort, { once: true });
+  if (signal?.aborted) onExternalAbort();
+  let firstFailure: unknown;
+  const runSibling = async (
+    controller: AbortController,
+    sibling: AbortController,
+    path: string,
+  ): Promise<CccPrdExecutableIdentity> => {
+    try {
+      return await sealedExecutableIdentity(path, EXECUTABLE_VERSION_ARGS, controller.signal);
+    } catch (error) {
+      if (firstFailure === undefined) firstFailure = error;
+      if (!sibling.signal.aborted) sibling.abort(error);
+      throw error;
+    }
+  };
+  let taskResult: PromiseSettledResult<CccPrdExecutableIdentity>;
+  let nodeResult: PromiseSettledResult<CccPrdExecutableIdentity>;
+  try {
+    [taskResult, nodeResult] = await Promise.allSettled([
+      runSibling(taskController, nodeController, taskExecutable),
+      runSibling(nodeController, taskController, nodeExecutable),
+    ]);
+  } finally {
+    signal?.removeEventListener("abort", onExternalAbort);
+  }
+  for (const result of [taskResult, nodeResult]) {
+    if (result.status === "rejected" && result.reason instanceof CccSemanticProofProbeQuiescenceError) {
+      throw new CccSemanticProofOwnedProcessCleanupError(outputRoot, result.reason.receipt, result.reason);
+    }
+  }
+  if (signal?.aborted) throw abortReason(signal);
+  if (firstFailure !== undefined) throw firstFailure;
+  if (taskResult.status !== "fulfilled" || nodeResult.status !== "fulfilled") {
+    throw new Error("CCC semantic-proof sealed Task/Node identity probes did not settle");
+  }
+  const sealedTask = taskResult.value;
+  const sealedNode = nodeResult.value;
   const sealedProofHost = await sealedProofHostIdentity(
     proofHostExecutable,
     sealedNode.executablePath,
     toolchain.proofHost.id,
+    signal,
   );
   const refreshedPython = python
-    ? await refreshSealedPythonExecutionToolchain(python)
+    ? await refreshSealedPythonExecutionToolchain(python, signal)
     : undefined;
   await chmod(toolchainRoot, 0o555);
   return {
@@ -1873,7 +2311,17 @@ export async function admitAndMaterializeCccSemanticProof(
   ) {
     throw new Error("CCC semantic-proof linked runtime manifest drift detected");
   }
-  const sealedExecutionToolchain = await sealExecutionToolchain(outputRoot, input.proof.executionToolchain);
+  throwIfProbeAborted(input.signal);
+  let sealedExecutionToolchain: CccSemanticProofMaterialization["sealedExecutionToolchain"];
+  try {
+    sealedExecutionToolchain = await sealExecutionToolchain(
+      outputRoot,
+      input.proof.executionToolchain,
+      input.signal,
+    );
+  } catch (error) {
+    throwOwnedProbeCleanupError(error, outputRoot);
+  }
   await chmod(proofRoot, 0o555);
   return {
     proofRoot,

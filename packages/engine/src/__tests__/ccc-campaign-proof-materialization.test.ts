@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { execFile as execFileCallback, execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { execFile as execFileCallback, execFileSync, spawn as spawnCallback } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import {
   chmod,
@@ -16,17 +17,20 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   CCC_PRD_SEMANTIC_PROOF_HOST_ID,
   computeCccPrdCandidateInputsSha256,
   computeCccPrdVerifierClosureSha256,
+  superviseSpawn,
   type CccPrdProofV2,
 } from "@fusion/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   admitAndMaterializeCccSemanticProof,
+  __setCccSemanticProofProbeGroupObservationForTests,
   EXECUTABLE_PROBE_TIMEOUT_MS,
   inspectCccSemanticProofExecutable,
   inspectCccSemanticProofLinkedRuntime,
@@ -55,12 +59,88 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 const execFile = promisify(execFileCallback);
 const actualExecFile = execFileCallback;
+const actualSpawn = spawnCallback;
 const roots: string[] = [];
 // This copies, hashes, and executes the complete host Python runtime under
 // sandbox-exec. Keep it out of the default parallel engine matrix; the
 // dedicated qualification command opts in with FUSION_TEST_REAL_PYTHON_SEAL_SMOKE=1.
 const runRealPythonSealSmoke = process.env.FUSION_TEST_REAL_PYTHON_SEAL_SMOKE === "1";
 const sha256 = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+
+function simulatedProbeChild(error: Error): ReturnType<typeof spawnCallback> {
+  const child = new EventEmitter() as ReturnType<typeof spawnCallback>;
+  Object.assign(child, {
+    pid: undefined,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: () => true,
+  });
+  queueMicrotask(() => {
+    const code = typeof (error as { code?: unknown }).code === "number"
+      ? (error as { code: number }).code
+      : null;
+    const signal = typeof (error as { signal?: unknown }).signal === "string"
+      ? (error as { signal: NodeJS.Signals }).signal
+      : null;
+    child.emit("error", error);
+    child.emit("close", code, signal);
+    child.stdout?.end();
+    child.stderr?.end();
+  });
+  return child;
+}
+
+function mockVersionProbeSpawn(
+  targetPath: string,
+  nextError: () => Error | undefined,
+): typeof spawnCallback {
+  return ((file: string, args: readonly string[], options: unknown) => {
+    if (file === targetPath && args[0] === "--version") {
+      const error = nextError();
+      if (error) return simulatedProbeChild(error);
+    }
+    return actualSpawn(file, args as string[], options as never);
+  }) as typeof spawnCallback;
+}
+
+async function waitForOwnedProcessGroupAbsent(
+  pgid: number,
+  deadlineAt: number,
+): Promise<boolean> {
+  while (Date.now() < deadlineAt) {
+    try {
+      process.kill(-pgid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
+function observeOwnedProcessGroupAbsent(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+    throw error;
+  }
+}
+
+async function waitForOwnedPidAbsent(pid: number, deadlineAt: number): Promise<boolean> {
+  while (Date.now() < deadlineAt) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
 
 const EXECUTABLE_PATH_PREFIX = "@executable_path/";
 
@@ -416,6 +496,558 @@ afterEach(async () => {
 });
 
 describe("CCC semantic-proof admission and materialization", () => {
+  it.skipIf(process.platform === "win32")(
+    "public superviseSpawn proves process-group drain after leader close",
+    async () => {
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-supervisor-prerequisite-"));
+      roots.push(fixtureRoot);
+      const descendantPath = join(fixtureRoot, "descendant.mjs");
+      const leaderPath = join(fixtureRoot, "leader.mjs");
+      const markerPath = join(fixtureRoot, "descendant.pid");
+      await writeFile(descendantPath, [
+        "import { writeFileSync } from 'node:fs';",
+        "writeFileSync(process.argv[2], String(process.pid));",
+        "setInterval(() => {}, 1_000);",
+        "",
+      ].join("\n"));
+      await writeFile(leaderPath, [
+        "import { spawn } from 'node:child_process';",
+        "const [descendant, marker] = process.argv.slice(2);",
+        "const child = spawn(process.execPath, [descendant, marker], { stdio: 'ignore' });",
+        "child.unref();",
+        "",
+      ].join("\n"));
+
+      let ownedPgid: number | null = null;
+      let supervised: ReturnType<typeof superviseSpawn> | undefined;
+      try {
+        supervised = superviseSpawn(process.execPath, [leaderPath, descendantPath, markerPath], {
+          stdio: ["ignore", "ignore", "ignore"],
+          diagnosticLabel: "ccc-supervisor-prerequisite",
+          maxLifetimeMs: Number.POSITIVE_INFINITY,
+        });
+        ownedPgid = supervised.pgid;
+        expect(ownedPgid).toEqual(expect.any(Number));
+
+        const deadlineAt = Date.now() + 5_000;
+        const exit = await Promise.race([
+          supervised.waitExit(),
+          new Promise<never>((_, reject) => {
+            const timer = setTimeout(() => reject(new Error("superviseSpawn prerequisite leader close timed out")), 5_000);
+            timer.unref();
+          }),
+        ]);
+        expect(exit.code).toBe(0);
+
+        let descendantPid: string | undefined;
+        while (Date.now() < deadlineAt) {
+          descendantPid = await readFile(markerPath, "utf8").catch(() => undefined);
+          if (descendantPid) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(descendantPid).toMatch(/^\d+$/u);
+        expect(() => process.kill(-(ownedPgid as number), 0)).not.toThrow();
+
+        supervised.kill("SIGTERM");
+        let groupAbsent = await waitForOwnedProcessGroupAbsent(ownedPgid as number, Math.min(deadlineAt, Date.now() + 1_000));
+        if (!groupAbsent) {
+          supervised.kill("SIGKILL");
+          groupAbsent = await waitForOwnedProcessGroupAbsent(ownedPgid as number, deadlineAt);
+        }
+        expect(groupAbsent).toBe(true);
+      } finally {
+        if (ownedPgid !== null) {
+          try {
+            process.kill(-ownedPgid, "SIGKILL");
+          } catch {
+            // The owned group already proved absent.
+          }
+          await waitForOwnedProcessGroupAbsent(ownedPgid, Date.now() + 1_000);
+        }
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "owned version-probe cancellation checks a pre-aborted signal before spawning",
+    async () => {
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-pre-abort-"));
+      roots.push(fixtureRoot);
+      const markerPath = join(fixtureRoot, "probe.pid");
+      const startedPath = join(fixtureRoot, "probe.started");
+      const probePath = join(fixtureRoot, "probe.mjs");
+      const descendantSource = [
+        "import { writeFileSync } from 'node:fs';",
+        "writeFileSync(process.argv[1], String(process.pid));",
+        "setInterval(() => {}, 1_000);",
+        "",
+      ].join("\n");
+      await writeFile(probePath, [
+        `#!${process.execPath}`,
+        "import { appendFileSync, writeFileSync } from 'node:fs';",
+        "import { spawn } from 'node:child_process';",
+        `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}, ${JSON.stringify(markerPath)}], { stdio: 'ignore' });`,
+        "child.unref();",
+        `appendFileSync(${JSON.stringify(startedPath)}, String(Date.now()) + "\\n");`,
+        `writeFileSync(${JSON.stringify(markerPath)}, String(child.pid));`,
+        "process.stdout.write('probe-version\\n');",
+        "",
+      ].join("\n"), { mode: 0o755 });
+      await chmod(probePath, 0o755);
+      const controller = new AbortController();
+      const reason = new Error("owned version probe cancelled before spawn");
+      controller.abort(reason);
+      let spawnCalls = 0;
+      vi.resetModules();
+      vi.doMock("node:child_process", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("node:child_process")>();
+        return {
+          ...actual,
+          spawn: ((...args: Parameters<typeof actual.spawn>) => {
+            spawnCalls += 1;
+            return actual.spawn(...args);
+          }) as typeof actual.spawn,
+        };
+      });
+      try {
+        const materialization = await import("../ccc-campaign-proof-materialization.js");
+        await expect(materialization.inspectCccSemanticProofExecutable(
+          probePath,
+          ["--version"],
+          controller.signal,
+        )).rejects.toBe(reason);
+        expect(spawnCalls).toBe(0);
+        await expect(readFile(startedPath)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        vi.doUnmock("node:child_process");
+        vi.resetModules();
+        const pidText = await readFile(markerPath, "utf8").catch(() => "");
+        const pid = Number(pidText);
+        if (Number.isInteger(pid) && pid > 0) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // The exact fixture descendant already exited.
+          }
+          await waitForOwnedPidAbsent(pid, Date.now() + 1_000);
+        }
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "owned version-probe cancellation drains both groups before propagating the exact reason",
+    async () => {
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-cancel-"));
+      roots.push(fixtureRoot);
+      const controller = new AbortController();
+      const reason = new Error("owned version probe cancellation sentinel");
+      const probes = await Promise.all(["task", "node"].map(async (name) => {
+        const markerPath = join(fixtureRoot, `${name}.pid`);
+        const startedPath = join(fixtureRoot, `${name}.started`);
+        const leaderPath = join(fixtureRoot, `${name}.leader.pid`);
+        const probePath = join(fixtureRoot, `${name}.mjs`);
+        const descendantSource = [
+          "import { writeFileSync } from 'node:fs';",
+          "writeFileSync(process.argv[1], String(process.pid));",
+          "setInterval(() => {}, 1_000);",
+          "",
+        ].join("\n");
+        await writeFile(probePath, [
+          `#!${process.execPath}`,
+          "import { appendFileSync, writeFileSync } from 'node:fs';",
+          "import { spawn } from 'node:child_process';",
+          `writeFileSync(${JSON.stringify(leaderPath)}, String(process.pid));`,
+          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}, ${JSON.stringify(markerPath)}], { stdio: 'ignore' });`,
+          "child.unref();",
+          `appendFileSync(${JSON.stringify(startedPath)}, String(Date.now()) + "\\n");`,
+          `writeFileSync(${JSON.stringify(markerPath)}, String(child.pid));`,
+          `setTimeout(() => process.stdout.write(${JSON.stringify(`${name}-probe-version\\n`)}), 2_000);`,
+          "",
+        ].join("\n"), { mode: 0o755 });
+        await chmod(probePath, 0o755);
+        return { markerPath, startedPath, leaderPath, probePath };
+      }));
+      const tasks = probes.map(({ probePath }) => inspectCccSemanticProofExecutable(
+        probePath,
+        ["--version"],
+        controller.signal,
+      ));
+      try {
+        const startedAt = Date.now();
+        while (Date.now() - startedAt < 2_000) {
+          const markers = await Promise.all(probes.map(({ startedPath }) => readFile(startedPath, "utf8").catch(() => "")));
+          if (markers.every((marker) => marker.length > 0)) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const started = await Promise.all(probes.map(({ startedPath }) => readFile(startedPath, "utf8")));
+        expect(started.every((value) => value.trim().length > 0)).toBe(true);
+        expect(Math.abs(Number(started[0]!.trim()) - Number(started[1]!.trim()))).toBeLessThan(1_000);
+        const pids = await Promise.all(probes.map(async ({ markerPath }) => Number((await readFile(markerPath, "utf8")).trim())));
+        const leaderPids = await Promise.all(probes.map(async ({ leaderPath }) => Number((await readFile(leaderPath, "utf8")).trim())));
+        const settlementGroupAbsence: boolean[] = [];
+        const observedTasks = tasks.map((task, index) => task.catch((error: unknown) => {
+          let absent = false;
+          try {
+            process.kill(-leaderPids[index]!, 0);
+          } catch (probeError) {
+            absent = (probeError as NodeJS.ErrnoException).code === "ESRCH";
+          }
+          settlementGroupAbsence[index] = absent;
+          throw error;
+        }));
+        controller.abort(reason);
+        const settled = await Promise.allSettled(observedTasks);
+        expect(settled.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+        expect(settled.map((result) => result.status === "rejected" ? result.reason : undefined)).toEqual([reason, reason]);
+        expect(settlementGroupAbsence).toEqual([true, true]);
+        expect(await Promise.all(pids.map((pid) => waitForOwnedPidAbsent(pid, Date.now() + 5_000)))).toEqual([true, true]);
+        const invocationCounts = await Promise.all(probes.map(async ({ startedPath }) => (
+          (await readFile(startedPath, "utf8")).trim().split("\n").filter(Boolean).length
+        )));
+        expect(invocationCounts).toEqual([1, 1]);
+      } finally {
+        const pids = await Promise.all(probes.map(async ({ markerPath }) => Number((await readFile(markerPath, "utf8").catch(() => "")).trim())));
+        for (const pid of pids) {
+          if (!Number.isInteger(pid) || pid <= 0) continue;
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {
+            // The exact fixture descendant already exited.
+          }
+          await waitForOwnedPidAbsent(pid, Date.now() + 1_000);
+        }
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "owned version-probe sibling drain waits for the original failure",
+    async () => {
+      const fixture = await createGitFixture();
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-sibling-drain-"));
+      const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-sibling-output-"));
+      roots.push(fixtureRoot, outputRoot);
+      const taskStarted = join(fixtureRoot, "task.started");
+      const nodeStarted = join(fixtureRoot, "node.started");
+      const taskReady = join(fixtureRoot, "task.ready");
+      const nodeAcknowledgedTask = join(fixtureRoot, "node.acknowledged-task");
+      const failureRelease = join(fixtureRoot, "failure.release");
+      const nodePid = join(fixtureRoot, "node.pid");
+      const taskLeaderPid = join(fixtureRoot, "task.leader.pid");
+      const nodeLeaderPid = join(fixtureRoot, "node.leader.pid");
+      const nodeCompleted = join(fixtureRoot, "node.completed");
+      const taskPath = join(fixtureRoot, "task.mjs");
+      const nodePath = join(fixtureRoot, "node.mjs");
+      const proofHostPath = join(fixtureRoot, "proof-host.mjs");
+      const descendantSource = [
+        "import { writeFileSync } from 'node:fs';",
+        "writeFileSync(process.argv[1], String(process.pid));",
+        "setInterval(() => {}, 1_000);",
+        "",
+      ].join("\n");
+      await writeFile(taskPath, [
+        `#!${process.execPath}`,
+        "import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';",
+        `writeFileSync(${JSON.stringify(taskLeaderPid)}, String(process.pid));`,
+        `const readyPath = ${JSON.stringify(nodeStarted)};`,
+        `const taskReadyPath = ${JSON.stringify(taskReady)};`,
+        `const nodeAcknowledgedTaskPath = ${JSON.stringify(nodeAcknowledgedTask)};`,
+        `const failureReleasePath = ${JSON.stringify(failureRelease)};`,
+        `const deadlineAt = Date.now() + 5_000;`,
+        "const waitForSibling = () => {",
+        "  try {",
+        "    if (readFileSync(readyPath, 'utf8').trim().length > 0) {",
+        "      writeFileSync(taskReadyPath, 'task-ready');",
+        "      const waitForAcknowledgement = () => {",
+        "        try {",
+        "          if (readFileSync(nodeAcknowledgedTaskPath, 'utf8').trim().length > 0) {",
+        "            const waitForFailureRelease = () => {",
+        "              try {",
+        "                if (readFileSync(failureReleasePath, 'utf8').trim().length > 0) {",
+        `                  appendFileSync(${JSON.stringify(taskStarted)}, 'failure-released\\n');`,
+        "                  setTimeout(() => { process.stderr.write('task-failure'); process.exit(7); }, 250);",
+        "                  return;",
+        "                }",
+        "              } catch {}",
+        "              if (Date.now() >= deadlineAt) process.exit(98);",
+        "              setTimeout(waitForFailureRelease, 10);",
+        "            };",
+        "            waitForFailureRelease();",
+        "            return;",
+        "          }",
+        "        } catch {}",
+        "        if (Date.now() >= deadlineAt) process.exit(98);",
+        "        setTimeout(waitForAcknowledgement, 10);",
+        "      };",
+        "      waitForAcknowledgement();",
+        "      return;",
+        "    }",
+        "  } catch {}",
+        "  if (Date.now() >= deadlineAt) process.exit(99);",
+        "  setTimeout(waitForSibling, 10);",
+        "};",
+        "waitForSibling();",
+        "",
+      ].join("\n"), { mode: 0o755 });
+      await writeFile(nodePath, [
+        `#!${process.execPath}`,
+        "import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';",
+        "import { spawn } from 'node:child_process';",
+        `writeFileSync(${JSON.stringify(nodeLeaderPid)}, String(process.pid));`,
+        `const taskReadyPath = ${JSON.stringify(taskReady)};`,
+        `const nodeAcknowledgedTaskPath = ${JSON.stringify(nodeAcknowledgedTask)};`,
+        `const nodeCompletedPath = ${JSON.stringify(nodeCompleted)};`,
+        `const deadlineAt = Date.now() + 5_000;`,
+        `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}, ${JSON.stringify(nodePid)}], { stdio: 'ignore' });`,
+        "child.unref();",
+        `writeFileSync(${JSON.stringify(nodePid)}, String(child.pid));`,
+        `appendFileSync(${JSON.stringify(nodeStarted)}, 'node-ready\\n');`,
+        "const waitForTask = () => {",
+        "  try {",
+        "    if (readFileSync(taskReadyPath, 'utf8').trim().length > 0) {",
+        "      writeFileSync(nodeAcknowledgedTaskPath, 'node-observed-task');",
+        "      setTimeout(() => {",
+        "        writeFileSync(nodeCompletedPath, 'node-completed');",
+        "        process.stdout.write('node-version\\n');",
+        "      }, 5_000);",
+        "      return;",
+        "    }",
+        "  } catch {}",
+        "  if (Date.now() >= deadlineAt) process.exit(97);",
+        "  setTimeout(waitForTask, 10);",
+        "};",
+        "waitForTask();",
+        "",
+      ].join("\n"), { mode: 0o755 });
+      await writeFile(proofHostPath, [
+        `#!${process.execPath}`,
+        "process.stdout.write('proof-host-version\\n');",
+        "",
+      ].join("\n"), { mode: 0o755 });
+      await Promise.all([chmod(taskPath, 0o755), chmod(nodePath, 0o755), chmod(proofHostPath, 0o755)]);
+      const identity = async (path: string) => ({
+        executablePath: path,
+        executableSha256: sha256(await readFile(path)),
+        version: "fixture-version",
+        versionOutputSha256: "0".repeat(64),
+      });
+      const definition = proof({
+        ...fixture,
+        taskIdentity: await identity(taskPath),
+        nodeIdentity: await identity(nodePath),
+        linkedRuntime: [],
+      });
+      definition.executionToolchain = {
+        ...definition.executionToolchain,
+        proofHost: {
+          id: "fixture-proof-host",
+          ...(await identity(proofHostPath)),
+        },
+      };
+
+      const materialization = admitAndMaterializeCccSemanticProof({
+        repositoryRoot: fixture.repository,
+        baseCommit: fixture.baseCommit,
+        sourceCommit: fixture.candidateCommit,
+        proof: definition,
+        modelWriteRoots: ["src"],
+        outputRoot,
+      });
+      const handshakeStartedAt = Date.now();
+      while (Date.now() - handshakeStartedAt < 2_000) {
+        const [nodeReady, taskReadyValue, nodeAcknowledged] = await Promise.all([
+          readFile(nodeStarted, "utf8").catch(() => ""),
+          readFile(taskReady, "utf8").catch(() => ""),
+          readFile(nodeAcknowledgedTask, "utf8").catch(() => ""),
+        ]);
+        if (
+          nodeReady.trim().length > 0
+          && taskReadyValue.trim() === "task-ready"
+          && nodeAcknowledged.trim() === "node-observed-task"
+        ) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect((await readFile(nodeStarted, "utf8")).trim()).toBe("node-ready");
+      expect((await readFile(taskReady, "utf8")).trim()).toBe("task-ready");
+      expect((await readFile(nodeAcknowledgedTask, "utf8")).trim()).toBe("node-observed-task");
+      const leaderPids = await Promise.all([
+        readFile(taskLeaderPid, "utf8").then((value) => Number(value.trim())),
+        readFile(nodeLeaderPid, "utf8").then((value) => Number(value.trim())),
+      ]);
+      expect(leaderPids.every((pid) => Number.isInteger(pid) && pid > 0)).toBe(true);
+      // Negative control: the synchronous absence checker must see both owned
+      // groups still live before the parent releases Task's exit-7 failure.
+      expect(leaderPids.map(observeOwnedProcessGroupAbsent)).toEqual([false, false]);
+      await expect(readFile(nodeCompleted, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      let settlementGroupAbsence: boolean[] | undefined;
+      let observedFailure: unknown;
+      const observedMaterialization = materialization.catch((error: unknown) => {
+        // This is the outer materialization rejection boundary. PGIDs were
+        // validated above, so the receipt is synchronous and has no await or
+        // filesystem read before the exact original failure is rethrown.
+        settlementGroupAbsence = leaderPids.map(observeOwnedProcessGroupAbsent);
+        observedFailure = error;
+        throw error;
+      });
+      await writeFile(failureRelease, "release\n");
+
+      let thrown: unknown;
+      try {
+        await observedMaterialization;
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toMatchObject({ message: expect.stringContaining("exit=7") });
+      expect((thrown as Error).message).toContain('"task-failure"');
+      expect(thrown).toBe(observedFailure);
+      expect(settlementGroupAbsence).toEqual([true, true]);
+      const started = await Promise.all([
+        readFile(taskStarted, "utf8"),
+        readFile(nodeStarted, "utf8"),
+      ]);
+      expect(started.every((value) => value.trim().length > 0)).toBe(true);
+      expect((await readFile(taskReady, "utf8")).trim()).toBe("task-ready");
+      expect((await readFile(nodeAcknowledgedTask, "utf8")).trim()).toBe("node-observed-task");
+      const descendant = Number((await readFile(nodePid, "utf8")).trim());
+      // Supplementary cleanup evidence is intentionally after settlement; it
+      // does not stand in for the synchronous group receipt above.
+      const eventualDescendantAbsent = await waitForOwnedPidAbsent(descendant, Date.now() + 5_000);
+      expect(eventualDescendantAbsent).toBe(true);
+      expect((await readFile(taskStarted, "utf8")).trim().split("\n").filter(Boolean)).toHaveLength(1);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "owned version-probe cleanup failure is DEPENDENCY_OPEN and retains the exact root",
+    async () => {
+      const fixture = await createGitFixture();
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-unprovable-fixture-"));
+      const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-unprovable-output-"));
+      roots.push(fixtureRoot, outputRoot);
+      const canonicalOutputRoot = await realpath(outputRoot);
+      const probePath = join(fixtureRoot, "probe.sh");
+      await writeFile(probePath, "#!/bin/sh\nprintf 'fixture-version\\n'\n", { mode: 0o755 });
+      await chmod(probePath, 0o755);
+      const identity = {
+        executablePath: probePath,
+        executableSha256: sha256(await readFile(probePath)),
+        version: "fixture-version",
+        versionOutputSha256: "0".repeat(64),
+      };
+      const definition = proof({
+        ...fixture,
+        taskIdentity: identity,
+        nodeIdentity: identity,
+        linkedRuntime: [],
+      });
+      const restoreObservation = __setCccSemanticProofProbeGroupObservationForTests(() => "present");
+      try {
+        let thrown: unknown;
+        try {
+          await admitAndMaterializeCccSemanticProof({
+            repositoryRoot: fixture.repository,
+            baseCommit: fixture.baseCommit,
+            sourceCommit: fixture.candidateCommit,
+            proof: definition,
+            modelWriteRoots: ["src"],
+            outputRoot,
+          });
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown).toMatchObject({
+          code: "DEPENDENCY_OPEN",
+          outputRoot: canonicalOutputRoot,
+          receipt: expect.objectContaining({
+            termSent: true,
+            killSent: true,
+            groupAbsent: false,
+          }),
+        });
+        expect((thrown as Error).message).not.toContain("fixture-version");
+        await expect(stat(outputRoot)).resolves.toBeDefined();
+      } finally {
+        restoreObservation();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "output.limit termination reports bounded non-timeout diagnostics without retry",
+    async () => {
+      const toolRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-probe-output-limit-"));
+      roots.push(toolRoot);
+      const toolPath = join(toolRoot, "tool.mjs");
+      const startedPath = join(toolRoot, "started");
+      await writeFile(toolPath, [
+        `#!${process.execPath}`,
+        "import { appendFileSync } from 'node:fs';",
+        `appendFileSync(${JSON.stringify(startedPath)}, 'started\\n');`,
+        "process.stdout.write(Buffer.alloc(1024 * 1024 + 1024, 'x'));",
+        "setInterval(() => {}, 1_000);",
+        "",
+      ].join("\n"), { mode: 0o755 });
+      await chmod(toolPath, 0o755);
+
+      let thrown: unknown;
+      try {
+        await inspectCccSemanticProofExecutable(toolPath, ["--version"]);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const message = (thrown as Error).message;
+      expect(message).toMatch(/timedOut=false/u);
+      expect(message).toMatch(/attempt=1\/2/u);
+      expect((await readFile(startedPath, "utf8")).trim().split("\n").filter(Boolean)).toHaveLength(1);
+    },
+  );
+
+  it("abort null preserves the exact explicit null reason before spawning", async () => {
+    const controller = new AbortController();
+    controller.abort(null);
+    await expect(inspectCccSemanticProofExecutable(process.execPath, ["--version"], controller.signal))
+      .rejects.toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "abort preserves the exact caller reason through public executable verification cleanup",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-verify-cancel-"));
+      roots.push(root);
+      const toolPath = join(root, "tool");
+      const blockPath = join(root, "block");
+      const startedPath = join(root, "started");
+      await writeFile(toolPath, [
+        "#!/bin/sh",
+        `if [ -f ${JSON.stringify(blockPath)} ]; then`,
+        `  printf started > ${JSON.stringify(startedPath)}`,
+        "  while :; do sleep 1; done",
+        "fi",
+        "printf 'fixture-version\\n'",
+        "",
+      ].join("\n"));
+      await chmod(toolPath, 0o755);
+      const identity = await inspectCccSemanticProofExecutable(toolPath, ["--version"]);
+      await writeFile(blockPath, "hold\n");
+      const controller = new AbortController();
+      const reason = new Error("public verifier cancellation sentinel");
+      const verification = verifyCccSemanticProofToolchainBeforeSpawn({
+        task: identity,
+        node: identity,
+        proofHost: { id: "fixture-proof-host", ...identity },
+        linkedRuntime: [],
+      }, controller.signal);
+      while (!(await readFile(startedPath, "utf8").catch(() => ""))) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      controller.abort(reason);
+      await expect(verification).rejects.toBe(reason);
+    },
+  );
+
   it("RED-S5-controller-git-custody: refuses to spawn a fake git earlier on PATH", async () => {
     const fixture = await createGitFixture();
     const outputRoot = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-output-"));
@@ -1689,7 +2321,15 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return {
+        execFile: fakeExecFile,
+        spawn: (file: string, args: readonly string[], options: unknown) => {
+          if (file === canonicalToolPath && args[0] === "--version") {
+            if (probeCount++ === 0) return simulatedProbeChild(timeoutError());
+          }
+          return actualSpawn(file, args as string[], options as never);
+        },
+      };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
@@ -1817,7 +2457,13 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return {
+        execFile: fakeExecFile,
+        spawn: mockVersionProbeSpawn(canonicalToolPath, () => {
+          probeCount++;
+          return timeoutError();
+        }),
+      };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
@@ -1891,7 +2537,10 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return {
+        execFile: fakeExecFile,
+        spawn: mockVersionProbeSpawn(canonicalToolPath, () => nonTransientError()),
+      };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
@@ -1984,7 +2633,13 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return {
+        execFile: fakeExecFile,
+        spawn: mockVersionProbeSpawn(canonicalToolPath, () => {
+          probeCount++;
+          return sigkillError();
+        }),
+      };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
@@ -2048,7 +2703,10 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return {
+        execFile: fakeExecFile,
+        spawn: mockVersionProbeSpawn(canonicalToolPath, () => nonTransientError()),
+      };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
@@ -2126,7 +2784,10 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return {
+        execFile: fakeExecFile,
+        spawn: mockVersionProbeSpawn(canonicalToolPath, () => stringStderrError()),
+      };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
@@ -2191,7 +2852,10 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return {
+        execFile: fakeExecFile,
+        spawn: mockVersionProbeSpawn(canonicalToolPath, () => emptyMessageError()),
+      };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
@@ -2268,7 +2932,7 @@ describe("CCC semantic-proof admission and materialization", () => {
           return execFile(file, args as string[], options as never);
         },
       });
-      return { execFile: fakeExecFile };
+      return { execFile: fakeExecFile, spawn: actualSpawn };
     });
     try {
       const materialization = await import("../ccc-campaign-proof-materialization.js");
