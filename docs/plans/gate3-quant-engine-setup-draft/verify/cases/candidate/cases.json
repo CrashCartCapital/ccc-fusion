@@ -1,0 +1,376 @@
+{
+  "schema": "qe-evidence-cases.v1",
+  "target": "candidate",
+  "note": "Oracle for task verify:evidence-candidate. Proves the joined package re-exports the whole public surface as the same objects the leaf modules define, and re-runs every leaf check on the joined commit so a join cannot quietly drift the label or verdict behaviour the leaf tasks already established, in either direction: good input and refused input alike. join_negative_controls and stdlib_negative_controls are calibration, not candidate input: the referee builds each declared broken shape and fails unless its own join and import predicates refuse every one of them, so \"the control passed\" cannot mean \"the candidate never happened to trip it\". The restated_export controls cover both a function export and a tuple export, because copying a function and copying a tuple fail along different paths.",
+  "blocking_reason_contract": "blocking_reasons carries exactly one entry per unmet condition, each entry containing that condition's name as a substring, the whole tuple sorted ascending, and empty exactly when promotable is true. expected_reason_tokens lists the condition names for each case.",
+  "checks": [
+    "package_exports_joined",
+    "package_join_control",
+    "vocabulary_frozen",
+    "promotion_gates_frozen",
+    "canonical_labels_positive",
+    "canonical_labels_order_and_type",
+    "canonical_labels_rejects_invalid",
+    "merge_labels_positive",
+    "merge_labels_preserves_inputs",
+    "derive_promotion_verdicts",
+    "derive_promotion_rejects_bad_gates",
+    "verdict_value_immutable",
+    "verdict_imports_labels",
+    "stdlib_only_imports",
+    "stdlib_import_control"
+  ],
+  "vocabulary": [
+    "CURRENT_CONSTITUENT_SURVIVORSHIP",
+    "FORWARD_OPTION_OBSERVATION",
+    "PAPER_OBSERVATION",
+    "POINT_IN_TIME_PROVIDER",
+    "PROMOTABLE",
+    "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+    "SNAPSHOT_REVISED_FUNDAMENTAL",
+    "SYNTHETIC_FIXTURE",
+    "YAHOO_REAL_PRICE_EXPLORATORY"
+  ],
+  "disqualifying": [
+    "CURRENT_CONSTITUENT_SURVIVORSHIP",
+    "FORWARD_OPTION_OBSERVATION",
+    "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+    "SNAPSHOT_REVISED_FUNDAMENTAL",
+    "SYNTHETIC_FIXTURE",
+    "YAHOO_REAL_PRICE_EXPLORATORY"
+  ],
+  "gates": [
+    "complete_trial_accounting",
+    "honest_universe",
+    "human_review",
+    "independent_calculation",
+    "point_in_time_data",
+    "realistic_costs",
+    "sealed_holdout_use"
+  ],
+  "canonical_labels_cases": [
+    {
+      "name": "unsorted_input_is_sorted",
+      "input": [
+        "SYNTHETIC_FIXTURE",
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "PAPER_OBSERVATION",
+        "SYNTHETIC_FIXTURE"
+      ]
+    },
+    {
+      "name": "duplicates_collapse_once",
+      "input": [
+        "POINT_IN_TIME_PROVIDER",
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "full_vocabulary_round_trip",
+      "input": [
+        "YAHOO_REAL_PRICE_EXPLORATORY",
+        "SYNTHETIC_FIXTURE",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+        "PROMOTABLE",
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION",
+        "FORWARD_OPTION_OBSERVATION",
+        "CURRENT_CONSTITUENT_SURVIVORSHIP"
+      ],
+      "expected": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "FORWARD_OPTION_OBSERVATION",
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER",
+        "PROMOTABLE",
+        "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "SYNTHETIC_FIXTURE",
+        "YAHOO_REAL_PRICE_EXPLORATORY"
+      ]
+    }
+  ],
+  "canonical_labels_invalid": [
+    {
+      "name": "unknown_label",
+      "input": [
+        "NOT_AN_EVIDENCE_CLASS"
+      ]
+    },
+    {
+      "name": "lowercase_label_is_unknown",
+      "input": [
+        "point_in_time_provider"
+      ]
+    },
+    {
+      "name": "empty_string_label",
+      "input": [
+        ""
+      ]
+    },
+    {
+      "name": "whitespace_label",
+      "input": [
+        "   "
+      ]
+    },
+    {
+      "name": "non_string_label_int",
+      "input": [
+        7
+      ]
+    },
+    {
+      "name": "non_string_label_null",
+      "input": [
+        null
+      ]
+    },
+    {
+      "name": "one_valid_one_invalid",
+      "input": [
+        "POINT_IN_TIME_PROVIDER",
+        "NOT_AN_EVIDENCE_CLASS"
+      ]
+    }
+  ],
+  "merge_labels_cases": [
+    {
+      "name": "overlap_collapses_once",
+      "existing": [
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION"
+      ],
+      "incoming": [
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "disqualifying_label_survives_a_clean_incoming_set",
+      "existing": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP"
+      ],
+      "incoming": [
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    }
+  ],
+  "verdict_cases": [
+    {
+      "name": "clean_point_in_time_with_every_gate_promotes",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": true,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "PROMOTABLE"
+      ],
+      "expected_reason_tokens": []
+    },
+    {
+      "name": "no_point_in_time_evidence_blocks",
+      "labels": [
+        "PAPER_OBSERVATION"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "PAPER_OBSERVATION"
+      ],
+      "expected_reason_tokens": [
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "disqualifying_label_blocks",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "SYNTHETIC_FIXTURE"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "SYNTHETIC_FIXTURE"
+      ],
+      "expected_reason_tokens": [
+        "SYNTHETIC_FIXTURE"
+      ]
+    },
+    {
+      "name": "single_unmet_gate_blocks",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": false,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "expected_reason_tokens": [
+        "human_review"
+      ]
+    }
+  ],
+  "verdict_invalid_gates": [
+    {
+      "name": "missing_gate",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      }
+    },
+    {
+      "name": "extra_gate",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true,
+        "invented_gate": true
+      }
+    },
+    {
+      "name": "misnamed_gate",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "humanreview": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      }
+    },
+    {
+      "name": "empty_gate_mapping",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {}
+    }
+  ],
+  "exports": {
+    "package": [
+      "EVIDENCE_LABELS",
+      "DISQUALIFYING_LABELS",
+      "canonical_labels",
+      "merge_labels",
+      "PROMOTION_GATES",
+      "derive_promotion"
+    ]
+  },
+  "join_negative_controls": [
+    {
+      "name": "partial_join_missing_export",
+      "kind": "missing_export",
+      "export": "derive_promotion"
+    },
+    {
+      "name": "renamed_export",
+      "kind": "renamed_export",
+      "export": "merge_labels",
+      "renamed_to": "merge_label"
+    },
+    {
+      "name": "restated_rather_than_joined",
+      "kind": "restated_export",
+      "export": "canonical_labels"
+    },
+    {
+      "name": "restated_tuple_export",
+      "kind": "restated_export",
+      "export": "EVIDENCE_LABELS"
+    }
+  ],
+  "stdlib_negative_controls": [
+    {
+      "name": "runtime_pulled_in_third_party",
+      "kind": "runtime_module",
+      "module": "numpy"
+    },
+    {
+      "name": "source_imports_third_party",
+      "kind": "source_import",
+      "filename": "labels.py",
+      "source": "import numpy\n\nEVIDENCE_LABELS = ()\n"
+    },
+    {
+      "name": "source_imports_first_party_package",
+      "kind": "source_import",
+      "filename": "verdict.py",
+      "source": "from qe_market_data.models import EvidenceClass\n"
+    }
+  ]
+}

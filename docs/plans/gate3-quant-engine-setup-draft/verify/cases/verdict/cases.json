@@ -1,0 +1,366 @@
+{
+  "schema": "qe-evidence-cases.v1",
+  "target": "verdict",
+  "note": "Oracle for task verify:evidence-verdict. Proves PROMOTION_GATES and derive_promotion, including the negative controls that promotion without point-in-time evidence, promotion beside a disqualifying label, promotion with an unmet or misnamed gate, and an omitted blocking reason must all be refused.",
+  "blocking_reason_contract": "blocking_reasons carries exactly one entry per unmet condition, each entry containing that condition's name as a substring, the whole tuple sorted ascending, and empty exactly when promotable is true. expected_reason_tokens lists the condition names for each case.",
+  "checks": [
+    "vocabulary_frozen",
+    "promotion_gates_frozen",
+    "derive_promotion_verdicts",
+    "derive_promotion_rejects_bad_gates",
+    "verdict_value_immutable",
+    "verdict_imports_labels",
+    "stdlib_only_imports"
+  ],
+  "vocabulary": [
+    "CURRENT_CONSTITUENT_SURVIVORSHIP",
+    "FORWARD_OPTION_OBSERVATION",
+    "PAPER_OBSERVATION",
+    "POINT_IN_TIME_PROVIDER",
+    "PROMOTABLE",
+    "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+    "SNAPSHOT_REVISED_FUNDAMENTAL",
+    "SYNTHETIC_FIXTURE",
+    "YAHOO_REAL_PRICE_EXPLORATORY"
+  ],
+  "disqualifying": [
+    "CURRENT_CONSTITUENT_SURVIVORSHIP",
+    "FORWARD_OPTION_OBSERVATION",
+    "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+    "SNAPSHOT_REVISED_FUNDAMENTAL",
+    "SYNTHETIC_FIXTURE",
+    "YAHOO_REAL_PRICE_EXPLORATORY"
+  ],
+  "gates": [
+    "complete_trial_accounting",
+    "honest_universe",
+    "human_review",
+    "independent_calculation",
+    "point_in_time_data",
+    "realistic_costs",
+    "sealed_holdout_use"
+  ],
+  "verdict_cases": [
+    {
+      "name": "clean_point_in_time_with_every_gate_promotes",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": true,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "PROMOTABLE"
+      ],
+      "expected_reason_tokens": []
+    },
+    {
+      "name": "paper_observation_does_not_block_promotion",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": true,
+      "expected_labels": [
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER",
+        "PROMOTABLE"
+      ],
+      "expected_reason_tokens": []
+    },
+    {
+      "name": "no_point_in_time_evidence_blocks",
+      "labels": [
+        "PAPER_OBSERVATION"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "PAPER_OBSERVATION"
+      ],
+      "expected_reason_tokens": [
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "disqualifying_label_blocks",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "SYNTHETIC_FIXTURE"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "SYNTHETIC_FIXTURE"
+      ],
+      "expected_reason_tokens": [
+        "SYNTHETIC_FIXTURE"
+      ]
+    },
+    {
+      "name": "every_disqualifying_label_is_named",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER",
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "FORWARD_OPTION_OBSERVATION",
+        "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "SYNTHETIC_FIXTURE",
+        "YAHOO_REAL_PRICE_EXPLORATORY"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "FORWARD_OPTION_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER",
+        "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "SYNTHETIC_FIXTURE",
+        "YAHOO_REAL_PRICE_EXPLORATORY"
+      ],
+      "expected_reason_tokens": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "FORWARD_OPTION_OBSERVATION",
+        "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "SYNTHETIC_FIXTURE",
+        "YAHOO_REAL_PRICE_EXPLORATORY"
+      ]
+    },
+    {
+      "name": "single_unmet_gate_blocks",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": false,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "expected_reason_tokens": [
+        "human_review"
+      ]
+    },
+    {
+      "name": "several_unmet_gates_each_named",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": false,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": false,
+        "sealed_holdout_use": false
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "expected_reason_tokens": [
+        "human_review",
+        "realistic_costs",
+        "sealed_holdout_use"
+      ]
+    },
+    {
+      "name": "no_gate_met",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": false,
+        "honest_universe": false,
+        "human_review": false,
+        "independent_calculation": false,
+        "point_in_time_data": false,
+        "realistic_costs": false,
+        "sealed_holdout_use": false
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "expected_reason_tokens": [
+        "complete_trial_accounting",
+        "honest_universe",
+        "human_review",
+        "independent_calculation",
+        "point_in_time_data",
+        "realistic_costs",
+        "sealed_holdout_use"
+      ]
+    },
+    {
+      "name": "empty_labels_block",
+      "labels": [],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [],
+      "expected_reason_tokens": [
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "disqualifying_label_and_unmet_gate_both_named",
+      "labels": [
+        "SYNTHETIC_FIXTURE"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": false,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "SYNTHETIC_FIXTURE"
+      ],
+      "expected_reason_tokens": [
+        "POINT_IN_TIME_PROVIDER",
+        "SYNTHETIC_FIXTURE",
+        "honest_universe"
+      ]
+    },
+    {
+      "name": "promotable_input_label_is_not_a_shortcut",
+      "labels": [
+        "PROMOTABLE"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      },
+      "expected_promotable": false,
+      "expected_labels": [
+        "PROMOTABLE"
+      ],
+      "expected_reason_tokens": [
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    }
+  ],
+  "verdict_invalid_gates": [
+    {
+      "name": "missing_gate",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      }
+    },
+    {
+      "name": "extra_gate",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "human_review": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true,
+        "invented_gate": true
+      }
+    },
+    {
+      "name": "misnamed_gate",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {
+        "complete_trial_accounting": true,
+        "honest_universe": true,
+        "humanreview": true,
+        "independent_calculation": true,
+        "point_in_time_data": true,
+        "realistic_costs": true,
+        "sealed_holdout_use": true
+      }
+    },
+    {
+      "name": "empty_gate_mapping",
+      "labels": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "gates": {}
+    }
+  ]
+}

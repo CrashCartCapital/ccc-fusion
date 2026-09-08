@@ -1,0 +1,254 @@
+{
+  "schema": "qe-evidence-cases.v1",
+  "target": "labels",
+  "note": "Oracle for task verify:evidence-labels. Proves the frozen vocabulary, canonical_labels, and merge_labels, including the negative controls that a dropped label, an unadmitted label, a malformed label, or a non-canonical order must be refused.",
+  "blocking_reason_contract": "blocking_reasons carries exactly one entry per unmet condition, each entry containing that condition's name as a substring, the whole tuple sorted ascending, and empty exactly when promotable is true. expected_reason_tokens lists the condition names for each case.",
+  "checks": [
+    "vocabulary_frozen",
+    "canonical_labels_positive",
+    "canonical_labels_order_and_type",
+    "canonical_labels_rejects_invalid",
+    "merge_labels_positive",
+    "merge_labels_preserves_inputs",
+    "stdlib_only_imports"
+  ],
+  "vocabulary": [
+    "CURRENT_CONSTITUENT_SURVIVORSHIP",
+    "FORWARD_OPTION_OBSERVATION",
+    "PAPER_OBSERVATION",
+    "POINT_IN_TIME_PROVIDER",
+    "PROMOTABLE",
+    "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+    "SNAPSHOT_REVISED_FUNDAMENTAL",
+    "SYNTHETIC_FIXTURE",
+    "YAHOO_REAL_PRICE_EXPLORATORY"
+  ],
+  "disqualifying": [
+    "CURRENT_CONSTITUENT_SURVIVORSHIP",
+    "FORWARD_OPTION_OBSERVATION",
+    "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+    "SNAPSHOT_REVISED_FUNDAMENTAL",
+    "SYNTHETIC_FIXTURE",
+    "YAHOO_REAL_PRICE_EXPLORATORY"
+  ],
+  "gates": [
+    "complete_trial_accounting",
+    "honest_universe",
+    "human_review",
+    "independent_calculation",
+    "point_in_time_data",
+    "realistic_costs",
+    "sealed_holdout_use"
+  ],
+  "canonical_labels_cases": [
+    {
+      "name": "single_admitted_label",
+      "input": [
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "expected": [
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "unsorted_input_is_sorted",
+      "input": [
+        "SYNTHETIC_FIXTURE",
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "PAPER_OBSERVATION",
+        "SYNTHETIC_FIXTURE"
+      ]
+    },
+    {
+      "name": "duplicates_collapse_once",
+      "input": [
+        "POINT_IN_TIME_PROVIDER",
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "full_vocabulary_round_trip",
+      "input": [
+        "YAHOO_REAL_PRICE_EXPLORATORY",
+        "SYNTHETIC_FIXTURE",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+        "PROMOTABLE",
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION",
+        "FORWARD_OPTION_OBSERVATION",
+        "CURRENT_CONSTITUENT_SURVIVORSHIP"
+      ],
+      "expected": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "FORWARD_OPTION_OBSERVATION",
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER",
+        "PROMOTABLE",
+        "PUBLIC_DATASET_REAL_PRICE_EXPLORATORY",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "SYNTHETIC_FIXTURE",
+        "YAHOO_REAL_PRICE_EXPLORATORY"
+      ]
+    },
+    {
+      "name": "empty_input_is_empty",
+      "input": [],
+      "expected": []
+    },
+    {
+      "name": "disqualifying_labels_are_kept",
+      "input": [
+        "YAHOO_REAL_PRICE_EXPLORATORY",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "expected": [
+        "POINT_IN_TIME_PROVIDER",
+        "SNAPSHOT_REVISED_FUNDAMENTAL",
+        "YAHOO_REAL_PRICE_EXPLORATORY"
+      ]
+    }
+  ],
+  "canonical_labels_invalid": [
+    {
+      "name": "unknown_label",
+      "input": [
+        "NOT_AN_EVIDENCE_CLASS"
+      ]
+    },
+    {
+      "name": "lowercase_label_is_unknown",
+      "input": [
+        "point_in_time_provider"
+      ]
+    },
+    {
+      "name": "empty_string_label",
+      "input": [
+        ""
+      ]
+    },
+    {
+      "name": "whitespace_label",
+      "input": [
+        "   "
+      ]
+    },
+    {
+      "name": "non_string_label_int",
+      "input": [
+        7
+      ]
+    },
+    {
+      "name": "non_string_label_null",
+      "input": [
+        null
+      ]
+    },
+    {
+      "name": "one_valid_one_invalid",
+      "input": [
+        "POINT_IN_TIME_PROVIDER",
+        "NOT_AN_EVIDENCE_CLASS"
+      ]
+    }
+  ],
+  "merge_labels_cases": [
+    {
+      "name": "empty_into_empty",
+      "existing": [],
+      "incoming": [],
+      "expected": []
+    },
+    {
+      "name": "incoming_empty_keeps_existing",
+      "existing": [
+        "SYNTHETIC_FIXTURE",
+        "POINT_IN_TIME_PROVIDER"
+      ],
+      "incoming": [],
+      "expected": [
+        "POINT_IN_TIME_PROVIDER",
+        "SYNTHETIC_FIXTURE"
+      ]
+    },
+    {
+      "name": "existing_empty_keeps_incoming",
+      "existing": [],
+      "incoming": [
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "PAPER_OBSERVATION"
+      ]
+    },
+    {
+      "name": "union_of_disjoint_sets",
+      "existing": [
+        "SYNTHETIC_FIXTURE"
+      ],
+      "incoming": [
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "PAPER_OBSERVATION",
+        "SYNTHETIC_FIXTURE"
+      ]
+    },
+    {
+      "name": "overlap_collapses_once",
+      "existing": [
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION"
+      ],
+      "incoming": [
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "disqualifying_label_survives_a_clean_incoming_set",
+      "existing": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP"
+      ],
+      "incoming": [
+        "POINT_IN_TIME_PROVIDER",
+        "PAPER_OBSERVATION"
+      ],
+      "expected": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "PAPER_OBSERVATION",
+        "POINT_IN_TIME_PROVIDER"
+      ]
+    },
+    {
+      "name": "unsorted_inputs_return_canonical",
+      "existing": [
+        "YAHOO_REAL_PRICE_EXPLORATORY",
+        "FORWARD_OPTION_OBSERVATION"
+      ],
+      "incoming": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP"
+      ],
+      "expected": [
+        "CURRENT_CONSTITUENT_SURVIVORSHIP",
+        "FORWARD_OPTION_OBSERVATION",
+        "YAHOO_REAL_PRICE_EXPLORATORY"
+      ]
+    }
+  ]
+}
