@@ -37,7 +37,14 @@ import { ensureCccCampaignJoinBaseBranch } from "../ccc-campaign-join-base.js";
 import {
   inspectCccSemanticProofExecutable,
   inspectCccSemanticProofLinkedRuntime,
+  admitAndMaterializeCccSemanticProof,
+  verifyCccSemanticProofToolchainBeforeSpawn,
 } from "../ccc-campaign-proof-materialization.js";
+import {
+  assertCccSemanticProofSandboxReady,
+  inspectCccSemanticProofSandboxReadiness,
+  runCccSemanticProofSandboxedProcess,
+} from "../ccc-campaign-proof-sandbox.js";
 import { PermanentError } from "../engine-errors.js";
 
 const execFile = promisify(execFileCallback);
@@ -47,6 +54,74 @@ const itSemanticHost = process.platform === "darwin"
   && existsSync("/opt/homebrew/bin/task")
   ? it
   : it.skip;
+const HOST_PREFLIGHT_PROOF_ID = "PROOF-EVIDENCE-LABELS";
+
+function emitHostPreflightMarker(stage: string, proofId: string, elapsedMs: number): void {
+  process.stderr.write(`${JSON.stringify({
+    stage,
+    proofId,
+    elapsedMs: Math.max(0, Math.trunc(elapsedMs)),
+  })}\n`);
+}
+
+async function measureHostPreflightStage<T>(
+  stage: string,
+  proofId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const startedAt = Date.now();
+  emitHostPreflightMarker(`${stage}:start`, proofId, 0);
+  try {
+    return await operation();
+  } finally {
+    emitHostPreflightMarker(`${stage}:end`, proofId, Date.now() - startedAt);
+  }
+}
+
+function hostPreflightDiagnosticDependencies() {
+  return {
+    materialize: (input: Parameters<typeof admitAndMaterializeCccSemanticProof>[0]) =>
+      measureHostPreflightStage(
+        "preflight:materialize",
+        input.proof.id,
+        () => admitAndMaterializeCccSemanticProof(input),
+      ),
+    verifyToolchain: (toolchain: CccPrdProofV2["executionToolchain"]) =>
+      measureHostPreflightStage(
+        "preflight:toolchain-verify",
+        HOST_PREFLIGHT_PROOF_ID,
+        () => verifyCccSemanticProofToolchainBeforeSpawn(toolchain),
+      ),
+    inspectSandboxReadiness: () =>
+      measureHostPreflightStage(
+        "preflight:sandbox-readiness",
+        HOST_PREFLIGHT_PROOF_ID,
+        () => inspectCccSemanticProofSandboxReadiness(),
+      ),
+    preflightSandbox: (input: Parameters<typeof assertCccSemanticProofSandboxReady>[0]) =>
+      measureHostPreflightStage(
+        "preflight:sandbox-policy",
+        HOST_PREFLIGHT_PROOF_ID,
+        () => assertCccSemanticProofSandboxReady(input),
+      ),
+    runSandbox: (input: Parameters<typeof runCccSemanticProofSandboxedProcess>[0]) =>
+      measureHostPreflightStage(
+        "preflight:run-sandbox",
+        input.proofEnvironment?.CCC_PROOF_ID ?? HOST_PREFLIGHT_PROOF_ID,
+        () => runCccSemanticProofSandboxedProcess(input),
+      ),
+  };
+}
+
+function runHostPreflight(
+  input: Parameters<typeof assertCccSemanticProofVerifierConformance>[0],
+): Promise<void> {
+  return measureHostPreflightStage(
+    "preflight:conformance",
+    input.proofs[0]?.id ?? HOST_PREFLIGHT_PROOF_ID,
+    () => assertCccSemanticProofVerifierConformance(input, hostPreflightDiagnosticDependencies()),
+  );
+}
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -2026,7 +2101,11 @@ describe("CCC semantic proof v2 execution", () => {
 // this exact defect only after a real task had already burned a live turn.
 describe("CCC semantic proof verifier conformance preflight", () => {
   async function preflightFixture(harnessSource: string) {
-    const scratch = await mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-fixture-"));
+    const scratch = await measureHostPreflightStage(
+      "fixture:mkdtemp",
+      HOST_PREFLIGHT_PROOF_ID,
+      () => mkdtemp(join(tmpdir(), "ccc-semantic-proof-preflight-fixture-")),
+    );
     scratchRoots.push(scratch);
     const repo = join(scratch, "target");
     await mkdir(join(repo, "proof"), { recursive: true });
@@ -2044,21 +2123,49 @@ describe("CCC semantic proof verifier conformance preflight", () => {
     // src/labels.py is deliberately never written: the whole point of this
     // preflight is to prove the verifier's *output shape* is correct before
     // any candidate implementation exists.
-    const baseCommit = await commit(repo, "base");
+    const baseCommit = await measureHostPreflightStage(
+      "fixture:base-commit",
+      HOST_PREFLIGHT_PROOF_ID,
+      () => commit(repo, "base"),
+    );
 
-    const taskPath = (await execFile("which", ["task"])).stdout.trim();
+    const taskPath = (await measureHostPreflightStage(
+      "fixture:task-lookup",
+      HOST_PREFLIGHT_PROOF_ID,
+      () => execFile("which", ["task"]),
+    )).stdout.trim();
     const [taskIdentity, nodeIdentity, taskRunner, harness] = await Promise.all([
-      inspectCccSemanticProofExecutable(taskPath, ["--version"]),
-      inspectCccSemanticProofExecutable(process.execPath, ["--version"]),
-      verifierClosureEntry(repo, baseCommit, "Taskfile.yml", "task_runner"),
-      verifierClosureEntry(repo, baseCommit, "proof/verify.mjs", "harness"),
+      measureHostPreflightStage(
+        "fixture:task-identity",
+        HOST_PREFLIGHT_PROOF_ID,
+        () => inspectCccSemanticProofExecutable(taskPath, ["--version"]),
+      ),
+      measureHostPreflightStage(
+        "fixture:node-identity",
+        HOST_PREFLIGHT_PROOF_ID,
+        () => inspectCccSemanticProofExecutable(process.execPath, ["--version"]),
+      ),
+      measureHostPreflightStage(
+        "fixture:task-runner-closure",
+        HOST_PREFLIGHT_PROOF_ID,
+        () => verifierClosureEntry(repo, baseCommit, "Taskfile.yml", "task_runner"),
+      ),
+      measureHostPreflightStage(
+        "fixture:harness-closure",
+        HOST_PREFLIGHT_PROOF_ID,
+        () => verifierClosureEntry(repo, baseCommit, "proof/verify.mjs", "harness"),
+      ),
     ]);
     const proofHostIdentity = { id: "proof-host-node", ...nodeIdentity };
-    const linkedRuntime = await inspectCccSemanticProofLinkedRuntime({
-      task: taskIdentity,
-      node: nodeIdentity,
-      proofHost: proofHostIdentity,
-    });
+    const linkedRuntime = await measureHostPreflightStage(
+      "fixture:linked-runtime",
+      HOST_PREFLIGHT_PROOF_ID,
+      () => inspectCccSemanticProofLinkedRuntime({
+        task: taskIdentity,
+        node: nodeIdentity,
+        proofHost: proofHostIdentity,
+      }),
+    );
     const definition = {
       schema: "ccc-prd.proof.v2",
       id: "PROOF-EVIDENCE-LABELS",
@@ -2134,7 +2241,7 @@ describe("CCC semantic proof verifier conformance preflight", () => {
     async () => {
       const { repo, baseCommit, proof } = await preflightFixture(NONCONFORMING_HARNESS);
 
-      const attempt = assertCccSemanticProofVerifierConformance({
+      const attempt = runHostPreflight({
         repositoryRoot: repo,
         baseCommit,
         proofs: [proof],
@@ -2157,7 +2264,7 @@ describe("CCC semantic proof verifier conformance preflight", () => {
     async () => {
       const { repo, baseCommit, proof } = await preflightFixture(CONFORMING_HARNESS);
 
-      await expect(assertCccSemanticProofVerifierConformance({
+      await expect(runHostPreflight({
         repositoryRoot: repo,
         baseCommit,
         proofs: [proof],
@@ -2206,7 +2313,7 @@ describe("CCC semantic proof verifier conformance preflight", () => {
     async () => {
       const { repo, baseCommit, proof } = await preflightFixture(DIRECTORY_AWARE_HARNESS);
 
-      await expect(assertCccSemanticProofVerifierConformance({
+      await expect(runHostPreflight({
         repositoryRoot: repo,
         baseCommit,
         proofs: [proof],
