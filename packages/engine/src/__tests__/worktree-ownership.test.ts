@@ -1,8 +1,10 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { acquireTaskWorktree } from "../worktree-acquisition.js";
+import { TaskExecutor } from "../executor.js";
 import {
   classifyWorktreeOwnership,
   createWorktreeOwnershipMarker,
@@ -145,6 +147,146 @@ describe("worktree ownership v1", () => {
     expect(parseWorktreeOwnershipMarker(managedBytes, f.context).lifecycle).toBe("managed");
     expect(await readFile(f.adminMarkerPath)).toEqual(managedBytes);
     expect(await readFile(f.worktreeMarkerPath)).toEqual(managedBytes);
+  });
+
+  it("wraps transition filesystem failures as typed errors and retains creating residue", async () => {
+    const f = await fixture();
+    const creatingBytes = await writeWorktreeOwnershipMarkers({ authority: f.authority, marker: f.marker, adminMarkerPath: f.adminMarkerPath, worktreeMarkerPath: f.worktreeMarkerPath });
+    await rm(f.adminMarkerPath);
+
+    let failure: unknown;
+    try {
+      await transitionWorktreeOwnershipMarkers({
+        authority: f.authority,
+        creatingBytes,
+        adminMarkerPath: f.adminMarkerPath,
+        worktreeMarkerPath: f.worktreeMarkerPath,
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(WorktreeOwnershipError);
+    expect(failure).toMatchObject({
+      code: "MARKER_WRITE_FAILED",
+      cause: expect.objectContaining({ code: "ENOENT" }),
+    });
+    expect(await readFile(f.worktreeMarkerPath)).toEqual(creatingBytes);
+    await expect(readFile(f.adminMarkerPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("wraps an injected transition rename failure and retains partial marker residue", async () => {
+    const f = await fixture();
+    const creatingBytes = await writeWorktreeOwnershipMarkers({ authority: f.authority, marker: f.marker, adminMarkerPath: f.adminMarkerPath, worktreeMarkerPath: f.worktreeMarkerPath });
+    const injected = Object.assign(new Error("injected rename failure"), { code: "EIO" });
+    let renameCalls = 0;
+    const injectedRename = vi.fn(async (source: string, destination: string) => {
+      renameCalls += 1;
+      if (renameCalls === 2) throw injected;
+      return rename(source, destination);
+    });
+
+    await expect(transitionWorktreeOwnershipMarkers({
+      authority: f.authority,
+      creatingBytes,
+      adminMarkerPath: f.adminMarkerPath,
+      worktreeMarkerPath: f.worktreeMarkerPath,
+      filesystem: { rename: injectedRename },
+    })).rejects.toMatchObject({
+      code: "MARKER_WRITE_FAILED",
+      cause: injected,
+    });
+    expect(renameCalls).toBe(2);
+    expect(parseWorktreeOwnershipMarker(await readFile(f.adminMarkerPath), f.context).lifecycle).toBe("managed");
+    expect(parseWorktreeOwnershipMarker(await readFile(f.worktreeMarkerPath), f.context).lifecycle).toBe("creating");
+  });
+
+  it("carries a fresh TaskExecutor worktree through acquisition, managed markers, and guarded removal", async () => {
+    const rawRoot = await mkdtemp(join(tmpdir(), "fusion-owner-caller-"));
+    const root = await realpath(rawRoot);
+    roots.push(root);
+    const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+    git(root, ["init", "-b", "main"]);
+    git(root, ["config", "user.email", "test@example.com"]);
+    git(root, ["config", "user.name", "Test User"]);
+    await writeFile(join(root, "README.md"), "root\n");
+    git(root, ["add", "README.md"]);
+    git(root, ["commit", "-m", "init"]);
+    await mkdir(join(root, ".worktrees"));
+
+    const task = {
+      id: "FN-401",
+      title: "fresh ownership caller",
+      description: "fresh ownership caller",
+      column: "in-progress",
+      branch: null,
+      worktree: null,
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } as any;
+    const persisted: Record<string, unknown> = {};
+    const settings = {
+      worktreeNaming: "task-id",
+      worktreesDir: join(root, ".worktrees"),
+      worktreeRebaseBeforeMerge: false,
+      secretsEnv: { enabled: false },
+    } as any;
+    const store = {
+      on: vi.fn(),
+      getSettings: vi.fn().mockResolvedValue(settings),
+      getTask: vi.fn(async () => ({ ...task, ...persisted })),
+      updateTask: vi.fn(async (_taskId: string, patch: Record<string, unknown>) => {
+        Object.assign(persisted, patch);
+        return { ...task, ...persisted };
+      }),
+      logEntry: vi.fn().mockResolvedValue(undefined),
+    } as any;
+    const authority: EngineMutationAuthority = { assertHeld: vi.fn() };
+    const context: WorktreeOwnershipContext = Object.freeze({
+      projectId: "project-real-caller",
+      projectRoot: root,
+      engineInstanceId: "engine-real-caller",
+      mutationAuthority: authority,
+    });
+    const executor = new TaskExecutor(store, root, {
+      worktreeOwnershipContext: context,
+      requireWorktreeOwnership: true,
+    });
+
+    const acquired = await acquireTaskWorktree({
+      task,
+      rootDir: root,
+      store,
+      settings,
+      logger: { log: () => {}, warn: () => {} },
+      ownershipContext: context,
+      requireOwnership: true,
+      createWorktree: (branch, path, taskId, startPoint, allowSiblingBranchRename) =>
+        (executor as any).createWorktree(branch, path, taskId, startPoint, allowSiblingBranchRename),
+    });
+
+    expect(acquired.source).toBe("fresh");
+    expect(persisted).toMatchObject({ worktree: acquired.worktreePath, branch: "fusion/fn-401" });
+    const worktreeGitDir = git(acquired.worktreePath, ["rev-parse", "--absolute-git-dir"]);
+    const adminMarkerPath = join(worktreeGitDir, "fusion-owner.json");
+    const worktreeMarkerPath = join(acquired.worktreePath, ".fusion", "fusion-owner.json");
+    expect(parseWorktreeOwnershipMarker(await readFile(adminMarkerPath), context).lifecycle).toBe("managed");
+    expect(parseWorktreeOwnershipMarker(await readFile(worktreeMarkerPath), context).lifecycle).toBe("managed");
+
+    await expect(removeWorktree({
+      rootDir: root,
+      worktreePath: acquired.worktreePath,
+      settings,
+      taskId: task.id,
+      reason: RemovalReason.PoolPrune,
+      ownershipContext: context,
+      requireOwnership: true,
+    } as never)).resolves.toMatchObject({ removed: true });
+    await expect(lstat(acquired.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("returns a typed inventory error instead of treating Git failure as empty", async () => {

@@ -20529,6 +20529,9 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
           if (isBranchConflict) {
             throw error;
           }
+          if (error instanceof WorktreeOwnershipError) {
+            throw error;
+          }
           throw new Error(
             `Failed to create worktree after ${this.MAX_WORKTREE_RETRIES} attempts: ${errorMessage}`,
           );
@@ -21207,8 +21210,19 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       return ownershipReceipt ? { path, branch, ownershipReceipt } : { path, branch };
     };
 
-    // If directory exists but is not a registered worktree, remove it first
+    // A guarded creation may only claim a path that was absent when creation started.
+    // The path can contain foreign files or a registered worktree, so classify neither
+    // case by mutating it: leave the existing state for an operator or later explicit
+    // ownership decision.
     if (existsSync(path)) {
+      if (this.options.requireWorktreeOwnership || this.options.worktreeOwnershipContext !== undefined) {
+        throw new WorktreeOwnershipError(
+          "MARKER_ALREADY_EXISTS",
+          `Refusing guarded worktree creation over pre-existing path: ${path}`,
+        );
+      }
+
+      // If directory exists but is not a registered worktree, remove it first
       const isRegistered = await this.isRegisteredWorktree(path);
       if (!isRegistered) {
         await this.store.logEntry(

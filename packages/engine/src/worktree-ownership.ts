@@ -60,6 +60,14 @@ export type WorktreeOwnershipErrorCode =
   | "MARKER_WRITE_FAILED"
   | "MARKER_TRANSITION_MISMATCH";
 
+export type WorktreeOwnershipTransitionFilesystem = Readonly<Partial<{
+  readFile: typeof readFile;
+  open: typeof open;
+  chmod: typeof chmod;
+  rename: typeof rename;
+  unlink: typeof unlink;
+}>>;
+
 export class WorktreeOwnershipError extends Error {
   constructor(public readonly code: WorktreeOwnershipErrorCode, message: string, cause?: unknown) {
     super(message);
@@ -418,21 +426,45 @@ export async function writeWorktreeOwnershipMarkers(input: {
   return bytes;
 }
 
-async function replaceFrozen(path: string, frozen: Buffer, replacement: Buffer, authority: EngineMutationAuthority): Promise<void> {
-  const current = await readFile(path);
+type ResolvedTransitionFilesystem = {
+  readFile: typeof readFile;
+  open: typeof open;
+  chmod: typeof chmod;
+  rename: typeof rename;
+  unlink: typeof unlink;
+};
+
+function resolveTransitionFilesystem(filesystem?: WorktreeOwnershipTransitionFilesystem): ResolvedTransitionFilesystem {
+  return {
+    readFile: filesystem?.readFile ?? readFile,
+    open: filesystem?.open ?? open,
+    chmod: filesystem?.chmod ?? chmod,
+    rename: filesystem?.rename ?? rename,
+    unlink: filesystem?.unlink ?? unlink,
+  };
+}
+
+async function replaceFrozen(
+  path: string,
+  frozen: Buffer,
+  replacement: Buffer,
+  authority: EngineMutationAuthority,
+  filesystem: ResolvedTransitionFilesystem,
+): Promise<void> {
+  const current = await filesystem.readFile(path);
   if (!current.equals(frozen)) throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", `Ownership marker changed before transition: ${path}`);
   const temp = resolve(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   try {
-    const handle = await open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+    const handle = await filesystem.open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
     await handle.writeFile(replacement);
     await handle.sync();
     await handle.close();
-    await chmod(temp, 0o600);
+    await filesystem.chmod(temp, 0o600);
     assertMutationAuthority(authority);
-    if (!(await readFile(path)).equals(frozen)) throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", `Ownership marker changed before transition: ${path}`);
-    await rename(temp, path);
+    if (!(await filesystem.readFile(path)).equals(frozen)) throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", `Ownership marker changed before transition: ${path}`);
+    await filesystem.rename(temp, path);
   } finally {
-    await unlink(temp).catch(() => {});
+    await filesystem.unlink(temp).catch(() => {});
   }
 }
 
@@ -441,6 +473,7 @@ export async function transitionWorktreeOwnershipMarkers(input: {
   creatingBytes: Buffer;
   adminMarkerPath: string;
   worktreeMarkerPath: string;
+  filesystem?: WorktreeOwnershipTransitionFilesystem;
 }): Promise<Buffer> {
   assertMutationAuthority(input.authority);
   const creating = parseWorktreeOwnershipMarker(input.creatingBytes);
@@ -449,15 +482,21 @@ export async function transitionWorktreeOwnershipMarkers(input: {
     || input.worktreeMarkerPath !== resolve(creating.worktreePath, WORKTREE_OWNERSHIP_MARKER_RELATIVE_PATH)) {
     throw new WorktreeOwnershipError("MARKER_CONTEXT_MISMATCH", "Marker destinations do not match the ownership marker paths");
   }
-  const current = await Promise.all([readFile(input.adminMarkerPath), readFile(input.worktreeMarkerPath)]);
-  if (!current.every((bytes) => bytes.equals(input.creatingBytes))) throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", "Creating marker copies do not match frozen bytes");
-  const managedBytes = serializeWorktreeOwnershipMarker({ ...creating, lifecycle: "managed" });
-  await replaceFrozen(input.adminMarkerPath, input.creatingBytes, managedBytes, input.authority);
-  await replaceFrozen(input.worktreeMarkerPath, input.creatingBytes, managedBytes, input.authority);
-  assertMutationAuthority(input.authority);
-  const final = await Promise.all([readFile(input.adminMarkerPath), readFile(input.worktreeMarkerPath)]);
-  if (!final.every((bytes) => bytes.equals(managedBytes))) throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", "Managed marker copies differ after transition");
-  return managedBytes;
+  const filesystem = resolveTransitionFilesystem(input.filesystem);
+  try {
+    const current = await Promise.all([filesystem.readFile(input.adminMarkerPath), filesystem.readFile(input.worktreeMarkerPath)]);
+    if (!current.every((bytes) => bytes.equals(input.creatingBytes))) throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", "Creating marker copies do not match frozen bytes");
+    const managedBytes = serializeWorktreeOwnershipMarker({ ...creating, lifecycle: "managed" });
+    await replaceFrozen(input.adminMarkerPath, input.creatingBytes, managedBytes, input.authority, filesystem);
+    await replaceFrozen(input.worktreeMarkerPath, input.creatingBytes, managedBytes, input.authority, filesystem);
+    assertMutationAuthority(input.authority);
+    const final = await Promise.all([filesystem.readFile(input.adminMarkerPath), filesystem.readFile(input.worktreeMarkerPath)]);
+    if (!final.every((bytes) => bytes.equals(managedBytes))) throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", "Managed marker copies differ after transition");
+    return managedBytes;
+  } catch (error) {
+    if (error instanceof WorktreeOwnershipError) throw error;
+    throw new WorktreeOwnershipError("MARKER_WRITE_FAILED", "Unable to transition ownership markers", error);
+  }
 }
 
 async function readOptional(path: string): Promise<{ exists: false } | { exists: true; bytes: Buffer; mode: number }> {
