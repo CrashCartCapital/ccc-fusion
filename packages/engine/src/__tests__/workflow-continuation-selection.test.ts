@@ -7,6 +7,7 @@ import {
   resolvePlanningContinuationCandidate,
   selectActionablePlanningContinuations,
 } from "../runtimes/in-process-runtime.js";
+import { runtimeLog } from "../logger.js";
 
 function workItem(
   id: string,
@@ -18,6 +19,47 @@ function workItem(
 
 function task(id: string, patch: Partial<Task> = {}): Task {
   return { id, column: "todo", paused: false, userPaused: false, ...patch } as Task;
+}
+
+type ContinuationDrainRuntime = InProcessRuntime & {
+  status: "active";
+  taskStore: TaskStore;
+  executor: { execute: ReturnType<typeof vi.fn> };
+  drainWorkflowContinuations: () => Promise<void>;
+};
+
+function continuationDrainRuntime(store: TaskStore): ContinuationDrainRuntime {
+  const runtime = new InProcessRuntime({
+    projectId: "orphan-cancellation-unit",
+    workingDirectory: "/tmp/orphan-cancellation-unit",
+    isolationMode: "in-process",
+    maxConcurrent: 1,
+    maxWorktrees: 1,
+  } as never, {} as never) as ContinuationDrainRuntime;
+  runtime.status = "active";
+  runtime.taskStore = store;
+  runtime.executor = { execute: vi.fn() };
+  return runtime;
+}
+
+function orphanContinuationStore(
+  item: WorkflowWorkItem,
+  getTask: ReturnType<typeof vi.fn>,
+  cancelResult: ReturnType<typeof vi.fn>,
+): TaskStore & {
+  cancelOrphanedWorkflowWorkItemIfExact: ReturnType<typeof vi.fn>;
+  transitionWorkflowWorkItem: ReturnType<typeof vi.fn>;
+} {
+  return {
+    listDueWorkflowWorkItems: vi.fn(async () => [item]),
+    getTask,
+    getCccCampaignContextForTask: vi.fn(async () => null),
+    cancelOrphanedWorkflowWorkItemIfExact: cancelResult,
+    transitionWorkflowWorkItem: vi.fn(),
+  } as unknown as TaskStore & {
+    cancelOrphanedWorkflowWorkItemIfExact: ReturnType<typeof vi.fn>;
+    transitionWorkflowWorkItem: ReturnType<typeof vi.fn>;
+  };
 }
 
 describe("isPlanningContinuationTaskDispatchable", () => {
@@ -123,6 +165,89 @@ describe("selectActionablePlanningContinuations", () => {
 describe("InProcessRuntime campaign continuation dispatch", () => {
   afterEach(() => {
     executingTaskLock._clearForTest();
+    vi.restoreAllMocks();
+  });
+
+  it("routes getTask lookup failures through atomic orphan classification", async () => {
+    const item = workItem("lookup-failure", "planning");
+    const lookupFailure = new Error("temporary archive read failure");
+    const getTask = vi.fn(async () => {
+      throw lookupFailure;
+    });
+    const cancel = vi.fn(async () => ({kind: "no-op", reason: "task-reactivated" as const}));
+    const store = orphanContinuationStore(item, getTask, cancel);
+    const runtime = continuationDrainRuntime(store);
+    const warn = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
+
+    await runtime.drainWorkflowContinuations();
+
+    expect(getTask).toHaveBeenCalledWith(item.taskId);
+    expect(cancel).toHaveBeenCalledWith(item);
+    expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    const warnings = warn.mock.calls.flat().join(" ");
+    expect(warnings).toContain(`getTask(${item.taskId}) failed`);
+    expect(warnings).toContain(lookupFailure.message);
+    expect(warnings).not.toContain("task-not-found");
+  });
+
+  it("warns and continues when atomic orphan classification has a transient error", async () => {
+    const item = workItem("helper-failure", "planning");
+    const lookupFailure = new Error("temporary task lookup failure");
+    const helperFailure = new Error("database connection reset");
+    const getTask = vi.fn(async () => {
+      throw lookupFailure;
+    });
+    const cancel = vi.fn(async () => {
+      throw helperFailure;
+    });
+    const store = orphanContinuationStore(item, getTask, cancel);
+    const runtime = continuationDrainRuntime(store);
+    const warn = vi.spyOn(runtimeLog, "warn").mockImplementation(() => {});
+
+    await expect(runtime.drainWorkflowContinuations()).resolves.toBeUndefined();
+
+    expect(cancel).toHaveBeenCalledWith(item);
+    expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    expect(warn.mock.calls.flat().join(" ")).toContain(helperFailure.message);
+  });
+
+  it("continues on every typed orphan no-op without transitioning", async () => {
+    const reasons = [
+      "work-item-missing",
+      "work-item-changed",
+      "work-item-ineligible",
+      "task-reactivated",
+      "task-lock-busy",
+    ] as const;
+    for (const reason of reasons) {
+      const item = workItem(`typed-no-op-${reason}`, "planning");
+      const getTask = vi.fn(async () => task(item.taskId, {column: "archived"}));
+      const cancel = vi.fn(async () => ({kind: "no-op", reason} as const));
+      const store = orphanContinuationStore(item, getTask, cancel);
+      const runtime = continuationDrainRuntime(store);
+
+      await runtime.drainWorkflowContinuations();
+
+      expect(cancel).toHaveBeenCalledWith(item);
+      expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    }
+  });
+
+  it("logs only the atomic terminal cancellation result as cancelled", async () => {
+    const item = workItem("terminal-helper-cancel", "planning");
+    const getTask = vi.fn(async () => task(item.taskId, {column: "done"}));
+    const cancel = vi.fn(async () => ({kind: "cancelled", reason: "task-terminal" as const, item}));
+    const store = orphanContinuationStore(item, getTask, cancel);
+    const runtime = continuationDrainRuntime(store);
+    const log = vi.spyOn(runtimeLog, "log").mockImplementation(() => {});
+
+    await runtime.drainWorkflowContinuations();
+
+    expect(cancel).toHaveBeenCalledWith(item);
+    expect(store.transitionWorkflowWorkItem).not.toHaveBeenCalled();
+    expect(log.mock.calls.flat().join(" ")).toContain(`Cancelled orphaned workflow work item ${item.id}`);
+    expect(log.mock.calls.flat().join(" ")).toContain("reason=task-terminal");
+    expect(log.mock.calls.flat().join(" ")).not.toContain("task-not-found");
   });
 
   it("waits for startup recovery before selecting workflow continuations", async () => {

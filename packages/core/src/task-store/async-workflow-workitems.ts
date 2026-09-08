@@ -307,11 +307,15 @@ export async function transitionWorkflowWorkItem(
   // FNXC:PostgresCutover 2026-06-27-10:15:
   // Accept an optional existing transaction for outer-tx threading.
   const doWork = async (tx: DbTransaction): Promise<WorkflowWorkItem> => {
+    const projectId = layer.projectId?.trim();
     const now = patch.now ?? new Date().toISOString();
     const existingRows = await tx
       .select()
       .from(schema.project.workflowWorkItems)
-      .where(eq(schema.project.workflowWorkItems.id, id))
+      .where(and(
+        eq(schema.project.workflowWorkItems.id, id),
+        projectId ? eq(schema.project.workflowWorkItems.projectId, projectId) : undefined,
+      ))
       .limit(1);
     const existing = existingRows[0] as WorkflowWorkItemRow | undefined;
     if (!existing) throw new Error(`Workflow work item ${id} not found`);
@@ -325,6 +329,7 @@ export async function transitionWorkflowWorkItem(
 
     const guards = [
       eq(schema.project.workflowWorkItems.id, id),
+      ...(projectId ? [eq(schema.project.workflowWorkItems.projectId, projectId)] : []),
       or(
         eq(schema.project.workflowWorkItems.state, state),
         notInArray(schema.project.workflowWorkItems.state, [...TERMINAL_WORKFLOW_WORK_ITEM_STATES]),
@@ -378,7 +383,7 @@ export async function transitionWorkflowWorkItem(
         toState: state,
         attempt: updated.attempt,
       },
-    });
+    }, projectId);
 
     return rowToWorkflowWorkItem(updated);
   };
