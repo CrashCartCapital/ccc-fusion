@@ -78,6 +78,39 @@ type ProductStatusOutput = Readonly<{
   }>[];
 }>;
 
+const VERTICAL_PHASE_MARKER_PREFIX = "[ccc-product-route-phase]";
+const VERTICAL_STATUS_HEARTBEAT_PREFIX = "[ccc-product-route-status]";
+
+function writeVerticalPhaseMarker(
+  startedAt: number,
+  phase: string,
+  edge: "before" | "after",
+): void {
+  process.stderr.write(
+    `${VERTICAL_PHASE_MARKER_PREFIX} phase=${phase} edge=${edge} elapsedMs=${Date.now() - startedAt}\n`,
+  );
+}
+
+function writeVerticalStatusHeartbeat(
+  startedAt: number,
+  lastHeartbeatAt: number,
+  phase: string,
+  value: ProductStatusOutput,
+): number {
+  const now = Date.now();
+  if (now - lastHeartbeatAt < 5_000) return lastHeartbeatAt;
+  const workItemStates = value.status.workItems
+    .slice(0, 8)
+    .map(({ state }) => state)
+    .join(",");
+  process.stderr.write(
+    `${VERTICAL_STATUS_HEARTBEAT_PREFIX} phase=${phase} edge=heartbeat `
+      + `elapsedMs=${now - startedAt} nextActionKind=${value.status.nextAction.kind} `
+      + `workItemStates=${workItemStates}\n`,
+  );
+  return now;
+}
+
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -887,9 +920,15 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
   );
 
   it("takes a frozen packet through CLI admission, real runtime coding, executed proof, and exact human landing approval", async () => {
+    const verticalPhaseStartedAt = Date.now();
+    let verticalStatusHeartbeatAt = 0;
     const rootDir = h.rootDir();
+    writeVerticalPhaseMarker(verticalPhaseStartedAt, "target-init", "before");
     const baseCommit = await initializeTarget(rootDir);
+    writeVerticalPhaseMarker(verticalPhaseStartedAt, "target-init", "after");
+    writeVerticalPhaseMarker(verticalPhaseStartedAt, "packet-create", "before");
     const packet = await createPacket(rootDir, baseCommit);
+    writeVerticalPhaseMarker(verticalPhaseStartedAt, "packet-create", "after");
     const store = h.store();
     const projectId = h.layer().projectId ?? "ccc-product-vertical";
     let runtime: InProcessRuntime | undefined;
@@ -1023,6 +1062,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         readTargetHead: async () => git(rootDir, "rev-parse", "refs/heads/main"),
       };
 
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "author", "before");
       const authored = await runProductCommand([
         "author",
         packet.packetRoot,
@@ -1049,6 +1089,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         "--max-review-items",
         "4",
       ], dependencies);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "author", "after");
       expect(authored).toMatchObject({
         exitCode: 0,
         values: [expect.objectContaining({ kind: "candidate" })],
@@ -1076,6 +1117,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
       expect(authoredSidecar.implementationFactProvenance).toMatchObject({
         schema: "ccc-prd.implementation-fact-provenance.v1",
       });
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "validate", "before");
       const validated = await runProductCommand([
         "validate",
         packet.packetRoot,
@@ -1084,10 +1126,12 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         rootDir,
         baseCommit,
       ], dependencies);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "validate", "after");
       expect(validated).toMatchObject({
         exitCode: 0,
         values: [expect.objectContaining({ kind: "diagnostics", valid: true })],
       });
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "compile", "before");
       const compiled = await runProductCommand([
         "compile",
         packet.packetRoot,
@@ -1096,6 +1140,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         rootDir,
         baseCommit,
       ], dependencies);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "compile", "after");
       expect(compiled).toMatchObject({
         exitCode: 0,
         values: [expect.objectContaining({
@@ -1135,7 +1180,9 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         rootDir,
         baseCommit,
       ];
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "preview", "before");
       const preview = await runProductCommand(["preview", ...common], dependencies);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "preview", "after");
       expect(preview.exitCode).toBe(0);
       const previewValue = preview.values[0] as {
         kind: string;
@@ -1146,6 +1193,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         confirmationDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
       });
       const idempotencyKey = "ccc-product-vertical-v1";
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "import", "before");
       const imported = await runProductCommand([
         "import",
         ...common,
@@ -1153,6 +1201,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         "--confirm",
         previewValue.confirmationDigest,
       ], dependencies);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "import", "after");
       expect(imported).toMatchObject({
         exitCode: 0,
         values: [expect.objectContaining({
@@ -1164,7 +1213,9 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
       expect(await readFile(join(rootDir, "src/value.txt"), "utf8")).toBe("bad\n");
 
       central = new CentralCore(h.globalDir(), { asyncLayer: h.layer() });
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "central-init", "before");
       await central.init();
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "central-init", "after");
       runtime = new InProcessRuntime({
         projectId,
         workingDirectory: rootDir,
@@ -1173,7 +1224,9 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         maxWorktrees: 1,
         externalTaskStore: store,
       }, central);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "runtime-start", "before");
       await runtime.start();
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "runtime-start", "after");
       const cliRuntime = runtime.getCliAgentRuntime();
       if (!cliRuntime) {
         throw new Error("real runtime did not initialize the CLI coding executor");
@@ -1189,17 +1242,31 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
       const runtimeControl = runtime as unknown as {
         drainWorkflowContinuations(): Promise<void>;
       };
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "first-drain", "before");
       await runtimeControl.drainWorkflowContinuations();
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "first-drain", "after");
+      verticalStatusHeartbeatAt = 0;
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "first-hold", "before");
       const firstHold = await waitFor(
-        async () => productStatus(await runProductCommand(
-          ["status", idempotencyKey],
-          dependencies,
-        )),
+        async () => {
+          const value = productStatus(await runProductCommand(
+            ["status", idempotencyKey],
+            dependencies,
+          ));
+          verticalStatusHeartbeatAt = writeVerticalStatusHeartbeat(
+            verticalPhaseStartedAt,
+            verticalStatusHeartbeatAt,
+            "first-hold",
+            value,
+          );
+          return value;
+        },
         (value) => value.status.workItems.some(
           (item) => item.state === "manual-required",
         ),
         "first campaign hold",
       );
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "first-hold", "after");
       const verticalTask = firstHold.status.tasks.find(
         (task) => task.semanticTaskId === "TASK-VERTICAL",
       );
@@ -1217,7 +1284,9 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
        * approve-execution (packages/engine/src/ccc-campaign-proof-workflow.ts),
        * so the actual strict assertion now runs after `executionDrain`.
        */
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "first-hold-audit", "before");
       await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId });
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "first-hold-audit", "after");
       const liveHold = firstHold;
       const liveAuthorization = liveHold.liveExecutionAuthorizationConfirmation;
       expect(liveAuthorization).toMatchObject({
@@ -1250,6 +1319,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
 
       const liveConfirmation =
         liveHold.liveExecutionAuthorizationConfirmation!;
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "approve-execution", "before");
       const executionApproved = await runProductCommand([
         "approve-execution",
         idempotencyKey,
@@ -1257,6 +1327,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         "--confirm",
         liveConfirmation.confirmation,
       ], dependencies);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "approve-execution", "after");
       expect(executionApproved).toMatchObject({
         exitCode: 0,
         values: [expect.objectContaining({
@@ -1265,7 +1336,10 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         })],
       });
 
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "execution-drain-call", "before");
       const executionDrain = runtimeControl.drainWorkflowContinuations();
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "execution-drain-call", "after");
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "provider-wait", "before");
       const providerObservation = await waitFor(
         async () => {
           let effect: { kind: string; cwd?: string; head?: string } | null = null;
@@ -1281,6 +1355,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         (value) => value.effect?.kind === "source-edited",
         "provider source edit",
       );
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "provider-wait", "after");
       const providerEffect = providerObservation.effect;
       if (!providerEffect) {
         throw new Error("campaign provider did not edit source");
@@ -1289,22 +1364,38 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         kind: "source-edited",
         cwd: expect.not.stringMatching(new RegExp(`^${rootDir}/?$`)),
       });
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "execution-drain-await", "before");
       await executionDrain;
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "execution-drain-await", "after");
 
+      verticalStatusHeartbeatAt = 0;
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "merge-wait", "before");
       const mergeHold = await waitFor(
-        async () => productStatus(await runProductCommand(
-          ["status", idempotencyKey],
-          dependencies,
-        )),
+        async () => {
+          const value = productStatus(await runProductCommand(
+            ["status", idempotencyKey],
+            dependencies,
+          ));
+          verticalStatusHeartbeatAt = writeVerticalStatusHeartbeat(
+            verticalPhaseStartedAt,
+            verticalStatusHeartbeatAt,
+            "merge-wait",
+            value,
+          );
+          return value;
+        },
         (value) => value.status.nextAction.kind === "approve-merge",
         "exact merge approval hold",
         undefined,
         mergeApprovalTerminalDiagnostic,
       );
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "merge-wait", "after");
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "proof-audit", "before");
       const proofAdmissionAudits = (
         await queryRunAuditEvents(h.layer().db, { taskId: verticalNativeTaskId })
       ).filter((event) =>
         event.mutationType === "ccc-campaign:proof-admission");
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "proof-audit", "after");
       expect(proofAdmissionAudits).toHaveLength(2);
       expect(proofAdmissionAudits).toEqual(expect.arrayContaining([
         expect.objectContaining({
@@ -1331,6 +1422,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         && attempt.result.stdoutTail.includes('"NEG-VERTICAL-001"'))).toBe(true);
       expect(mergeHold.mergeApprovalConfirmations).toHaveLength(1);
       const mergeConfirmation = mergeHold.mergeApprovalConfirmations![0]!;
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "approve-merge", "before");
       const mergeApproved = await runProductCommand([
         "approve-merge",
         idempotencyKey,
@@ -1338,6 +1430,7 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         "--confirm",
         mergeConfirmation.confirmation,
       ], dependencies);
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "approve-merge", "after");
       expect(mergeApproved).toMatchObject({
         exitCode: 0,
         values: [expect.objectContaining({
@@ -1349,11 +1442,13 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
         })],
       });
 
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "landing-audit", "before");
       const landingEvents = await queryRunAuditEvents(h.layer().db, {
         taskId: verticalNativeTaskId,
         domain: "git",
         mutationType: "ccc-campaign-git-landing:terminal",
       });
+      writeVerticalPhaseMarker(verticalPhaseStartedAt, "landing-audit", "after");
       const landingMetadata = landingEvents[0]?.metadata as {
         commitObject?: unknown;
       } | null | undefined;
