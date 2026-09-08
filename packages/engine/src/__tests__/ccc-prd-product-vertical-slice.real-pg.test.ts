@@ -43,6 +43,7 @@ import {
 import type { CliAgentAdapter } from "../cli-agent/adapter.js";
 import type { TelemetryHub } from "../cli-agent/telemetry-hub.js";
 import { bootstrapCccCampaignProofAdmissionHost } from "../ccc-campaign-proof-host.js";
+import { analyzeCccPrdMaterialCoverage } from "../ccc-prd/material-coverage.js";
 import { InProcessRuntime } from "../runtimes/in-process-runtime.js";
 
 const execFile = promisify(execFileCallback);
@@ -534,6 +535,472 @@ async function createPacket(
   };
 }
 
+type ProseMaterialDisposition = "task" | "explicit_deferral" | "out_of_scope";
+
+type ProseMaterialSpec = Readonly<{
+  source: "selected" | "context";
+  materialKind: "section" | "requirement";
+  anchor: string;
+  disposition: ProseMaterialDisposition;
+}>;
+
+type ProseCase = Readonly<{
+  label: string;
+  prdFile: string;
+  markdown: string;
+  requirementStatement: string;
+  acceptanceQuote: string;
+  nonGoal: string;
+  proofCommand: string;
+  positiveOracle: string;
+  negativeControl: string;
+  proofEvidenceQuote: string;
+  custodyQuote: string;
+  protectedActionQuote: string;
+  protectedActionTarget: string;
+  materials: readonly ProseMaterialSpec[];
+}>;
+
+type FrozenProsePacket = Readonly<{
+  packetRoot: string;
+  cleanupRoot: string;
+  manifestPath: string;
+  receiptPath: string;
+  proposalPath: string;
+  sidecarPath: string;
+  policyPath: string;
+  selectedPrdPath: string;
+  selectedSourcePath: string;
+  contextSourcePath: string;
+  originalSelectedBytes: Buffer;
+  packetHash: string;
+}>;
+
+type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
+type JsonObject = { [key: string]: JsonValue };
+
+const CONTEXT_MATERIALS: readonly ProseMaterialSpec[] = [
+  {
+    source: "context",
+    materialKind: "section",
+    anchor: "# Fusion Reviewed Operator Context",
+    disposition: "task",
+  },
+  {
+    source: "context",
+    materialKind: "section",
+    anchor: "## Target repository and baseline",
+    disposition: "task",
+  },
+  {
+    source: "context",
+    materialKind: "section",
+    anchor: "## Task custody",
+    disposition: "task",
+  },
+  {
+    source: "context",
+    materialKind: "section",
+    anchor: "## Admitted write roots",
+    disposition: "task",
+  },
+  {
+    source: "context",
+    materialKind: "section",
+    anchor: "## Execution bounds",
+    disposition: "task",
+  },
+];
+
+const GUIDED_WRITE_PURPOSE =
+  "disposable product acceptance repository; task verify:vertical";
+
+const PROSE_CASES: readonly ProseCase[] = [
+  {
+    label: "ordinary prose feature brief",
+    prdFile: "ordinary-feature.md",
+    markdown: [
+      "# Feature brief",
+      "",
+      "A small safe change should update the value in the admitted source file.",
+      "",
+      "## Requested change",
+      "The campaign may change the repository path src/value.txt from the planted value to the corrected value.",
+      "",
+      "### Acceptance",
+      "The verifier should reject the planted value and accept the corrected value after the change.",
+      "",
+      "### Validation",
+      "The repository verification step demonstrates that the verifier accepts the corrected value and rejects the planted value.",
+      "",
+      "## Non-goals",
+      "Non-goal: the request leaves every path outside src/value.txt unchanged.",
+      "",
+      "## Approval boundary",
+      "A promotion of the accepted change to the shared branch requires operator approval.",
+      "",
+    ].join("\n"),
+    requirementStatement:
+      "Update the value file at src/value.txt from its planted value to the corrected value.",
+    acceptanceQuote:
+      "The verifier should reject the planted value and accept the corrected value after the change.",
+    nonGoal: "the request leaves every path outside src/value.txt unchanged.",
+    proofCommand: "task verify:vertical",
+    positiveOracle: "the verifier accepts the corrected value",
+    negativeControl: "the verifier rejects the planted value",
+    proofEvidenceQuote:
+      "The repository verification step demonstrates that the verifier accepts the corrected value and rejects the planted value.",
+    custodyQuote:
+      "The campaign may change the repository path src/value.txt from the planted value to the corrected value.",
+    protectedActionQuote:
+      "A promotion of the accepted change to the shared branch requires operator approval.",
+    protectedActionTarget: "the accepted change to the shared branch",
+    materials: [
+      { source: "selected", materialKind: "section", anchor: "# Feature brief", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "## Requested change", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "### Acceptance", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "### Validation", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "## Non-goals", disposition: "out_of_scope" },
+      { source: "selected", materialKind: "section", anchor: "## Approval boundary", disposition: "task" },
+    ],
+  },
+  {
+    label: "optional-heading prose boundary brief",
+    prdFile: "optional-heading-boundary.md",
+    markdown: [
+      "# Boundary feature brief",
+      "",
+      "This brief exercises an optional empty heading and a deferred follow-up in ordinary prose.",
+      "",
+      "## Requested change",
+      "The campaign may change the repository path src/value.txt from the planted value to the corrected value.",
+      "",
+      "### Acceptance",
+      "The verifier should reject the planted value and accept the corrected value after the change.",
+      "",
+      "### Validation",
+      "The repository verification step demonstrates that the verifier accepts the corrected value and rejects the planted value.",
+      "",
+      "### Optional notes",
+      "## Deferred work",
+      "A later intake refinement remains explicitly deferred.",
+      "",
+      "## Additional context",
+      "The same task also owns this additional explanatory material.",
+      "",
+      "## Non-goals",
+      "Non-goal: the request leaves every path outside src/value.txt unchanged.",
+      "",
+      "## Approval boundary",
+      "A promotion of the accepted change to the shared branch requires operator approval.",
+      "",
+    ].join("\n"),
+    requirementStatement:
+      "Update the value file at src/value.txt from its planted value to the corrected value.",
+    acceptanceQuote:
+      "The verifier should reject the planted value and accept the corrected value after the change.",
+    nonGoal: "the request leaves every path outside src/value.txt unchanged.",
+    proofCommand: "task verify:vertical",
+    positiveOracle: "the verifier accepts the corrected value",
+    negativeControl: "the verifier rejects the planted value",
+    proofEvidenceQuote:
+      "The repository verification step demonstrates that the verifier accepts the corrected value and rejects the planted value.",
+    custodyQuote:
+      "The campaign may change the repository path src/value.txt from the planted value to the corrected value.",
+    protectedActionQuote:
+      "A promotion of the accepted change to the shared branch requires operator approval.",
+    protectedActionTarget: "the accepted change to the shared branch",
+    materials: [
+      { source: "selected", materialKind: "section", anchor: "# Boundary feature brief", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "## Requested change", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "### Acceptance", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "### Validation", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "## Deferred work", disposition: "explicit_deferral" },
+      { source: "selected", materialKind: "section", anchor: "## Additional context", disposition: "task" },
+      { source: "selected", materialKind: "section", anchor: "## Non-goals", disposition: "out_of_scope" },
+      { source: "selected", materialKind: "section", anchor: "## Approval boundary", disposition: "task" },
+    ],
+  },
+];
+
+function asJsonObject(value: JsonValue | undefined, label: string): JsonObject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  return value;
+}
+
+function asJsonArray(value: JsonValue | undefined, label: string): JsonValue[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value;
+}
+
+function sourceReference(path: string, exactQuote: string): JsonObject {
+  return { path, exactQuote };
+}
+
+function rewriteProposalSourceRefs(
+  value: JsonValue,
+  selectedPath: string,
+  selectedQuote: string,
+  contextPath: string,
+): JsonValue {
+  if (Array.isArray(value)) {
+    return value.map((item) => rewriteProposalSourceRefs(
+      item,
+      selectedPath,
+      selectedQuote,
+      contextPath,
+    ));
+  }
+  if (!value || typeof value !== "object") return value;
+  const output: JsonObject = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "sourceRefs" && Array.isArray(child)) {
+      output[key] = child.map(() => sourceReference(selectedPath, selectedQuote));
+      continue;
+    }
+    if (key === "sourcePaths" && Array.isArray(child)) {
+      output[key] = [selectedPath, contextPath];
+      continue;
+    }
+    output[key] = rewriteProposalSourceRefs(
+      child,
+      selectedPath,
+      selectedQuote,
+      contextPath,
+    );
+  }
+  return output;
+}
+
+function findUniqueByteAnchor(bytes: Buffer, anchor: string): {
+  byteStart: number;
+  byteEnd: number;
+} {
+  const quote = Buffer.from(anchor, "utf8");
+  const byteStart = bytes.indexOf(quote);
+  if (byteStart < 0 || bytes.indexOf(quote, byteStart + 1) >= 0) {
+    throw new Error(`expected unique prose material anchor: ${anchor}`);
+  }
+  return { byteStart, byteEnd: byteStart + quote.byteLength };
+}
+
+function assertProposalSourceRefs(
+  value: JsonValue,
+  sourceBytes: ReadonlyMap<string, Buffer>,
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) assertProposalSourceRefs(item, sourceBytes);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "sourceRefs" && Array.isArray(child)) {
+      for (const reference of child) {
+        const entry = asJsonObject(reference, "proposal source reference");
+        const path = entry.path;
+        const exactQuote = entry.exactQuote;
+        if (typeof path !== "string" || typeof exactQuote !== "string") {
+          throw new Error("proposal source reference must contain path and exactQuote");
+        }
+        const source = sourceBytes.get(path);
+        if (!source) throw new Error(`proposal source path is not in the manifest: ${path}`);
+        findUniqueByteAnchor(source, exactQuote);
+      }
+      continue;
+    }
+    if (key === "sourcePaths" && Array.isArray(child)) {
+      for (const path of child) {
+        if (typeof path !== "string" || !sourceBytes.has(path)) {
+          throw new Error(`proposal source path is not in the manifest: ${String(path)}`);
+        }
+      }
+      continue;
+    }
+    assertProposalSourceRefs(child, sourceBytes);
+  }
+}
+
+async function createFrozenProsePacket(
+  targetRoot: string,
+  targetBase: string,
+  proseCase: ProseCase,
+): Promise<FrozenProsePacket> {
+  const scaffold = await createPacket(targetRoot, targetBase);
+  try {
+    const activeProjectsRoot = join(scaffold.packetRoot, "active-projects");
+    const selectedPrdPath = join(
+      activeProjectsRoot,
+      "prose-intake",
+      proseCase.prdFile,
+    );
+    await mkdir(dirname(selectedPrdPath), { recursive: true });
+    await writeFile(selectedPrdPath, proseCase.markdown);
+    const originalSelectedBytes = await readFile(selectedPrdPath);
+    const packetRoot = join(scaffold.packetRoot, "frozen-prose-packet");
+    const frozen = await runProductCommand([
+      "freeze",
+      activeProjectsRoot,
+      selectedPrdPath,
+      packetRoot,
+      "--target",
+      targetRoot,
+      "--base",
+      targetBase,
+      "--owned-path",
+      "src/value.txt",
+      "--write-root",
+      ".",
+      "--write-purpose",
+      GUIDED_WRITE_PURPOSE,
+      "--max-requests",
+      "2",
+      "--max-duration-ms",
+      "120000",
+      "--max-concurrency",
+      "1",
+    ], {});
+    if (frozen.exitCode !== 0 || frozen.values.length !== 1) {
+      throw new Error(`prose packet freeze failed: ${JSON.stringify(frozen)}`);
+    }
+    const freezeResult = frozen.values[0] as {
+      rootDir: string;
+      manifestPath: string;
+      receiptPath: string;
+      selectedPrdPath: string;
+      packet: { packetHash: string };
+    };
+    const manifest = JSON.parse(
+      await readFile(freezeResult.manifestPath, "utf8"),
+    ) as {
+      entries: Array<{
+        relative_path: string;
+        role: string;
+        authoritative: boolean;
+        sha256: string;
+      }>;
+    };
+    const selectedEntry = manifest.entries.find(({ role, authoritative }) =>
+      role === "root" && authoritative);
+    const contextEntry = manifest.entries.find(({ relative_path, role, authoritative }) =>
+      relative_path.endsWith("REF-HUM-FusionOperatorContext.md")
+      && role === "support"
+      && authoritative);
+    if (!selectedEntry || !contextEntry) {
+      throw new Error("frozen prose packet did not contain selected and authoritative operator-context sources");
+    }
+    const selectedSourcePath = selectedEntry.relative_path;
+    const contextSourcePath = contextEntry.relative_path;
+    const selectedFrozenBytes = await readFile(join(packetRoot, selectedSourcePath));
+    if (!selectedFrozenBytes.equals(originalSelectedBytes)) {
+      throw new Error("freeze changed the selected prose bytes");
+    }
+    if (!(await readFile(selectedPrdPath)).equals(originalSelectedBytes)) {
+      throw new Error("freeze changed the original selected prose input");
+    }
+    const sourceBytes = new Map<string, Buffer>();
+    for (const entry of manifest.entries.filter(({ authoritative }) => authoritative)) {
+      sourceBytes.set(
+        entry.relative_path,
+        await readFile(join(packetRoot, entry.relative_path)),
+      );
+    }
+    const selectedQuote = sourceBytes.get(selectedSourcePath)!.toString("utf8");
+    const baseProposal = JSON.parse(
+      await readFile(scaffold.proposalPath, "utf8"),
+    ) as JsonObject;
+    const proposal = asJsonObject(
+      rewriteProposalSourceRefs(
+        baseProposal,
+        selectedSourcePath,
+        selectedQuote,
+        contextSourcePath,
+      ),
+      "parameterized proposal",
+    );
+    const selectedTaskRefs = proseCase.materials
+      .filter((material) => material.source === "selected" && material.disposition === "task")
+      .map((material) => sourceReference(selectedSourcePath, material.anchor));
+    selectedTaskRefs.push(
+      sourceReference(selectedSourcePath, proseCase.custodyQuote),
+      sourceReference(selectedSourcePath, proseCase.acceptanceQuote),
+      sourceReference(selectedSourcePath, proseCase.proofEvidenceQuote),
+    );
+    const contextTaskRefs = CONTEXT_MATERIALS.map((material) =>
+      sourceReference(contextSourcePath, material.anchor));
+    const contextProofQuote = `- Allowed write root purpose: ${GUIDED_WRITE_PURPOSE}`;
+    const taskRefs = [
+      ...selectedTaskRefs,
+      ...contextTaskRefs,
+      sourceReference(contextSourcePath, contextProofQuote),
+    ];
+    const requirements = asJsonArray(proposal.requirements, "requirements");
+    const requirement = asJsonObject(requirements[0], "first requirement");
+    requirement.statement = proseCase.requirementStatement;
+    requirement.acceptance = proseCase.acceptanceQuote;
+    requirement.sourceRefs = selectedTaskRefs;
+    const admittedWriteRoots = asJsonArray(
+      proposal.admittedWriteRoots,
+      "admitted write roots",
+    );
+    const admittedWriteRoot = asJsonObject(admittedWriteRoots[0], "first admitted write root");
+    admittedWriteRoot.purpose = GUIDED_WRITE_PURPOSE;
+    proposal.nonGoals = [proseCase.nonGoal];
+    const acceptanceClauses = asJsonArray(
+      requirement.acceptanceClauses,
+      "acceptance clauses",
+    );
+    const acceptanceClause = asJsonObject(acceptanceClauses[0], "first acceptance clause");
+    acceptanceClause.text = proseCase.acceptanceQuote;
+    acceptanceClause.sourceRefs = [
+      sourceReference(selectedSourcePath, proseCase.acceptanceQuote),
+    ];
+    const tasks = asJsonArray(proposal.tasks, "tasks");
+    const task = asJsonObject(tasks[0], "first task");
+    task.sourceRefs = taskRefs;
+    task.protectedActionIds = ["ACTION-VERTICAL-LIVE"];
+    const proofs = asJsonArray(proposal.proofs, "proofs");
+    const proof = asJsonObject(proofs[0], "first proof");
+    proof.command = proseCase.proofCommand;
+    proof.positiveOracle = proseCase.positiveOracle;
+    const negativeControls = asJsonArray(proof.negativeControls, "negative controls");
+    asJsonObject(negativeControls[0], "first negative control").description = proseCase.negativeControl;
+    proof.sourceRefs = taskRefs;
+    const workflows = asJsonArray(proposal.workflows, "workflows");
+    asJsonObject(workflows[0], "first workflow").sourceRefs = taskRefs;
+    const protectedActions = asJsonArray(proposal.protectedActions, "protected actions");
+    const protectedAction = asJsonObject(protectedActions[0], "first protected action");
+    protectedAction.kind = "promotion";
+    protectedAction.target = proseCase.protectedActionTarget;
+    protectedAction.operatorDecision = "approve_promotion";
+    protectedAction.sourceRefs = [
+      sourceReference(selectedSourcePath, proseCase.protectedActionQuote),
+    ];
+    proposal.protectedActions = [protectedAction];
+    assertProposalSourceRefs(proposal, sourceBytes);
+    const proposalPath = join(packetRoot, "authoring-proposal.json");
+    await writeFile(proposalPath, `${JSON.stringify(proposal, null, 2)}\n`);
+    return {
+      packetRoot,
+      cleanupRoot: scaffold.packetRoot,
+      manifestPath: freezeResult.manifestPath,
+      receiptPath: freezeResult.receiptPath,
+      proposalPath,
+      sidecarPath: join(packetRoot, "candidate.sidecar.json"),
+      policyPath: join(packetRoot, "execution-plan.json"),
+      selectedPrdPath,
+      selectedSourcePath,
+      contextSourcePath,
+      originalSelectedBytes,
+      packetHash: freezeResult.packet.packetHash,
+    };
+  } catch (error) {
+    await rm(scaffold.packetRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 function fixtureAdapter(
   providerScriptPath: string,
   providerMarkerPath: string,
@@ -885,6 +1352,633 @@ pgTest("CCC PRD product vertical acceptance", { timeout: 60_000 }, () => {
       }
     },
   );
+
+  const runProseAcceptance = async (
+    proseCase: ProseCase,
+    refusalOnly: boolean,
+  ): Promise<void> => {
+    const targetRoot = await mkdtemp(
+      join(tmpdir(), "ccc-product-prose-target-"),
+    );
+    const baseCommit = await initializeTarget(targetRoot);
+    let packet: FrozenProsePacket;
+    try {
+      packet = await createFrozenProsePacket(targetRoot, baseCommit, proseCase);
+    } catch (error) {
+      await rm(targetRoot, { recursive: true, force: true });
+      throw error;
+    }
+    const store = h.store();
+    let projectResolutions = 0;
+    let authoringServer: Server | undefined;
+    try {
+      const authoringRequests: Array<Record<string, unknown>> = [];
+      const proposalText = await readFile(packet.proposalPath, "utf8");
+      authoringServer = createServer((request, response) => {
+        const chunks: Buffer[] = [];
+        request.on("data", (chunk: Buffer) => chunks.push(chunk));
+        request.on("end", () => {
+          const rawBody = Buffer.concat(chunks).toString("utf8");
+          const body = rawBody.length > 0
+            ? JSON.parse(rawBody) as Record<string, unknown>
+            : {};
+          authoringRequests.push({
+            method: request.method,
+            url: request.url,
+            body,
+          });
+          if (request.method === "GET" && request.url === "/v1/models") {
+            response.writeHead(200, { "content-type": "application/json" });
+            response.end(JSON.stringify({
+              object: "list",
+              data: [{
+                id: "vertical-authoring-model",
+                object: "model",
+                owned_by: "ccc-product-authoring",
+              }],
+            }));
+            return;
+          }
+          response.writeHead(200, { "content-type": "text/event-stream" });
+          response.write(`data: ${JSON.stringify({
+            id: "chatcmpl-ccc-product-author",
+            object: "chat.completion.chunk",
+            model: "vertical-authoring-model",
+            choices: [{
+              index: 0,
+              delta: { role: "assistant", content: proposalText },
+              finish_reason: null,
+            }],
+          })}\n\n`);
+          response.write(`data: ${JSON.stringify({
+            id: "chatcmpl-ccc-product-author",
+            object: "chat.completion.chunk",
+            model: "vertical-authoring-model",
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+            }],
+            usage: {
+              prompt_tokens: 1,
+              completion_tokens: 1,
+              total_tokens: 2,
+            },
+          })}\n\n`);
+          response.end("data: [DONE]\n\n");
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        authoringServer!.once("error", reject);
+        authoringServer!.listen(0, "127.0.0.1", resolve);
+      });
+      const authoringAddress = authoringServer.address() as AddressInfo;
+      const authoringProvider = {
+        id: "ccc-product-authoring",
+        name: "CCC Product Authoring",
+        apiType: "openai-compatible" as const,
+        baseUrl: `http://127.0.0.1:${authoringAddress.port}/v1`,
+        apiKey: "fixture-key",
+        models: [{
+          id: "vertical-authoring-model",
+          name: "Vertical Authoring Model",
+          verbatimCapable: true,
+        }],
+      };
+      const authoringSettings = new GlobalSettingsStore(
+        resolveGlobalDirForHome(process.env.HOME!),
+      );
+      await authoringSettings.updateSettings({
+        customProviders: [authoringProvider],
+      });
+      const currentSettings = await store.getSettings();
+      await store.updateGlobalSettings({
+        experimentalFeatures: {
+          ...(currentSettings.experimentalFeatures ?? {}),
+          cliAgentExecutor: true,
+        },
+        customProviders: [authoringProvider],
+      });
+      await store.updateSettings({
+        pollIntervalMs: 60_000,
+        maxConcurrent: 1,
+        maxWorktrees: 1,
+      });
+
+      const dependencies: PrdCommandDependencies = {
+        bootstrapProofAdmission: () =>
+          bootstrapCccCampaignProofAdmissionHost({
+            builtRootPath: engineDistRoot,
+          }),
+        resolveProject: async () => {
+          projectResolutions += 1;
+          return {
+            projectId: h.layer().projectId ?? "ccc-product-prose",
+            projectPath: targetRoot,
+            projectName: "CCC Product Prose",
+            isRegistered: true,
+            store,
+          };
+        },
+        closeProjectStore: async () => undefined,
+        readTargetHead: async () =>
+          git(targetRoot, "rev-parse", "refs/heads/main"),
+      };
+      const manifest = JSON.parse(
+        await readFile(packet.manifestPath, "utf8"),
+      ) as {
+        entries: Array<{
+          relative_path: string;
+          role: string;
+          authoritative: boolean;
+          sha256: string;
+        }>;
+      };
+      const receipt = JSON.parse(
+        await readFile(packet.receiptPath, "utf8"),
+      ) as {
+        entries: Array<{
+          relativePath: string;
+          sha256: string;
+          byteLength: number;
+        }>;
+      };
+      const sourceBytes = new Map<string, Buffer>();
+      for (const entry of manifest.entries.filter(({ authoritative }) => authoritative)) {
+        sourceBytes.set(
+          entry.relative_path,
+          await readFile(join(packet.packetRoot, entry.relative_path)),
+        );
+      }
+      const assertFrozenSourceIntegrity = async (): Promise<void> => {
+        expect(await readFile(packet.selectedPrdPath))
+          .toEqual(packet.originalSelectedBytes);
+        expect(await readFile(join(packet.packetRoot, packet.selectedSourcePath)))
+          .toEqual(packet.originalSelectedBytes);
+        for (const entry of manifest.entries) {
+          const bytes = await readFile(join(packet.packetRoot, entry.relative_path));
+          expect(sha256(bytes)).toBe(entry.sha256);
+          const frozen = receipt.entries.find(({ relativePath }) =>
+            relativePath === entry.relative_path);
+          expect(frozen).toBeDefined();
+          expect(frozen!.sha256).toBe(entry.sha256);
+          expect(frozen!.byteLength).toBe(bytes.byteLength);
+        }
+      };
+      await assertFrozenSourceIntegrity();
+
+      const authored = await runProductCommand([
+        "author",
+        packet.packetRoot,
+        packet.manifestPath,
+        packet.sidecarPath,
+        "--target",
+        targetRoot,
+        "--base",
+        baseCommit,
+        "--provider",
+        "ccc-product-authoring",
+        "--model",
+        "vertical-authoring-model",
+        "--max-requests",
+        "2",
+        "--max-duration-ms",
+        "120000",
+        "--max-concurrency",
+        "1",
+        "--max-prompt-bytes",
+        "262144",
+        "--max-response-bytes",
+        "262144",
+        "--max-review-items",
+        "4",
+      ], dependencies);
+      expect(authored).toMatchObject({
+        exitCode: 0,
+        values: [{
+          kind: "candidate",
+          sidecarPath: packet.sidecarPath,
+        }],
+      });
+      const emittedProposal = JSON.parse(proposalText) as JsonObject;
+      expect(emittedProposal.schema).toBe("ccc-prd.authoring-proposal.v2");
+      expect(asJsonArray(emittedProposal.requirements, "emitted requirements")).toHaveLength(1);
+      expect(asJsonArray(emittedProposal.proofs, "emitted proofs")).toHaveLength(1);
+      expect(asJsonArray(emittedProposal.tasks, "emitted tasks")).toHaveLength(1);
+      expect(asJsonArray(emittedProposal.workflows, "emitted workflows")).toHaveLength(1);
+      expect(authoringRequests.filter(({ method }) => method === "POST"))
+        .toHaveLength(1);
+      await assertFrozenSourceIntegrity();
+
+      const sidecar = JSON.parse(
+        await readFile(packet.sidecarPath, "utf8"),
+      ) as {
+        requirements: unknown[];
+        tasks: unknown[];
+        unresolvedDecisions: unknown[];
+        materialCoverage?: unknown[];
+      };
+      const analysis = analyzeCccPrdMaterialCoverage({
+        sourceBytes,
+        requirements: sidecar.requirements as Parameters<
+          typeof analyzeCccPrdMaterialCoverage
+        >[0]["requirements"],
+        tasks: sidecar.tasks as Parameters<
+          typeof analyzeCccPrdMaterialCoverage
+        >[0]["tasks"],
+        unresolvedDecisions: sidecar.unresolvedDecisions as Parameters<
+          typeof analyzeCccPrdMaterialCoverage
+        >[0]["unresolvedDecisions"],
+      });
+      const materialKey = (value: unknown) => {
+        const item = value as {
+          sourcePath: string;
+          materialKind: string;
+          title: string;
+          spans: Array<{
+            byteStart: number;
+            byteEnd: number;
+            sha256: string;
+          }>;
+          disposition?: { kind: string };
+        };
+        if (!Array.isArray(item.spans) || item.spans.length !== 1) {
+          throw new Error("each material inventory item must have exactly one source span");
+        }
+        const span = item.spans[0]!;
+        return {
+          sourcePath: item.sourcePath,
+          materialKind: item.materialKind,
+          title: item.title,
+          spans: [{
+            byteStart: span.byteStart,
+            byteEnd: span.byteEnd,
+            sha256: span.sha256,
+          }],
+          ...(item.disposition ? { disposition: item.disposition.kind } : {}),
+        };
+      };
+      const expectedSpecs = [
+        ...proseCase.materials,
+        ...CONTEXT_MATERIALS,
+      ];
+      const expectedKeys = expectedSpecs.map((spec) => {
+        const sourcePath = spec.source === "selected"
+          ? packet.selectedSourcePath
+          : packet.contextSourcePath;
+        const bytes = sourceBytes.get(sourcePath);
+        if (!bytes) throw new Error(`missing source bytes for ${sourcePath}`);
+        const span = findUniqueByteAnchor(bytes, spec.anchor);
+        return {
+          sourcePath,
+          materialKind: spec.materialKind,
+          title: spec.materialKind === "requirement"
+            ? "REQ-VERTICAL"
+            : spec.anchor.replace(/^#+\s+/u, ""),
+          spans: [{
+            byteStart: span.byteStart,
+            byteEnd: span.byteEnd,
+            sha256: sha256(bytes),
+          }],
+          disposition: spec.disposition,
+        };
+      });
+      const expectedInventoryKeys = expectedKeys.map((value) =>
+        Object.fromEntries(
+          Object.entries(value).filter(([key]) => key !== "disposition"),
+        ));
+      const sortedKeys = (values: unknown[]) => values
+        .map(materialKey)
+        .sort((left, right) => String(JSON.stringify(left))
+          .localeCompare(String(JSON.stringify(right))));
+      expect(analysis.missing).toHaveLength(0);
+      expect(analysis.conflicts).toHaveLength(0);
+      expect(analysis.inventory.every(({ spans }) => spans.length === 1)).toBe(true);
+      expect(expectedKeys.every(({ spans }) => spans.length === 1)).toBe(true);
+      expect(sortedKeys(analysis.inventory)).toEqual(sortedKeys(expectedInventoryKeys));
+      expect(sortedKeys(analysis.coverage)).toEqual(sortedKeys(expectedKeys));
+      expect(sidecar.materialCoverage).toBeDefined();
+      expect(sortedKeys(sidecar.materialCoverage!)).toEqual(sortedKeys(analysis.coverage));
+      expect(analysis.inventory.some(({ title }) => title === "Optional empty heading"))
+        .toBe(false);
+
+      const compilerArgs = [
+        packet.packetRoot,
+        packet.manifestPath,
+        packet.sidecarPath,
+        targetRoot,
+        baseCommit,
+      ];
+      const validated = await runProductCommand(
+        ["validate", ...compilerArgs],
+        dependencies,
+      );
+      expect(validated).toMatchObject({
+        exitCode: 0,
+        values: [{ kind: "diagnostics", valid: true }],
+      });
+      await assertFrozenSourceIntegrity();
+      const compiled = await runProductCommand(
+        ["compile", ...compilerArgs],
+        dependencies,
+      );
+      expect(compiled).toMatchObject({
+        exitCode: 0,
+        values: [{
+          kind: "bundle",
+          tasks: [expect.objectContaining({
+            id: "TASK-VERTICAL",
+            ownedPaths: ["src/value.txt"],
+            allowedWriteRoots: ["src/value.txt"],
+          })],
+          workflows: [expect.objectContaining({
+            taskIds: ["TASK-VERTICAL"],
+            entryTaskIds: ["TASK-VERTICAL"],
+            terminalTaskIds: ["TASK-VERTICAL"],
+          })],
+        }],
+      });
+      const bundle = compiled.values[0] as {
+        kind: "bundle";
+        sourceHash: string;
+        sidecarHash: string;
+        bundleHash: string;
+        provenance: { packetHash: string };
+        tasks: Array<{
+          id: string;
+          ownedPaths: string[];
+          allowedWriteRoots: string[];
+        }>;
+        workflows: Array<{
+          taskIds: string[];
+          entryTaskIds: string[];
+          terminalTaskIds: string[];
+        }>;
+      };
+      expect(bundle.tasks).toHaveLength(1);
+      expect(bundle.workflows).toHaveLength(1);
+      expect(bundle.sourceHash).toBe(packet.packetHash);
+      expect(bundle.provenance.packetHash).toBe(packet.packetHash);
+      expect(bundle.sidecarHash).toBe(
+        sha256(await readFile(packet.sidecarPath)),
+      );
+      expect(bundle.bundleHash).toMatch(/^[a-f0-9]{64}$/u);
+      await assertFrozenSourceIntegrity();
+      const policy = await runProductCommand([
+        "policy",
+        packet.packetRoot,
+        packet.manifestPath,
+        packet.sidecarPath,
+        targetRoot,
+        baseCommit,
+        packet.policyPath,
+        "--provider",
+        "vertical-fixture-provider",
+        "--model",
+        "vertical-fixture-model",
+        "--transport",
+        "cli",
+        "--cli-adapter",
+        "ccc-product-vertical-fixture",
+      ], dependencies);
+      expect(policy).toMatchObject({
+        exitCode: 0,
+        values: [{ kind: "execution-plan" }],
+      });
+      const policyValue = policy.values[0] as {
+        kind: "execution-plan";
+        path: string;
+        sha256: string;
+        packetHash: string;
+        sidecarHash: string;
+        bundleHash: string;
+      };
+      expect(policyValue.path).toBe(packet.policyPath);
+      expect(policyValue.sha256).toBe(
+        sha256(await readFile(packet.policyPath)),
+      );
+      expect(policyValue.packetHash).toBe(bundle.sourceHash);
+      expect(policyValue.sidecarHash).toBe(bundle.sidecarHash);
+      expect(policyValue.bundleHash).toBe(bundle.bundleHash);
+      const executionPlan = JSON.parse(
+        await readFile(packet.policyPath, "utf8"),
+      ) as {
+        schema: string;
+        packetHash: string;
+        sidecarHash: string;
+        bundleHash: string;
+        policy: unknown;
+      };
+      expect(executionPlan).toMatchObject({
+        schema: "ccc-prd.execution-plan.v1",
+        packetHash: bundle.sourceHash,
+        sidecarHash: bundle.sidecarHash,
+        bundleHash: bundle.bundleHash,
+        policy: expect.any(Object),
+      });
+      await assertFrozenSourceIntegrity();
+
+      const productArgs = [
+        packet.packetRoot,
+        packet.manifestPath,
+        packet.sidecarPath,
+        packet.policyPath,
+        targetRoot,
+        baseCommit,
+      ];
+      const filesystemBeforeRefusal = await snapshotNonGitFilesystem(targetRoot);
+      const databaseSnapshot = async () => {
+        const tables = [
+          "ccc_prd_imports",
+          "ccc_prd_import_entities",
+          "ccc_prd_import_sources",
+          "missions",
+          "tasks",
+          "workflows",
+          "task_workflow_selection",
+          "task_documents",
+          "artifacts",
+          "workflow_work_items",
+          "run_audit_events",
+        ] as const;
+        const snapshot: Record<string, string> = {};
+        for (const table of tables) {
+          const rows = await h.layer().db.execute(sql.raw(
+            `SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb) AS rows FROM project.${table} AS t`,
+          )) as unknown as Array<{ rows: unknown }>;
+          snapshot[table] = JSON.stringify(rows[0]?.rows ?? []);
+        }
+        return snapshot;
+      };
+
+      if (!refusalOnly) {
+        const preview = await runProductCommand(
+          ["preview", ...productArgs],
+          dependencies,
+        );
+        expect(preview).toMatchObject({
+          exitCode: 0,
+          values: [{
+            kind: "preview",
+            confirmationDigest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          }],
+        });
+        await assertFrozenSourceIntegrity();
+        const previewValue = preview.values[0] as {
+          confirmationDigest: string;
+          packetHash: string;
+          sidecarHash: string;
+          bundleHash: string;
+        };
+        expect(previewValue.packetHash).toBe(bundle.sourceHash);
+        expect(previewValue.sidecarHash).toBe(bundle.sidecarHash);
+        expect(previewValue.bundleHash).toBe(bundle.bundleHash);
+        const imported = await runProductCommand([
+          "import",
+          ...productArgs,
+          `ccc-product-prose-${proseCase.prdFile}`,
+          "--confirm",
+          previewValue.confirmationDigest,
+        ], dependencies);
+        expect(imported).toMatchObject({
+          exitCode: 0,
+          values: [{
+            kind: "imported",
+            result: expect.objectContaining({ state: "active" }),
+          }],
+        });
+        await assertFrozenSourceIntegrity();
+        const importedValue = imported.values[0] as {
+          result: {
+            bundleHash: string;
+            directCounts: {
+              campaigns: number;
+              tasks: number;
+              workflows: number;
+              workItems: number;
+            };
+          };
+        };
+        expect(importedValue.result.bundleHash).toBe(bundle.bundleHash);
+        expect(importedValue.result.directCounts).toEqual(expect.objectContaining({
+          campaigns: 1,
+          tasks: 1,
+          workflows: 1,
+          workItems: 1,
+        }));
+        const importedTables = await databaseSnapshot();
+        const importRows = JSON.parse(importedTables.ccc_prd_imports) as Array<{
+          packet_hash: string;
+          sidecar_hash: string;
+          bundle_hash: string;
+          state: string;
+        }>;
+        expect(importRows).toHaveLength(1);
+        expect(importRows[0]).toMatchObject({
+          packet_hash: bundle.sourceHash,
+          sidecar_hash: bundle.sidecarHash,
+          bundle_hash: bundle.bundleHash,
+          state: "active",
+        });
+        const sourceRows = JSON.parse(importedTables.ccc_prd_import_sources) as Array<{
+          path: string;
+          raw_sha256: string;
+          byte_length: number;
+        }>;
+        expect(sourceRows).toHaveLength(manifest.entries.length);
+        for (const entry of manifest.entries) {
+          const sourceRow = sourceRows.find(({ path }) => path === entry.relative_path);
+          expect(sourceRow).toMatchObject({
+            path: entry.relative_path,
+            raw_sha256: entry.sha256,
+            byte_length: (sourceBytes.get(entry.relative_path) ?? Buffer.alloc(0)).byteLength,
+          });
+        }
+        const entityRows = JSON.parse(importedTables.ccc_prd_import_entities) as Array<{
+          entity_type: string;
+          entity_id: string;
+          native_id: string;
+        }>;
+        const taskEntities = entityRows.filter(({ entity_type }) => entity_type === "task");
+        const workflowEntities = entityRows.filter(({ entity_type }) => entity_type === "workflow");
+        const workItemEntities = entityRows.filter(({ entity_type }) => entity_type === "work_item");
+        expect(taskEntities).toHaveLength(1);
+        expect(taskEntities[0]).toMatchObject({
+          entity_id: "TASK-VERTICAL",
+          native_id: expect.stringMatching(/^[A-Z][A-Z0-9]*-\d+$/u),
+        });
+        expect(workflowEntities).toHaveLength(1);
+        expect(workflowEntities[0]).toMatchObject({
+          entity_id: "WORKFLOW-VERTICAL",
+          native_id: expect.stringContaining("--WORKFLOW-VERTICAL"),
+        });
+        expect(workItemEntities).toHaveLength(1);
+        expect(workItemEntities[0]).toMatchObject({
+          entity_id: "WORKFLOW-VERTICAL",
+          native_id: expect.stringContaining("--IMPORT-VERTICAL-WORK-ITEM"),
+        });
+        return;
+      }
+
+      const damagedSidecar = JSON.parse(
+        await readFile(packet.sidecarPath, "utf8"),
+      ) as { materialCoverage?: unknown[] };
+      damagedSidecar.materialCoverage = damagedSidecar.materialCoverage?.slice(0, -1);
+      await writeFile(packet.sidecarPath, `${JSON.stringify(damagedSidecar)}\n`);
+      const packetBeforeRefusal = await snapshotNonGitFilesystem(packet.packetRoot);
+      const databaseBeforeRefusal = await databaseSnapshot();
+      const refusalResults = [
+        await runProductCommand(["validate", ...compilerArgs], dependencies),
+        await runProductCommand(["compile", ...compilerArgs], dependencies),
+        await runProductCommand(["preview", ...productArgs], dependencies),
+        await runProductCommand([
+          "import",
+          ...productArgs,
+          "ccc-product-prose-refusal",
+          "--confirm",
+          "0".repeat(64),
+        ], dependencies),
+      ];
+      for (const result of refusalResults) {
+        expect(result.exitCode).toBe(1);
+        expect(result.values).toEqual([
+          expect.objectContaining({
+            diagnostics: expect.arrayContaining([
+              expect.objectContaining({ code: "CCC_PRD_MATERIAL_COVERAGE_INVALID" }),
+            ]),
+          }),
+        ]);
+      }
+      await assertFrozenSourceIntegrity();
+      expect(projectResolutions).toBe(0);
+      expect(await snapshotNonGitFilesystem(packet.packetRoot))
+        .toEqual(packetBeforeRefusal);
+      expect(await snapshotNonGitFilesystem(targetRoot))
+        .toEqual(filesystemBeforeRefusal);
+      expect(await databaseSnapshot()).toEqual(databaseBeforeRefusal);
+    } finally {
+      __resetWorkflowExtensionRegistryForTests();
+      if (authoringServer) {
+        authoringServer.closeAllConnections();
+        await new Promise<void>((resolve, reject) => {
+          authoringServer!.close((error) => error ? reject(error) : resolve());
+        });
+      }
+      await rm(packet.cleanupRoot, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+    }
+  };
+
+  it.each(PROSE_CASES)(
+    "imports $label from guided freeze through generated author and disposable PostgreSQL",
+    async (proseCase) => {
+      await runProseAcceptance(proseCase, false);
+    },
+  );
+
+  it("refuses damaged prose coverage with zero packet, target, or importer residue", async () => {
+    await runProseAcceptance(PROSE_CASES[0]!, true);
+  });
 
   it("takes a frozen packet through CLI admission, real runtime coding, executed proof, and exact human landing approval", async () => {
     const rootDir = h.rootDir();
