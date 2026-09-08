@@ -45,6 +45,12 @@ import { resolveIntegrationBranch } from "./integration-branch.js";
 import { activeSessionRegistry, type ActiveSessionRegistry } from "./active-session-registry.js";
 import { isImportedCccCampaignTask } from "./ccc-campaign-routing.js";
 import { PermanentError } from "./engine-errors.js";
+import {
+  transitionWorktreeOwnershipMarkers,
+  WorktreeOwnershipError,
+  type WorktreeOwnershipContext,
+  type WorktreeOwnershipCreationReceipt,
+} from "./worktree-ownership.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -144,7 +150,7 @@ export interface AcquireTaskWorktreeOptions {
     taskId: string,
     startPoint?: string,
     allowSiblingBranchRename?: boolean,
-  ) => Promise<{ path: string; branch: string }>;
+  ) => Promise<CreatedTaskWorktree>;
   runConfiguredCommand?: (command: string, cwd: string, timeoutMs: number, env?: NodeJS.ProcessEnv) => Promise<{
     spawnError?: string | Error;
     timedOut?: boolean;
@@ -156,7 +162,15 @@ export interface AcquireTaskWorktreeOptions {
   }>;
   taskEnv?: NodeJS.ProcessEnv;
   backend?: WorktreeBackend;
+  ownershipContext?: WorktreeOwnershipContext;
+  requireOwnership?: boolean;
 }
+
+export type CreatedTaskWorktree = {
+  path: string;
+  branch: string;
+  ownershipReceipt?: WorktreeOwnershipCreationReceipt;
+};
 
 export interface AcquireTaskWorktreeResult {
   worktreePath: string;
@@ -420,7 +434,7 @@ async function assertCccCampaignBranchNotForeign(input: {
 }
 
 export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Promise<AcquireTaskWorktreeResult> {
-  const { task, rootDir, store, settings, pool, logger, audit, runContext, createWorktree, runConfiguredCommand, runInitCommand, taskEnv, secretsStore } = opts;
+  const { task, rootDir, store, settings, pool, logger, audit, runContext, createWorktree, runConfiguredCommand, runInitCommand, taskEnv, secretsStore, ownershipContext, requireOwnership = false } = opts;
   const notifyFallback = async (op: WorktrunkOpName, stderr?: string) => {
     await store.logEntry(task.id, `Worktrunk ${op} failed; continuing with native worktree backend (${stderr ?? "no stderr"})`, undefined, runContext);
   };
@@ -581,6 +595,8 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
             taskId: createTaskId,
             reason: RemovalReason.ExecutorDispose,
             force: true,
+            ownershipContext,
+            requireOwnership,
           });
         },
       });
@@ -662,7 +678,7 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
   };
 
   const finalizeCreatedWorktree = async (
-    created: { path: string; branch: string },
+    created: CreatedTaskWorktree,
     source: "fresh" | "pool",
     logOrigin: "normal" | "return-guard",
   ): Promise<AcquireTaskWorktreeResult> => {
@@ -678,7 +694,21 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
 
     worktreePath = created.path;
     branch = created.branch;
+    if ((requireOwnership || ownershipContext) && (!ownershipContext || !created.ownershipReceipt)) {
+      throw new WorktreeOwnershipError(
+        "MARKER_CONTEXT_MISMATCH",
+        `Fresh worktree ${created.path} did not return a bound ownership creation receipt`,
+      );
+    }
     await store.updateTask(task.id, { worktree: created.path, branch: created.branch });
+    if (ownershipContext && created.ownershipReceipt) {
+      await transitionWorktreeOwnershipMarkers({
+        authority: ownershipContext.mutationAuthority,
+        creatingBytes: created.ownershipReceipt.creatingBytes,
+        adminMarkerPath: created.ownershipReceipt.adminMarkerPath,
+        worktreeMarkerPath: created.ownershipReceipt.worktreeMarkerPath,
+      });
+    }
     await audit?.git({ type: "worktree:create", target: created.path, metadata: { branch: created.branch, source: logOrigin === "return-guard" ? "acquire-return-guard" : undefined } });
     await audit?.git({ type: "branch:create", target: created.branch });
     if (created.branch !== branchName) {
@@ -857,6 +887,8 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
             reason: RemovalReason.PoolPrune,
             taskId: task.id,
             audit: undefined,
+            ownershipContext,
+            requireOwnership,
           });
         } catch (removeErr) {
           /*
@@ -973,6 +1005,8 @@ export async function acquireTaskWorktree(opts: AcquireTaskWorktreeOptions): Pro
                 reason: RemovalReason.PoolPrune,
                 taskId: task.id,
                 audit: undefined,
+                ownershipContext,
+                requireOwnership,
               });
             } catch (removeErr) {
               logger?.warn(`${task.id}: failed to remove unusable pooled worktree ${worktreePath}: ${formatError(removeErr)}`);

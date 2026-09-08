@@ -205,23 +205,37 @@ export async function acquireEngineSingleton(
   let server: net.Server | undefined;
   let held = false;
   let compromised = false;
+  let released = false;
+  let compromiseNotified = false;
   const socketPath = computeEngineSocketPath(projectId);
+  const revoke = (error?: Error) => {
+    compromised = true;
+    held = false;
+    if (error && !released && !compromiseNotified) {
+      compromiseNotified = true;
+      onCompromised(error);
+    }
+  };
   try {
     try {
       server = await bindLoopback(socketPath);
+      server.once("close", () => {
+        if (!released) revoke(new EngineMutationAuthorityError());
+      });
     } catch (err) {
       throw new EngineAlreadyRunningError(projectId, "socket", err);
     }
     try {
       lock = await acquireLockfile(workingDir, (error) => {
-        compromised = true;
-        held = false;
-        onCompromised(error);
+        revoke(error);
       });
-      held = !compromised;
     } catch (err) {
       throw new EngineAlreadyRunningError(projectId, "lockfile", err);
     }
+    if (compromised || !server.listening) {
+      throw new EngineMutationAuthorityError();
+    }
+    held = true;
   } catch (err) {
     if (server) {
       await closeServer(server).catch(() => {});
@@ -232,7 +246,6 @@ export async function acquireEngineSingleton(
     throw err;
   }
 
-  let released = false;
   const lockPath = lock.path;
   const release = lock.release;
   const boundServer = server;

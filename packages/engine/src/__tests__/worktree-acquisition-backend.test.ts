@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,11 @@ vi.mock("../worktree-hooks.js", () => ({
 }));
 import { acquireTaskWorktree } from "../worktree-acquisition.js";
 import type { WorktreeBackend } from "../worktree-backend.js";
+import {
+  createWorktreeOwnershipMarker,
+  parseWorktreeOwnershipMarker,
+  writeWorktreeOwnershipMarkers,
+} from "../worktree-ownership.js";
 
 vi.mock("../worktree-pool.js", async () => {
   const actual = await vi.importActual<any>("../worktree-pool.js");
@@ -19,16 +24,19 @@ vi.mock("../worktree-db-hydrate.js", () => ({
   hydrateWorktreeDb: vi.fn().mockResolvedValue({ degraded: false, tasksCopied: 1, documentsCopied: 1, artifactsCopied: 0 }),
 }));
 
-const { execMock, existsSyncMock } = vi.hoisted(() => {
+const { execMock, execFileMock, existsSyncMock } = vi.hoisted(() => {
   const mock = vi.fn();
   (mock as any)[Symbol.for("nodejs.util.promisify.custom")] = mock;
+  const fileMock = vi.fn();
+  (fileMock as any)[Symbol.for("nodejs.util.promisify.custom")] = fileMock;
   return {
     execMock: mock,
+    execFileMock: fileMock,
     existsSyncMock: vi.fn(),
   };
 });
 
-vi.mock("node:child_process", () => ({ exec: execMock, execFile: vi.fn() }));
+vi.mock("node:child_process", () => ({ exec: execMock, execFile: execFileMock }));
 /*
 FNXC:EngineTests 2026-07-17-11:55:
 Path reservation writes lock state under rootDir/.worktrees. Use real fs/promises
@@ -56,6 +64,8 @@ describe("acquireTaskWorktree backend wiring", () => {
 
   beforeEach(() => {
     execMock.mockReset();
+    execFileMock.mockReset();
+    execFileMock.mockResolvedValue({ stdout: "", stderr: "" });
     existsSyncMock.mockReset();
     existsSyncMock.mockReturnValue(true);
     store.updateTask.mockClear();
@@ -315,5 +325,60 @@ describe("acquireTaskWorktree backend wiring", () => {
       "git remote",
       expect.objectContaining({ cwd: rootDir }),
     );
+  });
+
+  it("persists the task binding before transitioning a creation receipt to managed", async () => {
+    const rootDir = await makeRootDir();
+    const worktreePath = join(rootDir, ".worktrees", "fn-1");
+    const repositoryCommonDir = join(rootDir, ".git");
+    const worktreeGitDir = join(repositoryCommonDir, "worktrees", "fn-1");
+    const adminMarkerPath = join(worktreeGitDir, "fusion-owner.json");
+    const worktreeMarkerPath = join(worktreePath, ".fusion", "fusion-owner.json");
+    await Promise.all([
+      mkdir(worktreePath, { recursive: true }),
+      mkdir(worktreeGitDir, { recursive: true }),
+    ]);
+    const authority = { assertHeld: vi.fn() };
+    const ownershipContext = Object.freeze({
+      projectId: "project-1",
+      projectRoot: rootDir,
+      engineInstanceId: "engine-1",
+      mutationAuthority: authority,
+    });
+    const marker = createWorktreeOwnershipMarker({
+      context: ownershipContext,
+      repositoryCommonDir,
+      worktreePath,
+      worktreeGitDir,
+    });
+    const creatingBytes = await writeWorktreeOwnershipMarkers({
+      authority,
+      marker,
+      adminMarkerPath,
+      worktreeMarkerPath,
+    });
+    let bindingObservedCreating = false;
+    store.updateTask.mockImplementation(async (_taskId: string, patch: { worktree?: string }) => {
+      if (patch.worktree === worktreePath) {
+        bindingObservedCreating = parseWorktreeOwnershipMarker(await readFile(worktreeMarkerPath)).lifecycle === "creating";
+      }
+    });
+
+    await acquireTaskWorktree({
+      task,
+      rootDir,
+      store,
+      settings: { worktreeNaming: "random" } as any,
+      ownershipContext,
+      createWorktree: vi.fn().mockResolvedValue({
+        path: worktreePath,
+        branch: "fusion/fn-1",
+        ownershipReceipt: { creatingBytes, adminMarkerPath, worktreeMarkerPath },
+      }),
+    } as any);
+
+    expect(bindingObservedCreating).toBe(true);
+    expect(parseWorktreeOwnershipMarker(await readFile(adminMarkerPath)).lifecycle).toBe("managed");
+    expect(await readFile(worktreeMarkerPath)).toEqual(await readFile(adminMarkerPath));
   });
 });

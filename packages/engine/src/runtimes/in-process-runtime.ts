@@ -562,7 +562,11 @@ export class InProcessRuntime
       const { reapOrphanWorktrees, scanIdleWorktrees } = await import("../worktree-pool.js");
       const settings = await this.taskStore.getSettings();
       try {
-        const reaped = await reapOrphanWorktrees(this.config.workingDirectory, settings);
+        const reaped = await reapOrphanWorktrees(
+          this.config.workingDirectory,
+          settings,
+          this.config.worktreeOwnershipContext,
+        );
         if (reaped > 0) {
           runtimeLog.log(`Reaped ${reaped} half-initialized orphan worktree(s) on startup`);
         }
@@ -590,6 +594,7 @@ export class InProcessRuntime
         this.config.workingDirectory,
         this.taskStore,
         settings,
+        this.config.worktreeOwnershipContext,
       );
       if (idleWorktrees.length > 0) {
         this.worktreePool.rehydrate(idleWorktrees);
@@ -892,6 +897,8 @@ export class InProcessRuntime
         messageStore: this.messageStore,
         missionStore,
         reflectionService,
+        worktreeOwnershipContext: this.config.worktreeOwnershipContext,
+        requireWorktreeOwnership: this.config.engineInstanceId !== undefined,
         // PR-entity nodes (U3): assemble the handler deps from the CLI-injected
         // GitHub ops (createPr/mergePr/respond) + the engine-owned store. The CLI
         // layer never holds a store reference; the engine binds it here. Absent

@@ -4,6 +4,7 @@ import {
   chmod,
   link,
   lstat,
+  mkdir,
   open,
   readFile,
   rename,
@@ -30,6 +31,12 @@ export type WorktreeOwnershipContext = Readonly<{
   projectRoot: string;
   engineInstanceId: string;
   mutationAuthority: EngineMutationAuthority;
+}>;
+
+export type WorktreeOwnershipCreationReceipt = Readonly<{
+  creatingBytes: Buffer;
+  adminMarkerPath: string;
+  worktreeMarkerPath: string;
 }>;
 
 export interface WorktreeOwnershipMarker {
@@ -112,11 +119,13 @@ function assertContext(marker: WorktreeOwnershipMarker, context: WorktreeOwnersh
 export function createWorktreeOwnershipMarker(input: {
   context: WorktreeOwnershipContext;
   ownerId?: string;
-  lifecycle?: WorktreeOwnershipLifecycle;
   repositoryCommonDir: string;
   worktreePath: string;
   worktreeGitDir: string;
 }): WorktreeOwnershipMarker {
+  if ((input as { lifecycle?: unknown }).lifecycle !== undefined) {
+    schemaError("lifecycle is controlled by the ownership transition");
+  }
   if (typeof input.context.projectId !== "string" || input.context.projectId.length === 0) schemaError("projectId must be non-empty");
   assertAbsolute(input.context.projectRoot, "projectRoot");
   assertAbsolute(input.repositoryCommonDir, "repositoryCommonDir");
@@ -128,7 +137,7 @@ export function createWorktreeOwnershipMarker(input: {
     schema: WORKTREE_OWNERSHIP_SCHEMA,
     owner: WORKTREE_OWNERSHIP_OWNER,
     ownerId,
-    lifecycle: input.lifecycle ?? "creating",
+    lifecycle: "creating",
     projectId: input.context.projectId,
     projectRoot: input.context.projectRoot,
     repositoryCommonDir: input.repositoryCommonDir,
@@ -190,24 +199,34 @@ function parseInventory(output: string | Buffer): StrictGitWorktreeInventoryEntr
   const fields = Buffer.from(output).toString("utf8").split("\0");
   const entries: StrictGitWorktreeInventoryEntry[] = [];
   let current: StrictGitWorktreeInventoryEntry | undefined;
+  let seen = new Set<string>();
   for (const field of fields) {
-    if (field === "") continue;
+    if (field === "") {
+      current = undefined;
+      seen = new Set();
+      continue;
+    }
     const separator = field.indexOf(" ");
     const key = separator < 0 ? field : field.slice(0, separator);
     const value = separator < 0 ? "" : field.slice(separator + 1);
     if (key === "worktree") {
+      if (current) throw new Error("worktree record is missing a terminator");
       if (!isAbsolute(value)) throw new Error("worktree path is not absolute");
       current = { path: value };
+      seen = new Set(["worktree"]);
       entries.push(current);
       continue;
     }
     if (!current) throw new Error("inventory field appeared before worktree");
+    if (seen.has(key)) throw new Error(`duplicate inventory field: ${key}`);
+    seen.add(key);
     if (key === "HEAD") current.head = value;
     else if (key === "branch") current.branch = value;
     else if (key === "bare") current.bare = true;
     else if (key === "detached") current.detached = true;
     else if (key === "locked") current.locked = value;
     else if (key === "prunable") current.prunable = value;
+    else throw new Error(`unknown inventory field: ${key}`);
   }
   return entries;
 }
@@ -225,12 +244,101 @@ export async function inspectStrictGitWorktreeInventory(repositoryRoot: string, 
   }
 }
 
+function singleGitPath(output: string | Buffer, cwd: string): string {
+  const value = Buffer.from(output).toString("utf8").trim();
+  if (!value || value.includes("\n") || value.includes("\0")) {
+    throw new Error("Git path probe returned an invalid value");
+  }
+  return isAbsolute(value) ? resolve(value) : resolve(cwd, value);
+}
+
+function comparableWorktreePath(path: string): string {
+  const resolved = resolve(path);
+  return resolved.startsWith("/private/var/") ? resolved.slice("/private".length) : resolved;
+}
+
+/**
+ * Build every input to the strict classifier from live Git state. Any failed
+ * or malformed probe returns an ambiguous classification, so maintenance can
+ * retain the path instead of guessing ownership.
+ */
+export async function inspectWorktreeOwnership(input: {
+  context: WorktreeOwnershipContext;
+  repositoryRoot: string;
+  worktreePath: string;
+  runGit?: GitInventoryRunner;
+}): Promise<WorktreeOwnershipClassification> {
+  const repositoryRoot = resolve(input.repositoryRoot);
+  const worktreePath = resolve(input.worktreePath);
+  if (resolve(input.context.projectRoot) !== repositoryRoot) {
+    return { kind: "ambiguous", reason: "project-root-mismatch" };
+  }
+  const runGit = input.runGit ?? defaultGitRunner;
+  const inventory = await inspectStrictGitWorktreeInventory(repositoryRoot, runGit);
+  if (!inventory.ok) return { kind: "ambiguous", reason: "inventory-error" };
+  const comparableTarget = comparableWorktreePath(worktreePath);
+  const normalizedInventory: StrictGitWorktreeInventory = {
+    ok: true,
+    entries: inventory.entries.map((entry) => comparableWorktreePath(entry.path) === comparableTarget
+      ? { ...entry, path: worktreePath }
+      : entry),
+  };
+
+  let repositoryCommonDir: string;
+  let worktreeGitDir: string;
+  let markerTrackedOrStaged: boolean;
+  try {
+    const [commonDirResult, gitDirResult, trackedResult] = await Promise.all([
+      runGit(worktreePath, ["rev-parse", "--git-common-dir"]),
+      runGit(worktreePath, ["rev-parse", "--absolute-git-dir"]),
+      runGit(worktreePath, ["ls-files", "--cached", "--", WORKTREE_OWNERSHIP_MARKER_RELATIVE_PATH]),
+    ]);
+    repositoryCommonDir = singleGitPath(commonDirResult.stdout, repositoryRoot);
+    worktreeGitDir = singleGitPath(gitDirResult.stdout, worktreePath);
+    markerTrackedOrStaged = Buffer.from(trackedResult.stdout).toString("utf8").trim().length > 0;
+  } catch {
+    return { kind: "ambiguous", reason: "ownership-probe-failed" };
+  }
+
+  return classifyWorktreeOwnership({
+    context: input.context,
+    inventory: normalizedInventory,
+    repositoryCommonDir,
+    worktreePath,
+    worktreeGitDir,
+    adminMarkerPath: resolve(worktreeGitDir, "fusion-owner.json"),
+    worktreeMarkerPath: resolve(worktreePath, WORKTREE_OWNERSHIP_MARKER_RELATIVE_PATH),
+    gitFilePath: resolve(worktreePath, ".git"),
+    markerTrackedOrStaged,
+  });
+}
+
 async function assertDirectory(path: string): Promise<void> {
   try {
     const stat = await lstat(path);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("not a real directory");
   } catch (error) {
     throw new WorktreeOwnershipError("MARKER_PARENT_INVALID", `Marker parent is invalid: ${path}`, error);
+  }
+}
+
+async function ensureWorktreeMarkerParent(worktreePath: string, markerParent: string): Promise<void> {
+  await assertDirectory(worktreePath);
+  if (markerParent !== resolve(worktreePath, ".fusion")) {
+    throw new WorktreeOwnershipError("MARKER_CONTEXT_MISMATCH", "Worktree marker parent is outside the canonical .fusion child");
+  }
+  try {
+    await assertDirectory(markerParent);
+    return;
+  } catch (error) {
+    if ((error as WorktreeOwnershipError & { cause?: NodeJS.ErrnoException }).cause?.code !== "ENOENT") throw error;
+  }
+  try {
+    await mkdir(markerParent, { mode: 0o700 });
+    await assertDirectory(markerParent);
+  } catch (error) {
+    if (error instanceof WorktreeOwnershipError) throw error;
+    throw new WorktreeOwnershipError("MARKER_PARENT_INVALID", `Marker parent is invalid: ${markerParent}`, error);
   }
 }
 
@@ -286,12 +394,16 @@ export async function writeWorktreeOwnershipMarkers(input: {
   worktreeMarkerPath: string;
 }): Promise<Buffer> {
   assertMutationAuthority(input.authority);
+  if (input.marker.lifecycle !== "creating") {
+    throw new WorktreeOwnershipError("MARKER_TRANSITION_MISMATCH", "Only creating ownership markers may be published");
+  }
   const bytes = serializeWorktreeOwnershipMarker(input.marker);
   parseWorktreeOwnershipMarker(bytes);
   if (input.adminMarkerPath !== resolve(input.marker.worktreeGitDir, "fusion-owner.json")
     || input.worktreeMarkerPath !== resolve(input.marker.worktreePath, WORKTREE_OWNERSHIP_MARKER_RELATIVE_PATH)) {
     throw new WorktreeOwnershipError("MARKER_CONTEXT_MISMATCH", "Marker destinations do not match the ownership marker paths");
   }
+  await ensureWorktreeMarkerParent(input.marker.worktreePath, dirname(input.worktreeMarkerPath));
   await Promise.all([
     assertDirectory(input.marker.repositoryCommonDir),
     assertDirectory(input.marker.worktreePath),
@@ -368,9 +480,10 @@ export async function classifyWorktreeOwnership(input: {
   adminMarkerPath: string;
   worktreeMarkerPath: string;
   gitFilePath: string;
-  markerTrackedOrStaged?: boolean;
+  markerTrackedOrStaged: boolean;
 }): Promise<WorktreeOwnershipClassification> {
   if (!input.inventory.ok) return { kind: "ambiguous", reason: "inventory-error" };
+  if (typeof input.markerTrackedOrStaged !== "boolean") return { kind: "ambiguous", reason: "marker-tracking-unproved" };
   if (input.markerTrackedOrStaged) return { kind: "ambiguous", reason: "marker-tracked-or-staged" };
   if (input.adminMarkerPath !== resolve(input.worktreeGitDir, "fusion-owner.json")
     || input.worktreeMarkerPath !== resolve(input.worktreePath, WORKTREE_OWNERSHIP_MARKER_RELATIVE_PATH)

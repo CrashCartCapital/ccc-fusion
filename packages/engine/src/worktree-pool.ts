@@ -21,6 +21,7 @@ import { removeDesktopBuildArtifacts } from "./worktree-desktop-artifacts.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
 import type { RunAuditor } from "./run-audit.js";
 import { pruneWorktreeAdminEntries } from "./worktree-prune.js";
+import { inspectWorktreeOwnership, type WorktreeOwnershipContext } from "./worktree-ownership.js";
 
 export {
   NativeWorktreeBackend,
@@ -868,6 +869,7 @@ export async function scanIdleWorktrees(
   rootDir: string,
   store: TaskStore,
   settings?: Pick<Settings, "worktreesDir">,
+  ownershipContext?: WorktreeOwnershipContext,
 ): Promise<string[]> {
   const worktreesDir = resolveWorktreesDir(rootDir, settings);
 
@@ -895,7 +897,20 @@ export async function scanIdleWorktrees(
   }
 
   const registeredWorktrees = await getRegisteredWorktreePaths(rootDir);
-  const registeredDirs = dirs.filter((dir) => registeredWorktrees.has(resolve(dir)));
+  let registeredDirs = dirs.filter((dir) => registeredWorktrees.has(resolve(dir)));
+  if (ownershipContext) {
+    const classified = await Promise.all(registeredDirs.map(async (dir) => ({
+      dir,
+      ownership: await inspectWorktreeOwnership({
+        context: ownershipContext,
+        repositoryRoot: rootDir,
+        worktreePath: dir,
+      }),
+    })));
+    registeredDirs = classified
+      .filter(({ ownership }) => ownership.kind === "owned-managed")
+      .map(({ dir }) => dir);
+  }
 
   // Find worktree paths assigned to non-done tasks (active worktrees)
   const tasks = await store.listTasks({ slim: true, includeArchived: false, startupMemo: true });
@@ -931,13 +946,14 @@ export async function cleanupOrphanedWorktrees(
   rootDir: string,
   store: TaskStore,
   settings?: Pick<Settings, "worktreesDir">,
+  ownershipContext?: WorktreeOwnershipContext,
 ): Promise<number> {
   const worktreesDir = resolveWorktreesDir(rootDir, settings);
   if (!existsSync(worktreesDir)) {
     return 0;
   }
 
-  const orphaned = await scanIdleWorktrees(rootDir, store, settings);
+  const orphaned = await scanIdleWorktrees(rootDir, store, settings, ownershipContext);
   const registeredWorktrees = await getRegisteredWorktreePaths(rootDir);
 
   let dirs: string[] = [];
@@ -985,18 +1001,31 @@ export async function cleanupOrphanedWorktrees(
           worktreePath,
           settings: settings ?? {},
           reason: RemovalReason.PoolPrune,
+          ownershipContext,
+          requireOwnership: ownershipContext !== undefined,
         });
       } else {
         if (!isInsideWorktreesDir(rootDir, worktreePath, settings)) {
           throw new Error(`Refusing to remove path outside .worktrees: ${worktreePath}`);
         }
-        rmSync(worktreePath, { recursive: true, force: true });
-        await pruneWorktreeAdminEntries({
-          rootDir,
-          reason: "pool-cleanup-orphan",
-          target: worktreePath,
-          logger: worktreePoolLog,
-        }).catch(() => undefined);
+        if (ownershipContext) {
+          await removeWorktreeViaBackend({
+            rootDir,
+            worktreePath,
+            settings: settings ?? {},
+            reason: RemovalReason.PoolPrune,
+            ownershipContext,
+            requireOwnership: true,
+          });
+        } else {
+          rmSync(worktreePath, { recursive: true, force: true });
+          await pruneWorktreeAdminEntries({
+            rootDir,
+            reason: "pool-cleanup-orphan",
+            target: worktreePath,
+            logger: worktreePoolLog,
+          }).catch(() => undefined);
+        }
       }
       worktreePoolLog.log(`Cleaned up orphaned worktree: ${worktreePath}`);
       cleaned++;
@@ -1061,6 +1090,7 @@ function dotGitPointerIsDangling(dotGitPath: string): boolean {
 export async function reapOrphanWorktrees(
   projectRoot: string,
   settings?: Pick<Settings, "worktreesDir">,
+  ownershipContext?: WorktreeOwnershipContext,
 ): Promise<number> {
   const worktreesDir = resolveWorktreesDir(projectRoot, settings);
 
@@ -1151,13 +1181,24 @@ export async function reapOrphanWorktrees(
       } catch (error) {
         worktreePoolLog.warn(`secrets-env cleanup failed for orphan ${name}: ${error instanceof Error ? error.message : String(error)}`);
       }
-      rmSync(resolvedFull, { recursive: true, force: true });
-      await pruneWorktreeAdminEntries({
-        rootDir: projectRoot,
-        reason: "pool-reap-orphan",
-        target: resolvedFull,
-        logger: worktreePoolLog,
-      }).catch(() => undefined);
+      if (ownershipContext) {
+        await removeWorktreeViaBackend({
+          rootDir: projectRoot,
+          worktreePath: resolvedFull,
+          settings: settings ?? {},
+          reason: RemovalReason.PoolPrune,
+          ownershipContext,
+          requireOwnership: true,
+        });
+      } else {
+        rmSync(resolvedFull, { recursive: true, force: true });
+        await pruneWorktreeAdminEntries({
+          rootDir: projectRoot,
+          reason: "pool-reap-orphan",
+          target: resolvedFull,
+          logger: worktreePoolLog,
+        }).catch(() => undefined);
+      }
       worktreePoolLog.log(`reapOrphanWorktrees: removed half-initialized orphan ${name}`);
       removed++;
     } catch (err: unknown) {

@@ -161,6 +161,28 @@ describe("engine-singleton-lock", () => {
     }
   });
 
+  it("revokes mutation authority when the bound socket closes unexpectedly", async () => {
+    const originalCreateServer = net.createServer.bind(net);
+    let boundServer: net.Server | undefined;
+    const serverSpy = vi.spyOn(net, "createServer").mockImplementationOnce((...args: Parameters<typeof net.createServer>) => {
+      boundServer = originalCreateServer(...args);
+      return boundServer;
+    });
+    const compromised = vi.fn();
+    try {
+      const lock = await acquireEngineSingleton(uniqueProjectId("authority-socket-close"), workDir, compromised);
+      acquired.push(lock);
+      expect(() => lock.assertHeld()).not.toThrow();
+
+      await new Promise<void>((resolve) => boundServer!.close(() => resolve()));
+
+      expect(() => lock.assertHeld()).toThrow(/mutation authority is not held/i);
+      expect(compromised).toHaveBeenCalledTimes(1);
+    } finally {
+      serverSpy.mockRestore();
+    }
+  });
+
   it("different projects don't block each other", async () => {
     const a = await acquireEngineSingleton(uniqueProjectId("a"), workDir);
     acquired.push(a);

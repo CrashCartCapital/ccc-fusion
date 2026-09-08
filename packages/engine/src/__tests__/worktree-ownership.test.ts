@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,6 +15,7 @@ import {
   type EngineMutationAuthority,
   type WorktreeOwnershipContext,
 } from "../worktree-ownership.js";
+import { removeWorktree, RemovalReason } from "../worktree-backend.js";
 
 const roots: string[] = [];
 
@@ -38,8 +40,7 @@ async function fixture() {
   const marker = createWorktreeOwnershipMarker({
     context,
     ownerId: "9ccf38dc-33e4-4dd4-919d-b88686052147",
-    lifecycle: "creating",
-    repositoryCommonDir,
+      repositoryCommonDir,
     worktreePath,
     worktreeGitDir,
   });
@@ -67,6 +68,25 @@ describe("worktree ownership v1", () => {
     );
   });
 
+  it("allows only the transition API to mint managed ownership", async () => {
+    const f = await fixture();
+    expect(() => createWorktreeOwnershipMarker({
+      context: f.context,
+      ownerId: f.marker.ownerId,
+      lifecycle: "managed",
+      repositoryCommonDir: f.repositoryCommonDir,
+      worktreePath: f.worktreePath,
+      worktreeGitDir: f.worktreeGitDir,
+    } as never)).toThrowError(expect.objectContaining({ code: "MARKER_SCHEMA_INVALID" }));
+
+    await expect(writeWorktreeOwnershipMarkers({
+      authority: f.authority,
+      marker: { ...f.marker, lifecycle: "managed" },
+      adminMarkerPath: f.adminMarkerPath,
+      worktreeMarkerPath: f.worktreeMarkerPath,
+    })).rejects.toMatchObject({ code: "MARKER_TRANSITION_MISMATCH" });
+  });
+
   it("writes identical 0600 marker copies without clobbering an existing destination", async () => {
     const f = await fixture();
     const bytes = await writeWorktreeOwnershipMarkers({
@@ -88,6 +108,34 @@ describe("worktree ownership v1", () => {
       worktreeMarkerPath: f.worktreeMarkerPath,
     })).rejects.toBeInstanceOf(WorktreeOwnershipError);
     expect(await readFile(f.adminMarkerPath)).toEqual(bytes);
+  });
+
+  it("creates only a missing real .fusion child and preserves partial creating residue", async () => {
+    const f = await fixture();
+    await rm(join(f.worktreePath, ".fusion"), { recursive: true });
+    await writeFile(f.worktreeMarkerPath, "occupied", { recursive: true } as never).catch(() => undefined);
+    await mkdir(join(f.worktreePath, ".fusion"));
+    await writeFile(f.worktreeMarkerPath, "occupied");
+
+    await expect(writeWorktreeOwnershipMarkers({
+      authority: f.authority,
+      marker: f.marker,
+      adminMarkerPath: f.adminMarkerPath,
+      worktreeMarkerPath: f.worktreeMarkerPath,
+    })).rejects.toMatchObject({ code: "MARKER_ALREADY_EXISTS" });
+    expect(parseWorktreeOwnershipMarker(await readFile(f.adminMarkerPath)).lifecycle).toBe("creating");
+    expect(await readFile(f.worktreeMarkerPath, "utf8")).toBe("occupied");
+
+    await rm(f.adminMarkerPath);
+    await rm(join(f.worktreePath, ".fusion"), { recursive: true });
+    const bytes = await writeWorktreeOwnershipMarkers({
+      authority: f.authority,
+      marker: f.marker,
+      adminMarkerPath: f.adminMarkerPath,
+      worktreeMarkerPath: f.worktreeMarkerPath,
+    });
+    expect((await lstat(join(f.worktreePath, ".fusion"))).isSymbolicLink()).toBe(false);
+    expect(await readFile(f.worktreeMarkerPath)).toEqual(bytes);
   });
 
   it("transitions both frozen creating copies to managed", async () => {
@@ -119,6 +167,18 @@ describe("worktree ownership v1", () => {
     });
   });
 
+  it("rejects unknown and duplicate inventory records", async () => {
+    const unknown = await inspectStrictGitWorktreeInventory("/repo", async () => ({
+      stdout: "worktree /repo\0mystery value\0\0",
+    }));
+    expect(unknown).toMatchObject({ ok: false, code: "GIT_INVENTORY_MALFORMED" });
+
+    const duplicate = await inspectStrictGitWorktreeInventory("/repo", async () => ({
+      stdout: "worktree /repo\0HEAD abc\0HEAD def\0\0",
+    }));
+    expect(duplicate).toMatchObject({ ok: false, code: "GIT_INVENTORY_MALFORMED" });
+  });
+
   it("classifies only exact dual managed registered ownership as owned-managed", async () => {
     const f = await fixture();
     const creatingBytes = await writeWorktreeOwnershipMarkers({ authority: f.authority, marker: f.marker, adminMarkerPath: f.adminMarkerPath, worktreeMarkerPath: f.worktreeMarkerPath });
@@ -132,6 +192,7 @@ describe("worktree ownership v1", () => {
       adminMarkerPath: f.adminMarkerPath,
       worktreeMarkerPath: f.worktreeMarkerPath,
       gitFilePath: join(f.worktreePath, ".git"),
+      markerTrackedOrStaged: false,
     });
     expect(result).toEqual(expect.objectContaining({ kind: "owned-managed", ownerId: f.marker.ownerId }));
   });
@@ -152,6 +213,7 @@ describe("worktree ownership v1", () => {
       adminMarkerPath: f.adminMarkerPath,
       worktreeMarkerPath: f.worktreeMarkerPath,
       gitFilePath: join(f.worktreePath, ".git"),
+      markerTrackedOrStaged: false,
     });
     expect(result).toEqual(expect.objectContaining({ kind: "owned-dangling-orphan", ownerId: f.marker.ownerId }));
   });
@@ -169,10 +231,87 @@ describe("worktree ownership v1", () => {
       adminMarkerPath: f.adminMarkerPath,
       worktreeMarkerPath: f.worktreeMarkerPath,
       gitFilePath: join(f.worktreePath, ".git"),
+      markerTrackedOrStaged: false,
     };
     expect(await classifyWorktreeOwnership(common)).toEqual(expect.objectContaining({ kind: "safe-parked" }));
 
     await writeFile(f.worktreeMarkerPath, serializeWorktreeOwnershipMarker({ ...f.marker, lifecycle: "managed" }), { mode: 0o600 });
     expect(await classifyWorktreeOwnership(common)).toEqual(expect.objectContaining({ kind: "ambiguous", reason: "git-file-invalid" }));
+  });
+
+  it("denies maintenance authority when tracked/staged evidence is absent, true, or non-boolean", async () => {
+    const f = await fixture();
+    const creatingBytes = await writeWorktreeOwnershipMarkers({ authority: f.authority, marker: f.marker, adminMarkerPath: f.adminMarkerPath, worktreeMarkerPath: f.worktreeMarkerPath });
+    await transitionWorktreeOwnershipMarkers({ authority: f.authority, creatingBytes, adminMarkerPath: f.adminMarkerPath, worktreeMarkerPath: f.worktreeMarkerPath });
+    const common = {
+      context: f.context,
+      inventory: { ok: true as const, entries: [{ path: f.worktreePath }] },
+      repositoryCommonDir: f.repositoryCommonDir,
+      worktreePath: f.worktreePath,
+      worktreeGitDir: f.worktreeGitDir,
+      adminMarkerPath: f.adminMarkerPath,
+      worktreeMarkerPath: f.worktreeMarkerPath,
+      gitFilePath: join(f.worktreePath, ".git"),
+    };
+    expect(await classifyWorktreeOwnership(common as never)).toMatchObject({ kind: "ambiguous", reason: "marker-tracking-unproved" });
+    expect(await classifyWorktreeOwnership({ ...common, markerTrackedOrStaged: true })).toMatchObject({ kind: "ambiguous", reason: "marker-tracked-or-staged" });
+    expect(await classifyWorktreeOwnership({ ...common, markerTrackedOrStaged: "false" } as never)).toMatchObject({ kind: "ambiguous", reason: "marker-tracking-unproved" });
+  });
+
+  it("production removal preserves an unmarked foreign Git worktree and accepts exact owned managed state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fusion-owner-real-git-"));
+    roots.push(root);
+    const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+    git(root, ["init", "-b", "main"]);
+    git(root, ["config", "user.email", "test@example.com"]);
+    git(root, ["config", "user.name", "Test User"]);
+    await writeFile(join(root, "README.md"), "root\n");
+    git(root, ["add", "README.md"]);
+    git(root, ["commit", "-m", "init"]);
+    const foreign = join(root, ".worktrees", "foreign");
+    const owned = join(root, ".worktrees", "owned");
+    await mkdir(join(root, ".worktrees"));
+    git(root, ["worktree", "add", "-b", "foreign", foreign, "main"]);
+    git(root, ["worktree", "add", "-b", "owned", owned, "main"]);
+    const authority: EngineMutationAuthority = { assertHeld: vi.fn() };
+    const context: WorktreeOwnershipContext = Object.freeze({
+      projectId: "project-real-git",
+      projectRoot: root,
+      engineInstanceId: "engine-real-git",
+      mutationAuthority: authority,
+    });
+    const audit = { git: vi.fn().mockResolvedValue(undefined) };
+
+    await expect(removeWorktree({
+      rootDir: root,
+      worktreePath: foreign,
+      settings: {},
+      audit,
+      reason: RemovalReason.PoolPrune,
+      ownershipContext: context,
+    } as never)).rejects.toMatchObject({ code: "WORKTREE_NOT_OWNED" });
+    expect((await lstat(foreign)).isDirectory()).toBe(true);
+    expect(audit.git).toHaveBeenCalledWith(expect.objectContaining({
+      type: "worktree:removal-refused-unowned",
+      target: foreign,
+      metadata: expect.objectContaining({ classification: expect.any(String), reason: expect.any(String) }),
+    }));
+
+    const worktreeGitDir = git(owned, ["rev-parse", "--absolute-git-dir"]);
+    const repositoryCommonDirRaw = git(owned, ["rev-parse", "--git-common-dir"]);
+    const repositoryCommonDir = repositoryCommonDirRaw.startsWith("/") ? repositoryCommonDirRaw : join(owned, repositoryCommonDirRaw);
+    const marker = createWorktreeOwnershipMarker({ context, repositoryCommonDir, worktreePath: owned, worktreeGitDir });
+    const adminMarkerPath = join(worktreeGitDir, "fusion-owner.json");
+    const worktreeMarkerPath = join(owned, ".fusion", "fusion-owner.json");
+    const creatingBytes = await writeWorktreeOwnershipMarkers({ authority, marker, adminMarkerPath, worktreeMarkerPath });
+    await transitionWorktreeOwnershipMarkers({ authority, creatingBytes, adminMarkerPath, worktreeMarkerPath });
+    await expect(removeWorktree({
+      rootDir: root,
+      worktreePath: owned,
+      settings: {},
+      reason: RemovalReason.PoolPrune,
+      ownershipContext: context,
+    } as never)).resolves.toMatchObject({ removed: true });
+    await expect(lstat(owned)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
