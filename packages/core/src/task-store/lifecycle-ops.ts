@@ -17,7 +17,7 @@ import {
 import {mkdir, readdir, readFile, stat, writeFile} from "node:fs/promises";
 import {join} from "node:path";
 import {existsSync, watch, type Dirent} from "node:fs";
-import type {Task, AgentLogEntry, Column, Settings, GlobalSettings} from "../types.js";
+import type {Task, AgentLogEntry, Column, Settings, GlobalSettings, RunAuditEventInput} from "../types.js";
 import {DEFAULT_SETTINGS} from "../types.js";
 import {MOVED_SETTINGS_KEYS, SETTINGS_MIGRATION_VERSION, SETTINGS_MIGRATION_MARKER_KEY} from "../moved-settings.js";
 import {stepsToWorkflowIr, stepToFragmentIr, layoutForIr} from "../workflow-steps-to-ir.js";
@@ -1304,7 +1304,7 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
       // vanished mid-sweep — skip.
       if (marker === undefined) continue;
 
-      await store.withTaskLock(id, async () => {
+      const auditInput = await store.withTaskLock(id, async () => {
         // Re-read inside the lock: another path may have cleared it already.
         const live = await readMarker(id);
         if (live == null) {
@@ -1365,10 +1365,14 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
         try {
           await clearMarker(id);
         } catch {
-          // best-effort; a later sweep retries.
+          storeLog.warn("transitionPending recovery: marker clear failed; will retry", {
+            phase: "recover-stale-transition-pending",
+            taskId: id,
+          });
+          return undefined;
         }
 
-        void store.recordRunAuditEvent({
+        return {
           taskId: id,
           agentId: "system",
           runId: `transition-pending-recovery-${id}-${Date.now()}`,
@@ -1381,9 +1385,13 @@ export async function recoverStaleTransitionPendingImpl(store: TaskStore): Promi
             droppedHooks: warnings.length,
             startedAt: live.startedAt,
           },
-        });
-        recovered += 1;
+        } as const satisfies RunAuditEventInput;
       });
+
+      if (auditInput) {
+        await store.recordRunAuditEvent(auditInput);
+        recovered += 1;
+      }
     }
 
     if (recovered > 0 || degradedHooks > 0) {

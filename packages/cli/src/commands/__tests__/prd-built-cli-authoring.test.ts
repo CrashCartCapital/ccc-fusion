@@ -118,7 +118,7 @@ describe("prd native authoring descendant contract", () => {
       const author = await runFnAsync([
         "prd", "author", packet.root, packet.manifest, packet.sidecar,
         "--target", packet.target, "--base", packet.base, "--provider", "loopback-authoring", "--model", "fixture-model",
-        "--max-requests", "1", "--max-duration-ms", "30000", "--max-concurrency", "1", "--max-prompt-bytes", "1000000", "--max-response-bytes", "262144", "--max-review-items", "8",
+        "--max-requests", "2", "--max-duration-ms", "30000", "--max-concurrency", "1", "--max-prompt-bytes", "1000000", "--max-response-bytes", "262144", "--max-review-items", "8",
       ], repoRoot, { HOME: isolatedHome, USERPROFILE: isolatedHome });
       expect(author.status, `${author.stdout}\n${author.stderr}`).toBe(0);
       expect(requests).toHaveLength(1);

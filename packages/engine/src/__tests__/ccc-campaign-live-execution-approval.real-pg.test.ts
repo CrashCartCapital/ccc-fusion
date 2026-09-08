@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import {
@@ -236,6 +237,18 @@ pgTest("CCC campaign live-execution approval", () => {
     const workItemId = `${imported.importId}--WORK-${suffix}`;
     const workItem = await h.store().getWorkflowWorkItem(workItemId);
     if (!workItem) throw new Error(`missing workflow work item ${workItemId}`);
+    if (suffix === "runner-gate") {
+      const taskWorktree = join(rootDir, ".task-worktree-runner-gate");
+      const taskBranch = "fusion/ccc-live-execution-runner-gate";
+      await execFile("git", [
+        "-C", rootDir, "worktree", "add", "-b", taskBranch, taskWorktree, baseCommit,
+      ]);
+      await h.store().updateTask(firstTaskId as string, {
+        worktree: taskWorktree,
+        branch: taskBranch,
+        baseCommitSha: baseCommit,
+      });
+    }
     return {
       rootDir,
       imported,
@@ -924,6 +937,24 @@ pgTest("CCC campaign live-execution approval", () => {
   it("parks the authoritative coding runner before provider dispatch until exact live approval is claimed", async () => {
     const api = liveExecutionApprovalApi();
     const fixture = await importFixture("runner-gate");
+    const leaseOwner = "runner-gate-owner";
+    const claimedWorkItem = await h.store().transitionWorkflowWorkItem(
+      fixture.workItem.id,
+      "running",
+      {
+        expectedState: fixture.workItem.state,
+        expectedAttempt: fixture.workItem.attempt,
+        expectedLeaseOwner: fixture.workItem.leaseOwner,
+        attempt: fixture.workItem.attempt + 1,
+        leaseOwner,
+        leaseExpiresAt: new Date(
+          Date.now() + LIVE_EXECUTION_APPROVAL_TEST_WINDOW_MS,
+        ).toISOString(),
+      },
+    );
+    if (claimedWorkItem.leaseOwner === null) {
+      throw new Error("runner-gate claim did not return a lease owner");
+    }
     const task = await h.store().getTask(fixture.firstTaskId);
     if (!task) throw new Error("missing imported live-execution task");
     const node: WorkflowIrNode = {
@@ -946,16 +977,16 @@ pgTest("CCC campaign live-execution approval", () => {
         semanticTaskId: fixture.firstSemanticTaskId,
         nativeTaskId: fixture.firstTaskId,
         semanticTask: task,
-        runId: fixture.workItem.runId,
+        runId: claimedWorkItem.runId,
         visitIdentity: Object.freeze({
           nodeId: node.id,
           materializedNodeId: node.id,
         }),
         executionFence: Object.freeze({
-          workItemId: fixture.workItem.id,
-          leaseOwner: "runner-gate-owner",
-          attempt: 1,
-          runId: fixture.workItem.runId,
+          workItemId: claimedWorkItem.id,
+          leaseOwner: claimedWorkItem.leaseOwner,
+          attempt: claimedWorkItem.attempt,
+          runId: claimedWorkItem.runId,
         }),
       }),
     });
@@ -975,7 +1006,7 @@ pgTest("CCC campaign live-execution approval", () => {
       store: h.store(),
       rootDir: fixture.rootDir,
       taskId: fixture.firstTaskId,
-      runId: fixture.workItem.runId,
+      runId: claimedWorkItem.runId,
     });
     const confirmation =
       api.computeCccCampaignLiveExecutionApprovalConfirmation(issued);
