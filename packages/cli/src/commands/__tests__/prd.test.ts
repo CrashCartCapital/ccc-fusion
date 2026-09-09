@@ -372,6 +372,7 @@ describe("prd command exit contract", () => {
       authorCccPrdPacket: authorCccPrdPacket as never,
       bootstrapProofAdmission: async () => ({}) as never,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(0);
 
@@ -469,7 +470,7 @@ describe("prd command exit contract", () => {
 
   it("generated author preflight refuses target baseline mismatch before adapter creation", async () => {
     const packet = createPacketRoot({ semanticV2: true });
-    const harness = generatedAuthorHarness(packet);
+    const harness = generatedAuthorHarness(packet, { preflightPlatform: "darwin" });
     harness.readTargetHead.mockResolvedValue("f".repeat(40));
     const output: string[] = [];
     const before = snapshotPacketRoot(packet.root);
@@ -500,6 +501,7 @@ describe("prd command exit contract", () => {
   it("generated author preflight refuses missing fixed tool paths before adapter creation", async () => {
     const packet = createPacketRoot({ semanticV2: true });
     const harness = generatedAuthorHarness(packet, {
+      preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: vi.fn(() => {
         throw new Error("Task executable is unavailable");
       }),
@@ -531,7 +533,7 @@ describe("prd command exit contract", () => {
 
   it("generated author preflight reports proposal and provider unknown while continuing", async () => {
     const packet = createPacketRoot({ semanticV2: true });
-    const harness = generatedAuthorHarness(packet);
+    const harness = generatedAuthorHarness(packet, { preflightPlatform: "darwin" });
     const output: string[] = [];
 
     expect(await runPrdCommand(
@@ -557,7 +559,7 @@ describe("prd command exit contract", () => {
 
   it("generated author preflight reports known readiness and continues the existing author path", async () => {
     const packet = createPacketRoot({ semanticV2: true });
-    const harness = generatedAuthorHarness(packet);
+    const harness = generatedAuthorHarness(packet, { preflightPlatform: "darwin" });
     const output: string[] = [];
 
     expect(await runPrdCommand(
@@ -669,6 +671,7 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       bootstrapProofAdmission,
       createNativeCccPrdAuthoringAdapter: () => adapter as never,
+      preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: resolveToolchain,
     })).toBe(1);
 
@@ -786,6 +789,7 @@ describe("prd command exit contract", () => {
     ], { write: (line) => output.push(line) }, {
       createNativeCccPrdAuthoringAdapter: createAdapter,
       bootstrapProofAdmission,
+      preflightPlatform: "darwin",
       resolveSemanticProofToolchainPaths: () => {
         throw new Error("built proof host missing");
       },
@@ -1985,6 +1989,7 @@ describe("prd command exit contract", () => {
           trustedPaths: ["/usr/bin/sandbox-exec"] as const,
         })),
         readTargetHead: vi.fn(async () => packet.base),
+        preflightPlatform: "darwin",
         resolveSemanticProofToolchainPaths: vi.fn(() => packet.semanticProofToolchainPaths!),
         // Keep the engine authoring function real: it must hydrate controller
         // proof custody and emit the complete admissible semantic-v2 sidecar.
