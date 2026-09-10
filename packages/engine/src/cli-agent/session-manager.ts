@@ -616,6 +616,8 @@ interface LiveSession {
     reject: (cause: unknown) => void;
   }>;
   cccNativeCliLifetimeTimer?: ReturnType<typeof setTimeout>;
+  /** Deferred `exit` close, held open so an in-flight `done` can win the close. */
+  cccNativeCliExitGraceTimer?: ReturnType<typeof setTimeout>;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -1007,7 +1009,12 @@ export class CliSessionManager {
       pty: child,
       pid: child.pid,
       scrollback: new ScrollbackRing(this.scrollbackBytes),
-      readiness: adapter.createReadinessDetector(),
+      // The launch context decides which readiness markers apply: an adapter's
+      // interactive and non-interactive forms can share none of them.
+      readiness: adapter.createReadinessDetector({
+        settings: launchSettings,
+        posture: record.autonomyPosture,
+      }),
       ready: false,
       readyWaiters: [],
       bracketedPasteActive: false,
@@ -1124,7 +1131,36 @@ export class CliSessionManager {
     this.settleExit(live, exitCode, signal);
 
     if (live.cccNativeCliPolicy) {
-      void this.closeCccNativeCliSession(live.id, "exit").catch(() => undefined);
+      // A campaign turn's positive completion is OUT OF BAND: the provider runs
+      // its notify program, which posts to the engine, which drives the state
+      // machine to `done`, which closes with trigger "done". The child exiting
+      // is a separate, in-band event. A non-interactive provider exits by itself
+      // moments after notifying (measured: `codex exec` notified ~1.55s before
+      // exit), but that ordering is incidental, not contractual.
+      //
+      // Closing immediately on the exit stamps trigger "exit", which the campaign
+      // observer reads as proved_failed. On the losing side of that race a turn
+      // whose work actually landed would be recorded as failed. So a CLEAN exit
+      // yields for a bounded grace to a done already in flight. The close is
+      // first-call-wins, so a done arriving in the window takes it and this
+      // deferred call becomes a no-op.
+      //
+      // This never accepts an exit AS a done: with no done the close still stamps
+      // "exit" and the turn still proves failed. The grace only decides WHEN that
+      // verdict is written, never WHAT it says.
+      const graceMs = exitCode === 0 && (signal === undefined || signal === 0)
+        ? this.cccNativeCliExitGraceMs(live.cccNativeCliPolicy)
+        : 0;
+      if (graceMs <= 0) {
+        void this.closeCccNativeCliSession(live.id, "exit").catch(() => undefined);
+        return;
+      }
+      const timer = setTimeout(() => {
+        live.cccNativeCliExitGraceTimer = undefined;
+        void this.closeCccNativeCliSession(live.id, "exit").catch(() => undefined);
+      }, graceMs);
+      timer.unref?.();
+      live.cccNativeCliExitGraceTimer = timer;
       return;
     }
 
@@ -1397,6 +1433,7 @@ export class CliSessionManager {
       throw new Error("CCC native CLI close trigger must be one of: done, exit, cancel, lifetime");
     }
     this.clearCccNativeCliLifetimeTimer(live);
+    this.clearCccNativeCliExitGraceTimer(live);
     if (live.cccNativeCliHeldClosure) return live.cccNativeCliHeldClosure.promise;
     const closure = {
       promise: this.closeCccNativeCliSessionLive(live, trigger),
@@ -1621,6 +1658,7 @@ export class CliSessionManager {
 
   private releaseLiveSlot(live: LiveSession): void {
     this.clearCccNativeCliLifetimeTimer(live);
+    this.clearCccNativeCliExitGraceTimer(live);
     live.terminated = true;
     for (const stream of live.streams) stream.close();
     live.streams.clear();
@@ -1842,5 +1880,22 @@ export class CliSessionManager {
     if (!live.cccNativeCliLifetimeTimer) return;
     clearTimeout(live.cccNativeCliLifetimeTimer);
     live.cccNativeCliLifetimeTimer = undefined;
+  }
+
+  /**
+   * How long a clean exit waits for an in-flight `done` before being closed as
+   * `exit`. Bounded by the policy's own term-grace budget and never past the
+   * campaign deadline, so the grace can neither be open-ended nor outlive the
+   * authority that funds it.
+   */
+  private cccNativeCliExitGraceMs(policy: CccNativeCliSessionPolicy): number {
+    const untilDeadlineMs = policy.deadlineAtMs - Date.now();
+    return Math.max(0, Math.min(policy.limits.termGraceMs, untilDeadlineMs));
+  }
+
+  private clearCccNativeCliExitGraceTimer(live: LiveSession): void {
+    if (!live.cccNativeCliExitGraceTimer) return;
+    clearTimeout(live.cccNativeCliExitGraceTimer);
+    live.cccNativeCliExitGraceTimer = undefined;
   }
 }

@@ -308,8 +308,19 @@ export class CliTaskSession {
     // deterministic `notifyProgram` path and emits it as a session-scoped
     // `-c notify=[...]` override. The scripts are written immediately after
     // spawn, before the first prompt is injected.
+    // A CCC native-CLI campaign turn is unattended by construction: one request
+    // (`limits.maxRequests === 1`), no human at the terminal, and a hard campaign
+    // deadline. Interactive CLI forms are the wrong shape for that — Codex's TUI
+    // blocks in startup waiting for terminal capability replies that an
+    // engine-owned PTY never sends, and it never exits on its own. Ask the
+    // adapter for its NON-INTERACTIVE form and hand it the prompt at launch.
+    const unattendedTurn = opts.cccNativeCli
+      ? { oneShot: true, oneShotPrompt: opts.prompt }
+      : {};
+
     const settings: Record<string, unknown> = {
       ...expandedSettings,
+      ...unattendedTurn,
       notifyProgram: notifyScriptPath,
       hookScripts: {
         stopScript: hookScriptPath,
@@ -385,8 +396,19 @@ export class CliTaskSession {
     session.subscribe();
     if (opts.cccNativeCli) void session.waitForCccNativeCliHeldClosure();
 
-    // 6. Inject the prompt after readiness (fire-and-forget; readiness gates it).
-    void session.injectAfterReady(opts.prompt, adapter.capabilities.nativeDone);
+    // 6. Deliver the prompt. An adapter whose launch already carries the prompt
+    // on argv is only armed here; injecting keystrokes into a non-interactive
+    // child writes bytes nothing reads. Otherwise inject after readiness
+    // (fire-and-forget; readiness gates it).
+    const promptOnLaunch = adapter.consumesPromptOnLaunch?.({
+      settings,
+      posture: opts.config.cliAutonomy ?? null,
+    }) === true;
+    if (promptOnLaunch) {
+      void session.armAfterReady();
+    } else {
+      void session.injectAfterReady(opts.prompt, adapter.capabilities.nativeDone);
+    }
 
     log(`cli-task-session ${record.id}: launched for task ${opts.taskId} (adapter ${opts.config.cliAdapterId})`);
     return session;
@@ -544,6 +566,44 @@ export class CliTaskSession {
     }
   }
 
+  /**
+   * Arm the authoritative state machine for a turn: `starting → ready → busy`.
+   *
+   * Called before any prompt bytes reach the child. A fast native adapter can
+   * emit `done` from inside `manager.inject()`; if the machine were still
+   * `starting` or `ready` that valid completion would be rejected as an invalid
+   * transition and the campaign would wait until its deadline. It also arms the
+   * inactivity watchdog, so a turn is only ever declared busy once.
+   */
+  private armMachineForTurn(): void {
+    const machine = this.hub.getStateMachine(this.sessionId);
+    if (!machine) return;
+    try {
+      if (machine.getState() === "starting") machine.markReady();
+      if (machine.getState() === "ready") machine.injectPrompt();
+    } catch {
+      // best-effort transition
+    }
+  }
+
+  /**
+   * Arm the turn for an adapter that received its prompt on argv. There is
+   * nothing to inject; we still wait for readiness so the machine's busy
+   * transition lines up with the child actually running, exactly as the
+   * injection path does.
+   */
+  private async armAfterReady(): Promise<void> {
+    try {
+      await this.manager.waitForReady(this.sessionId);
+    } catch {
+      // Died before readiness — the exit/state handlers resolve the outcome.
+      return;
+    }
+    if (this.settled) return;
+    this.armMachineForTurn();
+    this.log(`cli-task-session ${this.sessionId}: prompt carried on launch argv (non-interactive)`);
+  }
+
   private async injectAfterReady(prompt: string, _nativeDone: boolean): Promise<void> {
     try {
       await this.manager.waitForReady(this.sessionId);
@@ -553,19 +613,7 @@ export class CliTaskSession {
       return;
     }
     if (this.settled) return;
-    // Arm the authoritative machine before exposing prompt bytes to the child.
-    // A fast native adapter can emit `done` from inside manager.inject(); if the
-    // machine is still `starting` or `ready`, that valid completion is rejected
-    // as an invalid transition and the campaign waits until its deadline.
-    const machine = this.hub.getStateMachine(this.sessionId);
-    if (machine) {
-      try {
-        if (machine.getState() === "starting") machine.markReady();
-        if (machine.getState() === "ready") machine.injectPrompt();
-      } catch {
-        // best-effort transition
-      }
-    }
+    this.armMachineForTurn();
     try {
       await this.manager.inject(this.sessionId, prompt);
       // HTD: "ready → busy: prompt injected". The task-session is the component
