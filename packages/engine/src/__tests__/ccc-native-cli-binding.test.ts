@@ -822,6 +822,31 @@ describe("CCC native CLI held closure receipt/evidence usage (usage-lane U2/U5)"
     expect(receipt.usage).toEqual({ inputTokens: 100, outputTokens: 10 });
   });
 
+  it("RED-U2-8: restoreCccNativeCliHeldClosureReceipt accepts pre-usage-lane persisted evidence (version 1, no usage key) as usage: null", () => {
+    // Simulates evidence written to durable storage (autonomyPosture.cccNativeCliHeldClosureEvidence)
+    // by the pre-usage-lane code, i.e. HELD_CLOSURE_EVIDENCE_KEYS before "usage" was added and read
+    // back on a restart-recovery path (executor.ts selectCccNativeCliHeldClosureReceipt) after the
+    // upgrade. A JSON.parse of that old row never gains a "usage" key, so the exact-key check must
+    // not refuse it — it must be accepted as the legacy shape with usage: null.
+    const legacyEvidence = {
+      kind: "ccc-fusion.native-cli-held-closure-evidence",
+      version: 1,
+      sessionId: expected.sessionId,
+      trigger: "done",
+      exitCode: 0,
+      exitSignal: 0,
+      processGroupClosed: true,
+      proxyClosed: true,
+      durableFloorFlushed: true,
+      slotHeld: true,
+      // deliberately no "usage" key
+    };
+
+    const receipt = restoreCccNativeCliHeldClosureReceipt(legacyEvidence, expected);
+
+    expect(receipt.usage).toBeNull();
+  });
+
   it("RED-U2-4: validateCccNativeCliHeldClosureReceipt accepts a frozen exact receipt carrying usage", () => {
     const receipt = receiptFor({ inputTokens: 5, outputTokens: 1 });
     const policy = {

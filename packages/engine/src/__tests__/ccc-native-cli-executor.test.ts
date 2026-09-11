@@ -621,7 +621,10 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         cccNativeCliClosureState: "held-closed",
         cccNativeCliHeldClosureEvidence: {
           kind: "ccc-fusion.native-cli-held-closure-evidence",
-          version: 1,
+          // Current evidence shape (usage-lane U2 bumped this to 2); see
+          // RED-U2-8 in ccc-native-cli-binding.test.ts for the legacy-version-1
+          // back-compat path this deliberately does NOT exercise.
+          version: 2,
           sessionId: receipt.sessionId,
           trigger: receipt.trigger,
           exitCode: receipt.exitCode,
@@ -712,7 +715,10 @@ describe("runGraphCustomNode CLI agent native dispatch", () => {
         cccNativeCliClosureState: "held-closed",
         cccNativeCliHeldClosureEvidence: {
           kind: "ccc-fusion.native-cli-held-closure-evidence",
-          version: 1,
+          // Current evidence shape (usage-lane U2 bumped this to 2); see
+          // RED-U2-8 in ccc-native-cli-binding.test.ts for the legacy-version-1
+          // back-compat path this deliberately does NOT exercise.
+          version: 2,
           sessionId: receipt.sessionId,
           trigger: receipt.trigger,
           exitCode: receipt.exitCode,

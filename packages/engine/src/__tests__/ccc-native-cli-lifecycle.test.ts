@@ -298,7 +298,9 @@ describe("CCC native CLI campaign-held lifecycle", () => {
     expect((store.getSession(session.id) as StoredSession).autonomyPosture.cccNativeCliClosureState).toBe("held-closed");
     expect((store.getSession(session.id) as StoredSession).autonomyPosture.cccNativeCliHeldClosureEvidence).toEqual({
       kind: "ccc-fusion.native-cli-held-closure-evidence",
-      version: 1,
+      // usage-lane U2 bumped this to 2 when "usage" was added; see RED-U2-8
+      // in ccc-native-cli-binding.test.ts for the legacy-version-1 back-compat path.
+      version: 2,
       sessionId: session.id,
       trigger: "cancel",
       exitCode: -1,

@@ -27,7 +27,17 @@ export const CCC_NATIVE_CLI_SESSION_POLICY_VERSION = 1 as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_KIND = "ccc-fusion.native-cli-held-closure" as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_VERSION = 1 as const;
 export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND = "ccc-fusion.native-cli-held-closure-evidence" as const;
-export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION = 1 as const;
+/**
+ * Usage-lane U2: bumped 1 -> 2 when the "usage" key was added. Evidence is
+ * durable JSON (autonomyPosture.cccNativeCliHeldClosureEvidence), so rows
+ * written by the pre-usage-lane code are version 1 and lack "usage" forever
+ * — they are read back on restart recovery (executor.ts
+ * selectCccNativeCliHeldClosureReceipt) alongside fresh version-2 rows.
+ * validateCccNativeCliHeldClosureEvidence accepts both versions; see
+ * HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.
+ */
+export const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION = 2 as const;
+const CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION_V1_LEGACY = 1 as const;
 export const CCC_NATIVE_CLI_TRANSPORT = "cli" as const;
 export const CCC_NATIVE_CLI_BINDING_REFUSED_CODE = "CCC_NATIVE_CLI_BINDING_REFUSED" as const;
 
@@ -104,7 +114,9 @@ export type CccNativeCliHeldClosureReceipt = Readonly<{
 
 export type CccNativeCliHeldClosureEvidence = Readonly<{
   kind: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND;
-  version: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION;
+  // Usage-lane U2: version 2 (current) or 1 (pre-usage-lane legacy, accepted
+  // read-only for back-compat with rows already persisted to durable storage).
+  version: typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION | typeof CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION_V1_LEGACY;
   sessionId: string;
   trigger: CccNativeCliHeldClosureTrigger;
   exitCode: number;
@@ -203,6 +215,8 @@ const EFFECTIVE_ROUTE_COST_CLAIM_KEYS = ["amountUsd", "source"] as const;
 const EFFECTIVE_ROUTE_COST_UNKNOWN_KEYS = ["kind", "reason"] as const;
 const HELD_CLOSURE_RECEIPT_KEYS = ["kind", "version", "sessionId", "attemptKey", "controllerToken", "taskId", "authorityBindingHash", "turnKey", "dispatchKey", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld", "usage"] as const;
 const HELD_CLOSURE_EVIDENCE_KEYS = ["kind", "version", "sessionId", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld", "usage"] as const;
+/** Pre-usage-lane persisted evidence shape (version 1): no "usage" key at all. */
+const HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY = ["kind", "version", "sessionId", "trigger", "exitCode", "exitSignal", "processGroupClosed", "proxyClosed", "durableFloorFlushed", "slotHeld"] as const;
 const ROUTE_KEYS = ["adapterId", "providerId", "modelId", "transport"] as const;
 const LIMIT_KEYS = ["maxRequests", "lifetimeMs", "termGraceMs", "killClosureMs"] as const;
 const OBSERVER_KEYS = ["id", "observe"] as const;
@@ -559,14 +573,24 @@ function validateCccNativeCliHeldClosureEvidence(
 ): CccNativeCliHeldClosureEvidence {
   if (!isPlainObject(value)) throw refused("held closure evidence must be a plain object");
   const actualKeys = Object.keys(value);
-  if (
-    actualKeys.length !== HELD_CLOSURE_EVIDENCE_KEYS.length
-    || HELD_CLOSURE_EVIDENCE_KEYS.some((key) => !Object.hasOwn(value, key))
-  ) {
-    throw refused(`held closure evidence must have exact keys: ${HELD_CLOSURE_EVIDENCE_KEYS.join(", ")}`);
+  // Usage-lane U2 back-compat: durable evidence rows written before "usage"
+  // was added (version 1) never gain that key on JSON round-trip, so both
+  // the current shape and that exact legacy shape are accepted here.
+  const isLegacyShape = actualKeys.length === HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.length
+    && HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.every((key) => Object.hasOwn(value, key));
+  const isCurrentShape = actualKeys.length === HELD_CLOSURE_EVIDENCE_KEYS.length
+    && HELD_CLOSURE_EVIDENCE_KEYS.every((key) => Object.hasOwn(value, key));
+  if (!isLegacyShape && !isCurrentShape) {
+    throw refused(
+      `held closure evidence must have exact keys: ${HELD_CLOSURE_EVIDENCE_KEYS.join(", ")} `
+      + `(or the pre-usage-lane legacy shape: ${HELD_CLOSURE_EVIDENCE_KEYS_V1_LEGACY.join(", ")})`,
+    );
   }
   if (value.kind !== CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_KIND) throw refused("held closure evidence.kind mismatch");
-  if (value.version !== CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION) throw refused("held closure evidence.version mismatch");
+  const expectedVersion = isLegacyShape
+    ? CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION_V1_LEGACY
+    : CCC_NATIVE_CLI_HELD_CLOSURE_EVIDENCE_VERSION;
+  if (value.version !== expectedVersion) throw refused("held closure evidence.version mismatch");
   if (value.sessionId !== expectedSessionId) throw refused("held closure evidence sessionId mismatch");
   if (!isHeldClosureTrigger(value.trigger)) throw refused("held closure evidence trigger mismatch");
   if (typeof value.exitCode !== "number" || !Number.isSafeInteger(value.exitCode)) {
@@ -579,12 +603,16 @@ function validateCccNativeCliHeldClosureEvidence(
   if (value.proxyClosed !== true) throw refused("held closure evidence proxyClosed must be true");
   if (value.durableFloorFlushed !== true) throw refused("held closure evidence durableFloorFlushed must be true");
   if (value.slotHeld !== true) throw refused("held closure evidence slotHeld must be true");
+  // Legacy rows carry no usage key at all: they predate any usage capture,
+  // so usage is honestly null rather than validated against a missing field.
   // Not requireFrozen: evidence is read back verbatim from a durable JSON
   // store on restart, and JSON.parse never reproduces Object.freeze.
-  const usage = validateCccNativeCliUsageShape(value.usage, "held closure evidence usage", { requireFrozen: false });
+  const usage = isLegacyShape
+    ? null
+    : validateCccNativeCliUsageShape(value.usage, "held closure evidence usage", { requireFrozen: false });
   return Object.freeze({
     kind: value.kind,
-    version: value.version,
+    version: expectedVersion,
     sessionId: value.sessionId,
     trigger: value.trigger,
     exitCode: value.exitCode,
