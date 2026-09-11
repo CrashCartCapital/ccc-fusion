@@ -248,6 +248,36 @@ export const DEFAULT_CLI_READY_TIMEOUT_MS = 120_000;
 const CLI_READY_TAIL_MAX_CHARS = 500;
 
 /**
+ * How long a "done" close on an exec-mode Codex session waits for the child
+ * to exit on its own before escalating to SIGTERM.
+ *
+ * `policy.limits.termGraceMs` is the SIGTERM->SIGKILL escalation budget and
+ * production sets it to 1_000ms. That is not the same quantity as "how long
+ * after the turn finishes does codex exec actually exit", which was measured
+ * live (codex-cli 0.147.0, node-pty 0.13.1, 5 runs) at 1.9s-21.2s after the
+ * notify hook fires — longer than the escalation budget in every single run.
+ * Reusing termGraceMs here therefore changed nothing: the engine still
+ * SIGTERM'd a turn that had already completed, the receipt recorded
+ * exitSignal 15, and the committed-observation predicate (trigger "done" AND
+ * exitCode 0 AND exitSignal 0, ccc-native-cli-production-resolver.ts) failed
+ * a turn whose work had landed.
+ *
+ * 30s clears the measured maximum with headroom. The wait is always bounded
+ * by the campaign deadline, and it reserves the full termGraceMs +
+ * killClosureMs escalation budget inside that bound, so the worst case is
+ * still a closed, bounded session before the deadline.
+ *
+ * The predicate is deliberately NOT relaxed to accept an engine-sent SIGTERM.
+ * The same probe showed a mid-flight SIGTERM producing exitCode 0 AND
+ * exitSignal 0 in 2 of 3 runs, so exitSignal 0 never proved a natural exit
+ * in the first place; accepting signal 15 would replace an observation of
+ * how the process actually ended with the engine's own record of what it
+ * intended. Waiting makes the receipt true instead of making the check
+ * weaker.
+ */
+export const CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS = 30_000;
+
+/**
  * Node's setTimeout delay is a signed 32-bit int under the hood; anything
  * above this is silently clamped to ~1ms instead of firing after the
  * intended delay, which would turn a huge "generous" deadline into an
@@ -1673,7 +1703,15 @@ export class CliSessionManager {
     const policy = live.cccNativeCliPolicy;
     if (!policy) throw new UnknownCliSessionError(live.id);
     const closeStartedAtMs = Date.now();
-    const totalClosureBudgetMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
+    // A "done" close on an exec-mode Codex session first waits for the child's
+    // own exit (CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS), so its window is that
+    // grace PLUS the unchanged SIGTERM escalation budget. Every other close
+    // keeps exactly the budget it had.
+    const postDoneExitGraceMs = trigger === "done" && live.codexExecUsage
+      ? CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS
+      : 0;
+    const escalationBudgetMs = policy.limits.termGraceMs + policy.limits.killClosureMs;
+    const totalClosureBudgetMs = postDoneExitGraceMs + escalationBudgetMs;
     const absoluteClosureDeadlineMs = Math.min(
       policy.deadlineAtMs,
       closeStartedAtMs + totalClosureBudgetMs,
@@ -1695,8 +1733,14 @@ export class CliSessionManager {
       // absolute closure deadline the rest of this method already respects
       // so the worst-case total closure time is unchanged.
       let exitedNaturallyDuringGrace = false;
-      if (trigger === "done" && live.codexExecUsage) {
-        const graceMs = Math.min(policy.limits.termGraceMs, Math.max(0, absoluteClosureDeadlineMs - Date.now()));
+      if (postDoneExitGraceMs > 0) {
+        // Reserve the escalation budget inside the absolute deadline, so a
+        // campaign deadline that lands mid-grace still leaves room to SIGTERM
+        // and close rather than being consumed entirely by waiting.
+        const graceMs = Math.min(
+          postDoneExitGraceMs,
+          Math.max(0, absoluteClosureDeadlineMs - escalationBudgetMs - Date.now()),
+        );
         if (graceMs > 0) {
           try {
             await this.waitForRegisteredExit(live, graceMs);

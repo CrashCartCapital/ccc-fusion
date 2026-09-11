@@ -31,7 +31,10 @@ import {
 import { CliAdapterRegistry } from "../adapter.js";
 import { codexAdapter } from "../adapters/codex.js";
 import { CCC_NATIVE_CLI_DISPATCH_KEY } from "../ccc-native-cli-binding.js";
-import { CliSessionManager } from "../session-manager.js";
+import {
+  CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS,
+  CliSessionManager,
+} from "../session-manager.js";
 
 const nowMs = Date.now();
 const context: CccCampaignTaskContext = Object.freeze({
@@ -65,7 +68,7 @@ const authorityBinding = Object.freeze(createCccCampaignAuthorityBinding(context
   actionTarget: context.taskId,
 }));
 
-function buildPolicy(termGraceMs: number) {
+function buildPolicy(termGraceMs: number, deadlineAtMs?: number, killClosureMs = 5_000) {
   return Object.freeze({
     kind: "ccc-fusion.native-cli-session-policy",
     version: 1,
@@ -81,8 +84,8 @@ function buildPolicy(termGraceMs: number) {
       modelId: "gpt-5-codex",
       transport: "cli",
     }),
-    deadlineAtMs: Date.parse(context.campaignDeadlineAt),
-    limits: Object.freeze({ maxRequests: 1, lifetimeMs: 60_000, termGraceMs, killClosureMs: 5_000 }),
+    deadlineAtMs: deadlineAtMs ?? Date.parse(context.campaignDeadlineAt),
+    limits: Object.freeze({ maxRequests: 1, lifetimeMs: 60_000, termGraceMs, killClosureMs }),
   });
 }
 
@@ -171,8 +174,8 @@ function createPtyHarness() {
   };
 }
 
-function createHarness(termGraceMs: number) {
-  const policy = buildPolicy(termGraceMs);
+function createHarness(termGraceMs: number, deadlineAtMs?: number, killClosureMs?: number) {
+  const policy = buildPolicy(termGraceMs, deadlineAtMs, killClosureMs);
   const store = createStore();
   const pty = createPtyHarness();
   const registry = new CliAdapterRegistry();
@@ -223,8 +226,16 @@ describe("session-manager <-> codex-exec-usage glue (usage-lane review-round-2 A
     expect(receipt.usage).toEqual({ inputTokens: 24327, outputTokens: 5 });
   });
 
-  it("RED-A-2: a 'done' close sends SIGTERM only after termGraceMs elapses with no natural exit", async () => {
-    const { manager, pty, spawn } = createHarness(30);
+  /*
+   * Retargeted 2026-09-11 alongside CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS.
+   * The fallback SIGTERM now fires after the post-done exit grace, not after
+   * termGraceMs, and the grace is 30s — far too long to wait in a unit test.
+   * Drive the same fallback through the other bound instead: a campaign
+   * deadline that lands inside the grace clamps it, and the escalation budget
+   * reserved inside that deadline is what SIGTERMs the child.
+   */
+  it("RED-A-2: a 'done' close falls back to SIGTERM when the exit grace runs out with no natural exit", async () => {
+    const { manager, pty, spawn } = createHarness(100, Date.now() + 400, 100);
     const session = await spawn();
     pty.feedData(TURN_COMPLETED_LINE);
     pty.pty.kill.mockImplementationOnce(() => queueMicrotask(() => pty.exit(-1, 15)));
@@ -277,4 +288,43 @@ describe("session-manager codex-exec-usage resume invariant (usage-lane review-r
       /resumed session should never carry a codexExecUsage observer/,
     );
   });
+
+  /*
+   * Post-done exit grace (2026-09-11).
+   *
+   * `termGraceMs` is the SIGTERM->SIGKILL escalation budget and production
+   * sets it to 1_000ms (ccc-native-cli-production-resolver.ts). Live probes
+   * measured codex exec exiting 1.9s-21.2s AFTER its notify hook fires, so a
+   * 1s wait changes nothing: the engine still SIGTERMs a finished turn, which
+   * records exitSignal 15 and fails the committed-observation predicate
+   * (trigger "done" AND exitCode 0 AND exitSignal 0). Waiting for the natural
+   * exit is the honest fix — the receipt then states what actually happened —
+   * so the done path gets its own, much larger grace, bounded by the campaign
+   * deadline. The predicate is NOT relaxed: the same probe showed a mid-flight
+   * SIGTERM can also produce 0/0, so exitSignal 0 was never proof of a natural
+   * exit, and accepting signal 15 would have made the receipt depend on
+   * engine-recorded intent instead of observed process behavior.
+   */
+  it("waits past termGraceMs for a natural exit after a done close", async () => {
+    // Production-shaped escalation budget: 1s, shorter than every measured
+    // notify-to-exit gap.
+    const { manager, pty, spawn } = createHarness(1_000);
+    const session = await spawn();
+    pty.feedData(TURN_COMPLETED_LINE);
+    const naturalExit = setTimeout(() => pty.exit(0, 0), 1_200);
+
+    const receipt = await manager.closeCccNativeCliSession(session.id, "done");
+    clearTimeout(naturalExit);
+
+    expect(pty.pty.kill).not.toHaveBeenCalled();
+    expect(receipt.exitCode).toBe(0);
+    expect(receipt.exitSignal).toBe(0);
+    expect(receipt.trigger).toBe("done");
+  }, 20_000);
+
+  it("covers the measured notify-to-natural-exit range", () => {
+    // Live probe maximum was 21.2s; the grace must clear it with headroom.
+    expect(CCC_NATIVE_CLI_POST_DONE_EXIT_GRACE_MS).toBeGreaterThanOrEqual(25_000);
+  });
+
 });
