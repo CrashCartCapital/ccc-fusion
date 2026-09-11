@@ -23,6 +23,20 @@ export interface CodexExecTurnUsage {
   readonly outputTokens: number;
 }
 
+/**
+ * Cap on the trailing (not-yet-newline-terminated) line buffer, matching the
+ * order of magnitude of the PTY scrollback ring's own cap (session-manager.ts
+ * DEFAULT_SCROLLBACK_BYTES = 512 * 1024). Not just a memory bound: without a
+ * cap, a pathological unterminated chunk would keep growing the buffer
+ * forever, and the NEXT real newline-terminated line would get appended after
+ * it with no separating "\n" of its own -- the merged blob then fails to
+ * decode as JSON at all, silently losing the real turn.completed event.
+ * Measured in UTF-16 code units (this module never sees raw bytes — node-pty
+ * decodes to JS strings), a close-enough proxy for the byte-oriented cap it
+ * mirrors.
+ */
+const MAX_TRAILING_LINE_BUFFER_CHARS = 512 * 1024;
+
 function isSafeNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -63,6 +77,13 @@ export class CodexExecUsageObserver {
     const lines = normalized.split("\n");
     this.buffer = lines.pop() ?? "";
     for (const line of lines) this.observeLine(line);
+    if (this.buffer.length > MAX_TRAILING_LINE_BUFFER_CHARS) {
+      // Past the cap with no terminator in sight: it can never validly decode
+      // as a bounded JSON usage event anyway. Drop it and keep scanning fresh
+      // lines from here, rather than carrying it forward to poison whatever
+      // real line eventually does arrive.
+      this.buffer = "";
+    }
   }
 
   /** Decode a trailing line with no terminator yet (e.g. the process exited mid-line). */

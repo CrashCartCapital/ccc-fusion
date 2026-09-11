@@ -117,6 +117,19 @@ describe("CodexExecUsageObserver", () => {
 
     expect(observer.usage).toBeNull();
   });
+
+  it("RED-B-1: a pathological unterminated line past the 512KB cap is dropped, not carried forward to poison the next real line", () => {
+    const observer = new CodexExecUsageObserver();
+    // No trailing newline: without a cap this keeps growing the trailing-line
+    // buffer forever, and once a real newline-terminated line eventually
+    // arrives it gets appended AFTER this garbage with no separating "\n" of
+    // its own -- the whole merged blob then fails to decode as JSON, silently
+    // losing the real event. 600KB comfortably exceeds the 512KB cap.
+    observer.observe("x".repeat(600_000));
+    observer.observe('{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":2}}\n');
+
+    expect(observer.usage).toEqual({ inputTokens: 5, outputTokens: 2 });
+  });
 });
 
 describe("computeCodexExecAttemptUsage (U3 per-attempt honesty)", () => {

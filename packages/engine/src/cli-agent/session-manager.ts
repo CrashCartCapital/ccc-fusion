@@ -768,6 +768,13 @@ interface LiveSession {
    * null before/absent a turn.completed event.
    */
   codexExecUsage?: CodexExecUsageObserver;
+  /**
+   * Usage-lane review-round-2 C: true only when this LiveSession was created
+   * via `spawn({ resume: {...} })`. Backs the closeCccNativeCliSessionLive
+   * assertion that a codexExecUsage-bearing session is never a resume (see
+   * that assertion for the invariant it depends on).
+   */
+  resumedFromExisting: boolean;
 }
 
 // ── Manager options ──────────────────────────────────────────────────────────
@@ -1186,6 +1193,7 @@ export class CliSessionManager {
       cccNativeCliPolicy,
       cccNativeCliHeldClosure: null,
       cccNativeCliHeldClosureWaiters: [],
+      resumedFromExisting: Boolean(options.resume),
       // Usage-lane U2: only exec-mode Codex sessions get a usage observer.
       ...(adapter.id === "codex" && isCodexExecMode(launchSettings as CodexLaunchSettings)
         ? { codexExecUsage: new CodexExecUsageObserver() }
@@ -1724,6 +1732,21 @@ export class CliSessionManager {
 
     const exitCode = live.exitResult?.exitCode ?? -1;
     const exitSignal = live.exitResult?.signal ?? 0;
+    if (live.codexExecUsage) {
+      // Usage-lane review-round-2 A: the process has now exited. node-pty's
+      // own unix backend already defers emitting 'exit' until AFTER its
+      // underlying read stream reports 'close' (see node-pty's
+      // unixTerminal.ts: "Sometimes a data event is emitted after exit. Wait
+      // til socket is destroyed"), which normally guarantees any buffered PTY
+      // data has already reached handleData() by the time we get here. This
+      // is a second, cheap, defense-in-depth wait for that same hazard: give
+      // any data chunk that was already in flight one more event-loop turn to
+      // land. Node's poll phase (I/O callbacks, including PTY 'data') always
+      // runs before the check phase (setImmediate) within one loop iteration,
+      // so this lets anything already queued for delivery arrive before usage
+      // is read.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     // Usage-lane U2/U3: flush the trailing partial line (the process may have
     // exited right after writing turn.completed with no final newline), then
     // read the last observed cumulative usage. CCC native CLI bindings are
@@ -1732,6 +1755,21 @@ export class CliSessionManager {
     // thread's cumulative total IS this attempt's usage; there is no
     // prior-attempt baseline to subtract.
     live.codexExecUsage?.flush();
+    // Usage-lane review-round-2 C: isResumedThread is hard-coded false above,
+    // not derived from live state -- it relies on the resume-admission check
+    // in spawn() (autonomyPosture.cccNativeCliOneShot === true refuses any
+    // `resume`, and cccNativeCliOneShot is unconditionally set whenever
+    // cccNativeCliPolicy is provided, the same gate required for codexExecUsage
+    // to exist at all) to structurally guarantee a codexExecUsage-bearing
+    // session is never a resume. Assert that invariant here instead of only
+    // documenting it, so a future change to the admission check fails loudly
+    // here rather than silently mis-recording a resumed thread's cumulative
+    // total as if it were a fresh attempt's total.
+    if (live.codexExecUsage && live.resumedFromExisting) {
+      throw new Error(
+        "invariant violated: a resumed session should never carry a codexExecUsage observer",
+      );
+    }
     const usage = computeCodexExecAttemptUsage({
       observed: live.codexExecUsage?.usage ?? null,
       isResumedThread: false,
