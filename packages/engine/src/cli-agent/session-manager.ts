@@ -197,6 +197,107 @@ export class CliCancellationSignalError extends Error {
   }
 }
 
+/**
+ * A spawned session never reported readiness before its startup deadline
+ * (see armReadyDeadline). Interactive CLIs can stop at startup waiting for a
+ * person or a terminal — an "Update available… Press enter to continue"
+ * screen, a trust/login prompt, or an unanswered terminal query — and without
+ * this ceiling `waitForReady()` would wait forever (the stall watchdog is
+ * only armed by beginTurn(), which runs after readiness).
+ */
+export class CliSessionReadyTimeoutError extends Error {
+  readonly code = "CLI_SESSION_READY_TIMEOUT";
+
+  constructor(public readonly sessionId: string, public readonly timeoutMs: number, public readonly lastScreen: string) {
+    super(`CLI never became ready within ${Math.round(timeoutMs / 1000)}s; last screen: ${lastScreen}`);
+    this.name = "CliSessionReadyTimeoutError";
+  }
+}
+
+/**
+ * A session's PTY exited before it was ever observed ready. Without this,
+ * any pending waitForReady() caller would hang forever a second way: exit
+ * settles exitWaiters but previously left readyWaiters untouched.
+ */
+export class CliSessionExitBeforeReadyError extends Error {
+  readonly code = "CLI_SESSION_EXIT_BEFORE_READY";
+
+  constructor(public readonly sessionId: string, public readonly exitCode: number, public readonly signal: number | undefined) {
+    super(`CLI session exited before becoming ready: ${sessionId} (exitCode=${exitCode}, signal=${signal ?? "none"})`);
+    this.name = "CliSessionExitBeforeReadyError";
+  }
+}
+
+// ── Startup readiness deadline ──────────────────────────────────────────────
+
+/**
+ * Default ceiling (ms) a spawned session has to report readiness before the
+ * manager kills it and rejects waitForReady. Complements
+ * armCccNativeCliLifetimeTimer (a whole-campaign ceiling measured in hours,
+ * CCC-campaign-only): this one catches ANY session wedged at startup.
+ */
+export const DEFAULT_CLI_READY_TIMEOUT_MS = 120_000;
+
+/** Cap on the sanitized last-screen tail carried in a ready-timeout error. */
+const CLI_READY_TAIL_MAX_CHARS = 500;
+
+/**
+ * Resolve the default startup-readiness deadline. Override via
+ * FUSION_CLI_AGENT_READY_TIMEOUT_MS (a positive integer; anything else falls
+ * back to the default — mirrors the parseInt + Number.isFinite pattern used
+ * by FUSION_RESUME_ORPHAN_DELAY_MS in executor.ts). Read lazily, at spawn
+ * time, so an env change between module load and spawn() (e.g. set in a test
+ * setup file) is observed.
+ */
+function resolveDefaultReadyTimeoutMs(): number {
+  const raw = process.env.FUSION_CLI_AGENT_READY_TIMEOUT_MS;
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_CLI_READY_TIMEOUT_MS;
+}
+
+/**
+ * Strip ANSI/OSC/DCS escape sequences and control characters from raw PTY
+ * text, leaving a short, readable tail for a human-facing failure reason.
+ * This is a best-effort readability pass over the manager's OWN scrollback —
+ * distinct from the dashboard's neutralizeTerminalOutput (U10), which is a
+ * security-hardening pass applied to bytes forwarded to a browser/TUI and
+ * lives in a package this one does not depend on.
+ */
+export function sanitizeCliReadyTail(raw: string, maxChars: number = CLI_READY_TAIL_MAX_CHARS): string {
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    const code = ch.codePointAt(0)!;
+    if (code === 0x1b) {
+      const next = raw[i + 1];
+      if (next === "[") {
+        // CSI: ESC [ params/intermediates, terminated by a final byte @-~.
+        let j = i + 2;
+        while (j < raw.length && !/[@-~]/.test(raw[j])) j++;
+        i = j;
+        continue;
+      }
+      if (next === "]" || next === "P" || next === "X" || next === "^" || next === "_") {
+        // OSC/DCS/SOS/PM/APC: terminated by BEL or ST (ESC \).
+        let j = i + 2;
+        while (j < raw.length && raw[j] !== "\x07" && !(raw[j] === "\x1b" && raw[j + 1] === "\\")) j++;
+        i = raw[j] === "\x1b" ? j + 1 : j;
+        continue;
+      }
+      i += 1; // ESC + one following byte (short two-byte escape)
+      continue;
+    }
+    if (code < 0x20 && ch !== "\n" && ch !== "\t") continue; // other C0 controls
+    if (code === 0x7f) continue; // DEL
+    out += ch;
+  }
+  const collapsed = out.replace(/\s+/g, " ").trim();
+  return collapsed.length > maxChars ? collapsed.slice(-maxChars) : collapsed;
+}
+
 interface CccResumeContract {
   adapterId: string;
   nativeSessionId: string | null;
@@ -563,6 +664,15 @@ export interface SpawnCliSessionOptions {
     nativeSessionId: string;
   };
   cccNativeCliPolicy?: unknown;
+  /**
+   * Startup-readiness deadline override for this spawn (ms). Defaults to
+   * FUSION_CLI_AGENT_READY_TIMEOUT_MS or DEFAULT_CLI_READY_TIMEOUT_MS
+   * (120000ms) when omitted. Pass `null` to disable the deadline entirely —
+   * e.g. dashboard chat sessions, where a human is at the screen and may need
+   * time to answer a login/trust prompt (see
+   * packages/dashboard/src/cli-chat.ts ensureSession).
+   */
+  readyTimeoutMs?: number | null;
 }
 
 // ── Internal live-session state ─────────────────────────────────────────────
@@ -575,8 +685,10 @@ interface LiveSession {
   scrollback: ScrollbackRing;
   readiness: CliReadinessDetector;
   ready: boolean;
-  /** Resolvers waiting on readiness. */
-  readyWaiters: (() => void)[];
+  /** Resolvers/rejecters waiting on readiness. */
+  readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }>;
+  /** Startup-readiness deadline (cleared on ready/exit; see armReadyDeadline). */
+  readyDeadlineTimer?: ReturnType<typeof setTimeout>;
   /** True while bracketed paste is active (observed enable, no later disable). */
   bracketedPasteActive: boolean;
   /** Live attach streams. */
@@ -1039,6 +1151,7 @@ export class CliSessionManager {
     };
     this.sessions.set(record.id, live);
     this.armCccNativeCliLifetimeTimer(live);
+    this.armReadyDeadline(live, options.readyTimeoutMs);
 
     // Optional adapter telemetry wiring.
     let disposeTelemetry: (() => void) | void;
@@ -1094,8 +1207,9 @@ export class CliSessionManager {
     // Readiness detection (until satisfied once).
     if (!live.ready && live.readiness.observe(data)) {
       live.ready = true;
+      this.clearReadyDeadline(live);
       const waiters = live.readyWaiters.splice(0);
-      for (const w of waiters) w();
+      for (const w of waiters) w.resolve();
       this.maybeUpdateState(live, "ready");
     }
 
@@ -1129,6 +1243,10 @@ export class CliSessionManager {
     // still observing closure. Never let that old generation touch the new one.
     if (live.terminated || this.sessions.get(live.id) !== live) return;
     this.settleExit(live, exitCode, signal);
+    this.clearReadyDeadline(live);
+    if (!live.ready) {
+      this.rejectReadyWaiters(live, new CliSessionExitBeforeReadyError(live.id, exitCode, signal));
+    }
 
     if (live.cccNativeCliPolicy) {
       // A campaign turn's positive completion is OUT OF BAND: the provider runs
@@ -1229,7 +1347,7 @@ export class CliSessionManager {
   waitForReady(sessionId: string): Promise<void> {
     const live = this.require(sessionId);
     if (live.ready) return Promise.resolve();
-    return new Promise((resolve) => live.readyWaiters.push(resolve));
+    return new Promise((resolve, reject) => live.readyWaiters.push({ resolve, reject }));
   }
 
   /**
@@ -1897,5 +2015,59 @@ export class CliSessionManager {
     if (!live.cccNativeCliExitGraceTimer) return;
     clearTimeout(live.cccNativeCliExitGraceTimer);
     live.cccNativeCliExitGraceTimer = undefined;
+  }
+
+  /**
+   * Arm the startup-readiness deadline for a freshly spawned session.
+   * `overrideMs === null` disables it entirely (e.g. dashboard chat); a
+   * numeric override wins over the env/default resolution; omitted falls
+   * back to resolveDefaultReadyTimeoutMs().
+   */
+  private armReadyDeadline(live: LiveSession, overrideMs: number | null | undefined): void {
+    const timeoutMs = overrideMs === null ? null : overrideMs ?? resolveDefaultReadyTimeoutMs();
+    if (timeoutMs === null || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return;
+    const timer = setTimeout(() => this.handleReadyDeadline(live, timeoutMs), timeoutMs);
+    timer.unref?.();
+    live.readyDeadlineTimer = timer;
+  }
+
+  private clearReadyDeadline(live: LiveSession): void {
+    if (!live.readyDeadlineTimer) return;
+    clearTimeout(live.readyDeadlineTimer);
+    live.readyDeadlineTimer = undefined;
+  }
+
+  /**
+   * The startup deadline fired: reject waiters with a typed, readable error
+   * (sanitized scrollback tail included) and kill the child through the
+   * manager's existing kill path — closeCccNativeCliSession for a
+   * CCC-governed session (reusing its "lifetime" trigger, the same held-
+   * closure protocol armCccNativeCliLifetimeTimer already uses) or kill()
+   * for every other session.
+   */
+  private handleReadyDeadline(live: LiveSession, timeoutMs: number): void {
+    this.clearReadyDeadline(live);
+    if (live.ready || live.terminated) return;
+    const tail = sanitizeCliReadyTail(this.decodeScrollbackTail(live));
+    this.rejectReadyWaiters(live, new CliSessionReadyTimeoutError(live.id, timeoutMs, tail));
+    if (live.cccNativeCliPolicy) {
+      void this.closeCccNativeCliSession(live.id, "lifetime").catch(() => undefined);
+    } else {
+      void this.kill(live.id, "killed").catch(() => undefined);
+    }
+  }
+
+  private decodeScrollbackTail(live: LiveSession): string {
+    try {
+      return new TextDecoder("utf-8", { fatal: false }).decode(live.scrollback.snapshot());
+    } catch {
+      return "";
+    }
+  }
+
+  /** Reject every pending waitForReady() caller exactly once. */
+  private rejectReadyWaiters(live: LiveSession, error: Error): void {
+    const waiters = live.readyWaiters.splice(0);
+    for (const w of waiters) w.reject(error);
   }
 }

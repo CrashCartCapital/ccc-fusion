@@ -64,6 +64,12 @@ export interface CliSessionManagerLike {
     chatSessionId: string;
     worktreePath?: string | null;
     resume?: { sessionId: string; nativeSessionId: string };
+    /**
+     * Startup-readiness deadline override (ms); `null` disables it. Chat
+     * sessions always pass `null` here — a human is at the screen and may
+     * need time to answer a login/trust prompt (CLI Agent Executor, U12).
+     */
+    readyTimeoutMs?: number | null;
   }): Promise<CliSessionLike>;
   inject(sessionId: string, text: string): Promise<void>;
   /** Authoritative, freshly-read session record (used for flush decisions). */
@@ -147,6 +153,9 @@ export class CliChatSessionRunner {
       purpose: "chat",
       chatSessionId,
       worktreePath: opts.worktreePath ?? null,
+      // R2: a human is at the screen for chat sessions and may need time to
+      // answer a login/trust prompt — never subject to the startup deadline.
+      readyTimeoutMs: null,
       ...(resumeNative
         ? { resume: { sessionId: chatSessionId, nativeSessionId: resumeNative } }
         : {}),

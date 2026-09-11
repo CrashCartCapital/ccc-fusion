@@ -173,6 +173,13 @@ describe("CliChatSessionRunner — session lifecycle", () => {
     expect(call.resume).toBeUndefined();
   });
 
+  it("RED: opts out of the CLI startup deadline (a human may need time for a login/trust prompt)", async () => {
+    ctx.store.putSession({ id: "chat-1", cliExecutorAdapterId: "claude-local" });
+    await ctx.runner.ensureSession("chat-1", { projectId: "proj-1" });
+    const call = ctx.manager.spawnCalls[0] as Record<string, unknown>;
+    expect(call.readyTimeoutMs).toBeNull();
+  });
+
   it("resumes via the persisted native session id (cliSessionFile linkage)", async () => {
     ctx.store.putSession({ id: "chat-1", cliSessionFile: "native-abc" });
     await ctx.runner.ensureSession("chat-1", { projectId: "proj-1" });
