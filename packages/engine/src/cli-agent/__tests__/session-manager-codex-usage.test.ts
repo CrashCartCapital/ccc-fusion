@@ -2,14 +2,23 @@
  * End-to-end (fake PTY) coverage for the glue between session-manager.ts's
  * `handleData` -> `codexExecUsage.observe()` and `closeCccNativeCliSessionLive`
  * -> `codexExecUsage.flush()` for codex exec-mode sessions — usage-lane
- * review-round-2 items A (drain-before-flush half) and C. No prior test drove
- * this path at all: the narrower ccc-native-cli-lifecycle.test.ts harness
- * uses a non-codex fake adapter, so it never attaches a usage observer.
+ * review-round-2 items A and C. No prior test drove this path at all: the
+ * narrower ccc-native-cli-lifecycle.test.ts harness uses a non-codex fake
+ * adapter, so it never attaches a usage observer.
  *
- * The termGraceMs-wait-before-SIGTERM half of item A (the "done" close racing
- * the child's natural exit) lands in its own follow-up commit, since it
- * changes PR #80's held-closure timing and the reviewer asked for that
- * change to be independently visible.
+ * Findings that motivate what's exercised here (live probe, codex-cli
+ * 0.147.0, node-pty 0.13.1, 5 runs + 2 adversarial, see the round-2 report):
+ *  - `turn.completed` was observed on the PTY data stream BEFORE the notify
+ *    hook fired in every run, including an adversarial run that SIGTERM'd the
+ *    child the instant the notify hook was detected starting up. So usage
+ *    capture itself was never observed at risk from the "done"-triggers-
+ *    before-turn.completed ordering hazard the review raised.
+ *  - notify-to-natural-exit gaps were large and variable (1.9s-21.2s across 5
+ *    runs) -- a done-triggered close that SIGTERMs immediately routinely
+ *    kills a process still doing legitimate post-turn work. Fixed below by
+ *    giving exec-mode Codex sessions their termGraceMs to exit naturally on a
+ *    "done" close before reaching for SIGTERM at all. This half of item A
+ *    changes PR #80's held-closure timing (see this commit's message).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { IPty } from "node-pty";
@@ -194,6 +203,39 @@ afterEach(() => {
 });
 
 describe("session-manager <-> codex-exec-usage glue (usage-lane review-round-2 A)", () => {
+  it("RED-A-1: a 'done' close waits for the natural exit within termGraceMs instead of sending SIGTERM immediately, and captures usage observed before the close", async () => {
+    const { manager, pty, spawn } = createHarness(2_000);
+    const session = await spawn();
+
+    pty.feedData(TURN_COMPLETED_LINE);
+    // Simulate the out-of-band notify->done path racing well ahead of the
+    // child's own natural exit (matches the live probe: notify fired, then
+    // the process kept running for another 1.9s-21.2s before exiting on its
+    // own). The natural exit arrives shortly after, comfortably inside the
+    // 2s grace.
+    queueMicrotask(() => pty.exit(0, 0));
+
+    const receipt = await manager.closeCccNativeCliSession(session.id, "done");
+
+    expect(pty.pty.kill).not.toHaveBeenCalled();
+    expect(receipt.exitCode).toBe(0);
+    expect(receipt.exitSignal).toBe(0);
+    expect(receipt.usage).toEqual({ inputTokens: 24327, outputTokens: 5 });
+  });
+
+  it("RED-A-2: a 'done' close sends SIGTERM only after termGraceMs elapses with no natural exit", async () => {
+    const { manager, pty, spawn } = createHarness(30);
+    const session = await spawn();
+    pty.feedData(TURN_COMPLETED_LINE);
+    pty.pty.kill.mockImplementationOnce(() => queueMicrotask(() => pty.exit(-1, 15)));
+
+    const receipt = await manager.closeCccNativeCliSession(session.id, "done");
+
+    expect(pty.pty.kill).toHaveBeenCalledTimes(1);
+    expect(pty.pty.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(receipt.usage).toEqual({ inputTokens: 24327, outputTokens: 5 });
+  });
+
   it("RED-A-3: exit-before-last-data — a trailing chunk delivered on the next PTY tick after exit is still drained before usage is computed", async () => {
     const { manager, pty, spawn } = createHarness(2_000);
     const session = await spawn();

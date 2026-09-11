@@ -1681,17 +1681,44 @@ export class CliSessionManager {
 
     let processClosure: Promise<void> = Promise.resolve();
     if (!live.exitResult) {
-      try {
-        live.pty.kill("SIGTERM");
-      } catch (cause) {
-        await this.failCancellationWithoutClosure(
-          live,
-          "CANCELLATION_SIGNAL_FAILED",
-          cause instanceof Error ? cause : new CliCancellationSignalError(live.id, { cause }),
-        );
+      // Usage-lane review-round-2 A: a "done" close for exec-mode Codex
+      // sessions is driven out-of-band by the provider's notify hook, which
+      // does NOT wait for the child to exit. Measured live (codex-cli
+      // 0.147.0, node-pty 0.13.1, 5 runs + 2 adversarial): notify fired
+      // 130ms-950ms AFTER turn.completed already landed on the PTY stream
+      // (so usage capture was never observed at risk from this ordering),
+      // but notify-to-natural-exit gaps were large and variable
+      // (1.9s-21.2s) — SIGTERM-ing immediately on "done" routinely kills a
+      // process still doing legitimate post-turn work (session persistence,
+      // etc.). Give exec-mode Codex sessions their termGraceMs to exit
+      // naturally before reaching for SIGTERM at all, clamped to the same
+      // absolute closure deadline the rest of this method already respects
+      // so the worst-case total closure time is unchanged.
+      let exitedNaturallyDuringGrace = false;
+      if (trigger === "done" && live.codexExecUsage) {
+        const graceMs = Math.min(policy.limits.termGraceMs, Math.max(0, absoluteClosureDeadlineMs - Date.now()));
+        if (graceMs > 0) {
+          try {
+            await this.waitForRegisteredExit(live, graceMs);
+            exitedNaturallyDuringGrace = true;
+          } catch {
+            // Grace elapsed with no natural exit; fall through to SIGTERM below.
+          }
+        }
       }
-      const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
-      processClosure = this.waitForRegisteredExit(live, remainingClosureBudgetMs);
+      if (!exitedNaturallyDuringGrace && !live.exitResult) {
+        try {
+          live.pty.kill("SIGTERM");
+        } catch (cause) {
+          await this.failCancellationWithoutClosure(
+            live,
+            "CANCELLATION_SIGNAL_FAILED",
+            cause instanceof Error ? cause : new CliCancellationSignalError(live.id, { cause }),
+          );
+        }
+        const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
+        processClosure = this.waitForRegisteredExit(live, remainingClosureBudgetMs);
+      }
     }
 
     const remainingClosureBudgetMs = Math.max(0, absoluteClosureDeadlineMs - Date.now());
