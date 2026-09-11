@@ -603,7 +603,23 @@ describe("native CLI campaign turns run the provider's non-interactive form", ()
 
     const spawned = manager.spawn.mock.calls[0]?.[0] as { settings?: Record<string, unknown> };
     expect(spawned.settings?.oneShot).toBe(true);
-    expect(spawned.settings?.oneShotPrompt).toBe(opts.prompt);
+    // The sealed prompt is carried verbatim as a prefix; the runtime worktree
+    // binding is appended after it (see sealed-worktree-binding.ts).
+    expect(spawned.settings?.oneShotPrompt as string).toContain(opts.prompt);
+    expect((spawned.settings?.oneShotPrompt as string).startsWith(opts.prompt)).toBe(true);
+  });
+
+  it("binds the sealed prompt to the isolated worktree it actually runs in", async () => {
+    // Regression: the first Round 11 turn that executed refused to edit because
+    // the sealed prompt named the campaign target repo while the session ran in
+    // a different worktree. Without this binding the turn burns a request, exits
+    // 0, and lands an empty diff.
+    const { opts, manager } = setupCodexHarness();
+
+    await launchCliTaskSession(opts);
+
+    const spawned = manager.spawn.mock.calls[0]?.[0] as { settings?: Record<string, unknown> };
+    expect(spawned.settings?.oneShotPrompt as string).toContain(opts.worktreePath);
   });
 
   it("resolves to a `codex exec` argv carrying that prompt", async () => {
@@ -616,7 +632,8 @@ describe("native CLI campaign turns run the provider's non-interactive form", ()
 
     expect(launch.args[0]).toBe("exec");
     expect(launch.args).toContain("--json");
-    expect(launch.args[launch.args.length - 1]).toBe(opts.prompt);
+    expect(launch.args[launch.args.length - 1]).toBe(spawned.settings.oneShotPrompt);
+    expect(launch.args[launch.args.length - 1] as string).toContain(opts.prompt);
     // `codex exec` rejects this flag outright; emitting it would fail the launch.
     expect(launch.args).not.toContain("--ask-for-approval");
     // The sandbox contract still rides along on the exec argv.
@@ -643,6 +660,11 @@ describe("native CLI campaign turns run the provider's non-interactive form", ()
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(manager.inject).toHaveBeenCalledWith("cli-task-session-1", opts.prompt);
+    // Still injected (interactive contract unchanged), and still worktree-bound:
+    // the sealed-prompt/worktree mismatch is adapter-independent.
+    const injected = manager.inject.mock.calls[0]?.[1] as string;
+    expect(manager.inject).toHaveBeenCalledWith("cli-task-session-1", expect.any(String));
+    expect(injected.startsWith(opts.prompt)).toBe(true);
+    expect(injected).toContain(opts.worktreePath);
   });
 });

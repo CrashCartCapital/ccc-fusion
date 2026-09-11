@@ -67,6 +67,7 @@ import {
   type EffectivePosture,
 } from "./autonomy.js";
 import { applyCccNativeMcpPolicy } from "./ccc-native-mcp-policy.js";
+import { appendSealedWorktreeBinding } from "./sealed-worktree-binding.js";
 import {
   type CccNativeCliHeldClosureReceipt,
   type CccNativeCliHeldClosureTrigger,
@@ -314,8 +315,18 @@ export class CliTaskSession {
     // blocks in startup waiting for terminal capability replies that an
     // engine-owned PTY never sends, and it never exits on its own. Ask the
     // adapter for its NON-INTERACTIVE form and hand it the prompt at launch.
+    // A sealed CCC prompt can only name the campaign's target repository — the
+    // per-task isolated worktree is allocated here, at launch, long after the
+    // packet was frozen. Bind the two before dispatch: without it the provider
+    // reads "target repository X" while standing in worktree Y with write access
+    // to Y alone, and correctly refuses to edit anything. Append-only, so the
+    // sealed bytes the packet hash covers stay a byte-exact prefix.
+    const dispatchPrompt = opts.cccNativeCli
+      ? appendSealedWorktreeBinding(opts.prompt, opts.worktreePath)
+      : opts.prompt;
+
     const unattendedTurn = opts.cccNativeCli
-      ? { oneShot: true, oneShotPrompt: opts.prompt }
+      ? { oneShot: true, oneShotPrompt: dispatchPrompt }
       : {};
 
     const settings: Record<string, unknown> = {
@@ -407,7 +418,7 @@ export class CliTaskSession {
     if (promptOnLaunch) {
       void session.armAfterReady();
     } else {
-      void session.injectAfterReady(opts.prompt, adapter.capabilities.nativeDone);
+      void session.injectAfterReady(dispatchPrompt, adapter.capabilities.nativeDone);
     }
 
     log(`cli-task-session ${record.id}: launched for task ${opts.taskId} (adapter ${opts.config.cliAdapterId})`);
