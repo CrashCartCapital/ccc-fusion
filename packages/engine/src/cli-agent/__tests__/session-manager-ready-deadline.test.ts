@@ -23,6 +23,12 @@ import {
   sanitizeCliReadyTail,
 } from "../session-manager.js";
 
+/** setTimeout's delay is a signed 32-bit int; Node silently clamps anything
+ * above this to ~1ms instead of the intended delay. Mirrors the value the
+ * production fix pins as MAX_READY_TIMEOUT_MS (asserted by name once the
+ * export lands, in the "clamp" tests below via a follow-up import). */
+const SET_TIMEOUT_INT32_CEILING_MS = 2_147_483_647;
+
 // ── Fakes ────────────────────────────────────────────────────────────────
 
 type StoredSession = Record<string, unknown> & {
@@ -98,7 +104,7 @@ const adapter: CliAgentAdapter = {
   formatInjection: (text) => ({ payload: text }),
 };
 
-function createHarness() {
+function createHarness(managerOverrides?: Partial<ConstructorParameters<typeof CliSessionManager>[0]>) {
   const store = createStore();
   const pty = createPtyHarness();
   const registry = new CliAdapterRegistry();
@@ -108,6 +114,7 @@ function createHarness() {
     store: store as unknown as ConstructorParameters<typeof CliSessionManager>[0]["store"],
     concurrencyCeiling: 4,
     loadPty: async () => ({ spawn: () => pty.pty }) as never,
+    ...managerOverrides,
   });
   const spawn = (readyTimeoutMs?: number | null) => manager.spawn({
     adapterId: adapter.id,
@@ -219,5 +226,103 @@ describe("CliSessionManager startup deadline", () => {
     expect(tail).not.toContain("\x07");
     expect(tail.length).toBeLessThanOrEqual(500);
     expect(tail).toContain("enter to continue");
+  });
+
+  // ── Round 3: timer overflow, secret redaction, cancellation race, late-flip ──
+
+  it("RED: an env override above the setTimeout 32-bit ceiling falls back to the default with one warning", async () => {
+    process.env.FUSION_CLI_AGENT_READY_TIMEOUT_MS = String(SET_TIMEOUT_INT32_CEILING_MS + 1);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    const { spawn } = createHarness();
+
+    await spawn();
+
+    const deadlineCall = setTimeoutSpy.mock.calls.find(
+      (call) => typeof call[1] === "number" && (call[1] as number) > 1_000,
+    );
+    expect(deadlineCall?.[1]).toBe(DEFAULT_CLI_READY_TIMEOUT_MS);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    warnSpy.mockRestore();
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("RED: a per-spawn readyTimeoutMs above the setTimeout 32-bit ceiling is clamped, not thrown", async () => {
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+    const { spawn } = createHarness();
+
+    await expect(spawn(SET_TIMEOUT_INT32_CEILING_MS + 1_000_000)).resolves.toBeDefined();
+
+    const deadlineCall = setTimeoutSpy.mock.calls.find(
+      (call) => typeof call[1] === "number" && (call[1] as number) > 1_000,
+    );
+    expect(deadlineCall?.[1]).toBe(SET_TIMEOUT_INT32_CEILING_MS);
+
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("RED: the ready-timeout tail redacts secret-shaped content", async () => {
+    vi.useFakeTimers();
+    const { manager, pty, spawn } = createHarness();
+    const session = await spawn();
+    const readyPromise = manager.waitForReady(session.id);
+    const observed: { rejected?: unknown } = {};
+    readyPromise.catch((error) => { observed.rejected = error; });
+
+    pty.emitData("Paste your token: sk-abcdefghijklmnopqrstuvwx1234\n");
+    await vi.advanceTimersByTimeAsync(DEFAULT_CLI_READY_TIMEOUT_MS);
+
+    expect(observed.rejected).toBeInstanceOf(CliSessionReadyTimeoutError);
+    const error = observed.rejected as CliSessionReadyTimeoutError;
+    expect(error.lastScreen).not.toContain("sk-abcdefghijklmnopqrstuvwx1234");
+    expect(error.lastScreen).toContain("[REDACTED]");
+  });
+
+  it("RED: kill() racing the ready deadline settles waiters with the real cancellation reason, not a timeout", async () => {
+    vi.useFakeTimers();
+    const { manager, pty, spawn } = createHarness({ cancellationTimeoutMs: DEFAULT_CLI_READY_TIMEOUT_MS * 10 });
+    const session = await spawn();
+    const readyPromise = manager.waitForReady(session.id);
+    const observed: { rejected?: unknown } = {};
+    readyPromise.catch((error) => { observed.rejected = error; });
+
+    // A cancellation is already in flight (cancellationReason set
+    // synchronously, before any await in killLive) when the ready deadline
+    // fires below.
+    const killPromise = manager.kill(session.id, "killed");
+    killPromise.catch(() => undefined);
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_CLI_READY_TIMEOUT_MS);
+    expect(observed.rejected).toBeUndefined();
+
+    // Now let the child actually report exit, completing the cancellation.
+    pty.exit(1, 0);
+    await killPromise;
+
+    await expect(readyPromise).rejects.toThrow(CliSessionExitBeforeReadyError);
+    expect(pty.pty.kill).toHaveBeenCalledTimes(1);
+  });
+
+  it("RED: a late readiness signal after a ready-timeout kill does not flip ready back on", async () => {
+    vi.useFakeTimers();
+    const { manager, pty, spawn, store } = createHarness();
+    const session = await spawn();
+    const readyPromise = manager.waitForReady(session.id);
+    readyPromise.catch(() => undefined);
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_CLI_READY_TIMEOUT_MS);
+    expect(pty.pty.kill).toHaveBeenCalled();
+
+    store.updateSession.mockClear();
+
+    // A buffered chunk that happens to satisfy the readiness detector arrives
+    // after the kill has already been dispatched.
+    pty.emitData("READY\n");
+
+    const flippedReady = store.updateSession.mock.calls.some(
+      ([, patch]) => (patch as Record<string, unknown>).agentState === "ready",
+    );
+    expect(flippedReady).toBe(false);
   });
 });

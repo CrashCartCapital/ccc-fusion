@@ -31,6 +31,7 @@
 import {
   CCC_EFFECT_RECEIPT_CONTRACT,
   CliSessionStore,
+  redactSecrets,
   type CliAutonomyPosture,
   type CliSession,
   type CliSessionPurpose,
@@ -40,6 +41,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { PermanentError } from "../engine-errors.js";
 import { loadPtyModule } from "../pty-native.js";
+import { createLogger } from "../logger.js";
 import type { IPty } from "node-pty";
 import type { CliAdapterRegistry, CliAgentAdapter, CliLaunchSpec, CliReadinessDetector } from "./adapter.js";
 import {
@@ -230,6 +232,8 @@ export class CliSessionExitBeforeReadyError extends Error {
 
 // ── Startup readiness deadline ──────────────────────────────────────────────
 
+const log = createLogger("cli-session-manager");
+
 /**
  * Default ceiling (ms) a spawned session has to report readiness before the
  * manager kills it and rejects waitForReady. Complements
@@ -242,18 +246,36 @@ export const DEFAULT_CLI_READY_TIMEOUT_MS = 120_000;
 const CLI_READY_TAIL_MAX_CHARS = 500;
 
 /**
+ * Node's setTimeout delay is a signed 32-bit int under the hood; anything
+ * above this is silently clamped to ~1ms instead of firing after the
+ * intended delay, which would turn a huge "generous" deadline into an
+ * immediate kill. Never pass a larger delay to setTimeout.
+ */
+export const MAX_READY_TIMEOUT_MS = 2_147_483_647;
+
+/**
  * Resolve the default startup-readiness deadline. Override via
- * FUSION_CLI_AGENT_READY_TIMEOUT_MS (a positive integer; anything else falls
- * back to the default — mirrors the parseInt + Number.isFinite pattern used
- * by FUSION_RESUME_ORPHAN_DELAY_MS in executor.ts). Read lazily, at spawn
- * time, so an env change between module load and spawn() (e.g. set in a test
- * setup file) is observed.
+ * FUSION_CLI_AGENT_READY_TIMEOUT_MS (a positive integer no larger than
+ * MAX_READY_TIMEOUT_MS; anything else falls back to the default — mirrors
+ * the parseInt + Number.isFinite pattern used by FUSION_RESUME_ORPHAN_DELAY_MS
+ * in executor.ts). An in-range-but-oversized value logs one warning before
+ * falling back, since it is very likely a misconfiguration (seconds entered
+ * where ms was expected, etc.) rather than a deliberate huge deadline. Read
+ * lazily, at spawn time, so an env change between module load and spawn()
+ * (e.g. set in a test setup file) is observed.
  */
 function resolveDefaultReadyTimeoutMs(): number {
   const raw = process.env.FUSION_CLI_AGENT_READY_TIMEOUT_MS;
   if (raw !== undefined) {
     const parsed = Number.parseInt(raw, 10);
-    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    if (Number.isFinite(parsed) && parsed > 0) {
+      if (parsed <= MAX_READY_TIMEOUT_MS) return parsed;
+      log.warn(
+        `FUSION_CLI_AGENT_READY_TIMEOUT_MS=${raw} exceeds the setTimeout ceiling ` +
+          `(${MAX_READY_TIMEOUT_MS}ms); Node would clamp it to ~1ms instead of the ` +
+          `intended delay. Falling back to the default (${DEFAULT_CLI_READY_TIMEOUT_MS}ms).`,
+      );
+    }
   }
   return DEFAULT_CLI_READY_TIMEOUT_MS;
 }
@@ -689,6 +711,13 @@ interface LiveSession {
   readyWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }>;
   /** Startup-readiness deadline (cleared on ready/exit; see armReadyDeadline). */
   readyDeadlineTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Set once handleReadyDeadline has fired and dispatched a kill. Prevents a
+   * late-arriving readiness signal (buffered output flushing on the way to
+   * exit) from flipping ready/agentState back to "ready" after the session
+   * has already been condemned.
+   */
+  readyDeadlineExpired?: boolean;
   /** True while bracketed paste is active (observed enable, no later disable). */
   bracketedPasteActive: boolean;
   /** Live attach streams. */
@@ -1205,7 +1234,7 @@ export class CliSessionManager {
     }
 
     // Readiness detection (until satisfied once).
-    if (!live.ready && live.readiness.observe(data)) {
+    if (!live.ready && !live.readyDeadlineExpired && live.readiness.observe(data)) {
       live.ready = true;
       this.clearReadyDeadline(live);
       const waiters = live.readyWaiters.splice(0);
@@ -2024,8 +2053,16 @@ export class CliSessionManager {
    * back to resolveDefaultReadyTimeoutMs().
    */
   private armReadyDeadline(live: LiveSession, overrideMs: number | null | undefined): void {
-    const timeoutMs = overrideMs === null ? null : overrideMs ?? resolveDefaultReadyTimeoutMs();
-    if (timeoutMs === null || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return;
+    const requested = overrideMs === null ? null : overrideMs ?? resolveDefaultReadyTimeoutMs();
+    if (requested === null || !Number.isFinite(requested) || requested <= 0) return;
+    // Clamp rather than throw: an oversized per-spawn override is generous
+    // configuration, not malformed input, and a spawn() caller should never
+    // fail to start a session merely because its timeout budget exceeds what
+    // setTimeout can represent. Clamping to the largest delay setTimeout can
+    // actually honor keeps the deadline the caller clearly intended (wait a
+    // very long time) instead of letting Node's silent int32 clamp turn it
+    // into an near-immediate kill.
+    const timeoutMs = Math.min(requested, MAX_READY_TIMEOUT_MS);
     const timer = setTimeout(() => this.handleReadyDeadline(live, timeoutMs), timeoutMs);
     timer.unref?.();
     live.readyDeadlineTimer = timer;
@@ -2048,11 +2085,21 @@ export class CliSessionManager {
    * killAll()/dispose()) honestly means the engine chose to stop this
    * session. executor.ts treats both identically (cancelled/killed), so this
    * is a labeling fix only, no behavior change.
+   *
+   * A kill()/closeCccNativeCliSession() may already be in flight when this
+   * fires (both set their in-flight marker — cancellationReason /
+   * cccNativeCliHeldClosure — synchronously before any await), racing a
+   * timeout rejection in front of the real cancellation reason. Skip the
+   * timeout path entirely in that case: handleExit's exit-before-ready path
+   * settles readyWaiters with the real reason once that cancellation
+   * completes.
    */
   private handleReadyDeadline(live: LiveSession, timeoutMs: number): void {
     this.clearReadyDeadline(live);
     if (live.ready || live.terminated) return;
-    const tail = sanitizeCliReadyTail(this.decodeScrollbackTail(live));
+    if (live.cancellationReason !== null || live.cccNativeCliHeldClosure) return;
+    live.readyDeadlineExpired = true;
+    const tail = sanitizeCliReadyTail(redactSecrets(this.decodeScrollbackTail(live)));
     this.rejectReadyWaiters(live, new CliSessionReadyTimeoutError(live.id, timeoutMs, tail));
     if (live.cccNativeCliPolicy) {
       void this.closeCccNativeCliSession(live.id, "cancel").catch(() => undefined);
