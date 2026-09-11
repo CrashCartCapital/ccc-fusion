@@ -2041,9 +2041,13 @@ export class CliSessionManager {
    * The startup deadline fired: reject waiters with a typed, readable error
    * (sanitized scrollback tail included) and kill the child through the
    * manager's existing kill path — closeCccNativeCliSession for a
-   * CCC-governed session (reusing its "lifetime" trigger, the same held-
-   * closure protocol armCccNativeCliLifetimeTimer already uses) or kill()
-   * for every other session.
+   * CCC-governed session (held-closure protocol) or kill() for every other
+   * session. Uses the "cancel" trigger, not "lifetime": "lifetime" means the
+   * campaign's own deadline (policy.deadlineAtMs) was reached, which is false
+   * here — the campaign may have hours left. "cancel" (already used by
+   * killAll()/dispose()) honestly means the engine chose to stop this
+   * session. executor.ts treats both identically (cancelled/killed), so this
+   * is a labeling fix only, no behavior change.
    */
   private handleReadyDeadline(live: LiveSession, timeoutMs: number): void {
     this.clearReadyDeadline(live);
@@ -2051,7 +2055,7 @@ export class CliSessionManager {
     const tail = sanitizeCliReadyTail(this.decodeScrollbackTail(live));
     this.rejectReadyWaiters(live, new CliSessionReadyTimeoutError(live.id, timeoutMs, tail));
     if (live.cccNativeCliPolicy) {
-      void this.closeCccNativeCliSession(live.id, "lifetime").catch(() => undefined);
+      void this.closeCccNativeCliSession(live.id, "cancel").catch(() => undefined);
     } else {
       void this.kill(live.id, "killed").catch(() => undefined);
     }

@@ -262,6 +262,15 @@ export async function runOneShotSession(opts: RunOneShotOptions): Promise<OneSho
       // read-only too. See isReadOnlySession in the dashboard transport.
       posture: { readOnly: true },
       settings,
+      // One-shot completion is governed by exit (waitForExit below), never
+      // readiness — the bundled adapters' readiness detectors are
+      // interactive-TUI signals (bracketed paste / composer glyph) that a
+      // non-interactive JSON stream (`exec --json`, `--print`, …) never
+      // emits, so the manager's startup deadline would otherwise kill any
+      // validator/planning/CE run that legitimately took longer than it to
+      // finish. Callers that want an overall ceiling already have one: the
+      // optional `timeoutMs` race below.
+      readyTimeoutMs: null,
     });
     sessionId = record.id;
   } catch (err) {
